@@ -86,6 +86,7 @@
 //! The arms run in a fixed order (eager first in graph_block, graph first in graph_miss_layer and
 //! graph_trace), so slow clock or thermal drift falls on one side; the two runs of a window show it.
 
+use crate::family::exl3::launch::{Launch, MoeDims};
 use std::{
     ffi::OsStr,
     ops::Range,
@@ -107,7 +108,6 @@ use crate::{
             CudaProjector, CudaWeight, CudaWeights,
             exl3::{Exl3Bank, Exl3Io, Exl3Weight},
         },
-        qwen36::cuda::moe::{Launch, MoeDims},
     },
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, GraphExec,

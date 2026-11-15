@@ -1,7 +1,7 @@
 //! The launch scaffolding of the EXL3 MoE block: the dims record, the routing
 //! buffer views, and the context+stream pair every launcher takes. The Qwen3.6
-//! constructors (from `StepDims`) stay in `qwen36::cuda`; the paths re-export
-//! from there.
+//! constructors (from `StepDims`) stay in `qwen36::cuda`; every other consumer
+//! imports these names from here.
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

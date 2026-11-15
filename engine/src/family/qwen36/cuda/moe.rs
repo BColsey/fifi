@@ -31,7 +31,7 @@ use super::shard::ShardTable;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
 
-pub(in crate::family) use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::matmul_expert::{ExpertCall, ExpertSelect, ExpertStack};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;

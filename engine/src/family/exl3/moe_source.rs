@@ -7,12 +7,11 @@
 //! block and the upload: the router and the gate as F32 vectors, the routed experts of each
 //! projection as one bank, the shared expert as three single matrices.
 
+use crate::family::exl3::launch::MoeDims;
 use crate::family::{
     exl3::bank::{ExpertStore, PartStore},
     exl3_pack::{ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in},
-    qwen36::cuda::{
-        exl3_source::PackReader, layer_table::LayerTable, mixer_geometry::DenseSpec, moe::MoeDims,
-    },
+    qwen36::cuda::{exl3_source::PackReader, layer_table::LayerTable, mixer_geometry::DenseSpec},
 };
 use crate::{
     EngError,

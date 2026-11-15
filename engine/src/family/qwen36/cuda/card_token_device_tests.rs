@@ -33,10 +33,7 @@ use super::mixer::{BlockIo, CardKindOps, MixerParts, MixerViews, Mixers};
 use super::mixer_geometry::MixerGeometry;
 use super::mixer_ops::CardOp;
 use super::mixer_weights::{DenseWeight, LayerWeights, MixerWeights};
-use super::moe::{
-    ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
-    run_moe_block,
-};
+use super::moe::{ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, StackWeights, run_moe_block};
 use super::native_device_rig::{Rng, device_present, q4k_rows, raw_values};
 use super::shard::ShardTable;
 use super::state::ResidentState;
@@ -45,6 +42,7 @@ use super::state_layout::{Plane, Word};
 use super::step_ops::{final_resid, resid_in, resid_out};
 use super::step_plan::{KernelScratch, Slot, StepPlan};
 use crate::EngError;
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::project::cuda::served_admission;

@@ -345,6 +345,7 @@ pub(super) use device::{source_offsets, source_plan};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod device {
+    use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
     /// The router's picks per row: each row's expert ids and their weights.
     type RoutedPicks = Vec<(Vec<i32>, Vec<f32>)>;
     use super::super::step_plan::MAX_STEP_ROWS;
@@ -380,7 +381,6 @@ mod device {
                 },
                 exl3_jobs_plan::{EXL3_JOB_WORDS, MAX_EXL3_ROWS, exl3_job_bytes},
             },
-            qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
         },
         kernels::cuda::{
             CudaContext, DeviceBuffer, DeviceRange,

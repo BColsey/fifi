@@ -17,10 +17,10 @@ use super::{
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
-    moe::MoeDims,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3_pack::{ExpertPart, Root, expert_name_in, layer_name};
 use crate::{
     family::{

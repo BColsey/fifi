@@ -16,11 +16,11 @@ use super::{
     exl3_source::{PackReader, attention_weights, delta_weights},
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
-    moe::MoeDims,
     mtp_load::mtp_weights,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root};
 use crate::{
     EngError,

@@ -5,6 +5,7 @@
 //! weights and the block output with a host evaluation: the router in fp64, every picked
 //! expert's projections through the fp64 reference of the stored matrices, SiLU in fp64.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -17,7 +18,6 @@ use super::{
     exl3_moe_source::{moe_weights, moe_weights_banked},
     exl3_source::PackReader,
     layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
 };
 use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};

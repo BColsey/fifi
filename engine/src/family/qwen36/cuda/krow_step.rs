@@ -51,7 +51,6 @@ use super::super::{
     mixer::tail_extent,
     mixer_shapes::{attn_decode_shape, attn_prep_shape, delta_shape, plain_shape},
     mixer_weights::LayerWeights,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::{EmbedWeight, HeadWeight},
     state::{StepField, rollback::SnapPart},
     state_layout::{Plane, Word},
@@ -63,6 +62,7 @@ use super::{
     Mode, QwenResidentStep,
     krow_graph::{ENTERED_BY_GRAPH, Facts},
 };
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 #[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;
 #[cfg(test)]

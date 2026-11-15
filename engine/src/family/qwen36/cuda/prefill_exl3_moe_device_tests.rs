@@ -11,6 +11,7 @@
 //! and the least busy take the split-K tail (8 rows or fewer), so the block crosses every tile
 //! kernel of the rows entry.
 
+use crate::family::exl3::launch::{Launch, MoeDims};
 use std::path::Path;
 
 use crate::family::exl3::prefill_moe::{Bufs, routed_with, run, run_banked};
@@ -28,7 +29,6 @@ use crate::{
                 exl3_moe_source::{moe_weights, moe_weights_banked},
                 exl3_source::PackReader,
                 layer_table::LayerTable,
-                moe::{Launch, MoeDims},
                 prefill::{RouteIo, run_chunk_route},
             },
             exl3_pack::{expert_name, shared_name},

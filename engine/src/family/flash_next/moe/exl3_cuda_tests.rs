@@ -35,6 +35,7 @@
 //! the real weights. `FIFI_EXL3_INDEXED_PAIRS=20` queues the 20 gate and up pairs as one launch.
 //! The test prints the options it ran with.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::Path;
 
 use super::route;
@@ -51,7 +52,6 @@ use crate::{
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
-        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         DeviceBuffer, device_present,

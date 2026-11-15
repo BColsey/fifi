@@ -41,6 +41,7 @@
 // Staged: the executor is the first caller of the whole step.
 #![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::Cell;
 
 use crate::{
@@ -67,7 +68,6 @@ use crate::{
             CudaWeight, CudaWeights,
             exl3::{Exl3Io, Exl3JobsIo, Exl3Weight},
         },
-        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,

@@ -2,7 +2,8 @@
 //!
 //! Promoted from `qwen36::cuda`: the routed expert block, its
 //! merged-pass host path, and the weight source that lays experts out as a
-//! bank. The old `qwen36::cuda` paths re-export from here.
+//! bank. Consumers import these modules directly; `qwen36::cuda` keeps only
+//! what its own code uses.
 
 pub(in crate::family) mod bank;
 pub(in crate::family) mod launch;

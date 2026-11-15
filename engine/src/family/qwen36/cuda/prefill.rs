@@ -20,7 +20,7 @@ use super::{
     mixer_geometry::MixerGeometry,
     mixer_shapes::{attn_q8_shape, kv8_shape},
     mixer_weights::{DenseWeight, LayerWeights, MixerWeights},
-    moe::{Launch, MoeDims, MoeLayerWeights, StackWeights},
+    moe::{MoeLayerWeights, StackWeights},
     prefill_driver::Kv8Staging,
     prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
     sparse_exec::SparseExec,
@@ -28,6 +28,7 @@ use super::{
     state_layout::{Plane, Word},
     tiered_step::TieredRuntime,
 };
+use crate::family::exl3::launch::{Launch, MoeDims};
 use crate::family::exl3::prefill::Exl3Scratch;
 use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
 use crate::family::project::cuda::WeightLayout;

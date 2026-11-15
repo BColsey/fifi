@@ -40,6 +40,7 @@
 //! The mailbox carries at most 8 misses (the tiered kernels' limit, kept); Flash-Next picks 10. Run
 //! only inside an exclusive GPU window: the numbers are timings.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::{
     path::Path,
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
@@ -56,7 +57,6 @@ use crate::{
         exl3_pack::{ExpertPart, Root, expert_name_in},
         flash_next::load::{exl3_pack::inspect_flash_pack, model_shape},
         project::cuda::{CudaProjector, CudaWeights},
-        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::{
         cuda::{

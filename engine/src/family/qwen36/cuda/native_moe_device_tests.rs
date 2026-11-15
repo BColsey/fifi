@@ -12,12 +12,13 @@
 //! the produced q8 pack (each hop's own `A`, the shared down hop's from the shared pack), and some
 //! shared row's signal is asserted at 3x ITS OWN bound so a zeroed or swapped shared term (m9)
 //! cannot hide inside the bounds.
-use super::moe::{ExpertBufs, Launch, MoeBuffers, Packs, RouteBufs, run_moe_block};
+use super::moe::{ExpertBufs, MoeBuffers, Packs, run_moe_block};
 use super::native_device_rig::{
     DIMS, Sources, assert_finite, device_present, f32_buf, hop_bound, host_router, q8_1_bytes,
     rig_weights, rig_weights_agree, row_l1, sources, zero_buf,
 };
 use crate::EngError;
+use crate::family::exl3::launch::{Launch, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PackCall, xf_bytes};
 

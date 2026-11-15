@@ -11,8 +11,8 @@ use super::{
     exl3_source::{PackReader, attention_weights},
     layer_table::LayerTable,
     mixer_geometry::{DenseSpec, MixerGeometry},
-    moe::MoeDims,
 };
+use crate::family::exl3::launch::MoeDims;
 use crate::family::exl3_pack::Root;
 use crate::{
     EngError,

@@ -436,7 +436,7 @@ fn q8_layouts_refuse_a_mixed_buffer() {
 /// The up-half sub-view follows `dims.inter`, never a literal column.
 #[test]
 fn routed_up_view_follows_the_moe_inter() {
-    use super::moe::MoeDims;
+    use crate::family::exl3::launch::MoeDims;
     for dims in [
         MoeDims::new(&common_tests::dims(), 1),
         super::native_device_rig::DIMS,
@@ -568,7 +568,7 @@ fn prefill_call_shapes_are_the_plan_values() {
         "the launch plan's part bytes pass the flat cap"
     );
 
-    let moe = super::moe::MoeDims::new(&dims, 130);
+    let moe = crate::family::exl3::launch::MoeDims::new(&dims, 130);
     let router = chunk_router_shape(&moe, 130);
     assert_eq!(
         (router.m, router.hidden, router.n_expert, router.top_k),
@@ -655,7 +655,7 @@ fn prefill_stage_needs_fit_the_session_slots() {
             }
             let rows = ChunkRows::new(0, m, cap, m_sess).expect("rows");
             let (h, d, a) = (g.hidden, &g.delta, &g.attn);
-            let moe = super::moe::MoeDims::new(&dims, m);
+            let moe = crate::family::exl3::launch::MoeDims::new(&dims, m);
             let routed = m * moe.top_k;
             let row = |n| row_bytes(m, n).expect("row bytes");
             let q8 = |k, cols| q8_1_mmq_bytes(k, cols).expect("q8 bytes");

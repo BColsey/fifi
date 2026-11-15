@@ -26,12 +26,13 @@
 //! word and pair before accepting the token.
 
 use crate::EngError;
+use crate::family::exl3::launch::RouteBufs;
 use crate::family::qwen36::cuda::card_block::{run_card_block, run_card_moe_block};
 use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::Mixers;
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
 use crate::family::qwen36::cuda::moe::{
-    CardMoeOp, ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, RouteBufs, moe_sequence_card,
+    CardMoeOp, ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, moe_sequence_card,
 };
 use crate::family::qwen36::cuda::state::{ResidentState, StepField};
 use crate::family::qwen36::cuda::state_layout::Word;

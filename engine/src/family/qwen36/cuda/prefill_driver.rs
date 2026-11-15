@@ -19,6 +19,7 @@ use super::{
         chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
     },
 };
+use crate::family::exl3::launch::Launch;
 use crate::family::prefill::arena::PrefillStep;
 use crate::{
     EngError,
@@ -675,7 +676,6 @@ pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, 
 
 // ---- the shared chunk-family surface ---------------------------------------------------------
 
-use super::moe::Launch;
 use super::prefill::{ChunkBufs, ChunkModel, ChunkRows, ChunkSparse};
 use super::state::ResidentState;
 use crate::family::prefill::chunk_family::ChunkFamily;

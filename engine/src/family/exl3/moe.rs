@@ -24,10 +24,8 @@
 
 pub(in crate::family) mod merge;
 
-use crate::family::qwen36::cuda::{
-    layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
-};
+use super::launch::{Launch, MoeDims, RouteBufs};
+use crate::family::qwen36::cuda::layer_table::LayerTable;
 use crate::{
     EngError,
     family::{

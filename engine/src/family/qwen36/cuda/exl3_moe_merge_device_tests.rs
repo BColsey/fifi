@@ -21,6 +21,7 @@
 //! - `shared_in_routed_graph_has_seven_fewer_kernel_nodes`: the captured block has exactly 7
 //!   nodes fewer per layer.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::{collections::BTreeSet, path::Path};
 
 use super::{
@@ -33,7 +34,6 @@ use super::{
     exl3_moe_source::moe_weights,
     exl3_source::PackReader,
     layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
 };
 use crate::{

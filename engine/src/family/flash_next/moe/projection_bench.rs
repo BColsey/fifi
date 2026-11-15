@@ -42,6 +42,7 @@
 //! Each sample is one run of a case: its launches (three kernels each) plus a timing mark. A
 //! profiled run (Nsight Systems) splits it into kernels.
 
+use crate::family::exl3::launch::MoeDims;
 use std::{collections::HashSet, ops::Range, time::Instant};
 
 use super::{
@@ -50,10 +51,7 @@ use super::{
     residency_bench::{Res, clock_mark, device_us, emit, fail, open_layer},
 };
 use crate::{
-    family::{
-        project::cuda::{CudaProjector, exl3::Exl3Io},
-        qwen36::cuda::moe::MoeDims,
-    },
+    family::project::cuda::{CudaProjector, exl3::Exl3Io},
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceStream, TimingEvent,
         resident::exl3::{DP4A_VAR, INDEXED_PAIRS_VAR, IndexedOptions, PIPE_VAR},

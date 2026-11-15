@@ -33,6 +33,7 @@
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::RefCell;
 
 use super::{
@@ -47,8 +48,8 @@ use super::{
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
-        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, MoeOp, Packs, RouteBufs,
-        StackWeights, run_moe_block_marked, tiered::TieredScratch,
+        ExpertBufs, MoeBuffers, MoeLayerWeights, MoeOp, Packs, StackWeights, run_moe_block_marked,
+        tiered::TieredScratch,
     },
     prefill_driver::{
         AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
@@ -717,7 +718,7 @@ fn stage_route_layer(
     stream: &DeviceStream,
     stage: &RouteStage,
     layer: usize,
-    route: &super::moe::RouteBufs<'_>,
+    route: &RouteBufs<'_>,
 ) -> Result<(), EngError> {
     let at = layer * stage.stride;
     let ids = stage.buffer.range(at, stage.top_k * size_of::<i32>())?;
@@ -1512,7 +1513,6 @@ impl<'a> QwenResidentStep<'a> {
     /// status read gates publication. KV8 also uses blocking causal-length writes before each
     /// attention tile. Every error after the chunk opens poisons the state.
     pub(super) fn run_chunk(&mut self, p0: usize, rows: &[u32]) -> Result<(), EngError> {
-        use super::moe::Launch;
         use super::prefill::{
             ChunkBufs, ChunkModel, ChunkRows, ChunkSparse, ChunkViews, ChunkWeights,
         };
@@ -2343,7 +2343,7 @@ impl<'a> QwenResidentStep<'a> {
     fn capture_route_picks(
         &self,
         stream: &DeviceStream,
-        route: &super::moe::RouteBufs<'_>,
+        route: &RouteBufs<'_>,
         top_k: usize,
     ) -> Result<(), EngError> {
         let read = |range: &DeviceRange<'_>, bytes: usize| -> Result<Vec<u8>, EngError> {

@@ -30,6 +30,7 @@
 //! many of ROW 0's picks the bank holds — 0 the all-ring arm, 10 the all-bank arm, 6 the default
 //! mix — rows 1.. keep the default split in every arm.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::PathBuf;
 
 use super::{
@@ -51,7 +52,6 @@ use crate::{
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights},
-        qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
     },
     kernels::cuda::{
         DeviceBuffer, device_present,

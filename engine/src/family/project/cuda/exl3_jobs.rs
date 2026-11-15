@@ -13,12 +13,10 @@
 //! Pure plan functions plus launch construction over borrowed device ranges; nothing here
 //! allocates device memory, enqueues or observes health.
 
+use crate::family::exl3::launch::{Launch, MoeDims};
 use crate::{
     EngError,
-    family::{
-        project::cuda::{Exl3JobsIo, exl3::Exl3Members},
-        qwen36::cuda::moe::{Launch, MoeDims},
-    },
+    family::project::cuda::{Exl3JobsIo, exl3::Exl3Members},
     kernels::cuda::{DeviceRange, resident::exl3::Exl3Job},
 };
 

@@ -21,16 +21,14 @@
 //! laid out as two K-row groups, and any row-offset mistake of the K-row body. A host without a
 //! device skips them.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::collections::HashMap;
 
 use half::f16;
 
-use super::{
-    exl3_moe::{
-        Exl3MoeBufs, Exl3MoeWeights, GROUPED_PAIRS, Scratch, SharedRowsIo, SharedWeights,
-        run_exl3_moe, run_exl3_moe_rows, shared, shared_rows,
-    },
-    moe::{Launch, MoeDims, RouteBufs},
+use super::exl3_moe::{
+    Exl3MoeBufs, Exl3MoeWeights, GROUPED_PAIRS, Scratch, SharedRowsIo, SharedWeights, run_exl3_moe,
+    run_exl3_moe_rows, shared, shared_rows,
 };
 use crate::{
     EngError,

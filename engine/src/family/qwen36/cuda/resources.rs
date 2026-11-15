@@ -14,7 +14,7 @@ use super::{
     layer_table::LayerTable,
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
     mixer_weights::dense_weight,
-    moe::{MoeDims, MoeLayerWeights, StackWeights},
+    moe::{MoeLayerWeights, StackWeights},
     paging_plan::PagingPlan,
     paging_store::device_first::DeviceCachePlan,
     shard::ShardTable,
@@ -23,6 +23,7 @@ use super::{
     step_plan::{KernelScratch, MAX_STEP_ROWS, StepPlan},
     tiered_step::LayerParts,
 };
+use crate::family::exl3::launch::MoeDims;
 use crate::{
     EngError,
     family::spec::AttentionKind,

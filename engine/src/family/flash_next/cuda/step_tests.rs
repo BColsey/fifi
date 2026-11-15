@@ -21,6 +21,7 @@
 //!
 //! Needs a GPU, `--test-threads=1` and (for the full window) several GiB; ignored by default.
 
+use crate::family::exl3::launch::Launch;
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use super::{
@@ -54,7 +55,7 @@ use crate::{
             DenseProjector, DenseWeight, Projector,
             cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         },
-        qwen36::cuda::{exl3_source::PackReader, moe::Launch},
+        qwen36::cuda::exl3_source::PackReader,
     },
     kernels::{
         cuda::{DeviceStream, device_present},
@@ -636,7 +637,7 @@ fn split_block<'w>(
     weights: &'w CudaWeights,
     layers: &[usize],
     slots: usize,
-    dims: &crate::family::qwen36::cuda::moe::MoeDims,
+    dims: &crate::family::exl3::launch::MoeDims,
 ) -> SplitMoeAt<'w> {
     let source = PackRecordSource::new(checkpoint).expect("the record source");
     let record = source.layout().record_bytes();

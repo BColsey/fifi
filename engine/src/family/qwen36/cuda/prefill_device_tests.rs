@@ -12,7 +12,7 @@
 //! `BadRequest` before any native call (no latch), and the raw-FFI row reads the C status directly
 //! without the `native_error` mapping.
 
-use super::moe::{Launch, MoeDims, MoeLayerWeights, StackWeights};
+use super::moe::{MoeLayerWeights, StackWeights};
 use super::native_device_rig::{
     self, DIMS, Rng, assert_finite, device_present, f16, q4k_rows, q4k_value,
 };
@@ -27,6 +27,7 @@ use super::{
     mixer_weights::{DenseWeight, MixerWeights},
 };
 use crate::EngError;
+use crate::family::exl3::launch::{Launch, MoeDims};
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::prefill::mmq_size::{
     expert_bounds_ints, fixup_floats_max, ids_dst_ints, ids_src1_ints, q8_1_bytes,

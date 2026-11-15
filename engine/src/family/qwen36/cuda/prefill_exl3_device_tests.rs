@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use super::{TILE_ROWS, write_dense_jobs};
+use crate::family::exl3::launch::Launch;
 use crate::family::exl3::prefill::{Exl3Scratch, F32, Output, Projector};
 use crate::{
     family::{
@@ -29,7 +30,6 @@ use crate::{
             layer_table::LayerTable,
             mixer_geometry::MixerGeometry,
             mixer_weights::MixerWeights,
-            moe::Launch,
         },
     },
     kernels::cuda::{DeviceBuffer, DeviceRange, device_present, resident::router::RouterShape},
@@ -118,7 +118,7 @@ impl Scratch {
     /// The projector of a chunk of `rows` rows, its job table written.
     pub(super) fn chunk<'a>(
         &'a self,
-        launch: &'a crate::family::qwen36::cuda::moe::Launch<'a>,
+        launch: &'a crate::family::exl3::launch::Launch<'a>,
         rows: usize,
     ) -> Projector<'a> {
         let projector = Projector {
