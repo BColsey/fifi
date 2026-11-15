@@ -13,3 +13,4 @@ pub(in crate::family) mod moe_source;
 pub(in crate::family) mod prefill;
 pub(in crate::family) mod prefill_moe;
 pub(in crate::family) mod shapes;
+pub(in crate::family) mod source;
