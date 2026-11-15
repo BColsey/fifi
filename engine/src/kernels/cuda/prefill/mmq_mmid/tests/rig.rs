@@ -440,3 +440,124 @@ pub(super) fn launch_mode(
         fixup: !ntiles.is_multiple_of(blocks),
     }
 }
+
+/// An (n_experts, n) pair whose Q4_K launch at `m` runs stream-k with the fixup on the
+/// live card AND whose blocks cut a fixup boundary inside the empty top expert's tile
+/// past `ne_get_rows + 126` — the boundary the B2 reach assert exists for. The
+/// historical literals (8 experts, n 512 = 64 tiles, the shapes the 3090 battery covered)
+/// are tried first and kept whenever the card runs them stream-k with the fixup, so the
+/// covered shapes do not shrink; a card whose SM count fills 64 tiles exactly (tiling,
+/// no fixup) or whose blocks never cut the empty-expert boundary falls through to a
+/// search, experts preferred from 8 down so the fixtures keep their shape, n a multiple
+/// of 128 so the launch never falls back. The bounds fed to the reach check are the exact
+/// ones the pool's rows produce (`bounds[e]` = picks below `e`), so the acceptance sees
+/// the boundary the device will see. Returns `None` when nothing fits.
+pub(super) fn stream_k_shape(
+    facts: (i32, usize, usize),
+    m: usize,
+    top_k: usize,
+) -> Option<(usize, usize)> {
+    let fits = |e: usize, n: usize| {
+        let shape = MmidShape {
+            n_experts: e,
+            m,
+            top_k,
+        };
+        let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+        if mode.tiling || !mode.fixup || mode.ntx < 2 {
+            return false;
+        }
+        // The B2 reach boundary must exist for the rows the test will feed: the bounds
+        // are the exact per-expert prefix counts of the pool's rows (all but the top
+        // expert, which stays empty), so this is the boundary the device run finds.
+        let rows = super::tight::rows_from_pool(&shape, e - 1, 0xb3);
+        let mut bounds = vec![0_i32; e + 1];
+        for id in &rows {
+            bounds[*id as usize + 1] += 1;
+        }
+        for i in 1..=e {
+            bounds[i] += bounds[i - 1];
+        }
+        super::tight::b2_reach(&mode, 8, &shape, &bounds).is_some()
+    };
+    [(8usize, 512usize)]
+        .into_iter()
+        .filter(|&(e, n)| fits(e, n))
+        .chain(
+            (3..=8)
+                .rev()
+                .flat_map(|e| (1..=64).map(move |b| (e, 128 * b))),
+        )
+        .find(|&(e, n)| fits(e, n))
+}
+
+#[test]
+fn stream_k_shape_finds_a_shape_with_the_reach_boundary_on_every_fleet_card() {
+    // The B2 test's acceptance (stream-k with the fixup AND a fixup boundary in the empty
+    // top expert's tile) must be satisfiable on every card the fleet runs, with the facts
+    // of the parts that own those SM counts. This runs on every build, so a search-space
+    // edit that strands a card fails here without needing the device.
+    for (name, facts) in [
+        ("82-SM desktop card", (860, 82, 101_376)),
+        ("20-SM laptop card", (890, 20, 101_376)),
+        ("8-SM embedded part", (720, 8, 98_304)),
+    ] {
+        let found = stream_k_shape(facts, 130, 2);
+        let Some((e, n)) = found else {
+            panic!("{name}: no shape with the reach boundary")
+        };
+        // The chosen shape, re-derived: still stream-k with the fixup and at least two
+        // column tiles, and its bounds really cut a fixup boundary past `ne_get_rows + 126`.
+        let shape = MmidShape {
+            n_experts: e,
+            m: 130,
+            top_k: 2,
+        };
+        let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
+        assert!(
+            !mode.tiling && mode.fixup && mode.ntx >= 2,
+            "{name}: (e {e}, n {n}) -> {mode:?}"
+        );
+        let rows = super::tight::rows_from_pool(&shape, e - 1, 0xb3);
+        let mut bounds = vec![0_i32; e + 1];
+        for id in &rows {
+            bounds[*id as usize + 1] += 1;
+        }
+        for i in 1..=e {
+            bounds[i] += bounds[i - 1];
+        }
+        assert!(
+            super::tight::b2_reach(&mode, 8, &shape, &bounds).is_some(),
+            "{name}: (e {e}, n {n}) has no fixup boundary in the empty top expert"
+        );
+        eprintln!("{name}: {found:?}");
+    }
+}
+
+#[test]
+fn launch_mode_matches_the_documented_rule_on_small_mid_and_large_sm_counts() {
+    // The replica's rule (mmq.cuh:1399, int arithmetic): tiling when
+    // `100 * ntiles / (nsm * ceil(ntiles / nsm)) >= 90`, blocks `nsm` otherwise, the fixup
+    // whenever `ntiles` does not divide the blocks. Pinned on the SM counts the fleet
+    // spans (an 8-SM embedded part, a 20-SM laptop card, an 82-SM desktop card) so a
+    // replica edit that drifts from the kernel's decision fails here instead of quietly
+    // reshaping every sized test.
+    let mode = |e: usize, b: usize, nsm: usize| {
+        let shape = MmidShape {
+            n_experts: e,
+            m: 130,
+            top_k: 2,
+        };
+        launch_mode(QuantType::Q4K, 128 * b, &shape, (860, nsm, 101_376))
+    };
+    for (nsm, b, tiling, fixup) in [
+        (8usize, 1usize, true, false),
+        (20, 4, false, true),
+        (82, 4, false, true),
+        (82, 41, true, false),
+        (16, 1, true, false),
+    ] {
+        let got = mode(8, b, nsm);
+        assert_eq!((got.tiling, got.fixup), (tiling, fixup), "nsm {nsm} b {b}");
+    }
+}

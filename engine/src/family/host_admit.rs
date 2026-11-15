@@ -576,6 +576,36 @@ mod tests {
     }
 
     #[test]
+    fn captured_jetson_layout_refuses_cleanly_to_the_bare_fallback() {
+        // The Xavier (L4T) runs hybrid cgroup v1 with a controller-less unified tree: the
+        // membership's first line is a v1 controller line, not `0::`, and no memory limit
+        // lives anywhere the unified reader looks. The capture pins that this layout refuses
+        // with the clean "cannot map" error — the refusal `probe_or_bare` turns into the
+        // bare `/proc/meminfo` fallback — before any filesystem access at all.
+        let jetson: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/cgroup-jetson-20261118.json")).unwrap();
+        let view = &jetson["jetson"];
+        assert_eq!(view["unified_controllers"].as_str().unwrap(), "");
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().canonicalize().unwrap();
+        let result = cgroup_from_proc(
+            LABEL,
+            &directory,
+            view["membership"].as_str().unwrap(),
+            view["mountinfo"].as_str().unwrap(),
+            std::process::id(),
+        );
+        assert!(
+            matches!(&result, Err(EngError::MemoryPlan(message))
+                if message.contains("cannot map its process")),
+            "the Jetson layout must refuse, not resolve or panic: {result:?}"
+        );
+        // The refusal happens before the tree is read: the untouched directory proves it.
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        eprintln!("captured jetson view: refused cleanly, bare fallback applies");
+    }
+
+    #[test]
     fn captured_cgroup_host_member_maps_to_nested_group() {
         let captures: serde_json::Value =
             serde_json::from_str(include_str!("testdata/cgroup-views-20261028.json")).unwrap();

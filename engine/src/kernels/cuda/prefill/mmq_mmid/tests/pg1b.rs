@@ -17,6 +17,7 @@
 use super::device_facts;
 use super::rig::{
     LaunchSpec, Launched, expert_blocks, gate_dst, launch_mode, launch_once, normal_rows,
+    stream_k_shape,
 };
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
@@ -214,23 +215,31 @@ fn mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile() {
     if !testkit::device_present("mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile") {
         return;
     }
-    // A slot bank: 8 experts, every token picks experts 0 and 1, so both hold 130 columns in two
-    // J = 80 tiles, and the 64 tiles over 82 SMs run stream-k with the fixup (K 2,048 gives each
-    // block a part of a tile's k range). Since 3e48f7647 the default Q4_K hint clamps the tile
-    // to a tiling width, so this test forces the hint off — the rollback path of
-    // INFERENCE_CUDA_MMID_COLS_HINT=off and the only launch form that still runs grouped
-    // stream-k; the replica's `ncols_opt = m` is the un-hinted geometry.
+    // A slot bank: every token picks experts 0 and 1, so both hold 130 columns in two
+    // J = 80 tiles, and the tiles over the card's SMs run stream-k with the fixup
+    // (K 2,048 gives each block a part of a tile's k range). The (experts, n) pair
+    // comes from the live facts — the old literals (8 experts, n 512 = 64 tiles over
+    // 82 SMs) forced stream-k only on the 3090. Since 3e48f7647 the default Q4_K hint
+    // clamps the tile to a tiling width, so this test forces the hint off — the rollback
+    // path of INFERENCE_CUDA_MMID_COLS_HINT=off and the only launch form that still runs
+    // grouped stream-k; the replica's `ncols_opt = m` is the un-hinted geometry.
     set_hint_override(Some(None));
+    let facts = {
+        let ctx = CudaContext::new().expect("a context for the facts");
+        let f = device_facts(&ctx).expect("the device facts");
+        (f.cc, f.nsm, f.smpbo)
+    };
+    let (n_experts, n) = stream_k_shape(facts, 130, 2).expect("a stream-k shape for this card");
     let shape = MmidShape {
-        n_experts: 8,
+        n_experts,
         m: 130,
         top_k: 2,
     };
-    let (k, n) = (2048, 512);
+    let k = 2048;
     let rows: Vec<i32> = (0..shape.m)
         .flat_map(|t| if t % 2 == 0 { [0, 1] } else { [1, 0] })
         .collect();
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0x5ca1);
+    let weights = expert_blocks(QuantType::Q4K, n_experts, n, k, 0x5ca1);
     let x = normal_rows(shape.m, k, 0x5ca2);
     let spec = LaunchSpec {
         shape,

@@ -18,7 +18,7 @@
 
 use super::rig::{
     IdBufs, LaunchSpec, Mode, POISON, dequantized, errors, expert_blocks, f32_bytes, f32s,
-    gate_dst, launch_mode, nan_bytes, normal_rows, reference,
+    gate_dst, launch_mode, nan_bytes, normal_rows, reference, stream_k_shape,
 };
 use super::{device_facts, ints, read};
 use crate::EngError;
@@ -186,7 +186,7 @@ fn tight_phase(weights: &[u8], spec: &LaunchSpec<'_>) -> Result<Tight, EngError>
 /// finishes the tile it starts in when it starts mid-tile and does not end inside it, and then
 /// gathers `ids_dst[col_low + jt * J + j]` for all `j < J`, bounds or not): `(block, tile, last
 /// index gathered)`, with the last index above `ne_get_rows + 126`.
-fn b2_reach(
+pub(super) fn b2_reach(
     mode: &Mode,
     kb: usize,
     shape: &MmidShape,
@@ -211,7 +211,7 @@ fn b2_reach(
 
 /// Router rows over `shape` where each token draws `top_k` distinct experts from the first `pool`
 /// with a seeded shuffle.
-fn rows_from_pool(shape: &MmidShape, pool: usize, seed: u64) -> Vec<i32> {
+pub(super) fn rows_from_pool(shape: &MmidShape, pool: usize, seed: u64) -> Vec<i32> {
     let mut rng = Rng::new(seed);
     let mut rows = Vec::with_capacity(shape.ne_get_rows());
     for _ in 0..shape.m {
@@ -357,20 +357,26 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
     if !testkit::device_present("mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert") {
         return;
     }
-    // 8 experts, the highest empty, two column tiles (J 80 at M 130), K 2,048 (eight k-blocks), 64
-    // tiles over 82 SMs: stream-k with the fixup, whose ids gather has no exit for an empty tile.
-    // The hint-off override is load-bearing: since 3e48f7647 the default Q4_K hint clamps the
-    // tile to a tiling width, so without it this launches the tiling grid and the boundary below
-    // cannot exist. This is the rollback path of INFERENCE_CUDA_MMID_COLS_HINT=off.
+    // The highest expert is empty, two column tiles (J 80 at M 130), K 2,048 (eight
+    // k-blocks): stream-k with the fixup, whose ids gather has no exit for an empty tile.
+    // The (experts, n) pair comes from the live facts — the old literals (8 experts,
+    // n 512 = 64 tiles over 82 SMs) force stream-k only on the 3090; a card whose SM
+    // count divides 64 fills exactly and launches tiling, and the fixup boundary the
+    // test exists for would never run. The hint-off override is load-bearing: since
+    // 3e48f7647 the default Q4_K hint clamps the tile to a tiling width, so without it
+    // this launches the tiling grid and the boundary below cannot exist. This is the
+    // rollback path of INFERENCE_CUDA_MMID_COLS_HINT=off.
     set_hint_override(Some(None));
+    let facts = facts();
+    let (n_experts, n) = stream_k_shape(facts, 130, 2).expect("a stream-k shape for this card");
     let shape = MmidShape {
-        n_experts: 8,
+        n_experts,
         m: 130,
         top_k: 2,
     };
-    let (k, n) = (2048, 512);
-    let rows = rows_from_pool(&shape, 7, 0xb3);
-    let weights = expert_blocks(QuantType::Q4K, 8, n, k, 0xb301);
+    let k = 2048;
+    let rows = rows_from_pool(&shape, n_experts - 1, 0xb3);
+    let weights = expert_blocks(QuantType::Q4K, n_experts, n, k, 0xb301);
     let x = normal_rows(shape.m, k, 0xb302);
     let spec = LaunchSpec {
         shape,
@@ -382,13 +388,18 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
         x: &x,
         gather: false,
     };
-    let mode = launch_mode(QuantType::Q4K, n, &shape, facts());
+    let mode = launch_mode(QuantType::Q4K, n, &shape, facts);
     assert!(
         !mode.tiling && mode.fixup && mode.ntx >= 2,
         "the shape must run stream-k with the fixup over two column tiles: {mode:?}"
     );
-    let tight = run_row("B2 (8 experts, empty top expert, fixup)", &spec, &weights);
-    assert_eq!(tight.bounds[7], tight.bounds[8], "the top expert is empty");
+    let tight = run_row("B2 (empty top expert, fixup)", &spec, &weights);
+    let top = shape.n_experts;
+    assert_eq!(
+        tight.bounds[top - 1],
+        tight.bounds[top],
+        "the top expert is empty"
+    );
     let reach = b2_reach(&mode, k / 256, &shape, &tight.bounds);
     let (block, tile, last) =
         reach.expect("a stream-k boundary in an empty top-expert tile past ne_get_rows + 126");

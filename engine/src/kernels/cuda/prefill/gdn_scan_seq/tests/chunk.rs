@@ -332,14 +332,20 @@ fn gdn_scan_chunk_refuses_bad_calls() -> Result<(), EngError> {
 
 /// The switch routing: `FIFI_GDN_SCAN_CHUNK` set sends launches of at least `SCAN_MIN_ROWS`
 /// rows to the chunk kernel (the thread-local counter) and those bytes equal the direct
-/// chunk launch's; unset, and below the floor, the sequential kernel runs. Driven through
-/// the explicit-setting seam (the process reads its env once).
+/// chunk launch's; unset, and below the floor, the sequential kernel runs. Below sm_80 the
+/// switch falls back to the sequential kernels (`chunk_scan_hosted`: the tensor-core cubins
+/// are not device-qualified there), so the long rows also expect the sequential kernel.
+/// Driven through the explicit-setting seam (the process reads its env once).
 #[test]
 fn the_chunk_switch_routes_only_long_scans() -> Result<(), EngError> {
     use crate::kernels::cuda::prefill::gdn_scan_seq::SCAN_MIN_ROWS;
     if !testkit::device_present("chunk switch routing") {
         return Ok(());
     }
+    let hosted = {
+        let rig = Rig::new()?;
+        rig.ctx.chunk_scan_hosted()
+    };
     let (nk, nv) = (2usize, 4);
     let ctx_scan = |m: usize, chunk: Option<()>| -> Result<(Vec<u8>, Vec<u8>), EngError> {
         let inp = generate_scan(
@@ -381,11 +387,12 @@ fn the_chunk_switch_routes_only_long_scans() -> Result<(), EngError> {
         scan.state.read_at(&scan.rig.stream, 0, &mut state)?;
         Ok((out, state))
     };
-    for (m, on_chunk) in [
+    for (m, wants_chunk) in [
         (1usize, false),
         (SCAN_MIN_ROWS - 1, false),
         (SCAN_MIN_ROWS, true),
     ] {
+        let on_chunk = wants_chunk && hosted;
         let before = super::super::CHUNK_CALLS.with(std::cell::Cell::get);
         let got = ctx_scan(m, Some(()))?;
         let ran = super::super::CHUNK_CALLS.with(std::cell::Cell::get) - before;

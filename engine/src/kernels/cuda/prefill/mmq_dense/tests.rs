@@ -7,7 +7,7 @@ use crate::EngError;
 use crate::kernels::cuda::native::prefill::mmq_dense::{MmqDenseRaw, mmq_dense_launch};
 use crate::kernels::cuda::prefill::mmq_quant::MmqQuantizeCall;
 use crate::kernels::cuda::prefill::mmq_size::{
-    MmqType, NCOLS_LIMIT, Q8_1_PAD, fixup_floats_exact, fixup_floats_max, j_best, j_ub,
+    MmqConfig, MmqType, NCOLS_LIMIT, Q8_1_PAD, fixup_floats_exact, fixup_floats_max, j_best, j_ub,
 };
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::Rng;
@@ -214,6 +214,56 @@ fn mmq_dense_needs_refuse_overflow_by_tag() {
         let error = dense_needs(QuantType::Q80, 2048, n, m, ld, 0).expect_err("overflow");
         assert!(format!("{error:?}").contains("size overflow"), "{error:?}");
     }
+}
+
+/// The sizing search's `plan_of` mode decisions, tied to the production C oracle the native
+/// sweep already pins `rust_fixup_need` to: for every n the search can pick (the historical
+/// pair plus every 128 multiple it scans, at the search's own m and type) and the device
+/// facts of every fleet card, the fixup the search plans is exactly the fixup the kernel's
+/// C sizing says the launch needs. Needs no card; exists only in native-cuda builds, where
+/// the oracle is linked.
+#[cfg(feature = "native-cuda")]
+#[test]
+fn mmq_dense_search_modes_agree_with_the_c_oracle() {
+    use crate::kernels::cuda::native::prefill::mmq_dense::tests::{
+        c_fixup_need_at, compiled_archs,
+    };
+    let fleet: [(&str, i32, usize, usize); 3] = [
+        ("82-SM desktop card", 860, 82, 101_376),
+        ("20-SM laptop card", 890, 20, 102_400),
+        ("8-SM embedded part", 720, 8, 98_304),
+    ];
+    // A facts set whose arch this build did not compile is not a state it can be in (the
+    // same rule the native sweep enforces): the C config tables only exist for compiled
+    // archs, so the oracle's answer there is a build artifact, not a divergence.
+    let built = compiled_archs();
+    let ggml = 8; // Q8_0, the type the sizing search probes with
+    let mut compared = 0usize;
+    for (name, cc, nsm, smpbo) in fleet {
+        if !built.contains(&cc) {
+            println!("search-mode oracle pin: skipped {name}: {cc} not in this build {built:?}");
+            continue;
+        }
+        let facts = Facts { cc, nsm, smpbo };
+        let n_candidates = [2048usize, 5248]
+            .into_iter()
+            .chain((1..=41).map(|b| 128 * b));
+        for n in n_candidates {
+            let plan = plan_of(&dense("oracle pin", QuantType::Q80, (2048, n, 130)), facts);
+            let c = c_fixup_need_at(ggml, n, 130, cc, nsm as i32, smpbo);
+            assert_eq!(
+                plan.fixup,
+                c != 0,
+                "{name}: n {n}: plan fixup {} but C oracle {c} B",
+                plan.fixup
+            );
+            compared += 1;
+        }
+    }
+    assert!(
+        compared > 40,
+        "compared {compared}: every built fleet arch was skipped"
+    );
 }
 
 // ---- the fixup size ------------------------------------------------------------------------
@@ -1023,11 +1073,14 @@ fn plan_of(case: &Case, facts: Facts) -> Plan {
     let tiles = case.m.div_ceil(j) * case.n.div_ceil(128);
     let waves = tiles.div_ceil(facts.nsm);
     let tiling = 100 * tiles / (facts.nsm * waves) >= 90;
+    // The pascal table has no stream-k rows (the C oracle returns 0 there, mmq_dense.cu:174):
+    // a launch without stream-k has no fixup whatever the tile count says.
+    let stream_k = MmqConfig::select(facts.cc).stream_k(mmq_type_of(case.ty), j);
     Plan {
         j,
         tiles,
         tiling,
-        fixup: !tiling && !tiles.is_multiple_of(facts.nsm),
+        fixup: stream_k && !tiling && !tiles.is_multiple_of(facts.nsm),
     }
 }
 
@@ -1102,12 +1155,40 @@ fn mmq_dense_rows_are_invariant_within_a_tile_and_across_tiles_in_tiling_mode() 
     if !testkit::device_present(NAME) {
         return;
     }
+    // The n of both cases is sized from the live facts: the stream-k case must run with the
+    // fixup and the tiling case must fill the card at >= 90 %, and the historical literals
+    // (2,048 and 5,248 = 41 blocks = 82 tiles exactly) hit those modes only on 82 SMs. The
+    // historical pair is tried first and kept whenever the card runs it in the intended
+    // mode, so the 3090's covered shapes do not shrink; other cards fall through to the
+    // smallest n that lands the mode (j stays 80 because m stays 130).
+    let live = {
+        let rig = open_rig().expect("the facts rig");
+        facts_of(&rig.ctx).expect("the device facts")
+    };
+    let probe = |n: usize| plan_of(&dense("probe", QuantType::Q80, (2048, n, 130)), live);
+    let sk_n = [2048usize]
+        .into_iter()
+        .chain((1..=512).map(|b| 128 * b))
+        .find(|&n| {
+            let p = probe(n);
+            !p.tiling && p.fixup
+        })
+        .expect("an n the card runs stream-k with the fixup");
+    let tl_n = [5248usize]
+        .into_iter()
+        .chain((1..=512).map(|b| 128 * b))
+        .find(|&n| probe(n).tiling)
+        .expect("an n the card fills at >= 90 %");
+    println!(
+        "PG1b sizing: nsm {} -> stream-k n {sk_n}, tiling n {tl_n}",
+        live.nsm
+    );
     let stream_k = input(
-        dense("stream-k 2048x2048", QuantType::Q80, (2048, 2048, 130)),
+        dense("stream-k K2048 m130", QuantType::Q80, (2048, sk_n, 130)),
         0x6454_0001,
     );
     let tiling = input(
-        dense("tiling 2048x5248", QuantType::Q80, (2048, 5248, 130)),
+        dense("tiling K2048 m130", QuantType::Q80, (2048, tl_n, 130)),
         0x6454_0002,
     );
     let within = block_permutation(&[0, 80, 130], 0x6454_0003);

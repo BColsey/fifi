@@ -164,4 +164,4 @@ mod nvfp4;
 pub(in crate::kernels::cuda) use nvfp4::mmq_nvfp4_dense_launch;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

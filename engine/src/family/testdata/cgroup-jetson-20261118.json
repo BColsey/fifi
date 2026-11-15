@@ -1,0 +1,10 @@
+{
+  "jetson": {
+    "membership": "11:hugetlb:/\n10:perf_event:/\n9:memory:/user.slice/user-1000.slice/session-2501.scope\n8:freezer:/\n7:devices:/user.slice\n6:net_cls,net_prio:/\n5:blkio:/\n4:cpu,cpuacct:/\n3:cpuset:/\n2:pids:/user.slice/user-1000.slice/session-2501.scope\n1:name=systemd:/user.slice/user-1000.slice/session-2501.scope\n0::/user.slice/user-1000.slice/session-2501.scope\n",
+    "mountinfo": "39 31 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:6 - tmpfs tmpfs ro,mode=755\n40 39 0:31 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate\n41 39 0:32 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:8 - cgroup cgroup rw,xattr,name=systemd\n45 39 0:36 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec shared:17 - cgroup cgroup rw,pids\n46 39 0:37 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec shared:18 - cgroup cgroup rw,cpuset\n47 39 0:38 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec shared:19 - cgroup cgroup rw,cpu,cpuacct\n48 39 0:39 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec shared:20 - cgroup cgroup rw,blkio\n49 39 0:40 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec shared:21 - cgroup cgroup rw,net_cls,net_prio\n50 39 0:41 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec shared:22 - cgroup cgroup rw,devices\n51 39 0:42 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec shared:23 - cgroup cgroup rw,freezer\n52 39 0:43 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec shared:24 - cgroup cgroup rw,memory\n53 39 0:44 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec shared:25 - cgroup cgroup rw,perf_event\n54 39 0:45 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec shared:26 - cgroup cgroup rw,hugetlb\n",
+    "unified_controllers": "",
+    "meminfo": "MemTotal:       31734460 kB\nMemAvailable:   26472144 kB\n",
+    "captured_at": "2026-11-18T04:25:00Z",
+    "scope": "Xavier AGX (L4T hybrid cgroup v1 + a controller-less unified v2 tree at /sys/fs/cgroup/unified); read-only ssh capture of /proc/self/cgroup, /proc/self/mountinfo, /sys/fs/cgroup/unified/cgroup.controllers and /proc/meminfo; no command run on the board beyond reads"
+  }
+}

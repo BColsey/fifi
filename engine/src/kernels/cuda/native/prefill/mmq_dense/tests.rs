@@ -420,7 +420,7 @@ fn rust_fixup_need(ty: MmqType, n: usize, m: usize, ncols_opt: usize, facts: &Fa
 /// `__CUDA_ARCH_LIST__` header, the one `ggml_cuda_highest_compiled_arch` reads): the C
 /// replica selects its config table from it, so a device-facts set whose built architecture
 /// is not in it is not a state this build can be in.
-fn compiled_archs() -> Vec<i32> {
+pub(crate) fn compiled_archs() -> Vec<i32> {
     // Embedded at build time, not read at run time: a test exe copied away from its target
     // directory (a mutant's, a sanitizer's) still has the list.
     let generated = include_str!(concat!(env!("OUT_DIR"), "/fifi_cuda_arch_list.h"));
@@ -441,16 +441,22 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     // (fallback off) and the partial-tile ones (fallback on), all three weight types, and
     // device facts of the sm_86, sm_89 and sm_72 classes plus a one-SM device and a device
     // whose shared memory fits no tile width.
-    let sets: [(&str, i32, i32, usize); 6] = [
+    let sets: [(&str, i32, i32, usize); 7] = [
         ("sm_86, 82 SMs", 860, 82, 101_376),
-        ("sm_89, 20 SMs", 860, 20, 101_376),
+        ("sm_89 class, 20 SMs", 890, 20, 102_400),
         ("sm_72, 8 SMs", 720, 8, 98_304),
         ("sm_86 class, 1 SM", 860, 1, 101_376),
         ("sm_86 class, shared memory skips J >= 120", 860, 82, 56_000),
-        ("no tile width fits", 860, 82, 1_000),
+        ("sm_89 class, shared memory skips J >= 120", 890, 20, 56_000),
+        ("no tile width fits", 890, 82, 1_000),
     ];
     let types = [(8, MmqType::Q80), (12, MmqType::Q4K), (14, MmqType::Q6K)];
-    let rows = [8192usize, 4096, 2048, 512, 4160, 160, 32, 8];
+    // The rows include the column counts the dense sizing search can pick (2048 and 5248
+    // are the historical 3090 shapes, 128 * b the searched ones at b 1, 2, 9), so the
+    // search's mode decisions stay pinned to this production oracle, not to a comment.
+    let rows = [
+        8192usize, 4096, 2048, 512, 5248, 1152, 256, 128, 4160, 160, 32, 8,
+    ];
     let (mut zero, mut nonzero, mut compared) = (0usize, 0usize, 0usize);
     let built = compiled_archs();
     for (name, cc, nsm, smpbo) in sets {
@@ -486,12 +492,36 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     println!(
         "fixup-need cross-pin: {compared} cases equal, {nonzero} with a fixup, {zero} without"
     );
-    // The sweep is not vacuous: both outcomes occur in volume (the sm_86 sets are in every
-    // build).
+    // The sweep is not vacuous: both outcomes occur in volume. The set list follows the
+    // compiled archs (860, 890, 720 each own a set, the one-SM and no-fit rows sit on the
+    // two desktop classes), so a single-arch build still compares a full set of real cases
+    // — an arch without a set fails here loudly instead of sweeping zero cases.
     assert!(
         zero > 10_000 && nonzero > 10_000,
-        "zero {zero}, nonzero {nonzero}"
+        "zero {zero}, nonzero {nonzero}: is every set's arch absent from this build?"
     );
+}
+
+/// The same production oracle, behind a facts-shaped wrapper, for the dense sizing search's
+/// host-side pin (`prefill::mmq_dense::tests`): it ties the search's `plan_of` mode decisions
+/// to the C function the kernel uses, the same tie this module's sweep makes for
+/// `rust_fixup_need`. Host-only builds have neither the oracle nor that pin.
+pub(crate) fn c_fixup_need_at(
+    ggml: i32,
+    n: usize,
+    m: usize,
+    cc: i32,
+    nsm: i32,
+    smpbo: usize,
+) -> usize {
+    let facts = FactsRaw {
+        device: 0,
+        cc,
+        nsm,
+        reserved: 0,
+        smpbo,
+    };
+    c_fixup_need(ggml, n, m, &facts)
 }
 
 #[test]
@@ -554,12 +584,21 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_under_a_hint() {
 fn the_c_fixup_need_is_zero_for_arguments_the_entry_refuses() {
     // A pure function must not divide by an SM count of zero or read a type it has no row
     // for.
+    // The control shape's facts follow the compiled archs (the sweep's rule): a build
+    // without 860 would otherwise get 0 for the control too, and the refusal rows would
+    // compare against nothing.
+    let fleet = [(860i32, 82, 101_376), (890, 20, 102_400), (720, 8, 98_304)];
+    let built = compiled_archs();
+    let (cc, nsm, smpbo) = fleet
+        .iter()
+        .find(|(cc, _, _)| built.contains(cc))
+        .expect("a compiled fleet arch");
     let good = FactsRaw {
         device: 0,
-        cc: 860,
-        nsm: 82,
+        cc: *cc,
+        nsm: *nsm,
         reserved: 0,
-        smpbo: 101_376,
+        smpbo: *smpbo,
     };
     assert_ne!(
         c_fixup_need(8, 32, 24, &good),
