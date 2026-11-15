@@ -834,6 +834,11 @@ mod tests {
         let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
         std::fs::set_permissions(&readonly, perms).expect("locked");
+        if std::fs::File::create(readonly.join("probe")).is_ok() {
+            std::fs::remove_file(readonly.join("probe")).ok();
+            println!("SKIPPED: this process can write into a 0500 directory (runs as root)");
+            return;
+        }
         let destination = readonly.join("bundle.json");
         let error = super::write_atomically(&destination, "{}").expect_err("refused");
         assert!(error.contains("cannot write"), "{error}");
