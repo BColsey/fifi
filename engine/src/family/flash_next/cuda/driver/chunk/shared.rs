@@ -146,7 +146,9 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         self.preflight_shared(tokens)?;
         let cap = self.chunk_cap.max(1);
         if cap > MAX_EXL3_ROWS {
-            return Err(refuse("the shared path is not qualified above 64 rows"));
+            return Err(refuse(
+                format!("the shared path is not qualified above {MAX_EXL3_ROWS} rows").as_str(),
+            ));
         }
         let start = self.pos;
         let steps = tokens
@@ -175,7 +177,9 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         self.preflight_shared(tokens)?;
         let (p0, m) = (self.pos, tokens.len());
         if !(1..=MAX_EXL3_ROWS).contains(&m) {
-            return Err(refuse("a chunk must hold 1 to 64 rows"));
+            return Err(refuse(
+                format!("a chunk must hold 1 to {MAX_EXL3_ROWS} rows").as_str(),
+            ));
         }
         let began = Instant::now();
         let starts = self.feeds.begin_chunk(tokens)?;

@@ -503,10 +503,10 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     }
 }
 
-/// The K-row shared expert refuses one row and windows over `MAX_EXL3_ROWS` (64): the one-row
+/// The K-row shared expert refuses one row and windows over `MAX_EXL3_ROWS`: the one-row
 /// block is `shared()`, and both families' planners cap at the shared bound.
 #[test]
-fn the_k_row_shared_expert_refuses_one_row_and_windows_over_sixty_four() {
+fn the_k_row_shared_expert_refuses_one_row_and_windows_over_the_shared_bound() {
     if !device_present("K-row shared expert row counts") {
         return;
     }
@@ -522,7 +522,7 @@ fn the_k_row_shared_expert_refuses_one_row_and_windows_over_sixty_four() {
     for (rows, wanted) in [
         (0usize, "at least 2 rows"),
         (1, "at least 2 rows"),
-        (65, "at most 64 rows"),
+        (257, "at most 256 rows"),
     ] {
         let result = shared_rows(
             &launch,

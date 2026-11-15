@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6874,
-      "ignored": 614,
+      "test_fns": 6875,
+      "ignored": 615,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -155,6 +155,8 @@
         "FIFI_PF_SPLIT",
         "FIFI_PF_TIMING_ONLY",
         "FIFI_Q36_SERVE_PHASE",
+        "FIFI_RING_ORACLE_ROWS",
+        "FIFI_RING_REF_TIMING",
         "FIFI_SCRATCH_ROOT",
         "FIFI_SPEC_ROWS",
         "FIFI_SPEC_TEXT",
@@ -162,6 +164,7 @@
         "FIFI_TEST_FUSED_WALK_CHILD",
         "FIFI_TEST_GDN_PARTITIONED",
         "FIFI_TEST_REQUIRE_DATA",
+        "FIFI_UNION_ORACLE_ROWS",
         "FLASH_NEXT_ARTIFACT",
         "FLASH_NEXT_ARTIFACT_MANIFEST",
         "FLASH_NEXT_CACHE_LIMIT",

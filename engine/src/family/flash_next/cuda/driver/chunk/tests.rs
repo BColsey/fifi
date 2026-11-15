@@ -98,7 +98,7 @@ fn shared_prefill_preflight_refusals_do_not_open_or_poison() {
     }
     let mut driver = shared_driver(FakeFeeds::default());
     assert!(driver.feed_rows(&[1; 7]).is_err());
-    driver.chunk_cap = 65;
+    driver.chunk_cap = crate::family::project::exl3_jobs_plan::MAX_EXL3_ROWS + 1;
     assert!(driver.feed_rows(&[1]).is_err());
     assert!(driver.device().log.is_empty());
     driver.feed_rows(&[]).unwrap();
@@ -225,11 +225,17 @@ fn shared_prefill_startup_refuses_the_single_row_driver_only_when_enabled() {
             Err(EngError::BadRequest(message)) if message.contains("prefill_rows > 1")
         ));
     }
-    for rows in [2, 64] {
+    for rows in [2, 64, 65, 256] {
         assert!(check_shared_prefill_rows(true, rows).is_ok());
     }
     for rows in [0, 1, 2, 64] {
         assert!(check_shared_prefill_rows(false, rows).is_ok());
+    }
+    for rows in [65, 256, u32::MAX] {
+        assert!(matches!(
+            check_shared_prefill_rows(false, rows),
+            Err(EngError::BadRequest(message)) if message.contains("needs")
+        ));
     }
 }
 

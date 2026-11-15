@@ -47,10 +47,11 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 64. The default, 1, is the
-    /// decode shape: one row per device call, exactly as before. A value above one runs the
-    /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
-    /// unchanged at one row.
+    /// CUDA only: rows of one device step during prefill. With `INFERENCE_FLASH_NEXT_SHARED_PREFILL=1`
+    /// the bound is 2 to 256; without it, 1 to 64 — the legacy path's device coverage stops at 64
+    /// rows. The default, 1, is the decode shape: one row per device call, exactly as before. A
+    /// value above one runs the prompt as device chunks of that many rows (one PLE host
+    /// roundtrip per chunk), with decode unchanged at one row.
     pub(crate) prefill_rows: Option<u32>,
     /// CUDA only: the popularity profile file of the expert bank. A load reads it for a
     /// rank-ordered initial fill, and the bank rewrites it with its own usage counts on shutdown,
@@ -557,9 +558,9 @@ mod tests {
             };
             settings(Some(&options), &env)
         };
-        assert_eq!(at(64).unwrap().cuda.unwrap().prefill_rows, 64);
+        assert_eq!(at(256).unwrap().cuda.unwrap().prefill_rows, 256);
         assert_eq!(at(1).unwrap().cuda.unwrap().prefill_rows, 1);
-        assert!(message(at(65)).contains("prefill_rows"));
+        assert!(message(at(257)).contains("prefill_rows"));
         assert!(message(at(0)).contains("prefill_rows"));
     }
 

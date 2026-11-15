@@ -7,7 +7,8 @@ Unset, `0`, `false`, and `off` keep the existing path.
 `1`, `true`, and `on` select shared prefill.
 Any other value refuses startup before CUDA initialization.
 When ON, startup refuses `prefill_rows <= 1` before CUDA initialization.
-The default chunk width stays 64 rows.
+The default chunk width stays 64 rows: `prefill_rows` defaults to 64, the legacy path accepts
+at most 64 rows, and the shared path plans up to the shared bound of 256 rows.
 
 During an open prefill window, shared-owned steps use the common Projector and MoE pass.
 Decode and verify use the existing launches with either arena owner.

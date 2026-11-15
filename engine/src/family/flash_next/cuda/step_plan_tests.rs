@@ -32,7 +32,7 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     let (_, g) = real();
     assert_eq!(StepPlan::prefill_bytes(false, &g, 0, 0).unwrap(), 0);
-    for rows in [1, 64] {
+    for rows in [1, 64, 65, MAX_STEP_ROWS] {
         let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
         let actual = crate::kernels::cuda::plan_arena(&plan.arena_tensors())
             .unwrap()
@@ -42,13 +42,13 @@ fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
             u64::try_from(actual).unwrap()
         );
     }
-    assert!(StepPlan::prefill_bytes(true, &g, 65, 32_768).is_err());
+    assert!(StepPlan::prefill_bytes(true, &g, MAX_STEP_ROWS + 1, 32_768).is_err());
 }
 
 #[test]
 fn shared_prefill_extension_replans_the_full_tensor_list() {
     let (_, g) = real();
-    for rows in [1, 64] {
+    for rows in [1, 64, 65, MAX_STEP_ROWS] {
         let old = plan_at(&g, rows, 32_768);
         let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
         assert_eq!(plan.slots().len(), old.slots().len() + 2);
@@ -71,7 +71,7 @@ fn shared_prefill_extension_replans_the_full_tensor_list() {
 #[test]
 fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
     let (_, g) = real();
-    for (rows, perm_bytes) in [(1, 8288), (64, 13_472)] {
+    for (rows, perm_bytes) in [(1, 8288), (64, 13_472), (65, 13_568), (256, 29_312)] {
         let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
         let perm = slot(&plan, Slot::PrefillPerm);
         assert_eq!(perm.bytes, perm_bytes);
@@ -96,7 +96,7 @@ fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
 fn shared_prefill_extension_keeps_the_existing_bounds() {
     let (_, g) = real();
     let options = StepOptions::default();
-    for rows in [0, 65, usize::MAX] {
+    for rows in [0, MAX_STEP_ROWS + 1, usize::MAX] {
         assert!(StepPlan::new_prefill(&g, rows, 32_768, &options).is_err());
     }
     assert!(StepPlan::new_prefill(&g, 64, 0, &options).is_err());

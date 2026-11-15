@@ -578,11 +578,15 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
 }
 
 #[test]
-#[ignore = "needs a GPU (about 3 GiB), pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+#[ignore = "needs a GPU (about 3 GiB), pinned host memory, FIFI_FLASH_NEXT_EXL3_PACK and FIFI_RING_ORACLE_ROWS for the row count"]
 fn the_shared_prefill_ring_matches_the_oracle_for_full_tiles_tails_and_one_row() {
-    for rows in [1, 3, 64] {
-        ring_chunk_pass(rows, true, Some(6));
-    }
+    // One invocation per row set: FIFI_RING_ORACLE_ROWS selects the full-tile, tail,
+    // one-row or widened-bound window this run exercises.
+    let rows: usize = std::env::var("FIFI_RING_ORACLE_ROWS")
+        .expect("FIFI_RING_ORACLE_ROWS selects this oracle's row count")
+        .parse()
+        .expect("a row count");
+    ring_chunk_pass(rows, true, Some(6));
 }
 
 #[test]
@@ -591,6 +595,34 @@ fn the_shared_prefill_ring_handles_an_empty_bank_or_ring_pair_subset() {
     for held in [0, 10] {
         ring_chunk_pass(1, true, Some(held));
     }
+}
+
+fn threaded_references(
+    checkpoint: &Checkpoint,
+    routed: (usize, &Router),
+    one_row: &MoeDims,
+    row_inputs: &[Vec<f32>],
+) -> Vec<Reference> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let size = row_inputs.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = row_inputs
+            .chunks(size)
+            .map(|rows| {
+                scope.spawn(move || {
+                    rows.iter()
+                        .map(|row| {
+                            reference(checkpoint, routed, one_row, row).expect("fp64 reference")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("the reference thread"))
+            .collect()
+    })
 }
 
 fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
@@ -650,12 +682,15 @@ fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
                 .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
         })
         .expect("the all-resident block resolves");
-        let mut wants = Vec::with_capacity(m);
+        // The all-resident reference is the oracle: one launch per row, exactly as before
+        // the widening; only its fp64 sibling is threaded. The two elapsed prints give
+        // the per-layer split.
+        let started = std::time::Instant::now();
+        let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+        let references_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
         let mut residents = Vec::with_capacity(m);
         for row in &row_inputs {
-            wants.push(
-                reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"),
-            );
             let rig = Rig::new(&projector, &one_row, row).expect("rig");
             run_exl3_moe(
                 &launch,
@@ -670,6 +705,11 @@ fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
             launch.stream.synchronize().expect("sync");
             residents.push(rig.out_bytes(&projector));
         }
+        println!(
+            "layer {layer} over {m} rows: fp64 references {references_elapsed:.1?}, \
+             all-resident launches {:.1?}",
+            started.elapsed()
+        );
         arms.push(Arm {
             row_inputs,
             weights,
@@ -781,6 +821,42 @@ fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
         }
     }
     split.end_prefill().expect("hand the ring's stores back");
+}
+
+/// Prints the CPU cost of the fp64 references for a row count (no GPU).
+#[test]
+#[ignore = "set FIFI_RING_REF_TIMING to print the fp64 references' host cost"]
+fn ring_reference_cpu_cost() {
+    let Ok(rows) = std::env::var("FIFI_RING_REF_TIMING") else {
+        return;
+    };
+    let rows: usize = rows.parse().expect("a row count");
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let layer = moe_layer();
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let row_inputs: Vec<Vec<f32>> = (0..rows)
+        .map(|seed| input(one_row.hidden, seed + 7))
+        .collect();
+    let start = std::time::Instant::now();
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+    let elapsed = start.elapsed();
+    assert_eq!(wants.len(), rows);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    println!(
+        "FIFI_RING_REF_TIMING rows={rows} elapsed={elapsed:.1?} per_row={:.3}s threads={threads}",
+        elapsed.as_secs_f64() / rows as f64
+    );
 }
 
 /// The job-table family's per-projection bounds against fp64, split by projection and
@@ -1161,7 +1237,13 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
 #[test]
 #[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
-    for rows in [1, 3] {
+    // One invocation per row set: FIFI_UNION_ORACLE_ROWS runs exactly that row
+    // count (the widened-bound windows each need their own card lease); unset
+    // runs the full ladder in one process.
+    let ladder: Vec<usize> = std::env::var("FIFI_UNION_ORACLE_ROWS")
+        .map(|value| vec![value.parse().expect("a row count")])
+        .unwrap_or_else(|_| vec![1, 3, 65, 256]);
+    for rows in ladder {
         chunk_union_pass(rows, true);
     }
 }
@@ -1287,10 +1369,12 @@ fn chunk_union_pass(m: usize, shared: bool) {
             .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
     })
     .expect("the all-resident block resolves");
-    let mut wants = Vec::with_capacity(m);
+    // The fp64 references dominate the wall (the oracle prints 587.7s threaded for 256
+    // rows against 212.0ms of launches): compute them on every core, exactly as the ring
+    // oracle does, or a 256-row window cannot fit a card lease.
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
     let mut residents = Vec::with_capacity(m);
     for row in &row_inputs {
-        wants.push(reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"));
         let rig = Rig::new(&projector, &one_row, row).expect("rig");
         run_exl3_moe(
             &launch,

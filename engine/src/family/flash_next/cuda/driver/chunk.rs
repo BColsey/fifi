@@ -146,6 +146,11 @@ pub(in crate::family::flash_next) mod prof {
 
     pub(super) const SHARED_PREFILL: &str = "INFERENCE_FLASH_NEXT_SHARED_PREFILL";
 
+    /// The legacy prefill path's row limit: its device coverage stops at 64 rows (the widest
+    /// step exercised was 49, the qwen36 equivalence suite 64). Wider windows must run
+    /// the shared path.
+    const LEGACY_EXL3_ROWS: u32 = 64;
+
     pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<bool> {
         let on = parse_switch(raw).map_err(|seen| {
             EngError::BadRequest(format!(
@@ -162,6 +167,12 @@ pub(in crate::family::flash_next) mod prof {
         if shared_prefill && rows <= 1 {
             return Err(EngError::BadRequest(format!(
                 "{SHARED_PREFILL} requires prefill_rows > 1"
+            )));
+        }
+        if !shared_prefill && rows > LEGACY_EXL3_ROWS {
+            return Err(EngError::BadRequest(format!(
+                "prefill_rows > {LEGACY_EXL3_ROWS} needs {SHARED_PREFILL}=1; the legacy prefill \
+                 path is limited to {LEGACY_EXL3_ROWS} rows"
             )));
         }
         Ok(())
