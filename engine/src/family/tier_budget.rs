@@ -15,8 +15,6 @@
 //! wrapped, never a panic), and the split is deterministic: no I/O, no clocks,
 //! no randomness, no threads. The tiered load uses its VRAM plan.
 
-use super::TieredConfig;
-
 /// What the card has and what is already spoken for (the caller measures these
 /// at load; none of them is guessed here). All fields are bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,18 +35,6 @@ use crate::family::device_budget::KvPlan;
 pub struct ExpertSize {
     pub bytes: u64,
     pub layers: usize,
-}
-
-impl ExpertSize {
-    /// WHY: the split is only meaningful for the same layer count the policy
-    /// and residency tables index, so the geometry is borrowed from the one
-    /// config instead of being retyped (and drifting).
-    pub fn from_config(cfg: &TieredConfig, bytes: u64) -> Self {
-        Self {
-            bytes,
-            layers: cfg.layers,
-        }
-    }
 }
 
 /// Why a plan was refused. Every variant names the budget that lost, with all
@@ -250,8 +236,6 @@ mod tests {
     use super::{
         BudgetError, ExpertSize, HostBudget, KvPlan, VramBudget, bad_input, plan_host, plan_vram,
     };
-    use crate::family::qwen36::tiered::{PolicyMode, TieredConfig};
-
     /// One GiB (2^30 bytes); 8-bit KV bytes of one position (10 attention
     /// layers x 1,088 bytes); one quantized expert; the MoE layer count; and the
     /// VRAM one slot per layer costs (`EXPERT_BYTES * LAYERS`).
@@ -298,7 +282,7 @@ mod tests {
     }
 
     fn experts() -> ExpertSize {
-        ExpertSize::from_config(&TieredConfig::qwen36(1, PolicyMode::Static), EXPERT_BYTES)
+        geom(EXPERT_BYTES, LAYERS)
     }
 
     /// The host RAM fixture: 14.76 GiB total with the fixed commitments.
@@ -313,14 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_32k_8bit_kv_leaves_about_39_slots_per_layer() {
-        assert_eq!(
-            experts(),
-            ExpertSize {
-                bytes: EXPERT_BYTES,
-                layers: LAYERS
-            }
-        );
+    fn the_32k_8bit_kv_leaves_about_39_slots_per_layer() {
         let plan = plan_vram(&vram(3 * GIB / 4), &kv(32_768), &experts(), 0, 0).unwrap();
         assert_eq!(
             (plan.kv_vram_positions, plan.kv_host_positions),
@@ -330,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_128k_leaves_about_24() {
+    fn the_128k_leaves_about_24() {
         let plan = plan_vram(&vram(3 * GIB / 4), &kv(131_072), &experts(), 0, 0).unwrap();
         assert_eq!(
             (plan.kv_vram_positions, plan.kv_host_positions),
@@ -340,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_262k_in_vram_leaves_a_handful() {
+    fn the_262k_in_vram_leaves_a_handful() {
         assert_eq!(262_144 * BYTES_PER_POSITION, 2_852_126_720);
         let plan = plan_vram(&vram(3 * GIB / 4), &kv(262_144), &experts(), 0, 0).unwrap();
         assert_eq!(

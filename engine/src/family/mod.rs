@@ -89,6 +89,7 @@ pub mod spec;
 pub(crate) mod speculate;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod state_words;
+pub mod tier_budget;
 pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.
 #[cfg(test)]

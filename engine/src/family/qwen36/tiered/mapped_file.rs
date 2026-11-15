@@ -303,7 +303,6 @@ mod tests {
             include_str!("residency.rs"),
             include_str!("report.rs"),
             include_str!("cpu_pool.rs"),
-            include_str!("budget.rs"),
             include_str!("guess.rs"),
             include_str!("locator.rs"),
         ] {

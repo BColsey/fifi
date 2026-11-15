@@ -10,7 +10,6 @@
 //! mapping of [`mapped_file`]. The tiered step uses it through `cuda/tiered_step.rs`
 //! and `cuda/tiered_load.rs`.
 
-pub mod budget;
 pub mod cpu_pool;
 pub mod guess;
 pub mod host;
@@ -21,6 +20,18 @@ pub mod report;
 pub mod residency;
 pub mod server;
 pub mod watchdog;
+
+impl crate::family::tier_budget::ExpertSize {
+    /// WHY: the split is only meaningful for the same layer count the policy
+    /// and residency tables index, so the geometry is borrowed from the one
+    /// config instead of being retyped (and drifting).
+    pub fn from_config(cfg: &TieredConfig, bytes: u64) -> Self {
+        Self {
+            bytes,
+            layers: cfg.layers,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyMode {

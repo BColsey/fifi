@@ -13,7 +13,7 @@ use crate::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
-        qwen36::tiered::budget::{HostBudget, VramBudget},
+        tier_budget::{HostBudget, VramBudget},
         tiered_classify::classify_reference,
     },
 };
