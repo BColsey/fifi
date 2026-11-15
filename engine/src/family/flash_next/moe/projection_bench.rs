@@ -1,3 +1,5 @@
+//! Its original question - which IndexedOptions pay on the served Flash-Next shapes - is closed;
+//! the bench is kept as the ready-made harness for the next IndexedOptions change.
 //! The id-indexed EXL3 projection launch of the routed experts of one real Qwen3.8 Flash-Next
 //! layer on one GPU: the default launch against its opt-in options (`IndexedOptions`: the DP4A
 //! decode of book 2, one launch of the 20 gate and up pairs, the pipelined tile loop, and their
