@@ -12,10 +12,8 @@ use crate::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
-        qwen36::tiered::{
-            budget::{HostBudget, KvPlan, VramBudget},
-            classify::classify_reference,
-        },
+        qwen36::tiered::budget::{HostBudget, KvPlan, VramBudget},
+        tiered_classify::classify_reference,
     },
 };
 

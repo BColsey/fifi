@@ -21,6 +21,7 @@ pub struct LengthMismatch {
     pub weights: usize,
 }
 
+#[cfg(test)]
 pub fn word_after(layer: usize, previous: i32, layer_word: i32) -> i32 {
     if layer == 0 {
         layer_word
@@ -41,7 +42,7 @@ pub struct Classified {
     /// The misses `(expert id, router weight)` in pick order: the request of the CPU server.
     pub misses: Vec<(i32, f32)>,
     /// [`ROUTE_INVALID`] when a pick was refused, else 0. It is the word of THIS layer; see
-    /// [`word_after`] for the token's word.
+    /// `word_after` for the token's word.
     pub word: i32,
 }
 
@@ -49,6 +50,7 @@ impl Classified {
     /// True when every field is equal bit for bit: the weights and the log weights by `to_bits`
     /// (so a +0.0 rule violated as -0.0 differs and a NaN equals the same NaN). The derived
     /// `PartialEq` is not enough for a device comparison.
+    #[cfg(test)]
     pub fn same_bits(&self, other: &Self) -> bool {
         let pairs = |a: &[(i32, f32)], b: &[(i32, f32)]| {
             a.len() == b.len()

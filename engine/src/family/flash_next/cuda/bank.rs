@@ -52,7 +52,7 @@ use crate::{
     EngError,
     family::{
         flash_next::moe::{slot_bank::SlotBankLayout, tier_plan::TierPlan},
-        qwen36::tiered::classify::Classified,
+        tiered_classify::Classified,
     },
 };
 

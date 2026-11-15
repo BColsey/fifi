@@ -11,7 +11,6 @@
 //! and `cuda/tiered_load.rs`.
 
 pub mod budget;
-pub mod classify;
 pub mod cpu_pool;
 pub mod guess;
 pub mod host;

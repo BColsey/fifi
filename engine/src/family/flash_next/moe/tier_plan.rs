@@ -32,14 +32,16 @@
 use crate::{
     EngError,
     expert_tier::{ExpertId, Placement, Residency},
-    family::qwen36::tiered::{
-        PolicyMode, TieredConfig,
-        budget::{
-            BudgetError, ExpertSize, HostBudget, HostPlan, KvPlan, VramBudget, VramPlan, plan_host,
-            plan_vram,
+    family::{
+        qwen36::tiered::{
+            PolicyMode, TieredConfig,
+            budget::{
+                BudgetError, ExpertSize, HostBudget, HostPlan, KvPlan, VramBudget, VramPlan,
+                plan_host, plan_vram,
+            },
+            policy::StaticProfile,
         },
-        classify::{Classified, LengthMismatch, classify_reference},
-        policy::StaticProfile,
+        tiered_classify::{Classified, LengthMismatch, classify_reference},
     },
 };
 
