@@ -932,17 +932,10 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_exl3_jobs_fused_out(
+    fn inference_cuda_exl3_jobs_wide(
         args: *const JobsArgs,
         stream: *mut c_void,
         stage: *mut c_int,
-        fused_out: c_int,
-    ) -> c_int;
-    fn inference_cuda_exl3_jobs_modes(
-        args: *const JobsArgs,
-        stream: *mut c_void,
-        stage: *mut c_int,
-        fused_out: c_int,
         wide_input: c_int,
     ) -> c_int;
     fn inference_cuda_exl3_jobs_wide_input_kernel(args: *const JobsArgs, enabled: c_int) -> c_int;
@@ -950,7 +943,6 @@ unsafe extern "C" {
         args: *const JobsArgs,
         stream: *mut c_void,
         stage: *mut c_int,
-        fused_out: c_int,
     ) -> c_int;
     fn inference_cuda_exl3_jobs_rotate_pair(
         first: *const JobsArgs,
@@ -1222,46 +1214,20 @@ pub(in crate::kernels::cuda) fn jobs(
     checked(status, stage)
 }
 
-/// The same launches with an explicit fused-output-rotation request (the env default is off):
-/// for the device tests and the GPU qualification, where an env flip would race the process.
-/// Production builds never call it — the env decides — so the dead code is allowed there.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::kernels::cuda) fn jobs_fused(
-    stream: &RawStream,
-    call: &JobsRaw<'_>,
-    fused_out: bool,
-) -> Result<(), DeviceFailure> {
-    let args = jobs_args(call)?;
-    let mut stage = STAGE_NONE;
-    // SAFETY: the same checked argument block as jobs; the request only selects the epilogue of
-    // the register-decode kernel.
-    let status = unsafe {
-        inference_cuda_exl3_jobs_fused_out(&args, stream.as_ptr(), &mut stage, fused_out as c_int)
-    };
-    checked(status, stage)
-}
-
-/// The same launches with the fused output rotation and the warp-wide input rotation both
-/// explicit, for the device tests.
+/// The same launches with the warp-wide input rotation request explicit, for the device tests
+/// and the GPU qualification, where an env flip would race the process.
 #[cfg(test)]
-pub(in crate::kernels::cuda) fn jobs_modes(
+pub(in crate::kernels::cuda) fn jobs_wide(
     stream: &RawStream,
     call: &JobsRaw<'_>,
-    fused_out: bool,
     wide_input: bool,
 ) -> Result<(), DeviceFailure> {
     let args = jobs_args(call)?;
     let mut stage = STAGE_NONE;
-    // SAFETY: the same checked argument block as jobs; the requests only select kernels that give
-    // the same bytes.
+    // SAFETY: the same checked argument block as jobs; the request only selects a kernel that
+    // gives the same bytes.
     let status = unsafe {
-        inference_cuda_exl3_jobs_modes(
-            &args,
-            stream.as_ptr(),
-            &mut stage,
-            fused_out as c_int,
-            wide_input as c_int,
-        )
+        inference_cuda_exl3_jobs_wide(&args, stream.as_ptr(), &mut stage, wide_input as c_int)
     };
     checked(status, stage)
 }
@@ -1281,20 +1247,16 @@ pub(in crate::kernels::cuda) fn jobs_wide_input_usable(
     }
 }
 
-/// The projection and output rotation of a call whose `xh` already holds the rotated rows;
-/// `fused_out` is the fused output rotation request, `None` for the environment's.
+/// The projection and output rotation of a call whose `xh` already holds the rotated rows.
 pub(in crate::kernels::cuda) fn jobs_rotated(
     stream: &RawStream,
     call: &JobsRaw<'_>,
-    fused_out: Option<bool>,
 ) -> Result<(), DeviceFailure> {
     let args = jobs_args(call)?;
     let mut stage = STAGE_NONE;
-    let request = fused_out.map_or(-1, c_int::from);
     // SAFETY: the same checked argument block as jobs; the entry skips the input rotation and
     // reads the rows of xh that the pair rotation of the same stream wrote.
-    let status =
-        unsafe { inference_cuda_exl3_jobs_rotated(&args, stream.as_ptr(), &mut stage, request) };
+    let status = unsafe { inference_cuda_exl3_jobs_rotated(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

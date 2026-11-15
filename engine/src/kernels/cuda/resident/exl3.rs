@@ -934,30 +934,16 @@ impl CudaContext {
         self.exl3_jobs_with(stream, call, ffi::jobs)
     }
 
-    /// [`Self::exl3_jobs`] with the fused-output-rotation request made explicit, for the device
-    /// tests and the GPU qualification; `None` leaves the env default (off).
+    /// [`Self::exl3_jobs`] with the warp-wide input-rotation request made explicit, for the
+    /// device tests and the GPU qualification; it does not read the environment.
     #[cfg(test)]
-    pub(crate) fn exl3_jobs_fused_out(
+    pub(crate) fn exl3_jobs_wide(
         &self,
         stream: &DeviceStream,
         call: Exl3JobsCall<'_>,
-        fused_out: bool,
+        wide_input: bool,
     ) -> Result<(), EngError> {
-        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_fused(s, raw, fused_out))
-    }
-
-    /// [`Self::exl3_jobs`] with both requests explicit (the fused output rotation and the
-    /// warp-wide input rotation), for the device tests; neither reads the environment.
-    #[cfg(test)]
-    pub(crate) fn exl3_jobs_modes(
-        &self,
-        stream: &DeviceStream,
-        call: Exl3JobsCall<'_>,
-        (fused_out, wide_input): (bool, bool),
-    ) -> Result<(), EngError> {
-        self.exl3_jobs_with(stream, call, |s, raw| {
-            ffi::jobs_modes(s, raw, fused_out, wide_input)
-        })
+        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_wide(s, raw, wide_input))
     }
 
     /// Whether `call` would take the warp-wide input rotation under the request `enabled`: the
@@ -1061,21 +1047,17 @@ impl CudaContext {
     /// with their own scales and rotated-row buffers. With `pair` set and both calls aligned for
     /// the warp-wide kernel, the rows are read and rotated once for both, then each call
     /// projects; otherwise the two calls run one after the other. The bytes are the same.
-    /// `fused_out` is the fused-output request (`None` is the environment's). Returns whether
-    /// the pair rotation ran.
+    /// Returns whether the pair rotation ran.
     pub(crate) fn exl3_jobs_pair_mode(
         &self,
         stream: &DeviceStream,
         (first, second): (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
-        (pair, fused_out): (bool, Option<bool>),
+        pair: bool,
     ) -> Result<bool, EngError> {
         if !pair || !self.pair_usable(&first, &second)? {
             jobs_warp_rotate_setting()?;
             for call in [first, second] {
-                self.exl3_jobs_with(stream, call, |s, raw| match fused_out {
-                    Some(fused) => ffi::jobs_fused(s, raw, fused),
-                    None => ffi::jobs(s, raw),
-                })?;
+                self.exl3_jobs_with(stream, call, ffi::jobs)?;
             }
             return Ok(false);
         }
@@ -1083,8 +1065,8 @@ impl CudaContext {
         require_pair_apart((&first, &na), (&second, &nb))?;
         self.launch_on(stream, |s| {
             ffi::jobs_rotate_pair(s, (&ra, &rb))?;
-            ffi::jobs_rotated(s, &ra, fused_out)?;
-            ffi::jobs_rotated(s, &rb, fused_out)
+            ffi::jobs_rotated(s, &ra)?;
+            ffi::jobs_rotated(s, &rb)
         })?;
         Ok(true)
     }

@@ -1637,7 +1637,7 @@ mod device {
                                 listed,
                             )?,
                         );
-                        ctx.exl3_jobs_pair_mode(stream, calls, (true, None))?;
+                        ctx.exl3_jobs_pair_mode(stream, calls, true)?;
                     }
                     None => {
                         project_jobs(

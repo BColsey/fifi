@@ -331,11 +331,10 @@ fn routed_plan(
                 listed,
             )?,
         );
-        taken = projector.launch.ctx.exl3_jobs_pair_mode(
-            projector.launch.stream,
-            calls,
-            (true, None),
-        )?;
+        taken = projector
+            .launch
+            .ctx
+            .exl3_jobs_pair_mode(projector.launch.stream, calls, true)?;
     } else {
         for (half, &members) in members[..2].iter().enumerate() {
             project_jobs(
