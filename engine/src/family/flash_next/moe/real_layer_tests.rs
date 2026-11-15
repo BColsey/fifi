@@ -106,7 +106,7 @@ pub(super) fn plan_at(tier: TierShape, trunk: u64, positions: u64) -> TierPlan {
     let inputs = TierInputs::cost_model_3090(
         tier,
         (trunk, 36 * 3 * (1 << 20)),
-        crate::family::qwen36::tiered::budget::KvPlan {
+        crate::family::device_budget::KvPlan {
             positions,
             bytes_per_position: bytes,
         },

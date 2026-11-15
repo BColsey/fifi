@@ -8,11 +8,12 @@ use crate::family::expert_bank::*;
 use crate::{
     EngError,
     family::{
+        device_budget::KvPlan,
         flash_next::moe::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
-        qwen36::tiered::budget::{HostBudget, KvPlan, VramBudget},
+        qwen36::tiered::budget::{HostBudget, VramBudget},
         tiered_classify::classify_reference,
     },
 };

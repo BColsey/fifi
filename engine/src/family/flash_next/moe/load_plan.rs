@@ -25,9 +25,9 @@ use super::{
 };
 use crate::{
     EngError,
+    family::device_budget::KvPlan,
     family::exl3_pack::PackReport,
     family::flash_next::{deltanet::DeltaState, load::model_shape},
-    family::qwen36::tiered::budget::KvPlan,
 };
 
 const GIB: f64 = (1u64 << 30) as f64;

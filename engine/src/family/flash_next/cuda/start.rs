@@ -52,6 +52,7 @@ use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, Replac
 use crate::{
     EngError,
     family::{
+        device_budget::KvPlan,
         exl3_pack::layer_name,
         flash_next::{
             artifact::tokenizer_pin,
@@ -67,7 +68,7 @@ use crate::{
         },
         flint::exl3_resident::HostBudget,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
-        qwen36::{cuda::exl3_source::PackReader, tiered::budget::KvPlan},
+        qwen36::cuda::exl3_source::PackReader,
         session::DecodeSession,
     },
     kernels::cuda::{

@@ -30,14 +30,7 @@ pub struct VramBudget {
     pub desktop_reserve: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvPlan {
-    /// Context positions the caller configured (positions, not bytes).
-    pub positions: u64,
-    /// KV bytes one position costs (8-bit KV on every backend; the number is
-    /// the caller's measurement of the model's attention layers).
-    pub bytes_per_position: u64,
-}
+pub use crate::family::device_budget::KvPlan;
 
 /// The expert geometry: one expert size shared by every MoE layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

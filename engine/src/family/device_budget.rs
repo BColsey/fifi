@@ -17,6 +17,18 @@
 //! * [`DeviceReserve`] is the ordered, labelled charge list plus the
 //!   admission band, with a checked total.
 
+/// The KV side of a family preflight: how many positions the caller configured and
+/// what one position costs. A plain pair of the caller's measurements (8-bit KV on
+/// every backend); the tiered plans and the Flash-Next loaders both fill it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvPlan {
+    /// Context positions the caller configured (positions, not bytes).
+    pub positions: u64,
+    /// KV bytes one position costs (8-bit KV on every backend; the number is
+    /// the caller's measurement of the model's attention layers).
+    pub bytes_per_position: u64,
+}
+
 /// The largest context, a multiple of `step` and below `requested`, for which
 /// `fits` holds; `None` when not even one step fits (or `requested` is at
 /// most one step). `fits` must be monotone (a longer context never fits

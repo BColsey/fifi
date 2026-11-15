@@ -29,8 +29,8 @@ use super::tier_plan::{TierInputs, TierPlan, indexer_key_bytes};
 use crate::{
     EngError,
     family::{
-        device_budget::largest_fitting,
-        qwen36::{admission_sketch::CONTEXT_SEARCH_STEP, tiered::budget::KvPlan},
+        device_budget::KvPlan, device_budget::largest_fitting,
+        qwen36::admission_sketch::CONTEXT_SEARCH_STEP,
     },
 };
 

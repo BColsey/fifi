@@ -12,12 +12,13 @@ use super::{
 };
 use crate::{
     family::{
+        device_budget::KvPlan,
         flash_next::{
             cuda::load::{TrunkList, upload::trunk_weights},
             load::{exl3_pack::inspect_flash_pack, model_shape},
         },
         project::cuda::{CudaProjector, Reserve},
-        qwen36::{cuda::exl3_source::PackReader, tiered::budget::KvPlan},
+        qwen36::cuda::exl3_source::PackReader,
     },
     kernels::cuda::device_present,
     weights::exl3::Checkpoint,
