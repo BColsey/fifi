@@ -270,7 +270,7 @@ impl SectionMarks {
     }
 }
 
-pub(in crate::family) use crate::family::graph_state::{Mode, next_mode};
+use crate::family::graph_state::{Mode, next_mode};
 
 /// The pure part of `capture_once`: what to do with the result of the capture attempt.
 /// `Ok(Some(graph))`: the capture succeeded, the caller stores and replays the graph. `Ok(None)`:
@@ -1292,7 +1292,7 @@ impl<'a> QwenResidentStep<'a> {
                     arena: ledger_cost.map_or(0, |cost| cost.arena),
                     extras: &budget.extras,
                     staging: &plan,
-                    wide: wide.as_ref(),
+                    wide: wide.as_ref()
                 })
             );
             let full_capacity = plan.capacity;

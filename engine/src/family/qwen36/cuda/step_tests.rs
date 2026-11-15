@@ -6,10 +6,11 @@
 use super::run_report::CaptureOutcome;
 use super::state::StepField;
 use super::state_layout::Word;
-use super::step::{HowRan, Mode, fold_capture, next_mode, reported_outcome};
+use super::step::{HowRan, fold_capture, reported_outcome};
 use super::verdict::{FailureAction, action_for};
 use crate::EngError;
 use crate::family::graph_state::krow_graph::{ENTERED_BY_GRAPH, Facts, GraphTable, MAX_ROWS};
+use crate::family::graph_state::{Mode, next_mode};
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_KV_LEN, OFFSET_POS, OFFSET_STATUS, OFFSET_TOKEN_ID, STEP_PARAMS_BYTES,
 };
