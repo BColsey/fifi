@@ -41,32 +41,49 @@ impl LayerLru {
         *self = Self::from_identity(self.slot_of.len(), self.resident.len());
     }
 
-    /// Gives `incoming` the slot `outgoing` holds; the slot becomes the most recent. Fails when
-    /// either expert is outside the table (checked before any write), `incoming` is already
-    /// resident, or `outgoing` holds no slot. The failure text is the bare detail: the owning
-    /// family's error prefix wraps it.
-    pub(crate) fn swap(&mut self, incoming: u16, outgoing: u16) -> Result<u16, String> {
+    /// The checks of `swap` with no write: bounds, then `incoming` already resident, then
+    /// `outgoing` without a slot. The caller runs them, builds the copy, then commits with
+    /// `swap`.
+    pub(crate) fn validate_swap(&self, incoming: u16, outgoing: u16) -> Result<u16, String> {
         if usize::from(incoming) >= self.slot_of.len()
             || usize::from(outgoing) >= self.slot_of.len()
         {
             return Err("expert or slot is out of range".into());
         }
-        let slot = self
-            .slot_of(outgoing)
-            .ok_or_else(|| "outgoing expert holds no slot".to_string())?;
         if self.is_resident(usize::from(incoming)) {
             return Err("incoming expert already holds a slot".into());
         }
+        self.slot_of(outgoing)
+            .ok_or_else(|| "outgoing expert holds no slot".to_string())
+    }
+
+    /// Gives `incoming` the slot `outgoing` holds; the slot becomes the most recent. Fails on
+    /// exactly the checks of `validate_swap`, in that order, and writes nothing before they
+    /// pass - the recency position is looked up before any write too, so every failure path
+    /// leaves the row untouched. The failure text is the bare detail: the owning family's
+    /// error prefix wraps it. Residue, recorded not fixed: the remove/push after the writes
+    /// cannot fail, but a row invariant broken before the call can still surface as the
+    /// lookup's refusal.
+    pub(crate) fn swap(&mut self, incoming: u16, outgoing: u16) -> Result<u16, String> {
+        let slot = self.validate_swap(incoming, outgoing)?;
+        let at = self
+            .recency
+            .iter()
+            .position(|&other| other == slot)
+            .ok_or_else(|| "invalid recency order".to_string())?;
         self.slot_of[usize::from(outgoing)] = -1;
         self.slot_of[usize::from(incoming)] = i32::from(slot);
         self.resident[usize::from(slot)] = incoming;
-        self.promote(slot)?;
+        self.recency.remove(at);
+        self.recency.push(slot);
         Ok(slot)
     }
 
     /// Marks `experts` as just used, in the order given and without any copy: the later in the
-    /// list, the more recent. Experts without a slot are skipped. Failure text is the bare
-    /// detail; the owning family's error prefix wraps it.
+    /// list, the more recent. Experts without a slot are skipped. Not atomic on Err: a
+    /// partway run may already have promoted earlier experts; callers that need atomicity run
+    /// it on a scratch copy. Failure text is the bare detail; the owning family's error prefix
+    /// wraps it.
     pub(crate) fn touch(&mut self, experts: &[u16]) -> Result<(), String> {
         for &expert in experts {
             let Some(slot) = self.slot_of(expert) else {
@@ -90,8 +107,10 @@ impl LayerLru {
 
     /// Runs the experts of `order` through the layer: a hit becomes the most recent, a miss takes
     /// the least recent slot whose expert `demanded` does not protect. Fails only when everything
-    /// is protected, which the callers' capacity check rules out. Failure text is the bare
-    /// detail; the owning family's error prefix wraps it.
+    /// is protected, which the callers' capacity check rules out. Not atomic on Err: a refusal
+    /// after the first miss leaves the row partway applied; callers that need atomicity run it
+    /// on a scratch copy (the caller clones the row first). Failure text is the
+    /// bare detail; the owning family's error prefix wraps it.
     pub(crate) fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, String> {
         let mut plan = PassPlan {
             distinct: order.len(),
@@ -571,6 +590,42 @@ impl LayerSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row's refusals report the bare failure detail - four distinct strings - in the
+    /// check order the docs promise, and write nothing on the refusal paths.
+    #[test]
+    fn the_row_reports_bare_failure_details_and_writes_nothing_on_refusal() {
+        let mut row = LayerLru::from_identity(8, 4);
+        assert_eq!(
+            row.swap(8, 0).unwrap_err(),
+            "expert or slot is out of range"
+        );
+        assert_eq!(
+            row.swap(0, 8).unwrap_err(),
+            "expert or slot is out of range"
+        );
+        assert_eq!(
+            row.swap(0, 1).unwrap_err(),
+            "incoming expert already holds a slot"
+        );
+        assert_eq!(row.swap(7, 5).unwrap_err(), "outgoing expert holds no slot");
+        // Both faults at once pins the order: the incoming-resident check wins over the
+        // outgoing-no-slot one.
+        assert_eq!(
+            row.swap(0, 5).unwrap_err(),
+            "incoming expert already holds a slot"
+        );
+        let mut demanded = vec![true; 8];
+        demanded[7] = false;
+        assert_eq!(
+            row.apply(&[7, 0, 1, 2, 3], &demanded).unwrap_err(),
+            "no unprotected victim"
+        );
+        let fresh = LayerLru::from_identity(8, 4);
+        assert_eq!(row.state().0, fresh.state().0);
+        assert_eq!(row.state().1, fresh.state().1);
+        assert_eq!(row.state().2, fresh.state().2);
+    }
 
     // --- the slot table's own tests, moved with the type ---
 

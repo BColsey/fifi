@@ -366,16 +366,10 @@ impl LayerCache {
     /// pass of this layer; the slot becomes the most recently used one.
     pub(super) fn swap_in(&mut self, incoming: u16, outgoing: u16) -> Result<MissCopy, EngError> {
         self.check(Phase::Idle, self.stream)?;
-        if usize::from(incoming) >= EXPERTS || usize::from(outgoing) >= EXPERTS {
-            return Err(cache_error("expert or slot is out of range"));
-        }
-        if self.row.is_resident(usize::from(incoming)) {
-            return Err(cache_error("incoming expert already holds a slot"));
-        }
         let slot = self
             .row
-            .slot_of(outgoing)
-            .ok_or_else(|| cache_error("outgoing expert holds no slot"))?;
+            .validate_swap(incoming, outgoing)
+            .map_err(|detail| cache_error(&detail))?;
         // The copy builds before the row commits: a refused build leaves the row untouched.
         let copy = self.copy(incoming, slot)?;
         self.row
@@ -1967,8 +1961,12 @@ mod tests {
         let ready = cache.copy_ready(pass, 1, |_| Ok(())).unwrap();
         cache.release(ready, 1, || Ok(())).unwrap();
         let before = snapshot(&cache);
-        // Five distinct experts still exceed the bank with duplicates in the list.
-        assert!(cache.prepare(&[4, 4, 0, 1, 2, 3], usize::MAX).is_err());
+        // A pass that survives the union check is refused after the scratch apply when its
+        // copies exceed the byte bound; the live row keeps its state.
+        let error = cache.prepare(&[4, 4, 0, 1, 2], 0).unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("Flint expert cache"), "{text}");
+        assert!(text.contains("miss copies exceed byte bound"), "{text}");
         assert_eq!(snapshot(&cache), before);
     }
 
