@@ -367,7 +367,7 @@ mod tests {
         let super::super::super::host::MixerW::Delta(d) = &view.layers[0].mixer else {
             panic!("layer 0 is DeltaNet");
         };
-        let crate::family::flash_next::stored::StoredWeight::Packed(packed) = d.out else {
+        let crate::family::stored::StoredWeight::Packed(packed) = d.out else {
             panic!("out_proj is packed");
         };
         let resident = kernels.import_packed(packed).unwrap();

@@ -11,7 +11,7 @@ use super::super::{
 };
 use crate::{
     EngError,
-    family::flash_next::{ple, stored},
+    family::{flash_next::ple, stored},
     kernels::{BinaryOp, PackedWeight},
     tensor::ExecutionTensor,
     weights::StreamedCheckpoint,

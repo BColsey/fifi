@@ -33,7 +33,7 @@ use super::{attn, delta};
 use crate::family::qwen36::settings::KvDtype;
 use crate::{
     EngError,
-    family::flash_next::stored,
+    family::stored,
     kernels::BinaryOp,
     sched::GrowthPermit,
     tensor::{Dtype, ExecutionTensor},

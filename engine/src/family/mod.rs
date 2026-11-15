@@ -91,6 +91,11 @@ pub mod spec;
 pub(crate) mod speculate;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod state_words;
+#[allow(
+    dead_code,
+    reason = "the MLX and CUDA executor paths and their tests reach these weights; the plain host build does not until the trunk is qualified"
+)]
+pub(in crate::family) mod stored;
 pub mod tier_budget;
 pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.

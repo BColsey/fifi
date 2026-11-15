@@ -2301,7 +2301,7 @@ mod tests {
     type Counters = (
         crate::kernels::QualificationFlushStats,
         crate::kernels::QualificationTiming,
-        crate::family::flash_next::stored::ExpertReadStats,
+        crate::family::stored::ExpertReadStats,
     );
 
     #[cfg(feature = "native-fault-qualification")]
@@ -2310,7 +2310,7 @@ mod tests {
         (
             kernels.qualification_flush_stats(),
             kernels.qualification_timing(),
-            crate::family::flash_next::stored::qualification_expert_reads(),
+            crate::family::stored::qualification_expert_reads(),
         )
     }
 
@@ -2487,7 +2487,7 @@ mod tests {
             #[cfg(feature = "native-fault-qualification")]
             executor.decoder.kernels.qualification_reset_timing();
             #[cfg(feature = "native-fault-qualification")]
-            crate::family::flash_next::stored::qualification_reset_expert_reads();
+            crate::family::stored::qualification_reset_expert_reads();
             #[cfg(feature = "native-fault-qualification")]
             let flushes = executor.decoder.kernels.qualification_retire_stats().0;
             let started = std::time::Instant::now();
@@ -2568,7 +2568,7 @@ mod tests {
                     secs(timing.evaluate_ns),
                     timing.evaluate_calls,
                 ));
-                let reads = crate::family::flash_next::stored::qualification_expert_reads();
+                let reads = crate::family::stored::qualification_expert_reads();
                 lines.push_str(&format!(
                     "{run}_expert_read_seconds={}\n{run}_expert_read_bytes={}\n\
                      {run}_expert_slice_reads={}\n{run}_expert_page_imports={}\n\

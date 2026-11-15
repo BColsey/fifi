@@ -23,10 +23,8 @@ use super::{
 use crate::{
     family::{
         exl3_pack::{ExpertPart, Root, expert_name_in, router_name_in, shared_name_in},
-        flash_next::{
-            load::{exl3_pack::inspect_flash_pack, model_shape},
-            stored::host_f32,
-        },
+        flash_next::load::{exl3_pack::inspect_flash_pack, model_shape},
+        stored::host_f32,
     },
     kernels::{
         exl3_cpu::{Exl3Isa, Exl3Projection, ExpertCpu, ExpertPick, ExpertView},

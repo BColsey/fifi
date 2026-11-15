@@ -548,7 +548,7 @@ mod tests {
     fn host_moe(
         oracle: &HostWeights,
         layer: usize,
-    ) -> MoeW<'_, crate::family::flash_next::stored::StoredWeight> {
+    ) -> MoeW<'_, crate::family::stored::StoredWeight> {
         let view = oracle.view();
         let m = view.layers[layer].as_moe().unwrap();
         MoeW {
