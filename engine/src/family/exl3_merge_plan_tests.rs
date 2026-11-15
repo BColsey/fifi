@@ -295,11 +295,6 @@ fn squeeze(text: &str) -> String {
     flat.replace(",)", ")").replace(",}", "}")
 }
 
-/// Whether the squeezed `text` holds the squeezed `pattern`.
-fn has(text: &str, pattern: &str) -> bool {
-    text.contains(&squeeze(pattern))
-}
-
 /// A function body of `source` from `name` to its closing brace at column 0.
 fn section<'s>(source: &'s str, name: &str) -> &'s str {
     let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
@@ -312,7 +307,7 @@ fn section<'s>(source: &'s str, name: &str) -> &'s str {
 /// reach it, and Flash-Next (which calls it) cannot run the merged launches.
 #[test]
 fn the_reference_block_does_not_know_the_merged_one() {
-    let source = include_str!("../exl3/moe.rs");
+    let source = include_str!("exl3/moe.rs");
     let reference = source;
     for name in [
         "fn run_exl3_moe(",
@@ -348,21 +343,18 @@ fn the_reference_block_does_not_know_the_merged_one() {
 /// The id-indexed launch with the 20-pair kernels is reached by the merged block alone.
 #[test]
 fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
-    let merge = include_str!("../exl3/moe/merge.rs");
+    let merge = include_str!("exl3/moe/merge.rs");
     assert_eq!(merge.matches("exl3_grouped_indexed_wide(").count(), 1);
     for (file, source) in [
-        ("exl3/moe.rs", include_str!("../exl3/moe.rs")),
-        ("step.rs", include_str!("cuda/step.rs")),
-        ("mixer.rs", include_str!("cuda/mixer.rs")),
-        ("mixer_ops.rs", include_str!("cuda/mixer_ops.rs")),
-        (
-            "exl3/prefill_moe.rs",
-            include_str!("../exl3/prefill_moe.rs"),
-        ),
+        ("exl3/moe.rs", include_str!("exl3/moe.rs")),
+        ("step.rs", include_str!("qwen36/cuda/step.rs")),
+        ("mixer.rs", include_str!("qwen36/cuda/mixer.rs")),
+        ("mixer_ops.rs", include_str!("qwen36/cuda/mixer_ops.rs")),
+        ("exl3/prefill_moe.rs", include_str!("exl3/prefill_moe.rs")),
     ] {
         assert!(!source.contains("exl3_grouped_indexed_wide"), "{file}");
     }
-    let resident = include_str!("../../kernels/cuda/resident/exl3.rs");
+    let resident = include_str!("../kernels/cuda/resident/exl3.rs");
     // The default entry keeps its meaning: it forwards without widening.
     let default = squeeze(section(resident, "pub(crate) fn exl3_grouped_indexed("));
     assert!(
@@ -387,7 +379,7 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
 /// reads the switch at the start, before the stream, for the EXL3 layout only.
 #[test]
 fn the_step_reaches_the_merged_block_only_through_the_switch() {
-    let step = include_str!("cuda/step.rs");
+    let step = include_str!("qwen36/cuda/step.rs");
     let squeezed = squeeze(step);
     // Only an EXL3 load builds it, from the resolved intent, through `choose` (default falls back,
     // explicit refuses); every other layout gets `None`.
@@ -422,7 +414,7 @@ fn the_step_reaches_the_merged_block_only_through_the_switch() {
 /// The merged executor's device-pick path makes no host read and no wait: a captured body cannot.
 #[test]
 fn the_merged_device_path_never_waits_for_the_host() {
-    let source = include_str!("../exl3/moe/merge.rs");
+    let source = include_str!("exl3/moe/merge.rs");
     for name in [
         "fn merged_on_device(",
         "fn indexed_group(",
@@ -448,7 +440,7 @@ fn the_merged_device_path_never_waits_for_the_host() {
 /// The combine is the one kernel of the reference block: only its ranges move.
 #[test]
 fn the_combine_keeps_its_kernel_and_inputs() {
-    let source = include_str!("../exl3/moe.rs");
+    let source = include_str!("exl3/moe.rs");
     let combine = squeeze(section(source, "fn combine("));
     assert!(
         combine
@@ -464,7 +456,7 @@ fn the_combine_keeps_its_kernel_and_inputs() {
     ] {
         assert!(ranges.contains(part), "{part}: {ranges}");
     }
-    let merge = squeeze(include_str!("../exl3/moe/merge.rs"));
+    let merge = squeeze(include_str!("exl3/moe/merge.rs"));
     assert!(merge.contains("combine_ranges(launch,&bufs.route,(down,shared),dims)"));
 }
 
@@ -632,7 +624,7 @@ fn the_merged_block_accepts_the_qwen36_pack_and_refuses_what_it_cannot_run() {
 
 #[test]
 fn the_merged_block_checks_run_in_the_constructor_and_name_each_fact() {
-    let merge = include_str!("../exl3/moe/merge.rs");
+    let merge = include_str!("exl3/moe/merge.rs");
     let check = squeeze(section(merge, "pub(in crate::family) fn check("));
     for part in [
         "bias:weight.bias.is_some()",
@@ -796,7 +788,7 @@ fn the_load_resolves_each_case_to_a_run_a_logged_fallback_or_a_refusal() {
 /// and returns the source.
 #[test]
 fn the_load_acts_on_the_resolution_and_logs_the_fallback_reason() {
-    let merge = include_str!("../exl3/moe/merge.rs");
+    let merge = include_str!("exl3/moe/merge.rs");
     let choose = squeeze(section(merge, "pub(in crate::family) fn choose("));
     for part in [
         "letcheck=ifintent==Intent::Off{Ok(())}else{Self::check(ctx,dims,layers)};",
@@ -815,13 +807,16 @@ fn the_load_acts_on_the_resolution_and_logs_the_fallback_reason() {
 #[test]
 fn only_the_qwen36_exl3_load_can_reach_the_merged_block() {
     for (file, source) in [
-        ("flint", include_str!("../flint/cuda_executor.rs")),
-        ("flash_next step", include_str!("../flash_next/step.rs")),
+        ("flint", include_str!("flint/cuda_executor.rs")),
+        ("flash_next step", include_str!("flash_next/step.rs")),
         (
             "flash_next moe",
-            include_str!("../flash_next/moe/exl3_cuda_tests.rs"),
+            include_str!("flash_next/moe/exl3_cuda_tests.rs"),
         ),
-        ("qwen36 moe.rs (GGUF block)", include_str!("cuda/moe.rs")),
+        (
+            "qwen36 moe.rs (GGUF block)",
+            include_str!("qwen36/cuda/moe.rs"),
+        ),
     ] {
         for word in [
             "SharedMerge",
@@ -837,7 +832,7 @@ fn only_the_qwen36_exl3_load_can_reach_the_merged_block() {
 /// The start resolves the switch before the projector exists and before any weight is opened.
 #[test]
 fn the_start_resolves_the_switch_before_any_weight_work() {
-    let start = include_str!("cuda/start.rs");
+    let start = include_str!("qwen36/cuda/start.rs");
     let body = &start[start.find("pub(crate) fn start(").expect("start")..];
     let switch = body.find("resolve_switch(").expect("the switch check");
     for later in [
@@ -860,7 +855,7 @@ fn the_start_resolves_the_switch_before_any_weight_work() {
 /// The test hook of the step refuses a non-EXL3 layout instead of silently building nothing.
 #[test]
 fn the_step_hook_refuses_a_layout_that_is_not_exl3() {
-    let step = include_str!("cuda/step.rs");
+    let step = include_str!("qwen36/cuda/step.rs");
     let hook = squeeze(section(step, "pub(crate) fn set_shared_in_routed("));
     assert!(
         hook.contains("ifon&&self.layout!=WeightLayout::Exl3{returnErr("),
@@ -882,7 +877,7 @@ fn the_step_hook_refuses_a_layout_that_is_not_exl3() {
 
 #[test]
 fn the_executor_uses_the_plan_for_ids_rows_swiglu_and_the_combine() {
-    let merge = include_str!("../exl3/moe/merge.rs");
+    let merge = include_str!("exl3/moe/merge.rs");
     // Which ids word: the plan's, mapped to the router ids or the zero word, nothing else.
     let group = squeeze(section(merge, "fn indexed_group("));
     for part in [

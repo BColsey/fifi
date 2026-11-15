@@ -8,6 +8,17 @@ pub(crate) mod executor;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod exl3;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(
+        dead_code,
+        reason = "the CUDA step is the caller; host builds test the plan"
+    )
+)]
+pub(in crate::family) mod exl3_merge_plan;
+#[cfg(test)]
+mod exl3_merge_plan_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod exl3_pack;
 #[allow(
     dead_code,

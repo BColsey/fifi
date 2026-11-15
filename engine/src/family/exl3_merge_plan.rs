@@ -2,7 +2,7 @@
 //! routed launches (`FIFI_EXL3_SHARED_IN_ROUTED`): the switch, the pairs of each launch, and the
 //! byte layout of the working buffer. No device, no allocation. The CUDA side
 //! (`family/exl3/moe/merge.rs`, which holds the layout contract in its module doc) runs exactly the
-//! plan built here, and the host tests (`exl3_merge_plan_tests.rs`) pin it.
+//! plan built here, and the host tests (`exl3_exl3_merge_plan_tests.rs`) pin it.
 
 use std::ffi::OsStr;
 
