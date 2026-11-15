@@ -427,6 +427,47 @@ pub(in crate::family::flash_next) trait RecordSource {
 // The device owner.
 // ---------------------------------------------------------------------------------------------
 
+/// The buckets of the rows-per-expert route histogram: 1, 2, 3-4, 5-8, ..., 1025-2048 and
+/// 2049+. The prefill tiers experts at eight rows (the experts under it run on the CPU
+/// tail), so buckets 0-2 carry the tiered rows and bucket 3 straddles the edge at exactly
+/// eight.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) const ROUTE_BUCKETS: usize = 13;
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn route_bucket(rows: usize) -> usize {
+    match rows {
+        1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=128 => 7,
+        129..=256 => 8,
+        257..=512 => 9,
+        513..=1024 => 10,
+        1025..=2048 => 11,
+        _ => 12,
+    }
+}
+
+/// Folds one resolve's picks into per-expert row counts in `scratch` (reused across
+/// resolves, so the fold hashes nothing and allocates nothing); one nonzero count per
+/// distinct expert.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn route_counts(picks: &[usize], scratch: &mut [u32]) {
+    for rows in scratch.iter_mut() {
+        *rows = 0;
+    }
+    for &id in picks {
+        if let Some(count) = scratch.get_mut(id) {
+            *count += 1;
+        }
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) mod device {
     //! One device buffer of `slots` records and one pinned buffer of host places per layer. The
@@ -434,7 +475,9 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
-    use super::{HostPinPlan, RecordSource, ReplaceOnMissLru};
+    use super::{
+        HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
+    };
     use crate::family::expert_bank::{BankGeometry, BankStats, ExpertBankState, PassCopies};
     use crate::{
         EngError,
@@ -444,44 +487,6 @@ pub(super) mod device {
         sync::atomic::{AtomicU64, Ordering},
         time::Instant,
     };
-
-    /// The buckets of the rows-per-expert route histogram: 1, 2, 3-4, 5-8, ..., 1025-2048 and
-    /// 2049+. The prefill tiers experts at eight rows (the experts under it run on the CPU
-    /// tail), so buckets 0-2 carry the tiered rows and bucket 3 straddles the edge at exactly
-    /// eight.
-    pub(in crate::family::flash_next) const ROUTE_BUCKETS: usize = 13;
-
-    fn route_bucket(rows: usize) -> usize {
-        match rows {
-            1 => 0,
-            2 => 1,
-            3..=4 => 2,
-            5..=8 => 3,
-            9..=16 => 4,
-            17..=32 => 5,
-            33..=64 => 6,
-            65..=128 => 7,
-            129..=256 => 8,
-            257..=512 => 9,
-            513..=1024 => 10,
-            1025..=2048 => 11,
-            _ => 12,
-        }
-    }
-
-    /// Folds one resolve's picks into per-expert row counts in `scratch` (reused across
-    /// resolves, so the fold hashes nothing and allocates nothing); one nonzero count per
-    /// distinct expert.
-    fn route_counts(picks: &[usize], scratch: &mut [u32]) {
-        for rows in scratch.iter_mut() {
-            *rows = 0;
-        }
-        for &id in picks {
-            if let Some(count) = scratch.get_mut(id) {
-                *count += 1;
-            }
-        }
-    }
 
     pub(in crate::family::flash_next) struct DeviceBank {
         state: ExpertBankState<ReplaceOnMissLru>,
@@ -850,52 +855,52 @@ pub(super) mod device {
                 .read(geometry.offset(place as usize), out)
         }
     }
+}
 
-    #[cfg(test)]
-    mod route_tests {
-        use super::{ROUTE_BUCKETS, route_bucket, route_counts};
+#[cfg(test)]
+mod route_tests {
+    use super::{ROUTE_BUCKETS, route_bucket, route_counts};
 
-        #[test]
-        fn the_route_buckets_hold_the_tier_edge_exactly_at_eight() {
-            for (rows, bucket) in [
-                (1usize, 0usize),
-                (2, 1),
-                (3, 2),
-                (4, 2),
-                (5, 3),
-                (7, 3),
-                (8, 3),
-                (9, 4),
-                (16, 4),
-                (17, 5),
-                (64, 6),
-                (65, 7),
-                (128, 7),
-                (256, 8),
-                (2048, 11),
-                (2049, 12),
-                (4096, 12),
-            ] {
-                assert_eq!(route_bucket(rows), bucket, "rows {rows}");
-            }
-            assert_eq!(ROUTE_BUCKETS, 13);
+    #[test]
+    fn the_route_buckets_hold_the_tier_edge_exactly_at_eight() {
+        for (rows, bucket) in [
+            (1usize, 0usize),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (7, 3),
+            (8, 3),
+            (9, 4),
+            (16, 4),
+            (17, 5),
+            (64, 6),
+            (65, 7),
+            (128, 7),
+            (256, 8),
+            (2048, 11),
+            (2049, 12),
+            (4096, 12),
+        ] {
+            assert_eq!(route_bucket(rows), bucket, "rows {rows}");
         }
+        assert_eq!(ROUTE_BUCKETS, 13);
+    }
 
-        #[test]
-        fn one_resolve_folds_to_one_count_per_distinct_expert() {
-            let mut scratch = vec![0u32; 5];
-            route_counts(&[0, 0, 1, 3, 3, 3], &mut scratch);
-            assert_eq!(scratch, vec![2, 1, 0, 3, 0]);
-            // Reuse resets: a second resolve sees only its own picks.
-            route_counts(&[4], &mut scratch);
-            assert_eq!(scratch, vec![0, 0, 0, 0, 1]);
-        }
+    #[test]
+    fn one_resolve_folds_to_one_count_per_distinct_expert() {
+        let mut scratch = vec![0u32; 5];
+        route_counts(&[0, 0, 1, 3, 3, 3], &mut scratch);
+        assert_eq!(scratch, vec![2, 1, 0, 3, 0]);
+        // Reuse resets: a second resolve sees only its own picks.
+        route_counts(&[4], &mut scratch);
+        assert_eq!(scratch, vec![0, 0, 0, 0, 1]);
+    }
 
-        #[test]
-        fn an_out_of_range_pick_counts_nowhere_rather_than_panicking() {
-            let mut scratch = vec![0u32; 2];
-            route_counts(&[0, 7, 1], &mut scratch);
-            assert_eq!(scratch, vec![1, 1]);
-        }
+    #[test]
+    fn an_out_of_range_pick_counts_nowhere_rather_than_panicking() {
+        let mut scratch = vec![0u32; 2];
+        route_counts(&[0, 7, 1], &mut scratch);
+        assert_eq!(scratch, vec![1, 1]);
     }
 }

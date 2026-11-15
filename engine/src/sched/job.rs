@@ -333,7 +333,9 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefixHit, PrefixReport};
+    use super::{
+        EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefillBankReport, PrefixHit, PrefixReport,
+    };
     use crate::EngError;
     use crate::family::executor::GenerationState;
     use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -354,6 +356,49 @@ mod tests {
             prefix: None,
             prefill_bank: None,
         })
+    }
+
+    #[test]
+    fn prefill_bank_delta_saturates_and_keeps_each_after_histogram_length() {
+        let after = PrefillBankReport {
+            passes: 3,
+            misses: 4,
+            miss_histogram: vec![2, 8, 5],
+            route_histogram: vec![2, 8],
+            upload_bytes: 5,
+            upload_ns: 6,
+        };
+        let before = PrefillBankReport {
+            passes: 7,
+            misses: 8,
+            miss_histogram: vec![3, 4],
+            route_histogram: vec![3, 4, 9],
+            upload_bytes: 9,
+            upload_ns: 10,
+        };
+        assert_eq!(
+            after.saturating_sub(&before),
+            PrefillBankReport {
+                passes: 0,
+                misses: 0,
+                miss_histogram: vec![0, 4, 5],
+                route_histogram: vec![0, 4],
+                upload_bytes: 0,
+                upload_ns: 0,
+            }
+        );
+        // Reverse the shapes too: each histogram sees both a longer and a shorter baseline.
+        assert_eq!(
+            before.saturating_sub(&after),
+            PrefillBankReport {
+                passes: 4,
+                misses: 4,
+                miss_histogram: vec![1, 0],
+                route_histogram: vec![1, 0, 9],
+                upload_bytes: 4,
+                upload_ns: 4,
+            }
+        );
     }
 
     #[test]
