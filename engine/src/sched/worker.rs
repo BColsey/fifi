@@ -700,7 +700,17 @@ const PERIODIC_TOKENS: usize = 16_384;
 /// below the tip, otherwise the target is dropped. The moved position is always above the
 /// cursor, so no position is emitted twice. The points stay on chunk ends, so the periodic
 /// saves never split a chunk and the numeric path of an entry equals the path of a cold run,
-/// except after a root, which splits the sequence by design.
+/// except after a root, which splits the sequence by design, and after the rolling block cut
+/// when the piece does not divide the block spacing, which splits the chunk that contains it.
+/// A wide piece (256, 1024 against the 64-token spacing) would otherwise push the cut to a
+/// chunk end at or above the tip and drop it, losing the mid-turn block match for most tips;
+/// `run_job` re-anchors after every emitted point, so the split costs one re-anchored chunk.
+/// The cut keeps its true position only while no unprocessed periodic target lies deeper:
+/// a rolling block is replaced by the next job, a periodic entry persists, so when the old
+/// rule would have kept a deeper periodic the cut takes the old rule and rides the lattice
+/// (dropping against that periodic at a shared chunk end, as before). In production only the
+/// tip is deeper than the cut, and its final partial chunk, at most the spacing in length,
+/// re-tiles.
 fn save_points(
     plan: &PromptPlan<'_>,
     restored: usize,
@@ -727,11 +737,14 @@ fn save_points(
         // rolling cut of the lineage. The walk visits the targets in order, a periodic first at
         // a tie, so a boundary the lattice already cuts stays one save of the periodic kind;
         // the block candidate rides the same move-to-chunk-end and below-the-tip rules, so it
-        // never shifts the periodic positions. The tie rule also holds after the move to the
-        // chunk end: a block target whose chunk end an unprocessed periodic target reaches is
-        // skipped, because every target in (block_target, moved] projects onto `moved`, and the
-        // shared position must keep the periodic kind, which a later rolling K=1 replacement
-        // cannot remove.
+        // never shifts the periodic positions - unless the piece does not divide the block
+        // spacing: the chunk lattice of the cursor then sees almost no block boundary, so the
+        // block candidate is emitted at its true boundary instead of its chunk end. The tie
+        // rule also holds after the move to the chunk end: a block target whose chunk end an
+        // unprocessed periodic target reaches is skipped, because every target in
+        // (block_target, moved] projects onto `moved`, and the shared position must keep the
+        // periodic kind, which a later rolling K=1 replacement cannot remove.
+        let misaligned_cut = block.is_some_and(|spacing| !spacing.is_multiple_of(piece));
         let mut targets: Vec<(usize, bool)> = (PERIODIC_TOKENS..tip)
             .step_by(PERIODIC_TOKENS)
             .map(|target| (target, false))
@@ -743,6 +756,29 @@ fn save_points(
         let mut intermediate: Vec<(usize, SaveKind)> = Vec::new();
         for &(target, is_block) in &targets {
             if target <= cursor {
+                continue;
+            }
+            if is_block
+                && misaligned_cut
+                && !targets.iter().any(|&(candidate, candidate_is_block)| {
+                    !candidate_is_block && candidate > target
+                })
+            {
+                // The cut below the tip is strictly below it by construction, so the drop rule
+                // cannot fire here. A periodic target that shares the boundary, or whose
+                // chunk end passes it, was processed first and emitted: the periodic kind
+                // keeps the shared region, the same rule as the tie below, and the entry it
+                // leaves is deeper than the cut. A periodic target that was DROPPED (its
+                // ride reached the tip) leaves the cursor below the cut, and the cut then
+                // emits with the Block kind at the shared position - a rolling entry the
+                // next job replaces, where the dropped periodic would have persisted. A
+                // periodic target DEEPER than the cut keeps the old rule instead: this
+                // branch advances the cursor to the cut, from where that periodic's
+                // lattice ride can pass the tip and drop - a rolling block is replaced by
+                // the next job, a periodic entry persists, so the cut must not displace
+                // one that survives.
+                intermediate.push((target, SaveKind::Block));
+                cursor = target;
                 continue;
             }
             let moved = cursor + (target - cursor).div_ceil(piece) * piece;
@@ -771,7 +807,9 @@ fn save_points(
         // entry, first the intermediate entries of this same job and then the entries of
         // other conversations. The final store is the same without the shallow points, which
         // only spend snapshots. A moved position lies on the chunk lattice of the cursor, so
-        // skipping a shallow point does not change the position of a deeper one.
+        // skipping a shallow point does not change the position of a deeper one; the
+        // true-position cut lies off that lattice, but it changes no position but its own,
+        // so skipping stays safe.
         let skip = intermediate.len().saturating_sub(limits.entries - 1);
         points.extend(intermediate.into_iter().skip(skip));
     }
@@ -3828,6 +3866,11 @@ mod tests {
         entries: 6,
     };
 
+    const FLASH: StoreLimits = StoreLimits {
+        roots: 0,
+        entries: 2,
+    };
+
     #[test]
     fn periodic_points_land_on_the_chunk_ends_below_the_tip() {
         // No root, restored 0, piece 256: 16,384 = 64 * 256 and 32,768 = 128 * 256 are chunk
@@ -3977,6 +4020,384 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_at_the_cap_evicts_the_second_shallowest_periodic() {
+        // Spacing 64, piece 256, restored 0, tip 100,000, entries 6: the six periodics
+        // 16,384..98,304 are all chunk ends of the 256 piece. The old plan keeps the
+        // deepest five (32,768..98,304). The cut 99,968 - not a chunk end, so the parent
+        // projected it to 100,096, past the tip, and dropped it - now enters as a seventh
+        // intermediate and is the deepest, so the cap of five keeps 49,152..98,304 plus
+        // the Block at 99,968: the 32,768 periodic leaves through the cap, exactly the
+        // deepest-intermediate-wins rule the dividing configurations already follow.
+        let limits = StoreLimits {
+            roots: 2,
+            entries: 6,
+        };
+        assert_eq!(
+            save_points_old(Some(100_000), None, 0, 256, limits, Some(64)),
+            vec![
+                (32_768, SaveKind::Periodic),
+                (49_152, SaveKind::Periodic),
+                (65_536, SaveKind::Periodic),
+                (81_920, SaveKind::Periodic),
+                (98_304, SaveKind::Periodic),
+                (100_000, SaveKind::Tip),
+            ],
+            "the old plan keeps the deepest five periodics"
+        );
+        assert_eq!(
+            points_block(Some(100_000), None, 0, 256, limits, Some(64)),
+            vec![
+                (49_152, SaveKind::Periodic),
+                (65_536, SaveKind::Periodic),
+                (81_920, SaveKind::Periodic),
+                (98_304, SaveKind::Periodic),
+                (99_968, SaveKind::Block),
+                (100_000, SaveKind::Tip),
+            ],
+            "the cut enters as the deepest intermediate and evicts 32,768"
+        );
+    }
+
+    #[test]
+    fn a_block_cut_survives_a_piece_that_does_not_divide_the_spacing() {
+        // Spacing 64 with pieces 256 and 1,024. The first chunk end at or above the cut falls
+        // at or above the tip for most tips (10,100: cut 10,048, first chunk end 10,240 - the
+        // parent rule drops the cut there), so it emits at its true boundary instead and
+        // `run_job` re-anchors the split chunk.
+        for piece in [256usize, 1_024] {
+            let new = points_block(Some(10_100), None, 0, piece, WIDE, Some(64));
+            assert_eq!(
+                new.clone(),
+                vec![(10_048, SaveKind::Block), (10_100, SaveKind::Tip)],
+                "the rolling cut survives a wide piece"
+            );
+            // The parent plan drops the cut here, so the two plans differ - the test
+            // discriminates the fix, not just the output shape.
+            assert_ne!(
+                new,
+                save_points_old(Some(10_100), None, 0, piece, WIDE, Some(64)),
+                "the parent rule must not produce the same plan (piece {piece})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_dividing_block_cut_emits_at_its_true_position() {
+        // Restored 100, piece 256, spacing 64, tip 5,000: the cut 4,992 stays 4,992 instead
+        // of riding the restored cursor's chunk lattice to 5,220, which the below-the-tip
+        // rule would drop.
+        assert_eq!(
+            points_block(Some(5_000), None, 100, 256, WIDE, Some(64)),
+            vec![(4_992, SaveKind::Block), (5_000, SaveKind::Tip)],
+            "the cut lands on its true boundary, not the chunk lattice"
+        );
+        // Restored 4,992 covers the cut: a point there would save the restored key again.
+        assert_eq!(
+            points_block(Some(5_000), None, 4_992, 256, WIDE, Some(64)),
+            vec![(5_000, SaveKind::Tip)],
+            "a covered boundary cuts nothing"
+        );
+    }
+
+    #[test]
+    fn a_shared_boundary_keeps_the_periodic_kind_only_when_it_was_emitted() {
+        // Tip 32,769, spacing 64, piece 256, restored 0: the cut 32,768 is also the second
+        // periodic multiple, and 32,768 = 128 * 256 is a chunk end of the cursor, so the
+        // periodic is emitted first at its own position and the cut, now at or below the
+        // cursor, emits nothing - a shared position that SURVIVED its ride keeps the
+        // periodic kind, the same rule as the tie below.
+        assert_eq!(
+            points_block(Some(32_769), None, 0, 256, WIDE, Some(64)),
+            vec![
+                (16_384, SaveKind::Periodic),
+                (32_768, SaveKind::Periodic),
+                (32_769, SaveKind::Tip),
+            ],
+            "an emitted periodic keeps the shared boundary"
+        );
+        // Restored 100: the periodic 16,384 rides to 16,484 and survives, but the periodic
+        // 32,768 rides from there to 32,868, past the tip, and is DROPPED - the cursor
+        // stays below the cut, no deeper periodic target exists, so the cut emits at the
+        // shared position with the Block kind: a rolling entry the next job replaces,
+        // where the dropped periodic would have persisted. The parent had no entry there
+        // at all, so this is a gain, at the price of the kind.
+        assert_eq!(
+            points_block(Some(32_769), None, 100, 256, WIDE, Some(64)),
+            vec![
+                (16_484, SaveKind::Periodic),
+                (32_768, SaveKind::Block),
+                (32_769, SaveKind::Tip),
+            ],
+            "a dropped periodic leaves the shared boundary to the block kind"
+        );
+    }
+
+    #[test]
+    fn the_dividing_plans_are_byte_for_byte_the_chunk_end_rule() {
+        // The served configurations: the Flash-Next pieces 1 through 64 against the
+        // 64-token spacing, and the Qwen3.6 pieces 16, 128, 256, 512, 1,024, and 2,048
+        // against the 4,096-token spacing. Every one of them divides its spacing, so the plan
+        // must equal the pre-fix projection verbatim, whatever the cursor, root, tip, and
+        // store limits.
+        for spacing in [64usize, 4_096] {
+            for piece in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048] {
+                if !spacing.is_multiple_of(piece) {
+                    continue;
+                }
+                for limits in [WIDE, FLASH] {
+                    for (tip, restored, root) in [
+                        (10_000usize, 0usize, None),
+                        (5_000, 100, None),
+                        (20_000, 7_777, None),
+                        (10_000, 0, Some(3_000usize)),
+                        (40_000, 7_777, Some(3_000)),
+                        (10_000, 10_000, None),
+                        (10_000, 12_000, None),
+                    ] {
+                        assert_eq!(
+                            points_block(Some(tip), root, restored, piece, limits, Some(spacing)),
+                            save_points_old(
+                                Some(tip),
+                                root,
+                                restored,
+                                piece,
+                                limits,
+                                Some(spacing)
+                            ),
+                            "dividing piece {piece} keeps the chunk-end rule \
+                             (spacing {spacing}, limits {limits:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pre-fix projection, copied verbatim from `save_points` before the wide-piece fix:
+    /// every target rides the move-to-chunk-end and below-the-tip rules, block or periodic.
+    fn save_points_old(
+        boundary: Option<usize>,
+        root: Option<usize>,
+        restored: usize,
+        piece: usize,
+        limits: StoreLimits,
+        block: Option<usize>,
+    ) -> Vec<(usize, SaveKind)> {
+        let mut points = Vec::new();
+        let mut cursor = restored;
+        if let Some(root) = root
+            .filter(|_| limits.roots > 0)
+            .filter(|&root| root >= super::MIN_ROOT_TOKENS && root > restored)
+            .filter(|&root| boundary.is_some_and(|tip| root < tip))
+        {
+            points.push((root, SaveKind::Root));
+            cursor = root;
+        }
+        if let Some(tip) = boundary.filter(|_| super::cuts_intermediate(limits)) {
+            debug_assert!(piece > 0, "the prefill piece is positive");
+            let mut targets: Vec<(usize, bool)> = (super::PERIODIC_TOKENS..tip)
+                .step_by(super::PERIODIC_TOKENS)
+                .map(|target| (target, false))
+                .collect();
+            if let Some(spacing) = block {
+                targets.push(((tip - 1) / spacing * spacing, true));
+            }
+            targets.sort_unstable();
+            let mut intermediate: Vec<(usize, SaveKind)> = Vec::new();
+            for &(target, is_block) in &targets {
+                if target <= cursor {
+                    continue;
+                }
+                let moved = cursor + (target - cursor).div_ceil(piece) * piece;
+                if moved >= tip {
+                    continue;
+                }
+                if is_block
+                    && targets.iter().any(|&(candidate, candidate_is_block)| {
+                        !candidate_is_block && candidate > target && candidate <= moved
+                    })
+                {
+                    continue;
+                }
+                intermediate.push((
+                    moved,
+                    if is_block {
+                        SaveKind::Block
+                    } else {
+                        SaveKind::Periodic
+                    },
+                ));
+                cursor = moved;
+            }
+            let skip = intermediate.len().saturating_sub(limits.entries - 1);
+            points.extend(intermediate.into_iter().skip(skip));
+        }
+        if let Some(tip) = boundary.filter(|&tip| tip > restored) {
+            points.push((tip, SaveKind::Tip));
+        }
+        points
+    }
+
+    #[test]
+    fn an_earlier_periodic_that_projects_past_the_cut_subsumes_it() {
+        // Restored 32,720, piece 256, spacing 64, tip 33,000: the cut 32,960 is not a
+        // periodic boundary, but the periodic 32,768 rides the restored cursor's chunk
+        // lattice to 32,976, past the cut, so the periodic kind keeps the region and the
+        // block emits nothing - the same periodic-kind-wins rule as the shared boundary.
+        assert_eq!(
+            points_block(Some(33_000), None, 32_720, 256, WIDE, Some(64)),
+            vec![(32_976, SaveKind::Periodic), (33_000, SaveKind::Tip)],
+            "a periodic whose chunk end passes the cut subsumes it"
+        );
+    }
+
+    #[test]
+    fn a_non_dividing_cut_keeps_the_old_plan_s_periodics() {
+        // Properties, over random tips, cursors, pieces, spacings, roots, and store
+        // depths: (a) whatever the spacing, the new plan keeps the old plan's deepest
+        // periodic suffix - whenever the true-position branch fires no deeper periodic
+        // target survives it (the guard), so the cut is the deepest intermediate and can
+        // only push the shallowest old entry out through the cap; with room below the cap
+        // the periodic list is exactly the pre-fix one; (b) whatever the spacing, every
+        // Periodic entry of the old plan survives in the new one except through that
+        // same cap - a rolling block is replaced by the next job, a periodic entry
+        // persists, so the cut must never displace one. The plans also stay strictly
+        // increasing and carry at most one block.
+        let mut state = 0x5eed_1234_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2_000 {
+            let tip = 1 + next() as usize % 200_000;
+            let restored = next() as usize % tip;
+            let piece = 1 + next() as usize % 2_048;
+            let spacing = [64usize, 96, 4_096][next() as usize % 3];
+            let root = if tip > 2_050 && next() % 4 == 0 {
+                Some(2_048 + next() as usize % (tip - 2_049))
+            } else {
+                None
+            };
+            let limits = StoreLimits {
+                roots: 2,
+                entries: 2 + next() as usize % 5,
+            };
+            let old = save_points_old(Some(tip), root, restored, piece, limits, Some(spacing));
+            let new = points_block(Some(tip), root, restored, piece, limits, Some(spacing));
+            assert!(
+                new.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "positions strictly increase (tip {tip}, cursor {restored})"
+            );
+            assert!(
+                new.iter()
+                    .filter(|(_, kind)| *kind == SaveKind::Block)
+                    .count()
+                    <= 1,
+                "one block entry at most (tip {tip})"
+            );
+            for &(position, kind) in &old {
+                if kind == SaveKind::Periodic && !new.contains(&(position, SaveKind::Periodic)) {
+                    // A periodic may leave only through the LRU cap: the store keeps the
+                    // deepest entries - 1 intermediates, and the cut can add one deeper
+                    // entry that evicts it. Every kept intermediate must then be deeper,
+                    // and the plan must be at its cap - a shallower survivor would mean the
+                    // periodic never became a candidate, the displacement this test bans.
+                    let kept: Vec<usize> = new
+                        .iter()
+                        .filter(|(_, kind)| matches!(kind, SaveKind::Periodic | SaveKind::Block))
+                        .map(|&(kept_position, _)| kept_position)
+                        .collect();
+                    assert_eq!(
+                        kept.len(),
+                        limits.entries - 1,
+                        "the periodic at {position} survives (tip {tip}, cursor {restored}, \
+                         piece {piece}, spacing {spacing})"
+                    );
+                    assert!(
+                        kept.iter().all(|&kept_position| kept_position > position),
+                        "a periodic only leaves through the LRU cap (tip {tip}, \
+                         cursor {restored}, piece {piece}, spacing {spacing})"
+                    );
+                }
+            }
+            let new_periodics: Vec<(usize, SaveKind)> = new
+                .iter()
+                .filter(|(_, kind)| *kind == SaveKind::Periodic)
+                .copied()
+                .collect();
+            let old_periodics: Vec<(usize, SaveKind)> = old
+                .iter()
+                .filter(|(_, kind)| *kind == SaveKind::Periodic)
+                .copied()
+                .collect();
+            // The true-position branch adds exactly one candidate - the cut - and never
+            // moves another: whenever it fires, no deeper periodic target survives the
+            // guard, and the shallower periodics keep their identical rides; whenever the
+            // guard turns the branch off, the plan is the old one exactly. Either way the
+            // surviving periodics are the old plan's deepest periodic suffix; with room
+            // below the cap (the old periodics plus the cut fit) the suffix is the whole
+            // list - the exact pre-fix projection.
+            assert!(
+                old_periodics.ends_with(&new_periodics),
+                "the plan keeps the old plan's deepest periodic suffix (tip {tip}, \
+                 cursor {restored}, piece {piece}): \
+                 old {old_periodics:?} vs new {new_periodics:?}"
+            );
+            if old_periodics.len() < limits.entries - 1 {
+                assert_eq!(
+                    new_periodics, old_periodics,
+                    "room below the cap keeps the exact pre-fix plan \
+                     (tip {tip}, cursor {restored}, piece {piece})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_piece_job_splits_the_chunk_at_the_cut() {
+        // The wide-piece fix on the full worker path: piece 256 against the 64-token block
+        // spacing, tip 10,100 of a 10,101-token prompt. The cut 10,048 is not a chunk end
+        // of the cursor (the parent rule would ride it to 10,240, past the tip, and drop
+        // it), so the job saves it at its true boundary and re-anchors there: 39 chunks of
+        // 256, one of 64, the save at 10,048, then the 52-token tail chunk, the tip save,
+        // and the one token past the tip.
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        spy.piece = Some(256);
+        spy.inner.with_prefix_limits(2, 6);
+        spy.inner.with_block_match(64);
+        let store = spy.inner.prefix_store();
+        let engine = start_spy(4_096, spy);
+        let handle = engine.handle();
+        let (job, events) = job_with_boundary(&[1; 10_101], 10_100);
+        handle.try_submit(job).expect("submit");
+        assert_eq!(
+            collect(events),
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished_with_prefix(10_101, 1, 0, fake_report(2, PrefixHit::Miss, 0))
+            ]
+        );
+        let mut expected = strings(&["reset", "restore_prefix", "boundary"]);
+        expected.extend(vec!["prefill:256".to_string(); 39]);
+        expected.extend(strings(&[
+            "prefill:64",
+            "save_prefix:10048",
+            "prefill:52",
+            "save_prefix:10100",
+            "prefill:1",
+            "decode",
+        ]));
+        assert_eq!(calls(&log), expected, "the chunks re-anchor at the cut");
+        // The store holds both saves: the rolling Block at the cut and the Tip - the
+        // events pinned the calls, this pins what the store retained.
+        assert_eq!(stored(&store), vec![(10_048, false), (10_100, false)]);
+        engine.shutdown();
+    }
+
+    #[test]
     fn a_block_cut_needs_two_lru_places() {
         // Entries 1: the tip alone fills the LRU, so no intermediate point of any kind runs -
         // the same gate the periodic points already have.
@@ -4035,12 +4456,13 @@ mod tests {
     }
 
     #[test]
-    fn a_block_target_below_a_periodic_that_reaches_its_chunk_end_yields_the_periodic() {
-        // Spacing 4,095, tip 16,400, piece 256. The block target floor(16,399 / 4,095) * 4,095
-        // = 16,380 is below the periodic 16,384, but both reach the chunk end 16,384 = 64 *
-        // 256, so the tie happens after the projection. Emitting the Block there would give the
-        // shared position the replaceable kind, so the block is skipped and the periodic saves
-        // 16,384: the output equals the no-cut run.
+    fn a_block_below_an_unprocessed_periodic_keeps_the_chunk_end_rule() {
+        // Spacing 4,095, tip 16,400, piece 256: the piece does not divide the spacing, but the
+        // periodic 16,384 lies deeper than the cut 16,380 and is unprocessed, so the cut takes
+        // the old rule and rides the chunk lattice to 16,384 - the shared chunk end of both
+        // targets - where the tie rule drops it against the periodic. A rolling block is
+        // replaced by the next job, a periodic entry persists, so the cut must not displace
+        // one: the parent plan [(16,384, Periodic), (16,400, Tip)] stands unchanged.
         assert_eq!(
             points_block(
                 Some(16_400),
@@ -4054,7 +4476,7 @@ mod tests {
                 Some(4_095)
             ),
             vec![(16_384, SaveKind::Periodic), (16_400, SaveKind::Tip)],
-            "the periodic wins the chunk end both targets reach"
+            "a deeper unprocessed periodic keeps the chunk-end rule"
         );
     }
 

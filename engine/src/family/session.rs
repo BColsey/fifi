@@ -652,7 +652,10 @@ pub(crate) fn shadow_block_lcp_enabled() -> bool {
 ///
 /// The save planner targets
 /// the last spacing boundary strictly before the tip. `save_points` moves that
-/// target to the next chunk end relative to its cursor. The result must stay before
+/// target to the next chunk end relative to its cursor, except when the prefill
+/// piece does not divide the spacing and no unprocessed periodic target lies
+/// deeper: the cut then emits at its true boundary and the chunk that contains
+/// it is re-anchored. The result must stay before
 /// the tip, and a Periodic save takes precedence at a shared position.
 ///
 /// The store keeps at most one Block per stored path. Q36's engine-wide path thus

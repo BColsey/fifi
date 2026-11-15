@@ -102,13 +102,14 @@ const RESUME_LIMITS: StoreLimits = StoreLimits {
 /// tip, so the block sits `((tip - 1) % spacing) + 1` tokens under it; the re-rendered seam
 /// sits exactly two tokens under the tip (see `RESUME_LIMITS`). A fresh prefill cuts on the
 /// lattice, and only the `tip % spacing <= 2` residue classes fall through the seam
-/// (2 in 64 at the default spacing). A turn that STARTS from a restored position is
-/// different: the worker moves the cut up to the next prefill piece end (it never splits a
-/// piece), so with the default 16-row pieces the block sits 0-15 tokens ABOVE the lattice
-/// and the gap to the tip falls within the two-token seam for about 13 percent of tips —
-/// those suffixes fall back to the tip or a full prefill. A lattice-aware plan (splitting a
-/// piece at the lattice point, or cutting below the restored start) is worker-shared code
-/// and deliberately its own slice.
+/// (2 in 64 at the default spacing). A turn that STARTS from a restored position keeps the
+/// cut at its true boundary only when the prefill piece does not divide the spacing: the
+/// worker then emits the cut there and re-anchors the piece that contains it, and the same
+/// residue classes fall through as on a fresh prefill. A piece that divides the spacing
+/// (the 16-row default) still projects the cut to the next piece end of the restored
+/// cursor's lattice, 0-15 tokens above the cut, and the projection is dropped whenever it
+/// reaches the tip - about 12 percent of tips, most of them restored turns. Closing that
+/// loss is a separate decision, not this constant's.
 const RESUME_BLOCK_SPACING: usize = 64;
 
 impl<S: ResumesState> FlashCudaExecutor<S> {
