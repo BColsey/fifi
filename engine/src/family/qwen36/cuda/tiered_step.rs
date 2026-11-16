@@ -647,7 +647,19 @@ impl<'w> TieredRuntime<'w> {
         ),
         crate::family::qwen36::tiered::host::HostError,
     > {
-        let cap = self.cold.as_ref().map_or(0, ColdStaging::cap);
+        let allocated = self.cold.as_ref().map_or(0, ColdStaging::cap);
+        // Experiment: trade fewer PCIe expert transfers for more CPU overflow work.
+        // The allocation, admission charge and launch bank depth remain unchanged.
+        static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let limit = LIMIT.get_or_init(|| {
+            std::env::var("Q36_TIERED_COLD_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        });
+        let cap = limit.map_or(allocated, |limit| allocated.min(limit));
+        if limit.is_some() && layer == 0 {
+            eprintln!("tiered-cold-limit: allocated {allocated} using {cap}");
+        }
         self.host.begin_chunk_layer(layer, rows, cap)
     }
 
