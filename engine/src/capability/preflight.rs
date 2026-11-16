@@ -1126,7 +1126,7 @@ fn flint_estimate(
     };
 
     let plan = options.plan()?;
-    let (k_row, v_row) = plan.per_plane_row_bytes();
+    let (k_row, v_row) = plan.per_plane_row_bytes()?;
     let row_bytes = k_row + v_row;
     let kv_bytes = u64::try_from(plan.bytes(row_bytes)?)
         .map_err(|_| crate::EngError::MemoryPlan("Flint KV estimate overflows u64".to_string()))?;
@@ -2402,7 +2402,7 @@ mod tests {
         let options = FlintOptions::cuda_default();
         let env = flint_budget::FlintEnv::default();
         let plan = options.plan().unwrap();
-        let (k_row, v_row) = plan.per_plane_row_bytes();
+        let (k_row, v_row) = plan.per_plane_row_bytes().unwrap();
         let kv = plan.bytes(k_row + v_row).unwrap() as u64;
         let work = flint_budget::work_reserve_closed_form(
             options.prefill_chunk_size,

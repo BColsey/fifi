@@ -881,8 +881,8 @@ mod tests {
         assert_eq!(plan.k_storage(), KvStorage::Q8G32);
         assert_eq!(plan.v_storage(), KvStorage::F16);
         // Per-plane per-position charge: K 512 payload + 32 scales, V 1024 payload.
-        assert_eq!(plan.per_plane_row_bytes(), (544, 1024));
-        let (k, v) = plan.per_plane_row_bytes();
+        assert_eq!(plan.per_plane_row_bytes().unwrap(), (544, 1024));
+        let (k, v) = plan.per_plane_row_bytes().unwrap();
         // The summed charge sits between the uniform profiles.
         let q8: FlintOptions =
             serde_json::from_str(r#"{"context_limit":4096,"kv_profile":"q8"}"#).unwrap();
@@ -929,7 +929,7 @@ mod tests {
             ))
             .unwrap();
             let plan = options.plan().unwrap();
-            let (k, v) = plan.per_plane_row_bytes();
+            let (k, v) = plan.per_plane_row_bytes().unwrap();
             assert_eq!(k + v, plan.storage().row_bytes(), "{profile}@{context}");
         }
     }

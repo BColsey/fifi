@@ -319,7 +319,7 @@ fn reserve_with(
     kv: &super::kv_plan::KvPlan,
     cache_bytes: u64,
 ) -> Result<Reserve> {
-    let (k_row, v_row) = kv.per_plane_row_bytes();
+    let (k_row, v_row) = kv.per_plane_row_bytes()?;
     Ok(Reserve {
         kv_cache: kv.bytes(k_row + v_row)? as u64,
         work: work_reserve(kv, options.prefill_chunk_size, cache_bytes)?,

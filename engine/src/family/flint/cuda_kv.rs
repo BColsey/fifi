@@ -26,7 +26,7 @@ impl LayerKvAllocation {
     pub(crate) fn new(plan: &KvPlan, layer: usize) -> Result<Self, EngError> {
         let cache_rows = plan.cache_rows(layer)?;
         let plane = |storage: KvStorage| {
-            let (data_row, scale_row) = storage.plane_row_bytes();
+            let (data_row, scale_row) = storage.checked_plane_row_bytes()?;
             let plane_bytes = cache_rows
                 .checked_mul(data_row + scale_row)
                 .ok_or_else(|| EngError::MemoryPlan("Flint KV plane size overflows".into()))?;

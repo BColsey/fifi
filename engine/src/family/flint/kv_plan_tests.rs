@@ -2,6 +2,26 @@ use super::{config::FULL_LAYERS, kv_plan::KvPlan, reference::ChunkWindow};
 use crate::EngError;
 
 #[test]
+fn the_shared_format_computes_flints_literal_row_numbers() {
+    use super::kv_plan::KvStorage;
+
+    // The literals are Flint's fixed row figures; the equality stands on
+    // the shared format directly, with no golden switch in between.
+    assert_eq!(KvStorage::F16.checked_plane_row_bytes().unwrap(), (1024, 0));
+    assert_eq!(
+        KvStorage::Q8G32.checked_plane_row_bytes().unwrap(),
+        (512, 32)
+    );
+    assert_eq!(KvStorage::F16.row_bytes(), 2048);
+    assert_eq!(KvStorage::Q8G32.row_bytes(), 1088);
+    // The mixed q8k plan: K on q8g32 (512+32), V on f16 (1024+0).
+    let mixed = KvPlan::new(4096, 8, true)
+        .unwrap()
+        .with_kv_storage(KvStorage::Q8G32, KvStorage::F16);
+    assert_eq!(mixed.per_plane_row_bytes().unwrap(), (544, 1024));
+}
+
+#[test]
 fn ring_plan_separates_layer_capacity_and_compact_snapshot_shape() {
     let plan = KvPlan::new(262_144, 512, true).unwrap();
     let mut full = 0;

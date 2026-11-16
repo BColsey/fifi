@@ -101,7 +101,7 @@ fn internal_storage_charge_includes_both_native_scale_planes() {
         (KvStorage::Q8G32, 1088, (512, 32)),
     ] {
         let plan = default.with_storage(storage);
-        assert_eq!(storage.plane_row_bytes(), plane_row);
+        assert_eq!(storage.checked_plane_row_bytes().unwrap(), plane_row);
         assert_eq!(storage.row_bytes(), row_bytes);
         assert_eq!(plan.snapshots(), default.snapshots());
         let bytes: usize = (0..49)
@@ -124,7 +124,7 @@ fn mixed_q8k_plan_sizes_k_and_v_planes_independently() {
     let plan = KvPlan::new(4096, 8, true)
         .unwrap()
         .with_kv_storage(KvStorage::Q8G32, KvStorage::F16);
-    assert_eq!(plan.per_plane_row_bytes(), (544, 1024));
+    assert_eq!(plan.per_plane_row_bytes().unwrap(), (544, 1024));
     let bytes: usize = (0..49)
         .map(|layer| {
             let allocation = LayerKvAllocation::new(&plan, layer).unwrap();
@@ -135,7 +135,7 @@ fn mixed_q8k_plan_sizes_k_and_v_planes_independently() {
             allocation.plane_bytes() + allocation.v_plane_bytes()
         })
         .sum();
-    let (k, v) = plan.per_plane_row_bytes();
+    let (k, v) = plan.per_plane_row_bytes().unwrap();
     assert_eq!(bytes, plan.bytes(k + v).unwrap());
     // Same physical capacities as the uniform profiles of the same context.
     let uniform = KvPlan::new(4096, 8, true)

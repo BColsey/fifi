@@ -27,7 +27,7 @@ fn plane_text() -> String {
     // Local labels, not {storage:?}: the golden must move on bytes, not on a
     // Debug name.
     for (label, storage) in [("f16", KvStorage::F16), ("q8g32", KvStorage::Q8G32)] {
-        let (data, scales) = storage.plane_row_bytes();
+        let (data, scales) = storage.checked_plane_row_bytes().unwrap();
         let _ = writeln!(
             text,
             "{label} plane_data_bytes={data} plane_scale_bytes={scales} row_bytes={}",
@@ -59,7 +59,7 @@ fn plan_text() -> String {
         ),
     ];
     for (name, plan) in plans {
-        let (k_bytes, v_bytes) = plan.per_plane_row_bytes();
+        let (k_bytes, v_bytes) = plan.per_plane_row_bytes().unwrap();
         let _ = writeln!(
             text,
             "{name} cache_rows[0]={} cache_rows[48]={} k_row={k_bytes} v_row={v_bytes} k={} v={}",

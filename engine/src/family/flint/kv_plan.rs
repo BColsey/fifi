@@ -3,6 +3,7 @@
 
 use super::{config::FULL_LAYERS, reference::ChunkWindow};
 use crate::EngError;
+use crate::family::kv_format::{KvFormat, KvRowShape};
 
 pub(crate) const LAYERS: usize = 49;
 pub(super) const WINDOW: usize = 513;
@@ -14,21 +15,60 @@ pub(crate) enum KvStorage {
     Q8G32,
 }
 
+/// The geometry every Flint K/V plane allocates: 4 KV heads of 128 each.
+#[allow(
+    dead_code,
+    reason = "Portable serving does not use the CUDA KV adapter"
+)]
+const FLINT_KV_ROW: KvRowShape = KvRowShape {
+    heads_kv: 4,
+    head_dim: 128,
+};
+
 #[allow(
     dead_code,
     reason = "Portable serving does not use the CUDA KV adapter"
 )]
 impl KvStorage {
-    /// Payload and F16 scale bytes per row of one K or V plane.
-    pub(crate) fn plane_row_bytes(self) -> (usize, usize) {
+    /// The shared-format identity of this storage: the byte arithmetic lives in
+    /// `family::kv_format`; this mapping carries only the family vocabulary.
+    pub(crate) fn format(self) -> KvFormat {
         match self {
-            Self::F16 => (4 * 128 * 2, 0),
-            Self::Q8G32 => (4 * 128, 4 * (128 / 32) * 2),
+            Self::F16 => KvFormat::F16,
+            // One f16 scale per 32-element group: 4 heads * (128/32) groups * 2 bytes.
+            Self::Q8G32 => KvFormat::Int8 {
+                group: 32,
+                scale_bytes: 2,
+            },
         }
     }
 
+    /// Payload and scale bytes per row of one K or V plane, computed by the
+    /// shared format. This is the production path; Flint's fixed geometry
+    /// (128 divides into 32-wide groups, 4*128 elements) cannot trip the
+    /// shared refusals, so the error arm is unreachable and folds onto the
+    /// family's byte-error text. The literal test in `kv_plan_tests` keeps
+    /// the equality to the old numbers honest.
+    pub(crate) fn checked_plane_row_bytes(self) -> Result<(usize, usize), EngError> {
+        let format = self.format();
+        match (
+            format.payload_bytes(FLINT_KV_ROW),
+            format.scale_bytes(FLINT_KV_ROW),
+        ) {
+            (Ok(data), Ok(scales)) => Ok((
+                usize::try_from(data).map_err(|_| byte_error())?,
+                usize::try_from(scales).map_err(|_| byte_error())?,
+            )),
+            _ => Err(byte_error()),
+        }
+    }
+
+    /// Total encoded bytes per row of one K or V plane (test helper).
+    #[cfg(test)]
     pub(crate) fn row_bytes(self) -> usize {
-        let (data, scales) = self.plane_row_bytes();
+        let (data, scales) = self
+            .checked_plane_row_bytes()
+            .expect("the shared Flint row arithmetic cannot refuse its own geometry");
         2 * (data + scales)
     }
 }
@@ -155,12 +195,14 @@ impl KvPlan {
     }
 
     /// Encoded (K, V) row bytes for one cache position, each plane on its
-    /// own storage.
+    /// own storage, computed by the shared format per plane. Returns the
+    /// shared refusal if either plane's geometry is rejected; Flint's fixed
+    /// geometry never trips it. Tests unwrap, production propagates.
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-    pub(crate) fn per_plane_row_bytes(&self) -> (usize, usize) {
-        let k = self.k_storage.plane_row_bytes();
-        let v = self.v_storage.plane_row_bytes();
-        (k.0 + k.1, v.0 + v.1)
+    pub(crate) fn per_plane_row_bytes(&self) -> Result<(usize, usize), EngError> {
+        let k = self.k_storage.checked_plane_row_bytes()?;
+        let v = self.v_storage.checked_plane_row_bytes()?;
+        Ok((k.0 + k.1, v.0 + v.1))
     }
 
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
