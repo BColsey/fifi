@@ -58,6 +58,7 @@ pub mod nemotron35;
 )]
 pub(crate) mod parking;
 pub(crate) mod plan_decision;
+pub(crate) mod plan_rows;
 /// The shared prefill core promoted from the first chunked family: the admission arithmetic
 /// (device-free) and the CUDA arena-fill and chunk-driver primitives. Family plans stay with
 /// their families; nothing here names one.
