@@ -13,6 +13,9 @@
 use super::{BankGeometry, PassPlan, SlotMove, SlotPolicy, SlotTable, bank_error};
 use crate::EngError;
 
+#[cfg(test)]
+mod policy_trace_replay_host_tests;
+
 #[derive(Debug, Clone)]
 pub(crate) struct LayerLru {
     /// Slot of every expert or -1.
