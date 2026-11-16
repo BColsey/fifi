@@ -703,6 +703,81 @@ fn drive_chunks_slices_rows_at_their_positions() {
 }
 
 #[test]
+fn tiered_wide_deep_coalesces_only_contiguous_rows_through_8k() {
+    use super::prefill_driver::coalesce_tiered_deep;
+
+    let original = chunk_list(0, 8_288, 2_048).unwrap();
+    let widened = coalesce_tiered_deep(original, 2_048);
+    assert_eq!(
+        widened,
+        vec![
+            PrefillStep::Chunk { p0: 0, rows: 2_048 },
+            PrefillStep::Chunk {
+                p0: 2_048,
+                rows: 2_048
+            },
+            PrefillStep::Chunk {
+                p0: 4_096,
+                rows: 2_048
+            },
+            PrefillStep::Chunk {
+                p0: 6_144,
+                rows: 2_048
+            },
+            PrefillStep::Chunk {
+                p0: 8_192,
+                rows: 96
+            },
+        ]
+    );
+}
+
+#[test]
+fn tiered_wide_deep_respects_arena_gaps_feeds_and_depth_limit() {
+    use super::prefill_driver::coalesce_tiered_deep;
+
+    let source = vec![
+        PrefillStep::Chunk {
+            p0: 4_096,
+            rows: 1_024,
+        },
+        PrefillStep::Chunk {
+            p0: 5_120,
+            rows: 1_024,
+        },
+        PrefillStep::Feed { p0: 6_144 },
+        PrefillStep::Chunk {
+            p0: 7_168,
+            rows: 1_024,
+        },
+        PrefillStep::Chunk {
+            p0: 8_192,
+            rows: 1_024,
+        },
+    ];
+    assert_eq!(coalesce_tiered_deep(source.clone(), 1_024), source);
+    let got = coalesce_tiered_deep(source, 2_048);
+    assert_eq!(
+        got,
+        vec![
+            PrefillStep::Chunk {
+                p0: 4_096,
+                rows: 2_048
+            },
+            PrefillStep::Feed { p0: 6_144 },
+            PrefillStep::Chunk {
+                p0: 7_168,
+                rows: 1_024
+            },
+            PrefillStep::Chunk {
+                p0: 8_192,
+                rows: 1_024
+            },
+        ]
+    );
+}
+
+#[test]
 fn fixed_drive_limits_depth_without_shrinking_the_session_arena() {
     let tokens: Vec<u32> = (0..1024).collect();
     let mut seen = Vec::new();

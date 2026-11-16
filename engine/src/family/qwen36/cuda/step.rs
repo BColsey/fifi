@@ -1473,35 +1473,41 @@ impl<'a> QwenResidentStep<'a> {
         tokens: &[u32],
         m_sess: usize,
     ) -> Result<(), EngError> {
-        use super::prefill_driver::drive_chunks;
+        use super::prefill_driver::{drive_chunks, drive_tiered_wide_chunks};
         use crate::family::prefill::arena::PrefillStep;
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();
         let fixed_depth = self.fixed_prefill_depth();
         self.prefill_report.note_chunked_epoch_start(start);
-        drive_chunks(
-            start,
-            tokens,
-            m_sess,
-            fixed_depth,
-            |step, rows| match step {
-                PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
-                PrefillStep::Feed { p0 } => {
-                    let [token] = rows else {
-                        return Err(EngError::BadRequest(
-                            "prefill chunk: a feed step needs exactly one row".to_owned(),
-                        ));
-                    };
-                    let opened = std::time::Instant::now();
-                    TokenStepper::feed(self, *token)?;
-                    let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.record_feed(p0, ns);
-                    Ok(())
-                }
-            },
-        )
-        .map(|_| ())
+        let wide_tiered = self.tiered_mode
+            && self.kv8_chunked_prefill
+            && self.state.layout().kv.mode == KvMode::Int8G32
+            && super::prefill::tiered_chunk_enabled(
+                std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+            )
+            && std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1");
+        let run = |step, rows: &[u32]| match step {
+            PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
+            PrefillStep::Feed { p0 } => {
+                let [token] = rows else {
+                    return Err(EngError::BadRequest(
+                        "prefill chunk: a feed step needs exactly one row".to_owned(),
+                    ));
+                };
+                let opened = std::time::Instant::now();
+                TokenStepper::feed(self, *token)?;
+                let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.record_feed(p0, ns);
+                Ok(())
+            }
+        };
+        let result = if wide_tiered {
+            drive_tiered_wide_chunks(start, tokens, m_sess, fixed_depth, run)
+        } else {
+            drive_chunks(start, tokens, m_sess, fixed_depth, run)
+        };
+        result.map(|_| ())
     }
 
     pub(super) fn fixed_prefill_depth(&self) -> bool {
