@@ -141,6 +141,72 @@ mod from_config_tests {
 mod tests {
     use super::{PolicyMode, TieredConfig};
 
+    /// The shared mapped-file tests' deterministic generator (same LCG as
+    /// family/mapped_file.rs's own fixtures).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            let mixed = self.0.wrapping_mul(6364136223846793005);
+            self.0 = mixed.wrapping_add(1442695040888963407);
+            self.0 ^ (self.0 >> 21)
+        }
+
+        fn fill(&mut self, bytes: &mut [u8]) {
+            for chunk in bytes.chunks_mut(8) {
+                let value = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&value[..chunk.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_mapped_file_serves_the_pool_as_a_shared_region() {
+        use crate::family::mapped_file::MappedFile;
+        use std::io::Write as _;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        use super::cpu_pool::MappedRegion;
+
+        let len = (1u64 << 20) + 13;
+        let mut file = NamedTempFile::new().expect("temp file in TMPDIR");
+        let mut bytes = vec![0u8; usize::try_from(len).expect("test length fits usize")];
+        bytes[..4].copy_from_slice(b"GGUF");
+        Lcg(0x5eed_1234_5678_9abc).fill(&mut bytes[4..]);
+        file.write_all(&bytes).expect("fixture write");
+        file.flush().expect("fixture flush");
+        let mapped = MappedFile::open(file.path(), len).expect("matching length maps");
+        assert_eq!(mapped.len(), len);
+        assert_eq!(&mapped.as_ref()[..4], b"GGUF");
+        let plain = std::fs::read(file.path()).expect("plain read");
+        assert_eq!(mapped.as_ref(), plain.as_slice());
+        // The pool story: the value serves as a shared region through the
+        // blanket `MappedRegion` impl for every `AsRef<[u8]>`.
+        let region: Arc<dyn MappedRegion> = Arc::new(mapped);
+        assert_eq!(region.bytes(), plain.as_slice());
+    }
+
+    #[test]
+    fn the_module_has_exactly_one_unsafe_block_and_the_other_tiered_modules_have_none() {
+        let this_file = include_str!("../../mapped_file.rs");
+        let production = this_file.split("mod tests").next().unwrap_or_default();
+        // Assembled at run time so this source omits the literal it counts.
+        let needle: String = ["uns", "afe", " {"].concat();
+        assert_eq!(production.matches(&needle).count(), 1);
+        for source in [
+            include_str!("mod.rs"),
+            include_str!("policy.rs"),
+            include_str!("residency.rs"),
+            include_str!("report.rs"),
+            include_str!("cpu_pool.rs"),
+            include_str!("guess.rs"),
+            include_str!("locator.rs"),
+        ] {
+            assert!(!source.contains(&needle));
+        }
+    }
+
     #[test]
     fn tiered_config_defaults_and_checks() {
         let cfg = TieredConfig::qwen36(61, PolicyMode::Adaptive);
