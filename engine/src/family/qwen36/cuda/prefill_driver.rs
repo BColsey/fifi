@@ -666,6 +666,55 @@ pub(super) fn drive_chunks(
     drive_steps(start, tokens, steps, run)
 }
 
+/// Reuses the already-admitted 2,048-row arena for adjacent deep tiered chunks through 8K.
+/// This bounded experiment leaves the normal planner and every later position unchanged.
+pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Vec<PrefillStep> {
+    const FIRST_DEEP: usize = 3_072;
+    const LAST_END: usize = 8_192;
+    const KV8_MAX_ROWS: usize = 2_048;
+    let limit = m_sess.min(KV8_MAX_ROWS);
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let mut merged = false;
+        if let Some(PrefillStep::Chunk { p0, rows }) = out.last_mut()
+            && let PrefillStep::Chunk {
+                p0: next,
+                rows: more,
+            } = step
+            && *p0 >= FIRST_DEEP
+            && p0.checked_add(*rows) == Some(next)
+            && let Some(total) = rows.checked_add(more)
+            && total <= limit
+            && p0.checked_add(total).is_some_and(|end| end <= LAST_END)
+        {
+            *rows = total;
+            merged = true;
+        }
+        if !merged {
+            out.push(step);
+        }
+    }
+    out
+}
+
+/// Experimental tiered driver: coalesce only the bounded deep pieces of the normal plan.
+pub(super) fn drive_tiered_wide_chunks(
+    start: usize,
+    tokens: &[u32],
+    m_sess: usize,
+    fixed_depth: bool,
+    run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
+) -> Result<Vec<PrefillStep>, EngError> {
+    let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
+    let original = steps.len();
+    let widened = coalesce_tiered_deep(steps, m_sess);
+    eprintln!(
+        "tiered-wide-prefill: planned {original} steps as {}",
+        widened.len()
+    );
+    drive_steps(start, tokens, widened, run)
+}
+
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.
 pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, EngError> {
     rows.iter()
