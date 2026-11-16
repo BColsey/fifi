@@ -804,7 +804,7 @@ pub(super) struct BufFacts {
     pub(super) fixup_bytes: Option<usize>,
 }
 
-/// Guards, in order: (B1) `m_sess` in `1..=2048` (the chunk cap, `NCOLS_LIMIT`); (B2) `part`
+/// Guards, in order: (B1) `m_sess` in `1..=4096` (the chunk cap, `NCOLS_LIMIT`); (B2) `part`
 /// at least the flat attention cap; (B3) `part` at a 16-byte-aligned offset; (B4) `nsm >= 1`;
 /// (B5) `Fixup` at least the fixup floor of `nsm` SMs.
 pub(super) fn check_bufs(f: &BufFacts) -> Result<(), EngError> {
@@ -2055,8 +2055,8 @@ const KV8_LENGTH_OFFSET: usize = CPF_ATTN_PART_CAP - size_of::<i32>();
 const KV8_ATTN_TILE_ROWS: usize = 16;
 /// The bulk-row domain of the unstaged KV8 attention path. The scratch layout bound
 /// (`kv8_scratch_layout`: part_bytes + 2·(m·2048) B) must stay under KV8_LENGTH_OFFSET
-/// (≈ 8.4 MB of the 64 MiB cap at 2,048 rows).
-const KV8_BULK_ROWS: usize = 2048;
+/// (≈ 33.7 MB total including attention scratch at 4,096 rows).
+const KV8_BULK_ROWS: usize = 4096;
 
 /// A native attention tile keeps its absolute first query position, not the chunk end.
 /// Returns `(tile rows, first query's key count)` after checking the complete chunk end.
@@ -2144,7 +2144,7 @@ fn part_view<'a>(
     }
 }
 
-/// Q36 bulk work admits 1..=1024 rows. Unstaged KV8 attention uses tiles of at most 16 rows.
+/// Q36 bulk work admits 1..=4096 rows. Unstaged KV8 attention uses tiles of at most 16 rows.
 fn kv8_parts<'a>(run: &ChunkRun<'a, '_>) -> Result<Kv8Parts<'a>, EngError> {
     let g = run.model.geometry;
     let m = run.rows.m();
@@ -2360,6 +2360,11 @@ pub(super) fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resu
     if run.state.layout().kv.mode == KvMode::Int8G32 {
         if let Some(staging) = run.bufs.kv8_staging {
             if staging.plan.covers(run.rows.end()) {
+                // Large chunks retain their projections while the bounded query
+                // planner reuses the fixed partial buffer across subtiles.
+                if run.rows.m() > 2048 {
+                    return attn_flash_segmented(run, ctx, staging);
+                }
                 return attn_flash_staged(run, ctx, staging);
             }
             if staging.segmented && kv8_use_segments(run.rows.m()) {
@@ -3703,7 +3708,7 @@ pub(super) fn run_chunk_layer(
 
 /// The chunk layer loop: every host guard before the first launch, then the embedding and every
 /// layer on the state's owning stream. Resolves the prefill word ONCE; every stage takes it as a
-/// range. KV8 accepts bulk M up to 2048. Unstaged attention uses tiles up to 16; each tile
+/// range. KV8 accepts bulk M up to 4096. Unstaged attention uses tiles up to 16; each tile
 /// initializes its independent part-tail carrier with a blocking write. FP16 and staged KV8
 /// attention are enqueue-only. Normal chunk publication is unchanged.
 pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Result<(), EngError> {

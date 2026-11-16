@@ -1979,3 +1979,143 @@ fn fixed_admission_refuses_below_the_smallest_stage_with_the_original_text() {
         )
     );
 }
+
+#[test]
+fn tiered_4096_requires_opt_in_and_retains_admission_reserves() {
+    use super::prefill_driver::tiered_large_cap;
+    use super::prefill_plan::chunk_cost;
+    use std::ffi::OsStr;
+    for (value, eligible, cap, expected) in [
+        (None, true, 2048, Some(2048)),
+        (Some("0"), true, 2048, Some(2048)),
+        (Some("1"), true, 2048, Some(4096)),
+        (Some("1"), false, 2048, None),
+        (Some("1"), true, 1024, None),
+        (Some("2"), true, 2048, None),
+    ] {
+        assert_eq!(
+            tiered_large_cap(value.map(OsStr::new), eligible, cap).ok(),
+            expected
+        );
+    }
+    let dims = common_tests::dims();
+    let mut costs = chunk_costs(&dims, 68).unwrap();
+    assert!(
+        chunk_cost(&dims, 4096, 68).is_err(),
+        "an all-M FP16 partial does not fit"
+    );
+    let large = super::prefill_driver::tiered_large_cost(&dims, 68).unwrap();
+    let base = costs[0];
+    assert!(large.arena > base.arena);
+    costs.insert(0, large);
+    let extras = [Extra {
+        name: "partial",
+        fixed: 134_217_728,
+        bytes_per_token: 8192,
+    }];
+    let state = 123_456;
+    let decode = 654_321;
+    let need = state
+        + decode
+        + large.arena
+        + large.part.max(PART_CHARGE)
+        + extras[0].fixed
+        + extras[0].bytes_per_token * 4096
+        + SPARE_MIN;
+    let facts = AdmitFacts {
+        budget: need,
+        decode_arena: decode,
+        state_planned: state,
+        state_allocated: state,
+        cap: 4096,
+    };
+    assert_eq!(admit_m_sess(&facts, &extras, &costs).unwrap(), Some(4096));
+    assert_eq!(
+        admit_m_sess(
+            &AdmitFacts {
+                budget: need - 1,
+                ..facts
+            },
+            &extras,
+            &costs
+        )
+        .unwrap(),
+        Some(2048)
+    );
+    assert_eq!(
+        admit_m_sess(&AdmitFacts { cap: 2048, ..facts }, &extras, &costs).unwrap(),
+        Some(2048)
+    );
+    assert!(
+        admit_m_sess(
+            &AdmitFacts {
+                state_allocated: state - 1,
+                ..facts
+            },
+            &extras,
+            &costs
+        )
+        .is_err()
+    );
+    println!(
+        "4096 arena {} bytes versus 2048 arena {}; extra arena plus tiered partial {} bytes",
+        large.arena,
+        base.arena,
+        large.arena - base.arena + 2048 * 8192
+    );
+}
+
+#[test]
+fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
+    use super::executor::piece_of;
+    use super::prefill_driver::drive_tiered_wide_chunks;
+    for (start, total) in [
+        (0, 7903),
+        (4095, 3808),
+        (8191, 34),
+        (8192, 4096),
+        (73720, 32),
+    ] {
+        let tokens: Vec<u32> = (0..total as u32).collect();
+        let mut seen = Vec::new();
+        let mut at = start;
+        while at < start + total {
+            let size = piece_of(&ChunkVerdict::Ready { m_sess: 4096 }, at)
+                .unwrap()
+                .min(start + total - at);
+            assert!(size > 0 && size <= 4096);
+            if at >= 8192 {
+                assert!(size <= 2048);
+            }
+            let chunk = &tokens[at - start..at - start + size];
+            drive_tiered_wide_chunks(at, chunk, 4096, false, |step, rows| {
+                let (p0, count) = match step {
+                    PrefillStep::Feed { p0 } => (p0, 1),
+                    PrefillStep::Chunk { p0, rows } => (p0, rows),
+                };
+                assert_eq!(p0, start + seen.len());
+                assert_eq!(count, rows.len());
+                if count > 2048 {
+                    assert!(p0 + count <= 8192);
+                }
+                seen.extend_from_slice(rows);
+                Ok(())
+            })
+            .unwrap();
+            at += size;
+        }
+        assert_eq!(seen, tokens);
+    }
+    let steps =
+        super::prefill_driver::coalesce_tiered_deep(chunk_list(0, 7903, 4096).unwrap(), 4096);
+    assert_eq!(
+        steps,
+        vec![
+            PrefillStep::Chunk { p0: 0, rows: 4096 },
+            PrefillStep::Chunk {
+                p0: 4096,
+                rows: 3807
+            }
+        ]
+    );
+}

@@ -839,7 +839,7 @@ fn bufs_refuse_each_guard() {
     assert!(check_bufs(&valid).is_ok());
     // The accepting edges of B1.
     assert!(check_bufs(&facts(1, CPF_ATTN_PART_CAP, 0, 82, floor)).is_ok());
-    assert!(check_bufs(&facts(2_048, CPF_ATTN_PART_CAP, 0, 82, floor)).is_ok());
+    assert!(check_bufs(&facts(4_096, CPF_ATTN_PART_CAP, 0, 82, floor)).is_ok());
     let refuse = |f: &BufFacts, want: &str| {
         let error = check_bufs(f).expect_err("refused");
         assert!(
@@ -853,7 +853,7 @@ fn bufs_refuse_each_guard() {
         "prefill chunk: m_sess",
     );
     refuse(
-        &facts(2_049, CPF_ATTN_PART_CAP, 0, 82, floor),
+        &facts(4_097, CPF_ATTN_PART_CAP, 0, 82, floor),
         "prefill chunk: m_sess",
     );
     // B2.
@@ -1057,7 +1057,7 @@ fn run_refuses_each_bound() {
 #[test]
 fn kv8_attention_tiles_keep_bounds_and_absolute_offsets() {
     use super::prefill::kv8_attention_tile;
-    for m in 1..=1024 {
+    for m in 1..=4096 {
         let mut covered = 0;
         for row in (0..m).step_by(16) {
             let (rows, length) = kv8_attention_tile(972, m, row).unwrap();
@@ -1073,7 +1073,7 @@ fn kv8_attention_tiles_keep_bounds_and_absolute_offsets() {
     assert_eq!(kv8_attention_tile(32, 17, 16).unwrap(), (1, 49));
     for (p0, m, row) in [
         (0, 0, 0),
-        (0, 2049, 0),
+        (0, 4097, 0),
         (0, 1024, 1024),
         (0, 16, 16),
         (usize::MAX, 1, 0),
@@ -1128,7 +1128,7 @@ fn kv8_attention_row_extents_stay_inside_live_slots() {
 fn kv8_attention_part_capacity_is_bounded_and_disjoint() {
     use super::prefill::kv8_scratch_layout;
     use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
-    for m in 1..=1024 {
+    for m in 1..=4096 {
         let (part, k, v, rows) = kv8_scratch_layout(m, CPF_ATTN_PART_CAP).unwrap();
         assert_eq!(part, m.min(16) * 2 * 64 * 8 * (2 + 256) * 4);
         assert_eq!(rows, m * 2 * 256 * 4);
@@ -1147,7 +1147,7 @@ fn kv8_attention_part_capacity_is_bounded_and_disjoint() {
     assert_eq!(v + rows, 25_296_896);
     assert!(kv8_scratch_layout(1024, CPF_ATTN_PART_CAP - 1).is_err());
     assert!(kv8_scratch_layout(0, CPF_ATTN_PART_CAP).is_err());
-    assert!(kv8_scratch_layout(2049, CPF_ATTN_PART_CAP).is_err());
+    assert!(kv8_scratch_layout(4097, CPF_ATTN_PART_CAP).is_err());
 }
 
 /// Each stage passes the prefill word it was given. Mask 8 is unreachable through the body — the
@@ -1302,4 +1302,41 @@ fn cold_picks_take_their_own_span_and_leave_the_bank_groups_alone() {
     assert_eq!(sorted, (0..(m * top_k) as i32).collect::<Vec<_>>());
     assert!(bounds.windows(2).all(|g| g[1] >= g[0]));
     assert!(bounds.windows(2).all(|g| g[1] - g[0] <= m as i32));
+}
+
+#[test]
+fn large_staged_queries_reuse_the_fixed_part_buffer() {
+    use crate::kernels::cuda::prefill::attn_prefill::{
+        CPF_ATTN_MIN_KEYS, CPF_ATTN_PART_CAP, CPF_ATTN_Q_TILE, CpfAttnGeometry, CpfAttnPlan,
+        cpf_attn_part_bytes,
+    };
+    for m in [2049, 4095, 4096] {
+        let geometry = CpfAttnGeometry {
+            m,
+            n_head: 16,
+            n_kv_head: 2,
+            head_dim: 256,
+        };
+        let rows = kv8_segment_query_rows(geometry, 1).unwrap();
+        assert!(rows > 0 && rows <= m);
+        let plan = CpfAttnPlan {
+            q_tile: CPF_ATTN_Q_TILE,
+            max_splits: 1,
+            min_keys: CPF_ATTN_MIN_KEYS,
+        };
+        assert!(
+            cpf_attn_part_bytes(
+                CpfAttnGeometry {
+                    m: rows,
+                    ..geometry
+                },
+                plan
+            )
+            .unwrap()
+                <= CPF_ATTN_PART_CAP
+        );
+        if m >= 4095 {
+            assert_eq!(rows, 2048);
+        }
+    }
 }

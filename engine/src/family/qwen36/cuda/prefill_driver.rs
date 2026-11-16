@@ -103,9 +103,47 @@ pub(super) fn admit_m_sess(
         costs,
         PART_CHARGE,
         SPARE_MIN,
-        &M_LADDER,
+        if facts.cap == 4096 {
+            &super::prefill_plan::LARGE_M_LADDER
+        } else {
+            &M_LADDER
+        },
         "prefill_chunk",
     )
+}
+
+/// The large experiment uses bounded KV8 attention tiles, not an all-M FP16
+/// partial allocation. Charge the whole reused part buffer, including its K/V scratch.
+pub(super) fn tiered_large_cost(dims: &StepDims, nsm: usize) -> Result<ChunkCost, EngError> {
+    let m = 4096;
+    super::prefill::kv8_scratch_layout(m, CPF_ATTN_PART_CAP)?;
+    let geometry = super::mixer_geometry::MixerGeometry::new(dims)?;
+    super::prefill::kv8_segment_query_rows(super::prefill::chunk_attn_geometry(&geometry, m), 1)?;
+    let tensors: Vec<_> = chunk_tensors(dims, m, nsm)?
+        .into_iter()
+        .map(|(_, tensor)| tensor)
+        .collect();
+    Ok(ChunkCost {
+        m,
+        arena: crate::kernels::cuda::plan_arena(&tensors)?.total,
+        part: CPF_ATTN_PART_CAP,
+    })
+}
+
+pub(super) fn tiered_large_cap(
+    value: Option<&std::ffi::OsStr>,
+    eligible: bool,
+    cap: usize,
+) -> Result<usize, EngError> {
+    match value {
+        None => Ok(cap),
+        Some(v) if v == "0" => Ok(cap),
+        Some(v) if v == "1" && eligible && cap == 2048 => Ok(4096),
+        Some(v) if v == "1" => Err(EngError::BadRequest(
+            "Q36_TIERED_PREFILL_4096 requires native tiered KV8, non-fixed admission and a 2048-row cap".into(),
+        )),
+        Some(_) => Err(EngError::BadRequest("Q36_TIERED_PREFILL_4096 must be 0 or 1".into())),
+    }
 }
 
 /// One reusable layer's K/V half planes, bounded independently of stored KV capacity.
@@ -666,12 +704,13 @@ pub(super) fn drive_chunks(
     drive_steps(start, tokens, steps, run)
 }
 
-/// Reuses the already-admitted 2,048-row arena for adjacent deep tiered chunks through 8K.
+/// Reuses the admitted arena for adjacent tiered chunks through 8K.
+/// The 4,096-row experiment also coalesces the initial pieces; normal arenas keep their cutoff.
 /// This bounded experiment leaves the normal planner and every later position unchanged.
 pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Vec<PrefillStep> {
-    const FIRST_DEEP: usize = 3_072;
+    let first_deep = if m_sess == 4096 { 0 } else { 3_072 };
     const LAST_END: usize = 8_192;
-    const KV8_MAX_ROWS: usize = 2_048;
+    const KV8_MAX_ROWS: usize = 4_096;
     let limit = m_sess.min(KV8_MAX_ROWS);
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
@@ -681,7 +720,7 @@ pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Ve
                 p0: next,
                 rows: more,
             } = step
-            && *p0 >= FIRST_DEEP
+            && *p0 >= first_deep
             && p0.checked_add(*rows) == Some(next)
             && let Some(total) = rows.checked_add(more)
             && total <= limit
