@@ -440,6 +440,30 @@ impl TieredHost {
         rows: &[ChunkRouteRow],
         cold_cap: usize,
     ) -> Result<(ChunkLayerPlanHost, Vec<ChunkMissGroup>, Vec<ChunkColdStage>), HostError> {
+        // Default is the existing policy. A caller can opt into skipping transfers for
+        // experts with few uses; their picks keep the established CPU overflow path.
+        static MIN_ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let minimum = *MIN_ROWS.get_or_init(|| {
+            let value = std::env::var("Q36_TIERED_COLD_MIN_ROWS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            if value > 1 {
+                eprintln!("tiered-cold-min-rows: {value}");
+            }
+            value
+        });
+        self.begin_chunk_layer_with_min_rows(layer, rows, cold_cap, minimum)
+    }
+
+    fn begin_chunk_layer_with_min_rows(
+        &mut self,
+        layer: usize,
+        rows: &[ChunkRouteRow],
+        cold_cap: usize,
+        minimum: usize,
+    ) -> Result<(ChunkLayerPlanHost, Vec<ChunkMissGroup>, Vec<ChunkColdStage>), HostError> {
         if let Some(open) = &self.in_flight {
             return Err(HostError::Order(format!(
                 "begin_chunk_layer({layer}) while layer {} is in flight",
@@ -466,7 +490,7 @@ impl TieredHost {
             }
         }
         let mut hot: Vec<u16> = (0..self.cfg.experts)
-            .filter(|&e| miss_picks[e] > 0)
+            .filter(|&e| miss_picks[e] >= minimum.max(1))
             .map(|e| e as u16)
             .collect();
         hot.sort_by(|&a, &b| {
@@ -1296,6 +1320,90 @@ mod tests {
     /// The three-way chunk classify: the hottest `cold_cap` distinct missed experts take
     /// staging channels WITH their real router weights (no pool job), the rest stay
     /// weight-0.0 overflow groups, and cold_cap 0 keeps today's two-way plan.
+    #[test]
+    fn chunk_min_rows_keeps_common_experts_and_preserves_every_overflow_pick() {
+        for (cap, minimum, expected) in [
+            (2, 0, vec![3, 7]),
+            (2, 1, vec![3, 7]),
+            (2, 2, vec![3, 7]),
+            (2, 3, vec![3]),
+            (2, 4, vec![]),
+            (2, usize::MAX, vec![]),
+            (0, 1, vec![]),
+        ] {
+            let mut f = fixture();
+            let resident = install(&mut f.host, 1, 2, 1);
+            let rows = [
+                ChunkRouteRow {
+                    ids: vec![2, 7, 3, 5],
+                    weights: vec![0.30, 0.20, 0.10, 0.02],
+                },
+                ChunkRouteRow {
+                    ids: vec![3, 7, 2, 0],
+                    weights: vec![0.25, 0.15, 0.05, 0.01],
+                },
+                ChunkRouteRow {
+                    ids: vec![3, 6, 2, 1],
+                    weights: vec![0.10, 0.05, 0.04, 0.01],
+                },
+            ];
+            let (plan, overflow, cold) = f
+                .host
+                .begin_chunk_layer_with_min_rows(1, &rows, cap, minimum)
+                .unwrap();
+            assert_eq!(cold.iter().map(|c| c.expert).collect::<Vec<_>>(), expected);
+            assert!(cold.len() <= cap);
+            for (channel, c) in cold.iter().enumerate() {
+                assert_eq!(c.channel as usize, channel);
+                assert_eq!(
+                    c.gate,
+                    f.reference.ranges(1, c.expert as usize).unwrap().gate
+                );
+            }
+            let mut staged = 0;
+            let mut cpu = 0;
+            for (row, route) in rows.iter().enumerate() {
+                for (pick, (&expert, &weight)) in route.ids.iter().zip(&route.weights).enumerate() {
+                    let flat = row * 4 + pick;
+                    if expert == 2 {
+                        assert_eq!(plan.slot_ids[flat], resident as i32);
+                        assert_eq!(plan.cold_ids[flat], -1);
+                        assert_eq!(plan.device_weights[flat], weight);
+                    } else if let Some(channel) = expected.iter().position(|&e| e == expert as u16)
+                    {
+                        staged += 1;
+                        assert_eq!(plan.cold_ids[flat], channel as i32);
+                        assert_eq!(plan.device_weights[flat], weight);
+                        assert!(overflow.iter().all(|g| g.expert != expert as u16));
+                    } else {
+                        cpu += 1;
+                        assert_eq!(plan.cold_ids[flat], -1);
+                        assert_eq!(plan.device_weights[flat], 0.0);
+                        let group = overflow.iter().find(|g| g.expert == expert as u16).unwrap();
+                        let positions: Vec<_> = group
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| **r == row)
+                            .collect();
+                        assert_eq!(positions.len(), 1);
+                        assert_eq!(group.row_weights[positions[0].0], weight);
+                    }
+                }
+            }
+            assert_eq!(
+                (
+                    f.host.report.bank_hits,
+                    f.host.report.cold_served,
+                    f.host.report.cpu_served
+                ),
+                (3, staged, cpu)
+            );
+            assert_eq!(f.host.report.routed_weight_ppm, 1_280_000);
+            assert_eq!(staged + cpu, 9);
+        }
+    }
+
     #[test]
     fn chunk_classify_cuts_the_hottest_misses_into_cold_channels() {
         let mut f = fixture();
