@@ -250,10 +250,10 @@ fn small_kv8_dispatch_keeps_every_row_and_tail() {
 #[test]
 fn a_chunk_size_off_the_ladder_or_an_overflowing_run_is_refused() {
     // 0 comes last: a list that accepted it would make no progress.
-    for m_sess in [1000, 4096, 100, 1, 0] {
+    for m_sess in [1000, 8192, 100, 1, 0] {
         let error = chunk_list(0, 10, m_sess).expect_err("off the ladder");
         assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
-        assert!(error_text(error).contains("[2048, 1024, 512, 256, 128]"));
+        assert!(error_text(error).contains("[4096, 2048, 1024, 512, 256, 128]"));
     }
     let error = chunk_list(usize::MAX, 2, 2048).expect_err("p0 + n overflows");
     assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
@@ -1041,15 +1041,15 @@ fn the_part_cap_covers_every_chunks_own_split_plan() {
 }
 
 #[test]
-fn a_chunk_outside_one_to_2048_rows_or_a_zero_sm_count_is_refused() {
+fn a_chunk_outside_one_to_4096_rows_or_a_zero_sm_count_is_refused() {
     let d = dims();
-    for m in [0, 2049, 4096] {
+    for m in [0, 4097, 8192] {
         let error = chunk_tensors(&d, m, NSM).expect_err("m outside the domain");
         assert!(
             matches!(error, EngError::BadRequest(_)) && error_text(error).contains("chunk cap")
         );
     }
-    assert!(chunk_tensors(&d, 1, NSM).is_ok() && chunk_tensors(&d, 2048, NSM).is_ok());
+    assert!(chunk_tensors(&d, 1, NSM).is_ok() && chunk_tensors(&d, 4096, NSM).is_ok());
     let error = chunk_tensors(&d, 128, 0).expect_err("a zero SM count");
     assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
     assert!(

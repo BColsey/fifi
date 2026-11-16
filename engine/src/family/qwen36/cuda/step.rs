@@ -1226,15 +1226,26 @@ impl<'a> QwenResidentStep<'a> {
                 self.m_sess_cap as usize
             },
         };
+        admit.cap = super::prefill_driver::tiered_large_cap(
+            std::env::var_os("Q36_TIERED_PREFILL_4096").as_deref(),
+            self.tiered_mode && self.layout == WeightLayout::Native && kv8 && !fixed,
+            admit.cap,
+        )?;
         if fixed {
             admit.cap = fixed_chunk_rows(layout.kv.capacity, admit.cap);
         }
         let facts = self.context.mmq_device_facts()?;
-        let costs = if self.layout == WeightLayout::Exl3 {
+        let mut costs = if self.layout == WeightLayout::Exl3 {
             exl3_chunk_costs(&self.res.dims, facts.nsm)?
         } else {
             chunk_costs(&self.res.dims, facts.nsm)?
         };
+        if admit.cap == 4096 {
+            costs.insert(
+                0,
+                super::prefill_driver::tiered_large_cost(&self.res.dims, facts.nsm)?,
+            );
+        }
         let staging = if kv8 {
             let a = &self.res.geometry.attn;
             Some(if fixed {
@@ -1338,6 +1349,12 @@ impl<'a> QwenResidentStep<'a> {
         } else {
             admit_with_staging(&admit, &budget.extras, &costs, staging)?
         };
+        if admit.cap == 4096 {
+            eprintln!(
+                "tiered-prefill-4096: admitted {} rows",
+                admitted.unwrap_or(0)
+            );
+        }
         let Some(m) = admitted else {
             if kv8 {
                 eprintln!("q36 cuda: KV8 per-token prefill (no chunk arena admitted)");
@@ -1486,7 +1503,8 @@ impl<'a> QwenResidentStep<'a> {
             && super::prefill::tiered_chunk_enabled(
                 std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
             )
-            && std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1");
+            && (m_sess == 4096
+                || std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1"));
         let run = |step, rows: &[u32]| match step {
             PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
             PrefillStep::Feed { p0 } => {

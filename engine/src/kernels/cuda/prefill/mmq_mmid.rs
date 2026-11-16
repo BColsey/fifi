@@ -78,7 +78,7 @@ const I_TILE: usize = 128;
 const INT_MAX: usize = 0x7fff_ffff;
 
 /// The shape every id tensor of one mmid call shares: `m` tokens of `top_k` ids over
-/// `n_experts` experts. The rules: `1..=65_535` experts, `1..=2_048` tokens (the chunk cap,
+/// `n_experts` experts. The rules: `1..=65_535` experts, `1..=4_096` tokens (the chunk cap,
 /// `mmq_size::NCOLS_LIMIT`), `1..=min(n_experts, 32)` ids per token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MmidShape {
