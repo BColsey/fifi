@@ -283,7 +283,7 @@ fn flint_cuda_backend() -> bool {
 // Facts in, rows out: one function per family behind the dispatch, so the
 // report grows by a dispatch line, not a hand-written arm per family. The
 // shape itself lives with the shared trait, in family::plan_rows.
-use crate::family::plan_rows::{RowsFit, RowsSource};
+use crate::family::plan_rows::{RowsFit, RowsRequest, RowsSource};
 
 /// The report every deep arm finishes with: the shared dimensions and
 /// verdict over the arm's checks, qualification and decisions. `estimate`
@@ -334,12 +334,13 @@ fn rows_arm(
     qualification: Qualification,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    let (rows, note, fit) = match source(
+    let (rows, note, fit) = match source(&RowsRequest {
         model_dir,
-        candidate.context_limit,
-        candidate.kv_dtype.as_deref(),
+        tokenizer_dir,
+        context: candidate.context_limit,
+        kv_dtype: candidate.kv_dtype.as_deref(),
         facts,
-    ) {
+    }) {
         Ok(answer) => answer,
         Err(error) => {
             checks.push(Check::new(
@@ -2041,10 +2042,7 @@ mod tests {
     // ----- the rows arm -----
 
     fn rows_stub_ok(
-        _dir: &Path,
-        _context: Option<u32>,
-        _kv_dtype: Option<&str>,
-        _facts: &super::super::probe::HardwareFacts,
+        _request: &super::RowsRequest,
     ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
         Ok((
             vec![PlanDecision {
@@ -2059,19 +2057,13 @@ mod tests {
     }
 
     fn rows_stub_refused(
-        _dir: &Path,
-        _context: Option<u32>,
-        _kv_dtype: Option<&str>,
-        _facts: &super::super::probe::HardwareFacts,
+        _request: &super::RowsRequest,
     ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
         Err(crate::EngError::BadRequest("the stub refuses".to_string()))
     }
 
     fn rows_stub_constrained(
-        _dir: &Path,
-        _context: Option<u32>,
-        _kv_dtype: Option<&str>,
-        _facts: &super::super::probe::HardwareFacts,
+        _request: &super::RowsRequest,
     ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
         Ok((
             vec![
@@ -2101,10 +2093,7 @@ mod tests {
     }
 
     fn rows_stub_no_facts(
-        _dir: &Path,
-        _context: Option<u32>,
-        _kv_dtype: Option<&str>,
-        _facts: &super::super::probe::HardwareFacts,
+        _request: &super::RowsRequest,
     ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
         Ok((
             Vec::new(),

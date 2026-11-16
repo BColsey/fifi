@@ -847,10 +847,7 @@ impl FlashWeights {
 /// fault.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn preflight_rows(
-    dir: &std::path::Path,
-    context: Option<u32>,
-    kv_dtype: Option<&str>,
-    facts: &crate::capability::probe::HardwareFacts,
+    request: &crate::family::plan_rows::RowsRequest,
 ) -> Result<
     (
         Vec<crate::family::plan_decision::PlanDecision>,
@@ -863,6 +860,11 @@ pub(crate) fn preflight_rows(
     use crate::family::flash_next::moe::tier_plan::{TierInputs, TierShape};
     use crate::family::plan_decision::{PlanAlternative, PlanFixity};
     use crate::family::plan_rows::{PlanRows, RowsFit};
+    // The fields this family reads; the request's shape is shared.
+    let dir = request.model_dir;
+    let context = request.context;
+    let kv_dtype = request.kv_dtype;
+    let facts = request.facts;
 
     // The loader's own settings resolution: same keys, same texts, same
     // bounds (a multiple of 4 from 4 to 262144; f16 only, int8 has no
@@ -1056,6 +1058,21 @@ mod tests {
     use crate::family::plan_rows::RowsFit;
     use crate::weights::ShardIo;
 
+    fn rows_request<'a>(
+        dir: &'a std::path::Path,
+        context: Option<u32>,
+        kv_dtype: Option<&'a str>,
+        facts: &'a crate::capability::probe::HardwareFacts,
+    ) -> crate::family::plan_rows::RowsRequest<'a> {
+        crate::family::plan_rows::RowsRequest {
+            model_dir: dir,
+            tokenizer_dir: dir,
+            context,
+            kv_dtype,
+            facts,
+        }
+    }
+
     pub(super) const CONFIG: &[u8] =
         include_bytes!("../../../tests/fixtures/qwen3_8_flash_next_config.json");
 
@@ -1244,8 +1261,13 @@ mod tests {
     #[test]
     fn preflight_rows_render_the_loaders_plan_from_probed_facts() {
         let dir = pack_dir();
-        let (rows, note, fit) =
-            preflight_rows(dir.path(), None, None, &flash_facts(24 << 30)).unwrap();
+        let (rows, note, fit) = preflight_rows(&rows_request(
+            dir.path(),
+            None,
+            None,
+            &flash_facts(24 << 30),
+        ))
+        .unwrap();
         assert!(matches!(fit, RowsFit::Fits));
         assert_eq!(
             note,
@@ -1276,8 +1298,13 @@ mod tests {
     #[test]
     fn preflight_rows_name_the_largest_fitting_context_when_the_card_is_small() {
         let dir = pack_dir();
-        let (rows, _note, fit) =
-            preflight_rows(dir.path(), Some(262_144), None, &flash_facts(1_000_000_000)).unwrap();
+        let (rows, _note, fit) = preflight_rows(&rows_request(
+            dir.path(),
+            Some(262_144),
+            None,
+            &flash_facts(1_000_000_000),
+        ))
+        .unwrap();
         let context = rows.first().expect("the context row");
         assert_eq!(context.chosen, "262144 positions");
         assert_eq!(context.fixed_at, PlanFixity::Start);
@@ -1343,9 +1370,14 @@ mod tests {
         let dir = pack_dir();
         // The same serde text a config file with this value would print.
         assert_eq!(
-            preflight_rows(dir.path(), None, Some("q8"), &flash_facts(24 << 30))
-                .unwrap_err()
-                .describe(),
+            preflight_rows(&rows_request(
+                dir.path(),
+                None,
+                Some("q8"),
+                &flash_facts(24 << 30)
+            ))
+            .unwrap_err()
+            .describe(),
             "kv_format: unknown variant `q8`, expected `f16` or `int8`"
         );
     }
@@ -1354,9 +1386,14 @@ mod tests {
     fn preflight_rows_refuse_kv_int8_with_the_loaders_own_text() {
         let dir = pack_dir();
         assert_eq!(
-            preflight_rows(dir.path(), None, Some("int8"), &flash_facts(24 << 30))
-                .unwrap_err()
-                .describe(),
+            preflight_rows(&rows_request(
+                dir.path(),
+                None,
+                Some("int8"),
+                &flash_facts(24 << 30)
+            ))
+            .unwrap_err()
+            .describe(),
             "engine config: kv_format int8 has no attention kernel yet; use f16"
         );
     }
@@ -1365,16 +1402,26 @@ mod tests {
     fn preflight_rows_refuse_an_unmultiple_context_instead_of_clamping() {
         let dir = pack_dir();
         assert_eq!(
-            preflight_rows(dir.path(), Some(4097), None, &flash_facts(24 << 30))
-                .unwrap_err()
-                .describe(),
+            preflight_rows(&rows_request(
+                dir.path(),
+                Some(4097),
+                None,
+                &flash_facts(24 << 30)
+            ))
+            .unwrap_err()
+            .describe(),
             "engine config: context must be a multiple of 4, found 4097"
         );
         // Above the family's own ceiling is refused, not clamped down.
         assert_eq!(
-            preflight_rows(dir.path(), Some(262_148), None, &flash_facts(24 << 30))
-                .unwrap_err()
-                .describe(),
+            preflight_rows(&rows_request(
+                dir.path(),
+                Some(262_148),
+                None,
+                &flash_facts(24 << 30)
+            ))
+            .unwrap_err()
+            .describe(),
             "engine config: context must be between 4 and 262144, found 262148"
         );
     }
@@ -1417,7 +1464,8 @@ mod tests {
         let mut facts = flash_facts(24 << 30);
         facts.cuda.first_device_free_bytes =
             crate::capability::Probe::Unavailable("no driver".to_string());
-        let (rows, note, fit) = preflight_rows(dir.path(), None, None, &facts).unwrap();
+        let (rows, note, fit) =
+            preflight_rows(&rows_request(dir.path(), None, None, &facts)).unwrap();
         assert!(matches!(fit, RowsFit::Unknown));
         assert!(rows.is_empty());
         assert!(

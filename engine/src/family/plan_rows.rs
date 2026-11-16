@@ -20,11 +20,24 @@ pub(crate) trait PlanRows {
 /// the rows the plan rendered, a one-line note the report appends, and the
 /// configured context's fit as data for the report, never text to parse
 /// back.
+/// One borrowed request for a family's preflight rows: the directories
+/// the candidate names, the candidate's own context and K/V dtype
+/// choices, and the probed hardware. A family reads the fields it needs;
+/// the shape never grows a field for one family alone.
+pub(crate) struct RowsRequest<'a> {
+    pub(crate) model_dir: &'a std::path::Path,
+    #[allow(
+        dead_code,
+        reason = "read only by families whose settings resolution takes a tokenizer directory"
+    )]
+    pub(crate) tokenizer_dir: &'a std::path::Path,
+    pub(crate) context: Option<u32>,
+    pub(crate) kv_dtype: Option<&'a str>,
+    pub(crate) facts: &'a crate::capability::probe::HardwareFacts,
+}
+
 pub(crate) type RowsSource = fn(
-    &std::path::Path,
-    Option<u32>,
-    Option<&str>,
-    &crate::capability::probe::HardwareFacts,
+    &RowsRequest,
 ) -> Result<
     (
         Vec<crate::family::plan_decision::PlanDecision>,
