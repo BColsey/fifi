@@ -739,11 +739,35 @@ impl TieredHost {
         jobs: Vec<ExpertJob>,
         hidden: &[f32],
     ) -> Result<Option<LayerJobs>, PoolError> {
+        // Splitting helps a few misses occupy more workers. With many misses the
+        // two barriers can cost more than whole-expert jobs. Unset keeps the
+        // existing split policy; this experimental cap changes only dispatch.
+        static MAX_JOBS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let max_jobs = *MAX_JOBS.get_or_init(|| {
+            let limit = std::env::var("Q36_TIERED_SPLIT_MAX_JOBS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+            if let Some(limit) = limit {
+                eprintln!("tiered-split-max-jobs: {limit}");
+            }
+            limit
+        });
+        self.start_jobs_with_split_limit(jobs, hidden, split_jobs(), max_jobs)
+    }
+
+    fn start_jobs_with_split_limit(
+        &self,
+        jobs: Vec<ExpertJob>,
+        hidden: &[f32],
+        split_enabled: bool,
+        max_jobs: Option<usize>,
+    ) -> Result<Option<LayerJobs>, PoolError> {
         let whole = |jobs: Vec<ExpertJob>, pool: &CpuPool| {
             pool.start_layer(jobs, hidden)
                 .map(|p| p.map(LayerJobs::Whole))
         };
-        let split = split_jobs()
+        let split = split_enabled
+            && max_jobs.is_none_or(|limit| jobs.len() <= limit)
             && !jobs.is_empty()
             && self.pool.threads() >= 2
             && matches!(self.pool.kernel(), super::cpu_pool::ExpertKernel::Q8g(_));
@@ -1270,6 +1294,69 @@ mod tests {
 
     fn bits(v: &[f32]) -> Vec<u32> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    #[test]
+    fn bounded_split_dispatch_preserves_weighted_outputs_and_fallbacks() {
+        let mut f = fixture();
+        for (threads, kernel) in [
+            (8, ExpertKernel::Q8g(DotBackend::detect())),
+            (1, ExpertKernel::Q8g(DotBackend::detect())),
+            (8, ExpertKernel::Q8k(DotBackend::scalar())),
+        ] {
+            f.host.pool = CpuPool::with_kernel(threads, SHAPE, kernel).unwrap();
+            for count in 0..=EXPERTS {
+                let make_jobs = || {
+                    (0..count)
+                        .map(|expert| {
+                            f.reference
+                                .job(
+                                    Arc::clone(&f.region),
+                                    1,
+                                    expert,
+                                    (expert as f32 - 2.0) / 13.0,
+                                )
+                                .unwrap()
+                        })
+                        .collect()
+                };
+                let expected = f
+                    .host
+                    .pool
+                    .run_layer(make_jobs(), &f.hidden, f.host.timeout)
+                    .unwrap();
+                for (enabled, limit) in [
+                    (false, None),
+                    (true, None),
+                    (true, Some(0)),
+                    (true, Some(1)),
+                    (true, Some(4)),
+                    (true, Some(8)),
+                ] {
+                    let pending = f
+                        .host
+                        .start_jobs_with_split_limit(make_jobs(), &f.hidden, enabled, limit)
+                        .unwrap();
+                    let should_split = enabled
+                        && count > 0
+                        && threads >= 2
+                        && matches!(kernel, ExpertKernel::Q8g(_))
+                        && limit.is_none_or(|max| count <= max);
+                    assert_eq!(
+                        matches!(pending, Some(LayerJobs::Split { .. })),
+                        should_split
+                    );
+                    let actual = match pending {
+                        None => None,
+                        Some(LayerJobs::Whole(p)) => Some(p.finish(f.host.timeout).unwrap()),
+                        Some(LayerJobs::Split { sides, experts }) => {
+                            f.host.finish_split(sides, experts).unwrap()
+                        }
+                    };
+                    assert_eq!(actual.as_deref().map(bits), expected.as_deref().map(bits));
+                }
+            }
+        }
     }
 
     #[test]
