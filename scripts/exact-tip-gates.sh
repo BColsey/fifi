@@ -28,6 +28,12 @@
 #   GATES_LOCK_WAIT    optional; seconds to wait for the shared lock (default 7200;
 #                      a wait that times out refuses the run with rc 5)
 #   GATES_MIN_FREE_GB  optional; free-disk floor on the scratch filesystem (default 15)
+#   GATES_OWNER        optional; owner segment of the container name (default: the
+#                      lock file's base name, e.g. cpu-build.lock -> cpu-build)
+#
+# Stopping a run: signal THIS script (SIGINT/SIGTERM); its exit traps remove its
+# own container and scratch. Never `docker rm` by hand — a container name alone
+# does not say which lane owns the run, and the rm may kill another lane's gate.
 #
 # The Mac arm runs by default (--mac=always): every Mac breakage so far came from
 # a commit that touched no Mac-side file (a field added in sched/job.rs broke
@@ -59,7 +65,6 @@
 set -euo pipefail
 
 CTR_IMAGE=sha256:feff5d69da26e2508144318c62441fa292c0131efe91d6ccccaed4e9d1533d9d
-CTR_NAME=gates-$$
 
 # Remove THIS RUN's scratch directory on the Mac. The caller must have seen
 # the remote command's own exit status (any cargo rc) — never a timeout (124),
@@ -101,6 +106,10 @@ sha=$(git -C "$repo" rev-parse --verify "$commit^{commit}") || usage
 run=$GATES_SCRATCH/$sha
 logs=$run/logs
 lock=${GATES_LOCK:?GATES_LOCK is required (the shared CPU-build lock path)}
+# The container name carries its owner so concurrent lanes never clean up each
+# other's gate containers: GATES_OWNER wins, else the lock file's base name.
+owner=${GATES_OWNER:-$(basename "$lock" .lock)}
+CTR_NAME="gates-${owner}-$$"
 mac_max=${GATES_MAC_MAX_SEC:-1800}
 arm_max=${GATES_ARM_MAX_SEC:-3600}
 lock_wait=${GATES_LOCK_WAIT:-7200}
@@ -166,7 +175,8 @@ free_g=$(df -Bg --output=avail "$(dirname "$run")" | tail -1 | tr -dc '0-9')
 mkdir -p "$logs" "$run/tmp"
 
 start_ts=$(date -u +%FT%TZ)
-receipt=("EXACT-TIP GATES $start_ts commit=$sha platform=$(uname -sm) mac=$mac")
+receipt=("EXACT-TIP GATES $start_ts commit=$sha platform=$(uname -sm) mac=$mac"
+         "container=$CTR_NAME script_pid=$$")
 arm_status=()
 mac_job=
 mac_dir=
