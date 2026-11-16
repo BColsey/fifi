@@ -1379,6 +1379,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bad_request_from_a_running_job_answers_500_backend_error() {
+        // The engine's own invariant failures arrive as BadRequest mid-job; the client
+        // must not be told a server defect is its request, and the native text must not
+        // reach it.
+        let engine = testkit::refusing_engine(EngError::BadRequest(
+            "the executor planned a prefill piece of 0".to_string(),
+        ));
+        let (status, body) = post(&app(&engine, 4_096), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_code(&body), "backend_error");
+        assert_schema("BackendError", &body);
+        assert_eq!(body["error"]["message"], "Model execution failed.");
+    }
+
+    #[tokio::test]
     async fn a_prompt_over_the_limit_is_refused_with_no_prefill_on_the_engine() {
         // The rendered prompt of "hi" is 21 tokens, so an entry limit of 21 refuses it at
         // admission: the engine never sees the job.

@@ -158,7 +158,7 @@ impl RunningJob {
                         return Ok(step);
                     }
                 }
-                JobEvent::Error(error) => return Err(error.into()),
+                JobEvent::Error(error) => return Err(boundary_error(error)),
                 JobEvent::Finished(_) => {}
             }
         }
@@ -170,7 +170,7 @@ impl RunningJob {
     async fn read_finished(&mut self) -> Result<JobUsage, ServerError> {
         match self.handle.events.recv().await {
             Some(JobEvent::Finished(usage)) => Ok(usage),
-            Some(JobEvent::Error(error)) => Err(error.into()),
+            Some(JobEvent::Error(error)) => Err(boundary_error(error)),
             _ => Ok(JobUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -271,6 +271,22 @@ pub(crate) async fn collect_pieces(
     }
 }
 
+/// The boundary between the engine and the reply. Request validation happens before a
+/// job starts, so a `BadRequest` that arrives from a running job is an engine defect
+/// wearing the client's error code: rewrap it as the engine's own backend failure. The
+/// client sees the sanitized backend row (500 `backend_error`, no native text), while
+/// stderr and the request line keep the cause. The refusals that legitimately belong to
+/// the request (memory plan, context limit, over-length prompt) keep their rows.
+fn boundary_error(error: EngError) -> ServerError {
+    match error {
+        EngError::BadRequest(message) => ServerError::Eng(EngError::Backend {
+            operation: "engine",
+            message,
+        }),
+        error => ServerError::Eng(error),
+    }
+}
+
 pub(crate) async fn collect(
     job: &mut RunningJob,
 ) -> Result<(ReplyParts, FinishReason, Usage), ServerError> {
@@ -301,13 +317,14 @@ mod tests {
     use crate::family::executor::GenerationState;
     use crate::sched::job::{Job, JobEvent, JobUsage, PrefillBankReport};
     use crate::sched::worker::Engine;
-    use crate::server::error::ServerError;
+    use crate::server::error::{BACKEND_MESSAGE, ServerError};
     use crate::server::pieces::{Piece, ReplyParser};
     use crate::server::reqlog::{RequestLog, default_clock};
     use crate::server::testkit;
     use crate::server::wire::{FinishReason, ReplyHead, Usage};
     use crate::tokenizer::toolcall::{Start, ToolCall as ParsedCall};
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, OutputAssembler};
+    use axum::http::StatusCode;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -690,6 +707,27 @@ mod tests {
             error,
             ServerError::Eng(EngError::MemoryPlan("no room".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_from_a_running_job_is_the_engine_backend_failure() {
+        // The engine's internal invariant failures ride BadRequest; from a running job
+        // that is a server defect, so the boundary rewraps it instead of blaming the
+        // client with a 400 and an unsanitized message.
+        let native = "the executor planned a prefill piece of 0".to_string();
+        let engine = testkit::refusing_engine(EngError::BadRequest(native.clone()));
+        let (mut job, _cancel) = run(&engine, &[], 100);
+        let error = job.next().await.expect_err("error");
+        assert_eq!(
+            error,
+            ServerError::Eng(EngError::Backend {
+                operation: "engine",
+                message: native,
+            })
+        );
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "backend_error");
+        assert_eq!(error.message(), BACKEND_MESSAGE);
     }
 
     #[tokio::test]

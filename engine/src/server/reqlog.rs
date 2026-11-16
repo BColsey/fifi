@@ -2104,6 +2104,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bad_request_from_a_running_job_logs_backend_error_at_500() {
+        let engine = testkit::refusing_engine(EngError::BadRequest(
+            "the executor planned a prefill piece of 0".to_string(),
+        ));
+        let (app, capture) = app(&engine, 4_096);
+        let post = testkit::post_json("/v1/chat/completions", &request(json!({})));
+        let (status, _headers, _bytes) = testkit::send(&app, post).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let lines = capture.lines_with_keys(&ROUTE_KEYS);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["status"], 500);
+        assert_eq!(line["outcome"], "error");
+        assert_eq!(line["error_code"], "backend_error");
+    }
+
+    #[tokio::test]
     async fn an_over_length_refusal_logs_prompt_too_long_not_the_wire_code() {
         let engine = testkit::refusing_engine(EngError::PromptTooLong {
             prompt_tokens: 118_930,

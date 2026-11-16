@@ -2876,6 +2876,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bad_request_from_a_running_job_is_the_api_error_event() {
+        // An engine defect wearing BadRequest mid-job is a backend failure at the
+        // boundary, so the Anthropic route answers with its api_error form and the
+        // sanitized message, never the native cause.
+        let engine = testkit::refusing_engine(EngError::BadRequest(
+            "restored prefix covers the whole prompt".to_string(),
+        ));
+        let (status, content_type, events) =
+            stream(&app(&engine, 4_096), &stream_request(json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/event-stream");
+        let names: Vec<&str> = events
+            .iter()
+            .map(|event| event.name.as_deref().expect("named"))
+            .collect();
+        assert_eq!(names, ["message_start", "error"], "{events:?}");
+        let error = &of(&events, "error")[0];
+        assert_eq!(error["error"]["type"], "api_error");
+        assert_eq!(error["error"]["message"], "Model execution failed.");
+    }
+
+    #[tokio::test]
     async fn pool_exhaustion_on_a_stream_is_the_over_length_error_event() {
         // The stream has already sent its 200 headers when the pool denial
         // arrives, so the over-length report must reach Claude Code as the error
