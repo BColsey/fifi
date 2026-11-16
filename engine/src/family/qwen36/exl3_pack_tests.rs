@@ -6,10 +6,11 @@
 use std::path::Path;
 
 use super::{
-    exl3_pack::{ExpertPart, Marker, expert_name, inspect_pack, layer_name},
+    exl3_pack::{expert_name, inspect_pack_split},
     fixtures::{self, Entry},
     host::{AttnDims, DeltaDims, HostShape, MoeDims},
 };
+use crate::family::exl3_pack::{ExpertPart, Marker, codebook_name, layer_name};
 use crate::{
     EngError,
     family::{AttentionKind, QWEN3_6_35B_A3B},
@@ -199,7 +200,7 @@ fn counted(entries: &[Entry]) -> u64 {
 
 fn refusal(entries: Vec<Entry>) -> String {
     let source = fixtures::checkpoint(entries);
-    match inspect_pack(&source, &shape()) {
+    match inspect_pack_split(&source, &shape()) {
         Err(EngError::Checkpoint(message)) => message,
         other => panic!("expected a pack refusal, got {other:?}"),
     }
@@ -216,7 +217,7 @@ fn position(entries: &[Entry], name: &str) -> usize {
 fn a_pack_of_the_model_shape_is_counted_from_its_headers() {
     let entries = pack(&shape());
     let expected = counted(&entries);
-    let report = inspect_pack(&fixtures::checkpoint(entries), &shape()).unwrap();
+    let report = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
     assert_eq!(report.device_bytes, expected);
     assert_eq!(report.codebook, Marker::Mcg);
     // The head at 6 bits and every other matrix at 4: the rate is per matrix, the experts of one
@@ -225,6 +226,16 @@ fn a_pack_of_the_model_shape_is_counted_from_its_headers() {
     assert_eq!(report.matrices, report.rates.values().sum::<usize>());
     // 1 head + 3 + 4 mixer matrices + 2 layers x 3 projections x (3 experts + 1 shared).
     assert_eq!(report.matrices, 1 + 3 + 4 + 2 * 3 * 4);
+}
+
+/// The walk's report carries the routed experts' device bytes in `expert_bytes` (the field a
+/// banked load's dense/routed split reads); a synthetic pack with experts must produce a
+/// positive total there.
+#[test]
+fn the_walk_totals_routed_expert_bytes() {
+    let entries = pack(&shape());
+    let report = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
+    assert!(report.expert_bytes > 0, "the synthetic pack has experts");
 }
 
 #[test]
@@ -301,7 +312,7 @@ fn a_model_whose_widths_are_not_multiples_of_128_is_refused() {
     narrow.hidden = 192;
     let source = fixtures::checkpoint(pack(&narrow));
     assert!(matches!(
-        inspect_pack(&source, &narrow),
+        inspect_pack_split(&source, &narrow),
         Err(EngError::Checkpoint(m)) if m.contains("multiple of 128")
     ));
 }
@@ -319,7 +330,7 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
         .check_architecture_config(&checkpoint.model_config)
         .expect("the pack config is the model's");
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).unwrap();
-    let report = inspect_pack(&checkpoint.source, &shape).expect("the pack fits the model");
+    let report = inspect_pack_split(&checkpoint.source, &shape).expect("the pack fits the model");
     println!("{report:?}");
     let expected: u64 = std::env::var("FIFI_EXL3_EXPECT_BYTES")
         .expect("FIFI_EXL3_EXPECT_BYTES")
@@ -334,7 +345,8 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
 #[test]
 fn exl3_plan_refuses_a_directory_without_pack_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let error = super::exl3_plan(dir.path()).expect_err("an empty directory is not a pack");
+    let error =
+        super::exl3_pack::exl3_plan(dir.path()).expect_err("an empty directory is not a pack");
     let text = format!("{error:?}");
     assert!(
         text.contains("config.json"),
@@ -346,7 +358,6 @@ fn exl3_plan_refuses_a_directory_without_pack_metadata() {
 /// real pack's codebook in the decision rows, so the mapping is pinned, not println'd.
 #[test]
 fn codebook_names_are_the_markers_own() {
-    use super::exl3_pack::codebook_name;
     assert_eq!(codebook_name(Marker::Mul1), "Mul1");
     assert_eq!(codebook_name(Marker::Mcg), "Mcg");
 }
@@ -357,7 +368,7 @@ fn codebook_names_are_the_markers_own() {
 #[ignore = "reads the headers of a real pack in FIFI_EXL3_CHECKPOINT"]
 fn exl3_plan_reports_the_real_packs_walk() {
     let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
-    let plan = super::exl3_plan(Path::new(&dir)).expect("the pack fits the model");
+    let plan = super::exl3_pack::exl3_plan(Path::new(&dir)).expect("the pack fits the model");
     let expected: u64 = std::env::var("FIFI_EXL3_EXPECT_BYTES")
         .expect("FIFI_EXL3_EXPECT_BYTES")
         .parse()

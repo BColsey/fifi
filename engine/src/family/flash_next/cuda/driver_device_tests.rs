@@ -17,11 +17,22 @@
 //! Reported: the generated ids against the oracle's, the stage table, and the step-0 relative L2,
 //! largest difference, argmax and top-20 overlap against the oracle's full row.
 //!
+//! The `engine.json` record carries `bank_slots` and `resident_sha256` — the load's placement
+//! state. The step-0 logits (and any digest of them) follow that state, not just the binary:
+//! the bank size and the free VRAM at load pick the residents, so two records compare only at
+//! the same digest. The dependence is measured, not assumed: this run is `prefill_rows: 1`
+//! (the token driver, never a chunk driver), and at rows=1 forced placements of 206 and 150
+//! slots produced step-0 hashes 185d3542 and 4fc4e49f on the same binary — placement moves
+//! the logits, which is why the digest travels with every record.
+//!
 //! `teacher_forced_steps_follow_the_oracle_on_every_prompt`: every oracle prompt, fed the oracle's
 //! tokens, in one process.
 //! - `FIFI_FLASH_NEXT_EXL3_PACK`, `_DRIVER_ORACLE`, `_DRIVER_CONTEXT` (default: the largest prompt
 //!   plus its steps plus 8, rounded up to 4) and `_DRIVER_SLOTS` as above.
 //! - `FIFI_FLASH_NEXT_DRIVER_PROMPTS`: a comma-separated list of prompt ids (default: all).
+//! - `FIFI_FLASH_NEXT_DRIVER_ROWS` (follow harness, default 1): the driver's row plan
+//!   (scratch width, ring, driver class). The harness itself feeds one row per call at any
+//!   setting; a chunk-size comparison needs the direct driver test.
 //! - `FIFI_FLASH_NEXT_DRIVER_BUDGET_SEC`: wall seconds after which a prompt that would not finish
 //!   is skipped and named (default 700).
 //! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for `follow.json` (summaries), `engine-follow.json`
@@ -46,15 +57,19 @@ use std::time::Duration;
 
 use super::{
     driver::TokenTimes,
+    executor::{CudaRules, FlashCudaExecutor},
+    resume,
     start::{StepDriver, build_driver},
 };
 use crate::{
     family::{
         flash_next::settings::{CudaSettings, KvFormatName},
-        session::TokenStepper,
+        session::{SaveKind, TokenStepper},
     },
     kernels::cuda::device_present,
 };
+
+use std::sync::Arc;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -210,7 +225,8 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
     };
     let prompt = ids("prompt_ids");
     let expected = ids("generated");
-    let context: u32 = 512;
+    let context: u32 =
+        var("FIFI_FLASH_NEXT_DRIVER_CONTEXT").map_or(512, |v| v.parse().expect("context"));
     assert!(
         prompt.len() + steps < context as usize,
         "the context is too small"
@@ -262,6 +278,644 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
         agree >= 8.min(steps),
         "the chunked prefill driver agrees with the oracle on only {agree} of {steps}"
     );
+}
+
+/// The prefix resume on the real pack: a fresh prefill of prompt B is the reference, then a
+/// resumed turn (prefill of A, save at the boundary, decode past it, reset, restore, prefill of
+/// the tail) draws the same greedy tokens within the family's logit bound, and a fresh prefill
+/// AFTER stale planes (the resume-armed reset skips the QSA planes) still matches the reference
+/// — the invariant that makes keeping the rows in place safe.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_prefix_resume_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next prefix resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(64, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "chat-short")
+        .expect("the chat-short prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // B is the full prompt; A is all but the last 8 tokens, so the tail feeds 8 rows.
+    let cut = prompt.len().saturating_sub(8).max(1);
+    let (a, b) = prompt.split_at(cut);
+    assert!(prompt.len() + steps < 512, "raise the context");
+    let wanted = CudaSettings {
+        context: 512,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // `steps` greedy rows from the prompt's last token: the ids and the logits rows.
+    // (See the module-level `greedy`.)
+
+    // The fresh reference.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &prompt).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+
+    // The resumed turn.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, a).unwrap();
+    assert!(
+        executor.save_prefix(&session, a, SaveKind::Tip).unwrap(),
+        "the armed switch saves the boundary"
+    );
+    for _ in 0..8 {
+        executor
+            .stepper()
+            .logits(*a.last().expect("a boundary token"))
+            .expect("decode past the boundary");
+    }
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &prompt).unwrap();
+    assert_eq!(reused, a.len(), "the whole boundary is reused");
+    executor.prefill(&mut session, b).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the resumed turn draws the fresh greedy tokens"
+    );
+    // The family's cross-path ladder (step_tests): stream 2e-4, block logits 1.5e-3. The two
+    // prefill decompositions differ only in chunk boundaries (the EXL3 row-grouped reduction
+    // order); measured 1.19e-4 over 64 rows, so 2e-4 holds the same class while a stale-row
+    // read — an O(1) wrong row — lands orders of magnitude above it.
+    //
+    // Measured at the fixed tip (d088a09d8, 64 rows, this prompt): resumed-vs-fresh
+    // 1.189e-4 with the ring saved, bit-identical to the 1.189e-4 the ring-unsaved code
+    // measured — this prompt is ~8 completed blocks against a 512-block budget, so
+    // indexer selection cannot bind and a stale pooled key is invisible here by
+    // construction; 1.189e-4 is the split prefill's own cross-path noise floor. The
+    // fresh-after-stale and refused-restore arms measured 1.241e-4, the same class. The
+    // ring defect shows only over the block budget, which the mid-block test below
+    // covers (prefill-4k: FAILED unsaved, ok saved).
+    let bound = 2e-4f64;
+    let worst = resumed_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("resume rel-L2: max {worst:.3e} over {steps} rows, bound {bound:.0e}");
+    assert!(
+        worst <= bound,
+        "resumed logits drift {worst:.3e} above {bound:.0e}"
+    );
+
+    // A fresh prefill after stale planes matches the reference too.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &prompt).unwrap();
+    let (stale_ids, stale_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+    assert_eq!(
+        stale_ids, fresh_ids,
+        "a fresh turn never observes the stale planes"
+    );
+    let worst = stale_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("fresh-after-stale rel-L2: max {worst:.3e} over {steps} rows, bound {bound:.0e}");
+    assert!(
+        worst <= bound,
+        "stale-plane logits drift {worst:.3e} above {bound:.0e}"
+    );
+
+    // The stale-planes turn was a fresh prefill: the arena generation moved past the entry, so
+    // a restore of the boundary is refused (reuse 0) and the full prefill matches the reference.
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &prompt).unwrap();
+    assert_eq!(
+        reused, 0,
+        "a fresh prefill between the save and the restore refuses the entry"
+    );
+    executor.prefill(&mut session, &prompt).unwrap();
+    let (refused_ids, refused_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+    assert_eq!(
+        refused_ids, fresh_ids,
+        "the refused turn draws the fresh greedy tokens"
+    );
+    let worst = refused_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("refused-restore rel-L2: max {worst:.3e} over {steps} rows, bound {bound:.0e}");
+    assert!(
+        worst <= bound,
+        "the refused turn's logits drift {worst:.3e} above {bound:.0e}"
+    );
+}
+
+/// The mid-turn suffix case of the two-entry store: the re-rendered tail diverges inside the
+/// tip key (two tokens above the block boundary), so the tip is refused and the rolling block
+/// below it serves; the block-resumed turn draws the fresh greedy tokens within the family's
+/// stream bound. The block cut here is synthetic (`tip - 8` on the chat-short prompt): the
+/// 64-lattice position is the worker's planning choice (pinned in `sched`), while this test
+/// pins the numerics of a restore from a below-tip entry.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next suffix resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(64, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "chat-short")
+        .expect("the chat-short prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // The worker's two-entry shape at a synthetic block: the tip is all but the last 8
+    // tokens (the boundary of the 4-arm test), the block 8 below it, and the suffix prompt
+    // re-renders the two tokens above the block — the seam the template's tail merge makes.
+    let cut = prompt.len().saturating_sub(8).max(9);
+    let (a, b) = prompt.split_at(cut);
+    let block = cut - 8;
+    let mut c = a[..block].to_vec();
+    let seam = [
+        (a[block] + 1) % actual_vocab as u32,
+        (a[block + 1] + 2) % actual_vocab as u32,
+    ];
+    assert_ne!(seam[0], a[block]);
+    assert_ne!(seam[1], a[block + 1]);
+    c.extend_from_slice(&seam);
+    c.extend_from_slice(&a[block + 2..]);
+    c.extend_from_slice(b);
+    assert_eq!(c.len(), prompt.len());
+    assert_eq!(
+        &c[..block],
+        &a[..block],
+        "the suffix prefixes the block key"
+    );
+    assert_ne!(
+        &c[block..block + 2],
+        &a[block..block + 2],
+        "the seam is inside the tip key"
+    );
+    assert!(prompt.len() + steps < 512, "raise the context");
+    let wanted = CudaSettings {
+        context: 512,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // The fresh reference of the suffix prompt.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+
+    // Turn 1: prefill A, saving the block at its boundary and the tip at A's end.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &a[..block]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &a[..block], SaveKind::Block)
+            .unwrap(),
+        "the armed switch saves the block"
+    );
+    executor.prefill(&mut session, &a[block..]).unwrap();
+    assert!(executor.save_prefix(&session, a, SaveKind::Tip).unwrap());
+    for _ in 0..8 {
+        executor
+            .stepper()
+            .logits(*a.last().expect("a boundary token"))
+            .expect("decode past the boundary");
+    }
+    // The suffix turn: the tip is refused at the seam, the block restores, the tail feeds.
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, block, "the block serves the re-rendered tail");
+    executor.prefill(&mut session, &c[block..]).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the block-resumed turn draws the fresh greedy tokens"
+    );
+    // The family's cross-path ladder (step_tests): stream 2e-4 — the same bound the tip
+    // restore holds; a wrong (stale) row read lands orders of magnitude above it.
+    let bound = 2e-4f64;
+    let worst = resumed_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("block-resume rel-L2: max {worst:.3e} over {steps} rows, bound {bound:.0e}");
+    assert!(
+        worst <= bound,
+        "block-resumed logits drift {worst:.3e} above {bound:.0e}"
+    );
+}
+
+/// Device proof on the served 16|64 default: a plain conversation extension restores
+/// the off-lattice tip (4,557 = 284 x 16 + 13), the extension's prefill runs from there in
+/// 16-row pieces, and the turn's rolling cut at 5,056 - (5,056 - 4,557) = 499, not a
+/// multiple of 16 - is saved at its true boundary: the piece that contains it splits and
+/// re-anchors, where the pre-change ride to 4,557 + 32 x 16 = 5,069 would have passed the
+/// tip and dropped the cut. The resumed turn must still draw the fresh greedy tokens
+/// within the family's stream bound.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_extension_turn_after_an_off_lattice_tip_restore_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next off-lattice extension resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(32, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "prefill-4k")
+        .expect("the prefill-4k prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // The worker's served shape: the first turn ends at the off-lattice tip 4,557, the
+    // extension appends 544 tokens (5,101 total, new tip 5,100), and the plan cuts at
+    // 5,056 - a true boundary, not a chunk end of the restored cursor.
+    const PIECE: usize = 16;
+    const SPACING: usize = 64;
+    let tip1 = 4_557;
+    assert_eq!(
+        tip1 % PIECE,
+        13,
+        "the restored tip is off the piece lattice"
+    );
+    let mut c = prompt[..tip1].to_vec();
+    c.extend((0..544).map(|i| (i * 13 + 5) as u32 % actual_vocab as u32));
+    let tip2 = c.len() - 1;
+    // The plan the worker will rule for this turn, taken from the projection itself: the
+    // cut keeps its true boundary 5,056 - 4,557 = 499 tokens above the restored cursor,
+    // 31 chunks and 3 tokens, so the piece that contains it splits. The pre-fix ride
+    // would land the Block at 5,069 - still below the tip, so the old plan emitted it,
+    // 13 tokens above the true boundary; the ride drops a cut only when it reaches the
+    // tip, which needs a tip within one piece of the boundary.
+    let plan = crate::sched::worker::planned_points_for_tests(
+        Some(tip2),
+        None,
+        tip1,
+        PIECE,
+        crate::family::session::StoreLimits {
+            roots: 0,
+            entries: 2,
+        },
+        Some(SPACING),
+    );
+    assert_eq!(
+        plan,
+        vec![(5_056, SaveKind::Block), (tip2, SaveKind::Tip)],
+        "the ruled plan cuts at the true boundary below the new tip"
+    );
+    assert_eq!((5_056 - tip1) % PIECE, 3, "the cut is not a chunk end");
+    let cut2 = 5_056;
+    let context = u32::try_from(c.len() + steps + 8).expect("a context that fits");
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: PIECE as u32,
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // The fresh reference of the extension prompt.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+
+    // Turn 1: prefill to the off-lattice tip and save it.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c[..tip1]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip1], SaveKind::Tip)
+            .unwrap(),
+        "the armed switch saves the off-lattice tip"
+    );
+    // The extension turn: the tip restores (a plain extension re-renders nothing), the
+    // pieces run from the restored cursor, the cut's piece splits at the true boundary,
+    // and the turn's own Block and Tip save there and at the new tip.
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, tip1, "the off-lattice tip serves the extension");
+    let mut pos = tip1;
+    while pos < cut2 {
+        let end = (pos + PIECE).min(cut2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    assert!(
+        executor
+            .save_prefix(&session, &c[..cut2], SaveKind::Block)
+            .unwrap(),
+        "the split piece saves the cut at its true boundary"
+    );
+    while pos < tip2 {
+        let end = (pos + PIECE).min(tip2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip2], SaveKind::Tip)
+            .unwrap()
+    );
+    // The one token past the tip, the position the worker's `start` prefills after the
+    // tip save: without it the session holds c[tip2 - 1] pending and never feeds it.
+    executor.prefill(&mut session, &c[tip2..]).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the off-lattice restored turn draws the fresh greedy tokens"
+    );
+
+    // The control leg: the same tip restore and the same 16-row tail tiling with NO
+    // mid-turn Block save - the pre-change restored-turn shape. Both legs hold the
+    // family's cross-path ladder stream bound (step_tests: 2e-4), the same class the tip
+    // and block restores above hold: measured 1.462e-4 on both legs of this prompt
+    // (restores at 4,557 with a 544-token differently-tiled tail), so a real restore's
+    // depth-scaled rounding stays inside it while a stale-read class - a restore that
+    // misses rows - still lands orders of magnitude above. The control-relative ratio is
+    // the second assertion: it isolates the split's own contribution from the restore's
+    // depth noise, and both legs must draw the fresh greedy tokens.
+    executor.reset(&mut session).unwrap();
+    // Re-arm the 4,557 tip: the split leg's Tip save at 5,100 evicted it (the Tip store
+    // holds one entry), so turn 1's prefill and save run a second time before the
+    // control restores.
+    executor.prefill(&mut session, &c[..tip1]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip1], SaveKind::Tip)
+            .unwrap(),
+        "the control's turn 1 re-arms the off-lattice tip"
+    );
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, tip1, "the control restores the same tip");
+    let mut pos = tip1;
+    while pos < tip2 {
+        let end = (pos + PIECE).min(tip2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    executor.prefill(&mut session, &c[tip2..]).unwrap();
+    let (control_ids, control_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        control_ids, fresh_ids,
+        "the control restored turn draws the fresh greedy tokens"
+    );
+    let worst = |rows: &[Vec<f32>]| {
+        rows.iter()
+            .zip(&fresh_rows)
+            .map(|(got, want)| relative_l2(got, want))
+            .fold(0.0f64, f64::max)
+    };
+    let mean = |rows: &[Vec<f32>]| {
+        rows.iter()
+            .zip(&fresh_rows)
+            .map(|(got, want)| relative_l2(got, want))
+            .sum::<f64>()
+            / rows.len().max(1) as f64
+    };
+    let split_drift = worst(&resumed_rows);
+    let control_drift = worst(&control_rows);
+    println!(
+        "off-lattice extension rel-L2: split max {split_drift:.3e} mean {:.3e}, control max \
+         {control_drift:.3e} mean {:.3e} over {steps} rows, bound 2e-4",
+        mean(&resumed_rows),
+        mean(&control_rows)
+    );
+    assert!(
+        split_drift <= 2e-4,
+        "the split's logits drift {split_drift:.3e} escapes the family stream bound 2e-4"
+    );
+    assert!(
+        control_drift <= 2e-4,
+        "the control's logits drift {control_drift:.3e} escapes the family stream bound 2e-4"
+    );
+    assert!(
+        split_drift <= 4.0 * control_drift,
+        "the split's logits drift {split_drift:.3e} escapes the no-split control \
+         {control_drift:.3e} - a stale-read class, not depth noise"
+    );
+}
+
+/// The mid-block boundary case of the raw-key ring: a boundary whose open block is partially
+/// filled (`(boundary - 1) % ratio != 0`), a continuation longer than the block's remainder, and
+/// a prompt whose completed blocks exceed the indexer budget (the real pack: ratio 4, budget
+/// 2,048 positions = 512 blocks; `prefill-4k` at 4,565 tokens completes 1,141), so a wrong
+/// pooled key changes block selection. The ring is copied with the fixed state, so the resumed
+/// turn draws the fresh greedy tokens.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_mid_block_resume_over_a_block_budget_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next mid-block resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(32, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "prefill-4k")
+        .expect("the prefill-4k prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // The boundary leaves the open block two slots short (the pack's ratio is 4).
+    const RATIO: usize = 4;
+    let mut cut = prompt.len().saturating_sub(8).max(RATIO + 1);
+    while (cut - 1) % RATIO != 2 {
+        cut -= 1;
+    }
+    assert_eq!((cut - 1) % RATIO, 2, "the boundary is mid-block");
+    let (a, b) = prompt.split_at(cut);
+    let context = u32::try_from(prompt.len() + steps + 8).expect("a context that fits");
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // The fresh reference.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &prompt).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+
+    // Save at the mid-block boundary, then continue far enough to overwrite every open-block
+    // ring slot (a continuation of 8 covers the remaining 2 and the whole next block).
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, a).unwrap();
+    assert!(
+        executor.save_prefix(&session, a, SaveKind::Tip).unwrap(),
+        "the armed switch saves the mid-block boundary"
+    );
+    for _ in 0..2 * RATIO {
+        executor
+            .stepper()
+            .logits(*a.last().expect("a boundary token"))
+            .expect("decode past the boundary");
+    }
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &prompt).unwrap();
+    assert_eq!(reused, a.len(), "the whole mid-block boundary is reused");
+    executor.prefill(&mut session, b).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &prompt, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the mid-block resumed turn draws the fresh greedy tokens"
+    );
+    let worst = resumed_rows
+        .iter()
+        .zip(&fresh_rows)
+        .map(|(got, want)| relative_l2(got, want))
+        .fold(0.0f64, f64::max);
+    println!("mid-block resume rel-L2: max {worst:.3e} over {steps} rows");
+    assert!(
+        worst <= 2e-4,
+        "the mid-block resumed logits drift {worst:.3e} above the family stream bound"
+    );
+}
+
+/// `steps` greedy rows from the prompt's last token: the ids and the logits rows.
+fn greedy<S>(
+    executor: &mut FlashCudaExecutor<S>,
+    tail: &[u32],
+    steps: usize,
+    vocab: usize,
+) -> (Vec<u32>, Vec<Vec<f32>>)
+where
+    S: crate::family::flash_next::cuda::driver::ResumesState,
+{
+    let mut input = *tail.last().expect("a tail");
+    let mut ids = Vec::with_capacity(steps);
+    let mut rows = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let row = executor
+            .stepper()
+            .logits(input)
+            .unwrap_or_else(|e| panic!("step: {e:?}"));
+        let pick = argmax(&row[..vocab]) as u32;
+        ids.push(pick);
+        rows.push(row);
+        input = pick;
+    }
+    (ids, rows)
+}
+
+/// `(got - want) / max(|want|)` element-wise, folded to the relative L2 of the row.
+fn relative_l2(got: &[f32], want: &[f32]) -> f64 {
+    let (mut sum, mut norm) = (0.0f64, 0.0f64);
+    for (g, w) in got.iter().zip(want) {
+        let (g, w) = (f64::from(*g), f64::from(*w));
+        sum += (g - w) * (g - w);
+        norm += w * w;
+    }
+    (sum / norm.max(1e-30)).sqrt()
 }
 
 #[test]
@@ -321,6 +975,9 @@ fn the_first_real_tokens_match_the_oracle() {
     )
     .expect("build the driver");
     println!("load: {:.1} s", began.elapsed().as_secs_f64());
+    // The placement the run compares at: the load filled the residents this digest names, and
+    // the step-0 logits hash follows it (bank size and free VRAM at load pick them).
+    let placement = driver.placement_digest();
 
     let (last, head) = prompt.split_last().expect("a prompt");
     let fed = std::time::Instant::now();
@@ -341,6 +998,9 @@ fn the_first_real_tokens_match_the_oracle() {
     let mut records = Vec::new();
     let mut first_row: Vec<f32> = Vec::new();
     let mut step_samples = Vec::new();
+    // The decode-phase figure sums each step's logits wall only: the harness work between
+    // steps (argmax, the top-20 sort, the json record) stays out, so a decode A/B reads the
+    // driver, not the harness. Per-step `wall` below is that same logits-only clock.
     for step in 0..steps {
         let before = driver.bank_misses();
         let began = std::time::Instant::now();
@@ -371,6 +1031,12 @@ fn the_first_real_tokens_match_the_oracle() {
         generated.push(pick as u32);
         input = pick as u32;
     }
+    let decode_phase = step_samples.iter().map(|s| s.wall).sum::<Duration>();
+    println!(
+        "decode phase: {steps} steps in {:.2} s ({:.1} ms/token)",
+        decode_phase.as_secs_f64(),
+        decode_phase.as_secs_f64() * 1000.0 / steps as f64
+    );
     table("prompt tokens (no head)", &prompt_samples);
     table("generated tokens", &step_samples);
     println!("generated {generated:?}");
@@ -443,6 +1109,12 @@ fn the_first_real_tokens_match_the_oracle() {
             "schema": "fifi-flash-next-oracle/1", "role": "engine", "prompt": wanted_id,
             "prompt_ids": prompt, "generated": generated, "steps": records,
             "agree_prefix": agree,
+            "bank_slots": placement.0,
+            "resident_sha256": placement.1,
+            "decode_phase": {
+                "steps": steps,
+                "secs": decode_phase.as_secs_f64(),
+            },
         });
         std::fs::write(
             out.join("engine.json"),
@@ -581,8 +1253,12 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
-        prefill_rows: 1,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(1, |v| v.parse().expect("rows")),
     };
+    // `prefill_rows` picks the driver's row plan (scratch width, ring, driver class), not
+    // the chunk size this harness runs: it feeds the prompt one row per `feed` call and
+    // decodes one row per `logits` call whatever the plan says. A chunk-size comparison
+    // needs the direct chunk driver test, not this harness.
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
         &pack,
@@ -663,11 +1339,13 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         );
         driver.reset().expect("reset");
         let began = std::time::Instant::now();
+        let misses_before = driver.bank_misses();
         let (last, head) = prompt.split_last().expect("a prompt");
         for &token in head {
             driver.feed(token).expect("feed a prompt token");
         }
         feed_ms = began.elapsed().as_secs_f64() * 1e3 / head.len().max(1) as f64;
+        let prompt_misses = driver.bank_misses().saturating_sub(misses_before);
         let began = std::time::Instant::now();
         let mut steps: Vec<FollowStep> = Vec::with_capacity(count);
         let mut engine_steps = Vec::with_capacity(count);
@@ -749,13 +1427,20 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         let full: Vec<f64> = steps.iter().filter_map(|s| s.kl_full).collect();
         let (klf_mean, klf_max) = mean_max(&full);
         let overlap = steps.iter().map(|s| s.overlap).sum::<usize>() as f64 / count as f64;
+        let rows_plan = wanted.prefill_rows;
+        let step_misses = driver
+            .bank_misses()
+            .saturating_sub(misses_before + prompt_misses);
         println!(
             "{id}: {count} steps, top-1 {agree}/{count} ({:.4}), KL top-20 mean {kl20_mean:.3e} max {kl20_max:.3e}, \
              KL full-vocab ({} rows) mean {klf_mean:.3e} max {klf_max:.3e}, top-20 overlap mean {overlap:.2}/20, \
-             prompt {:.1} ms/token, steps {step_ms:.1} ms/token",
+             prompt {:.1} ms/token, steps {step_ms:.1} ms/token, misses prompt {prompt_misses} ({:.2}/tok) steps {step_misses} ({:.2}/tok), \
+             rows plan {rows_plan} (the follow harness feeds one row per call)",
             agree as f64 / count as f64,
             full.len(),
-            feed_ms
+            feed_ms,
+            prompt_misses as f64 / head.len().max(1) as f64,
+            step_misses as f64 / count as f64
         );
         let mut flips = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -874,6 +1559,10 @@ fn write_follow_reports(
 /// Environment: `FIFI_FLASH_NEXT_EXL3_PACK`, `FIFI_FLASH_NEXT_DRIVER_ORACLE`, `_PROMPT` (default
 /// `chat-short`), `_STEPS` (default 64), `_CONTEXT` (default 512), `_OUT`, `_CONFIG` (a label) and
 /// `_ROUND`.
+///
+/// The record also carries the run's bank placement (`bank_slots`, `resident_sha256`) - the
+/// load's residents, named before the run feeds experts - so runs compare hashes only at the
+/// same placement.
 #[test]
 #[ignore = "needs a GPU (about 21 GiB) and the full pack; run by the kernel receipt script"]
 fn single_row_kernel_receipt_run() {
@@ -934,6 +1623,10 @@ fn single_row_kernel_receipt_run() {
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");
+    // The placement the run's logits hashes compare at. Read now: the usage profile moves
+    // residents as the run feeds experts, and the driver's drop writes the usage dump after
+    // this; the digest names only the load's placement.
+    let placement = driver.placement_digest();
     let env = |name: &str| std::env::var(name).ok();
     println!(
         "config {config} round {round}: single-row kernel {kernel}; SINGLE_GATHER {:?} DP4A {:?} INDEXED_PAIRS {:?}",
@@ -1018,6 +1711,8 @@ fn single_row_kernel_receipt_run() {
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "config": config, "round": round, "kernel": kernel, "prompt": wanted_id,
+            "bank_slots": placement.0,
+            "resident_sha256": placement.1,
             "env": {"FIFI_EXL3_SINGLE_GATHER": env("FIFI_EXL3_SINGLE_GATHER"),
                     "FIFI_EXL3_DP4A": env("FIFI_EXL3_DP4A"),
                     "FIFI_EXL3_INDEXED_PAIRS": env("FIFI_EXL3_INDEXED_PAIRS")},

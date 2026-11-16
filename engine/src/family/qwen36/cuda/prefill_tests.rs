@@ -6,11 +6,12 @@ use super::{
     prefill::{
         ALL_SLOTS, ChunkRows, EMBED_PHASE, EMBED_SLOTS, MoeStage, Stage, check_q8_layouts,
         check_view_layout, check_view_list, kv8_segment_query_rows, kv8_use_segments, layer_stages,
-        moe_stage_phase, moe_stage_slots, resident_moe_stages, routed_swiglu, routed_up_view,
-        slot_position, stage_phase, stage_slots,
+        moe_stage_phase, moe_stage_slots, resident_moe_stages, routed_up_view, slot_position,
+        stage_phase, stage_slots,
     },
     prefill_plan::{M_LADDER, chunk_tensors},
 };
+use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
 use crate::family::project::cuda::WeightLayout;
 use crate::{
     EngError,
@@ -435,7 +436,7 @@ fn q8_layouts_refuse_a_mixed_buffer() {
 /// The up-half sub-view follows `dims.inter`, never a literal column.
 #[test]
 fn routed_up_view_follows_the_moe_inter() {
-    use super::moe::MoeDims;
+    use crate::family::exl3::launch::MoeDims;
     for dims in [
         MoeDims::new(&common_tests::dims(), 1),
         super::native_device_rig::DIMS,
@@ -467,9 +468,8 @@ fn routed_up_view_follows_the_moe_inter() {
 fn prefill_call_shapes_are_the_plan_values() {
     use super::mixer_geometry::MixerGeometry;
     use super::prefill::{
-        attn_proj_cols, chunk_attn_geometry, chunk_attn_shape, chunk_combine_shape,
-        chunk_conv_shape, chunk_mmid_shape, chunk_prep_shape, chunk_router_shape, chunk_scan_shape,
-        delta_proj_cols, shared_cols, shared_swiglu,
+        attn_proj_cols, chunk_attn_geometry, chunk_attn_shape, chunk_conv_shape, chunk_mmid_shape,
+        chunk_prep_shape, chunk_router_shape, chunk_scan_shape, delta_proj_cols, shared_cols,
     };
     use crate::family::gguf_model::Role;
     use crate::kernels::cuda::prefill::attn_prefill::{
@@ -568,7 +568,7 @@ fn prefill_call_shapes_are_the_plan_values() {
         "the launch plan's part bytes pass the flat cap"
     );
 
-    let moe = super::moe::MoeDims::new(&dims, 130);
+    let moe = crate::family::exl3::launch::MoeDims::new(&dims, 130);
     let router = chunk_router_shape(&moe, 130);
     assert_eq!(
         (router.m, router.hidden, router.n_expert, router.top_k),
@@ -593,7 +593,7 @@ fn prefill_call_shapes_are_the_plan_values() {
         ),
         (130, 512, 512, 1_024, 512)
     );
-    let routed = super::prefill::routed_swiglu(130, &moe);
+    let routed = routed_swiglu(130, &moe);
     assert_eq!(
         (
             routed.rows,
@@ -616,8 +616,7 @@ fn prefill_call_shapes_are_the_plan_values() {
 fn prefill_stage_needs_fit_the_session_slots() {
     use super::mixer_geometry::MixerGeometry;
     use super::prefill::{
-        attn_proj_cols, chunk_attn_geometry, chunk_conv_shape, delta_proj_cols, routed_swiglu,
-        routed_up_view, shared_swiglu,
+        attn_proj_cols, chunk_attn_geometry, chunk_conv_shape, delta_proj_cols, routed_up_view,
     };
     use crate::kernels::cuda::prefill::attn_prefill::{
         CPF_ATTN_PART_CAP, cpf_attn_launch_plan, cpf_attn_part_bytes,
@@ -656,7 +655,7 @@ fn prefill_stage_needs_fit_the_session_slots() {
             }
             let rows = ChunkRows::new(0, m, cap, m_sess).expect("rows");
             let (h, d, a) = (g.hidden, &g.delta, &g.attn);
-            let moe = super::moe::MoeDims::new(&dims, m);
+            let moe = crate::family::exl3::launch::MoeDims::new(&dims, m);
             let routed = m * moe.top_k;
             let row = |n| row_bytes(m, n).expect("row bytes");
             let q8 = |k, cols| q8_1_mmq_bytes(k, cols).expect("q8 bytes");
@@ -787,8 +786,7 @@ fn prefill_stage_needs_fit_the_session_slots() {
                 "gather x rows",
             );
             fits((routed * h) * 4, S::Down, "down dst");
-            let combine =
-                combine_down_bytes(&super::prefill::chunk_combine_shape(&moe, m)).expect("combine");
+            let combine = combine_down_bytes(&chunk_combine_shape(&moe, m)).expect("combine");
             fits(combine, S::Down, "combine down");
         }
     }
@@ -856,9 +854,9 @@ fn bufs_refuse_each_guard() {
 /// The valid 40-layer `ModelFacts` fixture of `model_refuses_each_guard` and
 /// `run_refuses_each_bound`: kinds and roles from the real table and geometry, every weight Native.
 fn model_fixture() -> super::prefill::ModelFacts {
-    use super::layer_table::LayerTable;
     use super::mixer_geometry::MixerGeometry;
     use super::prefill::LayerFacts;
+    use crate::family::exl3::layer_table::LayerTable;
     use crate::kernels::cuda::prefill::gdn_scan_seq::GDN_SCAN_EPS;
 
     let dims = common_tests::dims();

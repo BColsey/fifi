@@ -324,7 +324,10 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         config.listen_address().map_err(|e| e.to_string())?,
         config.api_key_env,
         if key_set { "set" } else { "NOT SET" },
-        config.prefix_reuse
+        match config.prefix_reuse {
+            Some(flag) => flag.to_string(),
+            None => "unset (per-family default)".to_string(),
+        }
     ));
     for engine in &config.engines {
         let is_q36_family = engine.family == crate::family::qwen36::factory::FAMILY
@@ -375,6 +378,8 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         use crate::family::qwen36::settings::{Q36Env, Q36Settings};
         let env = Q36Env {
             cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+            kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+            spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
         };
         let backend = backend_of_build();
         let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {
@@ -397,7 +402,10 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
                 super::describe_error(&error)
             )
         })?;
-        if config.prefix_reuse {
+        let prefix_reuse = config
+            .prefix_reuse
+            .unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
+        if prefix_reuse {
             settings
                 .check_prefix_reuse_cap(true)
                 .map_err(|error| super::describe_error(&error))?;

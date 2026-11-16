@@ -546,6 +546,8 @@ fn q36_preflight(
     };
     let env = Q36Env {
         cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
     };
     let settings = match Q36Settings::new(model_dir, tokenizer_dir, Some(&options), &env, backend) {
         Ok(settings) => {
@@ -1049,43 +1051,42 @@ fn flint_estimate(
         }
     };
 
-    let charge_terms = |margin: u64| {
-        let mut terms = vec![
-            ("kv cache".to_string(), kv_bytes),
-            ("work reserve".to_string(), work),
-            ("load headroom".to_string(), headroom),
-            ("bank margin".to_string(), margin),
-            (
-                "device scratch (excluded here; charged at load)".to_string(),
-                0,
-            ),
-        ];
+    let reserve = crate::family::device_budget::DeviceReserve::new(
+        crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+    )
+    .push("kv cache", kv_bytes)
+    .push("work reserve", work)
+    .push("load headroom", headroom)
+    .push("bank margin", margin);
+    // The receipt is the reserve's own charges (four terms when a bank
+    // margin applies, three when not) with the load-time scratch line
+    // appended last, exactly as before.
+    let charge_terms = || {
+        let mut terms: Vec<(String, u64)> = reserve
+            .charges()
+            .iter()
+            .map(|&(label, bytes)| (label.to_string(), bytes))
+            .collect();
         if margin == 0 {
             terms.retain(|(name, _)| name != "bank margin");
         }
+        terms.push((
+            "device scratch (excluded here; charged at load)".to_string(),
+            0,
+        ));
         terms
     };
-    let charges = [kv_bytes, work, headroom, margin]
-        .into_iter()
-        .try_fold(0u64, u64::checked_add)
-        .ok_or_else(estimate_overflow)?;
+    let charges = reserve.checked_total().ok_or_else(estimate_overflow)?;
     let total = weight_bytes
         .checked_add(charges)
         .ok_or_else(estimate_overflow)?;
 
-    let band =
-        i128::from(crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let band = i128::from(reserve.band_bytes());
     let (fit, borderline, largest_fitting) = match free {
         None => (ResourceFit::Unknown, false, None),
         Some(free) => {
             let slack = i128::from(free) - i128::from(weight_bytes) - i128::from(charges);
-            let (fit, borderline) = if slack >= band {
-                (ResourceFit::Fits, false)
-            } else if slack >= -band {
-                (ResourceFit::Unknown, true)
-            } else {
-                (ResourceFit::DoesNotFit, false)
-            };
+            let (fit, borderline) = band_verdict(slack, band);
             // The receipt sentence for an automatically banked load: the
             // largest context the all-resident plan would have admitted.
             let largest_fitting = if matches!(placement, BankPlan::Bank(BankReason::Auto)) {
@@ -1272,11 +1273,25 @@ fn flint_estimate(
         budget_limit_is_policy_share: false,
         largest_fitting_context: largest_fitting,
         admission_charges_bytes: charges,
-        admission_charge_terms: charge_terms(margin),
+        admission_charge_terms: charge_terms(),
         fit,
         borderline,
     };
     Ok((estimate, decisions))
+}
+
+/// The one band rule both family preflights judge slack by: at least a band
+/// above zero is a fit, within a band either side is borderline, and a band
+/// below zero does not fit. Shared by the Flint all-resident plan and the
+/// Qwen3.6 CUDA admission so the boundary is one rule, not two.
+fn band_verdict(slack: i128, band: i128) -> (ResourceFit, bool) {
+    if slack >= band {
+        (ResourceFit::Fits, false)
+    } else if slack >= -band {
+        (ResourceFit::Unknown, true)
+    } else {
+        (ResourceFit::DoesNotFit, false)
+    }
 }
 
 /// The largest context (a multiple of 1024, capped at the requested
@@ -1288,33 +1303,72 @@ fn largest_resident_context(
     resident_admits_at: &dyn Fn(u32, u64) -> bool,
     free: u64,
 ) -> Option<u32> {
-    let mut largest = None;
-    let mut context = 1024;
-    while context <= options.context_limit {
-        if resident_admits_at(context, free) {
-            largest = Some(context);
-        } else {
-            break;
-        }
-        context += 1024;
-    }
-    largest
+    crate::family::device_budget::largest_fitting_linear(options.context_limit, 1024, &|context| {
+        resident_admits_at(context, free)
+    })
 }
 
-/// The pinned CUDA checkpoint check, through the loader's own gate
-/// (`check_gguf_identity`: pinned name + exact size; the full-file
-/// SHA-256 stays the loader's opt-in, since hashing 20 GB is not a
-/// preflight default). Only a CUDA build has the gate at all — and a
-/// CUDA backend implies that build — so the non-CUDA arm below is
-/// reachable only from tests that inject the backend.
+/// The CUDA checkpoint check, through the loader's own gates: the
+/// `Q36_ALLOW_UNPINNED_GGUF` switch decides the selection, then
+/// `check_gguf_identity` pins the curated file's exact size (the
+/// full-file SHA-256 stays the loader's opt-in, since hashing 20 GB
+/// is not a preflight default; an unpinned checkpoint has no pinned
+/// size or digest and is validated by the model open). Only a CUDA
+/// build has the gate at all — and a CUDA backend implies that
+/// build — so the non-CUDA arm below is reachable only from tests
+/// that inject the backend.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn pinned_gguf_check(model_dir: &Path, _inspection: &ModelInspection) -> Check {
-    use crate::family::qwen36::cuda::start::{GGUF_NAME, check_gguf_identity};
-    match check_gguf_identity(&model_dir.join(GGUF_NAME), false) {
+    use crate::family::qwen36::cuda::start::ALLOW_UNPINNED_VAR;
+    gguf_admission_check(model_dir, std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())
+}
+
+/// The pure core of [`pinned_gguf_check`]: the raw switch value arrives resolved by the
+/// caller, so the branches (a bad spelling, a refused selection, the pinned and the admitted
+/// checkpoint) test without touching process-global state.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> Check {
+    use crate::family::qwen36::cuda::start::{
+        ALLOW_UNPINNED_VAR, GGUF_NAME, allow_unpinned_wanted, check_gguf_identity, select_gguf,
+    };
+    let allow_unpinned = match allow_unpinned_wanted(raw) {
+        Ok(wanted) => wanted,
+        Err(error) => {
+            return Check::new(
+                "weight format",
+                CheckStatus::Fail,
+                format!(
+                    "the loader would refuse this start: {}",
+                    super::describe_error(&error)
+                ),
+            );
+        }
+    };
+    let (gguf, pinned) = match select_gguf(model_dir, allow_unpinned) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Check::new(
+                "weight format",
+                CheckStatus::Fail,
+                format!(
+                    "the loader would refuse this checkpoint: {}",
+                    super::describe_error(&error)
+                ),
+            );
+        }
+    };
+    match check_gguf_identity(&gguf, false, pinned) {
         Ok(()) => Check::new(
             "weight format",
             CheckStatus::Pass,
-            format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size"),
+            if pinned {
+                format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size")
+            } else {
+                format!(
+                    "{} is admitted by {ALLOW_UNPINNED_VAR}=1; the model open validates it",
+                    gguf.display()
+                )
+            },
         ),
         Err(error) => Check::new(
             "weight format",
@@ -1445,6 +1499,7 @@ fn estimate_q36(
     backend: crate::family::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
+    use crate::family::admission_sketch::kv8_staging_bytes;
     use crate::family::qwen36::admission_sketch as sketch;
     use crate::family::qwen36::settings::{
         Backend, KvDtype, cache_growth_per_position, delta_state_bytes,
@@ -1487,14 +1542,17 @@ fn estimate_q36(
             return Ok(0);
         }
         let rows = sketch::fixed_staging_rows(usize::try_from(context).unwrap_or(usize::MAX));
-        u64::try_from(sketch::kv8_staging_bytes(
+        u64::try_from(kv8_staging_bytes(
             rows,
             spec.heads_kv as usize,
             spec.head_dim as usize,
         )?)
         .map_err(|_| crate::EngError::MemoryPlan("staging bytes exceed u64".to_string()))
     };
-    let cuda_demand_at = |context: u32| -> Result<sketch::AdmissionSketch, crate::EngError> {
+    let cuda_demand_at = |context: u32| -> Result<
+        crate::family::admission_sketch::AdmissionSketch,
+        crate::EngError,
+    > {
         let kv = per_position
             .checked_mul(u64::from(context))
             .ok_or_else(|| {
@@ -1511,30 +1569,28 @@ fn estimate_q36(
     let (free_bytes, limit_bytes, charges, charge_terms, fit, borderline) = match (&free, backend) {
         (Probe::Measured(free), Backend::Cuda) => {
             let demand = cuda_demand_at(settings.context_limit)?;
+            // The charge total is the whole demand (state included); the
+            // receipt lists only the five admission terms, as it always has.
             let charges = demand.total_after_weights()?;
+            let reserve = crate::family::device_budget::DeviceReserve::new(
+                sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+            )
+            .push("staged kv8 rows", demand.staging_bytes)
+            .push("part charge", demand.part_charge_bytes)
+            .push("spare minimum", demand.spare_min_bytes)
+            .push("admission margin", demand.margin_bytes)
+            .push("runtime overhead floor", demand.overhead_floor_bytes);
             let slack = i128::from(*free) - i128::from(weights) - i128::from(charges);
-            let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
-            let (fit, borderline) = if slack >= band {
-                (ResourceFit::Fits, false)
-            } else if slack >= -band {
-                (ResourceFit::Unknown, true)
-            } else {
-                (ResourceFit::DoesNotFit, false)
-            };
+            let (fit, borderline) = band_verdict(slack, i128::from(reserve.band_bytes()));
             (
                 Some(*free),
                 Some(*free),
                 charges,
-                vec![
-                    ("staged kv8 rows".to_string(), demand.staging_bytes),
-                    ("part charge".to_string(), demand.part_charge_bytes),
-                    ("spare minimum".to_string(), demand.spare_min_bytes),
-                    ("admission margin".to_string(), demand.margin_bytes),
-                    (
-                        "runtime overhead floor".to_string(),
-                        demand.overhead_floor_bytes,
-                    ),
-                ],
+                reserve
+                    .charges()
+                    .iter()
+                    .map(|&(label, bytes)| (label.to_string(), bytes))
+                    .collect(),
                 fit,
                 borderline,
             )
@@ -1596,7 +1652,7 @@ fn estimate_q36(
 /// rows only retell it, so the record and the estimate cannot disagree.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 fn q36_exl3_decisions(
-    plan: &crate::family::qwen36::Exl3PackPlan,
+    plan: &crate::family::exl3_pack::PackPlan,
     estimate: &Estimate,
     disk_bytes: u64,
     kv: crate::family::qwen36::settings::KvDtype,
@@ -1669,7 +1725,7 @@ fn largest_fitting_cuda(
     cuda_demand_at: &dyn Fn(
         u32,
     ) -> Result<
-        crate::family::qwen36::admission_sketch::AdmissionSketch,
+        crate::family::admission_sketch::AdmissionSketch,
         crate::EngError,
     >,
     requested: u32,
@@ -1685,11 +1741,93 @@ fn largest_fitting_cuda(
         };
         i128::from(free) - i128::from(weights) - i128::from(charges) >= band
     };
-    sketch::largest_fitting_context(requested, &fits)
+    crate::family::admission_sketch::largest_fitting_context(requested, &fits)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{largest_fitting_cuda, largest_resident_context};
+
+    /// c0 goldens (P4): `largest_fitting_cuda` on a linear charge model. The
+    /// demand carries the four canonical constants (part 64 MiB, spare 64 MiB,
+    /// margin 256 MiB, floor 384 MiB, so 768 MiB fixed) plus 1 MiB per lattice
+    /// step, and the admit rule is `free - weights - charges >= band`
+    /// (band 128 MiB), all in i128. Free values sit exactly on the boundary of
+    /// a chosen step count and one byte/one step either side.
+    #[test]
+    fn largest_fitting_cuda_golden_grid() {
+        const MIB: u64 = 1 << 20;
+        let demand = |context: u32| {
+            Ok(crate::family::qwen36::admission_sketch::admission_demand(
+                (u64::from(context) / 1024) * MIB,
+                0,
+                0,
+                0,
+            ))
+        };
+        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
+        let fixed = 768 * MIB + band; // part+spare+margin+floor+band
+        // free(fitting steps) = fixed + steps*MiB. Boundary at 97 steps.
+        let at = |steps: u64| fixed + steps * MIB;
+        let grid: [(u64, u32, Option<u32>); 8] = [
+            (at(96), 100_000, Some(98_304)),     // exactly 96 admitting steps
+            (at(97) - 1, 100_000, Some(98_304)), // one byte under 97 steps: still 96
+            (at(97), 100_000, Some(98_304)),     // 97 steps strand at 98_304 (off-lattice request)
+            (at(99), 100_000, Some(98_304)),     // 99 steps strand too: the request is off-lattice
+            (at(128), 131_072, Some(130_048)),   // 128 steps = 131_072 == request: never asked
+            (at(128), 262_144, Some(131_072)),   // 128 steps, room to return it
+            (at(0) - 1, 2048, None),             // under even the first probe
+            (at(1), 1024, None),                 // request at the step floor
+        ];
+        for (free, requested, expected) in grid {
+            assert_eq!(
+                largest_fitting_cuda(free, 0, &demand, requested),
+                expected,
+                "free={free} requested={requested}"
+            );
+        }
+    }
+
+    /// c0 goldens (P4): the Flint resident-context scan. It starts at 1024,
+    /// steps by 1024, and STOPS at the first non-admitting step - a later gap
+    /// never rescues a larger value - and never returns the limit itself.
+    #[test]
+    fn largest_resident_context_golden_scan() {
+        let opts = |limit: u32| {
+            let mut options = crate::family::flint::settings::FlintOptions::cuda_default();
+            options.context_limit = limit;
+            options
+        };
+        // Monotone cut at 50_000 (off-lattice): last admitting step 49_152.
+        let cut = |context: u32, _free: u64| context <= 50_000;
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &cut, 1 << 40),
+            Some(49_152)
+        );
+        // A gap (20_480..=30_720 refuses, above admits): the scan STOPS in the
+        // gap and returns 19_456, not the later larger value.
+        let gap = |context: u32, _free: u64| !(20_480..=30_720).contains(&context);
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &gap, 1 << 40),
+            Some(19_456)
+        );
+        // First step refuses, or the limit is below the first step.
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &|_, _| false, 1 << 40),
+            None
+        );
+        assert_eq!(
+            largest_resident_context(&opts(1023), &|_, _| true, 1 << 40),
+            None
+        );
+        // A cut exactly on the lattice returns that step.
+        let on_lattice = |context: u32, _free: u64| context <= 30_720;
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &on_lattice, 1 << 40),
+            Some(30_720)
+        );
+    }
+
     use super::{
         Check, CheckStatus, Compatibility, Estimate, PlanFixity, Qualification, ResourceFit,
         Verdict, q36_dimensions, q36_verdict,
@@ -1998,12 +2136,13 @@ mod tests {
 
     #[test]
     fn q36_exl3_decisions_retell_the_pack_walk_and_the_context_proposal() {
-        use crate::family::qwen36::Exl3PackPlan;
+        use crate::family::exl3_pack::PackPlan;
         use crate::family::qwen36::settings::KvDtype;
         use std::collections::BTreeMap;
 
-        let plan = Exl3PackPlan {
+        let plan = PackPlan {
             device_bytes: 21_000_000_000,
+            expert_bytes: 20_000_000_000,
             matrices: 1_976,
             rates: BTreeMap::from([(10u8, 976), (12u8, 1_000)]),
             codebook: "Mcg",
@@ -2240,6 +2379,7 @@ mod tests {
 
     #[test]
     fn largest_fitting_search_is_none_when_nothing_fits() {
+        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
         use crate::family::qwen36::admission_sketch;
         // A paper demand proportional to context, as the real one is.
         let demand = |context: u32| {
@@ -2256,7 +2396,7 @@ mod tests {
         let free = admission_sketch::RUNTIME_OVERHEAD_FLOOR_BYTES
             + admission_sketch::FIXED_ADMISSION_MARGIN_BYTES as u64
             + admission_sketch::PREFILL_SPARE_MIN_BYTES as u64
-            + admission_sketch::PREFILL_PART_CHARGE_BYTES as u64
+            + PREFILL_PART_CHARGE_BYTES as u64
             + admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES
             + 10 * 1024 * 1024;
         let got = super::largest_fitting_cuda(free, 0, &demand, 1_048_576);
@@ -2272,5 +2412,43 @@ mod tests {
         assert!(Verdict::Experimental.servable());
         assert!(!Verdict::ResourceConstrained.servable());
         assert!(!Verdict::Unsupported.servable());
+    }
+
+    // The preflight mirror of the loader's GGUF admission: every branch of
+    // `gguf_admission_check` without touching process-global state.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn gguf_admission_check_mirrors_the_loader_branches() {
+        use super::gguf_admission_check;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
+        std::fs::write(&foreign, b"").expect("write");
+        // Switch off, pinned file absent: Fail naming the pinned identity and the switch.
+        let off = gguf_admission_check(dir.path(), None);
+        assert_eq!(off.name, "weight format");
+        assert_eq!(off.status, super::CheckStatus::Fail);
+        assert!(
+            off.detail.contains("Qwen3.6-35B-A3B-Q4_K_M.gguf")
+                && off.detail.contains("Q36_ALLOW_UNPINNED_GGUF"),
+            "{}",
+            off.detail
+        );
+        // Switch on, one foreign file: Pass with the admitted-checkpoint note.
+        let on = gguf_admission_check(dir.path(), Some("1"));
+        assert_eq!(on.status, super::CheckStatus::Pass);
+        assert!(
+            on.detail.contains("Q5_K_M") && on.detail.contains("Q36_ALLOW_UNPINNED_GGUF=1"),
+            "{}",
+            on.detail
+        );
+        // A bad spelling: Fail before any selection, naming the refusal.
+        let bad = gguf_admission_check(dir.path(), Some("yes"));
+        assert_eq!(bad.status, super::CheckStatus::Fail);
+        assert!(bad.detail.contains("must be 0 or 1"), "{}", bad.detail);
+        // Switch on, two candidates: Fail on the ambiguity.
+        std::fs::write(dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf"), b"").expect("write");
+        let many = gguf_admission_check(dir.path(), Some("1"));
+        assert_eq!(many.status, super::CheckStatus::Fail);
+        assert!(many.detail.contains("exactly one .gguf"), "{}", many.detail);
     }
 }

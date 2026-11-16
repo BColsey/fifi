@@ -41,7 +41,7 @@ impl QwenResidentStep<'_> {
         }
         Ok(ExecutionSettings {
             weight_format: format!("{:?}", self.layout),
-            kv_dtype: format!("{:?}", self.state.layout().kv.mode),
+            kv_dtype: self.state.layout().kv.mode.name().to_owned(),
             context_tokens: self.context_limit(),
             prefill_chunk_tokens: self.m_sess_cap as usize,
             prefill_path: self

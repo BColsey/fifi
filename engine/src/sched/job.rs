@@ -27,7 +27,7 @@ pub(crate) const QUEUE_CAPACITY: usize = 32;
 /// event, so the data capacity the slow-client rule sees is unchanged.
 pub(crate) const EVENT_CAPACITY: usize = 1_025;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JobUsage {
     pub(crate) prompt_tokens: u32,
     /// Tokens in the batches that the executor committed, including a final EOS token.
@@ -35,10 +35,64 @@ pub(crate) struct JobUsage {
     /// It is 0 unless the job carries a prefix boundary and the executor restored a saved
     /// prefix.
     pub(crate) reused_tokens: u32,
-    /// The prefix-store report of the job, taken after the prefill: the store of a job with a
+    /// The prefix-store report of the job (log-only): the store of a job with a
     /// prefix boundary, or `None` when the executor keeps no prefix report (the default of
     /// `ExecutorOps::prefix_report`).
     pub(crate) prefix: Option<PrefixReport>,
+    /// The expert-bank counters of the prefill pass (log-only diagnostics; the delta
+    /// between the samples taken around the request, or `None` when the executor keeps
+    /// no report — the default of `ExecutorOps::prefill_bank_report`).
+    pub(crate) prefill_bank: Option<PrefillBankReport>,
+}
+
+/// The admit-path expert-bank counters of one prefill, for the request log's `prefill_bank_*`
+/// keys. The worker snapshots the executor's report before and after the prefill and logs the
+/// delta ([`PrefillBankReport::saturating_sub`]), so the keys carry THIS request's prefill
+/// admits, never other requests' decode traffic. The batch worker's slots share one executor,
+/// so a slot's delta spans the pieces other ready slots prefilled alongside it. `None` keeps
+/// the keys out of the line (an executor without an expert bank reports nothing; no false
+/// zeros).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillBankReport {
+    /// Admit passes: the layer resolves whose experts the bank moved in.
+    pub(crate) passes: u64,
+    /// Experts the admits moved in (not resident at admit), summed over passes.
+    pub(crate) misses: u64,
+    /// Passes by their miss count, bucketed 1, 2, 3-4, 5-8, ..., 1025-2048, 2049+ (13
+    /// buckets). A zero-miss pass lands in no bucket; `passes` minus the histogram sum
+    /// carries it.
+    pub(crate) miss_histogram: Vec<u64>,
+    /// Distinct experts per prefill resolve by their row count, the same 13 buckets.
+    pub(crate) route_histogram: Vec<u64>,
+    /// Bytes the prefill uploads queued: the admit copies (H2D plus any demotion D2H) and
+    /// any streamed expert records the copy path enqueues.
+    pub(crate) upload_bytes: u64,
+    /// Wall time of the admit copy spans, ending at the synchronization the copy path
+    /// already performs (no added wait); streamed records are counted in the bytes only,
+    /// because their wait is a GPU-side enqueue that returns at once.
+    pub(crate) upload_ns: u64,
+}
+
+impl PrefillBankReport {
+    /// The per-request view of `self` given the pre-prefill snapshot `before`: every counter
+    /// element-wise, saturating (a bank rebuild between the samples reads as zero).
+    pub(crate) fn saturating_sub(&self, before: &Self) -> Self {
+        fn histogram_delta(after: &[u64], before: &[u64]) -> Vec<u64> {
+            after
+                .iter()
+                .zip(before.iter().chain(std::iter::repeat(&0)))
+                .map(|(a, b)| a.saturating_sub(*b))
+                .collect()
+        }
+        Self {
+            passes: self.passes.saturating_sub(before.passes),
+            misses: self.misses.saturating_sub(before.misses),
+            miss_histogram: histogram_delta(&self.miss_histogram, &before.miss_histogram),
+            route_histogram: histogram_delta(&self.route_histogram, &before.route_histogram),
+            upload_bytes: self.upload_bytes.saturating_sub(before.upload_bytes),
+            upload_ns: self.upload_ns.saturating_sub(before.upload_ns),
+        }
+    }
 }
 
 /// The kind of the stored prefix entry that a job restored, for the request-log field
@@ -272,13 +326,16 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
             completion_tokens: 0,
             reused_tokens: 0,
             prefix: None,
+            prefill_bank: None,
         }),
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefixHit, PrefixReport};
+    use super::{
+        EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefillBankReport, PrefixHit, PrefixReport,
+    };
     use crate::EngError;
     use crate::family::executor::GenerationState;
     use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -297,7 +354,51 @@ mod tests {
             completion_tokens: 0,
             reused_tokens: 0,
             prefix: None,
+            prefill_bank: None,
         })
+    }
+
+    #[test]
+    fn prefill_bank_delta_saturates_and_keeps_each_after_histogram_length() {
+        let after = PrefillBankReport {
+            passes: 3,
+            misses: 4,
+            miss_histogram: vec![2, 8, 5],
+            route_histogram: vec![2, 8],
+            upload_bytes: 5,
+            upload_ns: 6,
+        };
+        let before = PrefillBankReport {
+            passes: 7,
+            misses: 8,
+            miss_histogram: vec![3, 4],
+            route_histogram: vec![3, 4, 9],
+            upload_bytes: 9,
+            upload_ns: 10,
+        };
+        assert_eq!(
+            after.saturating_sub(&before),
+            PrefillBankReport {
+                passes: 0,
+                misses: 0,
+                miss_histogram: vec![0, 4, 5],
+                route_histogram: vec![0, 4],
+                upload_bytes: 0,
+                upload_ns: 0,
+            }
+        );
+        // Reverse the shapes too: each histogram sees both a longer and a shorter baseline.
+        assert_eq!(
+            before.saturating_sub(&after),
+            PrefillBankReport {
+                passes: 4,
+                misses: 4,
+                miss_histogram: vec![1, 0],
+                route_histogram: vec![1, 0, 9],
+                upload_bytes: 4,
+                upload_ns: 4,
+            }
+        );
     }
 
     #[test]

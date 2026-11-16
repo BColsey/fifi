@@ -147,7 +147,8 @@ struct Shared {
     running: Mutex<Option<Arc<AtomicBool>>>,
     /// Opt-in window jobs only. The legacy single-slot path never registers here.
     active: Mutex<Vec<ActiveJob>>,
-    /// Jobs submitted but not yet dequeued by the engine thread.
+    /// Jobs being submitted or waiting to be dequeued. In-progress submissions
+    /// are included conservatively, even if the channel later refuses them.
     queued: AtomicUsize,
 }
 
@@ -214,14 +215,38 @@ pub(crate) enum SubmitError {
     Unavailable,
 }
 
+/// One reservation exists from before publication until dequeue or drop.
+/// This also accounts for refused sends and messages dropped with the receiver.
+struct QueueTicket(Arc<Shared>);
+
+impl QueueTicket {
+    fn reserve(shared: &Arc<Shared>) -> Self {
+        shared.queued.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(shared))
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // The sampler's capture handle grew Job past the large-variant floor; the
-// queue stays flat (one Arc worth of growth) rather than boxing every job.
+// queue stays flat rather than boxing every job.
 #[allow(clippy::large_enum_variant)]
 enum Message {
-    Job(Job),
+    Job(Job, QueueTicket),
     /// Ends the loop after the jobs ahead of it. `shutdown` sends it so that the thread stops
     /// while other handles are still alive.
     Stop,
+}
+
+fn publish_job(queue: &SyncSender<Message>, message: Message) -> Result<(), SubmitError> {
+    queue.try_send(message).map_err(|error| match error {
+        TrySendError::Full(_) => SubmitError::QueueFull,
+        TrySendError::Disconnected(_) => SubmitError::Unavailable,
+    })
 }
 
 /// The portable, shareable front of one engine thread.
@@ -259,6 +284,14 @@ impl EngineHandle {
     /// A job that a concurrent failure or stop catches in the queue can also end with a closed
     /// channel and no event. The owner then treats the closed channel as a `Backend` failure.
     pub(crate) fn try_submit(&self, job: Job) -> Result<(), SubmitError> {
+        self.try_submit_with(job, publish_job)
+    }
+
+    fn try_submit_with(
+        &self,
+        job: Job,
+        publish: impl FnOnce(&SyncSender<Message>, Message) -> Result<(), SubmitError>,
+    ) -> Result<(), SubmitError> {
         if self.shared.stop.load(Ordering::SeqCst) {
             return Err(SubmitError::Unavailable);
         }
@@ -268,17 +301,12 @@ impl EngineHandle {
             EngineState::Stopped => return Err(SubmitError::Unavailable),
             EngineState::Loading | EngineState::Ready | EngineState::Busy => {}
         }
-        self.queue
-            .try_send(Message::Job(job))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SubmitError::QueueFull,
-                TrySendError::Disconnected(_) => SubmitError::Unavailable,
-            })?;
-        self.shared.queued.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        let ticket = QueueTicket::reserve(&self.shared);
+        publish(&self.queue, Message::Job(job, ticket))
     }
 
-    /// Jobs waiting for the engine thread to dequeue them.
+    /// Jobs waiting to be dequeued or currently attempting submission.
+    /// This is a conservative observation, not an atomic idle fence.
     pub(crate) fn queued(&self) -> usize {
         self.shared.queued.load(Ordering::SeqCst)
     }
@@ -461,10 +489,8 @@ fn cancel_unstarted(job: Job) {
 
 fn drain(jobs: &Receiver<Message>, finish: fn(Job)) {
     while let Ok(message) = jobs.try_recv() {
-        if let Message::Job(job) = message {
-            // No shared counter here: drain runs on shutdown paths where
-            // the count is discarded with the engine. The live paths
-            // decrement at their own dequeue points.
+        if let Message::Job(job, ticket) = message {
+            drop(ticket);
             finish(job);
         }
     }
@@ -592,8 +618,8 @@ fn work<E, F>(
         );
         return;
     }
-    while let Ok(Message::Job(job)) = jobs.recv() {
-        shared.queued.fetch_sub(1, Ordering::SeqCst);
+    while let Ok(Message::Job(job, ticket)) = jobs.recv() {
+        drop(ticket);
         if shared.state() == EngineState::NativeFailed {
             reject(job);
             continue;
@@ -667,14 +693,27 @@ const PERIODIC_TOKENS: usize = 16_384;
 /// when the restore covered none of it.
 ///
 /// The prefill runs in chunks of `piece` tokens that start at the current cursor: the cursor
-/// starts at `restored` and moves to every point that this function emits, so a root at an
-/// arbitrary position moves it. A periodic target P counts only when it lies above the cursor.
-/// It moves to the end of the chunk that contains it, `cursor + ceil((P - cursor) / piece) *
-/// piece` (a P that is already a chunk end stays P), and the moved position must stay strictly
-/// below the tip, otherwise the target is dropped. The moved position is always above the
-/// cursor, so no position is emitted twice. The points stay on chunk ends, so the periodic
-/// saves never split a chunk and the numeric path of an entry equals the path of a cold run,
-/// except after a root, which splits the sequence by design.
+/// starts at `restored`, moves to the root, and then to every point this function emits, so a
+/// root or a restore from an arbitrary position moves it off the piece lattice. A periodic
+/// target P counts only when it lies above the cursor. It moves to the end of the chunk that
+/// contains it, `cursor + ceil((P - cursor) / piece) * piece` (a P that is already a chunk end
+/// stays P), and the moved position must stay strictly below the tip, otherwise the target is
+/// dropped. The moved position is always above the cursor, so no position is emitted twice.
+/// The rolling block cut gets the same move-to-chunk-end and below-the-tip rules, except when
+/// the cut is not a chunk end of the cursor (`(cut - cursor) % piece != 0`, the common case
+/// after a root or a restore from an off-lattice position, and almost always when the piece
+/// does not divide the block spacing): it then emits at its true boundary instead, because a
+/// misaligned ride would push the cut to a chunk end at or above the tip and drop it, losing
+/// the mid-turn block match. `run_job` re-anchors after every emitted point, so the split
+/// costs one re-anchored chunk. The cut keeps its true position only while the ride rule kept
+/// no periodic entry deeper: a rolling block is replaced by the next job, a periodic entry
+/// persists, so when the old rule would have kept a deeper periodic the cut takes the old rule
+/// and rides the lattice. A periodic target that the ride rule dropped (its ride reached the
+/// tip) shares its position with no persistent entry, so when the true-position cut lands
+/// exactly on such a dropped target the entry takes the periodic kind, the truthful one. For
+/// the default spacings every periodic target is a block-spacing multiple, so the
+/// deeper-periodic guard never fires on the served families and only the tip's final partial
+/// chunk, at most the spacing in length, re-tiles.
 fn save_points(
     plan: &PromptPlan<'_>,
     restored: usize,
@@ -701,11 +740,18 @@ fn save_points(
         // rolling cut of the lineage. The walk visits the targets in order, a periodic first at
         // a tie, so a boundary the lattice already cuts stays one save of the periodic kind;
         // the block candidate rides the same move-to-chunk-end and below-the-tip rules, so it
-        // never shifts the periodic positions. The tie rule also holds after the move to the
-        // chunk end: a block target whose chunk end an unprocessed periodic target reaches is
-        // skipped, because every target in (block_target, moved] projects onto `moved`, and the
-        // shared position must keep the periodic kind, which a later rolling K=1 replacement
-        // cannot remove.
+        // never shifts the periodic positions - unless the cut is not a chunk end of the
+        // cursor: the chunk lattice then cannot represent the boundary, so the block candidate
+        // is emitted at its true boundary instead of its chunk end. The tie rule also holds
+        // after the move to the chunk end: a block target whose chunk end an unprocessed
+        // periodic target reaches is skipped, because every target in (block_target, moved]
+        // projects onto `moved`, and the shared position must keep the periodic kind, which a
+        // later rolling K=1 replacement cannot remove.
+        //
+        // The true position carries over only when the ride rule kept no periodic entry deeper
+        // than the cut, so this pre-pass walks the same targets under the pure ride rule to
+        // learn which periodic targets that rule kept and which it dropped; the entries cap
+        // plays no part, it only trims the shallow end of the same walk.
         let mut targets: Vec<(usize, bool)> = (PERIODIC_TOKENS..tip)
             .step_by(PERIODIC_TOKENS)
             .map(|target| (target, false))
@@ -714,9 +760,61 @@ fn save_points(
             targets.push(((tip - 1) / spacing * spacing, true));
         }
         targets.sort_unstable();
+        let mut kept_periodic: Vec<usize> = Vec::new();
+        let mut dropped_periodic: Vec<usize> = Vec::new();
+        let mut ride_cursor = cursor;
+        for &(target, is_block) in &targets {
+            if target <= ride_cursor {
+                continue;
+            }
+            let moved = ride_cursor + (target - ride_cursor).div_ceil(piece) * piece;
+            if moved >= tip {
+                if !is_block {
+                    dropped_periodic.push(target);
+                }
+                continue;
+            }
+            if is_block
+                && targets.iter().any(|&(candidate, candidate_is_block)| {
+                    !candidate_is_block && candidate > target && candidate <= moved
+                })
+            {
+                continue;
+            }
+            if !is_block {
+                kept_periodic.push(target);
+            }
+            ride_cursor = moved;
+        }
         let mut intermediate: Vec<(usize, SaveKind)> = Vec::new();
         for &(target, is_block) in &targets {
             if target <= cursor {
+                continue;
+            }
+            if is_block
+                && !(target - cursor).is_multiple_of(piece)
+                && !kept_periodic.iter().any(|&kept| kept > target)
+            {
+                // The cut below the tip is strictly below it by construction, so the drop rule
+                // cannot fire here. A periodic target that shares the boundary, or whose
+                // chunk end passes it, was processed first and emitted: the periodic kind
+                // keeps the shared region, the same rule as the tie below, and the entry it
+                // leaves is deeper than the cut. A periodic target that the ride rule DROPPED
+                // (its ride reached the tip) shares its position with no persistent entry,
+                // so the cut landing exactly on it takes the periodic kind, the truthful
+                // one, where the old rule kept nothing at all. A periodic target the ride
+                // rule KEPT deeper than the cut holds the old rule instead: this branch
+                // advances the cursor to the cut, from where that periodic's lattice ride
+                // can pass the tip and drop - a rolling block is replaced by the next job,
+                // a periodic entry persists, so the cut must not displace one that
+                // survives.
+                let kind = if dropped_periodic.contains(&target) {
+                    SaveKind::Periodic
+                } else {
+                    SaveKind::Block
+                };
+                intermediate.push((target, kind));
+                cursor = target;
                 continue;
             }
             let moved = cursor + (target - cursor).div_ceil(piece) * piece;
@@ -745,7 +843,9 @@ fn save_points(
         // entry, first the intermediate entries of this same job and then the entries of
         // other conversations. The final store is the same without the shallow points, which
         // only spend snapshots. A moved position lies on the chunk lattice of the cursor, so
-        // skipping a shallow point does not change the position of a deeper one.
+        // skipping a shallow point does not change the position of a deeper one; the
+        // true-position cut lies off that lattice, but it changes no position but its own,
+        // so skipping stays safe.
         let skip = intermediate.len().saturating_sub(limits.entries - 1);
         points.extend(intermediate.into_iter().skip(skip));
     }
@@ -781,6 +881,9 @@ fn run_job<E: ExecutorOps>(
         send_terminal(events, JobEvent::Error(error));
         return EngineState::Ready;
     }
+    // The admit-path bank counters before the prefill, for this request's delta (log-only;
+    // `None` is the report of an executor without an expert bank, and the delta stays `None`).
+    let bank_before = executor.prefill_bank_report();
     let reused = match start(
         executor,
         session,
@@ -900,6 +1003,12 @@ fn run_job<E: ExecutorOps>(
     // the entries and bytes then include this job's save points. `None` is the report of an
     // executor that keeps none.
     let prefix = executor.prefix_report();
+    // The expert-bank counters after the prefill, for the request log's `prefill_bank_*` keys
+    // (log-only; `None` is the report of an executor without an expert bank).
+    let prefill_bank = match (executor.prefill_bank_report(), bank_before) {
+        (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
+        _ => None,
+    };
     let mut completion_tokens: u32 = 0;
     loop {
         let batch = match executor.decode(session, &mut generation) {
@@ -925,6 +1034,7 @@ fn run_job<E: ExecutorOps>(
                     completion_tokens,
                     reused_tokens,
                     prefix,
+                    prefill_bank,
                 }),
             );
             return EngineState::Ready;
@@ -1107,6 +1217,26 @@ fn fail<E: ExecutorOps>(
     }
 }
 
+/// The ruled plan for the device suites: they drive their prefill pieces off this
+/// projection so the card run exercises the sequence the worker will emit.
+#[cfg(test)]
+pub(crate) fn planned_points_for_tests(
+    boundary: Option<usize>,
+    root: Option<usize>,
+    restored: usize,
+    piece: usize,
+    limits: StoreLimits,
+    block: Option<usize>,
+) -> Vec<(usize, SaveKind)> {
+    let tokens = vec![0; 8];
+    let plan = PromptPlan {
+        tokens: &tokens,
+        boundary,
+        root,
+    };
+    save_points(&plan, restored, limits, piece, block)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1177,6 +1307,7 @@ mod tests {
         log: Log,
         hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         hold_after_emit: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        emit_ack: Option<mpsc::Receiver<()>>,
         fail_first_decode: Option<EngError>,
         fail_after_emit: Option<EngError>,
         cancel_after_prefill: Option<Arc<AtomicBool>>,
@@ -1205,6 +1336,12 @@ mod tests {
         piece_after_prefill: Option<usize>,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
+        /// The admit-path bank reports the spy answers: the `before` sample until the first
+        /// prefill, the `after` sample from it on, both log-only.
+        bank_reports: Option<(
+            crate::sched::job::PrefillBankReport,
+            crate::sched::job::PrefillBankReport,
+        )>,
     }
 
     impl Spy {
@@ -1214,6 +1351,7 @@ mod tests {
                 log: Arc::clone(log),
                 hold: None,
                 hold_after_emit: None,
+                emit_ack: None,
                 fail_first_decode: None,
                 fail_after_emit: None,
                 cancel_after_prefill: None,
@@ -1232,6 +1370,7 @@ mod tests {
                 piece: None,
                 piece_after_prefill: None,
                 context_limit: None,
+                bank_reports: None,
             }
         }
 
@@ -1275,6 +1414,15 @@ mod tests {
 
         fn prefix_report(&self) -> Option<PrefixReport> {
             self.inner.prefix_report()
+        }
+
+        fn prefill_bank_report(&self) -> Option<crate::sched::job::PrefillBankReport> {
+            let (before, after) = self.bank_reports.as_ref()?;
+            if self.prefill_calls > 0 {
+                Some(after.clone())
+            } else {
+                Some(before.clone())
+            }
         }
 
         fn evict_one_prefix_entry(&mut self, protect: Option<u64>) -> Option<u64> {
@@ -1348,6 +1496,10 @@ mod tests {
                 let _ = entered.send(());
                 let _ = release.recv();
             }
+            if let Some(ack) = &self.emit_ack {
+                ack.recv_timeout(Duration::from_secs(10))
+                    .expect("the consumer drains each batch");
+            }
             if let Some(error) = self.fail_after_emit.take() {
                 return Err(error);
             }
@@ -1418,6 +1570,56 @@ mod tests {
 
     fn job(prompt: &[u32]) -> (Job, JobHandle) {
         Job::new(prompt.to_vec(), generation()).expect("job")
+    }
+
+    #[test]
+    fn the_finished_usage_carries_the_prefill_bank_delta() {
+        use crate::sched::job::PrefillBankReport;
+
+        fn report(
+            passes: u64,
+            misses: u64,
+            histogram: Vec<u64>,
+            bytes: u64,
+            ns: u64,
+        ) -> PrefillBankReport {
+            PrefillBankReport {
+                passes,
+                misses,
+                miss_histogram: histogram.clone(),
+                route_histogram: histogram,
+                upload_bytes: bytes,
+                upload_ns: ns,
+            }
+        }
+        let log = Log::default();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        // Before the prefill the bank had already served one zero-miss admit; the request's
+        // own prefill adds three passes, seven misses and the byte/nanosecond deltas.
+        spy.bank_reports = Some((
+            report(2, 0, vec![1], 10, 5),
+            report(5, 7, vec![1, 0, 1], 110, 50),
+        ));
+        let engine = start_spy(4, spy);
+        let handle = engine.handle();
+        let (job, events) = job(&[1, 2, 3]);
+        handle.try_submit(job).expect("submit");
+        let events = collect(events);
+        let report = events
+            .iter()
+            .find_map(|event| match event {
+                JobEvent::Finished(usage) => usage.prefill_bank.as_ref(),
+                _ => None,
+            })
+            .expect("the finished usage carries the report");
+        assert_eq!(report.passes, 3);
+        assert_eq!(report.misses, 7);
+        assert_eq!(report.miss_histogram, vec![0, 0, 1]);
+        assert_eq!(report.route_histogram, vec![0, 0, 1]);
+        assert_eq!(report.upload_bytes, 100);
+        assert_eq!(report.upload_ns, 45);
+        drop(handle);
+        engine.shutdown();
     }
 
     fn start_spy(chunk: usize, spy: Spy) -> super::Engine {
@@ -1542,6 +1744,7 @@ mod tests {
             completion_tokens: completion,
             reused_tokens: reused,
             prefix,
+            prefill_bank: None,
         })
     }
 
@@ -1671,6 +1874,79 @@ mod tests {
         while events.events.blocking_recv().is_some() {}
         assert_eq!(handle.queued(), 0);
         drop(engine);
+    }
+
+    fn queue_for_test(capacity: usize) -> (EngineHandle, mpsc::Receiver<super::Message>) {
+        let (queue, receiver) = mpsc::sync_channel(capacity);
+        let shared = Arc::new(super::Shared::new());
+        (EngineHandle { queue, shared }, receiver)
+    }
+
+    #[test]
+    fn queue_ticket_survives_dequeue_before_submit_returns() {
+        let (handle, receiver) = queue_for_test(1);
+        let (job, _events) = job(&[1]);
+        handle
+            .try_submit_with(job, |queue, message| {
+                assert_eq!(handle.queued(), 1, "reserve before publication");
+                super::publish_job(queue, message)?;
+                let super::Message::Job(_job, ticket) = receiver.try_recv().expect("job") else {
+                    panic!("expected job");
+                };
+                drop(ticket);
+                assert_eq!(handle.queued(), 0, "worker finished before publish returns");
+                Ok(())
+            })
+            .expect("submit");
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_rolls_back_full_and_disconnected_sends() {
+        let (handle, receiver) = queue_for_test(1);
+        let (first, _first_events) = job(&[1]);
+        handle.try_submit(first).expect("first job");
+        assert_eq!(handle.queued(), 1);
+        let (full, _full_events) = job(&[2]);
+        assert_eq!(handle.try_submit(full), Err(SubmitError::QueueFull));
+        assert_eq!(handle.queued(), 1, "failed reservation is released");
+        drop(receiver);
+        assert_eq!(handle.queued(), 0, "receiver drop releases queued jobs");
+        let (disconnected, _disconnected_events) = job(&[3]);
+        assert_eq!(
+            handle.try_submit(disconnected),
+            Err(SubmitError::Unavailable)
+        );
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_releases_jobs_drained_after_stop() {
+        let (handle, receiver) = queue_for_test(2);
+        handle.queue.send(super::Message::Stop).expect("stop");
+        let (late, _events) = job(&[1]);
+        handle.try_submit(late).expect("job behind stop");
+        assert_eq!(handle.queued(), 1);
+        super::drain(&receiver, super::cancel_unstarted);
+        assert_eq!(handle.queued(), 0);
+    }
+
+    #[test]
+    fn queue_ticket_releases_late_job_when_receiver_drops_after_final_drain() {
+        let (handle, receiver) = queue_for_test(1);
+        let (late, _events) = job(&[1]);
+        handle
+            .try_submit_with(late, |queue, message| {
+                // The submit already passed its state check. The worker can
+                // fail and finish draining before this publication succeeds.
+                handle.shared.set_state(EngineState::Error);
+                super::drain(&receiver, super::reject);
+                super::publish_job(queue, message)
+            })
+            .expect("late publish");
+        assert_eq!(handle.queued(), 1);
+        drop(receiver);
+        assert_eq!(handle.queued(), 0);
     }
 
     /// The events of a job that stops at once, uses no extra tokens, and reports a store that
@@ -2056,6 +2332,7 @@ mod tests {
             })]
         );
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "terminal drain releases queue tickets");
         assert_eq!(handle.state(), EngineState::NativeFailed);
         let (late, _late_events) = job(&[2]);
         assert_eq!(handle.try_submit(late), Err(SubmitError::NativeFailed));
@@ -2119,6 +2396,11 @@ mod tests {
         handle.try_submit(queued).expect("submit while loading");
         release_tx.send(()).expect("release the load");
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(
+            handle.queued(),
+            0,
+            "failed-load drain releases queue tickets"
+        );
         assert_eq!(handle.state(), EngineState::Error);
         let cause = handle.failure().expect("a failed load keeps its cause");
         assert!(cause.contains("no weights"), "cause: {cause}");
@@ -2144,6 +2426,7 @@ mod tests {
         handle.try_submit(queued).expect("submit while loading");
         release_tx.send(()).expect("release the load");
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "panic drain releases queue tickets");
         wait_until("the Error state", || handle.state() != EngineState::Loading);
         assert_eq!(handle.state(), EngineState::Error);
         let cause = handle.failure().expect("a panic keeps its cause");
@@ -2180,6 +2463,7 @@ mod tests {
             })]
         );
         assert_eq!(collect(queued_events), vec![unavailable_event()]);
+        assert_eq!(handle.queued(), 0, "panic drain releases queue tickets");
         assert_eq!(handle.state(), EngineState::NativeFailed);
         let (late, _late_events) = job(&[2]);
         assert_eq!(handle.try_submit(late), Err(SubmitError::NativeFailed));
@@ -2431,6 +2715,53 @@ mod tests {
     }
 
     #[test]
+    fn an_actively_drained_job_can_outlive_its_event_channel_capacity() {
+        const TOKENS: usize = 2_100;
+        const { assert!(TOKENS > 2 * crate::sched::job::EVENT_CAPACITY) };
+        let log = new_log();
+        let mut script = vec![vec![0]; TOKENS];
+        script.push(vec![EOS]);
+        let mut spy = Spy::new(script, &log);
+        let (ack, received) = mpsc::channel();
+        spy.emit_ack = Some(received);
+        let engine = start_spy(8, spy);
+        let engine_handle = engine.handle();
+        let (job, mut handle) = job(&[2]);
+        engine_handle.try_submit(job).expect("submit");
+        let mut batches = 0;
+        loop {
+            match handle.events.blocking_recv().expect("terminal event") {
+                JobEvent::Started => {}
+                JobEvent::Batch(value) => {
+                    let last = batches == TOKENS;
+                    assert_eq!(value.tokens, if last { vec![EOS] } else { vec![0] });
+                    assert_eq!(
+                        value.finish,
+                        if last { Some(DecodeFinish::Stop) } else { None }
+                    );
+                    batches += 1;
+                    ack.send(())
+                        .expect("allow the next batch only after this one is drained");
+                }
+                JobEvent::Finished(usage) => {
+                    assert_eq!(usage.prompt_tokens, 1);
+                    assert_eq!(usage.completion_tokens, (TOKENS + 1) as u32);
+                    break;
+                }
+                JobEvent::Error(error) => panic!("generation failed: {error:?}"),
+            }
+        }
+        assert_eq!(batches, TOKENS + 1);
+        assert!(
+            !handle.is_cancelled(),
+            "a drained stream is not a slow client"
+        );
+        assert!(handle.events.blocking_recv().is_none());
+        drop(engine_handle);
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
+    }
+
+    #[test]
     fn a_batch_that_would_take_the_last_slot_cancels_the_job_as_a_slow_client() {
         let log = new_log();
         let engine = start_spy(8, Spy::new(vec![vec![0], vec![EOS]], &log));
@@ -2548,7 +2879,10 @@ mod tests {
         handle.queue.send(super::Message::Stop).expect("send stop");
         handle
             .queue
-            .send(super::Message::Job(late))
+            .send(super::Message::Job(
+                late,
+                super::QueueTicket::reserve(&handle.shared),
+            ))
             .unwrap_or_else(|_| panic!("the queue refused the job"));
         release_tx.send(()).expect("release the load");
         assert_eq!(
@@ -2560,6 +2894,7 @@ mod tests {
             ]
         );
         assert_eq!(handle.state(), EngineState::Stopped);
+        assert_eq!(handle.queued(), 0, "stop drain releases queue tickets");
         assert!(calls(&log).is_empty(), "the executor ran a stopped job");
         drop(handle);
         assert_eq!(engine.shutdown().state, EngineState::Stopped);
@@ -3664,6 +3999,11 @@ mod tests {
         entries: 6,
     };
 
+    const FLASH: StoreLimits = StoreLimits {
+        roots: 0,
+        entries: 2,
+    };
+
     #[test]
     fn periodic_points_land_on_the_chunk_ends_below_the_tip() {
         // No root, restored 0, piece 256: 16,384 = 64 * 256 and 32,768 = 128 * 256 are chunk
@@ -3762,17 +4102,20 @@ mod tests {
     }
 
     #[test]
-    fn a_block_cut_moves_to_the_chunk_end_like_a_periodic_target() {
-        // Root 3,000, so the chunks start at 3,000: the cut target 8,192 moves to
-        // 3,000 + ceil(5,192 / 256) * 256 = 3,000 + 21 * 256 = 8,376, strictly below the tip.
+    fn a_root_moves_the_cursor_and_the_cut_keeps_its_boundary() {
+        // Root 3,000, so the chunks start at 3,000: the cut target 8,192 is not a chunk
+        // end of that cursor (5,192 is not a multiple of 256), so it emits at its true
+        // boundary instead of riding to 3,000 + 21 * 256 = 8,376. A root already splits
+        // the numeric path by design, and the 184-token ride would push the cut deeper,
+        // losing block-match range for tips in between.
         assert_eq!(
             points_block(Some(10_000), Some(3_000), 0, 256, WIDE, Some(4_096)),
             vec![
                 (3_000, SaveKind::Root),
-                (8_376, SaveKind::Block),
+                (8_192, SaveKind::Block),
                 (10_000, SaveKind::Tip),
             ],
-            "the cut rides the chunk lattice of the cursor like a periodic target"
+            "the cut at the last block boundary, then the tip"
         );
     }
 
@@ -3810,6 +4153,622 @@ mod tests {
             ],
             "the periodic points keep their positions; the cut rides above the deepest"
         );
+    }
+
+    #[test]
+    fn a_cut_at_the_cap_evicts_the_second_shallowest_periodic() {
+        // Spacing 64, piece 256, restored 0, tip 100,000, entries 6: the six periodics
+        // 16,384..98,304 are all chunk ends of the 256 piece. The old plan keeps the
+        // deepest five (32,768..98,304). The cut 99,968 - not a chunk end, so the parent
+        // projected it to 100,096, past the tip, and dropped it - now enters as a seventh
+        // intermediate and is the deepest, so the cap of five keeps 49,152..98,304 plus
+        // the Block at 99,968: the 32,768 periodic leaves through the cap, exactly the
+        // deepest-intermediate-wins rule the dividing configurations already follow.
+        let limits = StoreLimits {
+            roots: 2,
+            entries: 6,
+        };
+        assert_eq!(
+            save_points_old(Some(100_000), None, 0, 256, limits, Some(64)),
+            vec![
+                (32_768, SaveKind::Periodic),
+                (49_152, SaveKind::Periodic),
+                (65_536, SaveKind::Periodic),
+                (81_920, SaveKind::Periodic),
+                (98_304, SaveKind::Periodic),
+                (100_000, SaveKind::Tip),
+            ],
+            "the old plan keeps the deepest five periodics"
+        );
+        assert_eq!(
+            points_block(Some(100_000), None, 0, 256, limits, Some(64)),
+            vec![
+                (49_152, SaveKind::Periodic),
+                (65_536, SaveKind::Periodic),
+                (81_920, SaveKind::Periodic),
+                (98_304, SaveKind::Periodic),
+                (99_968, SaveKind::Block),
+                (100_000, SaveKind::Tip),
+            ],
+            "the cut enters as the deepest intermediate and evicts 32,768"
+        );
+    }
+
+    #[test]
+    fn a_block_cut_survives_a_piece_that_does_not_divide_the_spacing() {
+        // Spacing 64 with pieces 256 and 1,024. The first chunk end at or above the cut falls
+        // at or above the tip for most tips (10,100: cut 10,048, first chunk end 10,240 - the
+        // parent rule drops the cut there), so it emits at its true boundary instead and
+        // `run_job` re-anchors the split chunk.
+        for piece in [256usize, 1_024] {
+            let new = points_block(Some(10_100), None, 0, piece, WIDE, Some(64));
+            assert_eq!(
+                new.clone(),
+                vec![(10_048, SaveKind::Block), (10_100, SaveKind::Tip)],
+                "the rolling cut survives a wide piece"
+            );
+            // The parent plan drops the cut here, so the two plans differ - the test
+            // discriminates the fix, not just the output shape.
+            assert_ne!(
+                new,
+                save_points_old(Some(10_100), None, 0, piece, WIDE, Some(64)),
+                "the parent rule must not produce the same plan (piece {piece})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_dividing_block_cut_emits_at_its_true_position() {
+        // Restored 100, piece 256, spacing 64, tip 5,000: the cut 4,992 stays 4,992 instead
+        // of riding the restored cursor's chunk lattice to 5,220, which the below-the-tip
+        // rule would drop.
+        assert_eq!(
+            points_block(Some(5_000), None, 100, 256, WIDE, Some(64)),
+            vec![(4_992, SaveKind::Block), (5_000, SaveKind::Tip)],
+            "the cut lands on its true boundary, not the chunk lattice"
+        );
+        // Restored 4,992 covers the cut: a point there would save the restored key again.
+        assert_eq!(
+            points_block(Some(5_000), None, 4_992, 256, WIDE, Some(64)),
+            vec![(5_000, SaveKind::Tip)],
+            "a covered boundary cuts nothing"
+        );
+    }
+
+    #[test]
+    fn a_shared_boundary_keeps_the_periodic_kind_only_when_it_was_emitted() {
+        // Tip 32,769, spacing 64, piece 256, restored 0: the cut 32,768 is also the second
+        // periodic multiple, and 32,768 = 128 * 256 is a chunk end of the cursor, so the
+        // periodic is emitted first at its own position and the cut, now at or below the
+        // cursor, emits nothing - a shared position that SURVIVED its ride keeps the
+        // periodic kind, the same rule as the tie below.
+        assert_eq!(
+            points_block(Some(32_769), None, 0, 256, WIDE, Some(64)),
+            vec![
+                (16_384, SaveKind::Periodic),
+                (32_768, SaveKind::Periodic),
+                (32_769, SaveKind::Tip),
+            ],
+            "an emitted periodic keeps the shared boundary"
+        );
+        // Restored 100: the periodic 16,384 rides to 16,484 and survives, but the periodic
+        // 32,768 rides from there to 32,868, past the tip, and is DROPPED - so the cut
+        // lands exactly on the dropped periodic's target and takes the periodic kind, the
+        // truthful one: the position is a periodic multiple, the entry persists where the
+        // old rule kept nothing at all. The parent had no entry there, so this is a gain.
+        assert_eq!(
+            points_block(Some(32_769), None, 100, 256, WIDE, Some(64)),
+            vec![
+                (16_484, SaveKind::Periodic),
+                (32_768, SaveKind::Periodic),
+                (32_769, SaveKind::Tip),
+            ],
+            "the cut on a dropped periodic's target takes the periodic kind"
+        );
+    }
+
+    #[test]
+    fn a_deeper_dropped_periodic_above_the_cut_keeps_the_block() {
+        // A spacing that does not divide 16,384 (4,095) lets the periodic 16,384 ride the
+        // cursor 100's 256-piece lattice to 16,444 - past the tip 16,400 - so it drops;
+        // its target 16,384 sits ABOVE the cut 16,380, so the guard that hands the region
+        // to a dropped periodic does not fire and the Block emits at its true boundary.
+        assert_eq!(
+            points_block(Some(16_400), None, 100, 256, WIDE, Some(4_095)),
+            vec![(16_380, SaveKind::Block), (16_400, SaveKind::Tip)],
+            "the block keeps the region when the dropped periodic's target is above the cut"
+        );
+    }
+
+    #[test]
+    fn the_dividing_plans_are_byte_for_byte_the_chunk_end_rule() {
+        // The served configurations: the Flash-Next pieces 1 through 64 against the
+        // 64-token spacing, and the Qwen3.6 pieces 16, 128, 256, 512, 1,024, and 2,048
+        // against the 4,096-token spacing. Every one of them divides its spacing, so a
+        // plan that starts cold - no restore, no root, the cursor on the 0-lattice - must
+        // equal the pre-fix projection verbatim, whatever the tip and store limits,
+        // including cold tips that cross the deep periodics (20,000 and 40,000); a
+        // restore that covers the tip is the same cold shape; and a restored cursor or
+        // root that sits ON the piece lattice takes the old path for every target
+        // (`(target - cursor) % piece == 0`), so it equals the projection too. An
+        // off-lattice cursor is the fix's own subject, pinned by the test below.
+        for spacing in [64usize, 4_096] {
+            for piece in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048] {
+                if !spacing.is_multiple_of(piece) {
+                    continue;
+                }
+                for limits in [WIDE, FLASH] {
+                    for (tip, restored, root) in [
+                        (10_000usize, 0usize, None),
+                        (10_000, 10_000, None),
+                        (10_000, 12_000, None),
+                        (20_000, 0, None),
+                        (40_000, 0, None),
+                        (5_000, 100, None),
+                        (20_000, 7_777, None),
+                        (10_000, 0, Some(3_000usize)),
+                        (40_000, 7_777, Some(3_000)),
+                    ] {
+                        let start = root.filter(|_| limits.roots > 0).unwrap_or(restored);
+                        let cut = (tip - 1) / spacing * spacing;
+                        let old = save_points_old(
+                            Some(tip),
+                            root,
+                            restored,
+                            piece,
+                            limits,
+                            Some(spacing),
+                        );
+                        if start > 0 && !old.contains(&(cut, SaveKind::Block)) {
+                            // A restored or rooted cursor rides the periodic targets onto
+                            // their own positions, which can leave the cut off the
+                            // cursor's chunk lattice - the fix's own class, pinned by the
+                            // test below. What stays here took the old path verbatim: the
+                            // old projection's own Block sits at the cut.
+                            continue;
+                        }
+                        assert_eq!(
+                            points_block(Some(tip), root, restored, piece, limits, Some(spacing)),
+                            old,
+                            "dividing piece {piece} keeps the chunk-end rule \
+                             (spacing {spacing}, limits {limits:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_off_lattice_cursor_cuts_at_the_true_boundary_under_a_dividing_piece() {
+        // A restored cursor, or a root, moves the chunk lattice off the block boundaries
+        // even when the piece divides the spacing: the ride rule would push the cut to a
+        // chunk end at or above the tip and drop it - the 12 percent loss class on the
+        // served default. The cut emits at its true boundary instead, and the plan keeps
+        // every entry the old one kept, with the block the only mover, downward.
+        for spacing in [64usize, 4_096] {
+            for piece in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048] {
+                if !spacing.is_multiple_of(piece) {
+                    continue;
+                }
+                for limits in [WIDE, FLASH] {
+                    for (tip, restored, root) in [
+                        (5_000usize, 100usize, None),
+                        (20_000, 7_777, None),
+                        (10_000, 0, Some(3_000usize)),
+                        (40_000, 7_777, Some(3_000)),
+                    ] {
+                        let old = save_points_old(
+                            Some(tip),
+                            root,
+                            restored,
+                            piece,
+                            limits,
+                            Some(spacing),
+                        );
+                        let new =
+                            points_block(Some(tip), root, restored, piece, limits, Some(spacing));
+                        assert_no_loss_of_old_entries(&new, &old, limits, tip, spacing, piece);
+                    }
+                }
+            }
+        }
+        // The ruled hand case on the served default: piece 16 divides the 64 spacing, the
+        // restored cursor 1,000 is off the 16-lattice, the cut target 4,992 rides to
+        // 5,000 - the tip - and the old plan drops it; the new plan keeps it at 4,992.
+        assert_eq!(
+            points_block(Some(5_000), None, 1_000, 16, FLASH, Some(64)),
+            vec![(4_992, SaveKind::Block), (5_000, SaveKind::Tip)],
+            "the off-lattice restored cursor keeps the cut at its true boundary"
+        );
+        assert_eq!(
+            save_points_old(Some(5_000), None, 1_000, 16, FLASH, Some(64)),
+            vec![(5_000, SaveKind::Tip)],
+            "the ride rule drops this cut - the loss this fix closes"
+        );
+    }
+
+    /// The no-displacement rule: every entry the old plan kept survives in the new plan
+    /// at the same position, except a block, which may only move DOWN to its true
+    /// boundary (the periodic kind there is the truthful one for a dropped periodic), and
+    /// except an eviction through the entries cap, where every kept intermediate is
+    /// deeper.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_no_loss_of_old_entries(
+        new: &[(usize, SaveKind)],
+        old: &[(usize, SaveKind)],
+        limits: StoreLimits,
+        tip: usize,
+        spacing: usize,
+        piece: usize,
+    ) {
+        let kept: Vec<usize> = new
+            .iter()
+            .filter(|(_, kind)| !matches!(kind, SaveKind::Tip | SaveKind::Root))
+            .map(|&(position, _)| position)
+            .collect();
+        for &(position, kind) in old {
+            match kind {
+                SaveKind::Tip | SaveKind::Root => {
+                    assert!(
+                        new.contains(&(position, kind)),
+                        "the {kind:?} at {position} survives \
+                         (tip {tip}, spacing {spacing}, piece {piece})"
+                    );
+                }
+                SaveKind::Periodic | SaveKind::Block => {
+                    if new.contains(&(position, kind)) {
+                        continue;
+                    }
+                    // The block is the one mover: it lands on the cut target, at or below
+                    // the position the old ride gave it, with the truthful kind when a
+                    // dropped periodic owns the target.
+                    let cut = (tip - 1) / spacing * spacing;
+                    let lowered = kind == SaveKind::Block && kept.contains(&cut) && cut <= position;
+                    let cap = kept.len() == limits.entries - 1
+                        && kept.iter().all(|&kept_position| kept_position > position);
+                    assert!(
+                        lowered || cap,
+                        "the {kind:?} at {position} keeps its position, moves down to {cut}, \
+                         or leaves through the cap (tip {tip}, spacing {spacing}, piece {piece})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pre-fix projection, copied verbatim from `save_points` before the wide-piece fix:
+    /// every target rides the move-to-chunk-end and below-the-tip rules, block or periodic.
+    fn save_points_old(
+        boundary: Option<usize>,
+        root: Option<usize>,
+        restored: usize,
+        piece: usize,
+        limits: StoreLimits,
+        block: Option<usize>,
+    ) -> Vec<(usize, SaveKind)> {
+        let mut points = Vec::new();
+        let mut cursor = restored;
+        if let Some(root) = root
+            .filter(|_| limits.roots > 0)
+            .filter(|&root| root >= super::MIN_ROOT_TOKENS && root > restored)
+            .filter(|&root| boundary.is_some_and(|tip| root < tip))
+        {
+            points.push((root, SaveKind::Root));
+            cursor = root;
+        }
+        if let Some(tip) = boundary.filter(|_| super::cuts_intermediate(limits)) {
+            debug_assert!(piece > 0, "the prefill piece is positive");
+            let mut targets: Vec<(usize, bool)> = (super::PERIODIC_TOKENS..tip)
+                .step_by(super::PERIODIC_TOKENS)
+                .map(|target| (target, false))
+                .collect();
+            if let Some(spacing) = block {
+                targets.push(((tip - 1) / spacing * spacing, true));
+            }
+            targets.sort_unstable();
+            let mut intermediate: Vec<(usize, SaveKind)> = Vec::new();
+            for &(target, is_block) in &targets {
+                if target <= cursor {
+                    continue;
+                }
+                let moved = cursor + (target - cursor).div_ceil(piece) * piece;
+                if moved >= tip {
+                    continue;
+                }
+                if is_block
+                    && targets.iter().any(|&(candidate, candidate_is_block)| {
+                        !candidate_is_block && candidate > target && candidate <= moved
+                    })
+                {
+                    continue;
+                }
+                intermediate.push((
+                    moved,
+                    if is_block {
+                        SaveKind::Block
+                    } else {
+                        SaveKind::Periodic
+                    },
+                ));
+                cursor = moved;
+            }
+            let skip = intermediate.len().saturating_sub(limits.entries - 1);
+            points.extend(intermediate.into_iter().skip(skip));
+        }
+        if let Some(tip) = boundary.filter(|&tip| tip > restored) {
+            points.push((tip, SaveKind::Tip));
+        }
+        points
+    }
+
+    #[test]
+    fn an_earlier_periodic_that_projects_past_the_cut_subsumes_it() {
+        // Restored 32,720, piece 256, spacing 64, tip 33,000: the cut 32,960 is not a
+        // periodic boundary, but the periodic 32,768 rides the restored cursor's chunk
+        // lattice to 32,976, past the cut, so the periodic kind keeps the region and the
+        // block emits nothing - the same periodic-kind-wins rule as the shared boundary.
+        assert_eq!(
+            points_block(Some(33_000), None, 32_720, 256, WIDE, Some(64)),
+            vec![(32_976, SaveKind::Periodic), (33_000, SaveKind::Tip)],
+            "a periodic whose chunk end passes the cut subsumes it"
+        );
+    }
+
+    #[test]
+    fn the_true_position_cut_never_displaces_an_old_entry() {
+        // Properties, over random tips, cursors, pieces, spacings, roots, and store
+        // depths: (a) whatever the spacing, every entry the old plan kept survives in the
+        // new one at the same position - the block may only move DOWN to its true
+        // boundary, and an entry may only leave through the entries cap; (b) a periodic
+        // position appears in the new plan only where the old one kept it, or at or below
+        // the cut - the cut landing on a dropped periodic's target (the truthful kind) or
+        // a deeper dropped periodic riding from the advanced cursor and surviving: gains,
+        // never displacements. A fresh no-root plan under a dividing piece is the exact
+        // pre-fix projection - and so is any no-root cursor ON the piece lattice: under a
+        // dividing piece every target of the walk is a chunk end of such a cursor, so the
+        // true-position condition and the guard never fire and the plan is the old one
+        // exactly. The plans also stay strictly increasing and carry at most one block.
+        const DIVISORS: [&[usize]; 3] = [
+            &[1, 2, 4, 8, 16, 32, 64],
+            &[1, 2, 3, 4, 6, 8, 12, 16, 24, 48, 96],
+            &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        ];
+        let mut state = 0x5eed_1234_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2_000 {
+            let tip = 1 + next() as usize % 200_000;
+            let mut restored = next() as usize % tip;
+            let mut piece = 1 + next() as usize % 2_048;
+            let spacing_idx = next() as usize % 3;
+            let spacing = [64usize, 96, 4_096][spacing_idx];
+            let mut root = if tip > 2_050 && next() % 4 == 0 {
+                Some(2_048 + next() as usize % (tip - 2_049))
+            } else {
+                None
+            };
+            // A fixed share of the draws pins the equality classes by construction instead
+            // of hoping `restored == 0` lands: every fifth draw is a fresh no-root plan,
+            // and every fifth lands the cursor on the piece lattice (a multiple of the
+            // piece, no root) - with the piece drawn from the divisors of the spacing, so
+            // both classes assert the exact pre-fix projection unconditionally.
+            let mut forced_equality = false;
+            match next() % 5 {
+                0 => {
+                    piece = DIVISORS[spacing_idx][next() as usize % DIVISORS[spacing_idx].len()];
+                    restored = 0;
+                    root = None;
+                    forced_equality = true;
+                }
+                1 => {
+                    piece = DIVISORS[spacing_idx][next() as usize % DIVISORS[spacing_idx].len()];
+                    let k_max = tip / piece;
+                    restored = if k_max == 0 {
+                        0
+                    } else {
+                        piece * (next() as usize % k_max)
+                    };
+                    root = None;
+                    forced_equality = true;
+                }
+                _ => {}
+            }
+            let limits = StoreLimits {
+                roots: 2,
+                entries: 2 + next() as usize % 5,
+            };
+            let old = save_points_old(Some(tip), root, restored, piece, limits, Some(spacing));
+            let new = points_block(Some(tip), root, restored, piece, limits, Some(spacing));
+            assert!(
+                new.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "positions strictly increase (tip {tip}, cursor {restored})"
+            );
+            assert!(
+                new.iter()
+                    .filter(|(_, kind)| *kind == SaveKind::Block)
+                    .count()
+                    <= 1,
+                "one block entry at most (tip {tip})"
+            );
+            for &(position, kind) in &old {
+                if kind == SaveKind::Periodic && !new.contains(&(position, SaveKind::Periodic)) {
+                    // A periodic may leave only through the LRU cap: the store keeps the
+                    // deepest entries - 1 intermediates, and the cut can add one deeper
+                    // entry that evicts it. Every kept intermediate must then be deeper,
+                    // and the plan must be at its cap - a shallower survivor would mean the
+                    // periodic never became a candidate, the displacement this test bans.
+                    let kept: Vec<usize> = new
+                        .iter()
+                        .filter(|(_, kind)| matches!(kind, SaveKind::Periodic | SaveKind::Block))
+                        .map(|&(kept_position, _)| kept_position)
+                        .collect();
+                    assert_eq!(
+                        kept.len(),
+                        limits.entries - 1,
+                        "the periodic at {position} survives (tip {tip}, cursor {restored}, \
+                         piece {piece}, spacing {spacing})"
+                    );
+                    assert!(
+                        kept.iter().all(|&kept_position| kept_position > position),
+                        "a periodic only leaves through the LRU cap (tip {tip}, \
+                         cursor {restored}, piece {piece}, spacing {spacing})"
+                    );
+                }
+            }
+            assert_no_loss_of_old_entries(&new, &old, limits, tip, spacing, piece);
+            let new_periodics: Vec<usize> = new
+                .iter()
+                .filter(|(_, kind)| *kind == SaveKind::Periodic)
+                .map(|&(position, _)| position)
+                .collect();
+            let old_periodics: Vec<usize> = old
+                .iter()
+                .filter(|(_, kind)| *kind == SaveKind::Periodic)
+                .map(|&(position, _)| position)
+                .collect();
+            // The true-position branch adds candidates - the cut, and any deeper dropped
+            // periodic that rides from the advanced cursor and survives - but never moves
+            // or invents a shallower one: whenever the branch fires no deeper periodic
+            // target that the old rule kept survives it (the guard), and the shallower
+            // periodics keep their identical rides; whenever the guard turns the branch
+            // off, the plan is the old one exactly.
+            let cut = (tip - 1) / spacing * spacing;
+            assert!(
+                new_periodics
+                    .iter()
+                    .all(|&position| old_periodics.contains(&position) || position >= cut),
+                "a periodic appears only where the old plan kept it, or at or below the \
+                 cut (tip {tip}, cursor {restored}, piece {piece}): \
+                 old {old_periodics:?} vs new {new_periodics:?}"
+            );
+            if forced_equality {
+                assert_eq!(
+                    new, old,
+                    "a fresh plan, or a cursor on the piece lattice, under a dividing piece \
+                     is the exact pre-fix projection (tip {tip}, cursor {restored}, piece \
+                     {piece}, spacing {spacing})"
+                );
+            } else if root.is_none()
+                && spacing.is_multiple_of(piece)
+                && restored.is_multiple_of(piece)
+                && old.contains(&((tip - 1) / spacing * spacing, SaveKind::Block))
+            {
+                assert_eq!(
+                    new, old,
+                    "a fresh plan, or one whose old projection kept its Block at the cut, \
+                     under a dividing piece is the exact pre-fix projection (tip {tip}, \
+                     cursor {restored}, piece {piece}, spacing {spacing})"
+                );
+            }
+        }
+    }
+
+    /// The dividing-piece fix on the full worker path: piece 16 against the 64-token
+    /// spacing, a first turn that ends at the off-lattice tip 5,000 (5,000 = 312 x 16 + 8),
+    /// and a restored second turn whose cursor 5,000 is off the 16-lattice. The cut
+    /// target 9,984 is not a chunk end of that cursor (4,984 = 310 x 16 + 8), and the ride
+    /// would land at 5,000 + 312 x 16 = 9,992 - the tip - so the old rule drops the cut
+    /// and the seam falls back to the tip; the new plan saves the cut at its true boundary
+    /// 9,984 and re-anchors there: 311 chunks of 16, one of 8, the save at 9,984, the
+    /// 8-token tail chunk, the tip save, and the one token past the tip. The store rolls
+    /// the old Block to the new one and keeps the new Tip.
+    #[test]
+    fn a_restored_turn_under_a_dividing_piece_keeps_the_cut_at_its_boundary() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]; 2], &log);
+        spy.piece = Some(16);
+        spy.inner.with_prefix_limits(2, 6);
+        spy.inner.with_block_match(64);
+        let store = spy.inner.prefix_store();
+        let engine = start_spy(64, spy);
+        let handle = engine.handle();
+        let (first, first_events) = job_with_boundary(&[2; 5_001], 5_000);
+        let first_done = run_one(&handle, first, first_events);
+        assert!(
+            matches!(first_done.last(), Some(JobEvent::Finished(usage)) if usage.prompt_tokens == 5_001),
+            "the first turn finishes: {first_done:?}"
+        );
+        let mut second_prompt = vec![2; 5_000];
+        second_prompt.resize(9_993, 7);
+        let (second, second_events) = job_with_boundary(&second_prompt, 9_992);
+        let second_done = run_one(&handle, second, second_events);
+        assert!(
+            matches!(second_done.last(), Some(JobEvent::Finished(usage)) if usage.prompt_tokens == 9_993),
+            "the restored turn finishes: {second_done:?}"
+        );
+        let mut expected = strings(&["reset", "restore_prefix", "boundary"]);
+        expected.extend(vec!["prefill:16".to_string(); 312]);
+        expected.extend(strings(&[
+            "save_prefix:4992",
+            "prefill:8",
+            "save_prefix:5000",
+            "prefill:1",
+            "decode",
+        ]));
+        expected.extend(strings(&["reset", "restore_prefix", "boundary"]));
+        expected.extend(vec!["prefill:16".to_string(); 311]);
+        expected.extend(strings(&[
+            "prefill:8",
+            "save_prefix:9984",
+            "prefill:8",
+            "save_prefix:9992",
+            "prefill:1",
+            "decode",
+        ]));
+        assert_eq!(calls(&log), expected, "the restored turn cuts at 9,984");
+        assert_eq!(
+            stored(&store),
+            vec![(9_984, false), (9_992, false)],
+            "the rolling Block and the new Tip survive"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_wide_piece_job_splits_the_chunk_at_the_cut() {
+        // The wide-piece fix on the full worker path: piece 256 against the 64-token block
+        // spacing, tip 10,100 of a 10,101-token prompt. The cut 10,048 is not a chunk end
+        // of the cursor (the parent rule would ride it to 10,240, past the tip, and drop
+        // it), so the job saves it at its true boundary and re-anchors there: 39 chunks of
+        // 256, one of 64, the save at 10,048, then the 52-token tail chunk, the tip save,
+        // and the one token past the tip.
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        spy.piece = Some(256);
+        spy.inner.with_prefix_limits(2, 6);
+        spy.inner.with_block_match(64);
+        let store = spy.inner.prefix_store();
+        let engine = start_spy(4_096, spy);
+        let handle = engine.handle();
+        let (job, events) = job_with_boundary(&[1; 10_101], 10_100);
+        handle.try_submit(job).expect("submit");
+        assert_eq!(
+            collect(events),
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished_with_prefix(10_101, 1, 0, fake_report(2, PrefixHit::Miss, 0))
+            ]
+        );
+        let mut expected = strings(&["reset", "restore_prefix", "boundary"]);
+        expected.extend(vec!["prefill:256".to_string(); 39]);
+        expected.extend(strings(&[
+            "prefill:64",
+            "save_prefix:10048",
+            "prefill:52",
+            "save_prefix:10100",
+            "prefill:1",
+            "decode",
+        ]));
+        assert_eq!(calls(&log), expected, "the chunks re-anchor at the cut");
+        // The store holds both saves: the rolling Block at the cut and the Tip - the
+        // events pinned the calls, this pins what the store retained.
+        assert_eq!(stored(&store), vec![(10_048, false), (10_100, false)]);
+        engine.shutdown();
     }
 
     #[test]
@@ -3871,12 +4830,13 @@ mod tests {
     }
 
     #[test]
-    fn a_block_target_below_a_periodic_that_reaches_its_chunk_end_yields_the_periodic() {
-        // Spacing 4,095, tip 16,400, piece 256. The block target floor(16,399 / 4,095) * 4,095
-        // = 16,380 is below the periodic 16,384, but both reach the chunk end 16,384 = 64 *
-        // 256, so the tie happens after the projection. Emitting the Block there would give the
-        // shared position the replaceable kind, so the block is skipped and the periodic saves
-        // 16,384: the output equals the no-cut run.
+    fn a_block_below_an_unprocessed_periodic_keeps_the_chunk_end_rule() {
+        // Spacing 4,095, tip 16,400, piece 256: the piece does not divide the spacing, but the
+        // periodic 16,384 lies deeper than the cut 16,380 and is unprocessed, so the cut takes
+        // the old rule and rides the chunk lattice to 16,384 - the shared chunk end of both
+        // targets - where the tie rule drops it against the periodic. A rolling block is
+        // replaced by the next job, a periodic entry persists, so the cut must not displace
+        // one: the parent plan [(16,384, Periodic), (16,400, Tip)] stands unchanged.
         assert_eq!(
             points_block(
                 Some(16_400),
@@ -3890,7 +4850,7 @@ mod tests {
                 Some(4_095)
             ),
             vec![(16_384, SaveKind::Periodic), (16_400, SaveKind::Tip)],
-            "the periodic wins the chunk end both targets reach"
+            "a deeper unprocessed periodic keeps the chunk-end rule"
         );
     }
 

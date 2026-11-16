@@ -21,6 +21,7 @@
 use std::{
     cell::Cell,
     path::Path,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -29,26 +30,30 @@ use std::{
 };
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     device::{CardChunkDevice, CardDevice},
     driver::chunk::ChunkDriver,
-    driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
+    driver::{
+        DriverShape, ResumeSnapshot, ResumesState, StepperPositions, TokenDriver, TokenTimes,
+    },
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
+    feeds::device::{DevicePle, PleUpload},
     load::{TrunkList, upload::trunk_weights},
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
-    ple_feed::{NgramRows, PleFeed, PleVectors},
+    ple_feed::{FixedProjection, NgramRows, PleFeed, PleVectors},
+    state::FlashGeometry,
     step::{FlashStep, SplitMoeAt},
+    step_plan::StepPlan,
 };
-use crate::family::session::TokenStepper;
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{
+        device_budget::KvPlan,
+        exl3::source::PackReader,
         exl3_pack::layer_name,
         flash_next::{
             artifact::tokenizer_pin,
@@ -64,28 +69,70 @@ use crate::{
         },
         flint::exl3_resident::HostBudget,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
-        qwen36::{cuda::exl3_source::PackReader, tiered::budget::KvPlan},
         session::DecodeSession,
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer,
-        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW},
+        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW, ServedKernels},
     },
     sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
     tokenizer::TokenizerBundle,
     weights::exl3::Checkpoint,
 };
 
-/// Threads of the host PLE projections (rows split over them).
-const PLE_THREADS: usize = 8;
+/// Threads of the host PLE projections (rows split over them). The two projection matvecs are
+/// DRAM-bandwidth-bound (131 MB per token), so more threads helps until the socket saturates;
+/// `INFERENCE_FLASH_NEXT_PLE_THREADS` overrides the default.
+fn ple_threads() -> usize {
+    std::env::var("INFERENCE_FLASH_NEXT_PLE_THREADS")
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 128))
+        .unwrap_or(8)
+}
+
+/// Whether the chunked prefill runs its two PLE projections on the card (the staged
+/// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
+/// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
+/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
+/// value other than `1` is refused.
+fn ple_device() -> Result<bool, EngError> {
+    match std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE") {
+        Ok(text) if text == "1" => Ok(true),
+        Ok(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_DEVICE must be unset or \"1\"".into(),
+        )),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Whether chunked prefill batches its two PLE host projections into one blocked product per
+/// chunk (`INFERENCE_FLASH_NEXT_PLE_BATCH=1` opts in): the chunk's embeddings project at once —
+/// the 131 MB of weight matrices stream once per token block instead of once per token — and
+/// each row's pair then feeds the unchanged host step through the fixed projection, so the
+/// numbers stay bit-identical to the per-token path. Strict: any set value other than `1` is
+/// refused.
+fn ple_batch() -> Result<bool, EngError> {
+    match std::env::var("INFERENCE_FLASH_NEXT_PLE_BATCH") {
+        Ok(text) if text == "1" => Ok(true),
+        Ok(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\"".into(),
+        )),
+        Err(_) => Ok(false),
+    }
+}
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
-/// (the codebook of this pack) and one launch for the 20 gate and up pairs of ten picks. Both write
-/// the bytes of the default launches; a set `FIFI_EXL3_DP4A` or `FIFI_EXL3_INDEXED_PAIRS` still wins
-/// for its own option.
+/// (the codebook of this pack), one launch for the 20 gate and up pairs of ten picks, and the
+/// pipelined tile loop on: it writes the bytes of the default launches and the serve A/B
+/// (alternating arms, two rounds, server metrics) took 8-11% off the time to first token at
+/// every depth and added 5-8% decode tokens per second. A set `FIFI_EXL3_DP4A`,
+/// `FIFI_EXL3_INDEXED_PAIRS` or `FIFI_EXL3_PIPELINE` still wins for its own option.
 const SERVED_INDEXED: IndexedOptions = IndexedOptions {
     dp4a: true,
     pairs20: true,
+    pipeline: true,
+    table: false,
 };
 
 /// Registers the kernels the Flash-Next decode runs on its context: the wide single-row kernel for
@@ -93,38 +140,16 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 /// register their own; a bad launch switch or an option the kernel cannot combine with is refused
 /// here, before any weight is uploaded.
 fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
-    ctx.set_single_row_default(SERVED_SINGLE_ROW);
-    ctx.set_indexed_default(SERVED_INDEXED);
-    ctx.set_odd_rate_kernel(true);
-    // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
-    // runs inside the projection kernel, two launches per set instead of three, bit-identical
-    // bytes (64/64 receipt logits match). Isolated it saves ~1.27 us per launch, but measured on
-    // the full 64-step decode it REGRESSES the step: median 39.25 vs 38.28 ms and paired mean
-    // +2.25 ms (steps 9-64 of the adjacent off/on pair; REPORT.md cites the artifacts) - the
-    // larger shared footprint and the per-column-block rotation recompute reduce the overlap the
-    // 253 small launches had with the attention and expert kernels. Kept off for re-measuring
-    // after the launch floor changes (e.g. graph capture); `FIFI_FLASH_NEXT_FUSED_IN=1` opts in,
-    // any other non-empty value is refused, never a silent fallback. Read once here, per process.
-    let fused_in = match std::env::var("FIFI_FLASH_NEXT_FUSED_IN") {
-        Err(_) => false,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v.is_empty() || v == "0" => false,
-        Ok(v) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_FUSED_IN={v}: only 0 and 1 are valid"
-            )));
-        }
-    };
-    ctx.set_fused_in_kernel(fused_in);
-    ctx.check_single_gather()?;
+    ctx.register_served_kernels(ServedKernels {
+        single_row: SERVED_SINGLE_ROW,
+        indexed: Some(SERVED_INDEXED),
+        odd_rates: true,
+    })?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
         ctx.single_row_kernel_name()?,
         ctx.single_gather_suffix()
     );
-    if fused_in {
-        eprintln!("flash-next cuda: fused-input launch on");
-    }
     Ok(())
 }
 
@@ -408,6 +433,8 @@ pub(super) fn build_driver(
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
+    let shared_prefill = super::driver::chunk::prof::check_switch_spelling()?;
+    super::driver::chunk::prof::check_shared_prefill_rows(shared_prefill, wanted.prefill_rows)?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -435,6 +462,32 @@ pub(super) fn build_driver(
         report.expert_bytes,
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
+    let rows = wanted.prefill_rows as usize;
+    let prefill_arena_bytes = if shared_prefill {
+        StepPlan::prefill_bytes(
+            true,
+            &FlashGeometry::new(&model, &kinds)?,
+            rows,
+            wanted.context as usize,
+        )?
+    } else {
+        0
+    };
+    // The prefill ring's budget, carved out before the load plan so the bank sizes itself
+    // into what remains: at most 1.5 GiB and 30% of the free card, only for chunked prefill.
+    // A ring below one streamed layer is not built (the multi-row path then keeps its
+    // union-admit shape, correct and slower).
+    let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
+    // INFERENCE_FLASH_NEXT_RING_BUDGET sets the ring's bytes. The ring measures a serve
+    // regression today (it re-issues its copies every chunk while the union-admit path
+    // copies once), so the default is off; the flag keeps the lane's experiments open.
+    // A budget above the free VRAM is clamped, not wrapped: the plan then fits the card.
+    let ring_budget = match std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET") {
+        Ok(bytes) => bytes.trim().parse::<u64>().map_err(|_| {
+            EngError::BadRequest("INFERENCE_FLASH_NEXT_RING_BUDGET must be a byte count".into())
+        })?,
+        Err(_) => 0,
+    };
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
     // placeholder positions) with the numbers the pack and the context give.
     let card = TierInputs::measured(
@@ -444,9 +497,10 @@ pub(super) fn build_driver(
             positions: 1,
             bytes_per_position: 1,
         },
-        free_vram,
+        free_vram.saturating_sub(ring_budget),
         (mem_total, mem_available),
-    );
+    )
+    .with_prefill_arena(prefill_arena_bytes)?;
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
     let load = load_plan.at_context(
         u64::from(wanted.context),
@@ -475,7 +529,6 @@ pub(super) fn build_driver(
     // The host side is admitted before anything is uploaded: the pinned store of the bank, the
     // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
     // `PleVectors::read` holds in F32 (`HostTerms::engine_heap` does not count them).
-    let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
     let geometry = BankGeometry::new(
         layers,
         model.moe.experts(),
@@ -604,9 +657,13 @@ pub(super) fn build_driver(
     stage("building the step");
     // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
     // device chunks of that many rows; one (the default) is the decode shape of before.
-    let rows = wanted.prefill_rows as usize;
     let stream = Box::leak(Box::new(ctx.stream()?));
-    let step = FlashStep::new(
+    let new_step = if shared_prefill {
+        FlashStep::new_prefill
+    } else {
+        FlashStep::new
+    };
+    let step = new_step(
         ctx,
         stream,
         weights,
@@ -615,25 +672,118 @@ pub(super) fn build_driver(
         rows,
         0..layers,
     )?;
-    let block = SplitMoe::new(
+    let mut block = SplitMoe::new(
         ctx,
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
         &step.moe_dims(rows),
     )?;
+    if rows > 1 && ring_budget > 0 {
+        let slots = block.plan_ring(
+            ctx,
+            (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
+        )?;
+        if slots == 0 {
+            eprintln!(
+                "flash-next cuda: prefill ring not funded ({} bytes reserved); the union-admit \
+             path serves prefill",
+                ring_budget
+            );
+        } else {
+            eprintln!(
+                "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank",
+                slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
 
+    // The batch flag is read before the 131 MB of projection weights, so a refused value
+    // fails fast instead of after the upload-scale read.
+    let batch_switch = ple_batch()?;
     stage("opening the n-gram table");
-    let (vectors, projection) =
-        PleVectors::read(&checkpoint.source, model.ple_layer, &model.ple, PLE_THREADS)?;
-    let ple = PleFeed::new(
-        model.ple,
-        NgramRows::new(ngram)?,
-        vectors,
-        Box::new(projection),
-    );
+    let (vectors, projection) = PleVectors::read(
+        &checkpoint.source,
+        model.ple_layer,
+        &model.ple,
+        ple_threads(),
+    )?;
+    let ngram_rows = NgramRows::new(ngram)?;
+    // The device route (chunked prefill only): the projections upload to the card and the feed
+    // takes precomputed pairs; the host projection still backs the flag-off path.
+    let device_ple = match ple_device()?.then_some(rows > 1) {
+        Some(true) => {
+            stage("uploading the PLE projections");
+            let dims = model.ple.dims();
+            let (dtype, key, value) =
+                PleVectors::raw_projections(&checkpoint.source, model.ple_layer, &model.ple)?;
+            Some(DevicePle::upload(
+                ctx,
+                dtype,
+                &key,
+                &value,
+                PleUpload {
+                    width: (dims.hidden * dims.branches) as usize,
+                    hidden: dims.hidden as usize,
+                    embed: model.ple.embed(),
+                    rows_max: rows,
+                },
+            )?)
+        }
+        Some(false) => {
+            eprintln!(
+                "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_DEVICE ignored (prefill rows = 1)"
+            );
+            None
+        }
+        None => None,
+    };
+    // The batch host route (chunked prefill only, no device route): the feed takes precomputed
+    // pairs from one blocked product per chunk; the projection runs that product.
+    let batch_ple = match batch_switch.then_some(rows > 1) {
+        Some(true) if device_ple.is_none() => true,
+        Some(_) => {
+            if device_ple.is_none() {
+                eprintln!(
+                    "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_BATCH ignored (prefill rows = 1)"
+                );
+            } else {
+                eprintln!(
+                    "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_BATCH ignored (PLE_DEVICE route)"
+                );
+            }
+            false
+        }
+        None => false,
+    };
+    let (ple, ple_host_batch) = if device_ple.is_some() {
+        (
+            PleFeed::with_fixed(
+                model.ple,
+                ngram_rows,
+                vectors,
+                Rc::new(FixedProjection::new()),
+            ),
+            None,
+        )
+    } else if batch_ple {
+        (
+            PleFeed::with_fixed(
+                model.ple,
+                ngram_rows,
+                vectors,
+                Rc::new(FixedProjection::new()),
+            ),
+            Some(Box::new(projection)),
+        )
+    } else {
+        (
+            PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection)),
+            None,
+        )
+    };
     let hidden = model.hyper.hidden();
     let branches = model.hyper.branches();
     let ple_embed = model.ple.embed();
@@ -648,28 +798,48 @@ pub(super) fn build_driver(
             ple_embed,
         },
     };
-    let ready = began.elapsed().as_secs_f64();
     let driver = if rows > 1 {
-        let mut chunked = ChunkDriver::new(CardChunkDevice::new(step, moe), feeds, shape)?;
+        let ple_route = device_ple;
+        let ple_on_card = ple_route.is_some();
+        let device = CardChunkDevice::with_ple(step, moe, ple_route);
+        let mut chunked = if shared_prefill {
+            ChunkDriver::new_shared(device, feeds, shape)?
+        } else {
+            ChunkDriver::new(device, feeds, shape)?
+        };
         chunked.chunk_cap = rows;
-        eprintln!("flash-next cuda: ready in {ready:.1} s, prefill chunks of {rows} rows");
+        chunked.ple_device = ple_on_card;
+        let route_note = if ple_on_card {
+            ", PLE projections on the card"
+        } else if ple_host_batch.is_some() {
+            ", PLE projections batched on the host"
+        } else {
+            ""
+        };
+        chunked.ple_host_batch = ple_host_batch;
+        eprintln!(
+            "flash-next cuda: ready in {:.1} s, prefill chunks of {rows} rows{route_note}",
+            began.elapsed().as_secs_f64(),
+        );
         StepDriver::Chunk(chunked)
     } else {
-        eprintln!("flash-next cuda: ready in {ready:.1} s");
+        eprintln!(
+            "flash-next cuda: ready in {:.1} s",
+            began.elapsed().as_secs_f64()
+        );
         StepDriver::Token(TokenDriver::new(CardDevice::new(step, moe), feeds, shape)?)
     };
     Ok(driver)
 }
 
-/// The executor's driver on the card: the exact token driver (one row per call), or the chunked
-/// driver when `prefill_rows` is set above one. Both follow the token stepper rules; the enum
-/// keeps `make` a single concrete executor type.
+/// The one driver type at the engine boundary: the plain token driver of decode, or the chunk
+/// driver `prefill_rows` builds. Forwards the stepper and the device-test surface.
 pub(in crate::family::flash_next::cuda) enum StepDriver {
     Token(TokenDriver<CardDevice, PackFeeds>),
     Chunk(ChunkDriver<CardChunkDevice, PackFeeds>),
 }
 
-impl TokenStepper for StepDriver {
+impl crate::family::session::TokenStepper for StepDriver {
     const OPERATION: &'static str = "flash_next_cuda";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
@@ -718,12 +888,55 @@ impl StepperPositions for StepDriver {
     }
 }
 
+impl ResumesState for StepDriver {
+    fn resume_generation(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.resume_generation(),
+            Self::Chunk(driver) => driver.resume_generation(),
+        }
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        StepDriver::bank_snapshot(self)
+    }
+
+    fn resume_host_bytes(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.resume_host_bytes(),
+            Self::Chunk(driver) => driver.resume_host_bytes(),
+        }
+    }
+
+    fn save_resume(&self) -> Result<ResumeSnapshot, EngError> {
+        match self {
+            Self::Token(driver) => driver.save_resume(),
+            Self::Chunk(driver) => driver.save_resume(),
+        }
+    }
+
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.restore_resume(snapshot),
+            Self::Chunk(driver) => driver.restore_resume(snapshot),
+        }
+    }
+}
+
 impl StepDriver {
     /// The bank's miss count for the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
         match self {
             Self::Token(driver) => driver.device().bank_misses(),
             Self::Chunk(driver) => driver.device().bank_misses(),
+        }
+    }
+
+    /// The bank's lifetime counters for the request log's `prefill_bank_*` keys (log-only):
+    /// the counters of whichever driver mode holds the device.
+    pub(super) fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        match self {
+            Self::Token(driver) => ResumesState::bank_snapshot(driver),
+            Self::Chunk(driver) => ResumesState::bank_snapshot(driver),
         }
     }
 
@@ -736,7 +949,7 @@ impl StepDriver {
         }
     }
 
-    /// The single-row kernel name, for the device tests.
+    /// The single-row kernel name, for the device tests (both devices expose it).
     #[cfg(test)]
     pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
         match self {
@@ -745,8 +958,18 @@ impl StepDriver {
         }
     }
 
-    /// The last step's host timing, for the device tests. The chunk driver keeps none; its
-    /// table prints the decode shape's zeros.
+    /// The bank's placement digest (slots per layer, SHA-256 of the resident set at load):
+    /// the state a run record's step-0 logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> (u32, String) {
+        match self {
+            Self::Token(driver) => driver.device().placement_digest(),
+            Self::Chunk(driver) => driver.device().placement_digest(),
+        }
+    }
+
+    /// The last step's stage times, for the driver device tests. The chunk driver does not
+    /// track stage times; the stage table runs on the token driver.
     pub(super) fn last_times(&self) -> TokenTimes {
         match self {
             Self::Token(driver) => driver.last_times(),
@@ -859,30 +1082,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// The served kernels are registered and checked before the pack is opened and before any
-    /// stream or weight exists, in the order set default, set options, check.
+    /// The served kernels are registered through the shared applier, before the pack is opened
+    /// and before any stream or weight exists.
     #[test]
     fn the_served_kernels_are_registered_and_checked_before_the_first_upload() {
         let source = include_str!("start.rs");
-        let register = &source[source
-            .find("fn register_served_kernels(")
-            .expect("register_served_kernels")..];
-        let single = register
-            .find("ctx.set_single_row_default(")
-            .expect("the single-row default");
-        let indexed = register
-            .find("ctx.set_indexed_default(")
-            .expect("the indexed default");
-        let odd = register
-            .find("ctx.set_odd_rate_kernel(true)")
-            .expect("the odd-rate kernel switch");
-        let check = register
-            .find("ctx.check_single_gather()?")
-            .expect("the switch check");
-        assert!(
-            single < indexed && indexed < odd && odd < check,
-            "the defaults must be registered before check_single_gather()"
-        );
         let build = &source[source
             .find("pub(super) fn build_driver(")
             .expect("build_driver")..];

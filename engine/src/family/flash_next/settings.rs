@@ -7,6 +7,7 @@
 
 use super::moe::context_budget::KvFormat;
 use crate::EngError;
+use crate::family::project::exl3_jobs_plan::MAX_EXL3_ROWS;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -46,10 +47,11 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 8. The default, 1, is the
-    /// decode shape: one row per device call, exactly as before. A value above one runs the
-    /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
-    /// unchanged at one row.
+    /// CUDA only: rows of one device step during prefill. With `INFERENCE_FLASH_NEXT_SHARED_PREFILL=1`
+    /// the bound is 2 to 256; without it, 1 to 64 — the legacy path's device coverage stops at 64
+    /// rows. The default, 1, is the decode shape: one row per device call, exactly as before. A
+    /// value above one runs the prompt as device chunks of that many rows (one PLE host
+    /// roundtrip per chunk), with decode unchanged at one row.
     pub(crate) prefill_rows: Option<u32>,
     /// CUDA only: the popularity profile file of the expert bank. A load reads it for a
     /// rank-ordered initial fill, and the bank rewrites it with its own usage counts on shutdown,
@@ -217,9 +219,16 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
     {
         return Err(bad("expert_stats must not be empty".into()));
     }
-    // The step's rows are capped by the merged expert launches; `MAX_STEP_ROWS` in
-    // `cuda/step_plan.rs` is the same 8.
-    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 8)?;
+    // The step plan refuses widths above `MAX_STEP_ROWS` (`cuda/step_plan.rs`), which equals
+    // `MAX_EXL3_ROWS` of `project/exl3_jobs_plan.rs`; refusing here names `prefill_rows` at
+    // parse time instead of a plan refusal at boot.
+    let prefill_rows = ranged(
+        "prefill_rows",
+        options.prefill_rows,
+        1,
+        1,
+        MAX_EXL3_ROWS as u32,
+    )?;
     Ok(Some(CudaSettings {
         context,
         kv_format,
@@ -535,6 +544,24 @@ mod tests {
             cuda_decode: Some(true),
             ..FlashOptions::default()
         }
+    }
+
+    /// `prefill_rows` takes the whole planned width (the shared `MAX_EXL3_ROWS`) and refuses
+    /// one row above it at parse time, naming the key.
+    #[test]
+    fn prefill_rows_is_bounded_at_the_planned_chunk_width() {
+        let env = FlashEnv::default();
+        let at = |rows: u32| {
+            let options = FlashOptions {
+                prefill_rows: Some(rows),
+                ..cuda_on()
+            };
+            settings(Some(&options), &env)
+        };
+        assert_eq!(at(256).unwrap().cuda.unwrap().prefill_rows, 256);
+        assert_eq!(at(1).unwrap().cuda.unwrap().prefill_rows, 1);
+        assert!(message(at(257)).contains("prefill_rows"));
+        assert!(message(at(0)).contains("prefill_rows"));
     }
 
     #[test]

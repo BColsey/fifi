@@ -106,7 +106,7 @@ pub(super) fn plan_at(tier: TierShape, trunk: u64, positions: u64) -> TierPlan {
     let inputs = TierInputs::cost_model_3090(
         tier,
         (trunk, 36 * 3 * (1 << 20)),
-        crate::family::qwen36::tiered::budget::KvPlan {
+        crate::family::device_budget::KvPlan {
             positions,
             bytes_per_position: bytes,
         },
@@ -124,7 +124,7 @@ pub(super) fn pack_sizes(checkpoint: &Checkpoint) -> (TierShape, u64, usize) {
     let embedding = shape.vocab as u64 * moe.hidden as u64 * 2;
     (
         tier,
-        report.pack.device_bytes - report.expert_bytes - embedding,
+        report.device_bytes - report.expert_bytes - embedding,
         moe.hidden,
     )
 }
@@ -145,7 +145,7 @@ fn the_real_router_picks_ten_and_the_tier_classifies_routes_outside_its_profile(
     // (which the host gathers) and the tensors a host feed reads, against the exact figure of the
     // plan doc (3.61 GiB).
     let embedding = shape.vocab as u64 * moe.hidden as u64 * 2;
-    let trunk = report.pack.device_bytes - report.expert_bytes - embedding;
+    let trunk = report.device_bytes - report.expert_bytes - embedding;
     eprintln!("trunk bytes {trunk} ({:.3} GiB)", trunk as f64 / GIB as f64);
     assert_eq!(
         trunk, 3_872_376_320,

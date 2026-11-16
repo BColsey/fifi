@@ -12,7 +12,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | --- | --- | --- | --- |
 | `listen` | yes | | Address and port, for example `127.0.0.1:18791`. The address must be `127.0.0.1` or `::1`. Port 8788 is refused. |
 | `api_key_env` | yes | | Name of the environment variable that holds the API key. Startup fails if the variable is unset or empty. |
-| `prefix_reuse` | no | `false` | Keep finished conversation prefixes so that a follow-up turn only processes its new tokens. Applies to every engine that supports it. See [How conversation reuse works](../explanation/prefix-reuse.md). |
+| `prefix_reuse` | no | unset | Keep finished conversation prefixes so that a follow-up turn only processes its new tokens. Unset resolves per family at startup: on for the two qualified reuse paths (Flash-Next CUDA, Qwen3.6 CUDA on the CUDA build) and off for every other family, because the boundary marking alone splits the prefill and changes greedy text. An explicit `true` or `false` overrides for all engines. Setting the Flash-Next environment switch to `0` does not revert this key's marking. See [How conversation reuse works](../explanation/prefix-reuse.md). |
 | `web_dir` | no | | Directory with the built web frontend (`npm run build` in `web/` writes `web/dist`). When set, `GET /` serves its `index.html` and `GET /assets/...` its hashed assets; startup refuses a directory without `index.html`. The shell is public like `/health`; every API route keeps its key. |
 | `engines` | yes | | The engines to serve, one object each. |
 
@@ -38,6 +38,12 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 
 Model weights must be on local storage; network storage is not a tier or a fallback. The server refuses to start an engine whose `model_dir` is on a network filesystem (NFS, SMB, AFP, WebDAV, sshfs, Ceph and similar), or on an automount that has mounted nothing. The loaders also refuse a shard file that is a symlink into such a mount, because a symlink counts as where it points. The error reads `model weights must be on local storage, but <path> is on a <type> filesystem`. If the filesystem cannot be determined, the error reads `cannot confirm that model weights at <path> is on local storage` and the engine does not start. The tokenizer directory holds only small text files and is not checked.
 
+### CUDA FP16 prefill attention
+
+FP16 prefill attention retains the original PTX-based launch path by default. Set [`FIFI_CUDA_ATTN_PREFILL_ADAPT=1`](environment.md#cuda) before engine startup to opt into selection for the current CUDA device and model geometry. The adaptive path uses the loaded kernel's PTX version, the device's per-block shared-memory limit and the device and kernel thread limits. It selects the tensor-core arm when it fits and its loaded code supports it, otherwise the compact SIMT arm when that fits. If neither fits, or a device query or shared-memory opt-in fails, the launch returns an error. Successful adaptive selections are cached per device and geometry.
+
+This selection applies to the FP16 attention part kernel, not every model kernel or the q8 attention path. It does not establish correctness or performance for every GPU and model. Device qualification of the selection across RTX 20, 30, 40 and 50 series remains open. The build must also contain compatible device code; see [`INFERENCE_CUDA_ARCHS`](environment.md#build).
+
 ## `qwen36`
 
 Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
@@ -53,9 +59,11 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `prefill_session_reserve_bytes` | MLX | derived | Memory that prompt processing leaves free. With `prefill_budget_bytes` and no reserve member, it is derived: the attention cache at `context_limit`, plus the DeltaNet state, plus `cache_limit_bytes`, plus a 1 GiB pressure margin (the shipped Mac profile's composition). An explicit value always wins. Refused without `prefill_budget_bytes`. |
 | `prefill_chunk` | MLX | 256 | Largest prompt chunk, 1 to 2,048 rows. The engine picks the largest chunk that fits the budget. |
 | `compile` | MLX | `false` | Compile the decode step with `mlx_compile`: 9.6 to 13% faster decoding. Logits differ from the uncompiled path by at most 5e-5. |
+| `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. See [compiled-program budgets](../mlx-compile-program-budget.md). |
 | `max_seqs` | MLX | 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
-| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
+| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file; with `Q36_ALLOW_UNPINNED_GGUF=1`, the directory's single `.gguf` of the family, validated at open) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
+| `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX and EXL3 refuse the key. See [content pinning](#gguf-content-pinning-cuda). |
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
@@ -77,6 +85,20 @@ MLX ignores `capture` with a log line, and refuses `tiered`.
 The `draft_*`, `num_draft_tokens`, `hybrid_draft_tokens`, `ngram_match_min` and `mtp_model_dir` keys are checked at start. A `draft_mode` other than `disabled` is refused on MLX and with GGUF weights, because nothing there can run a window. (EXL3 weights already refuse `kv_offload_host_bytes`, the one KV cache a window cannot export.) `mtp` is refused with EXL3 weights because its draft step does not exist. `ngram` works with EXL3 weights, and the output is the same as with `disabled` for any sampler. A window feeds its rows one at a time and first copies the whole committed session state to the host, so each window costs time proportional to the context and `ngram` is slower than `disabled`: use it to check output, not to serve long contexts.
 `prefix_store_entries` is ignored with a log line when `prefix_reuse` is off.
 
+### GGUF content pinning (CUDA)
+
+Set `qwen36.gguf_sha256` to a trusted full-file SHA-256 to bind startup to specific checkpoint bytes.
+The value accepts uppercase or lowercase hex digits.
+A mismatch refuses startup before model parsing or weight upload.
+This explicit pin takes precedence over `Q36_VERIFY_GGUF_SHA256`, so startup hashes the file once.
+Without the key, the existing filename, size and optional built-in hash checks remain unchanged.
+
+The key also works with `Q36_ALLOW_UNPINNED_GGUF=1` for an alternate checkpoint filename.
+It does not enable unpinned admission or change which file startup selects.
+The pinned filename still wins when present, and its size check still applies.
+A matching digest establishes content identity, not model quality or source authenticity.
+Keep the checkpoint files unchanged while the engine serves them.
+
 ### EXL3 pack (CUDA)
 
 `"weight_format": "exl3"` loads the weights from an EXL3 pack in `model_dir` instead of the GGUF file, and serves from it.
@@ -92,7 +114,7 @@ A prefix saved after a chunked prefill and restored from the device tip or the p
 ### Host-memory KV cache (CUDA)
 
 `kv_offload_host_bytes` keeps the KV cache in host memory for contexts that do not fit on the GPU.
-It needs `"kv_dtype": "q8"`, `"capture": false`, `"prefix_reuse": false` and `Q36_CUDA_CHUNK_PREFILL=0`.
+It needs `"kv_dtype": "q8"`, `"capture": false`, `"prefix_reuse": false` and `Q36_CUDA_CHUNK_PREFILL=0`; startup refuses the combination without `prefix_reuse` false, so on the CUDA build an omitted `prefix_reuse` key (which defaults on for Qwen3.6) also refuses `kv_offload_host_bytes` until the key is set to false explicitly.
 It reloads the cache from host memory for every token, so it is slow: an 8K-token replay decoded at 34.95 tokens/s, against 147.14 tokens/s with the cache on the GPU.
 `Q36_CUDA_PAGED_DEVICE_FIRST=1` keeps as much of the cache on the GPU as fits after a 1 GiB reserve.
 

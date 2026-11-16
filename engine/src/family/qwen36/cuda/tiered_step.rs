@@ -8,6 +8,7 @@
 //! block, [`TieredRuntime::end_token`] runs the token boundary: policy P decides the swaps and the
 //! bank slots are filled with blocking writes.
 
+use crate::family::exl3::launch::{Launch, MoeDims};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use super::mixer_weights::DenseWeight;
 use super::moe::tiered::{
     LayerPlan, RouteRead, TieredBlock, TieredLayerHost, TieredScratch, run_moe_block_tiered,
 };
-use super::moe::{Launch, MoeBuffers, MoeDims, MoeLayerWeights, StackWeights};
+use super::moe::{MoeBuffers, MoeLayerWeights, StackWeights};
 use super::run_report::HostSyncs;
 use crate::EngError;
 use crate::family::qwen36::tiered::cpu_pool::MappedRegion;

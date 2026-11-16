@@ -7,27 +7,33 @@
 //! owns the protocol around [`run_chunk_body`]. This module holds the slot views, the checked chunk
 //! rows, the pure call-shape builders, the stage lists, the constructor checks and the stage
 //! functions themselves. No function here allocates device memory, reads a device word or records
-//! an event. KV8 attention tiles update one device word with `write_at`, which waits for the owning
-//! stream. The body also calls [`super::state::ResidentState::check_chunk`].
+//! an event, with one exception: the serve-phase hook of [`phase_timing::serve`], which records
+//! timing events only when `FIFI_Q36_SERVE_PHASE` arms it. KV8 attention tiles update one device
+//! word with `write_at`, which waits for the owning stream. The body also calls
+//! [`super::state::ResidentState::check_chunk`].
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
     dims::{KvMode, StepDims},
     exl3_moe::Exl3MoeWeights,
-    layer_table::LayerTable,
     mixer::tail_extent,
     mixer_geometry::MixerGeometry,
     mixer_shapes::{attn_q8_shape, kv8_shape},
     mixer_weights::{DenseWeight, LayerWeights, MixerWeights},
-    moe::{Launch, MoeDims, MoeLayerWeights, StackWeights},
+    moe::{MoeLayerWeights, StackWeights},
     prefill_driver::Kv8Staging,
     prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
     sparse_exec::SparseExec,
     state::ResidentState,
-    state_layout::{Plane, Word},
+    state_layout::Plane,
     tiered_step::TieredRuntime,
 };
+use crate::family::exl3::launch::{Launch, MoeDims};
+use crate::family::exl3::prefill::Exl3Scratch;
+use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::spec::AttentionKind;
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::gguf_model::Role,
@@ -50,7 +56,7 @@ use crate::{
                 mmq_type_of,
             },
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
-            swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
+            swiglu_rows::SwigluRowsCall,
         },
         resident::{
             add_norm_pack::AddNormCall,
@@ -62,12 +68,13 @@ use crate::{
             gdn_conv::{ConvCall, ConvShape},
             kv8_append::Kv8Data,
             matvec_q::QuantType,
-            moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
+            moe_combine::{CombineCall, CombineOut, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
             sparse_sketch::{SparseSketchData, SparseSketchShape},
         },
     },
 };
+
 #[cfg(test)]
 use kernel_diagnostics::{
     diagnostic_dense, diagnostic_dense_input, diagnostic_routed, diagnostic_shared,
@@ -120,7 +127,7 @@ pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
 /// The rows of one chunk: `m` rows at the positions `p0..p0 + m` of a session whose arena was
 /// planned for `m_sess` rows. Constructed against the caller's `cap` and `m_sess`; the body
 /// re-checks the state's own cap (a chunk built against a larger cap than the state's).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ChunkRows {
     p0: usize,
     m: usize,
@@ -575,18 +582,6 @@ pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(
     Ok(())
 }
 
-/// The SwiGLU shape of the routed stacks (stage 14): `m * top_k` rows, the up half at column
-/// `inter` of a `2 * inter` row.
-pub(super) fn routed_swiglu(m: usize, dims: &MoeDims) -> SwigluRowsShape {
-    SwigluRowsShape {
-        rows: m * dims.top_k,
-        n_ff: dims.inter,
-        up_off: dims.inter,
-        ld_in: 2 * dims.inter,
-        ld_out: dims.inter,
-    }
-}
-
 /// The `(offset, length)` of the up half's sub-view of a `Gu` slot of `gu_bytes` bytes
 /// (stage 13b): the grouped launch has no column offset, so the up launch writes the tail
 /// that starts at column `dims.inter` — the same constant that sets [`routed_swiglu`]'s
@@ -703,16 +698,6 @@ pub(super) fn chunk_router_shape(dims: &MoeDims, m: usize) -> RouterShape {
     }
 }
 
-/// The combine shape (stage 17).
-pub(super) fn chunk_combine_shape(dims: &MoeDims, m: usize) -> CombineShape {
-    CombineShape {
-        m,
-        n: dims.hidden,
-        top_k: dims.top_k,
-        ld_down: dims.hidden,
-    }
-}
-
 /// The grouped-launch shape of the MoE block (stage 11).
 pub(super) fn chunk_mmid_shape(dims: &MoeDims, m: usize) -> MmidShape {
     MmidShape {
@@ -728,17 +713,6 @@ pub(super) fn shared_cols(dims: &MoeDims) -> [(usize, usize); 2] {
         (2 * dims.shared_inter, 0),
         (2 * dims.shared_inter, dims.shared_inter),
     ]
-}
-
-/// The shared expert's SwiGLU shape (stage 10d).
-pub(super) fn shared_swiglu(m: usize, dims: &MoeDims) -> SwigluRowsShape {
-    SwigluRowsShape {
-        rows: m,
-        n_ff: dims.shared_inter,
-        up_off: dims.shared_inter,
-        ld_in: 2 * dims.shared_inter,
-        ld_out: dims.shared_inter,
-    }
 }
 
 /// The `MmidWeight` of one routed stack (stages 13a, 13b, 16): the whole stack buffer, its
@@ -1336,7 +1310,7 @@ pub(super) struct ChunkRun<'r, 'w> {
     bufs: &'r ChunkBufs<'r>,
     rows: ChunkRows,
     sparse: Option<ChunkSparse<'r>>,
-    bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    bank: Option<&'r std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     /// The tiered runtime, present when the session is tiered AND the chunk flag is
     /// on: the chunk MoE stage routes through the bank stacks + CPU misses.
     tiered: Option<&'r std::cell::RefCell<TieredRuntime<'w>>>,
@@ -1421,7 +1395,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     /// and groups the launches on slot ids. `None` on resident loads.
     pub(super) fn with_bank(
         mut self,
-        bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+        bank: Option<&'r std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     ) -> Self {
         self.bank = bank;
         self
@@ -1480,8 +1454,8 @@ impl ChunkRun<'_, '_> {
         self.bufs.views.get(slot)
     }
 
-    fn exl3_scratch(&self) -> Result<exl3::Exl3Scratch<'_>, EngError> {
-        Ok(exl3::Exl3Scratch {
+    fn exl3_scratch(&self) -> Result<Exl3Scratch<'_>, EngError> {
+        Ok(Exl3Scratch {
             xh: self.v(ChunkSlot::Exl3Xh)?,
             z: self.v(ChunkSlot::Exl3Z)?,
             y: self.v(ChunkSlot::Exl3Y)?,
@@ -2341,7 +2315,6 @@ pub(super) struct MoeChunkIo<'b> {
     pub(super) scratch: &'b ChunkViews<'b>,
 }
 
-/// The MoE dispatch: the Resident arm, and the Tiered arm that chunked prefill refuses.
 /// Whether tiered sessions may run chunked prefill (`Q36_TIERED_CHUNK=1`). Default
 /// off: the chunk arm is complete but the gate ships dark until device-qualified.
 pub(super) const TIERED_CHUNK_VAR: &str = "Q36_TIERED_CHUNK";
@@ -2351,13 +2324,6 @@ pub(super) fn tiered_chunk_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 
 pub(super) enum ChunkMoe<'a, 'w> {
     Resident(&'a MoeLayerWeights<'w>),
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "v1's refusal reads neither field; tiered chunk prefill will read them"
-        )
-    )]
     Tiered {
         runtime: &'a mut TieredRuntime<'w>,
         layer: usize,
@@ -3350,6 +3316,7 @@ pub(super) fn run_chunk_layer(
             marks.push((layer, stage, event));
         }
         exl3::split::mark_stage(launch.stream, stage);
+        phase_timing::serve::note_stage(launch.stream, stage, slot.kind)?;
     }
     Ok(())
 }
@@ -3378,7 +3345,10 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
         exl3::clear_flag(launch, run)?;
         exl3::write_dense_jobs(launch, &run.exl3_scratch()?, run.rows.m())?;
     }
+    phase_timing::serve::begin(launch.ctx, run.rows.p0(), run.rows.m(), run.model.layers)?;
+    phase_timing::serve::note(launch.stream, "start")?;
     chunk_embed(launch, run, status)?;
+    phase_timing::serve::note(launch.stream, "embed")?;
     // One prefill-piece index for every layer of the piece (resident_trace's counter).
     let trace_piece = crate::family::qwen36::trace::begin_prefill();
     // The GPU-time profile of the piece (Q36_TIERED_TRACE=1): one timing event per
@@ -3474,6 +3444,681 @@ fn stage_name(stage: Stage) -> &'static str {
     }
 }
 
+/// Phase attribution of one chunk body: [`run_chunk_body`] with a timing event after
+/// every stage of every layer. The timed body mirrors the production body arm-for-arm;
+/// the production loop is the source of truth — keep the two in sync when a stage changes.
+///
+/// The module itself is compiled unconditionally: the production loop's `FIFI_Q36_SERVE_PHASE`
+/// hook (see [`serve`]) reuses `PhaseMarks` for serve-side attribution.
+pub(super) mod phase_timing {
+    use super::*;
+    use crate::kernels::cuda::{CudaContext, DeviceStream, TimingEvent};
+
+    /// The recorded marks of one body run: one event per stage boundary, tagged by stage.
+    pub(crate) struct PhaseMarks {
+        events: Vec<TimingEvent>,
+        tags: Vec<&'static str>,
+        next: usize,
+    }
+
+    impl PhaseMarks {
+        /// `capacity` must cover every mark of one body run (2 + layers x stages + slack).
+        pub(crate) fn new(ctx: &CudaContext, capacity: usize) -> Result<Self, EngError> {
+            let events = (0..capacity)
+                .map(|_| ctx.event_timing())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Self {
+                events,
+                tags: Vec::with_capacity(capacity),
+                next: 0,
+            })
+        }
+
+        fn mark(&mut self, stream: &DeviceStream, tag: &'static str) -> Result<(), EngError> {
+            let at = self.next;
+            self.next += 1;
+            self.tags.push(tag);
+            stream.record_timing(&self.events[at])
+        }
+
+        /// Milliseconds between consecutive marks, tagged by the mark that ended the span.
+        /// Legal only after the caller synchronized the stream.
+        pub(crate) fn shares(&self) -> Result<Vec<(&'static str, f32)>, EngError> {
+            let mut out = Vec::with_capacity(self.next.saturating_sub(1));
+            for at in 1..self.next {
+                let span = self.events[at - 1].elapsed_ms_since(&self.events[at])?;
+                out.push((self.tags[at], span));
+            }
+            Ok(out)
+        }
+    }
+
+    pub(super) fn stage_name(stage: Stage) -> &'static str {
+        match stage {
+            Stage::NormA => "norma",
+            Stage::QuantA => "quanta",
+            Stage::DeltaProj => "deltaproj",
+            Stage::Conv => "conv",
+            Stage::Scan => "scan",
+            Stage::QuantDOut => "quantdout",
+            Stage::SsmOut => "ssmout",
+            Stage::AttnProj => "attnproj",
+            Stage::Prep => "prep",
+            Stage::Flash => "flash",
+            Stage::QuantAOut => "quantaout",
+            Stage::AttnOut => "attnout",
+            Stage::NormF => "normf",
+            Stage::Route => "route",
+            Stage::Moe => "moe",
+            Stage::MoeStart => "moestart",
+            Stage::MoeShared => "moeshared",
+            Stage::MoeStage => "moestage",
+            Stage::MoeScatter => "moescatter",
+            Stage::MoeBankUp => "moebankup",
+            Stage::MoeColdUp => "moecoldup",
+            Stage::MoeSwiglu => "moeswiglu",
+            Stage::MoeGather => "moegather",
+            Stage::MoeBankDown => "moebankdown",
+            Stage::MoeColdDown => "moecolddown",
+            Stage::MoeCombine => "moecombine",
+        }
+    }
+
+    /// [`run_chunk_layer`] with a mark after every stage (the native arm only; the rig never
+    /// runs EXL3 chunks).
+    fn run_chunk_layer_timed(
+        launch: &Launch<'_>,
+        run: &ChunkRun<'_, '_>,
+        status: DeviceRange<'_>,
+        layer: usize,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let slot = run.model.table.slot(layer)?;
+        let moe = match &run.model.weights {
+            ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
+            ChunkWeights::Exl3 { .. } => {
+                return Err(EngError::BadRequest(
+                    "phase_timing: the EXL3 chunk arm is not mirrored".to_owned(),
+                ));
+            }
+        };
+        let ctx = LayerCtx {
+            launch,
+            weights: run.model.weights.mixer().layer_weights(layer)?,
+            moe,
+            ord: slot.ordinal,
+            layer,
+            kind: slot.kind,
+            status,
+        };
+        for stage in layer_stages(slot.kind)? {
+            match stage {
+                Stage::NormA => norm_a(run, &ctx)?,
+                Stage::QuantA => quant_a(run, &ctx)?,
+                Stage::DeltaProj => delta_proj(run, &ctx)?,
+                Stage::Conv => delta_conv(run, &ctx)?,
+                Stage::Scan => delta_scan(run, &ctx)?,
+                Stage::QuantDOut => quant_d_out(run, &ctx)?,
+                Stage::SsmOut => ssm_out(run, &ctx)?,
+                Stage::AttnProj => attn_proj(run, &ctx)?,
+                Stage::Prep => attn_prep(run, &ctx)?,
+                Stage::Flash => attn_flash(run, &ctx)?,
+                Stage::QuantAOut => quant_a_out(run, &ctx)?,
+                Stage::AttnOut => attn_out(run, &ctx)?,
+                Stage::NormF => norm_f(run, &ctx)?,
+                Stage::Route => chunk_route(run, &ctx)?,
+                Stage::Moe => {
+                    let LayerMoe::Native(weights) = &moe else {
+                        unreachable!("phase_timing: the EXL3 arm is refused above")
+                    };
+                    run_chunk_moe_timed(launch, weights, run, &ctx, marks)?
+                }
+                stage @ (Stage::MoeStart
+                | Stage::MoeShared
+                | Stage::MoeStage
+                | Stage::MoeScatter
+                | Stage::MoeBankUp
+                | Stage::MoeColdUp
+                | Stage::MoeSwiglu
+                | Stage::MoeGather
+                | Stage::MoeBankDown
+                | Stage::MoeColdDown
+                | Stage::MoeCombine) => {
+                    return Err(EngError::BadRequest(format!(
+                        "phase_timing: {stage:?} is a timing label, not a runnable stage"
+                    )));
+                }
+            }
+            marks.mark(launch.stream, stage_name(stage))?;
+        }
+        Ok(())
+    }
+
+    /// [`chunk_moe`] with the sub-mark split: shared (10a-f), routed (11-16: prep, gate+up,
+    /// swiglu, gather+down) and combine (17). The `io` construction mirrors `chunk_moe`.
+    fn run_chunk_moe_timed(
+        launch: &Launch<'_>,
+        moe: &MoeLayerWeights<'_>,
+        run: &ChunkRun<'_, '_>,
+        ctx: &LayerCtx<'_, '_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let io = MoeChunkIo {
+            m: run.rows.m(),
+            dims: run.model.dims_at(run.rows.m()),
+            x2: run.v(ChunkSlot::X2)?,
+            ids: run.v(ChunkSlot::TopkId)?,
+            weights: run.v(ChunkSlot::TopkWeight)?,
+            shared_gate: run.v(ChunkSlot::SharedGate)?,
+            h: run.v(ChunkSlot::Hidden)?,
+            status: ctx.status,
+            scratch: &run.bufs.views,
+        };
+        run_chunk_shared(launch, moe, &io)?;
+        marks.mark(launch.stream, "moe_shared")?;
+        run_chunk_routed_timed(launch, moe, &io, marks)?;
+        marks.mark(launch.stream, "moe_routed")?;
+        combine_chunk_moe(launch, &io)?;
+        marks.mark(launch.stream, "moe_combine")
+    }
+
+    /// [`run_chunk_routed`] with marks after the ids build + scatter quant (prep), the gate+up
+    /// launches (gu), the swiglu, and the gather quant + down launch (down).
+    fn run_chunk_routed_timed(
+        launch: &Launch<'_>,
+        mw: &MoeLayerWeights<'_>,
+        io: &MoeChunkIo<'_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        let (ctx, stream, m, dims, d) = (launch.ctx, launch.stream, io.m, &io.dims, io.scratch);
+        let ids = ctx.mmq_build_ids(
+            stream,
+            IdsGuardCall {
+                shape: chunk_mmid_shape(dims, m),
+                ids: io.ids,
+                ids_g: d.get(ChunkSlot::IdsG)?,
+                status: Some(io.status),
+            },
+            MmidIdsOut {
+                ids_src1: d.get(ChunkSlot::IdsSrc1)?,
+                ids_dst: d.get(ChunkSlot::IdsDst)?,
+                expert_bounds: d.get(ChunkSlot::ExpertBounds)?,
+            },
+        )?;
+        let gate = native_stack(&mw.gate)?;
+        ctx.mmq_quantize_scatter_ids(
+            stream,
+            &ids,
+            MmidQuantCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                quant: gate.quant(),
+                k: dims.hidden,
+                row_stride: dims.hidden,
+                x: io.x2,
+                y: d.get(ChunkSlot::Q8S)?,
+            },
+        )?;
+        marks.mark(stream, "moe_prep")?;
+        let gu = d.get(ChunkSlot::Gu)?;
+        let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
+        let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
+        let launch_mmid =
+            |weight: &NativeWeight, y: DeviceRange<'_>, ld: usize, dst: DeviceRange<'_>| {
+                let n = weight.n_rows() / weight.experts().unwrap_or(1);
+                ctx.mmq_mmid_launch(
+                    stream,
+                    MmidLaunchCall {
+                        shape: ids.shape(),
+                        weight: routed_weight(weight, dims, weight.k(), n)?,
+                        ids: &ids,
+                        y,
+                        dst,
+                        ld,
+                        fixup: d.get(ChunkSlot::Fixup)?,
+                    },
+                )
+            };
+        let q8s = d.get(ChunkSlot::Q8S)?;
+        launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
+        launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
+        marks.mark(stream, "moe_gu")?;
+        ctx.swiglu_rows(
+            stream,
+            SwigluRowsCall {
+                shape: routed_swiglu(m, dims),
+                gu: d.get(ChunkSlot::Gu)?,
+                act: d.get(ChunkSlot::Act)?,
+            },
+        )?;
+        marks.mark(stream, "moe_swiglu")?;
+        let down = native_stack(&mw.down)?;
+        ctx.mmq_quantize_gather_ids(
+            stream,
+            &ids,
+            MmidQuantCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                quant: down.quant(),
+                k: dims.inter,
+                row_stride: dims.inter,
+                x: d.get(ChunkSlot::Act)?,
+                y: d.get(ChunkSlot::Q8Act)?,
+            },
+        )?;
+        launch_mmid(
+            down,
+            d.get(ChunkSlot::Q8Act)?,
+            dims.hidden,
+            d.get(ChunkSlot::Down)?,
+        )?;
+        marks.mark(stream, "moe_down")
+    }
+
+    /// [`run_chunk_body`] with marks: `start`, `embed`, then every stage of every layer.
+    pub(crate) fn run_chunk_body_timed(
+        launch: &Launch<'_>,
+        run: &ChunkRun<'_, '_>,
+        marks: &mut PhaseMarks,
+    ) -> Result<(), EngError> {
+        run.state.check_chunk(launch.stream)?;
+        if run.rows.end() > run.state.layout().kv.capacity {
+            return Err(EngError::ContextLimit(format!(
+                "phase_timing chunk: rows: p0 {} + m {} passes the context cap {}",
+                run.rows.p0(),
+                run.rows.m(),
+                run.state.layout().kv.capacity
+            )));
+        }
+        if run.state.layout().kv.mode == KvMode::Int8G32 {
+            kv8_parts(run)?;
+        }
+        let status = run.state.word(Word::PrefillStatus)?;
+        marks.mark(launch.stream, "start")?;
+        chunk_embed(launch, run, status)?;
+        marks.mark(launch.stream, "embed")?;
+        for layer in 0..run.model.layers {
+            run_chunk_layer_timed(launch, run, status, layer, marks)?;
+        }
+        marks.mark(launch.stream, "end")?;
+        Ok(())
+    }
+
+    /// The serve-side attribution hook: `FIFI_Q36_SERVE_PHASE`, read once per process.
+    /// Armed, the production chunk loop records one event per stage (single-threaded per
+    /// engine, so a thread-local cell owns the marks) and every chunk prints its share
+    /// line after the status read that completes the stream. The switch follows the
+    /// strict rule of `FIFI_EXL3_SINGLE_GATHER`: unset and `0` stay off, `1` arms, any
+    /// other value (empty and non-UTF-8 included) fails the first chunk that would carry
+    /// marks with `BadRequest`, and the memoised refusal fails every later chunked
+    /// request until restart. Instrumentation failures of the armed path — event pool,
+    /// record, readback — close the backend's process-wide terminal latch: the chunk's
+    /// next device operation fails and the engine refuses all work until restart. The
+    /// marks are dropped and the failure noted on stderr, but the process does not
+    /// recover.
+    pub(in crate::family::qwen36::cuda) mod serve {
+        use super::*;
+        use std::cell::RefCell;
+        use std::ffi::OsStr;
+        use std::sync::OnceLock;
+
+        /// The switch rule of `doc/reference/environment.md`: unset and `0` stay off,
+        /// `1` arms, any other value is refused.
+        pub(crate) fn armed_from(raw: Option<&OsStr>) -> Option<bool> {
+            match raw {
+                None => Some(false),
+                Some(text) if text == OsStr::new("0") => Some(false),
+                Some(text) if text == OsStr::new("1") => Some(true),
+                Some(_) => None,
+            }
+        }
+
+        fn armed() -> Result<bool, EngError> {
+            static ARM: OnceLock<Option<bool>> = OnceLock::new();
+            let memoized = ARM.get_or_init(|| {
+                let raw = std::env::var_os("FIFI_Q36_SERVE_PHASE");
+                match armed_from(raw.as_deref()) {
+                    Some(on) => Some(on),
+                    None => {
+                        eprintln!("FIFI_Q36_SERVE_PHASE must be unset, \"0\" or \"1\"");
+                        None
+                    }
+                }
+            });
+            (*memoized).ok_or_else(|| {
+                EngError::BadRequest(
+                    "FIFI_Q36_SERVE_PHASE must be unset, \"0\" or \"1\"; unset it and restart"
+                        .into(),
+                )
+            })
+        }
+
+        thread_local! {
+            /// The marks of the chunk in flight: `None` between chunks.
+            static MARKS: RefCell<Option<(String, PhaseMarks)>> = const { RefCell::new(None) };
+        }
+
+        /// The ring capacity of one chunk: the production `layer_stages` tops at 10
+        /// stages per layer; 20 per layer leaves slack for a split stage without a
+        /// panic-prone exact count (the rig's sub-marked MoE layer tops at 16).
+        fn capacity(layers: usize) -> usize {
+            2 + layers.saturating_mul(20)
+        }
+
+        /// The share-line class of a stage recorded on a layer of `kind`: attention-
+        /// layer stages count as attention, delta-net stages as gdn, and the trailing
+        /// MoE stages (normf, route, moe) as moe on both kinds. Derived from the
+        /// recorded tag so there is one mapping; every_recorded_tag_is_pinned_by_table
+        /// pins each literal tag and its class for every stage of both kinds.
+        pub(crate) fn stage_class(stage: Stage, kind: AttentionKind) -> &'static str {
+            tag_class(stage_tag(stage, kind))
+        }
+
+        /// The recorded tag of one (stage, kind): `class:stage`, so the tag alone
+        /// carries the class the share line splits on. Literals, because the marks
+        /// store `&'static str` tags.
+        pub(crate) fn stage_tag(stage: Stage, kind: AttentionKind) -> &'static str {
+            match (stage, kind) {
+                (Stage::NormA, AttentionKind::Full) => "attn:norma",
+                (Stage::QuantA, AttentionKind::Full) => "attn:quanta",
+                (Stage::NormA, _) => "gdn:norma",
+                (Stage::QuantA, _) => "gdn:quanta",
+                (Stage::AttnProj, _) => "attn:attnproj",
+                (Stage::Prep, _) => "attn:prep",
+                (Stage::Flash, _) => "attn:flash",
+                (Stage::QuantAOut, _) => "attn:quantaout",
+                (Stage::AttnOut, _) => "attn:attnout",
+                (Stage::DeltaProj, _) => "gdn:deltaproj",
+                (Stage::Conv, _) => "gdn:conv",
+                (Stage::Scan, _) => "gdn:scan",
+                (Stage::QuantDOut, _) => "gdn:quantdout",
+                (Stage::SsmOut, _) => "gdn:ssmout",
+                (Stage::NormF, _) => "moe:normf",
+                (Stage::Route, _) => "moe:route",
+                (Stage::Moe, _) => "moe:moe",
+                (Stage::MoeStart, _) => "moe:moestart",
+                (Stage::MoeShared, _) => "moe:moeshared",
+                (Stage::MoeStage, _) => "moe:moestage",
+                (Stage::MoeScatter, _) => "moe:moescatter",
+                (Stage::MoeBankUp, _) => "moe:moebankup",
+                (Stage::MoeColdUp, _) => "moe:moecoldup",
+                (Stage::MoeSwiglu, _) => "moe:moeswiglu",
+                (Stage::MoeGather, _) => "moe:moegather",
+                (Stage::MoeBankDown, _) => "moe:moebankdown",
+                (Stage::MoeColdDown, _) => "moe:moecolddown",
+                (Stage::MoeCombine, _) => "moe:moecombine",
+            }
+        }
+
+        /// Records one stage boundary of the chunk in flight, class-prefixed by the
+        /// layer kind. No-op unless armed.
+        pub(crate) fn note_stage(
+            stream: &DeviceStream,
+            stage: Stage,
+            kind: AttentionKind,
+        ) -> Result<(), EngError> {
+            note(stream, stage_tag(stage, kind))
+        }
+
+        /// Sums one span list per stage tag, largest first. Pure, so the share line's
+        /// aggregation is testable on any host.
+        pub(crate) fn aggregate(spans: &[(&'static str, f32)]) -> Vec<(&'static str, f32)> {
+            let mut stages: Vec<(&'static str, f32)> = Vec::new();
+            for &(tag, ms) in spans {
+                match stages.iter_mut().find(|(known, _)| *known == tag) {
+                    Some(slot) => slot.1 += ms,
+                    None => stages.push((tag, ms)),
+                }
+            }
+            stages.sort_by(|a, b| b.1.total_cmp(&a.1));
+            stages
+        }
+
+        /// The class a recorded tag splits on: the `class:` prefix of a layer-stage
+        /// tag, or the fixed class of a bare chunk-boundary tag (`embed` for the
+        /// embedding span, `moe` for the zero-length open/end marks).
+        pub(crate) fn tag_class(tag: &str) -> &'static str {
+            match tag.split_once(':') {
+                Some((class, _)) => match class {
+                    "attn" => "attn",
+                    "gdn" => "gdn",
+                    "moe" => "moe",
+                    _ => "embed",
+                },
+                None => match tag {
+                    "embed" => "embed",
+                    _ => "moe",
+                },
+            }
+        }
+
+        /// The share line of one chunk's spans: per-class and top-stage sums, each as a
+        /// percentage of the whole span time. Pure; a zero whole prints 0%, never NaN.
+        pub(crate) fn share_line(spans: &[(&'static str, f32)]) -> String {
+            let whole: f32 = spans.iter().map(|(_, ms)| ms).sum();
+            let pct = |ms: f32| if whole > 0.0 { 100.0 * ms / whole } else { 0.0 };
+            let stages = aggregate(spans);
+            let mut line = format!(" whole={whole:.2}ms |");
+            for class in ["gdn", "attn", "moe", "embed"] {
+                let ms: f32 = stages
+                    .iter()
+                    .filter(|(tag, _)| tag_class(tag) == class)
+                    .map(|(_, v)| v)
+                    .sum();
+                line.push_str(&format!(" {class}={ms:.2}ms({:.0}%)", pct(ms)));
+            }
+            for (tag, ms) in stages.iter().take(6) {
+                line.push_str(&format!(" {tag}={ms:.2}ms({:.0}%)", pct(*ms)));
+            }
+            line
+        }
+
+        /// Begins the marks of one chunk. No-op unless armed.
+        pub(crate) fn begin(
+            ctx: &CudaContext,
+            p0: usize,
+            m: usize,
+            layers: usize,
+        ) -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            let marks = PhaseMarks::new(ctx, capacity(layers));
+            MARKS.with_borrow_mut(|cell| match (marks, cell.take()) {
+                (Ok(marks), _) => *cell = Some((format!("p0 {p0} m {m}"), marks)),
+                // An event-pool failure disarms this chunk (any earlier marks are
+                // dropped) — but the failed create has already closed the backend's
+                // terminal latch, so the chunk's next device operation fails and the
+                // engine refuses work until restart.
+                (Err(err), _) => eprintln!("phase-serve marks not started: {err:?}"),
+            });
+            Ok(())
+        }
+
+        /// Records one stage boundary of the chunk in flight. No-op unless armed.
+        pub(crate) fn note(stream: &DeviceStream, tag: &'static str) -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            let recorded = MARKS.with_borrow_mut(|cell| match cell {
+                Some((_, marks)) => marks.mark(stream, tag),
+                None => Ok(()),
+            });
+            match recorded {
+                Ok(()) => Ok(()),
+                // A failed record poisons this chunk's marks: drop them and stay
+                // quiet rather than fail the request over a diagnostic.
+                Err(err) => {
+                    MARKS.with_borrow_mut(Option::take);
+                    eprintln!("phase-serve mark lost, chunk unattributed: {err:?}");
+                    Ok(())
+                }
+            }
+        }
+
+        /// Drops the marks of the chunk in flight without printing: the chunk failed.
+        pub(crate) fn discard() {
+            MARKS.with_borrow_mut(Option::take);
+        }
+
+        /// Ends the chunk: prints the share line, legal only after the caller's status
+        /// read completed the stream. Per-class and per-stage sums over every span of
+        /// the chunk, each as a share of the whole. No-op unless armed.
+        pub(crate) fn end() -> Result<(), EngError> {
+            if !armed()? {
+                return Ok(());
+            }
+            if let Some((what, marks)) = MARKS.with_borrow_mut(Option::take) {
+                match marks.shares() {
+                    Ok(spans) => {
+                        eprintln!("phase-serve {what}{}", share_line(&spans));
+                    }
+                    Err(err) => {
+                        eprintln!("phase-serve shares unreadable: {err:?}");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Host tests of the serve-phase hook's pure parts: the strict switch rule and the
+    /// share-line aggregation.
+    #[cfg(test)]
+    mod serve_tests {
+        use super::super::{AttentionKind, Stage};
+        use super::serve::{aggregate, armed_from, share_line, stage_class, stage_tag, tag_class};
+        use super::stage_name;
+        use std::ffi::OsStr;
+
+        #[test]
+        fn switch_rule_is_unset_zero_one_nothing_else() {
+            assert_eq!(armed_from(None), Some(false));
+            assert_eq!(armed_from(Some(OsStr::new("0"))), Some(false));
+            assert_eq!(armed_from(Some(OsStr::new("1"))), Some(true));
+            for refused in ["", "on", "true", "2", " "] {
+                assert_eq!(armed_from(Some(OsStr::new(refused))), None, "{refused:?}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_value_is_refused() {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(armed_from(Some(OsStr::from_bytes(&[0xFF]))), None);
+        }
+
+        #[test]
+        fn aggregate_sums_by_tag_largest_first() {
+            let spans = [
+                ("flash", 10.0),
+                ("moe", 2.0),
+                ("flash", 30.0),
+                ("embed", 1.0),
+            ];
+            assert_eq!(
+                aggregate(&spans),
+                vec![("flash", 40.0), ("moe", 2.0), ("embed", 1.0)]
+            );
+        }
+
+        #[test]
+        fn every_stage_of_every_layer_kind_carries_its_class() {
+            let stages = [
+                Stage::NormA,
+                Stage::QuantA,
+                Stage::DeltaProj,
+                Stage::Conv,
+                Stage::Scan,
+                Stage::QuantDOut,
+                Stage::SsmOut,
+                Stage::AttnProj,
+                Stage::Prep,
+                Stage::Flash,
+                Stage::QuantAOut,
+                Stage::AttnOut,
+                Stage::NormF,
+                Stage::Route,
+                Stage::Moe,
+                Stage::MoeStart,
+                Stage::MoeShared,
+                Stage::MoeStage,
+                Stage::MoeScatter,
+                Stage::MoeBankUp,
+                Stage::MoeColdUp,
+                Stage::MoeSwiglu,
+                Stage::MoeGather,
+                Stage::MoeBankDown,
+                Stage::MoeColdDown,
+                Stage::MoeCombine,
+            ];
+            for kind in [AttentionKind::Full, AttentionKind::DeltaNet] {
+                for &stage in &stages {
+                    let class = stage_class(stage, kind);
+                    let tag = format!("{class}:{}", stage_name(stage));
+                    assert_eq!(tag_class(&tag), class, "{tag}");
+                }
+            }
+        }
+
+        #[test]
+        fn every_recorded_tag_is_pinned_by_table() {
+            // The expected literal for every stage of both layer kinds: a wrong
+            // class prefix or stage spelling in the stage_tag match fails here.
+            // (NormA and QuantA are the only kind-dependent arms; the trailing
+            // norm/route/moe stages are moe on both kinds.)
+            let full = [
+                (Stage::NormA, "attn:norma"),
+                (Stage::QuantA, "attn:quanta"),
+                (Stage::AttnProj, "attn:attnproj"),
+                (Stage::Prep, "attn:prep"),
+                (Stage::Flash, "attn:flash"),
+                (Stage::QuantAOut, "attn:quantaout"),
+                (Stage::AttnOut, "attn:attnout"),
+                (Stage::NormF, "moe:normf"),
+                (Stage::Route, "moe:route"),
+                (Stage::Moe, "moe:moe"),
+            ];
+            let delta = [
+                (Stage::NormA, "gdn:norma"),
+                (Stage::QuantA, "gdn:quanta"),
+                (Stage::DeltaProj, "gdn:deltaproj"),
+                (Stage::Conv, "gdn:conv"),
+                (Stage::Scan, "gdn:scan"),
+                (Stage::QuantDOut, "gdn:quantdout"),
+                (Stage::SsmOut, "gdn:ssmout"),
+                (Stage::NormF, "moe:normf"),
+                (Stage::Route, "moe:route"),
+                (Stage::Moe, "moe:moe"),
+            ];
+            let check = |kind: AttentionKind, expected: &[(Stage, &str)]| {
+                for &(stage, want) in expected {
+                    let tag = stage_tag(stage, kind);
+                    assert_eq!(tag, want, "{kind:?} {stage:?}");
+                    assert_eq!(tag_class(tag), stage_class(stage, kind), "{tag}");
+                }
+            };
+            check(AttentionKind::Full, &full);
+            check(AttentionKind::DeltaNet, &delta);
+        }
+
+        #[test]
+        fn share_line_splits_classes_and_survives_zero_whole() {
+            let spans = [
+                ("attn:flash", 30.0),
+                ("gdn:norma", 10.0),
+                ("moe:moe", 10.0),
+                ("embed", 0.0),
+            ];
+            let line = share_line(&spans);
+            assert!(line.contains("whole=50.00ms"), "{line}");
+            assert!(line.contains("attn=30.00ms(60%)"), "{line}");
+            assert!(line.contains("gdn=10.00ms(20%)"), "{line}");
+            assert!(line.contains("moe=10.00ms(20%)"), "{line}");
+            let zero = share_line(&[("attn:flash", 0.0)]);
+            assert!(zero.contains("(0%)"), "{zero}");
+            assert!(!zero.contains("NaN"), "{zero}");
+        }
+    }
+}
 /// Test-only native MMVQ projections over the existing chunk slots. These functions never
 /// interpret MMQ-packed bytes as native q8_1. They preserve chunk norms, SwiGLU and routing.
 #[cfg(test)]
@@ -3786,6 +4431,7 @@ mod kernel_diagnostics {
                     rows: dims.inter,
                     n_expert: dims.n_expert,
                     n_used: dims.top_k,
+                    glu_gate: None,
                 },
                 m,
             )?;
@@ -3823,6 +4469,7 @@ mod kernel_diagnostics {
                 rows: dims.hidden,
                 n_expert: dims.n_expert,
                 n_used: dims.top_k,
+                glu_gate: None,
             },
             m,
         )

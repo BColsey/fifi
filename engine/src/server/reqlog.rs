@@ -8,7 +8,7 @@
 use super::error::ServerError;
 use super::wire::{FinishReason, Usage};
 use crate::EngError;
-use crate::sched::job::PrefixReport;
+use crate::sched::job::{PrefillBankReport, PrefixReport};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -100,6 +100,9 @@ struct Entry<'a> {
     /// failed, refused, or stop-string request logs no prefix keys, and neither does an executor
     /// without a prefix report.
     prefix: Option<PrefixReport>,
+    /// The expert-bank counters of the job (log-only): the delta between the samples
+    /// taken around the request. `None` keeps the `prefill_bank_*` keys out of the line.
+    prefill_bank: Option<PrefillBankReport>,
 }
 
 /// Milliseconds with one decimal.
@@ -230,6 +233,33 @@ fn render(entry: &Entry<'_>) -> String {
                 json!(shadow.token_comparisons),
             );
         }
+    }
+    if let Some(bank) = entry.prefill_bank.as_ref()
+        && let Some(object) = line.as_object_mut()
+    {
+        // THIS request's prefill admits, as a before/after delta over the executor's
+        // admit-path counters (decode traffic never enters them). The histograms are arrays
+        // (`miss_histogram`: admits by their miss count; `route_histogram`: distinct experts
+        // per prefill resolve by row count), both bucketed 1, 2, 3-4, 5-8, ..., 1025-2048,
+        // 2049+ — buckets 0-2 carry the rows under the prefill's eight-row CPU-tail tiering,
+        // bucket 3 straddles the edge at exactly eight. `upload_bytes` counts the admit copies
+        // and the ring's streamed records; `upload_ns` is the admit copy spans' wall time,
+        // each ending in the store synchronize the copy path already performs.
+        object.insert("prefill_bank_passes".to_string(), json!(bank.passes));
+        object.insert("prefill_bank_misses".to_string(), json!(bank.misses));
+        object.insert(
+            "prefill_bank_miss_histogram".to_string(),
+            json!(bank.miss_histogram),
+        );
+        object.insert(
+            "prefill_bank_route_histogram".to_string(),
+            json!(bank.route_histogram),
+        );
+        object.insert(
+            "prefill_bank_upload_bytes".to_string(),
+            json!(bank.upload_bytes),
+        );
+        object.insert("prefill_bank_upload_ns".to_string(), json!(bank.upload_ns));
     }
     line.to_string()
 }
@@ -406,6 +436,7 @@ pub(crate) struct RequestLog {
     /// True after the handler marked a prefix boundary on this request.
     prefix_boundary: bool,
     prefix: Option<PrefixReport>,
+    prefill_bank: Option<PrefillBankReport>,
     /// The HTTP method and path that produced this request, and the prompt
     /// digests of the rendered prompt. Set by the handlers before any line
     /// is written; a log built by a test may leave them unset.
@@ -449,6 +480,7 @@ impl RequestLog {
             written: false,
             prefix_boundary: false,
             prefix: None,
+            prefill_bank: None,
             method: Some(method),
             endpoint: Some(endpoint),
             digests: None,
@@ -511,8 +543,10 @@ impl RequestLog {
         finish: FinishReason,
         usage: &Usage,
         prefix: Option<&PrefixReport>,
+        prefill_bank: Option<&PrefillBankReport>,
     ) {
         self.prefix = prefix.copied();
+        self.prefill_bank = prefill_bank.cloned();
         self.write(
             Some(200),
             Outcome::Ok,
@@ -602,6 +636,7 @@ impl RequestLog {
             first_token,
             decode,
             prefix: self.prefix.filter(|_| self.prefix_boundary),
+            prefill_bank: self.prefill_bank.clone(),
         };
         let mut line = render(&entry);
         line.push('\n');
@@ -685,7 +720,7 @@ mod tests {
         stepped_clock,
     };
     use crate::EngError;
-    use crate::sched::job::{PrefixHit, PrefixReport};
+    use crate::sched::job::{PrefillBankReport, PrefixHit, PrefixReport};
     use crate::sched::worker::{Engine, EngineState};
     use crate::server::router::router;
     use crate::server::state::AppState;
@@ -1140,7 +1175,7 @@ mod tests {
             "/v1/messages",
         );
         log.set_prompt_digests(&ids, 2999);
-        log.done(FinishReason::Stop, &Usage::new(3000, 0, 0), None);
+        log.done(FinishReason::Stop, &Usage::new(3000, 0, 0), None, None);
         let line = &capture.lines_with_keys(&ROUTE_KEYS)[0];
         assert_eq!(line["method"], "POST");
         assert_eq!(line["endpoint"], "/v1/messages");
@@ -1199,7 +1234,35 @@ mod tests {
             first_token: None,
             decode: None,
             prefix: None,
+            prefill_bank: None,
         }
+    }
+
+    #[test]
+    fn the_prefill_bank_keys_render_only_with_a_report() {
+        let mut entry = empty_entry();
+        let bare: Value = serde_json::from_str(&render(&entry)).expect("json");
+        assert!(bare.get("prefill_bank_misses").is_none());
+        // The decode-side pick counters were removed with the lifetime semantics.
+        entry.prefill_bank = Some(PrefillBankReport {
+            passes: 4,
+            misses: 2,
+            miss_histogram: vec![2, 1, 1],
+            route_histogram: vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            upload_bytes: 123_456,
+            upload_ns: 1_070_000_000,
+        });
+        let line: Value = serde_json::from_str(&render(&entry)).expect("json");
+        assert_eq!(line["prefill_bank_passes"], 4);
+        assert!(line.get("prefill_bank_picks").is_none());
+        assert_eq!(line["prefill_bank_misses"], 2);
+        assert_eq!(line["prefill_bank_miss_histogram"], json!([2, 1, 1]));
+        assert_eq!(
+            line["prefill_bank_route_histogram"],
+            json!([1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(line["prefill_bank_upload_bytes"], 123_456);
+        assert_eq!(line["prefill_bank_upload_ns"], 1_070_000_000);
     }
 
     #[test]
@@ -1293,7 +1356,12 @@ mod tests {
         for _ in 0..batches {
             log.batch(1);
         }
-        log.done(FinishReason::Length, &Usage::new(21, batches, 0), None);
+        log.done(
+            FinishReason::Length,
+            &Usage::new(21, batches, 0),
+            None,
+            None,
+        );
         drop(log);
         let mut lines = capture.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1434,7 +1502,7 @@ mod tests {
         log.batch(0);
         log.batch(1);
         log.batch(2);
-        log.done(FinishReason::Stop, &Usage::new(4, 3, 1), None);
+        log.done(FinishReason::Stop, &Usage::new(4, 3, 1), None, None);
         drop(log);
         let lines = capture.lines();
         assert_eq!(lines.len(), 1, "{:?}", capture.writes());
@@ -1467,7 +1535,7 @@ mod tests {
             "GET",
             "/v1/test",
         );
-        log.done(FinishReason::Stop, &Usage::new(4, 0, 0), None);
+        log.done(FinishReason::Stop, &Usage::new(4, 0, 0), None, None);
         drop(log);
     }
 

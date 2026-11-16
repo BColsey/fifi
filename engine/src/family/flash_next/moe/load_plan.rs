@@ -1,7 +1,7 @@
 //! The memory plan of a full Flash-Next load: what the pack's own header walk and config say about
 //! the sizes, joined to the context-aware expert budget.
 //!
-//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`FlashPackReport`), the model config
+//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`PackReport`), the model config
 //! and the n-gram table length, and derives every number the load needs without reading a payload:
 //! the routed-expert shape, the trunk bytes on the device (everything but the experts and the
 //! embedding, which the host gathers), the DeltaNet state, the K/V geometry of the attention layers
@@ -25,11 +25,9 @@ use super::{
 };
 use crate::{
     EngError,
-    family::flash_next::{
-        deltanet::DeltaState,
-        load::{exl3_pack::FlashPackReport, model_shape},
-    },
-    family::qwen36::tiered::budget::KvPlan,
+    family::device_budget::KvPlan,
+    family::exl3_pack::PackReport,
+    family::flash_next::{deltanet::DeltaState, load::model_shape},
 };
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -59,7 +57,7 @@ impl FlashLoadPlan {
     /// the cost-model fixture); its `shape`,
     /// `vram.non_expert` and `kv` fields are replaced by what the pack says.
     pub(in crate::family::flash_next) fn new(
-        report: &FlashPackReport,
+        report: &PackReport,
         model_config: &[u8],
         ngram_bytes: u64,
         card: TierInputs,
@@ -73,7 +71,6 @@ impl FlashLoadPlan {
             .checked_mul(moe.hidden as u64 * 2)
             .ok_or_else(|| refuse("the embedding size overflows".into()))?;
         let trunk_bytes = report
-            .pack
             .device_bytes
             .checked_sub(report.expert_bytes)
             .and_then(|rest| rest.checked_sub(embedding_bytes))

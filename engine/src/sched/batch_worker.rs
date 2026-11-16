@@ -25,6 +25,10 @@ struct Slot<S> {
     ready: bool,
     finished: bool,
     slow: bool,
+    /// The admit-path bank counters as they stood when the slot was built, so the ready
+    /// transition can log this slot's prefill delta once (the slots share one executor, so
+    /// the delta spans the pieces other ready slots prefilled alongside it).
+    bank_before: Option<crate::sched::job::PrefillBankReport>,
     /// Whether the eviction restart already ran for this slot: a restarted slot saves
     /// nothing. Later denials are NOT final by that alone: they evict one more entry and
     /// restart again - final only through `exhausted_restart` below, the classify gate, or
@@ -102,7 +106,7 @@ fn cancelled<S>(slot: &mut Slot<S>) {
                     finish: Some(DecodeFinish::Cancelled),
                 }),
             ) {
-                send_terminal(&slot.job.events, JobEvent::Finished(slot.usage));
+                send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
             }
         }
         Err(error) => send_terminal(&slot.job.events, JobEvent::Error(error)),
@@ -188,10 +192,12 @@ fn build_slot<E: ExecutorOps>(
             completion_tokens: 0,
             reused_tokens: 0,
             prefix: None,
+            prefill_bank: None,
         },
         ready: false,
         finished: false,
         slow: false,
+        bank_before: executor.prefill_bank_report(),
         retried: false,
         exhausted_restart: false,
     };
@@ -302,6 +308,12 @@ fn prefill<E: ExecutorOps>(
     refresh_report(executor, slot);
     if slot.cursor == slot.job.prompt.len() {
         slot.ready = true;
+        // The bank counters land once, at the ready transition, as this slot's prefill
+        // delta (log-only; `None` is the report of an executor without an expert bank).
+        slot.usage.prefill_bank = match (executor.prefill_bank_report(), slot.bank_before.take()) {
+            (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
+            _ => None,
+        };
     }
     Ok(())
 }
@@ -354,11 +366,11 @@ pub(super) fn work<E: ExecutorOps>(
                 }
                 break;
             };
-            let Message::Job(job) = message else {
+            let Message::Job(job, ticket) = message else {
                 shared.stop.store(true, Ordering::SeqCst);
                 break;
             };
-            shared.queued.fetch_sub(1, Ordering::SeqCst);
+            drop(ticket);
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
                 cancel_unstarted(job);
                 continue;
@@ -625,7 +637,7 @@ pub(super) fn work<E: ExecutorOps>(
         slots.retain(|slot| {
             if slot.slow || slot.finished {
                 if !slot.slow {
-                    send_terminal(&slot.job.events, JobEvent::Finished(slot.usage));
+                    send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
                 }
                 unregister(shared, &slot.job);
                 false

@@ -152,12 +152,35 @@ int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_linear_args *c
                                         unsigned cols);
 /* The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
  * with one packed byte dot product (DP4A), bit 1 takes up to 20 calls in one launch (else up to
- * 16); options 0 is refused (that is inference_cuda_exl3_grouped_indexed). Every byte written
- * equals the default launch of the same calls. */
+ * 16), bit 2 pipelines the tile loop (the next tile's loads issued before the current one's
+ * barriers); options 0 is refused (that is inference_cuda_exl3_grouped_indexed). Every byte
+ * written equals the default launch of the same calls. */
 int inference_cuda_exl3_grouped_indexed_option(const inference_cuda_exl3_linear_args *calls,
                                                const inference_cuda_exl3_index_args *index,
                                                size_t count, void *stream, int *out_stage,
                                                unsigned options);
+/* The pointer-table batched id-indexed launch: one kernel per stage over every record of a
+ * device-resident table (IndexedTablePair array), past the 4096-byte parameter block's 20-pair
+ * cap. `k_units`/`n_tiles`/`n_units` are the batch's widest shapes (ceil(k/128), n/16,
+ * ceil(n/128)); narrow records idle their tail blocks. Records carry their own k and n, so one
+ * batch may mix shapes. `options` bit 0 is DP4A, bit 2 the pipelined tile loop; bits 1 and 3 do
+ * not apply. Every byte written equals the option launch of the same calls one batch at a
+ * time. The caller fills and validates the table; this launches only. */
+struct IndexedTablePair;
+int inference_cuda_exl3_indexed_table(const IndexedTablePair *pairs, size_t pairs_count,
+                                      uint32_t k_units, uint32_t n_tiles, uint32_t n_units,
+                                      uint32_t *flag, uint32_t fused_publish, void *stream,
+                                      int *out_stage, unsigned options);
+/* The host-side packer for the table launch: fills `out` (an array of `pairs_count`
+ * IndexedTablePair the caller owns, `out_bytes` long) from the same call and index records
+ * the option launch takes, validating per record with per-record spans and cross-record write
+ * isolation. A count whose records do not fit `out_bytes` is refused, so a stale size constant
+ * on one side cannot overwrite the other's buffer. Shapes may differ per record; k and n are
+ * written into each record. */
+int inference_cuda_exl3_indexed_table_pack(const inference_cuda_exl3_linear_args *calls,
+                                           const inference_cuda_exl3_index_args *index,
+                                           size_t pairs_count, size_t out_bytes,
+                                           IndexedTablePair *out);
 /* Test probe of the DP4A decode: per word, the byte sum and the DP4A result (2 * count words);
  * per state 0..65535, the book-2 decode and its DP4A form (2 * 65536 halves). */
 int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count, uint32_t *sums,
@@ -254,17 +277,13 @@ static_assert(sizeof(inference_cuda_exl3_job) == 16 &&
 #endif
 int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *args,
                              void *stream, int *out_stage);
-/* The same launches with an explicit fused-output-rotation request (the FIFI_EXL3_JOBS_FUSED_OUT
- * default is off); the fusion applies only when the register-decode kernel is taken. */
-int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *args,
-                                       void *stream, int *out_stage, int fused_out);
-/* The same launches with both requests explicit: the fused output rotation (above) and the
- * warp-wide input rotation. The FIFI_EXL3_JOBS_WARP_ROTATE default is off. The wide kernel gives
- * the same xh bits as the one-thread-per-value kernel; it needs x and suh 16-byte aligned (and
- * the member stride of the scales a multiple of 4 floats), xh 8-byte aligned, and a call that
- * does not meet that runs the one-thread-per-value kernel whatever the request. */
-int inference_cuda_exl3_jobs_modes(const inference_cuda_exl3_jobs_args *args,
-                                   void *stream, int *out_stage, int fused_out, int wide_input);
+/* The same launches with the warp-wide input-rotation request explicit. The
+ * FIFI_EXL3_JOBS_WARP_ROTATE default is off. The wide kernel gives the same xh bits as the
+ * one-thread-per-value kernel; it needs x and suh 16-byte aligned (and the member stride of the
+ * scales a multiple of 4 floats), xh 8-byte aligned, and a call that does not meet that runs the
+ * one-thread-per-value kernel whatever the request. */
+int inference_cuda_exl3_jobs_wide(const inference_cuda_exl3_jobs_args *args,
+                                  void *stream, int *out_stage, int wide_input);
 /* Whether the warp-wide input rotation would run for a call with the request `enabled` (1) or
  * not (0), from the alignment rules alone; INFERENCE_CUDA_INVALID_ARGUMENT for a null args
  * pointer. */
@@ -294,10 +313,9 @@ int inference_cuda_exl3_jobs_pair_usable(const inference_cuda_exl3_jobs_args *a,
                                          const inference_cuda_exl3_jobs_args *b);
 /* The projection and the output rotation of a call whose xh already holds the rotated input rows
  * (written by inference_cuda_exl3_jobs_rotate_pair on the same stream): the input rotation is
- * skipped. fused_out is the fused output rotation request, negative for the environment's. Calling
- * it on an xh that was not rotated projects whatever xh holds. */
+ * skipped. Calling it on an xh that was not rotated projects whatever xh holds. */
 int inference_cuda_exl3_jobs_rotated(const inference_cuda_exl3_jobs_args *a, void *stream,
-                                     int *out_stage, int fused_out);
+                                     int *out_stage);
 
 /* Member addressing of a job-table call, shared by every stage kernel that reads the table: the
  * trellis of member m starts trellis_stride u16 elements after member m-1's, its suh and svh

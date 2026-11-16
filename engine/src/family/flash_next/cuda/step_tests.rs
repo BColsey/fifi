@@ -21,13 +21,11 @@
 //!
 //! Needs a GPU, `--test-threads=1` and (for the full window) several GiB; ignored by default.
 
+use crate::family::exl3::launch::Launch;
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     load::{
         TrunkList,
@@ -36,11 +34,13 @@ use super::{
     moe_block::SplitMoe,
     state::StateSlot,
     step::{AllResidentMoe, FlashStep, MIXER, MoeBlock, SplitMoeAt, bank_key, split_trunk},
-    step_plan::{Site, Slot},
+    step_plan::{PREFILL_TILE_ROWS, Site, Slot},
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{
+        exl3::source::PackReader,
         exl3_pack::{ExpertPart, Root, expert_name_in, layer_name},
         flash_next::{
             deltanet::{self, DeltaState, DeltaWeights},
@@ -56,7 +56,6 @@ use crate::{
             DenseProjector, DenseWeight, Projector,
             cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         },
-        qwen36::cuda::exl3_source::PackReader,
     },
     kernels::{
         cuda::{DeviceStream, device_present},
@@ -65,6 +64,64 @@ use crate::{
     },
     weights::exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
 };
+
+#[test]
+#[ignore = "needs CUDA and FIFI_FLASH_NEXT_EXL3_PACK layer-3 trunk"]
+fn shared_arena_ownership_does_not_enable_shared_decode() {
+    assert!(
+        device_present("Flash-Next prefill phase"),
+        "a GPU is required"
+    );
+    let pack = checkpoint();
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let weights = device_weights(&projector, &pack, &[3], (false, false));
+    for shared in [false, true] {
+        let make = if shared {
+            FlashStep::new_prefill
+        } else {
+            FlashStep::new
+        };
+        let step = make(
+            ctx,
+            &stream,
+            &weights,
+            &pack.model_config,
+            POSITIONS,
+            3,
+            3..4,
+        )
+        .expect("metadata-only step");
+        assert_eq!(step.step_plan.index(Slot::PrefillPerm).is_some(), shared);
+        assert!(
+            !step.shared_prefill(),
+            "decode starts outside the prefill window"
+        );
+        step.prefill_window.set(true);
+        assert_eq!(step.shared_prefill(), shared);
+        if shared {
+            let launch = Launch {
+                ctx,
+                stream: &stream,
+            };
+            let actual = step
+                .prefill_projector(&launch, 3)
+                .expect("actual projector");
+            assert_eq!(actual.tile_rows, PREFILL_TILE_ROWS);
+            let jobs = crate::family::exl3::prefill::dense_jobs(3, actual.tile_rows);
+            assert_eq!(
+                actual.scratch.jobs.bytes(),
+                crate::kernels::cuda::resident::exl3::Exl3Job::table(&jobs).len()
+            );
+        }
+        step.prefill_window.set(false);
+        assert!(!step.shared_prefill(), "closing the window restores decode");
+        step.prefill_window.set(true);
+        step.reset().expect("reset inside an open window");
+        assert!(!step.shared_prefill(), "reset closes the window");
+    }
+}
 
 /// Tokens of the sequence a layer runs.
 const TOKENS: usize = 10;
@@ -580,7 +637,7 @@ fn split_block<'w>(
     weights: &'w CudaWeights,
     layers: &[usize],
     slots: usize,
-    dims: &crate::family::qwen36::cuda::moe::MoeDims,
+    dims: &crate::family::exl3::launch::MoeDims,
 ) -> SplitMoeAt<'w> {
     let source = PackRecordSource::new(checkpoint).expect("the record source");
     let record = source.layout().record_bytes();
@@ -1222,6 +1279,7 @@ fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
 }
 
 #[test]
+#[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
 fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
     // The chunked prefill contract at the step level: M rows through one rows=M step equal M
     // launches of a rows=1 step, stream rows and DeltaNet states alike. The tolerance covers the
@@ -1366,6 +1424,45 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
             "layer {layer}: the chunk's conv ring drifts beyond the jobs-kernel rounding"
         );
     }
+}
+
+#[test]
+#[ignore = "needs a GPU, an 8 GiB lease and the pack in FIFI_FLASH_NEXT_EXL3_PACK (root weights only)"]
+fn shared_prefill_owner_allocates_the_extended_list_and_zeroes_it() {
+    assert!(device_present(
+        "shared_prefill_owner_allocates_the_extended_list_and_zeroes_it"
+    ));
+    let checkpoint = checkpoint();
+    let projector = CudaProjector::new().unwrap();
+    let ctx = projector.context();
+    let stream = ctx.stream().unwrap();
+    let weights = device_weights(&projector, &checkpoint, &[], (true, false));
+    let step = FlashStep::new_prefill(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        64,
+        64,
+        0..1,
+    )
+    .unwrap();
+    let view = step.slot(Slot::PrefillY).unwrap();
+    let scratch = view.buffer();
+    assert_eq!(scratch.bytes(), step.step_plan.arena_bytes());
+    assert!(step.step_plan.index(Slot::PrefillPerm).is_some());
+    assert!(step.step_plan.index(Slot::PrefillY).is_some());
+    for entry in step.step_plan.slots() {
+        let range = step.slot(entry.slot).unwrap();
+        assert_eq!(range.bytes(), entry.bytes);
+        assert_eq!(
+            step.step_plan.placement(entry.slot),
+            Some((range.offset(), range.bytes()))
+        );
+    }
+    let mut bytes = vec![0u8; scratch.bytes()];
+    scratch.read_at(&stream, 0, &mut bytes).unwrap();
+    assert!(bytes.iter().all(|&byte| byte == 0));
 }
 
 fn write_params(step: &FlashStep<'_>, token: i32, pos: i32) {

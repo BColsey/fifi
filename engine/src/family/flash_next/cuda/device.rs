@@ -15,12 +15,14 @@ use std::ops::Range;
 use super::{
     driver::TokenDevice,
     feeds::StartSink,
+    ple_feed::PleKeyValue,
+    state::StateSlot,
     step::{FlashStep, SplitMoeAt},
     step_plan::Slot,
 };
+use crate::family::flash_next::cuda::feeds::device::DevicePle;
 use crate::{
-    EngError, family::qwen36::exl3_tensors::f32_le_bytes,
-    kernels::cuda::resident::step_params::StepParams,
+    EngError, family::exl3_tensors::f32_le_bytes, kernels::cuda::resident::step_params::StepParams,
 };
 
 pub(super) struct CardDevice {
@@ -63,6 +65,38 @@ impl CardDevice {
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses
     }
+
+    /// The bank's admit-path counters for the request log's `prefill_bank_*` keys (log-only).
+    pub(super) fn bank_report(&self) -> crate::sched::job::PrefillBankReport {
+        self.moe.bank().prefill_report()
+    }
+
+    /// The bank's placement digest ([`bank_placement_digest`]): what a run record's step-0
+    /// logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> (u32, String) {
+        bank_placement_digest(&self.moe)
+    }
+}
+
+/// The expert bank's placement state: slots per layer and a SHA-256 over every layer's
+/// `(place, expert)` residents, by place. The step-0 logits of a run follow this state (the
+/// bank size and the free VRAM at load pick the residents), so two run records compare only
+/// at the same digest.
+#[cfg(test)]
+fn bank_placement_digest(moe: &SplitMoeAt<'static>) -> (u32, String) {
+    use sha2::{Digest, Sha256};
+    let state = moe.bank().state();
+    let geometry = *state.geometry();
+    let mut hasher = Sha256::new();
+    for layer in 0..geometry.layers {
+        hasher.update((layer as u32).to_le_bytes());
+        for (place, expert) in state.places().occupied(layer) {
+            hasher.update(place.to_le_bytes());
+            hasher.update(expert.to_le_bytes());
+        }
+    }
+    (geometry.slots as u32, format!("{:x}", hasher.finalize()))
 }
 
 impl StartSink for CardDevice {
@@ -130,6 +164,24 @@ impl TokenDevice for CardDevice {
     fn bank_misses(&self) -> Option<u64> {
         Some(CardDevice::bank_misses(self))
     }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        Some(CardDevice::bank_report(self))
+    }
+}
+
+impl super::driver::StateIo for CardDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.step.read_fixed_state()
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.step.fixed_state_bytes()
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step.write_fixed_state(parts)
+    }
 }
 
 /// The card implementation of [`ChunkDevice`]: the same [`FlashStep`] and [`SplitMoeAt`] as
@@ -139,6 +191,9 @@ impl TokenDevice for CardDevice {
 pub(super) struct CardChunkDevice {
     step: FlashStep<'static>,
     moe: SplitMoeAt<'static>,
+    /// The PLE projections on the card, when the device route is on: `write_chunk_ple` stages the
+    /// chunk's embeddings here and `ple_project_chunk` runs them.
+    ple: Option<DevicePle>,
     stream_width: usize,
     logits_width: usize,
     /// The rows of the chunk in flight, set by `write_chunk_params`.
@@ -147,11 +202,20 @@ pub(super) struct CardChunkDevice {
 
 impl CardChunkDevice {
     pub(super) fn new(step: FlashStep<'static>, moe: SplitMoeAt<'static>) -> Self {
+        Self::with_ple(step, moe, None)
+    }
+
+    pub(super) fn with_ple(
+        step: FlashStep<'static>,
+        moe: SplitMoeAt<'static>,
+        ple: Option<DevicePle>,
+    ) -> Self {
         let stream_width = step.geometry.branches * step.geometry.hidden;
         let logits_width = step.model.vocab;
         Self {
             step,
             moe,
+            ple,
             stream_width,
             logits_width,
             m: 1,
@@ -174,9 +238,25 @@ impl CardChunkDevice {
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses
     }
+
+    /// The bank's admit-path counters for the request log's `prefill_bank_*` keys (log-only).
+    pub(super) fn bank_report(&self) -> crate::sched::job::PrefillBankReport {
+        self.moe.bank().prefill_report()
+    }
+
+    /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
+    /// what a run record's step-0 logits hash compares at.
+    #[cfg(test)]
+    pub(super) fn placement_digest(&self) -> (u32, String) {
+        bank_placement_digest(&self.moe)
+    }
 }
 
 impl super::driver::chunk::ChunkDevice for CardChunkDevice {
+    fn drain(&mut self) -> Result<(), EngError> {
+        self.step.stream.synchronize()
+    }
+
     fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<(), EngError> {
         self.m = usize::try_from(m).map_err(|_| {
             EngError::BadRequest(format!("Flash-Next chunk driver: a negative row count {m}"))
@@ -197,13 +277,44 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
             .write_at(self.step.stream, range.offset(), &f32_le_bytes(rows))
     }
 
-    /// The PLE projections stage their own embedding; the chunk start needs no copy of it.
-    fn write_chunk_ple(&mut self, _rows: &[f32]) -> Result<(), EngError> {
-        Ok(())
+    /// The device route stages the chunk's embeddings and queues both projections right away:
+    /// they depend only on the embeddings, so the two launches ride ahead of the layers and are
+    /// done when `ple_project_chunk` reads them back. Without the route there is nothing to
+    /// stage; the projections run on the host inside `ple_update`.
+    fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<(), EngError> {
+        let Some(ple) = self.ple.as_mut() else {
+            return Ok(());
+        };
+        let m = self.m;
+        ple.enqueue_chunk(self.step.ctx, self.step.stream, rows, m)
+    }
+
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
+        let m = self.m;
+        let Some(ple) = self.ple.as_ref() else {
+            return Err(EngError::Backend {
+                operation: "flash_next_cuda_chunk",
+                message: "the PLE device route was armed but this device has no projections"
+                    .to_string(),
+            });
+        };
+        ple.collect_chunk(self.step.stream, m)
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {
+        self.moe.begin_chunk();
         self.step.begin_chunk(self.m)
+    }
+
+    fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.step.prefill_window.set(true);
+        self.moe.begin_prefill();
+        Ok(())
+    }
+
+    fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.step.prefill_window.set(false);
+        self.moe.end_prefill()
     }
 
     fn layers(
@@ -247,10 +358,34 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
 
     fn reset(&mut self) -> Result<(), EngError> {
         self.m = 1;
+        // A reset can land inside an open prefill window; close it so the next single-row
+        // step does not ride a stale plan. Best-effort: a failure here means the card is
+        // going down, and the step reset below still clears what it can.
+        if let Err(error) = self.moe.end_prefill() {
+            eprintln!("flash-next cuda: ending the prefill window on reset failed: {error:?}");
+        }
         self.step.reset()
     }
 
     fn bank_misses(&self) -> Option<u64> {
         Some(self.moe.bank().stats().misses)
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        Some(CardChunkDevice::bank_report(self))
+    }
+}
+
+impl super::driver::StateIo for CardChunkDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.step.read_fixed_state()
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.step.fixed_state_bytes()
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step.write_fixed_state(parts)
     }
 }

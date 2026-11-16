@@ -1,4 +1,4 @@
-//! The EXL3 MoE block of the CUDA step (`qwen36::cuda::exl3_moe`, shared with Flash-Next) on one
+//! The EXL3 MoE block of the CUDA step (`family::exl3::moe`, shared with Flash-Next) on one
 //! real layer of the Qwen3.8 Flash-Next EXL3 pack, against an fp64 evaluation of the same stored
 //! matrices and against this module's host `route`.
 //!
@@ -35,12 +35,14 @@
 //! the real weights. `FIFI_EXL3_INDEXED_PAIRS=20` queues the 20 gate and up pairs as one launch.
 //! The test prints the options it ran with.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::Path;
 
 use super::route;
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         exl3_pack::{
             ExpertPart, Root, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
         },
@@ -50,10 +52,6 @@ use crate::{
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
     },
     kernels::cuda::{
         DeviceBuffer, device_present,
@@ -216,9 +214,9 @@ pub(in crate::family::flash_next) struct Reference {
     /// The probability gap between the last pick and the best expert left out.
     margin: f64,
     /// `[top_k][gate | up]` in pick order, the layout of the block's `expert_gu`.
-    gu: Vec<f64>,
+    pub(in crate::family::flash_next) gu: Vec<f64>,
     /// `[top_k][hidden]`: each pick's down projection, unweighted, in pick order.
-    down: Vec<f64>,
+    pub(in crate::family::flash_next) down: Vec<f64>,
     pub(in crate::family::flash_next) out: Vec<f64>,
 }
 
@@ -399,6 +397,16 @@ pub(in crate::family::flash_next) fn relative_l2(actual: &[f32], expected: &[f64
     let (mut error, mut norm) = (0.0f64, 0.0f64);
     for (a, e) in actual.iter().zip(expected) {
         error += (f64::from(*a) - e).powi(2);
+        norm += e * e;
+    }
+    (error / norm).sqrt()
+}
+
+/// [`relative_l2`] with both sides already in f64 (device families against each other).
+pub(in crate::family::flash_next) fn relative_l2_f64(actual: &[f64], expected: &[f64]) -> f64 {
+    let (mut error, mut norm) = (0.0f64, 0.0f64);
+    for (a, e) in actual.iter().zip(expected) {
+        error += (a - e).powi(2);
         norm += e * e;
     }
     (error / norm).sqrt()

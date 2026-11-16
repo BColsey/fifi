@@ -2,10 +2,11 @@
 use super::{
     common_tests::{dims, plan},
     dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::{DenseSpec, MixerGeometry, check_dense},
+    mixer_geometry::MixerGeometry,
     shard::ShardTable,
     step_plan::{KernelScratch, Phase, Slot, StepPlan},
 };
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, gguf_model::Role};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;

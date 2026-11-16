@@ -370,9 +370,9 @@ impl ExpertLocator {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{ExpertLocator, ExpertTensorNames, LocatorError};
-    use crate::family::qwen36::tiered::budget::{ExpertSize, HostBudget, plan_host};
     use crate::family::qwen36::tiered::cpu_pool::{CpuPool, MappedRegion};
     use crate::family::qwen36::tiered::{PolicyMode, TieredConfig};
+    use crate::family::tier_budget::{ExpertSize, HostBudget, plan_host};
     use crate::kernels::expert_cpu::{
         ExpertScratch, ExpertShape, ExpertSlices, Q4K_BLOCK_BYTES, Q4K_BLOCK_VALUES, expert_forward,
     };

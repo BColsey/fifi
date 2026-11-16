@@ -10,6 +10,7 @@
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
+use crate::family::kv_format::KvRowShape;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
@@ -120,6 +121,8 @@ pub(crate) fn prefix_store_limits_of(
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Q36Options {
+    /// Optional content pin for the selected CUDA GGUF file: exactly 64 hex digits.
+    pub(crate) gguf_sha256: Option<String>,
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
     pub(crate) cache_limit_bytes: Option<u64>,
     /// The first position that the engine refuses, from 2. The default is 262,144 on the MLX arm
@@ -166,6 +169,9 @@ pub(crate) struct Q36Options {
     /// not bit-identical to the uncompiled path). The default is `false`; the shipped Mac config
     /// sets `true`. The MLX arm reads it; the CUDA arm records it as ignored.
     pub(crate) compile: Option<bool>,
+    /// MLX-only distinct compiled programs per adapter, positive and addressable. Default 8.
+    /// Raising this budget is opt-in and does not enable compilation.
+    pub(crate) compile_program_limit: Option<usize>,
     /// Concurrent MLX sessions, from 1 to 8. The default is 1; larger windows require compile.
     pub(crate) max_seqs: Option<usize>,
     /// The exact LRU entry count of the prefix store of a `prefix_reuse` engine, as the operator's
@@ -633,6 +639,31 @@ pub(crate) struct TieredSettings {
 pub(crate) struct Q36Env {
     /// `Q36_CACHE_LIMIT`, a byte count.
     pub(crate) cache_limit: Option<String>,
+    /// `Q36_KV_GEOMETRIC`, `1` arming the geometric KV capacity law (the raw value;
+    /// `resident::state::geometric_growth` remains the parse authority).
+    pub(crate) kv_geometric: Option<String>,
+    /// `Q36_SPEC_STEP_WINDOW`, `2` arming the checkpoint-window verify path (the raw
+    /// value; `resident::executor`'s one-shot readers remain the parse authority).
+    pub(crate) spec_step_window: Option<String>,
+}
+
+/// The checkpoint-window verify path (`Q36_SPEC_STEP_WINDOW=2`) commits at the NEXT
+/// driver cycle, and under the geometric KV law (`Q36_KV_GEOMETRIC=1`) the interleaved
+/// plain rows grow the shared caches before the commit fires, so the deferred commit's
+/// restore adopts the checkpoint's frozen capacities - an extent no reserve taken at the
+/// window can bound (measured on the Mac: a commit at live position 257 adopted 524,288
+/// bytes with 281,616 available). Engine open refuses the combination until the
+/// deferred commit is fixed; each variable alone still opens. The armed conditions
+/// mirror the one-shot readers in the resident modules (`Some("1")`, `Some("2")`).
+fn geometric_checkpoint_window(env: &Q36Env) -> Result<(), EngError> {
+    if env.kv_geometric.as_deref() == Some("1") && env.spec_step_window.as_deref() == Some("2") {
+        return Err(bad(
+            "Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The dtype of the Q36 decode activations: the hidden state between blocks, the inputs of the
@@ -685,6 +716,25 @@ pub(crate) const Q8_GROUP: u32 = 64;
 /// places and the portable check of `quantize_rows`.
 pub(crate) const Q8_BITS: u32 = 8;
 
+/// Parses the `Q36_KV_GEOMETRIC` value: absent or `0` is the quantum law (false), `1`
+/// is the geometric law (true), anything else is an error naming the value. Pure, so a
+/// host test pins every arm; `state::geometric_growth` applies it once per process.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn parse_kv_geometric(
+    value: Result<String, std::env::VarError>,
+) -> Result<bool, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(text) if text == "0" => Ok(false),
+        Ok(text) if text == "1" => Ok(true),
+        Ok(text) => Err(format!("Q36_KV_GEOMETRIC must be 0 or 1, got {text:?}")),
+        Err(error) => Err(format!("Q36_KV_GEOMETRIC is not valid text: {error}")),
+    }
+}
+
 /// The LOGICAL bytes that one more position adds to the cache of ONE attention layer, from the
 /// cache form and the activation dtype — the one byte authority: `attn::growth_bytes` (which
 /// `state::kv_growth_bytes` calls) and `cache_growth_per_position` reach it.
@@ -710,34 +760,14 @@ pub(crate) fn kv_growth_per_position(
             "kv_dtype q8 needs a head_dim that is a multiple of {Q8_GROUP}, got {head_dim}"
         )));
     }
-    let scale_bytes = act.dtype().byte_width();
-    let heads = u64::from(kv_heads);
-    let width = u64::from(head_dim);
-    let bytes = match kv {
-        // Keys and values `[1, KVH, 1, D]` F32.
-        KvDtype::F32 => heads
-            .checked_mul(width)
-            .and_then(|row| row.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(4)),
-        // Keys and values `[1, KVH, 1, D]` BF16: the F32 shapes at half storage.
-        KvDtype::Bf16 => heads
-            .checked_mul(width)
-            .and_then(|row| row.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(2)),
-        // Per side: codes `[1, KVH, 1, D/4]` U32 (`KVH * D` bytes), plus scales and biases
-        // `[1, KVH, 1, D/64]` (`2 sides * 2 arrays * KVH * groups * scale_bytes`).
-        KvDtype::Q8 => heads.checked_mul(width).and_then(|codes| {
-            let codes = codes.checked_mul(2)?;
-            let params = width
-                .checked_div(u64::from(Q8_GROUP))
-                .and_then(|groups| heads.checked_mul(groups))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_mul(scale_bytes))?;
-            codes.checked_add(params)
-        }),
-    };
-    bytes.ok_or_else(|| EngError::MemoryPlan("attention growth bytes overflow u64".into()))
+    let bytes = kv
+        .format(act)
+        .layer_position_bytes(KvRowShape {
+            heads_kv: u64::from(kv_heads),
+            head_dim: u64::from(head_dim),
+        })
+        .map_err(|_| EngError::MemoryPlan("attention growth bytes overflow u64".into()))?;
+    Ok(bytes)
 }
 
 /// Parses the `activation_dtype` member: `f32` or `bf16`. Any other text is refused in the style of
@@ -809,6 +839,24 @@ pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
         KvDtype::F32 => "f32",
         KvDtype::Bf16 => "bf16",
         KvDtype::Q8 => "q8",
+    }
+}
+
+impl KvDtype {
+    /// The storage format in the shared byte arithmetic (`family::kv_format`): Q8 keeps its
+    /// group-64 affine codes with a scale AND a bias of the activation width each
+    /// (2 sides x 2 arrays x groups x scale bytes).
+    pub(crate) fn format(self, act: Activation) -> crate::family::kv_format::KvFormat {
+        match self {
+            Self::F32 => crate::family::kv_format::KvFormat::F32,
+            Self::Bf16 => crate::family::kv_format::KvFormat::Bf16,
+            Self::Q8 => crate::family::kv_format::KvFormat::Affine8 {
+                group: Q8_GROUP,
+                param_bytes: u32::try_from(act.dtype().byte_width()).expect(
+                    "an activation width of more than 4 GiB per element is not a real dtype",
+                ),
+            },
+        }
     }
 }
 
@@ -884,6 +932,7 @@ pub(crate) struct Q36Settings {
     /// The default is `false`; the MLX arm reads it, admits the model at load, and warms one
     /// program per distinct compiled block, and the CUDA arm records the key as ignored.
     pub(crate) compile: bool,
+    pub(crate) compile_program_limit: crate::kernels::ProgramLimit,
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
     /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
@@ -903,6 +952,8 @@ pub(crate) struct Q36Settings {
     pub(crate) expert_bank: Option<ExpertBankSettings>,
     /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
     pub(crate) weights: WeightFormat,
+    /// Checked lowercase content pin for CUDA GGUF; absent preserves legacy verification.
+    pub(crate) gguf_sha256: Option<String>,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
     pub(crate) speculation: SpecConfig,
     /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
@@ -1253,10 +1304,24 @@ impl Q36Settings {
                 spec.name
             )));
         }
+        geometric_checkpoint_window(env)?;
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
         let weights = weight_format_of(options.weight_format.as_deref())?;
         check_weight_format(weights, options, backend)?;
+        let gguf_sha256 = options
+            .gguf_sha256
+            .as_deref()
+            .map(|digest| {
+                if backend != Backend::Cuda || weights != WeightFormat::Gguf {
+                    return Err(bad("gguf_sha256 requires CUDA GGUF weights".into()));
+                }
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(bad("gguf_sha256 must contain exactly 64 hex digits".into()));
+                }
+                Ok(digest.to_ascii_lowercase())
+            })
+            .transpose()?;
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
@@ -1377,6 +1442,13 @@ impl Q36Settings {
         };
         let tiered = tiered_settings(options, backend)?;
         let expert_bank = expert_bank_settings(options, backend, weights)?;
+        let compile_program_limit = match options.compile_program_limit {
+            Some(_) if backend != Backend::Mlx => {
+                return Err(bad("compile_program_limit requires the MLX backend".into()));
+            }
+            Some(value) => crate::kernels::ProgramLimit::new(value)?,
+            None => crate::kernels::ProgramLimit::default(),
+        };
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The override validates at boot through `ranged` (the same message shape as every
         // other member) so a typo cannot reach the store; the range keeps a fat finger from
@@ -1436,6 +1508,7 @@ impl Q36Settings {
                 Backend::Mlx => options.compile.unwrap_or(false),
                 Backend::Cuda => false,
             },
+            compile_program_limit,
             max_seqs,
             prefix_store_entries,
             backend,
@@ -1443,6 +1516,7 @@ impl Q36Settings {
             tiered,
             expert_bank,
             weights,
+            gguf_sha256,
             speculation,
             draft_rollback,
             draft_verify,
@@ -1552,6 +1626,9 @@ pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, 
 }
 
 #[cfg(test)]
+mod kv_bytes_golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,
@@ -1572,9 +1649,115 @@ mod tests {
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
 
+    /// S4: every arm of the `Q36_KV_GEOMETRIC` parse - absent, `0`, `1`, junk, and the
+    /// not-valid-text error - pinned on the host, because the caller lives in the
+    /// Mac-gated resident module.
+    #[test]
+    fn the_kv_geometric_parse_covers_every_arm() {
+        use super::parse_kv_geometric;
+        use std::env::VarError;
+        assert_eq!(parse_kv_geometric(Err(VarError::NotPresent)), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("0".into())), Ok(false));
+        assert_eq!(parse_kv_geometric(Ok("1".into())), Ok(true));
+        assert_eq!(
+            parse_kv_geometric(Ok("2".into())),
+            Err("Q36_KV_GEOMETRIC must be 0 or 1, got \"2\"".to_string())
+        );
+        assert_eq!(
+            parse_kv_geometric(Err(VarError::NotUnicode(std::ffi::OsString::new()))),
+            Err(
+                "Q36_KV_GEOMETRIC is not valid text: environment variable was not valid unicode: \"\""
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn compile_program_budget_defaults_validates_and_refuses_cuda() {
+        let options = |value| Q36Options {
+            compile_program_limit: value,
+            cache_limit_bytes: Some(1024),
+            ..Default::default()
+        };
+        for (value, expected) in [(None, 8), (Some(12), 12), (Some(1), 1)] {
+            let settings =
+                settings_for(Some(&options(value)), &Q36Env::default(), Backend::Mlx).unwrap();
+            assert_eq!(settings.compile_program_limit.get(), expected);
+            assert!(!settings.compile, "budget does not enable compilation");
+        }
+        for value in [0, usize::MAX] {
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Mlx,
+            )
+            .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit"));
+        }
+        for value in [8, 12] {
+            let error = settings_for(
+                Some(&options(Some(value))),
+                &Q36Env::default(),
+                Backend::Cuda,
+            )
+            .unwrap_err();
+            assert!(format!("{error:?}").contains("compile_program_limit requires the MLX"));
+        }
+        for json in [
+            r#"{"compile_program_limit":-1}"#,
+            r#"{"compile_program_limit":18446744073709551616}"#,
+        ] {
+            assert!(serde_json::from_str::<Q36Options>(json).is_err());
+        }
+    }
+
     fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         settings_for(Some(&options), &Q36Env::default(), Backend::Cuda)
+    }
+
+    #[test]
+    fn gguf_content_pin_is_optional_checked_and_cuda_only() {
+        assert!(cuda_offload("{}").unwrap().gguf_sha256.is_none());
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let object = serde_json::json!({"gguf_sha256": digest.to_uppercase()}).to_string();
+        let pinned = cuda_offload(&object).unwrap();
+        assert_eq!(pinned.gguf_sha256.as_deref(), Some(digest));
+        assert_eq!(pinned.cache_limit, 0);
+        for invalid in [
+            "".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ] {
+            let object = serde_json::json!({"gguf_sha256": invalid}).to_string();
+            let error = message(cuda_offload(&object));
+            assert!(
+                error.contains("gguf_sha256") && error.contains("64 hex"),
+                "{error}"
+            );
+        }
+        let options = Q36Options {
+            gguf_sha256: Some(digest.to_string()),
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        };
+        let error = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+        ));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
+        let object =
+            serde_json::json!({"gguf_sha256": digest, "weight_format": "exl3"}).to_string();
+        let error = message(cuda_offload(&object));
+        assert!(
+            error.contains("gguf_sha256") && error.contains("CUDA GGUF"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1627,6 +1810,7 @@ mod tests {
         let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
         let mlx = Q36Env {
             cache_limit: Some("1024".to_string()),
+            ..Q36Env::default()
         };
         assert!(
             message(settings_for(Some(&options), &mlx, Backend::Mlx))
@@ -2631,6 +2815,7 @@ mod tests {
                 kv_offload_host_bytes: None,
                 capture: false,
                 compile: false,
+                compile_program_limit: Default::default(),
                 max_seqs: 1,
                 prefix_store_entries: None,
                 backend: Backend::Mlx,
@@ -2638,6 +2823,7 @@ mod tests {
                 tiered: None,
                 expert_bank: None,
                 weights: super::WeightFormat::Gguf,
+                gguf_sha256: None,
                 speculation: SpecConfig::default(),
                 draft_rollback: RollbackMode::Host,
                 draft_verify: VerifyMode::Eager,
@@ -2893,12 +3079,59 @@ mod tests {
     fn the_environment_fills_the_cache_limit_and_the_object_wins() {
         let env = Q36Env {
             cache_limit: Some("77".to_string()),
+            ..Q36Env::default()
         };
         assert_eq!(settings(None, &env).unwrap().cache_limit, 77);
         assert_eq!(
             settings(Some(&with_limit()), &env).unwrap().cache_limit,
             1024,
             "the object wins"
+        );
+    }
+
+    #[test]
+    fn the_geometric_checkpoint_window_combination_is_refused_at_open() {
+        let both = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &both)),
+            "engine config: Q36_KV_GEOMETRIC=1 with Q36_SPEC_STEP_WINDOW=2 is not supported: \
+             the checkpoint-window commit is not yet supported under the geometric law"
+        );
+    }
+
+    #[test]
+    fn each_window_or_geometric_variable_alone_still_opens() {
+        // Each alone must reach the LATER per-arm validation (here: the MLX cache-limit
+        // refusal), proving the combination guard refused nothing by itself.
+        let geometric_alone = Q36Env {
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &geometric_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_alone = Q36Env {
+            spec_step_window: Some("2".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set"
+        );
+        let window_step_alone = Q36Env {
+            spec_step_window: Some("1".to_string()),
+            kv_geometric: Some("1".to_string()),
+            ..Q36Env::default()
+        };
+        assert_eq!(
+            message(settings(None, &window_step_alone)),
+            "engine config: cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set",
+            "the =1 step window is not the checkpoint window and stays allowed"
         );
     }
 
@@ -2910,6 +3143,7 @@ mod tests {
         );
         let empty = Q36Env {
             cache_limit: Some(String::new()),
+            ..Q36Env::default()
         };
         assert_eq!(
             message(settings(None, &empty)),
@@ -2917,6 +3151,7 @@ mod tests {
         );
         let env = Q36Env {
             cache_limit: Some("many".to_string()),
+            ..Q36Env::default()
         };
         assert_eq!(
             message(settings(None, &env)),

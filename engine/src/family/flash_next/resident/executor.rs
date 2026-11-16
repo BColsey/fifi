@@ -1884,7 +1884,8 @@ mod tests {
                     // The Flash-Next executor keeps the default `prefix_report` (`None`): although
                     // it saves and restores tips, it reports no store facts, so its request lines
                     // omit the four `prefix_*` keys.
-                    prefix: None
+                    prefix: None,
+                    prefill_bank: None,
                 }),
                 "round {round}: usage"
             );
@@ -2147,7 +2148,8 @@ mod tests {
                     prompt_tokens,
                     completion_tokens: 8,
                     reused_tokens: 0,
-                    prefix: None
+                    prefix: None,
+                    prefill_bank: None,
                 }),
                 "round {round}: usage"
             );
