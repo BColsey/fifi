@@ -91,6 +91,13 @@ pub(crate) fn largest_fitting_linear(
 /// ledger can widen it without touching the others.
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceReserve {
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        allow(
+            dead_code,
+            reason = "the Flint estimate reads it; that arm is compiled with the CUDA backend and in tests"
+        )
+    )]
     band_bytes: u64,
     charges: Vec<(&'static str, u64)>,
 }
@@ -111,6 +118,13 @@ impl DeviceReserve {
     }
 
     /// The band the reserve's slack is judged against.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        allow(
+            dead_code,
+            reason = "the Flint estimate reads it; that arm is compiled with the CUDA backend and in tests"
+        )
+    )]
     pub(crate) fn band_bytes(&self) -> u64 {
         self.band_bytes
     }

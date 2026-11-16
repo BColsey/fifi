@@ -29,6 +29,39 @@ pub(crate) fn largest_fitting_context(requested: u32, fits: &dyn Fn(u32) -> bool
     crate::family::device_budget::largest_fitting(requested, CONTEXT_SEARCH_STEP, fits)
 }
 
+/// A demand's verdict against a measured budget, with the band around the
+/// boundary as its own case. Capability's report layer maps this onto its
+/// serialized `ResourceFit` (`Borderline` becomes `Unknown` plus the
+/// borderline flag); the families' entries and the estimate arms share this
+/// one rule so the two never drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BandVerdict {
+    Fits,
+    Borderline,
+    DoesNotFit,
+}
+
+/// Slack at or above the band fits; inside the band (either side) the
+/// verdict is borderline - the caller's authority decides; below the
+/// negative band the demand does not fit.
+pub(crate) fn band_verdict(slack: i128, band: i128) -> BandVerdict {
+    if slack >= band {
+        BandVerdict::Fits
+    } else if slack >= -band {
+        BandVerdict::Borderline
+    } else {
+        BandVerdict::DoesNotFit
+    }
+}
+
+/// Whether a proposal (a largest fitting context) is worth searching for:
+/// only when the per-position charge exists and the configured context is
+/// not a confident fit. Both the capability estimate and the family's
+/// preflight rows call this; the gate exists once.
+pub(crate) fn proposal_needed(per_position: u64, verdict: BandVerdict) -> bool {
+    per_position > 0 && verdict != BandVerdict::Fits
+}
+
 /// The bytes of the time-major FP16 staging cache for `capacity` rows. Same
 /// checked arithmetic the kernel wrapper runs; canonical here so an estimate
 /// and an admission compute the same number.
@@ -82,6 +115,35 @@ impl AdmissionSketch {
 
 #[cfg(test)]
 mod tests {
+    use super::{BandVerdict, band_verdict, proposal_needed};
+
+    /// The band boundaries, one byte either side of each: slack at the
+    /// band fits, slack inside the band (either side) is borderline, slack
+    /// below the negative band does not fit.
+    #[test]
+    fn band_verdict_boundaries() {
+        const BAND: i128 = 128 << 20;
+        assert_eq!(band_verdict(BAND + 1, BAND), BandVerdict::Fits);
+        assert_eq!(band_verdict(BAND, BAND), BandVerdict::Fits);
+        assert_eq!(band_verdict(BAND - 1, BAND), BandVerdict::Borderline);
+        assert_eq!(band_verdict(0, BAND), BandVerdict::Borderline);
+        assert_eq!(band_verdict(-BAND, BAND), BandVerdict::Borderline);
+        assert_eq!(band_verdict(-BAND - 1, BAND), BandVerdict::DoesNotFit);
+    }
+
+    /// A proposal is searched only when positions charge and the
+    /// configured context is not a confident fit.
+    #[test]
+    fn proposal_needed_boundaries() {
+        for verdict in [BandVerdict::Borderline, BandVerdict::DoesNotFit] {
+            assert!(proposal_needed(1, verdict));
+        }
+        assert!(!proposal_needed(1, BandVerdict::Fits));
+        for verdict in [BandVerdict::Borderline, BandVerdict::DoesNotFit] {
+            assert!(!proposal_needed(0, verdict));
+        }
+    }
+
     use super::*;
 
     /// The probe SEQUENCE of `largest_fitting_context` is qualified output - a

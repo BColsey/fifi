@@ -876,11 +876,34 @@ fn q36_preflight(
             ),
         )),
     }
+    // Only the rows come from the family entry; the checks and the stored
+    // estimate above stay this arm's. The entry re-runs the same settings
+    // resolution, walk and search through the shared request — the second
+    // call of one implementation, never a second copy of the math.
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-    let decisions = exl3_plan
-        .as_ref()
-        .map(|plan| q36_exl3_decisions(plan, &estimate, disk_bytes, settings.kv))
-        .unwrap_or_default();
+    let decisions = match exl3_plan.as_ref() {
+        Some(_) => match crate::family::qwen36::preflight::preflight_rows(&RowsRequest {
+            model_dir,
+            tokenizer_dir,
+            context: candidate.context_limit,
+            kv_dtype: candidate.kv_dtype.as_deref(),
+            facts,
+        }) {
+            Ok((rows, _note, _fit)) => rows,
+            Err(error) => {
+                checks.push(Check::new(
+                    "exl3 pack",
+                    CheckStatus::Fail,
+                    format!(
+                        "the load would refuse this pack: {}",
+                        super::describe_error(&error)
+                    ),
+                ));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
     let decisions = Vec::new();
     finish(checks, Some(estimate), decisions, qualification)
@@ -1417,17 +1440,17 @@ fn flint_estimate(
     Ok((estimate, decisions))
 }
 
-/// The one band rule both family preflights judge slack by: at least a band
-/// above zero is a fit, within a band either side is borderline, and a band
-/// below zero does not fit. Shared by the Flint all-resident plan and the
-/// Qwen3.6 CUDA admission so the boundary is one rule, not two.
+/// The report layer's mapping of the one shared band rule (see
+/// `family::admission_sketch`) onto the serialized fit: borderline becomes
+/// `Unknown` plus the flag the report renders.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 fn band_verdict(slack: i128, band: i128) -> (ResourceFit, bool) {
-    if slack >= band {
-        (ResourceFit::Fits, false)
-    } else if slack >= -band {
-        (ResourceFit::Unknown, true)
-    } else {
-        (ResourceFit::DoesNotFit, false)
+    match crate::family::admission_sketch::band_verdict(slack, band) {
+        crate::family::admission_sketch::BandVerdict::Fits => (ResourceFit::Fits, false),
+        crate::family::admission_sketch::BandVerdict::Borderline => (ResourceFit::Unknown, true),
+        crate::family::admission_sketch::BandVerdict::DoesNotFit => {
+            (ResourceFit::DoesNotFit, false)
+        }
     }
 }
 
@@ -1636,19 +1659,18 @@ fn estimate_q36(
     backend: crate::family::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
-    use crate::family::admission_sketch::kv8_staging_bytes;
     use crate::family::qwen36::admission_sketch as sketch;
-    use crate::family::qwen36::settings::{
-        Backend, KvDtype, cache_growth_per_position, delta_state_bytes,
-    };
+    use crate::family::qwen36::settings::Backend;
 
-    let per_position = cache_growth_per_position(spec, settings.kv, settings.activation)?;
+    // The one CUDA demand model: the same builder the family's preflight
+    // rows call, so the estimate and the rows cannot drift apart.
+    let (per_position, state_bytes, cuda_demand_at) =
+        sketch::cuda_demand_model(spec, settings.kv, settings.activation)?;
     let kv_bytes = per_position
         .checked_mul(u64::from(settings.context_limit))
         .ok_or_else(|| {
             crate::EngError::MemoryPlan("preflight KV estimate overflows u64".to_string())
         })?;
-    let state_bytes = delta_state_bytes(spec)?;
     let weights = weight_bytes;
     let total = weights
         .checked_add(kv_bytes)
@@ -1671,90 +1693,79 @@ fn estimate_q36(
     };
     let policy = MemoryPolicy::default_share();
 
-    // Staged KV8 rows and the device-tip prefix copy are the two runtime
-    // charges the closed-form figures above do not carry; only the Q8 cache
-    // dequants into a staging cache (F32 and Bf16 are read natively).
-    let staging_at = |context: u32| -> Result<u64, crate::EngError> {
-        if settings.kv != KvDtype::Q8 {
-            return Ok(0);
-        }
-        let rows = sketch::fixed_staging_rows(usize::try_from(context).unwrap_or(usize::MAX));
-        u64::try_from(kv8_staging_bytes(
-            rows,
-            spec.heads_kv as usize,
-            spec.head_dim as usize,
-        )?)
-        .map_err(|_| crate::EngError::MemoryPlan("staging bytes exceed u64".to_string()))
-    };
-    let cuda_demand_at = |context: u32| -> Result<
-        crate::family::admission_sketch::AdmissionSketch,
-        crate::EngError,
-    > {
-        let kv = per_position
-            .checked_mul(u64::from(context))
-            .ok_or_else(|| {
-                crate::EngError::MemoryPlan("preflight KV estimate overflows u64".to_string())
-            })?;
-        Ok(sketch::admission_demand(
-            kv,
-            state_bytes,
-            state_bytes,
-            staging_at(context)?,
-        ))
-    };
-
-    let (free_bytes, limit_bytes, charges, charge_terms, fit, borderline) = match (&free, backend) {
-        (Probe::Measured(free), Backend::Cuda) => {
-            let demand = cuda_demand_at(settings.context_limit)?;
-            // The charge total is the whole demand (state included); the
-            // receipt lists only the five admission terms, as it always has.
-            let charges = demand.total_after_weights()?;
-            let reserve = crate::family::device_budget::DeviceReserve::new(
-                sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
-            )
-            .push("staged kv8 rows", demand.staging_bytes)
-            .push("part charge", demand.part_charge_bytes)
-            .push("spare minimum", demand.spare_min_bytes)
-            .push("admission margin", demand.margin_bytes)
-            .push("runtime overhead floor", demand.overhead_floor_bytes);
-            let slack = i128::from(*free) - i128::from(weights) - i128::from(charges);
-            let (fit, borderline) = band_verdict(slack, i128::from(reserve.band_bytes()));
-            (
-                Some(*free),
-                Some(*free),
-                charges,
-                reserve
-                    .charges()
-                    .iter()
-                    .map(|&(label, bytes)| (label.to_string(), bytes))
-                    .collect(),
-                fit,
-                borderline,
-            )
-        }
-        (Probe::Measured(free), Backend::Mlx) => {
-            let limit = policy.limit(*free);
-            let fit = if total <= limit {
-                ResourceFit::Fits
-            } else {
-                ResourceFit::DoesNotFit
-            };
-            (Some(*free), Some(limit), 0, Vec::new(), fit, false)
-        }
-        (Probe::Unavailable(_), _) => (None, None, 0, Vec::new(), ResourceFit::Unknown, false),
-    };
+    let (free_bytes, limit_bytes, charges, charge_terms, fit, borderline, cuda_proposal) =
+        match (&free, backend) {
+            (Probe::Measured(free), Backend::Cuda) => {
+                let demand = cuda_demand_at(settings.context_limit)?;
+                // The charge total is the whole demand (state included); the
+                // receipt lists only the five admission terms, as it always has.
+                let charges = demand.total_after_weights()?;
+                let reserve = crate::family::device_budget::DeviceReserve::new(
+                    sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+                )
+                .push("staged kv8 rows", demand.staging_bytes)
+                .push("part charge", demand.part_charge_bytes)
+                .push("spare minimum", demand.spare_min_bytes)
+                .push("admission margin", demand.margin_bytes)
+                .push("runtime overhead floor", demand.overhead_floor_bytes);
+                // The verdict and the proposal are the one shared call the
+                // preflight rows also make; the receipt above is the estimate's
+                // own composition of the same demand's terms.
+                let (verdict, largest_fitting) = sketch::cuda_verdict_and_proposal(
+                    *free,
+                    weights,
+                    &cuda_demand_at,
+                    per_position,
+                    settings.context_limit,
+                )?;
+                let (fit, borderline) = match verdict {
+                    crate::family::admission_sketch::BandVerdict::Fits => {
+                        (ResourceFit::Fits, false)
+                    }
+                    crate::family::admission_sketch::BandVerdict::Borderline => {
+                        (ResourceFit::Unknown, true)
+                    }
+                    crate::family::admission_sketch::BandVerdict::DoesNotFit => {
+                        (ResourceFit::DoesNotFit, false)
+                    }
+                };
+                (
+                    Some(*free),
+                    Some(*free),
+                    charges,
+                    reserve
+                        .charges()
+                        .iter()
+                        .map(|&(label, bytes)| (label.to_string(), bytes))
+                        .collect(),
+                    fit,
+                    borderline,
+                    largest_fitting,
+                )
+            }
+            (Probe::Measured(free), Backend::Mlx) => {
+                let limit = policy.limit(*free);
+                let fit = if total <= limit {
+                    ResourceFit::Fits
+                } else {
+                    ResourceFit::DoesNotFit
+                };
+                (Some(*free), Some(limit), 0, Vec::new(), fit, false, None)
+            }
+            (Probe::Unavailable(_), _) => {
+                (None, None, 0, Vec::new(), ResourceFit::Unknown, false, None)
+            }
+        };
 
     // A proposal only when the requested context is not a confident fit; the
     // search charges the same paper demand the runtime ledger charges, band
     // included. Not even a minimal context fitting yields None, and the
     // verdict then says so in its own words.
     let proposal_needed = per_position > 0 && (fit == ResourceFit::DoesNotFit || borderline);
-    let largest_fitting = if !proposal_needed {
+    let largest_fitting = if backend == Backend::Cuda {
+        cuda_proposal
+    } else if !proposal_needed {
         None
-    } else if backend == Backend::Cuda {
-        free_bytes.and_then(|free| {
-            largest_fitting_cuda(free, weights, &cuda_demand_at, settings.context_limit)
-        })
     } else {
         let for_kv = limit_bytes
             .unwrap_or(0)
@@ -1784,146 +1795,9 @@ fn estimate_q36(
     })
 }
 
-/// The EXL3 decision rows: what the loader's own header walk found in the pack, and the
-/// context the same paper charges admit. The walk already ran for the weight figure; these
-/// rows only retell it, so the record and the estimate cannot disagree.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-fn q36_exl3_decisions(
-    plan: &crate::family::exl3_pack::PackPlan,
-    estimate: &Estimate,
-    disk_bytes: u64,
-    kv: crate::family::qwen36::settings::KvDtype,
-) -> Vec<PlanDecision> {
-    use crate::family::qwen36::settings::kv_dtype_name;
-
-    // Rates are keyed by twice the bits per weight; render them as bpw.
-    let rates = if plan.rates.is_empty() {
-        "none".to_string()
-    } else {
-        plan.rates
-            .iter()
-            .map(|(twice_bits, count)| format!("{:.1} bpw x {count}", f64::from(*twice_bits) / 2.0))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let weights_row = PlanDecision {
-        name: "weight figure".to_string(),
-        chosen: format!(
-            "{} B device bytes from the pack walk ({} quantized matrices, rates {rates}, \
-             codebook {}); {} B on disk",
-            plan.device_bytes, plan.matrices, plan.codebook, disk_bytes
-        ),
-        alternatives: vec![PlanAlternative {
-            option: format!("the {disk_bytes} B the files occupy on disk"),
-            verdict: "refused".to_string(),
-            reason: format!(
-                "the load widens scales and plain vectors to F32, so the walk's {} B is the \
-                 figure the device holds",
-                plan.device_bytes
-            ),
-        }],
-        fixed_at: PlanFixity::Load,
-    };
-    let mut context_alternatives = Vec::new();
-    if let Some(largest) = estimate.largest_fitting_context {
-        context_alternatives.push(PlanAlternative {
-            option: format!("{largest} positions"),
-            verdict: "fits".to_string(),
-            reason: "largest context the same paper charges admit; a proposal, never applied"
-                .to_string(),
-        });
-    }
-    let context_row = PlanDecision {
-        name: "context".to_string(),
-        chosen: format!("{} positions", estimate.context_limit),
-        alternatives: context_alternatives,
-        fixed_at: PlanFixity::Start,
-    };
-    let kv_row = PlanDecision {
-        name: "kv cache".to_string(),
-        chosen: format!(
-            "{} at {} B per position",
-            kv_dtype_name(kv),
-            estimate.kv_bytes_per_position
-        ),
-        alternatives: Vec::new(),
-        fixed_at: PlanFixity::Start,
-    };
-    vec![weights_row, context_row, kv_row]
-}
-
-/// The largest context (a multiple of 1024, capped at the requested context)
-/// whose paper demand leaves at least the uncertainty band of slack against
-/// the measured budget. `None` when not even a minimal context fits — the
-/// honest answer the old division rule could not give (it proposed 0).
-fn largest_fitting_cuda(
-    free: u64,
-    weights: u64,
-    cuda_demand_at: &dyn Fn(
-        u32,
-    ) -> Result<
-        crate::family::admission_sketch::AdmissionSketch,
-        crate::EngError,
-    >,
-    requested: u32,
-) -> Option<u32> {
-    use crate::family::qwen36::admission_sketch as sketch;
-    let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
-    let fits = |context: u32| -> bool {
-        let Ok(demand) = cuda_demand_at(context) else {
-            return false;
-        };
-        let Ok(charges) = demand.total_after_weights() else {
-            return false;
-        };
-        i128::from(free) - i128::from(weights) - i128::from(charges) >= band
-    };
-    crate::family::admission_sketch::largest_fitting_context(requested, &fits)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{largest_fitting_cuda, largest_resident_context};
-
-    /// c0 goldens (P4): `largest_fitting_cuda` on a linear charge model. The
-    /// demand carries the four canonical constants (part 64 MiB, spare 64 MiB,
-    /// margin 256 MiB, floor 384 MiB, so 768 MiB fixed) plus 1 MiB per lattice
-    /// step, and the admit rule is `free - weights - charges >= band`
-    /// (band 128 MiB), all in i128. Free values sit exactly on the boundary of
-    /// a chosen step count and one byte/one step either side.
-    #[test]
-    fn largest_fitting_cuda_golden_grid() {
-        const MIB: u64 = 1 << 20;
-        let demand = |context: u32| {
-            Ok(crate::family::qwen36::admission_sketch::admission_demand(
-                (u64::from(context) / 1024) * MIB,
-                0,
-                0,
-                0,
-            ))
-        };
-        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
-        let fixed = 768 * MIB + band; // part+spare+margin+floor+band
-        // free(fitting steps) = fixed + steps*MiB. Boundary at 97 steps.
-        let at = |steps: u64| fixed + steps * MIB;
-        let grid: [(u64, u32, Option<u32>); 8] = [
-            (at(96), 100_000, Some(98_304)),     // exactly 96 admitting steps
-            (at(97) - 1, 100_000, Some(98_304)), // one byte under 97 steps: still 96
-            (at(97), 100_000, Some(98_304)),     // 97 steps strand at 98_304 (off-lattice request)
-            (at(99), 100_000, Some(98_304)),     // 99 steps strand too: the request is off-lattice
-            (at(128), 131_072, Some(130_048)),   // 128 steps = 131_072 == request: never asked
-            (at(128), 262_144, Some(131_072)),   // 128 steps, room to return it
-            (at(0) - 1, 2048, None),             // under even the first probe
-            (at(1), 1024, None),                 // request at the step floor
-        ];
-        for (free, requested, expected) in grid {
-            assert_eq!(
-                largest_fitting_cuda(free, 0, &demand, requested),
-                expected,
-                "free={free} requested={requested}"
-            );
-        }
-    }
+    use super::largest_resident_context;
 
     /// c0 goldens (P4): the Flint resident-context scan. It starts at 1024,
     /// steps by 1024, and STOPS at the first non-admitting step - a later gap
@@ -2286,6 +2160,149 @@ mod tests {
         }
     }
 
+    /// The estimate and the rows each call the one search, so on a real
+    /// pack the row's proposal and the estimate's largest fitting context
+    /// are the same value. The free bytes sit under the pack's demand so
+    /// the row carries a proposal at all.
+    /// The row's proposal equals the estimate's value, on a synthetic
+    /// plan: the entry's own composition past the walk (rows_from_walk)
+    /// runs against the estimate on the same settings, so a build without
+    /// a real pack protects the equality.
+    #[test]
+    fn the_rows_proposal_equals_the_estimates_value_on_a_synthetic_fixture() {
+        use crate::family::exl3_pack::PackPlan;
+        use crate::family::plan_rows::RowsFit;
+        use crate::family::qwen36::preflight::rows_from_walk;
+        use crate::family::qwen36::settings::{
+            Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
+        };
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = Q36Options {
+            context_limit: Some(262_144),
+            weight_format: Some("exl3".to_string()),
+            ..Q36Options::default()
+        };
+        let settings = Q36Settings::new(
+            dir.path(),
+            dir.path(),
+            Some(&options),
+            &Q36Env::default(),
+            Q36Backend::Cuda,
+        )
+        .expect("the pinned spec resolves without a pack");
+        let plan = PackPlan {
+            device_bytes: 21_000_000_000,
+            expert_bytes: 20_000_000_000,
+            matrices: 1_976,
+            rates: BTreeMap::new(),
+            codebook: "Mcg",
+        };
+        let facts = cuda_facts(23u64 << 30);
+        let estimate = super::estimate_q36(
+            &settings.spec,
+            &settings,
+            plan.device_bytes,
+            Q36Backend::Cuda,
+            &facts,
+        )
+        .expect("the estimate");
+        let (rows, fit) = rows_from_walk(
+            &settings,
+            &plan,
+            20_000_000_000,
+            &facts.cuda.first_device_free_bytes,
+        )
+        .expect("the rows");
+        let context = rows
+            .iter()
+            .find(|decision| decision.name == "context")
+            .expect("context row");
+        match estimate.largest_fitting_context {
+            Some(largest) => {
+                assert_eq!(context.alternatives.len(), 1);
+                assert_eq!(
+                    context.alternatives[0].option,
+                    format!("{largest} positions")
+                );
+                assert!(matches!(
+                    fit,
+                    RowsFit::Constrained {
+                        requested: 262_144,
+                        largest: largest_at
+                    } if largest_at == largest
+                ));
+            }
+            None => panic!(
+                "the fixture free bytes must demand a proposal; an empty equality proves nothing"
+            ),
+        }
+    }
+
+    /// The same equality on the real pack: the full entry (settings,
+    /// walk, inventory, rows) against the estimate.
+    #[test]
+    #[ignore = "reads a real pack in FIFI_EXL3_CHECKPOINT"]
+    fn the_rows_proposal_equals_the_estimates_value_on_one_fixture() {
+        use crate::family::plan_rows::RowsRequest;
+        use crate::family::qwen36::settings::{
+            Backend as Q36Backend, Q36Env, Q36Options, Q36Settings,
+        };
+
+        let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+        let dir = std::path::PathBuf::from(dir);
+        let facts = cuda_facts(23u64 << 30);
+        let options = Q36Options {
+            context_limit: Some(262_144),
+            weight_format: Some("exl3".to_string()),
+            ..Q36Options::default()
+        };
+        let settings = Q36Settings::new(
+            &dir,
+            &dir,
+            Some(&options),
+            &Q36Env::default(),
+            Q36Backend::Cuda,
+        )
+        .expect("the pack's settings resolve");
+        let plan = crate::family::qwen36::exl3_plan(&dir).expect("the pack walks");
+        let estimate = super::estimate_q36(
+            &settings.spec,
+            &settings,
+            plan.device_bytes,
+            Q36Backend::Cuda,
+            &facts,
+        )
+        .expect("the estimate");
+        let (rows, _note, _fit) = crate::family::qwen36::preflight::preflight_rows(&RowsRequest {
+            model_dir: &dir,
+            tokenizer_dir: &dir,
+            context: Some(262_144),
+            kv_dtype: None,
+            facts: &facts,
+        })
+        .expect("the rows");
+        let context = rows
+            .iter()
+            .find(|decision| decision.name == "context")
+            .expect("context row");
+        assert!(
+            estimate.largest_fitting_context.is_some(),
+            "the fixture free bytes must demand a proposal; an empty equality proves nothing"
+        );
+        match estimate.largest_fitting_context {
+            Some(largest) => {
+                assert_eq!(context.alternatives.len(), 1);
+                assert_eq!(
+                    context.alternatives[0].option,
+                    format!("{largest} positions")
+                );
+            }
+            None => assert!(context.alternatives.is_empty()),
+        }
+    }
+
     fn check_named<'a>(report: &'a super::PreflightReport, name: &str) -> &'a super::Check {
         report
             .checks
@@ -2499,83 +2516,6 @@ mod tests {
     }
 
     #[test]
-    fn q36_exl3_decisions_retell_the_pack_walk_and_the_context_proposal() {
-        use crate::family::exl3_pack::PackPlan;
-        use crate::family::qwen36::settings::KvDtype;
-        use std::collections::BTreeMap;
-
-        let plan = PackPlan {
-            device_bytes: 21_000_000_000,
-            expert_bytes: 20_000_000_000,
-            matrices: 1_976,
-            rates: BTreeMap::from([(10u8, 976), (12u8, 1_000)]),
-            codebook: "Mcg",
-        };
-        // An over-budget estimate carries the proposal the rows must retell.
-        let est = estimate(2000, Some(1000), Some(90));
-        let decisions = super::q36_exl3_decisions(&plan, &est, 20_000_000_000, KvDtype::F32);
-
-        let weights = decisions
-            .iter()
-            .find(|decision| decision.name == "weight figure")
-            .expect("weight figure row");
-        assert!(
-            weights.chosen.contains("21000000000 B device bytes"),
-            "{}",
-            weights.chosen
-        );
-        // The rates print in bpw, sorted by their key order, not insertion order.
-        assert!(
-            weights.chosen.contains("5.0 bpw x 976, 6.0 bpw x 1000"),
-            "{}",
-            weights.chosen
-        );
-        assert!(
-            weights.chosen.contains("codebook Mcg"),
-            "{}",
-            weights.chosen
-        );
-        assert_eq!(weights.fixed_at, PlanFixity::Load);
-        assert_eq!(weights.alternatives.len(), 1);
-        assert_eq!(weights.alternatives[0].verdict, "refused");
-        assert!(
-            weights.alternatives[0].option.contains("20000000000 B"),
-            "{}",
-            weights.alternatives[0].option
-        );
-
-        let context = decisions
-            .iter()
-            .find(|decision| decision.name == "context")
-            .expect("context row");
-        assert_eq!(context.chosen, "1000 positions");
-        assert_eq!(context.fixed_at, PlanFixity::Start);
-        assert_eq!(context.alternatives.len(), 1);
-        assert_eq!(context.alternatives[0].option, "90 positions");
-        assert_eq!(context.alternatives[0].verdict, "fits");
-
-        let kv = decisions
-            .iter()
-            .find(|decision| decision.name == "kv cache")
-            .expect("kv cache row");
-        assert_eq!(kv.chosen, "f32 at 10 B per position");
-
-        // A fitting estimate proposes nothing, so the context row has no alternative.
-        let fitting = estimate(500, Some(1000), None);
-        let decisions = super::q36_exl3_decisions(&plan, &fitting, 20_000_000_000, KvDtype::Q8);
-        let context = decisions
-            .iter()
-            .find(|decision| decision.name == "context")
-            .expect("context row");
-        assert!(context.alternatives.is_empty());
-        let kv = decisions
-            .iter()
-            .find(|decision| decision.name == "kv cache")
-            .expect("kv cache row");
-        assert_eq!(kv.chosen, "q8 at 10 B per position");
-    }
-
-    #[test]
     fn no_compiled_backend_is_unsupported_not_unverified() {
         let dir = tempfile::tempdir().unwrap().keep();
         let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
@@ -2739,35 +2679,6 @@ mod tests {
         let (verdict, next) = q36_verdict(&[], Some(&est), Qualification::Qualified);
         assert_eq!(verdict, Verdict::ReadyWithAdjustments);
         assert!(next.contains("measurement band"), "{next}");
-    }
-
-    #[test]
-    fn largest_fitting_search_is_none_when_nothing_fits() {
-        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
-        use crate::family::qwen36::admission_sketch;
-        // A paper demand proportional to context, as the real one is.
-        let demand = |context: u32| {
-            Ok(admission_sketch::admission_demand(
-                u64::from(context) * 1024,
-                0,
-                0,
-                0,
-            ))
-        };
-        // Beyond the fixed charges, free leaves the band plus 10 MiB of KV
-        // (10,240 positions at 1024 B each): the search proposes the largest
-        // multiple of 1024 whose slack still clears the band.
-        let free = admission_sketch::RUNTIME_OVERHEAD_FLOOR_BYTES
-            + admission_sketch::FIXED_ADMISSION_MARGIN_BYTES as u64
-            + admission_sketch::PREFILL_SPARE_MIN_BYTES as u64
-            + PREFILL_PART_CHARGE_BYTES as u64
-            + admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES
-            + 10 * 1024 * 1024;
-        let got = super::largest_fitting_cuda(free, 0, &demand, 1_048_576);
-        assert!(got.is_some_and(|c| c % 1024 == 0 && (9_000..=10_240).contains(&c)));
-        // Weights alone beyond the budget: not even a minimal context fits.
-        let got = super::largest_fitting_cuda(free, free + 1, &demand, 1_048_576);
-        assert_eq!(got, None);
     }
 
     #[test]

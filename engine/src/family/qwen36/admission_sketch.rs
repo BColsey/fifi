@@ -89,6 +89,114 @@ pub(crate) fn admission_demand(
     }
 }
 
+/// The CUDA admission demand as a function of the candidate context, on
+/// the paper math above. The per-position cache rate and the fixed state
+/// come back beside the closure because every caller needs the figures as
+/// well as the demand; the preflight estimate and the preflight rows both
+/// call this one builder, so the model is never re-implemented at a call
+/// site.
+#[allow(
+    clippy::type_complexity,
+    reason = "the builder hands back the figures and the closure together; an impl-Trait closure has no nameable type to factor out"
+)]
+pub(crate) fn cuda_demand_model(
+    spec: &crate::family::spec::FamilySpec,
+    kv: crate::family::qwen36::settings::KvDtype,
+    activation: crate::family::qwen36::settings::Activation,
+) -> Result<
+    (
+        u64,
+        u64,
+        impl Fn(u32) -> Result<AdmissionSketch, crate::EngError> + use<'_>,
+    ),
+    crate::EngError,
+> {
+    use crate::family::admission_sketch::kv8_staging_bytes;
+    use crate::family::qwen36::settings::{KvDtype, cache_growth_per_position, delta_state_bytes};
+
+    let per_position = cache_growth_per_position(spec, kv, activation)?;
+    let state_bytes = delta_state_bytes(spec)?;
+    // Staged KV8 rows and the device-tip prefix copy are the two runtime
+    // charges the closed-form figures above do not carry; only the Q8 cache
+    // dequants into a staging cache (F32 and Bf16 are read natively).
+    let staging_at = move |context: u32| -> Result<u64, crate::EngError> {
+        if kv != KvDtype::Q8 {
+            return Ok(0);
+        }
+        let rows = fixed_staging_rows(usize::try_from(context).unwrap_or(usize::MAX));
+        u64::try_from(kv8_staging_bytes(
+            rows,
+            spec.heads_kv as usize,
+            spec.head_dim as usize,
+        )?)
+        .map_err(|_| crate::EngError::MemoryPlan("staging bytes exceed u64".to_string()))
+    };
+    let demand_at = move |context: u32| -> Result<AdmissionSketch, crate::EngError> {
+        let kv_bytes = per_position
+            .checked_mul(u64::from(context))
+            .ok_or_else(|| {
+                crate::EngError::MemoryPlan("preflight KV estimate overflows u64".to_string())
+            })?;
+        Ok(admission_demand(
+            kv_bytes,
+            state_bytes,
+            state_bytes,
+            staging_at(context)?,
+        ))
+    };
+    Ok((per_position, state_bytes, demand_at))
+}
+
+/// The largest context (a multiple of 1024, capped at the requested context)
+/// whose paper demand leaves at least the uncertainty band of slack against
+/// the measured budget. `None` when not even a minimal context fits — the
+/// honest answer the old division rule could not give (it proposed 0).
+pub(crate) fn largest_fitting_cuda(
+    free: u64,
+    weights: u64,
+    cuda_demand_at: &dyn Fn(u32) -> Result<AdmissionSketch, crate::EngError>,
+    requested: u32,
+) -> Option<u32> {
+    let band = i128::from(ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let fits = |context: u32| -> bool {
+        let Ok(demand) = cuda_demand_at(context) else {
+            return false;
+        };
+        let Ok(charges) = demand.total_after_weights() else {
+            return false;
+        };
+        i128::from(free) - i128::from(weights) - i128::from(charges) >= band
+    };
+    crate::family::admission_sketch::largest_fitting_context(requested, &fits)
+}
+
+/// The configured context's verdict against the measured budget, and the
+/// largest fitting context when a proposal is worth one: the single gate
+/// and search behind both the capability estimate and the preflight rows.
+/// The demand at the configured context is evaluated here and (as a second
+/// call of the same pure closure) by callers that compose its charge terms
+/// into a receipt.
+pub(crate) fn cuda_verdict_and_proposal(
+    free: u64,
+    weights: u64,
+    demand_at: &dyn Fn(u32) -> Result<AdmissionSketch, crate::EngError>,
+    per_position: u64,
+    context_limit: u32,
+) -> Result<(crate::family::admission_sketch::BandVerdict, Option<u32>), crate::EngError> {
+    let charges = demand_at(context_limit)?.total_after_weights()?;
+    let slack = i128::from(free) - i128::from(weights) - i128::from(charges);
+    let verdict = crate::family::admission_sketch::band_verdict(
+        slack,
+        i128::from(ADMISSION_UNCERTAINTY_BAND_BYTES),
+    );
+    let largest = if crate::family::admission_sketch::proposal_needed(per_position, verdict) {
+        largest_fitting_cuda(free, weights, demand_at, context_limit)
+    } else {
+        None
+    };
+    Ok((verdict, largest))
+}
+
 #[cfg(test)]
 mod tests {
     /// c0 goldens (P4): the charge terms of `admission_demand` and its checked
@@ -117,6 +225,77 @@ mod tests {
         let huge = admission_demand(u64::MAX, u64::MAX, u64::MAX, 0);
         assert_eq!(huge.state_bytes, u64::MAX);
         assert!(huge.total_after_weights().is_err());
+    }
+
+    use super::largest_fitting_cuda;
+
+    /// c0 goldens (P4): `largest_fitting_cuda` on a linear charge model. The
+    /// demand carries the four canonical constants (part 64 MiB, spare 64 MiB,
+    /// margin 256 MiB, floor 384 MiB, so 768 MiB fixed) plus 1 MiB per lattice
+    /// step, and the admit rule is `free - weights - charges >= band`
+    /// (band 128 MiB), all in i128. Free values sit exactly on the boundary of
+    /// a chosen step count and one byte/one step either side.
+    #[test]
+    fn largest_fitting_cuda_golden_grid() {
+        const MIB: u64 = 1 << 20;
+        let demand = |context: u32| {
+            Ok(crate::family::qwen36::admission_sketch::admission_demand(
+                (u64::from(context) / 1024) * MIB,
+                0,
+                0,
+                0,
+            ))
+        };
+        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
+        let fixed = 768 * MIB + band; // part+spare+margin+floor+band
+        // free(fitting steps) = fixed + steps*MiB. Boundary at 97 steps.
+        let at = |steps: u64| fixed + steps * MIB;
+        let grid: [(u64, u32, Option<u32>); 8] = [
+            (at(96), 100_000, Some(98_304)),     // exactly 96 admitting steps
+            (at(97) - 1, 100_000, Some(98_304)), // one byte under 97 steps: still 96
+            (at(97), 100_000, Some(98_304)),     // 97 steps strand at 98_304 (off-lattice request)
+            (at(99), 100_000, Some(98_304)),     // 99 steps strand too: the request is off-lattice
+            (at(128), 131_072, Some(130_048)),   // 128 steps = 131_072 == request: never asked
+            (at(128), 262_144, Some(131_072)),   // 128 steps, room to return it
+            (at(0) - 1, 2048, None),             // under even the first probe
+            (at(1), 1024, None),                 // request at the step floor
+        ];
+        for (free, requested, expected) in grid {
+            assert_eq!(
+                largest_fitting_cuda(free, 0, &demand, requested),
+                expected,
+                "free={free} requested={requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn largest_fitting_search_is_none_when_nothing_fits() {
+        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
+        use crate::family::qwen36::admission_sketch;
+        // A paper demand proportional to context, as the real one is.
+        let demand = |context: u32| {
+            Ok(admission_sketch::admission_demand(
+                u64::from(context) * 1024,
+                0,
+                0,
+                0,
+            ))
+        };
+        // Beyond the fixed charges, free leaves the band plus 10 MiB of KV
+        // (10,240 positions at 1024 B each): the search proposes the largest
+        // multiple of 1024 whose slack still clears the band.
+        let free = admission_sketch::RUNTIME_OVERHEAD_FLOOR_BYTES
+            + admission_sketch::FIXED_ADMISSION_MARGIN_BYTES as u64
+            + admission_sketch::PREFILL_SPARE_MIN_BYTES as u64
+            + PREFILL_PART_CHARGE_BYTES as u64
+            + admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES
+            + 10 * 1024 * 1024;
+        let got = largest_fitting_cuda(free, 0, &demand, 1_048_576);
+        assert!(got.is_some_and(|c| c % 1024 == 0 && (9_000..=10_240).contains(&c)));
+        // Weights alone beyond the budget: not even a minimal context fits.
+        let got = largest_fitting_cuda(free, free + 1, &demand, 1_048_576);
+        assert_eq!(got, None);
     }
 
     use super::*;

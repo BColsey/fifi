@@ -45,6 +45,8 @@ mod krow_step_pin_tests;
 mod mtp_pack;
 #[cfg(test)]
 mod mtp_pack_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod preflight;
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
