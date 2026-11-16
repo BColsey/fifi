@@ -124,6 +124,20 @@ impl TieredConfig {
 }
 
 #[cfg(test)]
+mod from_config_tests {
+    use super::{PolicyMode, TieredConfig};
+    use crate::family::tier_budget::ExpertSize;
+
+    #[test]
+    fn from_config_borrows_the_layer_count_and_keeps_the_bytes() {
+        let cfg = TieredConfig::qwen36(1, PolicyMode::Static);
+        let size = ExpertSize::from_config(&cfg, 1_769_472);
+        assert_eq!(size.bytes, 1_769_472);
+        assert_eq!(size.layers, cfg.layers);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{PolicyMode, TieredConfig};
 
