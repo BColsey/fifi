@@ -970,9 +970,9 @@ pub(crate) fn preflight_rows(
     let kv = settings.kv_format.format();
     let min_slots = model.moe.top_k() + 1;
     let note = if shared_prefill {
-        "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+        "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
     } else {
-        "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+        "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
     };
     match plan.at_context(requested, kv, min_slots) {
         Ok(load) => Ok((load.plan_rows(), note.to_string(), RowsFit::Fits)),
@@ -1249,7 +1249,7 @@ mod tests {
         assert!(matches!(fit, RowsFit::Fits));
         assert_eq!(
             note,
-            "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+            "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
         );
         let rendered: Vec<(&str, &str, PlanFixity)> = rows
             .iter()
@@ -1364,18 +1364,51 @@ mod tests {
     #[test]
     fn preflight_rows_refuse_an_unmultiple_context_instead_of_clamping() {
         let dir = pack_dir();
-        let error = preflight_rows(dir.path(), Some(4097), None, &flash_facts(24 << 30))
-            .unwrap_err()
-            .describe();
-        assert!(
-            error.contains("context must be a multiple of 4, found 4097"),
-            "{error}"
+        assert_eq!(
+            preflight_rows(dir.path(), Some(4097), None, &flash_facts(24 << 30))
+                .unwrap_err()
+                .describe(),
+            "engine config: context must be a multiple of 4, found 4097"
         );
         // Above the family's own ceiling is refused, not clamped down.
-        let error = preflight_rows(dir.path(), Some(262_148), None, &flash_facts(24 << 30))
-            .unwrap_err()
-            .describe();
-        assert!(error.contains("262148"), "{error}");
+        assert_eq!(
+            preflight_rows(dir.path(), Some(262_148), None, &flash_facts(24 << 30))
+                .unwrap_err()
+                .describe(),
+            "engine config: context must be between 4 and 262144, found 262148"
+        );
+    }
+
+    #[test]
+    fn the_entry_runs_the_loader_switch_checks_before_it_probes_the_card() {
+        // The entry cannot take a variable through an env reader (the crate
+        // denies `unsafe_code`), so the calls are pinned in source order,
+        // the same pattern as the chunk tests use for start's order.
+        let source = include_str!("load.rs");
+        let entry = &source[source
+            .find("pub(crate) fn preflight_rows(")
+            .expect("the rows entry")..];
+        let settings = entry
+            .find("super::settings::cuda_settings(&options)?")
+            .expect("settings resolution");
+        let spelling = entry
+            .find("prof::check_switch_spelling()?")
+            .expect("switch spelling check");
+        let rows_check = entry
+            .find("prof::check_shared_prefill_rows(")
+            .expect("shared row configuration check");
+        let ple_device = entry
+            .find("super::settings::ple_device()?")
+            .expect("PLE device switch check");
+        let ple_batch = entry
+            .find("super::settings::ple_batch()?")
+            .expect("PLE batch switch check");
+        let probe = entry
+            .find("facts.cuda.first_device_free_bytes")
+            .expect("the card probe read");
+        assert!(settings < spelling && spelling < rows_check);
+        assert!(rows_check < ple_device && ple_device < ple_batch);
+        assert!(ple_batch < probe);
     }
 
     #[test]

@@ -416,7 +416,7 @@ fn rows_arm(
     )
 }
 
-/// The Flash-Next dispatch: the rows arm when this build carries the
+/// The rows-or-shallow dispatch: the rows arm when this build carries the
 /// family's entry, the shallow report when it does not — a build without
 /// the load path must not call the family unsupported. The qualification
 /// comes from this caller, not the arm.
@@ -2180,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rows_arm_reports_a_fits_alternative_as_constrained_not_pass() {
+    fn the_rows_arm_warns_when_the_fit_is_constrained() {
         let report = super::rows_arm(
             Path::new("/m"),
             Path::new("/t"),
@@ -2235,7 +2235,9 @@ mod tests {
             check.detail
         );
         // A fact the probe could not read is not the pack's fault.
-        assert_ne!(report.verdict, Verdict::Unsupported);
+        // A fact the probe could not read leaves the pack experimental,
+        // not unsupported: nothing about the pack failed.
+        assert_eq!(report.verdict, Verdict::Experimental);
         assert!(report.decisions.is_empty());
         assert_eq!(report.dimensions.resource_fit, super::ResourceFit::Unknown);
     }

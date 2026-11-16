@@ -356,7 +356,7 @@ impl FlashSettings {
     }
 }
 
-/// Whether the chunked prefill runs its two PLE projections on the card (the staged
+/// Whether the chunked prefill runs its two PLE projections on the card (the
 /// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
 /// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
 /// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
