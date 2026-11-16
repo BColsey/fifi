@@ -151,7 +151,10 @@ pub(in crate::family::flash_next) mod prof {
     /// the shared path.
     const LEGACY_EXL3_ROWS: u32 = 64;
 
-    pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<bool> {
+    pub(in crate::family::flash_next) fn check_switch_value(
+        name: &str,
+        raw: Option<&str>,
+    ) -> Result<bool> {
         let on = parse_switch(raw).map_err(|seen| {
             EngError::BadRequest(format!(
                 "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"

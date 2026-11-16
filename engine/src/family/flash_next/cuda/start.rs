@@ -49,6 +49,7 @@ use super::{
     step_plan::StepPlan,
 };
 use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
+use crate::family::flash_next::settings::{ple_batch, ple_device};
 use crate::{
     EngError,
     family::{
@@ -89,37 +90,6 @@ fn ple_threads() -> usize {
         .and_then(|text| text.parse::<usize>().ok())
         .map(|n| n.clamp(1, 128))
         .unwrap_or(8)
-}
-
-/// Whether the chunked prefill runs its two PLE projections on the card (the staged
-/// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
-/// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
-/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
-/// value other than `1` is refused.
-fn ple_device() -> Result<bool, EngError> {
-    match std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE") {
-        Ok(text) if text == "1" => Ok(true),
-        Ok(_) => Err(EngError::BadRequest(
-            "INFERENCE_FLASH_NEXT_PLE_DEVICE must be unset or \"1\"".into(),
-        )),
-        Err(_) => Ok(false),
-    }
-}
-
-/// Whether chunked prefill batches its two PLE host projections into one blocked product per
-/// chunk (`INFERENCE_FLASH_NEXT_PLE_BATCH=1` opts in): the chunk's embeddings project at once —
-/// the 131 MB of weight matrices stream once per token block instead of once per token — and
-/// each row's pair then feeds the unchanged host step through the fixed projection, so the
-/// numbers stay bit-identical to the per-token path. Strict: any set value other than `1` is
-/// refused.
-fn ple_batch() -> Result<bool, EngError> {
-    match std::env::var("INFERENCE_FLASH_NEXT_PLE_BATCH") {
-        Ok(text) if text == "1" => Ok(true),
-        Ok(_) => Err(EngError::BadRequest(
-            "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\"".into(),
-        )),
-        Err(_) => Ok(false),
-    }
 }
 
 /// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2

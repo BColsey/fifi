@@ -212,4 +212,4 @@ fn ple(walk: &mut Inspector<'_>, prefix: &str, dims: &Dims) -> Result<(), EngErr
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::family::flash_next) mod tests;

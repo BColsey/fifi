@@ -212,7 +212,9 @@ pub(in crate::family::flash_next) fn ring_budget_bytes(
 
 /// The CUDA keys. Absent when `cuda_decode` is off; the keys are then refused if present, so a
 /// misspelt switch cannot leave an operator believing the card is in use.
-fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngError> {
+pub(in crate::family::flash_next) fn cuda_settings(
+    options: &FlashOptions,
+) -> Result<Option<CudaSettings>, EngError> {
     if !options.cuda_decode.unwrap_or(false) {
         let stray = [
             ("context", options.context.is_some()),
@@ -351,6 +353,59 @@ impl FlashSettings {
             expert_prefetch: options.expert_prefetch.unwrap_or(false),
             cuda,
         })
+    }
+}
+
+/// Whether the chunked prefill runs its two PLE projections on the card (the staged
+/// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
+/// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
+/// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
+/// value other than `1` is refused.
+pub(in crate::family::flash_next) fn ple_device() -> Result<bool, EngError> {
+    ple_device_text(
+        std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The text core of [`ple_device`], split out so the strict rule is
+/// testable: this crate denies `unsafe_code`, so a test cannot carry the
+/// variable into the env reader itself.
+pub(in crate::family::flash_next) fn ple_device_text(raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        Some("1") => Ok(true),
+        Some(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_DEVICE must be unset or \"1\"".into(),
+        )),
+        None => Ok(false),
+    }
+}
+
+/// Whether chunked prefill batches its two PLE host projections into one blocked product per
+/// chunk (`INFERENCE_FLASH_NEXT_PLE_BATCH=1` opts in): the chunk's embeddings project at once —
+/// the 131 MB of weight matrices stream once per token block instead of once per token — and
+/// each row's pair then feeds the unchanged host step through the fixed projection, so the
+/// numbers stay bit-identical to the per-token path. Strict: any set value other than `1` is
+/// refused.
+pub(in crate::family::flash_next) fn ple_batch() -> Result<bool, EngError> {
+    ple_batch_text(
+        std::env::var("INFERENCE_FLASH_NEXT_PLE_BATCH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The text core of [`ple_batch`], split out so the strict rule is
+/// testable: this crate denies `unsafe_code`, so a test cannot carry the
+/// variable into the env reader itself.
+pub(in crate::family::flash_next) fn ple_batch_text(raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        Some("1") => Ok(true),
+        Some(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\"".into(),
+        )),
+        None => Ok(false),
     }
 }
 
@@ -844,5 +899,21 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<FlashOptions>(r#"{"kv_format": "fp8"}"#).is_err());
+    }
+
+    #[test]
+    fn the_ple_switch_texts_refuse_anything_but_one() {
+        assert!(!super::ple_device_text(None).unwrap());
+        assert!(super::ple_device_text(Some("1")).unwrap());
+        assert_eq!(
+            super::ple_device_text(Some("2")).unwrap_err().describe(),
+            "INFERENCE_FLASH_NEXT_PLE_DEVICE must be unset or \"1\""
+        );
+        assert!(!super::ple_batch_text(None).unwrap());
+        assert!(super::ple_batch_text(Some("1")).unwrap());
+        assert_eq!(
+            super::ple_batch_text(Some("yes")).unwrap_err().describe(),
+            "INFERENCE_FLASH_NEXT_PLE_BATCH must be unset or \"1\""
+        );
     }
 }

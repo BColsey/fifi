@@ -20,7 +20,7 @@ const HIGH: u32 = 80;
 
 /// The Flash-Next config at the smallest widths the format allows: 4 layers, the last a QSA
 /// layer, PLE on layer 1, 3 experts.
-fn config() -> Vec<u8> {
+pub(in crate::family::flash_next) fn config() -> Vec<u8> {
     let mut value: Value = serde_json::from_slice(CONFIG).unwrap();
     let text = value["text_config"].as_object_mut().unwrap();
     for (key, number) in [
@@ -59,7 +59,7 @@ fn config() -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
-type Entry = (String, &'static str, Vec<u32>);
+pub(in crate::family::flash_next) type Entry = (String, &'static str, Vec<u32>);
 
 fn plain(out: &mut Vec<Entry>, name: &str, dtype: &'static str, shape: &[u32]) {
     out.push((name.to_owned(), dtype, shape.to_vec()));
@@ -106,7 +106,7 @@ fn layer(index: usize, suffix: &str) -> String {
 }
 
 /// The stock layout of the small config, every tensor in its stored dtype.
-fn pack() -> Vec<Entry> {
+pub(in crate::family::flash_next) fn pack() -> Vec<Entry> {
     let mut out = Vec::new();
     plain(
         &mut out,

@@ -242,6 +242,18 @@ fn evaluate(
             checks,
         );
     }
+    if family_name == Some(crate::family::flash_next::factory::FAMILY) {
+        return rows_or_shallow(
+            model_dir,
+            tokenizer_dir,
+            inspection,
+            family,
+            candidate,
+            facts,
+            checks,
+            crate::family::flash_next::preflight_rows_entry(),
+        );
+    }
     if family_name == Some(crate::family::flint::FAMILY) {
         return flint_preflight(
             model_dir,
@@ -266,6 +278,172 @@ fn flint_cuda_backend() -> bool {
 #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
 fn flint_cuda_backend() -> bool {
     false
+}
+
+// Facts in, rows out: one function per family behind the dispatch, so the
+// report grows by a dispatch line, not a hand-written arm per family. The
+// shape itself lives with the shared trait, in family::plan_rows.
+use crate::family::plan_rows::{RowsFit, RowsSource};
+
+/// The report every deep arm finishes with: the shared dimensions and
+/// verdict over the arm's checks, qualification and decisions. `estimate`
+/// is what the arm measured and the report stores; `fit_estimate`, when a
+/// rows family restates its context fit as the fields the shared verdict
+/// reads, feeds only the verdict and dimensions and is never stored.
+#[allow(clippy::too_many_arguments)] // the report's identity, checks, estimate, rows and qualification are one composition, not a config object
+fn finish_report(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    family: Option<String>,
+    checks: Vec<Check>,
+    estimate: Option<&Estimate>,
+    fit_estimate: Option<&Estimate>,
+    decisions: Vec<PlanDecision>,
+    qualification: Qualification,
+) -> PreflightReport {
+    let fit = fit_estimate.or(estimate);
+    let dimensions = q36_dimensions(&checks, fit, qualification);
+    let (verdict, next_step) = q36_verdict(&checks, fit, qualification);
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family,
+        verdict,
+        dimensions,
+        checks,
+        decisions,
+        estimate: estimate.cloned(),
+        next_step,
+    }
+}
+
+/// The report a `RowsSource` family gets: the source's rows as the
+/// decisions, its refusal as one failed check in the loader's own voice,
+/// a fact it could not probe as a warning (not the pack's fault), and the
+/// configured context's fit as data, a constrained verdict with a warning,
+/// not a pass. No byte estimate is composed for these families; load-time
+/// admission stays authoritative.
+#[allow(clippy::too_many_arguments)] // forwarding the arm's inputs; the family grouping lives in the source, not here
+fn rows_arm(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    family: Option<String>,
+    source: RowsSource,
+    candidate: &Candidate,
+    facts: &HardwareFacts,
+    qualification: Qualification,
+    mut checks: Vec<Check>,
+) -> PreflightReport {
+    let (rows, note, fit) = match source(
+        model_dir,
+        candidate.context_limit,
+        candidate.kv_dtype.as_deref(),
+        facts,
+    ) {
+        Ok(answer) => answer,
+        Err(error) => {
+            checks.push(Check::new(
+                "load plan",
+                CheckStatus::Fail,
+                format!(
+                    "the load would refuse this pack: {}",
+                    super::describe_error(&error)
+                ),
+            ));
+            return finish_report(
+                model_dir,
+                tokenizer_dir,
+                family,
+                checks,
+                None,
+                None,
+                Vec::new(),
+                qualification,
+            );
+        }
+    };
+    let (status, detail, constrained) = match fit {
+        // Only the fields the shared verdict and dimensions read; the rest
+        // stay empty because no byte estimate was measured.
+        RowsFit::Constrained { requested, largest } => (
+            CheckStatus::Warn,
+            format!(
+                "the requested {requested} positions do not fit; the largest fitting context is {largest}, a multiple of 1024 — a proposal, never applied; {note}"
+            ),
+            Some(Estimate {
+                weight_bytes: 0,
+                kv_bytes_per_position: 0,
+                context_limit: requested,
+                kv_bytes: 0,
+                fixed_state_bytes: 0,
+                total_bytes: 0,
+                budget_kind: String::new(),
+                budget_free_bytes: None,
+                budget_limit_bytes: None,
+                budget_limit_is_policy_share: false,
+                largest_fitting_context: Some(largest),
+                admission_charges_bytes: 0,
+                admission_charge_terms: Vec::new(),
+                fit: ResourceFit::DoesNotFit,
+                borderline: false,
+            }),
+        ),
+        RowsFit::Fits if !rows.is_empty() => (
+            CheckStatus::Pass,
+            format!(
+                "{} decision rows from the same open, walk and plan the loader runs; {note}",
+                rows.len()
+            ),
+            None,
+        ),
+        // A grammar that answers Fits carries rows; Unknown never does.
+        // The defensive arm keeps a stray empty answer a warning, not a
+        // pass.
+        RowsFit::Unknown | RowsFit::Fits => {
+            (CheckStatus::Warn, format!("no decision rows: {note}"), None)
+        }
+    };
+    checks.push(Check::new("load plan", status, detail));
+    finish_report(
+        model_dir,
+        tokenizer_dir,
+        family,
+        checks,
+        None,
+        constrained.as_ref(),
+        rows,
+        qualification,
+    )
+}
+
+/// The Flash-Next dispatch: the rows arm when this build carries the
+/// family's entry, the shallow report when it does not — a build without
+/// the load path must not call the family unsupported. The qualification
+/// comes from this caller, not the arm.
+#[allow(clippy::too_many_arguments)] // a router over the arm's inputs plus the build's entry
+fn rows_or_shallow(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    inspection: &ModelInspection,
+    family: Option<String>,
+    candidate: &Candidate,
+    facts: &HardwareFacts,
+    checks: Vec<Check>,
+    entry: Option<RowsSource>,
+) -> PreflightReport {
+    match entry {
+        Some(source) => rows_arm(
+            model_dir,
+            tokenizer_dir,
+            family,
+            source,
+            candidate,
+            facts,
+            Qualification::Experimental,
+            checks,
+        ),
+        None => shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks),
+    }
 }
 
 fn inventory_checks(inspection: &ModelInspection, checks: &mut Vec<Check>) {
@@ -388,38 +566,6 @@ fn any_failed(checks: &[Check]) -> bool {
 
 fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
-}
-
-/// The report every deep arm finishes with: the shared dimensions and
-/// verdict over the arm's checks, qualification and decisions. `estimate`
-/// is what the arm measured and the report stores; `fit_estimate`, when a
-/// rows family restates its context fit as the fields the shared verdict
-/// reads, feeds only the verdict and dimensions and is never stored.
-#[allow(clippy::too_many_arguments)] // the report's identity, checks, estimate, rows and qualification are one composition, not a config object
-fn finish_report(
-    model_dir: &Path,
-    tokenizer_dir: &Path,
-    family: Option<String>,
-    checks: Vec<Check>,
-    estimate: Option<&Estimate>,
-    fit_estimate: Option<&Estimate>,
-    decisions: Vec<PlanDecision>,
-    qualification: Qualification,
-) -> PreflightReport {
-    let fit = fit_estimate.or(estimate);
-    let dimensions = q36_dimensions(&checks, fit, qualification);
-    let (verdict, next_step) = q36_verdict(&checks, fit, qualification);
-    PreflightReport {
-        model_dir: model_dir.to_path_buf(),
-        tokenizer_dir: tokenizer_dir.to_path_buf(),
-        family,
-        verdict,
-        dimensions,
-        checks,
-        decisions,
-        estimate: estimate.cloned(),
-        next_step,
-    }
 }
 
 fn shallow_preflight(
@@ -1818,9 +1964,11 @@ mod tests {
         );
     }
 
+    use std::path::Path;
+
     use super::{
-        Check, CheckStatus, Compatibility, Estimate, PlanFixity, Qualification, ResourceFit,
-        Verdict, q36_dimensions, q36_verdict,
+        Candidate, Check, CheckStatus, Compatibility, Estimate, PlanAlternative, PlanDecision,
+        PlanFixity, Qualification, ResourceFit, Verdict, q36_dimensions, q36_verdict,
     };
 
     fn estimate(total: u64, limit: Option<u64>, fitting: Option<u32>) -> Estimate {
@@ -1888,6 +2036,241 @@ mod tests {
             .0,
             Verdict::Unsupported
         );
+    }
+
+    // ----- the rows arm -----
+
+    fn rows_stub_ok(
+        _dir: &Path,
+        _context: Option<u32>,
+        _kv_dtype: Option<&str>,
+        _facts: &super::super::probe::HardwareFacts,
+    ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
+        Ok((
+            vec![PlanDecision {
+                name: "context".to_string(),
+                chosen: "4096 positions".to_string(),
+                alternatives: Vec::new(),
+                fixed_at: PlanFixity::Start,
+            }],
+            "a stub note".to_string(),
+            super::RowsFit::Fits,
+        ))
+    }
+
+    fn rows_stub_refused(
+        _dir: &Path,
+        _context: Option<u32>,
+        _kv_dtype: Option<&str>,
+        _facts: &super::super::probe::HardwareFacts,
+    ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
+        Err(crate::EngError::BadRequest("the stub refuses".to_string()))
+    }
+
+    fn rows_stub_constrained(
+        _dir: &Path,
+        _context: Option<u32>,
+        _kv_dtype: Option<&str>,
+        _facts: &super::super::probe::HardwareFacts,
+    ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
+        Ok((
+            vec![
+                PlanDecision {
+                    name: "context".to_string(),
+                    chosen: "262144 positions".to_string(),
+                    alternatives: vec![PlanAlternative {
+                        option: "97280 positions".to_string(),
+                        verdict: "fits".to_string(),
+                        reason: "largest multiple of 1024 the same plan admits".to_string(),
+                    }],
+                    fixed_at: PlanFixity::Start,
+                },
+                PlanDecision {
+                    name: "K/V".to_string(),
+                    chosen: "F16 0.05 GiB".to_string(),
+                    alternatives: Vec::new(),
+                    fixed_at: PlanFixity::Start,
+                },
+            ],
+            "a stub note".to_string(),
+            super::RowsFit::Constrained {
+                requested: 262_144,
+                largest: 97_280,
+            },
+        ))
+    }
+
+    fn rows_stub_no_facts(
+        _dir: &Path,
+        _context: Option<u32>,
+        _kv_dtype: Option<&str>,
+        _facts: &super::super::probe::HardwareFacts,
+    ) -> Result<(Vec<PlanDecision>, String, super::RowsFit), crate::EngError> {
+        Ok((
+            Vec::new(),
+            "the device's free memory could not be probed: no driver".to_string(),
+            super::RowsFit::Unknown,
+        ))
+    }
+
+    #[test]
+    fn the_rows_arm_renders_the_source_rows_as_the_decisions() {
+        let report = super::rows_arm(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some("a family".to_string()),
+            rows_stub_ok,
+            &Candidate::default(),
+            &cuda_facts(24 << 30),
+            Qualification::Experimental,
+            Vec::new(),
+        );
+        assert_eq!(report.family.as_deref(), Some("a family"));
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].chosen, "4096 positions");
+        assert_eq!(check_named(&report, "load plan").status, CheckStatus::Pass);
+        assert_eq!(report.verdict, Verdict::Experimental);
+        assert_eq!(report.dimensions.qualification, Qualification::Experimental);
+    }
+
+    #[test]
+    fn the_rows_arm_renders_a_source_refusal_as_one_failed_check() {
+        let report = super::rows_arm(
+            Path::new("/m"),
+            Path::new("/t"),
+            None,
+            rows_stub_refused,
+            &Candidate::default(),
+            &cuda_facts(24 << 30),
+            Qualification::Experimental,
+            Vec::new(),
+        );
+        assert!(report.decisions.is_empty());
+        let check = check_named(&report, "load plan");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.detail,
+            "the load would refuse this pack: the stub refuses"
+        );
+        assert_eq!(report.verdict, Verdict::Unsupported);
+    }
+
+    #[test]
+    fn the_flash_family_routes_to_the_rows_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tempfile::tempdir().unwrap();
+        let candidate = Candidate {
+            family: Some(crate::family::flash_next::factory::FAMILY.to_string()),
+            ..Candidate::default()
+        };
+        let mut facts = cuda_facts(24 << 30);
+        facts.host.mem_total_bytes = crate::capability::Probe::Measured(64 << 30);
+        facts.host.mem_available_bytes = crate::capability::Probe::Measured(32 << 30);
+        let report = super::preflight(dir.path(), tok.path(), &candidate, &facts)
+            .expect("an empty directory is inspectable");
+        let check = check_named(&report, "load plan");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.contains("the load would refuse this pack:"),
+            "{}",
+            check.detail
+        );
+        assert!(report.decisions.is_empty());
+        assert_eq!(report.verdict, Verdict::Unsupported);
+    }
+
+    #[test]
+    fn the_rows_arm_reports_a_fits_alternative_as_constrained_not_pass() {
+        let report = super::rows_arm(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some("a family".to_string()),
+            rows_stub_constrained,
+            &Candidate::default(),
+            &cuda_facts(24 << 30),
+            Qualification::Experimental,
+            Vec::new(),
+        );
+        let check = check_named(&report, "load plan");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("the requested 262144 positions do not fit")
+                && check.detail.contains("largest fitting context is 97280")
+                && check.detail.contains("a multiple of 1024")
+                && check.detail.contains("a stub note"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(report.verdict, Verdict::ResourceConstrained);
+        assert_eq!(
+            report.dimensions.resource_fit,
+            super::ResourceFit::DoesNotFit
+        );
+        assert!(report.next_step.contains("97280"), "{}", report.next_step);
+        // The constrained verdict is restated, never stored as an estimate.
+        assert!(report.estimate.is_none());
+    }
+
+    #[test]
+    fn the_rows_arm_warns_instead_of_failing_when_the_probe_missed_a_fact() {
+        let report = super::rows_arm(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some("a family".to_string()),
+            rows_stub_no_facts,
+            &Candidate::default(),
+            &cuda_facts(24 << 30),
+            Qualification::Experimental,
+            Vec::new(),
+        );
+        let check = check_named(&report, "load plan");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("no decision rows: the device's free memory could not be probed"),
+            "{}",
+            check.detail
+        );
+        // A fact the probe could not read is not the pack's fault.
+        assert_ne!(report.verdict, Verdict::Unsupported);
+        assert!(report.decisions.is_empty());
+        assert_eq!(report.dimensions.resource_fit, super::ResourceFit::Unknown);
+    }
+
+    #[test]
+    fn a_flash_build_without_the_rows_entry_keeps_the_shallow_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tempfile::tempdir().unwrap();
+        let inspection =
+            crate::capability::inspect::inspect(dir.path(), tok.path()).expect("inspectable");
+        let report = super::rows_or_shallow(
+            dir.path(),
+            tok.path(),
+            &inspection,
+            Some(crate::family::flash_next::factory::FAMILY.to_string()),
+            &Candidate::default(),
+            &cuda_facts(24 << 30),
+            Vec::new(),
+            // The entry a build without the Flash-Next CUDA load path
+            // carries: `None`, and the dispatch answers with the shallow
+            // report.
+            None,
+        );
+        // With no entry, the shallow report.
+        assert!(
+            report.checks.iter().any(|c| c.name == "memory estimate"),
+            "{:?}",
+            report.checks
+        );
+        assert!(
+            report.checks.iter().all(|c| c.name != "load plan"),
+            "{:?}",
+            report.checks
+        );
+        assert!(report.decisions.is_empty());
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {

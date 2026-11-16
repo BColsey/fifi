@@ -833,9 +833,227 @@ impl FlashWeights {
     }
 }
 
+/// The capability preflight's facts-in-rows-out entry for this family: the
+/// same settings resolution, open, walk and plan the loader runs, fed by
+/// probed facts instead of the live card, rendered as the shared decision
+/// rows with a one-line note the report appends. `context` and `kv_dtype`
+/// are the candidate's values; the settings resolution accepts and refuses
+/// exactly what the loader would, with its own texts and key names. The
+/// ring budget is read from the same environment variable and clamped the
+/// same way; the prefill arena is start-only policy, so the expert row is
+/// taken before it — the note says so. When the probed facts cannot carry
+/// a plan (no free-bytes or host reading), the entry answers with no rows
+/// and the reason: a fact the probe could not read is not the pack's
+/// fault.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn preflight_rows(
+    dir: &std::path::Path,
+    context: Option<u32>,
+    kv_dtype: Option<&str>,
+    facts: &crate::capability::probe::HardwareFacts,
+) -> Result<
+    (
+        Vec<crate::family::plan_decision::PlanDecision>,
+        String,
+        crate::family::plan_rows::RowsFit,
+    ),
+    EngError,
+> {
+    use crate::capability::Probe;
+    use crate::family::flash_next::moe::tier_plan::{TierInputs, TierShape};
+    use crate::family::plan_decision::{PlanAlternative, PlanFixity};
+    use crate::family::plan_rows::{PlanRows, RowsFit};
+
+    // The loader's own settings resolution: same keys, same texts, same
+    // bounds (a multiple of 4 from 4 to 262144; f16 only, int8 has no
+    // attention kernel yet) — refused, never clamped.
+    let options = super::settings::FlashOptions {
+        cuda_decode: Some(true),
+        context,
+        kv_format: match kv_dtype {
+            None => None,
+            Some(name) => Some(
+                serde_json::from_value::<super::settings::KvFormatName>(serde_json::Value::String(
+                    name.to_string(),
+                ))
+                .map_err(|error| EngError::BadRequest(format!("kv_format: {error}")))?,
+            ),
+        },
+        ..super::settings::FlashOptions::default()
+    };
+    let settings = match super::settings::cuda_settings(&options)? {
+        Some(settings) => settings,
+        // Unreachable in practice: the options above set cuda_decode. A
+        // report path refuses; it never panics.
+        None => {
+            return Err(EngError::BadRequest(
+                "cuda_decode is set but the settings resolution returned none".into(),
+            ));
+        }
+    };
+
+    // The loader's own switch checks, called the same way `build_driver`
+    // calls them: the spelling pass over the Flash-Next environment
+    // switches, then the shared-prefill row rule against the same resolved
+    // `prefill_rows` (the default when the candidate says nothing).
+    let shared_prefill = super::cuda::driver::chunk::prof::check_switch_spelling()?;
+    super::cuda::driver::chunk::prof::check_shared_prefill_rows(
+        shared_prefill,
+        settings.prefill_rows,
+    )?;
+    // The two PLE switches refuse on spelling the same way at start; their
+    // values change no row, so only their refusal is shared.
+    super::settings::ple_device()?;
+    super::settings::ple_batch()?;
+
+    let free_vram = match &facts.cuda.first_device_free_bytes {
+        Probe::Measured(free) => *free,
+        Probe::Unavailable(reason) => {
+            return Ok((
+                Vec::new(),
+                format!("the device's free memory could not be probed: {reason}"),
+                RowsFit::Unknown,
+            ));
+        }
+    };
+    let host = match (&facts.host.mem_total_bytes, &facts.host.mem_available_bytes) {
+        (Probe::Measured(total), Probe::Measured(available)) => (*total, *available),
+        _ => {
+            return Ok((
+                Vec::new(),
+                "the host's memory could not be probed, so the host side of the plan cannot be checked".to_string(),
+                RowsFit::Unknown,
+            ));
+        }
+    };
+
+    // The loader's own open: the storage guard judges the directory, every
+    // shard, the metadata files and the n-gram table before anything is
+    // read, refusing a network-backed path by name.
+    let pack_files::FlashPackFiles {
+        checkpoint,
+        ngram: _,
+        report,
+    } = pack_files::FlashPackFiles::open(dir)?;
+    let (model, kinds) = model_shape(&checkpoint.model_config)?;
+    let ngram_bytes = std::fs::metadata(dir.join(pack_files::NGRAM_FILE))
+        .map_err(|error| EngError::Checkpoint(format!("{}: {error}", pack_files::NGRAM_FILE)))?
+        .len();
+    let tier_shape = TierShape::from_pack(
+        kinds.len(),
+        model.moe.experts(),
+        model.moe.top_k(),
+        report.expert_bytes,
+    )?;
+    let ring_budget = super::settings::ring_budget_bytes(
+        std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
+            .ok()
+            .as_deref(),
+    )?;
+    let card = TierInputs::measured(
+        tier_shape,
+        (0, 0),
+        crate::family::device_budget::KvPlan {
+            positions: 1,
+            bytes_per_position: 1,
+        },
+        free_vram.saturating_sub(ring_budget),
+        host,
+    );
+    let plan = crate::family::flash_next::moe::load_plan::FlashLoadPlan::new(
+        &report,
+        &checkpoint.model_config,
+        ngram_bytes,
+        card,
+    )?;
+    let requested = u64::from(settings.context);
+    let kv = settings.kv_format.format();
+    let min_slots = model.moe.top_k() + 1;
+    let note = if shared_prefill {
+        "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+    } else {
+        "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+    };
+    match plan.at_context(requested, kv, min_slots) {
+        Ok(load) => Ok((load.plan_rows(), note.to_string(), RowsFit::Fits)),
+        Err(refusal) => {
+            // The context row keeps the configured truth and carries the
+            // largest fitting context as a proposal, never applied; every
+            // size row is the largest fitting plan's own, and the
+            // alternative says so.
+            let Some(largest) = largest_fitting_context(&plan, requested, kv, min_slots) else {
+                return Err(refusal);
+            };
+            let largest = u32::try_from(largest).map_err(|_| {
+                EngError::BadRequest(
+                    "the largest fitting context overflows the settings range".into(),
+                )
+            })?;
+            let load = plan.at_context(u64::from(largest), kv, min_slots)?;
+            let mut rows = load.plan_rows();
+            if let Some(row) = rows.iter_mut().find(|row| row.name == "context") {
+                *row = crate::family::plan_decision::PlanDecision {
+                    name: row.name.clone(),
+                    chosen: format!("{requested} positions"),
+                    alternatives: vec![PlanAlternative {
+                        option: format!("{largest} positions"),
+                        verdict: "fits".to_string(),
+                        reason: "largest multiple of 1024 the same plan admits; a proposal, never applied — the size rows are this plan's".to_string(),
+                    }],
+                    fixed_at: PlanFixity::Start,
+                };
+            }
+            // The two rows the plan scales with the context say which
+            // context they are for; the fixed rows (trunk, embedding,
+            // n-gram) do not scale and stay context-free.
+            for row in rows
+                .iter_mut()
+                .filter(|row| matches!(row.name.as_str(), "K/V" | "expert placement"))
+            {
+                row.chosen = format!("{} at {largest} positions", row.chosen);
+            }
+            Ok((
+                rows,
+                note.to_string(),
+                RowsFit::Constrained {
+                    requested: settings.context,
+                    largest,
+                },
+            ))
+        }
+    }
+}
+
+/// The largest multiple-of-1024 context at or below `requested` the plan
+/// still admits at `min_slots`, found by binary search over the same
+/// refusal the loader raises (the plan's fit is monotone in the context).
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn largest_fitting_context(
+    plan: &crate::family::flash_next::moe::load_plan::FlashLoadPlan,
+    requested: u64,
+    kv: crate::family::flash_next::moe::context_budget::KvFormat,
+    min_slots: usize,
+) -> Option<u64> {
+    // Search over multiples of 1024, like the qwen36 proposal. The caller
+    // already knows `requested` does not fit, so `hi` starts refused.
+    let mut lo = 0u64;
+    let mut hi = requested / 1024;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if plan.at_context(mid * 1024, kv, min_slots).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    (lo > 0).then(|| lo * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::plan_decision::{PlanAlternative, PlanFixity};
+    use crate::family::plan_rows::RowsFit;
     use crate::weights::ShardIo;
 
     pub(super) const CONFIG: &[u8] =
@@ -939,5 +1157,239 @@ mod tests {
             Err(other) => panic!("expected a checkpoint error, got {other:?}"),
             Ok(_) => panic!("load unexpectedly accepted ple_layer_ids [49]"),
         }
+    }
+
+    // ----- the preflight rows entry -----
+
+    /// The committed real n-gram table header: sparse-file layout, so the
+    /// 32.6 GB it describes never touch the disk here.
+    const NGRAM_HEADER: &[u8] =
+        include_bytes!("../../../tests/fixtures/flash_next_exl3_ngram/ngram_embedding.header");
+
+    fn width_of(dtype: &str) -> usize {
+        match dtype {
+            "F16" | "BF16" | "I16" => 2,
+            _ => 4,
+        }
+    }
+
+    /// A pack of the small stock layout on disk, its PLE widened so the
+    /// n-gram table's layout is the committed real one (heads 16, rows of
+    /// 160 values), plus the n-gram header as the table file.
+    fn pack_dir() -> tempfile::TempDir {
+        use crate::weights::exl3::flint_pack::PackBuilder;
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&super::exl3_pack::tests::config()).unwrap();
+        let text = value["text_config"].as_object_mut().unwrap();
+        text.insert("heads_per_ngram".into(), serde_json::json!(8));
+        text.insert("ple_embed_dim".into(), serde_json::json!(2560));
+        // The pack's own header block: the model config above carries the
+        // HF-style quantization block, not the pack reader's.
+        value["quantization_config"] =
+            serde_json::json!({"quant_method": "exl3", "version": "1.6.2"});
+        let mut entries = super::exl3_pack::tests::pack();
+        for (name, _, shape) in &mut entries {
+            if name.ends_with("ple.key_proj.weight") {
+                *shape = vec![256, 2560];
+            }
+            if name.ends_with("ple.value_proj.weight") {
+                *shape = vec![128, 2560];
+            }
+        }
+        let mut builder = PackBuilder {
+            config: value,
+            tensors: std::collections::BTreeMap::new(),
+        };
+        for (name, dtype, shape) in entries {
+            let bytes = shape.iter().map(|&d| d as usize).product::<usize>() * width_of(dtype);
+            builder.put(&name, dtype, &shape, vec![0u8; bytes]);
+        }
+        let dir = builder.write();
+        let ngram_path = dir.path().join(super::pack_files::NGRAM_FILE);
+        std::fs::write(&ngram_path, NGRAM_HEADER).unwrap();
+        // The sparse-file trick of the n-gram table's own tests: the header
+        // describes the real 32.6 GB table, and the hole never touches disk.
+        std::fs::File::options()
+            .write(true)
+            .open(&ngram_path)
+            .unwrap()
+            .set_len(32_640_183_408)
+            .unwrap();
+        dir
+    }
+
+    fn flash_facts(free_vram: u64) -> crate::capability::probe::HardwareFacts {
+        use crate::capability::Probe;
+        use crate::capability::probe::{CompiledBackends, CudaFacts, HardwareFacts, HostFacts};
+        HardwareFacts {
+            backends: CompiledBackends {
+                cuda: true,
+                mlx: false,
+            },
+            cuda: CudaFacts {
+                device_count: Probe::Measured(1),
+                first_device_integrated: Probe::Measured(false),
+                first_device_free_bytes: Probe::Measured(free_vram),
+                first_device_total_bytes: Probe::Measured(24u64 << 30),
+            },
+            host: HostFacts {
+                mem_total_bytes: Probe::Measured(64u64 << 30),
+                mem_available_bytes: Probe::Measured(32u64 << 30),
+                cpu_threads: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn preflight_rows_render_the_loaders_plan_from_probed_facts() {
+        let dir = pack_dir();
+        let (rows, note, fit) =
+            preflight_rows(dir.path(), None, None, &flash_facts(24 << 30)).unwrap();
+        assert!(matches!(fit, RowsFit::Fits));
+        assert_eq!(
+            note,
+            "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
+        );
+        let rendered: Vec<(&str, &str, PlanFixity)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.chosen.as_str(), row.fixed_at))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("context", "4096 positions", PlanFixity::Start),
+                ("K/V", "F16 0.00 GiB", PlanFixity::Start),
+                ("trunk", "0.00 GiB on the device", PlanFixity::Load),
+                (
+                    "expert placement",
+                    "3 of 3 experts per layer in VRAM (0.00 GiB), 0.00 GiB pinned in host RAM",
+                    PlanFixity::Load
+                ),
+                ("embedding", "0.00 GiB host", PlanFixity::Load),
+                ("n-gram table", "30.40 GiB local NVMe", PlanFixity::Load),
+            ]
+        );
+        assert!(rows.iter().all(|row| row.alternatives.is_empty()));
+    }
+
+    #[test]
+    fn preflight_rows_name_the_largest_fitting_context_when_the_card_is_small() {
+        let dir = pack_dir();
+        let (rows, _note, fit) =
+            preflight_rows(dir.path(), Some(262_144), None, &flash_facts(1_000_000_000)).unwrap();
+        let context = rows.first().expect("the context row");
+        assert_eq!(context.chosen, "262144 positions");
+        assert_eq!(context.fixed_at, PlanFixity::Start);
+        assert_eq!(
+            context.alternatives,
+            vec![PlanAlternative {
+                option: "97280 positions".to_string(),
+                verdict: "fits".to_string(),
+                reason: "largest multiple of 1024 the same plan admits; a proposal, never applied — the size rows are this plan's"
+                    .to_string(),
+            }]
+        );
+        assert!(
+            matches!(
+                fit,
+                RowsFit::Constrained {
+                    requested: 262_144,
+                    largest: 97_280
+                }
+            ),
+            "{fit:?}"
+        );
+        let kv = &rows[1];
+        // The context-scaled rows say which context they are for.
+        assert_eq!(kv.chosen, "F16 0.05 GiB at 97280 positions");
+        let placement = rows
+            .iter()
+            .find(|row| row.name == "expert placement")
+            .expect("the placement row");
+        assert!(placement.chosen.ends_with(" at 97280 positions"));
+    }
+
+    #[test]
+    fn the_switch_checks_the_loader_runs_are_the_preflight_runs_too() {
+        use super::super::cuda::driver::chunk::prof::{
+            check_shared_prefill_rows, check_switch_value,
+        };
+        // A value the switches do not read, with the loader's own text.
+        let error = check_switch_value("INFERENCE_FLASH_NEXT_SHARED_PREFILL", Some("yes"))
+            .unwrap_err()
+            .describe();
+        assert!(
+            error.contains("must be 1, true, on, 0, false or off, not yes"),
+            "{error}"
+        );
+        // The shared-prefill row rule against the resolved default rows.
+        let error = check_shared_prefill_rows(true, 1).unwrap_err().describe();
+        assert!(
+            error.contains("INFERENCE_FLASH_NEXT_SHARED_PREFILL requires prefill_rows > 1"),
+            "{error}"
+        );
+        assert!(check_shared_prefill_rows(true, 8).is_ok());
+        let error = check_shared_prefill_rows(false, 65).unwrap_err().describe();
+        assert!(
+            error.contains("needs INFERENCE_FLASH_NEXT_SHARED_PREFILL=1"),
+            "{error}"
+        );
+        assert!(check_shared_prefill_rows(false, 64).is_ok());
+    }
+
+    #[test]
+    fn preflight_rows_refuse_a_kv_name_the_settings_refuse() {
+        let dir = pack_dir();
+        // The same serde text a config file with this value would print.
+        assert_eq!(
+            preflight_rows(dir.path(), None, Some("q8"), &flash_facts(24 << 30))
+                .unwrap_err()
+                .describe(),
+            "kv_format: unknown variant `q8`, expected `f16` or `int8`"
+        );
+    }
+
+    #[test]
+    fn preflight_rows_refuse_kv_int8_with_the_loaders_own_text() {
+        let dir = pack_dir();
+        assert_eq!(
+            preflight_rows(dir.path(), None, Some("int8"), &flash_facts(24 << 30))
+                .unwrap_err()
+                .describe(),
+            "engine config: kv_format int8 has no attention kernel yet; use f16"
+        );
+    }
+
+    #[test]
+    fn preflight_rows_refuse_an_unmultiple_context_instead_of_clamping() {
+        let dir = pack_dir();
+        let error = preflight_rows(dir.path(), Some(4097), None, &flash_facts(24 << 30))
+            .unwrap_err()
+            .describe();
+        assert!(
+            error.contains("context must be a multiple of 4, found 4097"),
+            "{error}"
+        );
+        // Above the family's own ceiling is refused, not clamped down.
+        let error = preflight_rows(dir.path(), Some(262_148), None, &flash_facts(24 << 30))
+            .unwrap_err()
+            .describe();
+        assert!(error.contains("262148"), "{error}");
+    }
+
+    #[test]
+    fn preflight_rows_answer_no_rows_when_the_probe_could_not_read_the_card() {
+        let dir = pack_dir();
+        let mut facts = flash_facts(24 << 30);
+        facts.cuda.first_device_free_bytes =
+            crate::capability::Probe::Unavailable("no driver".to_string());
+        let (rows, note, fit) = preflight_rows(dir.path(), None, None, &facts).unwrap();
+        assert!(matches!(fit, RowsFit::Unknown));
+        assert!(rows.is_empty());
+        assert!(
+            note.contains("the device's free memory could not be probed: no driver"),
+            "{note}"
+        );
     }
 }
