@@ -49,6 +49,7 @@ pub(crate) mod host_admit;
 pub mod keys;
 pub(crate) mod kv_format;
 pub mod layer_weights;
+pub mod mapped_file;
 pub(in crate::family) mod math;
 pub mod nemotron35;
 #[allow(

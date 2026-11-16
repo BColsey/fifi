@@ -7,14 +7,13 @@
 //! ([`residency`]). There is no CUDA here and no clock read outside [`server`]'s
 //! thread and the pool's bounded `finish` (whose waits time themselves); time
 //! otherwise arrives as a parameter, and the only file access is the read-only
-//! mapping of [`mapped_file`]. The tiered step uses it through `cuda/tiered_step.rs`
+//! mapping of [`crate::family::mapped_file`]. The tiered step uses it through `cuda/tiered_step.rs`
 //! and `cuda/tiered_load.rs`.
 
 pub mod cpu_pool;
 pub mod guess;
 pub mod host;
 pub mod locator;
-pub mod mapped_file;
 pub mod policy;
 pub mod report;
 pub mod residency;

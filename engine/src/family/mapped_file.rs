@@ -298,13 +298,13 @@ mod tests {
         let needle: String = ["uns", "afe", " {"].concat();
         assert_eq!(production.matches(&needle).count(), 1);
         for source in [
-            include_str!("mod.rs"),
-            include_str!("policy.rs"),
-            include_str!("residency.rs"),
-            include_str!("report.rs"),
-            include_str!("cpu_pool.rs"),
-            include_str!("guess.rs"),
-            include_str!("locator.rs"),
+            include_str!("qwen36/tiered/mod.rs"),
+            include_str!("qwen36/tiered/policy.rs"),
+            include_str!("qwen36/tiered/residency.rs"),
+            include_str!("qwen36/tiered/report.rs"),
+            include_str!("qwen36/tiered/cpu_pool.rs"),
+            include_str!("qwen36/tiered/guess.rs"),
+            include_str!("qwen36/tiered/locator.rs"),
         ] {
             assert!(!source.contains(&needle));
         }
