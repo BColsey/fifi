@@ -578,7 +578,7 @@ pub(super) fn build_driver(
     );
     let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
     let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
-    HostAdmission::probe()?.admit_for(
+    HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?.admit_for(
         host_plan.process_bytes + ple_bytes,
         "Flash-Next expert bank and PLE projections",
     )?;

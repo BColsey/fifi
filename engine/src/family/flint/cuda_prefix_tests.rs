@@ -648,7 +648,8 @@ fn prefix_save_restore_envelope_under_guard() {
     // save. What must still hold after allocation is the floor: the OS
     // headroom the budget always requires (admit with charge 0 asserts
     // exactly os_floor <= available).
-    let budget = crate::family::host_admit::HostAdmission::probe().expect("probe the host budget");
+    let budget = crate::family::host_admit::HostAdmission::probe("Flint expert cache", "Flint")
+        .expect("probe the host budget");
     budget
         .admit_for(0, "post-save floor")
         .expect("the host floor must still hold after the snapshot is live");

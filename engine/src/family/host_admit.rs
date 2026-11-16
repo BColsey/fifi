@@ -2,8 +2,8 @@
 //!
 //! probe reads /proc/meminfo and the process's cgroup tree, and admit
 //! refuses a payload that would break the OS floor or the enclosing cgroup
-//! limit. The wording in the error strings is kept byte-identical to the
-//! extraction source.
+//! limit. Every refusal names the caller that refused; the frozen
+//! families' exact texts are pinned by the full-text tests in this module.
 
 use crate::EngError;
 
@@ -19,8 +19,10 @@ impl HostAdmission {
         dead_code,
         reason = "the callers live on the CUDA executor paths; host tests exercise probe_in"
     )]
-    pub(crate) fn probe() -> Result<Self, EngError> {
+    pub(crate) fn probe(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
         Self::probe_in(
+            label,
+            root_label,
             std::path::Path::new("/proc"),
             std::path::Path::new("/sys/fs/cgroup"),
             std::process::id(),
@@ -28,26 +30,32 @@ impl HostAdmission {
     }
 
     fn probe_in(
+        label: &'static str,
+        root_label: &'static str,
         proc: &std::path::Path,
         root: &std::path::Path,
         pid: u32,
     ) -> Result<Self, EngError> {
-        let meminfo = read_admission_file(&proc.join("meminfo"))?;
-        let membership = read_admission_file(&proc.join("self/cgroup"))?;
-        let mounts = read_admission_file(&proc.join("self/mountinfo"))?;
-        let group = cgroup_from_proc(root, &membership, &mounts, pid)?;
+        let meminfo = read_admission_file(label, &proc.join("meminfo"))?;
+        let membership = read_admission_file(label, &proc.join("self/cgroup"))?;
+        let mounts = read_admission_file(label, &proc.join("self/mountinfo"))?;
+        let group = cgroup_from_proc(label, root, &membership, &mounts, pid)?;
         let root = std::fs::canonicalize(root)
-            .map_err(|error| EngError::MemoryPlan(format!("Flint cgroup root: {error}")))?;
-        Self::from_meminfo(&meminfo, cgroup_remaining_in(&root, &group)?)
+            .map_err(|error| EngError::MemoryPlan(format!("{root_label} cgroup root: {error}")))?;
+        Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)
     }
 
-    fn from_meminfo(contents: &str, cgroup_remaining: Option<u64>) -> Result<Self, EngError> {
-        let total = meminfo_bytes(contents, "MemTotal:")?;
-        let available = meminfo_bytes(contents, "MemAvailable:")?;
+    fn from_meminfo(
+        label: &'static str,
+        contents: &str,
+        cgroup_remaining: Option<u64>,
+    ) -> Result<Self, EngError> {
+        let total = meminfo_bytes(label, contents, "MemTotal:")?;
+        let available = meminfo_bytes(label, contents, "MemAvailable:")?;
         if total == 0 || available > total {
-            return Err(EngError::MemoryPlan(
-                "Flint expert cache memory snapshot has inconsistent totals.".into(),
-            ));
+            return Err(EngError::MemoryPlan(format!(
+                "{label} memory snapshot has inconsistent totals."
+            )));
         }
         Ok(Self {
             mem_available: available,
@@ -56,12 +64,13 @@ impl HostAdmission {
         })
     }
 
-    pub(crate) fn admit(&self, required: u64) -> Result<(), EngError> {
-        self.admit_for(required, "Flint expert cache")
+    /// [`admit_for`] with the caller's label as the refusing name.
+    pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
+        self.admit_for(required, label)
     }
 
-    /// [`admit`] with the caller's name in the refusal, so a prefix
-    /// snapshot refusal does not masquerade as an expert-cache one
+    /// The admission check with the caller's name in the refusal, so a prefix
+    /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
         let available = self
@@ -82,10 +91,10 @@ impl HostAdmission {
     }
 }
 
-fn meminfo_bytes(contents: &str, name: &str) -> Result<u64, EngError> {
+fn meminfo_bytes(label: &'static str, contents: &str, name: &str) -> Result<u64, EngError> {
     let invalid = || {
         EngError::MemoryPlan(format!(
-            "Flint expert cache needs one valid {name} value in kB from /proc/meminfo."
+            "{label} needs one valid {name} value in kB from /proc/meminfo."
         ))
     };
     let mut matches = contents.lines().filter_map(|line| line.strip_prefix(name));
@@ -101,12 +110,15 @@ fn meminfo_bytes(contents: &str, name: &str) -> Result<u64, EngError> {
     Ok(bytes)
 }
 
-fn cgroup_remaining_bytes(maximum: &str, current: &str) -> Result<Option<u64>, EngError> {
+fn cgroup_remaining_bytes(
+    label: &'static str,
+    maximum: &str,
+    current: &str,
+) -> Result<Option<u64>, EngError> {
     let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache needs memory.max as max or an unsigned byte count, and memory.current as an unsigned byte count."
-                .into(),
-        )
+        EngError::MemoryPlan(format!(
+            "{label} needs memory.max as max or an unsigned byte count, and memory.current as an unsigned byte count."
+        ))
     };
     let parse = |value: &str| {
         let value = value.trim();
@@ -122,17 +134,15 @@ fn cgroup_remaining_bytes(maximum: &str, current: &str) -> Result<Option<u64>, E
     }
 }
 
-fn read_admission_file(path: &std::path::Path) -> Result<String, EngError> {
+fn read_admission_file(label: &'static str, path: &std::path::Path) -> Result<String, EngError> {
     std::fs::read_to_string(path).map_err(|error| {
-        EngError::MemoryPlan(format!(
-            "Flint expert cache cannot read {}: {error}",
-            path.display()
-        ))
+        EngError::MemoryPlan(format!("{label} cannot read {}: {error}", path.display()))
     })
 }
 
 // Discovery must verify the global controller root and reject hidden ancestors first.
 fn cgroup_remaining_in(
+    label: &'static str,
     root: &std::path::Path,
     cgroup: &std::path::Path,
 ) -> Result<Option<u64>, EngError> {
@@ -144,22 +154,23 @@ fn cgroup_remaining_in(
             .chain(cgroup.components())
             .any(|component| component == std::path::Component::ParentDir)
     {
-        return Err(EngError::MemoryPlan(
-            "Flint expert cache cgroup must be inside its verified controller root.".into(),
-        ));
+        return Err(EngError::MemoryPlan(format!(
+            "{label} cgroup must be inside its verified controller root."
+        )));
     }
     let mut minimum: Option<u64> = None;
     let mut group = cgroup;
     while group != root {
         let parent = group.parent().ok_or_else(|| {
-            EngError::MemoryPlan("Flint expert cache cgroup has no controller ancestor.".into())
+            EngError::MemoryPlan(format!("{label} cgroup has no controller ancestor."))
         })?;
-        if read_admission_file(&parent.join("cgroup.subtree_control"))?
+        if read_admission_file(label, &parent.join("cgroup.subtree_control"))?
             .split_whitespace()
             .any(|controller| controller == "memory")
             && let Some(remaining) = cgroup_remaining_bytes(
-                &read_admission_file(&group.join("memory.max"))?,
-                &read_admission_file(&group.join("memory.current"))?,
+                label,
+                &read_admission_file(label, &group.join("memory.max"))?,
+                &read_admission_file(label, &group.join("memory.current"))?,
             )?
         {
             minimum = Some(minimum.map_or(remaining, |previous| previous.min(remaining)));
@@ -170,8 +181,9 @@ fn cgroup_remaining_in(
     // its limit is the outermost one. The global root has no limit files.
     if root.join("memory.max").exists() {
         let remaining = cgroup_remaining_bytes(
-            &read_admission_file(&root.join("memory.max"))?,
-            &read_admission_file(&root.join("memory.current"))?,
+            label,
+            &read_admission_file(label, &root.join("memory.max"))?,
+            &read_admission_file(label, &root.join("memory.current"))?,
         )?;
         if let Some(remaining) = remaining {
             minimum = Some(minimum.map_or(remaining, |previous| previous.min(remaining)));
@@ -180,11 +192,15 @@ fn cgroup_remaining_in(
     Ok(minimum)
 }
 
-fn verify_cgroup_root(root: &std::path::Path, mounts: &str) -> Result<(), EngError> {
+fn verify_cgroup_root(
+    label: &'static str,
+    root: &std::path::Path,
+    mounts: &str,
+) -> Result<(), EngError> {
     let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache needs one complete cgroup2 root with the memory controller.".into(),
-        )
+        EngError::MemoryPlan(format!(
+            "{label} needs one complete cgroup2 root with the memory controller."
+        ))
     };
     let point = root.to_str().ok_or_else(invalid)?;
     let mut mounted = false;
@@ -205,7 +221,7 @@ fn verify_cgroup_root(root: &std::path::Path, mounts: &str) -> Result<(), EngErr
         mounted = true;
     }
     if !mounted
-        || !read_admission_file(&root.join("cgroup.controllers"))?
+        || !read_admission_file(label, &root.join("cgroup.controllers"))?
             .split_whitespace()
             .any(|controller| controller == "memory")
     {
@@ -222,7 +238,7 @@ fn verify_cgroup_root(root: &std::path::Path, mounts: &str) -> Result<(), EngErr
             Ok(_) => present += 1,
             Err(error) => {
                 return Err(EngError::MemoryPlan(format!(
-                    "Flint expert cache cannot verify {}: {error}",
+                    "{label} cannot verify {}: {error}",
                     path.display()
                 )));
             }
@@ -235,16 +251,16 @@ fn verify_cgroup_root(root: &std::path::Path, mounts: &str) -> Result<(), EngErr
 }
 
 fn cgroup_from_proc(
+    label: &'static str,
     root: &std::path::Path,
     membership: &str,
     mounts: &str,
     pid: u32,
 ) -> Result<std::path::PathBuf, EngError> {
     let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache cannot map its process inside a complete unified cgroup tree."
-                .into(),
-        )
+        EngError::MemoryPlan(format!(
+            "{label} cannot map its process inside a complete unified cgroup tree."
+        ))
     };
     let mut lines = membership.lines();
     let path = std::path::Path::new(
@@ -267,22 +283,22 @@ fn cgroup_from_proc(
     let resolve = |path: &std::path::Path| {
         std::fs::canonicalize(path).map_err(|error| {
             EngError::MemoryPlan(format!(
-                "Flint expert cache cannot resolve {}: {error}",
+                "{label} cannot resolve {}: {error}",
                 path.display()
             ))
         })
     };
     let root = resolve(root)?;
-    verify_cgroup_root(&root, mounts)?;
+    verify_cgroup_root(label, &root, mounts)?;
     let group = resolve(&root.join(path.strip_prefix("/").map_err(|_| invalid())?))?;
     if !group.starts_with(&root) {
         return Err(invalid());
     }
-    if group != root && read_admission_file(&group.join("cgroup.type"))?.trim() != "domain" {
+    if group != root && read_admission_file(label, &group.join("cgroup.type"))?.trim() != "domain" {
         return Err(invalid());
     }
     let mut found = false;
-    for owner in read_admission_file(&group.join("cgroup.procs"))?.split_whitespace() {
+    for owner in read_admission_file(label, &group.join("cgroup.procs"))?.split_whitespace() {
         found |= owner.parse::<u32>().map_err(|_| invalid())? == pid;
     }
     if !found {
@@ -293,7 +309,168 @@ fn cgroup_from_proc(
 
 #[cfg(test)]
 mod tests {
+    const LABEL: &str = "the caller";
+    const ROOT_LABEL: &str = "the caller";
     use super::*;
+
+    fn refusal_text<T>(result: Result<T, EngError>) -> String {
+        match result {
+            Err(EngError::MemoryPlan(message)) => message,
+            Err(other) => panic!("unexpected refusal variant: {other:?}"),
+            Ok(_) => panic!("expected a refusal"),
+        }
+    }
+
+    #[test]
+    fn refusal_texts_carry_the_neutral_label_and_name_no_family() {
+        let no_family = |message: &str| {
+            assert!(message.contains(LABEL), "{message}");
+            assert!(
+                !message.contains("Flint") && !message.contains("Flash"),
+                "{message}"
+            );
+        };
+        // Every reachable refusal, produced, not quoted from the source.
+        no_family(&refusal_text(HostAdmission::from_meminfo(
+            LABEL,
+            "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
+            None,
+        )));
+        no_family(&refusal_text(meminfo_bytes(LABEL, "junk", "MemAvailable:")));
+        no_family(&refusal_text(cgroup_remaining_bytes(LABEL, "bogus", "0")));
+        no_family(&refusal_text(read_admission_file(
+            LABEL,
+            std::path::Path::new("/nonexistent-admission-file"),
+        )));
+        no_family(&refusal_text(cgroup_remaining_in(
+            LABEL,
+            std::path::Path::new("/sys/fs/cgroup"),
+            std::path::Path::new("/var"),
+        )));
+        no_family(&refusal_text(verify_cgroup_root(
+            LABEL,
+            std::path::Path::new("/definitely/not/here"),
+            "",
+        )));
+        let (root, proc) = namespace_root("max", "memory\n");
+        no_family(&refusal_text(cgroup_from_proc(
+            LABEL,
+            root.path(),
+            "0::\nbroken",
+            "",
+            42,
+        )));
+        let mounts = std::fs::read_to_string(proc.path().join("self/mountinfo")).unwrap();
+        let looped = root.path().join("cgroup.type");
+        std::fs::remove_file(&looped).unwrap();
+        std::os::unix::fs::symlink("cgroup.type", &looped).unwrap();
+        no_family(&refusal_text(verify_cgroup_root(
+            LABEL,
+            root.path(),
+            &mounts,
+        )));
+        // The no-ancestor refusal is structurally unreachable: a cgroup that
+        // starts_with(root) always walks up to root, so that branch stays
+        // untriggered by design.
+        // The root-label line ("{root_label} cgroup root:") only fires in
+        // the window between cgroup_from_proc's canonicalize and probe_in's
+        // own, so it cannot be produced deterministically.
+        no_family(&refusal_text(cgroup_from_proc(
+            LABEL,
+            root.path(),
+            "0::/missing-group\n",
+            &std::fs::read_to_string(proc.path().join("self/mountinfo")).unwrap(),
+            42,
+        )));
+        assert_eq!(
+            refusal_text(HostAdmission::from_meminfo(
+                LABEL,
+                "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
+                None
+            )),
+            "the caller memory snapshot has inconsistent totals."
+        );
+        assert_eq!(
+            refusal_text(meminfo_bytes(LABEL, "junk", "MemAvailable:")),
+            "the caller needs one valid MemAvailable: value in kB from /proc/meminfo."
+        );
+        assert_eq!(
+            refusal_text(cgroup_remaining_bytes(LABEL, "bogus", "0")),
+            "the caller needs memory.max as max or an unsigned byte count, and memory.current as an unsigned byte count."
+        );
+        assert!(
+            refusal_text(read_admission_file(
+                LABEL,
+                std::path::Path::new("/nonexistent-admission-file")
+            ))
+            .starts_with("the caller cannot read /nonexistent-admission-file: ")
+        );
+        assert_eq!(
+            refusal_text(cgroup_remaining_in(
+                LABEL,
+                std::path::Path::new("/sys/fs/cgroup"),
+                std::path::Path::new("/var")
+            )),
+            "the caller cgroup must be inside its verified controller root."
+        );
+        assert_eq!(
+            refusal_text(verify_cgroup_root(
+                LABEL,
+                std::path::Path::new("/definitely/not/here"),
+                ""
+            )),
+            "the caller needs one complete cgroup2 root with the memory controller."
+        );
+        assert_eq!(
+            refusal_text(cgroup_from_proc(
+                LABEL,
+                std::path::Path::new("/sys/fs/cgroup"),
+                "garbage",
+                "",
+                42
+            )),
+            "the caller cannot map its process inside a complete unified cgroup tree."
+        );
+    }
+
+    #[test]
+    fn flint_label_refusals_keep_the_frozen_texts_in_full() {
+        const FLINT: &str = "Flint expert cache";
+        assert_eq!(
+            refusal_text(HostAdmission::from_meminfo(
+                FLINT,
+                "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
+                None
+            )),
+            "Flint expert cache memory snapshot has inconsistent totals."
+        );
+        assert_eq!(
+            refusal_text(cgroup_remaining_in(
+                FLINT,
+                std::path::Path::new("/sys/fs/cgroup"),
+                std::path::Path::new("/var")
+            )),
+            "Flint expert cache cgroup must be inside its verified controller root."
+        );
+        assert_eq!(
+            refusal_text(verify_cgroup_root(
+                FLINT,
+                std::path::Path::new("/definitely/not/here"),
+                ""
+            )),
+            "Flint expert cache needs one complete cgroup2 root with the memory controller."
+        );
+        assert_eq!(
+            refusal_text(cgroup_from_proc(
+                FLINT,
+                std::path::Path::new("/sys/fs/cgroup"),
+                "garbage",
+                "",
+                42
+            )),
+            "Flint expert cache cannot map its process inside a complete unified cgroup tree."
+        );
+    }
 
     #[test]
     fn captured_cgroup_roots_match_real_admission() {
@@ -332,7 +509,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .replace("/sys/fs/cgroup", &directory.display().to_string());
-            let result = verify_cgroup_root(&directory, &mounts);
+            let result = verify_cgroup_root(LABEL, &directory, &mounts);
             eprintln!("captured view {name}: accepted={}", result.is_ok());
             if accepted {
                 assert!(result.is_ok(), "{name}: {result:?}");
@@ -373,7 +550,7 @@ mod tests {
             .unwrap()
             .replace("/sys/fs/cgroup", &directory.display().to_string());
         let pid = u32::try_from(view["pid"].as_u64().unwrap()).unwrap();
-        let result = cgroup_from_proc(&directory, membership, &mounts, pid);
+        let result = cgroup_from_proc(LABEL, &directory, membership, &mounts, pid);
         assert_eq!(result.unwrap(), group);
         eprintln!("captured host member: mapped=true pid={pid}");
     }
@@ -396,7 +573,7 @@ mod tests {
     #[test]
     fn cgroup_discovery_resolves_own_pid_in_global_tree() {
         let (root, group, mounts) = discovery_fixture();
-        let resolved = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
+        let resolved = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
         assert!(
             resolved.is_ok(),
             "a complete global cgroup tree must resolve its own process group"
@@ -411,7 +588,7 @@ mod tests {
         let aliases = tempfile::tempdir().unwrap();
         let alias = aliases.path().join("controller-root");
         std::os::unix::fs::symlink(root.path(), &alias).unwrap();
-        let resolved = cgroup_from_proc(&alias, "0::/work\n", &mounts, 42).unwrap();
+        let resolved = cgroup_from_proc(LABEL, &alias, "0::/work\n", &mounts, 42).unwrap();
         assert_eq!(resolved, group);
     }
 
@@ -425,7 +602,7 @@ mod tests {
         ] {
             let (root, _, mounts) = discovery_fixture();
             std::fs::write(root.path().join(name), contents).unwrap();
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
+            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -443,7 +620,7 @@ mod tests {
                 group.parent().unwrap().display()
             )
             .repeat(copies);
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
+            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -488,17 +665,19 @@ mod tests {
     #[test]
     fn a_namespace_root_applies_its_own_limit_or_falls_back_to_available_memory() {
         let (root, proc) = namespace_root("8589934592\n", "memory\n");
-        let budget = HostAdmission::probe_in(proc.path(), root.path(), 42).unwrap();
+        let budget =
+            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
         assert_eq!(budget.os_floor, 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
-        assert!(budget.admit(1).is_err());
+        assert!(budget.admit(LABEL, 1).is_err());
         let (root, proc) = namespace_root("max\n", "memory\n");
-        let budget = HostAdmission::probe_in(proc.path(), root.path(), 42).unwrap();
+        let budget =
+            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
-        assert!(budget.admit(16u64 << 30).is_ok());
-        assert!(budget.admit((16u64 << 30) + 1).is_err());
+        assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (16u64 << 30) + 1).is_err());
     }
 
     #[test]
@@ -515,7 +694,7 @@ mod tests {
                     std::fs::write(root.path().join(name), contents).unwrap();
                 }
             }
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
+            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -528,7 +707,7 @@ mod tests {
     #[test]
     fn a_namespace_root_without_the_memory_controller_is_refused_clearly() {
         let (root, proc) = namespace_root("max\n", "cpu\n");
-        let result = HostAdmission::probe_in(proc.path(), root.path(), 42);
+        let result = HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42);
         assert!(matches!(result, Err(EngError::MemoryPlan(message))
                 if message.contains("complete cgroup2 root with the memory controller")));
     }
@@ -548,7 +727,7 @@ mod tests {
             let (root, group, mounts) = discovery_fixture();
             std::fs::write(group.join("cgroup.procs"), owners).unwrap();
             std::fs::write(group.join("cgroup.type"), kind).unwrap();
-            let result = cgroup_from_proc(root.path(), membership, &mounts, pid);
+            let result = cgroup_from_proc(LABEL, root.path(), membership, &mounts, pid);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("cannot map its process")),
@@ -565,7 +744,7 @@ mod tests {
         std::fs::write(root.path().join("cgroup.controllers"), "memory\n").unwrap();
         std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(child.join("memory.max"), "max\n").unwrap();
-        let result = cgroup_remaining_in(root.path(), &child);
+        let result = cgroup_remaining_in(LABEL, root.path(), &child);
         assert!(
             matches!(
                 result,
@@ -592,7 +771,7 @@ mod tests {
             std::fs::write(directory.join("memory.max"), maximum).unwrap();
             std::fs::write(directory.join("memory.current"), current).unwrap();
         }
-        let remaining = cgroup_remaining_in(root.path(), &child);
+        let remaining = cgroup_remaining_in(LABEL, root.path(), &child);
         assert!(
             remaining.is_ok(),
             "a readable hierarchy must honor finite ancestor charges"
@@ -602,7 +781,7 @@ mod tests {
 
     #[test]
     fn cgroup_snapshot_accounts_for_current_charges() {
-        let remaining = cgroup_remaining_bytes("17179869184\n", "4294967296\n");
+        let remaining = cgroup_remaining_bytes(LABEL, "17179869184\n", "4294967296\n");
         assert!(
             remaining.is_ok(),
             "valid finite cgroup limit and current charges must produce a budget"
@@ -610,12 +789,13 @@ mod tests {
         let remaining = remaining.unwrap();
         assert_eq!(remaining, Some(12u64 << 30));
         let budget = HostAdmission::from_meminfo(
+            LABEL,
             "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
             remaining,
         )
         .unwrap();
-        assert!(budget.admit(4u64 << 30).is_ok());
-        assert!(budget.admit((4u64 << 30) + 1).is_err());
+        assert!(budget.admit(LABEL, 4u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (4u64 << 30) + 1).is_err());
     }
 
     #[test]
@@ -630,7 +810,7 @@ mod tests {
             ("18446744073709551615", "18446744073709551615", Some(0)),
         ] {
             assert_eq!(
-                cgroup_remaining_bytes(maximum, current).unwrap(),
+                cgroup_remaining_bytes(LABEL, maximum, current).unwrap(),
                 remaining,
                 "{maximum:?} / {current:?}"
             );
@@ -662,7 +842,7 @@ mod tests {
             ("max", "18446744073709551616"),
         ] {
             assert!(
-                cgroup_remaining_bytes(maximum, current).is_err(),
+                cgroup_remaining_bytes(LABEL, maximum, current).is_err(),
                 "{maximum:?} / {current:?}"
             );
         }
@@ -671,6 +851,7 @@ mod tests {
     #[test]
     fn host_snapshot_uses_mem_available_and_model_scaled_os_floor() {
         let result = HostAdmission::from_meminfo(
+            LABEL,
             "MemTotal:       268435456 kB\nMemAvailable:    50331648 kB\n",
             None,
         );
@@ -682,28 +863,29 @@ mod tests {
         assert_eq!(budget.mem_available, 48u64 << 30);
         assert_eq!(budget.os_floor, 27_487_790_695);
         assert_eq!(budget.cgroup_remaining, None);
-        assert!(budget.admit(256 * 47 * 1_603_584u64).is_ok());
+        assert!(budget.admit(LABEL, 256 * 47 * 1_603_584u64).is_ok());
     }
 
     #[test]
     fn host_snapshot_preserves_minimum_floor_and_finite_cgroup() {
         let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
         let floor = 8u64 << 30;
-        let budget = HostAdmission::from_meminfo(text, Some(floor + 1)).unwrap();
+        let budget = HostAdmission::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
         assert_eq!(budget.os_floor, floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
-        assert!(budget.admit(1).is_ok());
-        assert!(budget.admit(2).is_err());
+        assert!(budget.admit(LABEL, 1).is_ok());
+        assert!(budget.admit(LABEL, 2).is_err());
         assert!(
-            HostAdmission::from_meminfo(text, Some(0))
+            HostAdmission::from_meminfo(LABEL, text, Some(0))
                 .unwrap()
-                .admit(0)
+                .admit(LABEL, 0)
                 .is_err()
         );
         let empty =
-            HostAdmission::from_meminfo("MemTotal: 1 kB\nMemAvailable: 0 kB\n", None).unwrap();
+            HostAdmission::from_meminfo(LABEL, "MemTotal: 1 kB\nMemAvailable: 0 kB\n", None)
+                .unwrap();
         assert_eq!(empty.mem_available, 0);
-        assert!(empty.admit(0).is_err());
+        assert!(empty.admit(LABEL, 0).is_err());
     }
 
     #[test]
@@ -724,7 +906,10 @@ mod tests {
             "MemTotal: 18014398509481984 kB\nMemAvailable: 0 kB\n",
             "MemTotal: 1 kB\nMemAvailable: 18014398509481984 kB\n",
         ] {
-            assert!(HostAdmission::from_meminfo(text, None).is_err(), "{text:?}");
+            assert!(
+                HostAdmission::from_meminfo(LABEL, text, None).is_err(),
+                "{text:?}"
+            );
         }
     }
 
@@ -735,8 +920,8 @@ mod tests {
             cgroup_remaining: None,
             os_floor: 1,
         };
-        assert!(budget.admit(u64::MAX).is_err());
-        assert!(budget.admit(u64::MAX - 1).is_ok());
+        assert!(budget.admit(LABEL, u64::MAX).is_err());
+        assert!(budget.admit(LABEL, u64::MAX - 1).is_ok());
     }
 
     #[test]
@@ -749,7 +934,7 @@ mod tests {
             os_floor: floor,
         };
         assert!(
-            exact.admit(required).is_ok(),
+            exact.admit(LABEL, required).is_ok(),
             "exact model demand plus OS floor must admit"
         );
         assert!(
@@ -757,7 +942,7 @@ mod tests {
                 mem_available: exact.mem_available - 1,
                 ..exact
             }
-            .admit(required)
+            .admit(LABEL, required)
             .is_err()
         );
         assert!(
@@ -765,7 +950,7 @@ mod tests {
                 cgroup_remaining: Some(required + floor - 1),
                 ..exact
             }
-            .admit(required)
+            .admit(LABEL, required)
             .is_err()
         );
         assert!(
@@ -773,7 +958,7 @@ mod tests {
                 cgroup_remaining: None,
                 ..exact
             }
-            .admit(required)
+            .admit(LABEL, required)
             .is_ok(),
             "an unlimited cgroup still obeys host availability and the OS floor"
         );
@@ -794,11 +979,12 @@ mod tests {
         std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(group.join("memory.max"), "17179869184\n").unwrap();
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
-        let budget = HostAdmission::probe_in(proc.path(), root.path(), 42).unwrap();
+        let budget =
+            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
-        assert!(budget.admit(7u64 << 30).is_ok());
-        assert!(budget.admit((7u64 << 30) + 1).is_err());
+        assert!(budget.admit(LABEL, 7u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (7u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
-        assert!(HostAdmission::probe_in(proc.path(), root.path(), 42).is_err());
+        assert!(HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).is_err());
     }
 }

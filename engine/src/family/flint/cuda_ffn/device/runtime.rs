@@ -354,7 +354,8 @@ impl State {
             .map(|bytes| 2u64.saturating_mul(u64::try_from(*bytes).unwrap_or(u64::MAX)))
             .fold(0u64, u64::saturating_add)
             .saturating_add(health_len);
-        let budget = crate::family::host_admit::HostAdmission::probe()?;
+        let budget =
+            crate::family::host_admit::HostAdmission::probe("Flint expert cache", "Flint")?;
         budget
             .admit_for(charge, "flint cuda prefix snapshot")
             .inspect_err(|_| {
