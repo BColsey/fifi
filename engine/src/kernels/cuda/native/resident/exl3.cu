@@ -1248,8 +1248,15 @@ __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
 template <int Cols>
 constexpr int wide_min_blocks = Cols == 1 ? 5 : 1;
 
-template <int Cols>
-__global__ void __launch_bounds__(256, wide_min_blocks<Cols>) grouped_project_small_wide(
+// The launch width at and past which the two-column wide kernel compiles for five resident
+// blocks per SM instead of the compiler's choice: on the RTX 3090 the extra occupancy (fewer
+// registers per thread) wins on the wide register-limited launches and loses on the narrow
+// ones, measured interleaved on the card (three runs per side, 2026-11-16). Byte output is
+// identical either way; only the occupancy hint differs.
+constexpr uint32_t wide2_dense_min_blocks_n = 4096;
+
+template <int Cols, int MinBlocks = wide_min_blocks<Cols>>
+__global__ void __launch_bounds__(256, MinBlocks) grouped_project_small_wide(
     const __grid_constant__ GroupArgs p) {
     __shared__ float partial[8][16 * Cols];
     // 8-byte aligned: the rate-8 table is read and written as uint2 pairs.
@@ -1860,6 +1867,11 @@ static inline __attribute__((always_inline)) int grouped_launch(
                         } else {
                             grouped_project_rows<grouped_max_rows><<<by_group,block,0,(cudaStream_t)stream>>>(args);
                         }
+                    } else if constexpr (Cols == 2) {
+                        if (args.n >= wide2_dense_min_blocks_n)
+                            grouped_project_small_wide<2, 5><<<wide,block,0,(cudaStream_t)stream>>>(args);
+                        else
+                            grouped_project_small_wide<2, 1><<<wide,block,0,(cudaStream_t)stream>>>(args);
                     } else {
                         grouped_project_small_wide<Cols><<<wide,block,0,(cudaStream_t)stream>>>(args);
                     }
