@@ -482,12 +482,11 @@ pub(super) fn build_driver(
     // regression today (it re-issues its copies every chunk while the union-admit path
     // copies once), so the default is off; the flag keeps the lane's experiments open.
     // A budget above the free VRAM is clamped, not wrapped: the plan then fits the card.
-    let ring_budget = match std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET") {
-        Ok(bytes) => bytes.trim().parse::<u64>().map_err(|_| {
-            EngError::BadRequest("INFERENCE_FLASH_NEXT_RING_BUDGET must be a byte count".into())
-        })?,
-        Err(_) => 0,
-    };
+    let ring_budget = crate::family::flash_next::settings::ring_budget_bytes(
+        std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
+            .ok()
+            .as_deref(),
+    )?;
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
     // placeholder positions) with the numbers the pack and the context give.
     let card = TierInputs::measured(

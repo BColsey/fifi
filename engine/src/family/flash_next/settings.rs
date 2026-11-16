@@ -193,6 +193,23 @@ fn manifest_path(options: &FlashOptions, env: &FlashEnv) -> Result<PathBuf, EngE
         })
 }
 
+/// The ring budget from its environment variable's value, shared by the
+/// loader and the preflight rows: unset is off (0) and a value that is not
+/// a byte count refuses with the loader's own text, byte for byte. The
+/// value is the raw budget — the plan ring and the reserved-bytes line
+/// consume it as-is; only the free-memory carve saturates against it.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) fn ring_budget_bytes(
+    spec: Option<&str>,
+) -> Result<u64, EngError> {
+    match spec {
+        None => Ok(0),
+        Some(text) => text.trim().parse::<u64>().map_err(|_| {
+            EngError::BadRequest("INFERENCE_FLASH_NEXT_RING_BUDGET must be a byte count".into())
+        }),
+    }
+}
+
 /// The CUDA keys. Absent when `cuda_decode` is off; the keys are then refused if present, so a
 /// misspelt switch cannot leave an operator believing the card is in use.
 fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngError> {
@@ -366,6 +383,27 @@ mod tests {
             Err(EngError::BadRequest(text)) => text,
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ring_budget_bytes_parses_the_raw_value_and_refuses_with_start_text() {
+        use super::ring_budget_bytes;
+        assert_eq!(ring_budget_bytes(None).unwrap(), 0);
+        assert_eq!(ring_budget_bytes(Some("0")).unwrap(), 0);
+        assert_eq!(ring_budget_bytes(Some(" 1073741824 ")).unwrap(), 1 << 30);
+        // The raw budget survives above the free card: the plan ring's slot
+        // count and the reserved-bytes line consume it as-is, and only the
+        // carve saturates (free_vram - budget), so a budget above the card
+        // funds nothing at the carve and changes no other line.
+        assert_eq!(
+            ring_budget_bytes(Some("99999999999")).unwrap(),
+            99_999_999_999
+        );
+        // Start's own refusal text, byte for byte.
+        assert_eq!(
+            ring_budget_bytes(Some("1 GiB")).unwrap_err().describe(),
+            "INFERENCE_FLASH_NEXT_RING_BUDGET must be a byte count"
+        );
     }
 
     #[test]
