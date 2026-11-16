@@ -30,7 +30,7 @@ use super::super::weights::RMoe;
 use crate::{
     EngError,
     family::{
-        flash_next::math::expect_len,
+        math::expect_len,
         qwen36::host::HostShape,
         route::{Routed, route_experts},
         spec::Router,

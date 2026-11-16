@@ -929,7 +929,7 @@ mod tests {
     use super::super::ops::{assert_parity, f32_tensor, values};
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
-    use crate::family::flash_next::math::rope_half;
+    use crate::family::math::rope_half;
     use crate::family::project::Projector;
     use crate::family::qwen36::host::{self, AttnW, KvCache as HostCache, MixerW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;

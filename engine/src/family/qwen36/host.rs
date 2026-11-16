@@ -11,7 +11,7 @@
 //! This code is a reference for later packets. It favors plain loops over speed.
 
 use crate::EngError;
-use crate::family::flash_next::math::{expect_len, rope_half, sigmoid, silu, softplus};
+use crate::family::math::{expect_len, rope_half, sigmoid, silu, softplus};
 use crate::family::project::Projector;
 use crate::family::route::route_experts;
 use crate::family::spec::{AttentionKind, FamilySpec, Router};
