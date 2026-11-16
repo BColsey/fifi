@@ -347,3 +347,5 @@ mod tests {
 
 #[cfg(test)]
 mod exl3_bank_pick_golden_host_tests;
+#[cfg(test)]
+mod policy_differential_host_tests;

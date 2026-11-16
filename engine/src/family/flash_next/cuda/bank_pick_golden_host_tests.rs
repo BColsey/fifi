@@ -69,15 +69,21 @@ fn call_picks(seed: u64, call: usize) -> Vec<i32> {
 }
 
 fn policy(seed: u64) -> ReplaceOnMissLru {
+    policy_sized(seed, SLOTS)
+}
+
+/// `policy` at an operator slot count: `TOP_K + 1` is the tightest legal bank, where
+/// every call outside the bank's own picks misses — the arm that makes misses the rule.
+fn policy_sized(seed: u64, slots: usize) -> ReplaceOnMissLru {
     let geometry =
-        BankGeometry::new(LAYERS, EXPERTS, TOP_K, SLOTS, RECORD).expect("a legal geometry");
+        BankGeometry::new(LAYERS, EXPERTS, TOP_K, slots, RECORD).expect("a legal geometry");
     let profile = counts(seed);
     // Expert `i` in slot `i`: full, as `TierPlan::hot_set` tables are; the profile only sets
     // the initial victim order.
     let tables: Vec<Vec<i32>> = (0..LAYERS)
         .map(|_| {
             let mut row = vec![-1i32; EXPERTS];
-            for (expert, slot) in row.iter_mut().enumerate().take(SLOTS) {
+            for (expert, slot) in row.iter_mut().enumerate().take(slots) {
                 *slot = expert as i32;
             }
             row
@@ -235,12 +241,47 @@ fn state_text(mode: HostMode, seed: u64) -> String {
     text
 }
 
+/// Renders the tight arm: the replay at `TOP_K + 1` slots, where the pick stream's
+/// working set outgrows the bank and the hit rate collapses — the misses-heavy regime
+/// the 48-slot arm cannot show.
+fn tight_text(seed: u64) -> String {
+    let mut bank = policy_sized(seed, TOP_K + 1);
+    let mut text = String::new();
+    let (mut hits, mut moves) = (0usize, 0usize);
+    for call in 0..CALLS {
+        let picks = call_picks(seed, call);
+        let plan = bank
+            .plan_pass(0, &picks)
+            .expect("in-range picks and faults");
+        hits += plan.hits;
+        moves += plan.moves.len();
+        let _ = writeln!(
+            text,
+            "call {call} picks={picks:?} distinct={} hits={} moves={}",
+            plan.distinct,
+            plan.hits,
+            plan.moves.len()
+        );
+        for (i, m) in plan.moves.iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "move {call} {i} slot={} in={} out={}",
+                m.slot, m.incoming, m.outgoing
+            );
+        }
+        let _ = writeln!(text, "table {call} layer=0 row={:?}", bank.slot_row(0));
+    }
+    let _ = writeln!(text, "counters calls={CALLS} hits={hits} moves={moves}");
+    text
+}
+
 /// The digests of this family's arms.
 pub(super) fn sections() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (name, text) in [
         ("fill", arm_text(0xfeed_0001)),
         ("error", error_text(0xfeed_0002)),
+        ("tight", tight_text(0xfeed_0005)),
         (
             "state-exclusive",
             state_text(HostMode::Exclusive, 0xfeed_0003),

@@ -1,0 +1,10 @@
+{
+  "arms": {
+    "duplicates": "1404c8c6fc92cd210b1d50f2e227a3fad1e62dd6de4e4fda68ee232f3827b777",
+    "poison-reset": "6d4ad433f8257b0b9decc165c93f7df8992b407177f208266b6a069b5d2ccd5a",
+    "refusals": "74bf91d32ddf018f1f72099c3c425c2b2cb17266aa5243dda2ce183c031cbcf2",
+    "stream": "a9647102f3ef4e93528b5f4599a51ea6f5622eb57bdce9eb720b8a0429b013be",
+    "swap": "541eddc498a29a6513eb7f62dde0257201a2d19598c518a9d96e0b258e8637a3",
+    "touch": "55f9285eb4587202132df53d109af54e27e2a08e0b35a7b143ef3d8c2083d8c8"
+  }
+}

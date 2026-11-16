@@ -467,6 +467,10 @@ fn cache_error(message: &str) -> EngError {
     EngError::BadRequest(format!("Flint expert cache: {message}"))
 }
 
+/// The pick-replay golden of this cache's row (see the module doc).
+#[cfg(test)]
+mod cache_golden_host_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

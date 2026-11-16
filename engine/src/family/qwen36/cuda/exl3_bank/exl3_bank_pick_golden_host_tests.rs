@@ -1,9 +1,11 @@
 //! The pick-replay golden of the Q36 bank policy: `LayerSlots` (LRU, and LRU with the sticky
-//! decayed-hot set) replayed over deterministic pick streams, recording per call the picks,
-//! the returned slots, the miss list, the gated pick set (the picks whose expert refilled this
-//! call), the event flag a `resolve_split` would raise, the refill plan (three parts, part
-//! offset and length per miss, in miss order), the whole slot table after every call, and the
-//! counters. The error arm pins the RECORDED DEFECT: `assign` is not atomic (a mid-stream
+//! decayed-hot set) replayed over deterministic pick streams, recording per call its DECISIONS
+//! only — the picks, the returned slots, the miss list, the gated pick set (the picks whose
+//! expert refilled this call), the event flag a `resolve_split` would raise, and the counters.
+//! The refill part offsets and the per-call slot table are derivable arithmetic (miss slot ->
+//! record offset; the row the seam reads), so they are asserted, not rendered: a pure
+//! re-render of the same decisions must not touch this golden. The error arm pins the
+//! RECORDED DEFECT: `assign` is not atomic (a mid-stream
 //! `Err` leaves `tick` advanced and earlier assignments standing), and a failed refill write in
 //! `resolve_mapped` leaves the table ahead of the device bytes — the fix is a later change
 //! of its own, and this golden is what proves it unchanged until then and moved after.
@@ -17,17 +19,13 @@
 //! (`flash_next/cuda/bank_pick_golden_host_tests.rs`) owns its own file, same format.
 
 use super::LayerTables;
-use crate::family::exl3::bank::{DECAY_CALLS, EMPTY, LayerSlots, NO_SLOT, refill_plan};
+use crate::family::exl3::bank::{DECAY_CALLS, EMPTY, LayerSlots, NO_SLOT};
 use crate::family::expert_bank::SlotTable;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
 const EXPERTS: usize = 512;
 const SLOTS: usize = 48;
-/// The three part lengths of the 3.05 pack's record (gate/up/down), 1,881,600 bytes
-/// together. Mirrors `parts_strides` (the derivation `resolve_mapped` feeds `refill_plan`)
-/// for that pack; the refill lines below pin the strides, offsets and experts against it.
-const PART_LEN: [usize; 3] = [626_864, 626_864, 626_872];
 const CALLS: usize = 200;
 const PICKS: usize = 8;
 
@@ -75,25 +73,6 @@ fn arm_text(slots: usize, sticky: usize, seed: u64) -> String {
              gated={gated:?} event={}",
             !miss_slots.is_empty()
         );
-        for (i, ops) in refill_plan(&table, &miss_slots, PART_LEN)
-            .chunks(3)
-            .enumerate()
-        {
-            for op in ops {
-                let _ = writeln!(
-                    text,
-                    "refill {call} {i} part={} expert={} off={} len={}",
-                    op.part,
-                    op.expert,
-                    op.offset(),
-                    op.record
-                );
-            }
-        }
-        // The row is already the seam's shape (`NO_SLOT = -1`): the golden and the
-        // shared `SlotTable::slot_row` read the same array.
-        let row: Vec<i32> = table.slot_of.clone();
-        let _ = writeln!(text, "table {call} tick={} row={row:?}", table.tick);
     }
     let decays = table.tick / DECAY_CALLS;
     // The seam's two directions agree after the replay: a slot holds an expert exactly
@@ -156,8 +135,6 @@ fn error_text(seed: u64) -> String {
         follow.1,
         !follow.1.is_empty()
     );
-    let row: Vec<i32> = table.slot_of.clone();
-    let _ = writeln!(text, "table 5 tick={} row={row:?}", table.tick);
     text
 }
 
@@ -188,8 +165,7 @@ fn invalidate_text(seed: u64) -> String {
             "expert {expert} reads absent"
         );
     }
-    let row: Vec<i32> = table.slot_of.clone();
-    let _ = writeln!(text, "invalidated tick={} row={row:?}", table.tick);
+    let _ = writeln!(text, "invalidated tick={} slots={misses:?}", table.tick);
     let (_, again) = table.assign(&picks).expect("the same picks serve again");
     assert_eq!(
         again.len(),
