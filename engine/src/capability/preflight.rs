@@ -390,6 +390,38 @@ fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
 }
 
+/// The report every deep arm finishes with: the shared dimensions and
+/// verdict over the arm's checks, qualification and decisions. `estimate`
+/// is what the arm measured and the report stores; `fit_estimate`, when a
+/// rows family restates its context fit as the fields the shared verdict
+/// reads, feeds only the verdict and dimensions and is never stored.
+#[allow(clippy::too_many_arguments)] // the report's identity, checks, estimate, rows and qualification are one composition, not a config object
+fn finish_report(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    family: Option<String>,
+    checks: Vec<Check>,
+    estimate: Option<&Estimate>,
+    fit_estimate: Option<&Estimate>,
+    decisions: Vec<PlanDecision>,
+    qualification: Qualification,
+) -> PreflightReport {
+    let fit = fit_estimate.or(estimate);
+    let dimensions = q36_dimensions(&checks, fit, qualification);
+    let (verdict, next_step) = q36_verdict(&checks, fit, qualification);
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family,
+        verdict,
+        dimensions,
+        checks,
+        decisions,
+        estimate: estimate.cloned(),
+        next_step,
+    }
+}
+
 fn shallow_preflight(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -451,19 +483,16 @@ fn q36_preflight(
                   estimate: Option<Estimate>,
                   decisions: Vec<PlanDecision>,
                   qualification: Qualification| {
-        let dimensions = q36_dimensions(&checks, estimate.as_ref(), qualification);
-        let (verdict, next_step) = q36_verdict(&checks, estimate.as_ref(), qualification);
-        PreflightReport {
-            model_dir: model_dir.to_path_buf(),
-            tokenizer_dir: tokenizer_dir.to_path_buf(),
-            family: family.clone(),
-            verdict,
-            dimensions,
+        finish_report(
+            model_dir,
+            tokenizer_dir,
+            family.clone(),
             checks,
+            estimate.as_ref(),
+            None,
             decisions,
-            estimate,
-            next_step,
-        }
+            qualification,
+        )
     };
 
     let Some(backend) = backend else {
@@ -732,19 +761,16 @@ fn flint_preflight(
                   estimate: Option<Estimate>,
                   decisions: Vec<PlanDecision>,
                   qualification: Qualification| {
-        let dimensions = q36_dimensions(&checks, estimate.as_ref(), qualification);
-        let (verdict, next_step) = q36_verdict(&checks, estimate.as_ref(), qualification);
-        PreflightReport {
-            model_dir: model_dir.to_path_buf(),
-            tokenizer_dir: tokenizer_dir.to_path_buf(),
-            family: family.clone(),
-            verdict,
-            dimensions,
+        finish_report(
+            model_dir,
+            tokenizer_dir,
+            family.clone(),
             checks,
+            estimate.as_ref(),
+            None,
             decisions,
-            estimate,
-            next_step,
-        }
+            qualification,
+        )
     };
 
     if !cuda_backend {
