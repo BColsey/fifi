@@ -2,8 +2,14 @@
 //!
 //! `FIFI_EXL3_CHECKPOINT` names the pack directory; `FIFI_EXL3_SLOTS`, `FIFI_EXL3_STICKY`
 //! and `FIFI_EXL3_TOKENS` override the slot count (69), the sticky pin count (0) and the
-//! decode length (96) for policy measurement, and `FIFI_EXL3_TRACE` dumps every decode
-//! resolve's picks for the offline admission-policy study. The test loads the banked model (the
+//! decode length (96) for policy measurement, and `FIFI_EXL3_TRACE` dumps every resolve
+//! (one `layer pick ...` line per call). For the admission-policy study the prompt can be
+//! real text instead of the pinned token row: `FIFI_EXL3_PROMPT_DIR` names a directory whose
+//! `*.rs` files are read in sorted order and concatenated, `FIFI_EXL3_PROMPT_TOKENS` cuts
+//! the encode to that many tokens (BOS first, as the pinned row has), and with those set the
+//! prompt phase's resolves also go to a trace, at `FIFI_EXL3_TRACE` + `.prefill`, while the
+//! decode phase keeps the plain `FIFI_EXL3_TRACE` path — so prefill and decode stay
+//! distinguishable in the offline replay. The test loads the banked model (the
 //! admission-floor slot count, every expert in the host store), decodes a fixed prompt plus
 //! `TOKENS` greedy tokens, and reports the wall time per token beside the shares the test-only
 //! probe accumulates: the readback drains (the blocking device-to-host waits of the pick
@@ -31,6 +37,48 @@ use crate::family::project::cuda::{CudaProjector, Reserve};
 /// `layer pick ...` line per call) for the offline admission-policy study.
 fn trace_path() -> Option<std::path::PathBuf> {
     std::env::var_os("FIFI_EXL3_TRACE").map(std::path::PathBuf::from)
+}
+
+/// The prompt tokens: the pinned row, or real text for the admission-policy study.
+/// `FIFI_EXL3_PROMPT_DIR` names a directory whose `*.rs` files are read in sorted
+/// order and concatenated — repository source, not filler tokens, so the expert
+/// picks have real distributions — encoded with the pack's own tokenizer.json and
+/// cut to `FIFI_EXL3_PROMPT_TOKENS` ids, BOS first like the pinned row.
+fn prompt_ids() -> Vec<u32> {
+    let Some(dir) = std::env::var_os("FIFI_EXL3_PROMPT_DIR") else {
+        return PROMPT.to_vec();
+    };
+    let tokens: usize = match std::env::var("FIFI_EXL3_PROMPT_TOKENS") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("FIFI_EXL3_PROMPT_TOKENS is not a number: {v:?}")),
+        Err(_) => panic!("FIFI_EXL3_PROMPT_DIR needs FIFI_EXL3_PROMPT_TOKENS"),
+    };
+    let dir = Path::new(&dir);
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("FIFI_EXL3_PROMPT_DIR {dir:?} does not read: {e}"))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    names.sort();
+    let mut text = String::new();
+    for name in &names {
+        text.push_str(
+            &std::fs::read_to_string(name)
+                .unwrap_or_else(|e| panic!("{} does not read: {e}", name.display())),
+        );
+    }
+    let checkpoint = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    let tokenizer = tokenizers::Tokenizer::from_file(Path::new(&checkpoint).join("tokenizer.json"))
+        .expect("the pack's tokenizer.json");
+    let encoding = tokenizer
+        .encode(text.as_str(), false)
+        .expect("the source encodes");
+    let mut ids = vec![PROMPT[0]]; // BOS, as the pinned row has
+    ids.extend(encoding.get_ids().iter().copied());
+    ids.truncate(tokens);
+    ids
 }
 
 /// Tokens decoded after the prompt: enough for the banks to reach their steady state.
@@ -61,7 +109,9 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
                 .unwrap_or_else(|_| panic!("FIFI_EXL3_TOKENS is not a number: {v:?}"))
         })
         .unwrap_or(TOKENS);
-    step_options.context_tokens = PROMPT.len() + tokens + 1;
+    let prompt = prompt_ids();
+    let real_text = std::env::var_os("FIFI_EXL3_PROMPT_DIR").is_some();
+    step_options.context_tokens = prompt.len() + tokens + 1;
     let rules = QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS).expect("rules");
     let resources =
         StepResources::new(context, dims(), &inventory(), &step_options).expect("resources");
@@ -120,19 +170,35 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
     .expect("capture off");
 
     // The prompt decodes one token per row (run_token with logits), as the serve path does.
+    if real_text && trace_path().is_some() {
+        crate::family::exl3::bank::trace::arm();
+    }
     let began = Instant::now();
     let mut id = 0u32;
-    for &token in &PROMPT {
+    for &token in &prompt {
         id = step.run_token(token, true).expect("prompt token");
     }
     let prompt_wall = began.elapsed();
+    if real_text && let Some(path) = &trace_path() {
+        let prefill_path = {
+            let mut p = path.clone().into_os_string();
+            p.push(".prefill");
+            std::path::PathBuf::from(p)
+        };
+        let lines =
+            crate::family::exl3::bank::trace::dump(&prefill_path).expect("the prefill dump");
+        println!(
+            "banked decode probe: prefill trace {lines} resolve calls to {}",
+            prefill_path.display()
+        );
+    }
     let ((prompt_drains, prompt_drain_ns), (prompt_resolves, prompt_resolve_ns)) =
         crate::family::exl3::bank::probe::take();
     let ms_prompt = |ns: u64, count: u64| ns as f64 / 1e6 / count.max(1) as f64;
     println!(
         "banked decode probe: prompt {} rows {:.0} ms ({} drains {:.2} ms each, {} resolves \
          {:.2} ms each)",
-        PROMPT.len(),
+        prompt.len(),
         prompt_wall.as_secs_f64() * 1e3,
         prompt_drains,
         ms_prompt(prompt_drain_ns, prompt_drains),
