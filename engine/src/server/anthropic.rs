@@ -2188,6 +2188,28 @@ mod tests {
     // ── route: errors ──────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn a_bad_request_from_a_running_job_is_the_non_stream_api_error() {
+        // The Anthropic non-stream form answers an engine defect wearing BadRequest
+        // with its api_error type and the sanitized message at 500.
+        let engine = testkit::refusing_engine(EngError::BadRequest(
+            "attention requires a single-head dense cache".to_string(),
+        ));
+        let response = tower::ServiceExt::oneshot(
+            app(&engine, 4_096),
+            testkit::post_json("/v1/messages", &request(json!({}))),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = testkit::json_of(&bytes);
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Model execution failed.");
+    }
+
+    #[tokio::test]
     async fn missing_max_tokens_is_invalid_request_error() {
         let engine = testkit::engine(Vec::new());
         let body = json!({"model": "model-a",

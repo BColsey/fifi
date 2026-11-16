@@ -491,6 +491,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bad_request_from_a_running_job_is_the_backend_error_event() {
+        // An engine defect wearing BadRequest mid-job reaches the stream as the
+        // sanitized backend row, not a client-blaming 400 with native text.
+        let engine =
+            testkit::refusing_engine(EngError::BadRequest("prompt span is outside".to_string()));
+        let (status, content_type, events) =
+            stream(&app(&engine), &stream_request(json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/event-stream");
+        let error = events
+            .iter()
+            .find(|event| event.name.as_deref() == Some("error"))
+            .expect("an error event");
+        let body: Value = serde_json::from_str(&error.data).expect("error json");
+        assert_schema("Error", &body);
+        assert_eq!(body["error"]["code"], "backend_error");
+        assert_eq!(body["error"]["message"], "Model execution failed.");
+    }
+
+    #[tokio::test]
     async fn error_after_headers_emits_one_error_event_and_closes() {
         let failure = EngError::Backend {
             operation: "qmm",

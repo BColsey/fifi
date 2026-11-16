@@ -276,14 +276,22 @@ pub(crate) async fn collect_pieces(
 /// wearing the client's error code: rewrap it as the engine's own backend failure. The
 /// client sees the sanitized backend row (500 `backend_error`, no native text), while
 /// stderr and the request line keep the cause. The refusals that legitimately belong to
-/// the request (memory plan, context limit, over-length prompt) keep their rows.
+/// the request (memory plan, context limit, over-length prompt) keep their rows. The
+/// match is exhaustive with no catch-all so a new error kind must decide its side here;
+/// `operation` is `engine job` to tell the rewrap apart in stderr from the
+/// engine-closed-without-result failure, and no client-visible text carries it.
 fn boundary_error(error: EngError) -> ServerError {
     match error {
         EngError::BadRequest(message) => ServerError::Eng(EngError::Backend {
-            operation: "engine",
+            operation: "engine job",
             message,
         }),
-        error => ServerError::Eng(error),
+        error @ (EngError::Checkpoint(_)
+        | EngError::ModelOutput(_)
+        | EngError::MemoryPlan(_)
+        | EngError::ContextLimit(_)
+        | EngError::PromptTooLong { .. }
+        | EngError::Backend { .. }) => ServerError::Eng(error),
     }
 }
 
@@ -721,7 +729,7 @@ mod tests {
         assert_eq!(
             error,
             ServerError::Eng(EngError::Backend {
-                operation: "engine",
+                operation: "engine job",
                 message: native,
             })
         );
@@ -805,6 +813,51 @@ mod tests {
         };
         assert_eq!(text, "ab");
         assert_eq!(failure, Err(ServerError::Eng(lost())));
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_after_a_terminal_batch_is_rewrapped_at_the_second_site() {
+        // The Finished read after a self-ending batch is the boundary's second call
+        // site; the engine's own BadRequest there is the job's backend failure too.
+        let native = "restored prefix covers the whole prompt".to_string();
+        let bundle = testkit::bundle();
+        let generation = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()));
+        let (_job, mut handle) = Job::new(PROMPT.to_vec(), generation).expect("job");
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        handle.events = receiver;
+        sender
+            .try_send(JobEvent::Batch(DecodeBatch {
+                tokens: vec![97],
+                text: "a".to_string(),
+                finish: Some(DecodeFinish::Stop),
+            }))
+            .expect("terminal batch");
+        sender
+            .try_send(JobEvent::Error(EngError::BadRequest(native.clone())))
+            .expect("deferred failure");
+        drop(sender);
+        let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
+        let parser = ReplyParser::new(Start::Content, &[], "call_");
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "m",
+            false,
+            3,
+            "GET",
+            "/v1/test",
+        );
+        log.admit();
+        let mut running = RunningJob::new(handle, assembler, parser, 3, log, None);
+        let error = running.next().await.expect_err("error");
+        assert_eq!(
+            error,
+            ServerError::Eng(EngError::Backend {
+                operation: "engine job",
+                message: native,
+            })
+        );
     }
 
     #[tokio::test]
