@@ -1480,7 +1480,7 @@ mod tests {
     use crate::family::session::SaveSideTotals;
     use crate::family::speculate::driver::{Drafter, Proposal, Speculator};
     use crate::{
-        family::sampler::{Sampler, SamplingParams},
+        family::sampler::{Sampler, SamplingParams, top2_margin},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
     };
 
@@ -2628,6 +2628,19 @@ mod tests {
             .collect()
     }
 
+    /// The piece shape the worker reports for `fed` tokens fed in pieces of `chunk` rows:
+    /// one piece per chunk-sized split, the largest piece the chunk or the final remainder.
+    /// Mirrors `prefill_chunks`; these prompts are too short for a root or periodic save
+    /// point and no tip save lies inside the fed region, so it splits as one unbroken run.
+    /// A tip save inside the fed region splits the head run there; the prefix-reuse tests
+    /// pin those per-round shapes literally instead of using this helper.
+    fn fed_pieces(fed: usize, chunk: usize) -> crate::sched::job::PrefillPieces {
+        crate::sched::job::PrefillPieces {
+            count: u32::try_from(fed.div_ceil(chunk)).unwrap(),
+            max_rows: u32::try_from(chunk.min(fed)).unwrap(),
+        }
+    }
+
     /// The row count of each chunk that ran since the last call. The log is cleared.
     fn take_log(executor: &Q36Executor) -> Vec<usize> {
         std::mem::take(&mut *executor.log.lock().unwrap())
@@ -3114,15 +3127,28 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), vec![3, 4, 2], "chunk rows");
         assert_eq!(tokens.len(), 4, "tokens");
+        let usage = usage.expect("usage");
+        // The chunk path equals the step oracle only within the chunk-parity tolerance,
+        // so the first-token margin is compared within tolerance; the rest is exact.
+        let oracle = logits_alone(&cycle(10));
+        let oracle_margin = top2_margin(&oracle[..VOCAB]).expect("oracle margin");
+        let scale = oracle[..VOCAB].iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let margin = usage.first_token_margin.expect("first-token margin");
+        assert!(
+            (margin - oracle_margin).abs() <= 2.0e-4 * scale,
+            "first-token margin {margin} vs step oracle {oracle_margin}"
+        );
         assert_eq!(
             usage,
-            Some(JobUsage {
+            JobUsage {
                 prompt_tokens: 10,
                 completion_tokens: 4,
                 reused_tokens: 0,
                 prefix: Some(PrefixReport::default()),
                 prefill_bank: None,
-            }),
+                prefill_pieces: fed_pieces(10, 4),
+                first_token_margin: Some(margin),
+            },
             "usage"
         );
         assert_eq!(
@@ -3469,6 +3495,7 @@ mod tests {
         .enumerate()
         {
             let prompt_tokens = u32::try_from(prompt.len()).unwrap();
+            let first_margin = top2_margin(&logits_alone(&prompt)[..VOCAB]);
             let (job, mut handle) = Job::new(prompt, seeded_generation(4)).unwrap();
             engine.handle().try_submit(job).unwrap();
             let mut tokens = Vec::new();
@@ -3490,6 +3517,8 @@ mod tests {
                     reused_tokens: 0,
                     prefix: Some(PrefixReport::default()),
                     prefill_bank: None,
+                    prefill_pieces: fed_pieces(prompt_tokens as usize, 2),
+                    first_token_margin: first_margin,
                 }),
                 "round {round}: usage"
             );
@@ -4817,6 +4846,21 @@ mod tests {
                 ),
             ),
         ];
+        // Per-round fed piece shapes (count, max_rows), pinned from the save-point plan:
+        // the tip save at 4 lies inside the fed region whenever the job restores fewer than
+        // 4 tokens, so the head run splits there (worker piece 3). A 6-token prompt feeds
+        // head 3,1 then tail 2; restored 3 feeds head 1 (3..4) then tail 2; restored 4 feeds
+        // only the tail 2; E (4 tokens, boundary 3) feeds head 3 then tail 1.
+        let piece_shapes = [
+            (3u32, 3u32), // A: head 3,1 + tail 2
+            (1, 2),       // A restored 4: tail 2
+            (1, 2),       // A restored 4: tail 2
+            (2, 3),       // E: head 3 + tail 1
+            (2, 2),       // A restored 3: head 1 + tail 2
+            (1, 2),       // A restored 4: tail 2
+            (3, 3),       // B: head 3,1 + tail 2
+            (3, 3),       // A: head 3,1 + tail 2
+        ];
         for (round, (prompt, boundary, want, reused, report)) in rounds.into_iter().enumerate() {
             let (job, mut handle) = Job::new(prompt.clone(), seeded_generation(4)).unwrap();
             let job = job.with_prefix_boundary(boundary).unwrap();
@@ -4842,6 +4886,11 @@ mod tests {
                     reused_tokens: reused,
                     prefix: report,
                     prefill_bank: None,
+                    prefill_pieces: crate::sched::job::PrefillPieces {
+                        count: piece_shapes[round].0,
+                        max_rows: piece_shapes[round].1,
+                    },
+                    first_token_margin: top2_margin(&logits_alone(prompt)[..VOCAB]),
                 }),
                 "round {round}: usage"
             );

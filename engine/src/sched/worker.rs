@@ -24,7 +24,8 @@
 //! other `EngineHandle` clones to drop (`scheduler.md`: a stopped engine cancels its jobs).
 
 use super::job::{
-    Job, JobEvent, JobUsage, QUEUE_CAPACITY, send_cancelled, send_data, send_terminal,
+    Job, JobEvent, JobUsage, PrefillPieces, QUEUE_CAPACITY, send_cancelled, send_data,
+    send_terminal,
 };
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
@@ -884,12 +885,14 @@ fn run_job<E: ExecutorOps>(
     // The admit-path bank counters before the prefill, for this request's delta (log-only;
     // `None` is the report of an executor without an expert bank, and the delta stays `None`).
     let bank_before = executor.prefill_bank_report();
+    let mut pieces = PrefillPieces::default();
     let reused = match start(
         executor,
         session,
         plan,
         prefill_chunk,
         &generation.cancel,
+        &mut pieces,
         false,
     ) {
         Ok(reused) => reused,
@@ -959,6 +962,7 @@ fn run_job<E: ExecutorOps>(
                 plan,
                 prefill_chunk,
                 &generation.cancel,
+                &mut pieces,
                 true,
             );
             while let Err(EngError::MemoryPlan(_)) = retried {
@@ -975,6 +979,7 @@ fn run_job<E: ExecutorOps>(
                     plan,
                     prefill_chunk,
                     &generation.cancel,
+                    &mut pieces,
                     true,
                 );
             }
@@ -1035,6 +1040,8 @@ fn run_job<E: ExecutorOps>(
                     reused_tokens,
                     prefix,
                     prefill_bank,
+                    prefill_pieces: pieces,
+                    first_token_margin: generation.sampler.first_top2_margin(),
                 }),
             );
             return EngineState::Ready;
@@ -1079,8 +1086,12 @@ fn start<E: ExecutorOps>(
     plan: &PromptPlan<'_>,
     prefill_chunk: usize,
     cancel: &AtomicBool,
+    pieces: &mut PrefillPieces,
     retrying: bool,
 ) -> Result<usize, EngError> {
+    // A restart re-feeds from the cursor, so the log keeps only the run that served the
+    // prompt, never the aborted attempt's pieces.
+    *pieces = PrefillPieces::default();
     executor.reset(session)?;
     let restored = match plan.boundary {
         Some(_) => executor.restore_prefix(session, plan.tokens)?,
@@ -1092,7 +1103,6 @@ fn start<E: ExecutorOps>(
         ));
     }
     executor.boundary(session);
-    let mut chunks_run = 0;
     let mut next = restored;
     let points = if retrying {
         Vec::new()
@@ -1107,14 +1117,7 @@ fn start<E: ExecutorOps>(
     };
     for (point, kind) in points {
         let head = span(plan.tokens, next, point)?;
-        if !prefill_chunks(
-            executor,
-            session,
-            head,
-            prefill_chunk,
-            cancel,
-            &mut chunks_run,
-        )? {
+        if !prefill_chunks(executor, session, head, prefill_chunk, cancel, pieces)? {
             return Ok(restored);
         }
         if cancel.load(Ordering::SeqCst) {
@@ -1125,14 +1128,7 @@ fn start<E: ExecutorOps>(
         executor.save_prefix(session, span(plan.tokens, 0, point)?, kind)?;
     }
     let tail = span(plan.tokens, next, plan.tokens.len())?;
-    prefill_chunks(
-        executor,
-        session,
-        tail,
-        prefill_chunk,
-        cancel,
-        &mut chunks_run,
-    )?;
+    prefill_chunks(executor, session, tail, prefill_chunk, cancel, pieces)?;
     Ok(restored)
 }
 
@@ -1150,11 +1146,11 @@ fn prefill_chunks<E: ExecutorOps>(
     tokens: &[u32],
     prefill_chunk: usize,
     cancel: &AtomicBool,
-    chunks_run: &mut usize,
+    pieces: &mut PrefillPieces,
 ) -> Result<bool, EngError> {
     let mut remaining = tokens;
     while !remaining.is_empty() {
-        if *chunks_run > 0 && cancel.load(Ordering::SeqCst) {
+        if pieces.count > 0 && cancel.load(Ordering::SeqCst) {
             return Ok(false);
         }
         let rows = executor
@@ -1168,7 +1164,10 @@ fn prefill_chunks<E: ExecutorOps>(
         }
         let (piece, rest) = remaining.split_at(rows.min(remaining.len()));
         executor.prefill(session, piece)?;
-        *chunks_run += 1;
+        pieces.count = pieces.count.saturating_add(1);
+        pieces.max_rows = pieces
+            .max_rows
+            .max(u32::try_from(piece.len()).unwrap_or(u32::MAX));
         remaining = rest;
     }
     Ok(true)
@@ -1286,7 +1285,9 @@ mod tests {
     use crate::exec_fake::FakeExecutor;
     use crate::family::executor::{ExecutorOps, GenerationState};
     use crate::family::session::{PrefixStore, SaveKind, StoreLimits, check_prompt};
-    use crate::sched::job::{Job, JobEvent, JobHandle, JobUsage, PrefixHit, PrefixReport};
+    use crate::sched::job::{
+        Job, JobEvent, JobHandle, JobUsage, PrefillPieces, PrefixHit, PrefixReport,
+    };
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -1613,6 +1614,21 @@ mod tests {
             })
             .expect("the finished usage carries the report");
         assert_eq!(report.passes, 3);
+        let pieces = events
+            .iter()
+            .find_map(|event| match event {
+                JobEvent::Finished(usage) => Some(usage.prefill_pieces),
+                _ => None,
+            })
+            .expect("the finished usage carries the pieces");
+        // The three-token prompt runs as one piece of three rows under the four-row chunk.
+        assert_eq!(
+            pieces,
+            PrefillPieces {
+                count: 1,
+                max_rows: 3
+            }
+        );
         assert_eq!(report.misses, 7);
         assert_eq!(report.miss_histogram, vec![0, 0, 1]);
         assert_eq!(report.route_histogram, vec![0, 0, 1]);
@@ -1723,21 +1739,42 @@ mod tests {
         })
     }
 
-    fn finished(prompt: u32, completion: u32) -> JobEvent {
-        finished_reusing(prompt, completion, 0)
+    fn finished(log: &Log, prompt: u32, completion: u32) -> JobEvent {
+        finished_reusing(log, prompt, completion, 0)
     }
 
-    fn finished_reusing(prompt: u32, completion: u32, reused: u32) -> JobEvent {
-        finished_with_prefix(prompt, completion, reused, Some(PrefixReport::default()))
+    fn finished_reusing(log: &Log, prompt: u32, completion: u32, reused: u32) -> JobEvent {
+        finished_with_prefix(
+            log,
+            prompt,
+            completion,
+            reused,
+            Some(PrefixReport::default()),
+        )
     }
 
     /// The `Finished` event of a job whose executor reported `prefix`: the fake always reports
-    /// its store, so the value is `Some` even without a restore.
+    /// its store, so the value is `Some` even without a restore. The piece shape reads the
+    /// spy's own `prefill:N` notes, so the expectation is what the executor was fed — the same
+    /// fact the production counter logs.
     fn finished_with_prefix(
+        log: &Log,
         prompt: u32,
         completion: u32,
         reused: u32,
         prefix: Option<PrefixReport>,
+    ) -> JobEvent {
+        finished_pieces(prompt, completion, reused, prefix, fed_pieces_of(log))
+    }
+
+    /// The `Finished` event with an explicit piece shape, for the multi-log tests that keep
+    /// the spy of only one conversation.
+    fn finished_pieces(
+        prompt: u32,
+        completion: u32,
+        reused: u32,
+        prefix: Option<PrefixReport>,
+        pieces: PrefillPieces,
     ) -> JobEvent {
         JobEvent::Finished(JobUsage {
             prompt_tokens: prompt,
@@ -1745,7 +1782,27 @@ mod tests {
             reused_tokens: reused,
             prefix,
             prefill_bank: None,
+            prefill_pieces: pieces,
+            first_token_margin: None,
         })
+    }
+
+    /// The piece shape of a spy log: every `prefill:N` note is one piece. Each job begins
+    /// with a `reset` note (`start` resets first, and so does its restart), so the pieces of
+    /// the CURRENT job are the `prefill:N` notes after the last `reset` — a multi-job test's
+    /// expectation reads its own job, never the earlier ones.
+    fn fed_pieces_of(log: &Log) -> PrefillPieces {
+        let mut pieces = PrefillPieces::default();
+        for note in calls(log) {
+            if note == "reset" {
+                pieces = PrefillPieces::default();
+            } else if let Some(rows) = note.strip_prefix("prefill:") {
+                let rows: u32 = rows.parse().unwrap_or(0);
+                pieces.count = pieces.count.saturating_add(1);
+                pieces.max_rows = pieces.max_rows.max(rows);
+            }
+        }
+        pieces
     }
 
     /// The report of the fake's store: `entries` entries at a flat 1,000 charged bytes each,
@@ -1951,19 +2008,20 @@ mod tests {
 
     /// The events of a job that stops at once, uses no extra tokens, and reports a store that
     /// holds nothing and restored nothing.
-    fn stop_events(prompt: u32, reused: u32) -> Vec<JobEvent> {
-        stop_events_with_prefix(prompt, reused, Some(PrefixReport::default()))
+    fn stop_events(log: &Log, prompt: u32, reused: u32) -> Vec<JobEvent> {
+        stop_events_with_prefix(log, prompt, reused, Some(PrefixReport::default()))
     }
 
     /// `stop_events` with the executor's prefix report of the job.
     fn stop_events_with_prefix(
+        log: &Log,
         prompt: u32,
         reused: u32,
         prefix: Option<PrefixReport>,
     ) -> Vec<JobEvent> {
         vec![
             batch(&[EOS], "", Some(DecodeFinish::Stop)),
-            finished_with_prefix(prompt, 1, reused, prefix),
+            finished_with_prefix(log, prompt, 1, reused, prefix),
         ]
     }
 
@@ -1993,7 +2051,10 @@ mod tests {
         assert_eq!(first, Some(batch(&[0], "a", None)));
         assert_eq!(
             rest,
-            vec![batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(3, 2)]
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 3, 2)
+            ]
         );
     }
 
@@ -2028,7 +2089,7 @@ mod tests {
                 batch(&[0], "a", None),
                 batch(&[1], "b", None),
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished(3, 3),
+                finished(&log, 3, 3),
             ]
         );
         assert_eq!(engine.shutdown().state, EngineState::Stopped);
@@ -2070,7 +2131,7 @@ mod tests {
             vec![
                 batch(&[0], "a", None),
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished(1, 2),
+                finished(&log, 1, 2),
             ]
         );
         assert_eq!(
@@ -2078,7 +2139,7 @@ mod tests {
             vec![
                 batch(&[1], "b", None),
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished(1, 2),
+                finished(&log, 1, 2),
             ]
         );
         drop(handle);
@@ -2113,7 +2174,17 @@ mod tests {
         for events in handles {
             assert_eq!(
                 collect(events).last(),
-                Some(&finished(1, 1)),
+                // Every queued job ran the same one-token prompt as one piece.
+                Some(&finished_pieces(
+                    1,
+                    1,
+                    0,
+                    Some(PrefixReport::default()),
+                    PrefillPieces {
+                        count: 1,
+                        max_rows: 1
+                    }
+                )),
                 "a queued job did not finish"
             );
         }
@@ -2142,8 +2213,8 @@ mod tests {
             collect(queued_events),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                // A queued job never ran, so it carries no executor report at all.
-                finished_with_prefix(2, 0, 0, None)
+                // A queued job never ran, so it carries no executor report and no pieces.
+                finished_pieces(2, 0, 0, None, PrefillPieces::default())
             ]
         );
         assert_eq!(
@@ -2169,7 +2240,7 @@ mod tests {
             collect(handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished(1538, 0),
+                finished(&log, 1538, 0),
             ]
         );
         assert_eq!(
@@ -2193,7 +2264,7 @@ mod tests {
             collect(handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished(6, 0)
+                finished(&log, 6, 0)
             ]
         );
         assert_eq!(
@@ -2216,7 +2287,10 @@ mod tests {
         handle.try_submit(next).expect("submit the next job");
         assert_eq!(
             collect(next_events),
-            vec![batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 1)
+            ]
         );
         assert!(slow_events.is_cancelled(), "the engine did not cancel");
         let mut expected = strings(&["reset", "boundary", "prefill:1"]);
@@ -2281,7 +2355,10 @@ mod tests {
         assert_eq!(collect(failed_events), vec![JobEvent::Error(error)]);
         assert_eq!(
             collect(next_events),
-            vec![batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 1)
+            ]
         );
         wait_until("the recovered worker to become ready", || {
             handle.state() == EngineState::Ready
@@ -2361,7 +2438,10 @@ mod tests {
         );
         assert_eq!(
             collect(second_events),
-            vec![batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 1)
+            ]
         );
         assert_eq!(handle.state(), EngineState::Ready);
         assert_eq!(
@@ -2545,7 +2625,10 @@ mod tests {
         handle.try_submit(second).expect("submit second");
         assert_eq!(
             collect(second_events),
-            vec![batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
+            vec![
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 1)
+            ]
         );
         assert_eq!(handle.state(), EngineState::Ready);
         assert_eq!(
@@ -2668,7 +2751,7 @@ mod tests {
     fn fill(job: &Job, pending: usize) {
         for index in 0..pending {
             job.events
-                .try_send(finished(0, 0))
+                .try_send(finished_pieces(0, 0, 0, None, PrefillPieces::default()))
                 .unwrap_or_else(|error| panic!("filler {index} did not fit: {error:?}"));
         }
     }
@@ -2709,7 +2792,10 @@ mod tests {
         assert_eq!(delivered.len(), 1_024);
         assert_eq!(
             delivered[1_022..],
-            [batch(&[EOS], "", Some(DecodeFinish::Stop)), finished(1, 1)]
+            [
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 1)
+            ]
         );
         engine.shutdown();
     }
@@ -2801,7 +2887,7 @@ mod tests {
         handle.try_submit(queued).expect("submit queued");
         drop(queued_events);
         release_tx.send(()).expect("release the worker");
-        assert_eq!(collect(running_events).last(), Some(&finished(1, 1)));
+        assert_eq!(collect(running_events).last(), Some(&finished(&log, 1, 1)));
         drop(handle);
         assert_eq!(engine.shutdown().state, EngineState::Stopped);
         assert_eq!(
@@ -2845,15 +2931,16 @@ mod tests {
         );
         let cancelled = vec![
             batch(&[], "", Some(DecodeFinish::Cancelled)),
-            finished(1, 0),
+            finished(&log, 1, 0),
         ];
         assert_eq!(collect(running_events), cancelled);
-        // The queued job never reached the executor, so its usage carries no report.
+        // The queued job never reached the executor, so its usage carries no report and no
+        // pieces (the running job it was queued behind holds the log's last segment).
         assert_eq!(
             collect(queued_events),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished_with_prefix(1, 0, 0, None)
+                finished_pieces(1, 0, 0, None, PrefillPieces::default())
             ]
         );
         assert_eq!(
@@ -2890,7 +2977,7 @@ mod tests {
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
                 // The late job never ran: no executor report.
-                finished_with_prefix(1, 0, 0, None)
+                finished_with_prefix(&log, 1, 0, 0, None)
             ]
         );
         assert_eq!(handle.state(), EngineState::Stopped);
@@ -2909,12 +2996,13 @@ mod tests {
         let (first, first_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7], 4);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(6, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 6, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         let (second, second_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7, 7, 7, 7], 6);
         assert_eq!(
             run_one(&handle, second, second_events),
             stop_events_with_prefix(
+                &log,
                 9,
                 4,
                 fake_report_save(1, PrefixHit::Tip, 0, replaced_once())
@@ -2957,7 +3045,7 @@ mod tests {
         let (first, first_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7, 7], 4);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(7, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 7, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         let saved = calls(&log);
         // Every refused prompt starts with the saved key and carries a boundary, so a check that
@@ -2988,7 +3076,7 @@ mod tests {
         let (next, next_events) = job_with_boundary(&[2, 2, 2, 2, 7, 7, 7], 4);
         assert_eq!(
             run_one(&handle, next, next_events),
-            stop_events_with_prefix(7, 4, fake_report(1, PrefixHit::Tip, 0))
+            stop_events_with_prefix(&log, 7, 4, fake_report(1, PrefixHit::Tip, 0))
         );
         drop(handle);
         engine.shutdown();
@@ -3002,7 +3090,7 @@ mod tests {
         let (a1, a1_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
         assert_eq!(
             run_one(&handle, a1, a1_events),
-            stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 5, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         // B shares no key with A. It restores nothing and replaces the saved state.
         let (b, b_events) = job_with_boundary(&[1, 1, 1, 1, 1], 3);
@@ -3010,6 +3098,7 @@ mod tests {
             run_one(&handle, b, b_events),
             // B's save removes A's entry for room: the churn the old counters could not see.
             stop_events_with_prefix(
+                &log,
                 5,
                 0,
                 fake_report_save(
@@ -3029,6 +3118,7 @@ mod tests {
             run_one(&handle, a2, a2_events),
             // Lifetime totals: A2's save makes the second room removal (B's entry went for A2's).
             stop_events_with_prefix(
+                &log,
                 6,
                 0,
                 fake_report_save(
@@ -3048,6 +3138,7 @@ mod tests {
             run_one(&handle, a3, a3_events),
             // Lifetime: the two room removals of the anonymous round ride every later report.
             stop_events_with_prefix(
+                &log,
                 7,
                 3,
                 fake_report_save(
@@ -3094,14 +3185,14 @@ mod tests {
         let (first, first_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 5, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         let (second, second_events) = job(&[2, 2, 2, 2, 2]);
         // The second job has no boundary: it reports the store the first job filled, with the
         // miss of its own restore-free run.
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 5, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         let calls = calls(&log);
         let tail = calls.get(7..).expect("calls of the second job");
@@ -3131,7 +3222,7 @@ mod tests {
         let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(2_198, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         // Job 2 shares the system prefix and 52 tokens more with the stored tip, but diverges
         // before it: it restores the root, and the 52 tokens it shares with the tip beyond the
@@ -3141,7 +3232,12 @@ mod tests {
         let (second, second_events) = job_with_points(&second_prompt, 2_100, ROOT);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(2_150, ROOT as u32, fake_report(3, PrefixHit::Root, 52))
+            stop_events_with_prefix(
+                &log,
+                2_150,
+                ROOT as u32,
+                fake_report(3, PrefixHit::Root, 52)
+            )
         );
         assert_eq!(
             stored(&store),
@@ -3152,7 +3248,7 @@ mod tests {
         let (third, third_events) = job(&first_prompt);
         assert_eq!(
             run_one(&handle, third, third_events),
-            stop_events_with_prefix(2_198, 0, fake_report(3, PrefixHit::Miss, 0)),
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(3, PrefixHit::Miss, 0)),
             "the store is reported, the hit of job 2 is not"
         );
         drop(handle);
@@ -3173,7 +3269,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished(6, 0)
+                finished(&log, 6, 0)
             ]
         );
         assert_eq!(
@@ -3197,7 +3293,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished(6, 0)
+                finished(&log, 6, 0)
             ]
         );
         assert_eq!(
@@ -3239,6 +3335,7 @@ mod tests {
         assert_eq!(
             run_one(&handle, first, first_events),
             stop_events_with_prefix(
+                &log,
                 5,
                 0,
                 fake_report_save(0, PrefixHit::Miss, 0, refused_once())
@@ -3248,6 +3345,7 @@ mod tests {
         assert_eq!(
             run_one(&handle, second, second_events),
             stop_events_with_prefix(
+                &log,
                 6,
                 0,
                 fake_report_save(
@@ -3690,6 +3788,7 @@ mod tests {
         assert_eq!(
             run_one(&engine.handle(), job, events),
             stop_events_with_prefix(
+                &log,
                 2_198,
                 0,
                 fake_report_save(1, PrefixHit::Miss, 0, refused_once())
@@ -3718,7 +3817,7 @@ mod tests {
         let engine = start_spy(100, spy);
         let handle = engine.handle();
         let (job, events) = job_with_boundary(&[2, 2, 2, 2, 2, 2, 2], 3);
-        assert_eq!(run_one(&handle, job, events), stop_events(7, 5));
+        assert_eq!(run_one(&handle, job, events), stop_events(&log, 7, 5));
         assert_eq!(
             calls(&log),
             strings(&["reset", "restore_prefix", "boundary", "prefill:2", "decode"])
@@ -3745,7 +3844,7 @@ mod tests {
         let (second, second_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 5, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         assert_eq!(
             calls(&log),
@@ -3821,7 +3920,7 @@ mod tests {
         let (second, second_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(5, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 5, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         assert_eq!(
             calls(&log),
@@ -4751,7 +4850,7 @@ mod tests {
             collect(events),
             vec![
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished_with_prefix(10_101, 1, 0, fake_report(2, PrefixHit::Miss, 0))
+                finished_with_prefix(&log, 10_101, 1, 0, fake_report(2, PrefixHit::Miss, 0))
             ]
         );
         let mut expected = strings(&["reset", "restore_prefix", "boundary"]);
@@ -5075,7 +5174,7 @@ mod tests {
         let (job, events) = job_with_points(&prompt, TIP, ROOT);
         assert_eq!(
             run_one(&engine.handle(), job, events),
-            stop_events_with_prefix(2_198, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         assert_eq!(
             stored(&store),
@@ -5094,7 +5193,7 @@ mod tests {
         let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(2_198, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         // The same 2,048-token system prefix, a different first turn, and a different tail: the
         // stored tip key does not match, the root key does.
@@ -5103,7 +5202,7 @@ mod tests {
         let (second, second_events) = job_with_points(&second_prompt, 2_100, ROOT);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(2_150, ROOT as u32, fake_report(3, PrefixHit::Root, 0)),
+            stop_events_with_prefix(&log, 2_150, ROOT as u32, fake_report(3, PrefixHit::Root, 0)),
             "the second conversation reuses the root tokens"
         );
         assert_eq!(
@@ -5124,7 +5223,7 @@ mod tests {
         let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(2_198, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         // A strict extension of the first prompt: the longest stored key, the tip, wins, and
         // the tip that this job saves drops the restored entry (the lineage rule).
@@ -5134,6 +5233,7 @@ mod tests {
         assert_eq!(
             run_one(&handle, job, events),
             stop_events_with_prefix(
+                &log,
                 2_298,
                 TIP as u32,
                 fake_report_save(2, PrefixHit::Tip, 0, replaced_once())
@@ -5164,7 +5264,7 @@ mod tests {
         let (first, first_events) = job_with_points(&first_prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(2_198, 0, fake_report(3, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(3, PrefixHit::Miss, 0))
         );
         assert_eq!(
             stored(&store),
@@ -5176,7 +5276,7 @@ mod tests {
         let (job, events) = job_with_points(&rewritten, 2_146, ROOT);
         assert_eq!(
             run_one(&handle, job, events),
-            stop_events_with_prefix(2_196, 2_144, fake_report(4, PrefixHit::Block, 2)),
+            stop_events_with_prefix(&log, 2_196, 2_144, fake_report(4, PrefixHit::Block, 2)),
             "the rewrite restores the cut and its tokens count as reused; the two shared \
              tokens past the cut (to the old tip's divergence at 2,146) stay uncached"
         );
@@ -5209,7 +5309,7 @@ mod tests {
         let (job, events) = job_with_points(&base, 3_248, ROOT);
         assert_eq!(
             run_one(&handle, job, events),
-            stop_events_with_prefix(3_298, 0, fake_report(3, PrefixHit::Miss, 0)),
+            stop_events_with_prefix(&log, 3_298, 0, fake_report(3, PrefixHit::Miss, 0)),
             "the base turn saves the root, the rolled block, and the tip"
         );
         assert_eq!(
@@ -5226,6 +5326,7 @@ mod tests {
         assert_eq!(
             run_one(&handle, job, events),
             stop_events_with_prefix(
+                &log,
                 3_398,
                 3_248,
                 fake_report_save(3, PrefixHit::Tip, 0, replaced_once())
@@ -5247,6 +5348,7 @@ mod tests {
         assert_eq!(
             run_one(&handle, job, events),
             stop_events_with_prefix(
+                &log,
                 3_325,
                 3_072,
                 fake_report_save(4, PrefixHit::Block, 203, replaced_once())
@@ -5281,7 +5383,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished(2_198, 0)
+                finished(&log, 2_198, 0)
             ]
         );
         assert!(stored(&store).is_empty(), "the store changed on a cancel");
@@ -5308,7 +5410,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished_with_prefix(2_198, 0, 0, fake_report(1, PrefixHit::Miss, 0))
+                finished_with_prefix(&log, 2_198, 0, 0, fake_report(1, PrefixHit::Miss, 0))
             ]
         );
         assert_eq!(
@@ -5346,7 +5448,7 @@ mod tests {
         let (second, second_events) = job_with_points(&prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(2_198, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         drop(handle);
         engine.shutdown();
@@ -5377,7 +5479,7 @@ mod tests {
         };
         assert_eq!(
             run_one(&engine.handle(), job, events),
-            stop_events_with_prefix(2_198, 0, fake_report(entries, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 2_198, 0, fake_report(entries, PrefixHit::Miss, 0))
         );
         engine.shutdown();
         (calls(&log), stored(&store))
@@ -5479,7 +5581,7 @@ mod tests {
         let (second, second_events) = job_with_points(&prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(2_198, ROOT as u32, fake_report(2, PrefixHit::Root, 0))
+            stop_events_with_prefix(&log, 2_198, ROOT as u32, fake_report(2, PrefixHit::Root, 0))
         );
         drop(handle);
         engine.shutdown();
@@ -5502,7 +5604,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished_with_prefix(2_198, 0, 0, fake_report(1, PrefixHit::Miss, 0))
+                finished_with_prefix(&log, 2_198, 0, 0, fake_report(1, PrefixHit::Miss, 0))
             ]
         );
         assert_eq!(
@@ -5548,7 +5650,7 @@ mod tests {
         let (first, first_events) = job_with_boundary(&first_prompt, LONG_TIP);
         assert_eq!(
             run_one(&handle, first, first_events),
-            stop_events_with_prefix(40_000, 0, fake_report(3, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 40_000, 0, fake_report(3, PrefixHit::Miss, 0))
         );
         assert_eq!(
             saves_in(&calls(&log)),
@@ -5576,7 +5678,12 @@ mod tests {
         let (second, second_events) = job_with_boundary(&second_prompt, 33_999);
         assert_eq!(
             run_one(&handle, second, second_events),
-            stop_events_with_prefix(34_000, 32_768, fake_report(4, PrefixHit::Periodic, 232)),
+            stop_events_with_prefix(
+                &log,
+                34_000,
+                32_768,
+                fake_report(4, PrefixHit::Periodic, 232)
+            ),
             "the second job reuses the 32,768 periodic entry"
         );
         assert_eq!(
@@ -5604,7 +5711,12 @@ mod tests {
         let (third, third_events) = job_with_boundary(&third_prompt, 24_999);
         assert_eq!(
             run_one(&handle, third, third_events),
-            stop_events_with_prefix(25_000, 16_384, fake_report(5, PrefixHit::Periodic, 3_616)),
+            stop_events_with_prefix(
+                &log,
+                25_000,
+                16_384,
+                fake_report(5, PrefixHit::Periodic, 3_616)
+            ),
             "the diverging job reuses the 16,384 periodic entry"
         );
         assert_eq!(
@@ -5645,7 +5757,7 @@ mod tests {
             run_one(&engine.handle(), job, handle),
             vec![
                 batch(&[], "", Some(DecodeFinish::Cancelled)),
-                finished_with_prefix(40_000, 0, 0, fake_report(1, PrefixHit::Miss, 0)),
+                finished_with_prefix(&log, 40_000, 0, 0, fake_report(1, PrefixHit::Miss, 0)),
             ]
         );
         assert_eq!(
@@ -5674,7 +5786,7 @@ mod tests {
         let (job, events) = job_with_boundary(&prompt, LONG_TIP);
         assert_eq!(
             run_one(&engine.handle(), job, events),
-            stop_events_with_prefix(40_000, 0, fake_report(1, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 40_000, 0, fake_report(1, PrefixHit::Miss, 0))
         );
         assert_eq!(
             saves_in(&calls(&log)),
@@ -5702,12 +5814,15 @@ mod tests {
         let handle = engine.handle();
         let prompt = vec![2; 40_292];
         let (cold, cold_events) = job(&prompt);
-        assert_eq!(run_one(&handle, cold, cold_events), stop_events(40_292, 0));
+        assert_eq!(
+            run_one(&handle, cold, cold_events),
+            stop_events(&log, 40_292, 0)
+        );
         let after_cold = calls(&log).len();
         let (cut, cut_events) = job_with_boundary(&prompt, 40_192);
         assert_eq!(
             run_one(&handle, cut, cut_events),
-            stop_events_with_prefix(40_292, 0, fake_report(4, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 40_292, 0, fake_report(4, PrefixHit::Miss, 0))
         );
         let all = calls(&log);
         let pieces = |entries: &[String]| -> Vec<String> {
@@ -5746,12 +5861,15 @@ mod tests {
         let handle = engine.handle();
         let prompt = vec![2; 40_292];
         let (cold, cold_events) = job(&prompt);
-        assert_eq!(run_one(&handle, cold, cold_events), stop_events(40_292, 0));
+        assert_eq!(
+            run_one(&handle, cold, cold_events),
+            stop_events(&log, 40_292, 0)
+        );
         let after_cold = calls(&log).len();
         let (periodic, periodic_events) = job_with_boundary(&prompt, 40_192);
         assert_eq!(
             run_one(&handle, periodic, periodic_events),
-            stop_events_with_prefix(40_292, 0, fake_report(3, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 40_292, 0, fake_report(3, PrefixHit::Miss, 0))
         );
         let all = calls(&log);
         let pieces = |entries: &[String]| -> Vec<String> {
@@ -5795,12 +5913,15 @@ mod tests {
         let handle = engine.handle();
         let prompt = vec![2; 20_000];
         let (cold, cold_events) = job(&prompt);
-        assert_eq!(run_one(&handle, cold, cold_events), stop_events(20_000, 0));
+        assert_eq!(
+            run_one(&handle, cold, cold_events),
+            stop_events(&log, 20_000, 0)
+        );
         let after_cold = calls(&log).len();
         let (periodic, periodic_events) = job_with_boundary(&prompt, 19_900);
         assert_eq!(
             run_one(&handle, periodic, periodic_events),
-            stop_events_with_prefix(20_000, 0, fake_report(2, PrefixHit::Miss, 0))
+            stop_events_with_prefix(&log, 20_000, 0, fake_report(2, PrefixHit::Miss, 0))
         );
         let all = calls(&log);
         let pieces = |entries: &[String]| -> Vec<String> {

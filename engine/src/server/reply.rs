@@ -11,7 +11,9 @@ use super::reqlog::RequestLog;
 use super::sampler_trace::TraceAligner;
 use super::wire::{FinishReason, ReplyParts, ToolCall, Usage};
 use crate::EngError;
-use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefillBankReport, PrefixReport};
+use crate::sched::job::{
+    JobEvent, JobHandle, JobUsage, PrefillBankReport, PrefillPieces, PrefixReport,
+};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, OutputAssembler};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +51,12 @@ pub(crate) struct RunningJob {
     /// per-request delta of the counters (log-only `prefill_bank_*` keys); `None` keeps
     /// them out.
     prefill_bank: Option<PrefillBankReport>,
+    /// The prefill piece shape read from the same `Finished` event, with the same fallback
+    /// as `reused`: zeros when the pump never read the event.
+    prefill_pieces: PrefillPieces,
+    /// The top-two logit margin at the first decode position, read from the same `Finished`
+    /// event (log-only); `None` when no draw happened or the pump never read the event.
+    first_token_margin: Option<f32>,
     calls: u32,
     /// The alignment replay of a traced reply: fed every batch's tokens,
     /// finished at `Done`. `None` on every request that did not arm capture.
@@ -84,6 +92,8 @@ impl RunningJob {
             reused: 0,
             prefix: None,
             prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
             calls: 0,
             trace,
             log,
@@ -141,6 +151,8 @@ impl RunningJob {
                         self.reused = usage.reused_tokens;
                         self.prefix = usage.prefix;
                         self.prefill_bank = usage.prefill_bank;
+                        self.prefill_pieces = usage.prefill_pieces;
+                        self.first_token_margin = usage.first_token_margin;
                     }
                     if let Some(step) = self.on_batch(&batch)? {
                         return Ok(step);
@@ -165,6 +177,8 @@ impl RunningJob {
                 reused_tokens: 0,
                 prefix: None,
                 prefill_bank: None,
+                prefill_pieces: PrefillPieces::default(),
+                first_token_margin: None,
             }),
         }
     }
@@ -209,6 +223,8 @@ impl RunningJob {
             &usage,
             self.prefix.as_ref(),
             self.prefill_bank.as_ref(),
+            self.prefill_pieces,
+            self.first_token_margin,
         );
         Step::Done {
             pieces,
@@ -280,7 +296,7 @@ fn add_pieces(parts: &mut ReplyParts, pieces: Vec<Piece>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunningJob, Step, collect};
+    use super::{PrefillPieces, RunningJob, Step, collect};
     use crate::EngError;
     use crate::family::executor::GenerationState;
     use crate::sched::job::{Job, JobEvent, JobUsage, PrefillBankReport};
@@ -501,6 +517,8 @@ mod tests {
                     upload_bytes: 123_456,
                     upload_ns: 789,
                 }),
+                prefill_pieces: PrefillPieces::default(),
+                first_token_margin: None,
             }))
             .expect("usage");
         drop(sender);

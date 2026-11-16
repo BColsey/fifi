@@ -560,6 +560,18 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
         "the job runs: {events:?}"
     );
     assert_eq!(usage(&events).prompt_tokens, 5, "the whole prompt re-ran");
+    // The restart resets the piece count, so the line carries only the serving run's
+    // two pieces (4 rows then 1), never the aborted attempt's two as well.
+    assert_eq!(
+        usage(&events).prefill_pieces.count,
+        2,
+        "only the serving run's pieces: {events:?}"
+    );
+    assert_eq!(
+        usage(&events).prefill_pieces.max_rows,
+        4,
+        "the largest serving piece"
+    );
     let trace = lock(&log);
     assert_eq!(
         trace.calls,
@@ -802,6 +814,72 @@ fn prefill_uses_existing_pieces_and_never_adds_prompt_rows_to_a_window() {
         ["prefill:1", "prefill:4", "prefill:4", "prefill:2"]
     );
     drop(trace);
+    engine.shutdown();
+}
+
+#[test]
+fn a_multi_piece_prompt_counts_every_piece_without_a_restart() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    // 10 tokens at worker piece 4 feed 4,4,2 with no denial: the count accumulates
+    // across the pieces (the restart test pins the reset; this pins the steady path).
+    let (long, long_events) = job(&[1; 10], 1);
+    engine.handle().try_submit(long).expect("submit");
+    release.send(()).expect("load");
+    let events = collect(long_events);
+    assert_eq!(
+        usage(&events).prefill_pieces.count,
+        3,
+        "three pieces: {events:?}"
+    );
+    assert_eq!(
+        usage(&events).prefill_pieces.max_rows,
+        4,
+        "the largest piece"
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn two_slots_count_their_own_prefill_pieces() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    let (short, short_events) = job(&[0], 1);
+    let (long, long_events) = job(&[1; 10], 1);
+    engine.handle().try_submit(short).expect("short");
+    engine.handle().try_submit(long).expect("long");
+    release.send(()).expect("load");
+    let short_usage = usage(&collect(short_events));
+    let long_usage = usage(&collect(long_events));
+    assert_eq!(
+        short_usage.prefill_pieces.count, 1,
+        "short slot: {short_usage:?}"
+    );
+    assert_eq!(short_usage.prefill_pieces.max_rows, 1);
+    assert_eq!(
+        long_usage.prefill_pieces.count, 3,
+        "long slot: {long_usage:?}"
+    );
+    assert_eq!(long_usage.prefill_pieces.max_rows, 4);
+    engine.shutdown();
+}
+
+#[test]
+fn a_batch_jobs_first_token_margin_rides_the_slot_usage() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    // The fake draws from [0,0,0]: the top two tie, so the latched margin is zero.
+    fake.draws = true;
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[7, 7, 7, 7, 7], 1);
+    engine.handle().try_submit(first).expect("submit");
+    release.send(()).expect("load");
+    let events = collect(first_events);
+    assert_eq!(
+        usage(&events).first_token_margin,
+        Some(0.0),
+        "the served margin rides the slot usage: {events:?}"
+    );
     engine.shutdown();
 }
 
