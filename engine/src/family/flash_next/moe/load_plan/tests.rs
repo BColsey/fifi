@@ -178,3 +178,35 @@ fn the_load_line_is_one_literal_line() {
     );
     assert!(rows.iter().all(|r| r.alternatives.is_empty()));
 }
+
+#[test]
+fn the_load_line_is_the_rows_render() {
+    // The line start prints at load is exactly the decision rows the
+    // preflight prints, joined — the same function of the same plan.
+    let plan = FlashLoadPlan::new(&report(3_854_000_000), CONFIG, 32_640_183_408, card()).unwrap();
+    let load = plan.at_context(4_096, KvFormat::F16, 100).unwrap();
+    let joined = format!(
+        "Flash-Next load: {}",
+        load.plan_rows()
+            .iter()
+            .map(|row| format!("{} {}", row.name, row.chosen))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    assert_eq!(load.to_string(), joined);
+}
+
+#[test]
+fn start_prints_the_rows_render_at_load() {
+    // The load log line is the plan's own render: start prints `{load}`
+    // after it builds the plan, never a second hand-written summary.
+    let source = include_str!("../../cuda/start.rs");
+    let build = &source[source.find("fn build_driver(").expect("driver builder")..];
+    let plan = build
+        .find("load_plan.at_context(")
+        .expect("the plan at context");
+    let print = build
+        .find("eprintln!(\"{load}")
+        .expect("the load line prints the plan render");
+    assert!(plan < print);
+}
