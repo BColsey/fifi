@@ -741,7 +741,7 @@ pub(in crate::kernels::cuda) fn pinned_read_f32_into(
 ) -> Result<(), DeviceFailure> {
     let bytes = out.len().checked_mul(4).ok_or_else(invalid_argument)?;
     let end = offset.checked_add(bytes).ok_or_else(invalid_argument)?;
-    if end > pinned.bytes || offset % 4 != 0 {
+    if end > pinned.bytes || !offset.is_multiple_of(4) {
         return Err(invalid_argument());
     }
     let base = pinned.ptr.as_ptr().cast::<f32>().cast_const();

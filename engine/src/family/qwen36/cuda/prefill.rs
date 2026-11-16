@@ -3181,7 +3181,7 @@ fn chunk_moe(
         return run_chunk_moe(
             launch,
             ChunkMoe::Tiered {
-                runtime: &mut *runtime,
+                runtime: &mut runtime,
                 layer: ctx.layer,
             },
             &io,

@@ -115,7 +115,12 @@ impl ColdStaging {
         let bytes = region.bytes();
         let ColdStaging { bank, cap, ring } = self;
         let (gate_up, down) = bank.slice_bytes()?;
-        let stacks: [(&DeviceBuffer, usize, fn(&ChunkColdStage) -> &Range<usize>); 3] = [
+        type ColdStack<'a> = (
+            &'a DeviceBuffer,
+            usize,
+            fn(&ChunkColdStage) -> &Range<usize>,
+        );
+        let stacks: [ColdStack<'_>; 3] = [
             (bank.gate().buffer(), gate_up, |c| &c.gate),
             (bank.up().buffer(), gate_up, |c| &c.up),
             (bank.down().buffer(), down, |c| &c.down),
@@ -310,6 +315,7 @@ pub(super) struct RouteLayout {
 
 /// Persistent pinned/device buffers of the chunk route readback and the overflow
 /// partial upload (grow-only in `m`; a few tens of MiB, below any admission ledger).
+#[derive(Default)]
 pub(super) struct RouteScratch {
     pinned: Option<PinnedBuf>,
     event: Option<DeviceEvent>,
@@ -321,22 +327,6 @@ pub(super) struct RouteScratch {
     partial_dst: Option<DeviceBuffer>,
     /// The hidden block's f32 staging, grown with m and refilled per layer.
     hidden_f32: Vec<f32>,
-}
-
-impl Default for RouteScratch {
-    fn default() -> Self {
-        Self {
-            pinned: None,
-            event: None,
-            partial: None,
-            partial_event: None,
-            cap: 0,
-            partial_cap: 0,
-            partial_bytes: Vec::new(),
-            partial_dst: None,
-            hidden_f32: Vec::new(),
-        }
-    }
 }
 
 impl<'w> TieredRuntime<'w> {
@@ -437,6 +427,7 @@ impl<'w> TieredRuntime<'w> {
 
     /// Enqueues the batched route readback (ids, weights, normed rows) into the
     /// REUSABLE pinned buffer, growing it only when the piece's `m` grows.
+    #[allow(clippy::too_many_arguments)] // The buffer ranges and their shape form one transfer.
     pub(super) fn route_enqueue(
         &mut self,
         ctx: &CudaContext,
@@ -615,7 +606,7 @@ impl<'w> TieredRuntime<'w> {
             };
             stream.record(event)?;
         }
-        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
+        let ones: Vec<u8> = [0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
         let ones_buf = ctx.upload(&ones)?;
         let down = self
             .route
