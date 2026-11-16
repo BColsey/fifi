@@ -40,8 +40,7 @@ impl HostAdmission {
         let membership = read_admission_file(label, &proc.join("self/cgroup"))?;
         let mounts = read_admission_file(label, &proc.join("self/mountinfo"))?;
         let group = cgroup_from_proc(label, root, &membership, &mounts, pid)?;
-        let root = std::fs::canonicalize(root)
-            .map_err(|error| EngError::MemoryPlan(format!("{root_label} cgroup root: {error}")))?;
+        let root = std::fs::canonicalize(root).map_err(|error| root_error(root_label, error))?;
         Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)
     }
 
@@ -132,6 +131,10 @@ fn cgroup_remaining_bytes(
         "max" => Ok(None),
         maximum => Ok(Some(parse(maximum)?.saturating_sub(current))),
     }
+}
+
+fn root_error(root_label: &str, error: std::io::Error) -> EngError {
+    EngError::MemoryPlan(format!("{root_label} cgroup root: {error}"))
 }
 
 fn read_admission_file(label: &'static str, path: &std::path::Path) -> Result<String, EngError> {
@@ -372,9 +375,13 @@ mod tests {
         // The no-ancestor refusal is structurally unreachable: a cgroup that
         // starts_with(root) always walks up to root, so that branch stays
         // untriggered by design.
-        // The root-label line ("{root_label} cgroup root:") only fires in
-        // the window between cgroup_from_proc's canonicalize and probe_in's
-        // own, so it cannot be produced deterministically.
+        // The root-label line only fires in the window between
+        // cgroup_from_proc's canonicalize and probe_in's own, so it is
+        // pinned through root_error rather than produced end to end.
+        assert_eq!(
+            refusal_text::<()>(Err(root_error(ROOT_LABEL, std::io::Error::other("x")))),
+            "the caller cgroup root: x"
+        );
         no_family(&refusal_text(cgroup_from_proc(
             LABEL,
             root.path(),
@@ -469,6 +476,10 @@ mod tests {
                 42
             )),
             "Flint expert cache cannot map its process inside a complete unified cgroup tree."
+        );
+        assert_eq!(
+            refusal_text::<()>(Err(root_error("Flint", std::io::Error::other("x")))),
+            "Flint cgroup root: x"
         );
     }
 
