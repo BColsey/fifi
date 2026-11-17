@@ -23,8 +23,8 @@
 #                      Mac (not /tmp; validated before any rm -rf under it)
 #   GATES_MAC_MAX_SEC  optional; LOCAL time limit around the Mac ssh (default
 #                      1800). It bounds the wait, not the remote build: on a
-#                      timeout kill the remote clippy may still be running, and
-#                      its directory is then LEFT-BEHIND and named in the receipt.
+#                      timeout kill the remote shell's own EXIT trap still
+#                      removes its directory when the build ends.
 #   GATES_ARM_MAX_SEC  optional; per-arm time limit for every Linux arm (default 3600)
 #   GATES_LOCK_WAIT    optional; seconds to wait for the shared lock (default 7200;
 #                      a wait that times out refuses the run with rc 5)
@@ -48,14 +48,25 @@
 # the receipt at the end. It streams the archive over ssh; never a push, never
 # the Mac's own checkout.
 #
-# Mac cleanup contract: a run removes ONLY its own scratch directory, and only
-# when the remote clippy returned its own exit status (any cargo status counts).
-# After a local timeout kill (124, or 125 on hosts whose timeout(1) reports the
-# kill that way), a lost connection (255) or an interrupt the remote build may still be running — a non-tty ssh does not guarantee the
-# remote dies with its connection — so the directory is LEFT-BEHIND and named
-# in the receipt for manual cleanup. No pid files, no remote process
-# signalling, no sweeping of other directories: killing remote processes by a
-# pid read from a file has no safe validation on a shared build host.
+# Mac cleanup contract: a run removes ONLY its own scratch directory. The
+# remote wrapper arms `trap 'rm -rf "$d"' EXIT` before its cd, so the remote
+# shell removes its own directory on every exit of its own — its clippy's
+# exit status, a remote-side timeout, or the connection's death (the shell
+# runs the trap after its foreground build is done, so rm never races a live
+# build). Paths where the clippy ssh never started (tar failure, connect
+# failure, an interrupt in the tar phase) cannot have anything building
+# remotely, so the local side removes the tree with the validated name only;
+# the mac-clippy.started flag marks where the remote trap takes over. No pid
+# files, no signalling of remote processes, no sweeping of other directories.
+# The remote command is kept POSIX: the login shell there may not be bash.
+# The local teardown (mac_teardown) is a prompt backstop for the collected
+# paths.
+#
+# Mac disk floor: before the arm starts, free space on the volume holding
+# GATES_MAC_BASE is measured with df (after mkdir -p, so a first use works);
+# below GATES_MAC_MIN_FREE_GB (default 25, whole GiB) the arm refuses and the
+# number goes into the receipt. One tree is about 2.2 GB; clippy needs
+# headroom beyond that.
 #
 # Exit codes: 0 all selected arms passed; 1 unexpected command failure under
 # set -e; 2 usage or environment error; 3 memory/disk guard; 4 a gate failed;
@@ -187,13 +198,22 @@ finish() {
     trap '' INT TERM HUP   # cleanup itself must not be interrupted
     if [[ -n $mac_job ]]; then
         # Interrupted run: kill the LOCAL driver subshell (its ssh child dies
-        # with it) and touch nothing on the Mac — see the header contract. The
-        # remote build may still be running; its directory is LEFT-BEHIND.
+        # with it). If the clippy ssh had started, the remote shell's own EXIT
+        # trap removes its directory when its build ends. If it had not (the
+        # interrupt landed in the tar phase), nothing on the Mac can still be
+        # building, so the local side removes the tree (validated name only).
         pkill -TERM -P "$mac_job" 2>/dev/null || true
         kill "$mac_job" 2>/dev/null || true
         wait "$mac_job" 2>/dev/null || true
         mac_job=
-        receipt+=("NOTE: interrupted with the Mac arm live; its scratch dir $mac_dir is LEFT-BEHIND on the Mac for manual cleanup")
+        if [[ -f $logs/mac-clippy.started ]]; then
+            receipt+=("NOTE: interrupted with the Mac arm live; the remote shell's EXIT trap removes $mac_dir when its build ends")
+        else
+            local_dir=$mac_dir
+            mac_dir=
+            mac_teardown "$local_dir"
+            receipt+=("NOTE: interrupted before the Mac clippy started; removed $local_dir locally")
+        fi
     elif [[ -n $mac_dir && $mac_dir == "$mac_base"/gates.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9] ]]; then
         # The Mac arm already returned its own exit status and its directory
         # was NOT removed in the collection block (that block only removes on
@@ -232,7 +252,7 @@ if grep -qx "worktree $run/src" <<<"$wt_list"; then
 fi
 mkdir -p "$run/tmp"
 
-rm -f "$logs"/*.exit "$logs/receipt.txt"
+rm -f "$logs"/*.exit "$logs/receipt.txt" "$logs/mac-clippy.started"
 git -C "$repo" worktree add --detach --quiet "$run/src" "$sha"
 
 export TMPDIR=$run/tmp TMP=$run/tmp TEMP=$run/tmp
@@ -272,7 +292,7 @@ fail_now() {
     for ((i = start + 1; i < ${#arms[@]}; i++)); do
         label=${arms[i]}
         if [[ $label == mac-clippy && $mac_ran == true ]]; then
-            arm_status+=("NOT-COLLECTED mac-clippy (concurrent; dir ${mac_dir:-unset}; log $logs/mac-clippy.driver.log)")
+            arm_status+=("NOT-COLLECTED mac-clippy (concurrent; the remote shell's EXIT trap removes its dir; log $logs/mac-clippy.driver.log)")
         else
             arm_status+=("NOT-RUN $label (stopped at $failed)")
         fi
@@ -297,25 +317,65 @@ cd "$run/src/engine"
 # The Mac arm starts first and runs concurrently with the Linux arms: its
 # subshell closes the lock fd (fd 9) so its ssh children never hold the local
 # lock, and its rc is collected into the receipt at the end. The remote shell
-# writes its pid so cleanup can stop it by pid instead of by pattern.
+# owns its cleanup: its EXIT trap removes its scratch directory on every exit
+# of its own, so no local path can leave a tree behind.
 if [[ $mac != never ]]; then
-    if ! mac_dir=$(ssh "${ssh_opts[@]}" -- "$mac_host" "mkdir -p '$mac_base' && mktemp -d '$mac_base/gates.XXXXXXXXXX'"); then
+    # Disk floor before anything is created remotely (F5): one tree is about
+    # 2.2 GB and clippy needs headroom; 63 left-behind trees filled the Mac's
+    # data volume on 2026-11-17. mkdir first so a first use of the base works;
+    # df -g: 1 GiB blocks, column 4 = available.
+    mac_min_free_gb=${GATES_MAC_MIN_FREE_GB:-25}
+    [[ $mac_min_free_gb =~ ^[0-9]+$ ]] || {
+        echo "GATES_MAC_MIN_FREE_GB must be a whole number of GiB: '$mac_min_free_gb'" >&2
+        exit 2
+    }
+    # 10# rejects octal reading: "08" would abort the arithmetic below.
+    mac_min_free_gb=$((10#$mac_min_free_gb))
+    if ! mac_free_gb=$(ssh "${ssh_opts[@]}" -- "$mac_host" "mkdir -p '$mac_base' && df -g '$mac_base' | awk 'NR==2 {print \$4; exit}'"); then
+        arm_status+=("FAIL mac-clippy rc=unreachable-host log=$logs/mac-clippy.log")
+        fail_now mac-setup ''
+    fi
+    [[ $mac_free_gb =~ ^[0-9]+$ ]] || {
+        echo "GATES FAIL: the Mac returned an unexpected df value: '$mac_free_gb'" >&2
+        arm_status+=("FAIL mac-clippy rc=bad-df-output log=$logs/mac-clippy.log")
+        fail_now mac-setup ''
+    }
+    if (( 10#$mac_free_gb < mac_min_free_gb )); then
+        echo "GATES FAIL: Mac free space ${mac_free_gb} GiB below the ${mac_min_free_gb} GiB floor on $mac_base" >&2
+        arm_status+=("FAIL mac-clippy rc=mac-low-disk log=$logs/mac-clippy.log (free ${mac_free_gb} GiB < floor ${mac_min_free_gb} GiB)")
+        fail_now mac-setup ''
+    fi
+    arm_status+=("mac-disk free=${mac_free_gb}GiB floor=${mac_min_free_gb}GiB")
+    if ! mac_dir=$(ssh "${ssh_opts[@]}" -- "$mac_host" "mktemp -d '$mac_base/gates.XXXXXXXXXX'"); then
         arm_status+=("FAIL mac-clippy rc=unreachable-host log=$logs/mac-clippy.log")
         fail_now mac-setup ''
     fi
     # mktemp's own output is the only accepted shape — exactly gates. plus the
     # ten characters mktemp draws from — before it is ever used in a command.
+    # A rejected name is logged and NEVER passed to rm -rf: it can be empty,
+    # the base dir, or anything else, so nothing is removed on this path.
     [[ $mac_dir == "$mac_base"/gates.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9] ]] || {
         echo "GATES FAIL: the Mac returned an unexpected scratch dir name: '$mac_dir'" >&2
-        arm_status+=("FAIL mac-clippy rc=bad-scratch-name")
+        arm_status+=("FAIL mac-clippy rc=bad-scratch-name (logged, nothing removed)")
         fail_now mac-setup ''
     }
     (
         exec 9>&-   # the lock fd must not leak into the ssh children
-        remote_cmd="cd '$mac_dir/engine' && PATH=/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$mac_dir/target' cargo clippy --all-targets --locked --features native-mlx -- -D warnings"
-        git -C "$repo" archive --format=tar "$sha" |
-            ssh "${ssh_opts[@]}" -- "$mac_host" "tar -x -C '$mac_dir'" &&
-            run_arm mac-clippy timeout -k 30 "$mac_max" ssh "${ssh_opts[@]}" -- "$mac_host" "$remote_cmd"
+        # The trap arms before cd, so even a failed cd still removes the tree.
+        # Keep the command POSIX: the remote login shell may not be bash.
+        remote_cmd="d='$mac_dir'; trap 'rm -rf \"\$d\"' EXIT; cd \"\$d/engine\" && PATH=/opt/homebrew/bin:\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR=\"\$d/target\" cargo clippy --all-targets --locked --features native-mlx -- -D warnings"
+        if ! git -C "$repo" archive --format=tar "$sha" |
+            ssh "${ssh_opts[@]}" -- "$mac_host" "tar -x -C '$mac_dir'"; then
+            # The clippy ssh never started, so nothing on the Mac can still be
+            # building a clippy; the local side removes the tree (validated
+            # name only). A remote tar that is still draining its EOF exits
+            # on its own - this rm may race it, which is accepted: the tree is
+            # this run's own and no result is read from it afterwards.
+            mac_teardown "$mac_dir"
+            exit 1
+        fi
+        touch "$logs/mac-clippy.started"
+        run_arm mac-clippy timeout -k 30 "$mac_max" ssh "${ssh_opts[@]}" -- "$mac_host" "$remote_cmd"
     ) > "$logs/mac-clippy.driver.log" 2>&1 &
     mac_job=$!
 fi
@@ -365,9 +425,9 @@ run_arm ctr-lib-run "${ctr[@]}" test --release --locked --lib --features native-
 
 # Collect the concurrent Mac arm into the receipt. The subshell's own PASS/FAIL
 # line went to its driver log; the exit file it wrote carries the rc here.
-# The directory is removed ONLY when the remote command returned its own exit
-# a local timeout kill (124 or 125), a lost connection (255) or no exit file
-# at all, the remote may still be building, so it is LEFT-BEHIND, named.
+# Collected statuses (including every real cargo rc) are removed promptly by
+# mac_teardown; a local timeout kill (124 or 125), a lost connection (255) or
+# no exit file at all leaves removal to the remote shell's own EXIT trap.
 if [[ -n $mac_job ]]; then
     mac_rc=$(cat "$logs/mac-clippy.exit" 2>/dev/null || echo unknown)
     if wait "$mac_job" && [[ $mac_rc != unknown ]]; then
@@ -379,8 +439,24 @@ if [[ -n $mac_job ]]; then
         arm_status+=("FAIL mac-clippy rc=$mac_rc log=$logs/mac-clippy.log")
         mac_job=      # the driver subshell has exited; finish() must not kill again
         if [[ $mac_rc == 124 || $mac_rc == 125 || $mac_rc == 255 || $mac_rc == unknown ]]; then
-            arm_status+=("mac-clippy scratch dir LEFT-BEHIND (remote may still be building): $mac_dir")
-            mac_dir=
+            if [[ $mac_rc == 255 ]]; then
+                # A lost connection gives no evidence the remote trap armed
+                # (the ssh may have failed before the remote shell ran), so the
+                # local side removes the tree. If the trap did arm, the remote
+                # rm and this one are both idempotent.
+                local_dir=$mac_dir
+                mac_dir=
+                mac_teardown "$local_dir"
+                arm_status+=("mac-clippy: connection lost; removed $local_dir locally")
+            elif [[ -f $logs/mac-clippy.started ]]; then
+                arm_status+=("mac-clippy: removal left to the remote EXIT trap (remote may still be building): $mac_dir")
+                mac_dir=
+            else
+                local_dir=$mac_dir
+                mac_dir=
+                mac_teardown "$local_dir"
+                arm_status+=("mac-clippy: the clippy ssh never started; removed $local_dir locally")
+            fi
         else
             local_dir=$mac_dir
             mac_dir=
