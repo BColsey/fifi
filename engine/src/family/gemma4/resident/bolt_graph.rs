@@ -117,6 +117,12 @@ impl DecodeGraphMode {
         self.wanted && self.refusal.is_none()
     }
 
+    /// Arms or disarms the graph (the environment sets the load-time
+    /// default; a sticky refusal survives a later arming attempt).
+    pub(crate) fn set_on(&mut self, on: bool) {
+        self.wanted = on;
+    }
+
     /// The sticky refusal, if any.
     pub(crate) fn refusal(&self) -> Option<&str> {
         self.refusal.as_deref()

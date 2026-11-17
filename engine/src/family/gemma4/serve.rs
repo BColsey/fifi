@@ -442,6 +442,79 @@ mod device {
             );
         }
 
+        /// The graphed decode must draw the identical greedy chain as the
+        /// eager one. Run 1 draws eagerly; the re-feed from position 0
+        /// overwrites every cell the first run read below its position word;
+        /// run 2 arms the graph (the first clean step warms, the second
+        /// captures, the rest replay) and must reproduce run 1's chain over a
+        /// mid-run prefill too — the restore flow feeds rows while the graph
+        /// exists, and the next decode must still replay it.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn a_graphed_greedy_run_matches_the_eager_run() {
+            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            assert!(
+                !model.graph_mode.active(),
+                "the graph stays off without FIFI_BOLT_DECODE_GRAPH"
+            );
+            // 1,000 prompt rows and 96 more drawn: every decode reads past
+            // the 512-cell sliding window of the local layers (Bolt's
+            // LOCAL_WINDOW is the spec's sliding_window), so the windowed
+            // attention of a replay is exercised over its full span.
+            let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
+            let extension: Vec<u32> = (0..8u32).map(|index| 90_000 + index).collect();
+            let run = |model: &mut Bolt, prompt: &[u32]| -> Vec<u32> {
+                feed(model, prompt);
+                let saved = prompt.len() - 1;
+                let mut token = prompt[saved];
+                let mut drawn = Vec::new();
+                for pos in (saved..).take(10) {
+                    token = greedy_step(model, token, pos);
+                    drawn.push(token);
+                }
+                model
+                    .prefill_batch(&extension, saved + 10, false)
+                    .expect("mid-run prefill");
+                let mut token = *extension.last().expect("extension");
+                for pos in (saved + 10 + extension.len()..).take(86) {
+                    token = greedy_step(model, token, pos);
+                    drawn.push(token);
+                }
+                drawn
+            };
+            let eager = run(&mut model, &prompt);
+            // Poison: a divergent eager run leaves OTHER values in every cell
+            // the graphed run will read, so a replay that reads or writes a
+            // stale cell (the capture-time position, say) draws a different
+            // chain instead of matching the identical leftovers.
+            let poison: Vec<u32> = (0..1_000u32).map(|index| 200_000 + (index % 891)).collect();
+            let spoiled = run(&mut model, &poison);
+            assert_ne!(eager, spoiled, "the poison run must diverge");
+            model.use_decode_graph(true);
+            let graphed = run(&mut model, &prompt);
+            assert_eq!(eager, graphed, "the graphed chain must be byte-identical");
+            assert!(
+                model.graph_mode.replays() > 80,
+                "the steps must have replayed (replays: {})",
+                model.graph_mode.replays()
+            );
+            assert_eq!(model.graph_mode.refusal(), None, "no refusal may occur");
+            let mut status = [0u8; 4];
+            model
+                .ctx
+                .download(&model.scratch.status, &mut status)
+                .expect("status word");
+            assert_eq!(
+                u32::from_le_bytes(status),
+                0,
+                "no KV8 append may have refused mid-run"
+            );
+            assert!(
+                eager.windows(2).any(|pair| pair[0] != pair[1]),
+                "the drawn chain must not be constant"
+            );
+        }
+
         /// A one-token prompt feeds nothing in prefill, so its first decode
         /// writes cell 0 through `logits`: that decode must advance the cell
         /// generation, or a stale entry would match over the overwritten cell.

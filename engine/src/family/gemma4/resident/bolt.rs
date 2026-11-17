@@ -481,6 +481,12 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
 impl Bolt {
     pub(crate) const PREFILL_BATCH: usize = 8;
 
+    /// Arms or disarms the decode graph for this model (the environment
+    /// sets the load-time default; the tests flip it between runs).
+    pub(crate) fn use_decode_graph(&mut self, on: bool) {
+        self.graph_mode.set_on(on);
+    }
+
     /// The capped logits of the newest logits-bearing forward, for host
     /// sampling. The tie to `logits_capped` (not `logits`) matches the
     /// model's own output distribution.
