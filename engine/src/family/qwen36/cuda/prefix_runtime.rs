@@ -1,6 +1,5 @@
 //! The step's deferred prefix lifecycle. This is a child of step, so device owners stay private.
 use super::super::{
-    book::Health,
     prefix::{CudaSavedPrefix, PendingPrefix, entry_bytes},
     state::{
         device_tip::DeviceTip,
@@ -8,6 +7,7 @@ use super::super::{
     },
 };
 use super::QwenResidentStep;
+use crate::family::graph_state::book::Health;
 use crate::{
     EngError,
     family::qwen36::window_logic,

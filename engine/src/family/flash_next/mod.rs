@@ -9,7 +9,6 @@ mod deltanet;
 pub(crate) mod factory;
 mod hyper;
 mod load;
-pub(in crate::family) mod math;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx;
 mod moe;
@@ -25,4 +24,3 @@ pub(crate) mod settings;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod start;
 mod step;
-pub(in crate::family) mod stored;

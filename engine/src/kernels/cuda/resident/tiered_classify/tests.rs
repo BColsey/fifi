@@ -12,7 +12,7 @@ use super::{
     CTRL_BYTES, ClassifyCall, ClassifyShape, LOG_BYTES_PER_PICK, REQUEST_BYTES, check_shape,
 };
 use crate::EngError;
-use crate::family::qwen36::tiered::classify::{Classified, classify_reference, word_after};
+use crate::family::tiered_classify::{Classified, classify_reference, word_after};
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::testkit::{self, Rng};

@@ -3,9 +3,9 @@
 //! This child of `step.rs` uses private fields and the existing chunk protocol. It does not open
 //! the public KV8 gate or change the Q6_K guard. The comparison is KV8 route equivalence, not KV8
 //! acceptance against FP16, a full-body error bound, or a 256-row qualification.
+use crate::family::graph_state::book::Health;
 
 use super::super::{
-    book::Health,
     common_tests::{dims as step_dims, inventory},
     prefill::{ChunkKernelClass, ChunkViews},
     prefill_driver::admit_m_sess,

@@ -616,7 +616,7 @@ fn prefix_save_restore_envelope_under_guard() {
     // host constant could never fail on a 24 GiB card. The right budgets:
     // the DEVICE series stays under the card total with headroom, and the
     // snapshot's HOST charge (report.bytes — the figure the save admitted
-    // against HostBudget) still fits that same host/cgroup budget.
+    // against the host guard) still fits that same host/cgroup budget.
     for (label, value) in [
         ("before", before),
         ("prefill", mid),
@@ -648,8 +648,8 @@ fn prefix_save_restore_envelope_under_guard() {
     // save. What must still hold after allocation is the floor: the OS
     // headroom the budget always requires (admit with charge 0 asserts
     // exactly os_floor <= available).
-    let budget =
-        crate::family::flint::exl3_resident::HostBudget::probe().expect("probe the host budget");
+    let budget = crate::family::host_admit::HostAdmission::probe("Flint expert cache", "Flint")
+        .expect("probe the host budget");
     budget
         .admit_for(0, "post-save floor")
         .expect("the host floor must still hold after the snapshot is live");

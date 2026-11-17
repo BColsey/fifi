@@ -11,9 +11,10 @@
 //! 2. The resident pass runs, and the host learns the picks (hits included) so that
 //!    [`ExpertBankState::begin_pass`] can plan the copies: every expert of the pass is protected, a
 //!    miss takes the least recently used unprotected slot, and the slot's old expert leaves the card.
-//! 3. [`PassCopies`] says what to move. The copy is synchronous (the missed picks wait for it).
-//! 4. The missed picks run on their new slots with their true weights, every other pick on the
-//!    filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit for bit.
+//! 3. `PassCopies` says what to move. The copy is synchronous (the missed picks wait for it).
+//! 4. The missed picks run on their new slots with their true weights — the missed picks ONLY,
+//!    no filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit
+//!    for bit.
 //!
 //! WHY this shape:
 //!
@@ -34,8 +35,9 @@
 //!   (equal strides for the id-indexed launch), the policy and the placement are pure and tested on
 //!   the host.
 //!
-//! A shared slot cache in `expert_tier` can replace [`ReplaceOnMissLru`] behind [`SlotPolicy`]
-//! and nothing else: the interface is `plan_pass(layer, picks) -> PassPlan`,
+//! The slot policy lives in the shared module (`family::expert_bank::policy`): the same
+//! `ReplaceOnMissLru` behind the same `SlotPolicy` seam, moved there so a second family's bank
+//! can serve it unchanged. The interface is `plan_pass(layer, picks) -> PassPlan`,
 //! `admit(layer, experts_by_use) -> PassPlan`, `slot_row(layer)` and `expert_in_slot(layer, slot)`.
 //! Host places, copies, budget and the device owner do not change. The policy must keep three rules:
 //! the experts of a pass are never victims, slot 0 is not a victim in a pass with a miss, and the
@@ -50,78 +52,18 @@ use crate::{
     EngError,
     family::{
         flash_next::moe::{slot_bank::SlotBankLayout, tier_plan::TierPlan},
-        qwen36::tiered::classify::Classified,
+        tiered_classify::Classified,
     },
 };
 
-const GIB: u64 = 1 << 30;
-const MIB: u64 = 1 << 20;
-const NO_PLACE: u32 = u32::MAX;
-
-fn plan_error(detail: String) -> EngError {
-    EngError::MemoryPlan(format!("Flash-Next expert bank: {detail}"))
-}
-
-fn bank_error(detail: String) -> EngError {
-    EngError::BadRequest(format!("Flash-Next expert bank: {detail}"))
-}
-
-/// The sizes of the bank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BankGeometry {
-    pub(super) layers: usize,
-    pub(super) experts: usize,
-    pub(super) top_k: usize,
-    /// Device slots in every layer.
-    pub(super) slots: usize,
-    /// Bytes of one expert record (`SlotBankLayout::record_bytes`, 1,881,600 in the 3.05 pack).
-    pub(super) record_bytes: usize,
-}
+use crate::family::expert_bank::{
+    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_error, plan_error,
+};
 
 impl BankGeometry {
-    /// Refuses a bank without `top_k + 1` slots (the filler needs one), more slots than experts,
-    /// expert numbers that do not fit u16 and a record that is not whole floats.
-    pub(super) fn new(
-        layers: usize,
-        experts: usize,
-        top_k: usize,
-        slots: usize,
-        record_bytes: usize,
-    ) -> Result<Self, EngError> {
-        if layers == 0 || top_k == 0 || record_bytes == 0 || !record_bytes.is_multiple_of(4) {
-            return Err(plan_error(format!(
-                "{layers} layers, top-{top_k} and a {record_bytes}-byte record are not a bank"
-            )));
-        }
-        // `u16::MAX` is the empty-slot sentinel of the policy, so it cannot be an expert number.
-        if experts == 0 || experts > usize::from(u16::MAX) {
-            return Err(plan_error(format!(
-                "{experts} experts do not fit a 16-bit expert number below the sentinel"
-            )));
-        }
-        if slots <= top_k {
-            return Err(plan_error(format!(
-                "{slots} slots per layer cannot protect {top_k} picks and the filler slot; \
-                 the bank needs {} or more",
-                top_k + 1
-            )));
-        }
-        if slots > experts {
-            return Err(plan_error(format!(
-                "{slots} slots exceed the {experts} experts of a layer"
-            )));
-        }
-        Ok(Self {
-            layers,
-            experts,
-            top_k,
-            slots,
-            record_bytes,
-        })
-    }
-
     /// The bank the tier plan settled, for records of `layout`. The record size must be the plan's
-    /// expert size, which comes from the header walk.
+    /// expert size, which comes from the header walk. Flash-Next's construction of the shared
+    /// type, kept here so the seam module does not depend on the Flash-Next moe modules.
     pub(super) fn from_plan(plan: &TierPlan, layout: &SlotBankLayout) -> Result<Self, EngError> {
         let shape = plan.shape();
         if layout.record_bytes() as u64 != shape.expert_bytes {
@@ -139,42 +81,17 @@ impl BankGeometry {
             layout.record_bytes(),
         )
     }
-
-    /// Byte offset of `slot` (or of a host place) in a layer's buffer.
-    pub(super) fn offset(&self, index: usize) -> usize {
-        index * self.record_bytes
-    }
-
-    pub(super) fn device_bytes_per_layer(&self) -> u64 {
-        self.slots as u64 * self.record_bytes as u64
-    }
 }
 
-/// Which experts the pinned store holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HostMode {
-    /// Only the experts that are not in a slot, plus one spare place per layer. An expert that
-    /// leaves a slot is written back into the place its successor just left.
-    Exclusive,
-    /// Every expert of every layer: eviction is free, and the store is 43 GiB.
-    Inclusive,
-}
-
-impl HostMode {
-    pub(super) fn places_per_layer(self, geometry: &BankGeometry) -> usize {
-        match self {
-            Self::Exclusive => geometry.experts - geometry.slots + 1,
-            Self::Inclusive => geometry.experts,
-        }
-    }
-}
+const GIB: u64 = 1 << 30;
+const MIB: u64 = 1 << 20;
 
 // ---------------------------------------------------------------------------------------------
 // Host memory budget.
 // ---------------------------------------------------------------------------------------------
 
 /// `MemTotal` and `MemAvailable` of the machine, in bytes. `available` is the caller's minimum of
-/// the host figure and every cgroup ancestor's remaining bytes (`flint::exl3_resident::HostBudget`
+/// the host figure and every cgroup ancestor's remaining bytes (`family::host_admit::HostAdmission`
 /// reads that on the CUDA path; see [`HostPinPlan::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostMemory {
@@ -210,8 +127,8 @@ impl HostMemory {
         Ok(Self { total, available })
     }
 
-    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as Flint's
-    /// `HostBudget::from_meminfo`, which keeps it private.
+    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the
+    /// host guard's `from_meminfo`, which keeps it private.
     pub(super) fn os_floor(&self) -> u64 {
         self.total.div_ceil(10).max(8 * GIB)
     }
@@ -292,7 +209,7 @@ impl HostPinPlan {
     /// - the process and the OS floor exceed `available`, or
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
-    /// On the CUDA path the caller also runs `HostBudget::probe()?.admit_for(process_bytes, ..)`,
+    /// On the CUDA path the caller also runs the host guard's `probe()?.admit_for(process_bytes, ..)`,
     /// which applies the cgroup ancestors (and refuses a cgroup-namespace root, so run on the host).
     pub(super) fn new(
         geometry: &BankGeometry,
@@ -424,501 +341,6 @@ pub(super) fn parse_route_counts(
     Ok(counts)
 }
 
-// ---------------------------------------------------------------------------------------------
-// The slot policy.
-// ---------------------------------------------------------------------------------------------
-
-/// One slot changing hands: `incoming` takes `slot` from `outgoing`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SlotMove {
-    pub(super) slot: u16,
-    pub(super) incoming: u16,
-    pub(super) outgoing: u16,
-}
-
-/// What a policy decided for one pass.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(super) struct PassPlan {
-    /// Distinct experts of the pass.
-    pub(super) distinct: usize,
-    pub(super) hits: usize,
-    /// In pick order.
-    pub(super) moves: Vec<SlotMove>,
-}
-
-/// The seam a shared policy fills in. Every method keeps the rules in the module doc.
-pub(super) trait SlotPolicy {
-    /// Plans the copies of one layer for the router's picks. `picks` holds every pick of the token
-    /// in this layer, hits included (`-1`, the router fault, is skipped; any other id outside the
-    /// layer is refused; repeats count once). Atomic: an `Err` changes nothing.
-    fn plan_pass(&mut self, layer: usize, picks: &[i32]) -> Result<PassPlan, EngError>;
-
-    /// Admits experts without a router pass, oldest use first (a prefill chunk's experts after the
-    /// chunk). The last `slots` distinct experts are kept; the rest are dropped.
-    fn admit(&mut self, layer: usize, experts_by_use: &[u16]) -> Result<PassPlan, EngError>;
-
-    /// The classifier's table of `layer`: the slot of every expert, or -1.
-    fn slot_row(&self, layer: usize) -> &[i32];
-
-    /// The expert in `slot` of `layer`.
-    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16>;
-}
-
-#[derive(Debug, Clone)]
-struct LayerLru {
-    /// Slot of every expert or -1.
-    slot_of: Vec<i32>,
-    /// Expert of every slot.
-    resident: Vec<u16>,
-    /// Slots, least recently used first.
-    recency: Vec<u16>,
-}
-
-impl LayerLru {
-    /// Runs the experts of `order` through the layer: a hit becomes the most recent, a miss takes
-    /// the least recent slot whose expert `demanded` does not protect. Fails only when everything
-    /// is protected, which the callers' capacity check rules out.
-    fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, EngError> {
-        let mut plan = PassPlan {
-            distinct: order.len(),
-            ..PassPlan::default()
-        };
-        for &expert in order {
-            let slot = match u16::try_from(self.slot_of[usize::from(expert)]) {
-                Ok(slot) => {
-                    plan.hits += 1;
-                    slot
-                }
-                Err(_) => {
-                    let slot = self
-                        .recency
-                        .iter()
-                        .copied()
-                        .find(|&slot| !demanded[usize::from(self.resident[usize::from(slot)])])
-                        .ok_or_else(|| bank_error("no unprotected victim".into()))?;
-                    let outgoing = self.resident[usize::from(slot)];
-                    self.slot_of[usize::from(outgoing)] = -1;
-                    self.slot_of[usize::from(expert)] = i32::from(slot);
-                    self.resident[usize::from(slot)] = expert;
-                    plan.moves.push(SlotMove {
-                        slot,
-                        incoming: expert,
-                        outgoing,
-                    });
-                    slot
-                }
-            };
-            let at = self
-                .recency
-                .iter()
-                .position(|&other| other == slot)
-                .ok_or_else(|| bank_error("invalid recency order".into()))?;
-            self.recency.remove(at);
-            self.recency.push(slot);
-        }
-        Ok(plan)
-    }
-}
-
-/// Per-layer replace-on-miss LRU with the experts of the pass protected (Flint's cache semantics,
-/// written for 512 experts and 10 picks). Every miss is admitted; there is no swap limit.
-#[derive(Debug, Clone)]
-pub(super) struct ReplaceOnMissLru {
-    geometry: BankGeometry,
-    layers: Vec<LayerLru>,
-    /// Per-layer pick counts, written to `usage_out` on drop so a run can produce the popularity
-    /// profile of its own workload (the read side is `FIFI_FLASH_NEXT_EXPERT_STATS`, or the
-    /// `expert_stats` engine key). `None` when no write path is set.
-    usage: Option<Vec<Vec<u64>>>,
-    /// Where the dump goes: the `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` value, or the engine's
-    /// `expert_stats` path (which then also feeds the next start's fill).
-    usage_out: Option<std::path::PathBuf>,
-    /// Per-layer miss counts of the same dump: where the slot capacity actually binds.
-    miss_counts: Vec<u64>,
-}
-
-impl ReplaceOnMissLru {
-    /// Starts from a filled bank: `rows[layer][expert]` is the slot of the expert or -1, with exactly
-    /// `slots` experts held (`TierPlan::hot_set`'s table). The least popular holder (by `counts`,
-    /// ties to the higher id) is the first victim.
-    pub(super) fn from_fill(
-        geometry: BankGeometry,
-        rows: &[&[i32]],
-        counts: &[Vec<u64>],
-        usage_out: Option<&std::path::Path>,
-    ) -> Result<Self, EngError> {
-        if rows.len() != geometry.layers || counts.len() != geometry.layers {
-            return Err(bank_error(format!(
-                "{} rows and {} count rows for {} layers",
-                rows.len(),
-                counts.len(),
-                geometry.layers
-            )));
-        }
-        let mut layers = Vec::with_capacity(geometry.layers);
-        for (layer, (row, count)) in rows.iter().zip(counts).enumerate() {
-            if row.len() != geometry.experts || count.len() != geometry.experts {
-                return Err(bank_error(format!(
-                    "layer {layer}: a row of {} and counts of {} for {} experts",
-                    row.len(),
-                    count.len(),
-                    geometry.experts
-                )));
-            }
-            let mut resident = vec![u16::MAX; geometry.slots];
-            for (expert, &slot) in row.iter().enumerate() {
-                if slot < 0 {
-                    continue;
-                }
-                let held = resident.get_mut(slot as usize).ok_or_else(|| {
-                    bank_error(format!("layer {layer}: slot {slot} is outside the bank"))
-                })?;
-                if *held != u16::MAX {
-                    return Err(bank_error(format!("layer {layer}: slot {slot} twice")));
-                }
-                *held = expert as u16;
-            }
-            if resident.contains(&u16::MAX) {
-                return Err(bank_error(format!("layer {layer}: a slot is not filled")));
-            }
-            let mut recency: Vec<u16> = (0..geometry.slots as u16).collect();
-            recency.sort_by_key(|&slot| {
-                let expert = resident[usize::from(slot)];
-                (count[usize::from(expert)], std::cmp::Reverse(expert))
-            });
-            layers.push(LayerLru {
-                slot_of: row.to_vec(),
-                resident,
-                recency,
-            });
-        }
-        let usage_out = usage_out.map(std::path::Path::to_path_buf);
-        let usage = usage_out
-            .as_ref()
-            .map(|_| vec![vec![0u64; geometry.experts]; geometry.layers]);
-        let miss_counts = vec![0u64; geometry.layers];
-        Ok(Self {
-            geometry,
-            layers,
-            usage,
-            usage_out,
-            miss_counts,
-        })
-    }
-
-    /// Writes the collected pick counts in the `expert_stats` layer-key format the profile
-    /// reader takes, so the file feeds straight back through `FIFI_FLASH_NEXT_EXPERT_STATS`.
-    fn dump_usage(&self) {
-        let Some(path) = self.usage_out.as_deref() else {
-            return;
-        };
-        let Some(usage) = &self.usage else { return };
-        let layers: serde_json::Map<String, serde_json::Value> = usage
-            .iter()
-            .enumerate()
-            .map(|(layer, counts)| {
-                (
-                    format!("model.language_model.layers.{layer}.mlp"),
-                    serde_json::json!(counts),
-                )
-            })
-            .collect();
-        let usage_misses = self.miss_counts.clone();
-        let body =
-            serde_json::json!({"schema": "fifi-usage/1", "layers": layers, "misses": usage_misses});
-        // Write-and-rename: a crash mid-dump must not leave a truncated file the next start
-        // refuses. The temp file sits next to the target so the rename stays on one filesystem.
-        let temp = path.with_extension("json.tmp");
-        match serde_json::to_vec(&body) {
-            Ok(bytes) => {
-                let written =
-                    std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
-                if let Err(e) = written {
-                    std::fs::remove_file(&temp).ok();
-                    eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display());
-                }
-            }
-            // The body is maps of u64 vectors: serialization cannot fail. Skip the write
-            // instead of emitting an empty file a next start would refuse.
-            Err(e) => eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display()),
-        }
-    }
-
-    fn layer(&self, layer: usize) -> Result<&LayerLru, EngError> {
-        self.layers
-            .get(layer)
-            .ok_or_else(|| bank_error(format!("layer {layer} is outside the bank")))
-    }
-
-    fn check_expert(&self, id: i32) -> Result<u16, EngError> {
-        usize::try_from(id)
-            .ok()
-            .filter(|&expert| expert < self.geometry.experts)
-            .map(|expert| expert as u16)
-            .ok_or_else(|| bank_error(format!("expert {id} is outside the layer")))
-    }
-}
-
-impl Drop for ReplaceOnMissLru {
-    fn drop(&mut self) {
-        self.dump_usage();
-    }
-}
-
-impl SlotPolicy for ReplaceOnMissLru {
-    fn plan_pass(&mut self, layer: usize, picks: &[i32]) -> Result<PassPlan, EngError> {
-        let current = self.layer(layer)?;
-        let mut demanded = vec![false; self.geometry.experts];
-        let mut order = Vec::with_capacity(picks.len());
-        // Pick ids deferred to after `current`'s borrow ends, for the usage profile.
-        let mut picked = Vec::with_capacity(picks.len());
-        for &id in picks {
-            if id == -1 {
-                continue;
-            }
-            let expert = self.check_expert(id)?;
-            picked.push(usize::from(expert));
-            if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
-                order.push(expert);
-            }
-        }
-        if order
-            .iter()
-            .any(|&expert| current.slot_of[usize::from(expert)] < 0)
-        {
-            // The filler: slot 0 is read by the resident pass while the copies run.
-            demanded[usize::from(current.resident[0])] = true;
-        }
-        let protected = demanded.iter().filter(|&&flag| flag).count();
-        if protected > self.geometry.slots {
-            return Err(bank_error(format!(
-                "{protected} protected experts exceed the {} slots",
-                self.geometry.slots
-            )));
-        }
-        let mut next = current.clone();
-        let _ = current; // end the borrow: the write-back below takes the layer slot
-        if let Some(usage) = &mut self.usage {
-            for expert in picked {
-                usage[layer][expert] += 1;
-            }
-        }
-        let plan = next.apply(&order, &demanded)?;
-        self.miss_counts[layer] += plan.moves.len() as u64;
-        self.layers[layer] = next;
-        Ok(plan)
-    }
-
-    fn admit(&mut self, layer: usize, experts_by_use: &[u16]) -> Result<PassPlan, EngError> {
-        let current = self.layer(layer)?;
-        let mut demanded = vec![false; self.geometry.experts];
-        let mut newest_first = Vec::new();
-        for &expert in experts_by_use.iter().rev() {
-            self.check_expert(i32::from(expert))?;
-            if newest_first.len() < self.geometry.slots
-                && !std::mem::replace(&mut demanded[usize::from(expert)], true)
-            {
-                newest_first.push(expert);
-            }
-        }
-        newest_first.reverse();
-        let mut next = current.clone();
-        let plan = next.apply(&newest_first, &demanded)?;
-        self.layers[layer] = next;
-        Ok(plan)
-    }
-
-    fn slot_row(&self, layer: usize) -> &[i32] {
-        self.layers.get(layer).map_or(&[], |lru| &lru.slot_of)
-    }
-
-    fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
-        self.layers.get(layer)?.resident.get(slot).copied()
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Host places and the copies of a pass.
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct LayerPlaces {
-    /// Place of every expert in the pinned store or `NO_PLACE`.
-    place_of: Vec<u32>,
-    free: Vec<u32>,
-}
-
-/// The place of every expert that is in the pinned store.
-#[derive(Debug, Clone)]
-pub(super) struct HostPlaces {
-    mode: HostMode,
-    layers: Vec<LayerPlaces>,
-}
-
-impl HostPlaces {
-    /// `rows[layer][expert]` is the slot of the expert or -1. Exclusive: the experts without a slot
-    /// take places 0.. in id order and one place stays free. Inclusive: place = expert.
-    fn new(geometry: &BankGeometry, mode: HostMode, rows: &[&[i32]]) -> Self {
-        let layers = rows
-            .iter()
-            .map(|row| match mode {
-                HostMode::Inclusive => LayerPlaces {
-                    place_of: (0..geometry.experts as u32).collect(),
-                    free: Vec::new(),
-                },
-                HostMode::Exclusive => {
-                    let mut place_of = vec![NO_PLACE; geometry.experts];
-                    let mut next = 0u32;
-                    for (expert, &slot) in row.iter().enumerate() {
-                        if slot < 0 {
-                            place_of[expert] = next;
-                            next += 1;
-                        }
-                    }
-                    LayerPlaces {
-                        place_of,
-                        free: vec![next],
-                    }
-                }
-            })
-            .collect();
-        Self { mode, layers }
-    }
-
-    pub(super) fn place_of(&self, layer: usize, expert: u16) -> Option<u32> {
-        let place = *self.layers.get(layer)?.place_of.get(usize::from(expert))?;
-        (place != NO_PLACE).then_some(place)
-    }
-
-    /// `(place, expert)` of every expert the store holds in `layer`, by place.
-    pub(super) fn occupied(&self, layer: usize) -> Vec<(u32, u16)> {
-        let mut held: Vec<(u32, u16)> = self.layers.get(layer).map_or_else(Vec::new, |places| {
-            places
-                .place_of
-                .iter()
-                .enumerate()
-                .filter(|&(_, &place)| place != NO_PLACE)
-                .map(|(expert, &place)| (place, expert as u16))
-                .collect()
-        });
-        held.sort_unstable();
-        held
-    }
-
-    /// An expert leaves a slot: Exclusive gives it a free place (the one to write it back to).
-    fn demote(&mut self, layer: usize, expert: u16) -> Result<Option<u32>, EngError> {
-        if self.mode == HostMode::Inclusive {
-            return Ok(None);
-        }
-        let places = self
-            .layers
-            .get_mut(layer)
-            .ok_or_else(|| bank_error(format!("layer {layer} is outside the bank")))?;
-        let place = places
-            .free
-            .pop()
-            .ok_or_else(|| bank_error("no free host place for the evicted expert".into()))?;
-        let slot = &mut places.place_of[usize::from(expert)];
-        if *slot != NO_PLACE {
-            return Err(bank_error(format!(
-                "expert {expert} already has a host place"
-            )));
-        }
-        *slot = place;
-        Ok(Some(place))
-    }
-
-    /// An expert enters a slot: its place is where the copy reads, and Exclusive frees it.
-    fn promote(&mut self, layer: usize, expert: u16) -> Result<u32, EngError> {
-        let places = self
-            .layers
-            .get_mut(layer)
-            .ok_or_else(|| bank_error(format!("layer {layer} is outside the bank")))?;
-        let place = places.place_of[usize::from(expert)];
-        if place == NO_PLACE {
-            return Err(bank_error(format!("expert {expert} has no host place")));
-        }
-        if self.mode == HostMode::Exclusive {
-            places.place_of[usize::from(expert)] = NO_PLACE;
-            places.free.push(place);
-        }
-        Ok(place)
-    }
-}
-
-/// The evicted expert, written back (D2H) from the slot into `dst_place` before the slot is
-/// overwritten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Demote {
-    pub(super) expert: u16,
-    pub(super) dst_place: u32,
-}
-
-/// One slot refill, in stream order: the optional write-back, then the H2D of `src_place`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CopyOp {
-    pub(super) slot: u16,
-    pub(super) incoming: u16,
-    pub(super) src_place: u32,
-    pub(super) demote: Option<Demote>,
-}
-
-/// The copies of one layer's pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PassCopies {
-    pub(super) layer: usize,
-    pub(super) distinct: usize,
-    pub(super) hits: usize,
-    pub(super) ops: Vec<CopyOp>,
-}
-
-/// Counters of the passes so far.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BankStats {
-    pub(super) passes: u64,
-    pub(super) picks: u64,
-    pub(super) hits: u64,
-    pub(super) misses: u64,
-    pub(super) demotions: u64,
-    /// Passes with three or more misses in one layer: the first two hide behind the resident pass
-    /// (`flash-next-moe-graph-ab-measured`).
-    pub(super) layers_with_3_plus_misses: u64,
-    /// Passes by their miss count, `0..=top_k`.
-    pub(super) miss_histogram: Vec<u64>,
-}
-
-impl BankStats {
-    fn new(top_k: usize) -> Self {
-        Self {
-            passes: 0,
-            picks: 0,
-            hits: 0,
-            misses: 0,
-            demotions: 0,
-            layers_with_3_plus_misses: 0,
-            miss_histogram: vec![0; top_k + 1],
-        }
-    }
-
-    pub(super) fn hit_rate(&self) -> f64 {
-        if self.picks == 0 {
-            1.0
-        } else {
-            self.hits as f64 / self.picks as f64
-        }
-    }
-}
-
-/// The host owner of the bank: the policy, the host places, the counters.
-pub(super) struct ExpertBankState<P: SlotPolicy> {
-    geometry: BankGeometry,
-    mode: HostMode,
-    policy: P,
-    places: HostPlaces,
-    stats: BankStats,
-    poisoned: bool,
-}
-
 impl ExpertBankState<ReplaceOnMissLru> {
     /// The bank of `plan`, filled from the popularity profile `counts[layer][expert]` (the static
     /// fill of `TierPlan::hot_set`), then managed by replace-on-miss LRU.
@@ -943,160 +365,15 @@ impl ExpertBankState<ReplaceOnMissLru> {
     }
 }
 
-impl<P: SlotPolicy> ExpertBankState<P> {
-    /// A bank around any policy that starts filled (every slot holds an expert).
-    pub(super) fn with_policy(
-        geometry: BankGeometry,
-        mode: HostMode,
-        policy: P,
-    ) -> Result<Self, EngError> {
-        let rows: Vec<&[i32]> = (0..geometry.layers)
-            .map(|layer| policy.slot_row(layer))
-            .collect();
-        if rows.iter().any(|row| row.len() != geometry.experts) {
-            return Err(bank_error("the policy has no slot row for a layer".into()));
-        }
-        for (layer, row) in rows.iter().enumerate() {
-            let held = row.iter().filter(|&&slot| slot >= 0).count();
-            if held != geometry.slots {
-                return Err(bank_error(format!(
-                    "layer {layer}: the policy holds {held} experts, the bank has {} slots",
-                    geometry.slots
-                )));
-            }
-        }
-        let places = HostPlaces::new(&geometry, mode, &rows);
-        Ok(Self {
-            geometry,
-            mode,
-            policy,
-            places,
-            stats: BankStats::new(geometry.top_k),
-            poisoned: false,
-        })
-    }
-
-    pub(super) fn geometry(&self) -> &BankGeometry {
-        &self.geometry
-    }
-
-    pub(super) fn mode(&self) -> HostMode {
-        self.mode
-    }
-
-    pub(super) fn places(&self) -> &HostPlaces {
-        &self.places
-    }
-
-    pub(super) fn stats(&self) -> &BankStats {
-        &self.stats
-    }
-
-    /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).
-    pub(super) fn slot_row(&self, layer: usize) -> &[i32] {
-        self.policy.slot_row(layer)
-    }
-
-    pub(super) fn expert_in_slot(&self, layer: usize, slot: usize) -> Option<u16> {
-        self.policy.expert_in_slot(layer, slot)
-    }
-
-    /// Plans the copies of one decode layer for the router's picks (all of them, hits included).
-    pub(super) fn begin_pass(
-        &mut self,
-        layer: usize,
-        picks: &[i32],
-    ) -> Result<PassCopies, EngError> {
-        self.check_usable()?;
-        let plan = self.policy.plan_pass(layer, picks)?;
-        self.translate(layer, plan, true)
-    }
-
-    /// Admits the experts a prefill chunk used, oldest use first. Not counted as decode traffic.
-    pub(super) fn admit(
-        &mut self,
-        layer: usize,
-        experts_by_use: &[u16],
-    ) -> Result<PassCopies, EngError> {
-        self.check_usable()?;
-        let plan = self.policy.admit(layer, experts_by_use)?;
-        self.translate(layer, plan, false)
-    }
-
-    /// Marks the host model as ahead of or apart from the device: every later pass is refused. The
-    /// device owner calls it when the copies of a planned pass failed.
-    pub(super) fn poison(&mut self) {
-        self.poisoned = true;
-    }
-
-    /// Whether the host model may no longer match the device. Readers of the slot row check it
-    /// (`DeviceBank::slot_row` refuses once it is set).
-    pub(super) fn is_poisoned(&self) -> bool {
-        self.poisoned
-    }
-
-    fn check_usable(&self) -> Result<(), EngError> {
-        if self.poisoned {
-            return Err(bank_error(
-                "an earlier pass left the host places inconsistent with the policy".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn translate(
-        &mut self,
-        layer: usize,
-        plan: PassPlan,
-        counted: bool,
-    ) -> Result<PassCopies, EngError> {
-        let mut ops = Vec::with_capacity(plan.moves.len());
-        for mv in &plan.moves {
-            // Demote first: the write-back takes a free place, and the incoming expert's place
-            // frees only after its copy (stream order makes the reuse safe).
-            let step = self
-                .places
-                .demote(layer, mv.outgoing)
-                .and_then(|demote| Ok((demote, self.places.promote(layer, mv.incoming)?)));
-            let (demote, src_place) = step.inspect_err(|_| self.poisoned = true)?;
-            ops.push(CopyOp {
-                slot: mv.slot,
-                incoming: mv.incoming,
-                src_place,
-                demote: demote.map(|dst_place| Demote {
-                    expert: mv.outgoing,
-                    dst_place,
-                }),
-            });
-        }
-        if counted {
-            let misses = plan.moves.len();
-            self.stats.passes += 1;
-            self.stats.picks += plan.distinct as u64;
-            self.stats.hits += plan.hits as u64;
-            self.stats.misses += misses as u64;
-            self.stats.demotions += ops.iter().filter(|op| op.demote.is_some()).count() as u64;
-            self.stats.layers_with_3_plus_misses += u64::from(misses >= 3);
-            let bin = misses.min(self.geometry.top_k);
-            self.stats.miss_histogram[bin] += 1;
-        }
-        Ok(PassCopies {
-            layer,
-            distinct: plan.distinct,
-            hits: plan.hits,
-            ops,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // The filler rule for the second pass.
 // ---------------------------------------------------------------------------------------------
 
-/// The slot ids and weights of the missed-pick launch, after the copies: a missed pick runs on its
-/// new slot with the router's weight, every other pick on the filler (slot 0, weight +0.0). The
-/// resident pass (`classified.slot_ids`, `classified.weights`) and this one add to the router's
-/// weights bit for bit, so the combine sees each pick exactly once.
+/// The slot ids and weights of the missed-pick launch, after the copies: every missed pick runs
+/// on its new slot with the router's weight — the missed picks ONLY, no +0.0 filler, so the
+/// launch carries [`Classified::misses`] entries instead of `top_k`. The resident pass
+/// (`classified.slot_ids`, `classified.weights`) carries the rest: the two passes' weights add
+/// to the router's weights bit for bit, so the combine sees each pick exactly once.
 ///
 /// Refuses a row the classifier flagged invalid, a router fault, lists of different lengths and a
 /// missed expert that still has no slot.
@@ -1114,8 +391,8 @@ pub(super) fn miss_pass_inputs(
             "the classifier flagged the route invalid".into(),
         ));
     }
-    let mut slots = Vec::with_capacity(ids.len());
-    let mut out = Vec::with_capacity(ids.len());
+    let mut slots = Vec::with_capacity(classified.misses.len());
+    let mut out = Vec::with_capacity(classified.misses.len());
     for (&id, &weight) in ids.iter().zip(weights) {
         if id < 0 {
             return Err(bank_error("a router fault has no second pass".into()));
@@ -1130,9 +407,6 @@ pub(super) fn miss_pass_inputs(
                 })?;
             slots.push(slot);
             out.push(weight);
-        } else {
-            slots.push(0);
-            out.push(0.0);
         }
     }
     Ok((slots, out))
@@ -1153,6 +427,47 @@ pub(in crate::family::flash_next) trait RecordSource {
 // The device owner.
 // ---------------------------------------------------------------------------------------------
 
+/// The buckets of the rows-per-expert route histogram: 1, 2, 3-4, 5-8, ..., 1025-2048 and
+/// 2049+. The prefill tiers experts at eight rows (the experts under it run on the CPU
+/// tail), so buckets 0-2 carry the tiered rows and bucket 3 straddles the edge at exactly
+/// eight.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) const ROUTE_BUCKETS: usize = 13;
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn route_bucket(rows: usize) -> usize {
+    match rows {
+        1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        65..=128 => 7,
+        129..=256 => 8,
+        257..=512 => 9,
+        513..=1024 => 10,
+        1025..=2048 => 11,
+        _ => 12,
+    }
+}
+
+/// Folds one resolve's picks into per-expert row counts in `scratch` (reused across
+/// resolves, so the fold hashes nothing and allocates nothing); one nonzero count per
+/// distinct expert.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn route_counts(picks: &[usize], scratch: &mut [u32]) {
+    for rows in scratch.iter_mut() {
+        *rows = 0;
+    }
+    for &id in picks {
+        if let Some(count) = scratch.get_mut(id) {
+            *count += 1;
+        }
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) mod device {
     //! One device buffer of `slots` records and one pinned buffer of host places per layer. The
@@ -1161,12 +476,16 @@ pub(super) mod device {
     //! They are allocated once and held: dropping one synchronizes the device.
 
     use super::{
-        BankGeometry, BankStats, ExpertBankState, HostPinPlan, PassCopies, RecordSource,
-        ReplaceOnMissLru,
+        HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
     };
+    use crate::family::expert_bank::{BankGeometry, BankStats, ExpertBankState, PassCopies};
     use crate::{
         EngError,
-        kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
+        kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
+    };
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
     };
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -1174,12 +493,29 @@ pub(super) mod device {
         slots: Vec<DeviceBuffer>,
         store: Vec<PinnedBuf>,
         stream: DeviceStream,
+        /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
+        /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
+        /// each moved in (misses), those misses bucketed by [`route_bucket`], the bytes the
+        /// admit copies and the ring's streamed records queued, and the wall time of the admit
+        /// copy spans, which end in the existing store synchronize. Atomics only to satisfy the
+        /// shared borrows of the ring views; the engine thread is the sole writer.
+        admit_passes: AtomicU64,
+        admit_misses: AtomicU64,
+        admit_miss_histogram: Vec<AtomicU64>,
+        upload_bytes: AtomicU64,
+        upload_ns: AtomicU64,
+        /// Log-only rows-per-expert histogram over every resolve of the prefill stores, by
+        /// [`route_bucket`]. Same counters convention as `admit_passes`.
+        route_histogram: Vec<AtomicU64>,
+        /// Scratch for [`DeviceBank::record_route`]: one counter per expert, reused across
+        /// resolves so the fold allocates nothing and hashes nothing per call.
+        route_scratch: std::cell::RefCell<Vec<u32>>,
     }
 
     impl DeviceBank {
         /// Allocates the buffers, writes the host places and fills every slot from `source`.
         /// Returns when the device holds the fill. `plan` is the host budget the caller admitted
-        /// (`HostPinPlan::new`, plus Flint's cgroup-aware `HostBudget::admit_for` on the CUDA path):
+        /// (`HostPinPlan::new`, plus the cgroup-aware host guard's `admit_for` on the CUDA path):
         /// it must be for this bank's mode and place count, so a store is never pinned unchecked.
         pub(in crate::family::flash_next) fn build(
             ctx: &CudaContext,
@@ -1226,11 +562,19 @@ pub(super) mod device {
                 }
             }
             stream.synchronize()?;
+            let experts = geometry.experts;
             Ok(Self {
                 state,
                 slots,
                 store,
                 stream,
+                admit_passes: AtomicU64::new(0),
+                admit_misses: AtomicU64::new(0),
+                admit_miss_histogram: (0..ROUTE_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+                upload_bytes: AtomicU64::new(0),
+                upload_ns: AtomicU64::new(0),
+                route_histogram: (0..ROUTE_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+                route_scratch: std::cell::RefCell::new(vec![0u32; experts]),
             })
         }
 
@@ -1269,6 +613,31 @@ pub(super) mod device {
             Ok(())
         }
 
+        /// Waits every copy `stream` may still hold on layer `layer`'s pinned store and
+        /// clears its pending record: the prefill ring's window hands the stores back to the
+        /// decode path this way.
+        pub(in crate::family::flash_next) fn synchronize_store(
+            &mut self,
+            layer: usize,
+            stream: &DeviceStream,
+        ) -> Result<(), EngError> {
+            let store = self.store.get_mut(layer).ok_or_else(|| {
+                EngError::BadRequest(format!("layer {layer} is outside the bank"))
+            })?;
+            store.synchronize(stream)
+        }
+
+        /// The stream id holding `layer`'s pinned store copy, if any (read-only). The prefill
+        /// union admit drains a pending ring-stream copy before admitting on the bank stream.
+        pub(in crate::family::flash_next) fn store_pending_stream(
+            &self,
+            layer: usize,
+        ) -> Option<u64> {
+            self.store
+                .get(layer)
+                .and_then(|store| store.pending_stream())
+        }
+
         /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).
         /// Refused once the bank is poisoned, so a launch cannot classify against a table the
         /// device does not hold.
@@ -1295,6 +664,76 @@ pub(super) mod device {
             self.slots
                 .get(layer)
                 .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))
+        }
+
+        /// Queues the bytes of one expert place from the pinned store into `dst` on `stream` (the
+        /// prefill ring's copy stream). The host model is not changed.
+        /// The pinned host place of an expert's record, for the prefill ring's plan (a
+        /// non-resident expert without a place cannot stream and rides the miss pass).
+        pub(in crate::family::flash_next) fn place_of(
+            &self,
+            layer: usize,
+            expert: u16,
+        ) -> Option<u32> {
+            self.state.places().place_of(layer, expert)
+        }
+
+        pub(in crate::family::flash_next) fn stream_place(
+            &mut self,
+            ctx: &CudaContext,
+            stream: &DeviceStream,
+            layer: usize,
+            place: u32,
+            dst: DeviceRange<'_>,
+        ) -> Result<(), EngError> {
+            self.check_usable()?;
+            let geometry = self.state.geometry();
+            let store = self.store.get_mut(layer).ok_or_else(|| {
+                EngError::BadRequest(format!("layer {layer} is outside the bank"))
+            })?;
+            // Log-only: the ring streams one record of a held expert to the device, a real
+            // prefill upload; only its bytes are counted (its wait is a GPU-side enqueue that
+            // returns at once, so it carries no honest wall time).
+            self.upload_bytes
+                .fetch_add(geometry.record_bytes as u64, Ordering::Relaxed);
+            ctx.copy_from_pinned(stream, store, geometry.offset(place as usize), dst)
+        }
+
+        /// Log-only: folds one prefill resolve's picks into the rows-per-expert route histogram:
+        /// one histogram count per distinct expert, at that expert's row count in the resolve.
+        /// Counts into the per-expert scratch, so the fold hashes nothing and allocates nothing.
+        pub(in crate::family::flash_next) fn record_route(&self, picks: &[usize]) {
+            let mut scratch = self.route_scratch.borrow_mut();
+            route_counts(picks, &mut scratch);
+            for rows in scratch.iter() {
+                if *rows > 0
+                    && let Some(bucket) = self.route_histogram.get(route_bucket(*rows as usize))
+                {
+                    bucket.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        /// The log-only admit-path counters of the bank, for the per-request report.
+        pub(in crate::family::flash_next) fn prefill_report(
+            &self,
+        ) -> crate::sched::job::PrefillBankReport {
+            crate::sched::job::PrefillBankReport {
+                passes: self.admit_passes.load(Ordering::Relaxed),
+                misses: self.admit_misses.load(Ordering::Relaxed),
+                miss_histogram: self
+                    .admit_miss_histogram
+                    .iter()
+                    .map(|bucket| bucket.load(Ordering::Relaxed))
+                    .collect(),
+                route_histogram: self
+                    .route_histogram
+                    .iter()
+                    .map(|bucket| bucket.load(Ordering::Relaxed))
+                    .collect(),
+                upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+                upload_ns: self.upload_ns.load(Ordering::Relaxed),
+            }
         }
 
         pub(in crate::family::flash_next) fn stream(&self) -> &DeviceStream {
@@ -1331,7 +770,36 @@ pub(super) mod device {
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
             let copies = self.state.admit(layer, experts_by_use)?;
-            self.finish(ctx, copies)
+            // Log-only, admit path: one pass, the experts it moved in (misses) with their
+            // bucket, the bytes queued (H2D plus any demotion D2H) and the wall of the copy
+            // span, which ends in the existing store synchronize. The decode `step` traffic
+            // never enters these counters.
+            self.admit_passes.fetch_add(1, Ordering::Relaxed);
+            self.admit_misses
+                .fetch_add(copies.ops.len() as u64, Ordering::Relaxed);
+            // A zero-miss admit (everything already resident) lands in no bucket; the passes
+            // count minus the histogram sum carries it.
+            if !copies.ops.is_empty()
+                && let Some(bucket) = self
+                    .admit_miss_histogram
+                    .get(route_bucket(copies.ops.len()))
+            {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+            let record = self.state.geometry().record_bytes as u64;
+            let mut bytes = 0u64;
+            for op in &copies.ops {
+                bytes += record;
+                if op.demote.is_some() {
+                    bytes += record;
+                }
+            }
+            self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+            let started = Instant::now();
+            self.finish(ctx, copies).inspect(|_| {
+                self.upload_ns
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            })
         }
 
         fn finish(
@@ -1397,5 +865,53 @@ pub(super) mod device {
                 .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))?
                 .read(geometry.offset(place as usize), out)
         }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::{ROUTE_BUCKETS, route_bucket, route_counts};
+
+    #[test]
+    fn the_route_buckets_hold_the_tier_edge_exactly_at_eight() {
+        for (rows, bucket) in [
+            (1usize, 0usize),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (7, 3),
+            (8, 3),
+            (9, 4),
+            (16, 4),
+            (17, 5),
+            (64, 6),
+            (65, 7),
+            (128, 7),
+            (256, 8),
+            (2048, 11),
+            (2049, 12),
+            (4096, 12),
+        ] {
+            assert_eq!(route_bucket(rows), bucket, "rows {rows}");
+        }
+        assert_eq!(ROUTE_BUCKETS, 13);
+    }
+
+    #[test]
+    fn one_resolve_folds_to_one_count_per_distinct_expert() {
+        let mut scratch = vec![0u32; 5];
+        route_counts(&[0, 0, 1, 3, 3, 3], &mut scratch);
+        assert_eq!(scratch, vec![2, 1, 0, 3, 0]);
+        // Reuse resets: a second resolve sees only its own picks.
+        route_counts(&[4], &mut scratch);
+        assert_eq!(scratch, vec![0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn an_out_of_range_pick_counts_nowhere_rather_than_panicking() {
+        let mut scratch = vec![0u32; 2];
+        route_counts(&[0, 7, 1], &mut scratch);
+        assert_eq!(scratch, vec![1, 1]);
     }
 }

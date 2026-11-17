@@ -13,8 +13,6 @@ mod cache;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[path = "exl3_resident/native/packing.rs"]
 mod packing;
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) use cache::HostBudget;
 mod plan;
 #[cfg(test)]
 use plan::plan_resident;

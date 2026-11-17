@@ -42,18 +42,23 @@
 use super::super::attn::KvBuffers;
 use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta_subchunk};
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
+use super::super::executor::compiled_layer_on;
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
 use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
-use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
+use super::super::state::{LayerState, ResidentState, advance_charge};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
+use super::delta::fused_prefill_enabled;
 use super::{attn, delta, moe};
 use crate::family::qwen36::settings::KvDtype;
+use crate::kernels::mlx::native::compile::{
+    CompileAttnPostLayerArgs, CompileAttnPreLayerArgs, CompileDeltaLayerArgs,
+};
 use crate::{
     EngError,
-    family::flash_next::stored::{self, SlicedWeight},
     family::route::check_health,
+    family::stored::{self, SlicedWeight},
     kernels::{BinaryOp, PackedWeight},
     sched::GrowthPermit,
     tensor::{Dtype, ExecutionTensor},
@@ -169,7 +174,7 @@ pub(in super::super) fn chunk_with_cap(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?;
-    let growth = chunk_growth_bytes(&decoder.weights, rows)?;
+    let growth = advance_charge(state, &decoder.weights, rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     match decoder.kernels.set_retire_cap(cap) {
@@ -322,6 +327,170 @@ fn run(
     // `route_experts` and holds no node.
     let mut healths: Vec<ExecutionTensor> = Vec::new();
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
+        // (`Q36_COMPILED_LAYER=1`): one DELTA-mixer layer with a device-routed MoE runs as
+        // ONE compiled closure instead of ~395 eager native entries. The states the closure
+        // does not cover keep the eager body below: `Record` (its recorded rows), the last
+        // layer of a `Prompt` chunk (it skips its MoE), host routing, and any non-Delta or
+        // non-Moe layer.
+        if mode != StepMode::Record
+            && !(mode == StepMode::Prompt && index == last)
+            && decoder.routing == Routing::Device
+            && compiled_layer_on()
+            // The closure serves only the verify-window regime: it needs T >= 2 (a 1-row
+            // replay tail stays eager), stays under the T where the eager chunk switches to
+            // the WY `flash_delta` kernel (different numerics by design, and faster), and
+            // inside the native body's 1024-row bound - a 2048-row prompt chunk must keep
+            // the eager path rather than fail the adapter.
+            && (2..16).contains(&rows)
+            // The closure bakes the fused `gdn_prep`/`gdn_post` kernels and the production
+            // head layout, so it routes only when the eager fused prefill is on too; the
+            // kill switches stay effective.
+            && fused_prefill_enabled()
+            // (the same dims gate as the eager fused prefill); other dims stay eager.
+            && shape.delta.key_heads == 16
+            && shape.delta.key_dim == 128
+            && shape.delta.value_heads == 32
+            && shape.delta.value_dim == 128
+            && let (RMixer::Delta(w), LayerState::Delta { rec, ring }, RFeedForward::Moe(moe_w)) =
+                (&layer.mixer, &old_layer, &layer.feed_forward)
+        {
+            let d = &shape.delta;
+            let s = ctx.kernels.compiled_delta_layer(&CompileDeltaLayerArgs {
+                x: &h,
+                rec,
+                ring,
+                dims: [
+                    d.key_heads as u32,
+                    d.key_dim as u32,
+                    d.value_heads as u32,
+                    d.value_dim as u32,
+                    d.conv_dim() as u32,
+                    (d.conv_kernel - 1) as u32,
+                ],
+                packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
+                plain: [
+                    &w.conv_taps,
+                    &w.conv_last,
+                    &w.neg_exp_a_log,
+                    &w.dt_bias,
+                    &w.norm,
+                ],
+                qk_eps: &ctx.consts.qk_eps,
+                sqrt_kd: &ctx.consts.sqrt_kd,
+                in_norm: &layer.input_norm,
+                post_norm: &layer.post_norm,
+                router_t: &moe_w.router_t,
+                shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
+                shared_scalar_t: &moe_w.shared_scalar_t,
+                stacks: [&moe_w.gate_up, &moe_w.down],
+                hidden: shape.hidden as u32,
+                experts: shape.moe.experts as u32,
+                top_k: shape.moe.top_k as u32,
+                renorm: shape.moe.renorm,
+                eps: shape.eps,
+                act: ctx.consts.act,
+            })?;
+            h = s.out;
+            healths.push(s.health);
+            layers.push(LayerState::Delta {
+                rec: s.rec,
+                ring: s.ring,
+            });
+            check_dtype("compiled layer output", &h, ctx.consts.act)?;
+            continue;
+        }
+        // (`Q36_COMPILED_LAYER=1`): one ATTN-mixer layer runs as TWO compiled closures -
+        // PRE (the input norm, the q/k/v projections, the q/k head norms, the gate slice) and
+        // POST (the composite gate chain, the output projection, the mixer residual, and the
+        // folded device-routed MoE rows sequence) - with the eager window attention middle
+        // (`attn::chunk_core`: RoPE, the cache-form casts, the append, and the
+        // position-dependent prefix attention) between them. The regime gates mirror the
+        // delta closure (fused prefill included, so the fused-prefill kill switch also
+        // disarms these closures); the dims gate keeps the closures on the production
+        // attention layout of the 35B A3B (16 query heads, 2 KV heads, width 256 - also
+        // the fused attn_gate regime, whose kernel the POST body's composite chain
+        // replaces byte-equal, proven by the oracle), so the flag keeps changing nothing
+        // where the closure is unqualified. The query-slice block setting does not apply:
+        // the closure reads one attention call over the whole chunk.
+        if mode != StepMode::Record
+            && !(mode == StepMode::Prompt && index == last)
+            && decoder.routing == Routing::Device
+            && compiled_layer_on()
+            && fused_prefill_enabled()
+            && (2..16).contains(&rows)
+            && shape.attn.heads_q == 16
+            && shape.attn.heads_kv == 2
+            && shape.attn.head_dim == 256
+            && let (RMixer::Attn(w), LayerState::Attn(cache), RFeedForward::Moe(moe_w)) =
+                (&layer.mixer, &old_layer, &layer.feed_forward)
+            // The acceptance oracle proves byte parity for the F32 and Q8 cache forms; the
+            // BF16 cache stays eager until an oracle arm covers it (its casts live in the
+            // shared eager middle, but the form stays unproven, so it does not enter).
+            && !matches!(cache.kv, KvDtype::Bf16)
+        {
+            let a = &shape.attn;
+            let pre = ctx
+                .kernels
+                .compiled_attn_pre_layer(&CompileAttnPreLayerArgs {
+                    x: &h,
+                    in_norm: &layer.input_norm,
+                    packed: [&w.q, &w.k, &w.v],
+                    norms: [&w.q_norm, &w.k_norm],
+                    hidden: shape.hidden as u32,
+                    heads: a.heads_q as u32,
+                    kv_heads: a.heads_kv as u32,
+                    width: a.head_dim as u32,
+                    eps: shape.eps,
+                    act: ctx.consts.act,
+                })?;
+            // The state is borrowed, so `chunk_core` receives a share and the old
+            // binding stays alive through the iteration. Measured on the two-fill
+            // probe (`compiled_layer_window_peak_at_large_cache`, 8-row Window steps
+            // on 65,536- and 65,520-token F32 fills, MLX on the 36 GB Mac Studio):
+            // cold - the first window after the flag flip - the closure arm peaked
+            // 0.25-0.48 GiB above the eager arm, but with a warm-up window absorbing
+            // the one-off compile work the steady transient is about 0.05 GiB at both
+            // fills, growth boundary or not. The by-value variant measured MORE cold
+            // (about 0.81 GiB at a plain append), so the borrow stays; what the
+            // remaining ~0.05 GiB is made of is not settled.
+            let (att, cache) = attn::chunk_core(
+                &mut ctx,
+                shape,
+                cache.share(),
+                pos,
+                rows,
+                &pre.q,
+                &pre.k,
+                &pre.v,
+                None,
+            )?;
+            let post = ctx
+                .kernels
+                .compiled_attn_post_layer(&CompileAttnPostLayerArgs {
+                    att: &att,
+                    gate: &pre.gate,
+                    h: &h,
+                    packed: &w.o,
+                    post_norm: &layer.post_norm,
+                    router_t: &moe_w.router_t,
+                    shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
+                    shared_scalar_t: &moe_w.shared_scalar_t,
+                    stacks: [&moe_w.gate_up, &moe_w.down],
+                    hidden: shape.hidden as u32,
+                    heads: a.heads_q as u32,
+                    width: a.head_dim as u32,
+                    experts: shape.moe.experts as u32,
+                    top_k: shape.moe.top_k as u32,
+                    renorm: shape.moe.renorm,
+                    eps: shape.eps,
+                    act: ctx.consts.act,
+                })?;
+            h = post.out;
+            healths.push(post.health);
+            layers.push(LayerState::Attn(cache));
+            check_dtype("compiled attn layer output", &h, ctx.consts.act)?;
+            continue;
+        }
         let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
         // The same dtype guard as the decode step. MLX promotes mixed operands,
         // so a stray F32 operand would turn BF16 activations back to F32 without an error.
@@ -731,6 +900,803 @@ mod tests {
                 &format!("{what} next logits"),
             );
         }
+    }
+
+    #[test]
+    fn the_compiled_layer_flag_keeps_non_fused_dims_on_the_eager_chunk() {
+        let _serial = crate::native_test_lock();
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
+        decoder.set_routing(Routing::Device);
+        // The tiny model's head layout is not the fused `gdn_prep` layout the closure bakes, so
+        // the forced flag must NOT route any layer: identical native-entry count and identical
+        // step result. (Byte parity of the routed closure itself is the ignored real-checkpoint
+        // test below - the production head layout only exists there.)
+        for rows in [2u32, 3, 8] {
+            let tokens: Vec<u32> = (0..rows).map(token).collect();
+            let mut a = decoder.zero_state().unwrap();
+            let eager = ok(decoder.prefill(&mut a, &tokens, StepMode::Window), "eager");
+            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
+            let mut b = decoder.zero_state().unwrap();
+            let flagged = ok(
+                decoder.prefill(&mut b, &tokens, StepMode::Window),
+                "flagged",
+            );
+            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+            assert_eq!(eager, flagged, "rows {rows}: the flag changes nothing here");
+            // Result equality alone proves the gate held: the closure's fused `gdn_prep`
+            // kernel cannot trace the tiny head layout (it failed with a reshape error before
+            // the gate existed), so a routed layer would fail loudly instead of matching.
+        }
+    }
+
+    /// The compiled-layer acceptance oracle on the production checkpoint, run once per
+    /// covered KV cache form (F32 and Q8 - the two forms the closures admit; BF16 stays
+    /// eager until an arm covers it): the same device-routed Window chunk runs eager and
+    /// through the compiled whole-layer closure, and EVERY compared byte must match - the
+    /// step result, each DeltaNet layer's recurrent state and ring, and each attention
+    /// layer's full KV capacity buffers. This also decides the
+    /// `moe::chunk_device`-versus-rows-sequence numerics question at batch T: the closure
+    /// replays the rows sequence, so byte equality proves the two agree exactly. Ignored
+    /// without the checkpoint: run on the Mac with `Q36_CKPT_DIR` set (the tokenizer file
+    /// is not needed - fixed token ids keep the comparison input-identical).
+    #[test]
+    #[ignore = "needs the real checkpoint: set Q36_CKPT_DIR"]
+    fn the_compiled_layer_chunk_is_byte_equal_on_the_real_checkpoint() {
+        let _serial = crate::native_test_lock();
+        compiled_layer_chunk_parity_on(KvDtype::F32);
+        compiled_layer_chunk_parity_on(KvDtype::Q8);
+    }
+
+    /// One KV-form arm of the acceptance oracle above: `kv` fixes the cache form the
+    /// decoder plans, and the byte comparison below covers that form's buffers.
+    fn compiled_layer_chunk_parity_on(kv: KvDtype) {
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            512,
+            crate::family::qwen36::settings::Activation::Bf16,
+            kv,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        let bits = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u32> {
+            ok(values(kernels, t), "values")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        // Raw storage bytes of one readback: dtype-agnostic, so the U32 codes and the
+        // BF16 scales/biases of the Q8 arm compare without a typed reader.
+        let raw = |kernels: &mut crate::kernels::MlxKernels, t: &ExecutionTensor| -> Vec<u8> {
+            let host = ok(kernels.readback(t), "readback");
+            some(host.host_bytes(), "host bytes").to_vec()
+        };
+        let tokens: Vec<u32> = (11..75).collect();
+        // Serve-order coverage, corrected by review: with the flag ON below, this 64-row
+        // `Prompt` chunk stays EAGER by the (2..16) window gate (the eager WY path serves
+        // large chunks) - so a misrouted large chunk cannot poison the adapter silently.
+        // The windows then trace at 2, 3 and 8 in rising order: successive compiles under
+        // one adapter must reuse the cache across T, never alias it, so the rising order
+        // exercises the cross-T cache-reuse contract of the closures.
+        // Each arm seeds its own state with the same eager prompt, so every compared
+        // window appends onto a POPULATED cache - the path the ownership change touches -
+        // and the third arm holds a decoder snapshot across the compiled window: the
+        // verify regime, where a share of the KV buffers stays alive by design.
+        for rows in [2usize, 3, 8] {
+            let toks = &tokens[..rows];
+            let mut eager_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut eager_state, &tokens[..64], StepMode::Prompt),
+                "eager prompt",
+            );
+            crate::kernels::mlx::reset_dispatch_count();
+            let eager = ok(
+                decoder.prefill(&mut eager_state, toks, StepMode::Window),
+                "eager",
+            );
+            let eager_ops = crate::kernels::mlx::dispatch_count();
+            COMPILED_LAYER_TEST.store(true, Ordering::Relaxed);
+            let mut compiled_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut compiled_state, &tokens[..64], StepMode::Prompt),
+                "compiled-arm prompt",
+            );
+            crate::kernels::mlx::reset_dispatch_count();
+            let attn_calls_before = decoder.kernels.compile_counters().attn.calls;
+            let compiled = ok(
+                decoder.prefill(&mut compiled_state, toks, StepMode::Window),
+                "compiled",
+            );
+            let compiled_ops = crate::kernels::mlx::dispatch_count();
+            // The verify regime: the same compiled window with a held snapshot share of
+            // the KV buffers. Its step result must equal the eager arm byte for byte.
+            let mut shared_state = decoder.zero_state().unwrap();
+            ok(
+                decoder.prefill(&mut shared_state, &tokens[..64], StepMode::Prompt),
+                "shared-arm prompt",
+            );
+            let held_snapshot = decoder.snapshot(&shared_state).expect("snapshot");
+            // The snapshot's own bytes, read before and after the window: the append
+            // through the share must leave the held prefix untouched (a shared buffer
+            // is copied on write, never moved). F32 only - the Q8 form has no
+            // non-F32 readback in the test support.
+            let snapshot_f32 =
+                |snap: &super::super::super::state::ResidentSnapshot,
+                 kernels: &mut crate::kernels::MlxKernels| {
+                    snap.attn_f32_values(kernels).unwrap()
+                };
+            let snapshot_before = if kv == KvDtype::F32 {
+                Some(snapshot_f32(&held_snapshot, &mut decoder.kernels))
+            } else {
+                None
+            };
+            let shared = ok(
+                decoder.prefill(&mut shared_state, toks, StepMode::Window),
+                "compiled with a held snapshot",
+            );
+            assert_eq!(
+                eager, shared,
+                "rows {rows}: the held-snapshot compiled window matches the eager step"
+            );
+            if let Some(before) = snapshot_before {
+                assert_eq!(
+                    before,
+                    snapshot_f32(&held_snapshot, &mut decoder.kernels),
+                    "rows {rows}: the held snapshot's KV bytes are unchanged by the window"
+                );
+            }
+            drop(held_snapshot);
+            COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+            // The attention closures must actually have run: each attention layer pays one
+            // PRE and one POST call per compiled chunk, so a silent gate failure leaves the
+            // count flat and fails here instead of passing vacuously on the eager fallback.
+            let attn_calls = {
+                let after = decoder.kernels.compile_counters().attn.calls;
+                after - attn_calls_before
+            };
+            assert_eq!(
+                eager, compiled,
+                "rows {rows}: the whole step result matches"
+            );
+            let mut attn_layers = 0usize;
+            for (l, (a, b)) in eager_state
+                .layers()
+                .iter()
+                .zip(compiled_state.layers())
+                .enumerate()
+            {
+                if matches!(a, LayerState::Attn(_)) {
+                    attn_layers += 1;
+                }
+                match (a, b) {
+                    (
+                        LayerState::Delta {
+                            rec: a_rec,
+                            ring: a_ring,
+                        },
+                        LayerState::Delta {
+                            rec: b_rec,
+                            ring: b_ring,
+                        },
+                    ) => {
+                        assert_eq!(
+                            bits(&mut decoder.kernels, a_rec),
+                            bits(&mut decoder.kernels, b_rec),
+                            "rows {rows} layer {l}: the recurrent state is byte equal"
+                        );
+                        assert_eq!(
+                            bits(&mut decoder.kernels, a_ring),
+                            bits(&mut decoder.kernels, b_ring),
+                            "rows {rows} layer {l}: the ring is byte equal"
+                        );
+                    }
+                    (LayerState::Attn(a), LayerState::Attn(b)) => {
+                        assert_eq!(a.len, b.len, "rows {rows} layer {l}: cache length");
+                        // the attention layers run through the PRE/POST closures with
+                        // the eager middle shared, so the cache buffers themselves must be
+                        // byte equal, not just the length. Both covered cache forms compare
+                        // here: F32 (the control) and Q8 (the serve-quantized form).
+                        match (a.buffers.as_ref(), b.buffers.as_ref()) {
+                            (
+                                Some(KvBuffers::F32 { k: ak, v: av }),
+                                Some(KvBuffers::F32 { k: bk, v: bv }),
+                            ) => {
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, ak),
+                                    bits(&mut decoder.kernels, bk),
+                                    "rows {rows} layer {l}: the key cache is byte equal"
+                                );
+                                assert_eq!(
+                                    bits(&mut decoder.kernels, av),
+                                    bits(&mut decoder.kernels, bv),
+                                    "rows {rows} layer {l}: the value cache is byte equal"
+                                );
+                            }
+                            // The Q8 arm (the serve-quantized form): the codes,
+                            // scales, and biases of each side compare as raw bits.
+                            (
+                                Some(KvBuffers::Q8 { k: ak, v: av }),
+                                Some(KvBuffers::Q8 { k: bk, v: bv }),
+                            ) => {
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &ak.codes),
+                                    raw(&mut decoder.kernels, &bk.codes),
+                                    "rows {rows} layer {l}: the key codes are byte equal"
+                                );
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &ak.scales),
+                                    raw(&mut decoder.kernels, &bk.scales),
+                                    "rows {rows} layer {l}: the key scales are byte equal"
+                                );
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &ak.biases),
+                                    raw(&mut decoder.kernels, &bk.biases),
+                                    "rows {rows} layer {l}: the key biases are byte equal"
+                                );
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &av.codes),
+                                    raw(&mut decoder.kernels, &bv.codes),
+                                    "rows {rows} layer {l}: the value codes are byte equal"
+                                );
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &av.scales),
+                                    raw(&mut decoder.kernels, &bv.scales),
+                                    "rows {rows} layer {l}: the value scales are byte equal"
+                                );
+                                assert_eq!(
+                                    raw(&mut decoder.kernels, &av.biases),
+                                    raw(&mut decoder.kernels, &bv.biases),
+                                    "rows {rows} layer {l}: the value biases are byte equal"
+                                );
+                            }
+                            (None, None) => {}
+                            _ => panic!("rows {rows} layer {l}: cache form mismatch"),
+                        }
+                    }
+                    _ => panic!("rows {rows} layer {l}: state kind mismatch"),
+                }
+            }
+            println!(
+                "COMPILED_LAYER_PARITY kv={kv:?} rows={rows} attn_layers={attn_layers} attn_calls={attn_calls} eager_ops={eager_ops} compiled_ops={compiled_ops}"
+            );
+            // The layer-kind count comes from the eager state: a zero would let the call and
+            // saving checks below pass vacuously, so pin it first.
+            assert!(
+                attn_layers > 0,
+                "rows {rows}: the parity state must hold attention layers (found {attn_layers})"
+            );
+            assert!(
+                attn_calls >= 2 * attn_layers as u64,
+                "rows {rows}: the attention closures must run once per layer pair (calls {attn_calls} < 2 x {attn_layers})"
+            );
+            // The eager baseline is not a constant (main wiring compiled delta rows into the
+            // chunk path moved it), so the saving is pinned per attention layer instead of as
+            // a ratio: each closed attention layer removes the eager qkv/moe dispatch storm.
+            // Measured savings run 7.8 to 11.7 entries per attention layer on the 35B A3B
+            // family shape (10 attention layers), so 2 per layer is a conservative floor.
+            assert!(
+                compiled_ops < eager_ops,
+                "rows {rows}: compiled {compiled_ops} entries must stay under eager {eager_ops} (the residue is the eager window attention middle, the still-shared head, and the chunk edges)"
+            );
+            assert!(
+                eager_ops - compiled_ops >= (attn_layers as u64) * 2,
+                "rows {rows}: the compiled chunk must save at least 2 entries per attention layer (saved {}, layers {attn_layers})",
+                eager_ops - compiled_ops
+            );
+        }
+    }
+
+    /// Peak-memory probe of a compiled 2..15-row Window chunk that CROSSES a capacity
+    /// growth step at a large fill (the regime the KV-copy limit was stated for: the
+    /// cache grows in KV_STEP=256 steps, so a window whose rows cross a 256 boundary
+    /// rebuilds every buffer). Each arm starts from a fresh state and the same
+    /// 65,536-token prompt (len == cap exactly), resets the process-wide peak counter
+    /// right before the 8-row window step, and prints the peak after it. The peaks are
+    /// the measurement, so nothing asserts on them. Ignored without the checkpoint
+    /// (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn compiled_layer_window_peak_at_large_cache() {
+        let _serial = crate::native_test_lock();
+        use super::super::super::executor::COMPILED_LAYER_TEST;
+        use std::sync::atomic::Ordering;
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        let tokens: Vec<u32> = (0..65_544).map(|i| token(i as u32)).collect();
+        // Two fills: 65,536 (len == cap, the 8-row window crosses a KV_STEP growth) and
+        // 65,520 (8 rows fit the spare capacity, no growth) - the second separates the
+        // plain append from the rebuild. The premise itself is asserted from the
+        // capacity rule, not from the fill comments: at 65,536 the rule grows the
+        // cache for 8 more rows, at 65,520 (cap 65,792) it does not.
+        let step = super::super::super::kv_plan::KV_STEP;
+        let cap_at =
+            |len: usize| super::super::super::kv_plan::next_capacity(len, 0, 0, step, 0).unwrap();
+        let cap_65536 = cap_at(65_536);
+        let cap_65520 = cap_at(65_520);
+        assert!(
+            super::super::super::kv_plan::next_capacity(65_536, 8, cap_65536, step, 0).unwrap()
+                > cap_65536,
+            "the 65,536 fill must cross a growth boundary for 8 rows"
+        );
+        assert_eq!(
+            super::super::super::kv_plan::next_capacity(65_520, 8, cap_65520, step, 0).unwrap(),
+            cap_65520,
+            "the 65,520 fill must fit its 8 rows in spare capacity"
+        );
+        for fill in [65_536usize, 65_520] {
+            for (label, on) in [("eager", false), ("compiled", true)] {
+                let mut state = decoder.zero_state().unwrap();
+                ok(
+                    decoder.prefill(&mut state, &tokens[..fill], StepMode::Prompt),
+                    "prompt",
+                );
+                // A warm-up window under the same flag, dropped from the peak: the
+                // first compiled window pays the closures' one-off compile work and
+                // the flag flip's first allocation, none of which is the window's
+                // steady transient under measurement.
+                COMPILED_LAYER_TEST.store(on, Ordering::Relaxed);
+                ok(
+                    decoder.prefill(&mut state, &tokens[..8], StepMode::Record),
+                    "warm-up",
+                );
+                COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+                decoder.kernels.reset_peak_memory().unwrap();
+                let calls_before = decoder.kernels.compile_counters().attn.calls;
+                COMPILED_LAYER_TEST.store(on, Ordering::Relaxed);
+                ok(
+                    decoder.prefill(&mut state, &tokens[65_536..65_544], StepMode::Window),
+                    "window",
+                );
+                COMPILED_LAYER_TEST.store(false, Ordering::Relaxed);
+                // The measured arm must have run the attention closures: a silent
+                // gate failure would leave the counter flat and the peak vacuous.
+                let calls = decoder.kernels.compile_counters().attn.calls - calls_before;
+                assert!(
+                    !on || calls > 0,
+                    "the compiled window must call the attention closures (calls {calls})"
+                );
+                let peak = decoder.kernels.memory_stats().unwrap().peak;
+                println!(
+                    "COMPILED_LAYER_PEAK fill={fill} {label} peak_bytes={peak} attn_calls={calls}"
+                );
+            }
+        }
+    }
+
+    /// Wall probe of the capacity-growth rebuild: successive 8-row Window steps through
+    /// two KV_STEP=256 boundaries at a 64K fill, each step timed around the whole
+    /// synchronous prefill call. A step that starts at a 256 multiple crosses a boundary
+    /// and rebuilds every attention layer's buffers (one `grown` copy per side); the
+    /// others append in place. Prints the mean wall of the crossing and non-crossing
+    /// steps; the difference is the per-crossing rebuild cost of all attention layers.
+    /// Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    /// NOTE: valid only with `Q36_KV_GEOMETRIC` unset. The bucket labels below are the
+    /// quantum law's crossings (`from` 65,280 and 65,536 grow to 65,536 and 65,792);
+    /// the probe compares against a plain append and pins nothing about the geometric
+    /// law's capacities or crossing positions.
+    fn window_step_wall_at_capacity_boundaries() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let kv = match std::env::var("Q36_KV_DTYPE").as_deref() {
+            Ok("q8") => KvDtype::Q8,
+            _ => KvDtype::F32,
+        };
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            kv,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        // Start just below the 65_536 boundary and step 8 rows at a time through two
+        // boundaries (65_536 and 65_792): 40 steps, the two at multiples of 256 cross.
+        let start = 65_280usize;
+        let tokens: Vec<u32> = (0..start + 8 * 40).map(|i| token(i as u32)).collect();
+        let mut state = decoder.zero_state().unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens[..start], StepMode::Prompt),
+            "prompt",
+        );
+        let mut crossing = Vec::new();
+        let mut steady = Vec::new();
+        for step in 0..40u32 {
+            let from = start + (step as usize) * 8;
+            let t0 = std::time::Instant::now();
+            ok(
+                decoder.prefill(&mut state, &tokens[from..from + 8], StepMode::Window),
+                "window",
+            );
+            let wall = t0.elapsed().as_secs_f64() * 1e3;
+            if from.is_multiple_of(256) {
+                crossing.push(wall);
+            } else {
+                steady.push(wall);
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        println!(
+            "BOUNDARY_WALL kv={kv:?} crossing_ms={} n={} steady_ms={} n={}",
+            mean(&crossing),
+            crossing.len(),
+            mean(&steady),
+            steady.len(),
+        );
+    }
+
+    /// Byte parity of the KV caches across growth boundaries, asserted in-process: one
+    /// prompt of 1,300 tokens fed in 256-row chunks crosses five quantum boundaries
+    /// (capacities 256..1,536) or three geometric doublings (256, 512, 1,024, 2,048);
+    /// after the two shared growths, every later capacity differs between the laws. The
+    /// cache VALUES must be identical under either law, so the test prefills a quantum
+    /// state and a geometric state from the same decoder and asserts the value vectors
+    /// equal while the capacities differ. A per-law digest is still printed for the
+    /// external runs. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn kv_values_match_across_growth_boundaries() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        // 256-row chunks make every 256-token quantum a growth event; the decoder's
+        // default 512 would merge the boundaries in pairs.
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..1_300u32).map(token).collect();
+        let a = &decoder.weights.shape.attn;
+        let (kv_heads, width) = (a.heads_kv as u32, a.head_dim as u32);
+
+        // A fn, not a closure: a closure would hold its borrow of `decoder.kernels`
+        // across the `decoder.prefill` calls below.
+        fn digest(
+            state: &mut super::super::super::state::ResidentState,
+            kernels: &mut crate::kernels::MlxKernels,
+            kv_heads: u32,
+            width: u32,
+            geometric: bool,
+        ) -> (Vec<Vec<f32>>, u64, usize) {
+            let values = state.attn_kv_values(kernels, kv_heads, width).unwrap();
+            let mut hasher = DefaultHasher::new();
+            for side in &values {
+                side.len().hash(&mut hasher);
+                for word in side {
+                    word.to_bits().hash(&mut hasher);
+                }
+            }
+            let cap = state.attn_cap();
+            println!(
+                "KV_GROWTH_DIGEST geometric={geometric} cap={cap} sides={} values={} digest={:016x}",
+                values.len(),
+                values.iter().map(Vec::len).sum::<usize>(),
+                hasher.finish(),
+            );
+            (values, hasher.finish(), cap)
+        }
+
+        // Both laws in one process: the quantum state from `zero`, the geometric state
+        // from `zero_geometric`, regardless of the ambient Q36_KV_GEOMETRIC.
+        let mut quantum =
+            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
+                .unwrap();
+        ok(
+            decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
+            "quantum prompt",
+        );
+        let (quantum_values, quantum_digest, quantum_cap) =
+            digest(&mut quantum, &mut decoder.kernels, kv_heads, width, false);
+
+        let mut geometric = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut geometric, &tokens, StepMode::Prompt),
+            "geometric prompt",
+        );
+        let (geometric_values, geometric_digest, geometric_cap) =
+            digest(&mut geometric, &mut decoder.kernels, kv_heads, width, true);
+
+        assert_eq!(
+            quantum_values, geometric_values,
+            "the KV values must be identical under either growth law"
+        );
+        assert_eq!(quantum_digest, geometric_digest);
+        // 1,300 tokens at step 256. Capacity sequences: quantum 256, 512, 768, 1,024,
+        // 1,280, 1,536 (six allocations); geometric 256, 512, 1,024, 2,048 (four). The
+        // first two allocations coincide, and every capacity from the third differs.
+        assert_eq!(quantum_cap, 1_536, "the quantum capacity");
+        assert_eq!(geometric_cap, 2_048, "the geometric capacity");
+    }
+
+    /// Under the geometric law admission charges the ALLOCATED capacity, not the valid
+    /// length: sessions ending just past a doubling charge the doubled capacity, several
+    /// sessions sum, and a session that cannot afford its next capacity is refused by the
+    /// budget. The quantum control first proves the same fill charges its length only.
+    #[test]
+    fn geometric_admission_charges_the_allocated_capacity() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1_024);
+        // 256-row chunks: the first chunk allocates 256 (a quantum from empty), the SECOND
+        // chunk's 4 rows cross the 256 boundary and double to 512 - a session ends just
+        // past a true doubling, not a first allocation.
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..260).map(token).collect();
+
+        // Quantum control: the charge is the valid length. Built with `zero`, so the
+        // ambient Q36_KV_GEOMETRIC cannot flip the control's law.
+        decoder.set_session_budget(SessionBudget::new(260 * GROWTH));
+        let mut quantum =
+            super::super::super::state::ResidentState::zero(&mut decoder.kernels, &decoder.weights)
+                .unwrap();
+        ok(
+            decoder.prefill(&mut quantum, &tokens, StepMode::Prompt),
+            "quantum prompt",
+        );
+        assert_eq!(decoder.session_used(), 260 * GROWTH);
+
+        // Geometric: one session charges the ALLOCATED capacity (512 rows), two fit the
+        // cap, the third is refused before it allocates anything.
+        let one = 512 * GROWTH;
+        decoder.set_session_budget(SessionBudget::new(2 * one));
+        let mut first = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut first, &tokens, StepMode::Prompt),
+            "first geometric prompt",
+        );
+        assert_eq!(
+            first.attn_cap(),
+            512,
+            "260 tokens cross 256, so the cache doubles"
+        );
+        assert_eq!(
+            decoder.session_used(),
+            one,
+            "the charge is the allocated capacity, not the valid length"
+        );
+        let mut second = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut second, &tokens, StepMode::Prompt),
+            "second geometric prompt",
+        );
+        assert_eq!(decoder.session_used(), 2 * one);
+        let mut third = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            1_024,
+        )
+        .unwrap();
+        let refused = decoder.prefill(&mut third, &tokens, StepMode::Prompt);
+        assert!(
+            matches!(refused, Err(EngError::MemoryPlan(_))),
+            "{refused:?}"
+        );
+        assert_eq!(third.pos(), 0, "no chunk ran");
+        assert!(!third.is_poisoned(), "a denial does not poison");
+        assert_eq!(
+            decoder.session_used(),
+            2 * one,
+            "the denial charges nothing"
+        );
+    }
+
+    /// The geometric law holds at the Q8 form too: the same fill doubles the capacity
+    /// through the Q8 append path. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn geometric_growth_holds_at_the_q8_form() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::Q8,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..600u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "q8 prompt",
+        );
+        assert_eq!(
+            state.attn_cap(),
+            1_024,
+            "600 tokens double 512 to 1,024 at Q8"
+        );
+    }
+
+    /// A reset keeps the geometric law (`Q36_KV_GEOMETRIC` semantics, built directly):
+    /// after a reset the caches grow by doubling again, not by one `KV_STEP`. Ignored
+    /// without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn a_reset_keeps_the_geometric_law() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..600u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "first prompt",
+        );
+        assert_eq!(state.attn_cap(), 1_024, "600 tokens double 512 to 1,024");
+        decoder.reset(&mut state).unwrap();
+        assert_eq!(state.attn_cap(), 0, "the reset state has no capacity");
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "second prompt",
+        );
+        assert_eq!(
+            state.attn_cap(),
+            1_024,
+            "after the reset the caches double again, not one KV_STEP (would be 768)"
+        );
+    }
+
+    /// A prompt ending just past a doubling: 1,030 tokens cross 1,024, so the geometric
+    /// law allocates 2,048 while the quantum law stays at 1,280. The charge EQUALS the
+    /// allocated storage. Ignored without the checkpoint (Mac, `Q36_CKPT_DIR`).
+    #[test]
+    #[ignore = "needs the real checkpoint on the Mac; run with --ignored"]
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64",))]
+    fn a_prompt_just_past_a_doubling_charges_the_allocated_storage() {
+        let _serial = crate::native_test_lock();
+        let dir = super::super::super::real::env_path("Q36_CKPT_DIR");
+        let real = super::super::super::real::open(&dir);
+        let host = crate::family::qwen36::host_load::HostWeights::load(
+            &real.ckpt,
+            &crate::family::spec::QWEN3_6_35B_A3B,
+            &real.config,
+        )
+        .unwrap();
+        let mut decoder = crate::family::qwen36::resident::decoder::ResidentDecoder::new_with_kv(
+            crate::kernels::MlxKernels::try_new().unwrap(),
+            &real.ckpt,
+            host,
+            262_144,
+            crate::family::qwen36::settings::Activation::Bf16,
+            KvDtype::F32,
+        )
+        .unwrap();
+        decoder.routing = Routing::Device;
+        decoder.set_chunk_rows(256).unwrap();
+        let tokens: Vec<u32> = (0..1_030u32).map(token).collect();
+        let mut state = super::super::super::state::ResidentState::zero_geometric(
+            &mut decoder.kernels,
+            &decoder.weights,
+            262_144,
+        )
+        .unwrap();
+        ok(
+            decoder.prefill(&mut state, &tokens, StepMode::Prompt),
+            "prompt",
+        );
+        let cap = state.attn_cap();
+        assert_eq!(cap, 2_048, "1,030 crosses 1,024, so the cache doubles");
+        // The charge is the ALLOCATED capacity: the stored bytes and the session charge
+        // are equal, with no logical-vs-allocated gap to bound.
+        let charged = state.charged_bytes().unwrap();
+        let stored = super::super::super::state::kv_storage_bytes(state.layers());
+        assert_eq!(
+            stored, charged,
+            "the geometric charge must equal the allocated storage"
+        );
     }
 
     #[test]
@@ -1306,7 +2272,7 @@ mod tests {
         );
         let tokens: Vec<u32> = (0..8).map(token).collect();
         let rows = row_count(&tokens).unwrap();
-        let growth = chunk_growth_bytes(&decoder.weights, rows).unwrap();
+        let growth = advance_charge(&state, &decoder.weights, rows).unwrap();
         let permit = decoder.budget.acquire_growth(growth).unwrap();
         let refused = run(
             &mut decoder,

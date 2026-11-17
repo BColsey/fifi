@@ -822,6 +822,34 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// The whole-layer DeltaNet chunk closure (B1): one compiled entry for one DELTA-mixer
+    /// layer of the chunk prefill (input norm, projections, fused prep/recurrence/post,
+    /// mixer residual, and the folded device-routed MoE rows sequence). `dims` holds hidden,
+    /// kh, kd, vh, vd, cd, taps, kw, kw2, experts, top_k, renorm; `quant` holds mode, group,
+    /// bits per weight for the ten packed weights; `inputs` holds the 44 caller inputs (the
+    /// wrapper appends the two gather row-index operands itself, per the window's row count).
+    /// The four outputs (out [T,H], rec, ring, health [T]) are lazy. A non-zero status is a
+    /// native failure of the adapter.
+    #[link_name = "inference_mlx_compile_delta_layer"]
+    pub(super) fn mlx_compile_delta_layer(
+        out: *mut mlx_array,
+        rec: *mut mlx_array,
+        ring: *mut mlx_array,
+        health: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        prep_source: *const c_char,
+        delta_source: *const c_char,
+        post_source: *const c_char,
+        router_source: *const c_char,
+        owner: usize,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
     #[cfg(test)]
     #[link_name = "inference_mlx_compile_flint_tail_body_entries"]
     pub(super) fn mlx_compile_flint_tail_body_entries() -> u64;
@@ -924,6 +952,57 @@ unsafe extern "C" {
         dims: *const i32,
         quant: *const i32,
         activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The attention-layer PRE closure of the chunk prefill as one compiled closure (window
+    /// attention closure, behind the `Q36_COMPILED_LAYER` env var only): the input RMS norm,
+    /// the q, k, v projections, the q and k head norms, and the gate slice. `dims` holds
+    /// hidden, heads, kv_heads, width; `quant`
+    /// holds mode, group, bits per weight for the q, k, v projections; `inputs` holds the 13
+    /// closure inputs (the residual stream `[T, H]`, then the q, k, v packed triples, then
+    /// q_norm, k_norm, then the folded input norm weight). The four outputs
+    /// (q `[1, heads, T, width]`, k and v `[1, kv_heads, T, width]`, gate `[T, heads, width]`)
+    /// are lazy. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_compile_attn_pre_layer_block"]
+    pub(super) fn mlx_compile_attn_pre_layer_block(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        gate: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The attention-layer POST closure of the chunk prefill as one compiled closure (window
+    /// attention closure, behind the `Q36_COMPILED_LAYER` env var only): the composite gate
+    /// chain, the output projection, the mixer residual, and the folded device-routed MoE
+    /// rows sequence. `dims` holds hidden, heads,
+    /// width, experts, top_k, renorm; `quant` holds mode, group, bits per weight for the six
+    /// packed weights (o_proj, shared gate, shared up, shared down, gate/up stack, down
+    /// stack); `inputs` holds the 24 caller inputs (the attention core output
+    /// `[1, heads, T, width]`, the gate `[T, heads, width]`, the residual stream `[T, H]`, the
+    /// o_proj triple, the post norm, the transposed router, the three shared-expert triples,
+    /// the shared scalar head weight, the two stack triples); the wrapper appends the two
+    /// gather row-index operands itself, per the window's row count. The two outputs
+    /// (out `[T, H]`, health `[T]`) are lazy. A non-zero status is a native failure of the
+    /// adapter.
+    #[link_name = "inference_mlx_compile_attn_post_layer"]
+    pub(super) fn mlx_compile_attn_post_layer(
+        out: *mut mlx_array,
+        health: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        owner: usize,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;

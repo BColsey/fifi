@@ -3,7 +3,7 @@
 use crate::EngError;
 use crate::family::sampler::Sampler;
 use crate::family::session::{SaveKind, StoreLimits};
-use crate::sched::job::PrefixReport;
+use crate::sched::job::{PrefillBankReport, PrefixReport};
 use crate::tokenizer::{DecodeBatch, IncrementalDecoder};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -152,6 +152,15 @@ pub(crate) trait ExecutorOps {
     /// with a boundary (no false zeros). The Flash-Next executor keeps this default: it reports
     /// nothing.
     fn prefix_report(&self) -> Option<PrefixReport> {
+        None
+    }
+    /// The expert-bank admit-path counters of this executor, which the worker snapshots
+    /// before and after the prefill and logs as a per-request delta in `JobUsage`: admit
+    /// passes and misses, the miss and rows-per-expert route histograms, and the upload
+    /// bytes and wall time of the admit copy spans. Decode traffic never enters them.
+    /// Executors without an expert bank use this default: `None`, and the request log
+    /// omits the `prefill_bank_*` keys (no false zeros).
+    fn prefill_bank_report(&self) -> Option<PrefillBankReport> {
         None
     }
     /// Evicts ONE of the engine's evictable prefix entries per the incremental denial order: dead

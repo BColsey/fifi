@@ -12,9 +12,9 @@ use crate::expert_tier::{
     ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView, Placement, Residency,
 };
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-use crate::family::nemotron35::loader::{ExpertLayerMapping, ProjectionRanges};
+use crate::family::mapped_file::MappedFile;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-use crate::family::qwen36::tiered::mapped_file::MappedFile;
+use crate::family::nemotron35::loader::{ExpertLayerMapping, ProjectionRanges};
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use crate::kernels::cuda::resident::expert_activation::ReluSquaredCall;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

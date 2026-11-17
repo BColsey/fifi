@@ -14,8 +14,8 @@ use super::super::cache::choose_slots;
 use super::super::{
     FfnRoles, FlintResidentLimits, ResidentPlan,
     cache::{
-        BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode, HostBudget,
-        HostStore, LayerCache, LayerLayout, MissCopy, plan_bank,
+        BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode, HostStore,
+        LayerCache, LayerLayout, MissCopy, plan_bank,
     },
     plan::plan_resident,
 };
@@ -102,7 +102,8 @@ fn admit_cached(
         .checked_add(packing.staging.checked_mul(2).ok_or_else(overflow)?)
         .and_then(|bytes| bytes.checked_add(metadata as u64))
         .ok_or_else(overflow)?;
-    HostBudget::probe()?.admit(required)?;
+    crate::family::host_admit::HostAdmission::probe("Flint expert cache", "Flint")?
+        .admit("Flint expert cache", required)?;
     plan::admit(
         &plan::Demand {
             tensors: packing.bytes as u64,

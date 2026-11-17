@@ -14,17 +14,15 @@ const CONFIG: &[u8] =
 const GIB_U: u64 = 1 << 30;
 const EXPERT_BYTES: u64 = 1_881_600;
 
-fn report(trunk: u64) -> FlashPackReport {
+fn report(trunk: u64) -> PackReport {
     let experts = 24_576 * EXPERT_BYTES;
     let embedding = 248_320u64 * 2560 * 2;
-    FlashPackReport {
-        pack: PackReport {
-            device_bytes: experts + embedding + trunk,
-            matrices: 74_041,
-            rates: BTreeMap::new(),
-            codebook: Marker::Mul1,
-        },
+    PackReport {
+        device_bytes: experts + embedding + trunk,
         expert_bytes: experts,
+        matrices: 74_041,
+        rates: BTreeMap::new(),
+        codebook: Marker::Mul1,
     }
 }
 
@@ -128,7 +126,7 @@ fn a_context_that_keeps_too_few_slots_is_refused_with_the_longest_that_works() {
 #[test]
 fn a_report_smaller_than_its_experts_and_embedding_is_refused() {
     let mut small = report(0);
-    small.pack.device_bytes = small.expert_bytes;
+    small.device_bytes = small.expert_bytes;
     let text = FlashLoadPlan::new(&small, CONFIG, 0, card())
         .unwrap_err()
         .describe();
@@ -149,4 +147,34 @@ fn the_real_pack_headers_give_the_documented_plan() {
         eprintln!("{line}");
         assert!((lo..=hi).contains(&slots), "{context}: {slots}");
     }
+}
+
+#[test]
+fn the_load_line_is_one_literal_line() {
+    // The full line, as one literal, so a reworded value or unit fails
+    // rather than slipping past a contains-check.
+    let plan = FlashLoadPlan::new(&report(3_854_000_000), CONFIG, 32_640_183_408, card()).unwrap();
+    let long = plan.at_context(262_144, KvFormat::F16, 100).unwrap();
+    assert_eq!(
+        long.to_string(),
+        "Flash-Next load: context 262144 positions; K/V F16 6.38 GiB; trunk 3.59 GiB on the device; \
+         expert placement 142 of 512 experts per layer in VRAM (11.94 GiB), 31.12 GiB pinned in host RAM; \
+         embedding 1.18 GiB host; n-gram table 30.40 GiB local NVMe"
+    );
+    use crate::family::plan_decision::PlanFixity;
+    let rows = long.plan_rows();
+    let fixities: Vec<(&str, PlanFixity)> =
+        rows.iter().map(|r| (r.name.as_str(), r.fixed_at)).collect();
+    assert_eq!(
+        fixities,
+        vec![
+            ("context", PlanFixity::Start),
+            ("K/V", PlanFixity::Start),
+            ("trunk", PlanFixity::Load),
+            ("expert placement", PlanFixity::Load),
+            ("embedding", PlanFixity::Load),
+            ("n-gram table", PlanFixity::Load),
+        ]
+    );
+    assert!(rows.iter().all(|r| r.alternatives.is_empty()));
 }

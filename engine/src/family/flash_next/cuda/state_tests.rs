@@ -16,7 +16,8 @@ use crate::{
             ple::PleState,
             step::ModelShape,
         },
-        qwen36::cuda::{book::Health, state_layout::Word},
+        graph_state::book::Health,
+        state_words::Word,
     },
     kernels::cuda::{
         prefill::gdn_scan_seq::{ScanShape, scan_bytes},

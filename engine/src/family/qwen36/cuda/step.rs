@@ -11,7 +11,8 @@
 //!    records (its doc states the contract);
 //! 3. the read-back, the event and ONE blocking wait (`read_back`).
 //!
-//! The body of a token runs in one of three modes (the pure `next_mode` rule below): eager (the
+//! The body of a token runs in one of three modes (the pure `next_mode` rule of
+//! `family::graph_state`): eager (the
 //! warm-up token, every fallback and every plain session), captured (one capture, then
 //! replays), or eager-after-refusal. A refused capture is STICKY for the whole step
 //! construction: later tokens stay eager and keep reporting `RefusedFellBackToEager`, across
@@ -31,24 +32,24 @@
 //! Drop order: the captured graph first (it keeps the holds of its capture and covers the state
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::RefCell;
 
 use super::{
     dims::{KvMode, StepOptions},
-    exl3_bank::Exl3SlotResolver,
     exl3_moe::{
         Exl3MoeBufs, Exl3MoeWeights, Scratch,
         merge::{SharedMerge, run_exl3_moe_merged},
         run_exl3_moe,
     },
-    layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
-        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
-        run_moe_block, tiered::TieredScratch,
+        ExpertBufs, MoeBuffers, MoeLayerWeights, MoeOp, Packs, StackWeights, run_moe_block_marked,
+        tiered::TieredScratch,
     },
     prefill_driver::{
         AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
@@ -71,7 +72,7 @@ use super::{
     run_report::{CaptureOutcome, HostSyncs, PrefillReport, RunReport, StepKind, StepRecord},
     section_timing::{FineSplit, MarkedGroup, SectionPlan, SectionTimes, section_plan},
     state::{ResidentState, StepField, export::ExportedState},
-    state_layout::{StateLayout, Word},
+    state_layout::StateLayout,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
     step_plan::Slot,
     tiered_step::{LayerParts, TieredRuntime},
@@ -79,12 +80,14 @@ use super::{
         Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
     },
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
-    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::exl3_merge_plan::{
+    family::exl3::bank::Exl3SlotResolver,
+    family::exl3_merge_plan::{
         Intent, Source, load_suffix, resolve_switch, shared_in_routed_explicit,
     },
+    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
@@ -150,6 +153,13 @@ struct SectionMarks {
     /// mixer half (the `Conv`/`AttnPrep` start to the `Delta`/`AttnDecode` end).
     mixer_end: Vec<TimingEvent>,
     core: Vec<(TimingEvent, TimingEvent)>,
+    /// The finer MoE split: one event per marked group at the `Router` end and one at the
+    /// `ExpertDownQ` end, recorded through `run_moe_block_marked`'s hook. Armed only for the
+    /// native resident path (`moe_subs`); other layouts never record these events, and a
+    /// never-recorded event must never be queried.
+    router_end: Vec<TimingEvent>,
+    experts_end: Vec<TimingEvent>,
+    moe_subs: bool,
     head_start: TimingEvent,
     head_end: TimingEvent,
     tail_start: TimingEvent,
@@ -162,15 +172,23 @@ struct SectionMarks {
 }
 
 impl SectionMarks {
-    fn new(context: &CudaContext, kinds: &[AttentionKind]) -> Result<Self, EngError> {
+    fn new(
+        context: &CudaContext,
+        kinds: &[AttentionKind],
+        moe_subs: bool,
+    ) -> Result<Self, EngError> {
         let plan = section_plan(kinds);
         let mut groups = Vec::with_capacity(plan.groups.len());
         let mut mixer_end = Vec::with_capacity(plan.groups.len());
         let mut core = Vec::with_capacity(plan.groups.len());
+        let mut router_end = Vec::with_capacity(plan.groups.len());
+        let mut experts_end = Vec::with_capacity(plan.groups.len());
         for _ in &plan.groups {
             groups.push((context.event_timing()?, context.event_timing()?));
             mixer_end.push(context.event_timing()?);
             core.push((context.event_timing()?, context.event_timing()?));
+            router_end.push(context.event_timing()?);
+            experts_end.push(context.event_timing()?);
         }
         Ok(Self {
             whole_start: context.event_timing()?,
@@ -179,6 +197,9 @@ impl SectionMarks {
             groups,
             mixer_end,
             core,
+            router_end,
+            experts_end,
+            moe_subs,
             head_start: context.event_timing()?,
             head_end: context.event_timing()?,
             tail_start: context.event_timing()?,
@@ -238,25 +259,19 @@ impl SectionMarks {
             .iter()
             .position(|group| group.layer == layer)
     }
-}
 
-pub(super) enum Mode {
-    Replay,
-    Capture,
-    Eager,
-}
-
-/// The dispatch rule: replay once a graph exists; attempt the capture only on a warmed step
-/// that asked for it and has not already refused one; otherwise run eagerly.
-pub(super) fn next_mode(graph_ready: bool, warmed: bool, capture_on: bool, refused: bool) -> Mode {
-    if graph_ready {
-        Mode::Replay
-    } else if warmed && capture_on && !refused {
-        Mode::Capture
-    } else {
-        Mode::Eager
+    /// Records the MoE sub-split events of the marked group `at`: the `Router` end and the
+    /// `ExpertDownQ` end, fired after those ops inside `run_moe_block_marked`.
+    fn record_moe_sub(&self, op: MoeOp, at: usize, stream: &DeviceStream) -> Result<(), EngError> {
+        match op {
+            MoeOp::Router => stream.record_timing(&self.router_end[at]),
+            MoeOp::ExpertDownQ => stream.record_timing(&self.experts_end[at]),
+            _ => Ok(()),
+        }
     }
 }
+
+use crate::family::graph_state::{Mode, next_mode};
 
 /// The pure part of `capture_once`: what to do with the result of the capture attempt.
 /// `Ok(Some(graph))`: the capture succeeded, the caller stores and replays the graph. `Ok(None)`:
@@ -339,9 +354,7 @@ pub(super) fn exl3_device_pick_refusal(
     Ok(())
 }
 
-pub(super) fn exl3_flag_error() -> EngError {
-    EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
-}
+use crate::family::graph_state::book::exl3_flag_error;
 
 /// The refusal of a result pair whose status carries the EXL3 arithmetic verdict (mask 16). It is
 /// taken before `decide` sees the pair, so a flagged EXL3 token never commits, whatever other
@@ -706,7 +719,7 @@ fn stage_route_layer(
     stream: &DeviceStream,
     stage: &RouteStage,
     layer: usize,
-    route: &super::moe::RouteBufs<'_>,
+    route: &RouteBufs<'_>,
 ) -> Result<(), EngError> {
     let at = layer * stage.stride;
     let ids = stage.buffer.range(at, stage.top_k * size_of::<i32>())?;
@@ -883,7 +896,8 @@ impl<'a> QwenResidentStep<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             // The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a
             // mixed override (tiled stacks in some layers, native in others) refuses here
-            // instead of failing per layer inside the block's own check.
+            // instead of failing per layer inside the block's own check. Only the refusal
+            // matters; the uniform value itself is the layer weights' own kind.
             moe_override_uniform(
                 &moe.iter()
                     .map(|w| matches!(w.gate, StackWeights::Tiled(_)))
@@ -1102,7 +1116,13 @@ impl<'a> QwenResidentStep<'a> {
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
-            Some(SectionMarks::new(self.context, &self.res.dims.shape.kinds)?)
+            // The MoE sub-split exists only on the native resident path: the exl3 and tiered
+            // arms never run `run_moe_block_marked`, so their sub events would never record.
+            Some(SectionMarks::new(
+                self.context,
+                &self.res.dims.shape.kinds,
+                self.layout == WeightLayout::Native && !self.tiered_mode,
+            )?)
         } else {
             None
         };
@@ -1446,7 +1466,7 @@ impl<'a> QwenResidentStep<'a> {
         m_sess: usize,
     ) -> Result<(), EngError> {
         use super::prefill_driver::drive_chunks;
-        use super::prefill_plan::PrefillStep;
+        use crate::family::prefill::arena::PrefillStep;
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();
@@ -1494,13 +1514,12 @@ impl<'a> QwenResidentStep<'a> {
     /// status read gates publication. KV8 also uses blocking causal-length writes before each
     /// attention tile. Every error after the chunk opens poisons the state.
     pub(super) fn run_chunk(&mut self, p0: usize, rows: &[u32]) -> Result<(), EngError> {
-        use super::moe::Launch;
         use super::prefill::{
-            ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkSparse, ChunkViews, ChunkWeights,
-            run_chunk_body,
+            ChunkBufs, ChunkModel, ChunkRows, ChunkSparse, ChunkViews, ChunkWeights,
         };
-        use super::prefill_driver::{check_chunk_start, chunk_ids};
+        use super::prefill_driver::{Q36ChunkCtx, Q36ChunkFamily, check_chunk_start, chunk_ids};
         use super::prefill_plan::ChunkSlot;
+        use crate::family::prefill::chunk_family::ChunkFamily;
 
         // A chunk advances the live state: refused through a gated state or an awaiting window.
         self.state_usable()?;
@@ -1559,36 +1578,59 @@ impl<'a> QwenResidentStep<'a> {
         // 3. From here every error poisons.
         *started = true;
         let opened = std::time::Instant::now();
-        let body = || -> Result<usize, EngError> {
-            state.begin_prefill()?;
-            state.clear_prefill_status(stream)?;
-            let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-            ids_range
-                .buffer()
-                .write_at(stream, ids_range.offset(), &bytes)?;
-            let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
-            let run = run.with_bank(self.exl3_bank).with_sparse(
-                res.sparse
-                    .as_ref()
-                    .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
-            );
+        // The sparse projection is a preflight product too (built from `res` before the window).
+        let sparse = res
+            .sparse
+            .as_ref()
+            .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds));
+        let mut fam = Q36ChunkFamily::new(
+            self.exl3_bank,
             #[cfg(test)]
-            let run = run.with_kernel_class(kernel_class);
-            run_chunk_body(
-                &Launch {
-                    ctx: context,
-                    stream,
-                },
-                &run,
-            )?;
-            Ok(run.segmented_parts())
+            kernel_class,
+        );
+        let mut ctx = Q36ChunkCtx {
+            state,
+            launch: Launch {
+                ctx: context,
+                stream,
+            },
+            ids: &ids,
+            ids_range,
+            model: &model,
+            bufs: &bufs,
+            chunk_rows,
+            sparse,
         };
-        let segmented_parts = body().inspect_err(|_| state.poison())?;
-        prefill_report.note_segmented_parts(segmented_parts);
-        let status = state
-            .read_prefill_status(stream)
-            .inspect_err(|_| state.poison())?;
+        // Qwen3.6 opens and commits per chunk, clearing status before staging ids. This caller
+        // owns that order and window lifetime. Each call takes its own dyn borrow of `fam`, so
+        // the step's report reads `fam.segmented_parts` between them.
+        fn open_and_run<'a, 'w>(
+            family: &mut dyn ChunkFamily<Ctx = Q36ChunkCtx<'a, 'w>>,
+            ctx: &mut Q36ChunkCtx<'a, 'w>,
+            p0: usize,
+            m: usize,
+        ) -> Result<(), EngError> {
+            family.begin_window(ctx)?;
+            family.clear_chunk_status(ctx)?;
+            family.write_chunk_inputs(ctx, p0, m)?;
+            family.run_layers(ctx, p0, m)
+        }
+        open_and_run(&mut fam, &mut ctx, p0, m).inspect_err(|_| {
+            ctx.state.poison();
+            super::prefill::phase_timing::serve::discard();
+        })?;
+        prefill_report.note_segmented_parts(fam.segmented_parts);
+        let status = (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
+            .read_health(&mut ctx)
+            .inspect_err(|_| {
+                ctx.state.poison();
+                super::prefill::phase_timing::serve::discard();
+            })?;
+        // The status read completed the stream, so the serve-phase marks (if armed) are
+        // readable now; nothing prints when the knob is off. The elapsed read comes
+        // first so the recorded step time excludes the share line's queries and print.
         let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        super::prefill::phase_timing::serve::end()?;
         prefill_report.push_step(StepRecord {
             p0,
             rows: m,
@@ -1596,9 +1638,9 @@ impl<'a> QwenResidentStep<'a> {
             ns,
             status,
         });
-        state
-            .revalidate(stream, p0 + m, status)
-            .inspect_err(|_| state.poison())?;
+        (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
+            .commit_chunk(&mut ctx, p0, m, status)
+            .inspect_err(|_| ctx.state.poison())?;
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
         // selection-eligible prefix grows with it, but only when this chunk continues
         // it exactly (interrupted or gapped prefill keeps the smaller prefix).
@@ -1615,6 +1657,13 @@ impl<'a> QwenResidentStep<'a> {
 
     pub(crate) fn last_prefill_report(&self) -> &PrefillReport {
         &self.prefill_report
+    }
+
+    /// The session's admitted prefill arena (test-only): the golden arms read `m_sess` and the
+    /// built table through it, so the verdict and the real arena are asserted to agree.
+    #[cfg(test)]
+    pub(super) fn test_prefill_arena(&self) -> Option<&PrefillArena> {
+        self.prefill.as_ref()
     }
 
     pub(super) fn note_feed_rows(&mut self, verdict: &ChunkVerdict, rows: usize) {
@@ -2093,6 +2142,26 @@ impl<'a> QwenResidentStep<'a> {
             vec![0.0; marks.core.len()]
         };
         let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
+        let (router_ms, experts_ms) = if marks.moe_subs {
+            (
+                marks
+                    .mixer_end
+                    .iter()
+                    .zip(&marks.router_end)
+                    .map(|(moe_start, router_end)| moe_start.elapsed_ms_since(router_end))
+                    .collect::<Result<Vec<_>, _>>()?,
+                marks
+                    .router_end
+                    .iter()
+                    .zip(&marks.experts_end)
+                    .map(|(router_end, experts_end)| router_end.elapsed_ms_since(experts_end))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            // The MoE sub-split was not armed: empty readings (a never-recorded event must
+            // never be queried).
+            (Vec::new(), Vec::new())
+        };
         marks
             .plan
             .reconcile(
@@ -2103,6 +2172,8 @@ impl<'a> QwenResidentStep<'a> {
                     mixer_ms,
                     core_ms,
                     head_ms,
+                    router_ms,
+                    experts_ms,
                 },
                 whole,
             )
@@ -2273,7 +2344,7 @@ impl<'a> QwenResidentStep<'a> {
     fn capture_route_picks(
         &self,
         stream: &DeviceStream,
-        route: &super::moe::RouteBufs<'_>,
+        route: &RouteBufs<'_>,
         top_k: usize,
     ) -> Result<(), EngError> {
         let read = |range: &DeviceRange<'_>, bytes: usize| -> Result<Vec<u8>, EngError> {
@@ -2470,7 +2541,16 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
-                let block = run_moe_block(&launch, weights, bufs, &self.moe_dims);
+                let sub = self
+                    .marks
+                    .as_ref()
+                    .filter(|m| m.moe_subs)
+                    .and_then(|m| m.group_index(layer).map(|at| (m, at)));
+                let block =
+                    run_moe_block_marked(&launch, weights, bufs, &self.moe_dims, |op| match &sub {
+                        Some((m, at)) => m.record_moe_sub(op, *at, s),
+                        None => Ok(()),
+                    });
                 if block.is_ok() {
                     if let Some(stage) = &self.route_stage {
                         stage_route_layer(ctx, s, stage, layer, &bufs.route)?;
@@ -2745,8 +2825,12 @@ mod shortlist_bench;
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
 
-#[path = "krow_graph.rs"]
-mod krow_graph;
+use crate::family::graph_state::krow_graph;
+
+// The K-row table's capacity must equal the family's window cap: three literals
+// exist (settings, this table, rollback's alias of settings); this ties them at compile time.
+const _: () =
+    assert!(krow_graph::MAX_ROWS == crate::family::qwen36::settings::QWEN36_MAX_WINDOW_ROWS);
 
 #[path = "krow_step.rs"]
 mod krow_step;

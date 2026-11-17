@@ -7,10 +7,10 @@
 //! route recorder needs no extra readback.
 
 use super::super::moe::{MoeShape, select};
-use super::super::stored::read_stack_into;
 use super::ops::{Ctx, dim, linear, short_import, values};
 use super::slots::{ExpertSlots, SetLayout};
 use super::weights::RMoe;
+use crate::family::stored::read_stack_into;
 use crate::{
     EngError,
     kernels::{BinaryOp, HostPages, ReduceOp, ResidentPackedWeight, UnaryOp},

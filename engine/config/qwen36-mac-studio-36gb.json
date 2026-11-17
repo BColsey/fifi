@@ -1,6 +1,7 @@
 {
   "listen": "127.0.0.1:18791",
   "api_key_env": "ENGINESRV_API_KEY",
+  "prefix_reuse": false,
   "engines": [
     {
       "id": "q36",

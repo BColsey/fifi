@@ -19,6 +19,22 @@ use crate::tensor::Dtype;
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
+/// read by the MLX layer-closure compile path (host builds compile this module without it).
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) const DELTA_LAYER_TAG: u64 = 0x0036_5147_a5a0_0007;
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) const ATTN_PRE_LAYER_TAG: u64 = 0x0036_5147_a5a0_0008;
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) const ATTN_POST_LAYER_TAG: u64 = 0x0036_5147_a5a0_0009;
 /// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
 pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
 pub(crate) const ATTN_POST_TAG: u64 = 0x0036_5147_a5a0_0006;
@@ -156,6 +172,55 @@ pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
     mix_fun_id(DELTA_TAG, &parts)
 }
 
+/// The baked constants of one compiled whole-layer DeltaNet chunk step (B1): the input
+/// norm, the four projections, the fused prep/recurrence/post kernels, the mixer residual,
+/// and the folded device-routed MoE rows sequence. T (the row count) is NOT baked: the
+/// nonshapeless MLX cache specializes it under the one key, like the B axis of the decode
+/// blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) struct DeltaLayerBaked {
+    pub(crate) hidden: u32,
+    /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw).
+    pub(crate) dims: [u32; 8],
+    pub(crate) experts: u32,
+    pub(crate) top_k: u32,
+    /// 1 when the gates renormalize over the selection, 0 otherwise.
+    pub(crate) renorm: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the input and post norms.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and output.
+    pub(crate) act: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order qkv, z, b, a,
+    /// out, shared gate, shared up, shared down, gate/up stack, down stack.
+    pub(crate) scale_keys: [u64; 10],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 10],
+}
+
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) fn delta_layer_fun_id(baked: &DeltaLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(48);
+    parts.push(u64::from(baked.hidden));
+    parts.extend(baked.dims.iter().map(|&dim| u64::from(dim)));
+    parts.push(u64::from(baked.experts));
+    parts.push(u64::from(baked.top_k));
+    parts.push(u64::from(baked.renorm));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(DELTA_LAYER_TAG, &parts)
+}
+
 /// The baked constants of one compiled Flint decode tail: the
 /// post-attention residual add, the RMS norm, and the dense SwiGLU, all in one closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +253,111 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
         parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
     }
     mix_fun_id(FLINT_TAIL_TAG, &parts)
+}
+
+/// The baked constants of one compiled attention-layer PRE closure of the chunk prefill
+/// (window attention closure): the input RMS norm, the q, k, v projections, the q and k head norms, and the
+/// gate slice. T is NOT baked: the nonshapeless MLX cache specializes it under the one
+/// key, like the whole-layer delta closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) struct AttnPreLayerBaked {
+    pub(crate) hidden: u32,
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The key/value head count (grouped-query attention).
+    pub(crate) kv_heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the input and head norms.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and outputs.
+    pub(crate) act: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order q, k, v.
+    pub(crate) scale_keys: [u64; 3],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 3],
+}
+
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) fn attn_pre_layer_fun_id(baked: &AttnPreLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(16);
+    parts.push(u64::from(baked.hidden));
+    parts.push(u64::from(baked.heads));
+    parts.push(u64::from(baked.kv_heads));
+    parts.push(u64::from(baked.width));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(ATTN_PRE_LAYER_TAG, &parts)
+}
+
+/// The baked constants of one compiled attention-layer POST closure of the chunk prefill
+/// (window attention closure): the composite gate chain, the output projection, the mixer residual, and the
+/// folded device-routed MoE rows sequence (post norm, router, gathered experts, shared
+/// expert, output residual) — the same fold as the whole-layer delta closure. T rides on
+/// the residual operand's shape and is NOT baked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) struct AttnPostLayerBaked {
+    pub(crate) hidden: u32,
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// The router expert count.
+    pub(crate) experts: u32,
+    /// The router selection width.
+    pub(crate) top_k: u32,
+    /// 1 when the gates renormalize over the selection, 0 otherwise.
+    pub(crate) renorm: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the post norm.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the layer input and output.
+    pub(crate) act: u64,
+    /// The dtype key of the attention core output operand: it is F32 over the F32 cache and
+    /// the activation dtype over the quantized cache, so it joins the key even though the
+    /// body relies on MLX's runtime promotion instead of branching on it.
+    pub(crate) att: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order o_proj,
+    /// shared gate, shared up, shared down, gate/up stack, down stack.
+    pub(crate) scale_keys: [u64; 6],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 6],
+}
+
+#[cfg_attr(
+    not(feature = "native-mlx"),
+    expect(dead_code, reason = "read by the MLX layer-closure compile path")
+)]
+pub(crate) fn attn_post_layer_fun_id(baked: &AttnPostLayerBaked) -> u64 {
+    let mut parts = Vec::with_capacity(30);
+    parts.push(u64::from(baked.hidden));
+    parts.push(u64::from(baked.heads));
+    parts.push(u64::from(baked.width));
+    parts.push(u64::from(baked.experts));
+    parts.push(u64::from(baked.top_k));
+    parts.push(u64::from(baked.renorm));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.push(baked.att);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(ATTN_POST_LAYER_TAG, &parts)
 }
 
 /// The baked constants of one compiled attention pre-RoPE step: the q/k/v projections, the
@@ -284,16 +454,7 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     mix_fun_id(MOE_TAG, &parts)
 }
 
-/// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
-/// the attention pre-RoPE and post-core closures of a uniform model need four keys, and a
-/// fifth covers one extra distinct constant set (for example a second quantization). The
-/// dense releases mix per-layer quantization overrides, so one attention layer set is no
-/// longer one constant set: the oQ6 pack needs 2 delta + 3 attention sets (2 programs each)
-/// = 8 keys. A ninth distinct key is an unapproved configuration change. This does not
-/// count MLX tapes: one MoE key permits B=1/2/4/8, so one adapter context can approve at
-/// most thirty-two key/batch pairs. Other contexts, cache clears and other threads are not
-/// bounded by this registry.
-pub(crate) const PROGRAM_LIMIT: usize = 8;
+pub(crate) use super::ProgramLimit;
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
@@ -302,17 +463,34 @@ pub(crate) const PROGRAM_LIMIT: usize = 8;
 #[derive(Debug, Default)]
 pub(crate) struct ProgramRegistry {
     seen: Vec<u64>,
+    limit: ProgramLimit,
 }
 
 impl ProgramRegistry {
+    /// Configuration is allowed only before any key is admitted; it never resets deduplication.
+    pub(crate) fn set_limit(&mut self, limit: ProgramLimit) -> Result<(), EngError> {
+        if !self.seen.is_empty() {
+            return Err(EngError::BadRequest(
+                "compile_program_limit must be configured before compiling any program".into(),
+            ));
+        }
+        self.limit = limit;
+        Ok(())
+    }
+
+    pub(crate) fn limit(&self) -> ProgramLimit {
+        self.limit
+    }
+
     pub(crate) fn admit(&mut self, id: u64) -> Result<bool, EngError> {
         if self.seen.contains(&id) {
             return Ok(false);
         }
-        if self.seen.len() >= PROGRAM_LIMIT {
+        if self.seen.len() >= self.limit.get() {
             return Err(EngError::BadRequest(format!(
-                "at most {PROGRAM_LIMIT} compiled programs per adapter; cache key {id:#x} is a \
-                 further distinct set of baked constants"
+                "at most {} compiled programs per adapter; cache key {id:#x} is a \
+                 further distinct set of baked constants",
+                self.limit.get()
             )));
         }
         self.seen.push(id);
@@ -998,18 +1176,39 @@ mod tests {
         refuse([1, 32, 2, 32, 127, 3], "must equal 2 * kw + vh * vd");
     }
 
-    /// The registry of one adapter context holds the limit rule as a plain function of the ids
-    /// seen: five distinct ids register, a repeat is a cache hit, and the SIXTH distinct id is
-    /// refused with `BadRequest` naming the limit — reaching the limit through the ids, not
-    /// through the constant.
+    /// Default adapters admit eight distinct ids and deduplicate repeats even when full.
+    #[test]
+    fn explicit_program_budget_is_bounded_and_deduplicates() {
+        let mut registry = ProgramRegistry::default();
+        registry.set_limit(ProgramLimit::new(12).unwrap()).unwrap();
+        assert_eq!(registry.limit().get(), 12);
+        for id in 0..12 {
+            assert_eq!(registry.admit(id), Ok(true));
+        }
+        assert_eq!(registry.admit(0), Ok(false));
+        assert!(registry.admit(12).is_err());
+        assert_eq!(registry.seen().len(), 12);
+        assert!(registry.set_limit(ProgramLimit::new(13).unwrap()).is_err());
+        assert_eq!(registry.limit().get(), 12);
+        assert_eq!(ProgramRegistry::default().limit().get(), 8);
+    }
+
+    #[test]
+    fn program_budget_rejects_zero_and_address_space_overflow() {
+        assert!(ProgramLimit::new(0).is_err());
+        assert!(ProgramLimit::new(usize::MAX).is_err());
+        assert!(ProgramLimit::new(isize::MAX as usize / size_of::<u64>() + 1).is_err());
+        assert_eq!(ProgramLimit::new(1).unwrap().get(), 1);
+    }
+
     #[test]
     fn a_local_registry_holds_the_same_rule() {
         let mut registry = ProgramRegistry::default();
         assert!(registry.seen().is_empty(), "a fresh adapter holds none");
-        for id in 7u64..7 + PROGRAM_LIMIT as u64 {
+        for id in 7u64..15 {
             assert_eq!(registry.admit(id), Ok(true));
         }
-        assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
+        assert_eq!(registry.seen().len(), 8);
         // A repeat of a registered id is fine: it is a cache hit, not a new program.
         assert_eq!(registry.admit(8), Ok(false));
         let ninth = registry.admit(16);
@@ -1022,7 +1221,7 @@ mod tests {
         );
         // The refused id was not registered, so the registry still holds exactly the limit and
         // stays refused for a further distinct id.
-        assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
+        assert_eq!(registry.seen().len(), 8);
         assert!(registry.admit(24).is_err(), "the limit stays refused");
     }
 }

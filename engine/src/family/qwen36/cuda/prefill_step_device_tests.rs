@@ -2,8 +2,8 @@
 //! They load the pinned 20 GB model, so they are ignored by default and run by name. The rows cover
 //! a clean chunk, continuation at the committed rows, an injected router fault, a stale prefill
 //! word, the token ids of the chunk rows, an unadmitted session and the worker's pieces.
+use crate::family::graph_state::book::Health;
 
-use super::book::Health;
 use super::common_tests::{dims as step_dims, inventory};
 use super::dims::{KvMode, StepOptions};
 use super::prefill_driver::PrefillBudget;
@@ -234,7 +234,7 @@ fn a_router_fault_in_a_chunk_poisons_and_publishes_nothing() {
 #[test]
 #[ignore = "the 3090, held exclusively: loads the real model; run by name"]
 fn a_stale_prefill_word_cannot_fail_a_clean_chunk() {
-    use super::state_layout::Word;
+    use crate::family::state_words::Word;
 
     let p5 = prompt_ids("P5");
     let head = &p5[..129];

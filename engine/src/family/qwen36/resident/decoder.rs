@@ -384,7 +384,7 @@ impl<'c> ResidentDecoder<'c> {
     /// Turns the compiled decode blocks on or off. Turning them on admits the WHOLE model first
     /// — every DeltaNet layer and every device-routed MoE layer's weight facts over the warm-up
     /// plan — and refuses the load with `EngError::Backend { operation: "compile_warm_up", .. }`
-    /// when the plan refuses (a packed weight without biases, more than four distinct programs),
+    /// when the plan refuses (a packed weight without biases, more programs than the adapter budget),
     /// so no compiled call can fail in the middle of a request. The warm-up then traces ONE
     /// layer per distinct cache key on zero tensors, evaluates the traced results, and records
     /// the per-block seconds in `compile_warmup`, so the first token of the first request
@@ -470,7 +470,14 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Dense(_) => None,
             })
             .collect::<Result<_, EngError>>()?;
-        let plan = super::compile_plan::model_warmup(true, true, &delta_facts, &moe_facts, &[])?;
+        let plan = super::compile_plan::model_warmup(
+            self.kernels.program_limit(),
+            true,
+            true,
+            &delta_facts,
+            &moe_facts,
+            &[],
+        )?;
         if delta_facts.iter().any(|facts| facts.dims[5] <= 1) {
             return Err(EngError::BadRequest(
                 "compiled DeltaNet rows need more than one convolution tap".into(),
@@ -614,6 +621,7 @@ impl<'c> ResidentDecoder<'c> {
             })
             .collect::<Result<Vec<_>, EngError>>()?;
         let plan = super::compile_plan::model_warmup(
+            self.kernels.program_limit(),
             self.compile,
             self.routing == Routing::Device,
             &delta_facts,
@@ -699,7 +707,7 @@ impl<'c> ResidentDecoder<'c> {
                 let norm_in = &layer_ref.input_norm;
                 let started = std::time::Instant::now();
                 let got =
-                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, &norm_in)?;
+                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, norm_in)?;
                 ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])?;
                 delta_seconds.push(started.elapsed().as_secs_f64());
             }
@@ -712,8 +720,7 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Moe(w) => {
                     let norm_post = &layer.post_norm;
                     let started = std::time::Instant::now();
-                    let got =
-                        super::compiled::moe_step_device(&mut ctx, &shape, w, &x, &norm_post)?;
+                    let got = super::compiled::moe_step_device(&mut ctx, &shape, w, &x, norm_post)?;
                     ctx.kernels.evaluate(&[
                         &got.0,
                         got.1.ids.ids(),
@@ -796,8 +803,15 @@ impl<'c> ResidentDecoder<'c> {
         Ok(())
     }
 
-    /// Imports a zero state with one synchronization.
+    /// Imports a zero state with one synchronization. Under `Q36_KV_GEOMETRIC` the attention
+    /// caches grow geometrically with this decoder's `context_limit` as the ceiling.
     pub(super) fn zero_state(&mut self) -> Result<ResidentState, EngError> {
+        if super::state::geometric_growth()? {
+            let ceiling = usize::try_from(self.context_limit).map_err(|_| {
+                EngError::MemoryPlan("q36 kv plan: the context limit overflows usize".into())
+            })?;
+            return ResidentState::zero_geometric(&mut self.kernels, &self.weights, ceiling);
+        }
         ResidentState::zero(&mut self.kernels, &self.weights)
     }
 
@@ -810,6 +824,12 @@ impl<'c> ResidentDecoder<'c> {
     /// `ResidentState::snapshot`.
     pub(super) fn snapshot(&mut self, state: &ResidentState) -> Result<ResidentSnapshot, EngError> {
         state.snapshot(&mut self.budget)
+    }
+
+    /// The bytes one snapshot of `state` would charge, without charging them: the admission
+    /// probe of the checkpoint window (`Q36_SPEC_STEP_WINDOW=2`).
+    pub(super) fn snapshot_bytes(&self, state: &ResidentState) -> Result<u64, EngError> {
+        state.snapshot_bytes()
     }
 
     /// Replaces `state` with `snapshot`. See `ResidentState::restore`.

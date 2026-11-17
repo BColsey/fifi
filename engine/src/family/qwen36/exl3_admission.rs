@@ -2,11 +2,8 @@
 //! byte budget, checked without a device. The device loader checks the same facts through the
 //! step's geometry.
 
-use super::{
-    exl3_tensors::{effective_norm_bytes, norm_layout},
-    host::HostShape,
-    host_load::rotary_dim,
-};
+use super::{host::HostShape, host_load::rotary_dim};
+use crate::family::exl3_tensors::{effective_norm_bytes, norm_layout};
 use crate::{
     EngError,
     family::{AttentionKind, FamilySpec},

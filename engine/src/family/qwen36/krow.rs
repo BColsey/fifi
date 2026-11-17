@@ -33,10 +33,8 @@
 
 use std::ffi::OsStr;
 
-use super::{
-    exl3_merge_plan::{SHARED_IN_ROUTED_VAR, shared_in_routed_from_env},
-    rollback::{MAX_ROWS, check_window_fits},
-};
+use super::rollback::{MAX_ROWS, check_window_fits};
+use crate::family::exl3_merge_plan::{SHARED_IN_ROUTED_VAR, shared_in_routed_from_env};
 use crate::{
     EngError,
     family::sampler::{SamplingParams, check_shortlist},

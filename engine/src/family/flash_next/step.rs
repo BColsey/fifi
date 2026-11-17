@@ -2,11 +2,11 @@
 
 use super::deltanet::{self, DeltaShape, DeltaState, DeltaWeights};
 use super::hyper::{self, HyperShape, HyperWeights};
-use super::math::expect_len;
 use super::moe::{self, MoeShape, MoeWeights};
 use super::ple::{self, PleShape, PleState, PleWeights};
 use super::qsa::{self, QsaCache, QsaShape, QsaWeights};
 use crate::EngError;
+use crate::family::math::expect_len;
 use crate::family::project::Projector;
 
 /// Checked shapes of every block and the model-level layout.

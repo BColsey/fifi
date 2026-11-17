@@ -7,14 +7,14 @@
 //!
 //! One row only: the MoE block takes `m = 1`, so the plan, the arena and every launch of the step
 //! are made for [`STEP_ROWS`] row.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::sparse_exec::{SparseConfig, SparseExec, SparseGeometry};
 use super::{
     dims::{KvMode, StepDims, StepOptions},
-    layer_table::LayerTable,
-    mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
+    mixer_geometry::{MixerGeometry, check_native_dense},
     mixer_weights::dense_weight,
-    moe::{MoeDims, MoeLayerWeights, StackWeights},
+    moe::{MoeLayerWeights, StackWeights},
     paging_plan::PagingPlan,
     paging_store::device_first::DeviceCachePlan,
     shard::ShardTable,
@@ -23,6 +23,8 @@ use super::{
     step_plan::{KernelScratch, MAX_STEP_ROWS, StepPlan},
     tiered_step::LayerParts,
 };
+use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::{
     EngError,
     family::spec::AttentionKind,
@@ -614,6 +616,8 @@ fn stack_of<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "moe weights: {name} needs EXL3 per-expert dispatch"
         ))),
+        // (Tiled, Native) never reaches here: the first arm already accepted it (the hybrid
+        // seam serves Tiled expert stacks in a Native session).
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("moe weights: {name} is loaded in the other layout than the session"),
         )),

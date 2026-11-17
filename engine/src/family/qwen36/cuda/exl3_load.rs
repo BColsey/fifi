@@ -11,25 +11,27 @@ use std::path::Path;
 
 use super::{
     super::{
-        exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root, inspect_pack, inspect_pack_split},
+        exl3_pack::{inspect_pack_split, inspect_pack_split_visits},
         mtp_pack::inspect_mtp_pack,
     },
     dims::StepDims,
-    exl3_bank::ExpertStore,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
-    exl3_source::{PackReader, attention_weights, delta_weights},
-    layer_table::LayerTable,
+    exl3_source::{attention_weights, delta_weights},
     mixer_geometry::MixerGeometry,
-    moe::MoeDims,
     mtp_load::mtp_weights,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3::layer_table::LayerTable;
+use crate::family::exl3::source::PackReader;
+use crate::family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root};
 use crate::{
     EngError,
     capability::probe::probe_host,
     family::{
         AttentionKind, FamilySpec, QWEN3_6_35B_A3B,
+        exl3::bank::ExpertStore,
         gguf_model::Inventory,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         qwen36::{host::HostShape, settings::ExpertBankSettings},
@@ -61,7 +63,6 @@ pub(super) struct BankedModel {
     /// The model's routed experts per layer (the store holds every one; the banks hold
     /// `slots`).
     pub(super) experts: usize,
-    pub(super) routed_bytes: u64,
     pub(super) dense_bytes: u64,
 }
 
@@ -84,12 +85,18 @@ pub(super) fn load_exl3_banked_dir(
         inventory: &inventory,
     };
     let reader = PackReader::new(projector, &checkpoint, reserve);
-    let split = inspect_pack_split(&checkpoint.source, &shape)?;
-    let dense = split.report.device_bytes.saturating_sub(split.routed_bytes);
+    let (report, visits) = inspect_pack_split_visits(&checkpoint.source, &shape)?;
+    let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     reader.admit(dense)?;
     let layers = LayerTable::new(&dims, &inventory)?.len();
     let mut store = ExpertStore::with_layers(layers);
-    let weights = model_weights_admitted(&reader, &facts, Some((slots, &mut store)))?;
+    let weights = model_weights_admitted(
+        &reader,
+        &facts,
+        &visits,
+        Some((slots, &mut store)),
+        &dir.display().to_string(),
+    )?;
     // The store never changes again: page-lock it so the bank refills DMA without staging.
     // A failed pin is best-effort: refills then copy through pageable staging, and the
     // operator sees it here rather than inferring it from refill timings.
@@ -101,7 +108,6 @@ pub(super) fn load_exl3_banked_dir(
         store,
         slots,
         experts: shape.moe.experts,
-        routed_bytes: split.routed_bytes,
         dense_bytes: dense,
     })
 }
@@ -129,7 +135,7 @@ pub(super) fn load_exl3_dir_decided(
     };
     let checkpoint = Checkpoint::open(dir)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    let split = inspect_pack_split(&checkpoint.source, &shape)?;
+    let report = inspect_pack_split(&checkpoint.source, &shape)?;
     let host_facts = probe_host();
     let host = (
         host_facts.mem_total_bytes.clone(),
@@ -143,14 +149,14 @@ pub(super) fn load_exl3_dir_decided(
         _ => None,
     };
     let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
-    let dense = split.report.device_bytes.saturating_sub(split.routed_bytes);
+    let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     let layers = shape.kinds.len();
     let experts = shape.moe.experts;
     let decision = super::exl3_bank::decide(
         bank.slots,
         bank.mode,
         dense,
-        split.routed_bytes,
+        report.expert_bytes,
         layers,
         experts,
         free,
@@ -201,7 +207,7 @@ pub(super) fn load_exl3_dir_with_head(
         inventory: &inventory,
     };
     let reader = PackReader::new(projector, &checkpoint, reserve);
-    let mut weights = model_weights(&reader, &facts)?;
+    let mut weights = model_weights(&reader, &facts, &dir.display().to_string())?;
     if let Some(head_dir) = head_dir {
         let head = Checkpoint::open(head_dir)?;
         let reader = PackReader::new(projector, &head, reserve).under(Root::Mtp);
@@ -213,8 +219,9 @@ pub(super) fn load_exl3_dir_with_head(
 pub(super) fn load_exl3_model(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    pack: &str,
 ) -> Result<CudaWeights, EngError> {
-    CudaWeights::from_exl3(model_weights(reader, facts)?)
+    CudaWeights::from_exl3(model_weights(reader, facts, pack)?)
 }
 
 /// The MTP head of the pack behind `reader` (which reads the MTP root), under the names of a
@@ -262,12 +269,13 @@ fn mtp_layers(config: &[u8]) -> Result<usize, EngError> {
 fn model_weights(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    pack: &str,
 ) -> Result<Vec<CudaWeight>, EngError> {
     // Every tensor is checked against the model from the headers alone, and the whole load is
     // admitted against the free memory, before the first upload.
-    let report = inspect_pack(&reader.checkpoint.source, &facts.dims.shape)?;
+    let (report, visits) = inspect_pack_split_visits(&reader.checkpoint.source, &facts.dims.shape)?;
     reader.admit(report.device_bytes)?;
-    model_weights_admitted(reader, facts, None)
+    model_weights_admitted(reader, facts, &visits, None, pack)
 }
 
 /// The per-layer loads after admission (the resident arm admitted the whole pack figure, the
@@ -277,7 +285,9 @@ fn model_weights(
 fn model_weights_admitted(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    visits: &[crate::family::exl3_pack::Visit],
     mut banked: Option<(usize, &mut ExpertStore)>,
+    pack: &str,
 ) -> Result<Vec<CudaWeight>, EngError> {
     let model_config = &reader.checkpoint.model_config;
     if model_config.len() as u64 > crate::weights::exl3::CONFIG_LIMIT {
@@ -310,6 +320,7 @@ fn model_weights_admitted(
         }
     }
     weights.extend(global_weights(reader, facts)?);
+    reader.check_coverage(visits, pack)?;
     Ok(weights)
 }
 

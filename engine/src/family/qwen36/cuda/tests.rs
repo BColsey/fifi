@@ -3,10 +3,11 @@
 use super::super::host::HostShape;
 use super::{
     dims::{KvMode, KvRequest, StepDims, StepOptions},
-    state_layout::{KvPool, Plane, StateLayout, Word},
+    state_layout::{KvPool, Plane, StateLayout},
     step_plan::{KernelScratch, MAX_STEP_ROWS, PHASES, Phase, Slot, StepPlan, writes_status},
 };
 use crate::family::project::cuda::WeightLayout;
+use crate::family::state_words::Word;
 use crate::family::{AttentionKind, QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::{ArenaTensor, plan_arena};
 
