@@ -1,15 +1,15 @@
 //! The admission-policy replay over recorded pick traces: three rows over the same
-//! per-layer streams — the sticky row at 60 slots, sticky 36, the same row with the
-//! row with the whole call's picks protected up front (the minimal candidate: an earlier
-//! miss in a call may not evict an expert the same call picks later), and the shared
-//! [`LayerLru`] run per call with the call's own picks as the protected set. Per row and
-//! phase the test reports misses, uploaded bytes (misses times the record bytes env) and
-//! the worst single call, so a real routed trace — not a synthetic stream — decides
-//! whether the candidate closes the item.
+//! per-layer streams — the served row at 60 slots, sticky 36 (whole-call protection:
+//! an earlier miss in a call may not evict an expert the same call picks later), the
+//! prefix rule the bank served before that protection (only the picks already
+//! assigned are protected), and the shared [`LayerLru`] run per call with the call's
+//! own picks as the protected set. Per row and phase the test reports misses, uploaded
+//! bytes (misses times the record bytes env) and the worst single call, so any
+//! recorded trace keeps measuring the landed change against the rule it replaced.
 //!
-//! A child of [`policy`] on purpose: the candidate row mirrors `assign_steps`/`victim`
-//! down to the private fields, and the second test validates the mirror against the
-//! served row on every protection-free call.
+//! A child of [`policy`] on purpose: the old-rule row mirrors the pre-change
+//! `assign_steps`/`victim` down to the private fields, and the second test validates
+//! the mirror against the served row on every call where the two rules coincide.
 //!
 //! Input: `FIFI_EXL3_TRACE_DIR`, a directory of `<run>.prefill` / `<run>.decode` files as
 //! the ignored banked probe dumps them (one `layer pick ...` line per resolve call). The
@@ -137,28 +137,25 @@ fn replay_lru(calls: &[Vec<Call>], experts: usize, slots: usize) -> RowTotals {
     row
 }
 
-/// Row 2, the minimal candidate: the served rule with one change — the victim choice
-/// protects every pick of the call up front, not only the picks already assigned. The
-/// body mirrors `assign_steps`/`victim` line for line (tick stamp, decay, hot set,
-/// empty-first fill, the lowest `last_used` tie, pinning that yields to progress), so the
-/// second test's protection-free validation is a real proof the mirror is faithful.
+/// Row 2, the prefix rule the bank served before the whole-call protection: the
+/// victim choice protects only the picks already assigned (the slots this call took),
+/// so a miss may evict an expert the same call picks later. The body mirrors the
+/// pre-change `assign_steps`/`victim` line for line (tick stamp, decay, hot set,
+/// empty-first fill, the lowest `last_used` tie, pinning that yields to progress), so
+/// the second test's coincidence validation is a real proof the mirror is faithful.
 impl LayerSlots {
-    /// One call through the mirrored rule; returns the misses. Whether a decision
+    /// One call through the mirrored old rule; returns the misses. Whether a decision
     /// actually diverged from the served row is measured outside, by lockstep state
     /// comparison — a filtered victim search can end at the same slot it would have
     /// picked anyway, so eviction counting underreports.
-    fn assign_whole_call(&mut self, picks: &[usize]) -> usize {
-        let mut protected = vec![false; self.experts];
-        for &pick in picks {
-            protected[pick] = true;
-        }
+    fn assign_prefix(&mut self, picks: &[usize]) -> usize {
         let mut scratch = self.clone();
-        let outcome = scratch.assign_steps_protected(picks, &protected);
+        let outcome = scratch.assign_steps_prefix(picks);
         *self = scratch;
         outcome
     }
 
-    fn assign_steps_protected(&mut self, picks: &[usize], protected: &[bool]) -> usize {
+    fn assign_steps_prefix(&mut self, picks: &[usize]) -> usize {
         self.tick += 1;
         if self.tick.is_multiple_of(DECAY_CALLS) {
             self.decay();
@@ -171,7 +168,7 @@ impl LayerSlots {
             }
             let slot = match self.slot_of[expert] {
                 s if (0..self.slots as i32).contains(&s) => s as usize,
-                _ => self.victim_protected(&taken, protected),
+                _ => self.victim_prefix(&taken).expect("the picks fit the slots"),
             };
             if self.slot_of[expert] == NO_SLOT {
                 let evicted = self.expert_of[slot];
@@ -190,44 +187,25 @@ impl LayerSlots {
         misses
     }
 
-    /// `victim` with the call's whole pick set riding the candidate filter: the two hot
-    /// passes skip a slot whose resident expert this call picks, and only when BOTH pass
-    /// empty does the row relax the extra protection — progress first, exactly as the
-    /// hot-pinning already yields.
-    fn victim_protected(&self, taken: &[usize], protected: &[bool]) -> usize {
+    /// The pre-change `victim`: an empty slot first, else the least-recently-used
+    /// untouched slot, cold before hot — no whole-call protection anywhere.
+    fn victim_prefix(&self, taken: &[usize]) -> Option<usize> {
         if let Some(slot) = (0..self.slots).find(|&slot| self.expert_of[slot] == EMPTY) {
-            return slot;
+            return Some(slot);
         }
-        let pass = |hot: bool, protect: bool| {
+        let all = |hot: bool| {
             (0..self.slots)
                 .filter(|&slot| {
-                    let resident = usize::from(self.expert_of[slot]);
-                    !taken.contains(&slot)
-                        && protected[resident] != protect
-                        && self.hot[resident] == hot
+                    !taken.contains(&slot) && self.hot[usize::from(self.expert_of[slot])] == hot
                 })
                 .min_by_key(|&slot| self.last_used[slot])
         };
-        pass(false, true)
-            .or_else(|| pass(true, true))
-            .or_else(|| pass(false, false))
-            .or_else(|| pass(true, false))
-            .unwrap_or_else(|| self.victim_relaxed(taken))
-    }
-
-    /// The last relaxation, shared with the served row's refusal escape: every remaining
-    /// slot holds a pick of this call, so take the least-recently-used slot not taken
-    /// this call — the call's width exceeds what fits, and progress beats protection.
-    fn victim_relaxed(&self, taken: &[usize]) -> usize {
-        (0..self.slots)
-            .filter(|&slot| !taken.contains(&slot))
-            .min_by_key(|&slot| self.last_used[slot])
-            .expect("slots hold the picks of one call")
+        all(false).or_else(|| all(true))
     }
 }
 
 /// Whole-table equality of two rows: every decision-affecting field compared, so a
-/// lockstep replay can name the exact call where the candidate's extra protection first
+/// lockstep replay can name the exact call where the new rule's protection first
 /// changed a decision.
 fn state_eq(a: &LayerSlots, b: &LayerSlots) -> bool {
     a.slot_of == b.slot_of
@@ -238,11 +216,11 @@ fn state_eq(a: &LayerSlots, b: &LayerSlots) -> bool {
         && a.tick == b.tick
 }
 
-/// The candidate row replayed in lockstep with the served row: `(row totals, calls whose
+/// The old rule replayed in lockstep with the served row: `(row totals, calls whose
 /// end state diverged)`. Divergence after a call means the up-front protection changed
-/// at least one decision in it — the candidate working, not the mirror drifting (the
+/// at least one decision in it — the two rules differing, not the mirror drifting (the
 /// second test proves that half).
-fn replay_protected(
+fn replay_prefix(
     calls: &[Vec<Call>],
     experts: usize,
     slots: usize,
@@ -252,17 +230,17 @@ fn replay_protected(
     let mut divergent = 0;
     for layer in calls {
         let mut served = LayerSlots::new(experts, slots, sticky);
-        let mut candidate = LayerSlots::new(experts, slots, sticky);
+        let mut old = LayerSlots::new(experts, slots, sticky);
         for call in layer {
             let (_, served_misses) = served
                 .assign(&call.picks)
                 .unwrap_or_else(|e| panic!("assign: {e:?}"));
-            let candidate_misses = candidate.assign_whole_call(&call.picks);
-            if !state_eq(&served, &candidate) {
+            let old_misses = old.assign_prefix(&call.picks);
+            if !state_eq(&served, &old) {
                 divergent += 1;
             }
             let _ = served_misses; // the served row's own totals come from replay_served
-            row.one_call(candidate_misses);
+            row.one_call(old_misses);
         }
     }
     (row, divergent)
@@ -310,7 +288,7 @@ fn the_three_slot_rows_replay_the_recorded_traces() {
         // degenerate synthetic traces (any real trace has experts far above slots).
         let sticky = sticky.min(experts.saturating_sub(1));
         let served = replay_served(&calls, experts, slots, sticky);
-        let (protected, divergent) = replay_protected(&calls, experts, slots, sticky);
+        let (prefix, divergent) = replay_prefix(&calls, experts, slots, sticky);
         let lru = replay_lru(&calls, experts, slots);
         println!(
             "trace {name}: {} layers, {} calls",
@@ -323,19 +301,20 @@ fn the_three_slot_rows_replay_the_recorded_traces() {
         );
         println!(
             "{}",
-            protected.report("whole-call protected", &name, record_bytes)
+            prefix.report("prefix protected (old rule)", &name, record_bytes)
         );
         println!("{name}: {divergent} calls diverged (a decision changed)");
         println!("{}", lru.report("LayerLru per call", &name, record_bytes));
         assert!(served.misses > 0, "a real trace at these slots misses");
-        assert_eq!(served.calls, protected.calls, "the rows see the same calls");
+        assert_eq!(served.calls, prefix.calls, "the rows see the same calls");
         assert_eq!(served.calls, lru.calls, "the rows see the same calls");
     }
 }
 
-/// The candidate mirror is the served rule whenever its extra protection does not fire:
+/// The old-rule mirror equals the served row whenever the new protection does not fire:
 /// on every call with no protected eviction the two rows must take the same miss count
-/// from the same starting state, or the mirror has drifted from `assign_steps`.
+/// from the same starting state, or the mirror has drifted from the pre-change
+/// `assign_steps`.
 #[test]
 fn the_mirrored_row_equals_the_served_row_on_protection_free_calls() {
     let Some(phases) = phase_files() else {
@@ -360,7 +339,7 @@ fn the_mirrored_row_equals_the_served_row_on_protection_free_calls() {
                 let (_, served_misses) = served
                     .assign(&call.picks)
                     .unwrap_or_else(|e| panic!("assign: {e:?}"));
-                let mirror_misses = mirrored.assign_whole_call(&call.picks);
+                let mirror_misses = mirrored.assign_prefix(&call.picks);
                 if state_eq(&served, &mirrored) {
                     assert_eq!(
                         served_misses.len(),
@@ -370,12 +349,14 @@ fn the_mirrored_row_equals_the_served_row_on_protection_free_calls() {
                     );
                     checked += 1;
                 } else {
-                    // The first divergence is the candidate working: the served row
-                    // evicted an expert this same call picks, so its count can already
-                    // be higher here — that difference is the measurement, not drift.
+                    // The first divergence is the protection working: the old rule
+                    // evicted an expert this same call picks and re-missed it, so the
+                    // mirror's count is the higher one here — that difference is the
+                    // measurement, not drift. Equal counts with different end states
+                    // (same victim count, different victims) also stand.
                     assert!(
-                        mirror_misses <= served_misses.len(),
-                        "layer {} first divergence RAISED the call's misses",
+                        mirror_misses >= served_misses.len(),
+                        "layer {} first divergence LOWERED the call's misses",
                         call.layer
                     );
                     layers_diverged += 1;

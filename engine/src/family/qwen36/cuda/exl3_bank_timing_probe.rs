@@ -209,8 +209,16 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
     if trace_path().is_some() {
         crate::family::exl3::bank::trace::arm();
     }
+    // The literal decode the caller asked for: every greedy id the run emitted, one
+    // per line, so two runs compare by digest (FIFI_EXL3_DECODE_IDS).
+    let mut ids_file = std::env::var_os("FIFI_EXL3_DECODE_IDS")
+        .map(|p| std::fs::File::create(std::path::PathBuf::from(p)).expect("the ids file"));
     for _ in 0..tokens {
         id = step.run_token(id, true).expect("decoded token");
+        if let Some(file) = ids_file.as_mut() {
+            use std::io::Write as _;
+            writeln!(file, "{id}").expect("the ids file writes");
+        }
     }
     let decode_wall = began.elapsed();
     let ((readback_calls, readback_ns), (_resolve_calls, resolve_ns)) =

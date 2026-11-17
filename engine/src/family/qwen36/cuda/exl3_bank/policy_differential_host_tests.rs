@@ -1,11 +1,13 @@
 //! The differential of the two EXL3 slot rows: Qwen3.6's [`LayerSlots`] (sticky 0, the
 //! plain-LRU arm) against the shared [`LayerLru`] that Flint and Flash-Next run, driven
-//! through the same pick streams from equivalent states. The two rows differ in
-//! three decision-affecting ways — per-call tick stamps with a lowest-slot tie against a
-//! per-touch recency list, prefix-of-call protection against whole-pass protection, and
-//! empty-slot-first fill — and this test turns each into a pinned fact, then quantifies
-//! how often a realistic stream diverges. The map is the input to any later decision to
-//! align the rows: until then it proves the two are NOT one rule written twice.
+//! through the same pick streams from equivalent states. The rows once differed in
+//! three decision-affecting ways; the protection scopes are now aligned (both rows
+//! protect the whole call's picks up front — the second test below pins that), so
+//! two remain — per-call tick stamps with a lowest-slot tie against a
+//! per-touch recency list, and empty-slot-first fill — each pinned as a fact, then
+//! quantified by how often a realistic stream diverges. The map is the input to any
+//! later decision to align the rest: until then it proves the two are NOT one rule
+//! written twice.
 //!
 //! Native-cuda gated with its module (the q36 EXL3 bank), so it runs in every container
 //! test battery; the q36 pick golden remains the row's own pinned replay.
@@ -17,9 +19,11 @@ const EXPERTS: usize = 512;
 const SLOTS: usize = 48;
 const CALLS: usize = 200;
 const PICKS: usize = 8;
-/// Measured on this file's first run — see the last test.
+/// Measured runs of this file's stream — see the last test. Before the
+/// whole-call protection the slots row missed 1478; the protection cut it to 1468,
+/// one below the list row's 1469 (the tie rule and empty-first keep the rows apart).
 const LRU_MISSES: usize = 1469;
-const SLOTS_ROW_MISSES: usize = 1478;
+const SLOTS_ROW_MISSES: usize = 1468;
 
 /// The xorshift stream the pick goldens use: `CALLS` calls of `PICKS` distinct experts.
 fn call_picks(seed: u64, call: usize) -> Vec<usize> {
@@ -130,12 +134,12 @@ fn the_tie_rule_diverges_when_a_call_touches_slots_out_of_order() {
 }
 
 #[test]
-fn the_protection_scope_diverges_when_a_miss_precedes_a_resident_pick() {
-    // A call [miss, resident pick] on the coldest slot: LayerLru protects the whole
-    // pass up front, so the miss evicts slot 1 and the resident pick stays a hit — one
-    // miss. LayerSlots protects only the picks assigned so far, so the miss takes the
-    // coldest slot (0, the resident pick's own slot) and the pick then misses again —
-    // two misses, the resident expert moved.
+fn the_protection_scope_is_whole_call_in_both_rows() {
+    // A call [miss, resident pick] on the coldest slot: both rows protect the whole
+    // pass up front, so the miss evicts slot 1 in BOTH rows and the resident pick
+    // stays a hit. Before the scopes were aligned the slots row took the coldest
+    // slot (0, the pick's own slot) and the pick re-missed: two misses, the resident
+    // expert moved.
     let (mut row, mut table) = equivalent_pair();
 
     let lru = step_lru(&mut row, &[100, 0]);
@@ -148,12 +152,11 @@ fn the_protection_scope_diverges_when_a_miss_precedes_a_resident_pick() {
 
     let slots_row = step_slots(&mut table, &[100, 0]);
     assert_eq!(
-        slots_row.misses.len(),
-        2,
-        "the miss evicted expert 0's slot and the pick re-missed: {:?}",
-        slots_row.misses
+        slots_row.misses,
+        vec![(100, 1)],
+        "the call's picks are protected up front, the list row's scope"
     );
-    assert_ne!(table.slot_row()[0], 0, "expert 0 left its own slot");
+    assert_eq!(table.slot_row()[0], 0, "expert 0 keeps its own slot");
 }
 
 #[test]

@@ -484,13 +484,26 @@ impl LayerSlots {
         // clone (the table is KiBs — noise next to the three record copies one miss
         // issues) and only lands on Ok, so a mid-stream refusal leaves the live table
         // exactly as the call found it.
+        // The whole call's picks ride the pass as a protected set: an earlier miss may
+        // not evict an expert this same call picks later. A pick beyond the expert
+        // count stays unmarked here and refuses in `assign_steps`, as before.
+        let mut protected = vec![false; self.experts];
+        for &expert in picks {
+            if expert < self.experts {
+                protected[expert] = true;
+            }
+        }
         let mut scratch = self.clone();
-        let outcome = scratch.assign_steps(picks)?;
+        let outcome = scratch.assign_steps(picks, &protected)?;
         *self = scratch;
         Ok(outcome)
     }
 
-    fn assign_steps(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
+    fn assign_steps(
+        &mut self,
+        picks: &[usize],
+        protected: &[bool],
+    ) -> Result<(Vec<usize>, Vec<usize>), EngError> {
         self.tick += 1;
         if self.tick.is_multiple_of(DECAY_CALLS) {
             self.decay();
@@ -509,7 +522,7 @@ impl LayerSlots {
             }
             let slot = match self.slot_of[expert] {
                 s if (0..self.slots as i32).contains(&s) => s as usize,
-                _ => self.victim(&slots)?,
+                _ => self.victim(&slots, protected)?,
             };
             let miss = self.slot_of[expert] == NO_SLOT;
             if miss {
@@ -533,28 +546,44 @@ impl LayerSlots {
         Ok((slots, misses))
     }
 
-    /// The next slot for a miss: an empty one, else the least-recently-used slot no pick of
-    /// this call took. A slot holding a hot (sticky) expert is skipped unless every
-    /// untouched slot is hot — pinning yields to progress, never to a refusal.
-    fn victim(&self, taken: &[usize]) -> Result<usize, EngError> {
+    /// The next slot for a miss: an empty one, else the least-recently-used slot no pick
+    /// of this call took. Within that, a slot whose resident expert this call picks is
+    /// evicted only as a last resort — the passes try cold-then-hot among experts the
+    /// call does NOT pick first, so a miss late in the call cannot evict a pick early in
+    /// it. Protection outranks the sticky set: a hot expert the call does not pick is
+    /// evicted before a cold expert it does. Both yield to progress — a hot sticky
+    /// slot is taken when every untouched slot is hot, a protected slot when every
+    /// untouched slot holds a pick of the call — never to a refusal.
+    fn victim(&self, taken: &[usize], protected: &[bool]) -> Result<usize, EngError> {
         if let Some(slot) = (0..self.slots).find(|&slot| self.expert_of[slot] == EMPTY) {
             return Ok(slot);
         }
-        let all = |hot: bool| {
+        // `evict_pick` orders the passes: unprotected residents first (cold, then hot),
+        // the call's own picks only when nothing else is left. The last two passes
+        // together cover every untouched slot, so the refusal below fires exactly when
+        // the call is wider than the table — as before the protection existed.
+        let pass = |hot: bool, evict_pick: bool| {
             (0..self.slots)
                 .filter(|&slot| {
-                    !taken.contains(&slot) && self.hot[usize::from(self.expert_of[slot])] == hot
+                    let resident = usize::from(self.expert_of[slot]);
+                    !taken.contains(&slot)
+                        && protected[resident] == evict_pick
+                        && self.hot[resident] == hot
                 })
                 .min_by_key(|&slot| self.last_used[slot])
         };
-        all(false).or_else(|| all(true)).ok_or_else(|| {
-            EngError::BadRequest(format!(
-                "EXL3 expert bank: {} slots cannot hold the {} picks of one call \
+        pass(false, false)
+            .or_else(|| pass(true, false))
+            .or_else(|| pass(false, true))
+            .or_else(|| pass(true, true))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "EXL3 expert bank: {} slots cannot hold the {} picks of one call \
                      (a decode token, or a prefill sub-block's rows together)",
-                self.slots,
-                taken.len() + 1
-            ))
-        })
+                    self.slots,
+                    taken.len() + 1
+                ))
+            })
     }
 
     /// The expert a slot holds (for the store read of a miss copy).
@@ -727,6 +756,33 @@ mod tests {
         assert!(error.contains("cannot hold"), "{error}");
     }
 
+    /// A miss earlier in a call may not evict an expert the same call picks later,
+    /// and a refusal leaves the table exactly as the call found it.
+    #[test]
+    fn a_miss_does_not_evict_a_later_pick_of_the_same_call() {
+        let mut table = LayerSlots::new(64, 4, 0);
+        table.assign(&[0, 1, 2, 3]).expect("the fill");
+        table
+            .assign(&[1])
+            .expect("touch 1, so slot 0 is the coldest");
+        // The call misses on 50 and picks resident 0 after: without the whole-call
+        // protection the miss takes the coldest slot (0, the pick's own) and the pick
+        // re-misses. With it, the miss takes an unprotected slot and the pick keeps
+        // its own.
+        let (slots, misses) = table.assign(&[50, 0]).expect("the picks fit the slots");
+        assert_eq!(misses.len(), 1, "only the miss on 50");
+        assert_eq!(slots[1], 0, "the resident pick kept slot 0");
+        assert_eq!(table.expert_in_slot(0), Some(0), "expert 0 keeps its slot");
+        // A call wider than the table refuses, and the refusal changes nothing: the
+        // pass runs on a scratch clone that only lands on Ok, so the whole table
+        // (slots, residents, tick, counts, hot flags) compares equal, not just the
+        // slot row.
+        let before = table.clone();
+        let error = format!("{:?}", table.assign(&[60, 61, 62, 63, 58]).unwrap_err());
+        assert!(error.contains("cannot hold"), "{error}");
+        assert_eq!(table, before, "the refusal changed nothing");
+    }
+
     /// A pick outside the layer's experts is refused by name.
     #[test]
     fn slot_table_refuses_out_of_range_picks() {
@@ -739,8 +795,11 @@ mod tests {
     const SLOTS: usize = 48;
     const PICKS: usize = 10;
     const CALLS: usize = 200;
-    const PLAIN_MISSES: usize = 1790;
-    const STICKY_MISSES: usize = 1779;
+    // Pinned totals for this fixed stream. Before the whole-call protection the arms
+    // missed 1790 (plain) and 1779 (sticky=8); the protection cut them to 1779 and 1764
+    // -- an earlier miss can no longer evict an expert the same call picks later.
+    const PLAIN_MISSES: usize = 1779;
+    const STICKY_MISSES: usize = 1764;
 
     /// The pick stream: the xorshift64 generator the bank pick-replay goldens use, with
     /// this test's own seed, mapped per call to router faults (-1) and in-range experts,
@@ -811,7 +870,8 @@ mod tests {
         // Pinned totals for this fixed stream: both arms miss (the route is wider than
         // the 48 slots), the sticky arm misses strictly less (the stream's extra weight on
         // experts 0..9 is exactly the hot set sticky=8 protects across the decays at
-        // ticks 64/128/192), and both replays are deterministic.
+        // ticks 64/128/192, on top of the whole-call protection both arms now carry),
+        // and both replays are deterministic.
         assert_eq!(plain, PLAIN_MISSES);
         assert_eq!(sticky, STICKY_MISSES);
         assert!(plain > 0);

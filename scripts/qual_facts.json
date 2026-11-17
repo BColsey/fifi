@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6943,
+      "test_fns": 6944,
       "ignored": 620,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -45,6 +45,7 @@
         "FIFI_D1_VERIFY",
         "FIFI_DELTA_TRACE",
         "FIFI_EXL3_CHECKPOINT",
+        "FIFI_EXL3_DECODE_IDS",
         "FIFI_EXL3_EXPECT_BYTES",
         "FIFI_EXL3_GREEDY_IDS",
         "FIFI_EXL3_GROUP_SPLIT",
