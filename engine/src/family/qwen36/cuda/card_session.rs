@@ -620,6 +620,9 @@ impl TokenStepper for CardSession {
         self.fed = 0;
         self.poisoned = false;
         self.full_params_next = false;
+        if let Some(chunk) = &self.chunk {
+            chunk.invalidate_staging();
+        }
         Ok(())
     }
 }
@@ -720,6 +723,9 @@ impl ExecutorOps for CardSession {
             }
             self.fed = tokens;
             self.full_params_next = true;
+            if let Some(chunk) = self.chunk.as_ref() {
+                chunk.invalidate_staging();
+            }
             Ok(())
         });
         self.prefix = slot;

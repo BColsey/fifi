@@ -50,7 +50,9 @@ use crate::{
     EngError,
     family::qwen36::host::MoeDims as HostMoeDims,
     kernels::cuda::peer_ring::{MAX_VALUES, RingMode},
-    kernels::cuda::{NativeWeight, plan_arena, prefill::attn_prefill::CPF_ATTN_PART_CAP},
+    kernels::cuda::{
+        DeviceBuffer, NativeWeight, plan_arena, prefill::attn_prefill::CPF_ATTN_PART_CAP,
+    },
 };
 
 /// The largest chunk rows the driver accepts for this shape: every layer
@@ -140,6 +142,36 @@ struct CardChunkCard {
     arena: PrefillArena,
     model: ChunkModel<'static, 'static>,
     moe: &'static [MoeLayerWeights<'static>],
+    /// Per-LAYER persistent fp16 staging (one buffer per full-attention
+    /// layer: its own K|V planes), filled incrementally across the chunks
+    /// of one prefill job. `None` without Q36_P2P_CHUNK_STAGED: the
+    /// arena's shared staging with its whole-prefix re-dequant runs instead.
+    layer_staging: Option<LayerStaging>,
+}
+
+/// Persistent staging of one card: per-layer plane pairs plus each layer's
+/// filled-through watermark. `Cell` so invalidation and watermark notes
+/// need only a shared borrow.
+struct LayerStaging {
+    capacity: usize,
+    planes: Vec<DeviceBuffer>,
+    /// usize::MAX = invalid (reset or prefix import); fill [0, end) then.
+    through: Vec<std::cell::Cell<usize>>,
+}
+
+impl LayerStaging {
+    fn through(&self, ord: usize) -> Option<usize> {
+        let v = self.through[ord].get();
+        (v != usize::MAX).then_some(v)
+    }
+    fn note(&self, ord: usize, end: usize) {
+        self.through[ord].set(end)
+    }
+    fn invalidate(&self) {
+        for t in &self.through {
+            t.set(usize::MAX)
+        }
+    }
 }
 
 /// The session's chunk resources, built once at start.
@@ -299,6 +331,7 @@ pub(super) fn build_card_chunk_with_stage_rows(
             arena,
             model,
             moe: moe_card,
+            layer_staging: None,
         });
     }
 
@@ -348,6 +381,38 @@ pub(super) fn build_card_chunk_with_stage_rows(
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+    // Admit optional persistent copies only after every card's shared staging
+    // has been built. This also respects the floor when cards share a device.
+    if std::env::var_os("Q36_P2P_CHUNK_STAGED").is_some_and(|v| v == "1") {
+        let layers = dims
+            .shape
+            .kinds
+            .iter()
+            .filter(|kind| **kind == crate::family::AttentionKind::Full)
+            .count();
+        for (card, chunk_card) in out.iter_mut().enumerate() {
+            let Some(stage) = chunk_card.arena.kv8_staging()? else {
+                continue;
+            };
+            let plan = stage.plan;
+            let context = &stack.contexts()[card];
+            let floor = super::pinned::min_free_after_load()?;
+            let budget = chunk_budget(context.memory_info()?.free, 0, floor)?;
+            let needed = layer_staging_bytes(plan.bytes, layers)?;
+            if layers == 0 || needed > budget {
+                continue;
+            }
+            let planes = (0..layers)
+                .map(|_| context.allocate(plan.bytes))
+                .collect::<Result<Vec<_>, _>>()?;
+            chunk_budget(context.memory_info()?.free, 0, floor)?;
+            chunk_card.layer_staging = Some(LayerStaging {
+                capacity: plan.capacity,
+                planes,
+                through: vec![std::cell::Cell::new(usize::MAX); layers],
+            });
         }
     }
     Ok(CardChunk {
@@ -627,7 +692,7 @@ fn run_card_chunk_layer(
                         Stage::SsmOut => ssm_out(&runs[card], &ctx)?,
                         Stage::AttnProj => attn_proj(&runs[card], &ctx)?,
                         Stage::Prep => attn_prep(&runs[card], &ctx)?,
-                        Stage::Flash => attn_flash(&runs[card], &ctx)?,
+                        Stage::Flash => flash_stage(drive, card, &ctx)?,
                         Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
                         Stage::AttnOut => attn_out(&runs[card], &ctx)?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
@@ -640,6 +705,107 @@ fn run_card_chunk_layer(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Stage 6 with persistent per-layer staging: dequant only the rows the
+/// previous chunks of this job have not staged yet, then run the fp16
+/// flash over the layer's planes. Beyond the staging capacity (or without
+/// per-layer buffers) the legacy `attn_flash` runs instead.
+fn flash_stage(
+    drive: &LayerDrive<'_, '_, '_, '_>,
+    card: usize,
+    ctx: &super::prefill::LayerCtx<'_, '_>,
+) -> Result<(), EngError> {
+    let run = &drive.runs[card];
+    let end = run.rows_end();
+    let Some(staging) = drive.chunk.cards[card].layer_staging.as_ref() else {
+        return attn_flash(run, ctx);
+    };
+    if end > staging.capacity {
+        return attn_flash(run, ctx);
+    }
+    let ordinal = ctx.ord;
+    let start = staging_refill_start(staging.through(ordinal), run.rows_start());
+    if start < end {
+        stage_new_rows(run, ctx, staging, ordinal, start, end)?;
+    }
+    let planes = staging_plane_ranges(staging, ordinal)?;
+    super::prefill::attn_flash_fp16(run, ctx, staging.capacity, planes)?;
+    staging.note(ordinal, end);
+    Ok(())
+}
+
+fn layer_staging_bytes(plane_pair: usize, layers: usize) -> Result<usize, EngError> {
+    plane_pair
+        .checked_mul(layers)
+        .ok_or_else(|| EngError::MemoryPlan("card chunk: layer staging size overflow".into()))
+}
+
+fn staging_refill_start(through: Option<usize>, chunk_start: usize) -> usize {
+    through.filter(|filled| *filled <= chunk_start).unwrap_or(0)
+}
+
+fn staging_plane_ranges<'s>(
+    staging: &'s LayerStaging,
+    ordinal: usize,
+) -> Result<[crate::kernels::cuda::DeviceRange<'s>; 2], EngError> {
+    let buffer = staging
+        .planes
+        .get(ordinal)
+        .ok_or_else(|| EngError::BadRequest("card chunk: staging layer is out of range".into()))?;
+    let half = buffer.bytes() / 2;
+    Ok([buffer.range(0, half)?, buffer.range(half, half)?])
+}
+
+/// Dequants cache rows [start, end) into the layer's planes AT THE ROW
+/// OFFSET. kv8_dequant_segment's origin shifts only the SOURCE read; its
+/// OUT always writes [0, rows), so the OUT range is sliced to start at
+/// the `start` plane row. A whole-prefix refill when the watermark is
+/// invalid.
+fn stage_new_rows(
+    run: &ChunkRun<'_, '_>,
+    ctx: &super::prefill::LayerCtx<'_, '_>,
+    staging: &LayerStaging,
+    ordinal: usize,
+    start: usize,
+    end: usize,
+) -> Result<(), EngError> {
+    let a = run.card_attn_geom();
+    let planes = staging_plane_ranges(staging, ordinal)?;
+    let rows = end - start;
+    let row_bytes = planes[0].bytes() / staging.capacity;
+    for (codes, scales, out) in [
+        (
+            super::state_layout::Plane::K,
+            super::state_layout::Plane::KScales,
+            planes[0],
+        ),
+        (
+            super::state_layout::Plane::V,
+            super::state_layout::Plane::VScales,
+            planes[1],
+        ),
+    ] {
+        let out = out
+            .buffer()
+            .range(out.offset() + start * row_bytes, rows * row_bytes)?;
+        ctx.launch.ctx.kv8_dequant_segment(
+            ctx.launch.stream,
+            crate::kernels::cuda::prefill::kv8_dequant::Kv8DequantCall {
+                shape: crate::kernels::cuda::prefill::kv8_dequant::Kv8DequantShape {
+                    capacity: run.run_kv_capacity(),
+                    rows,
+                    n_kv_head: a.heads_kv,
+                    head_dim: a.head_dim,
+                },
+                codes: run.run_kv_plane(ctx.ord, codes)?,
+                scales: run.run_kv_plane(ctx.ord, scales)?,
+                out,
+            },
+            start,
+        )?;
     }
     Ok(())
 }
@@ -775,5 +941,42 @@ mod config_tests {
         );
         assert!(card_staging_plan(KvMode::Int8G32, 1, 2, 256, floor - 1, floor).is_err());
         assert!(card_staging_plan(KvMode::Int8G32, usize::MAX, 2, 256, usize::MAX, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod incremental_staging_tests {
+    use super::*;
+
+    #[test]
+    fn admission_counts_every_layer_and_checks_overflow() {
+        assert_eq!(layer_staging_bytes(1024, 8).unwrap(), 8192);
+        assert_eq!(layer_staging_bytes(1024, 0).unwrap(), 0);
+        assert!(layer_staging_bytes(usize::MAX, 2).is_err());
+        assert!(chunk_budget(9000, layer_staging_bytes(1024, 8).unwrap(), 1000).is_err());
+    }
+
+    #[test]
+    fn refill_handles_continuation_gaps_and_rewinds() {
+        assert_eq!(staging_refill_start(None, 512), 0);
+        assert_eq!(staging_refill_start(Some(512), 512), 512);
+        assert_eq!(staging_refill_start(Some(256), 512), 256);
+        assert_eq!(staging_refill_start(Some(768), 512), 0);
+    }
+
+    #[test]
+    fn reset_invalidates_every_layer_watermark() {
+        let stage = LayerStaging {
+            capacity: 1024,
+            planes: vec![],
+            through: vec![std::cell::Cell::new(usize::MAX); 2],
+        };
+        assert_eq!(stage.through(0), None);
+        stage.note(0, 512);
+        stage.note(1, 256);
+        assert_eq!(stage.through(0), Some(512));
+        stage.invalidate();
+        assert_eq!(stage.through(0), None);
+        assert_eq!(stage.through(1), None);
     }
 }
