@@ -899,3 +899,32 @@ fn the_k_row_graphs_are_declared_before_the_buffers_they_bake_in() {
         "the K-row graphs sit next to the one-row graph, after it"
     );
 }
+
+/// The one-row graph's drop-order cover: `graph` bakes in the state's and the
+/// rollback slots' addresses without pinning them, so it must be declared
+/// before both and drop first (the K-row order above is the same argument).
+#[test]
+fn the_step_graph_is_declared_before_the_state_and_rollback_slots() {
+    let source = include_str!("step.rs");
+    let start = source
+        .find("pub(crate) struct QwenResidentStep<'a> {")
+        .expect("the step struct");
+    let end = start
+        + source[start..]
+            .find("\n}\n")
+            .expect("the end of the struct");
+    let fields = &source[start..end];
+    let declared = |name: &str| -> usize {
+        let needle = format!("\n    {name}: ");
+        fields
+            .find(&needle)
+            .unwrap_or_else(|| panic!("the field {name:?} is not declared in the step struct"))
+    };
+    let graph = declared("graph");
+    for later in ["state", "rollback", "context", "stream"] {
+        assert!(
+            graph < declared(later),
+            "the one-row graph must be declared before {later}: it drops first"
+        );
+    }
+}
