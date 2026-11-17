@@ -149,7 +149,7 @@ if [[ $mac == auto ]]; then
     fi
 fi
 
-arms=(fmt host-clippy host-lib published-text qual qual-validate ctr-clippy ctr-tests ctr-lib-run)
+arms=(fmt dead-test-scan host-clippy host-lib published-text qual qual-validate ctr-clippy ctr-tests ctr-lib-run)
 [[ $mac == never ]] || arms+=(mac-clippy)
 
 if $list_only; then
@@ -381,6 +381,7 @@ if [[ $mac != never ]]; then
 fi
 
 run_arm fmt cargo fmt --all --check || fail_now fmt fmt
+run_arm dead-test-scan python3 "$run/src/scripts/dead_test_scan.py" || fail_now dead-test-scan dead-test-scan
 run_arm host-clippy cargo clippy --locked --all-targets -- -D warnings || fail_now host-clippy host-clippy
 run_arm host-lib cargo test --locked --lib || fail_now host-lib host-lib
 run_arm published-text cargo test --locked --test published_text || fail_now published-text published-text
