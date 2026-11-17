@@ -1,0 +1,26 @@
+# First sanitizer table: device kernels the CUDA best-practices work named as
+# the starting set, plus the two alloc-cache lifetime tests and the whole-model
+# card-token rigs.
+# Run: scripts/sanitizer_run.sh scripts/sanitizer_tests.txt [memcheck synccheck]
+# Format: ENV|STATE|NAME  (see sanitizer_run.sh header).
+|run|mmq_dense_memcheck_shapes_run_inside_their_buffers
+# gdn scan columns: the kernel-launching device tests (the parse/arithmetic
+# host tests of the same kernels prove nothing under a sanitizer).
+|run|the_narrow_block_scan_writes_the_bytes_of_the_original
+|run|the_switch_routes_only_long_scans_to_the_narrow_block_kernel
+# gdn conv prefill: same choice, device tests over host-only routing tests.
+|run|the_prefill_kernel_writes_the_bytes_of_the_original
+|run|the_switch_routes_only_long_launches_to_the_prefill_kernel
+# alloc-cache lifetimes.
+|run|dropping_a_buffer_with_a_copy_in_flight_is_clean
+|run|lazy_return_skips_the_synchronize_on_one_stream_and_settles_before_a_host_write
+# whole-model card-token rigs (file-level tests, no ::tests module); two long
+# rigs - check their wall time against SANITIZER_LEG_SEC at the first run.
+|run-match|card_token_device_tests::a_whole_token
+# Flint decode step under memcheck: pick the exact decode-step test names from
+# the --list at the first run and move them to run lines.
+FIFI_FLINT_CUDA_ALLOC_CACHE=0|skip:pick the exact Flint decode-step test names from --list at the first run
+# The cache-on leg needs the debug poison fill so initcheck can see fresh
+# writes in recycled blocks (initcheck counts a recycled block as already
+# written); flip to run once the poison switch is on main.
+FIFI_FLINT_CUDA_ALLOC_CACHE=1,FIFI_CUDA_POISON_ALLOC=1|skip:until the poison switch lands on main; initcheck counts a recycled block as written, so the cache-on leg needs the poison
