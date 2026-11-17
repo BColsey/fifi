@@ -781,6 +781,17 @@ fn a_wrong_header_hash_is_refused() {
     assert!(error.to_lowercase().contains("sha256"), "{error}");
 }
 
+/// The fork's frozen 42-token prompt (fixture-run1.log), the exact input the
+/// `fixtures1` dumps were produced from.
+const FIXTURE1_TOKENS: [u32; 42] = [
+    166863, 54935, 7821, 44, 11456, 189096, 257706, 142907, 189286, 9305, 39154, 166294, 107408,
+    51684, 46, 224037, 18624, 166295, 11234, 166471, 167757, 142907, 22233, 5407, 5066, 46, 254733,
+    27335, 44, 4565, 46, 124319, 156431, 44, 235664, 73629, 177858, 9678, 444, 2452, 44, 3248,
+];
+
+/// The fork's top-3 final logits over the same prompt (fixtures1.top20).
+const FIXTURE1_TOP3: [(u32, f32); 3] = [(44, 21.714_62), (58, 19.871_094), (369, 19.577_736)];
+
 /// Reads a fixture file as little-endian f32 in ggml linear order.
 fn read_fixture_f32(path: &std::path::Path) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -789,6 +800,532 @@ fn read_fixture_f32(path: &std::path::Path) -> Vec<f32> {
         .chunks_exact(bytewidth)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Fixture provenance. The dumps came from the KRAFTON fork at commit
+/// `fb895662`, its `examples/eval-callback` with the additive dump patch
+/// (RAON_DUMP_DIR / RAON_DUMP_FILTER), run over the frozen 42-token prompt.
+/// The fork commit is printed with the run.
+const FIXTURE1_FORK_COMMIT: &str = "fb895662";
+
+/// Reads the fixture env pair in one go: both unset skips the test; a
+/// half-set pair fails loudly instead of silently skipping.
+fn fixture_env() -> Option<(String, String)> {
+    let model = std::env::var("RAON_Q4_KM");
+    let fixtures = std::env::var("RAON_FIXTURES1");
+    match (model, fixtures) {
+        (Ok(m), Ok(f)) => Some((m, f)),
+        (Err(_), Err(_)) => {
+            eprintln!("skipped: RAON_Q4_KM and RAON_FIXTURES1 are unset");
+            None
+        }
+        (m, f) => panic!(
+            "fixture pair half-set: RAON_Q4_KM={m:?} RAON_FIXTURES1={f:?} \
+             (both are needed to run the fixture tests)"
+        ),
+    }
+}
+
+/// The fork's own top-k selection, extracted from its biased-score dump by
+/// the same descending, ties-to-lower-index rule the reference uses.
+fn fork_selection(sel: &[f32], ne: usize, nt: usize, nu: usize) -> Vec<u8> {
+    let mut ids = vec![0u8; nu * nt];
+    for t in 0..nt {
+        let mut idx: Vec<usize> = (0..ne).collect();
+        idx.sort_by(|&a, &b| sel[b + t * ne].total_cmp(&sel[a + t * ne]));
+        for (slot, &e) in idx.iter().enumerate().take(nu) {
+            ids[slot + t * nu] = u8::try_from(e).expect("expert id fits u8");
+        }
+    }
+    ids
+}
+
+/// The stages whose values are bounded near 1 (sigmoid/softmax outputs,
+/// normalized routing weights, helmert comb entries, the per-head beta).
+fn is_bound1(base: &str) -> bool {
+    matches!(
+        base,
+        "hc_pre"
+            | "hc_post"
+            | "hc_comb"
+            | "ffn_moe_probs"
+            | "ffn_moe_probs_biased"
+            | "ffn_moe_weights"
+            | "ffn_moe_weights_norm"
+            | "ffn_moe_weights_sum"
+            | "ffn_moe_weights_sum_clamped"
+            | "rda_beta"
+    )
+}
+
+/// Tolerance for the UNFORCED whole-graph pass (stage A), as a fraction of
+/// the stage's value range. The reference's own layer outputs feed the next
+/// layer, so the fork-vs-reference f32/f64 accumulation difference rides the
+/// fold amplification chain: measured worst 1.8e-2 of range (rda_g1-2) in
+/// the pre-flip region, 1.2e-2 absolute on routing weights (layer 4). The
+/// chain table sits above that; the tight value oracle for every layer is
+/// stage B's `oracle_tolerance`.
+fn chain_tolerance(base: &str) -> f32 {
+    if is_bound1(base) { 3e-2 } else { 5e-2 }
+}
+
+/// Tolerance for the TEACHER-FORCED pass (stage B), ~10x above the worst
+/// measured diff/range per class over all of fixtures1 (the `measure ...`
+/// lines print when the test runs with the env pair set):
+/// - bound-1 stages: worst 2.7e-4 of range (rda_beta); the class is 37x
+///   above it and still <= ~1e-2 absolute, tight enough that a wrong
+///   constant or a gamma/rho slip in the mHC fold fails.
+/// - everything else: worst 6.3e-3 of range (ffn_moe_out); the class is 8x
+///   above it. A wrong formula moves O(range).
+fn oracle_tolerance(base: &str) -> f32 {
+    if is_bound1(base) { 1e-2 } else { 5e-2 }
+}
+
+/// One teacher-forced stage compare: positional, finite, per-class tolerance.
+fn compare_stage(where_: &str, name: &str, mine: &[f32], fork: &[f32]) {
+    assert_eq!(mine.len(), fork.len(), "{where_} {name}: lengths differ");
+    assert!(
+        mine.iter().all(|v| v.is_finite()),
+        "{where_} {name}: reference produced non-finite values"
+    );
+    let mut worst = 0.0f32;
+    let mut worst_at = 0usize;
+    for (i, (&a, &b)) in mine.iter().zip(fork.iter()).enumerate() {
+        let diff = (a - b).abs();
+        if diff > worst {
+            worst = diff;
+            worst_at = i;
+        }
+    }
+    let range = fork.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
+    let base = name.rsplit_once('-').map_or(name, |(b, _)| b);
+    let tol = oracle_tolerance(base) * range;
+    eprintln!(
+        "measure {where_} {name}: worst/range {:+.3e} (tol {:.0e})",
+        worst / range,
+        tol
+    );
+    if std::env::var("RAON_MEASURE").is_ok() {
+        return;
+    }
+    assert!(
+        worst <= tol,
+        "{where_} stage {name} diverged: abs diff {worst:.3e} vs tol {tol:.3e} \
+         at [{worst_at}] (reference {}, fork {})",
+        mine[worst_at],
+        fork[worst_at],
+    );
+}
+
+/// The published Q4_K_M file against the fork's frozen fixtures1 stage dumps,
+/// in two stages.
+///
+/// Stage A runs the whole graph unforced: it pins the embedding, layer 0
+/// completely, and layer 1 up to the known top-k boundary flip (t=35,
+/// experts 73/124, selection gap 1.2e-3); after the flip the rest is
+/// structure-only (names, lengths, finiteness).
+///
+/// Stage B teacher-forces: every layer runs from the fork's own boundary
+/// dumps (`l_out-{n-1}` / `hc_attn_out-{n}`), and each MoE layer's top-k is
+/// forced to the fork's own selection, so nothing can cascade and EVERY
+/// layer — all seven MLA layers included — plus the output head is
+/// value-compared. Skipped when RAON_Q4_KM or RAON_FIXTURES1 is unset.
+#[test]
+fn the_host_reference_matches_the_fork_fixtures() {
+    let Some((model_path, fixtures)) = fixture_env() else {
+        return;
+    };
+    eprintln!("fixtures1 provenance: fork commit {FIXTURE1_FORK_COMMIT}");
+    const HEADER_SHA: &str = "b8e287e3eae14db453bf8f13addace471cc2472324021369cd809dcac6cf9f17";
+    let model = open_raon_1_mini_preview(std::path::Path::new(&model_path), Some(HEADER_SHA))
+        .unwrap_or_else(|error| panic!("the published file must open: {error:?}"));
+
+    // The semantic fixture sequence: every dump except pure view/reshape nodes,
+    // in manifest (graph) order.
+    let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&fixtures)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixtures))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            if !name.ends_with(".f32") || name.contains("(view)") || name.contains("(reshaped)") {
+                return None;
+            }
+            let number: u64 = name.split('-').next()?.parse().ok()?;
+            Some((number, path))
+        })
+        .collect();
+    files.sort_by_key(|(number, _)| *number);
+    assert_eq!(files.len(), 877, "the semantic fixture count is pinned");
+
+    let mut emitted: Vec<(String, Vec<f32>)> = Vec::new();
+    // Set once the first top-k boundary flip is excused: after it, the flip's
+    // moe_out perturbation (~0.15 of range) spreads through attention into
+    // every later stage, so detailed parity degrades to a coarse sanity bar.
+    // The flip evidence itself (five of six expert columns matching exactly)
+    // is what pins the formulas; the cascade is chaotic, not wrong.
+    let mut cascade = false;
+    reference::forward(&model, &FIXTURE1_TOKENS, &mut |name, data| {
+        emitted.push((name.to_owned(), data.to_vec()))
+    })
+    .unwrap_or_else(|error| panic!("the reference must run: {error:?}"));
+    assert_eq!(emitted.len(), files.len(), "stage counts must agree");
+
+    for (idx, ((name, mine), (_, path))) in emitted.iter().zip(files.iter()).enumerate() {
+        let fixture_name = path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+            .trim_end_matches(".f32")
+            .to_owned();
+        assert_eq!(
+            name, &fixture_name,
+            "stage {idx}: name order diverged from the fork graph"
+        );
+        let fork = read_fixture_f32(path);
+        assert_eq!(mine.len(), fork.len(), "stage {name}: lengths differ");
+        // Once a selection flip cascaded, the fixture stream is no longer
+        // reproducible by an independent-precision implementation: the flip's
+        // ~0.15 moe_out perturbation rides the 260x fold amplification and
+        // eventually overflows the scan's f32-representable envelope. Later
+        // stages pin structure only (the name/length asserts above); the
+        // engine's own Raon-1 implementation validates against this reference
+        // directly, where the reference's own selections are consistent and
+        // the stream stays finite.
+        if cascade {
+            continue;
+        }
+        assert!(
+            mine.iter().all(|v| v.is_finite()),
+            "stage {name}: reference produced non-finite values"
+        );
+        // The reference's dots accumulate F64 where the fork accumulates
+        // F32, so per-stage diffs are that accumulation noise; cancellation-
+        // heavy fold chains amplify it (see `chain_tolerance`). A wrong
+        // formula moves values by O(range); noise does not.
+        let range = fork.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
+        let base = name.rsplit_once('-').map_or(&name[..], |(b, _)| b);
+        let tol = chain_tolerance(base) * range;
+        // Slot-ordered MoE dumps pair each token's six expert columns with the
+        // top-k ORDER, and that order is chaotic at near-ties: the fork ranks
+        // on its own F32 logits, the oracle on F64 ones, and selection gaps
+        // as small as 1.2e-3 (layer 1, t=35, experts 73/124) flip slot pairs
+        // while the emitted weights and the order-independent moe_out stay
+        // within tolerance. Those stages compare per token after greedy slot
+        // matching instead of positionally.
+        let base: &str = name.rsplit_once('-').map_or(name, |(b, _)| b);
+        // Selection-dependent stages: the routing weights and normalized
+        // forms are 6-wide per token (the greedy matching below treats them
+        // as feat=1 vectors), the sums are one value per token (a 1-wide
+        // frame), and the per-expert slot dumps are feat-wide. All depend on
+        // the biased top-k SET, chaotic at near-ties (the fork ranks on its
+        // f32 scores, this reference on f64 ones); over-tolerance tokens are
+        // suspects excused only via the moe_out verification below.
+        let selection_dependent = matches!(
+            base,
+            "ffn_moe_weights"
+                | "ffn_moe_weights_norm"
+                | "ffn_moe_weights_sum"
+                | "ffn_moe_weights_sum_clamped"
+                | "ffn_moe_gate"
+                | "ffn_moe_up"
+                | "ffn_moe_situ"
+                | "ffn_moe_down"
+                | "ffn_moe_weighted"
+        );
+        let mut worst = 0.0f32;
+        let mut worst_at = 0usize;
+        // (stage name, token, per-token matched cost) for tokens whose match
+        // exceeds tolerance: boundary flips of the top-k SET.
+        let mut suspects: Vec<(&str, usize, f32)> = Vec::new();
+        if selection_dependent {
+            const NT: usize = 42;
+            let nu = if matches!(base, "ffn_moe_weights_sum" | "ffn_moe_weights_sum_clamped") {
+                1
+            } else {
+                6
+            };
+            let feat = fork.len() / (nu * NT);
+            assert_eq!(fork.len(), feat * nu * NT, "stage {name} layout");
+            for t in 0..NT {
+                let mut pairs: Vec<(f32, usize, usize)> = Vec::with_capacity(nu * nu);
+                for i in 0..nu {
+                    for j in 0..nu {
+                        let mut c = 0.0f32;
+                        for f in 0..feat {
+                            let a = mine[f + i * feat + t * feat * nu];
+                            let b = fork[f + j * feat + t * feat * nu];
+                            c = c.max((a - b).abs());
+                        }
+                        pairs.push((c, i, j));
+                    }
+                }
+                pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                let mut mine_taken = vec![false; nu];
+                let mut fork_taken = vec![false; nu];
+                let mut token_worst = 0.0f32;
+                let mut bad_pairs = 0usize;
+                for &(c, i, j) in &pairs {
+                    if mine_taken[i] || fork_taken[j] {
+                        continue;
+                    }
+                    mine_taken[i] = true;
+                    fork_taken[j] = true;
+                    token_worst = token_worst.max(c);
+                    if c > tol {
+                        bad_pairs += 1;
+                    }
+                    if mine_taken.iter().filter(|&&v| v).count() == nu {
+                        break;
+                    }
+                }
+                // A boundary flip breaks exactly one expert pair; anything
+                // else is a real divergence and must fail here.
+                assert!(
+                    bad_pairs <= 1,
+                    "stage {name} t={t}: {bad_pairs} slot pairs over tol, \
+                     (token_worst {token_worst:.3e}) - not a top-k boundary flip"
+                );
+                if bad_pairs == 1 {
+                    suspects.push((name, t, token_worst));
+                } else {
+                    worst = worst.max(token_worst);
+                }
+            }
+            for (suspect_stage, t, cost) in &suspects {
+                assert!(
+                    suspects.len() <= 4,
+                    "more than four excused flips in one stage smells systemic"
+                );
+                let layer = suspect_stage.rsplit_once('-').expect("layer suffix").1;
+                // Gap evidence: the excuse is legitimate only for a genuine
+                // near-tie. The fork's own biased scores at this token must
+                // put the 6th and 7th ranked experts within 5e-3 (the two
+                // measured flips sit at 9.8e-4 and 2.4e-3; every non-flip
+                // margin in these columns is >= 3e-2, so the bound is 2x
+                // above the largest flip and 6x below the smallest margin);
+                // a real routing divergence moves the boundary by O(0.1).
+                let biased_name = format!("ffn_moe_probs_biased-{layer}");
+                let fork_biased = files
+                    .iter()
+                    .find(|(_, p)| {
+                        p.file_name()
+                            .and_then(|f| f.to_str())
+                            .is_some_and(|f| f.ends_with(&format!("-{biased_name}.f32")))
+                    })
+                    .map(|(_, p)| read_fixture_f32(p))
+                    .unwrap_or_else(|| panic!("fixture for {biased_name} missing"));
+                let ne = fork_biased.len() / 42;
+                let mine_biased = emitted
+                    .iter()
+                    .find(|(n, _)| n == &biased_name)
+                    .map(|(_, d)| d)
+                    .unwrap_or_else(|| panic!("{biased_name} missing for suspect check"));
+                // Rank both sides' biased scores for this token, descending;
+                // expert ids are the positions in the ranked index order.
+                let rank_desc = |scores: &[f32]| {
+                    let mut idx: Vec<usize> = (0..ne).collect();
+                    idx.sort_by(|&a, &b| scores[b + t * ne].total_cmp(&scores[a + t * ne]));
+                    idx
+                };
+                let fork_rank = rank_desc(&fork_biased);
+                let mine_rank = rank_desc(mine_biased);
+                let gap = fork_biased[fork_rank[5] + t * ne] - fork_biased[fork_rank[6] + t * ne];
+                assert!(
+                    gap < 5e-3,
+                    "slot suspect {suspect_stage} t={t} has no near-tie: \
+                     the fork's biased-score gap at rank 6/7 is {gap:.3e}"
+                );
+                // Identity: the swap must be exactly the fork's 7th expert
+                // in place of its 6th, and ranks 0..=4 must be untouched on
+                // both sides. A near tie at 6/7 with any other set change is
+                // a real divergence hiding behind the tie.
+                assert!(
+                    mine_rank[5] == fork_rank[6]
+                        && mine_rank[6] == fork_rank[5]
+                        && mine_rank[..5] == fork_rank[..5],
+                    "slot suspect {suspect_stage} t={t} changed the wrong experts: \
+                     the reference ranks {} and {} where the fork ranks {} and {}",
+                    mine_rank[5],
+                    mine_rank[6],
+                    fork_rank[5],
+                    fork_rank[6]
+                );
+                let out_name = format!("ffn_moe_out-{layer}");
+                let mine_out = emitted
+                    .iter()
+                    .find(|(n, _)| n == &out_name)
+                    .map(|(_, d)| d)
+                    .unwrap_or_else(|| panic!("{out_name} missing for suspect check"));
+                let fork_out = files
+                    .iter()
+                    .find(|(_, p)| {
+                        p.file_name()
+                            .and_then(|f| f.to_str())
+                            .is_some_and(|f| f.ends_with(&format!("-{out_name}.f32")))
+                    })
+                    .map(|(_, p)| read_fixture_f32(p))
+                    .unwrap_or_else(|| panic!("fixture for {out_name} missing"));
+                let h = fork_out.len() / 42;
+                let mut oworst = 0.0f32;
+                for k in 0..h {
+                    let d = (mine_out[k + t * h] - fork_out[k + t * h]).abs();
+                    oworst = oworst.max(d);
+                }
+                let orange = 1.0
+                    + fork_out[t * h..(t + 1) * h]
+                        .iter()
+                        .fold(0.0f32, |m, v| m.max(v.abs()));
+                // A single expert swap moves this token's moe_out by up to
+                // ~0.15 of range on this fixture (measured); 0.3 admits that
+                // swap while still rejecting a wrong formula, which moves
+                // values by O(range) across every token.
+                assert!(
+                    oworst <= 3e-1 * orange,
+                    "slot suspect {suspect_stage} t={t} (cost {cost:.3e}) is a real \
+                     divergence: moe_out diff {oworst:.3e} vs {}",
+                    3e-1 * orange
+                );
+                eprintln!(
+                    "excused selection flip {suspect_stage} t={t} cost {cost:.3e} \
+                     (moe_out diff {oworst:.3e}, fork rank-6/7 score gap {gap:.3e})"
+                );
+            }
+            if !suspects.is_empty() {
+                cascade = true;
+            }
+        } else {
+            for (i, (&a, &b)) in mine.iter().zip(fork.iter()).enumerate() {
+                let diff = (a - b).abs();
+                if diff > worst {
+                    worst = diff;
+                    worst_at = i;
+                }
+            }
+        }
+        if idx % 100 == 0 {
+            eprintln!("stage {idx} {name}: worst/range {:+.3e}", worst / range);
+        }
+        if std::env::var("RAON_MEASURE").is_ok() {
+            continue;
+        }
+        assert!(
+            worst <= tol,
+            "stage {name} diverged: abs diff {worst:.3e} vs tol {tol:.3e} at [{worst_at}] \
+             (reference {}, fork {})",
+            mine[worst_at],
+            fork[worst_at],
+        );
+    }
+
+    // Stage B: teacher-forced, every layer and the head value-compared. The
+    // fixture cursor walks the same ordered dump list stage A proved matches
+    // the reference's emission order; files[0] is embd, which stage B feeds
+    // directly instead of emitting.
+    let spec = model.spec();
+    let hy =
+        reference::hyper(&model, spec).unwrap_or_else(|error| panic!("hyper must read: {error:?}"));
+    let h = spec.hidden as usize;
+    let hc = hy.streams;
+    let nt = FIXTURE1_TOKENS.len();
+    let fixture = |name: &str| -> Vec<f32> {
+        files
+            .iter()
+            .find(|(_, p)| {
+                p.file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|f| f.ends_with(&format!("-{name}.f32")))
+            })
+            .map(|(_, p)| read_fixture_f32(p))
+            .unwrap_or_else(|| panic!("fixture {name} missing"))
+    };
+    let embd = fixture("embd");
+    let mut cursor = 1usize;
+    for layer in 0..spec.layers {
+        let inp: Vec<f32> = if layer == 0 {
+            let mut v = vec![0.0f32; h * hc * nt];
+            for t in 0..nt {
+                for s in 0..hc {
+                    for k in 0..h {
+                        v[k + s * h + t * h * hc] = embd[k + t * h];
+                    }
+                }
+            }
+            v
+        } else {
+            fixture(&format!("l_out-{}", layer - 1))
+        };
+        let mut emitted_attn: Vec<(String, Vec<f32>)> = Vec::new();
+        reference::attn_half(&model, spec, &hy, &inp, layer, &mut |name, data| {
+            emitted_attn.push((name.to_owned(), data.to_vec()))
+        })
+        .unwrap_or_else(|error| panic!("attn half {layer} must run: {error:?}"));
+        for (name, mine) in &emitted_attn {
+            let (_, path) = &files[cursor];
+            cursor += 1;
+            let fork = read_fixture_f32(path);
+            compare_stage(&format!("attn half {layer}"), name, mine, &fork);
+        }
+
+        let inp = fixture(&format!("hc_attn_out-{layer}"));
+        let forced = if layer >= spec.leading_dense {
+            let sel = fixture(&format!("ffn_moe_probs_biased-{layer}"));
+            Some(fork_selection(
+                &sel,
+                spec.experts as usize,
+                nt,
+                hy.used_experts,
+            ))
+        } else {
+            None
+        };
+        let mut emitted_ffn: Vec<(String, Vec<f32>)> = Vec::new();
+        reference::ffn_half(
+            &model,
+            spec,
+            &hy,
+            &inp,
+            layer,
+            &mut |name, data| emitted_ffn.push((name.to_owned(), data.to_vec())),
+            forced.as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("ffn half {layer} must run: {error:?}"));
+        for (name, mine) in &emitted_ffn {
+            let (_, path) = &files[cursor];
+            cursor += 1;
+            let fork = read_fixture_f32(path);
+            compare_stage(&format!("ffn half {layer}"), name, mine, &fork);
+        }
+    }
+
+    let last = fixture(&format!("l_out-{}", spec.layers - 1));
+    let mut emitted_head: Vec<(String, Vec<f32>)> = Vec::new();
+    let logits = reference::head(&model, spec, &hy, &last, nt, &mut |name, data| {
+        emitted_head.push((name.to_owned(), data.to_vec()))
+    })
+    .unwrap_or_else(|error| panic!("head must run: {error:?}"));
+    for (name, mine) in &emitted_head {
+        let (_, path) = &files[cursor];
+        cursor += 1;
+        let fork = read_fixture_f32(path);
+        compare_stage("head", name, mine, &fork);
+    }
+    assert_eq!(
+        cursor,
+        files.len(),
+        "the teacher-forced walk covered every dump"
+    );
+    for &(tok, value) in FIXTURE1_TOP3.iter() {
+        // Absolute 5e-2 on logits of range ~22 (top-3 span): the teacher-
+        // forced layers already match per stage, so this absorbs only the
+        // f64-vs-f32 head drift; a wrong head misranks the top-3 by O(1).
+        assert!(
+            (logits[tok as usize] - value).abs() <= 5e-2,
+            "teacher-forced logit {tok}: {} vs {value}",
+            logits[tok as usize]
+        );
+    }
 }
 
 /// `f16_roundtrip` against f16-exact and subnormal values (the Q8_0 scale
@@ -802,17 +1339,13 @@ fn f16_roundtrip_pins_known_values() {
     assert_eq!(reference::f16_roundtrip(0.0), 0.0);
 }
 
-/// The layer-1 MoE expert-124 gate column against the fork's slot dump:
-/// the dump matches the fork bit-for-bit, so this pins the engine-side expert
-/// slice + quantized dot in isolation.
+/// The layer-1 MoE expert-124 gate column against the fork's slot dump
+/// (`00074-ffn_moe_gate-1.f32`, token 35, slot 5): measured reference-vs-
+/// fork worst diff ~2e-2 absolute on the 1088-wide column, which pins the
+/// engine-side expert slice + quantized dot in isolation.
 #[test]
 fn the_moe_expert_gate_column_pins_the_fork_slot() {
-    let Ok(model_path) = std::env::var("RAON_Q4_KM") else {
-        eprintln!("skipped: RAON_Q4_KM is unset");
-        return;
-    };
-    let Ok(fixtures) = std::env::var("RAON_FIXTURES1") else {
-        eprintln!("skipped: RAON_FIXTURES1 is unset");
+    let Some((model_path, fixtures)) = fixture_env() else {
         return;
     };
     const HEADER_SHA: &str = "b8e287e3eae14db453bf8f13addace471cc2472324021369cd809dcac6cf9f17";
@@ -847,15 +1380,11 @@ fn the_moe_expert_gate_column_pins_the_fork_slot() {
 
 /// One dense-FFN gate element recomputed against the fork's Q8_K-quantized
 /// dot, pinning `fork_mm`'s numerics in isolation from the whole graph.
-/// Reference values: exact 15.113298, quantized 15.101180, fork 15.101177.
+/// Measured on `00027-ffn_norm-0.f32` token 6, output row 1893: exact F64
+/// 15.113298, Q8_K-quantized 15.101180, fork dump 15.101177.
 #[test]
 fn the_dense_ffn_gate_element_pins_the_quantized_dot() {
-    let Ok(model_path) = std::env::var("RAON_Q4_KM") else {
-        eprintln!("skipped: RAON_Q4_KM is unset");
-        return;
-    };
-    let Ok(fixtures) = std::env::var("RAON_FIXTURES1") else {
-        eprintln!("skipped: RAON_FIXTURES1 is unset");
+    let Some((model_path, fixtures)) = fixture_env() else {
         return;
     };
     const HEADER_SHA: &str = "b8e287e3eae14db453bf8f13addace471cc2472324021369cd809dcac6cf9f17";

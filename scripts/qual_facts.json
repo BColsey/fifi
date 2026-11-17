@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7032,
+      "test_fns": 7033,
       "ignored": 635,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -365,6 +365,7 @@
         "QWEN36_G2A_COMPILE",
         "QWEN36_ORACLE_DIR",
         "RAON_FIXTURES1",
+        "RAON_MEASURE",
         "RAON_Q4_KM",
         "RD4A_FIXTURES",
         "RD7A_FIXTURES",
