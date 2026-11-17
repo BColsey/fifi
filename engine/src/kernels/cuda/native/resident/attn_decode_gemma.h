@@ -26,8 +26,8 @@ typedef struct inference_cuda_attn_decode_gemma_args {
     const void *v_scales;    /* f16 bits [n_kv_head][cells][head_dim/32] */
     const void *kv_len;      /* one i32 device word */
     int m;                   /* tokens, 1..16 */
-    int n_q_head;            /* 16 */
-    int n_kv_head;           /* 1 (global) or 8 (local) */
+    int n_q_head;            /* 16 (Humanizer) or 8 (Bolt) */
+    int n_kv_head;           /* 1 or 8 (Humanizer), 2 (Bolt) */
     int head_dim;            /* 256 or 512 */
     int cells;               /* KV capacity per head */
     int window;              /* 0 all keys, else the last W keys */

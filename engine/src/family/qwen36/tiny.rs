@@ -31,6 +31,7 @@ const fn model(
         heads_q,
         heads_kv,
         head_dim,
+        global_head_dim: 0,
         rope_theta: 10_000.0,
         rms_norm_eps: 1e-6,
         model_types: &["qwen3_5_moe", "qwen3_5_moe_text"],
@@ -46,6 +47,8 @@ const fn model(
         router: Router::SoftmaxTopK { renorm: true },
         mtp: false,
         layers_attention: kinds,
+        sliding_window: 0,
+        kv_shared_layers: 0,
         linear: Some(LinearAttention {
             key_heads,
             key_head_dim: 32,

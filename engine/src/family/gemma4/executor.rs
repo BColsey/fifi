@@ -1,4 +1,4 @@
-// Staged until the server factory constructs the Gemma engine; remove this allow then.
+// The server factory serves the Bolt engine, so this Humanizer executor is not on the serving path.
 #![allow(dead_code)]
 
 //! The Humanizer executor: the engine worker drives the resident decode step
@@ -11,10 +11,10 @@
 //! Sampling happens on the device (sample_gemma); this adapter never reads the
 //! logits row back. It reads a token id, its log probability and a status word per step.
 //!
-//! Limits of this slice:
+//! Limits:
 //! - Prefill feeds one token per step, so a long prompt costs a step per token.
 //! - No prefix store: save_prefix and restore_prefix keep their defaults.
-//! - The sampler does not yet match the canonical bit-exact contract.
+//! - The sampler does not match the canonical bit-exact contract.
 
 use super::resident::{CELLS, Gemma, VOCAB};
 use crate::EngError;

@@ -1,0 +1,10 @@
+# Clangd include paths for the CUDA kernel sources, mirroring the nvcc
+# command build.rs issues (see build_cuda): without these, every .cu under
+# src/kernels/cuda/native reports 'abi.h not found' and cascades unknown
+# identifiers, because no compile database covers .cu files.
+CompileFlags:
+  Add:
+    - "-Isrc/kernels/cuda/native"
+    - "-Ivendor/ggml-cuda-mmq/src"
+    - "-Ivendor/ggml-cuda-mmq/src/ggml-cuda"
+    - "-Isrc/kernels/cuda/native/prefill/ggml_shim"

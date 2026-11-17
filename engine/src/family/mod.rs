@@ -117,8 +117,8 @@ pub use recurrent::RecurrentLayout;
 pub use recurrent::RecurrentState;
 pub use route::{Routed, route_experts};
 pub use spec::{
-    Act, AttentionKind, DenseMlp, FamilySpec, HyperConnection, LinearAttention, QWEN3_6_35B_A3B,
-    QWEN3_8_27B_DENSE, QWEN3_8_FLASH_NEXT, Router, qwen3_8_flash_next,
+    Act, AttentionKind, DenseMlp, FamilySpec, HyperConnection, LinearAttention, NEMOTRON_BOLT_E4B,
+    QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE, QWEN3_8_FLASH_NEXT, Router, qwen3_8_flash_next,
 };
 pub use weight_plan::{PlanEntry, WeightPlan};
 

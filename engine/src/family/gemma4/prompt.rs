@@ -11,7 +11,10 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged until the server wires the prompt")
+    expect(
+        dead_code,
+        reason = "gemma4 prompt builder; no caller on the host build"
+    )
 )]
 
 use crate::EngError;

@@ -7,10 +7,6 @@
 //! Every refusal is a BadRequest and happens before any native call: the backend is
 //! usable, m is in 1..=65535, n is a multiple of 32 in 32..=65536, the three ranges
 //! hold m*n floats at 4-byte alignment, and out overlaps neither gate nor up.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

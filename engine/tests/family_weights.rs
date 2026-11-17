@@ -102,6 +102,9 @@ const TINY: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: false,
     layers_attention: &TINY_LAYERS,
+    global_head_dim: 0,
+    sliding_window: 0,
+    kv_shared_layers: 0,
     // Key width 128 and value width 256 reproduce the fixture rows: 512 fused, 256 gate, 64 heads.
     linear: Some(LinearAttention {
         key_heads: 16,
@@ -677,6 +680,9 @@ const RATIO: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: false,
     layers_attention: &RATIO_LAYERS,
+    global_head_dim: 0,
+    sliding_window: 0,
+    kv_shared_layers: 0,
     linear: Some(RATIO_LINEAR),
     hyper: None,
 };

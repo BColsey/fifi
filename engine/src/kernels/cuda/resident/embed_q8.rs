@@ -9,10 +9,6 @@
 //! usable; m is in 1..=4096; k is a multiple of 32 in 32..=32768; n_rows is in
 //! 1..=2^28; every host-known id is inside the table; the ranges hold their bytes at
 //! 16-byte (out) and 4-byte (w, ids) alignment; out overlaps neither w nor ids.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

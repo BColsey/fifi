@@ -2,6 +2,28 @@
 use super::*;
 use crate::kernels::cuda::{CudaContext, testkit};
 
+#[test]
+fn rope_head_dim_modes_are_admitted_and_refused() {
+    // 256 local and 512 global are admitted; mismatched pairs are refused before
+    // any native call. The (8,2) head shape is shared with the attention kernel
+    // and host-tested there via admit_gemma_heads.
+    assert!(admit_rope_head_dim(256, false).is_ok());
+    assert!(admit_rope_head_dim(512, true).is_ok());
+    for (dim, global) in [
+        (256, true),
+        (512, false),
+        (128, false),
+        (128, true),
+        (0, false),
+    ] {
+        let error = admit_rope_head_dim(dim, global).expect_err("mismatched pair must be refused");
+        assert!(
+            matches!(error, crate::EngError::BadRequest(_)),
+            "({dim},{global}): {error:?}"
+        );
+    }
+}
+
 const LOCAL: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/testdata/gemma4/kernels/rope-local-8191.bin"

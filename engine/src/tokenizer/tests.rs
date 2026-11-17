@@ -2386,6 +2386,65 @@ fn unknown_method_serves_the_five_string_methods() {
 }
 
 #[test]
+fn unknown_method_serves_map_get() {
+    let template = ChatTemplate::from_str(concat!(
+        "{% set d = {'a': 'present'} %}",
+        "{{ d.get('a') }}|",
+        "{{ d.get('missing') or 'fallback' }}|",
+        "{{ d.get('missing', 'explicit') }}"
+    ))
+    .expect("parse template");
+    let messages = [PromptMessage {
+        role: Role::User,
+        content: Some("hi".to_string()),
+        reasoning_content: None,
+        name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+    }];
+    let rendered = template
+        .render(&messages, &[], Thinking::Default)
+        .expect("render");
+    assert_eq!(rendered, "present|fallback|explicit");
+}
+
+#[test]
+fn unknown_method_map_get_is_undefined_not_none_and_checks_arity() {
+    let messages = [PromptMessage {
+        role: Role::User,
+        content: Some("hi".to_string()),
+        reasoning_content: None,
+        name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+    }];
+    // A missing key with no default is undefined (not Python's None); a
+    // non-string key on a string-keyed map is undefined too, so it is falsy.
+    let kinds = ChatTemplate::from_str(concat!(
+        "{% set d = {'a': 'present'} %}",
+        "{{ d.get('missing') is undefined }}|",
+        "{{ d.get('missing') is none }}|",
+        "{{ d.get(5) or 'fallback' }}"
+    ))
+    .expect("parse template");
+    let rendered = kinds
+        .render(&messages, &[], Thinking::Default)
+        .expect("render");
+    assert_eq!(rendered, "True|False|fallback");
+    // get requires a key and accepts at most one default.
+    for source in [
+        "{% set d = {'a': 1} %}{{ d.get() }}",
+        "{% set d = {'a': 1} %}{{ d.get('a', 'b', 'c') }}",
+    ] {
+        let template = ChatTemplate::from_str(source).expect("parse template");
+        let error = template
+            .render(&messages, &[], Thinking::Default)
+            .expect_err("bad get arity must fail");
+        assert!(matches!(&error, EngError::Checkpoint(_)), "{error:?}");
+    }
+}
+
+#[test]
 fn unknown_method_rejects_bad_callers_and_arguments() {
     let messages = [PromptMessage {
         reasoning_content: None,

@@ -365,6 +365,9 @@ pub(super) fn layer_stages(kind: AttentionKind) -> Result<Vec<Stage>, EngError> 
         AttentionKind::Qsa => Err(EngError::BadRequest(
             "prefill chunk: kind: the Qsa mixer has no chunk stage list".to_owned(),
         )),
+        AttentionKind::Sliding => Err(EngError::BadRequest(
+            "prefill chunk: kind: the Sliding mixer has no chunk stage list".to_owned(),
+        )),
     }
 }
 
@@ -1432,7 +1435,9 @@ fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErro
     let rep = match ctx.kind {
         AttentionKind::DeltaNet => Role::AttnQkv,
         AttentionKind::Full => Role::AttnQ,
-        AttentionKind::Qsa => unreachable!("layer_stages refused the kind"),
+        AttentionKind::Qsa | AttentionKind::Sliding => {
+            unreachable!("layer_stages refused the kind")
+        }
     };
     run.dense_input(
         launch,

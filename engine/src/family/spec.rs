@@ -21,6 +21,9 @@ pub enum Router {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionKind {
     Full,
+    /// Windowed attention over the last `FamilySpec::sliding_window` tokens. The
+    /// layer stores its own K/V, like `Full`; only the reachable context differs.
+    Sliding,
     DeltaNet,
     Qsa,
 }
@@ -125,6 +128,8 @@ pub struct FamilySpec {
     pub heads_q: u32,
     pub heads_kv: u32,
     pub head_dim: u32,
+    /// Head dimension of `AttentionKind::Full` layers. Zero selects `head_dim`.
+    pub global_head_dim: u32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     /// Accepted `model_type` values of the configuration, at the root and in `text_config`.
@@ -143,9 +148,66 @@ pub struct FamilySpec {
     pub router: Router,
     pub mtp: bool,
     pub layers_attention: &'static [AttentionKind],
+    /// Reachable context of `AttentionKind::Sliding` layers. Zero when the family
+    /// has no sliding layers.
+    pub sliding_window: u32,
+    /// Count of trailing layers that store no K/V of their own and instead attend
+    /// into the cache slot of the last physical layer of the same attention kind.
+    /// Zero when every layer stores its own K/V.
+    pub kv_shared_layers: u32,
     /// Required when any layer uses `AttentionKind::DeltaNet`.
     pub linear: Option<LinearAttention>,
     pub hyper: Option<HyperConnection>,
+}
+
+impl FamilySpec {
+    /// Index of the first layer that stores no K/V of its own. Layers at or above
+    /// it attend into the cache slot a physical source layer wrote. Saturating so
+    /// an unvalidated descriptor (more shared layers than layers) cannot underflow.
+    pub fn first_shared_layer(&self) -> u32 {
+        self.layers.saturating_sub(self.kv_shared_layers)
+    }
+
+    /// The head dimension of a `Full` layer: `global_head_dim` when non-zero,
+    /// otherwise `head_dim`. The single resolver of the zero-selects-head_dim rule.
+    pub fn full_head_dim(&self) -> u32 {
+        if self.global_head_dim != 0 {
+            self.global_head_dim
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// The physical layer whose K/V a shared layer attends into: the last layer
+    /// before `first_shared_layer` with the same attention kind. Safe on an
+    /// unvalidated descriptor: every index is bounds-checked.
+    pub fn shared_kv_source(&self, layer: u32) -> Result<u32, EngError> {
+        let first_shared = self.first_shared_layer();
+        if layer < first_shared || layer >= self.layers {
+            return Err(EngError::Checkpoint(format!(
+                "family {} layer {layer} is not a shared-K/V layer",
+                self.name
+            )));
+        }
+        let kind = *self.layers_attention.get(layer as usize).ok_or_else(|| {
+            EngError::Checkpoint(format!(
+                "family {} layer {layer} is outside the attention table",
+                self.name
+            ))
+        })?;
+        self.layers_attention
+            .get(..first_shared as usize)
+            .unwrap_or_default()
+            .iter()
+            .rposition(|candidate| *candidate == kind)
+            .map(|index| index as u32)
+            .ok_or_else(|| {
+                EngError::Checkpoint(format!(
+                    "family {} shared layer {layer} has no physical {kind:?} source",
+                    self.name
+                ))
+            })
+    }
 }
 
 const QWEN3_6_35B_A3B_LAYERS: [AttentionKind; 40] = [
@@ -198,6 +260,7 @@ pub const QWEN3_6_35B_A3B: FamilySpec = FamilySpec {
     heads_q: 16,
     heads_kv: 2,
     head_dim: 256,
+    global_head_dim: 0,
     rope_theta: 10_000_000.0,
     rms_norm_eps: 1e-6,
     model_types: &["qwen3_5_moe", "qwen3_5_moe_text"],
@@ -213,6 +276,8 @@ pub const QWEN3_6_35B_A3B: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: false,
     layers_attention: &QWEN3_6_35B_A3B_LAYERS,
+    sliding_window: 0,
+    kv_shared_layers: 0,
     linear: Some(LinearAttention {
         key_heads: 16,
         key_head_dim: 128,
@@ -247,6 +312,7 @@ pub const QWEN3_8_27B_DENSE: FamilySpec = FamilySpec {
     heads_q: 24,
     heads_kv: 4,
     head_dim: 256,
+    global_head_dim: 0,
     rope_theta: 10_000_000.0,
     rms_norm_eps: 1e-6,
     model_types: &["qwen3_5", "qwen3_5_text"],
@@ -266,6 +332,8 @@ pub const QWEN3_8_27B_DENSE: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: false,
     layers_attention: &QWEN3_8_27B_DENSE_LAYERS,
+    sliding_window: 0,
+    kv_shared_layers: 0,
     linear: Some(LinearAttention {
         key_heads: 16,
         key_head_dim: 128,
@@ -341,6 +409,7 @@ pub const QWEN3_8_FLASH_NEXT: FamilySpec = FamilySpec {
     heads_q: 24,
     heads_kv: 2,
     head_dim: 256,
+    global_head_dim: 0,
     rope_theta: 10_000_000.0,
     rms_norm_eps: 1e-6,
     model_types: &["qwen4_exp", "qwen4_exp_text"],
@@ -356,6 +425,8 @@ pub const QWEN3_8_FLASH_NEXT: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: true,
     layers_attention: &QWEN3_8_FLASH_NEXT_LAYERS,
+    sliding_window: 0,
+    kv_shared_layers: 0,
     linear: Some(LinearAttention {
         key_heads: 16,
         key_head_dim: 128,
@@ -372,6 +443,69 @@ pub const QWEN3_8_FLASH_NEXT: FamilySpec = FamilySpec {
 pub fn qwen3_8_flash_next() -> FamilySpec {
     QWEN3_8_FLASH_NEXT
 }
+
+const fn bolt_e4b_attention() -> [AttentionKind; 42] {
+    let mut kinds = [AttentionKind::Sliding; 42];
+    let mut index = 5;
+    while index < kinds.len() {
+        kinds[index] = AttentionKind::Full;
+        index += 6;
+    }
+    kinds
+}
+
+const NEMOTRON_BOLT_E4B_LAYERS: [AttentionKind; 42] = bolt_e4b_attention();
+
+/// The Nemotron 3.5 Bolt E4B family:
+/// `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16`, model type `gemma4` (text
+/// `gemma4_text`), served through the base Gemma 4 architecture.
+///
+/// The first 24 layers are physical attention layers that store their own K/V;
+/// the last 18 (`kv_shared_layers`) have no K/V projections and attend into the
+/// cache slot of the last physical layer of the same kind: layer 22 for sliding
+/// layers, layer 23 for full-attention layers. Sliding layers use a 512-token
+/// window and 256-dim heads; full-attention layers use 512-dim heads
+/// (`global_head_dim`).
+///
+/// The descriptor does not carry these checkpoint properties: rope per kind
+/// (sliding: full rotary, theta 10,000, carried by `rope_theta`; full attention:
+/// proportional rotary, partial factor 0.25, theta 1,000,000), final logit
+/// softcapping 30.0, a per-layer input projection (vocabulary 262,144 to hidden
+/// 256), query/key/value RMS norms, attention without 1/sqrt(d) scaling, tied
+/// embeddings, and `use_double_wide_mlp: false`. The quantization fields are
+/// zero: the BF16 source carries no affine quantization.
+pub const NEMOTRON_BOLT_E4B: FamilySpec = FamilySpec {
+    name: "nemotron_bolt_e4b",
+    layers: 42,
+    hidden: 2560,
+    heads_q: 8,
+    heads_kv: 2,
+    head_dim: 256,
+    global_head_dim: 512,
+    rope_theta: 10_000.0,
+    rms_norm_eps: 1e-6,
+    model_types: &["gemma4", "gemma4_text"],
+    vocab: 262_144,
+    feed_forward: Some(DenseMlp {
+        intermediate: 10_240,
+        context_limit: 65_536,
+    }),
+    experts: 0,
+    top_k: 0,
+    moe_inter: 0,
+    shared_inter: 0,
+    quant_bits: 0,
+    quant_group: 0,
+    act: Act::GeluApprox,
+    // Dense layers do not use a router.
+    router: Router::SoftmaxTopK { renorm: true },
+    mtp: false,
+    layers_attention: &NEMOTRON_BOLT_E4B_LAYERS,
+    sliding_window: 512,
+    kv_shared_layers: 18,
+    linear: None,
+    hyper: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -483,5 +617,202 @@ mod tests {
     #[test]
     fn flash_next_passes_family_validation() {
         TierAssignment::from_keys(&[], &qwen3_8_flash_next()).expect("valid family");
+    }
+
+    fn shared_test_spec(
+        layers_attention: &'static [AttentionKind],
+        sliding_window: u32,
+        kv_shared_layers: u32,
+    ) -> FamilySpec {
+        FamilySpec {
+            name: "shared_test",
+            layers: layers_attention.len() as u32,
+            hidden: 8,
+            heads_q: 2,
+            heads_kv: 1,
+            head_dim: 4,
+            global_head_dim: 0,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            model_types: &["shared_test"],
+            vocab: 16,
+            feed_forward: Some(DenseMlp {
+                intermediate: 8,
+                context_limit: 128,
+            }),
+            experts: 0,
+            top_k: 0,
+            moe_inter: 0,
+            shared_inter: 0,
+            quant_bits: 4,
+            quant_group: 64,
+            act: Act::Silu,
+            router: Router::SoftmaxTopK { renorm: true },
+            mtp: false,
+            layers_attention,
+            sliding_window,
+            kv_shared_layers,
+            linear: None,
+            hyper: None,
+        }
+    }
+
+    #[test]
+    fn bolt_layer_attention_has_42_entries() {
+        let spec = NEMOTRON_BOLT_E4B;
+        assert_eq!(spec.layers, 42);
+        assert_eq!(spec.layers_attention.len(), 42);
+    }
+
+    #[test]
+    fn bolt_places_seven_full_layers_at_the_documented_indices() {
+        let full: Vec<usize> = NEMOTRON_BOLT_E4B
+            .layers_attention
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == AttentionKind::Full)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(full.len(), 7);
+        assert_eq!(full, [5, 11, 17, 23, 29, 35, 41]);
+    }
+
+    #[test]
+    fn bolt_shares_k_v_across_the_last_eighteen_layers() {
+        let spec = NEMOTRON_BOLT_E4B;
+        assert_eq!(spec.kv_shared_layers, 18);
+        assert_eq!(spec.first_shared_layer(), 24);
+        for layer in [24, 25, 28, 30, 40] {
+            assert_eq!(spec.shared_kv_source(layer).expect("sliding source"), 22);
+        }
+        for layer in [29, 35, 41] {
+            assert_eq!(spec.shared_kv_source(layer).expect("full source"), 23);
+        }
+        assert!(spec.shared_kv_source(23).is_err());
+    }
+
+    #[test]
+    fn bolt_geometry_matches_the_pinned_dimensions() {
+        let spec = NEMOTRON_BOLT_E4B;
+        assert_eq!((spec.layers, spec.hidden, spec.vocab), (42, 2560, 262_144));
+        assert_eq!((spec.heads_q, spec.heads_kv), (8, 2));
+        assert_eq!(
+            (spec.head_dim, spec.global_head_dim, spec.sliding_window),
+            (256, 512, 512)
+        );
+        assert_eq!(
+            spec.feed_forward,
+            Some(DenseMlp {
+                intermediate: 10_240,
+                context_limit: 65_536,
+            })
+        );
+        assert_eq!(spec.act, Act::GeluApprox);
+        assert_eq!((spec.linear, spec.hyper, spec.mtp), (None, None, false));
+    }
+
+    #[test]
+    fn bolt_passes_family_validation() {
+        TierAssignment::from_keys(&[], &NEMOTRON_BOLT_E4B).expect("valid family");
+    }
+
+    const SHARED_SOURCE_LAYERS: [AttentionKind; 3] = [
+        AttentionKind::Sliding,
+        AttentionKind::Sliding,
+        AttentionKind::Full,
+    ];
+
+    #[test]
+    fn shared_k_v_without_a_physical_source_is_rejected() {
+        // Layer 2 is a shared full-attention layer, but both physical layers are sliding.
+        let spec = shared_test_spec(&SHARED_SOURCE_LAYERS, 64, 1);
+        let error = TierAssignment::from_keys(&[], &spec).expect_err("no physical source");
+        assert!(format!("{error:?}").contains("no physical Full source"));
+    }
+
+    #[test]
+    fn sliding_layers_and_the_window_are_declared_together() {
+        const SLIDING: [AttentionKind; 1] = [AttentionKind::Sliding];
+        let without_window = shared_test_spec(&SLIDING, 0, 0);
+        assert!(TierAssignment::from_keys(&[], &without_window).is_err());
+        const FULL: [AttentionKind; 1] = [AttentionKind::Full];
+        let unused_window = shared_test_spec(&FULL, 64, 0);
+        assert!(TierAssignment::from_keys(&[], &unused_window).is_err());
+    }
+
+    #[test]
+    fn shared_helpers_are_safe_on_an_unvalidated_descriptor() {
+        // More shared layers than layers: first_shared_layer saturates to 0 and
+        // shared_kv_source refuses without underflowing or indexing out of bounds.
+        let spec = shared_test_spec(&SHARED_SOURCE_LAYERS, 64, 5);
+        assert_eq!(spec.first_shared_layer(), 0);
+        for layer in 0..spec.layers {
+            assert!(spec.shared_kv_source(layer).is_err());
+        }
+        assert!(spec.shared_kv_source(spec.layers).is_err());
+    }
+
+    #[test]
+    fn full_head_dim_resolves_the_zero_selects_head_dim_rule() {
+        assert_eq!(NEMOTRON_BOLT_E4B.full_head_dim(), 512);
+        let inherited = shared_test_spec(&SHARED_SOURCE_LAYERS, 64, 0);
+        assert_eq!(inherited.global_head_dim, 0);
+        assert_eq!(inherited.full_head_dim(), inherited.head_dim);
+    }
+
+    #[test]
+    fn shared_k_v_boundaries_are_validated() {
+        const THREE: [AttentionKind; 3] = [
+            AttentionKind::Sliding,
+            AttentionKind::Sliding,
+            AttentionKind::Sliding,
+        ];
+        // Zero shared layers: every layer stores its own K/V.
+        let none_shared = shared_test_spec(&THREE, 64, 0);
+        TierAssignment::from_keys(&[], &none_shared).expect("zero shared is valid");
+        // All-but-one shared: the single physical sliding layer serves the rest.
+        let all_but_one = shared_test_spec(&THREE, 64, 2);
+        TierAssignment::from_keys(&[], &all_but_one).expect("all-but-one shared is valid");
+        assert_eq!(all_but_one.first_shared_layer(), 1);
+        assert_eq!(all_but_one.shared_kv_source(2).expect("source"), 0);
+        // Shared across every layer (and beyond) is refused: no physical source.
+        for shared in [3, 5] {
+            let over = shared_test_spec(&THREE, 64, shared);
+            let error = TierAssignment::from_keys(&[], &over).expect_err("shared >= layers");
+            assert!(format!("{error:?}").contains("shares K/V across"));
+        }
+        // All-but-one shared over a kind the physical layer cannot serve is refused.
+        let mixed = shared_test_spec(&SHARED_SOURCE_LAYERS, 64, 2);
+        let error = TierAssignment::from_keys(&[], &mixed).expect_err("no physical Full source");
+        assert!(format!("{error:?}").contains("no physical Full source"));
+    }
+
+    #[test]
+    fn shared_k_v_over_a_non_attention_layer_is_rejected() {
+        // A shared Qsa layer stores no K/V, even with a same-kind physical source.
+        const QSA: [AttentionKind; 2] = [AttentionKind::Qsa, AttentionKind::Qsa];
+        let spec = shared_test_spec(&QSA, 0, 1);
+        let error = TierAssignment::from_keys(&[], &spec).expect_err("Qsa shares no K/V");
+        assert!(format!("{error:?}").contains("stores no K/V"));
+        // DeltaNet state is not a shareable K/V cache; the kind check precedes the
+        // linear-dimension check, so this refuses even without linear dimensions.
+        const DELTA: [AttentionKind; 2] = [AttentionKind::DeltaNet, AttentionKind::DeltaNet];
+        let spec = shared_test_spec(&DELTA, 0, 1);
+        let error = TierAssignment::from_keys(&[], &spec).expect_err("DeltaNet shares no K/V");
+        assert!(format!("{error:?}").contains("stores no K/V"));
+    }
+
+    #[test]
+    fn global_head_dim_requires_a_full_attention_layer() {
+        const SLIDING: [AttentionKind; 2] = [AttentionKind::Sliding, AttentionKind::Sliding];
+        let mut spec = shared_test_spec(&SLIDING, 64, 0);
+        spec.global_head_dim = 512;
+        let error = TierAssignment::from_keys(&[], &spec).expect_err("no full layer");
+        assert!(format!("{error:?}").contains("without a full-attention layer"));
+        // A full-attention layer carries the global head dimension.
+        const MIXED: [AttentionKind; 2] = [AttentionKind::Sliding, AttentionKind::Full];
+        let mut spec = shared_test_spec(&MIXED, 64, 0);
+        spec.global_head_dim = 512;
+        TierAssignment::from_keys(&[], &spec).expect("full layer carries the global head dim");
     }
 }

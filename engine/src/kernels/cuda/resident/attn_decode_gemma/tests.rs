@@ -2,6 +2,34 @@
 use super::*;
 use crate::kernels::cuda::{CudaContext, testkit};
 
+#[test]
+fn gemma_head_shapes_are_admitted_and_refused() {
+    // The Bolt (8,2) shape and the Humanizer (16,1)/(16,8) shapes are admitted;
+    // their neighbours are refused before any native call.
+    for (q, kv) in [(16, 1), (16, 8), (8, 2)] {
+        assert!(
+            admit_gemma_heads(q, kv).is_ok(),
+            "({q},{kv}) must be admitted"
+        );
+    }
+    for (q, kv) in [
+        (8, 1),
+        (8, 8),
+        (16, 2),
+        (16, 4),
+        (4, 2),
+        (2, 8),
+        (0, 0),
+        (32, 8),
+    ] {
+        let error = admit_gemma_heads(q, kv).expect_err("neighbour must be refused");
+        assert!(
+            matches!(error, crate::EngError::BadRequest(_)),
+            "({q},{kv}): {error:?}"
+        );
+    }
+}
+
 const LOCAL: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/testdata/gemma4/kernels/local-gqa2.bin"

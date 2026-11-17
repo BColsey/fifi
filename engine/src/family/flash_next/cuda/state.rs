@@ -453,7 +453,7 @@ impl StatePlan {
                     slots.push((StateSlot::QsaIndexKeys(layer), keys));
                     slots.push((StateSlot::QsaRawRing(layer), raw));
                 }
-                AttentionKind::Full => {
+                AttentionKind::Full | AttentionKind::Sliding => {
                     return Err(refuse(format!(
                         "layer {layer} is dense attention, which Flash-Next does not have"
                     )));

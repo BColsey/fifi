@@ -10,10 +10,6 @@
 //! floats at 4-byte alignment, and out must be disjoint from x. Stream ownership is checked
 //! after range planning. A rejected call queues no work. Existing terminal errors keep
 //! their error mapping.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{

@@ -286,7 +286,9 @@ fn inventory() -> BTreeMap<String, Expected> {
         let own: &[Group] = match kind {
             AttentionKind::DeltaNet => &DELTA_LAYER,
             AttentionKind::Full => &FULL_LAYER,
-            AttentionKind::Qsa => panic!("the stepping stone has no QSA layer"),
+            AttentionKind::Qsa | AttentionKind::Sliding => {
+                panic!("Qwen3.6 has no such attention layer")
+            }
         };
         for group in EVERY_LAYER.iter().chain(own) {
             add_group(&mut out, &prefix, group);

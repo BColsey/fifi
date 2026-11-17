@@ -1,0 +1,137 @@
+//! KV-cache budget of the resident Bolt (Nemotron 3.5 Bolt) executor.
+//!
+//! The resident Bolt cache stores KV8 planes (one int8 code per value plus one
+//! fp16 scale per 32-value block) on the physical layers only: the shared
+//! trailing layers attend into the planes of the last physical layer of their
+//! own kind, so they cost no cache bytes. The derivation reads the family
+//! descriptor, so the geometry has one source of truth.
+
+#![cfg_attr(
+    all(not(test), not(feature = "native-cuda")),
+    expect(
+        dead_code,
+        reason = "the host build has no caller; the native-cuda Bolt loader admits it"
+    )
+)]
+
+use crate::family::device_budget::KvPlan;
+use crate::family::spec::AttentionKind;
+use crate::family::spec::NEMOTRON_BOLT_E4B;
+
+/// KV8 bytes one context position costs on one layer: one code byte per k and v
+/// value plus one fp16 scale per 32-value block of each plane.
+fn kv8_layer_bytes(heads: u32, head: u32) -> Option<u64> {
+    let codes = (heads as u64).checked_mul(head as u64)? * 2;
+    let scales = (heads as u64).checked_mul(head as u64 / 32)? * 2 * 2;
+    codes.checked_add(scales)
+}
+
+/// The Bolt cache cost of one context position, summed over the twenty-four
+/// physical layers (twenty sliding at head 256, four full at head 512).
+/// `None` if the arithmetic overflows.
+pub(crate) fn bolt_kv_bytes_per_position() -> Option<u64> {
+    let spec = NEMOTRON_BOLT_E4B;
+    let mut total = 0u64;
+    for &kind in &spec.layers_attention[..spec.first_shared_layer() as usize] {
+        let head = match kind {
+            AttentionKind::Full => spec.full_head_dim(),
+            _ => spec.head_dim,
+        };
+        total = total.checked_add(kv8_layer_bytes(spec.heads_kv, head)?)?;
+    }
+    Some(total)
+}
+
+/// Device bytes the load keeps free beside its weights, KV cache and scratch.
+/// The resident admission folds it into the demand through the shared
+/// `plan::admit`, the same headroom rule the other resident executors use, so
+/// an exact fit of the allocations alone is refused.
+pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
+
+/// The cache the resident executor holds: one plane set per configured position.
+/// The starter admits this plan against free device memory before loading; the
+/// positions come from the caller (the executor pins its cell count). `None`
+/// if the per-position cost overflows.
+pub(crate) fn bolt_kv_plan(positions: u64) -> Option<KvPlan> {
+    Some(KvPlan {
+        positions,
+        bytes_per_position: bolt_kv_bytes_per_position()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bolt_costs_30464_bytes_per_position() {
+        // Twenty sliding layers at 1088 bytes plus four full layers at 2176.
+        assert_eq!(20 * 1088 + 4 * 2176, 30_464);
+        assert_eq!(bolt_kv_bytes_per_position(), Some(30_464));
+    }
+
+    #[test]
+    fn the_headroom_keeps_half_a_gib_free() {
+        // The resident admission folds this into the demand, so an exact fit of
+        // the allocations alone is refused.
+        assert_eq!(BOLT_HEADROOM_BYTES, 512 << 20);
+    }
+
+    #[test]
+    fn one_layer_costs_codes_plus_scales() {
+        // Sliding: 2 heads x 256 codes x 2 planes + 2 x 8 blocks x 2 B x 2 planes.
+        assert_eq!(kv8_layer_bytes(2, 256), Some(1088));
+        // Full: 2 heads x 512 codes x 2 planes + 2 x 16 blocks x 2 B x 2 planes.
+        assert_eq!(kv8_layer_bytes(2, 512), Some(2176));
+        // The humanizer local geometry stays in range of the arithmetic.
+        assert_eq!(kv8_layer_bytes(8, 256), Some(4352));
+        assert_eq!(kv8_layer_bytes(1, 512), Some(1088));
+    }
+
+    #[test]
+    fn the_shared_layers_cost_nothing() {
+        let spec = NEMOTRON_BOLT_E4B;
+        assert_eq!(spec.first_shared_layer(), 24);
+        assert_eq!(spec.layers, 42);
+    }
+
+    #[test]
+    fn the_plan_reports_the_cell_count_charge() {
+        // The executor's full cache: 32,768 cells at 30,464 bytes each is just
+        // under one GiB, the number a serving preflight must admit.
+        let plan = bolt_kv_plan(32_768).expect("bounded plan");
+        assert_eq!(plan.positions, 32_768);
+        assert_eq!(plan.bytes_per_position, 30_464);
+        assert_eq!(plan.positions * plan.bytes_per_position, 998_244_352);
+    }
+
+    #[test]
+    #[cfg(feature = "native-cuda")]
+    fn the_allocation_geometry_matches_the_budget_derivation() {
+        use crate::family::gemma4::resident::bolt::{
+            GLOBAL_HEAD, KV_HEADS, LOCAL_HEAD, PHYSICAL_LAYERS,
+        };
+        let spec = NEMOTRON_BOLT_E4B;
+        // The executor's hard-coded geometry is the descriptor's geometry.
+        assert_eq!(KV_HEADS as u32, spec.heads_kv);
+        assert_eq!(LOCAL_HEAD as u32, spec.head_dim);
+        assert_eq!(GLOBAL_HEAD as u32, spec.full_head_dim());
+        assert_eq!(PHYSICAL_LAYERS as u32, spec.first_shared_layer());
+        // Sum the per-position allocation exactly as the executor lays out the
+        // planes: k and v codes plus fp16 scales, full attention every sixth
+        // layer. Sliding layers reserve the full cell count too — the window
+        // bounds attention, not the allocation — so they cost full cells here.
+        let mut allocated = 0u64;
+        for layer in 0..PHYSICAL_LAYERS {
+            let head = if layer % 6 == 5 {
+                GLOBAL_HEAD
+            } else {
+                LOCAL_HEAD
+            } as u64;
+            let codes = 2 * KV_HEADS as u64 * head;
+            let scales = 2 * KV_HEADS as u64 * (head / 32) * 2;
+            allocated += codes + scales;
+        }
+        assert_eq!(Some(allocated), bolt_kv_bytes_per_position());
+    }
+}

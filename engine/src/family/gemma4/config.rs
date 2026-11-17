@@ -3,6 +3,7 @@ use serde_json::Value;
 use crate::{EngError, checkpoint_json::UniqueValue};
 
 const ARCHITECTURE: &str = "Gemma4UnifiedForConditionalGeneration";
+const BOLT_ARCHITECTURE: &str = "Gemma4ForConditionalGeneration";
 
 pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     let root = serde_json::from_slice::<UniqueValue>(json)
@@ -14,7 +15,7 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
         ));
     }
     expect_string(&root, "model_type", "model_type", "gemma4_unified")?;
-    expect_architecture(&root)?;
+    expect_architecture(&root, ARCHITECTURE)?;
     expect_bool(&root, "tie_word_embeddings", "tie_word_embeddings", true)?;
     let text = root
         .get("text_config")
@@ -36,7 +37,7 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
         "text_config.tie_word_embeddings",
         true,
     )?;
-    check_layer_types(text)?;
+    check_layer_types(text, 48)?;
     check_rope_parameters(text)?;
     expect_string(
         text,
@@ -108,17 +109,116 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     Ok(())
 }
 
-fn expect_architecture(root: &Value) -> Result<(), EngError> {
+/// The strict configuration check for the Nemotron 3.5 Bolt E4B checkpoint
+/// (`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16`): the base Gemma 4 architecture
+/// with two KV heads and eighteen shared-K/V layers. The multimodal checkpoint
+/// carries vision and audio sections this family does not serve; the check
+/// reads only the root identity and the text stack.
+pub fn check_bolt_config(json: &[u8]) -> Result<(), EngError> {
+    let root = serde_json::from_slice::<UniqueValue>(json)
+        .map_err(|error| EngError::Checkpoint(format!("configuration JSON: {error}")))?
+        .0;
+    if !root.is_object() {
+        return Err(EngError::Checkpoint(
+            "configuration must be a JSON object".into(),
+        ));
+    }
+    expect_string(&root, "model_type", "model_type", "gemma4")?;
+    expect_architecture(&root, BOLT_ARCHITECTURE)?;
+    expect_bool(&root, "tie_word_embeddings", "tie_word_embeddings", true)?;
+    let text = root
+        .get("text_config")
+        .ok_or_else(|| EngError::Checkpoint("configuration lacks text_config".into()))?;
+    if !text.is_object() {
+        return Err(EngError::Checkpoint(
+            "configuration text_config must be a JSON object".into(),
+        ));
+    }
+    expect_string(text, "model_type", "text_config.model_type", "gemma4_text")?;
+    expect_bool(
+        text,
+        "tie_word_embeddings",
+        "text_config.tie_word_embeddings",
+        true,
+    )?;
+    check_layer_types(text, 42)?;
+    check_rope_parameters(text)?;
+    expect_string(
+        text,
+        "hidden_activation",
+        "text_config.hidden_activation",
+        "gelu_pytorch_tanh",
+    )?;
+    expect_f64(text, "rms_norm_eps", "text_config.rms_norm_eps", 1e-6)?;
+    expect_f64(
+        text,
+        "final_logit_softcapping",
+        "text_config.final_logit_softcapping",
+        30.0,
+    )?;
+    expect_bool(text, "attention_bias", "text_config.attention_bias", false)?;
+    expect_bool(
+        text,
+        "attention_k_eq_v",
+        "text_config.attention_k_eq_v",
+        false,
+    )?;
+    expect_bool(
+        text,
+        "enable_moe_block",
+        "text_config.enable_moe_block",
+        false,
+    )?;
+    expect_bool(text, "use_cache", "text_config.use_cache", true)?;
+    expect_bool(
+        text,
+        "use_double_wide_mlp",
+        "text_config.use_double_wide_mlp",
+        false,
+    )?;
+    expect_null(text, "use_bidirectional_attention")?;
+    for name in [
+        "num_experts",
+        "top_k_experts",
+        "expert_intermediate_size",
+        "num_global_key_value_heads",
+    ] {
+        expect_null(text, name)?;
+    }
+    for (name, expected) in [
+        ("hidden_size", 2560),
+        ("intermediate_size", 10_240),
+        ("num_hidden_layers", 42),
+        ("num_attention_heads", 8),
+        ("num_key_value_heads", 2),
+        ("num_kv_shared_layers", 18),
+        ("hidden_size_per_layer_input", 256),
+        ("head_dim", 256),
+        ("global_head_dim", 512),
+        ("max_position_embeddings", 65_536),
+        ("sliding_window", 512),
+        ("vocab_size", 262_144),
+        ("vocab_size_per_layer_input", 262_144),
+        ("bos_token_id", 2),
+        ("eos_token_id", 1),
+        ("pad_token_id", 0),
+    ] {
+        expect_u32(text, name, expected)?;
+    }
+    Ok(())
+}
+
+fn expect_architecture(root: &Value, architecture: &str) -> Result<(), EngError> {
     let name = "architectures";
     let value = required(root, name)?;
     let found = value
         .as_array()
         .ok_or_else(|| EngError::Checkpoint(format!("configuration {name} must be an array")))?;
-    if found.len() == 1 && found[0].as_str() == Some(ARCHITECTURE) {
+    if found.len() == 1 && found[0].as_str() == Some(architecture) {
         return Ok(());
     }
     Err(EngError::Checkpoint(format!(
-        "configuration {name} must be [{ARCHITECTURE:?}]"
+        "configuration {name} is {value}, expected [{architecture:?}]"
     )))
 }
 
@@ -174,20 +274,20 @@ fn expect_u32(object: &Value, name: &str, expected: u32) -> Result<(), EngError>
     Ok(())
 }
 
-fn check_layer_types(text: &Value) -> Result<(), EngError> {
+fn check_layer_types(text: &Value, layers: usize) -> Result<(), EngError> {
     let name = "text_config.layer_types";
     let value = required(text, "layer_types")
         .map_err(|_| EngError::Checkpoint(format!("configuration lacks {name}")))?;
-    let layers = value
+    let kinds = value
         .as_array()
         .ok_or_else(|| EngError::Checkpoint(format!("configuration {name} must be an array")))?;
-    if layers.len() != 48 {
+    if kinds.len() != layers {
         return Err(EngError::Checkpoint(format!(
-            "configuration {name} has {} entries, expected 48",
-            layers.len()
+            "configuration {name} has {} entries, expected {layers}",
+            kinds.len()
         )));
     }
-    for (index, layer) in layers.iter().enumerate() {
+    for (index, layer) in kinds.iter().enumerate() {
         let expected = if index % 6 == 5 {
             "full_attention"
         } else {
@@ -195,7 +295,7 @@ fn check_layer_types(text: &Value) -> Result<(), EngError> {
         };
         if layer.as_str() != Some(expected) {
             return Err(EngError::Checkpoint(format!(
-                "configuration {name}[{index}] must be {expected:?}"
+                "configuration {name}[{index}] is {layer}, expected {expected:?}"
             )));
         }
     }
@@ -293,6 +393,50 @@ fn expect_null(object: &Value, name: &str) -> Result<(), EngError> {
         return Ok(());
     }
     Err(EngError::Checkpoint(format!(
-        "configuration {path} must be null"
+        "configuration {path} is {value}, expected null"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn architecture_refusal_names_found_and_expected() {
+        let root = json!({"architectures": ["OtherArch"]});
+        let Err(EngError::Checkpoint(message)) = expect_architecture(&root, "TestArch") else {
+            panic!("expected a checkpoint refusal");
+        };
+        assert_eq!(
+            message,
+            "configuration architectures is [\"OtherArch\"], expected [\"TestArch\"]"
+        );
+    }
+
+    #[test]
+    fn layer_type_refusal_names_found_and_expected() {
+        let text = json!({"layer_types": ["full_attention", "sliding_attention"]});
+        let Err(EngError::Checkpoint(message)) = check_layer_types(&text, 2) else {
+            panic!("expected a checkpoint refusal");
+        };
+        assert_eq!(
+            message,
+            "configuration text_config.layer_types[0] is \"full_attention\", \
+             expected \"sliding_attention\""
+        );
+    }
+
+    #[test]
+    fn null_refusal_names_the_found_value() {
+        let text = json!({"use_bidirectional_attention": true});
+        let Err(EngError::Checkpoint(message)) = expect_null(&text, "use_bidirectional_attention")
+        else {
+            panic!("expected a checkpoint refusal");
+        };
+        assert_eq!(
+            message,
+            "configuration text_config.use_bidirectional_attention is true, expected null"
+        );
+    }
 }

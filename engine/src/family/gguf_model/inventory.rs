@@ -260,6 +260,12 @@ impl Inventory {
         for (layer, kind) in spec.layers_attention.iter().enumerate() {
             let mixer = match kind {
                 AttentionKind::Full => FULL_ROLES.as_slice(),
+                AttentionKind::Sliding => {
+                    return Err(EngError::Checkpoint(format!(
+                        "family {} layer {layer}: attention kind Sliding has no GGUF tensors",
+                        spec.name
+                    )));
+                }
                 AttentionKind::DeltaNet => DELTA_ROLES.as_slice(),
                 AttentionKind::Qsa => {
                     return Err(EngError::Checkpoint(format!(

@@ -172,6 +172,40 @@ pub(crate) fn validate_family(spec: &FamilySpec) -> Result<(), EngError> {
             spec.name, spec.layers, declared
         )));
     }
+    let has_sliding = spec.layers_attention.contains(&AttentionKind::Sliding);
+    if has_sliding != (spec.sliding_window > 0) {
+        let detail = if has_sliding {
+            "sliding layers without a sliding window"
+        } else {
+            "a sliding window without sliding layers"
+        };
+        return Err(EngError::Checkpoint(format!(
+            "family {} declares {detail}",
+            spec.name
+        )));
+    }
+    if spec.kv_shared_layers >= spec.layers {
+        return Err(EngError::Checkpoint(format!(
+            "family {} shares K/V across {} of {} layers",
+            spec.name, spec.kv_shared_layers, spec.layers
+        )));
+    }
+    if spec.global_head_dim != 0 && !spec.layers_attention.contains(&AttentionKind::Full) {
+        return Err(EngError::Checkpoint(format!(
+            "family {} declares a global head dimension without a full-attention layer",
+            spec.name
+        )));
+    }
+    for layer in spec.first_shared_layer()..spec.layers {
+        let kind = spec.layers_attention[layer as usize];
+        if !matches!(kind, AttentionKind::Full | AttentionKind::Sliding) {
+            return Err(EngError::Checkpoint(format!(
+                "family {} shares K/V over layer {layer} of kind {kind:?}, which stores no K/V",
+                spec.name
+            )));
+        }
+        spec.shared_kv_source(layer)?;
+    }
     let needs_linear = spec.layers_attention.contains(&AttentionKind::DeltaNet);
     match spec.linear {
         None if needs_linear => Err(EngError::Checkpoint(format!(
@@ -355,6 +389,7 @@ mod tests {
         heads_q: 8,
         heads_kv: 2,
         head_dim: 32,
+        global_head_dim: 0,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-6,
         model_types: &["test_model"],
@@ -370,6 +405,8 @@ mod tests {
         router: Router::SoftmaxTopK { renorm: true },
         mtp: false,
         layers_attention: &[AttentionKind::DeltaNet, AttentionKind::Full],
+        sliding_window: 0,
+        kv_shared_layers: 0,
         linear: Some(LinearAttention {
             key_heads: 2,
             key_head_dim: 16,
@@ -633,6 +670,7 @@ mod tests {
             heads_q: 8,
             heads_kv: 2,
             head_dim: 32,
+            global_head_dim: 0,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-6,
             model_types: &["test_model"],
@@ -648,6 +686,8 @@ mod tests {
             router: Router::SoftmaxTopK { renorm: true },
             mtp: false,
             layers_attention: &[AttentionKind::Full],
+            sliding_window: 0,
+            kv_shared_layers: 0,
             linear: None,
             hyper: None,
         };

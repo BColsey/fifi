@@ -16,9 +16,13 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6957,
-      "ignored": 620,
+      "test_fns": 7009,
+      "ignored": 625,
       "env_gates": [
+        "BOLT_DUMP_LOGITS",
+        "BOLT_Q8_FILE",
+        "BOLT_Q8_HEADER_SHA256",
+        "BOLT_TRACE_DIR",
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
         "DT_CLASS_PARTITION",

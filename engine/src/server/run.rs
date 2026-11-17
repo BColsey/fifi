@@ -507,21 +507,45 @@ fn start_fake(
     })
 }
 
-/// The staged Gemma4 row. The registry entry exists so a config naming
-/// the family reaches this precise refusal instead of the config gate's
-/// generic "does not support" text; construct the engine here when the
-/// Gemma factory exists (the Starter doc above documents the one-row
-/// contract).
+/// The Gemma4 row. The Bolt E4B dispatches by its model directory's
+/// `config.json` (validated by `gemma4::serve::bolt_configured`) and starts
+/// on the CUDA build; any other model in the family reaches this refusal
+/// (the Starter doc above documents the one-row contract).
 fn start_gemma4(
-    _config: &EngineConfig,
+    config: &EngineConfig,
     _prefix_reuse: bool,
     _ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    Err(EngError::BadRequest(
-        "gemma4 is staged in this build: the server factory does not construct \
-         the Gemma engine yet; nothing was read from the model directory"
-            .into(),
-    ))
+    #[cfg(feature = "native-cuda")]
+    {
+        match gemma4::serve::bolt_configured(&config.model_dir) {
+            Ok(()) => {
+                let started = gemma4::serve::start_bolt_engine(
+                    &config.model_dir,
+                    &config.tokenizer_dir,
+                    _ready_note,
+                )?;
+                Ok(StartedEngine {
+                    engine: started.engine,
+                    bundle: Arc::new(started.bundle),
+                    context_limit: started.context_limit,
+                    effective: Vec::new(),
+                })
+            }
+            Err(cause) => Err(EngError::BadRequest(format!(
+                "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+                     the model directory {} failed the Bolt configuration check: {}",
+                config.model_dir.display(),
+                cause.describe()
+            ))),
+        }
+    }
+    #[cfg(not(feature = "native-cuda"))]
+    Err(EngError::BadRequest(format!(
+        "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+         this build has no CUDA engine (model directory {})",
+        config.model_dir.display()
+    )))
 }
 
 /// The closed registry of families this build starts. Staged backends

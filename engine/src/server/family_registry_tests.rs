@@ -74,10 +74,9 @@ fn nemotron35_row_pins_to_the_nemotron_factory_refusal() {
 
 /// No other test pins the gemma4 ROW — a wrong row would pass every
 /// other test. Drives the starter with a gate-valid config (the model
-/// directory does not exist) and asserts the staged refusal, so the row
-/// provably refuses before any model or tokenizer read.
+/// directory does not exist) and asserts the row's own refusal.
 #[test]
-fn gemma4_row_refuses_staged_before_any_read() {
+fn gemma4_row_refuses_without_a_bolt_model() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("enginesrv.json");
     std::fs::write(
@@ -92,18 +91,29 @@ fn gemma4_row_refuses_staged_before_any_read() {
         }"#,
     )
     .expect("write config");
-    let config = crate::server::config::Config::from_file(&path)
-        .expect("gate accepts the staged gemma4 name");
+    let config =
+        crate::server::config::Config::from_file(&path).expect("gate accepts the gemma4 name");
     let entry = &config.engines[0];
     let starter = family_starter(&entry.family).expect("gemma4 starter");
     match starter(entry, false, None) {
-        Err(crate::EngError::BadRequest(message)) => assert_eq!(
-            message,
-            "gemma4 is staged in this build: the server factory does not construct \
-             the Gemma engine yet; nothing was read from the model directory",
-            "the refusal must be the gemma4 row's own staged text"
-        ),
-        other => panic!("expected the staged refusal, got Ok: {}", other.is_ok()),
+        Err(crate::EngError::BadRequest(message)) => {
+            #[cfg(feature = "native-cuda")]
+            assert!(
+                message.starts_with(
+                    "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+                     the model directory m failed the Bolt configuration check:"
+                ),
+                "the refusal must name the Bolt configuration cause, got {message}"
+            );
+            #[cfg(not(feature = "native-cuda"))]
+            assert_eq!(
+                message,
+                "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
+                 this build has no CUDA engine (model directory m)",
+                "the refusal must be the gemma4 row's own text"
+            );
+        }
+        other => panic!("expected the gemma4 refusal, got Ok: {}", other.is_ok()),
     }
 }
 

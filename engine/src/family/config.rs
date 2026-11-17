@@ -22,8 +22,7 @@ impl FamilySpec {
     /// members and a null `head_dim` (a null value is not an absent value). The `mtp`
     /// flag selects an execution mode and has no configuration field to check.
     ///
-    /// TODO(S7): the check does not compare `partial_rotary_factor` or the rope dimension.
-    /// The S7 lane owns that field and its correction.
+    /// The check does not compare `partial_rotary_factor` or the rope dimension.
     pub(crate) fn check_architecture_config(&self, config: &[u8]) -> Result<(), EngError> {
         let root = serde_json::from_slice::<UniqueValue>(config)
             .map_err(|error| EngError::Checkpoint(format!("configuration JSON: {error}")))?
@@ -274,12 +273,12 @@ impl FamilySpec {
 }
 
 /// The configuration vocabulary distinguishes only `full_attention` and
-/// `linear_attention`. A family executes the full-attention positions either as
-/// `AttentionKind::Full` or as the sparse `AttentionKind::Qsa`, so both declare
-/// the same configuration kind.
+/// `linear_attention`. A family executes the full-attention positions as plain,
+/// sparse, or windowed attention (`AttentionKind::Full`, `Qsa`, or `Sliding`),
+/// so all declare the same configuration kind.
 fn config_layer_kind(kind: AttentionKind) -> AttentionKind {
     match kind {
-        AttentionKind::Full | AttentionKind::Qsa => AttentionKind::Full,
+        AttentionKind::Full | AttentionKind::Qsa | AttentionKind::Sliding => AttentionKind::Full,
         AttentionKind::DeltaNet => AttentionKind::DeltaNet,
     }
 }

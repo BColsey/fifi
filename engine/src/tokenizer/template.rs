@@ -262,6 +262,18 @@ fn unknown_method(
         let _: () = minijinja::value::from_args(args)?;
         return state.apply_filter("items", std::slice::from_ref(value));
     }
+    if value.kind() == minijinja::value::ValueKind::Map && method == "get" {
+        // Python dict.get shape, but a missing key with no default yields
+        // undefined, not Python's None, on purpose: the Bolt template's falsy
+        // chains treat undefined and None alike, and `is undefined` stays
+        // distinguishable from `is none`.
+        let (key, default): (Value, Option<Value>) = minijinja::value::from_args(args)?;
+        let found = value.get_item(&key)?;
+        if found.is_undefined() {
+            return Ok(default.unwrap_or(Value::UNDEFINED));
+        }
+        return Ok(found);
+    }
     let Some(text) = value.as_str() else {
         return Err(unknown_name(method));
     };

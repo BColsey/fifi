@@ -10,7 +10,7 @@
 //! orders the launches and owns the buffers. It uploads the id, position and cache-length
 //! words each step (so it does allocate per step, and that free synchronizes the device).
 //!
-//! Limits of this slice:
+//! Limits:
 //! - Prefill runs bounded batches through the batched step (single tokens take the m = 1
 //!   path of the same step).
 //! - The per-head RMSNorm still runs one launch per head.
@@ -19,9 +19,13 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "staged until the executor is wired to the worker")
+    expect(
+        dead_code,
+        reason = "native-cuda resident helpers beyond the serving path"
+    )
 )]
 
+pub(crate) mod bolt;
 mod step;
 #[cfg(test)]
 mod tests;

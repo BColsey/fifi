@@ -20,6 +20,7 @@ static SPEC: FamilySpec = FamilySpec {
     heads_q: 8,
     heads_kv: 2,
     head_dim: 32,
+    global_head_dim: 0,
     rope_theta: 10000.0,
     rms_norm_eps: 1e-6,
     model_types: &["test_model"],
@@ -35,6 +36,8 @@ static SPEC: FamilySpec = FamilySpec {
     router: Router::SoftmaxTopK { renorm: true },
     mtp: false,
     layers_attention: &[AttentionKind::Full, AttentionKind::Full],
+    sliding_window: 0,
+    kv_shared_layers: 0,
     linear: None,
     hyper: None,
 };

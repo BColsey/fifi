@@ -8,13 +8,10 @@
 //! it is queued. It allocates nothing, copies nothing and never synchronizes.
 //!
 //! Every refusal is a BadRequest and happens before any native call: the backend is
-//! usable, rows are in 1..=16, n_q_head is 16, n_kv_head is 1 or 8, head_dim matches
+//! usable, rows are in 1..=16, query heads 16 with kv heads 1 or 8, or 8 with 2,
+//! head_dim matches
 //! the mode (256 local, 512 global), the ranges hold their rows at 4-byte alignment,
 //! and q shares no byte with k. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -34,6 +31,18 @@ pub(crate) struct RopeGemmaCall<'b> {
     pub(crate) n_kv_head: usize,
     pub(crate) head_dim: usize,
     pub(crate) global_mode: bool,
+}
+
+/// The RoPE head_dim/mode pairs the kernel admits: 256 local or 512 global. Pure
+/// geometry checked before any native call, so the admission is testable on the host.
+pub(crate) fn admit_rope_head_dim(head_dim: usize, global_mode: bool) -> Result<(), EngError> {
+    if !matches!((head_dim, global_mode), (256, false) | (512, true)) {
+        return Err(EngError::BadRequest(format!(
+            "the rope_gemma needs head_dim 256 local or 512 global, got {head_dim} \
+             global_mode {global_mode}"
+        )));
+    }
+    Ok(())
 }
 
 impl CudaContext {
@@ -73,27 +82,8 @@ impl CudaContext {
                 call.rows_q, call.rows_k
             )));
         }
-        if call.n_q_head != 16 {
-            return Err(EngError::BadRequest(format!(
-                "the rope_gemma needs 16 query heads, got {}",
-                call.n_q_head
-            )));
-        }
-        if call.n_kv_head != 1 && call.n_kv_head != 8 {
-            return Err(EngError::BadRequest(format!(
-                "the rope_gemma needs 1 or 8 kv heads, got {}",
-                call.n_kv_head
-            )));
-        }
-        if !matches!(
-            (call.head_dim, call.global_mode),
-            (256, false) | (512, true)
-        ) {
-            return Err(EngError::BadRequest(format!(
-                "the rope_gemma needs head_dim 256 local or 512 global, got {} global_mode {}",
-                call.head_dim, call.global_mode
-            )));
-        }
+        super::attn_decode_gemma::admit_gemma_heads(call.n_q_head, call.n_kv_head)?;
+        admit_rope_head_dim(call.head_dim, call.global_mode)?;
         require_fit("q", &call.q, q_bytes, 4)?;
         require_fit("k", &call.k, k_bytes, 4)?;
         require_fit("pos", &call.pos, 4, 4)?;

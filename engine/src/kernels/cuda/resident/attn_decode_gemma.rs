@@ -1,6 +1,7 @@
 //! The Gemma 4 Humanizer decode attention over the KV8 planes: one single-pass
 //! launch per call. GQA maps query head h to kv head h*n_kv_head/n_q_head (2:1 on
-//! local layers, 16:1 on global layers); head_dim is 256 local or 512 global; the
+//! local layers, 16:1 on global layers of the Humanizer, 4:1 on the Bolt layers);
+//! head_dim is 256 local or 512 global; the
 //! window cuts the keys to the last W positions (0 means all); the scale is a
 //! parameter (Gemma uses 1.0); there is no output gate. The device kv_len word is
 //! authoritative: token t sees keys 0..kv_len+t-1, out is NaN and status bit 4 is
@@ -11,14 +12,11 @@
 //! synchronizes.
 //!
 //! Every refusal is a BadRequest and happens before any native call: the backend is
-//! usable; m is in 1..=16; n_q_head is 16; n_kv_head is 1 or 8; head_dim is 256 or
+//! usable; m is in 1..=16; query heads 16 with kv heads 1 or 8, or 8 with 2;
+//! head_dim is 256 or
 //! 512; cells is positive; the scale is finite below 1e30 in magnitude; every range
 //! holds its bytes at 4-byte alignment; out overlaps none of q, the K code plane or
 //! the V code plane. A refused call changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the resident decode step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -44,6 +42,20 @@ pub(crate) struct AttnDecodeGemmaCall<'b> {
     pub(crate) cells: usize,
     pub(crate) window: usize,
     pub(crate) scale: f32,
+}
+
+/// The query/kv head shapes the Gemma attention and RoPE kernels admit: 16 query
+/// heads with 1 or 8 kv heads (the Humanizer local/global layers), or 8 with 2
+/// (the Bolt layers). Pure geometry checked before any native call, so the
+/// admission is testable on the host.
+pub(crate) fn admit_gemma_heads(n_q_head: usize, n_kv_head: usize) -> Result<(), EngError> {
+    if !matches!((n_q_head, n_kv_head), (16, 1) | (16, 8) | (8, 2)) {
+        return Err(EngError::BadRequest(format!(
+            "the gemma kernels need query heads 16 with kv heads 1 or 8, or 8 with 2, \
+             got {n_q_head} and {n_kv_head}"
+        )));
+    }
+    Ok(())
 }
 
 impl CudaContext {
@@ -97,18 +109,7 @@ impl CudaContext {
                 call.m
             )));
         }
-        if call.n_q_head != 16 {
-            return Err(EngError::BadRequest(format!(
-                "the attention needs 16 query heads, got {}",
-                call.n_q_head
-            )));
-        }
-        if !matches!(call.n_kv_head, 1 | 8) {
-            return Err(EngError::BadRequest(format!(
-                "the attention needs 1 or 8 kv heads, got {}",
-                call.n_kv_head
-            )));
-        }
+        admit_gemma_heads(call.n_q_head, call.n_kv_head)?;
         if !matches!(call.head_dim, 256 | 512) {
             return Err(EngError::BadRequest(format!(
                 "the attention needs head_dim 256 or 512, got {}",

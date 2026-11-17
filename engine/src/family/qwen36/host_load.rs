@@ -226,6 +226,11 @@ impl HostWeights {
                         "layer {index} is a QSA layer"
                     )));
                 }
+                AttentionKind::Sliding => {
+                    return Err(EngError::Checkpoint(format!(
+                        "layer {index} is a sliding-attention layer"
+                    )));
+                }
             };
             layers.push(OwnedLayer {
                 input_norm: loader.floats(&format!("{prefix}input_layernorm.weight"), hidden)?,
@@ -408,6 +413,7 @@ mod tests {
         heads_q: 2,
         heads_kv: 1,
         head_dim: 32,
+        global_head_dim: 0,
         rope_theta: 10_000.0,
         rms_norm_eps: 1e-6,
         model_types: &["qwen3_5_moe", "qwen3_5_moe_text"],
@@ -423,6 +429,8 @@ mod tests {
         router: Router::SoftmaxTopK { renorm: true },
         mtp: false,
         layers_attention: &[AttentionKind::DeltaNet, AttentionKind::Full],
+        sliding_window: 0,
+        kv_shared_layers: 0,
         linear: Some(LinearAttention {
             key_heads: 1,
             key_head_dim: 32,

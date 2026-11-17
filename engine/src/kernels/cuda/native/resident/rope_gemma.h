@@ -22,8 +22,8 @@ typedef struct inference_cuda_rope_gemma_args {
     const void *factors;  /* f32 [head_dim/2] or NULL */
     int rows_q;           /* 1..16 */
     int rows_k;           /* 1..16 */
-    int n_q_head;         /* 16 */
-    int n_kv_head;        /* 1 (global) or 8 (local) */
+    int n_q_head;         /* 16 (Humanizer) or 8 (Bolt) */
+    int n_kv_head;        /* 1 or 8 (Humanizer), 2 (Bolt) */
     int head_dim;         /* 256 (local) or 512 (global) */
     int global_mode;      /* 0 local, 1 global */
 } inference_cuda_rope_gemma_args;

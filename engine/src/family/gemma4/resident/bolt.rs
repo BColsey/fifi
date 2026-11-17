@@ -1,0 +1,1697 @@
+//! The resident Nemotron Bolt E4B decode step on one CUDA device.
+//!
+//! This module composes the checked resident operations over the converted Bolt
+//! Q8_0 checkpoint. Each of the forty-two decoder layers runs three residual
+//! blocks: attention over the KV8 planes, the dense GeLU-tanh feed-forward and
+//! the per-layer-input block. The last eighteen layers hold no k/v projections
+//! and no cache planes; their attention reads the cache of the last physical
+//! layer of their own kind (layer 22 for sliding, 23 for full), so only the
+//! twenty-four physical layers consume cache memory.
+//!
+//! The per-layer inputs are computed once per step from the scaled embedding:
+//! the model projection times hidden^-0.5, one 256-wide RMSNorm slice per
+//! layer, plus sixteen times the token's per-layer embedding row, all scaled by
+//! 2^-0.5. The step ends with the final RMSNorm, the tied-embedding logit
+//! projection and the logit softcap.
+//!
+//! Limits:
+//! - The cache holds 32,768 cells per physical layer, half the model's 65,536
+//!   maximum positions; widening is a constant change.
+//! - Prefill runs bounded batches through the batched step.
+//! - The per-head RMSNorm runs one batched launch across heads.
+//! - Shared layers rotate one scratch k row, because the rope kernel requires
+//!   at least one; the row is never read.
+//! - A decode step's capped logits are read back to the host; host sampling
+//!   draws from that row.
+
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "native-cuda resident helpers beyond the serving path"
+    )
+)]
+
+use super::step::layer_buffers;
+use super::{
+    Kv, Matrix, PackedMatrix, Vector, epsilon, matrix, packed_matrix, scalar, vector,
+    vector_filled, zero,
+};
+use crate::EngError;
+use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
+use crate::kernels::cuda::DeviceBuffer;
+use crate::kernels::cuda::DeviceRange;
+use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
+use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
+use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
+use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
+use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
+use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
+use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
+use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
+use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
+use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
+use crate::kernels::cuda::resident::row_add::RowAddCall;
+use crate::kernels::cuda::resident::row_scale::RowScaleCall;
+use crate::kernels::cuda::resident::softcap::SoftcapCall;
+use crate::kernels::cuda::{CudaContext, DeviceStream};
+
+// Geometry is read from the family descriptor, the single source of truth;
+// the executor pins only the cache cell count and the checkpoint properties
+// the descriptor does not carry (PLE width, soft cap).
+pub(crate) const LAYERS: usize = NEMOTRON_BOLT_E4B.layers as usize;
+/// The physical k/v layers; the shared layers attend into their caches.
+pub(crate) const PHYSICAL_LAYERS: usize =
+    (NEMOTRON_BOLT_E4B.layers - NEMOTRON_BOLT_E4B.kv_shared_layers) as usize;
+/// Values per hidden row.
+pub(crate) const HIDDEN: usize = NEMOTRON_BOLT_E4B.hidden as usize;
+/// Rows of the tied embedding and of the logit projection.
+pub(crate) const VOCAB: usize = NEMOTRON_BOLT_E4B.vocab as usize;
+pub(crate) const HEADS: usize = NEMOTRON_BOLT_E4B.heads_q as usize;
+pub(crate) const KV_HEADS: usize = NEMOTRON_BOLT_E4B.heads_kv as usize;
+pub(crate) const LOCAL_HEAD: usize = NEMOTRON_BOLT_E4B.head_dim as usize;
+pub(crate) const GLOBAL_HEAD: usize = NEMOTRON_BOLT_E4B.global_head_dim as usize;
+/// Width of one per-layer input and of the gated mixing inside every layer.
+pub(crate) const PLE: usize = 256;
+pub(crate) const FFN: usize = 10_240;
+/// KV cells per physical layer: half the model's 65,536 maximum positions.
+pub(crate) const CELLS: usize = 32_768;
+pub(crate) const LOCAL_WINDOW: usize = NEMOTRON_BOLT_E4B.sliding_window as usize;
+pub(crate) const SOFT_CAP: f32 = 30.0;
+/// The identity and mixing scales applied to the per-layer inputs.
+const PLE_IDENTITY_SCALE: f32 = 16.0;
+const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
+
+/// The device bytes the scratch can hold at once: every growable activation
+/// vector and q8 buffer sized for `PREFILL_BATCH` rows (the maximum
+/// `grow_scratch` allocates), plus the fixed ones/logits/head/qk buffers and
+/// the three input cells. The starter admits this against free memory before
+/// loading. `None` on overflow. Mirrors `grow_scratch` so the charge cannot
+/// undercount the prefill working set.
+pub(crate) fn scratch_bytes() -> Option<u64> {
+    let rows = Bolt::PREFILL_BATCH as u64;
+    let growable_f32 = [
+        8 * HIDDEN,                 // h[4], nrm, nrm2, proj, down
+        3 * HEADS * GLOBAL_HEAD,    // q_normed, q, ctx_out
+        4 * KV_HEADS * GLOBAL_HEAD, // k_normed, v_normed, k, v
+        3 * FFN,                    // gate, up, mixed
+        2 * LAYERS * PLE,           // ple_all, ple_scaled
+        3 * PLE,                    // ple_nrm, ple_tbl, ple_mixed
+    ];
+    let mut total = 0u64;
+    for elements in growable_f32 {
+        total = total.checked_add((elements as u64).checked_mul(rows)?.checked_mul(4)?)?;
+    }
+    // Fixed f32 buffers: ones, logits, logits_capped.
+    total = total.checked_add(((GLOBAL_HEAD + 2 * VOCAB) as u64).checked_mul(4)?)?;
+    // Growable q8 buffers at PREFILL_BATCH columns.
+    for width in [HIDDEN, HEADS * GLOBAL_HEAD, FFN, PLE] {
+        total = total.checked_add(q8_1_bytes(width, Bolt::PREFILL_BATCH)? as u64)?;
+    }
+    // Fixed q8 buffers: the head row and the qk dump.
+    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, 1)? as u64)?;
+    total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS)? as u64)?;
+    // ids, pos, kv_len input cells.
+    total.checked_add(12)
+}
+
+/// The parity dump directory, read from BOLT_TRACE_DIR once. The trace hook
+/// runs per checkpoint per token; caching the environment read keeps the
+/// off-path free of repeated allocations.
+fn trace_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("BOLT_TRACE_DIR").ok())
+        .as_deref()
+}
+
+pub(crate) struct BoltLayer {
+    attn_norm: Vector,
+    q_norm: Vector,
+    k_norm: Option<Vector>,
+    q: PackedMatrix,
+    k: Option<PackedMatrix>,
+    v: Option<PackedMatrix>,
+    out: PackedMatrix,
+    post_attn_norm: Vector,
+    ffn_norm: Vector,
+    ffn_gate: PackedMatrix,
+    ffn_up: PackedMatrix,
+    ffn_down: PackedMatrix,
+    post_ffw_norm: Vector,
+    ple_gate: PackedMatrix,
+    ple_proj: PackedMatrix,
+    post_ple_norm: Vector,
+    table: Matrix,
+    scale: f32,
+    global: bool,
+    head: usize,
+    kv: Option<Kv>,
+    kv_source: Option<usize>,
+}
+
+/// The per-step buffers, sized once at load.
+pub(crate) struct Scratch {
+    pub(crate) h: [Vector; 4],
+    pub(crate) nrm: Vector,
+    pub(crate) nrm2: Vector,
+    pub(crate) q_normed: Vector,
+    pub(crate) k_normed: Vector,
+    pub(crate) v_normed: Vector,
+    pub(crate) ones: Vector,
+    pub(crate) q: Vector,
+    pub(crate) k: Vector,
+    pub(crate) v: Vector,
+    pub(crate) ctx_out: Vector,
+    pub(crate) proj: Vector,
+    pub(crate) gate: Vector,
+    pub(crate) up: Vector,
+    pub(crate) mixed: Vector,
+    pub(crate) down: Vector,
+    pub(crate) ple_all: Vector,
+    pub(crate) ple_scaled: Vector,
+    pub(crate) ple_nrm: Vector,
+    pub(crate) ple_tbl: Vector,
+    pub(crate) ple_mixed: Vector,
+    pub(crate) q8_hidden: DeviceBuffer,
+    pub(crate) q8_ctx: DeviceBuffer,
+    pub(crate) q8_mixed: DeviceBuffer,
+    pub(crate) q8_ple_mixed: DeviceBuffer,
+    pub(crate) q8_head: DeviceBuffer,
+    /// The QK-norm dump: rows of quantized heads nobody reads back, sized for a
+    /// full prefill batch of every q head at the wider head width.
+    pub(crate) q8_qk: DeviceBuffer,
+    pub(crate) ids: DeviceBuffer,
+    pub(crate) pos: DeviceBuffer,
+    pub(crate) kv_len: DeviceBuffer,
+}
+
+pub(crate) struct Bolt {
+    pub(crate) ctx: CudaContext,
+    pub(crate) stream: DeviceStream,
+    pub(crate) layers: Vec<BoltLayer>,
+    pub(crate) embed: Matrix,
+    pub(crate) ple_model: PackedMatrix,
+    pub(crate) ple_model_norm: Vector,
+    pub(crate) out_norm: Vector,
+    pub(crate) rope_freqs: Option<Vector>,
+    pub(crate) scratch: Scratch,
+    pub(crate) logits: Vector,
+    pub(crate) logits_capped: Vector,
+    pub(crate) eps: f32,
+}
+
+fn embed_scale() -> f32 {
+    (HIDDEN as f32).sqrt()
+}
+
+/// The device demand of a Bolt load: the weights file bytes, the KV8 cache of
+/// the physical layers at `CELLS` positions, the prefill scratch, and the
+/// shared headroom reserve. Pure arithmetic, so the admission refusal is
+/// testable on the host without a device.
+pub(crate) fn bolt_demand(
+    weights_bytes: u64,
+) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
+    let kv = super::super::budget::bolt_kv_plan(CELLS as u64)
+        .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
+    let kv_bytes = kv
+        .positions
+        .checked_mul(kv.bytes_per_position)
+        .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
+    let scratch = scratch_bytes()
+        .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
+    Ok(crate::kernels::cuda::plan::Demand {
+        tensors: weights_bytes,
+        kv_cache: kv_bytes,
+        work: scratch,
+        headroom: super::super::budget::BOLT_HEADROOM_BYTES,
+    })
+}
+
+pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
+    let weights = super::super::open_bolt_weights(path, header_sha256)?;
+    let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
+    let stream = ctx.stream()?;
+    // Admit the device budget before allocating: weights + KV cache + scratch
+    // plus headroom against free device memory, through the shared plan::admit
+    // the other resident executors use. An exact fit of the allocations alone
+    // is refused; the shared error names the needed and free bytes.
+    let free = ctx.memory_info()?.free as u64;
+    let weights_bytes = std::fs::metadata(path)
+        .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
+        .len();
+    let demand = bolt_demand(weights_bytes)?;
+    crate::kernels::cuda::plan::admit(&demand, free)?;
+    let mut layers = Vec::with_capacity(LAYERS);
+    for layer in 0..LAYERS {
+        let global = NEMOTRON_BOLT_E4B.layers_attention[layer] == AttentionKind::Full;
+        let head = if global { GLOBAL_HEAD } else { LOCAL_HEAD };
+        let physical = layer < PHYSICAL_LAYERS;
+        // A shared layer attends into the cache of the last physical layer of its own kind.
+        let kv_source = if physical {
+            None
+        } else {
+            Some(NEMOTRON_BOLT_E4B.shared_kv_source(layer as u32)? as usize)
+        };
+        let base = format!("blk.{layer}.");
+        let kv = if physical {
+            Some(Kv {
+                k_codes: zero(&ctx, KV_HEADS * CELLS * head)?,
+                k_scales: zero(&ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
+                v_codes: zero(&ctx, KV_HEADS * CELLS * head)?,
+                v_scales: zero(&ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
+                shape: Kv8Shape {
+                    rows: 1,
+                    n_kv_head: KV_HEADS,
+                    head_dim: head,
+                    cells: CELLS,
+                    code_scale: Kv8CodeScale::UnroundedF32,
+                },
+            })
+        } else {
+            None
+        };
+        layers.push(BoltLayer {
+            attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,
+            q_norm: vector(&weights, &ctx, &format!("{base}attn_q_norm.weight"), head)?,
+            k_norm: if physical {
+                Some(vector(
+                    &weights,
+                    &ctx,
+                    &format!("{base}attn_k_norm.weight"),
+                    head,
+                )?)
+            } else {
+                None
+            },
+            q: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}attn_q.weight"),
+                HIDDEN,
+                HEADS * head,
+            )?,
+            k: if physical {
+                Some(packed_matrix(
+                    &weights,
+                    &ctx,
+                    &format!("{base}attn_k.weight"),
+                    HIDDEN,
+                    KV_HEADS * head,
+                )?)
+            } else {
+                None
+            },
+            v: if physical {
+                Some(packed_matrix(
+                    &weights,
+                    &ctx,
+                    &format!("{base}attn_v.weight"),
+                    HIDDEN,
+                    KV_HEADS * head,
+                )?)
+            } else {
+                None
+            },
+            out: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}attn_output.weight"),
+                HEADS * head,
+                HIDDEN,
+            )?,
+            post_attn_norm: vector(
+                &weights,
+                &ctx,
+                &format!("{base}post_attention_norm.weight"),
+                HIDDEN,
+            )?,
+            ffn_norm: vector(&weights, &ctx, &format!("{base}ffn_norm.weight"), HIDDEN)?,
+            ffn_gate: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}ffn_gate.weight"),
+                HIDDEN,
+                FFN,
+            )?,
+            ffn_up: packed_matrix(&weights, &ctx, &format!("{base}ffn_up.weight"), HIDDEN, FFN)?,
+            ffn_down: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}ffn_down.weight"),
+                FFN,
+                HIDDEN,
+            )?,
+            post_ffw_norm: vector(
+                &weights,
+                &ctx,
+                &format!("{base}post_ffw_norm.weight"),
+                HIDDEN,
+            )?,
+            ple_gate: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}per_layer_gate.weight"),
+                HIDDEN,
+                PLE,
+            )?,
+            ple_proj: packed_matrix(
+                &weights,
+                &ctx,
+                &format!("{base}per_layer_proj.weight"),
+                PLE,
+                HIDDEN,
+            )?,
+            post_ple_norm: vector(
+                &weights,
+                &ctx,
+                &format!("{base}post_per_layer_input_norm.weight"),
+                HIDDEN,
+            )?,
+            table: matrix(
+                &weights,
+                &ctx,
+                &format!("{base}per_layer_embd.weight"),
+                PLE,
+                VOCAB,
+            )?,
+            scale: scalar(&weights, &format!("{base}layer_output_scale.weight"))?,
+            global,
+            head,
+            kv,
+            kv_source,
+        });
+    }
+    let embed = matrix(&weights, &ctx, "token_embd.weight", HIDDEN, VOCAB)?;
+    let ple_model = packed_matrix(
+        &weights,
+        &ctx,
+        "per_layer_model_projection.weight",
+        HIDDEN,
+        LAYERS * PLE,
+    )?;
+    let ple_model_norm = vector(&weights, &ctx, "per_layer_projection_norm.weight", PLE)?;
+    let out_norm = vector(&weights, &ctx, "output_norm.weight", HIDDEN)?;
+    let rope_freqs = Some(vector(&weights, &ctx, "rope_freqs.weight", 256)?);
+    let eps = epsilon(&weights)?;
+    let h = [
+        vector_filled(&ctx, HIDDEN, 0.0)?,
+        vector_filled(&ctx, HIDDEN, 0.0)?,
+        vector_filled(&ctx, HIDDEN, 0.0)?,
+        vector_filled(&ctx, HIDDEN, 0.0)?,
+    ];
+    let scratch = Scratch {
+        h,
+        nrm: vector_filled(&ctx, HIDDEN, 0.0)?,
+        nrm2: vector_filled(&ctx, HIDDEN, 0.0)?,
+        q_normed: vector_filled(&ctx, HEADS * GLOBAL_HEAD, 0.0)?,
+        k_normed: vector_filled(&ctx, KV_HEADS * GLOBAL_HEAD, 0.0)?,
+        v_normed: vector_filled(&ctx, KV_HEADS * GLOBAL_HEAD, 0.0)?,
+        ones: vector_filled(&ctx, GLOBAL_HEAD, 1.0)?,
+        q: vector_filled(&ctx, HEADS * GLOBAL_HEAD, 0.0)?,
+        k: vector_filled(&ctx, KV_HEADS * GLOBAL_HEAD, 0.0)?,
+        v: vector_filled(&ctx, KV_HEADS * GLOBAL_HEAD, 0.0)?,
+        ctx_out: vector_filled(&ctx, HEADS * GLOBAL_HEAD, 0.0)?,
+        proj: vector_filled(&ctx, HIDDEN, 0.0)?,
+        gate: vector_filled(&ctx, FFN, 0.0)?,
+        up: vector_filled(&ctx, FFN, 0.0)?,
+        mixed: vector_filled(&ctx, FFN, 0.0)?,
+        down: vector_filled(&ctx, HIDDEN, 0.0)?,
+        ple_all: vector_filled(&ctx, LAYERS * PLE, 0.0)?,
+        ple_scaled: vector_filled(&ctx, LAYERS * PLE, 0.0)?,
+        ple_nrm: vector_filled(&ctx, PLE, 0.0)?,
+        ple_tbl: vector_filled(&ctx, PLE, 0.0)?,
+        ple_mixed: vector_filled(&ctx, PLE, 0.0)?,
+        q8_hidden: zero(&ctx, q8_1_bytes(HIDDEN, 1).expect("hidden q8 size"))?,
+        q8_ctx: zero(
+            &ctx,
+            q8_1_bytes(HEADS * GLOBAL_HEAD, 1).expect("context q8 size"),
+        )?,
+        q8_mixed: zero(&ctx, q8_1_bytes(FFN, 1).expect("mixed q8 size"))?,
+        q8_ple_mixed: zero(&ctx, q8_1_bytes(PLE, 1).expect("ple mixed q8 size"))?,
+        q8_head: zero(&ctx, q8_1_bytes(GLOBAL_HEAD, 1).expect("head q8 size"))?,
+        q8_qk: zero(
+            &ctx,
+            q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS).expect("qk dump size"),
+        )?,
+        ids: zero(&ctx, 4)?,
+        pos: zero(&ctx, 4)?,
+        kv_len: zero(&ctx, 4)?,
+    };
+    let logits = vector_filled(&ctx, VOCAB, 0.0)?;
+    let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
+    Ok(Bolt {
+        ctx,
+        stream,
+        layers,
+        embed,
+        ple_model,
+        ple_model_norm,
+        out_norm,
+        rope_freqs,
+        scratch,
+        logits,
+        logits_capped,
+        eps,
+    })
+}
+
+impl Bolt {
+    pub(crate) const PREFILL_BATCH: usize = 8;
+
+    /// The capped logits of the newest logits-bearing forward, for host
+    /// sampling. The tie to `logits_capped` (not `logits`) matches the
+    /// model's own output distribution.
+    pub(crate) fn capped_logits(&self) -> Result<Vec<f32>, EngError> {
+        let mut bytes = vec![0u8; VOCAB * 4];
+        self.ctx.download(&self.logits_capped.buf, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    /// Debug parity hook: with BOLT_TRACE_DIR set, one raw f32 vector lands per
+    /// checkpoint (embed, each layer's output) as p{pos}_{name}.f32. No-op
+    /// without the variable; a parity comparison reads the dumps.
+    fn trace(&self, pos: usize, name: &str, v: &Vector, bytes: usize) {
+        let Some(dir) = trace_dir() else {
+            return;
+        };
+        let mut raw = vec![0u8; bytes];
+        if self.ctx.download(&v.buf, &mut raw).is_ok() {
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join(format!("p{pos}_{name}.f32")),
+                raw,
+            );
+        }
+    }
+
+    /// Runs a bounded prompt batch. Only its last row can produce logits.
+    /// Scratch grows once; each batch synchronizes once at the end when no
+    /// logits are drawn.
+    pub(crate) fn prefill_batch(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        logits: bool,
+    ) -> Result<(), EngError> {
+        if !(1..=Self::PREFILL_BATCH).contains(&tokens.len()) {
+            return Err(EngError::BadRequest(
+                "a Bolt prefill batch needs 1 to 8 tokens".to_owned(),
+            ));
+        }
+        if pos.checked_add(tokens.len()).is_none_or(|end| end > CELLS) {
+            return Err(EngError::ContextLimit(
+                "the Bolt prefill batch exceeds the context".to_owned(),
+            ));
+        }
+        self.grow_scratch(tokens.len())?;
+        self.decode_with_logits(tokens, pos, logits)?;
+        if !logits {
+            self.stream.synchronize()?;
+        }
+        Ok(())
+    }
+
+    fn grow_scratch(&mut self, rows: usize) -> Result<(), EngError> {
+        let sc = &mut self.scratch;
+        for (v, width) in sc.h.iter_mut().map(|v| (v, HIDDEN)).chain([
+            (&mut sc.nrm, HIDDEN),
+            (&mut sc.nrm2, HIDDEN),
+            (&mut sc.q_normed, HEADS * GLOBAL_HEAD),
+            (&mut sc.k_normed, KV_HEADS * GLOBAL_HEAD),
+            (&mut sc.v_normed, KV_HEADS * GLOBAL_HEAD),
+            (&mut sc.q, HEADS * GLOBAL_HEAD),
+            (&mut sc.k, KV_HEADS * GLOBAL_HEAD),
+            (&mut sc.v, KV_HEADS * GLOBAL_HEAD),
+            (&mut sc.ctx_out, HEADS * GLOBAL_HEAD),
+            (&mut sc.proj, HIDDEN),
+            (&mut sc.gate, FFN),
+            (&mut sc.up, FFN),
+            (&mut sc.mixed, FFN),
+            (&mut sc.down, HIDDEN),
+            (&mut sc.ple_all, LAYERS * PLE),
+            (&mut sc.ple_scaled, LAYERS * PLE),
+            (&mut sc.ple_nrm, PLE),
+            (&mut sc.ple_tbl, PLE),
+            (&mut sc.ple_mixed, PLE),
+        ]) {
+            if v.len < rows * width {
+                let len = Self::PREFILL_BATCH * width;
+                v.buf = self.ctx.allocate(len * 4)?;
+                v.len = len;
+            }
+        }
+        for (buffer, width) in [
+            (&mut sc.q8_hidden, HIDDEN),
+            (&mut sc.q8_ctx, HEADS * GLOBAL_HEAD),
+            (&mut sc.q8_mixed, FFN),
+            (&mut sc.q8_ple_mixed, PLE),
+        ] {
+            if buffer.bytes() < q8_1_bytes(width, rows).expect("bounded q8 rows") {
+                *buffer = self
+                    .ctx
+                    .allocate(q8_1_bytes(width, Self::PREFILL_BATCH).expect("bounded q8 rows"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the existing norm reduction and quantization order for every activation row.
+    fn norm_rows<'b>(
+        &self,
+        stream: &DeviceStream,
+        h: DeviceRange<'b>,
+        weight: DeviceRange<'b>,
+        norm_out: DeviceRange<'b>,
+        q8: DeviceRange<'b>,
+        rows: usize,
+    ) -> Result<(), EngError> {
+        self.ctx.add_rmsnorm_q8(
+            stream,
+            AddNormQ8Call {
+                n: HIDDEN,
+                eps: self.eps,
+                h,
+                delta: None,
+                weight,
+                norm_out,
+                q8,
+                rows,
+            },
+        )
+    }
+
+    /// Runs one decode step for the token at the position and leaves the capped
+    /// logits in the device buffer. Synchronizes once at the end.
+    pub(crate) fn decode(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
+        self.decode_with_logits(&[token], pos, true)
+    }
+
+    /// Runs one step without the output norm and the logits projection, for prompt tokens
+    /// whose logits are never read. It queues the step and does not synchronize.
+    /// The shared-KV layers are skipped: they write no cache cells, and their
+    /// hidden state only feeds the final norm, so a token whose logits are
+    /// never read does not need them.
+    pub(crate) fn decode_hidden(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
+        self.decode_with_logits(&[token], pos, false)
+    }
+
+    fn decode_with_logits(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        logits: bool,
+    ) -> Result<(), EngError> {
+        let m = tokens.len();
+        if pos.checked_add(m).is_none_or(|end| end > CELLS) {
+            return Err(EngError::ContextLimit(
+                "the Bolt decode step exceeds the context".to_owned(),
+            ));
+        }
+        let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.scratch.ids = self.ctx.upload(&ids)?;
+        self.scratch.pos = self.ctx.upload(&(pos as i32).to_le_bytes())?;
+        self.scratch.kv_len = self.ctx.upload(&((pos as i32) + 1).to_le_bytes())?;
+        let ctx = &self.ctx;
+        let stream = &self.stream;
+        let sc = &self.scratch;
+        let h0 = &sc.h[0];
+        let h1 = &sc.h[1];
+        let h2 = &sc.h[2];
+        let h3 = &sc.h[3];
+        ctx.embed_q8(
+            stream,
+            EmbedQ8Call {
+                out: h0.buf.range(0, h0.bytes())?,
+                w: self.embed.buf.range(0, self.embed.bytes())?,
+                ids: sc.ids.range(0, m * 4)?,
+                m,
+                n_rows: self.embed.rows,
+                k: self.embed.k,
+            },
+        )?;
+        ctx.row_scale(
+            stream,
+            RowScaleCall {
+                out: h1.buf.range(0, h1.bytes())?,
+                x: h0.buf.range(0, h0.bytes())?,
+                scale: embed_scale(),
+                m,
+                n: HIDDEN,
+            },
+        )?;
+        // K/V-only prefill: only the cache-writing prefix of layers runs when
+        // no logits are read; the shared-KV layers after it neither write cache
+        // cells nor feed anything but the final norm.
+        let kv_prefix = if logits {
+            LAYERS
+        } else {
+            self.layers
+                .iter()
+                .position(|layer| layer.kv.is_none())
+                .unwrap_or(LAYERS)
+        };
+        self.per_layer_inputs(h1, m, kv_prefix * PLE)?;
+        self.trace(pos, "embed", h1, m * HIDDEN * 4);
+        let h = [h0, h1, h2, h3];
+        let mut current = 1usize;
+        for index in 0..kv_prefix {
+            let (input, r1, r2, out) = layer_buffers(current);
+            self.decode_layer(
+                index,
+                h[input],
+                h[r1],
+                h[r2],
+                h[out],
+                pos,
+                kv_prefix * PLE,
+                m,
+            )?;
+            current = out;
+        }
+        if !logits {
+            // Only the last prompt token contributes logits, so the output norm and the
+            // tied-embedding projection are skipped for the rest.
+            return Ok(());
+        }
+        let input = h[current];
+        ctx.add_rmsnorm_q8(
+            stream,
+            AddNormQ8Call {
+                n: HIDDEN,
+                eps: self.eps,
+                h: input.buf.range((m - 1) * HIDDEN * 4, HIDDEN * 4)?,
+                delta: None,
+                weight: self.out_norm.buf.range(0, self.out_norm.bytes())?,
+                norm_out: sc.nrm.buf.range(0, sc.nrm.bytes())?,
+                q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                rows: 1,
+            },
+        )?;
+        ctx.matvec_q(
+            stream,
+            MatvecCall {
+                ty: QuantType::Q80,
+                w: self.embed.buf.range(0, self.embed.bytes())?,
+                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                y: self.logits.buf.range(0, self.logits.bytes())?,
+                k: HIDDEN,
+                rows: self.embed.rows,
+                ncols: 1,
+            },
+        )?;
+        ctx.softcap(
+            stream,
+            SoftcapCall {
+                out: self
+                    .logits_capped
+                    .buf
+                    .range(0, self.logits_capped.bytes())?,
+                x: self.logits.buf.range(0, self.logits.bytes())?,
+                cap: SOFT_CAP,
+                n: VOCAB,
+            },
+        )?;
+        self.trace(pos, "logits", &self.logits_capped, VOCAB * 4);
+        self.stream.synchronize()
+    }
+
+    /// Projects the scaled embedding into the per-layer planes and scales by
+    /// hidden^-0.5; the per-layer 256-wide norms and table sums run inside each
+    /// layer, where the result is consumed.
+    fn per_layer_inputs(&self, embed: &Vector, m: usize, ple_rows: usize) -> Result<(), EngError> {
+        let ctx = &self.ctx;
+        let stream = &self.stream;
+        let sc = &self.scratch;
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: embed.buf.range(0, m * HIDDEN * 4)?,
+                y: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                k: HIDDEN,
+                ncols: m,
+            },
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: self.ple_model.qs.range(0, self.ple_model.qs_bytes())?,
+                w_scales: self
+                    .ple_model
+                    .scales
+                    .range(0, self.ple_model.scales_bytes())?,
+                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                y: sc.ple_all.buf.range(0, m * ple_rows * 4)?,
+                k: HIDDEN,
+                rows: ple_rows,
+                ncols: m,
+            },
+        )?;
+        ctx.row_scale(
+            stream,
+            RowScaleCall {
+                out: sc.ple_scaled.buf.range(0, sc.ple_scaled.bytes())?,
+                x: sc.ple_all.buf.range(0, sc.ple_all.bytes())?,
+                scale: (HIDDEN as f32).recip().sqrt(),
+                m,
+                n: ple_rows,
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the residual rotation keeps four separate buffers"
+    )]
+    fn decode_layer(
+        &self,
+        index: usize,
+        input: &Vector,
+        r1: &Vector,
+        r2: &Vector,
+        out: &Vector,
+        pos: usize,
+        ple_stride: usize,
+        m: usize,
+    ) -> Result<(), EngError> {
+        let layer = &self.layers[index];
+        let ctx = &self.ctx;
+        let stream = &self.stream;
+        let sc = &self.scratch;
+        let head = layer.head;
+        let q_rows = HEADS * head;
+        let kv_rows = KV_HEADS * head;
+        let (own_kv, shared) = match &layer.kv {
+            Some(own) => (own, false),
+            None => (
+                self.layers[layer
+                    .kv_source
+                    .expect("a cacheless layer names its shared-KV source")]
+                .kv
+                .as_ref()
+                .expect("the shared-KV source layer is physical"),
+                true,
+            ),
+        };
+        self.norm_rows(
+            stream,
+            input.buf.range(0, input.bytes())?,
+            layer.attn_norm.buf.range(0, layer.attn_norm.bytes())?,
+            sc.nrm.buf.range(0, sc.nrm.bytes())?,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            m,
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: layer.q.qs.range(0, layer.q.qs_bytes())?,
+                w_scales: layer.q.scales.range(0, layer.q.scales_bytes())?,
+                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                y: sc.q.buf.range(0, m * q_rows * 4)?,
+                k: HIDDEN,
+                rows: q_rows,
+                ncols: m,
+            },
+        )?;
+        if let (Some(k), Some(v)) = (&layer.k, &layer.v) {
+            for (weight, y) in [(k, &sc.k), (v, &sc.v)] {
+                ctx.gemma_matvec(
+                    stream,
+                    GemmaMatvecCall {
+                        w_qs: weight.qs.range(0, weight.qs_bytes())?,
+                        w_scales: weight.scales.range(0, weight.scales_bytes())?,
+                        x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                        y: y.buf.range(0, m * kv_rows * 4)?,
+                        k: HIDDEN,
+                        rows: kv_rows,
+                        ncols: m,
+                    },
+                )?;
+            }
+        }
+        // The QK-norm of the reference graph: each head of q and of k is
+        // RMS-normalized and scaled by its own weight before RoPE. Values get the
+        // reference's unweighted per-head RMS norm before their cache write; the
+        // ones vector makes the weighted kernel compute the unweighted norm. The
+        // head rows are contiguous, so each loop is ONE batched launch; the q8
+        // side of the kernel is a dump nobody reads.
+        ctx.add_rmsnorm_q8(
+            stream,
+            AddNormQ8Call {
+                n: head,
+                eps: self.eps,
+                h: sc.q.buf.range(0, m * q_rows * 4)?,
+                delta: None,
+                weight: layer.q_norm.buf.range(0, head * 4)?,
+                norm_out: sc.q_normed.buf.range(0, m * q_rows * 4)?,
+                q8: sc.q8_qk.range(0, sc.q8_qk.bytes())?,
+                rows: m * HEADS,
+            },
+        )?;
+        if !shared {
+            ctx.add_rmsnorm_q8(
+                stream,
+                AddNormQ8Call {
+                    n: head,
+                    eps: self.eps,
+                    h: sc.k.buf.range(0, m * kv_rows * 4)?,
+                    delta: None,
+                    weight: layer
+                        .k_norm
+                        .as_ref()
+                        .expect("physical layers carry a k norm")
+                        .buf
+                        .range(0, head * 4)?,
+                    norm_out: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
+                    q8: sc.q8_qk.range(0, sc.q8_qk.bytes())?,
+                    rows: m * KV_HEADS,
+                },
+            )?;
+            ctx.add_rmsnorm_q8(
+                stream,
+                AddNormQ8Call {
+                    n: head,
+                    eps: self.eps,
+                    h: sc.v.buf.range(0, m * kv_rows * 4)?,
+                    delta: None,
+                    weight: sc.ones.buf.range(0, head * 4)?,
+                    norm_out: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
+                    q8: sc.q8_qk.range(0, sc.q8_qk.bytes())?,
+                    rows: m * KV_HEADS,
+                },
+            )?;
+        }
+        // A shared layer rotates its query only; the rope kernel requires at least
+        // one k row, so it rotates one scratch row that no later launch reads.
+        let physical = !shared;
+        ctx.rope_gemma(
+            stream,
+            RopeGemmaCall {
+                q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
+                k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
+                pos: sc.pos.range(0, 4)?,
+                factors: match (&self.rope_freqs, layer.global) {
+                    (Some(freqs), true) => Some(freqs.buf.range(0, freqs.bytes())?),
+                    _ => None,
+                },
+                rows_q: m,
+                rows_k: if physical { m } else { 1 },
+                n_q_head: HEADS,
+                n_kv_head: KV_HEADS,
+                head_dim: head,
+                global_mode: layer.global,
+            },
+        )?;
+        if physical {
+            ctx.kv8_chunk(
+                stream,
+                Kv8Shape {
+                    rows: m,
+                    ..layer
+                        .kv
+                        .as_ref()
+                        .expect("physical layers own a cache")
+                        .shape
+                },
+                Kv8Data {
+                    k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
+                    v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
+                    k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
+                    k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
+                    v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
+                    v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
+                },
+                pos,
+            )?;
+        }
+        self.trace(pos, &format!("L{index}_v"), &sc.v_normed, m * kv_rows * 4);
+        ctx.attn_decode_gemma(
+            stream,
+            AttnDecodeGemmaCall {
+                out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
+                status: None,
+                q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
+                k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
+                k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
+                v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
+                v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
+                kv_len: sc.kv_len.range(0, 4)?,
+                m,
+                n_q_head: HEADS,
+                n_kv_head: KV_HEADS,
+                head_dim: head,
+                cells: CELLS,
+                window: if layer.global { 0 } else { LOCAL_WINDOW },
+                scale: 1.0,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_ctx"), &sc.ctx_out, m * q_rows * 4);
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
+                y: sc.q8_ctx.range(0, sc.q8_ctx.bytes())?,
+                k: q_rows,
+                ncols: m,
+            },
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: layer.out.qs.range(0, layer.out.qs_bytes())?,
+                w_scales: layer.out.scales.range(0, layer.out.scales_bytes())?,
+                x_q8: sc.q8_ctx.range(0, sc.q8_ctx.bytes())?,
+                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
+                k: q_rows,
+                rows: HIDDEN,
+                ncols: m,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_proj"), &sc.proj, m * HIDDEN * 4);
+        self.norm_rows(
+            stream,
+            sc.proj.buf.range(0, m * HIDDEN * 4)?,
+            layer
+                .post_attn_norm
+                .buf
+                .range(0, layer.post_attn_norm.bytes())?,
+            sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            m,
+        )?;
+        self.trace(pos, &format!("L{index}_nrm"), &sc.nrm2, m * HIDDEN * 4);
+        ctx.row_add(
+            stream,
+            RowAddCall {
+                out: r1.buf.range(0, r1.bytes())?,
+                x: input.buf.range(0, input.bytes())?,
+                y: sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+                n: m * HIDDEN,
+                flag: None,
+                fused: false,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_r1"), r1, m * HIDDEN * 4);
+        self.norm_rows(
+            stream,
+            r1.buf.range(0, r1.bytes())?,
+            layer.ffn_norm.buf.range(0, layer.ffn_norm.bytes())?,
+            sc.nrm.buf.range(0, sc.nrm.bytes())?,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            m,
+        )?;
+        for (weight, y) in [(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)] {
+            ctx.gemma_matvec(
+                stream,
+                GemmaMatvecCall {
+                    w_qs: weight.qs.range(0, weight.qs_bytes())?,
+                    w_scales: weight.scales.range(0, weight.scales_bytes())?,
+                    x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                    y: y.buf.range(0, m * FFN * 4)?,
+                    k: HIDDEN,
+                    rows: FFN,
+                    ncols: m,
+                },
+            )?;
+        }
+        ctx.gelu_ffn(
+            stream,
+            GeluFfnCall {
+                out: sc.mixed.buf.range(0, m * FFN * 4)?,
+                gate: sc.gate.buf.range(0, m * FFN * 4)?,
+                up: sc.up.buf.range(0, m * FFN * 4)?,
+                m,
+                n: FFN,
+            },
+        )?;
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: sc.mixed.buf.range(0, m * FFN * 4)?,
+                y: sc.q8_mixed.range(0, sc.q8_mixed.bytes())?,
+                k: FFN,
+                ncols: m,
+            },
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: layer.ffn_down.qs.range(0, layer.ffn_down.qs_bytes())?,
+                w_scales: layer
+                    .ffn_down
+                    .scales
+                    .range(0, layer.ffn_down.scales_bytes())?,
+                x_q8: sc.q8_mixed.range(0, sc.q8_mixed.bytes())?,
+                y: sc.down.buf.range(0, m * HIDDEN * 4)?,
+                k: FFN,
+                rows: HIDDEN,
+                ncols: m,
+            },
+        )?;
+        self.norm_rows(
+            stream,
+            sc.down.buf.range(0, m * HIDDEN * 4)?,
+            layer
+                .post_ffw_norm
+                .buf
+                .range(0, layer.post_ffw_norm.bytes())?,
+            sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            m,
+        )?;
+        ctx.row_add(
+            stream,
+            RowAddCall {
+                out: r2.buf.range(0, r2.bytes())?,
+                x: r1.buf.range(0, r1.bytes())?,
+                y: sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+                n: m * HIDDEN,
+                flag: None,
+                fused: false,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_r2"), r2, m * HIDDEN * 4);
+        // The per-layer-input block: the gated mixing of the second residual with
+        // this layer's token-identity input, projected back to the hidden width.
+        for row in 0..m {
+            // The skipped-shared prefill packs the per-layer planes at the prefix
+            // stride, not the full 42-layer stride.
+            let at = (row * ple_stride + index * PLE) * 4;
+            ctx.add_rmsnorm_q8(
+                stream,
+                AddNormQ8Call {
+                    n: PLE,
+                    eps: self.eps,
+                    h: sc.ple_scaled.buf.range(at, PLE * 4)?,
+                    delta: None,
+                    weight: self
+                        .ple_model_norm
+                        .buf
+                        .range(0, self.ple_model_norm.bytes())?,
+                    norm_out: sc.ple_nrm.buf.range(row * PLE * 4, PLE * 4)?,
+                    q8: sc.q8_head.range(0, sc.q8_head.bytes())?,
+                    rows: 1,
+                },
+            )?;
+        }
+        ctx.embed_q8(
+            stream,
+            EmbedQ8Call {
+                out: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                w: layer.table.buf.range(0, layer.table.bytes())?,
+                ids: sc.ids.range(0, m * 4)?,
+                m,
+                n_rows: layer.table.rows,
+                k: layer.table.k,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_plep"), &sc.ple_nrm, m * PLE * 4);
+        self.trace(pos, &format!("L{index}_pletbl"), &sc.ple_tbl, m * PLE * 4);
+        ctx.row_scale(
+            stream,
+            RowScaleCall {
+                out: sc.ple_mixed.buf.range(0, m * PLE * 4)?,
+                x: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                scale: PLE_IDENTITY_SCALE,
+                m,
+                n: PLE,
+            },
+        )?;
+        ctx.row_add(
+            stream,
+            RowAddCall {
+                out: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                x: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
+                y: sc.ple_mixed.buf.range(0, m * PLE * 4)?,
+                n: m * PLE,
+                flag: None,
+                fused: false,
+            },
+        )?;
+        ctx.row_scale(
+            stream,
+            RowScaleCall {
+                out: sc.ple_mixed.buf.range(0, m * PLE * 4)?,
+                x: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                scale: PLE_COMBINED_SCALE,
+                m,
+                n: PLE,
+            },
+        )?;
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: r2.buf.range(0, m * HIDDEN * 4)?,
+                y: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                k: HIDDEN,
+                ncols: m,
+            },
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: layer.ple_gate.qs.range(0, layer.ple_gate.qs_bytes())?,
+                w_scales: layer
+                    .ple_gate
+                    .scales
+                    .range(0, layer.ple_gate.scales_bytes())?,
+                x_q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                y: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
+                k: HIDDEN,
+                rows: PLE,
+                ncols: m,
+            },
+        )?;
+        ctx.gelu_ffn(
+            stream,
+            GeluFfnCall {
+                out: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                gate: sc.ple_nrm.buf.range(0, m * PLE * 4)?,
+                up: sc.ple_mixed.buf.range(0, m * PLE * 4)?,
+                m,
+                n: PLE,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_plegate"), &sc.ple_nrm, m * PLE * 4);
+        self.trace(pos, &format!("L{index}_plemix"), &sc.ple_tbl, m * PLE * 4);
+        ctx.quantize_q8_1(
+            stream,
+            QuantizeCall {
+                x: sc.ple_tbl.buf.range(0, m * PLE * 4)?,
+                y: sc.q8_ple_mixed.range(0, sc.q8_ple_mixed.bytes())?,
+                k: PLE,
+                ncols: m,
+            },
+        )?;
+        ctx.gemma_matvec(
+            stream,
+            GemmaMatvecCall {
+                w_qs: layer.ple_proj.qs.range(0, layer.ple_proj.qs_bytes())?,
+                w_scales: layer
+                    .ple_proj
+                    .scales
+                    .range(0, layer.ple_proj.scales_bytes())?,
+                x_q8: sc.q8_ple_mixed.range(0, sc.q8_ple_mixed.bytes())?,
+                y: sc.proj.buf.range(0, m * HIDDEN * 4)?,
+                k: PLE,
+                rows: HIDDEN,
+                ncols: m,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}_pled"), &sc.proj, m * HIDDEN * 4);
+        self.norm_rows(
+            stream,
+            sc.proj.buf.range(0, m * HIDDEN * 4)?,
+            layer
+                .post_ple_norm
+                .buf
+                .range(0, layer.post_ple_norm.bytes())?,
+            sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+            sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+            m,
+        )?;
+        ctx.row_add(
+            stream,
+            RowAddCall {
+                out: input.buf.range(0, input.bytes())?,
+                x: r2.buf.range(0, r2.bytes())?,
+                y: sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
+                n: m * HIDDEN,
+                flag: None,
+                fused: false,
+            },
+        )?;
+        // The scaled layer output lands in `out`; `input` held the dead pre-layer
+        // residual, so the scale has a distinct source buffer.
+        ctx.row_scale(
+            stream,
+            RowScaleCall {
+                out: out.buf.range(0, out.bytes())?,
+                x: input.buf.range(0, input.bytes())?,
+                scale: layer.scale,
+                m,
+                n: HIDDEN,
+            },
+        )?;
+        self.trace(pos, &format!("L{index}"), out, m * HIDDEN * 4);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_bytes_charges_the_prefill_maximum() {
+        // Growable f32 vectors at PREFILL_BATCH rows (89,856 elements x 8 x 4),
+        // fixed f32 ones + two logits rows (524,800 x 4), growable q8 at eight
+        // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes.
+        assert_eq!(scratch_bytes(), Some(5_168_716));
+    }
+
+    #[test]
+    fn the_bolt_demand_is_refused_without_the_headroom() {
+        // A device holding exactly the allocations (weights + KV + scratch) with
+        // no room for the headroom reserve must be refused by the shared admit;
+        // the same demand fits once the reserve is included.
+        let weights_bytes = 3_000_000_000u64;
+        let demand = bolt_demand(weights_bytes).expect("the Bolt demand computes");
+        assert_eq!(demand.tensors, weights_bytes);
+        assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
+        let allocations = demand.tensors + demand.kv_cache + demand.work;
+        let error = crate::kernels::cuda::plan::admit(&demand, allocations)
+            .expect_err("an exact fit of the allocations alone must be refused");
+        let EngError::MemoryPlan(message) = error else {
+            panic!("expected MemoryPlan, got {error:?}");
+        };
+        assert!(message.contains("headroom"), "{message}");
+        assert!(
+            message.ends_with(&format!("device has {allocations} free")),
+            "{message}"
+        );
+        assert_eq!(
+            crate::kernels::cuda::plan::admit(&demand, allocations + demand.headroom),
+            Ok(allocations + demand.headroom)
+        );
+    }
+
+    fn logits(model: &Bolt) -> Vec<f32> {
+        let mut bytes = vec![0u8; VOCAB * 4];
+        model
+            .ctx
+            .download(&model.logits_capped.buf, &mut bytes)
+            .expect("logits");
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+
+    fn assert_logits(got: &[f32], want: &[f32]) {
+        let mut max_relative = 0.0f32;
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(g.is_finite() && w.is_finite(), "non-finite logit {i}");
+            let error = (g - w).abs();
+            assert!(error <= 2e-5 * w.abs(), "logit {i}: {g} versus {w}");
+            if w != 0.0 {
+                max_relative = max_relative.max(error / w.abs());
+            }
+        }
+        eprintln!("logits max relative error {max_relative}");
+    }
+
+    /// Every launch shape of the Bolt step, replayed with tiny buffers: the wrappers
+    /// and native entries must admit the whole geometry before any model runs. This
+    /// test exists because a validation reject surfaced only on the device path.
+    #[test]
+    #[ignore = "requires a CUDA device; use --release --test-threads=1"]
+    fn bolt_step_shapes_are_admitted() {
+        use crate::kernels::cuda::CudaContext;
+        use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
+        use crate::kernels::cuda::resident::kv8_append::{Kv8Data, Kv8Shape};
+        let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())
+            .expect("context");
+        let stream = ctx.stream().expect("stream");
+        let zero = |n: usize| vec![0u8; n];
+        let f32s = |n: usize| ctx.upload(&zero(n * 4)).expect("f32 upload");
+        let u16s = |n: usize| ctx.upload(&zero(n * 2)).expect("u16 upload");
+        let i8s = |n: usize| ctx.upload(&zero(n)).expect("i8 upload");
+        let mut word_bytes = Vec::with_capacity(8);
+        word_bytes.extend_from_slice(&0i32.to_le_bytes());
+        word_bytes.extend_from_slice(&1i32.to_le_bytes());
+        let words = ctx.upload(&word_bytes).expect("words");
+        // Embedding gather and the hidden-path ops at full Bolt widths.
+        ctx.embed_q8(
+            &stream,
+            EmbedQ8Call {
+                out: f32s(2560).range(0, 2560 * 4).unwrap(),
+                w: i8s(1024 * (2560 / 32) * 34)
+                    .range(0, 1024 * (2560 / 32) * 34)
+                    .unwrap(),
+                ids: words.range(0, 4).unwrap(),
+                m: 1,
+                n_rows: 1024,
+                k: 2560,
+            },
+        )
+        .expect("embed 2560");
+        for (m, n) in [(1, 2560), (1, 256 * 42), (1, 256), (1, 2560)] {
+            ctx.row_scale(
+                &stream,
+                RowScaleCall {
+                    out: f32s(n).range(0, n * 4).unwrap(),
+                    x: f32s(n).range(0, n * 4).unwrap(),
+                    scale: 0.5,
+                    m,
+                    n,
+                },
+            )
+            .expect("row_scale {n}");
+            ctx.row_add(
+                &stream,
+                RowAddCall {
+                    out: f32s(n).range(0, n * 4).unwrap(),
+                    x: f32s(n).range(0, n * 4).unwrap(),
+                    y: f32s(n).range(0, n * 4).unwrap(),
+                    n,
+                    flag: None,
+                    fused: false,
+                },
+            )
+            .expect("row_add {n}");
+        }
+        // The quantize/matvec pairs at every k the step uses.
+        for k in [2560, 2048, 1024, 256] {
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: f32s(k).range(0, k * 4).unwrap(),
+                    y: i8s(q8_1_bytes(k, 1).unwrap())
+                        .range(0, q8_1_bytes(k, 1).unwrap())
+                        .unwrap(),
+                    k,
+                    ncols: 1,
+                },
+            )
+            .expect("quantize {k}");
+            ctx.gemma_matvec(
+                &stream,
+                GemmaMatvecCall {
+                    w_qs: i8s(256 * k).range(0, 256 * k).unwrap(),
+                    w_scales: u16s(256 * (k / 32)).range(0, 256 * (k / 32) * 2).unwrap(),
+                    x_q8: i8s(q8_1_bytes(k, 1).unwrap())
+                        .range(0, q8_1_bytes(k, 1).unwrap())
+                        .unwrap(),
+                    y: f32s(256).range(0, 256 * 4).unwrap(),
+                    k,
+                    rows: 256,
+                    ncols: 1,
+                },
+            )
+            .expect("matvec k={k}");
+        }
+        ctx.gemma_matvec(
+            &stream,
+            GemmaMatvecCall {
+                w_qs: i8s(10752 * 2560).range(0, 10752 * 2560).unwrap(),
+                w_scales: u16s(10752 * 80).range(0, 10752 * 80 * 2).unwrap(),
+                x_q8: i8s(q8_1_bytes(2560, 1).unwrap())
+                    .range(0, q8_1_bytes(2560, 1).unwrap())
+                    .unwrap(),
+                y: f32s(10752).range(0, 10752 * 4).unwrap(),
+                k: 2560,
+                rows: 10752,
+                ncols: 1,
+            },
+        )
+        .expect("matvec ple projection");
+        // The per-head norm at 256 and 512, including the interior-slice pattern.
+        let ple = f32s(256 * 42);
+        for n in [256usize, 512] {
+            ctx.add_rmsnorm_q8(
+                &stream,
+                AddNormQ8Call {
+                    n,
+                    eps: 1e-6,
+                    h: f32s(n).range(0, n * 4).unwrap(),
+                    delta: None,
+                    weight: f32s(n).range(0, n * 4).unwrap(),
+                    norm_out: f32s(n).range(0, n * 4).unwrap(),
+                    q8: i8s(q8_1_bytes(n, 1).unwrap())
+                        .range(0, q8_1_bytes(n, 1).unwrap())
+                        .unwrap(),
+                    rows: 1,
+                },
+            )
+            .expect("head norm {n}");
+        }
+        ctx.add_rmsnorm_q8(
+            &stream,
+            AddNormQ8Call {
+                n: 256,
+                eps: 1e-6,
+                h: ple.range(256 * 4, 256 * 4).unwrap(),
+                delta: None,
+                weight: f32s(256).range(0, 256 * 4).unwrap(),
+                norm_out: f32s(256).range(0, 256 * 4).unwrap(),
+                q8: i8s(q8_1_bytes(256, 1).unwrap())
+                    .range(0, q8_1_bytes(256, 1).unwrap())
+                    .unwrap(),
+                rows: 1,
+            },
+        )
+        .expect("ple slice norm");
+        // The PLE table gather and the gated mixing at 256.
+        ctx.embed_q8(
+            &stream,
+            EmbedQ8Call {
+                out: f32s(256).range(0, 256 * 4).unwrap(),
+                w: i8s(1024 * (256 / 32) * 34)
+                    .range(0, 1024 * (256 / 32) * 34)
+                    .unwrap(),
+                ids: words.range(0, 4).unwrap(),
+                m: 1,
+                n_rows: 1024,
+                k: 256,
+            },
+        )
+        .expect("ple table gather");
+        ctx.gelu_ffn(
+            &stream,
+            GeluFfnCall {
+                out: f32s(256).range(0, 256 * 4).unwrap(),
+                gate: f32s(256).range(0, 256 * 4).unwrap(),
+                up: f32s(256).range(0, 256 * 4).unwrap(),
+                m: 1,
+                n: 256,
+            },
+        )
+        .expect("gelu 256");
+        // The attention path at both head widths, 8 q heads, 2 kv heads.
+        for head in [256usize, 512] {
+            let shape = Kv8Shape {
+                rows: 1,
+                n_kv_head: 2,
+                head_dim: head,
+                cells: 32768,
+                code_scale: crate::kernels::cuda::resident::kv8_append::Kv8CodeScale::UnroundedF32,
+            };
+            let codes = 2 * 32768 * head;
+            let scales = 2 * 32768 * (head / 32);
+            ctx.kv8_chunk(
+                &stream,
+                shape,
+                Kv8Data {
+                    k: f32s(2 * head).range(0, 2 * head * 4).unwrap(),
+                    v: f32s(2 * head).range(0, 2 * head * 4).unwrap(),
+                    k_codes: i8s(codes).range(0, codes).unwrap(),
+                    k_scales: u16s(scales).range(0, scales * 2).unwrap(),
+                    v_codes: i8s(codes).range(0, codes).unwrap(),
+                    v_scales: u16s(scales).range(0, scales * 2).unwrap(),
+                },
+                0,
+            )
+            .expect("kv8 chunk {head}");
+            ctx.rope_gemma(
+                &stream,
+                RopeGemmaCall {
+                    q: f32s(8 * head).range(0, 8 * head * 4).unwrap(),
+                    k: f32s(2 * head).range(0, 2 * head * 4).unwrap(),
+                    pos: words.range(0, 4).unwrap(),
+                    factors: None,
+                    rows_q: 1,
+                    rows_k: 1,
+                    n_q_head: 8,
+                    n_kv_head: 2,
+                    head_dim: head,
+                    global_mode: head == 512,
+                },
+            )
+            .expect("rope {head}");
+            ctx.attn_decode_gemma(
+                &stream,
+                AttnDecodeGemmaCall {
+                    out: f32s(8 * head).range(0, 8 * head * 4).unwrap(),
+                    status: None,
+                    q: f32s(8 * head).range(0, 8 * head * 4).unwrap(),
+                    k_codes: i8s(codes).range(0, codes).unwrap(),
+                    k_scales: u16s(scales).range(0, scales * 2).unwrap(),
+                    v_codes: i8s(codes).range(0, codes).unwrap(),
+                    v_scales: u16s(scales).range(0, scales * 2).unwrap(),
+                    kv_len: words.range(4, 4).unwrap(),
+                    m: 1,
+                    n_q_head: 8,
+                    n_kv_head: 2,
+                    head_dim: head,
+                    cells: 32768,
+                    window: if head == 512 { 0 } else { 512 },
+                    scale: 1.0,
+                },
+            )
+            .expect("attn {head}");
+        }
+        stream.synchronize().expect("sync");
+    }
+
+    /// Single-step parity vehicle: with BOLT_TRACE_DIR set, writes one f32
+    /// checkpoint per layer (and the scaled embedding) for the first two
+    /// positions, unmodified by any batched replay. The torch reference writes
+    /// the same names; the first diverging layer names the wrong op.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn trace_two_single_steps() {
+        let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
+        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        for (pos, token) in [2u32, 19].into_iter().enumerate() {
+            if pos == 0 {
+                model.decode(token, pos).expect("first token with logits");
+            } else {
+                model
+                    .decode_hidden(token, pos)
+                    .expect("second token hidden");
+            }
+        }
+    }
+
+    /// Greedy-quality gate: the full reference prompt, logits traced at every step.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn trace_full_prompt_logits() {
+        let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
+        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        for pos in 0..32u32 {
+            let token = 2 + pos * 17;
+            model.decode(token, pos as usize).expect("step");
+        }
+    }
+
+    /// One model owns the device. Replaying from position zero overwrites every live cache cell.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn batched_prefill_matches_single_steps() {
+        let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
+        let header = std::env::var("BOLT_Q8_HEADER_SHA256").ok();
+        let mut model = super::load(std::path::Path::new(&path), header.as_deref()).expect("load");
+        assert!(matches!(
+            model.prefill_batch(&[], 0, false),
+            Err(EngError::BadRequest(_))
+        ));
+        assert!(matches!(
+            model.prefill_batch(&[2; 9], 0, false),
+            Err(EngError::BadRequest(_))
+        ));
+        assert!(matches!(
+            model.prefill_batch(&[2], CELLS, false),
+            Err(EngError::ContextLimit(_))
+        ));
+        assert!(matches!(
+            model.prefill_batch(&[2], usize::MAX, false),
+            Err(EngError::ContextLimit(_))
+        ));
+        // Decode bounds its position like prefill: the last valid cell is one below the cap.
+        assert!(matches!(
+            model.decode(2, CELLS),
+            Err(EngError::ContextLimit(_))
+        ));
+        assert!(matches!(
+            model.decode_hidden(2, CELLS),
+            Err(EngError::ContextLimit(_))
+        ));
+        assert!(matches!(
+            model.decode(2, usize::MAX),
+            Err(EngError::ContextLimit(_))
+        ));
+        let prompt: Vec<u32> = (0..32).map(|i| 2 + i * 17).collect();
+        let single_started = std::time::Instant::now();
+        for (pos, &token) in prompt.iter().enumerate() {
+            if pos + 1 == prompt.len() {
+                model.decode(token, pos).expect("single last token");
+            } else {
+                model
+                    .decode_hidden(token, pos)
+                    .expect("single hidden token");
+            }
+        }
+        let single_elapsed = single_started.elapsed();
+        let expected = logits(&model);
+        // Parity hook: write this run's single-step logits for the reference
+        // comparison (scratch tooling reads it; no assertion depends on it).
+        if let Ok(path) = std::env::var("BOLT_DUMP_LOGITS") {
+            let bytes: Vec<u8> = expected.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).expect("dump logits");
+            eprintln!("logits dumped to {path}");
+        }
+        model.decode(2, prompt.len()).expect("single continuation");
+        let continued = logits(&model);
+        eprintln!("timing 32 single steps {single_elapsed:?}");
+        // Eight rows is the shipped cap; three also exercises a partial final batch.
+        for width in [1, Bolt::PREFILL_BATCH, 3] {
+            let started = std::time::Instant::now();
+            let mut pos = 0;
+            for batch in prompt.chunks(width) {
+                model
+                    .prefill_batch(batch, pos, pos + batch.len() == prompt.len())
+                    .expect("batch");
+                pos += batch.len();
+            }
+            let elapsed = started.elapsed();
+            assert_logits(&logits(&model), &expected);
+            model.decode(2, prompt.len()).expect("batch continuation");
+            assert_logits(&logits(&model), &continued);
+            eprintln!(
+                "timing 32 batched tokens m={width} {elapsed:?}; speedup {:.3}",
+                single_elapsed.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
+    }
+
+    /// The skipped-shared prefill must leave the same final logits as a
+    /// full-layer prefill: a hidden batch runs only the cache-writing physical
+    /// prefix, while a logits batch runs every layer. The shared layers write
+    /// no cache cells and feed only the final norm, so both paths agree.
+    /// Each width reloads a fresh (zeroed) cache and runs the skip path FIRST,
+    /// so a missing skip-path cache write at any width corrupts its logits
+    /// instead of being masked by an earlier full write; the full path then
+    /// overwrites the same cells from position 0.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn skip_prefill_matches_full_layer_prefill() {
+        let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
+        let prompt: Vec<u32> = (0..32).map(|i| 2 + i * 17).collect();
+        let n = prompt.len();
+        // Widths 8 (the shipped cap), 3 (a partial final batch) and 1.
+        for width in [Bolt::PREFILL_BATCH, 3, 1] {
+            // Fresh load per width: the cache starts zeroed, so a missing
+            // skip-path write here is not masked by the last width's cells.
+            let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+            // Skip-prefill: non-final batches hide logits and run only the
+            // physical prefix; the final batch reads logits over the cache.
+            let mut pos = 0;
+            for batch in prompt.chunks(width) {
+                model
+                    .prefill_batch(batch, pos, pos + batch.len() == n)
+                    .expect("skip batch");
+                pos += batch.len();
+            }
+            let skip = logits(&model);
+            model.decode(2, n).expect("skip continuation");
+            let skip_continued = logits(&model);
+            // Full-layer prefill overwrites the same cells from position 0:
+            // every batch reads logits, so every layer runs.
+            let mut pos = 0;
+            for batch in prompt.chunks(Bolt::PREFILL_BATCH) {
+                model.prefill_batch(batch, pos, true).expect("full batch");
+                pos += batch.len();
+            }
+            assert_logits(&logits(&model), &skip);
+            model.decode(2, n).expect("full continuation");
+            assert_logits(&logits(&model), &skip_continued);
+        }
+    }
+}

@@ -82,8 +82,7 @@ fn check_rope_gemma(call: &RopeGemmaRaw<'_>) -> Result<(), DeviceFailure> {
     let f_bytes = call.head_dim.checked_div(2).and_then(|v| v.checked_mul(4));
     let dims = (1..=16).contains(&call.rows_q)
         && (1..=16).contains(&call.rows_k)
-        && call.n_q_head == 16
-        && (call.n_kv_head == 1 || call.n_kv_head == 8)
+        && matches!((call.n_q_head, call.n_kv_head), (16, 1) | (16, 8) | (8, 2))
         && matches!(
             (call.head_dim, call.global_mode),
             (256, false) | (512, true)

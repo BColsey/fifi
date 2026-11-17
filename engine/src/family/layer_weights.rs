@@ -99,6 +99,11 @@ impl LayerWeights {
                     "layer {layer} uses unsupported qsa attention"
                 )));
             }
+            AttentionKind::Sliding => {
+                return Err(EngError::Checkpoint(format!(
+                    "layer {layer} uses unsupported sliding attention"
+                )));
+            }
         };
         let feed_forward = if let Some(dense) = spec.feed_forward {
             FeedForwardWeights::Dense {
@@ -416,7 +421,10 @@ mod tests {
             heads_q: 4,
             heads_kv: 2,
             head_dim: 16,
+            global_head_dim: 0,
             layers_attention: &[AttentionKind::Full],
+            sliding_window: 0,
+            kv_shared_layers: 0,
             linear: None,
             feed_forward: Some(DenseMlp {
                 intermediate: 128,

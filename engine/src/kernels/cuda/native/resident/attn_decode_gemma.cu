@@ -120,8 +120,8 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
             args->kv_len == NULL)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (args->m < 1 || args->m > 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        if (args->n_q_head != 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        if (args->n_kv_head != 1 && args->n_kv_head != 8)
+        if (!(args->n_q_head == 16 && (args->n_kv_head == 1 || args->n_kv_head == 8))
+            && !(args->n_q_head == 8 && args->n_kv_head == 2))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (args->head_dim != 256 && args->head_dim != 512)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
