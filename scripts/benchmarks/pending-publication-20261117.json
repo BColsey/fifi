@@ -1097,5 +1097,7 @@
         }
       ]
     }
-  ]
+  ],
+  "record_scope": "Historical publication snapshot before the merge-readiness repairs. Earlier remaining_work and CI fields are retained as history, not current blockers.",
+  "superseded_by": "merge-readiness-20261117.json"
 }
