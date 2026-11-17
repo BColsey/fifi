@@ -59,7 +59,16 @@ async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
         let keep_alive = state.keep_alive();
         return Ok(sse::respond(submitted.head, submitted.running, keep_alive));
     }
-    let (parts, finish, usage) = collect(&mut submitted.running).await?;
+    let (parts, finish, usage) = match collect(&mut submitted.running).await {
+        Ok(done) => done,
+        // A failure after the job started carries the work it had done, so a client
+        // can account for the compute a failed request consumed.
+        Err(error) => {
+            error.log();
+            let body = error.body_with_usage(&submitted.running.partial_usage());
+            return Ok((error.status(), Json(body)).into_response());
+        }
+    };
     let completion = ChatCompletion::new(&submitted.head, parts, finish, usage);
     Ok(Json(completion).into_response())
 }
@@ -362,7 +371,8 @@ pub(super) fn admit(
 
 fn failed(log: &mut RequestLog, error: impl Into<ServerError>) -> ServerError {
     let error = error.into();
-    log.fail(&error);
+    // No job ran, so the line cannot carry a prefix report.
+    log.fail(&error, 0);
     error
 }
 
@@ -1409,6 +1419,36 @@ mod tests {
         assert_eq!(error_code(&body), "backend_error");
         assert_schema("BackendError", &body);
         assert_eq!(body["error"]["message"], "Model execution failed.");
+    }
+
+    #[tokio::test]
+    async fn a_failure_mid_reply_carries_the_work_the_job_had_done() {
+        // A request that fails after the job started reports the work it consumed:
+        // the accepted prompt and the two committed tokens, in the error body.
+        let failure = EngError::Backend {
+            operation: "qmm",
+            message: "Metal command buffer 7 failed".to_string(),
+        };
+        let engine = testkit::ending_engine("ab", testkit::Ending::Error(failure));
+        let (status, body) = post(&app(&engine, 4_096), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_schema("BackendError", &body);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        let prompt = body["usage"]["prompt_tokens"].as_u64().expect("prompt");
+        assert!(prompt > 0);
+        assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(prompt + 2));
+    }
+
+    #[tokio::test]
+    async fn a_prefill_refusal_carries_the_prompt_and_zero_work() {
+        // The refusal happens before any decode, so the usage in the error body is the
+        // accepted prompt with no completion: the job had done no work to report.
+        let engine = testkit::refusing_engine(EngError::MemoryPlan("no room".to_string()));
+        let (status, body) = post(&app(&engine, 4_096), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "memory_plan");
+        assert!(body["usage"]["prompt_tokens"].as_u64().expect("prompt") > 0);
+        assert_eq!(body["usage"]["completion_tokens"], 0);
     }
 
     #[tokio::test]

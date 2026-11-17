@@ -611,7 +611,9 @@ impl RequestLog {
         self.write(Some(200), Outcome::Ok, None, None, 0);
     }
 
-    pub(crate) fn fail(&mut self, error: &ServerError) {
+    /// The reused count is the one the job had already reported when it failed: 0 unless
+    /// a `Finished` event was read before the failure, matching the prefix keys.
+    pub(crate) fn fail(&mut self, error: &ServerError, reused_tokens: u32) {
         let status = if self.headers_sent() {
             200
         } else {
@@ -624,7 +626,13 @@ impl RequestLog {
             ServerError::Eng(EngError::PromptTooLong { .. }) => "prompt_too_long",
             other => other.code(),
         };
-        self.write(Some(status), Outcome::Error, Some(code), None, 0);
+        self.write(
+            Some(status),
+            Outcome::Error,
+            Some(code),
+            None,
+            reused_tokens,
+        );
     }
 
     fn headers_sent(&self) -> bool {

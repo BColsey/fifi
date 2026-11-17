@@ -5,8 +5,9 @@
 //! quiet interval, so that a long prefill does not trip a client timeout. Think text goes to
 //! `reasoning_content`. A tool call goes out as two entries when it is complete. The last chunk
 //! carries the finish reason and the usage, and a successful stream ends with `[DONE]`.
-//! After the headers, an error sends one `event: error` and closes the stream with no usage and no
-//! `[DONE]`. A job that the engine aborted closes the stream with no event, as on a disconnect.
+//! After the headers, an error sends one `event: error` — the last usage report of the
+//! stream, with the work the job had done — and closes with no `[DONE]`. A job that the
+//! engine aborted closes the stream with no event, as on a disconnect.
 
 use super::error::ServerError;
 use super::pieces::Piece;
@@ -106,7 +107,9 @@ async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
             }
             Err(error) => {
                 state.phase = Phase::Finished;
-                vec![error_event(&error)]
+                // A failed stream reports the work the job had done in the same event, so
+                // a client can account for the compute a failed request consumed.
+                vec![error_event(&error, Some(state.running.partial_usage()))]
             }
         },
     };
@@ -155,18 +158,26 @@ fn last_event(state: &Streaming, finish: FinishReason, usage: Usage) -> Event {
 
 fn chunk_event(chunk: &impl Serialize) -> Event {
     Event::default().json_data(chunk).unwrap_or_else(|error| {
-        error_event(&ServerError::Eng(EngError::Backend {
-            operation: "serialize",
-            message: error.to_string(),
-        }))
+        error_event(
+            &ServerError::Eng(EngError::Backend {
+                operation: "serialize",
+                message: error.to_string(),
+            }),
+            None,
+        )
     })
 }
 
-fn error_event(error: &ServerError) -> Event {
+/// The data of the event is the error body, with the job's partial usage beside it when a
+/// running job failed — the stream's last usage report, because no `usage` chunk follows an
+/// error.
+fn error_event(error: &ServerError, usage: Option<Usage>) -> Event {
     error.log();
-    Event::default()
-        .event("error")
-        .data(error.body().to_string())
+    let body = match usage {
+        Some(usage) => error.body_with_usage(&usage),
+        None => error.body(),
+    };
+    Event::default().event("error").data(body.to_string())
 }
 
 #[cfg(test)]
@@ -527,7 +538,15 @@ mod tests {
         assert_schema("BackendError", &body);
         assert!(!events[3].data.contains("Metal"), "{:?}", events[3]);
         assert!(events.iter().all(|event| event.data != "[DONE]"));
-        assert!(events.iter().all(|event| !event.data.contains("usage")));
+        // The error event is the stream's last usage report: the two committed
+        // tokens beside the accepted prompt. No usage chunk follows an error.
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+        assert!(
+            events[..3]
+                .iter()
+                .all(|event| !event.data.contains("usage"))
+        );
     }
 
     #[tokio::test]

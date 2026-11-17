@@ -112,13 +112,25 @@ impl RunningJob {
     }
 
     /// After `Done`, `Aborted`, or an error, the caller stops.
-    /// `Done` and an error write the line of the request log.
+    /// `Done` and an error write the line of the request log. The failure line's reuse
+    /// is 0 on most real failures: a prefix report arrives only in the `Finished`
+    /// event, which a failing job usually never sends.
     pub(crate) async fn next(&mut self) -> Result<Step, ServerError> {
         let step = self.read_step().await;
         if let Err(error) = &step {
-            self.log.fail(error);
+            self.log.fail(error, self.reused);
         }
         step
+    }
+
+    /// The work a failed request had done: the accepted prompt and the tokens the job
+    /// committed before the failure. `produced` counts tokens generated, not tokens
+    /// delivered: a stop tail the assembler was still holding back is not subtracted.
+    /// The error payload of a reply reports this, so a client can account for the
+    /// compute a failed request consumed. `reused_tokens` is 0 unless the job's
+    /// `Finished` event was read before the failure, which a failing job rarely sends.
+    pub(crate) fn partial_usage(&self) -> Usage {
+        Usage::new(self.prompt_tokens, self.produced, self.reused)
     }
 
     async fn read_step(&mut self) -> Result<Step, ServerError> {
@@ -264,7 +276,7 @@ pub(crate) async fn collect_pieces(
                     operation: "engine",
                     message: "the engine ended the job without a finish".to_string(),
                 });
-                job.log.fail(&error);
+                job.log.fail(&error, job.reused);
                 return Err(error);
             }
         }
@@ -858,6 +870,133 @@ mod tests {
                 message: native,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_reports_its_partial_usage_and_known_reuse() {
+        // After the failure the caller can still read the work the job had done: the
+        // accepted prompt, the committed tokens, and the prefix report that the
+        // Finished event had delivered before the failure. The request line carries
+        // the same reuse; without a Finished it stays 0.
+        let bundle = testkit::bundle();
+        let generation = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()));
+        let (_job, mut handle) = Job::new(PROMPT.to_vec(), generation).expect("job");
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        handle.events = receiver;
+        sender
+            .try_send(JobEvent::Batch(DecodeBatch {
+                tokens: vec![97],
+                text: "a".to_string(),
+                finish: Some(DecodeFinish::Stop),
+            }))
+            .expect("terminal batch");
+        sender
+            .try_send(JobEvent::Finished(JobUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                reused_tokens: 2,
+                prefix: None,
+                prefill_bank: None,
+                prefill_pieces: PrefillPieces::default(),
+                first_token_margin: None,
+            }))
+            .expect("usage");
+        sender
+            .try_send(JobEvent::Error(EngError::BadRequest(
+                "late defect".to_string(),
+            )))
+            .expect("failure after the usage");
+        drop(sender);
+        let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
+        let parser = ReplyParser::new(Start::Content, &[], "call_");
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "m",
+            false,
+            3,
+            "GET",
+            "/v1/test",
+        );
+        log.admit();
+        let mut running = RunningJob::new(handle, assembler, parser, 3, log, None);
+        // The terminal batch is read first: its Done step carries the Finished usage
+        // (reused 2) and writes the done line. The queued error is what the SECOND
+        // read returns; partial usage still reports the reuse that was read.
+        let done = match running.next().await.expect("done step") {
+            Step::Done { usage, .. } => usage,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert_eq!(done.reused_tokens(), 2);
+        let error = running.next().await.expect_err("error");
+        assert_eq!(error.code(), "backend_error");
+        assert_eq!(running.partial_usage(), Usage::new(3, 1, 2));
+        let line: serde_json::Value =
+            serde_json::from_str(capture.text().trim_end()).expect("the log line");
+        assert_eq!(line["completion_tokens"], 1);
+        assert_eq!(line["reused_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_finished_keeps_reuse_at_zero() {
+        // Most real failures never read a Finished event, so the failure line's
+        // reuse stays 0: the prefix report was never delivered.
+        let bundle = testkit::bundle();
+        let generation = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()));
+        let (_job, mut handle) = Job::new(PROMPT.to_vec(), generation).expect("job");
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        handle.events = receiver;
+        sender
+            .try_send(JobEvent::Batch(DecodeBatch {
+                tokens: vec![97, 98],
+                text: "ab".to_string(),
+                finish: None,
+            }))
+            .expect("batch");
+        sender
+            .try_send(JobEvent::Error(EngError::Backend {
+                operation: "qmm",
+                message: "Metal command buffer 7 failed".to_string(),
+            }))
+            .expect("failure");
+        drop(sender);
+        let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
+        let parser = ReplyParser::new(Start::Content, &[], "call_");
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "m",
+            false,
+            3,
+            "GET",
+            "/v1/test",
+        );
+        log.admit();
+        let mut running = RunningJob::new(handle, assembler, parser, 3, log, None);
+        // The batch yields Pieces first; the failure is what the next read returns.
+        let mut text = String::new();
+        let error = loop {
+            match running.next().await {
+                Err(error) => break error,
+                Ok(Step::Pieces(pieces)) => {
+                    for piece in pieces {
+                        if let Piece::Content(chunk) = piece {
+                            text.push_str(&chunk);
+                        }
+                    }
+                }
+                Ok(other) => panic!("expected the failure, got {other:?}"),
+            }
+        };
+        assert_eq!(text, "ab");
+        assert!(matches!(error, ServerError::Eng(EngError::Backend { .. })));
+        assert_eq!(running.partial_usage(), Usage::new(3, 2, 0));
+        let line: serde_json::Value =
+            serde_json::from_str(capture.text().trim_end()).expect("the log line");
+        assert_eq!(line["outcome"], "error");
+        assert_eq!(line["reused_tokens"], 0);
     }
 
     #[tokio::test]

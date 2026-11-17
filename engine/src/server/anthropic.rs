@@ -1223,6 +1223,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_anthropic_error_body_carries_no_usage_member() {
+        // The Messages contract's error form is exact: even a failure from a
+        // running job reports no usage, unlike the OpenAI-style routes.
+        let error = ServerError::Eng(EngError::Backend {
+            operation: "engine job",
+            message: "private native cause".into(),
+        });
+        assert_eq!(
+            super::anthropic_error_body(&error),
+            json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": super::BACKEND_MESSAGE},
+            })
+        );
+    }
+
     /// A router whose entry reuses prefixes and renders with the pinned
     /// template bundle, so a second conversation restores the root. Same
     /// construction as chat.rs's `reuse_app_with_bundle`; that one takes
@@ -2208,6 +2225,9 @@ mod tests {
         let body = testkit::json_of(&bytes);
         assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(body["error"]["message"], "Model execution failed.");
+        // Route-level pin: even a failure from a running job carries no usage —
+        // the OpenAI-style routes add that member, the Messages routes never do.
+        assert!(body.get("usage").is_none(), "{body}");
     }
 
     #[tokio::test]

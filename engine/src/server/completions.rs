@@ -65,7 +65,15 @@ async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
             keep_alive,
         ));
     }
-    let (parts, finish, usage) = collect(&mut submitted.running).await?;
+    let (parts, finish, usage) = match collect(&mut submitted.running).await {
+        Ok(done) => done,
+        // Same accounting as the chat route: a failed request reports the work it did.
+        Err(error) => {
+            error.log();
+            let body = error.body_with_usage(&submitted.running.partial_usage());
+            return Ok((error.status(), Json(body)).into_response());
+        }
+    };
     let completion = Completion::reply(&submitted.head, parts.content, finish, usage);
     Ok(Json(completion).into_response())
 }
@@ -371,6 +379,26 @@ mod tests {
         assert_eq!(last.name.as_deref(), Some("error"), "{events:?}");
         assert!(!last.data.contains("device lost"), "{events:?}");
         assert!(events.iter().all(|event| event.data != "[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn a_non_stream_failure_carries_the_work_the_job_had_done() {
+        // The legacy route reports the same accounting as chat completions: the
+        // error body carries the accepted prompt and the two generated tokens.
+        let engine = testkit::ending_engine(
+            "ab",
+            testkit::Ending::Error(EngError::Backend {
+                operation: "qmm",
+                message: "device lost".to_string(),
+            }),
+        );
+        let (status, body) = post(&app(&engine, 4_096), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_schema("BackendError", &body);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        let prompt = body["usage"]["prompt_tokens"].as_u64().expect("prompt");
+        assert!(prompt > 0);
+        assert_eq!(body["usage"]["total_tokens"].as_u64(), Some(prompt + 2));
     }
 
     #[tokio::test]

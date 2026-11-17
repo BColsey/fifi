@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "414e9e5083349a81decda17637f2415d75a8888ff255d04b81f40ce988274149",
+ "x-source-sha256": "389534412ad52596530b3da8fe4e7eff86407531cedacaab5079a95ec28ba109",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -120,6 +120,10 @@
         ]
        }
       }
+     },
+     "usage": {
+      "$ref": "#/components/schemas/Usage",
+      "description": "Present only on the OpenAI-style routes (/v1/chat/completions, /v1/completions, and their streams) when a request had started running before it failed: the work the job had done. A validation error and every Anthropic-route error keep it absent."
      }
     }
    },
@@ -147,6 +151,10 @@
         "const": "backend_error"
        }
       }
+     },
+     "usage": {
+      "$ref": "#/components/schemas/Usage",
+      "description": "Present only when the request had started running before the failure: the work the job had done. Absent on a refusal before any job started."
      }
     }
    },

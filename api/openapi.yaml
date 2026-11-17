@@ -144,6 +144,13 @@ components:
                 - overloaded
                 - not_ready
                 - backend_error
+        usage:
+          $ref: "#/components/schemas/Usage"
+          description: >-
+            Present only on the OpenAI-style routes (/v1/chat/completions,
+            /v1/completions, and their streams) when a request had started
+            running before it failed: the work the job had done. A validation
+            error and every Anthropic-route error keep it absent.
     BackendError:
       type: object
       additionalProperties: false
@@ -160,6 +167,12 @@ components:
             code:
               type: string
               const: backend_error
+        usage:
+          $ref: "#/components/schemas/Usage"
+          description: >-
+            Present only when the request had started running before the
+            failure: the work the job had done. Absent on a refusal before
+            any job started.
     Model:
       type: object
       required: [id, object, created, owned_by, engines]

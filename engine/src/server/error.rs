@@ -1,5 +1,6 @@
 //! The table "Error codes" in the server design is normative.
 
+use super::wire::Usage;
 use crate::EngError;
 use axum::Json;
 use axum::http::StatusCode;
@@ -79,6 +80,15 @@ impl ServerError {
         json!({"error": {"message": self.message(), "code": self.code()}})
     }
 
+    /// The OpenAI-form error body of a request that had started running: the plain body
+    /// plus the work the job had done when it failed. Only the OpenAI-style routes carry
+    /// the member; the Anthropic error keeps its exact spec form.
+    pub(crate) fn body_with_usage(&self, usage: &Usage) -> Value {
+        let mut body = self.body();
+        body["usage"] = serde_json::to_value(usage).expect("usage serializes");
+        body
+    }
+
     pub(crate) fn log(&self) {
         if let ServerError::Eng(EngError::Backend { operation, message }) = self {
             eprintln!("backend failure in {operation}: {message}");
@@ -101,6 +111,8 @@ mod tests {
     use super::{BACKEND_MESSAGE, ServerError};
     use crate::EngError;
     use crate::server::contract::assert_schema;
+    use crate::server::contract::matches_schema;
+    use crate::server::wire::Usage;
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
     use serde_json::json;
@@ -175,6 +187,23 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("qmm"), "operation name leaked: {text}");
         assert!(!text.contains("Metal"), "diagnostic text leaked: {text}");
+    }
+
+    #[test]
+    fn a_body_with_usage_keeps_the_sanitization_and_matches_both_schemas() {
+        let error = backend();
+        let body = error.body_with_usage(&Usage::new(21, 2, 5));
+        assert_schema("Error", &body);
+        assert_schema("BackendError", &body);
+        assert_eq!(body["usage"]["prompt_tokens"], 21);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        assert_eq!(body["usage"]["total_tokens"], 23);
+        let text = body.to_string();
+        assert!(!text.contains("qmm"), "operation name leaked: {text}");
+        assert!(!text.contains("Metal"), "diagnostic text leaked: {text}");
+        // A usage that breaks the contract fails the schema, like any other member.
+        let bad = json!({"error": {"message": "x", "code": "bad_request"}, "usage": 5});
+        assert!(!matches_schema("Error", &bad));
     }
 
     #[test]

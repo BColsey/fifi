@@ -81,7 +81,7 @@ The reply has `object` `text_completion` and one choice with `index`, `text`, `l
 `usage` has the fields of chat completions.
 A stream sends one chunk for each piece of text, then a chunk with empty `text`, the `finish_reason` and the `usage`, then `data: [DONE]`.
 Chunks carry no role.
-A failure after the first chunk sends an `event: error` and no `[DONE]`.
+A failure after the first chunk sends an `event: error` with the usage counted so far and no `[DONE]`.
 The server marks no prefix boundary for a completion, so it does not save or restore a prefix for it.
 
 ## Token and template routes
@@ -131,6 +131,7 @@ Content blocks in the reply are `text`, `thinking` (with an empty `signature`) a
 
 Errors have the form `{"error": {"message": "...", "code": "..."}}`.
 The Messages routes use the Anthropic error format instead.
+An error on the OpenAI-style routes (`/v1/chat/completions`, `/v1/completions`, and their streams) that arrives after the request started running also carries `usage` beside `error`, with the work the job had done when it failed: the accepted prompt tokens and the tokens generated so far (a stop tail the server was still holding back is not subtracted). A prefill refusal reports the accepted prompt with 0 completion tokens. `reused_tokens` is 0 on most failures, because a prefix report arrives only in the `Finished` event, which a failing job usually never sends. This is the stream's only usage report in that case, because a failure after the first chunk sends an `event: error` with that `usage` and no `[DONE]`. Validation errors, and every Messages-route error, carry no `usage`.
 
 | Status | Code | Meaning |
 | --- | --- | --- |
