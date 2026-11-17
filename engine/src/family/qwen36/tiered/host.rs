@@ -123,6 +123,23 @@ enum LayerJobs {
     },
 }
 
+/// The staging cut for one prefill chunk. Limits only reduce admitted capacity.
+/// `short_limit` is an opt-in cap for chunks of at most 2,048 rows; the normal
+/// limit still bounds every chunk, including the larger 4,096-row experiment.
+pub(crate) fn chunk_cold_cap(
+    allocated: usize,
+    limit: Option<usize>,
+    short_limit: Option<usize>,
+    rows: usize,
+) -> usize {
+    let cap = limit.map_or(allocated, |limit| allocated.min(limit));
+    if rows <= 2048 {
+        short_limit.map_or(cap, |short| cap.min(short))
+    } else {
+        cap
+    }
+}
+
 /// The split-job lever's flag: halves on the workers, the down pass on the joining
 /// thread. Default off — the whole-expert path is the reviewed default.
 fn split_jobs() -> bool {
@@ -1367,6 +1384,75 @@ mod tests {
         // all-CPU layer 0.5 + 0.5, the faulted layer none.
         assert_eq!(f.host.report.routed_weight_ppm, 2_900_000);
         assert_eq!(f.host.report.cpu_weight_ppm, 1_300_000);
+    }
+
+    #[test]
+    fn chunk_cold_short_limit_changes_only_short_chunks() {
+        for rows in [0, 1, 1976, 2047, 2048] {
+            assert_eq!(chunk_cold_cap(78, None, Some(64), rows), 64);
+        }
+        for rows in [2049, 3808, 4095, 4096, usize::MAX] {
+            assert_eq!(chunk_cold_cap(78, None, Some(64), rows), 78);
+        }
+        for rows in [1, 2048, 2049, 4096] {
+            assert_eq!(chunk_cold_cap(78, None, None, rows), 78);
+            assert_eq!(chunk_cold_cap(78, Some(64), None, rows), 64);
+            assert_eq!(chunk_cold_cap(78, Some(48), Some(64), rows), 48);
+            assert_eq!(chunk_cold_cap(48, Some(78), Some(64), rows), 48);
+            assert_eq!(chunk_cold_cap(0, Some(78), Some(64), rows), 0);
+            assert_eq!(chunk_cold_cap(78, Some(0), Some(64), rows), 0);
+        }
+        assert_eq!(chunk_cold_cap(78, None, Some(0), 2048), 0);
+        assert_eq!(chunk_cold_cap(78, None, Some(0), 2049), 78);
+    }
+
+    #[test]
+    fn chunk_cold_short_limit_preserves_routes_across_the_threshold() {
+        for (count, expected_staged) in [(2048, 2), (2049, 3)] {
+            let mut f = fixture();
+            let resident = install(&mut f.host, 1, 2, 1);
+            let rows: Vec<_> = (0..count)
+                .map(|_| ChunkRouteRow {
+                    ids: vec![2, 7, 3, 5],
+                    weights: vec![0.30, 0.20, 0.10, 0.02],
+                })
+                .collect();
+            let cap = chunk_cold_cap(3, None, Some(2), rows.len());
+            let (plan, overflow, cold) = f
+                .host
+                .begin_chunk_layer_with_min_rows(1, &rows, cap, 16)
+                .unwrap();
+            assert_eq!(cold.len(), expected_staged);
+            assert_eq!(overflow.len(), 3 - expected_staged);
+            for (row_at, row) in rows.iter().enumerate() {
+                for (pick, (&expert, &weight)) in row.ids.iter().zip(&row.weights).enumerate() {
+                    let at = row_at * 4 + pick;
+                    if expert == 2 {
+                        assert_eq!(plan.slot_ids[at], resident as i32);
+                        assert_eq!(plan.cold_ids[at], -1);
+                        assert_eq!(plan.device_weights[at], weight);
+                    } else if let Some(c) = cold.iter().find(|c| c.expert == expert as u16) {
+                        assert!((c.channel as usize) < cap);
+                        assert_eq!(plan.cold_ids[at], c.channel as i32);
+                        assert_eq!(plan.device_weights[at], weight);
+                        assert!(overflow.iter().all(|g| g.expert != expert as u16));
+                    } else {
+                        assert_eq!(plan.cold_ids[at], -1);
+                        assert_eq!(plan.device_weights[at], 0.0);
+                        let g = overflow.iter().find(|g| g.expert == expert as u16).unwrap();
+                        assert_eq!(g.rows.len(), count);
+                        assert_eq!(g.rows[row_at], row_at);
+                        assert_eq!(g.row_weights[row_at], weight);
+                    }
+                }
+            }
+            assert_eq!(f.host.report.bank_hits as usize, count);
+            assert_eq!(f.host.report.cold_served as usize, count * expected_staged);
+            assert_eq!(
+                f.host.report.cpu_served as usize,
+                count * (3 - expected_staged)
+            );
+        }
     }
 
     /// The three-way chunk classify: the hottest `cold_cap` distinct missed experts take
