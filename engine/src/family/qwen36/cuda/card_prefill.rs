@@ -46,7 +46,7 @@ use super::{
 use crate::{
     EngError,
     family::qwen36::host::MoeDims as HostMoeDims,
-    kernels::cuda::NativeWeight,
+    kernels::cuda::{DeviceBuffer, NativeWeight},
     kernels::cuda::peer_ring::{MAX_VALUES, RingMode},
 };
 
@@ -121,6 +121,36 @@ struct CardChunkCard {
     arena: PrefillArena,
     model: ChunkModel<'static, 'static>,
     moe: &'static [MoeLayerWeights<'static>],
+    /// Per-LAYER persistent fp16 staging (one buffer per full-attention
+    /// layer: its own K|V planes), filled incrementally across the chunks
+    /// of one prefill job. `None` without Q36_P2P_CHUNK_STAGED: the
+    /// arena's shared staging with its whole-prefix re-dequant runs instead.
+    layer_staging: Option<LayerStaging>,
+}
+
+/// Persistent staging of one card: per-layer plane pairs plus each layer's
+/// filled-through watermark. `Cell` so invalidation and watermark notes
+/// need only a shared borrow.
+struct LayerStaging {
+    capacity: usize,
+    planes: Vec<DeviceBuffer>,
+    /// usize::MAX = invalid (reset or prefix import); fill [0, end) then.
+    through: Vec<std::cell::Cell<usize>>,
+}
+
+impl LayerStaging {
+    fn through(&self, ord: usize) -> Option<usize> {
+        let v = self.through[ord].get();
+        (v != usize::MAX).then_some(v)
+    }
+    fn note(&self, ord: usize, end: usize) {
+        self.through[ord].set(end)
+    }
+    fn invalidate(&self) {
+        for t in &self.through {
+            t.set(usize::MAX)
+        }
+    }
 }
 
 /// The session's chunk resources, built once at start.
@@ -128,6 +158,19 @@ pub(crate) struct CardChunk {
     cards: Vec<CardChunkCard>,
     m_sess: usize,
     hidden: usize,
+}
+
+impl CardChunk {
+    /// Drops every layer's staging watermark: the next chunk refills its
+    /// whole prefix. Called on session reset and prefix import, where the
+    /// KV cache content changes wholesale.
+    pub(crate) fn invalidate_staging(&self) {
+        for card in &self.cards {
+            if let Some(staging) = &card.layer_staging {
+                staging.invalidate();
+            }
+        }
+    }
 }
 
 impl CardChunk {
@@ -194,14 +237,31 @@ pub(super) fn build_card_chunk(
         // guesses (chunk-capacity plans, head-count plans) fail the same
         // way; this needs the native grid inspection. Q36_P2P_CHUNK_STAGED
         // opts in for the investigation.
-        if std::env::var_os("Q36_P2P_CHUNK_STAGED").is_some_and(|v| v == "1") {
-            let plan = super::prefill_driver::Kv8StagingPlan::for_context(
-                65_536,
-                geometry.attn.heads_kv,
-                geometry.attn.head_dim,
-            )?;
-            arena.attach_kv8_staging(&stack.contexts()[card], plan, false)?;
-        }
+        let layer_staging =
+            if std::env::var_os("Q36_P2P_CHUNK_STAGED").is_some_and(|v| v == "1") {
+                let plan = super::prefill_driver::Kv8StagingPlan::for_context(
+                    65_536,
+                    geometry.attn.heads_kv,
+                    geometry.attn.head_dim,
+                )?;
+                let full_layers = dims
+                    .shape
+                    .kinds
+                    .iter()
+                    .filter(|k| **k == crate::family::AttentionKind::Full)
+                    .count();
+                let mut planes = Vec::with_capacity(full_layers);
+                for _ in 0..full_layers {
+                    planes.push(stack.contexts()[card].allocate(plan.bytes)?);
+                }
+                Some(LayerStaging {
+                    capacity: plan.capacity,
+                    planes,
+                    through: vec![std::cell::Cell::new(usize::MAX); full_layers],
+                })
+            } else {
+                None
+            };
         // The card's own views, resolved exactly as the session resolves
         // them, then leaked for the chunk models' process lifetime.
         let weights_card_of = inputs.weights[card];
@@ -252,6 +312,7 @@ pub(super) fn build_card_chunk(
             arena,
             model,
             moe: moe_card,
+            layer_staging,
         });
     }
     Ok(CardChunk {
@@ -524,7 +585,7 @@ fn run_card_chunk_layer(
                             time_stage("attn_proj", || attn_proj(&runs[card], &ctx))?
                         }
                         Stage::Prep => time_stage("attn_prep", || attn_prep(&runs[card], &ctx))?,
-                        Stage::Flash => time_stage("attn_flash", || attn_flash(&runs[card], &ctx))?,
+                        Stage::Flash => flash_stage(drive, card, ordinal)?,
                         Stage::QuantAOut => {
                             time_stage("quant_aout", || quant_a_out(&runs[card], &ctx))?
                         }
@@ -534,6 +595,116 @@ fn run_card_chunk_layer(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Stage 6 with persistent per-layer staging: dequant only the rows the
+/// previous chunks of this job have not staged yet, then run the fp16
+/// flash over the layer's planes. Beyond the staging capacity (or without
+/// per-layer buffers) the legacy `attn_flash` runs instead.
+fn flash_stage(
+    drive: &LayerDrive<'_, '_, '_, '_>,
+    card: usize,
+    ordinal: usize,
+) -> Result<(), EngError> {
+    let run = &drive.runs[card];
+    let end = run.rows_end();
+    let Some(staging) = drive.chunk.cards[card].layer_staging.as_ref() else {
+        let ctx = layer_ctx(
+            drive.launches,
+            drive.chunk,
+            drive.status,
+            card,
+            0,
+            crate::family::AttentionKind::Full,
+            ordinal,
+        )?;
+        return time_stage("attn_flash", || attn_flash(run, &ctx));
+    };
+    let ctx = layer_ctx(
+        drive.launches,
+        drive.chunk,
+        drive.status,
+        card,
+        0,
+        crate::family::AttentionKind::Full,
+        ordinal,
+    )?;
+    if end > staging.capacity {
+        return time_stage("attn_flash", || attn_flash(run, &ctx));
+    }
+    let start = staging.through(ordinal).filter(|t| *t <= end).unwrap_or(0);
+    if start < end {
+        time_stage(
+            "attn_dequant_new",
+            || stage_new_rows(run, &ctx, staging, ordinal, start, end),
+        )?;
+    }
+    let planes = staging_plane_ranges(staging, ordinal)?;
+    time_stage("attn_flash", || {
+        super::prefill::attn_flash_fp16(run, &ctx, staging.capacity, planes)
+    })?;
+    staging.note(ordinal, end);
+    Ok(())
+}
+
+fn staging_plane_ranges<'s>(
+    staging: &'s LayerStaging,
+    ordinal: usize,
+) -> Result<[crate::kernels::cuda::DeviceRange<'s>; 2], EngError> {
+    let buffer = &staging.planes[ordinal];
+    let half = buffer.bytes() / 2;
+    Ok([buffer.range(0, half)?, buffer.range(half, half)?])
+}
+
+/// Dequants cache rows [start, end) into the layer's planes AT THE ROW
+/// OFFSET. kv8_dequant_segment's origin shifts only the SOURCE read; its
+/// OUT always writes [0, rows), so the OUT range is sliced to start at
+/// the `start` plane row. A whole-prefix refill when the watermark is
+/// invalid.
+fn stage_new_rows(
+    run: &ChunkRun<'_, '_>,
+    ctx: &super::prefill::LayerCtx<'_, '_>,
+    staging: &LayerStaging,
+    ordinal: usize,
+    start: usize,
+    end: usize,
+) -> Result<(), EngError> {
+    let a = run.card_attn_geom();
+    let planes = staging_plane_ranges(staging, ordinal)?;
+    let rows = end - start;
+    let row_bytes = planes[0].bytes() / staging.capacity;
+    for (codes, scales, out) in [
+        (
+            super::state_layout::Plane::K,
+            super::state_layout::Plane::KScales,
+            planes[0],
+        ),
+        (
+            super::state_layout::Plane::V,
+            super::state_layout::Plane::VScales,
+            planes[1],
+        ),
+    ] {
+        let out = out
+            .buffer()
+            .range(out.offset() + start * row_bytes, rows * row_bytes)?;
+        ctx.launch.ctx.kv8_dequant_segment(
+            ctx.launch.stream,
+            crate::kernels::cuda::prefill::kv8_dequant::Kv8DequantCall {
+                shape: crate::kernels::cuda::prefill::kv8_dequant::Kv8DequantShape {
+                    capacity: run.run_kv_capacity(),
+                    rows,
+                    n_kv_head: a.heads_kv,
+                    head_dim: a.head_dim,
+                },
+                codes: run.run_kv_plane(ctx.ord, codes)?,
+                scales: run.run_kv_plane(ctx.ord, scales)?,
+                out,
+            },
+            start,
+        )?;
     }
     Ok(())
 }

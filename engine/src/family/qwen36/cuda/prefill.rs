@@ -1360,6 +1360,52 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     pub(super) fn model(&self) -> &'r ChunkModel<'r, 'w> {
         self.model
     }
+    /// The chunk's end position (the card driver's incremental staging).
+    pub(super) fn rows_end(&self) -> usize {
+        self.rows.end()
+    }
+
+    /// The run's attention geometry (the card driver's staging fill).
+    pub(super) fn card_attn_geom(&self) -> &'r super::mixer_geometry::AttnGeometry {
+        &self.model.geometry.attn
+    }
+
+    /// The KV capacity (the card driver's staging fill).
+    pub(super) fn run_kv_capacity(&self) -> usize {
+        self.state.layout().kv.capacity
+    }
+
+    /// A KV plane of the run's state (the card driver's staging fill).
+    pub(super) fn run_kv_plane(
+        &self,
+        ordinal: usize,
+        plane: super::state_layout::Plane,
+    ) -> Result<crate::kernels::cuda::DeviceRange<'_>, crate::EngError> {
+        self.state.kv_plane(ordinal, plane)
+    }
+    /// The chunk's end position (the card driver's incremental staging).
+    pub(super) fn rows_end(&self) -> usize {
+        self.rows.end()
+    }
+
+    /// The run's attention geometry (the card driver's staging fill).
+    pub(super) fn card_attn_geom(&self) -> &'r super::mixer_geometry::AttnGeometry {
+        &self.model.geometry.attn
+    }
+
+    /// The KV capacity (the card driver's staging fill).
+    pub(super) fn run_kv_capacity(&self) -> usize {
+        self.state.layout().kv.capacity
+    }
+
+    /// A KV plane of the run's state (the card driver's staging fill).
+    pub(super) fn run_kv_plane(
+        &self,
+        ordinal: usize,
+        plane: super::state_layout::Plane,
+    ) -> Result<crate::kernels::cuda::DeviceRange<'_>, crate::EngError> {
+        self.state.kv_plane(ordinal, plane)
+    }
 
     pub(super) fn new(
         state: &'r ResidentState,
@@ -2189,7 +2235,7 @@ fn attn_flash_staged(
     attn_flash_fp16(run, ctx, staging.plan.capacity, staging.planes)
 }
 
-fn attn_flash_fp16(
+pub(super) fn attn_flash_fp16(
     run: &ChunkRun<'_, '_>,
     ctx: &LayerCtx<'_, '_>,
     capacity: usize,
