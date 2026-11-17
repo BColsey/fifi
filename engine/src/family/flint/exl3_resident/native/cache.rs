@@ -4,16 +4,13 @@
 use crate::EngError;
 
 // The pure bank policy lives in `family::flint::budget` so host builds
-// compose the same decisions; re-exported here because the native loader
-// and its tests historically reach it through this module.
+// compose the same decisions; its consumers import it from there directly.
 use crate::family::expert_bank::policy::LayerLru;
+use crate::family::flint::budget::EXPERTS;
 #[cfg(test)]
-use crate::family::flint::budget::CpuMoeConfig;
-#[cfg(test)]
-pub(super) use crate::family::flint::budget::choose_slots;
-pub(super) use crate::family::flint::budget::{
-    BankBudget, BankPlan, BankReason, BankRequest, CACHE_VAR, EXPERTS, ExpertCacheMode, SLOTS_VAR,
-    cpu_moe_bank, plan_bank,
+use crate::family::flint::budget::{
+    BankBudget, BankPlan, BankReason, BankRequest, CACHE_VAR, CpuMoeConfig, ExpertCacheMode,
+    SLOTS_VAR, choose_slots, cpu_moe_bank, plan_bank,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

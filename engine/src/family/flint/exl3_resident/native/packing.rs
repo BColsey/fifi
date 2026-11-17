@@ -36,7 +36,7 @@ pub(super) struct CachedPacking {
     pub(super) arena_base: usize,
     pub(super) routed: Vec<Option<(usize, u16)>>,
     pub(super) layers: Vec<usize>,
-    pub(super) reason: super::cache::BankReason,
+    pub(super) reason: crate::family::flint::budget::BankReason,
 }
 
 impl CachedAudit {
@@ -73,7 +73,7 @@ impl CachedAudit {
         self,
         slot_count: usize,
         offloaded: usize,
-        reason: super::cache::BankReason,
+        reason: crate::family::flint::budget::BankReason,
         limits: &FlintResidentLimits,
     ) -> Result<CachedPacking, EngError> {
         let layout =
@@ -106,7 +106,7 @@ fn audit_layer_stride(
     experts: &[[usize; 3]],
     ordinal: usize,
 ) -> Result<usize, EngError> {
-    if experts.len() != super::cache::EXPERTS {
+    if experts.len() != crate::family::flint::budget::EXPERTS {
         return Err(EngError::Checkpoint(
             "Flint host cache requires all 256 experts".into(),
         ));
@@ -282,8 +282,8 @@ fn allocation(error: std::collections::TryReserveError) -> EngError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::BankReason;
     use super::*;
+    use crate::family::flint::budget::BankReason;
     use crate::weights::exl3::flint_pack::{Geometry, PackBuilder};
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

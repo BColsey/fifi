@@ -9,19 +9,19 @@ use std::{
     path::Path,
 };
 
-#[cfg(test)]
-use super::super::cache::choose_slots;
 use super::super::{
     FfnRoles, FlintResidentLimits, ResidentPlan,
-    cache::{
-        BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode, HostStore,
-        LayerCache, LayerLayout, MissCopy, plan_bank,
-    },
+    cache::{HostStore, LayerCache, LayerLayout, MissCopy},
     plan::plan_resident,
 };
 use super::{
     FlintExl3Resident, FlintExpertBank, FlintExpertView, PackedMatrix, PackedRange,
     packing::{CachedAudit, CachedPacking, Packing},
+};
+#[cfg(test)]
+use crate::family::flint::budget::choose_slots;
+use crate::family::flint::budget::{
+    BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode, plan_bank,
 };
 use crate::{
     EngError,
