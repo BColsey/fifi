@@ -12,6 +12,18 @@ mod contract_tests;
 pub(crate) mod native;
 mod staging;
 
+/// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn dispatch_count() -> u64 {
+    native::dispatch_count()
+}
+
+/// Zeroes the calling thread's native-dispatch count (the parity oracle's op-count asserts;
+/// only tests reset it, the probes read the live count).
+#[cfg(test)]
+pub(crate) fn reset_dispatch_count() {
+    native::reset_dispatch_count()
+}
+
 /// Process-wide production counters of the compiled block calls of the `mlx_compile` seam. The
 /// trace counts come from the NATIVE seam: the body of a compiled closure runs once per trace —
 /// and on every call when MLX returns the uncompiled function — while a cache hit replays the
@@ -721,6 +733,17 @@ impl MlxKernels {
             return Err(EngError::BadRequest("retire cap must exceed zero".into()));
         }
         self.context.set_retire_cap(bytes)
+    }
+
+    pub(crate) fn program_limit(&self) -> crate::kernels::compile_key::ProgramLimit {
+        self.context.program_limit()
+    }
+
+    pub(crate) fn set_program_limit(
+        &mut self,
+        limit: crate::kernels::compile_key::ProgramLimit,
+    ) -> Result<(), EngError> {
+        self.context.set_program_limit(limit)
     }
 
     pub fn try_new() -> Result<Self, EngError> {
@@ -2099,6 +2122,43 @@ impl MlxKernels {
         args: &native::compile::CompileDeltaArgs<'_>,
     ) -> Result<native::compile::CompiledDelta, EngError> {
         self.context.compiled_delta_step(args)
+    }
+
+    /// One whole DELTA-mixer layer of the chunk prefill through one `mlx_compile`d closure
+    /// (B1): input norm, projections, fused prep/recurrence/post, mixer residual, and the
+    /// folded device-routed MoE rows sequence. T is an input shape the native cache
+    /// specializes; the gather row-index operands are appended natively per window. See the
+    /// `Context` method of the same name in `kernels/mlx/native/compile.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compiled_delta_layer(
+        &mut self,
+        args: &native::compile::CompileDeltaLayerArgs<'_>,
+    ) -> Result<native::compile::CompiledDeltaLayer, EngError> {
+        self.context.compiled_delta_layer(args)
+    }
+
+    /// The PRE head of one attention layer of the chunk prefill (window attention closure) through one
+    /// `mlx_compile`d closure: the input norm, the q/k/v projections, the q/k head norms, and
+    /// the gate slice, batched to `[1, heads, T, width]` for the eager window attention core.
+    /// See the `Context` method of the same name in `kernels/mlx/native/compile.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compiled_attn_pre_layer(
+        &mut self,
+        args: &native::compile::CompileAttnPreLayerArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPreLayer, EngError> {
+        self.context.compiled_attn_pre_layer(args)
+    }
+
+    /// The POST tail of one attention layer of the chunk prefill (window attention closure) through one
+    /// `mlx_compile`d closure: the composite gate chain, the output projection, the mixer
+    /// residual, and the folded device-routed MoE rows sequence. See the `Context` method of
+    /// the same name in `kernels/mlx/native/compile.rs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compiled_attn_post_layer(
+        &mut self,
+        args: &native::compile::CompileAttnPostLayerArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPostLayer, EngError> {
+        self.context.compiled_attn_post_layer(args)
     }
 
     /// Staged B2/4/8 DeltaNet seam. Slot zero is in `args`; other states follow row order.

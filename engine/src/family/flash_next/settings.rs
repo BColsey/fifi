@@ -7,6 +7,7 @@
 
 use super::moe::context_budget::KvFormat;
 use crate::EngError;
+use crate::family::project::exl3_jobs_plan::MAX_EXL3_ROWS;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -46,11 +47,17 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, from 1 to 8. The default, 1, is the
-    /// decode shape: one row per device call, exactly as before. A value above one runs the
-    /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
-    /// unchanged at one row.
+    /// CUDA only: rows of one device step during prefill. With `INFERENCE_FLASH_NEXT_SHARED_PREFILL=1`
+    /// the bound is 2 to 256; without it, 1 to 64 — the legacy path's device coverage stops at 64
+    /// rows. The default, 1, is the decode shape: one row per device call, exactly as before. A
+    /// value above one runs the prompt as device chunks of that many rows (one PLE host
+    /// roundtrip per chunk), with decode unchanged at one row.
     pub(crate) prefill_rows: Option<u32>,
+    /// CUDA only, shared prefill path only: the chunked-prefill row count at and above which
+    /// an active prefill ring serves the whole chunk; below it the bank's union-admit path
+    /// serves. The legacy (non-shared) path ignores this key and always streams the ring.
+    /// A value above `prefill_rows` never engages the ring (every chunk is below it). Default 32.
+    pub(crate) ring_rows: Option<u32>,
     /// CUDA only: the popularity profile file of the expert bank. A load reads it for a
     /// rank-ordered initial fill, and the bank rewrites it with its own usage counts on shutdown,
     /// so the next start of the same entry serves warm. A file that does not exist yet is a cold
@@ -87,12 +94,32 @@ pub(crate) struct CudaSettings {
     pub(crate) expert_stats: Option<PathBuf>,
     /// Rows of one device prefill step (1 = the decode shape). From `prefill_rows`.
     pub(crate) prefill_rows: u32,
+    /// The row threshold of the prefill ring (from `ring_rows`, default 32); the shared
+    /// prefill path only, the legacy path always streams the ring.
+    pub(crate) ring_rows: u32,
 }
 
 /// Default positions of the CUDA K/V caches.
 pub(crate) const DEFAULT_CUDA_CONTEXT: u32 = 4096;
 /// Largest `context` value of the CUDA decoder.
 pub(crate) const MAX_CUDA_CONTEXT: u32 = 262_144;
+/// Default row threshold of the prefill ring (`ring_rows`): on the shared prefill path,
+/// chunks at or above it take the ring's whole-chunk path, chunks below it the bank's
+/// union-admit path.
+pub(crate) const DEFAULT_RING_ROWS: u32 = 32;
+
+/// Whether a chunked-prefill chunk takes the ring's whole-chunk path: the ring is active and
+/// the chunk reaches `ring_min_rows`, or the window already latched onto the ring
+/// (`ring_engaged`). Below the threshold and not latched, the chunk takes the bank's
+/// union-admit path. Pure so the threshold crossing is host-testable without a device.
+pub(crate) fn ring_whole_chunk(
+    ring_active: bool,
+    rows: usize,
+    ring_min_rows: usize,
+    ring_engaged: bool,
+) -> bool {
+    ring_active && (rows >= ring_min_rows || ring_engaged)
+}
 /// The attention indexer's block ratio: the caches hold whole blocks.
 const CUDA_CONTEXT_MULTIPLE: u32 = 4;
 /// Fewest expert slots: ten picks and the filler slot.
@@ -176,6 +203,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
             ("slots", options.slots.is_some()),
             ("expert_stats", options.expert_stats.is_some()),
             ("prefill_rows", options.prefill_rows.is_some()),
+            ("ring_rows", options.ring_rows.is_some()),
         ];
         return match stray.iter().find(|(_, set)| *set) {
             Some((key, _)) => Err(bad(format!("{key} needs cuda_decode set to true"))),
@@ -217,14 +245,33 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
     {
         return Err(bad("expert_stats must not be empty".into()));
     }
-    // The step's rows are capped by the merged expert launches; `MAX_STEP_ROWS` in
-    // `cuda/step_plan.rs` is the same 8.
-    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 8)?;
+    // The step plan refuses widths above `MAX_STEP_ROWS` (`cuda/step_plan.rs`), which equals
+    // `MAX_EXL3_ROWS` of `project/exl3_jobs_plan.rs`; refusing here names `prefill_rows` at
+    // parse time instead of a plan refusal at boot.
+    let prefill_rows = ranged(
+        "prefill_rows",
+        options.prefill_rows,
+        1,
+        1,
+        MAX_EXL3_ROWS as u32,
+    )?;
+    // The stock threshold is 32: at 32 rows a top-10 union already outgrows a 200-slot
+    // bank, so smaller chunks usually fit the bank without admission while larger ones
+    // want the ring's whole-chunk grouping. A ring_rows above prefill_rows is accepted but
+    // never engages the ring: every chunk is below the threshold, so the window stays on
+    // the union-admit path (the ring's reservation is still carved at start).
+    let ring_rows = bounded(
+        "ring_rows",
+        options.ring_rows.unwrap_or(DEFAULT_RING_ROWS),
+        1,
+        MAX_EXL3_ROWS as u32,
+    )?;
     Ok(Some(CudaSettings {
         context,
         kv_format,
         slots,
         prefill_rows,
+        ring_rows,
         expert_stats: options.expert_stats.clone(),
     }))
 }
@@ -292,7 +339,9 @@ impl FlashSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaSettings, FlashEnv, FlashOptions, FlashSettings, KvFormatName};
+    use super::{
+        CudaSettings, FlashEnv, FlashOptions, FlashSettings, KvFormatName, ring_whole_chunk,
+    };
     use crate::EngError;
     use crate::family::flash_next::moe::context_budget::KvFormat;
     use std::path::{Path, PathBuf};
@@ -537,6 +586,63 @@ mod tests {
         }
     }
 
+    /// `prefill_rows` takes the whole planned width (the shared `MAX_EXL3_ROWS`) and refuses
+    /// one row above it at parse time, naming the key.
+    #[test]
+    fn prefill_rows_is_bounded_at_the_planned_chunk_width() {
+        let env = FlashEnv::default();
+        let at = |rows: u32| {
+            let options = FlashOptions {
+                prefill_rows: Some(rows),
+                ..cuda_on()
+            };
+            settings(Some(&options), &env)
+        };
+        assert_eq!(at(256).unwrap().cuda.unwrap().prefill_rows, 256);
+        assert_eq!(at(1).unwrap().cuda.unwrap().prefill_rows, 1);
+        assert!(message(at(257)).contains("prefill_rows"));
+        assert!(message(at(0)).contains("prefill_rows"));
+    }
+
+    /// `ring_rows` defaults to the stock 32, takes any value 1 to 256 (the ExL3 row cap),
+    /// refuses values outside it at parse time naming the key, and stays refused without
+    /// `cuda_decode`.
+    #[test]
+    fn ring_rows_defaults_to_32_and_is_bounded_at_256() {
+        let env = FlashEnv::default();
+        let at = |rows: Option<u32>| {
+            let options = FlashOptions {
+                ring_rows: rows,
+                ..cuda_on()
+            };
+            settings(Some(&options), &env)
+        };
+        assert_eq!(at(None).unwrap().cuda.unwrap().ring_rows, 32);
+        assert_eq!(at(Some(256)).unwrap().cuda.unwrap().ring_rows, 256);
+        assert_eq!(at(Some(1)).unwrap().cuda.unwrap().ring_rows, 1);
+        assert!(message(at(Some(257))).contains("ring_rows"));
+        assert!(message(at(Some(0))).contains("ring_rows"));
+        let stray = FlashOptions {
+            ring_rows: Some(32),
+            ..FlashOptions::default()
+        };
+        assert!(message(settings(Some(&stray), &env)).contains("ring_rows"));
+    }
+
+    #[test]
+    fn the_ring_whole_chunk_predicate_crosses_at_the_threshold_and_latches() {
+        // At the threshold the ring serves; one row below it the union admits.
+        assert!(ring_whole_chunk(true, 32, 32, false));
+        assert!(!ring_whole_chunk(true, 31, 32, false));
+        // Once latched, even a 1-row tail stays on the ring.
+        assert!(ring_whole_chunk(true, 1, 32, true));
+        // No active ring: always the union path, latched or not.
+        assert!(!ring_whole_chunk(false, 256, 32, false));
+        assert!(!ring_whole_chunk(false, 1, 32, true));
+        // Threshold 1: every chunk is whole.
+        assert!(ring_whole_chunk(true, 1, 1, false));
+    }
+
     #[test]
     fn the_cuda_decoder_is_off_by_default_and_its_keys_need_the_switch() {
         let env = FlashEnv::default();
@@ -588,6 +694,7 @@ mod tests {
                 slots: None,
                 expert_stats: None,
                 prefill_rows: 1,
+                ring_rows: 32,
             })
         );
         // The manifest is still required: it pins the tokenizer.
@@ -617,6 +724,7 @@ mod tests {
                 slots: Some(48),
                 expert_stats: None,
                 prefill_rows: 1,
+                ring_rows: 32,
             })
         );
         assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);

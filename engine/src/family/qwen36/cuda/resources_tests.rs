@@ -3,7 +3,6 @@
 use super::{
     common_tests::{dims, inventory},
     dims::{KvMode, StepOptions, TieredPlan},
-    mixer_geometry::DenseSpec,
     resources::{
         GlobalNames, GlobalSpecs, MoeSpecs, PagedResourcesPlan, STEP_ROWS, StackSpec,
         check_native_stack, check_paged_modes, check_stack, check_stage1_options, f32_bytes,
@@ -17,6 +16,7 @@ use super::{
     state::PagedStatePlan,
     step_plan::{KernelScratch, StepPlan},
 };
+use crate::family::exl3::source::DenseSpec;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::attn_decode_q8::{
     AttnQ8Shape, attn_q8_part_bytes, paged::PagedQ8Scratch,

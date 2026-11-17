@@ -771,10 +771,10 @@ impl TieredHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::qwen36::tiered::classify::{ROUTE_INVALID, classify_reference};
     use crate::family::qwen36::tiered::cpu_pool::ExpertKernel;
     use crate::family::qwen36::tiered::locator::ExpertTensorNames;
     use crate::family::qwen36::tiered::locator::tests::{Lcg, expert_file, parse};
+    use crate::family::tiered_classify::{ROUTE_INVALID, classify_reference};
     use crate::kernels::expert_cpu::{ExpertShape, ExpertSlices};
     use crate::kernels::expert_cpu_q8k::{DotBackend, ExpertScratchQ8k, expert_forward_q8k};
 

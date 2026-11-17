@@ -1,5 +1,5 @@
 //! The split MoE block on two real layers of the full pack, against the all-resident block
-//! (`qwen36::cuda::exl3_moe::run_exl3_moe` over a bank of every expert) and against an fp64
+//! (`family::exl3::moe::run_exl3_moe` over a bank of every expert) and against an fp64
 //! evaluation of the stored matrices.
 //!
 //! `FIFI_FLASH_NEXT_EXL3_PACK` names the local pack directory (the full 3.05 bpw pack, or a copy
@@ -22,33 +22,36 @@
 //! Checked: a layer without a miss writes the bytes of the all-resident block; a layer with misses
 //! is within a relative L2 of 1e-6 of it (the sums are associated in two groups, every product is
 //! the same); both are within the block's bound of fp64; the bank holds every pick afterwards.
+//!
+//! The prefill ring has its own tests: `a_chunk_over_the_prefill_ring_matches_the_all_resident_block`
+//! (49 rows over a funded ring, RING_BOUND against the all-resident block and fp64) and
+//! [`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`] (the launch-family
+//! A/B behind that bound). `FIFI_FLASH_NEXT_RING_HELD` (test-only, read by the ring test) picks how
+//! many of ROW 0's picks the bank holds — 0 the all-ring arm, 10 the all-bank arm, 6 the default
+//! mix — rows 1.. keep the default split in every arm.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::PathBuf;
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     moe_block::{SplitMoe, SplitMoeTrunk},
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{
+        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
         flash_next::{
             load::{exl3_pack::inspect_flash_pack, model_shape, pack_files::FlashPackFiles},
             moe::exl3_cuda_tests::{
                 OUTPUT_BOUND, Reference, Router, floats, input, keys, reference, relative_l2,
-                upload,
+                relative_l2_f64, upload,
             },
         },
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights},
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
-        },
     },
     kernels::cuda::{
         DeviceBuffer, device_present,
@@ -61,6 +64,22 @@ const F32: usize = 4;
 const SLOTS: usize = 16;
 /// The two groupings of the sums differ only by association: a handful of float roundings.
 const SPLIT_BOUND: f64 = 1e-6;
+/// The ring branch's per-row output deviates from the all-resident block and from fp64 by
+/// 1.5e-4 to 2.9e-4 relative L2, measured on this pack at rows=49; the deviation is
+/// identical with the fused pair launch on and off and with all, none or some of row 0's
+/// picks held in the bank (FIFI_FLASH_NEXT_RING_HELD arms those variants; the knob moves
+/// row 0 only — the fixture's other rows keep the default split), so sum order and that
+/// source split are excluded. The per-projection device test
+/// ([`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`])
+/// separates the families' arithmetic: the job-table tile kernels stage the activations as
+/// F16 operands (`exl3.cu`'s
+/// jobs_input_rotate rounds to F16 where it writes the rotated rows; JobsTile multiplies
+/// F16 halves) while the flat indexed launches read their F32 staging — giving 1.9-3.9e-4
+/// per projection against fp64 where the indexed family sits at 1.5-3.0e-7 — the block
+/// deviation is that launch-family arithmetic, not a defect of the ring branch.
+/// The bound covers the block-level combine (1.4x headroom over the 2.9e-4 maximum); the
+/// per-projection figures are bounded separately at `GATE_UP_BOUND`/`DOWN_BOUND`.
+const RING_BOUND: f64 = 4e-4;
 
 fn pack_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"))
@@ -350,7 +369,7 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
     let layout = source.layout().clone();
 
     for verify in [true, false] {
-        for case in ["mixed", "forced miss"] {
+        for case in ["mixed", "one miss", "forced miss"] {
             // Per bank layer: the experts its slots hold and the misses its row will cause.
             let held: Vec<Vec<u16>> = prepared
                 .iter()
@@ -360,6 +379,14 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
                         let mut held: Vec<u16> =
                             p.picks().iter().take(6).map(|&e| e as u16).collect();
                         held.extend(others(p.picks(), SLOTS - 6));
+                        held
+                    }
+                    // Nine of the ten picks held: exactly one miss, the narrowest compact
+                    // miss pass (width 1 where the filler launch always carried 10).
+                    "one miss" => {
+                        let mut held: Vec<u16> =
+                            p.picks().iter().take(9).map(|&e| e as u16).collect();
+                        held.extend(others(p.picks(), SLOTS - 9));
                         held
                     }
                     // None held: ten misses, the resident pass is all filler.
@@ -435,9 +462,10 @@ fn floats_f64(bytes: &[u8]) -> Vec<f64> {
     floats(bytes).into_iter().map(f64::from).collect()
 }
 
-/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. The
-/// grouped launches chunk at the same capacity as one row's, restarting at scratch row 0, so
-/// the EXL3 scratch keeps its one-row sizing.
+/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. A
+/// source's gate/up launch stages one `xh` row per pair and the whole chunk can be one
+/// source's, so the scratch staging is sized `m·k` rows (the F32 byte sizing also covers
+/// the F16 staging the job-table family writes into the same ranges).
 struct RigRows {
     owned: Vec<DeviceBuffer>,
     hidden: usize,
@@ -474,8 +502,10 @@ impl RigRows {
             zeros(m * 2 * moe.shared_inter * F32)?,
             zeros(m * moe.shared_inter * F32)?,
             zeros(m * h)?,
-            zeros(2 * k * moe.hidden * F32)?,
-            zeros(2 * k * moe.inter.max(moe.hidden) * F32)?,
+            // A source's gate/up launch stages one xh row a pair, and the whole chunk can be
+            // one source's: m·k rows, like the down windows through z.
+            zeros(m * k * moe.hidden * F32)?,
+            zeros(m * k * moe.inter.max(moe.hidden) * F32)?,
             zeros(4)?,
         ];
         Ok(Self {
@@ -519,15 +549,525 @@ impl RigRows {
             .expect("read the outputs");
         bytes[r * self.hidden..][..self.hidden].to_vec()
     }
+
+    /// `expert_gu`, `expert_down` (whole chunk) and the routed ids, read back.
+    fn expert_bytes(&self, projector: &CudaProjector) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let stream = projector.context().stream().expect("stream");
+        let read = |i: usize| {
+            let mut bytes = vec![0u8; self.owned[i].bytes()];
+            self.owned[i]
+                .read_at(&stream, 0, &mut bytes)
+                .expect("read the expert buffers");
+            bytes
+        };
+        (read(8), read(10), read(4))
+    }
 }
 
-/// `run_rows` over a partial bank with eviction pressure: a chunk of `m` rows of distinct
-/// inputs, whose distinct picks far exceed the bank's slots, so rows evict each other's
-/// chunk-initial hits and every per-row miss pass runs behind earlier rows' bank copies — the
-/// ordering the chunked block must serialize. Every row matches the all-resident block within
-/// the split bound and fp64 within the output bound, and the same chunk again finds no miss.
+/// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
+/// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
+/// every row matches the all-resident block and fp64 within RING_BOUND run after run (the
+/// ring re-arms per chunk like the driver cadence). RING_BOUND, not SPLIT_BOUND, because the
+/// ring branch's job-table tile launches are not the flat indexed launches of the reference
+/// — see RING_BOUND's doc and the per-projection device test that separates the two
+/// families' arithmetic.
 #[test]
-#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+#[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
+    ring_chunk_pass(49, false, None);
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), pinned host memory, FIFI_FLASH_NEXT_EXL3_PACK and FIFI_RING_ORACLE_ROWS for the row count"]
+fn the_shared_prefill_ring_matches_the_oracle_for_full_tiles_tails_and_one_row() {
+    // One invocation per row set: FIFI_RING_ORACLE_ROWS selects the full-tile, tail,
+    // one-row or widened-bound window this run exercises.
+    let rows: usize = std::env::var("FIFI_RING_ORACLE_ROWS")
+        .expect("FIFI_RING_ORACLE_ROWS selects this oracle's row count")
+        .parse()
+        .expect("a row count");
+    ring_chunk_pass(rows, true, Some(6));
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_shared_prefill_ring_handles_an_empty_bank_or_ring_pair_subset() {
+    for held in [0, 10] {
+        ring_chunk_pass(1, true, Some(held));
+    }
+}
+
+fn threaded_references(
+    checkpoint: &Checkpoint,
+    routed: (usize, &Router),
+    one_row: &MoeDims,
+    row_inputs: &[Vec<f32>],
+) -> Vec<Reference> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let size = row_inputs.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = row_inputs
+            .chunks(size)
+            .map(|rows| {
+                scope.spawn(move || {
+                    rows.iter()
+                        .map(|row| {
+                            reference(checkpoint, routed, one_row, row).expect("fp64 reference")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("the reference thread"))
+            .collect()
+    })
+}
+
+fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first, first + 1];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    // The legacy oracle uses 49 rows; the promoted-store arms also cover the full tile,
+    // a short tail and the active prefill's trailing one-row window.
+    let chunk = MoeDims { rows: m, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // Per bank layer: uploads, the chunk's rows, and per-row fp64 and all-resident references.
+    struct Arm {
+        row_inputs: Vec<Vec<f32>>,
+        weights: CudaWeights,
+        keys: Vec<(Role, String)>,
+        wants: Vec<Reference>,
+        residents: Vec<Vec<u8>>,
+    }
+    let mut arms: Vec<Arm> = Vec::with_capacity(layers.len());
+    for (index, &layer) in layers.iter().enumerate() {
+        let router = Router::read(checkpoint, layer, &one_row).expect("router");
+        let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+        let keys = keys(layer);
+        let row_inputs: Vec<Vec<f32>> = (0..m)
+            .map(|seed| input(one_row.hidden, seed + 7 * (index + 1)))
+            .collect();
+        let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+        })
+        .expect("the all-resident block resolves");
+        // The all-resident reference is the oracle: one launch per row, exactly as before
+        // the widening; only its fp64 sibling is threaded. The two elapsed prints give
+        // the per-layer split.
+        let started = std::time::Instant::now();
+        let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+        let references_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut residents = Vec::with_capacity(m);
+        for row in &row_inputs {
+            let rig = Rig::new(&projector, &one_row, row).expect("rig");
+            run_exl3_moe(
+                &launch,
+                &block,
+                &rig.bufs().expect("bufs"),
+                &one_row,
+                true,
+                None,
+                false,
+            )
+            .expect("the all-resident block");
+            launch.stream.synchronize().expect("sync");
+            residents.push(rig.out_bytes(&projector));
+        }
+        println!(
+            "layer {layer} over {m} rows: fp64 references {references_elapsed:.1?}, \
+             all-resident launches {:.1?}",
+            started.elapsed()
+        );
+        arms.push(Arm {
+            row_inputs,
+            weights,
+            keys,
+            wants,
+            residents,
+        });
+    }
+
+    // The bank holds the first `held_of` of row 0's picks per layer, padded with other
+    // experts: the default 6 leaves row 0 mixed; the ring-tolerance measurements hold every
+    // pick of row 0 (FIFI_FLASH_NEXT_RING_HELD=10, the all-bank arm) or none (0, the
+    // all-ring arm). Rows 1.. keep the default split in every arm.
+    let held_of: usize = held.unwrap_or_else(|| {
+        std::env::var("FIFI_FLASH_NEXT_RING_HELD")
+            .map_or(6, |v| v.parse().expect("a held-pick count"))
+    });
+    let held: Vec<Vec<u16>> = arms
+        .iter()
+        .map(|arm| {
+            let mut held: Vec<u16> = arm.wants[0]
+                .ids
+                .iter()
+                .take(held_of)
+                .map(|&e| e as u16)
+                .collect();
+            held.extend(others(&arm.wants[0].ids, SLOTS - held.len()));
+            held
+        })
+        .collect();
+    let bank = build_bank(&projector, &source, &layers, &held);
+    let trunks: Vec<SplitMoeTrunk<'_>> = arms
+        .iter()
+        .map(|arm| {
+            let key = |role: Role| {
+                arm.keys
+                    .iter()
+                    .find(|(candidate, _)| *candidate == role)
+                    .map(|(_, key)| key.as_str())
+                    .unwrap_or_else(|| panic!("no key for {role:?}"))
+            };
+            SplitMoeTrunk {
+                router: raw(&arm.weights, key(Role::FfnGateInp)),
+                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
+                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
+                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
+                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
+            }
+        })
+        .collect();
+    let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
+    let streamed = shape.experts() - SLOTS;
+    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    split.begin_prefill().unwrap();
+
+    // One chunk per run, every layer of it in order — the driver cadence the ring's free
+    // cursor assumes.
+    for run in 0..2 {
+        for (bank_layer, arm) in arms.iter().enumerate() {
+            if bank_layer == 0 {
+                split.begin_chunk();
+            }
+            let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
+            let before = split.bank().state().stats().clone();
+            let frozen = split.bank().state().slot_row(bank_layer).to_vec();
+            if shared {
+                shared_prefill_pass(
+                    &mut split,
+                    &launch,
+                    bank_layer,
+                    &rig.bufs().expect("bufs"),
+                    &chunk,
+                );
+            } else {
+                split
+                    .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
+                    .expect("the ring block");
+            }
+            stream.synchronize().expect("sync");
+            let tag = format!(
+                "bank layer {bank_layer} (pack layer {}), run {run}",
+                layers[bank_layer]
+            );
+            // Streaming changes neither the slot mapping nor any decode/admission counter.
+            assert_eq!(
+                split.bank().state().stats(),
+                &before,
+                "{tag}: bank counters"
+            );
+            assert_eq!(
+                split.bank().state().slot_row(bank_layer),
+                frozen,
+                "{tag}: frozen bank"
+            );
+            for r in 0..m {
+                let got = rig.out_row(&projector, r);
+                let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
+                let fp64_error = relative_l2(&floats(&got), &arm.wants[r].out);
+                println!(
+                    "{tag}, row {r}: vs all-resident {resident_error:.3e}, vs fp64 {fp64_error:.3e}"
+                );
+                assert!(fp64_error < RING_BOUND, "{tag}, row {r}: fp64 {fp64_error}");
+                assert!(
+                    resident_error < RING_BOUND,
+                    "{tag}, row {r}: all-resident {resident_error}"
+                );
+            }
+        }
+    }
+    split.end_prefill().expect("hand the ring's stores back");
+}
+
+/// Prints the CPU cost of the fp64 references for a row count (no GPU).
+#[test]
+#[ignore = "set FIFI_RING_REF_TIMING to print the fp64 references' host cost"]
+fn ring_reference_cpu_cost() {
+    let Ok(rows) = std::env::var("FIFI_RING_REF_TIMING") else {
+        return;
+    };
+    let rows: usize = rows.parse().expect("a row count");
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let layer = moe_layer();
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let row_inputs: Vec<Vec<f32>> = (0..rows)
+        .map(|seed| input(one_row.hidden, seed + 7))
+        .collect();
+    let start = std::time::Instant::now();
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+    let elapsed = start.elapsed();
+    assert_eq!(wants.len(), rows);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    println!(
+        "FIFI_RING_REF_TIMING rows={rows} elapsed={elapsed:.1?} per_row={:.3}s threads={threads}",
+        elapsed.as_secs_f64() / rows as f64
+    );
+}
+
+/// The job-table family's per-projection bounds against fp64, split by projection and
+/// measured on this pack (Qwen3.8-Flash-Next exl3 3.05bpw h5 ng5, pack layer 3 — the
+/// `FIFI_FLASH_NEXT_EXL3_MOE_LAYER` default — its ten picks of one deterministic row, seed 9;
+/// 3090): gate/up 1.9-2.2e-4 and down 2.9-3.9e-4, the F16 activation operand class
+/// (2^-11 = 4.88e-4; the down bound keeps 1.3x headroom over its 3.9e-4 maximum).
+const GATE_UP_BOUND: f64 = 3e-4;
+const DOWN_BOUND: f64 = 5e-4;
+/// The flat indexed family reads F32 operands: 1.5-3.0e-7 against fp64 on the same row
+/// (same provenance), three orders under the jobs family, so the two cannot be confused.
+const INDEXED_BOUND: f64 = 1e-6;
+
+/// The launch families the ring tolerance splits between, on one row and one expert each:
+/// the flat all-resident block runs the indexed launches (F32 operands), the funded ring runs
+/// the job-table tile kernels (F16-staged activations, `exl3.cu`'s jobs_input_rotate and
+/// JobsTile), and every projection of the same routed expert is asserted across the two
+/// families and against fp64, both twin rows each. Measured on the provenance above:
+/// indexed 1.5-3.0e-7 vs fp64, jobs 1.9-2.2e-4 (gate/up) and 2.9-3.9e-4 (down), and
+/// jobs-vs-indexed equals jobs-vs-fp64 because the indexed family sits at 1e-7 — the ring
+/// branch's whole-block deviation is the job-table family's F16 operand arithmetic, not a
+/// defect of the ring branch. The dtype statement rests on the kernel source (the staging
+/// write at `exl3.cu`'s jobs_input_rotate rounds to F16; the indexed launches read F32) and
+/// on those asserted error classes; no byte-level staging comparison is made. The Qwen3.6
+/// chunk prefill test runs these same job-table kernels; its measured print (layer 3, 1024
+/// rows, the Qwen3.6 4.00 bpw pack, the host's RTX 3090) is `whole row 8.183e-6; moe term
+/// vs residual norm 2.450e-2; delta only 3.341e-4` — the MoE term is 2.45% of the residual
+/// stream's norm, and the delta-only figure sits in the 1.9-3.9e-4 job-table class above:
+/// the whole-row figure is consistent with that F16-operand error diluted by the residual
+/// stream. Margins: down 1.28x over 3.9e-4, gate/up 1.36x over 2.2e-4, indexed 3.4x over
+/// 2.9e-7.
+#[test]
+#[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    // The split block takes 2 to 64 rows: the row is run twice, identically, so every
+    // pick's projection appears once per twin row in the jobs segment; the scan below
+    // asserts both twins, so a defect in one twin alone fails.
+    let two_rows = MoeDims { rows: 2, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // The flat arm: the all-resident block, one row, indexed launches for every pick.
+    let router = Router::read(checkpoint, first, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (first, &router), &one_row).expect("upload");
+    let keys = keys(first);
+    let row = input(one_row.hidden, 9);
+    let want = reference(checkpoint, (first, &router), &one_row, &row).expect("fp64 reference");
+    let block = Exl3MoeWeights::resolve_by(&weights, first, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    let flat_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row.clone()]).expect("rig");
+    // The flat qwen36 block is per-row: one call computes row 0's picks and fills the gu/down
+    // slots at offset 0 (`norm_row` is that row's h bytes).
+    run_exl3_moe(
+        &launch,
+        &block,
+        &flat_rig.bufs().expect("bufs"),
+        &one_row,
+        true,
+        None,
+        false,
+    )
+    .expect("the all-resident block");
+    launch.stream.synchronize().expect("sync");
+    let (flat_gu, flat_down, flat_ids) = flat_rig.expert_bytes(&projector);
+
+    // The jobs arm: a bank with none of the row's picks resident, the ring funded, the same
+    // row through the job-table tile kernels.
+    let held = others(&want.ids, SLOTS);
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let trunk = {
+        let key = |role: Role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .unwrap_or_else(|| panic!("no key for {role:?}"))
+        };
+        SplitMoeTrunk {
+            router: raw(&weights, key(Role::FfnGateInp)),
+            router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+            shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+            shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+            shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+        }
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &two_rows).expect("split");
+    let streamed = shape.experts() - SLOTS;
+    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    split.begin_prefill().unwrap();
+    split.begin_chunk();
+    let jobs_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row]).expect("rig");
+    split
+        .run_rows(&launch, 0, &jobs_rig.bufs().expect("bufs"), &two_rows)
+        .expect("the ring block");
+    stream.synchronize().expect("sync");
+    let (jobs_gu, jobs_down, jobs_ids) = jobs_rig.expert_bytes(&projector);
+
+    // The flat block writes the routed ids of row 0 only; both arms route the same logits
+    // through the same route kernel, so row 0's picks must agree.
+    let (k, i, h) = (one_row.top_k, one_row.inter, one_row.hidden);
+    assert_eq!(
+        &flat_ids[..k * 4],
+        &jobs_ids[..k * 4],
+        "both arms route to the same picks"
+    );
+    // No byte-level staging comparison between the arms is made; the families' difference
+    // is established by the asserted error classes below. The dtype statement rests on the
+    // kernel source (jobs_input_rotate rounds its operands to F16 where it stores the
+    // rotated rows; the indexed launches
+    // read the F32 staging) and on the per-projection error classes asserted below: the
+    // indexed family reproduces fp64 at 1e-7 while the jobs family sits at 1e-4.
+    let (flat_gu, flat_down) = (floats_f64(&flat_gu), floats_f64(&flat_down));
+    let (jobs_gu, jobs_down) = (floats_f64(&jobs_gu), floats_f64(&jobs_down));
+    // The jobs segment's pair order follows the ring's slot order, not the routing order, so
+    // each fp64 pick is matched by scanning the segment: every segment row within the
+    // family bound IS this pick (every other expert's projection is orders off — no
+    // ambiguity at these gaps), and the row is run twice, identically, so the pick appears
+    // once per twin row: exactly two rows must match, and a defect in one twin alone fails.
+    let twins = |rows: &[f64], want: &[f64], bound: f64| -> Vec<f64> {
+        rows.chunks(want.len())
+            .map(|got| relative_l2_f64(got, want))
+            .filter(|error| *error < bound)
+            .collect()
+    };
+    let max_of = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max);
+    for p in 0..k {
+        let fg = &flat_gu[p * 2 * i..][..2 * i];
+        let wg = &want.gu[p * 2 * i..][..2 * i];
+        let fd = &flat_down[p * h..][..h];
+        let wd = &want.down[p * h..][..h];
+        // The indexed family against fp64, asserted at its own F32 class.
+        let (gu_indexed, down_indexed) = (relative_l2_f64(fg, wg), relative_l2_f64(fd, wd));
+        assert!(
+            gu_indexed < INDEXED_BOUND,
+            "pick {p}: indexed gate/up vs fp64 {gu_indexed:.3e}"
+        );
+        assert!(
+            down_indexed < INDEXED_BOUND,
+            "pick {p}: indexed down vs fp64 {down_indexed:.3e}"
+        );
+        // The jobs family against fp64 and against the indexed row, both twins asserted.
+        let gu_twins = twins(&jobs_gu, wg, GATE_UP_BOUND);
+        let down_twins = twins(&jobs_down, wd, DOWN_BOUND);
+        assert_eq!(
+            gu_twins.len(),
+            2,
+            "pick {p}: both gate/up twin rows match fp64 (errors {:?})",
+            gu_twins
+        );
+        assert_eq!(
+            down_twins.len(),
+            2,
+            "pick {p}: both down twin rows match fp64 (errors {:?})",
+            down_twins
+        );
+        let jg = twins(&jobs_gu, fg, GATE_UP_BOUND);
+        let jd = twins(&jobs_down, fd, DOWN_BOUND);
+        assert_eq!(
+            jg.len(),
+            2,
+            "pick {p}: both gate/up twin rows match the indexed row (errors {:?})",
+            jg
+        );
+        assert_eq!(
+            jd.len(),
+            2,
+            "pick {p}: both down twin rows match the indexed row (errors {:?})",
+            jd
+        );
+        println!(
+            "pick {p} gate/up: indexed vs fp64 {gu_indexed:.3e}; jobs vs fp64 {:.3e} (both twins); jobs vs indexed {:.3e}; down: indexed vs fp64 {down_indexed:.3e}; jobs vs fp64 {:.3e}; jobs vs indexed {:.3e}",
+            max_of(&gu_twins),
+            max_of(&jg),
+            max_of(&down_twins),
+            max_of(&jd),
+        );
+    }
+}
+
 fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
     assert!(
         device_present("Flash-Next split MoE block"),
@@ -681,4 +1221,400 @@ fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
             }
         }
     }
+}
+
+/// `run_rows` when the chunk's distinct picks fit the bank (2 rows against 20 slots): the
+/// union admit runs and every row rides the flat resident pass — no per-row `step`, which the
+/// pass counter proves (decode passes stay flat). Every row matches the all-resident block
+/// within the split bound, every pick of the union is resident afterwards, and the same chunk
+/// again changes nothing.
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
+    chunk_union_pass(2, false);
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
+    // One invocation per row set: FIFI_UNION_ORACLE_ROWS runs exactly that row
+    // count (the widened-bound windows each need their own card lease); unset
+    // runs the full ladder in one process.
+    let ladder: Vec<usize> = std::env::var("FIFI_UNION_ORACLE_ROWS")
+        .map(|value| vec![value.parse().expect("a row count")])
+        .unwrap_or_else(|_| vec![1, 3, 65, 256]);
+    for rows in ladder {
+        chunk_union_pass(rows, true);
+    }
+}
+
+fn shared_prefill_pass(
+    split: &mut SplitMoe<'_>,
+    launch: &Launch<'_>,
+    layer: usize,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) {
+    use crate::family::{
+        exl3::prefill::{Exl3Scratch, Projector, write_dense_jobs},
+        project::exl3_jobs_plan::exl3_job_bytes,
+    };
+    let (dense_bytes, perm_bytes) =
+        exl3_job_bytes(dims.rows, 256, dims.n_expert, dims.top_k).expect("job sizes");
+    let ctx = launch.ctx;
+    let y = ctx
+        .upload(&vec![
+            0u8;
+            dims.rows * dims.hidden.max(dims.shared_inter) * F32
+        ])
+        .expect("dense scratch");
+    let jobs = ctx.upload(&vec![0u8; dense_bytes]).expect("dense jobs");
+    let guarded = ctx
+        .upload(&vec![0xA5; perm_bytes + 16])
+        .expect("guarded permutation");
+    let scratch = Exl3Scratch {
+        xh: bufs.scratch.xh,
+        z: bufs.scratch.z,
+        y: y.range(0, y.bytes()).expect("y range"),
+        flag: bufs.scratch.flag,
+        jobs: jobs.range(0, jobs.bytes()).expect("jobs range"),
+    };
+    write_dense_jobs(launch, &scratch, dims.rows, 256).expect("write dense jobs");
+    let projector = Projector {
+        launch,
+        scratch,
+        rows: dims.rows,
+        tile_rows: 256,
+    };
+    let row_before = split.bank().state().slot_row(layer).to_vec();
+    let short = guarded.range(8, perm_bytes - 1).expect("short permutation");
+    let error = split
+        .run_prefill(&projector, layer, bufs, dims, short)
+        .expect_err("refuse before routing or admitting");
+    assert!(
+        matches!(error, crate::EngError::BadRequest(message) if message.contains("permutation range"))
+    );
+    assert_eq!(split.bank().state().slot_row(layer), row_before);
+    // The in-place combine must receive the residual, not bytes left in the output face.
+    bufs.route
+        .resid_out
+        .buffer()
+        .write_at(
+            launch.stream,
+            bufs.route.resid_out.offset(),
+            &vec![0xFF; dims.rows * dims.hidden * F32],
+        )
+        .expect("poison output");
+    split
+        .run_prefill(
+            &projector,
+            layer,
+            bufs,
+            dims,
+            guarded.range(8, perm_bytes).expect("permutation range"),
+        )
+        .expect("the shared banked pass");
+    launch.stream.synchronize().expect("drain shared pass");
+    let mut bytes = vec![0u8; guarded.bytes()];
+    guarded
+        .read_at(launch.stream, 0, &mut bytes)
+        .expect("read guards");
+    assert_eq!(&bytes[..8], &[0xA5; 8]);
+    assert_eq!(&bytes[8 + perm_bytes..], &[0xA5; 8]);
+}
+
+fn chunk_union_pass(m: usize, shared: bool) {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let layer = moe_layer();
+    let layers = vec![layer];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    assert_eq!((one_row.n_expert, one_row.top_k), (512, 10));
+    let chunk = MoeDims { rows: m, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+    let keys = keys(layer);
+    let row_inputs: Vec<Vec<f32>> = (0..m)
+        .map(|seed| input(one_row.hidden, seed + 31))
+        .collect();
+    let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    // The fp64 references dominate the wall (the oracle prints 587.7s threaded for 256
+    // rows against 212.0ms of launches): compute them on every core, exactly as the ring
+    // oracle does, or a 256-row window cannot fit a card lease.
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+    let mut residents = Vec::with_capacity(m);
+    for row in &row_inputs {
+        let rig = Rig::new(&projector, &one_row, row).expect("rig");
+        run_exl3_moe(
+            &launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            &one_row,
+            true,
+            None,
+            false,
+        )
+        .expect("the all-resident block");
+        launch.stream.synchronize().expect("sync");
+        residents.push(rig.out_bytes(&projector));
+    }
+
+    // The fill holds all 10 of row 0's picks of 20 slots; the chunk's union (at most 20
+    // distinct) always fits, so run_rows takes the union-admit path, never the per-row tail.
+    let mut held: Vec<u16> = wants[0].ids.iter().take(10).map(|&e| e as u16).collect();
+    held.extend(others(&wants[0].ids, 10));
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let key = |role: Role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .unwrap_or_else(|| panic!("no key for {role:?}"))
+    };
+    let trunk = SplitMoeTrunk {
+        router: raw(&weights, key(Role::FfnGateInp)),
+        router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+        shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+        shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+        shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &chunk).expect("split");
+
+    let union: Vec<u16> = {
+        let mut seen = [false; 512];
+        let mut union = Vec::new();
+        for want in &wants {
+            for &id in &want.ids {
+                if !seen[id] {
+                    seen[id] = true;
+                    union.push(id as u16);
+                }
+            }
+        }
+        union
+    };
+    if !shared {
+        assert!(
+            union.len() <= 20,
+            "the two rows pick at most 20 distinct experts"
+        );
+    }
+    for run in 0..2 {
+        let rig = RigRows::new(&projector, &chunk, &row_inputs).expect("rig");
+        let passes = split.bank().state().stats().passes;
+        if shared {
+            shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), &chunk);
+        } else {
+            split
+                .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)
+                .expect("the chunked block");
+        }
+        stream.synchronize().expect("sync");
+        let tag = format!("run {run}");
+        // The admit is not decode traffic and never moves the pass counter; a per-row `step`
+        // would. This is the assertion that the union-admit path ran, not the tail.
+        assert_eq!(
+            split.bank().state().stats().passes,
+            passes,
+            "{tag}: no per-row bank steps"
+        );
+        // The promoted pass uses the same FP16 job family as the measured ring path.
+        let (resident_bound, oracle_bound) = if shared {
+            (RING_BOUND, RING_BOUND)
+        } else {
+            (SPLIT_BOUND, OUTPUT_BOUND)
+        };
+        for r in 0..m {
+            let got = rig.out_row(&projector, r);
+            assert!(
+                relative_l2(&floats(&got), &floats_f64(&residents[r])) < resident_bound,
+                "{tag}, row {r}: the all-resident bound"
+            );
+            assert!(
+                relative_l2(&floats(&got), &wants[r].out) < oracle_bound,
+                "{tag}, row {r}: the fp64 bound"
+            );
+        }
+        let last_window = if shared { (m - 1) / 2 * 2 } else { 0 };
+        for want in &wants[last_window..] {
+            for &pick in &want.ids {
+                assert!(
+                    split.bank().state().slot_row(0)[pick] >= 0,
+                    "{tag}: pick {pick} of the final window is in the bank"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_prefill_ring_and_union_paths_cross_both_ways_without_a_copy_conflict() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let layer = moe_layer();
+    let layers = vec![layer];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    // A whole chunk at or above the threshold streams the ring; a smaller piece takes the
+    // bank's union admit. Reopening the window after a ring chunk leaves the ring's
+    // stream-ahead copies pending on the copy stream, so the next union piece must drain
+    // them before the bank admits on its own stream (ring -> union); the reverse order
+    // (union -> ring) is safe because the bank synchronizes its own admit copies first.
+    const THRESHOLD: usize = 8;
+    const BIG: usize = 16;
+    const SMALL: usize = 2;
+    let big = MoeDims {
+        rows: BIG,
+        ..one_row
+    };
+    let small = MoeDims {
+        rows: SMALL,
+        ..one_row
+    };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+    let keys = keys(layer);
+    let row_inputs: Vec<Vec<f32>> = (0..BIG)
+        .map(|seed| input(one_row.hidden, seed + 31))
+        .collect();
+    let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+    let mut residents = Vec::with_capacity(BIG);
+    for row in &row_inputs {
+        let rig = Rig::new(&projector, &one_row, row).expect("rig");
+        run_exl3_moe(
+            &launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            &one_row,
+            true,
+            None,
+            false,
+        )
+        .expect("the all-resident block");
+        launch.stream.synchronize().expect("sync");
+        residents.push(rig.out_bytes(&projector));
+    }
+    let mut held: Vec<u16> = wants[0].ids.iter().take(10).map(|&e| e as u16).collect();
+    held.extend(others(&wants[0].ids, 10));
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let key = |role: Role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .unwrap_or_else(|| panic!("no key for {role:?}"))
+    };
+    let trunk = SplitMoeTrunk {
+        router: raw(&weights, key(Role::FfnGateInp)),
+        router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+        shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+        shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+        shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &big).expect("split");
+    let streamed = shape.experts() - SLOTS;
+    let slots = split
+        .plan_ring(ctx, streamed, THRESHOLD)
+        .expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    // Each window reopens (begin_prefill) and runs one chunk; no end_prefill between them,
+    // so the ring's copies stay pending across the ring -> union crossing.
+    let windows = [
+        (&big, BIG, "ring window"),
+        (&small, SMALL, "union after ring"),
+        (&big, BIG, "ring after union"),
+    ];
+    for (dims, rows, tag) in windows {
+        split.begin_prefill().unwrap();
+        split.begin_chunk();
+        let rig = RigRows::new(&projector, dims, &row_inputs[..rows]).expect("rig");
+        let admit_before = split.bank().prefill_report();
+        shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), dims);
+        stream.synchronize().expect("sync");
+        if tag == "union after ring" {
+            // The union window must really admit (not a zero-op early return): its two rows'
+            // union outgrows the 16-slot bank, so the admit copies. That copy on the bank
+            // stream is what the reopen drain made safe against the ring's pending copies.
+            let admit_after = split.bank().prefill_report();
+            assert!(
+                admit_after.passes > admit_before.passes,
+                "union after ring must run a bank admit"
+            );
+            assert!(
+                admit_after.misses > admit_before.misses,
+                "union after ring must copy (exercise the reopen drain)"
+            );
+        }
+        for r in 0..rows {
+            let got = rig.out_row(&projector, r);
+            let resident_error = relative_l2(&floats(&got), &floats_f64(&residents[r]));
+            let fp64_error = relative_l2(&floats(&got), &wants[r].out);
+            assert!(
+                resident_error < RING_BOUND,
+                "{tag}, row {r}: all-resident {resident_error}"
+            );
+            assert!(fp64_error < RING_BOUND, "{tag}, row {r}: fp64 {fp64_error}");
+        }
+    }
+    split.end_prefill().expect("hand the ring's stores back");
 }

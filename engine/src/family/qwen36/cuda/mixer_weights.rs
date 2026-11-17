@@ -10,11 +10,10 @@
 //! Native load; `new` takes the session's layout and refuses a tensor of the other layout by name,
 //! so a mixed load cannot reach a launch (beside `CudaWeights::layout`'s own mixed refusal). The
 //! Native rows%4 rule is `mixer_geometry::check_native_dense`.
+use crate::family::exl3::layer_table::LayerTable;
 
-use super::{
-    layer_table::LayerTable,
-    mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
-};
+use super::mixer_geometry::{MixerGeometry, check_native_dense};
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::{
     EngError,
     family::{
@@ -230,6 +229,8 @@ pub(super) fn dense_weight<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "mixer weights: {name} does not match the requested EXL3 layout"
         ))),
+        // (Tiled, Native) never reaches here: the first arm already accepted it (a dense Tiled
+        // weight runs in a Native session - the hybrid seam), so only the reverse refuses.
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the native layout, the step runs tiled"),
         )),

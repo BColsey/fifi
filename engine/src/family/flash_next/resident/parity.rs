@@ -15,13 +15,13 @@ use super::super::mlx::tests::{
 };
 use super::super::moe::MoeShape;
 use super::super::step::{ModelShape, ModelState, step as host_step};
-use super::super::stored::{StackLayout, read_slice};
 use super::ops::{Ctx, dim, f32_tensor, linear, values};
 use super::slots::{ExpertSlots, POOL_SETS, SetLayout};
 use super::state::{LayerState, ResidentState};
 use super::trace::{RouteTrace, TRACE_SCHEMA, TraceMode, TraceStep, check_step, tsv_columns};
 use super::weights::{RAttn, RHyper, RLayer, RMoe, RPle, ResidentWeights};
 use super::{ResidentDecoder, StepMode, deltanet, hyper, moe, ple, qsa};
+use crate::family::stored::{StackLayout, read_slice};
 use crate::{
     EngError,
     kernels::{HostPages, MlxKernels, ResidentPackedWeight},
