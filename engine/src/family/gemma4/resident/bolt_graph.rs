@@ -26,7 +26,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "staged for the decode-graph lane; the capture lands next"
+        reason = "the receipt getters are not read outside tests yet"
     )
 )]
 
@@ -98,6 +98,7 @@ pub(crate) fn check_decode_graph(facts: DecodeGraphFacts) -> Result<(), EngError
 pub(crate) struct DecodeGraphMode {
     wanted: bool,
     refusal: Option<String>,
+    warm: bool,
     replays: u64,
     eager_steps: u64,
 }
@@ -126,6 +127,17 @@ impl DecodeGraphMode {
         if self.refusal.is_none() {
             self.refusal = Some(why.to_owned());
         }
+    }
+
+    /// Whether one clean eager logits step has warmed the kernels the capture
+    /// records: a first launch loads its module, which a capture forbids.
+    pub(crate) fn warm(&self) -> bool {
+        self.warm
+    }
+
+    /// One clean eager step ran; the next clean step may capture.
+    pub(crate) fn note_warm(&mut self) {
+        self.warm = true;
     }
 
     /// One replay ran.
@@ -203,6 +215,15 @@ mod tests {
     }
 
     #[test]
+    fn warm_latches_after_one_clean_eager_step() {
+        let mut mode = DecodeGraphMode::new(true);
+        assert!(!mode.warm());
+        mode.note_warm();
+        mode.refuse("later");
+        assert!(mode.warm(), "warmth outlives a refusal");
+    }
+
+    #[test]
     fn a_refusal_is_sticky_and_keeps_the_first_reason() {
         let mut mode = DecodeGraphMode::new(true);
         assert!(mode.active());
@@ -210,6 +231,28 @@ mod tests {
         mode.refuse("second");
         assert!(!mode.active());
         assert_eq!(mode.refusal(), Some("first"));
+    }
+
+    /// Fields drop in declaration order, and the graph must be destroyed
+    /// before every buffer whose address it baked. By NAME, never by line:
+    /// the lines keep moving.
+    #[test]
+    fn the_graph_is_declared_before_every_buffer_it_bakes_in() {
+        let source = include_str!("bolt.rs");
+        let start = source
+            .find("pub(crate) struct Bolt {")
+            .expect("the Bolt struct");
+        let end = source[start..].find("\n}").expect("the struct's end");
+        let fields = &source[start..start + end];
+        let at = |name: &str| {
+            fields
+                .find(&format!("{name}:"))
+                .unwrap_or_else(|| panic!("field `{name}` missing from Bolt"))
+        };
+        let graph = at("graph");
+        for buffer in ["ctx", "layers", "embed", "scratch", "logits", "rope_freqs"] {
+            assert!(graph < at(buffer), "the graph must drop before `{buffer}`");
+        }
     }
 
     #[test]

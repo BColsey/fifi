@@ -32,7 +32,9 @@
     )
 )]
 
-use super::bolt_graph::{DecodeGraphMode, decode_graph_wanted};
+use super::bolt_graph::{
+    DecodeGraphFacts, DecodeGraphMode, check_decode_graph, decode_graph_wanted,
+};
 use super::step::layer_buffers;
 use super::{
     Kv, Matrix, PackedMatrix, Vector, epsilon, matrix, packed_matrix, scalar, vector,
@@ -55,7 +57,7 @@ use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
 use crate::kernels::cuda::resident::row_add::RowAddCall;
 use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
-use crate::kernels::cuda::{CudaContext, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
 
 // Geometry is read from the family descriptor, the single source of truth;
 // the executor pins only the cache cell count and the checkpoint properties
@@ -184,9 +186,22 @@ pub(crate) struct Scratch {
     pub(crate) ids: DeviceBuffer,
     pub(crate) pos: DeviceBuffer,
     pub(crate) kv_len: DeviceBuffer,
+    /// The KV8 decode-append status word. The launch contract requires it;
+    /// the caller's host range checks make the kernel's refuse path
+    /// unreachable, so nothing reads it back.
+    pub(crate) status: DeviceBuffer,
 }
 
 pub(crate) struct Bolt {
+    /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
+    /// FIRST so it drops first: fields drop in declaration order, and the
+    /// graph must be destroyed before any buffer whose address it baked (a
+    /// pin test holds the order). The graph pins nothing (`CapturePlan::pins`
+    /// is empty, the flash_next bench pattern): safety is by ownership
+    /// instead - no buffer the body touches is reallocated (the step words
+    /// are written in place, the scratch sits at its load-time capacity) and a
+    /// scratch grow drops the graph before any replacement.
+    graph: Option<GraphExec<'static>>,
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<BoltLayer>,
@@ -200,8 +215,8 @@ pub(crate) struct Bolt {
     pub(crate) logits_capped: Vector,
     pub(crate) eps: f32,
     /// The sticky decode-graph mode: wanted from the environment, refused on
-    /// the first reason, always counted. The capture that replays the decode
-    /// body lands in this lane; until then every step notes itself eager.
+    /// the first reason, always counted. Every capture refusal pins the mode
+    /// to eager; the eager body stays the reference.
     pub(crate) graph_mode: DecodeGraphMode,
 }
 
@@ -441,6 +456,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         ids: zero(&ctx, Bolt::PREFILL_BATCH * 4)?,
         pos: zero(&ctx, 4)?,
         kv_len: zero(&ctx, 4)?,
+        status: zero(&ctx, 4)?,
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
@@ -458,6 +474,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         logits_capped,
         eps,
         graph_mode: DecodeGraphMode::new(decode_graph_wanted()?),
+        graph: None,
     })
 }
 
@@ -522,6 +539,22 @@ impl Bolt {
     }
 
     fn grow_scratch(&mut self, rows: usize) -> Result<(), EngError> {
+        // A buffer replacement invalidates a captured body (it baked the old
+        // address), so the graph drops when a replacement actually happens -
+        // not on every call, or no prefill would ever leave the graph armed.
+        // (The load-time capacity already covers every PREFILL_BATCH chunk, so
+        // nothing replaces in practice.)
+        let replaced = self.grow_scratch_buffers(rows)?;
+        if replaced {
+            self.graph = None;
+        }
+        Ok(())
+    }
+
+    /// Grows every scratch buffer whose capacity is below `rows` up to the
+    /// PREFILL_BATCH capacity, reporting whether any buffer was replaced.
+    fn grow_scratch_buffers(&mut self, rows: usize) -> Result<bool, EngError> {
+        let mut replaced = false;
         let sc = &mut self.scratch;
         for (v, width) in sc.h.iter_mut().map(|v| (v, HIDDEN)).chain([
             (&mut sc.nrm, HIDDEN),
@@ -548,6 +581,7 @@ impl Bolt {
                 let len = Self::PREFILL_BATCH * width;
                 v.buf = self.ctx.allocate(len * 4)?;
                 v.len = len;
+                replaced = true;
             }
         }
         for (buffer, width) in [
@@ -560,9 +594,10 @@ impl Bolt {
                 *buffer = self
                     .ctx
                     .allocate(q8_1_bytes(width, Self::PREFILL_BATCH).expect("bounded q8 rows"))?;
+                replaced = true;
             }
         }
-        Ok(())
+        Ok(replaced)
     }
 
     /// Keeps the existing norm reduction and quantization order for every activation row.
@@ -628,7 +663,50 @@ impl Bolt {
         self.scratch
             .kv_len
             .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+        let facts = DecodeGraphFacts {
+            trace_armed: trace_dir().is_some(),
+            multi_token: m > 1,
+            hidden: !logits,
+        };
+        if check_decode_graph(facts).is_ok() {
+            // The mode gates the replay too: a disarmed (or refused) mode must
+            // not keep replaying a graph it captured earlier.
+            if let Some(exec) = self.graph.as_ref().filter(|_| self.graph_mode.active()) {
+                exec.launch(&self.stream)?;
+                self.graph_mode.note_replay();
+                return self.stream.synchronize();
+            }
+            if self.graph_mode.active() && self.graph_mode.warm() {
+                match self.capture_decode_graph(pos) {
+                    Ok(()) => {
+                        self.graph_mode.note_replay();
+                        return self.stream.synchronize();
+                    }
+                    Err(failure) if is_capture_refusal(&failure) => {
+                        // The body never ran; the sticky refusal makes every
+                        // later step eager, and this one runs below.
+                        self.graph_mode.refuse(&failure.describe());
+                    }
+                    Err(failure) => return Err(failure),
+                }
+            }
+        }
+        self.decode_body(pos, logits, m)?;
         self.graph_mode.note_eager();
+        if check_decode_graph(facts).is_ok() {
+            // One clean eager step warms every kernel the capture records
+            // (a first launch loads its module, which a capture forbids).
+            self.graph_mode.note_warm();
+        }
+        self.stream.synchronize()
+    }
+
+    /// The launches of one decode step, from the embedding to the capped
+    /// logits: everything a replay re-runs, and the body a capture records.
+    /// No per-step scalar but the trace label's position reaches the kernels
+    /// through arguments; the kernels that depend on the position or the KV
+    /// length read the step words.
+    fn decode_body(&self, pos: usize, logits: bool, m: usize) -> Result<(), EngError> {
         let ctx = &self.ctx;
         let stream = &self.stream;
         let sc = &self.scratch;
@@ -730,7 +808,24 @@ impl Bolt {
             },
         )?;
         self.trace(pos, "logits", &self.logits_capped, VOCAB * 4);
-        self.stream.synchronize()
+        Ok(())
+    }
+
+    /// Captures the one-token logits body and replays it once: a capture
+    /// records the work without running it, so this step's token is produced
+    /// by the first replay. A refusal propagates to the caller, which notes it
+    /// sticky and runs the body eagerly.
+    fn capture_decode_graph(&mut self, pos: usize) -> Result<(), EngError> {
+        let plan = CapturePlan {
+            pins: &[],
+            holds: Vec::new(),
+        };
+        let (exec, ()) = self
+            .ctx
+            .capture(&self.stream, plan, || self.decode_body(pos, true, 1))?;
+        exec.launch(&self.stream)?;
+        self.graph = Some(exec);
+        Ok(())
     }
 
     /// Projects the scaled embedding into the per-layer planes and scales by
@@ -920,26 +1015,59 @@ impl Bolt {
             },
         )?;
         if physical {
-            ctx.kv8_chunk(
-                stream,
-                Kv8Shape {
-                    rows: m,
-                    ..layer
-                        .kv
-                        .as_ref()
-                        .expect("physical layers own a cache")
-                        .shape
-                },
-                Kv8Data {
-                    k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
-                    v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
-                    k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
-                    k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
-                    v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
-                    v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
-                },
-                pos,
-            )?;
+            if m == 1 {
+                // The decode entry: the device pos word is authoritative, so a
+                // captured replay writes the cell of the step it replays
+                // instead of the capture-time cell. The status word satisfies
+                // the launch contract; the caller's host check that
+                // `pos + m` leaves the context makes the kernel's refuse
+                // path unreachable, so the word is never read back.
+                ctx.kv8_append(
+                    stream,
+                    Kv8Shape {
+                        rows: 1,
+                        ..layer
+                            .kv
+                            .as_ref()
+                            .expect("physical layers own a cache")
+                            .shape
+                    },
+                    Kv8Data {
+                        k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
+                        v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
+                        k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
+                        k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
+                        v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
+                        v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
+                    },
+                    sc.pos.range(0, 4)?,
+                    sc.status.range(0, 4)?,
+                )?;
+            } else {
+                // The prefill chunk entry takes its position as a host
+                // scalar; it is never captured (a multi-token step refuses
+                // arming), so the baked-scalar hazard does not arise.
+                ctx.kv8_chunk(
+                    stream,
+                    Kv8Shape {
+                        rows: m,
+                        ..layer
+                            .kv
+                            .as_ref()
+                            .expect("physical layers own a cache")
+                            .shape
+                    },
+                    Kv8Data {
+                        k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
+                        v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
+                        k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
+                        k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
+                        v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
+                        v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
+                    },
+                    pos,
+                )?;
+            }
         }
         self.trace(pos, &format!("L{index}_v"), &sc.v_normed, m * kv_rows * 4);
         ctx.attn_decode_gemma(
