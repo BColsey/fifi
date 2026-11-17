@@ -226,13 +226,6 @@ fn moe_trunks(
         .collect()
 }
 
-fn read_meminfo() -> Result<(u64, u64), EngError> {
-    let text = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| EngError::MemoryPlan(format!("/proc/meminfo: {error}")))?;
-    let memory = HostMemory::from_meminfo(&text)?;
-    Ok((memory.total, memory.available))
-}
-
 /// A record source that adds up the time spent reading and packing records from the pack, so the
 /// load log can split the bank fill into the pack read and the pin and upload.
 struct TimedSource<'a> {
@@ -435,7 +428,12 @@ pub(super) fn build_driver(
         model.moe.top_k(),
         report.expert_bytes,
     )?;
-    let (mem_total, mem_available) = read_meminfo()?;
+    // One admission snapshot: `MemAvailable` clamped by the enclosing cgroup limits. The tier
+    // plan, the host pin plan and the final guard all read this pair, so the plan that sizes the
+    // store cannot build from a figure the guard disagrees with (a cgroup-capped host used to
+    // plan an inclusive store the guard then refused at load time).
+    let host_admission = HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?;
+    let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
     let prefill_arena_bytes = if shared_prefill {
         StepPlan::prefill_bytes(
@@ -501,7 +499,14 @@ pub(super) fn build_driver(
 
     // The host side is admitted before anything is uploaded: the pinned store of the bank, the
     // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
-    // `PleVectors::read` holds in F32 (`HostTerms::engine_heap` does not count them).
+    // `PleVectors::read` holds in F32 (their bytes ride inside the plan's `engine_heap` term
+    // below, so the plan and the guard count exactly the same bytes).
+    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
+    let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
+    let terms = HostTerms {
+        engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes,
+        ..HostTerms::DEFAULT
+    };
     let geometry = BankGeometry::new(
         layers,
         model.moe.experts(),
@@ -520,21 +525,17 @@ pub(super) fn build_driver(
     };
     let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
         Err(_) | Ok("") | Ok("auto") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT).or_else(
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms).or_else(
                 |inclusive| {
                     eprintln!(
                         "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
                     );
-                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
+                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
                 },
             )?
         }
-        Ok("inclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)?
-        }
-        Ok("exclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)?
-        }
+        Ok("inclusive") => HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms)?,
+        Ok("exclusive") => HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)?,
         Ok(other) => {
             return Err(EngError::BadRequest(format!(
                 "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
@@ -549,10 +550,10 @@ pub(super) fn build_driver(
         },
         host_plan.store_bytes
     );
-    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
-    let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
-    HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?.admit_for(
-        host_plan.process_bytes + ple_bytes,
+    // The guard reads the same snapshot the plan sized from, and the PLE bytes already ride
+    // inside `process_bytes` (the `engine_heap` term), so plan and guard admit one figure.
+    host_admission.admit_for(
+        host_plan.process_bytes,
         "Flash-Next expert bank and PLE projections",
     )?;
 

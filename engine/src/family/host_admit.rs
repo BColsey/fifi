@@ -8,6 +8,7 @@
 use crate::EngError;
 
 pub(crate) struct HostAdmission {
+    mem_total: u64,
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
@@ -29,6 +30,34 @@ impl HostAdmission {
         )
     }
 
+    /// The admission pair for facts paths that must not go dark inside a container: when the
+    /// cgroup probe refuses (a namespace root, for example), the pair falls back to the bare
+    /// `/proc/meminfo` figures and logs the refusal — those callers worked on the bare figure
+    /// before, so they keep it. Planning that sizes memory uses [`HostAdmission::probe`] and
+    /// refuses instead; an optional feature may plan zero on the refusal. Gated like its two
+    /// callers (the CUDA-build facts paths): the plain host build never compiles it.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn probe_or_bare(
+        label: &'static str,
+        root_label: &'static str,
+    ) -> Result<(u64, u64), EngError> {
+        match Self::probe(label, root_label) {
+            Ok(admission) => Ok(admission.host_memory()),
+            Err(refusal) => {
+                let text = std::fs::read_to_string("/proc/meminfo").map_err(|error| {
+                    EngError::MemoryPlan(format!(
+                        "{label} cannot read /proc/meminfo for the bare fallback: {error}"
+                    ))
+                })?;
+                let bare = Self::from_meminfo(label, &text, None)?;
+                eprintln!(
+                    "{root_label}: cgroup budget unknown ({refusal:?}); using the bare MemAvailable figure"
+                );
+                Ok(bare.host_memory())
+            }
+        }
+    }
+
     fn probe_in(
         label: &'static str,
         root_label: &'static str,
@@ -44,7 +73,10 @@ impl HostAdmission {
         Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)
     }
 
-    fn from_meminfo(
+    /// Private to `probe_in` except for the host tests of the memory plans, which build the
+    /// synthetic cgroup-clamped snapshot the CUDA start builds through `probe` (the same
+    /// seam as `probe_in`).
+    pub(crate) fn from_meminfo(
         label: &'static str,
         contents: &str,
         cgroup_remaining: Option<u64>,
@@ -57,10 +89,28 @@ impl HostAdmission {
             )));
         }
         Ok(Self {
+            mem_total: total,
             mem_available: available,
             cgroup_remaining,
             os_floor: total.div_ceil(10).max(8u64 << 30),
         })
+    }
+
+    /// The byte budget admission admits against: `MemAvailable` clamped by every enclosing
+    /// cgroup's remaining bytes. The same figure [`HostAdmission::admit_for`] refuses against,
+    /// so a host plan sized from it cannot disagree with the guard that checks it. Names no
+    /// model family, so any family's host plan may reuse it.
+    pub(crate) fn available_budget(&self) -> u64 {
+        self.cgroup_remaining
+            .map_or(self.mem_available, |remaining| {
+                remaining.min(self.mem_available)
+            })
+    }
+
+    /// `MemTotal` paired with [`HostAdmission::available_budget`], for host plans that carry
+    /// both figures (the tier and bank plans read them as a pair).
+    pub(crate) fn host_memory(&self) -> (u64, u64) {
+        (self.mem_total, self.available_budget())
     }
 
     /// [`admit_for`] with the caller's label as the refusing name.
@@ -72,11 +122,7 @@ impl HostAdmission {
     /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self
-            .cgroup_remaining
-            .map_or(self.mem_available, |remaining| {
-                remaining.min(self.mem_available)
-            });
+        let available = self.available_budget();
         if required
             .checked_add(self.os_floor)
             .is_none_or(|needed| needed > available)
@@ -810,6 +856,42 @@ mod tests {
     }
 
     #[test]
+    fn available_budget_is_the_cgroup_minimum_in_either_order() {
+        // The plan-facing accessor must hand a plan the same number the guard refuses against:
+        // MemAvailable clamped by the cgroup remaining bytes, whichever side is smaller, and
+        // the bare host figure when the cgroup is unlimited.
+        let unlimited = HostAdmission::from_meminfo(
+            LABEL,
+            "MemTotal: 67108864 kB\nMemAvailable: 25165824 kB\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(unlimited.available_budget(), 24 << 30);
+        assert_eq!(unlimited.host_memory(), (64 << 30, 24 << 30));
+
+        let cgroup_smaller = HostAdmission::from_meminfo(
+            LABEL,
+            "MemTotal: 67108864 kB\nMemAvailable: 25165824 kB\n",
+            Some(12 << 30),
+        )
+        .unwrap();
+        assert_eq!(cgroup_smaller.available_budget(), 12 << 30);
+
+        let host_smaller = HostAdmission::from_meminfo(
+            LABEL,
+            "MemTotal: 67108864 kB\nMemAvailable: 8388608 kB\n",
+            Some(12 << 30),
+        )
+        .unwrap();
+        assert_eq!(host_smaller.available_budget(), 8 << 30);
+
+        // One budget for plan and guard: the last byte the guard admits is the accessor's
+        // figure minus the OS floor (8 GiB of the 64 GiB host).
+        assert!(cgroup_smaller.admit(LABEL, 4u64 << 30).is_ok());
+        assert!(cgroup_smaller.admit(LABEL, (4u64 << 30) + 1).is_err());
+    }
+
+    #[test]
     fn cgroup_snapshot_distinguishes_unlimited_and_exhausted_limits() {
         for (maximum, current, remaining) in [
             ("max\n", "0\n", None),
@@ -927,6 +1009,7 @@ mod tests {
     #[test]
     fn host_budget_rejects_unrepresentable_payload_plus_floor() {
         let budget = HostAdmission {
+            mem_total: u64::MAX,
             mem_available: u64::MAX,
             cgroup_remaining: None,
             os_floor: 1,
@@ -940,6 +1023,7 @@ mod tests {
         let required = 256 * 47 * 1_603_584u64;
         let floor = 8u64 << 30;
         let exact = HostAdmission {
+            mem_total: required + floor,
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
             os_floor: floor,

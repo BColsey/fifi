@@ -1,5 +1,8 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+// Clamped in only on the CUDA build, where `family::host_admit` compiles.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::host_admit::HostAdmission;
 use crate::{
     EngError,
     memory::MemoryPolicy,
@@ -422,8 +425,19 @@ fn serving_plan(
     ))
 }
 
+/// The host budget the serving and runner admissions size from: on the CUDA build the
+/// admission pair (`probe_or_bare`: the cgroup-aware budget, and the bare figure with a logged
+/// `cgroup budget unknown` line when the cgroup tree refuses) — the same figure the other
+/// families' host guards admit against. The plain host build keeps the bare meminfo figure
+/// (`host_admit` compiles only with the CUDA families), which the runner documents.
 pub(super) fn host_available_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    {
+        HostAdmission::probe_or_bare("Nemotron admission", "Nemotron35")
+            .map(|(_total, available)| available)
+            .ok()
+    }
+    #[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
     {
         fs::read_to_string("/proc/meminfo")
             .ok()
@@ -433,7 +447,7 @@ pub(super) fn host_available_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
 fn parse_mem_available(contents: &str) -> Option<u64> {
     let line = contents
         .lines()

@@ -6,7 +6,10 @@
 //! report, and consolidating the loaders onto it is follow-up work, not a
 //! silent side effect of adding a report.
 
+// Clamped in only on the CUDA build, where `family::host_admit` compiles.
 use super::Probe;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::family::host_admit::HostAdmission;
 use serde::Serialize;
 
 /// Which native backends are compiled into this binary. A build fact, not
@@ -141,8 +144,14 @@ fn probe_cuda() -> CudaFacts {
 }
 
 /// Host facts only. Unlike `probe`, this is safe inside a serving
-/// process: it reads `/proc/meminfo` and the CPU count, and makes no
-/// CUDA call that could latch the backend.
+/// process: it reads the host memory figures and the CPU count, and makes no
+/// CUDA call that could latch the backend. On the CUDA build the memory pair
+/// comes from the admission snapshot (the cgroup-aware budget the families'
+/// host guards admit against, so a preflight plan agrees with the start in a
+/// capped container); when the cgroup tree refuses, the pair falls back to
+/// the bare `/proc/meminfo` figures with a logged `cgroup budget unknown`
+/// line, so nothing that worked inside a container goes dark. The plain host
+/// build parses `/proc/meminfo` directly.
 pub(crate) fn probe_host() -> HostFacts {
     let (total, available) = read_meminfo().map_or_else(
         |reason| {
@@ -161,7 +170,12 @@ pub(crate) fn probe_host() -> HostFacts {
 }
 
 fn read_meminfo() -> Result<(u64, u64), String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    {
+        HostAdmission::probe_or_bare("Hardware facts", "the host")
+            .map_err(|error| format!("the host memory probe refused: {error:?}"))
+    }
+    #[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
     {
         let contents = std::fs::read_to_string("/proc/meminfo")
             .map_err(|error| format!("/proc/meminfo cannot be read: {error}"))?;
@@ -178,7 +192,7 @@ fn read_meminfo() -> Result<(u64, u64), String> {
 /// strictness as the admission-time parsers: exactly one value per field,
 /// a `kB` unit, and available never above total — anything else is not a
 /// memory reading this report may print.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(all(not(feature = "native-cuda"), target_os = "linux"), test))]
 pub(crate) fn parse_meminfo(contents: &str) -> Option<(u64, u64)> {
     let mut total = None;
     let mut available = None;
@@ -216,6 +230,19 @@ mod tests {
             parse_meminfo(text),
             Some((33_554_432 * 1024, 25_165_824 * 1024))
         );
+    }
+
+    #[test]
+    fn the_bare_parser_and_the_admission_parser_agree_on_the_same_figures() {
+        // `probe_or_bare`'s fallback hand facts callers the bare figure; uncapped, the
+        // admission budget equals it exactly, so both probe paths read one pair.
+        let text = "MemTotal: 65467540 kB\nMemAvailable: 48156564 kB\n";
+        let bare = parse_meminfo(text);
+        let admitted =
+            crate::family::host_admit::HostAdmission::from_meminfo("the caller", text, None)
+                .map(|admission| admission.host_memory())
+                .ok();
+        assert_eq!(bare, admitted);
     }
 
     #[test]

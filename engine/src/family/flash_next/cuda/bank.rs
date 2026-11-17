@@ -88,8 +88,9 @@ const MIB: u64 = 1 << 20;
 // ---------------------------------------------------------------------------------------------
 
 /// `MemTotal` and `MemAvailable` of the machine, in bytes. `available` is the caller's minimum of
-/// the host figure and every cgroup ancestor's remaining bytes (`family::host_admit::HostAdmission`
-/// reads that on the CUDA path; see [`HostPinPlan::new`]).
+/// the host figure and every cgroup ancestor's remaining bytes (the CUDA start passes
+/// `family::host_admit::HostAdmission::host_memory`, the one snapshot its guard admits against;
+/// see [`HostPinPlan::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostMemory {
     pub(super) total: u64,
@@ -97,35 +98,8 @@ pub(super) struct HostMemory {
 }
 
 impl HostMemory {
-    /// Parses the text of `/proc/meminfo`. Refuses a missing field, a unit other than kB and an
-    /// available figure above the total.
-    pub(super) fn from_meminfo(text: &str) -> Result<Self, EngError> {
-        let field = |name: &str| -> Result<u64, EngError> {
-            let invalid = || plan_error(format!("/proc/meminfo has no valid {name} in kB"));
-            let line = text
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .and_then(|rest| rest.strip_prefix(':'))
-                .ok_or_else(invalid)?;
-            let mut words = line.split_whitespace();
-            let kib: u64 = words
-                .next()
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(invalid)?;
-            if words.next() != Some("kB") || words.next().is_some() {
-                return Err(invalid());
-            }
-            kib.checked_mul(1024).ok_or_else(invalid)
-        };
-        let (total, available) = (field("MemTotal")?, field("MemAvailable")?);
-        if total == 0 || available > total {
-            return Err(plan_error("/proc/meminfo totals are inconsistent".into()));
-        }
-        Ok(Self { total, available })
-    }
-
-    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the
-    /// host guard's `from_meminfo`, which keeps it private.
+    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the host
+    /// guard's floor in `family::host_admit`, so the plan's floor and the guard's agree.
     pub(super) fn os_floor(&self) -> u64 {
         self.total.div_ceil(10).max(8 * GIB)
     }
@@ -135,7 +109,8 @@ impl HostMemory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostTerms {
     /// Process memory outside the pins: the BF16 embedding (1.18 GiB), the CUDA driver and process
-    /// (about 1.5 GiB), small host buffers (0.1 GiB).
+    /// (about 1.5 GiB), small host buffers (0.1 GiB). The start folds the two PLE projection
+    /// matrices' F32 bytes into this figure, so the plan counts every byte the guard admits.
     pub(super) engine_heap: u64,
     /// Kept free so the plan does not ride the line (exllamav3 keeps 2 GiB as well).
     pub(super) margin: u64,
@@ -206,8 +181,10 @@ impl HostPinPlan {
     /// - the process and the OS floor exceed `available`, or
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
-    /// On the CUDA path the caller also runs the host guard's `probe()?.admit_for(process_bytes, ..)`,
-    /// which applies the cgroup ancestors (and refuses a cgroup-namespace root, so run on the host).
+    /// On the CUDA path the plan and the guard read one admission snapshot: the start probes
+    /// `HostAdmission` once, builds `HostMemory.available` from its budget and guards the plan's
+    /// `process_bytes` with the same figure (the guard also refuses a cgroup-namespace root,
+    /// so run on the host).
     pub(super) fn new(
         geometry: &BankGeometry,
         mode: HostMode,

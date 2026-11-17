@@ -10,6 +10,7 @@ use super::QwenResidentStep;
 use crate::family::graph_state::book::Health;
 use crate::{
     EngError,
+    family::host_admit::HostAdmission,
     family::qwen36::window_logic,
     family::session::{DecodeSession, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled},
 };
@@ -28,6 +29,9 @@ fn byte_limit(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<usiz
     Ok(Some(bytes))
 }
 
+// Production reads the admission budget instead; this parser stays as the pinned-prefix
+// test seam for the malformed-figure refusals below.
+#[cfg(test)]
 fn mem_available(contents: &str) -> Option<usize> {
     let value = contents
         .lines()
@@ -84,13 +88,22 @@ impl QwenResidentStep<'_> {
         let checkpoint = PrefixPinPool::checkpoint_bytes(self.state.layout())?;
         let limit = byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
             .unwrap_or_else(|| default_pin_bytes(checkpoint));
-        let available = std::fs::read_to_string("/proc/meminfo")
+        // The admission budget (`MemAvailable` clamped by the cgroup limits), not the bare
+        // meminfo figure: a cgroup-capped host must size its pins from the capped budget, and
+        // there is no later guard here. A failed probe plans ZERO pinned entries (logged):
+        // the probe refuses on exactly the cases the clamp exists for, so falling back to the
+        // unclamped figure would repeat the bug this closes.
+        let available = HostAdmission::probe("Qwen36 pinned prefix", "Qwen36")
+            .map(|admission| usize::try_from(admission.available_budget()).ok())
+            .inspect_err(|error| {
+                eprintln!("q36 cuda: pinned prefix host probe failed ({error:?}); pins stay off")
+            })
             .ok()
-            .and_then(|contents| mem_available(&contents));
+            .flatten();
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(
-                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {PIN_MEMORY_HEADROOM} B, MemAvailable {available:?}; retained entries 0, bytes 0"
+                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {PIN_MEMORY_HEADROOM} B, budget {available:?}; retained entries 0, bytes 0"
             );
             return Ok(());
         }

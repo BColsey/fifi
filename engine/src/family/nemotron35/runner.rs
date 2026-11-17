@@ -195,7 +195,8 @@ pub struct Generated {
     pub hybrid: Option<exec::HybridReport>,
 }
 
-/// Runs one greedy generation after probing Linux `MemAvailable` and admitting its memory plan.
+/// Runs one greedy generation after probing the cgroup-aware host budget and admitting its
+/// memory plan.
 pub fn generate(
     model_dir: &Path,
     prompt_tokens: &[u32],
@@ -324,6 +325,8 @@ fn generate_with_constructor<A>(
 }
 
 fn probed_available_bytes() -> Result<u64, EngError> {
+    // The cgroup-aware budget on the CUDA build (see `admission::host_available_bytes`);
+    // the bare meminfo figure on the plain host build.
     admission::host_available_bytes().ok_or_else(|| {
         EngError::MemoryPlan(
             "Nemotron admission: host availability probe requires Linux; use generate_with_admission with an explicit available-byte budget".into(),

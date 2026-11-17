@@ -13,6 +13,7 @@ use crate::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
+        host_admit::HostAdmission,
         tier_budget::{HostBudget, VramBudget},
         tiered_classify::classify_reference,
     },
@@ -139,11 +140,13 @@ fn the_geometry_takes_the_plan_and_refuses_another_record_size() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn meminfo_gives_the_machine_and_the_os_floor() {
-    let text = "MemTotal:       65467544 kB\nMemFree:  1 kB\nMemAvailable:   50000000 kB\n";
-    let memory = HostMemory::from_meminfo(text).unwrap();
-    assert_eq!(memory.total, HOST_TOTAL);
-    assert_eq!(memory.available, 50_000_000 * 1024);
+fn the_os_floor_is_a_tenth_of_the_ram_with_an_8_gib_minimum() {
+    // `HostMemory` carries figures its caller probed (the admission snapshot); the
+    // meminfo parsing itself lives in `family::host_admit` and is tested there.
+    let memory = HostMemory {
+        total: HOST_TOTAL,
+        available: 50_000_000 * 1024,
+    };
     assert_eq!(
         memory.os_floor(),
         8 * GIB,
@@ -154,16 +157,6 @@ fn meminfo_gives_the_machine_and_the_os_floor() {
         available: 100 * GIB,
     };
     assert_eq!(big.os_floor(), 20 * GIB);
-    for bad in [
-        "MemTotal: 10 kB\n",
-        "MemAvailable: 10 kB\n",
-        "MemTotal: 10 MB\nMemAvailable: 1 kB\n",
-        "MemTotal: 10 kB\nMemAvailable: 11 kB\n",
-        "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
-        "MemTotal: x kB\nMemAvailable: 1 kB\n",
-    ] {
-        assert!(HostMemory::from_meminfo(bad).is_err(), "{bad:?}");
-    }
 }
 
 #[test]
@@ -240,6 +233,85 @@ fn the_budget_at_the_contexts_of_the_tier_plan() {
         gib(plan.store_bytes),
         short.slots
     );
+}
+
+#[test]
+fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_refuse() {
+    // The one-budget rule end to end: HostMemory.available is the admission budget
+    // (MemAvailable clamped by the cgroup), so the same snapshot decides the auto mode and
+    // the guard. At 143 slots the inclusive need is about 56 GiB and the exclusive need about
+    // 44 GiB; 60 GiB of MemAvailable would take the inclusive store, a 50 GiB cgroup budget
+    // must not. The terms fold a 1 GiB PLE into engine_heap, the way the start does, so the
+    // plan counts every byte the guard admits.
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms {
+        engine_heap: HostTerms::DEFAULT.engine_heap + GIB,
+        ..HostTerms::DEFAULT
+    };
+    let admission = |cgroup| {
+        HostAdmission::from_meminfo(
+            "the caller",
+            "MemTotal: 67108864 kB\nMemAvailable: 62914560 kB\n",
+            cgroup,
+        )
+        .unwrap()
+    };
+    let memory_of = |admission: &HostAdmission| HostMemory {
+        total: 64 * GIB,
+        available: admission.available_budget(),
+    };
+
+    // Uncapped the inclusive store plans and its bytes pass the guard on the same snapshot.
+    let uncapped = admission(None);
+    let inclusive = HostPinPlan::new(
+        &geometry,
+        HostMode::Inclusive,
+        &memory_of(&uncapped),
+        &terms,
+    )
+    .unwrap();
+    assert!(
+        uncapped
+            .admit_for(inclusive.process_bytes, "the caller")
+            .is_ok()
+    );
+
+    let capped = admission(Some(50 * GIB));
+    let memory = memory_of(&capped);
+    assert!(
+        HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms).is_err(),
+        "the cgroup budget, not the host figure, must refuse the inclusive store"
+    );
+    let exclusive = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms).unwrap();
+    // The PLE bytes ride inside process_bytes (the engine_heap term), so the guard admits the
+    // plan's figure unchanged — the same call the start makes.
+    assert!(
+        capped
+            .admit_for(exclusive.process_bytes, "the caller")
+            .is_ok()
+    );
+
+    // Below both needs the exclusive plan refuses too, and the refusal names the cgroup budget
+    // (40 GiB = 42,949,672,960 bytes), the figure the start shows the operator.
+    let tight = admission(Some(40 * GIB));
+    let memory = memory_of(&tight);
+    let error =
+        message(HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms).unwrap_err());
+    assert!(error.contains("42949672960"), "{error}");
+
+    // The same snapshot through the tier plan: non-reclaimable is the total minus the budget,
+    // never the bare meminfo figure.
+    let inputs = TierInputs::measured(
+        shape(),
+        (0, 0),
+        KvPlan {
+            positions: 1,
+            bytes_per_position: 1,
+        },
+        0,
+        capped.host_memory(),
+    );
+    assert_eq!(inputs.host.non_reclaimable, 64 * GIB - 50 * GIB);
 }
 
 /// The terms with the 8 GiB page-cache floor the plan used before the n-gram reads were measured, to
