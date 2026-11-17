@@ -109,6 +109,7 @@ impl Gemma {
             self.ctx.add_rmsnorm_q8(
                 &self.stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: call.n,
                     eps: call.eps,
                     h: slice(call.h, call.n * 4)?,
@@ -189,6 +190,7 @@ impl Gemma {
         ctx.add_rmsnorm_q8(
             stream,
             AddNormQ8Call {
+                rows: 1,
                 n: HIDDEN,
                 eps: self.eps,
                 h: input.buf.range((m - 1) * HIDDEN * 4, HIDDEN * 4)?,
@@ -248,6 +250,7 @@ impl Gemma {
         let kv_rows = n_kv * head;
         self.norm_rows(
             AddNormQ8Call {
+                rows: 1,
                 n: HIDDEN,
                 eps: self.eps,
                 h: input.buf.range(0, input.bytes())?,
@@ -317,6 +320,7 @@ impl Gemma {
             ctx.add_rmsnorm_q8(
                 stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: head,
                     eps: self.eps,
                     h: sc.q.buf.range(h * head * 4, head * 4)?,
@@ -331,6 +335,7 @@ impl Gemma {
             ctx.add_rmsnorm_q8(
                 stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: head,
                     eps: self.eps,
                     h: sc.k.buf.range(h * head * 4, head * 4)?,
@@ -348,6 +353,7 @@ impl Gemma {
             ctx.add_rmsnorm_q8(
                 stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: head,
                     eps: self.eps,
                     h: sc.v.buf.range(h * head * 4, head * 4)?,
@@ -435,6 +441,7 @@ impl Gemma {
         )?;
         self.norm_rows(
             AddNormQ8Call {
+                rows: 1,
                 n: HIDDEN,
                 eps: self.eps,
                 h: sc.proj.buf.range(0, m * HIDDEN * 4)?,
@@ -461,6 +468,7 @@ impl Gemma {
         )?;
         self.norm_rows(
             AddNormQ8Call {
+                rows: 1,
                 n: HIDDEN,
                 eps: self.eps,
                 h: r1.buf.range(0, r1.bytes())?,
@@ -518,6 +526,7 @@ impl Gemma {
         )?;
         self.norm_rows(
             AddNormQ8Call {
+                rows: 1,
                 n: HIDDEN,
                 eps: self.eps,
                 h: sc.down.buf.range(0, m * HIDDEN * 4)?,

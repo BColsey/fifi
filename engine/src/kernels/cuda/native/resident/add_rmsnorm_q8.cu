@@ -31,6 +31,7 @@ namespace {
 
 constexpr int kThreads = 256;  // add_rmsnorm_pack_k's block size (ops.cu)
 constexpr int kMaxWidth = 32768;
+constexpr int kMaxRows = 262144;  // one block per row; far past any head or batch loop
 constexpr int64_t kMatrixRowPadding = 512;  // common.cuh, the MMVQ activation padding
 constexpr int64_t kQk8_1 = 32;              // QK8_1
 
@@ -56,9 +57,18 @@ __device__ __forceinline__ float block_sum(float v) {
 /* The fused producer: h += delta in place (when given), the f32 normalized row into norm_out
  * (byte-identical to add_rmsnorm_pack_k's norm_out), and the block_q8_1 quantization of the same
  * values into q8, one warp per 32-value block over the padded width (the tail past n is zeros:
- * d = 0, q = 0, s = 0). One block of 256 threads, m = 1. */
-__global__ void add_rmsnorm_q8_k(float *h, const float *delta, const float *w, int n, float eps,
-                                 float *norm_out, block_q8_1 *y) {
+ * d = 0, q = 0, s = 0). One block of 256 threads per row: the grid's x dimension is the row
+ * count, every block strides h (and delta), norm_out and q8 by one row, and the rows share the
+ * weight — a whole per-head or per-batch norm loop collapses into one launch. */
+__global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const float *w, int n,
+                                 float eps, float *base_norm_out, block_q8_1 *base_y) {
+  const int64_t padded =
+      ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
+  const int64_t r = blockIdx.x;
+  float *h = base_h + r * n;
+  const float *delta = base_delta != NULL ? base_delta + r * n : NULL;
+  float *norm_out = base_norm_out + r * n;
+  block_q8_1 *y = base_y + r * (padded / kQk8_1);
   float ss = 0.f;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     float v = h[i];
@@ -69,8 +79,6 @@ __global__ void add_rmsnorm_q8_k(float *h, const float *delta, const float *w, i
     ss += v * v;
   }
   float rstd = rsqrtf(block_sum(ss) / n + eps);
-  const int64_t padded =
-      ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
   const int nwarps = (int)blockDim.x / 32;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
@@ -112,21 +120,24 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const int n = args->n;
+        const int64_t rows = args->rows;
         if (args->h == NULL || args->w == NULL || args->norm_out == NULL || args->q8 == NULL ||
             n < 256 || n > kMaxWidth || n % 256 != 0 || !std::isfinite(args->eps) ||
-            args->eps <= 0.0f || !aligned(args->h, 4) ||
+            args->eps <= 0.0f || rows < 1 || rows > kMaxRows || !aligned(args->h, 4) ||
             (args->delta != NULL && !aligned(args->delta, 4)) || !aligned(args->w, 4) ||
             !aligned(args->norm_out, 16) || !aligned(args->q8, 4)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        // The kernel writes h, norm_out and q8 while it reads delta and w; the guard needs the
-        // byte counts (pad(n, 512)/32 blocks of 36 bytes) and must not wrap.
+        // The kernel writes h, norm_out and q8 (row-strided over `rows` blocks) while it reads
+        // delta (row-strided) and w (one shared row); the guard needs the byte counts
+        // (pad(n, 512)/32 blocks of 36 bytes) and must not wrap.
         const int64_t padded = ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
         const int64_t row = (int64_t)n * (int64_t)sizeof(float);
         const int64_t q8_bytes = padded / kQk8_1 * (int64_t)sizeof(block_q8_1);
-        const Extent written[3] = {{args->h, (size_t)row}, {args->norm_out, (size_t)row},
-                                   {args->q8, (size_t)q8_bytes}};
-        const Extent read[2] = {{args->delta, (size_t)row}, {args->w, (size_t)row}};
+        const Extent written[3] = {{args->h, (size_t)(row * rows)},
+                                   {args->norm_out, (size_t)(row * rows)},
+                                   {args->q8, (size_t)(q8_bytes * rows)}};
+        const Extent read[2] = {{args->delta, (size_t)(row * rows)}, {args->w, (size_t)row}};
         for (int i = 0; i < 3; ++i) {
             for (int j = i + 1; j < 3; ++j) {
                 if (!apart(written[i].p, written[i].bytes, written[j].p, written[j].bytes)) {
@@ -140,7 +151,7 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
                 }
             }
         }
-        add_rmsnorm_q8_k<<<1, kThreads, 0, (cudaStream_t)stream>>>(
+        add_rmsnorm_q8_k<<<dim3((unsigned)rows), kThreads, 0, (cudaStream_t)stream>>>(
             (float *)args->h, (const float *)args->delta, (const float *)args->w, n, args->eps,
             (float *)args->norm_out, (block_q8_1 *)args->q8);
         Failure failure;

@@ -250,6 +250,7 @@ pub(crate) fn run_card_token(
             ctx.add_rmsnorm_q8(
                 stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: hidden,
                     eps,
                     h: view(card, final_resid(kinds.len()))?,

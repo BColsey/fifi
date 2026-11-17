@@ -695,6 +695,7 @@ fn the_native_norm_row_equals_the_tiled_norm_row() {
             ctx.add_rmsnorm_q8(
                 &stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n,
                     eps,
                     h: nh.range(0, nh.bytes())?,

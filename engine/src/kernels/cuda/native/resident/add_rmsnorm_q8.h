@@ -31,20 +31,21 @@ extern "C" {
  * with each other only. stream must not be NULL. Returns INFERENCE_CUDA_INVALID_ARGUMENT
  * before any CUDA call for a bad argument. */
 typedef struct inference_cuda_add_rmsnorm_q8_args {
-    void *h;            /* f32 [n], read; written with h + delta when delta is given */
-    const void *delta;  /* f32 [n] or NULL */
-    const void *w;      /* f32 [n], the RMSNorm weight */
-    void *norm_out;     /* f32 [n] out, 16-byte aligned: byte-identical to add_norm_pack's */
-    void *q8;           /* block_q8_1 out: pad(n, 512)/32 * 36 bytes */
+    void *h;            /* f32 [n * rows], read; written with h + delta when delta is given */
+    const void *delta;  /* f32 [n * rows] or NULL */
+    const void *w;      /* f32 [n], the RMSNorm weight shared by every row */
+    void *norm_out;     /* f32 [n * rows] out, 16-byte aligned: byte-identical to add_norm_pack's */
+    void *q8;           /* block_q8_1 out: rows * pad(n, 512)/32 * 36 bytes */
     int n;              /* multiple of 256, 256..32768 */
     float eps;          /* finite, > 0 */
+    int rows;           /* row count, 1..262144; one block per row */
 } inference_cuda_add_rmsnorm_q8_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44,
+static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48,
               "inference_cuda_add_rmsnorm_q8_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 48 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44,
+_Static_assert(sizeof(inference_cuda_add_rmsnorm_q8_args) == 56 && offsetof(inference_cuda_add_rmsnorm_q8_args, h) == 0 && offsetof(inference_cuda_add_rmsnorm_q8_args, delta) == 8 && offsetof(inference_cuda_add_rmsnorm_q8_args, w) == 16 && offsetof(inference_cuda_add_rmsnorm_q8_args, norm_out) == 24 && offsetof(inference_cuda_add_rmsnorm_q8_args, q8) == 32 && offsetof(inference_cuda_add_rmsnorm_q8_args, n) == 40 && offsetof(inference_cuda_add_rmsnorm_q8_args, eps) == 44 && offsetof(inference_cuda_add_rmsnorm_q8_args, rows) == 48,
                "inference_cuda_add_rmsnorm_q8_args layout");
 #endif
 

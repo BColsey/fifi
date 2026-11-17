@@ -1012,6 +1012,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             ctx0.add_rmsnorm_q8(
                 stream0,
                 AddNormQ8Call {
+                    rows: 1,
                     n: hidden,
                     eps,
                     h: ref_view(final_resid(layers))?,

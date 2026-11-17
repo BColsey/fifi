@@ -586,6 +586,7 @@ impl<'a> Mixers<'a> {
             } => ctx.add_rmsnorm_q8(
                 stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: g.hidden,
                     eps: g.eps,
                     h: run.io.resid,

@@ -51,6 +51,9 @@ pub(crate) struct AddNormQ8Call<'b> {
     pub(crate) weight: DeviceRange<'b>,
     pub(crate) norm_out: DeviceRange<'b>,
     pub(crate) q8: DeviceRange<'b>,
+    /// Row count: one block per row, consecutive rows, one shared weight. 1 restates the
+    /// single-row call of the resident step.
+    pub(crate) rows: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,11 +63,11 @@ pub(crate) struct AddNormQ8Needs {
     pub(crate) q8: usize,
 }
 
-pub(crate) fn add_rmsnorm_q8_needs(n: usize) -> Option<AddNormQ8Needs> {
+pub(crate) fn add_rmsnorm_q8_needs(n: usize, rows: usize) -> Option<AddNormQ8Needs> {
     Some(AddNormQ8Needs {
-        row: n.checked_mul(4)?,
+        row: n.checked_mul(4)?.checked_mul(rows)?,
         weight: n.checked_mul(4)?,
-        q8: q8_1_bytes(n, 1)?,
+        q8: q8_1_bytes(n, rows)?,
     })
 }
 
@@ -111,7 +114,13 @@ impl CudaContext {
                 "the CUDA add_rmsnorm_q8 needs eps finite and above 0".to_owned(),
             ));
         }
-        let need = add_rmsnorm_q8_needs(call.n).ok_or_else(|| {
+        if call.rows == 0 || call.rows > 262_144 {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA add_rmsnorm_q8 takes rows in 1 to 262144, got {}",
+                call.rows
+            )));
+        }
+        let need = add_rmsnorm_q8_needs(call.n, call.rows).ok_or_else(|| {
             EngError::BadRequest("the CUDA add_rmsnorm_q8 size overflows".to_owned())
         })?;
         require_fit("h", &call.h, need.row, 4)?;
@@ -145,6 +154,7 @@ impl CudaContext {
             q8,
             n: call.n,
             eps: call.eps,
+            rows: call.rows,
         })
     }
 }

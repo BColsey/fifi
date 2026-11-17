@@ -165,7 +165,7 @@ fn launch_mine(
     weight: &[f32],
     eps: f32,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let need = add_rmsnorm_q8_needs(n).expect("sizes");
+    let need = add_rmsnorm_q8_needs(n, 1).expect("sizes");
     let h_dev = testkit::upload_f32(ctx, h);
     let delta_dev = delta.map(|values| testkit::upload_f32(ctx, values));
     let weight_dev = testkit::upload_f32(ctx, weight);
@@ -183,6 +183,7 @@ fn launch_mine(
             weight: weight_dev.range(0, need.weight).expect("weight range"),
             norm_out: norm.range(0, need.row).expect("norm_out range"),
             q8: q8.range(0, need.q8).expect("q8 range"),
+            rows: 1,
         },
     )
     .expect("queue add_rmsnorm_q8");
@@ -318,21 +319,147 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     }
 }
 
+/// The batched launch must produce, per row, exactly the bytes the single-row launch
+/// produces on the same row with the same shared weight: the per-head and per-batch norm
+/// loops collapse into one launch without changing any output.
+#[test]
+fn add_rmsnorm_q8_batches_rows_like_single_launches() {
+    if !testkit::device_present("add_rmsnorm_q8_batches_rows_like_single_launches") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let eps = 1e-6f32;
+    let mut rng = testkit::Rng::new(0x5eed_0ff5);
+    for (n, rows, with_delta) in [
+        (2048usize, 5usize, false),
+        (512, 13, false),
+        (256, 7, false),
+        (2048, 5, true),
+        (512, 4, true),
+        (256, 7, true),
+    ] {
+        let need = add_rmsnorm_q8_needs(n, 1).expect("sizes");
+        let all = add_rmsnorm_q8_needs(n, rows).expect("sizes");
+        let h: Vec<f32> = (0..rows * n)
+            .map(|_| (rng.normal() as f32) * 0.05)
+            .collect();
+        let w: Vec<f32> = (0..n).map(|_| 1.0 + (rng.normal() as f32) * 0.1).collect();
+        let delta: Option<Vec<f32>> = with_delta.then(|| {
+            (0..rows * n)
+                .map(|_| (rng.normal() as f32) * 0.05)
+                .collect()
+        });
+        let h_dev = testkit::upload_f32(&ctx, &h);
+        let w_dev = testkit::upload_f32(&ctx, &w);
+        let delta_dev = delta
+            .as_ref()
+            .map(|values| testkit::upload_f32(&ctx, values));
+        let kind = if with_delta { "with-delta" } else { "plain" };
+        let norm = testkit::upload_filled(&ctx, 0xAB, all.row + 64);
+        let q8 = testkit::upload_filled(&ctx, 0xA5, all.q8 + 64);
+        ctx.add_rmsnorm_q8(
+            &stream,
+            AddNormQ8Call {
+                n,
+                eps,
+                h: h_dev.range(0, all.row).expect("h range"),
+                delta: delta_dev
+                    .as_ref()
+                    .map(|buffer| buffer.range(0, all.row).expect("delta range")),
+                weight: w_dev.range(0, need.weight).expect("weight range"),
+                norm_out: norm.range(0, all.row).expect("norm_out range"),
+                q8: q8.range(0, all.q8).expect("q8 range"),
+                rows,
+            },
+        )
+        .expect("queue batched add_rmsnorm_q8");
+        stream.synchronize().expect("drain");
+        let norm_all = testkit::read_bytes(&ctx, &norm, all.row + 64);
+        let q8_all = testkit::read_bytes(&ctx, &q8, all.q8 + 64);
+        let h_all = testkit::read_bytes(&ctx, &h_dev, all.row);
+        assert!(
+            norm_all[all.row..].iter().all(|&byte| byte == 0xAB),
+            "n {n}: the batched norm_out wrote past its range"
+        );
+        assert!(
+            q8_all[all.q8..].iter().all(|&byte| byte == 0xA5),
+            "n {n}: the batched q8 wrote past its range"
+        );
+        for row in 0..rows {
+            // The batched launch updates h_dev in place when delta is given, so each
+            // anchor starts from a fresh upload of the ORIGINAL row, not the mutated buffer.
+            let anchor_h = testkit::upload_f32(&ctx, &h[row * n..(row + 1) * n]);
+            let anchor_norm = testkit::upload_filled(&ctx, 0, need.row);
+            let anchor_q8 = testkit::upload_filled(&ctx, 0, need.q8);
+            let row_offset = row * need.row;
+            ctx.add_rmsnorm_q8(
+                &stream,
+                AddNormQ8Call {
+                    n,
+                    eps,
+                    h: anchor_h.range(0, need.row).expect("anchor h range"),
+                    delta: delta_dev
+                        .as_ref()
+                        .map(|buffer| buffer.range(row_offset, need.row).expect("row delta range")),
+                    weight: w_dev.range(0, need.weight).expect("weight range"),
+                    norm_out: anchor_norm.range(0, need.row).expect("norm range"),
+                    q8: anchor_q8.range(0, need.q8).expect("q8 range"),
+                    rows: 1,
+                },
+            )
+            .expect("queue single-row anchor");
+            stream.synchronize().expect("drain");
+            let want_norm = testkit::read_bytes(&ctx, &anchor_norm, need.row);
+            let want_q8 = testkit::read_bytes(&ctx, &anchor_q8, need.q8);
+            let want_h = testkit::read_bytes(&ctx, &anchor_h, need.row);
+            let got_norm = &norm_all[row * need.row..(row + 1) * need.row];
+            let got_q8 = &q8_all[row * need.q8..(row + 1) * need.q8];
+            let got_h = &h_all[row * need.row..(row + 1) * need.row];
+            assert_eq!(
+                got_norm,
+                &want_norm[..],
+                "n {n} row {row} ({kind}): batched norm bytes differ from the single launch"
+            );
+            assert_eq!(
+                got_q8,
+                &want_q8[..],
+                "n {n} row {row} ({kind}): batched q8 bytes differ from the single launch"
+            );
+            assert_eq!(
+                got_h,
+                &want_h[..],
+                "n {n} row {row} ({kind}): batched in-place h differs from the single launch"
+            );
+        }
+    }
+}
+
 #[test]
 fn add_rmsnorm_q8_needs_are_pure_and_exact() {
-    let need = add_rmsnorm_q8_needs(2048).expect("sizes");
+    let need = add_rmsnorm_q8_needs(2048, 1).expect("sizes");
     assert_eq!(
         (need.row, need.weight, need.q8),
         (2048 * 4, 2048 * 4, 64 * 36)
     );
     // n 2304 pads to 2560 (Mellum): 80 blocks per row, not 72.
-    let need = add_rmsnorm_q8_needs(2304).expect("sizes");
+    let need = add_rmsnorm_q8_needs(2304, 1).expect("sizes");
     assert_eq!((need.row, need.q8), (2304 * 4, 80 * 36));
-    assert_eq!(add_rmsnorm_q8_needs(256).map(|n| n.q8), Some(16 * 36));
-    assert_eq!(add_rmsnorm_q8_needs(4096).map(|n| n.q8), Some(128 * 36));
-    assert_eq!(add_rmsnorm_q8_needs(32_768).map(|n| n.q8), Some(1024 * 36));
-    assert_eq!(add_rmsnorm_q8_needs(usize::MAX), None);
-    assert_eq!(add_rmsnorm_q8_needs(usize::MAX / 2), None);
+    assert_eq!(add_rmsnorm_q8_needs(2304, 1).map(|n| n.q8), Some(80 * 36));
+    assert_eq!(add_rmsnorm_q8_needs(256, 1).map(|n| n.q8), Some(16 * 36));
+    assert_eq!(add_rmsnorm_q8_needs(4096, 1).map(|n| n.q8), Some(128 * 36));
+    assert_eq!(
+        add_rmsnorm_q8_needs(32_768, 1).map(|n| n.q8),
+        Some(1024 * 36)
+    );
+    assert_eq!(add_rmsnorm_q8_needs(usize::MAX, 1), None);
+    // Three rows: every written extent scales by the row count, the weight stays one row.
+    let need = add_rmsnorm_q8_needs(256, 3).expect("sizes");
+    assert_eq!(
+        (need.row, need.weight, need.q8),
+        (3 * 256 * 4, 256 * 4, 3 * 16 * 36)
+    );
+    assert_eq!(add_rmsnorm_q8_needs(usize::MAX / 2, 1), None);
 }
 
 #[test]
@@ -516,6 +643,7 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), cra
             weight: rig.weight.range(spec.weight.0, spec.weight.1)?,
             norm_out: norm_buffer.range(spec.norm_out.0, spec.norm_out.1)?,
             q8: q8_buffer.range(spec.q8.0, spec.q8.1)?,
+            rows: 1,
         },
     )
 }
@@ -745,7 +873,7 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
         q8_ref::row(&norm),
         "the fused row is the IEEE host row"
     );
-    let need = add_rmsnorm_q8_needs(n).expect("sizes");
+    let need = add_rmsnorm_q8_needs(n, 1).expect("sizes");
     let norm_dev = testkit::upload_bytes(&ctx, &norm_bytes);
     let unfused = testkit::upload_filled(&ctx, 0xA5, need.q8 + 64);
     ctx.quantize_q8_1(
@@ -819,7 +947,7 @@ fn add_rmsnorm_q8_feeds_matvec_q() {
     let h: Vec<f32> = (0..k).map(|_| (rng.normal() as f32) * 0.05).collect();
     let norm_w: Vec<f32> = (0..k).map(|_| 0.5 + rng.unit() as f32).collect();
     let (_, norm_bytes, q8_mine) = launch_mine(&ctx, &stream, k, &h, None, &norm_w, eps);
-    let need = add_rmsnorm_q8_needs(k).expect("sizes");
+    let need = add_rmsnorm_q8_needs(k, 1).expect("sizes");
     let norm_dev = testkit::upload_bytes(&ctx, &norm_bytes);
     let unfused = testkit::upload_filled(&ctx, 0xA5, need.q8);
     ctx.quantize_q8_1(

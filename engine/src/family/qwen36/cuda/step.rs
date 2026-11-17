@@ -2647,6 +2647,7 @@ impl<'a> QwenResidentStep<'a> {
             WeightLayout::Native => self.context.add_rmsnorm_q8(
                 &self.stream,
                 AddNormQ8Call {
+                    rows: 1,
                     n: self.res.geometry.hidden,
                     eps: self.res.geometry.eps,
                     h,

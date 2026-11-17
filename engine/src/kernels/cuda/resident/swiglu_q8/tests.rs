@@ -555,7 +555,7 @@ fn q8_producers_inside_a_capture_equal_eager() {
     for value in &mut gu {
         *value = (rng.normal() as f32) * 0.3;
     }
-    let k1 = add_rmsnorm_q8_needs(n).expect("sizes");
+    let k1 = add_rmsnorm_q8_needs(n, 1).expect("sizes");
     let k2 = swiglu_q8_needs(n_ff, stride, slots).expect("sizes");
     let h_dev = testkit::upload_f32(&ctx, &h);
     let weight_dev = testkit::upload_f32(&ctx, &weight);
@@ -576,6 +576,7 @@ fn q8_producers_inside_a_capture_equal_eager() {
         ctx.add_rmsnorm_q8(
             stream,
             AddNormQ8Call {
+                rows: 1,
                 n,
                 eps,
                 h: h_dev.range(0, k1.row)?,
@@ -661,7 +662,7 @@ fn q8_producers_are_deterministic() {
     for value in &mut gu {
         *value = (rng.normal() as f32) * 0.3;
     }
-    let k1 = add_rmsnorm_q8_needs(n).expect("sizes");
+    let k1 = add_rmsnorm_q8_needs(n, 1).expect("sizes");
     let k2 = swiglu_q8_needs(n_ff, stride, slots).expect("sizes");
     let h_dev = testkit::upload_f32(&ctx, &h);
     let weight_dev = testkit::upload_f32(&ctx, &weight);
@@ -673,6 +674,7 @@ fn q8_producers_are_deterministic() {
         ctx.add_rmsnorm_q8(
             &stream,
             AddNormQ8Call {
+                rows: 1,
                 n,
                 eps,
                 h: h_dev.range(0, k1.row).expect("h"),
@@ -727,7 +729,7 @@ fn q8_producers_write_only_their_range() {
     for value in &mut gu {
         *value = (rng.normal() as f32) * 0.3;
     }
-    let k1 = add_rmsnorm_q8_needs(n).expect("sizes");
+    let k1 = add_rmsnorm_q8_needs(n, 1).expect("sizes");
     let k2 = swiglu_q8_needs(n_ff, stride, slots).expect("sizes");
     let h_dev = testkit::upload_filled(&ctx, 0x11, k1.row + 64);
     let h_bytes: Vec<u8> = h.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -744,6 +746,7 @@ fn q8_producers_write_only_their_range() {
     ctx.add_rmsnorm_q8(
         &stream,
         AddNormQ8Call {
+            rows: 1,
             n,
             eps,
             h: h_dev.range(0, k1.row).expect("h"),

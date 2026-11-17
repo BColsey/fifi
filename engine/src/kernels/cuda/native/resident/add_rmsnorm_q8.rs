@@ -41,10 +41,11 @@ struct AddNormQ8ArgsRepr {
     q8: *mut c_void,
     n: c_int,
     eps: f32,
+    rows: c_int,
 }
 
 const _: () = assert!(
-    size_of::<AddNormQ8ArgsRepr>() == 48
+    size_of::<AddNormQ8ArgsRepr>() == 56
         && offset_of!(AddNormQ8ArgsRepr, h) == 0
         && offset_of!(AddNormQ8ArgsRepr, delta) == 8
         && offset_of!(AddNormQ8ArgsRepr, w) == 16
@@ -52,6 +53,7 @@ const _: () = assert!(
         && offset_of!(AddNormQ8ArgsRepr, q8) == 32
         && offset_of!(AddNormQ8ArgsRepr, n) == 40
         && offset_of!(AddNormQ8ArgsRepr, eps) == 44
+        && offset_of!(AddNormQ8ArgsRepr, rows) == 48
 );
 
 /// What one launch reads and writes: the residual row `h` (updated in place when `delta` is
@@ -65,6 +67,7 @@ pub(in crate::kernels::cuda) struct AddNormQ8Raw<'a> {
     pub(in crate::kernels::cuda) q8: RawRange<'a>,
     pub(in crate::kernels::cuda) n: usize,
     pub(in crate::kernels::cuda) eps: f32,
+    pub(in crate::kernels::cuda) rows: usize,
 }
 
 /// Bytes of the `block_q8_1` output of one row of `n` values: padded to 512 values, one 36-byte
@@ -78,33 +81,38 @@ fn q8_bytes_native(n: usize) -> Option<usize> {
 /// `delta` and `weight` may share bytes; every extent the kernel writes must be apart.
 fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
     let n = call.n;
+    let rows = call.rows;
+    let rows_bytes = |per_row: usize| per_row.checked_mul(rows);
     let row = n.checked_mul(4).ok_or_else(invalid_argument)?;
+    let all_rows = rows_bytes(row).ok_or_else(invalid_argument)?;
     let q8_need = q8_bytes_native(n).ok_or_else(invalid_argument)?;
+    let q8_all = rows_bytes(q8_need).ok_or_else(invalid_argument)?;
     let fits = |range: &RawRange<'_>, need: usize, align: usize| {
         range.bytes >= need && range.offset.is_multiple_of(align)
     };
-    if !fits(&call.h, row, 4)
+    if !fits(&call.h, all_rows, 4)
         || !fits(&call.weight, row, 4)
-        || !fits(&call.norm_out, row, 16)
-        || !fits(&call.q8, q8_need, 4)
+        || !fits(&call.norm_out, all_rows, 16)
+        || !fits(&call.q8, q8_all, 4)
         || call
             .delta
             .as_ref()
-            .is_some_and(|delta| !fits(delta, row, 4))
+            .is_some_and(|delta| !fits(delta, all_rows, 4))
         || !(256..=32_768).contains(&n)
         || !n.is_multiple_of(256)
         || !call.eps.is_finite()
         || call.eps <= 0.0
+        || !(1..=262_144).contains(&rows)
     {
         return Err(invalid_argument());
     }
     let written = [
-        Span::of(&call.h, row),
-        Span::of(&call.norm_out, row),
-        Span::of(&call.q8, q8_need),
+        Span::of(&call.h, all_rows),
+        Span::of(&call.norm_out, all_rows),
+        Span::of(&call.q8, q8_all),
     ];
     let read = [
-        call.delta.map(|delta| Span::of(&delta, row)),
+        call.delta.map(|delta| Span::of(&delta, all_rows)),
         Some(Span::of(&call.weight, row)),
     ];
     for (i, span) in written.iter().enumerate() {
@@ -133,6 +141,7 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
         q8: call.q8.address(),
         n: c_int::try_from(call.n).map_err(|_| invalid_argument())?,
         eps: call.eps,
+        rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_add_norm_q8` proved every range inside its live allocation, large enough,
@@ -162,6 +171,7 @@ mod tests {
         q8: usize,
         n: c_int,
         eps: f32,
+        rows: c_int,
         stream: usize,
     }
 
@@ -176,6 +186,7 @@ mod tests {
         q8: 0x90_0000,
         n: 2048,
         eps: 1e-6,
+        rows: 1,
         stream: 0x1,
     };
 
@@ -194,6 +205,7 @@ mod tests {
             q8: pointer(args.q8),
             n: args.n,
             eps: args.eps,
+            rows: args.rows,
         };
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or
@@ -204,7 +216,7 @@ mod tests {
     /// Host only: every case is refused by the entry's own checks before any CUDA call.
     #[test]
     fn add_rmsnorm_q8_arguments_are_checked_before_any_launch() {
-        let cases: [Case; 22] = [
+        let cases: [Case; 24] = [
             ("NULL h", |a| a.h = 0),
             ("NULL w", |a| a.w = 0),
             ("NULL norm_out", |a| a.norm_out = 0),
@@ -216,6 +228,8 @@ mod tests {
             ("eps zero", |a| a.eps = 0.0),
             ("eps negative", |a| a.eps = -1e-6),
             ("eps NaN", |a| a.eps = f32::NAN),
+            ("rows zero", |a| a.rows = 0),
+            ("rows above the bound", |a| a.rows = 262_145),
             ("h offset not a multiple of 4", |a| a.h += 2),
             ("delta offset not a multiple of 4", |a| a.delta += 2),
             ("w offset not a multiple of 4", |a| a.w += 2),
@@ -295,6 +309,7 @@ mod tests {
             q8: range(layout.q8),
             n: layout.n,
             eps,
+            rows: 1,
         })
     }
 

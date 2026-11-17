@@ -135,6 +135,7 @@ fn rmsnorm_rows_match_the_eighteen_frozen_cases() {
         ctx.add_rmsnorm_q8(
             &stream,
             AddNormQ8Call {
+                rows: 1,
                 n,
                 eps: epsilon,
                 h: h.range(0, n * 4).expect("input"),
