@@ -5,6 +5,9 @@
 //! fits the memory plan.
 
 use crate::EngError;
+#[cfg(test)]
+use crate::family::prefill::mlx::RETIRE_CAP_BASE;
+use crate::family::prefill::mlx::{self, PREFILL_RETIRE_CAP};
 
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
@@ -123,42 +126,21 @@ pub(crate) fn coalesce_runs(distinct: &[u32]) -> Result<Vec<ExpertRun>, EngError
     Ok(runs)
 }
 
-/// The retire cap of a decode step and the base of the prefill retire cap: 64 MiB.
-pub(crate) const RETIRE_CAP_BASE: u64 = 64 << 20;
-
-/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB. The adapter returns to
-/// its previous cap after the chunk.
-pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
-
-/// State-sized tensors that the unrolled DeltaNet loop drops per token and layer: the decayed
-/// state, the outer product, and the replaced state.
-pub(crate) const DELTA_RETIRED_STATES: u64 = 3;
-
 /// Retired bytes of one chunk token in one DeltaNet layer (F32 state).
 pub(crate) fn delta_retire_per_token(
     value_heads: u32,
     key_dim: u32,
     value_dim: u32,
 ) -> Result<u64, EngError> {
-    u64::from(value_heads)
-        .checked_mul(u64::from(key_dim))
-        .and_then(|n| n.checked_mul(u64::from(value_dim)))
-        .and_then(|n| n.checked_mul(4))
-        .and_then(|n| n.checked_mul(DELTA_RETIRED_STATES))
-        .filter(|&n| n > 0)
+    mlx::delta_retire_per_token(value_heads, key_dim, value_dim)
         .ok_or_else(|| bad("delta retire bytes are zero or overflow"))
 }
 
 /// The layer state is evaluated between sub-chunks, so the retired bytes of one layer stay near
 /// `cap`.
 pub(crate) fn delta_subchunk(tokens: u32, cap: u64, per_token: u64) -> Result<u32, EngError> {
-    if tokens == 0 || per_token == 0 {
-        return Err(bad(
-            "delta sub-chunk needs positive tokens and bytes per token",
-        ));
-    }
-    let fit = cap.saturating_sub(RETIRE_CAP_BASE) / per_token;
-    Ok(u32::try_from(fit).unwrap_or(u32::MAX).clamp(1, tokens))
+    mlx::delta_subchunk(tokens, cap, per_token)
+        .ok_or_else(|| bad("delta sub-chunk needs positive tokens and bytes per token"))
 }
 
 pub(crate) fn delta_ranges(tokens: u32, sub: u32) -> Result<Vec<(u32, u32)>, EngError> {
@@ -290,25 +272,6 @@ impl ChunkCost {
     }
 }
 
-pub(crate) fn largest_chunk(
-    cost: &ChunkCost,
-    candidates: &[u32],
-    remaining: u64,
-) -> Result<Option<u32>, EngError> {
-    let mut best: Option<u32> = None;
-    for &tokens in candidates {
-        if tokens == 0 {
-            return Err(bad("prefill chunk size must exceed zero"));
-        }
-        if cost.workspace(tokens)? <= remaining {
-            best = best.max(Some(tokens));
-        }
-    }
-    Ok(best)
-}
-
-pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1];
-
 /// Experts per wave, `U_w`. The first release runs one wave: 512 is the expert count of a layer.
 pub(crate) const PREFILL_WAVE_CAP: u32 = 512;
 
@@ -323,7 +286,7 @@ const PLAN_FIXED: u64 = 100_000_000;
 /// experts per token, `expert_bytes` per expert (page rounded), and OS page size `page`.
 ///
 /// It holds the planning terms, the wave cap `PREFILL_WAVE_CAP`, the retire cap, and the route
-/// pages. `largest_chunk` and the prefill page sets read the same value, so they cannot disagree.
+/// pages. `admitted_chunk` and the prefill page sets read the same value, so they cannot disagree.
 pub(crate) fn admission_cost(
     experts: u32,
     top_k: u32,
@@ -413,7 +376,7 @@ pub(crate) struct PrefillPlan {
 
 /// A chunk of one token is the one-token path, so a result of 1 is `None`.
 pub(crate) fn admitted_chunk(cost: &ChunkCost, remaining: u64) -> Result<Option<u32>, EngError> {
-    Ok(largest_chunk(cost, &PREFILL_CANDIDATES, remaining)?.filter(|&tokens| tokens > 1))
+    mlx::admitted_chunk(u32::MAX, remaining, |rows| cost.workspace(rows))
 }
 
 /// One wave of a chunk: at most `wave_cap` consecutive ranks of the sorted union and the pairs
@@ -689,7 +652,10 @@ mod tests {
         let cost = cost();
         let sizes = [512, 256, 128, 64, 32, 16, 8, 4, 1];
         let pick = |candidates: &[u32], remaining: u64| {
-            largest_chunk(&cost, candidates, remaining).unwrap()
+            mlx::largest_fitting_chunk(candidates.iter().copied(), remaining, |rows| {
+                cost.workspace(rows)
+            })
+            .unwrap()
         };
         assert_eq!(pick(&sizes, 1_000_000_000), Some(16));
         assert_eq!(pick(&sizes, 997_536_000), Some(16), "exact fit");
@@ -702,7 +668,11 @@ mod tests {
             "any order"
         );
         assert_eq!(pick(&[], 3_000_000_000), None, "no candidates");
-        assert!(is_bad_request(largest_chunk(&cost, &[4, 0], u64::MAX)));
+        assert!(is_bad_request(mlx::largest_fitting_chunk(
+            [4, 0],
+            u64::MAX,
+            |rows| cost.workspace(rows)
+        )));
     }
 
     /// Tokens 0 to 2 select (3, 8), (4, 20), and (5, 7). The union is 3, 4, 5, 7, 8, 20.
@@ -1173,11 +1143,13 @@ mod tests {
         // 1 GB: without waves the largest chunk is 16 tokens. With 128-expert waves it is 128.
         let sizes = [512, 256, 128, 64, 32, 16, 8, 4, 1];
         assert_eq!(
-            largest_chunk(&cost(), &sizes, 1_000_000_000).unwrap(),
+            mlx::largest_fitting_chunk(sizes, 1_000_000_000, |rows| cost().workspace(rows))
+                .unwrap(),
             Some(16)
         );
         assert_eq!(
-            largest_chunk(&capped, &sizes, 1_000_000_000).unwrap(),
+            mlx::largest_fitting_chunk(sizes, 1_000_000_000, |rows| capped.workspace(rows))
+                .unwrap(),
             Some(128)
         );
     }

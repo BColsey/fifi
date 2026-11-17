@@ -65,9 +65,10 @@
 //! drops that entry and tries the next candidate.
 
 use super::attn::growth_bytes;
-use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
+use super::chunk_plan::{ChunkCost, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
 use super::state::{ResidentSnapshot, ResidentState, advance_charge};
+use crate::family::prefill::mlx::PREFILL_CANDIDATES;
 use crate::{
     EngError,
     family::{

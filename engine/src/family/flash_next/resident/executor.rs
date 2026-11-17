@@ -2489,6 +2489,8 @@ mod tests {
         );
         #[cfg(feature = "native-fault-qualification")]
         let _caps = {
+            use crate::family::prefill::mlx::PREFILL_RETIRE_CAP;
+
             let cap = |name: &str| -> Option<u64> {
                 std::env::var(name).ok().map(|v| {
                     v.parse()
@@ -2500,11 +2502,9 @@ mod tests {
             lines.push_str(&format!(
                 "prefill_retire_cap_plan_bytes={}\nprefill_retire_cap_used_bytes={}\n\
                  prefill_subchunk_cap_used_bytes={}\n",
-                prefill_plan::PREFILL_RETIRE_CAP,
-                retire.unwrap_or(prefill_plan::PREFILL_RETIRE_CAP),
-                subchunk
-                    .or(retire)
-                    .unwrap_or(prefill_plan::PREFILL_RETIRE_CAP),
+                PREFILL_RETIRE_CAP,
+                retire.unwrap_or(PREFILL_RETIRE_CAP),
+                subchunk.or(retire).unwrap_or(PREFILL_RETIRE_CAP),
             ));
             super::super::prefill::step::PrefillCapOverride::set(retire, subchunk)
         };

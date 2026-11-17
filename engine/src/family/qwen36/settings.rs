@@ -11,6 +11,7 @@
 use super::host::HostShape;
 use super::host_load::rotary_dim;
 use crate::family::kv_format::KvRowShape;
+use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
@@ -65,8 +66,6 @@ pub(crate) const NO_BUDGET_PIECE: u32 = 16;
 /// The largest accepted prefill chunk. It matches the decoder's `MAX_CHUNK_ROWS`; 2048 is opt-in
 /// (the default stays `DEFAULT_PREFILL_CHUNK`). On the M4 Max it shortened a 49K prefill by 4%.
 pub(crate) const MAX_PREFILL_CHUNK: u32 = 2048;
-/// The smallest multi-token candidate in Q36's prefill admission ladder.
-pub(crate) const MIN_PREFILL_CHUNK_ROWS: u32 = 4;
 /// The CUDA arm cap of M_sess: the largest chunk the prefill ladder admits, independent of the MLX
 /// prefill_chunk ceiling above.
 pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;

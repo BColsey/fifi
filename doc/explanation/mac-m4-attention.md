@@ -6,6 +6,8 @@ The records in this document were measured by the PR author on his own M4 Mac mi
 
 Measured 17 November 2026 on a 10-GPU-core M4, macOS 26.3, with the locked release build, Rust 1.98.1, Xcode 26.5 and `native-mlx`, on the author's Mac performance branch. The benchmark test and the dense-prefill reference correction are the ported commit `3b307c6d8` (`chore(mlx): measure Q8 decode dispatch and align the dense prefill oracle`). Both benchmarks used synthetic resident inputs and timed one attention layer through a synchronized host readback. Whole-model decode throughput, time to first token and generation quality still need a checkpoint run.
 
+The [MLX architecture guide](mlx-architecture.md) describes the shared execution paths and the checks that fit on this mini.
+
 ## Qwen3.6 decode
 
 One BF16 query, 16 query heads, two KV heads, head width 256, Q8 cache with group size 64. Cache capacity rounded up to 256 positions. Each depth ran in three fresh benchmark processes, with four warm-up pairs and 20 timed pairs per process. Each pair used the same query for both arms, varied the query between pairs and alternated the first arm. The times below are the median of the three per-process medians. The last column gives the range of within-process latency reductions.

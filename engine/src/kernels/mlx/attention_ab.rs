@@ -51,8 +51,7 @@
 //! Protocol. Three warm-up rounds and ten timed rounds per path, each round one graph build
 //! plus one `evaluate` of the output; the reported milliseconds are the mean wall of one timed
 //! round. The composite runs first, then the dequantized path, cases in ascending length, on
-//! one adapter under the serving prefill retire cap (512 MiB, `chunk_plan::PREFILL_RETIRE_CAP`,
-//! chunk_plan.rs:17). No speed bound is asserted.
+//! one adapter under the 512 MiB serving prefill retire cap. No speed bound is asserted.
 //!
 //! Agreement. Both outputs are checked F32 of the query shape BEFORE the compare. Both paths
 //! run the same masked softmax over the same dequantized numbers (the composite reconstructs
@@ -127,8 +126,7 @@ const KV_STEP: u32 = 256;
 const CASES: [(u32, u32); 4] = [(8_192, 256), (32_768, 256), (65_536, 256), (131_072, 64)];
 const WARMUP_ROUNDS: usize = 3;
 const TIMED_ROUNDS: usize = 10;
-/// The retire cap the serving prefill runs under (chunk_plan.rs:15-17,
-/// `PREFILL_RETIRE_CAP`): a flat 512 MiB.
+/// The 512 MiB retire cap pinned by this measurement protocol.
 const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 /// The agreement bound, derived in the module doc: 1e-5 relative to `max(1, |composite|)`.
 const TOLERANCE: f32 = 1e-5;

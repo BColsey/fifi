@@ -5,20 +5,12 @@
 //! split a prompt into chunks and a DeltaNet layer into sub-chunks. Nothing here calls the native
 //! adapter, so the tests run on Linux.
 
-use super::{super::settings::MIN_PREFILL_CHUNK_ROWS, kv_plan::SCORE_BUDGET_BYTES};
+use super::kv_plan::SCORE_BUDGET_BYTES;
+use crate::family::prefill::mlx;
 use crate::{EngError, family::route::Routed};
-
-/// The reserve that `delta_subchunk` keeps below the retire cap, and the default cap of the
-/// adapter: 64 MiB. The decoder's decode cap is `DECODE_RETIRE_CAP` (4 GiB).
-pub(super) const RETIRE_CAP_BASE: u64 = 64 << 20;
-
-/// The retire cap of the adapter while a prefill chunk runs: a flat 512 MiB. The adapter returns
-/// to its previous cap after the chunk.
-pub(super) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
-
-/// State-sized tensors that the unrolled DeltaNet loop drops per token and layer: the replaced
-/// state, the decayed state, and the outer product.
-const DELTA_RETIRED_STATES: u64 = 3;
+use mlx::PREFILL_RETIRE_CAP;
+#[cfg(test)]
+use mlx::RETIRE_CAP_BASE;
 
 /// The pairs of one chunk in expert order. Pair `p = t * top_k + j` is choice `j` of token `t`.
 /// All four vectors have one entry per pair.
@@ -104,12 +96,7 @@ pub(super) fn delta_retire_per_token(
     key_dim: u32,
     value_dim: u32,
 ) -> Result<u64, EngError> {
-    u64::from(value_heads)
-        .checked_mul(u64::from(key_dim))
-        .and_then(|n| n.checked_mul(u64::from(value_dim)))
-        .and_then(|n| n.checked_mul(4))
-        .and_then(|n| n.checked_mul(DELTA_RETIRED_STATES))
-        .filter(|&n| n > 0)
+    mlx::delta_retire_per_token(value_heads, key_dim, value_dim)
         .ok_or_else(|| bad("delta retire bytes are zero or overflow"))
 }
 
@@ -117,30 +104,9 @@ pub(super) fn delta_retire_per_token(
 /// `rows`. The layer state is evaluated between sub-chunks, so the retired bytes of one layer stay
 /// near `cap`. `rows` and `per_token` must be positive.
 pub(super) fn delta_subchunk(rows: u32, cap: u64, per_token: u64) -> Result<u32, EngError> {
-    if rows == 0 || per_token == 0 {
-        return Err(bad("a sub-chunk needs positive rows and bytes per token"));
-    }
-    let fit = cap.saturating_sub(RETIRE_CAP_BASE) / per_token;
-    Ok(u32::try_from(fit).unwrap_or(u32::MAX).clamp(1, rows))
+    mlx::delta_subchunk(rows, cap, per_token)
+        .ok_or_else(|| bad("a sub-chunk needs positive rows and bytes per token"))
 }
-
-/// The chunk sizes that the admission rule tries, largest first (Q36 keeps its own copy of the
-/// list). The largest is the most rows that `ResidentDecoder::set_chunk_rows` accepts
-/// (`decoder::MAX_CHUNK_ROWS`). A compile-time check in `executor.rs` fails the build if the two
-/// differ. A size of 1 is the one-token path and is never a chunk.
-pub(super) const PREFILL_CANDIDATES: [u32; 11] = [
-    2048,
-    1024,
-    512,
-    256,
-    128,
-    64,
-    32,
-    16,
-    8,
-    MIN_PREFILL_CHUNK_ROWS,
-    1,
-];
 
 /// Activation bytes per chunk token outside the attention scores, a planning value [A]: the mixer
 /// projections, the 8 routed pairs of each token (about 0.4 MB [D]), and the shared expert. The
@@ -264,15 +230,7 @@ pub(super) fn admitted_chunk(
     if max_rows == 0 {
         return Err(bad("the largest chunk must exceed zero rows"));
     }
-    for rows in PREFILL_CANDIDATES
-        .into_iter()
-        .filter(|&rows| rows > 1 && rows <= max_rows)
-    {
-        if cost.workspace(rows)? <= remaining {
-            return Ok(Some(rows));
-        }
-    }
-    Ok(None)
+    mlx::admitted_chunk(max_rows, remaining, |rows| cost.workspace(rows))
 }
 
 #[cfg(test)]

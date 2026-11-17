@@ -41,9 +41,9 @@ use super::qsa::dense_rows;
 use super::{deltanet, hyper, moe, ple, qsa, start};
 use crate::family::flash_next::deltanet::DeltaShape;
 use crate::family::flash_next::prefill_plan::{
-    PREFILL_RETIRE_CAP, delta_ranges, delta_retire_per_token, delta_subchunk, prefill_set_experts,
-    wave_count,
+    delta_ranges, delta_retire_per_token, delta_subchunk, prefill_set_experts, wave_count,
 };
+use crate::family::prefill::mlx::PREFILL_RETIRE_CAP;
 use crate::{EngError, sched::GrowthPermit, tensor::ExecutionTensor};
 
 fn bad(message: &str) -> EngError {

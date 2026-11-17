@@ -215,22 +215,7 @@ pub(super) fn linear(
     weight: &ResidentPackedWeight,
     x: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
-    let &[_, input] = weight.logical_shape() else {
-        return Err(EngError::BadRequest(
-            "resident linear needs a rank-2 weight".into(),
-        ));
-    };
-    let count = x
-        .shape()
-        .iter()
-        .try_fold(1u64, |n, &d| n.checked_mul(u64::from(d)));
-    if count != Some(u64::from(input)) {
-        return Err(EngError::BadRequest(
-            "resident linear input width differs from the weight".into(),
-        ));
-    }
-    let flat = ctx.kernels.reshape(x, &[1, input])?;
-    ctx.kernels.qmm(&flat, weight)
+    ctx.kernels.qmm_row(x, weight)
 }
 
 /// The rank-2 form of `linear`: every row of `[rows, input]` meets the weight in

@@ -111,8 +111,7 @@
 //! ```
 
 use super::super::chunk_plan::{
-    ChunkCost, PREFILL_CANDIDATES, PREFILL_RETIRE_CAP, PrefillTerms, admitted_chunk,
-    delta_retire_per_token, delta_subchunk,
+    ChunkCost, PrefillTerms, admitted_chunk, delta_retire_per_token, delta_subchunk,
 };
 use super::super::decode_timing::{read_prompt_ids, required_activation_from_env};
 use super::super::decoder::ResidentDecoder;
@@ -129,6 +128,7 @@ use super::super::tool_forward::{
 };
 use super::super::weights::RMixer;
 use super::{attn, delta, moe};
+use crate::family::prefill::mlx::{PREFILL_CANDIDATES, PREFILL_RETIRE_CAP};
 use crate::{
     EngError,
     family::{

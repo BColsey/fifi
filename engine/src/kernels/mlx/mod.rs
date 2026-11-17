@@ -985,6 +985,31 @@ impl MlxKernels {
         timing::timed(timing::Kind::Readback, || self.context.readback(source))
     }
 
+    /// Project one activation row through a packed `[out, in]` weight. Resident
+    /// callers may supply any input shape with exactly `in` elements.
+    pub(crate) fn qmm_row(
+        &mut self,
+        x: &ExecutionTensor,
+        weight: &ResidentPackedWeight,
+    ) -> Result<ExecutionTensor, EngError> {
+        let &[_, input] = weight.logical_shape() else {
+            return Err(EngError::BadRequest(
+                "resident linear needs a rank-2 weight".into(),
+            ));
+        };
+        let count = x
+            .shape()
+            .iter()
+            .try_fold(1u64, |n, &d| n.checked_mul(u64::from(d)));
+        if count != Some(u64::from(input)) {
+            return Err(EngError::BadRequest(
+                "resident linear input width differs from the weight".into(),
+            ));
+        }
+        let flat = self.reshape(x, &[1, input])?;
+        self.qmm(&flat, weight)
+    }
+
     pub fn qmm(
         &mut self,
         activation: &ExecutionTensor,
