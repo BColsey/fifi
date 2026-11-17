@@ -18,7 +18,7 @@
 //! `Select`, `AttnCore`, then `MixerOut` (the out-projection of either mixer), `HyperApplyA`,
 //! `HyperReadM`, `Route`, `GateUp`, `Swiglu`, `Down`, `Combine`, `HyperApplyM`; after the last
 //! layer `FinalMix`, `LmHead`, `Argmax`, `Advance`. The EXL3 MoE block runs the routed and shared
-//! experts as one op in stream order (`qwen36/cuda/exl3_moe.rs`), so the tensors it touches are live
+//! experts as one op in stream order (`family/exl3/moe.rs`), so the tensors it touches are live
 //! from `GateUp` to `Combine`.
 //!
 //! # Rows
@@ -39,7 +39,10 @@
 use super::state::{FlashGeometry, StateBytes, StatePlan, overflow, product, sum};
 use crate::{
     EngError,
-    family::flash_next::moe::context_budget::KvFormat,
+    family::{
+        flash_next::moe::context_budget::KvFormat,
+        project::exl3_jobs_plan::{MAX_EXL3_ROWS, exl3_job_bytes},
+    },
     kernels::cuda::{
         ArenaPlan, ArenaTensor, plan_arena,
         prefill::gdn_scan_seq::{cpf_dn_conv_out_bytes, cpf_dn_scan_out_bytes},
@@ -55,9 +58,17 @@ use crate::{
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
 
-/// Most rows of one decode step, as in Qwen3.6 (`MAX_STEP_ROWS`): the merged expert launches take
-/// at most 8 rows and the verify window is capped there.
-pub(super) const MAX_STEP_ROWS: usize = 8;
+/// Most rows of one decode step. Qwen3.6 caps the merged expert launches at 8 rows and its
+/// verify window there; the Flash-Next chunk driver builds its plan at the prefill chunk width,
+/// whose shared expert splits its down groups at the kernel's 8-row bound, so the plan takes
+/// wider chunks: every doubling halves the per-layer-chunk drain count of a deep prefill.
+/// The bound is the shared `MAX_EXL3_ROWS`: `shared_rows` refuses wider windows whatever the
+/// caller. The kernel's dense job bound is wider still (`jobs_row_cap`, 256, exl3.cu), so
+/// raising this is a planning decision, not a kernel port; see `begin_chunk`.
+pub(super) const MAX_STEP_ROWS: usize = MAX_EXL3_ROWS;
+
+/// Shared by the arena charge, dense job writer and actual prefill Projector.
+pub(super) const PREFILL_TILE_ROWS: usize = 256;
 
 /// Splits of the QSA attention in a decode step unless the options say otherwise. The attended
 /// positions of a token are the selected blocks (2,048 at most) and the open tail; the part
@@ -156,12 +167,16 @@ pub(super) enum Slot {
     Exl3Xh,
     Exl3Z,
     Exl3Flag,
-    /// The device job table of a chunk's job-table projections: one entry (a chunk of at most
-    /// `MAX_STEP_ROWS` rows is one tile), 16 bytes.
+    /// The device job table of a chunk's job-table projections: one entry (a whole chunk,
+    /// whatever its row count within `MAX_STEP_ROWS`), 16 bytes.
     Exl3Jobs,
     /// f32 `[rows][vocab]`.
     Logits,
     ArgmaxPart,
+    /// Routed input/output row lists and the shared prefill job table.
+    PrefillPerm,
+    /// f32 `[rows][value_heads]`: a plain beta/alpha projection before column scatter.
+    PrefillY,
 }
 
 /// Phases of one layer plus the prologue and epilogue; the discriminant is the lifetime number.
@@ -306,12 +321,25 @@ fn exl3_scratch(geometry: &FlashGeometry, rows: usize) -> Result<(usize, usize),
         &geometry.qsa,
     );
     let (top_k, inter, shared_inter) = moe;
+    // The routed experts: one row runs the grouped launch of both projections (2 * top_k member
+    // rows); a chunk runs them as one job-table launch over its routed pairs, and the pair
+    // layout rotates the second projection's input from the partial tail, so the rotation
+    // face holds one routed face, not two.
+    let (routed_in, routed_out) = if rows == 1 {
+        (2 * top_k, top_k)
+    } else {
+        let routed = rows.checked_mul(top_k).ok_or_else(|| {
+            EngError::BadRequest("the chunk's routed pair count overflows".into())
+        })?;
+        (routed, routed)
+    };
     let mut launches = vec![
         // lm_head
         (rows, h, geometry.vocab),
-        // routed gate and up of every pick in one group, then the down group
-        (2 * top_k, h, inter),
-        (top_k, inter, h),
+        // the routed job table of the chunked prefill: one launch covers every pair of the
+        // chunk, so the rotation and the partials hold the whole chunk's pairs
+        (routed_in, h, inter),
+        (routed_out, inter, h),
         // shared gate and up as 2 * rows groups, then its down
         (2 * rows, h, shared_inter),
         (rows, shared_inter, h),
@@ -589,6 +617,53 @@ impl StepPlan {
             slots,
             arena,
         })
+    }
+
+    /// Extends the existing family list for shared prefill, retaining its row bound and indices.
+    pub(super) fn new_prefill(
+        geometry: &FlashGeometry,
+        rows: usize,
+        positions: usize,
+        options: &StepOptions,
+    ) -> Result<Self, EngError> {
+        let mut plan = Self::new(geometry, rows, positions, options)?;
+        let (dense_bytes, perm_bytes) =
+            exl3_job_bytes(rows, PREFILL_TILE_ROWS, geometry.experts, geometry.top_k)
+                .ok_or_else(overflow)?;
+        let mut list = SlotList {
+            rows,
+            slots: plan.slots,
+        };
+        list.slots
+            .iter_mut()
+            .find(|entry| entry.slot == Slot::Exl3Jobs)
+            .ok_or_else(|| refuse("the dense EXL3 job slot is missing".into()))?
+            .bytes = dense_bytes;
+        // One stream serializes dense and routed uses of the existing, pairs-sized EXL3 scratch.
+        list.add(Slot::PrefillPerm, Ok(perm_bytes), Phase::Route, Phase::Down)?;
+        list.add(
+            Slot::PrefillY,
+            product(&[rows, geometry.delta.value_heads, F32]),
+            Phase::Ple,
+            Phase::LmHead,
+        )?;
+        plan.slots = list.slots;
+        plan.arena = plan_arena(&plan.arena_tensors())?;
+        Ok(plan)
+    }
+
+    /// The full aligned scratch of the shared owner; no shared list is built while it is off.
+    pub(super) fn prefill_bytes(
+        enabled: bool,
+        geometry: &FlashGeometry,
+        rows: usize,
+        positions: usize,
+    ) -> Result<u64, EngError> {
+        if !enabled {
+            return Ok(0);
+        }
+        let plan = Self::new_prefill(geometry, rows, positions, &StepOptions::default())?;
+        u64::try_from(plan.arena_bytes()).map_err(|_| overflow())
     }
 
     pub(super) fn rows(&self) -> usize {

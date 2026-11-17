@@ -1,5 +1,7 @@
 #[cfg(test)]
 pub(crate) mod attention_reference;
+#[cfg(test)]
+pub(crate) mod gdn_reference;
 
 #[cfg(test)]
 mod evaluate_wall;
@@ -62,6 +64,54 @@ pub(crate) const ARENA_ALIGN: usize = 256;
 #[cfg_attr(not(any(test, feature = "native-cuda")), allow(dead_code))]
 pub(crate) const CHUNK_LIMIT: usize = 64 << 20;
 
+/// Host time blocked in the stream-synchronise of a completed pageable copy
+/// (`write_at` / `read_at`), split by direction. Armed by the same
+/// `INFERENCE_FLASH_NEXT_PROFILE` switch as the chunk phase profile: the split decides
+/// whether the routing host thread's block sits in the uploads or the readbacks.
+#[cfg_attr(not(any(test, feature = "native-cuda")), allow(dead_code))]
+pub(crate) mod page_io_block {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    pub(crate) static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static READBACK_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Arms or disarms the counters; the chunk profile's own switch passes the parsed
+    /// value, so this module names no variable of any family. Returns the value set.
+    pub(crate) fn arm(on: bool) -> bool {
+        let _ = ENABLED.set(on);
+        on
+    }
+
+    /// Whether any copy is being recorded; reading this never arms the switch. The
+    /// pageable-copy path reads it before taking any clock read, so the Qwen3.6 and Flint
+    /// copies that share that path pay one load and a branch while disarmed.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[inline]
+    pub(crate) fn armed() -> bool {
+        ENABLED.get().copied().unwrap_or(false)
+    }
+
+    /// Records `ns` spent blocked. The pageable-copy path calls this only after `armed()`
+    /// said yes; the guard here keeps the counter off for any other caller. Only the
+    /// native page-io wrappers call this, so it exists where they do.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[inline]
+    pub(crate) fn note(upload: bool, ns: u64) {
+        if ENABLED.get().copied().unwrap_or(false) {
+            (if upload { &UPLOAD_NS } else { &READBACK_NS }).fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Both counters and a reset; `None` when nothing was recorded.
+    pub(crate) fn take() -> Option<(u64, u64)> {
+        let up = UPLOAD_NS.swap(0, Ordering::Relaxed);
+        let down = READBACK_NS.swap(0, Ordering::Relaxed);
+        (up != 0 || down != 0).then_some((up, down))
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub mod cuda;
 
@@ -85,6 +135,33 @@ pub use packed::PackedWeight;
 pub use rope::{RopeSpec, RopeStep};
 
 use crate::EngError;
+
+/// Per-adapter budget of distinct baked keys, not tapes or bytes. Settings need this
+/// checked value on every backend, even when the native compile registry is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramLimit(usize);
+
+impl Default for ProgramLimit {
+    fn default() -> Self {
+        Self(8)
+    }
+}
+
+impl ProgramLimit {
+    pub(crate) fn new(value: usize) -> Result<Self, EngError> {
+        // Vec<u64> must be addressable even if the registry eventually fills the budget.
+        if value == 0 || value > isize::MAX as usize / size_of::<u64>() {
+            return Err(EngError::BadRequest(
+                "compile_program_limit must be positive and fit the registry address space".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationMode {

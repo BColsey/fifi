@@ -1,7 +1,7 @@
 //! Flash-Next QSA decode step (design section "QSA").
 
-use super::math::{dot, expect_len, rms0, rope_half, sigmoid};
 use crate::EngError;
+use crate::family::math::{dot, expect_len, rms0, rope_half, sigmoid};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]

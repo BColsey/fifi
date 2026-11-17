@@ -1,4 +1,4 @@
-//! Device tests of the shared expert inside the routed launches (`exl3_moe/merge.rs`). All are
+//! Device tests of the shared expert inside the routed launches (`family/exl3/moe/merge.rs`). All are
 //! `#[ignore]`: they need the 3090 held exclusively and the pinned 4.00 pack in
 //! `FIFI_EXL3_CHECKPOINT`, and run in a window with its own authorization.
 //!
@@ -20,7 +20,9 @@
 //!   outputs; and the routed pairs of that launch against the default 16-pair launch.
 //! - `shared_in_routed_graph_has_seven_fewer_kernel_nodes`: the captured block has exactly 7
 //!   nodes fewer per layer.
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::{collections::BTreeSet, path::Path};
 
 use super::{
@@ -31,11 +33,9 @@ use super::{
         run_exl3_moe,
     },
     exl3_moe_source::moe_weights,
-    exl3_source::PackReader,
-    layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
 };
+use crate::family::exl3::source::PackReader;
 use crate::{
     EngError,
     family::project::cuda::{

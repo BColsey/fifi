@@ -390,6 +390,8 @@ fn engine_input(
             .map_err(|error| super::describe_error(&error));
     let env = crate::family::qwen36::settings::Q36Env {
         cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
     };
     let effective = effective_rows(engine, &env);
     EngineInput {
@@ -832,6 +834,11 @@ mod tests {
         let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
         std::fs::set_permissions(&readonly, perms).expect("locked");
+        if std::fs::File::create(readonly.join("probe")).is_ok() {
+            std::fs::remove_file(readonly.join("probe")).ok();
+            println!("SKIPPED: this process can write into a 0500 directory (runs as root)");
+            return;
+        }
         let destination = readonly.join("bundle.json");
         let error = super::write_atomically(&destination, "{}").expect_err("refused");
         assert!(error.contains("cannot write"), "{error}");
@@ -923,6 +930,7 @@ mod tests {
         // process environment: tests must not depend on Q36_CACHE_LIMIT.
         let env = crate::family::qwen36::settings::Q36Env {
             cache_limit: Some("8589934592".to_string()),
+            ..crate::family::qwen36::settings::Q36Env::default()
         };
         // Deliberately NOT asserting row count or keys: the resolver owns
         // the surface; the bundle only carries it with origins attached.

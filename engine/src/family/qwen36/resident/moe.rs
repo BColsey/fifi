@@ -23,9 +23,7 @@ use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values}
 use super::weights::{RDense, RMoe};
 use crate::{
     EngError,
-    family::{
-        flash_next::math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router,
-    },
+    family::{math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router},
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
@@ -566,7 +564,7 @@ mod tests {
     fn host_moe<'a>(
         oracle: &'a HostWeights,
         layer: usize,
-    ) -> MoeW<'a, crate::family::flash_next::stored::StoredWeight> {
+    ) -> MoeW<'a, crate::family::stored::StoredWeight> {
         let view = oracle.view();
         let m = view.layers[layer].as_moe().unwrap();
         MoeW {

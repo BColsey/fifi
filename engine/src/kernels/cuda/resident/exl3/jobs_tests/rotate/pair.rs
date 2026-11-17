@@ -104,25 +104,23 @@ fn run_pair(
     match how {
         How::Separate => {
             for at in 0..2 {
-                ctx.exl3_jobs_modes(stream, call(at)?, (false, false))?;
+                ctx.exl3_jobs_wide(stream, call(at)?, false)?;
             }
         }
         How::SeparateWarp => {
             for at in 0..2 {
-                ctx.exl3_jobs_modes(stream, call(at)?, (false, true))?;
+                ctx.exl3_jobs_wide(stream, call(at)?, true)?;
             }
         }
         How::Pair => {
-            let taken =
-                ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (true, Some(false)))?;
+            let taken = ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), true)?;
             assert_eq!(
                 taken, usable,
                 "the pair rotation runs exactly when the calls allow it"
             );
         }
         How::PairOff => {
-            let taken =
-                ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (false, Some(false)))?;
+            let taken = ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), false)?;
             assert!(!taken, "the pair rotation must not run with the switch off");
         }
         #[cfg(feature = "cuda-exl3-rotate-mutants")]

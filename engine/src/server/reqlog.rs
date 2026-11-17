@@ -8,7 +8,7 @@
 use super::error::ServerError;
 use super::wire::{FinishReason, Usage};
 use crate::EngError;
-use crate::sched::job::PrefixReport;
+use crate::sched::job::{PrefillBankReport, PrefillPieces, PrefixReport};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -100,6 +100,20 @@ struct Entry<'a> {
     /// failed, refused, or stop-string request logs no prefix keys, and neither does an executor
     /// without a prefix report.
     prefix: Option<PrefixReport>,
+    /// The expert-bank counters of the job (log-only): the delta between the samples
+    /// taken around the request. `None` keeps the `prefill_bank_*` keys out of the line.
+    prefill_bank: Option<PrefillBankReport>,
+    /// The prefill piece shape of the job (log-only): pieces fed and the largest piece's
+    /// token count. Zeros when no piece ran, and also the pump's fallback when it never
+    /// read the `Finished` event (a dropped stream, an error, or a never-started job), so
+    /// zeros alone do not distinguish those cases.
+    prefill_pieces: PrefillPieces,
+    /// The top-two logit margin at the request's first decode position (log-only): the
+    /// gap between the two largest logits of the row the first token came from. Null
+    /// (`None`) when no draw happened or the greedy device argmax returned only the
+    /// selected token (no runner-up logit); zero means the top two tied. A small value
+    /// flags the flip risk behind greedy divergence between serving paths.
+    first_token_margin: Option<f32>,
 }
 
 /// Milliseconds with one decimal.
@@ -112,6 +126,12 @@ fn rate(tokens: u32, span: Duration) -> Option<f64> {
         return None;
     }
     Some((f64::from(tokens) / span.as_secs_f64() * 100.0).round() / 100.0)
+}
+
+/// The first-token margin rounded to six decimals: `serde_json` stores an `f32` as an
+/// `f64`, so an unrounded `0.3_f32` would print `0.30000001192092896`.
+fn margin(value: f32) -> f64 {
+    (f64::from(value) * 1_000_000.0).round() / 1_000_000.0
 }
 
 /// The log line without the final newline. `queue_wait_ms` and
@@ -134,6 +154,9 @@ fn render(entry: &Entry<'_>) -> String {
         "prompt_tokens": entry.prompt_tokens,
         "completion_tokens": entry.completion_tokens,
         "reused_tokens": entry.reused_tokens,
+        "prefill_pieces": entry.prefill_pieces.count,
+        "prefill_max_piece": entry.prefill_pieces.max_rows,
+        "first_token_margin": entry.first_token_margin.map(margin),
         "queue_wait_ms": entry.queue_wait.map(millis),
         "prefill_ms": entry.prefill.map(millis),
         "time_to_first_token_ms": entry.first_token.map(millis),
@@ -230,6 +253,33 @@ fn render(entry: &Entry<'_>) -> String {
                 json!(shadow.token_comparisons),
             );
         }
+    }
+    if let Some(bank) = entry.prefill_bank.as_ref()
+        && let Some(object) = line.as_object_mut()
+    {
+        // THIS request's prefill admits, as a before/after delta over the executor's
+        // admit-path counters (decode traffic never enters them). The histograms are arrays
+        // (`miss_histogram`: admits by their miss count; `route_histogram`: distinct experts
+        // per prefill resolve by row count), both bucketed 1, 2, 3-4, 5-8, ..., 1025-2048,
+        // 2049+ — buckets 0-2 carry the rows under the prefill's eight-row CPU-tail tiering,
+        // bucket 3 straddles the edge at exactly eight. `upload_bytes` counts the admit copies
+        // and the ring's streamed records; `upload_ns` is the admit copy spans' wall time,
+        // each ending in the store synchronize the copy path already performs.
+        object.insert("prefill_bank_passes".to_string(), json!(bank.passes));
+        object.insert("prefill_bank_misses".to_string(), json!(bank.misses));
+        object.insert(
+            "prefill_bank_miss_histogram".to_string(),
+            json!(bank.miss_histogram),
+        );
+        object.insert(
+            "prefill_bank_route_histogram".to_string(),
+            json!(bank.route_histogram),
+        );
+        object.insert(
+            "prefill_bank_upload_bytes".to_string(),
+            json!(bank.upload_bytes),
+        );
+        object.insert("prefill_bank_upload_ns".to_string(), json!(bank.upload_ns));
     }
     line.to_string()
 }
@@ -406,6 +456,9 @@ pub(crate) struct RequestLog {
     /// True after the handler marked a prefix boundary on this request.
     prefix_boundary: bool,
     prefix: Option<PrefixReport>,
+    prefill_bank: Option<PrefillBankReport>,
+    prefill_pieces: PrefillPieces,
+    first_token_margin: Option<f32>,
     /// The HTTP method and path that produced this request, and the prompt
     /// digests of the rendered prompt. Set by the handlers before any line
     /// is written; a log built by a test may leave them unset.
@@ -449,6 +502,9 @@ impl RequestLog {
             written: false,
             prefix_boundary: false,
             prefix: None,
+            prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
             method: Some(method),
             endpoint: Some(endpoint),
             digests: None,
@@ -511,8 +567,14 @@ impl RequestLog {
         finish: FinishReason,
         usage: &Usage,
         prefix: Option<&PrefixReport>,
+        prefill_bank: Option<&PrefillBankReport>,
+        prefill_pieces: PrefillPieces,
+        first_token_margin: Option<f32>,
     ) {
         self.prefix = prefix.copied();
+        self.prefill_bank = prefill_bank.cloned();
+        self.prefill_pieces = prefill_pieces;
+        self.first_token_margin = first_token_margin;
         self.write(
             Some(200),
             Outcome::Ok,
@@ -602,6 +664,9 @@ impl RequestLog {
             first_token,
             decode,
             prefix: self.prefix.filter(|_| self.prefix_boundary),
+            prefill_bank: self.prefill_bank.clone(),
+            prefill_pieces: self.prefill_pieces,
+            first_token_margin: self.first_token_margin,
         };
         let mut line = render(&entry);
         line.push('\n');
@@ -685,7 +750,7 @@ mod tests {
         stepped_clock,
     };
     use crate::EngError;
-    use crate::sched::job::{PrefixHit, PrefixReport};
+    use crate::sched::job::{PrefillBankReport, PrefillPieces, PrefixHit, PrefixReport};
     use crate::sched::worker::{Engine, EngineState};
     use crate::server::router::router;
     use crate::server::state::AppState;
@@ -705,18 +770,21 @@ mod tests {
     /// The keys of every line without a prefix boundary, sorted.
     /// The keys of a route-produced row: the serving path always sets the
     /// prompt digests after the prompt renders.
-    const ROUTE_KEYS: [&str; 24] = [
+    const ROUTE_KEYS: [&str; 27] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
         "engine",
         "error_code",
         "finish_reason",
+        "first_token_margin",
         "lcp_prev_request_tokens",
         "method",
         "model",
         "outcome",
+        "prefill_max_piece",
         "prefill_ms",
+        "prefill_pieces",
         "prompt_hash_1024",
         "prompt_hash_4096",
         "prompt_hash_anchors",
@@ -732,17 +800,20 @@ mod tests {
         "time_to_first_token_ms",
     ];
 
-    const KEYS: [&str; 19] = [
+    const KEYS: [&str; 22] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
         "engine",
         "error_code",
         "finish_reason",
+        "first_token_margin",
         "method",
         "model",
         "outcome",
+        "prefill_max_piece",
         "prefill_ms",
+        "prefill_pieces",
         "prompt_tokens",
         "queue_wait_ms",
         "request_id",
@@ -756,18 +827,21 @@ mod tests {
 
     /// The keys of a line whose request carried a prefix boundary: the keys above plus
     /// the `prefix_*` keys, sorted.
-    const PREFIX_KEYS: [&str; 35] = [
+    const PREFIX_KEYS: [&str; 38] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
         "engine",
         "error_code",
         "finish_reason",
+        "first_token_margin",
         "lcp_prev_request_tokens",
         "method",
         "model",
         "outcome",
+        "prefill_max_piece",
         "prefill_ms",
+        "prefill_pieces",
         "prefix_bytes",
         "prefix_entries",
         "prefix_evictions",
@@ -1140,7 +1214,14 @@ mod tests {
             "/v1/messages",
         );
         log.set_prompt_digests(&ids, 2999);
-        log.done(FinishReason::Stop, &Usage::new(3000, 0, 0), None);
+        log.done(
+            FinishReason::Stop,
+            &Usage::new(3000, 0, 0),
+            None,
+            None,
+            PrefillPieces::default(),
+            None,
+        );
         let line = &capture.lines_with_keys(&ROUTE_KEYS)[0];
         assert_eq!(line["method"], "POST");
         assert_eq!(line["endpoint"], "/v1/messages");
@@ -1189,6 +1270,7 @@ mod tests {
             queue_wait: None,
             prefill: None,
             stream: false,
+            first_token_margin: None,
             status: None,
             outcome: Outcome::Cancelled,
             error_code: None,
@@ -1199,7 +1281,38 @@ mod tests {
             first_token: None,
             decode: None,
             prefix: None,
+            prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
         }
+    }
+
+    #[test]
+    fn the_prefill_bank_keys_render_only_with_a_report() {
+        let mut entry = empty_entry();
+        let bare: Value = serde_json::from_str(&render(&entry)).expect("json");
+        assert!(bare.get("prefill_bank_misses").is_none());
+        assert_eq!(bare["prefill_pieces"], 0);
+        assert_eq!(bare["prefill_max_piece"], 0);
+        // The decode-side pick counters were removed with the lifetime semantics.
+        entry.prefill_bank = Some(PrefillBankReport {
+            passes: 4,
+            misses: 2,
+            miss_histogram: vec![2, 1, 1],
+            route_histogram: vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            upload_bytes: 123_456,
+            upload_ns: 1_070_000_000,
+        });
+        let line: Value = serde_json::from_str(&render(&entry)).expect("json");
+        assert_eq!(line["prefill_bank_passes"], 4);
+        assert!(line.get("prefill_bank_picks").is_none());
+        assert_eq!(line["prefill_bank_misses"], 2);
+        assert_eq!(line["prefill_bank_miss_histogram"], json!([2, 1, 1]));
+        assert_eq!(
+            line["prefill_bank_route_histogram"],
+            json!([1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(line["prefill_bank_upload_bytes"], 123_456);
+        assert_eq!(line["prefill_bank_upload_ns"], 1_070_000_000);
     }
 
     #[test]
@@ -1242,6 +1355,9 @@ mod tests {
                 "prompt_tokens": 21,
                 "completion_tokens": 10,
                 "reused_tokens": 3,
+                "prefill_pieces": 0,
+                "prefill_max_piece": 0,
+                "first_token_margin": null,
                 "queue_wait_ms": null,
                 "prefill_ms": null,
                 "time_to_first_token_ms": 1500.0,
@@ -1293,7 +1409,17 @@ mod tests {
         for _ in 0..batches {
             log.batch(1);
         }
-        log.done(FinishReason::Length, &Usage::new(21, batches, 0), None);
+        log.done(
+            FinishReason::Length,
+            &Usage::new(21, batches, 0),
+            None,
+            None,
+            PrefillPieces {
+                count: 94,
+                max_rows: 256,
+            },
+            None,
+        );
         drop(log);
         let mut lines = capture.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1358,6 +1484,9 @@ mod tests {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "reused_tokens": 0,
+                "prefill_pieces": 0,
+                "prefill_max_piece": 0,
+                "first_token_margin": null,
                 "queue_wait_ms": null,
                 "prefill_ms": null,
                 "time_to_first_token_ms": null,
@@ -1434,7 +1563,14 @@ mod tests {
         log.batch(0);
         log.batch(1);
         log.batch(2);
-        log.done(FinishReason::Stop, &Usage::new(4, 3, 1), None);
+        log.done(
+            FinishReason::Stop,
+            &Usage::new(4, 3, 1),
+            None,
+            None,
+            PrefillPieces::default(),
+            None,
+        );
         drop(log);
         let lines = capture.lines();
         assert_eq!(lines.len(), 1, "{:?}", capture.writes());
@@ -1467,7 +1603,14 @@ mod tests {
             "GET",
             "/v1/test",
         );
-        log.done(FinishReason::Stop, &Usage::new(4, 0, 0), None);
+        log.done(
+            FinishReason::Stop,
+            &Usage::new(4, 0, 0),
+            None,
+            None,
+            PrefillPieces::default(),
+            None,
+        );
         drop(log);
     }
 
@@ -1609,6 +1752,9 @@ mod tests {
             "prompt_tokens": 2_131,
             "completion_tokens": 2,
             "reused_tokens": 0,
+            "prefill_pieces": 7,
+            "prefill_max_piece": 512,
+            "first_token_margin": null,
             "queue_wait_ms": 2.0,
             "prefill_ms": 2.0,
             "time_to_first_token_ms": 4.0,
@@ -1769,6 +1915,9 @@ mod tests {
             "prompt_tokens": 21,
             "completion_tokens": 5,
             "reused_tokens": 0,
+            "prefill_pieces": 1,
+            "prefill_max_piece": 21,
+            "first_token_margin": 1.0,
             "queue_wait_ms": 2.0,
             "prefill_ms": 2.0,
             "time_to_first_token_ms": 4.0,
@@ -1902,6 +2051,9 @@ mod tests {
                 "prompt_tokens": 21,
                 "completion_tokens": 0,
                 "reused_tokens": 0,
+                "prefill_pieces": 0,
+                "prefill_max_piece": 0,
+                "first_token_margin": null,
                 "queue_wait_ms": null,
                 "prefill_ms": null,
                 "time_to_first_token_ms": null,

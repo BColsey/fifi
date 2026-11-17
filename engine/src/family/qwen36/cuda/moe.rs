@@ -30,6 +30,8 @@ use super::mixer_weights::DenseWeight;
 use super::shard::ShardTable;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
+
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::matmul_expert::{ExpertCall, ExpertSelect, ExpertStack};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
@@ -43,29 +45,14 @@ use crate::kernels::cuda::resident::router::{
 use crate::kernels::cuda::resident::swiglu_pack::SwigluPackCall;
 use crate::kernels::cuda::resident::swiglu_q8::SwigluQ8Call;
 use crate::kernels::cuda::{
-    CudaContext, DeviceBuffer, DeviceRange, DeviceStream, MatmulIo, NativeWeight, Projection,
-    TiledWeight, resident::quantize_q8_1::q8_1_bytes, xf_bytes,
+    DeviceBuffer, DeviceRange, MatmulIo, NativeWeight, Projection, TiledWeight,
+    resident::quantize_q8_1::q8_1_bytes, xf_bytes,
 };
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
 /// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`).
 const PACK_WIDTH: usize = 256;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::family) struct MoeDims {
-    /// Token rows; stage 1 runs this block at one row (verify windows need their own sizing).
-    pub(in crate::family) rows: usize,
-    /// Hidden size: the router and shared-projection width, the residual width.
-    pub(in crate::family) hidden: usize,
-    pub(in crate::family) n_expert: usize,
-    /// Experts picked per row.
-    pub(in crate::family) top_k: usize,
-    /// Rows of one expert's gate and up projections.
-    pub(in crate::family) inter: usize,
-    /// Rows of the shared expert's gate and up projections.
-    pub(in crate::family) shared_inter: usize,
-}
 
 impl MoeDims {
     pub(super) fn new(dims: &StepDims, rows: usize) -> Self {
@@ -138,6 +125,11 @@ pub(super) enum MoeOp {
     ExpertGateQ,
     /// The ONE merged up matmul of every pick slot (the twin of [`MoeOp::ExpertGateQ`]).
     ExpertUpQ,
+    /// The fused gate+up matvec of every pick slot ([`MoeOp::ExpertGateQ`] and
+    /// [`MoeOp::ExpertUpQ`] as ONE `matvec_expert` launch with the GLU gate): the kernel writes
+    /// silu(gate)*up into the FIRST half of each `ExpertGu` slot row, so the matching pack op is
+    /// [`MoeOp::SwigluExpertsGlu`]. Opt-in (`INFERENCE_CUDA_MOE_GLU_FUSE`).
+    ExpertGluQ,
     /// The shared expert's gate matvec against `Q8Moe` (`matvec_q`).
     SharedGateQ,
     /// The shared expert's up matvec against `Q8Moe`.
@@ -146,6 +138,9 @@ pub(super) enum MoeOp {
     SwigluSharedQ,
     /// The batched SwiGLU and q8_1 quantize of the eight slots into `Q8Down` (`swiglu_q8`).
     SwigluExperts,
+    /// [`MoeOp::SwigluExperts`] after [`MoeOp::ExpertGluQ`]: the activation is already in the
+    /// first half of each slot row, so the launch only quantizes (`glu_done`).
+    SwigluExpertsGlu,
     /// The ONE merged down matvec of every pick slot (`matvec_expert`, `x_per_slot` true, the
     /// per-slot rows of `Q8Down`).
     ExpertDownQ,
@@ -158,6 +153,20 @@ pub(super) enum MoeOp {
 /// combine. `top_k` slots make `3 * top_k + 14` ops.
 pub(super) fn moe_sequence(top_k: usize, layout: WeightLayout) -> Vec<MoeOp> {
     if layout == WeightLayout::Native {
+        if crate::family::project::cuda::moe_glu_fuse() {
+            // The gate+up pair collapses to the fused GLU launch, so 9 ops.
+            return vec![
+                MoeOp::Router,
+                MoeOp::ExpertGluQ,
+                MoeOp::SharedGateQ,
+                MoeOp::SharedUpQ,
+                MoeOp::SwigluSharedQ,
+                MoeOp::SwigluExpertsGlu,
+                MoeOp::ExpertDownQ,
+                MoeOp::SharedDownQ,
+                MoeOp::Combine,
+            ];
+        }
         // The per-slot triples collapse to one merged launch each, so a Native block is 10 ops.
         return vec![
             MoeOp::Router,
@@ -308,7 +317,7 @@ pub(super) fn op_slots(op: MoeOp) -> OpSlots {
             writes: &[Slot::ResidB],
             phase: Phase::Combine as usize,
         },
-        MoeOp::ExpertGateQ | MoeOp::ExpertUpQ => OpSlots {
+        MoeOp::ExpertGateQ | MoeOp::ExpertUpQ | MoeOp::ExpertGluQ => OpSlots {
             reads: &[Slot::Q8Moe, Slot::TopkId],
             writes: &[Slot::ExpertGu],
             phase: Phase::GateUp as usize,
@@ -323,7 +332,7 @@ pub(super) fn op_slots(op: MoeOp) -> OpSlots {
             writes: &[Slot::Q8Shared],
             phase: Phase::Swiglu as usize,
         },
-        MoeOp::SwigluExperts => OpSlots {
+        MoeOp::SwigluExperts | MoeOp::SwigluExpertsGlu => OpSlots {
             reads: &[Slot::ExpertGu],
             writes: &[Slot::Q8Down],
             phase: Phase::Swiglu as usize,
@@ -772,26 +781,6 @@ pub(super) struct MoeLayerWeights<'w> {
     pub(super) shared_down: DenseWeight<'w>,
 }
 
-/// The routing and residual ranges of the block: views of the step arena and the status word.
-pub(in crate::family) struct RouteBufs<'b> {
-    /// f32 `[hidden]`: the residual after the mixer add, the block input.
-    pub(in crate::family) resid_in: DeviceRange<'b>,
-    /// f32 `[hidden]`: the other residual buffer, the block output.
-    pub(in crate::family) resid_out: DeviceRange<'b>,
-    /// f32 `[hidden]`: the normalized row, the router input.
-    pub(in crate::family) norm_row: DeviceRange<'b>,
-    /// The router's logits scratch (`RouterLogits`).
-    pub(in crate::family) logits: DeviceRange<'b>,
-    /// i32 `[top_k]`: the pick ids, read on the device only.
-    pub(in crate::family) ids: DeviceRange<'b>,
-    /// f32 `[top_k]`: the renormalized pick weights.
-    pub(in crate::family) weights: DeviceRange<'b>,
-    /// f32: the shared gate, sigmoid-ed by the router.
-    pub(in crate::family) shared_gate: DeviceRange<'b>,
-    /// The status word the router ORs its fault bit into.
-    pub(in crate::family) status: DeviceRange<'b>,
-}
-
 /// The expert and shared-expert ranges of the block: views of the step arena, the input packs
 /// grouped in [`Packs`].
 pub(super) struct ExpertBufs<'b> {
@@ -933,15 +922,6 @@ impl MoeBuffers<'_> {
             },
         }
     }
-}
-
-/// The context and the one owned stream the block queues on. Grouping them keeps every function
-/// of this file at four arguments or fewer (the project rules).
-pub(in crate::family) struct Launch<'a> {
-    /// The adapter that owns every buffer of the block.
-    pub(in crate::family) ctx: &'a CudaContext,
-    /// The one owned stream: every op queues on it, and none of them makes the host wait.
-    pub(in crate::family) stream: &'a DeviceStream,
 }
 
 /// The block dims back from the facts [`check_block`] pins exactly, so that the launcher carries
@@ -1209,9 +1189,11 @@ fn op_pack(
 }
 
 /// The ONE merged gate/up matvec of the native block ([`MoeOp::ExpertGateQ`],
-/// [`MoeOp::ExpertUpQ`]): a single `matvec_expert` launch over the device ids, every slot reading
-/// the same `Q8Moe` row (`x_per_slot` false), writing slot `s`'s `rows` floats at column offset
-/// 0 (gate) or `inter` (up) of `ExpertGu` with the stride `2 * inter`.
+/// [`MoeOp::ExpertUpQ`], [`MoeOp::ExpertGluQ`]): a single `matvec_expert` launch over the device
+/// ids, every slot reading the same `Q8Moe` row (`x_per_slot` false), writing slot `s`'s `rows`
+/// floats at column offset 0 (gate) or `inter` (up) of `ExpertGu` with the stride `2 * inter`.
+/// The `ExpertGluQ` form takes both stacks in one launch (`glu_gate`), so the kernel writes
+/// silu(gate)*up into the FIRST half.
 fn op_expert_gu(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
@@ -1219,18 +1201,39 @@ fn op_expert_gu(
     op: MoeOp,
 ) -> Result<(), EngError> {
     let dims = dims_of(weights, bufs);
-    let (stack, offset) = match op {
-        MoeOp::ExpertGateQ => (&weights.gate, 0),
-        MoeOp::ExpertUpQ => (&weights.up, dims.inter),
+    let (stack, offset, glu_gate) = match op {
+        MoeOp::ExpertGateQ => (&weights.gate, 0, false),
+        MoeOp::ExpertUpQ => (&weights.up, dims.inter, false),
+        // the fused launch dots the UP stack and gates with the GATE stack
+        MoeOp::ExpertGluQ => (&weights.up, 0, true),
         _ => return Err(refuse("the merged gate/up launch takes a Q op".to_owned())),
     };
     let native = stack.native()?;
+    let gate_native = if glu_gate {
+        let gate = weights.gate.native()?;
+        // The kernel decodes both stacks with the UP launch's quant type, so a mismatched
+        // gate stack (equal block bytes, e.g. Q4_0 vs Q4_K) would silently decode wrong.
+        if gate.quant() != native.quant() {
+            return Err(refuse(format!(
+                "the fused gate/up launch needs identical stack quant (gate {:?}, up {:?})",
+                gate.quant(),
+                native.quant()
+            )));
+        }
+        Some(gate)
+    } else {
+        None
+    };
     let (moe, _, _) = bufs.expert.packs.q8()?;
     launch.ctx.matvec_expert(
         launch.stream,
         ExpertMatvecCall {
             ty: native.quant(),
             w_stack: native_stack(native)?,
+            glu_gate: match gate_native {
+                Some(g) => Some(native_stack(g)?),
+                None => None,
+            },
             ids: bufs.route.ids,
             x_q8: moe,
             x_per_slot: false,
@@ -1260,6 +1263,7 @@ fn op_expert_down(
         ExpertMatvecCall {
             ty: native.quant(),
             w_stack: native_stack(native)?,
+            glu_gate: None,
             ids: bufs.route.ids,
             x_q8: down,
             x_per_slot: true,
@@ -1331,13 +1335,23 @@ fn op_swiglu_q(
     op: MoeOp,
 ) -> Result<(), EngError> {
     let (_, down, shared) = bufs.expert.packs.q8()?;
-    let (gu, q8, n_ff, y_slot_stride, slots) = match op {
+    let (gu, q8, n_ff, y_slot_stride, slots, glu_done) = match op {
         MoeOp::SwigluExperts => (
             whole_of(&bufs.expert.expert_gu)?,
             down,
             dims.inter,
             2 * dims.inter,
             dims.top_k,
+            false,
+        ),
+        MoeOp::SwigluExpertsGlu => (
+            whole_of(&bufs.expert.expert_gu)?,
+            down,
+            dims.inter,
+            2 * dims.inter,
+            dims.top_k,
+            // the fused matvec already wrote silu(gate)*up into the first half
+            true,
         ),
         MoeOp::SwigluSharedQ => (
             whole_of(&bufs.expert.shared_gu)?,
@@ -1345,6 +1359,7 @@ fn op_swiglu_q(
             dims.shared_inter,
             2 * dims.shared_inter,
             1,
+            false,
         ),
         _ => return Err(refuse("the native swiglu takes a Q op".to_owned())),
     };
@@ -1356,6 +1371,7 @@ fn op_swiglu_q(
             n_ff,
             y_slot_stride,
             slots,
+            glu_done,
         },
     )
 }
@@ -1405,11 +1421,15 @@ pub(super) fn launch_op(
         MoeOp::SwigluExpert(_) => op_pack(launch, weights, bufs, op),
         MoeOp::SharedDown => op_shared(launch, weights, bufs, op),
         MoeOp::Combine => op_combine(launch, bufs, dims),
-        MoeOp::ExpertGateQ | MoeOp::ExpertUpQ => op_expert_gu(launch, weights, bufs, op),
+        MoeOp::ExpertGateQ | MoeOp::ExpertUpQ | MoeOp::ExpertGluQ => {
+            op_expert_gu(launch, weights, bufs, op)
+        }
         MoeOp::SharedGateQ | MoeOp::SharedUpQ | MoeOp::SharedDownQ => {
             op_shared_q(launch, weights, bufs, op)
         }
-        MoeOp::SwigluSharedQ | MoeOp::SwigluExperts => op_swiglu_q(launch, bufs, dims, op),
+        MoeOp::SwigluSharedQ | MoeOp::SwigluExperts | MoeOp::SwigluExpertsGlu => {
+            op_swiglu_q(launch, bufs, dims, op)
+        }
         MoeOp::ExpertDownQ => op_expert_down(launch, weights, bufs),
     }
 }
@@ -1420,9 +1440,22 @@ pub(super) fn run_moe_block(
     bufs: &MoeBuffers<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
+    run_moe_block_marked(launch, weights, bufs, dims, |_| Ok(()))
+}
+
+/// [`run_moe_block`] with a hook fired after each op: the step's section marks record the
+/// in-graph MoE sub-split (the `Router` end and the expert-matvec end) through it.
+pub(super) fn run_moe_block_marked(
+    launch: &Launch<'_>,
+    weights: &MoeLayerWeights<'_>,
+    bufs: &MoeBuffers<'_>,
+    dims: &MoeDims,
+    mut mark_after: impl FnMut(MoeOp) -> Result<(), EngError>,
+) -> Result<(), EngError> {
     check_block(dims, &weights.facts(), &bufs.facts())?;
     for op in moe_sequence(dims.top_k, bufs.expert.packs.kind().layout()) {
         launch_op(launch, weights, bufs, op)?;
+        mark_after(op)?;
     }
     Ok(())
 }

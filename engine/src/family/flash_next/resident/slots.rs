@@ -15,9 +15,9 @@
 //! set while it runs. With the release points above, the set of layer `L - 2` is always free at
 //! layer `L`, so two sets suffice and the third is slack.
 
-use super::super::stored::{RoleRange, StackLayout};
 use super::prefetch::{Admission, ExpertHint};
 use super::weights::RMoe;
+use crate::family::stored::{RoleRange, StackLayout};
 use crate::{
     EngError,
     kernels::{HostPages, PackedPages, PageRange},

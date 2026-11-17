@@ -32,12 +32,13 @@ use super::common_tests::dims as step_dims;
 use super::dims::{KvMode, StepOptions};
 use super::mixer_weights::DenseWeight;
 use super::moe::{
-    CardMoeOp, ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs,
-    StackWeights, moe_sequence_card, run_moe_block,
+    CardMoeOp, ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, StackWeights, moe_sequence_card,
+    run_moe_block,
 };
 use super::native_device_rig::{Rng, device_present, f32_buf, q4k_rows, q8_1_bytes, zero_buf};
 use super::shard::ShardTable;
 use crate::EngError;
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::project::cuda::served_admission;
 use crate::kernels::cuda::NativeWeight;

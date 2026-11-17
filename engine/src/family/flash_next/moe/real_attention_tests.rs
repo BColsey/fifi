@@ -19,10 +19,10 @@ use super::{
     super::{
         hyper::{self, HyperShape, HyperWeights},
         qsa::{self, QsaCache, QsaWeights},
-        stored::host_f32,
     },
     real_layer_tests::{input, matrix, open, relative_l2, relative_l2_f64, widened},
 };
+use crate::family::stored::host_f32;
 use crate::{
     family::{
         flash_next::load::model_shape,

@@ -10,9 +10,9 @@ use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
+        exl3_merge_plan::{Intent, SHARED_IN_ROUTED_VAR, Source},
         project::cuda::WeightLayout,
         qwen36::{
-            exl3_merge_plan::{Intent, SHARED_IN_ROUTED_VAR, Source},
             krow::{KrowFacts, SINGLE_GATHER_NAME, check_krow_arming},
             rollback::{ArmingFacts, Cover, RollbackPlan, check_arming, check_uncharged_slots},
         },

@@ -21,6 +21,7 @@ fn base() -> Nvfp4Args {
             m: 5,
             ld: 6144,
             col_off: 0,
+            cols_hint: 0,
         },
         y_scale: at(0x5000_0000).cast(),
     }
@@ -39,7 +40,7 @@ fn nvfp4_native_fill_pins_real_dense_shape_and_legacy_refusals() {
     assert_eq!(view[5], args.y_scale as u64);
     assert_eq!(&view[8..14], &[2048, 6144, 5, 32, 5, 6144]);
     assert_eq!(view[26], 40);
-    assert_eq!(size_of::<MmqDenseArgsRaw>(), 64);
+    assert_eq!(size_of::<MmqDenseArgsRaw>(), 72);
     assert_eq!(
         super::super::tests::fill(&args.matrix).err(),
         Some(STATUS_INVALID_ARGUMENT)

@@ -146,6 +146,9 @@ pub(crate) struct CudaContext {
     pub(in crate::kernels::cuda) mmq_facts: MmqFactsCache,
     // Device region of one argmax reduction, allocated on first use.
     argmax_scratch: RefCell<Option<DeviceBuffer>>,
+    /// The device regions of the pointer-table EXL3 launch, one per stream id: written by a
+    /// stream-ordered host copy that never waits on the device, grown when a batch outgrows one.
+    exl3_table_regions: RefCell<Vec<(u64, DeviceBuffer)>>,
     /// Workspace allocations made, the first one included; tests compare it.
     #[cfg(test)]
     workspace_allocations: std::cell::Cell<usize>,
@@ -161,8 +164,6 @@ pub(crate) struct CudaContext {
         std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
     /// Whether the one-tile wide launches may take the rate 10 and rate 6 body of book 2.
     pub(in crate::kernels::cuda) exl3_odd_rates: std::cell::Cell<bool>,
-    /// Whether the grouped launches may fuse the input rotation into the projection kernel.
-    pub(in crate::kernels::cuda) exl3_fused_in: std::cell::Cell<bool>,
     /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
@@ -381,6 +382,7 @@ impl CudaContext {
             growth,
             mmq_facts: MmqFactsCache::default(),
             argmax_scratch: RefCell::new(None),
+            exl3_table_regions: RefCell::new(Vec::new()),
             pinned_stage: RefCell::new(None),
             #[cfg(test)]
             workspace_allocations: std::cell::Cell::new(1),
@@ -391,7 +393,6 @@ impl CudaContext {
             exl3_single_row_default: std::cell::Cell::new(None),
             exl3_indexed_default: std::cell::Cell::new(None),
             exl3_odd_rates: std::cell::Cell::new(false),
-            exl3_fused_in: std::cell::Cell::new(false),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]
@@ -1088,6 +1089,63 @@ impl CudaContext {
         Ok(buffer)
     }
 
+    /// Stages the record table of a pointer-table EXL3 launch on `stream` and returns the device
+    /// address of the records. One region per stream, written by a stream-ordered host copy: the
+    /// copy lands behind the kernel that read the previous table, so the launch path never waits
+    /// on the device the way a cached upload would (its reuse settles, a full sync). Grown when a
+    /// batch outgrows the region; the replaced region frees only after its readers ran.
+    pub(in crate::kernels::cuda) fn stage_exl3_indexed_table(
+        &self,
+        stream: &DeviceStream,
+        records: &[u8],
+    ) -> Result<*mut std::ffi::c_void, EngError> {
+        self.ensure_usable()?;
+        graph::ensure_closed("an upload")?;
+        // Before the copy takes the stream's raw handle: a stream of another adapter must be
+        // refused before it receives any work (launch_on checks only after its launches).
+        stream::same_adapter(&self.lease, stream.lease(), "stream")?;
+        if records.is_empty() {
+            return Err(EngError::BadRequest(
+                "EXL3 indexed table: empty records".into(),
+            ));
+        }
+        let stream_raw = stream.raw()?;
+        let _dispatch = self.enter()?;
+        let mut regions = self
+            .exl3_table_regions
+            .try_borrow_mut()
+            .map_err(|_| workspace_in_use())?;
+        let region = match regions.iter_mut().find(|(id, _)| *id == stream.id()) {
+            Some((_, buffer)) => {
+                if buffer.bytes() < records.len() {
+                    // The free entry device-syncs before cudaFree, so readers of the replaced
+                    // region have completed; growth pays that sync (rare, only when a batch
+                    // outgrows the region).
+                    *buffer = DeviceBuffer::allocate(
+                        &self.lease,
+                        records.len().max(buffer.bytes() * 2).max(4096),
+                    )?;
+                }
+                buffer
+            }
+            None => {
+                regions.push((
+                    stream.id(),
+                    DeviceBuffer::allocate(&self.lease, records.len().max(4096))?,
+                ));
+                &mut regions.last_mut().expect("just pushed").1
+            }
+        };
+        let raw = self.owned(region)?;
+        // Unreachable in practice (`records.len()` was checked non-zero and the region grown to
+        // fit); a `None` would mean the byte math above disagrees with `RawRange::new`.
+        let range = native::resident::RawRange::new(raw, 0, records.len()).ok_or_else(|| {
+            EngError::BadRequest("EXL3 indexed table: the region does not fit the records".into())
+        })?;
+        native::resident::copy_h2d_enqueue(range, records, stream_raw).map_err(device_error)?;
+        Ok(range.address())
+    }
+
     /// The tiles are group-major, so each chunk lands at the byte offset of
     /// its first group.
     fn upload_groups(
@@ -1368,7 +1426,7 @@ pub(crate) fn drop_page_cache(file: &std::fs::File, offset: u64, len: u64) -> Re
     })
 }
 
-fn device_error(failure: DeviceFailure) -> EngError {
+pub(crate) fn device_error(failure: DeviceFailure) -> EngError {
     native_error(&TERMINAL, graph::operation_of(&failure), failure.status)
 }
 

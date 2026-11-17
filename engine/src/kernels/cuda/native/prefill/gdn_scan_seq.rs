@@ -101,6 +101,25 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_scan_chunk_launch"]
+    fn gdn_scan_chunk_launch_raw(
+        args: *const GdnScanSeqArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+}
+
+#[cfg(all(test, feature = "cuda-fault-qualification"))]
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch"]
+    fn gdn_scan_chunk_fault_bad_bounds_raw(
+        args: *const GdnScanSeqArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+}
+
 #[cfg(all(test, feature = "cuda-gdn-mutants"))]
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_scan_seq_cols_bad_bounds_launch"]
@@ -331,6 +350,25 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_launch(
     checked(status, stage)
 }
 
+/// Queues the chunk-parallel WY scan (the state updated in place, the pre-norm rows
+/// written), then the same gated output RMSNorm in place on the same rows. Same checks and
+/// same written bytes as [`gdn_scan_seq_launch`]; the scan values differ from the
+/// sequential kernel's only by rounding.
+pub(in crate::kernels::cuda) fn gdn_scan_chunk_launch(
+    stream: &RawStream,
+    io: GdnScanSeqRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_scan(&io)?;
+    let args = c_args(&io);
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_scan_seq_launch`: `check_scan` proved every range inside its live
+    // allocation, large enough, 4-byte aligned, and `state` and `o_out` disjoint from every
+    // other range; the entry repeats the checks on the addresses. `args` lives across the
+    // call, `stage` is a live writable `c_int` and `stream` is live for the call.
+    let status = unsafe { gdn_scan_chunk_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
 /// The launch of `gdn_scan_seq_cols_k` with a deliberately violated p0 bound, so its own device re-check
 /// (no state load, NaN rows, mask 8) is the code under test; every other rule of the call holds.
 /// Mutation-test build only.
@@ -371,5 +409,24 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_fault_bad_bounds(
     // SAFETY: as `gdn_scan_seq_launch`; the guards refuse before any state access, and the
     // NaN writes stay inside the proved `o_out` range.
     let status = unsafe { gdn_scan_seq_fault_bad_bounds_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The chunk-parallel twin of [`gdn_scan_seq_fault_bad_bounds`]: the same deliberately
+/// violated p0 bound, but against `gdn_scan_chunk_k`, whose device re-check (no state
+/// load, NaN of its full (m x kCols) o_out tile per block, mask 8) is the code under test.
+/// Qualified fault path only.
+#[cfg(all(test, feature = "cuda-fault-qualification"))]
+pub(in crate::kernels::cuda) fn gdn_scan_chunk_fault_bad_bounds(
+    stream: &RawStream,
+    io: GdnScanSeqRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_scan(&io)?;
+    let mut args = c_args(&io);
+    args.p0 = io.ints.ctx_tokens; // ctx_tokens + m > ctx_tokens: the violation
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_scan_chunk_launch`; the guard refuses before any state access, and
+    // the NaN sweep stays inside the proved `o_out` range.
+    let status = unsafe { gdn_scan_chunk_fault_bad_bounds_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }

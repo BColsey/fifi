@@ -25,7 +25,7 @@ pub fn route(logits: &[f32]) -> Result<Routed, EngError> {
     }
     let scores: Vec<_> = logits
         .iter()
-        .map(|&x| super::super::flash_next::math::sigmoid(x))
+        .map(|&x| crate::family::math::sigmoid(x))
         .collect();
     route_experts(&scores, &Router::SigmoidTopK, 6)
 }

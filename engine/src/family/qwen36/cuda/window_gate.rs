@@ -3,8 +3,9 @@
 //!
 //! A failed or indeterminate window commit poisons the state and sets `needs_reset`. Only
 //! `reset_state` clears it.
-use super::super::{book::Health, state::export::ExportedState};
+use super::super::state::export::ExportedState;
 use super::QwenResidentStep;
+use crate::family::graph_state::book::Health;
 use crate::{EngError, family::qwen36::window_logic};
 
 impl QwenResidentStep<'_> {

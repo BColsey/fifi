@@ -58,13 +58,12 @@
 use super::dims::{KvMode, StepDims, StepOptions};
 use crate::{
     EngError,
-    family::AttentionKind,
-    kernels::cuda::resident::step_params::{RESULT_PAIR_BYTES, STEP_PARAMS_BYTES},
+    family::{AttentionKind, kv_format::KvRowShape},
 };
 
 /// Offsets inside a state pool are multiples of this many bytes (the `cudaMalloc` alignment, as
-/// in the arena planner).
-pub(super) const STATE_ALIGN: usize = 256;
+/// in the arena planner). The shared words contract owns the constant.
+use crate::family::state_words::STATE_ALIGN;
 /// Values per fp16 scale in the `Int8G32` format.
 pub(super) const KV8_GROUP: usize = 32;
 const HALF: usize = 2;
@@ -235,15 +234,25 @@ impl KvPool {
         Ok(layout)
     }
 
+    /// The aligned per-layer stride the pool reserves (K/V and scale planes, alignment
+    /// rounded); the golden pins this and `total` together.
+    pub(super) fn layer_stride(&self) -> usize {
+        self.layer_stride
+    }
+
     /// KV bytes for one position over all attention layers (exact, not rounded to the alignment).
     pub(crate) fn bytes_per_token(dims: &StepDims, mode: KvMode) -> Result<usize, EngError> {
         let a = &dims.shape.attn;
-        let width = mul(a.heads_kv, a.head_dim)?;
-        let per_plane = match mode {
-            KvMode::Fp16 => mul(width, HALF)?,
-            KvMode::Int8G32 => add(width, mul(width / KV8_GROUP, HALF)?)?,
-        };
-        mul(mul(per_plane, 2)?, dims.layers_of(AttentionKind::Full))
+        // The per-layer K/V bytes are the shared arithmetic; the layer count is this
+        // family's geometry. One behavior change beyond any caller: the shared form
+        // refuses a head_dim that is not a multiple of the group, where the old divide
+        // truncated silently.
+        let per_layer = usize::try_from(mode.format().layer_position_bytes(KvRowShape {
+            heads_kv: a.heads_kv as u64,
+            head_dim: a.head_dim as u64,
+        })?)
+        .map_err(|_| overflow())?;
+        mul(per_layer, dims.layers_of(AttentionKind::Full))
     }
 
     fn plane_start(&self, ordinal: usize, plane: Plane) -> Result<usize, EngError> {
@@ -336,49 +345,6 @@ impl KvPool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Word {
-    StepParams,
-    /// The result pair `{token, status}`; the host copies these 8 bytes after a step.
-    ResultPair,
-    /// The prefill status word; the host zeroes it at chunk open
-    /// (`ResidentState::clear_prefill_status`), not the first kernel of the chunk.
-    PrefillStatus,
-}
-
-// The merged ABI: the pair must be 8-aligned in its slot and every word must fit one slot.
-const _: () = assert!(
-    Word::StepParams.bytes() == 32 && Word::ResultPair.bytes() == 8,
-    "the words block is laid out for StepParams of 32 bytes and a result pair of 8 bytes"
-);
-const _: () = assert!(
-    Word::StepParams.bytes() <= STATE_ALIGN
-        && Word::ResultPair.bytes() <= STATE_ALIGN
-        && Word::PrefillStatus.bytes() <= STATE_ALIGN
-        && Word::ResultPair.offset().is_multiple_of(8)
-);
-
-impl Word {
-    /// Bytes the kernels use: `STEP_PARAMS_BYTES` (32) and `RESULT_PAIR_BYTES` (8), taken from the
-    /// kernel wrapper, and one i32 for the prefill status.
-    pub(crate) const fn bytes(self) -> usize {
-        match self {
-            Self::StepParams => STEP_PARAMS_BYTES,
-            Self::ResultPair => RESULT_PAIR_BYTES,
-            Self::PrefillStatus => 4,
-        }
-    }
-
-    /// Byte offset in the words block: one `STATE_ALIGN` slot per word, in declaration order.
-    pub(crate) const fn offset(self) -> usize {
-        match self {
-            Self::StepParams => 0,
-            Self::ResultPair => STATE_ALIGN,
-            Self::PrefillStatus => 2 * STATE_ALIGN,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WordsBlock {
     pub(crate) total: usize,
 }
@@ -430,3 +396,5 @@ impl StateLayout {
         })
     }
 }
+
+use crate::family::state_words::Word;

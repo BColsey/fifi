@@ -3,14 +3,22 @@
 //! bank. The expert outputs are synthetic and deterministic; the device test (ignored) runs the
 //! real kernels on a real layer.
 
-use super::{
-    bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
-    moe_block::{
-        PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-        plan_second_pass,
-    },
+use super::moe_block::{
+    PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
+    pick_union, plan_second_pass,
 };
-use crate::{EngError, family::flash_next::moe::slot_bank::SlotBankLayout};
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
+use crate::{
+    EngError,
+    family::{flash_next::moe::slot_bank::SlotBankLayout, project::exl3_jobs_plan::EXL3_JOB_WORDS},
+};
+// The planning items sit in the native-cuda device module; the scratch-size tests above run on
+// every host, so only these imports carry the gate.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use {
+    super::moe_block::{source_offsets, source_plan},
+    crate::family::project::cuda::exl3_jobs::PairPlan,
+};
 
 const EXPERTS: usize = 512;
 const TOP_K: usize = 10;
@@ -151,6 +159,10 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
         (layout.miss_ids, 40),
         (layout.miss_weights, 40),
         (layout.partial, 2560 * 4),
+        // The job-table perm region: the two sources' lists and job tables together —
+        // 2 list words plus one 4-word job record per pair (a source's jobs are at most its
+        // pairs) — at routed = rows·top_k = 10.
+        (layout.perm, 240),
     ];
     for (index, &(offset, bytes)) in regions.iter().enumerate() {
         assert_eq!(offset % 256, 0, "region {index}");
@@ -159,7 +171,91 @@ fn the_private_scratch_is_aligned_disjoint_and_small() {
             assert!(offset + bytes <= other || other + other_bytes <= offset);
         }
     }
-    assert_eq!(layout.total, 24_576, "24 KiB at the real sizes");
+    assert_eq!(layout.total, 24_832, "24.25 KiB at the real sizes");
+}
+
+/// The perm region is the last region and covers the widest split of the chunk's pairs over
+/// the two sources even when every pair is its own job; the allocation grows with the planned
+/// chunk width (the row-indexed regions scale with it).
+#[test]
+fn the_private_scratch_covers_the_widest_chunk_plan() {
+    let one = ScratchLayout::new(512, 10, 2560, 1).unwrap();
+    for (rows, routed) in [(32usize, 320usize), (64, 640)] {
+        let layout = ScratchLayout::new(512, 10, 2560, rows).unwrap();
+        assert_eq!(layout.rows, rows);
+        // The perm region is last; its size is 2 list words plus one job record (4 words) per
+        // pair — the worst case is every pair in one source with a job of its own, and the two
+        // sources sum to the same bound.
+        assert_eq!(
+            layout.total - layout.perm,
+            (2 + EXL3_JOB_WORDS) * routed * 4
+        );
+        assert!(layout.total > one.total);
+        // The row-indexed regions grow by more than the perm region alone.
+        assert!(layout.total - one.total > (routed - 10) * (2 + EXL3_JOB_WORDS) * 4);
+    }
+}
+
+/// One source's counting sort: sorted positions map back to the chunk's pair positions, and
+/// a slot id outside the source's slots refuses the chunk.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[test]
+fn source_plan_maps_sorted_positions_to_chunk_pairs() {
+    // A chunk of 2 rows, top_k 2: pair = row·2 + rank. Pairs 0, 2 and 3 pick bank slots
+    // (5, 5, 0); pair 1 picks the ring (slot 9).
+    let ids = [5i32, 9, 5, 0];
+    let bank = source_plan(&ids, &[0, 2, 3], 8, 2).unwrap();
+    assert_eq!(bank.counts, {
+        let mut counts = vec![0usize; 8];
+        counts[0] = 1;
+        counts[5] = 2;
+        counts
+    });
+    // Slot 0 owns pair 3 (row 1); slot 5 owns pairs 0 and 2 (rows 0 and 1), chunk order kept.
+    assert_eq!(bank.order, [1, 0, 1]);
+    assert_eq!(bank.scatter, [3, 0, 2]);
+    let ring = source_plan(&ids, &[1], 16, 2).unwrap();
+    assert_eq!(ring.counts, {
+        let mut counts = vec![0usize; 16];
+        counts[9] = 1;
+        counts
+    });
+    assert_eq!(ring.order, [0]);
+    assert_eq!(ring.scatter, [1]);
+    // A slot id outside the source's slots is a router fault, refused.
+    assert!(matches!(
+        source_plan(&ids, &[1], 8, 2),
+        Err(EngError::ModelOutput(_))
+    ));
+}
+
+/// The two sources' lists and job tables pack into the perm region back to back, and their
+/// gate/up segments tile the pair faces in source order.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[test]
+fn source_offsets_pack_the_perm_region() {
+    // Counts drive the job tables: one job per expert with rows (the 64-row tile never splits
+    // these small counts), so the bank (3 + 1 rows over two experts) takes two jobs.
+    let bank = PairPlan {
+        counts: vec![3, 1],
+        order: vec![],
+        scatter: vec![],
+    };
+    let ring = PairPlan {
+        counts: vec![2],
+        order: vec![],
+        scatter: vec![],
+    };
+    let (sub_bank, sub_ring) = ([0usize, 1, 2, 3], [4usize, 5]);
+    let (at_of, seg_of) = source_offsets(1_000, [&bank, &ring], [&sub_bank, &sub_ring]);
+    // Bank: 4 pairs and 2 jobs — (2·4 + 4·2)·4 bytes of lists and table.
+    assert_eq!(at_of, [1_000, 1_000 + (2 * 4 + EXL3_JOB_WORDS * 2) * 4]);
+    assert_eq!(seg_of, [0, 4]);
+    // Ring: 2 pairs and 1 job; the packing ends inside the perm formula's bound
+    // (2 words + one job record a pair over all 6 pairs, 3 jobs).
+    let end = at_of[1] + (2 * 2 + EXL3_JOB_WORDS) * 4;
+    assert_eq!(end - 1_000, (2 * 6 + EXL3_JOB_WORDS * 3) * 4);
+    assert!(end - 1_000 <= (2 + EXL3_JOB_WORDS) * 6 * 4);
 }
 
 #[test]
@@ -264,23 +360,28 @@ fn a_miss_pass_adds_each_missed_pick_once() {
     assert_eq!(classified.misses.len(), 2);
     let (result, inputs) = split(&mut state, &ids, &w, 0.6);
     let (slots, miss_weights) = inputs.miss.expect("two misses");
-    // The weights of the two passes add to the router's weights bit for bit, one pick per pick.
+    // The compact list carries the missed picks (rank positions 2 and 7) in pick order; every
+    // other pick contributes exactly +0.0 to the split by being absent, not by a filler entry.
+    assert_eq!(slots.len(), 2);
     for (pick, &weight) in w.iter().enumerate() {
-        let sum = classified.weights[pick] + miss_weights[pick];
-        assert_eq!(sum.to_bits(), weight.to_bits(), "pick {pick}");
         let missed = pick == 2 || pick == 7;
-        assert_eq!(miss_weights[pick] != 0.0, missed, "pick {pick}");
         assert_eq!(classified.weights[pick] != 0.0, !missed, "pick {pick}");
-        if !missed {
-            assert_eq!(slots[pick], 0, "a filler pick reads slot 0");
-            assert_eq!(miss_weights[pick].to_bits(), 0.0f32.to_bits());
-        }
+        let carried = match pick {
+            2 | 7 => miss_weights[if pick == 2 { 0 } else { 1 }],
+            _ => 0.0,
+        };
+        // The weights of the two passes add to the router's weights bit for bit.
+        assert_eq!(
+            (classified.weights[pick] + carried).to_bits(),
+            weight.to_bits(),
+            "pick {pick}"
+        );
     }
     // The missed picks sit on slots the copies filled, never on slot 0.
-    for &pick in &[2usize, 7] {
-        assert_ne!(slots[pick], 0);
+    for (entry, &pick) in [2usize, 7].iter().enumerate() {
+        assert_ne!(slots[entry], 0);
         assert_eq!(
-            state.expert_in_slot(0, slots[pick] as usize),
+            state.expert_in_slot(0, slots[entry] as usize),
             Some(ids[pick] as u16)
         );
     }
@@ -360,7 +461,8 @@ fn the_bank_state_after_a_pass_is_what_the_second_pass_reads() {
     assert_eq!((copies.hits, copies.ops.len()), (9, 1));
     let second = plan_second_pass(&ids, &w, &classified, state.slot_row(0)).unwrap();
     let (slots, _) = second.miss.unwrap();
-    assert_eq!(slots[9], i32::from(copies.ops[0].slot));
+    // Pick 9 is the only miss, so the compact list holds it at index 0.
+    assert_eq!(slots[0], i32::from(copies.ops[0].slot));
     // The classification made before the copies is stale after them: a second use of the old row
     // would send the missed pick to the filler.
     assert_eq!(row_before[200], -1);
@@ -412,4 +514,59 @@ fn a_non_finite_filler_row_is_found_by_pick() {
     let negative = [-0.0f32, 0.0, 0.4, 0.0];
     let first = le_rows(&[nan, finite.clone(), finite.clone(), finite.clone()]);
     assert_eq!(first_poisoned_filler(&first, HIDDEN, &negative), Some(0));
+}
+
+#[test]
+fn pick_union_keeps_each_distinct_id_first_use_first() {
+    let rows: Vec<&[i32]> = vec![&[7, 3, 7], &[3, 9], &[]];
+    assert_eq!(pick_union(&rows, 16), vec![7, 3, 9]);
+    // Duplicates inside one row and across rows collapse to the first use.
+    assert_eq!(pick_union(&[&[5, 0, 5], &[0, 5]], 8), vec![5, 0]);
+}
+
+#[test]
+fn slot_spans_fit_a_ring_smaller_than_the_bank_slot_row() {
+    let layout = layout();
+    let record = layout.record_bytes();
+    // A ring's spans over the SAME layout with FEWER slots, checked against the layout's own
+    // arithmetic - not against `bank_ranges`, which is what `SlotSpans::new` calls: each
+    // part's band starts at its record-0 offset and ends at that offset plus the part's own
+    // bytes plus one record stride per extra slot, so the whole band fits the ring's
+    // `slots * record_bytes` buffer, and a one-slot ring keeps exactly the base record ranges.
+    for slots in [1usize, 2, 7, 16] {
+        let spans = SlotSpans::new(&layout, slots).unwrap();
+        for part in 0..3 {
+            let base = layout.part(part);
+            let bands = [&base.trellis, &base.suh, &base.svh];
+            let got = [
+                &spans.parts[part].trellis,
+                &spans.parts[part].suh,
+                &spans.parts[part].svh,
+            ];
+            for (band, got) in bands.iter().zip(got) {
+                let (band, got) = (
+                    band as &std::ops::Range<usize>,
+                    got as &std::ops::Range<usize>,
+                );
+                assert_eq!(
+                    got.start, band.start,
+                    "part {part} band start at {slots} slots"
+                );
+                assert_eq!(
+                    got.end,
+                    band.end + (slots - 1) * record,
+                    "part {part} band end at {slots} slots"
+                );
+                assert!(
+                    got.end <= record * slots,
+                    "part {part} band at {slots} slots leaves the ring buffer"
+                );
+                if slots == 1 {
+                    assert_eq!(got, band, "part {part} one-slot ring keeps the base range");
+                }
+            }
+        }
+    }
+    // Zero slots is a refusal, the same one the layout's bank_ranges gives.
+    assert!(SlotSpans::new(&layout, 0).is_err());
 }
