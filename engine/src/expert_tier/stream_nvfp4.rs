@@ -178,6 +178,9 @@ mod tests {
 
     #[test]
     fn bank_ranges_keep_the_routed_pair_order() {
+        if !crate::kernels::cuda::device_present("bank_ranges_keep_the_routed_pair_order") {
+            return;
+        }
         let observed = (|| -> Result<_, EngError> {
             let ctx = CudaContext::new()?;
             let mut banks = CudaStreamBanks::new(&ctx, StreamBankPlan::new(1024, 0, 4096)?)?;

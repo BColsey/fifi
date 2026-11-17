@@ -457,6 +457,11 @@ mod tests {
 
     #[test]
     fn two_banks_copy_in_order_and_filter_persistent_tiers() {
+        if !crate::kernels::cuda::device_present(
+            "two_banks_copy_in_order_and_filter_persistent_tiers",
+        ) {
+            return;
+        }
         let observed = (|| -> Result<_, EngError> {
             let capture = super::super::stream_cuda_profile::Capture::start();
             let ctx = CudaContext::new()?;

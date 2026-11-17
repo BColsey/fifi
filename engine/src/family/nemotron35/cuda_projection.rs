@@ -1082,6 +1082,10 @@ mod batch_tests {
 
     #[test]
     fn batched_matvec_is_bit_identical_to_single_calls() -> Result<(), EngError> {
+        if !crate::kernels::cuda::device_present("batched_matvec_is_bit_identical_to_single_calls")
+        {
+            return Ok(());
+        }
         let projector = projector();
         let context = context(&projector);
         const N: usize = 3;
@@ -1172,6 +1176,11 @@ mod bf16_f8_tests {
 
     #[test]
     fn stored_bf16_projection_matches_the_widened_reference_exactly() {
+        if !crate::kernels::cuda::device_present(
+            "stored_bf16_projection_matches_the_widened_reference_exactly",
+        ) {
+            return;
+        }
         // 1.0, -2.0, 0.5, 4.0 as BF16 bit patterns: exactly representable, so
         // widening is exact and the reference dot products are the F32 truth.
         let values = [1.0f32, -2.0, 0.5, 4.0, 0.25, -0.5, 2.0, 8.0];
@@ -1232,6 +1241,11 @@ mod f8_tests {
 
     #[test]
     fn stored_f8_projection_matches_the_decoded_reference_exactly() {
+        if !crate::kernels::cuda::device_present(
+            "stored_f8_projection_matches_the_decoded_reference_exactly",
+        ) {
+            return;
+        }
         // Codes from the existing fixture family: finite E4M3FN values with a
         // positive per-tensor scale, so the decoded reference is finite.
         let codes = [0x38, 0x40, 0xb8, 0x30, 0x38, 0x40, 0xb8, 0x30];
@@ -1361,6 +1375,11 @@ mod tests {
 
     #[test]
     fn cuda_projection_matches_exact_decoded_fp8_and_nvfp4_fixtures() {
+        if !crate::kernels::cuda::device_present(
+            "cuda_projection_matches_exact_decoded_fp8_and_nvfp4_fixtures",
+        ) {
+            return;
+        }
         let mut projector = admitted_projector([1, 16]);
         // Same codes and scales as tests/nemotron35_loader.rs; input scales are not weights.
         let (fp8, scale) = f8::WeightBlock {
@@ -1401,6 +1420,11 @@ mod tests {
 
     #[test]
     fn cuda_projection_rejects_invalid_weights_inputs_and_unsupported_operations() {
+        if !crate::kernels::cuda::device_present(
+            "cuda_projection_rejects_invalid_weights_inputs_and_unsupported_operations",
+        ) {
+            return;
+        }
         let mut projector = admitted_projector([1, 2]);
         let weight = tensor(&[1, 2], &[1.0, 2.0]);
         for invalid in [
@@ -1443,6 +1467,11 @@ mod tests {
 
     #[test]
     fn cached_linear_returns_identical_results_and_resuses_resident_weights() {
+        if !crate::kernels::cuda::device_present(
+            "cached_linear_returns_identical_results_and_resuses_resident_weights",
+        ) {
+            return;
+        }
         let mut cached = cached_projector([2, 2], 1 << 20);
         let mut streaming = admitted_projector([2, 2]);
         let a = tensor(&[2, 2], &[1.0, 2.0, 3.0, 4.0]);
@@ -1458,6 +1487,11 @@ mod tests {
 
     #[test]
     fn cache_evicts_lru_under_budget_and_keeps_exact_results() {
+        if !crate::kernels::cuda::device_present(
+            "cache_evicts_lru_under_budget_and_keeps_exact_results",
+        ) {
+            return;
+        }
         // The budget holds exactly one [2, 2] tensor (16 bytes).
         let mut cached = cached_projector([2, 2], 16);
         let mut streaming = admitted_projector([2, 2]);
@@ -1482,6 +1516,11 @@ mod tests {
 
     #[test]
     fn cuda_head_argmax_returns_the_lowest_index_of_the_largest_logit() {
+        if !crate::kernels::cuda::device_present(
+            "cuda_head_argmax_returns_the_lowest_index_of_the_largest_logit",
+        ) {
+            return;
+        }
         let mut projector = admitted_projector([3, 2]);
         // Rows 1 and 2 tie at the maximum.
         let weight = tensor(&[3, 2], &[1.0, 0.0, 3.0, 0.0, 3.0, 0.0]);

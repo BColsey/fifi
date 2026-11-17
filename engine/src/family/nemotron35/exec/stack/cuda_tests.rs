@@ -301,19 +301,7 @@ fn cuda_fixture_spec() -> NemotronExecSpec {
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn cuda_device_present() -> bool {
-    let count = crate::kernels::cuda::device_count().expect("CUDA device count query");
-    println!("CUDA devices visible: {count}");
-    if count > 0 {
-        return true;
-    }
-    let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-        .is_ok_and(|value| !value.is_empty() && value != "0");
-    assert!(
-        !required,
-        "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-    );
-    println!("SKIPPED cuda_stack_matches_cpu_across_prefill_and_decode: no CUDA device");
-    false
+    crate::kernels::cuda::device_present("cuda_stack_matches_cpu_across_prefill_and_decode")
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

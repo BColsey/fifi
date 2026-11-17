@@ -448,14 +448,7 @@ mod tests {
 
     impl DeviceFixture {
         fn new(token: u32) -> Option<Self> {
-            let count = crate::kernels::cuda::device_count().expect("CUDA device count");
-            eprintln!("CUDA devices visible: {count}");
-            if count == 0 {
-                assert!(
-                    !std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-                        .is_ok_and(|value| !value.is_empty() && value != "0"),
-                    "a CUDA device is required"
-                );
+            if !crate::kernels::cuda::device_present("gemma4 executor DeviceFixture") {
                 return None;
             }
             let ctx = CudaContext::new().expect("context");

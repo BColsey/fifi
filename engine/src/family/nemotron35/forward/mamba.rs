@@ -539,6 +539,11 @@ mod projector_tests {
             cuda_projection::CudaProjector, projection::HostProjector,
         };
 
+        if !crate::kernels::cuda::device_present(
+            "cuda_projected_mamba_matches_host_output_and_states_without_input_mutation",
+        ) {
+            return;
+        }
         let mut inputs = Inputs::new();
         inputs.hidden = tensor(&[1, 2], &[1.0, 2.0]);
         // Single selected term per row makes both projections exact without a tolerance.

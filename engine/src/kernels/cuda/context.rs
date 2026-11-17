@@ -200,13 +200,14 @@ pub(crate) struct TiledWeight {
 impl CudaContext {
     /// Plans one fixed single-row workspace and its lazy head scratch.
     ///
-    /// This calls host-only sizing and does not acquire a device lease.
+    /// This calls host-only sizing: it does not acquire a device lease and
+    /// does not require a usable backend, so admission planning still answers
+    /// when the backend is terminal.
     pub(crate) fn fixed_projection_plan(
         [rows, columns]: [usize; 2],
     ) -> Result<(Admission, u64), EngError> {
-        // Invalid axes are a client error regardless of the backend state:
-        // the pure validation runs before the usability gate, so a dead
-        // backend still answers BadRequest for bad shapes (the contract
+        // Invalid axes are a client error: the pure validation answers
+        // BadRequest for bad shapes without any device work (the contract
         // test rejects invalid axes before any device work).
         let invalid = || {
             EngError::BadRequest(
@@ -225,7 +226,6 @@ impl CudaContext {
         if rows > c_int::MAX as usize || columns > native::MAX_DIM {
             return Err(invalid());
         }
-        super::ensure_usable(&TERMINAL)?;
         let admission = Admission {
             shapes: vec![WorkspaceShape {
                 n_rows: rows,
@@ -234,7 +234,6 @@ impl CudaContext {
             }],
             growth: Growth::Fixed,
         };
-        let _dispatch = enter_dispatch()?;
         let workspace = workspace::place(admission.caps()?)?;
         let bytes = workspace
             .total
@@ -1405,10 +1404,10 @@ impl TiledWeight {
 
 /// Drops the page cache of `len` bytes of `file` from `offset`.
 ///
-/// The call is host only, so its failure leaves the backend usable. After a
-/// terminal failure it still reports `Backend` `execute`, like every call.
+/// The call is host only, so its failure leaves the backend usable, and it
+/// runs even when the backend is terminal: a page-cache eviction cannot
+/// touch device state, and OOM recovery needs it whatever preceded it.
 pub(crate) fn drop_page_cache(file: &std::fs::File, offset: u64, len: u64) -> Result<(), EngError> {
-    super::ensure_usable(&TERMINAL)?;
     native::drop_page_cache(file, offset, len).map_err(|failure| {
         // Errno 0 means the adapter rejected the call itself, and
         // `io::Error` would render it as "Success".
@@ -1860,21 +1859,6 @@ mod group_stride_tests {
 mod f32_projection_tests {
     use super::*;
 
-    // Use the existing projection test's device gate; no device is needed to type-check.
-    fn device_present() -> bool {
-        if super::super::device_count().expect("CUDA device count") > 0 {
-            return true;
-        }
-        let required = std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE")
-            .is_ok_and(|value| !value.is_empty() && value != "0");
-        assert!(
-            !required,
-            "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible"
-        );
-        println!("SKIPPED F32 projection: no CUDA device");
-        false
-    }
-
     fn upload_floats(ctx: &CudaContext, values: &[f32]) -> DeviceBuffer {
         let bytes: Vec<_> = values
             .iter()
@@ -1915,7 +1899,9 @@ mod f32_projection_tests {
 
     #[test]
     fn linear_f32_rejects_caller_errors_without_poisoning_or_growing() {
-        if !device_present() {
+        if !super::super::device_present(
+            "linear_f32_rejects_caller_errors_without_poisoning_or_growing",
+        ) {
             return;
         }
         let caps = Activations { x: 4, xf: 4, y: 4 };
@@ -1955,7 +1941,9 @@ mod f32_projection_tests {
 
     #[test]
     fn linear_f32_returns_nonzero_rows_and_reuses_a_grown_workspace() {
-        if !device_present() {
+        if !super::super::device_present(
+            "linear_f32_returns_nonzero_rows_and_reuses_a_grown_workspace",
+        ) {
             return;
         }
         let ctx = CudaContext::with_workspace(Activations { x: 4, xf: 4, y: 4 })

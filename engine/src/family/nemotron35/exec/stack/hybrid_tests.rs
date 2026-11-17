@@ -699,7 +699,7 @@ mod cuda {
     }
 
     fn device_present() -> bool {
-        crate::kernels::cuda::device_count().expect("CUDA device count query") > 0
+        crate::kernels::cuda::device_present("nemotron35 hybrid cuda tests")
     }
 
     #[test]

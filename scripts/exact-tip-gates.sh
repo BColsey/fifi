@@ -4,7 +4,8 @@
 # The host arms alone miss breakage that only the container (native-cuda) or the
 # Mac (native-mlx) build sees, so this battery runs every arm a handoff needs:
 # fmt, host clippy, host lib tests, published_text, the qualification inventory,
-# container clippy and container test build (release, native-cuda), and a Mac
+# container clippy, container test build and a device-free lib test run (release,
+# native-cuda, no GPU), and a Mac
 # native-mlx clippy. The commit is materialized as a detached worktree — a clean
 # checkout of the exact hash, never a working copy — and every Linux arm reads
 # that worktree; the Mac arm reads a `git archive` stream of the same commit
@@ -137,7 +138,7 @@ if [[ $mac == auto ]]; then
     fi
 fi
 
-arms=(fmt host-clippy host-lib published-text qual qual-validate ctr-clippy ctr-tests)
+arms=(fmt host-clippy host-lib published-text qual qual-validate ctr-clippy ctr-tests ctr-lib-run)
 [[ $mac == never ]] || arms+=(mac-clippy)
 
 if $list_only; then
@@ -354,6 +355,13 @@ mkdir -p "$run/target-host" "$run/target-ctr"
 export CARGO_TARGET_DIR=$run/target-ctr
 run_arm ctr-clippy "${ctr[@]}" clippy --release --locked --all-targets --features native-cuda -- -D warnings || fail_now ctr-clippy ctr-clippy
 run_arm ctr-tests "${ctr[@]}" test --release --locked --tests --no-run --features native-cuda || fail_now ctr-tests ctr-tests
+# ctr-tests only BUILDS the native-cuda tests (--no-run), so the device-free tests under
+# cfg(feature = "native-cuda") never executed in any battery. Run the lib test executable in
+# the same no-GPU container (build reused, no recompile). No --include-ignored: ignored device
+# tests stay out; non-ignored device tests skip via testkit::device_present. --nocapture so the
+# SKIPPED lines are countable. The container mounts $run/src at the compile-time
+# CARGO_MANIFEST_DIR path, so source-tree tests (wrapper_completeness) find their files.
+run_arm ctr-lib-run "${ctr[@]}" test --release --locked --lib --features native-cuda -- --test-threads=1 --nocapture || fail_now ctr-lib-run ctr-lib-run
 
 # Collect the concurrent Mac arm into the receipt. The subshell's own PASS/FAIL
 # line went to its driver log; the exit file it wrote carries the rc here.
@@ -383,8 +391,32 @@ if [[ -n $mac_job ]]; then
 fi
 
 exe_count=$(grep -c 'Executable' "$logs/ctr-tests.log" || true)
+# Report the lib-run result plus the device-present SKIPPED count, and refuse a
+# run that executed too few tests: a run where nearly everything skipped must
+# not read as a pass of the device-free tests (executed = passed - skipped).
+lib_line=$(grep 'test result:' "$logs/ctr-lib-run.log" | tail -1)
+lib_skipped=$(grep -c 'SKIPPED .*: no CUDA device' "$logs/ctr-lib-run.log" || true)
+lib_passed=$(grep -oE '[0-9]+ passed' <<<"$lib_line" | head -1 | awk '{print $1}')
+lib_executed=$(( ${lib_passed:-0} - lib_skipped ))
+# PROVISIONAL floor: set to 1 until the first green no-GPU lib run fixes the
+# real executed count; the fold right after that run sets the floor to that
+# number minus a stated margin and names it in the commit message.
+lib_floor=1
+if (( lib_executed < lib_floor )); then
+    # Replace run_arm's PASS line so the receipt carries exactly one
+    # ctr-lib-run status.
+    rebuilt=()
+    for status_line in "${arm_status[@]}"; do
+        [[ $status_line == "PASS ctr-lib-run "* ]] || rebuilt+=("$status_line")
+    done
+    arm_status=("${rebuilt[@]}")
+    arm_status+=("FAIL ctr-lib-run (only ${lib_executed} executed, below the ${lib_floor}-test floor)")
+    fail_now ctr-lib-run ctr-lib-run
+fi
 receipt+=("${arm_status[@]}")
 receipt+=("ctr-tests ${exe_count:-0} release test executables built")
+receipt+=("ctr-lib-run ${lib_line#test result: }")
+receipt+=("ctr-lib-run ${lib_skipped} printed SKIPPED (no CUDA device); ${lib_executed} executed (passed minus skipped)")
 receipt+=("started $start_ts")
 receipt+=("ended $(date -u +%FT%TZ) OK")
 echo
