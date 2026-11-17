@@ -438,7 +438,9 @@ extern "C" int inference_cuda_linear_ws(int ggml_type, const void *weight, int n
         if (!workspace_usable(*workspace, need)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         LinearCall call = {ggml_type, (const uint4 *)weight, n_rows, k, k_x, x, m, y};
         run_linear(call, *workspace, need, failure);
@@ -510,6 +512,20 @@ extern "C" int inference_cuda_matmul_launch(int ggml_type, int m, const void *we
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+/* Test hook (always built, reached only from cfg(test) Rust): plants a pending
+ * error with no context side effects. cudaSetDevice with an ordinal no host has
+ * fails with cudaErrorInvalidDevice and writes the per-thread error slot without
+ * switching devices, so device tests can drive the STICKY_PRIOR entry check. */
+extern "C" int inference_cuda_test_plant_sticky(void) {
+    return (int)cudaSetDevice(1 << 24);
+}
+
+/* Test-only read of the device.h counter: how many pending errors ABI entries
+ * have reported and consumed so far on this thread. */
+extern "C" unsigned inference_cuda_sticky_prior_reports(void) {
+    return g_sticky_prior_reports;
 }
 
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION

@@ -4,8 +4,10 @@
  * fault in queued work surfaces at the next synchronize. Handles (stream,
  * event, pinned memory) are opaque and owned by Rust; each is destroyed once
  * with its destroy function. Lifecycle entries (create, destroy, alloc, free)
- * clear the thread's pending non-sticky CUDA error first, like abi.h; launch
- * entries do not, so the status they return is their own.
+ * clear the thread's pending non-sticky CUDA error before and after their
+ * calls, without reporting (abi.h states the full pending-error rule; compute
+ * entries peek, report and consume instead); launch entries do not touch the
+ * slot, so the status they return is their own.
  * Per-kernel launch entries live in their own headers, native/resident/<n>.h, one per
  * kernel; this header stays closed (see kernels/cuda/resident/mod.rs).
  */

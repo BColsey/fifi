@@ -2,6 +2,7 @@
 
 #include "abi.h"
 #include "abi_device.h"
+#include "device.h"
 
 extern "C" int inference_cuda_device_integrated(int *out_integrated) {
     try {
@@ -9,7 +10,9 @@ extern "C" int inference_cuda_device_integrated(int *out_integrated) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         *out_integrated = 0;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, NULL))
+            return static_cast<int>(sticky);
         int device = 0;
         int value = 0;
         cudaError_t err = cudaGetDevice(&device);

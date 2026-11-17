@@ -158,7 +158,9 @@ extern "C" int inference_cuda_nvfp4_gemv_batch_ws(
         if (!usable(weight_scales, weight_scales_bytes, n * sizeof(float), alignof(float)))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         device_started = true;
         failure.record(cudaMemcpy(workspace->x, x, need.x, cudaMemcpyHostToDevice),
                        INFERENCE_CUDA_STAGE_COPY);

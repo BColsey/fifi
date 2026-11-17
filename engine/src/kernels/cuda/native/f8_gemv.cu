@@ -129,7 +129,9 @@ extern "C" int inference_cuda_f8_gemv_ws(
         for (size_t column = 0; column < columns; ++column)
             if (!std::isfinite(x[column])) return INFERENCE_CUDA_INVALID_ARGUMENT;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         device_started = true;
         failure.record(cudaMemcpy(workspace->x, x, need.x, cudaMemcpyHostToDevice),
                        INFERENCE_CUDA_STAGE_COPY);
@@ -188,7 +190,9 @@ extern "C" int inference_cuda_f8_gemv_launch(
             !apart(x, need.x, workspace->y, need.y))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         failure.record(cudaMemsetAsync(workspace->xf, 0, need.flag, cuda_stream),
                        INFERENCE_CUDA_STAGE_COPY);

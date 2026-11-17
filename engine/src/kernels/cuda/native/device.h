@@ -23,6 +23,7 @@ static inline const char *stage_name(int stage) {
     case INFERENCE_CUDA_STAGE_COPY: return "copy";
     case INFERENCE_CUDA_STAGE_LAUNCH: return "launch";
     case INFERENCE_CUDA_STAGE_SYNCHRONIZE: return "synchronize";
+    case INFERENCE_CUDA_STAGE_STICKY_PRIOR: return "sticky-prior";
     default: return "unknown";
     }
 }
@@ -84,6 +85,39 @@ static inline void report_stage(int *out_stage, int stage) {
     if (out_stage != NULL) {
         *out_stage = stage;
     }
+}
+
+/* Test hook counter: how many pending errors ABI entries have reported (and
+ * consumed) on this thread. thread_local because it counts the per-thread
+ * pending-error slot itself. Test-only read via the accessor in projector.cu;
+ * no production code reads it. */
+inline thread_local unsigned g_sticky_prior_reports = 0;
+
+/* An error left pending by an earlier unchecked CUDA call, found at an ABI
+ * entry: report it on stderr and consume it, then peek again. If the slot
+ * still holds an error after the consume, treat it as a sticky,
+ * context-corrupting error and fail the entry with
+ * INFERENCE_CUDA_STAGE_STICKY_PRIOR; the Rust side then latches the backend
+ * terminal, which is what an unrecoverable context deserves. No CUDA
+ * document promises that a peek after a consuming read returns the code
+ * again; the recheck is defensive, and its failure mode is safe either way:
+ * if it never fires, the next real CUDA call fails and surfaces the same
+ * broken context. A non-sticky pending error was a one-shot status of an
+ * earlier call that nobody read; the entry proceeds normally after the
+ * report, so served behaviour is unchanged except for the stderr line. A
+ * successful CUDA call does not reset the slot, so the value the consuming
+ * read returns is the value the entry peeked. */
+static inline bool sticky_prior(cudaError_t pending, int *out_stage) {
+    (void)cudaGetLastError();
+    ++g_sticky_prior_reports;
+    std::fprintf(stderr,
+                 "CUDA STICKY PRIOR: %s (code %d) left pending by an earlier call\n",
+                 cudaGetErrorString(pending), static_cast<int>(pending));
+    if (cudaPeekAtLastError() == cudaSuccess) {
+        return false;
+    }
+    report_stage(out_stage, INFERENCE_CUDA_STAGE_STICKY_PRIOR);
+    return true;
 }
 
 #endif /* INFERENCE_CUDA_DEVICE_H */

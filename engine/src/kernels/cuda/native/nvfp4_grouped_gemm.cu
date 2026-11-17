@@ -156,7 +156,9 @@ extern "C" int inference_cuda_nvfp4_grouped_gemm_launch(
     report_stage(stage,INFERENCE_CUDA_STAGE_NONE);
     Needs v;
     if (!needs(n,rows,columns,v) || !valid(p,np,s,ns,g,ng,w,v)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-    (void)cudaGetLastError();
+    const cudaError_t sticky = cudaPeekAtLastError();
+    if (sticky != cudaSuccess && sticky_prior(sticky, stage))
+        return static_cast<int>(sticky);
     const cudaError_t status = enqueue(p,s,g,n,rows,columns,w,reinterpret_cast<cudaStream_t>(stream));
     if (status != cudaSuccess) report_stage(stage,INFERENCE_CUDA_STAGE_LAUNCH);
     return int(status);
@@ -176,7 +178,9 @@ extern "C" int inference_cuda_nvfp4_grouped_gemm_ws(
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         for (size_t i=0;i<v.x/sizeof(float);++i)
             if (!std::isfinite(x[i])) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, stage))
+            return static_cast<int>(sticky);
         started = true;
         failure.record(cudaMemcpy(w->x,x,v.x,cudaMemcpyHostToDevice),INFERENCE_CUDA_STAGE_COPY);
         if (failure.ok()) failure.record(enqueue(p,s,g,n,rows,columns,w,nullptr),INFERENCE_CUDA_STAGE_LAUNCH);

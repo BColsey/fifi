@@ -850,6 +850,9 @@ bool arm_receipt() {
                      attr.maxThreadsPerBlock, sms);
         return err == cudaSuccess && attr.localSizeBytes == 0 && attr.maxThreadsPerBlock >= 256;
     }();
+    // err (and any later query status) is handled by the receipt decision above,
+    // so consume whatever the slot holds instead of leaving it pending.
+    (void)cudaGetLastError();
     if (!ok) {
         std::fprintf(stderr, "attn_q8 register_v prefetch receipt: REFUSING to launch\n");
     }
@@ -977,6 +980,9 @@ extern "C" int inference_cuda_attn_decode_q8_arm_attrs(int prefetch, int *regs, 
     cudaFuncAttributes attr{};
     const cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
     if (err != cudaSuccess) {
+        // Consume at the handling point: the return below surfaces err, and the
+        // slot must not keep it pending for the next entry's prior check.
+        (void)cudaGetLastError();
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     *regs = attr.numRegs;
@@ -993,20 +999,29 @@ extern "C" int inference_cuda_attn_decode_q8_dispatched() {
 extern "C" int inference_cuda_attn_decode_q8_kernel_identity_reset() {
     const int zero = 0;
     if (cudaMemcpyToSymbol(g_kernel_ran, &zero, sizeof(int)) != cudaSuccess) {
+        // Consume at the handling point: the return surfaces the decision, not
+        // the raw code, so the slot must not keep the error pending.
+        (void)cudaGetLastError();
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     // The copy rides the default stream while fixture legs launch on the context
     // stream: order the reset against the following leg explicitly.
-    return cudaDeviceSynchronize() == cudaSuccess ? 0 : INFERENCE_CUDA_INVALID_ARGUMENT;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();  // same rule as the copy above
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    return 0;
 }
 
 extern "C" int inference_cuda_attn_decode_q8_kernel_identity(int *ran) {
     if (ran == nullptr) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    return cudaMemcpyFromSymbol(ran, g_kernel_ran, sizeof(int)) == cudaSuccess
-               ? 0
-               : INFERENCE_CUDA_INVALID_ARGUMENT;
+    if (cudaMemcpyFromSymbol(ran, g_kernel_ran, sizeof(int)) != cudaSuccess) {
+        (void)cudaGetLastError();  // same rule as the reset above
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    return 0;
 }
 
 // Device-side split-plan probe: calls the same __device__ helper the kernels call,
@@ -1045,6 +1060,9 @@ extern "C" int inference_cuda_attn_decode_q8_split_plan_device(int n_keys, int m
     }
     int *device_out = nullptr;
     if (cudaMalloc(&device_out, 2 * sizeof(int)) != cudaSuccess) {
+        // Consume at the handling point: the return surfaces the decision, not
+        // the raw code, so the slot must not keep the error pending.
+        (void)cudaGetLastError();
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     attn_q8_split_plan_probe_k<<<1, 1>>>(n_keys, max_splits, min_keys, device_out,
@@ -1056,6 +1074,9 @@ extern "C" int inference_cuda_attn_decode_q8_split_plan_device(int n_keys, int m
         cudaMemcpy(host_out, device_out, 2 * sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(device_out);
     if (launch_err != cudaSuccess || sync_err != cudaSuccess || copy_err != cudaSuccess) {
+        // Consume at the handling point: these codes surface only as the generic
+        // refusal below, so the slot must not keep one pending.
+        (void)cudaGetLastError();
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     *chunk = host_out[0];

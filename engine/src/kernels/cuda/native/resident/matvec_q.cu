@@ -221,6 +221,9 @@ extern "C" int inference_cuda_mem_info(size_t *out_free, size_t *out_total, int 
         }
         size_t free_bytes = 0, total_bytes = 0;
         const cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        // Consume at the handling point: err is surfaced by the return below, so
+        // the slot must not keep it pending for the next entry's prior check.
+        (void)cudaGetLastError();
         if (err == cudaSuccess) {
             *out_free = free_bytes;
             *out_total = total_bytes;

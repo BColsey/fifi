@@ -119,7 +119,9 @@ extern "C" int inference_cuda_mamba_conv1d_step_launch(
             !step_usable(out, out_bytes, conv_dim * sizeof(float)) ||
             nonfinite == nullptr)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
         failure.record(cudaMemsetAsync(nonfinite, 0, 4, s),
                        INFERENCE_CUDA_STAGE_COPY);
@@ -169,7 +171,9 @@ extern "C" int inference_cuda_mamba_ssm_step_launch(
             !step_usable(out, out_bytes, total * sizeof(float)) ||
             nonfinite == nullptr || !std::isfinite(time_step_min))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
         failure.record(cudaMemsetAsync(nonfinite, 0, 4, s),
                        INFERENCE_CUDA_STAGE_COPY);
@@ -253,7 +257,9 @@ extern "C" int inference_cuda_mamba_gated_norm_launch(
             !step_usable(out, out_bytes, total * sizeof(float)) ||
             nonfinite == nullptr)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
         failure.record(cudaMemsetAsync(nonfinite, 0, 4, s),
                        INFERENCE_CUDA_STAGE_COPY);
@@ -286,7 +292,9 @@ extern "C" int inference_cuda_mamba_residual_launch(
             !step_usable(out, out_bytes, total * sizeof(float)) ||
             nonfinite == nullptr)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
         failure.record(cudaMemsetAsync(nonfinite, 0, 4, s),
                        INFERENCE_CUDA_STAGE_COPY);

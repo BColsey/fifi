@@ -12,10 +12,21 @@
  * borrowed host pointer after a call returns under ordinary synchronous SDK
  * semantics. A terminal failure may retain device storage until process exit.
  *
- * Each function clears the calling thread's pending CUDA runtime error
- * before it returns, so a later call reports only its own failure. Sticky
- * device errors (for example cudaErrorIllegalAddress) cannot be cleared;
- * the Rust caller treats them as terminal for the process.
+ * Pending-error rule. Compute entries (the *_ws, *_launch and gemv entries,
+ * linear_ws, vector_add_f32, host_register, device_integrated) peek the
+ * calling thread's pending CUDA runtime error at entry: a pending error is
+ * reported on stderr and consumed; only an error that the slot still holds
+ * after the consume is treated as sticky (context-corrupting) and fails the
+ * entry with stage INFERENCE_CUDA_STAGE_STICKY_PRIOR, which the Rust caller
+ * treats as terminal for the process. That recheck is defensive - no CUDA
+ * document promises the re-latch - and safe either way: if it never fires,
+ * the next real CUDA call fails and surfaces the same broken context. A
+ * non-sticky pending error does not change the entry's result. Lifecycle and
+ * upload entries (streams, events, pinned memory, alloc/free, upload/download)
+ * instead clear the pending error before and after their calls without
+ * reporting, as before. Launch-only resident entries do neither and return
+ * only their own status. Entries that handle an error and continue consume it
+ * at the handling point.
  */
 #ifndef INFERENCE_CUDA_ABI_H
 #define INFERENCE_CUDA_ABI_H
@@ -52,6 +63,11 @@ int inference_cuda_module_loading_mode(int *out_mode);
 #define INFERENCE_CUDA_STAGE_COPY 2
 #define INFERENCE_CUDA_STAGE_LAUNCH 3
 #define INFERENCE_CUDA_STAGE_SYNCHRONIZE 4
+/* An error found pending at an ABI entry, left by an earlier unchecked CUDA
+ * call: reported instead of discarded (see sticky_prior in device.h). 5 is
+ * not free: graph.h defines INFERENCE_CUDA_STAGE_CAPTURE as 5 for its own
+ * stage codes; this one is 6. */
+#define INFERENCE_CUDA_STAGE_STICKY_PRIOR 6
 
 /* Computes out[i] = lhs[i] + rhs[i] for i in [0, len) on the first device.
  * The call blocks until the device has finished and the result is copied

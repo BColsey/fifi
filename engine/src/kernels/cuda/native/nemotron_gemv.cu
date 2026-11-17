@@ -127,7 +127,9 @@ extern "C" int inference_cuda_nemotron_gemv_f32_ws(
         for (size_t column = 0; column < columns; ++column)
             if (!std::isfinite(x[column])) return INFERENCE_CUDA_INVALID_ARGUMENT;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         device_started = true;
         failure.record(cudaMemcpy(workspace->x, x, need.x, cudaMemcpyHostToDevice),
                        INFERENCE_CUDA_STAGE_COPY);
@@ -180,7 +182,9 @@ extern "C" int inference_cuda_nemotron_gemv_argmax_f32_ws(
         for (size_t column = 0; column < columns; ++column)
             if (!std::isfinite(x[column])) return INFERENCE_CUDA_INVALID_ARGUMENT;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         device_started = true;
         failure.record(cudaMemcpy(workspace->x, x, need.x, cudaMemcpyHostToDevice),
                        INFERENCE_CUDA_STAGE_COPY);

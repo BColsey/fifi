@@ -130,6 +130,7 @@ const ALLOCATE_OPERATION: &str = "cuda allocate";
 const COPY_OPERATION: &str = "cuda copy";
 const LAUNCH_OPERATION: &str = "cuda launch";
 const SYNCHRONIZE_OPERATION: &str = "cuda synchronize";
+const STICKY_PRIOR_OPERATION: &str = "cuda sticky-prior";
 const ADAPTER_OPERATION: &str = "cuda adapter";
 const CAPTURE_OPERATION: &str = "cuda capture";
 const EXECUTE_OPERATION: &str = "execute";
@@ -253,6 +254,7 @@ fn stage_operation(stage: c_int) -> &'static str {
         native::STAGE_COPY => COPY_OPERATION,
         native::STAGE_LAUNCH => LAUNCH_OPERATION,
         native::STAGE_SYNCHRONIZE => SYNCHRONIZE_OPERATION,
+        native::STAGE_STICKY_PRIOR => STICKY_PRIOR_OPERATION,
         native::resident::graph::STAGE_CAPTURE => CAPTURE_OPERATION,
         _ => ADAPTER_OPERATION,
     }
@@ -460,8 +462,66 @@ mod tests {
             stage_operation(native::STAGE_SYNCHRONIZE),
             "cuda synchronize"
         );
+        assert_eq!(
+            stage_operation(native::STAGE_STICKY_PRIOR),
+            "cuda sticky-prior"
+        );
         assert_eq!(stage_operation(native::STAGE_NONE), "cuda adapter");
         assert_eq!(stage_operation(99), "cuda adapter");
+    }
+
+    /// A pending non-sticky error from an earlier call is reported and
+    /// consumed at the next ABI entry, and the entry then succeeds normally:
+    /// a one-shot status nobody read must not fail later work.
+    #[test]
+    #[ignore = "needs a CUDA device; run by name with the device suites"]
+    fn sticky_prior_entry_reports_the_pending_error() {
+        if !testkit::device_present("sticky_prior_entry_reports_the_pending_error") {
+            return;
+        }
+        let planted = native::test_plant_sticky();
+        assert_ne!(
+            planted,
+            native::STATUS_OK,
+            "the planter must fail, got {planted}"
+        );
+        let before = native::sticky_prior_reports();
+        let buffer = [0u8; 4096];
+        host_register(&buffer)
+            .expect("a non-sticky pending error is consumed and reported, not failed on");
+        assert_eq!(
+            native::sticky_prior_reports(),
+            before + 1,
+            "the entry must have reported and consumed the planted error"
+        );
+        host_unregister(&buffer).expect("the registration must release");
+    }
+
+    /// After a report the slot is clean, so a following entry sees no pending
+    /// error and does not report again. A sticky (context-corrupting) error
+    /// cannot be planted from host code without breaking the context, so the
+    /// failing side of the rule is covered by the fault-qualification suites.
+    #[test]
+    #[ignore = "needs a CUDA device; run by name with the device suites"]
+    fn sticky_prior_report_consumes_the_pending_error() {
+        if !testkit::device_present("sticky_prior_report_consumes_the_pending_error") {
+            return;
+        }
+        let buffer = [0u8; 4096];
+        native::test_plant_sticky();
+        let before = native::sticky_prior_reports();
+        host_register(&buffer)
+            .expect("the non-sticky pending error is consumed, so the entry succeeds");
+        assert_eq!(native::sticky_prior_reports(), before + 1);
+        host_unregister(&buffer).expect("the successful registration must release");
+        let clean = native::sticky_prior_reports();
+        host_register(&buffer).expect("a clean slot must not disturb the entry");
+        assert_eq!(
+            native::sticky_prior_reports(),
+            clean,
+            "a clean slot must not be reported"
+        );
+        host_unregister(&buffer).expect("the successful registration must release");
     }
 
     #[test]

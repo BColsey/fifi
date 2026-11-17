@@ -30,6 +30,9 @@ pub(super) const STAGE_ALLOCATE: c_int = 1;
 pub(super) const STAGE_COPY: c_int = 2;
 pub(super) const STAGE_LAUNCH: c_int = 3;
 pub(super) const STAGE_SYNCHRONIZE: c_int = 4;
+/// An error found pending at an ABI entry, left by an earlier unchecked CUDA
+/// call (see `sticky_prior` in native/device.h).
+pub(super) const STAGE_STICKY_PRIOR: c_int = 6;
 
 /// Rows and columns of one tile of the vendored `mma884` layout.
 pub(super) const TILE_ROWS: usize = 8;
@@ -596,6 +599,34 @@ unsafe extern "C" {
     fn fault_vendor_launch_raw(out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_allocation_calls"]
     fn allocation_calls_raw(out_mallocs: *mut u64, out_frees: *mut u64) -> c_int;
+}
+
+#[cfg(test)]
+unsafe extern "C" {
+    #[link_name = "inference_cuda_test_plant_sticky"]
+    fn test_plant_sticky_raw() -> c_int;
+    #[link_name = "inference_cuda_sticky_prior_reports"]
+    fn sticky_prior_reports_raw() -> std::ffi::c_uint;
+}
+
+/// Plants a pending non-sticky CUDA error — `cudaSetDevice` with an ordinal no
+/// host has answers `cudaErrorInvalidDevice` and writes the per-thread error
+/// slot without touching any context — so device tests can drive the entry
+/// check. The error is non-sticky: consuming it clears the slot, exactly what
+/// a handled-and-forgotten earlier failure leaves behind. The native symbol is
+/// always built and reached only from this cfg(test) wrapper.
+#[cfg(test)]
+pub(super) fn test_plant_sticky() -> c_int {
+    // SAFETY: no pointers; the failing call changes no device state.
+    unsafe { test_plant_sticky_raw() }
+}
+
+/// Test-only count of pending errors ABI entries have reported and consumed
+/// on this thread so far (the device.h counter via its projector.cu accessor).
+#[cfg(test)]
+pub(super) fn sticky_prior_reports() -> u32 {
+    // SAFETY: no pointers; reads a counter.
+    unsafe { sticky_prior_reports_raw() }
 }
 
 fn invalid_argument() -> DeviceFailure {

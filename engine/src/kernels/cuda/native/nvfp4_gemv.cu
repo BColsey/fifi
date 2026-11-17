@@ -255,7 +255,9 @@ extern "C" int inference_cuda_nvfp4_gemv_ws(
         const bool wide = reinterpret_cast<uintptr_t>(packed) % 4u == 0 &&
                           reinterpret_cast<uintptr_t>(workspace->x) % 8u == 0;
 
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         device_started = true;
         failure.record(cudaMemcpy(workspace->x, x, need.x, cudaMemcpyHostToDevice),
                        INFERENCE_CUDA_STAGE_COPY);

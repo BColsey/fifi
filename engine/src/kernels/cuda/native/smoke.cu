@@ -149,8 +149,11 @@ extern "C" int inference_cuda_vector_add_f32(const float *lhs,
             len > SIZE_MAX / sizeof(float) || out_cleanup_status == NULL) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        /* Clear a stale error so this call reports only its own failure. */
-        (void)cudaGetLastError();
+        /* A pending error from an earlier call is reported and consumed, not
+         * silently discarded: see sticky_prior in device.h. */
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         const VectorAddHost host = {lhs, rhs, out, len};
         VectorAddDevice dev;
         Failure failure;

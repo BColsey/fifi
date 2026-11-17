@@ -1044,6 +1044,8 @@ Failure enqueue_typed(const Args &k, void *stream) {
             arm = legacy;
         }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
+        if (!failure.ok() && cudaPeekAtLastError() == arm.err)
+            (void)cudaGetLastError();  // consume the duplicate of the reported arm failure
         if (failure.ok()) {
             const int q_tiles = (k.m + kQTile - 1) / kQTile;
             const int splits = k.mode == 1 ? 1 : k.max_splits;
@@ -1308,6 +1310,8 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
     }();
     if (arm_error != cudaSuccess) {
         failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);
+        if (cudaPeekAtLastError() == arm_error)
+            (void)cudaGetLastError();  // consume the duplicate of the reported arm failure
         return failure;
     }
     attn_prefill_part_q8_tile_k<128><<<dim3((k.m + kQTile - 1) / kQTile, k.n_kv_head,

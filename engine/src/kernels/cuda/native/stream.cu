@@ -5,8 +5,10 @@
  * Every exported function has C linkage, takes and returns C types only, and
  * wraps its body in try/catch, like the projector adapter. Lifecycle entries
  * clear the thread's pending non-sticky CUDA error before and after their
- * calls; the launch entries (event record, stream wait, the two host copies)
- * and the two synchronizes do not, so they return their own status.
+ * calls, without reporting; the launch entries (event record, stream wait, the
+ * two host copies) and the two synchronizes do not touch the slot, so they
+ * return their own status. Compute entries follow the peek-report-consume
+ * rule stated in abi.h instead of clearing.
  */
 #include <cuda_runtime.h>
 
@@ -233,7 +235,9 @@ extern "C" int inference_cuda_host_register(void *host, size_t bytes, int *out_s
         if (host == NULL || bytes == 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaHostRegister(host, bytes, cudaHostRegisterDefault),
                        INFERENCE_CUDA_STAGE_ALLOCATE);
