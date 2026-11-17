@@ -2,7 +2,7 @@
 //! counters, this module reads the rows back from the device. Everything here runs ONLY under
 //! `Q36_LAYER_TRACE_DIR` (the callers hold an `Option`), so the default path pays nothing.
 
-use super::moe::Launch;
+use crate::family::exl3::launch::Launch;
 use crate::{EngError, kernels::cuda::DeviceRange};
 
 /// How many rows of a prefill piece the trace keeps: the last five, enough to see the seam

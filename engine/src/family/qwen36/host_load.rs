@@ -14,9 +14,9 @@ use crate::{
     EngError,
     checkpoint_json::UniqueValue,
     family::{
-        flash_next::stored::{self, StoredWeight},
         quantization::{ModuleQuantization, QuantizationMap},
         spec::{AttentionKind, FamilySpec},
+        stored::{self, StoredWeight},
     },
     kernels::{QuantizationMode, QuantizationSpec},
     weights::StreamedCheckpoint,

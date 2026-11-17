@@ -1,7 +1,7 @@
 //! The stock-pack tensor names of Qwen3.6 and a header-only inspection of a pack against the
 //! model shape.
 //!
-//! [`inspect_pack`] reads no payload: it walks every tensor the loader will read, checks its
+//! [`inspect_pack_split`] reads no payload: it walks every tensor the loader will read, checks its
 //! stored dtype and shape against the model, requires the routed experts of a projection to
 //! share one rate (a bank has one stride), and sums the device bytes the load will hold. A pack
 //! of another size, rate, codebook or layout is refused here, before the first upload, and the
@@ -14,14 +14,17 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-pub(super) use crate::family::exl3_pack::{
-    EMBED_NAME, ExpertPart, HEAD_PREFIX, Inspector, Marker, MoeBlock, NORM_NAME, PackReport, Root,
-    expert_name_in, layer_name, router_name_in, shared_gate_name_in, shared_name_in,
+use crate::family::exl3_pack::{
+    EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root, Visit,
+};
+#[cfg(test)]
+use crate::family::exl3_pack::{
+    ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
 };
 
 /// The router weight of a layer of the model.
 #[cfg(test)]
-pub(super) fn router_name(layer: usize) -> String {
+pub(in crate::family) fn router_name(layer: usize) -> String {
     router_name_in(Root::Layers, layer)
 }
 
@@ -33,13 +36,13 @@ pub(super) fn shared_gate_name(layer: usize) -> String {
 
 /// One projection of one routed expert of a layer of the model.
 #[cfg(test)]
-pub(super) fn expert_name(layer: usize, expert: usize, part: ExpertPart) -> String {
+pub(in crate::family) fn expert_name(layer: usize, expert: usize, part: ExpertPart) -> String {
     expert_name_in(Root::Layers, layer, expert, part)
 }
 
 /// One projection of the shared expert of a layer of the model.
 #[cfg(test)]
-pub(super) fn shared_name(layer: usize, part: ExpertPart) -> String {
+pub(in crate::family) fn shared_name(layer: usize, part: ExpertPart) -> String {
     shared_name_in(Root::Layers, layer, part)
 }
 
@@ -47,26 +50,23 @@ fn refuse(detail: String) -> EngError {
     EngError::Checkpoint(format!("EXL3 pack: {detail}"))
 }
 
-pub(super) fn inspect_pack(
-    source: &StreamedCheckpoint,
-    shape: &HostShape,
-) -> Result<PackReport, EngError> {
-    inspect_pack_split(source, shape).map(|split| split.report)
-}
-
-/// The pack walk plus its expert/dense split: `routed_bytes` is the device bytes of the routed
-/// experts alone (the banks a banked load replaces with `slots` members per projection), so
-/// `report.device_bytes - routed_bytes` is what a banked load still uploads.
-pub(super) struct PackSplit {
-    pub(super) report: PackReport,
-    pub(super) routed_bytes: u64,
-}
-
+/// The routed experts' device bytes are the report's `expert_bytes` (the banks a banked load
+/// replaces with `slots` members per projection); `device_bytes - expert_bytes` is what a
+/// banked load still uploads.
 pub(super) fn inspect_pack_split(
     source: &StreamedCheckpoint,
     shape: &HostShape,
-) -> Result<PackSplit, EngError> {
-    let mut walk = Inspector::new(source, Root::Layers);
+) -> Result<PackReport, EngError> {
+    Ok(inspect_pack_split_visits(source, shape)?.0)
+}
+
+/// The pack report with the walk's recorded visits, for the load's coverage check: the
+/// loader reads exactly what a recording walk stood for, or refuses.
+pub(super) fn inspect_pack_split_visits(
+    source: &StreamedCheckpoint,
+    shape: &HostShape,
+) -> Result<(PackReport, Vec<Visit>), EngError> {
+    let mut walk = Inspector::new(source, Root::Layers).recording();
     let dim = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     let h = shape.hidden;
     // The step gathers rows from the table as BF16 (`exl3_global`); another width would load
@@ -79,7 +79,6 @@ pub(super) fn inspect_pack_split(
     }
     walk.plain(NORM_NAME, &[dim(h)], false)?;
     walk.matrix(HEAD_PREFIX, h, shape.vocab)?;
-    let mut routed_total = 0u64;
     for (layer, kind) in shape.kinds.iter().enumerate() {
         walk.plain(
             &walk.root().name(layer, "input_layernorm.weight"),
@@ -96,13 +95,9 @@ pub(super) fn inspect_pack_split(
             AttentionKind::DeltaNet => walk.delta(layer, shape)?,
             other => return Err(refuse(format!("layer {layer} is {other:?}"))),
         }
-        routed_total = routed_total.saturating_add(walk.moe(layer, shape)?);
+        walk.moe(layer, shape)?;
     }
-    let report = walk.report()?;
-    Ok(PackSplit {
-        report,
-        routed_bytes: routed_total,
-    })
+    walk.report_with_visits()
 }
 
 impl Inspector<'_> {
@@ -162,8 +157,8 @@ impl Inspector<'_> {
         Ok(())
     }
 
-    /// The routed-expert device bytes of the layer (see [`Inspector::moe_block`]).
-    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<u64, EngError> {
+    /// The routed-expert block of the layer (see [`Inspector::moe_block`]).
+    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<(), EngError> {
         let m = &shape.moe;
         self.moe_block(
             layer,
@@ -177,44 +172,22 @@ impl Inspector<'_> {
     }
 }
 
-/// The planning summary of one pack directory for a device-free estimate: exactly the
-/// loader's own header walk, with its totals copied out for callers outside `family`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Exl3PackPlan {
-    /// Device bytes the load will hold ([`PackReport::device_bytes`]: trellises as stored,
-    /// scales and plain vectors widened to F32, the embedding as stored).
-    pub(crate) device_bytes: u64,
-    /// Quantized matrices (a routed expert counts one per projection).
-    pub(crate) matrices: usize,
-    /// Matrices per rate, keyed by twice the bits per weight.
-    pub(crate) rates: std::collections::BTreeMap<u8, usize>,
-    /// The codebook marker tensor every matrix of the pack carries, by name.
-    pub(crate) codebook: &'static str,
-}
-
-/// The name of the codebook marker a matrix carries, for rows that retell the walk.
-pub(super) fn codebook_name(marker: Marker) -> &'static str {
-    match marker {
-        Marker::Mul1 => "Mul1",
-        Marker::Mcg => "Mcg",
-    }
-}
-
-/// Walks the pack of `dir` the way the serving load does (`load_exl3_dir`: pinned model,
-/// pinned rotary dimension, no MTP head) and returns its planning facts. A pack of another
-/// size, rate, codebook or layout is refused here, exactly as the load would refuse it
-/// before the first upload.
-pub(crate) fn exl3_plan(dir: &std::path::Path) -> Result<Exl3PackPlan, EngError> {
+/// The Q36 walk: the header rules of `load_exl3_dir` (pinned model, pinned rotary
+/// dimension, no MTP head). A pack of another size, rate, codebook or layout is refused
+/// here, exactly as the load would refuse it before the first upload.
+fn walk_q36(dir: &std::path::Path) -> Result<PackReport, EngError> {
     let checkpoint = crate::weights::exl3::Checkpoint::open(dir)?;
     let shape = HostShape::from_spec(
         &crate::family::spec::QWEN3_6_35B_A3B,
         super::settings::ROTARY_DIM,
     )?;
-    let report = inspect_pack(&checkpoint.source, &shape)?;
-    Ok(Exl3PackPlan {
-        device_bytes: report.device_bytes,
-        matrices: report.matrices,
-        rates: report.rates,
-        codebook: codebook_name(report.codebook),
-    })
+    inspect_pack_split(&checkpoint.source, &shape)
+}
+
+/// The device-free estimate of one pack directory for this family's serving load:
+/// the header walk's totals, produced through the family-neutral plan.
+pub(crate) fn exl3_plan(
+    dir: &std::path::Path,
+) -> Result<crate::family::exl3_pack::PackPlan, EngError> {
+    walk_q36(dir).map(crate::family::exl3_pack::plan_from_report)
 }

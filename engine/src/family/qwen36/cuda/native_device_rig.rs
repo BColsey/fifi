@@ -12,8 +12,9 @@
 //! back host `Vec`s; the caller drops every device owner simply by receiving them, and only
 //! THEN asserts. A failing rig assertion can no longer latch the backend for later tests.
 use super::mixer_weights::DenseWeight;
-use super::moe::{MoeDims, MoeLayerWeights, StackWeights};
+use super::moe::{MoeLayerWeights, StackWeights};
 use crate::EngError;
+use crate::family::exl3::launch::MoeDims;
 use crate::family::project::cuda::WeightLayout;
 pub(super) use crate::kernels::cuda::device_present;
 pub(super) use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;

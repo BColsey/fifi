@@ -1,11 +1,11 @@
 //! Unit tests of the result-pair decision and the failure action. CPU only.
 use super::{
-    book::CommitRefusal,
     rules::sampler_width,
     verdict::{
         Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
     },
 };
+use crate::family::graph_state::book::CommitRefusal;
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 
 /// The Qwen3.6 head width.

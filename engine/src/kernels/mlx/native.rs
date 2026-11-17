@@ -31,6 +31,17 @@ pub(crate) mod attn_dispatch;
 pub(crate) mod compile;
 mod ffi;
 mod guard;
+
+/// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+pub(crate) fn dispatch_count() -> u64 {
+    guard::dispatch_count()
+}
+
+/// Zeroes the calling thread's native-dispatch count (the parity oracle's op-count asserts).
+#[cfg(test)]
+pub(crate) fn reset_dispatch_count() {
+    guard::reset_dispatch_count()
+}
 mod handles;
 mod host;
 mod pages;
@@ -238,6 +249,26 @@ impl Context {
         self.check_ready()?;
         Ok(float_flash_staging_bytes(dtype, d)
             <= self.state.as_ref().unwrap().max_threadgroup_memory)
+    }
+
+    pub(super) fn program_limit(&self) -> crate::kernels::compile_key::ProgramLimit {
+        self.state
+            .as_ref()
+            .expect("live MLX adapter")
+            .programs
+            .limit()
+    }
+
+    pub(super) fn set_program_limit(
+        &mut self,
+        limit: crate::kernels::compile_key::ProgramLimit,
+    ) -> Result<(), EngError> {
+        self.check_ready()?;
+        self.state
+            .as_mut()
+            .expect("live MLX adapter")
+            .programs
+            .set_limit(limit)
     }
 
     pub(super) fn try_new() -> Result<Self, EngError> {

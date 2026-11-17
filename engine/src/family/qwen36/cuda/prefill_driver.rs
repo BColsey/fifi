@@ -15,13 +15,18 @@
 use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot, Extra, PART_CHARGE, PrefillStep, SPARE_MIN,
+        Admission, ChunkCost, ChunkSlot, Extra, M_LADDER, PART_CHARGE, SPARE_MIN,
         chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
     },
 };
+use crate::family::exl3::launch::Launch;
+use crate::family::prefill::arena::PrefillStep;
 use crate::{
     EngError,
-    family::project::cuda::WeightLayout,
+    family::{
+        prefill::arena::{ArenaHooks, allocate_zeroed, drive_steps},
+        project::cuda::WeightLayout,
+    },
     kernels::cuda::{
         ArenaTensor, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
         prefill::{
@@ -29,6 +34,13 @@ use crate::{
         },
     },
 };
+
+// The family-neutral halves moved to the shared prefill core (`family::prefill`); these
+// re-exports keep the old paths alive for the step and the driver tests.
+pub(super) use crate::family::prefill::admission::AdmitFacts;
+pub(super) use crate::family::prefill::arena::check_chunk_start;
+#[cfg(test)]
+pub(super) use crate::family::prefill::arena::{ZERO_CHUNK, zero_spans};
 
 /// Free VRAM after the weight load and before state/decode allocation, less the selected
 /// headroom. Extras include caller-owned allocations such as the device prefix tip.
@@ -53,10 +65,9 @@ pub(super) mod io {
     pub(in super::super) static ALLOCS: AtomicUsize = AtomicUsize::new(0);
     /// Zero-fill span writes of the arena build (27-93 for the ladder's arenas).
     pub(in super::super) static SPAN_WRITES: AtomicUsize = AtomicUsize::new(0);
-    /// Prefill-status reads, exactly one per chunk at chunk close.
-    pub(super) static STATUS_READS: AtomicUsize = AtomicUsize::new(0);
-    /// Device-to-host reads of intermediate buffers, which the I/O rule bans per chunk.
-    pub(super) static D2H_READS: AtomicUsize = AtomicUsize::new(0);
+    /// Scribble writes of the golden capture arm (0 without `FIFI_GOLDEN_SCRIBBLE`): the whole
+    /// fresh arena in [`ZERO_CHUNK`] pieces, so the arm can assert the scribble ran at all.
+    pub(in super::super) static SCRIBBLES: AtomicUsize = AtomicUsize::new(0);
 
     pub(in super::super) fn reset() {
         ALLOCS.store(0, Ordering::Relaxed);
@@ -70,50 +81,31 @@ pub(super) mod io {
     pub(super) fn bump_span_write() {
         SPAN_WRITES.fetch_add(1, Ordering::Relaxed);
     }
-}
 
-/// The admission inputs the step reads at session build: the budget the caller measured, the decode
-/// arena, the state term in its two forms, and the cap of `M_sess`. Pure host values, so the host
-/// rows pin the rule without a device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AdmitFacts {
-    /// `PrefillBudget::device_free`: free VRAM measured ONCE after the weight load and
-    /// before state/decode allocation, less the selected admission headroom (`start.rs`).
-    pub(super) budget: usize,
-    /// `res.arena.bytes()` of the decode plan (`DeviceArena::bytes`).
-    pub(super) decode_arena: usize,
-    /// `state_bytes(dims, kv_mode, capacity, delta_slots)`: the PLANNED state term.
-    pub(super) state_planned: usize,
-    /// `self.state.layout().bytes()`: the state the step really allocated. The KV mode, the
-    /// KV capacity and the DeltaNet slots all flow through the layout (`ResidentState::allocate`).
-    pub(super) state_allocated: usize,
-    /// `self.m_sess_cap as usize` (`set_m_sess_cap`).
-    pub(super) cap: usize,
+    pub(super) fn bump_scribble() {
+        SCRIBBLES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Feeds the prefill plan's [`Admission`] with the REAL resident state: the planned term must equal
 /// the allocated layout, so a figure from anywhere else — the KV bytes alone, about 62.8 MiB short
-/// at the 16K window — is a `Checkpoint` refusal BEFORE anything else. `Admission::admit` then
+/// at the 16K window — is a `Checkpoint` refusal BEFORE anything else. [`Admission::admit`] then
 /// picks the largest ladder size at most `cap` whose device sum leaves the spare minimum; `None`
-/// means no size fits and the session keeps the per-token path.
+/// means no size fits and the session keeps the per-token path. The Qwen3.6 constants bind here.
 pub(super) fn admit_m_sess(
     facts: &AdmitFacts,
     extras: &[Extra],
     costs: &[ChunkCost],
 ) -> Result<Option<usize>, EngError> {
-    if facts.state_planned != facts.state_allocated {
-        return Err(EngError::Checkpoint(format!(
-            "prefill admission: the planned state {} B is not the allocated state {} B",
-            facts.state_planned, facts.state_allocated
-        )));
-    }
-    let admission = Admission {
-        device_budget: facts.budget,
-        decode_arena: facts.decode_arena,
-        device_extras: extras.to_vec(),
-        ..Admission::new(facts.budget)
-    };
-    admission.admit(facts.state_planned, costs, Some(facts.cap))
+    crate::family::prefill::admission::admit_m_sess(
+        facts,
+        extras,
+        costs,
+        PART_CHARGE,
+        SPARE_MIN,
+        &M_LADDER,
+        "prefill_chunk",
+    )
 }
 
 /// One reusable layer's K/V half planes, bounded independently of stored KV capacity.
@@ -443,7 +435,7 @@ pub(super) fn require_fixed_room(
             fixed: staging.bytes,
             bytes_per_token: 0,
         }],
-        ..Admission::new(budget)
+        ..Admission::qwen36(budget)
     };
     if !admission.passes(0, cost)? {
         return Err(EngError::MemoryPlan(format!(
@@ -486,29 +478,6 @@ pub(super) fn admit_guard(started: bool, admitted: bool) -> Result<(), EngError>
         ));
     }
     Ok(())
-}
-
-/// The one reused zero buffer of the arena fill: about 8 MiB per synchronous `write_at`, 27-93
-/// spans for the 213.6-741 MiB arenas of the ladder (`zero_spans`, ESTIMATE).
-pub(super) const ZERO_CHUNK: usize = 8 << 20;
-
-/// The spans that cover `[0, total)` exactly once, each `1..=chunk` bytes long, contiguous
-/// from 0: the zero fill of a whole arena (the fixup range included) runs through one reused
-/// host buffer of at most [`ZERO_CHUNK`] bytes. Refuses a zero-byte span.
-pub(super) fn zero_spans(total: usize, chunk: usize) -> Result<Vec<(usize, usize)>, EngError> {
-    if chunk == 0 {
-        return Err(EngError::BadRequest(format!(
-            "prefill arena: a zero fill of {total} B cannot write zero-byte spans"
-        )));
-    }
-    let mut spans = Vec::new();
-    let mut at = 0;
-    while at < total {
-        let len = chunk.min(total - at);
-        spans.push((at, len));
-        at += len;
-    }
-    Ok(spans)
 }
 
 /// The prefill arena of one session: the chunk tensors of the ADMITTED `M_sess` in one device
@@ -573,15 +542,21 @@ impl PrefillArena {
         (m_sess, facts, budget): (usize, MmqFacts, usize),
     ) -> Result<Self, EngError> {
         let tensors: Vec<ArenaTensor> = list.iter().map(|&(_, tensor)| tensor).collect();
-        let arena = ctx.arena(&tensors)?;
+        // The fill itself is the shared core's (`family::prefill::arena`): one arena, a whole-arena
+        // 0xA5 scribble when the golden capture arm asks for it, then the one zero fill. The
+        // test-only I/O counters ride along as hooks so the shared core stays family-neutral.
         #[cfg(test)]
-        io::bump_alloc();
-        let zeros = vec![0u8; ZERO_CHUNK.min(arena.bytes())];
-        for (at, len) in zero_spans(arena.bytes(), ZERO_CHUNK)? {
-            arena.buffer().write_at(stream, at, &zeros[..len])?;
-            #[cfg(test)]
-            io::bump_span_write();
-        }
+        let (scribble, hooks) = (
+            std::env::var_os("FIFI_GOLDEN_SCRIBBLE").is_some(),
+            ArenaHooks {
+                on_alloc: Some(io::bump_alloc),
+                on_scribble: Some(io::bump_scribble),
+                on_span_write: Some(io::bump_span_write),
+            },
+        );
+        #[cfg(not(test))]
+        let (scribble, hooks) = (false, ArenaHooks::default());
+        let arena = allocate_zeroed(ctx, stream, &tensors, scribble, hooks)?;
         let part = ctx.allocate(CPF_ATTN_PART_CAP)?;
         #[cfg(test)]
         io::bump_alloc();
@@ -669,15 +644,8 @@ impl PrefillArena {
     }
 }
 
-/// Checks the continuation position before the chunk changes device state.
-pub(super) fn check_chunk_start(p0: usize, committed: usize) -> Result<(), EngError> {
-    if p0 != committed {
-        return Err(EngError::BadRequest(format!(
-            "prefill chunk: p0 {p0} is not the committed rows {committed}"
-        )));
-    }
-    Ok(())
-}
+// `check_chunk_start` moved to the shared prefill core (`family::prefill::arena`); the old
+// path lives as the re-export at the top of this file.
 
 /// Drives the prompt rows of one feed_rows call through the prefill plan: each step gets its own
 /// rows, a feed step exactly one. The start position is the committed row count at the call, so a
@@ -688,31 +656,10 @@ pub(super) fn drive_chunks(
     tokens: &[u32],
     m_sess: usize,
     fixed_depth: bool,
-    mut run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
+    run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
-    for step in &steps {
-        let (at, rows) = match *step {
-            PrefillStep::Chunk { p0, rows } => (p0, rows),
-            PrefillStep::Feed { p0 } => (p0, 1),
-        };
-        let offset = at.checked_sub(start).ok_or_else(|| {
-            EngError::BadRequest(format!(
-                "prefill chunk: step at {at} precedes the start row {start}"
-            ))
-        })?;
-        let end = offset.checked_add(rows).ok_or_else(|| {
-            EngError::BadRequest("prefill chunk: the row window overflows".to_owned())
-        })?;
-        let slice = tokens.get(offset..end).ok_or_else(|| {
-            EngError::BadRequest(format!(
-                "prefill chunk: the plan names rows {offset}..{end} of {} tokens",
-                tokens.len()
-            ))
-        })?;
-        run(*step, slice)?;
-    }
-    Ok(steps)
+    drive_steps(start, tokens, steps, run)
 }
 
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.
@@ -725,4 +672,103 @@ pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, 
             })
         })
         .collect()
+}
+
+// ---- the shared chunk-family surface ---------------------------------------------------------
+
+use super::prefill::{ChunkBufs, ChunkModel, ChunkRows, ChunkSparse};
+use super::state::ResidentState;
+use crate::family::prefill::chunk_family::ChunkFamily;
+
+/// What the chunk body captures today, handed to the trait opaquely: the state, the launch, the
+/// host-checked ids with their arena range, the prebuilt model, buffers, rows and sparse
+/// projection. The ids are a PREFLIGHT product (`chunk_ids` runs before the window opens), so a
+/// refused token id changes nothing on the device. The context is single-use: `run_layers`
+/// consumes its sparse projection; each chunk builds a fresh context.
+pub(super) struct Q36ChunkCtx<'a, 'w> {
+    pub(super) state: &'a mut ResidentState,
+    pub(super) launch: Launch<'a>,
+    pub(super) ids: &'a [i32],
+    pub(super) ids_range: DeviceRange<'a>,
+    pub(super) model: &'a ChunkModel<'a, 'w>,
+    pub(super) bufs: &'a ChunkBufs<'a>,
+    pub(super) chunk_rows: ChunkRows,
+    pub(super) sparse: Option<ChunkSparse<'a>>,
+}
+
+/// The Qwen3.6 [`ChunkFamily`]: every method calls the site it replaced verbatim; the
+/// instruction order inside a chunk is unchanged. `run_layers` stores the run's part count in
+/// `segmented_parts` for the step's report (a Qwen3.6-only figure, so it stays here and not in
+/// the trait).
+pub(super) struct Q36ChunkFamily<'a, 'w> {
+    bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+    #[cfg(test)]
+    kernel_class: super::prefill::ChunkKernelClass,
+    pub(super) segmented_parts: usize,
+}
+
+impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
+    pub(super) fn new(
+        bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+        #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
+    ) -> Self {
+        Self {
+            bank,
+            #[cfg(test)]
+            kernel_class,
+            segmented_parts: 0,
+        }
+    }
+}
+
+impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
+    type Ctx = Q36ChunkCtx<'a, 'w>;
+
+    fn begin_window(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
+        ctx.state.begin_prefill()
+    }
+
+    fn clear_chunk_status(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
+        ctx.state.clear_prefill_status(ctx.launch.stream)
+    }
+
+    fn write_chunk_inputs(
+        &mut self,
+        ctx: &mut Self::Ctx,
+        _p0: usize,
+        _m: usize,
+    ) -> Result<(), EngError> {
+        let bytes: Vec<u8> = ctx.ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        ctx.ids_range
+            .buffer()
+            .write_at(ctx.launch.stream, ctx.ids_range.offset(), &bytes)
+    }
+
+    fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<(), EngError> {
+        let run = super::prefill::ChunkRun::new(&*ctx.state, ctx.model, ctx.bufs, ctx.chunk_rows)?;
+        let run = run.with_bank(self.bank).with_sparse(ctx.sparse.take());
+        #[cfg(test)]
+        let run = run.with_kernel_class(self.kernel_class);
+        super::prefill::run_chunk_body(&ctx.launch, &run)?;
+        self.segmented_parts = run.segmented_parts();
+        Ok(())
+    }
+
+    fn read_health(&mut self, ctx: &mut Self::Ctx) -> Result<i32, EngError> {
+        ctx.state.read_prefill_status(ctx.launch.stream)
+    }
+
+    fn commit_chunk(
+        &mut self,
+        ctx: &mut Self::Ctx,
+        p0: usize,
+        m: usize,
+        status: i32,
+    ) -> Result<(), EngError> {
+        ctx.state.revalidate(ctx.launch.stream, p0 + m, status)
+    }
+
+    fn bank_misses(&self) -> Option<u64> {
+        self.bank.as_ref().map(|bank| bank.borrow().stats().1)
+    }
 }

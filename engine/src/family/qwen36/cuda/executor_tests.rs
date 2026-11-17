@@ -6,11 +6,11 @@
 use super::common_tests;
 use super::dims::KvMode;
 use super::executor::{ChunkPath, chunk_path_of, feed_per_token, piece_of};
-use super::layer_table::LayerTable;
 use super::mixer_geometry::MixerGeometry;
 use super::start_pins::{pinned, section_of};
 use super::step::{CHUNK_MOE_ROLES, ChunkFacts, ChunkVerdict, any_chunk_weight_q6k, chunk_verdict};
 use crate::EngError;
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::session::{DecodeSession, TokenStepper};

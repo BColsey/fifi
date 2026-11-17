@@ -34,7 +34,7 @@ pub(in crate::family) fn write_stream(
     buffer: &DeviceBuffer,
     values: &[f32],
 ) -> Result<(), EngError> {
-    let bytes = crate::family::qwen36::exl3_tensors::f32_le_bytes(values);
+    let bytes = crate::family::exl3_tensors::f32_le_bytes(values);
     context.upload_at(buffer, 0, &bytes)
 }
 

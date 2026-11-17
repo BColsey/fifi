@@ -9,7 +9,9 @@ use super::{
 use crate::EngError;
 use crate::family::executor::ExecutorOps;
 use crate::family::session::SaveKind;
-use crate::sched::job::{Job, JobEvent, JobUsage, QUEUE_CAPACITY, send_data, send_terminal};
+use crate::sched::job::{
+    Job, JobEvent, JobUsage, PrefillPieces, QUEUE_CAPACITY, send_data, send_terminal,
+};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -25,6 +27,10 @@ struct Slot<S> {
     ready: bool,
     finished: bool,
     slow: bool,
+    /// The admit-path bank counters as they stood when the slot was built, so the ready
+    /// transition can log this slot's prefill delta once (the slots share one executor, so
+    /// the delta spans the pieces other ready slots prefilled alongside it).
+    bank_before: Option<crate::sched::job::PrefillBankReport>,
     /// Whether the eviction restart already ran for this slot: a restarted slot saves
     /// nothing. Later denials are NOT final by that alone: they evict one more entry and
     /// restart again - final only through `exhausted_restart` below, the classify gate, or
@@ -102,7 +108,7 @@ fn cancelled<S>(slot: &mut Slot<S>) {
                     finish: Some(DecodeFinish::Cancelled),
                 }),
             ) {
-                send_terminal(&slot.job.events, JobEvent::Finished(slot.usage));
+                send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
             }
         }
         Err(error) => send_terminal(&slot.job.events, JobEvent::Error(error)),
@@ -155,6 +161,9 @@ fn setup_slot<E: ExecutorOps>(
     slot.usage.prompt_tokens = prompt_tokens(&slot.job.prompt);
     slot.usage.reused_tokens = u32::try_from(restored).unwrap_or(u32::MAX);
     slot.usage.prefix = prefix;
+    // A restart re-feeds from the cursor, so the piece count keeps only the run that
+    // served the prompt, never the aborted attempt's pieces (mirrors the single worker).
+    slot.usage.prefill_pieces = PrefillPieces::default();
     slot.cursor = restored;
     slot.ready = false;
     Ok(())
@@ -188,10 +197,14 @@ fn build_slot<E: ExecutorOps>(
             completion_tokens: 0,
             reused_tokens: 0,
             prefix: None,
+            prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
         },
         ready: false,
         finished: false,
         slow: false,
+        bank_before: executor.prefill_bank_report(),
         retried: false,
         exhausted_restart: false,
     };
@@ -291,6 +304,12 @@ fn prefill<E: ExecutorOps>(
     let remaining = span(&slot.job.prompt, slot.cursor, target)?;
     let end = slot.cursor + rows.min(remaining.len());
     executor.prefill(&mut slot.session, span(&slot.job.prompt, slot.cursor, end)?)?;
+    slot.usage.prefill_pieces.count = slot.usage.prefill_pieces.count.saturating_add(1);
+    slot.usage.prefill_pieces.max_rows = slot
+        .usage
+        .prefill_pieces
+        .max_rows
+        .max(u32::try_from(end - slot.cursor).unwrap_or(u32::MAX));
     slot.cursor = end;
     if slot.job.generation.cancel.load(Ordering::SeqCst) {
         refresh_report(executor, slot);
@@ -302,6 +321,12 @@ fn prefill<E: ExecutorOps>(
     refresh_report(executor, slot);
     if slot.cursor == slot.job.prompt.len() {
         slot.ready = true;
+        // The bank counters land once, at the ready transition, as this slot's prefill
+        // delta (log-only; `None` is the report of an executor without an expert bank).
+        slot.usage.prefill_bank = match (executor.prefill_bank_report(), slot.bank_before.take()) {
+            (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
+            _ => None,
+        };
     }
     Ok(())
 }
@@ -354,11 +379,11 @@ pub(super) fn work<E: ExecutorOps>(
                 }
                 break;
             };
-            let Message::Job(job) = message else {
+            let Message::Job(job, ticket) = message else {
                 shared.stop.store(true, Ordering::SeqCst);
                 break;
             };
-            shared.queued.fetch_sub(1, Ordering::SeqCst);
+            drop(ticket);
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
                 cancel_unstarted(job);
                 continue;
@@ -601,6 +626,9 @@ pub(super) fn work<E: ExecutorOps>(
                 .usage
                 .completion_tokens
                 .saturating_add(u32::try_from(batch.tokens.len()).unwrap_or(u32::MAX));
+            // The sampler's first-draw latch is the request's first decode position; the
+            // served margin rides the slot usage from the window that drew it.
+            slot.usage.first_token_margin = slot.job.generation.sampler.first_top2_margin();
             slot.finished = batch.finish.is_some();
             if !send_data(&slot.job.events, JobEvent::Batch(batch)) {
                 slot.job.generation.cancel.store(true, Ordering::SeqCst);
@@ -625,7 +653,7 @@ pub(super) fn work<E: ExecutorOps>(
         slots.retain(|slot| {
             if slot.slow || slot.finished {
                 if !slot.slow {
-                    send_terminal(&slot.job.events, JobEvent::Finished(slot.usage));
+                    send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
                 }
                 unregister(shared, &slot.job);
                 false

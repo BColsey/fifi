@@ -15,10 +15,11 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::CudaProjector,
-    family::qwen36::tiered::classify::classify_reference,
+    family::tiered_classify::classify_reference,
     family::{
         exl3_pack::{Root, router_name_in},
-        flash_next::{load::model_shape, stored::host_f32},
+        flash_next::load::model_shape,
+        stored::host_f32,
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, device_present,

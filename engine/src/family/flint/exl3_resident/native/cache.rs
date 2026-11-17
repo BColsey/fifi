@@ -6,6 +6,7 @@ use crate::EngError;
 // The pure bank policy lives in `family::flint::budget` so host builds
 // compose the same decisions; re-exported here because the native loader
 // and its tests historically reach it through this module.
+use crate::family::expert_bank::policy::LayerLru;
 #[cfg(test)]
 use crate::family::flint::budget::CpuMoeConfig;
 #[cfg(test)]
@@ -222,10 +223,8 @@ pub(super) struct LayerCache {
     stream: u64,
     key: PassKey,
     phase: Phase,
-    // These three are sized by the layer's resident count, not by a compile-time bank.
-    residents: Box<[u16]>,
-    slots: [Option<u16>; EXPERTS],
-    recency: Box<[u16]>,
+    // The slot table, the resident map and the recency order: one shared LRU row.
+    row: LayerLru,
     demanded: [bool; EXPERTS],
     copies: Box<[MissCopy]>,
     copy_count: usize,
@@ -242,11 +241,9 @@ impl LayerCache {
                 |value| value.checked_add(1),
             )
             .map_err(|_| cache_overflow())?;
-        let canonical: Box<[u16]> = (0..geometry.slot_count).map(|index| index as u16).collect();
+        let canonical = LayerLru::from_identity(EXPERTS, geometry.slot_count);
         Ok(Self {
-            slots: Self::canonical_slots(geometry.slot_count),
-            residents: canonical.clone(),
-            recency: canonical,
+            row: canonical,
             copies: vec![MissCopy::EMPTY; geometry.slot_count].into(),
             geometry,
             stream,
@@ -258,10 +255,6 @@ impl LayerCache {
             demanded: [false; EXPERTS],
             copy_count: 0,
         })
-    }
-
-    fn canonical_slots(slot_count: usize) -> [Option<u16>; EXPERTS] {
-        std::array::from_fn(|index| (index < slot_count).then_some(index as u16))
     }
 
     fn check(&self, phase: Phase, stream: u64) -> Result<(), EngError> {
@@ -314,6 +307,9 @@ impl LayerCache {
         self.check(Phase::Idle, self.stream)?;
         let mut demanded = [false; EXPERTS];
         let mut count = 0;
+        // The raw id order, duplicates kept: a repeated id re-promotes its slot, so the
+        // recency a pass leaves is the last-occurrence order, as before.
+        let mut order = Vec::with_capacity(ids.len());
         for &id in ids {
             let index = usize::try_from(id).map_err(|_| cache_error("unknown expert ID"))?;
             let entry = demanded
@@ -323,6 +319,7 @@ impl LayerCache {
                 count += 1;
                 *entry = true;
             }
+            order.push(id as u16);
         }
         let slot_count = self.geometry.slot_count;
         if count > slot_count {
@@ -333,44 +330,24 @@ impl LayerCache {
             .generation
             .checked_add(1)
             .ok_or_else(cache_overflow)?;
-        let mut residents = self.residents.clone();
-        let mut slots = self.slots;
-        let mut recency = self.recency.clone();
+        // The pass runs on a scratch row and only lands on Ok, so a refusal leaves the
+        // live table exactly as the call found it.
+        let mut next = self.row.clone();
+        let plan = next
+            .apply(&order, &demanded)
+            .map_err(|detail| cache_error(&detail))?;
         let mut copies = [MissCopy::EMPTY; EXPERTS];
-        let mut copy_count = 0usize;
-        for &id in ids {
-            let expert = id as u16;
-            let slot = if let Some(slot) = slots[usize::from(expert)] {
-                usize::from(slot)
-            } else {
-                let slot = recency
-                    .iter()
-                    .copied()
-                    .find(|&slot| !demanded[usize::from(residents[usize::from(slot)])])
-                    .ok_or_else(|| cache_error("no unprotected victim"))?;
-                slots[usize::from(residents[usize::from(slot)])] = None;
-                residents[usize::from(slot)] = expert;
-                slots[usize::from(expert)] = Some(slot);
-                copies[copy_count] = self.copy(expert, slot)?;
-                copy_count += 1;
-                usize::from(slot)
-            };
-            let position = recency
-                .iter()
-                .position(|&value| usize::from(value) == slot)
-                .ok_or_else(|| cache_error("invalid recency order"))?;
-            recency.copy_within(position + 1..slot_count, position);
-            recency[slot_count - 1] = slot as u16;
+        for (index, swap) in plan.moves.iter().enumerate() {
+            copies[index] = self.copy(swap.incoming, swap.slot)?;
         }
+        let copy_count = plan.moves.len();
         let bytes = copy_count
             .checked_mul(self.geometry.stride)
             .ok_or_else(cache_overflow)?;
         if bytes > max_copy_bytes {
             return Err(cache_error("miss copies exceed byte bound"));
         }
-        self.residents = residents;
-        self.slots = slots;
-        self.recency = recency;
+        self.row = next;
         self.demanded = demanded;
         self.copies[..copy_count].copy_from_slice(&copies[..copy_count]);
         self.copy_count = copy_count;
@@ -381,7 +358,7 @@ impl LayerCache {
 
     /// Which experts hold a device slot now.
     pub(super) fn resident_flags(&self) -> [bool; EXPERTS] {
-        std::array::from_fn(|expert| self.slots[expert].is_some())
+        std::array::from_fn(|expert| self.row.is_resident(expert))
     }
 
     /// Gives `incoming` the slot `outgoing` holds, for the slow hot-set policy of CPU-served
@@ -389,23 +366,15 @@ impl LayerCache {
     /// pass of this layer; the slot becomes the most recently used one.
     pub(super) fn swap_in(&mut self, incoming: u16, outgoing: u16) -> Result<MissCopy, EngError> {
         self.check(Phase::Idle, self.stream)?;
-        if self.slots[usize::from(incoming)].is_some() {
-            return Err(cache_error("incoming expert already holds a slot"));
-        }
-        let slot = self.slots[usize::from(outgoing)]
-            .take()
-            .ok_or_else(|| cache_error("outgoing expert holds no slot"))?;
+        let slot = self
+            .row
+            .validate_swap(incoming, outgoing)
+            .map_err(|detail| cache_error(&detail))?;
+        // The copy builds before the row commits: a refused build leaves the row untouched.
         let copy = self.copy(incoming, slot)?;
-        self.residents[usize::from(slot)] = incoming;
-        self.slots[usize::from(incoming)] = Some(slot);
-        let position = self
-            .recency
-            .iter()
-            .position(|&value| value == slot)
-            .ok_or_else(|| cache_error("invalid recency order"))?;
-        let last = self.geometry.slot_count;
-        self.recency.copy_within(position + 1..last, position);
-        self.recency[last - 1] = slot;
+        self.row
+            .swap(incoming, outgoing)
+            .map_err(|detail| cache_error(&detail))?;
         Ok(copy)
     }
 
@@ -432,7 +401,9 @@ impl LayerCache {
         {
             return Err(cache_error("expert is outside this pass"));
         }
-        self.slots[usize::from(expert)].ok_or_else(|| cache_error("expert has no slot"))
+        self.row
+            .slot_of(expert)
+            .ok_or_else(|| cache_error("expert has no slot"))
     }
 
     pub(super) fn release<T>(
@@ -456,20 +427,9 @@ impl LayerCache {
     /// which the decode that follows then evicts against.
     pub(super) fn touch(&mut self, experts: &[u16]) -> Result<(), EngError> {
         self.check(Phase::Idle, self.stream)?;
-        let slot_count = self.geometry.slot_count;
-        for &expert in experts {
-            let Some(slot) = self.slots.get(usize::from(expert)).copied().flatten() else {
-                continue;
-            };
-            let position = self
-                .recency
-                .iter()
-                .position(|&value| value == slot)
-                .ok_or_else(|| cache_error("invalid recency order"))?;
-            self.recency.copy_within(position + 1..slot_count, position);
-            self.recency[slot_count - 1] = slot;
-        }
-        Ok(())
+        self.row
+            .touch(experts)
+            .map_err(|detail| cache_error(&detail))
     }
 
     pub(super) fn poison(&mut self) {
@@ -489,11 +449,7 @@ impl LayerCache {
             .ok_or_else(cache_overflow)?;
         self.phase = Phase::Poisoned;
         drain()?;
-        for (index, resident) in self.residents.iter_mut().enumerate() {
-            *resident = index as u16;
-        }
-        self.recency.copy_from_slice(&self.residents);
-        self.slots = Self::canonical_slots(self.geometry.slot_count);
+        self.row.reset_identity();
         self.demanded = [false; EXPERTS];
         self.copies.fill(MissCopy::EMPTY);
         self.copy_count = 0;
@@ -511,289 +467,6 @@ fn cache_error(message: &str) -> EngError {
     EngError::BadRequest(format!("Flint expert cache: {message}"))
 }
 
-pub(crate) struct HostBudget {
-    pub(super) mem_available: u64,
-    // None means a confirmed unlimited cgroup, never a failed limit read.
-    pub(super) cgroup_remaining: Option<u64>,
-    pub(super) os_floor: u64,
-}
-
-impl HostBudget {
-    pub(crate) fn probe() -> Result<Self, EngError> {
-        Self::probe_in(
-            std::path::Path::new("/proc"),
-            std::path::Path::new("/sys/fs/cgroup"),
-            std::process::id(),
-        )
-    }
-
-    fn probe_in(
-        proc: &std::path::Path,
-        root: &std::path::Path,
-        pid: u32,
-    ) -> Result<Self, EngError> {
-        let meminfo = read_admission_file(&proc.join("meminfo"))?;
-        let membership = read_admission_file(&proc.join("self/cgroup"))?;
-        let mounts = read_admission_file(&proc.join("self/mountinfo"))?;
-        let group = cgroup_from_proc(root, &membership, &mounts, pid)?;
-        let root = std::fs::canonicalize(root)
-            .map_err(|error| EngError::MemoryPlan(format!("Flint cgroup root: {error}")))?;
-        Self::from_meminfo(&meminfo, cgroup_remaining_in(&root, &group)?)
-    }
-
-    pub(super) fn from_meminfo(
-        contents: &str,
-        cgroup_remaining: Option<u64>,
-    ) -> Result<Self, EngError> {
-        let total = meminfo_bytes(contents, "MemTotal:")?;
-        let available = meminfo_bytes(contents, "MemAvailable:")?;
-        if total == 0 || available > total {
-            return Err(EngError::MemoryPlan(
-                "Flint expert cache memory snapshot has inconsistent totals.".into(),
-            ));
-        }
-        Ok(Self {
-            mem_available: available,
-            cgroup_remaining,
-            os_floor: total.div_ceil(10).max(8u64 << 30),
-        })
-    }
-
-    pub(crate) fn admit(&self, required: u64) -> Result<(), EngError> {
-        self.admit_for(required, "Flint expert cache")
-    }
-
-    /// [`admit`] with the caller's name in the refusal, so a prefix
-    /// snapshot refusal does not masquerade as an expert-cache one
-    /// (the refusal names the caller).
-    pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self
-            .cgroup_remaining
-            .map_or(self.mem_available, |remaining| {
-                remaining.min(self.mem_available)
-            });
-        if required
-            .checked_add(self.os_floor)
-            .is_none_or(|needed| needed > available)
-        {
-            return Err(EngError::MemoryPlan(format!(
-                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
-                self.os_floor
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn meminfo_bytes(contents: &str, name: &str) -> Result<u64, EngError> {
-    let invalid = || {
-        EngError::MemoryPlan(format!(
-            "Flint expert cache needs one valid {name} value in kB from /proc/meminfo."
-        ))
-    };
-    let mut matches = contents.lines().filter_map(|line| line.strip_prefix(name));
-    let mut fields = matches.next().ok_or_else(invalid)?.split_whitespace();
-    let bytes = fields
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|kib| kib.checked_mul(1024))
-        .ok_or_else(invalid)?;
-    if fields.next() != Some("kB") || fields.next().is_some() || matches.next().is_some() {
-        return Err(invalid());
-    }
-    Ok(bytes)
-}
-
-fn cgroup_remaining_bytes(maximum: &str, current: &str) -> Result<Option<u64>, EngError> {
-    let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache needs memory.max as max or an unsigned byte count, and memory.current as an unsigned byte count."
-                .into(),
-        )
-    };
-    let parse = |value: &str| {
-        let value = value.trim();
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid());
-        }
-        value.parse::<u64>().map_err(|_| invalid())
-    };
-    let current = parse(current)?;
-    match maximum.trim() {
-        "max" => Ok(None),
-        maximum => Ok(Some(parse(maximum)?.saturating_sub(current))),
-    }
-}
-
-fn read_admission_file(path: &std::path::Path) -> Result<String, EngError> {
-    std::fs::read_to_string(path).map_err(|error| {
-        EngError::MemoryPlan(format!(
-            "Flint expert cache cannot read {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-// Discovery must verify the global controller root and reject hidden ancestors first.
-fn cgroup_remaining_in(
-    root: &std::path::Path,
-    cgroup: &std::path::Path,
-) -> Result<Option<u64>, EngError> {
-    if !root.is_absolute()
-        || !cgroup.is_absolute()
-        || !cgroup.starts_with(root)
-        || root
-            .components()
-            .chain(cgroup.components())
-            .any(|component| component == std::path::Component::ParentDir)
-    {
-        return Err(EngError::MemoryPlan(
-            "Flint expert cache cgroup must be inside its verified controller root.".into(),
-        ));
-    }
-    let mut minimum: Option<u64> = None;
-    let mut group = cgroup;
-    while group != root {
-        let parent = group.parent().ok_or_else(|| {
-            EngError::MemoryPlan("Flint expert cache cgroup has no controller ancestor.".into())
-        })?;
-        if read_admission_file(&parent.join("cgroup.subtree_control"))?
-            .split_whitespace()
-            .any(|controller| controller == "memory")
-            && let Some(remaining) = cgroup_remaining_bytes(
-                &read_admission_file(&group.join("memory.max"))?,
-                &read_admission_file(&group.join("memory.current"))?,
-            )?
-        {
-            minimum = Some(minimum.map_or(remaining, |previous| previous.min(remaining)));
-        }
-        group = parent;
-    }
-    // The root of a cgroup namespace is the container's own cgroup: no parent is visible, so
-    // its limit is the outermost one. The global root has no limit files.
-    if root.join("memory.max").exists() {
-        let remaining = cgroup_remaining_bytes(
-            &read_admission_file(&root.join("memory.max"))?,
-            &read_admission_file(&root.join("memory.current"))?,
-        )?;
-        if let Some(remaining) = remaining {
-            minimum = Some(minimum.map_or(remaining, |previous| previous.min(remaining)));
-        }
-    }
-    Ok(minimum)
-}
-
-fn verify_cgroup_root(root: &std::path::Path, mounts: &str) -> Result<(), EngError> {
-    let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache needs one complete cgroup2 root with the memory controller.".into(),
-        )
-    };
-    let point = root.to_str().ok_or_else(invalid)?;
-    let mut mounted = false;
-    for line in mounts.lines() {
-        let Some((head, tail)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<_> = head.split_ascii_whitespace().collect();
-        if fields.get(4) != Some(&point) {
-            continue;
-        }
-        if mounted
-            || fields.get(3) != Some(&"/")
-            || tail.split_ascii_whitespace().next() != Some("cgroup2")
-        {
-            return Err(invalid());
-        }
-        mounted = true;
-    }
-    if !mounted
-        || !read_admission_file(&root.join("cgroup.controllers"))?
-            .split_whitespace()
-            .any(|controller| controller == "memory")
-    {
-        return Err(invalid());
-    }
-    // These interfaces exist on namespace/subtree roots (a container's own cgroup), but not on
-    // the global root. All three together mean a namespace root, whose own limit
-    // `cgroup_remaining_in` applies; some of them alone is an ambiguous tree.
-    let mut present = 0;
-    for name in ["cgroup.type", "memory.max", "memory.current"] {
-        let path = root.join(name);
-        match std::fs::metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => present += 1,
-            Err(error) => {
-                return Err(EngError::MemoryPlan(format!(
-                    "Flint expert cache cannot verify {}: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    if present != 0 && present != 3 {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-fn cgroup_from_proc(
-    root: &std::path::Path,
-    membership: &str,
-    mounts: &str,
-    pid: u32,
-) -> Result<std::path::PathBuf, EngError> {
-    let invalid = || {
-        EngError::MemoryPlan(
-            "Flint expert cache cannot map its process inside a complete unified cgroup tree."
-                .into(),
-        )
-    };
-    let mut lines = membership.lines();
-    let path = std::path::Path::new(
-        lines
-            .next()
-            .and_then(|line| line.strip_prefix("0::"))
-            .ok_or_else(invalid)?,
-    );
-    if pid == 0
-        || lines.next().is_some()
-        || !root.is_absolute()
-        || !path.is_absolute()
-        || root
-            .components()
-            .chain(path.components())
-            .any(|component| component == std::path::Component::ParentDir)
-    {
-        return Err(invalid());
-    }
-    let resolve = |path: &std::path::Path| {
-        std::fs::canonicalize(path).map_err(|error| {
-            EngError::MemoryPlan(format!(
-                "Flint expert cache cannot resolve {}: {error}",
-                path.display()
-            ))
-        })
-    };
-    let root = resolve(root)?;
-    verify_cgroup_root(&root, mounts)?;
-    let group = resolve(&root.join(path.strip_prefix("/").map_err(|_| invalid())?))?;
-    if !group.starts_with(&root) {
-        return Err(invalid());
-    }
-    if group != root && read_admission_file(&group.join("cgroup.type"))?.trim() != "domain" {
-        return Err(invalid());
-    }
-    let mut found = false;
-    for owner in read_admission_file(&group.join("cgroup.procs"))?.split_whitespace() {
-        found |= owner.parse::<u32>().map_err(|_| invalid())? == pid;
-    }
-    if !found {
-        return Err(invalid());
-    }
-    Ok(group)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,9 +474,9 @@ mod tests {
     const SLOTS: usize = 224;
 
     type BankState = (
-        [Option<u16>; EXPERTS],
-        Box<[u16]>,
-        Box<[u16]>,
+        Vec<i32>,
+        Vec<u16>,
+        Vec<u16>,
         [bool; EXPERTS],
         Box<[MissCopy]>,
         usize,
@@ -812,9 +485,9 @@ mod tests {
     // What the bank holds, without the pass key that every cache owns uniquely.
     fn bank_state(cache: &LayerCache) -> BankState {
         (
-            cache.slots,
-            cache.residents.clone(),
-            cache.recency.clone(),
+            cache.row.state().0.to_vec(),
+            cache.row.state().1.to_vec(),
+            cache.row.state().2.to_vec(),
             cache.demanded,
             cache.copies.clone(),
             cache.copy_count,
@@ -882,8 +555,8 @@ mod tests {
         assert!(flags[9] && !flags[1] && flags[0] && flags[2] && flags[3]);
         assert_eq!(flags.iter().filter(|f| **f).count(), 4);
         // The swapped slot is the most recently used one, so the next LRU victim is slot 0.
-        assert_eq!(cache.recency.last().copied(), Some(1));
-        assert_eq!(cache.recency[0], 0);
+        assert_eq!(cache.row.state().2.last().copied(), Some(1));
+        assert_eq!(cache.row.state().2[0], 0);
         // Refusals leave the cache untouched.
         let before = snapshot(&cache);
         assert!(cache.swap_in(9, 2).is_err(), "incoming already resident");
@@ -1014,10 +687,10 @@ mod tests {
         // Experts 0, 1 and 2 are the oldest. Touching them in the order 2, 0, 1 makes expert 1 the
         // newest and expert 3 the oldest, so the next two misses evict 3 and 4, not 0, 1 or 2.
         cache.touch(&[2, 0, 1, 250]).unwrap();
-        assert_eq!(cache.recency[SLOTS - 1], 1);
-        assert_eq!(cache.recency[SLOTS - 2], 0);
-        assert_eq!(cache.recency[SLOTS - 3], 2);
-        assert_eq!(cache.recency[0], 3);
+        assert_eq!(cache.row.state().2[SLOTS - 1], 1);
+        assert_eq!(cache.row.state().2[SLOTS - 2], 0);
+        assert_eq!(cache.row.state().2[SLOTS - 3], 2);
+        assert_eq!(cache.row.state().2[0], 3);
         let pass = cache.prepare(&[224, 225], usize::MAX).unwrap();
         let ready = cache
             .copy_ready(pass, 7, |copies| {
@@ -1029,9 +702,9 @@ mod tests {
         cache.release(ready, 7, || Ok(())).unwrap();
         // A touch outside the idle phase is refused and changes nothing.
         let pass = cache.prepare(&[1], usize::MAX).unwrap();
-        let before = cache.recency.clone();
+        let before = cache.row.state().2.to_vec();
         assert!(cache.touch(&[5]).is_err());
-        assert_eq!(cache.recency, before);
+        assert_eq!(cache.row.state().2, before.as_slice());
         let _ = pass;
     }
 
@@ -1149,8 +822,8 @@ mod tests {
         assert!(cache.prepare(&[224], 2).is_err());
         assert_eq!(snapshot(&cache), before);
         let pass = cache.prepare(&[224, 0, 224, 1], 3).unwrap();
-        assert_eq!(cache.slots[2], None);
-        assert_eq!(cache.slots[224], Some(2));
+        assert_eq!(cache.row.state().0[2], -1);
+        assert_eq!(cache.row.state().0[224], 2);
         assert!(cache.prepare(&[225], 3).is_err());
         assert!(
             cache
@@ -1249,7 +922,10 @@ mod tests {
             ["initial", "copy", "finish", "drain", "reinitialize"]
         );
         for id in 0..EXPERTS {
-            assert_eq!(cache.slots[id], (id < SLOTS).then_some(id as u16));
+            assert_eq!(
+                cache.row.state().0[id],
+                if id < SLOTS { id as i32 } else { -1 }
+            );
         }
         let pass = cache.prepare(&[0], 0).unwrap();
         assert!(
@@ -1311,489 +987,6 @@ mod tests {
         assert!(cache.prepare(&[0], 0).is_err());
         cache.reset_after_drain(7, || Ok(())).unwrap();
         assert!(cache.phase == Phase::Initial);
-    }
-
-    #[test]
-    fn captured_cgroup_roots_match_real_admission() {
-        let captures: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-views-20261028.json")).unwrap();
-        let hostns: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-hostns-20261028.json")).unwrap();
-        let host_files = captures["host"]["root_file_names"].as_array().unwrap();
-        for name in ["cgroup.type", "memory.max", "memory.current"] {
-            assert!(!host_files.iter().any(|value| value.as_str() == Some(name)));
-        }
-        for (name, view, accepted) in [
-            ("container", &captures["container"], false),
-            ("host", &captures["host"], true),
-            ("hostns", &hostns, true),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let directory = root.path().canonicalize().unwrap();
-            let controllers = view["controllers"].as_str().unwrap();
-            assert!(
-                controllers
-                    .split_whitespace()
-                    .any(|value| value == "memory")
-            );
-            std::fs::write(directory.join("cgroup.controllers"), controllers).unwrap();
-            for (file, key) in [
-                ("cgroup.type", "cgroup_type"),
-                ("memory.max", "memory_max"),
-                ("memory.current", "memory_current"),
-            ] {
-                if let Some(contents) = view[key].as_str() {
-                    std::fs::write(directory.join(file), contents).unwrap();
-                }
-            }
-            let mounts = view["mountinfo"]
-                .as_str()
-                .unwrap()
-                .replace("/sys/fs/cgroup", &directory.display().to_string());
-            let result = verify_cgroup_root(&directory, &mounts);
-            eprintln!("captured view {name}: accepted={}", result.is_ok());
-            if accepted {
-                assert!(result.is_ok(), "{name}: {result:?}");
-            } else {
-                assert!(matches!(result, Err(EngError::MemoryPlan(message))
-                    if message.contains("one complete cgroup2 root")));
-            }
-        }
-    }
-
-    #[test]
-    fn captured_cgroup_host_member_maps_to_nested_group() {
-        let captures: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-views-20261028.json")).unwrap();
-        let view = &captures["host"];
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().canonicalize().unwrap();
-        std::fs::write(
-            directory.join("cgroup.controllers"),
-            view["controllers"].as_str().unwrap(),
-        )
-        .unwrap();
-        let membership = view["membership"].as_str().unwrap();
-        let group = directory.join(membership.trim().strip_prefix("0::/").unwrap());
-        std::fs::create_dir_all(&group).unwrap();
-        std::fs::write(
-            group.join("cgroup.type"),
-            view["member_type"].as_str().unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            group.join("cgroup.procs"),
-            view["member_procs"].as_str().unwrap(),
-        )
-        .unwrap();
-        let mounts = view["mountinfo"]
-            .as_str()
-            .unwrap()
-            .replace("/sys/fs/cgroup", &directory.display().to_string());
-        let pid = u32::try_from(view["pid"].as_u64().unwrap()).unwrap();
-        let result = cgroup_from_proc(&directory, membership, &mounts, pid);
-        assert_eq!(result.unwrap(), group);
-        eprintln!("captured host member: mapped=true pid={pid}");
-    }
-
-    fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().canonicalize().unwrap();
-        let group = directory.join("work");
-        std::fs::create_dir(&group).unwrap();
-        std::fs::write(directory.join("cgroup.controllers"), "memory\n").unwrap();
-        std::fs::write(group.join("cgroup.type"), "domain\n").unwrap();
-        std::fs::write(group.join("cgroup.procs"), "41\n42\n").unwrap();
-        let mounts = format!(
-            "36 29 0:33 / {} rw - cgroup2 cgroup rw\n",
-            directory.display()
-        );
-        (root, group, mounts)
-    }
-
-    #[test]
-    fn cgroup_discovery_resolves_own_pid_in_global_tree() {
-        let (root, group, mounts) = discovery_fixture();
-        let resolved = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
-        assert!(
-            resolved.is_ok(),
-            "a complete global cgroup tree must resolve its own process group"
-        );
-        assert_eq!(resolved.unwrap(), group);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cgroup_discovery_matches_canonical_mount_paths() {
-        let (root, group, mounts) = discovery_fixture();
-        let aliases = tempfile::tempdir().unwrap();
-        let alias = aliases.path().join("controller-root");
-        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
-        let resolved = cgroup_from_proc(&alias, "0::/work\n", &mounts, 42).unwrap();
-        assert_eq!(resolved, group);
-    }
-
-    #[test]
-    fn cgroup_discovery_rejects_hidden_or_ambiguous_roots() {
-        for (name, contents) in [
-            ("cgroup.type", "domain\n"),
-            ("memory.max", "max\n"),
-            ("memory.current", "0\n"),
-            ("cgroup.controllers", "cpu\n"),
-        ] {
-            let (root, _, mounts) = discovery_fixture();
-            std::fs::write(root.path().join(name), contents).unwrap();
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
-            assert!(
-                matches!(result, Err(EngError::MemoryPlan(message))
-                    if message.contains("complete cgroup2 root")),
-                "must reject root interface {name}"
-            );
-        }
-        for (source, filesystem, copies) in [
-            ("/delegated", "cgroup2", 1),
-            ("/", "tmpfs", 1),
-            ("/", "cgroup2", 2),
-        ] {
-            let (root, group, _) = discovery_fixture();
-            let mounts = format!(
-                "36 29 0:33 {source} {} rw - {filesystem} cgroup rw\n",
-                group.parent().unwrap().display()
-            )
-            .repeat(copies);
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
-            assert!(
-                matches!(result, Err(EngError::MemoryPlan(message))
-                    if message.contains("complete cgroup2 root")),
-                "must reject mount {source}/{filesystem}/{copies}"
-            );
-        }
-    }
-
-    /// A container's view: the cgroup root is the container's own cgroup, with limit files.
-    fn namespace_root(maximum: &str, controllers: &str) -> (tempfile::TempDir, tempfile::TempDir) {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().canonicalize().unwrap();
-        for (name, contents) in [
-            ("cgroup.controllers", controllers),
-            ("cgroup.subtree_control", ""),
-            ("cgroup.type", "domain\n"),
-            ("cgroup.procs", "1\n42\n"),
-            ("memory.max", maximum),
-            ("memory.current", "2147483648\n"),
-        ] {
-            std::fs::write(directory.join(name), contents).unwrap();
-        }
-        let proc = tempfile::tempdir().unwrap();
-        std::fs::create_dir(proc.path().join("self")).unwrap();
-        std::fs::write(
-            proc.path().join("meminfo"),
-            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
-        )
-        .unwrap();
-        std::fs::write(proc.path().join("self/cgroup"), "0::/\n").unwrap();
-        std::fs::write(
-            proc.path().join("self/mountinfo"),
-            format!(
-                "36 29 0:33 / {} rw - cgroup2 cgroup rw\n",
-                directory.display()
-            ),
-        )
-        .unwrap();
-        (root, proc)
-    }
-
-    #[test]
-    fn a_namespace_root_applies_its_own_limit_or_falls_back_to_available_memory() {
-        let (root, proc) = namespace_root("8589934592\n", "memory\n");
-        let budget = HostBudget::probe_in(proc.path(), root.path(), 42).unwrap();
-        assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
-        assert_eq!(budget.os_floor, 8u64 << 30);
-        // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
-        assert!(budget.admit(1).is_err());
-        let (root, proc) = namespace_root("max\n", "memory\n");
-        let budget = HostBudget::probe_in(proc.path(), root.path(), 42).unwrap();
-        assert_eq!(budget.cgroup_remaining, None);
-        // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
-        assert!(budget.admit(16u64 << 30).is_ok());
-        assert!(budget.admit((16u64 << 30) + 1).is_err());
-    }
-
-    #[test]
-    fn a_root_with_some_but_not_all_namespace_files_is_refused() {
-        let files = [
-            ("cgroup.type", "domain\n"),
-            ("memory.max", "max\n"),
-            ("memory.current", "0\n"),
-        ];
-        for skipped in 0..files.len() {
-            let (root, _, mounts) = discovery_fixture();
-            for (index, (name, contents)) in files.iter().enumerate() {
-                if index != skipped {
-                    std::fs::write(root.path().join(name), contents).unwrap();
-                }
-            }
-            let result = cgroup_from_proc(root.path(), "0::/work\n", &mounts, 42);
-            assert!(
-                matches!(result, Err(EngError::MemoryPlan(message))
-                    if message.contains("complete cgroup2 root")),
-                "two of three root files without {} must be refused",
-                files[skipped].0
-            );
-        }
-    }
-
-    #[test]
-    fn a_namespace_root_without_the_memory_controller_is_refused_clearly() {
-        let (root, proc) = namespace_root("max\n", "cpu\n");
-        let result = HostBudget::probe_in(proc.path(), root.path(), 42);
-        assert!(matches!(result, Err(EngError::MemoryPlan(message))
-                if message.contains("complete cgroup2 root with the memory controller")));
-    }
-
-    #[test]
-    fn cgroup_discovery_rejects_bad_process_mapping() {
-        for (membership, pid, owners, kind) in [
-            ("0::/../work\n", 42, "41\n42\n", "domain"),
-            ("0::work\n", 42, "41\n42\n", "domain"),
-            ("0::/work\n0::/work\n", 42, "41\n42\n", "domain"),
-            ("1:memory:/work\n", 42, "41\n42\n", "domain"),
-            ("0::/work\n", 0, "41\n42\n", "domain"),
-            ("0::/work\n", 42, "41\n", "domain"),
-            ("0::/work\n", 42, "41\n42\n", "threaded"),
-            ("0::/work\n", 42, "41\n42\nnot-a-pid\n", "domain"),
-        ] {
-            let (root, group, mounts) = discovery_fixture();
-            std::fs::write(group.join("cgroup.procs"), owners).unwrap();
-            std::fs::write(group.join("cgroup.type"), kind).unwrap();
-            let result = cgroup_from_proc(root.path(), membership, &mounts, pid);
-            assert!(
-                matches!(result, Err(EngError::MemoryPlan(message))
-                    if message.contains("cannot map its process")),
-                "must reject process mapping {membership:?}/{pid}/{owners:?}/{kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn cgroup_reader_rejects_missing_current_with_unlimited_max() {
-        let root = tempfile::tempdir().unwrap();
-        let child = root.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        std::fs::write(root.path().join("cgroup.controllers"), "memory\n").unwrap();
-        std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
-        std::fs::write(child.join("memory.max"), "max\n").unwrap();
-        let result = cgroup_remaining_in(root.path(), &child);
-        assert!(
-            matches!(
-                result,
-                Err(EngError::MemoryPlan(message)) if message.contains("memory.current")
-            ),
-            "an unreadable active charge file must not become an unlimited budget"
-        );
-    }
-
-    #[test]
-    fn cgroup_reader_applies_finite_ancestor_charges() {
-        let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("parent");
-        let child = parent.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(root.path().join("cgroup.controllers"), "memory\n").unwrap();
-        for directory in [root.path(), parent.as_path()] {
-            std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
-        }
-        for (directory, maximum, current) in [
-            (&parent, "17179869184\n", "4294967296\n"),
-            (&child, "68719476736\n", "1073741824\n"),
-        ] {
-            std::fs::write(directory.join("memory.max"), maximum).unwrap();
-            std::fs::write(directory.join("memory.current"), current).unwrap();
-        }
-        let remaining = cgroup_remaining_in(root.path(), &child);
-        assert!(
-            remaining.is_ok(),
-            "a readable hierarchy must honor finite ancestor charges"
-        );
-        assert_eq!(remaining.unwrap(), Some(12u64 << 30));
-    }
-
-    #[test]
-    fn cgroup_snapshot_accounts_for_current_charges() {
-        let remaining = cgroup_remaining_bytes("17179869184\n", "4294967296\n");
-        assert!(
-            remaining.is_ok(),
-            "valid finite cgroup limit and current charges must produce a budget"
-        );
-        let remaining = remaining.unwrap();
-        assert_eq!(remaining, Some(12u64 << 30));
-        let budget = HostBudget::from_meminfo(
-            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
-            remaining,
-        )
-        .unwrap();
-        assert!(budget.admit(4u64 << 30).is_ok());
-        assert!(budget.admit((4u64 << 30) + 1).is_err());
-    }
-
-    #[test]
-    fn cgroup_snapshot_distinguishes_unlimited_and_exhausted_limits() {
-        for (maximum, current, remaining) in [
-            ("max\n", "0\n", None),
-            (" max\n", "18446744073709551615\n", None),
-            ("0", "0", Some(0)),
-            ("1024", "1024", Some(0)),
-            ("4", "8", Some(0)),
-            ("18446744073709551615", "0", Some(u64::MAX)),
-            ("18446744073709551615", "18446744073709551615", Some(0)),
-        ] {
-            assert_eq!(
-                cgroup_remaining_bytes(maximum, current).unwrap(),
-                remaining,
-                "{maximum:?} / {current:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cgroup_snapshot_rejects_malformed_limits_and_current_charges() {
-        for (maximum, current) in [
-            ("", "0"),
-            ("MAX", "0"),
-            ("bad", "0"),
-            ("1 kB", "0"),
-            ("1 2", "0"),
-            ("1.5", "0"),
-            ("-1", "0"),
-            ("+1", "0"),
-            ("18446744073709551616", "0"),
-            ("1", ""),
-            ("1", "bad"),
-            ("1", "1 kB"),
-            ("1", "-1"),
-            ("1", "+1"),
-            ("1", "18446744073709551616"),
-            ("max", ""),
-            ("max", "bad"),
-            ("max", "max"),
-            ("max", "-1"),
-            ("max", "18446744073709551616"),
-        ] {
-            assert!(
-                cgroup_remaining_bytes(maximum, current).is_err(),
-                "{maximum:?} / {current:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn host_snapshot_uses_mem_available_and_model_scaled_os_floor() {
-        let result = HostBudget::from_meminfo(
-            "MemTotal:       268435456 kB\nMemAvailable:    50331648 kB\n",
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "valid memory snapshot must produce an admission budget"
-        );
-        let budget = result.unwrap();
-        assert_eq!(budget.mem_available, 48u64 << 30);
-        assert_eq!(budget.os_floor, 27_487_790_695);
-        assert_eq!(budget.cgroup_remaining, None);
-        assert!(budget.admit(256 * 47 * 1_603_584u64).is_ok());
-    }
-
-    #[test]
-    fn host_snapshot_preserves_minimum_floor_and_finite_cgroup() {
-        let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
-        let floor = 8u64 << 30;
-        let budget = HostBudget::from_meminfo(text, Some(floor + 1)).unwrap();
-        assert_eq!(budget.os_floor, floor);
-        assert_eq!(budget.cgroup_remaining, Some(floor + 1));
-        assert!(budget.admit(1).is_ok());
-        assert!(budget.admit(2).is_err());
-        assert!(
-            HostBudget::from_meminfo(text, Some(0))
-                .unwrap()
-                .admit(0)
-                .is_err()
-        );
-        let empty = HostBudget::from_meminfo("MemTotal: 1 kB\nMemAvailable: 0 kB\n", None).unwrap();
-        assert_eq!(empty.mem_available, 0);
-        assert!(empty.admit(0).is_err());
-    }
-
-    #[test]
-    fn host_snapshot_rejects_malformed_or_inconsistent_fields() {
-        for text in [
-            "",
-            "MemTotal: 1 kB\n",
-            "MemAvailable: 1 kB\n",
-            "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
-            "MemTotal: -1 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 MB\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 kB\nMemAvailable: bad kB\n",
-            "MemTotal: 1 kB\nMemAvailable: 0 MB\n",
-            "MemTotal: 1 kB trailing\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 kB\nMemTotal: 1 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 kB\nMemAvailable: 0 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 18014398509481984 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 1 kB\nMemAvailable: 18014398509481984 kB\n",
-        ] {
-            assert!(HostBudget::from_meminfo(text, None).is_err(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn host_budget_rejects_unrepresentable_payload_plus_floor() {
-        let budget = HostBudget {
-            mem_available: u64::MAX,
-            cgroup_remaining: None,
-            os_floor: 1,
-        };
-        assert!(budget.admit(u64::MAX).is_err());
-        assert!(budget.admit(u64::MAX - 1).is_ok());
-    }
-
-    #[test]
-    fn host_budget_accepts_exact_model_demand_only_after_os_floor() {
-        let required = 256 * 47 * 1_603_584u64;
-        let floor = 8u64 << 30;
-        let exact = HostBudget {
-            mem_available: required + floor,
-            cgroup_remaining: Some(required + floor),
-            os_floor: floor,
-        };
-        assert!(
-            exact.admit(required).is_ok(),
-            "exact model demand plus OS floor must admit"
-        );
-        assert!(
-            HostBudget {
-                mem_available: exact.mem_available - 1,
-                ..exact
-            }
-            .admit(required)
-            .is_err()
-        );
-        assert!(
-            HostBudget {
-                cgroup_remaining: Some(required + floor - 1),
-                ..exact
-            }
-            .admit(required)
-            .is_err()
-        );
-        assert!(
-            HostBudget {
-                cgroup_remaining: None,
-                ..exact
-            }
-            .admit(required)
-            .is_ok(),
-            "an unlimited cgroup still obeys host availability and the OS floor"
-        );
     }
 
     #[test]
@@ -1929,16 +1122,18 @@ mod tests {
                 for &id in &ids {
                     let slot = cache.slot(ready, id as u16).unwrap();
                     assert!(usize::from(slot) < slots);
-                    assert_eq!(cache.residents[usize::from(slot)], id as u16);
+                    assert_eq!(cache.row.state().1[usize::from(slot)], id as u16);
                     used.insert((id, slot));
                 }
                 // One slot per demanded expert: a victim is never a member of the pass.
                 assert_eq!(used.len(), unique.len());
                 cache.release(ready, 7, || Ok(())).unwrap();
                 let recency: Vec<u16> = cache
-                    .recency
+                    .row
+                    .state()
+                    .2
                     .iter()
-                    .map(|&slot| cache.residents[usize::from(slot)])
+                    .map(|&slot| cache.row.state().1[usize::from(slot)])
                     .collect();
                 assert_eq!(recency, bank, "slots={slots}");
             }
@@ -1970,6 +1165,43 @@ mod tests {
                 .unwrap();
             cache.release(ready, 7, || Ok(())).unwrap();
         }
+    }
+
+    #[test]
+    fn swap_in_refuses_an_out_of_range_expert_and_leaves_the_row_untouched() {
+        let layout = HostLayout::new(&[1], 4).unwrap();
+        let store = HostStore::build(layout, |_, _, range| Ok(range.bytes)).unwrap();
+        let mut cache = LayerCache::new(&store, 0, 1).unwrap();
+        cache.publish_initial(1, |_| Ok(())).unwrap();
+        let before = snapshot(&cache);
+        for (incoming, outgoing) in [(EXPERTS as u16, 0), (2, EXPERTS as u16)] {
+            let error = cache.swap_in(incoming, outgoing).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(text.contains("Flint expert cache"), "{text}");
+            assert!(text.contains("expert or slot is out of range"), "{text}");
+        }
+        assert_eq!(snapshot(&cache), before);
+    }
+
+    #[test]
+    fn a_refused_prepare_with_duplicate_ids_leaves_the_live_row_untouched() {
+        let layout = HostLayout::new(&[1], 4).unwrap();
+        let store = HostStore::build(layout, |_, _, range| Ok(range.bytes)).unwrap();
+        let mut cache = LayerCache::new(&store, 0, 1).unwrap();
+        cache.publish_initial(1, |_| Ok(())).unwrap();
+        // A duplicate counts once toward the demanded union: four distinct experts fill
+        // the four-slot bank exactly.
+        let pass = cache.prepare(&[0, 0, 1, 2, 3, 0], usize::MAX).unwrap();
+        let ready = cache.copy_ready(pass, 1, |_| Ok(())).unwrap();
+        cache.release(ready, 1, || Ok(())).unwrap();
+        let before = snapshot(&cache);
+        // A pass that survives the union check is refused after the scratch apply when its
+        // copies exceed the byte bound; the live row keeps its state.
+        let error = cache.prepare(&[4, 4, 0, 1, 2], 0).unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("Flint expert cache"), "{text}");
+        assert!(text.contains("miss copies exceed byte bound"), "{text}");
+        assert_eq!(snapshot(&cache), before);
     }
 
     #[test]
@@ -2006,7 +1238,10 @@ mod tests {
             // A recovered bank is indistinguishable from a freshly loaded one.
             assert_eq!(bank_state(&cache), bank_state(&fresh));
             for id in 0..EXPERTS {
-                assert_eq!(cache.slots[id], (id < slots).then_some(id as u16));
+                assert_eq!(
+                    cache.row.state().0[id],
+                    if id < slots { id as i32 } else { -1 }
+                );
             }
         }
     }
@@ -2189,28 +1424,5 @@ mod tests {
         );
         let reasons = [Auto, Forced, Override].map(BankReason::as_str);
         assert_eq!(reasons, ["auto", "forced", "override"]);
-    }
-
-    #[test]
-    fn composed_host_probe_uses_verified_tree_and_fails_closed() {
-        let (root, group, mounts) = discovery_fixture();
-        let proc = tempfile::tempdir().unwrap();
-        std::fs::create_dir(proc.path().join("self")).unwrap();
-        std::fs::write(
-            proc.path().join("meminfo"),
-            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
-        )
-        .unwrap();
-        std::fs::write(proc.path().join("self/cgroup"), "0::/work\n").unwrap();
-        std::fs::write(proc.path().join("self/mountinfo"), mounts).unwrap();
-        std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
-        std::fs::write(group.join("memory.max"), "17179869184\n").unwrap();
-        std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
-        let budget = HostBudget::probe_in(proc.path(), root.path(), 42).unwrap();
-        assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
-        assert!(budget.admit(7u64 << 30).is_ok());
-        assert!(budget.admit((7u64 << 30) + 1).is_err());
-        std::fs::remove_file(group.join("memory.current")).unwrap();
-        assert!(HostBudget::probe_in(proc.path(), root.path(), 42).is_err());
     }
 }

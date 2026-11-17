@@ -76,6 +76,7 @@ fn base() -> MmqDenseArgsRaw {
         m: 64,
         ld: 512,
         col_off: 0,
+        cols_hint: 0,
     }
 }
 
@@ -127,6 +128,22 @@ fn the_dense_fill_pins_every_mmq_args_field() {
         ]
     );
     assert_eq!((v.type_x, v.reserved), (8, 0));
+
+    // The tile-width hint reaches ncols_opt (the J-selection input) and nothing else: a
+    // positive hint below m replaces it, a hint at or above m keeps the stock value.
+    let qkv_shape = |cols_hint: c_int| MmqDenseArgsRaw {
+        n: 8192,
+        m: 49,
+        ld: 8192,
+        cols_hint,
+        ..base()
+    };
+    let hinted = fill(&qkv_shape(17)).expect("the hinted fill");
+    assert_eq!(hinted.ints[16..], [49, 17]);
+    let clamped = fill(&qkv_shape(80)).expect("the over-wide hint fill");
+    assert_eq!(clamped.ints[16..], [49, 49]);
+    assert_eq!(hinted.ints[..16], v.ints[..16]);
+    assert_eq!(clamped.ints[..16], v.ints[..16]);
 
     // A Q4_K slice of a fused destination: ld wider than n, a column offset (floats), the
     // stride in 256-value blocks.
@@ -357,18 +374,35 @@ fn c_fixup_need(ty: c_int, n: usize, m: usize, facts: &FactsRaw) -> usize {
     unsafe { inference_cuda_mmq_dense_fixup_need(&args, facts) }
 }
 
+/// The hinted variant: `cols_hint` steers the J choice the way `fill_dense_args` would, so
+/// this pins the launch-side sizing path an armed hint actually takes.
+fn c_fixup_need_hinted(ty: c_int, n: usize, m: usize, hint: c_int, facts: &FactsRaw) -> usize {
+    let n = c_int::try_from(n).expect("n fits");
+    let args = MmqDenseArgsRaw {
+        ty,
+        n,
+        m: c_int::try_from(m).expect("m fits"),
+        ld: n,
+        cols_hint: hint,
+        ..base()
+    };
+    // SAFETY: as above, pure integer function of the args.
+    unsafe { inference_cuda_mmq_dense_fixup_need(&args, facts) }
+}
+
 /// The Rust side of the cross-pin: the tile width from the Rust replica `j_best`, then the
-/// vendored launch's tile count, tiling-mode test and block count (mmq.cuh:1395-1408), then
+/// vendored launch's tile count, tiling-mode test and block count (mmq.cuh:1534-1547), then
 /// `fixup_floats_exact`. Every kept config row has I = 128 and stream-k on.
-fn rust_fixup_need(ty: MmqType, n: usize, m: usize, facts: &FactsRaw) -> usize {
+fn rust_fixup_need(ty: MmqType, n: usize, m: usize, ncols_opt: usize, facts: &FactsRaw) -> usize {
     let nsm = usize::try_from(facts.nsm).expect("nsm");
-    let Some(j) = j_best(ty, !n.is_multiple_of(128), facts.cc, facts.smpbo, m) else {
+    let Some(j) = j_best(ty, !n.is_multiple_of(128), facts.cc, facts.smpbo, ncols_opt) else {
         return 0;
     };
     // A tiling config needs no fixup: patch V-5 makes the Q4_K rows at or below 64 tiles.
     if !MmqConfig::select(facts.cc).stream_k(ty, j) {
         return 0;
     }
+    // The grid tiles come from ncols_max (the real m, mmq.cuh:1645); only J reads the hint.
     let tiles = m.div_ceil(j) * n.div_ceil(128);
     let waves = tiles.div_ceil(nsm);
     let blocks = if 100 * tiles / (nsm * waves) >= 90 {
@@ -436,7 +470,7 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
                 for m in 1..=2048usize {
                     let (c, r) = (
                         c_fixup_need(ggml, n, m, &facts),
-                        rust_fixup_need(ty, n, m, &facts),
+                        rust_fixup_need(ty, n, m, m, &facts),
                     );
                     assert_eq!(c, r, "{name}, {ty:?}, n {n}, m {m}: C {c} B, Rust {r} B");
                     compared += 1;
@@ -458,6 +492,62 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
         zero > 10_000 && nonzero > 10_000,
         "zero {zero}, nonzero {nonzero}"
     );
+}
+
+#[test]
+fn the_c_fixup_need_agrees_with_the_rust_sizing_under_a_hint() {
+    // The hint changes the J choice (ncols_opt) but never the launch grid (ncols_max,
+    // mmq.cuh:1645) or the tile count the fixup need reads. Pinned on the sm_72 set — the
+    // board this knob exists for — over hints that straddle every J breakpoint, including
+    // over-wide hints (>= m keep stock) and the armed J = 16 pin.
+    let facts = FactsRaw {
+        device: 0,
+        cc: 720,
+        nsm: 8,
+        reserved: 0,
+        smpbo: 98_304,
+    };
+    let types = [(8, MmqType::Q80), (12, MmqType::Q4K), (14, MmqType::Q6K)];
+    let built = compiled_archs();
+    if !built.contains(&720) {
+        println!("hint cross-pin: skipped: sm_72 not in this build {built:?}");
+        return;
+    }
+    let hints: [c_int; 7] = [1, 8, 16, 24, 64, 128, 49];
+    let mut changed_j = 0usize;
+    for (ggml, ty) in types {
+        for n in [8192usize, 512, 160, 32] {
+            for m in [512usize, 96, 49] {
+                for hint in hints {
+                    if hint >= c_int::try_from(m).expect("m fits") {
+                        continue; // the C helper keeps stock when the hint reaches m
+                    }
+                    let stock = c_fixup_need(ggml, n, m, &facts);
+                    let armed = c_fixup_need_hinted(ggml, n, m, hint, &facts);
+                    let rust = rust_fixup_need(
+                        ty,
+                        n,
+                        m,
+                        hint.min(c_int::try_from(m).expect("m fits")) as usize,
+                        &facts,
+                    );
+                    assert_eq!(
+                        armed, rust,
+                        "{ty:?}, n {n}, m {m}, hint {hint}: C {armed} B, Rust {rust} B"
+                    );
+                    // The pin must bite: at least one armed hint changes the stock answer.
+                    if armed != stock {
+                        changed_j += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        changed_j > 0,
+        "no armed hint changed the fixup answer; pin is vacuous"
+    );
+    println!("hint cross-pin: {changed_j} armed answers differ from stock");
 }
 
 #[test]

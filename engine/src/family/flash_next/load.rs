@@ -9,8 +9,8 @@ use super::{
     ple::{PleDims, PleShape, PleWeights},
     qsa::{QsaDims, QsaShape, QsaWeights},
     step::{AttnWeights, FlashLayerWeights, ModelShape, ModelWeights},
-    stored::{self, StoredWeight},
 };
+use crate::family::stored::{self, StoredWeight};
 use crate::{
     EngError,
     checkpoint_json::UniqueValue,

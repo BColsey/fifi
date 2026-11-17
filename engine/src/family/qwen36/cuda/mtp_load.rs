@@ -5,23 +5,20 @@
 //! the device under the names of a one-layer table (`LayerTable::single`), the rest under the
 //! names below, so they join the model's `CudaWeights` without colliding with it. The head has no
 //! embedding table and no output head: the draft step reads the model's.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
-    exl3_moe_source::moe_weights,
-    exl3_source::{PackReader, attention_weights},
-    layer_table::LayerTable,
-    mixer_geometry::{DenseSpec, MixerGeometry},
-    moe::MoeDims,
+    exl3_moe_source::moe_weights, exl3_source::attention_weights, mixer_geometry::MixerGeometry,
 };
+use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3::source::{DenseSpec, PackReader};
+use crate::family::exl3_pack::Root;
 use crate::{
     EngError,
     family::{
         gguf_model::Role,
         project::cuda::CudaWeight,
-        qwen36::{
-            exl3_pack::Root,
-            mtp_pack::{FC_PREFIX, NORM_NAME, PRE_FC_NORM_EMBEDDING, PRE_FC_NORM_HIDDEN},
-        },
+        qwen36::mtp_pack::{FC_PREFIX, NORM_NAME, PRE_FC_NORM_EMBEDDING, PRE_FC_NORM_HIDDEN},
     },
 };
 

@@ -147,6 +147,31 @@ fn resolve_serves_what_fits_and_names_the_boundary_of_what_does_not() {
     assert!(text.contains("zero positions"), "{text}");
 }
 
+/// c0 goldens (P4): `largest_context` exact cells and `resolve` refusal text
+/// VERBATIM (the refusal strings are qualified output; P4 adapters must
+/// reproduce them byte for byte, so they are pinned whole, not by substring).
+#[test]
+fn largest_context_and_refusals_golden_verbatim() {
+    let budget = budget();
+    // Structural cells: a limit below one granule refuses; the answer never
+    // exceeds the request, so a larger limit cannot change it.
+    assert_eq!(budget.largest_context(KvFormat::F16, 100, 1_000), None);
+    assert_eq!(
+        budget.largest_context(KvFormat::F16, 160, 262_144),
+        budget.largest_context(KvFormat::F16, 160, 1 << 20)
+    );
+    // The exact refusal string, whole, including the refuse() prefix.
+    let text = message(budget.resolve(262_144, KvFormat::F16, 160).unwrap_err());
+    let longest = budget.largest_context(KvFormat::F16, 160, 262_144).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "Flash-Next context budget: 262144 positions leave 142 slots per layer; \
+             the longest context with 160 slots is {longest}"
+        )
+    );
+}
+
 #[test]
 fn a_format_without_a_kernel_is_planned_but_not_served() {
     let text = message(budget().resolve(131_072, KvFormat::Int8, 100).unwrap_err());
