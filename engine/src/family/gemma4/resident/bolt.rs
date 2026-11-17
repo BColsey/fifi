@@ -32,6 +32,7 @@
     )
 )]
 
+use super::bolt_graph::{DecodeGraphMode, decode_graph_wanted};
 use super::step::layer_buffers;
 use super::{
     Kv, Matrix, PackedMatrix, Vector, epsilon, matrix, packed_matrix, scalar, vector,
@@ -198,6 +199,10 @@ pub(crate) struct Bolt {
     pub(crate) logits: Vector,
     pub(crate) logits_capped: Vector,
     pub(crate) eps: f32,
+    /// The sticky decode-graph mode: wanted from the environment, refused on
+    /// the first reason, always counted. The capture that replays the decode
+    /// body lands in this lane; until then every step notes itself eager.
+    pub(crate) graph_mode: DecodeGraphMode,
 }
 
 fn embed_scale() -> f32 {
@@ -433,7 +438,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
             &ctx,
             q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS).expect("qk dump size"),
         )?,
-        ids: zero(&ctx, 4)?,
+        ids: zero(&ctx, Bolt::PREFILL_BATCH * 4)?,
         pos: zero(&ctx, 4)?,
         kv_len: zero(&ctx, 4)?,
     };
@@ -452,6 +457,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         logits,
         logits_capped,
         eps,
+        graph_mode: DecodeGraphMode::new(decode_graph_wanted()?),
     })
 }
 
@@ -612,9 +618,17 @@ impl Bolt {
             ));
         }
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        self.scratch.ids = self.ctx.upload(&ids)?;
-        self.scratch.pos = self.ctx.upload(&(pos as i32).to_le_bytes())?;
-        self.scratch.kv_len = self.ctx.upload(&((pos as i32) + 1).to_le_bytes())?;
+        // The step words are written in place, never reallocated: a captured
+        // decode graph bakes their addresses, and the eager path saves the
+        // three per-step allocations the uploads made.
+        self.scratch.ids.write_at_enqueue(&self.stream, 0, &ids)?;
+        self.scratch
+            .pos
+            .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
+        self.scratch
+            .kv_len
+            .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+        self.graph_mode.note_eager();
         let ctx = &self.ctx;
         let stream = &self.stream;
         let sc = &self.scratch;

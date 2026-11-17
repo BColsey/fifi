@@ -26,6 +26,7 @@
 )]
 
 pub(crate) mod bolt;
+mod bolt_graph;
 mod step;
 #[cfg(test)]
 mod tests;
