@@ -1262,6 +1262,11 @@ pub(super) fn enter_on(device: c_int) -> Result<DispatchGuard<'static>, EngError
 }
 
 impl DeviceBuffer {
+    /// Allocation backing for internal diagnostics; unexpected combinations stay unknown.
+    pub(crate) fn backing_label(&self) -> &'static str {
+        backing_label(self.raw.is_some(), self.mapped.is_some())
+    }
+
     fn raw_view(&self) -> Option<&RawDevice> {
         self.raw
             .as_ref()
@@ -1312,6 +1317,27 @@ impl DeviceBuffer {
             _thread_confined: PhantomData,
             alloc_cache: None,
         }
+    }
+}
+
+fn backing_label(device: bool, mapped: bool) -> &'static str {
+    match (device, mapped) {
+        (true, false) => "device",
+        (false, true) => "host-mapped",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod backing_label_tests {
+    use super::backing_label;
+
+    #[test]
+    fn reports_only_unambiguous_backing() {
+        assert_eq!(backing_label(true, false), "device");
+        assert_eq!(backing_label(false, true), "host-mapped");
+        assert_eq!(backing_label(false, false), "unknown");
+        assert_eq!(backing_label(true, true), "unknown");
     }
 }
 
