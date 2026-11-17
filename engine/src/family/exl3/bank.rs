@@ -439,8 +439,11 @@ impl LayerResolver<'_, '_> {
             // both streams were quiescent at the readback that produced the picks.
             // The store is pinned, so the record must stay untouched until the
             // streams drain; the store is immutable post-load and
-            // process-long-lived, which is that invariant — and pin() seals the
+            // process-long-lived, which is that invariant - and pin() seals the
             // store so a post-load write refuses instead of racing this DMA.
+            // Rule 4 (the readback ordering) is a convention - see
+            // doc/reference/cuda-conventions.md; the store-lifetime half is
+            // enforced by pin()/Drop (rule 3 there).
             if let Err(err) = parts[op.part]
                 .bank
                 .write_at_enqueue(refill, op.offset(), record)

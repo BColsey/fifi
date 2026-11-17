@@ -170,6 +170,7 @@ impl Drop for WindowScope {
 pub(crate) struct CapturePlan<'p> {
     /// The weights and every buffer whose address the graph bakes in. The graph borrows them for
     /// its whole life. They are not compared with the buffers the body uses; the caller lists all.
+    /// This is a convention only - see doc/reference/cuda-conventions.md (rule 2).
     pub(crate) pins: &'p [&'p DeviceBuffer],
     /// Holds on the arenas the graph uses (`workspace_hold`, `DeviceArena::hold`); the graph owns
     /// them until it is dropped.

@@ -60,6 +60,8 @@ impl ReturnPolicy {
     }
 
     /// The decision for a block returned while the adapter owns `streams` streams.
+    /// Defer is safe only under the single-stream invariant - see
+    /// doc/reference/cuda-conventions.md (rule 1) for what holds it.
     pub(super) fn on_return(&mut self, streams: usize) -> OnReturn {
         if self.lazy && streams <= 1 {
             self.dirty = true;
