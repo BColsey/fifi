@@ -67,7 +67,7 @@ fn max_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 512, None);
+    check_card_chunk(devices, 512, None, false);
 }
 
 #[test]
