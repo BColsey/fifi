@@ -29,7 +29,7 @@
 //! sequence handshake).
 
 use crate::EngError;
-use crate::family::qwen36::cuda::card_step::CardStack;
+use crate::family::qwen36::cuda::card_step::{CardStack, expert_sum_count};
 use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
 use crate::family::qwen36::cuda::moe::{CardMoeOp, Launch, MoeBuffers, MoeLayerWeights, launch_op};
@@ -188,8 +188,8 @@ pub(crate) fn run_card_block(
 ///   then computes the same experts;
 /// * `MoeSum`: each pick slot's `expert_down` row and the `shared_out` row
 ///   are full-width partials (the card's down projection covers its
-///   intermediate slice), summed in place per row - the ring's payload cap
-///   is one hidden row.
+///   intermediate slice). The routed rows are summed separately by default,
+///   or as one contiguous payload when the experimental switch is on.
 pub(crate) fn run_card_moe_block(
     stack: &CardStack,
     weights: &[MoeLayerWeights<'_>],
@@ -274,15 +274,46 @@ pub(crate) fn run_card_moe_block(
             CardMoeOp::MoeSum => {
                 let top_k = bufs[0].route.ids.bytes() / 4;
                 let hidden = bufs[0].route.resid_in.bytes() / 4;
-                for slot in 0..top_k {
+                if stack.fused_expert_sum() {
+                    let count = expert_sum_count(hidden, top_k)?;
+                    let bytes = count.checked_mul(F32).ok_or_else(|| {
+                        EngError::BadRequest("card moe: fused expert sum bytes overflow".into())
+                    })?;
                     let mut partials = Vec::with_capacity(cards);
                     for buf in bufs {
-                        partials.push(buf.expert.expert_down.buffer().range(
-                            buf.expert.expert_down.offset() + slot * hidden * F32,
-                            hidden * F32,
-                        )?);
+                        if buf.route.ids.bytes() != top_k * F32
+                            || buf.route.resid_in.bytes() != hidden * F32
+                            || buf.expert.expert_down.bytes() < bytes
+                        {
+                            return Err(EngError::BadRequest(
+                                "card moe: fused expert sum ranges do not match".into(),
+                            ));
+                        }
+                        partials.push(
+                            buf.expert
+                                .expert_down
+                                .buffer()
+                                .range(buf.expert.expert_down.offset(), bytes)?,
+                        );
                     }
-                    stack.exchange_sum(&partials, &partials, &statuses, hidden, RingMode::F32)?;
+                    stack.exchange_sum(&partials, &partials, &statuses, count, RingMode::F32)?;
+                } else {
+                    for slot in 0..top_k {
+                        let mut partials = Vec::with_capacity(cards);
+                        for buf in bufs {
+                            partials.push(buf.expert.expert_down.buffer().range(
+                                buf.expert.expert_down.offset() + slot * hidden * F32,
+                                hidden * F32,
+                            )?);
+                        }
+                        stack.exchange_sum(
+                            &partials,
+                            &partials,
+                            &statuses,
+                            hidden,
+                            RingMode::F32,
+                        )?;
+                    }
                 }
                 let shared: Vec<DeviceRange<'_>> = (0..cards)
                     .map(|card| bufs[card].expert.shared_out)

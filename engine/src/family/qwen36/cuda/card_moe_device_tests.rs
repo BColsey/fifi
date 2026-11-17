@@ -256,6 +256,7 @@ fn produce(ctx: &CudaContext, stream: &DeviceStream, b: &RunBufs) -> Result<(), 
 }
 
 /// One token's read-back, plain data for the host asserts.
+#[derive(Debug, PartialEq)]
 struct TokenRun {
     ids: Vec<i32>,
     weights: Vec<f32>,
@@ -344,7 +345,7 @@ struct Evidence {
     words: Vec<u32>,
 }
 
-fn run_rig() -> Result<Evidence, EngError> {
+fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngError> {
     let d = step_dims();
     let table = ShardTable::new(&d.shape, 2, 32).expect("table");
     let full = MoeDims::new(&d, 1);
@@ -361,7 +362,12 @@ fn run_rig() -> Result<Evidence, EngError> {
 
     let s = sources(&full, 0x50E_FEED);
     let admission = served_admission();
-    let (stack, _states) = CardStack::new(&d, &options(), &[0, 0], &admission)?;
+    let (mut stack, _states) = if compare_fused {
+        CardStack::new_for_fused_expert_sum_test(&d, &options(), &devices, &admission)?
+    } else {
+        CardStack::new(&d, &options(), &devices, &admission)?
+    };
+    stack.enable_broadcast_sync_for_test();
     let ctx0 = &stack.contexts()[0];
 
     // The reference: full widths, card 0's context. Its router rows serve
@@ -489,8 +495,10 @@ fn run_rig() -> Result<Evidence, EngError> {
         .collect();
     let op_lists: Vec<&[CardMoeOp]> = ops.iter().map(|o| o.as_slice()).collect();
 
-    let mut tokens = Vec::with_capacity(TOKENS);
-    for t in 0..TOKENS {
+    let rounds = if compare_fused { 8 } else { 1 };
+    let mut tokens = Vec::with_capacity(TOKENS * rounds);
+    for step in 0..TOKENS * rounds {
+        let t = step % TOKENS;
         // The reference first, on card 0's stream: write, pack, run, sync.
         {
             let stream = &stack.streams()[0];
@@ -516,10 +524,54 @@ fn run_rig() -> Result<Evidence, EngError> {
         }
         let buf_sets: Vec<MoeBuffers<'_>> =
             card_bufs.iter().map(moe_bufs).collect::<Result<_, _>>()?;
+        let separate_start = stack.ring().next_sequence_for_test();
         run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
+        let separate_count = stack.ring().next_sequence_for_test() - separate_start;
         for (stream, bufs) in stack.streams().iter().zip(&card_bufs) {
             stream.synchronize()?;
             card_runs.push(read_run(stream, bufs)?);
+        }
+        if compare_fused {
+            stack.set_fused_expert_sum_for_test(true);
+            for ((ctx, stream), bufs) in
+                stack.contexts().iter().zip(stack.streams()).zip(&card_bufs)
+            {
+                bufs.norm.write_at(stream, 0, &f32_bytes(&s.norms[t]))?;
+                bufs.resid.write_at(stream, 0, &f32_bytes(&s.resids[t]))?;
+                produce(ctx, stream, bufs)?;
+            }
+            let fused_start = stack.ring().next_sequence_for_test();
+            run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
+            let fused_count = stack.ring().next_sequence_for_test() - fused_start;
+            assert_eq!(
+                separate_count,
+                fused_count + u32::try_from(full.top_k - 1).unwrap(),
+                "the fused path must replace top-k sums with one exchange"
+            );
+            if step == 0 {
+                println!("MoE ring exchanges: separate {separate_count}, fused {fused_count}");
+            }
+            for (card, (stream, bufs)) in stack.streams().iter().zip(&card_bufs).enumerate() {
+                stream.synchronize()?;
+                let fused = read_run(stream, bufs)?;
+                assert_eq!(fused, card_runs[card], "step {step} card {card}");
+                for (label, got, want) in [
+                    (
+                        "expert_down",
+                        &fused.expert_down,
+                        &card_runs[card].expert_down,
+                    ),
+                    ("resid_out", &fused.resid_out, &card_runs[card].resid_out),
+                ] {
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(
+                        bits(got),
+                        bits(want),
+                        "step {step} card {card} {label} bits"
+                    );
+                }
+            }
+            stack.set_fused_expert_sum_for_test(false);
         }
         tokens.push((reference_run, card_runs));
     }
@@ -562,7 +614,7 @@ fn a_moe_block_runs_distributed_and_matches_the_reference() {
     if !device_present(NAME) {
         return;
     }
-    let ev = run_rig().expect("the rig");
+    let ev = run_rig([0, 0], false).expect("the rig");
     let dims = &ev.dims;
     let gu_stride = |d: &MoeDims| d.inter * 2;
     let pack_row = |d: &MoeDims| q8_1_bytes(d.inter, 1).expect("q8 row");
@@ -672,4 +724,19 @@ fn a_moe_block_runs_distributed_and_matches_the_reference() {
     for (card, word) in ev.words.iter().enumerate() {
         assert_eq!(*word, 0, "{NAME}: card {card}: ring not clean");
     }
+}
+
+#[test]
+#[ignore = "requires two peer-enabled CUDA devices; run alone under the GPU lease"]
+fn fused_expert_sums_match_separate_sums_on_peer_gpus() {
+    assert!(device_present(
+        "fused_expert_sums_match_separate_sums_on_peer_gpus"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
+    let evidence = run_rig(devices, true).expect("fused and separate sums");
+    assert_eq!(evidence.tokens.len(), TOKENS * 8);
+    assert_eq!(evidence.words, vec![0, 0]);
 }
