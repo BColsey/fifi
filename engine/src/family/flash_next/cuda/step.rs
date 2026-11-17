@@ -361,10 +361,6 @@ impl<'a> FlashStep<'a> {
         Ok((self.state.buffer(), words.offset()))
     }
 
-    pub(super) fn arena_buffers(&self) -> (&DeviceBuffer, &DeviceBuffer) {
-        (self.state.buffer(), self.scratch.buffer())
-    }
-
     /// The offset of `slot` in the step arena buffer.
     pub(super) fn slot_offset(&self, slot: Slot) -> Result<usize, EngError> {
         Ok(self.slot(slot)?.offset())

@@ -11,9 +11,11 @@
 //! 2. [`AdmitPlan::of`] decides the chunk admit: the union of the chunk's picks, whether the
 //!    union fits the bank's slots, and how many of the union are not resident.
 //! 3. If the union fits and anything is missing, the caller drains its own stream, then
-//!    [`PrefillAdapter::admit_union`] admits the union in one pass. An admit that does not
-//!    run returns `None`. An already-resident union needs only its slot mapping; an
-//!    over-capacity union requires smaller sub-blocks or the legacy per-row step tail.
+//!    the plan's union is admitted in one pass ([`PrefillAdapter::admit_planned`] over a
+//!    plan [`PrefillAdapter::admit_plan`] computed, so a conditionally-draining caller
+//!    does not pay the union twice). An admit that does not run returns `None`. An
+//!    already-resident union needs only its slot mapping; an over-capacity union requires
+//!    smaller sub-blocks or the legacy per-row step tail.
 //! 4. Whenever the returned copies have ops, the caller uploads the bank's slot row again
 //!    before the next classify.
 //!
@@ -295,8 +297,8 @@ pub(in crate::family::flash_next) mod device {
 
         /// Runs a plan `admit_plan` already computed, so a caller that drains its stream only
         /// when an admit will run does not pay the union twice. `None` when the plan does not
-        /// admit. Same contract as [`Self::admit_union`]: copies on the bank's own stream, the
-        /// caller drained first, re-upload [`Self::slot_row`] when ops are returned.
+        /// admit. Copies on the bank's own stream, the caller drained first, re-upload
+        /// [`Self::slot_row`] when ops are returned.
         pub(in crate::family::flash_next) fn admit_planned(
             &mut self,
             ctx: &CudaContext,
@@ -307,25 +309,6 @@ pub(in crate::family::flash_next) mod device {
                 return Ok(None);
             }
             Ok(Some(self.bank.admit(ctx, layer, &plan.union)?))
-        }
-
-        /// Admits the chunk's union in one pass when the plan admits; `None` when it does not
-        /// (the union does not fit, or everything is already resident). An over-capacity union
-        /// needs smaller sub-blocks or the per-row [`Self::step`] tail; a resident union only
-        /// needs its mapping. A caller that wants to drain its own stream only
-        /// when an admit will run computes [`Self::admit_plan`] first and uses
-        /// [`Self::admit_planned`] instead, so the union is not computed twice. The copies run
-        /// on the bank's own stream and the call returns when they have finished; the caller
-        /// must drain its own stream first, exactly as `DeviceBank::step` requires. When the
-        /// returned copies have ops, upload [`Self::slot_row`] again before the next classify.
-        pub(in crate::family::flash_next) fn admit_union(
-            &mut self,
-            ctx: &CudaContext,
-            layer: usize,
-            picks_rows: &[&[i32]],
-        ) -> Result<Option<PassCopies>, EngError> {
-            let plan = self.admit_plan(layer, picks_rows)?;
-            self.admit_planned(ctx, layer, &plan)
         }
 
         /// The per-row fallback: one decode-shaped pass for the rows the union admit did not
@@ -410,7 +393,7 @@ pub(in crate::family::flash_next) mod device {
         }
 
         /// Whether a failed copy left the device out of step with the host model. While this
-        /// holds, `admit_plan`, `admit_union`, `admit_planned`, `step`, `slot_row`, `slots` and
+        /// holds, `admit_plan`, `admit_planned`, `step`, `slot_row`, `slots` and
         /// `stream_place` are refused; `place_of`, `synchronize_store`, `stream`, `stats`,
         /// `geometry` and this method still answer (the ring must be able to hand its stores
         /// back and the counters to be read out while a rebuild is decided).

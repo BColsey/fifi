@@ -43,10 +43,7 @@
 //! the experts of a pass are never victims, slot 0 is not a victim in a pass with a miss, and the
 //! slot row it publishes is the classifier's table.
 //!
-//! Nothing here is called by a model step yet; the decode step wires it in a later change.
-
-// Staged: the Flash-Next CUDA step is the first caller.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The decode step is the first caller (start.rs wires ExpertBankState with the policy).
 
 use crate::{
     EngError,
