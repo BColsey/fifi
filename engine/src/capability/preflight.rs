@@ -1212,7 +1212,7 @@ fn flint_estimate(
     };
 
     let reserve = crate::family::device_budget::DeviceReserve::new(
-        crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+        crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
     )
     .push("kv cache", kv_bytes)
     .push("work reserve", work)
@@ -1659,6 +1659,7 @@ fn estimate_q36(
     backend: crate::family::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
+    use crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
     use crate::family::qwen36::admission_sketch as sketch;
     use crate::family::qwen36::settings::Backend;
 
@@ -1701,7 +1702,7 @@ fn estimate_q36(
                 // receipt lists only the five admission terms, as it always has.
                 let charges = demand.total_after_weights()?;
                 let reserve = crate::family::device_budget::DeviceReserve::new(
-                    sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+                    ADMISSION_UNCERTAINTY_BAND_BYTES,
                 )
                 .push("staged kv8 rows", demand.staging_bytes)
                 .push("part charge", demand.part_charge_bytes)
@@ -2496,7 +2497,7 @@ mod tests {
 
         // Free bytes that cover the all-resident plan keep every expert
         // on the GPU: the auto decision's other arm.
-        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
+        let band = crate::family::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
         let resident_free =
             audit.resident_bytes + kv + work + flint_budget::FLINT_HEADROOM_BYTES + band + 1;
         let (estimate, decisions) =

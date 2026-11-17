@@ -5,9 +5,9 @@
 //! the device-budget search, the KV8 staging arithmetic (a checked mirror
 //! of the kernel wrapper's), the sketch type that sums a demand, and the
 //! chunked-attention part charge, which equals the kernel cap. The family
-//! policy and measured constants (margin, spare minimum, staging tiers,
-//! runtime overhead floor, uncertainty band) stay with the families that
-//! measured them.
+//! The fixed-CUDA admission policy constants shared by the families (margin,
+//! spare minimum, uncertainty band) live here beside the kernel-tied part
+//! charge; measured floors stay with the families that measured them.
 
 use crate::EngError;
 
@@ -16,6 +16,21 @@ use crate::EngError;
 /// from the kernel constant and const-asserts the two agree, so a retuned
 /// kernel cap cannot leave this copy behind.
 pub(crate) const PREFILL_PART_CHARGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The headroom the fixed CUDA admission keeps below measured free VRAM
+/// before any charge (`budget = free - margin`). Canonical value: the runtime
+/// path in `cuda::prefill_driver` aliases this constant.
+pub(crate) const FIXED_ADMISSION_MARGIN_BYTES: usize = 256 << 20;
+
+/// The minimum spare the fixed CUDA admission leaves after every charge
+/// (`SPARE_MIN` in `cuda::prefill_plan`). Canonical value.
+pub(crate) const PREFILL_SPARE_MIN_BYTES: usize = 64 << 20;
+
+/// The measurement gap an estimate cannot close: probe free VRAM versus the
+/// serving process's own post-load reading varies by a few hundred MiB with
+/// driver state and baseline residency. Slack within this band of the budget
+/// boundary is reported as borderline; load-time admission decides.
+pub(crate) const ADMISSION_UNCERTAINTY_BAND_BYTES: u64 = 128 << 20;
 
 /// The step of the context search, and the least context it tries.
 pub(crate) const CONTEXT_SEARCH_STEP: u32 = 1024;

@@ -185,7 +185,7 @@ pub(super) fn admit_with_staging(
 }
 
 pub(super) const FIXED_ADMISSION_MARGIN: usize =
-    crate::family::qwen36::admission_sketch::FIXED_ADMISSION_MARGIN_BYTES;
+    crate::family::admission_sketch::FIXED_ADMISSION_MARGIN_BYTES;
 
 pub(super) fn fixed_chunk_rows(capacity: usize, cap: usize) -> usize {
     // Below the stage tier the whole context fits one stage; above it the

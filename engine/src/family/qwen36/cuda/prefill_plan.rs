@@ -48,9 +48,8 @@ pub(crate) const M_LADDER: [usize; 5] = [2048, 1024, 512, 256, 128];
 const TIER_1024_FROM: usize = 3 * 1024;
 const TIER_512_FROM: usize = 64 * 1024;
 /// A chunk size is admitted only if at least this many device bytes stay spare.
-/// Canonical value in `admission_sketch` (the family home), shared with the preflight estimate.
-pub(crate) const SPARE_MIN: usize =
-    crate::family::qwen36::admission_sketch::PREFILL_SPARE_MIN_BYTES;
+/// Canonical value in the shared `admission_sketch`, shared with the preflight estimate.
+pub(crate) const SPARE_MIN: usize = crate::family::admission_sketch::PREFILL_SPARE_MIN_BYTES;
 /// The flat device charge for the attention `part` buffer in every admission row.
 pub(crate) const PART_CHARGE: usize = CPF_ATTN_PART_CAP;
 /// The sketch copy of the part charge must equal the kernel cap it mirrors;

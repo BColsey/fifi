@@ -167,15 +167,14 @@ impl TierInputs {
         free_vram: u64,
         (mem_total, mem_available): (u64, u64),
     ) -> Self {
-        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
-        // Borrowed policy: the four qwen36 constants below are the fixed-CUDA
-        // admission ledger that family measured; the expert budget admits
-        // against the same ledger and no Flash-server floor has been qualified.
-        // Flash-Next's own values replace the borrow when measured.
-        use crate::family::qwen36::admission_sketch::{
+        use crate::family::admission_sketch::{
             ADMISSION_UNCERTAINTY_BAND_BYTES, FIXED_ADMISSION_MARGIN_BYTES,
-            PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
+            PREFILL_PART_CHARGE_BYTES, PREFILL_SPARE_MIN_BYTES,
         };
+        /// The serving process's own CUDA-context floor, charged as one term.
+        /// Qwen3.6's measured value (2026-11-03 qualification, n=1), borrowed
+        /// until Flash-Next measures its own floor: unqualified for Flash-Next.
+        const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 = 384 << 20;
         const GIB: u64 = 1 << 30;
         Self {
             shape,

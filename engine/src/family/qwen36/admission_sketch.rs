@@ -19,18 +19,13 @@
 //! * load-time admission stays the authority: within the band an estimate is
 //!   borderline, not a verdict either way.
 
-// The neutral search step, sketch type, and kernel-tied part charge live in the
-// family home; private use only, so the export surface stays alias-free.
-use crate::family::admission_sketch::{AdmissionSketch, PREFILL_PART_CHARGE_BYTES};
-
-/// The headroom the fixed CUDA admission keeps below measured free VRAM
-/// before any charge (`budget = free - margin`). Canonical value: the runtime
-/// path in `cuda::prefill_driver` aliases this constant.
-pub(crate) const FIXED_ADMISSION_MARGIN_BYTES: usize = 256 << 20;
-
-/// The minimum spare the fixed CUDA admission leaves after every charge
-/// (`SPARE_MIN` in `cuda::prefill_plan`). Canonical value.
-pub(crate) const PREFILL_SPARE_MIN_BYTES: usize = 64 << 20;
+// The neutral search step, sketch type, kernel-tied part charge, and the
+// fixed-CUDA admission policy constants live in the family home; private use
+// only, so the export surface stays alias-free.
+use crate::family::admission_sketch::{
+    ADMISSION_UNCERTAINTY_BAND_BYTES, AdmissionSketch, FIXED_ADMISSION_MARGIN_BYTES,
+    PREFILL_PART_CHARGE_BYTES, PREFILL_SPARE_MIN_BYTES,
+};
 
 /// The full-stage tier bound: the maximum rows one default stage carries and
 /// the boundary above which [`fixed_staging_rows`] shrinks to the 32K tail —
@@ -58,12 +53,6 @@ pub(crate) fn fixed_staging_rows(context_limit: usize) -> usize {
 /// fresh probe-context process, plus ~555 MiB against `nvidia-smi` free
 /// (n=1). Charged as one floor, never as a precise term.
 pub(crate) const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 = 384 << 20;
-
-/// The measurement gap an estimate cannot close: probe free VRAM versus the
-/// serving process's own post-load reading varies by a few hundred MiB with
-/// driver state and baseline residency. Slack within this band of the budget
-/// boundary is reported as borderline; load-time admission decides.
-pub(crate) const ADMISSION_UNCERTAINTY_BAND_BYTES: u64 = 128 << 20;
 
 /// Compose the sketch from the exact state terms. `kv_bytes` is the whole
 /// cache at the requested context; `fixed_state_bytes` the model's fixed
