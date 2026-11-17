@@ -398,10 +398,11 @@ lib_line=$(grep 'test result:' "$logs/ctr-lib-run.log" | tail -1)
 lib_skipped=$(grep -c 'SKIPPED .*: no CUDA device' "$logs/ctr-lib-run.log" || true)
 lib_passed=$(grep -oE '[0-9]+ passed' <<<"$lib_line" | head -1 | awk '{print $1}')
 lib_executed=$(( ${lib_passed:-0} - lib_skipped ))
-# PROVISIONAL floor: set to 1 until the first green no-GPU lib run fixes the
-# real executed count; the fold right after that run sets the floor to that
-# number minus a stated margin and names it in the commit message.
-lib_floor=1
+# Executed floor: the first green no-GPU lib run (8c7d6a4f6, 2026-11-17) executed
+# 4938 tests; the floor is that number minus ~7% rounded down, so a mass-skip
+# regression (every device test skipping and nothing executing) cannot read
+# as green. Raise it when the suite grows materially.
+lib_floor=4600
 if (( lib_executed < lib_floor )); then
     # Replace run_arm's PASS line so the receipt carries exactly one
     # ctr-lib-run status.

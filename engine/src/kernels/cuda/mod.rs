@@ -120,7 +120,7 @@ pub(crate) use native::prefill::PREFILL_STATUS_BOUND_VIOLATION;
 pub(crate) use testkit::device_present;
 
 use std::ffi::c_int;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::EngError;
 
@@ -139,6 +139,12 @@ const EXECUTE_OPERATION: &str = "execute";
 const CUDA_ERROR_MEMORY_ALLOCATION: c_int = 2;
 
 static TERMINAL: AtomicBool = AtomicBool::new(false);
+
+/// The CUDA status of the first native failure that latched [`TERMINAL`], kept so a
+/// later device probe can tell a no-device latch from a real failure. [`NO_LATCHED_STATUS`]
+/// means the backend is usable or the latch carries no status (a panic-latch).
+static TERMINAL_STATUS: AtomicI32 = AtomicI32::new(NO_LATCHED_STATUS);
+const NO_LATCHED_STATUS: i32 = i32::MIN;
 
 /// Returns the number of CUDA devices the runtime can use.
 ///
@@ -320,8 +326,37 @@ fn native_error(terminal: &AtomicBool, operation: &'static str, status: c_int) -
     if operation == CAPTURE_OPERATION && is_capture_status(status) {
         return EngError::Backend { operation, message };
     }
-    terminal.store(true, Ordering::Release);
+    // Keep the first failure's status with the global latch so a later probe can
+    // classify a no-device latch (35/100) as Skip. Only the global TERMINAL carries a
+    // cause; the local unit-test flags latch alone.
+    latch_terminal(
+        terminal,
+        std::ptr::eq(terminal, &TERMINAL).then_some(&TERMINAL_STATUS),
+        status,
+    );
     EngError::Backend { operation, message }
+}
+
+/// Latches `terminal` on its first false-to-true transition and records that
+/// first cause on `status_store` when one is given. Returns whether this call
+/// won the transition; later callers never overwrite the recorded cause.
+fn latch_terminal(terminal: &AtomicBool, status_store: Option<&AtomicI32>, status: c_int) -> bool {
+    let first = terminal
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if let Some(store) = status_store.filter(|_| first) {
+        store.store(status, Ordering::Release);
+    }
+    first
+}
+
+/// The CUDA status of the first native failure that latched the global backend terminal,
+/// or `None` when the backend is usable or the latch carries no status (a panic-latch).
+/// A device probe reads it to classify an already-terminal backend like its first probe.
+#[cfg(test)]
+pub(crate) fn latched_status() -> Option<i32> {
+    let status = TERMINAL_STATUS.load(Ordering::Acquire);
+    (status != NO_LATCHED_STATUS).then_some(status)
 }
 
 /// The seven `cudaErrorStreamCapture*` statuses. The one definition
@@ -337,6 +372,22 @@ fn is_capture_status(status: c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latch_records_only_the_first_status_of_the_global_backend() {
+        let terminal = AtomicBool::new(false);
+        let status = AtomicI32::new(NO_LATCHED_STATUS);
+        // 35 is cudaErrorInsufficientDriver: the no-device latch a probe must
+        // classify as Skip.
+        assert!(latch_terminal(&terminal, Some(&status), 35));
+        assert_eq!(status.load(Ordering::Acquire), 35);
+        // A later failure never overwrites the first recorded cause.
+        assert!(!latch_terminal(&terminal, Some(&status), 999));
+        assert_eq!(status.load(Ordering::Acquire), 35);
+        // A local test flag latches without recording anything.
+        let local = AtomicBool::new(false);
+        assert!(latch_terminal(&local, None, 100));
+    }
 
     #[test]
     fn terminal_device_query_does_not_call_native() {

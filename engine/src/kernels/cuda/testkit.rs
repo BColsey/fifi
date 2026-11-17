@@ -79,7 +79,25 @@ fn status_of(error: &EngError) -> Option<i32> {
 /// The count of [`super::device_count`], widened back: it returned a `usize` converted
 /// from a non-negative `c_int`, so the value always fits an `i32`.
 fn probe_count() -> Result<i32, EngError> {
-    super::device_count().map(|visible| visible as i32)
+    let count = super::device_count().map(|visible| visible as i32);
+    recover_latched_status(count, super::latched_status())
+}
+
+/// A terminal backend's count refusal carries no "(status N)" suffix, so `presence`
+/// would fail it. When a native failure stored its status with the latch, re-emit the
+/// refusal carrying that status so the probe classifies it exactly as the first probe
+/// would: Skip on 35/100, Fail on every other cause. Pure, so it is host-testable.
+fn recover_latched_status(
+    count: Result<i32, EngError>,
+    latched: Option<i32>,
+) -> Result<i32, EngError> {
+    match (&count, latched) {
+        (Err(error), Some(status)) if status_of(error).is_none() => Err(EngError::Backend {
+            operation: super::INITIALIZE_OPERATION,
+            message: format!("latched CUDA device query (status {status})"),
+        }),
+        _ => count,
+    }
 }
 
 /// What the process's one device probe saw: the count, and the decision [`presence`]
@@ -938,6 +956,46 @@ mod presence_tests {
         assert_eq!(second.decision(|| Ok(1)).visible, Some(1));
         assert_eq!(
             second.decision(|| Err(backend_error(35))).decision,
+            Presence::Present
+        );
+    }
+
+    /// An already-terminal backend's status-less refusal is classified by the cause that
+    /// latched it: 35/100 skip like the first probe, any other cause (or none) fails.
+    #[test]
+    fn a_latched_terminal_refusal_is_classified_by_its_stored_cause() {
+        let terminal_refusal = || EngError::Backend {
+            operation: "execute",
+            message: "CUDA backend is terminal after an earlier native failure".to_owned(),
+        };
+        for status in [35, 100] {
+            assert_eq!(
+                presence(
+                    recover_latched_status(Err(terminal_refusal()), Some(status)),
+                    false
+                ),
+                Presence::Skip
+            );
+            assert_eq!(
+                presence(
+                    recover_latched_status(Err(terminal_refusal()), Some(status)),
+                    true
+                ),
+                Presence::Fail(REQUIRE_DEVICE_MESSAGE.to_owned())
+            );
+        }
+        for status in [999, -3, 2] {
+            let recovered = recover_latched_status(Err(terminal_refusal()), Some(status));
+            assert!(matches!(presence(recovered, false), Presence::Fail(_)));
+        }
+        // No stored cause (a panic-latch) stays a failure.
+        let recovered = recover_latched_status(Err(terminal_refusal()), None);
+        assert!(matches!(presence(recovered, false), Presence::Fail(_)));
+        // A result that already carries a status, or a visible count, is untouched.
+        let untouched = recover_latched_status(Err(backend_error(35)), Some(999));
+        assert_eq!(presence(untouched, false), Presence::Skip);
+        assert_eq!(
+            presence(recover_latched_status(Ok(1), Some(35)), false),
             Presence::Present
         );
     }
