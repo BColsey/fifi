@@ -134,5 +134,7 @@ mod executor;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
 mod pack_feeds;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod quality_shared_tests;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::flash_next) mod start;

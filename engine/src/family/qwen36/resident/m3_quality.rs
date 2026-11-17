@@ -45,7 +45,7 @@ impl Margins {
 /// token (always <= 0; the receipt refuses a positive one), `top1_correct`
 /// is the greedy argmax equality on the true token.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::family::qwen36) struct PositionRow {
+pub(in crate::family) struct PositionRow {
     pub cluster: u32,
     pub logprob_true: f32,
     pub top1_correct: bool,
@@ -92,7 +92,7 @@ impl Rng {
 /// replacement and re-extracts the paired difference each draw. `upper`
 /// picks the side: the one-sided 95% percentile of the draw distribution,
 /// upper for the NLL ceiling, lower for the accuracy floors.
-fn bootstrap_bound(
+pub(in crate::family) fn bootstrap_bound(
     candidate: &[f64],
     reference: &[f64],
     clusters: &[u32],
@@ -140,7 +140,7 @@ fn bootstrap_bound(
 /// the mean NLL delta and the +0.02-nat ceiling reads correctly. A positive
 /// logprob row is refused (the receipt semantics: true log-probabilities are
 /// always <= 0).
-fn nll_rows(rows: &[PositionRow]) -> Result<Vec<f64>, String> {
+pub(in crate::family) fn nll_rows(rows: &[PositionRow]) -> Result<Vec<f64>, String> {
     rows.iter()
         .map(|row| {
             if row.logprob_true > 0.0 || !row.logprob_true.is_finite() {
@@ -156,7 +156,7 @@ fn nll_rows(rows: &[PositionRow]) -> Result<Vec<f64>, String> {
 }
 
 /// The top-1 rows: 1.0 where the arm's greedy pick matched the true token.
-fn top1_rows(rows: &[PositionRow]) -> Vec<f64> {
+pub(in crate::family) fn top1_rows(rows: &[PositionRow]) -> Vec<f64> {
     rows.iter()
         .map(|row| f64::from(row.top1_correct as u8))
         .collect()

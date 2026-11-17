@@ -113,7 +113,8 @@ mod long_context;
 /// unit tests; the model arms join behind the native cfg once the
 /// registration is approved.
 #[cfg(test)]
-pub(super) mod m3_quality;
+// Widened to the family: the flash_next quality arm reuses this frozen core.
+pub(in crate::family) mod m3_quality;
 /// Pure host math for the frozen gate's device loops; test-only like its only
 /// caller (`m3_run`), so the production lib and the release binary stay
 /// main-identical (Phase B integration criterion).

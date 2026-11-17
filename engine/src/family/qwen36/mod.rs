@@ -51,7 +51,7 @@ pub(crate) mod preflight;
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
-mod resident;
+pub(in crate::family) mod resident;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(
     not(test),
