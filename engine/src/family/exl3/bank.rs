@@ -185,12 +185,15 @@ impl ExpertStore {
     }
 
     /// Page-locks every member's storage (see [`PartStore::pin`]); true when every
-    /// member pinned.
+    /// member pinned. Every part is pinned even when some registrations fail:
+    /// `Iterator::all` would short-circuit past the first failure, and the parts
+    /// it skipped would never seal, leaving them writable while refills read
+    /// them.
     pub(crate) fn pin_all(&mut self) -> bool {
         self.layers
             .iter_mut()
             .flat_map(|parts| parts.iter_mut())
-            .all(|part| part.pin())
+            .fold(true, |all, part| part.pin() & all)
     }
 
     /// The whole store's bytes, for the start line and the admission's echo.
@@ -684,5 +687,31 @@ mod tests {
         assert!(record[stride..].iter().all(|&byte| byte == 8));
         // A second pin() is harmless: same answer, no re-registration.
         assert_eq!(fresh.pin(), fresh.pin());
+    }
+
+    #[test]
+    fn pin_all_seals_every_part_even_when_registrations_fail() {
+        let shape = [64usize, 32];
+        let (stride, scale_stride) = exl3_member_layout(shape, 8);
+        let staged = Exl3MemberStaging {
+            trellis: vec![7u8; stride],
+            scales: vec![8u8; scale_stride],
+        };
+        let part = || PartStore::new(shape, 8, 2);
+        let mut store = ExpertStore::with_layers(1);
+        store.push_layer([part(), part(), part()]);
+        // On a host with no visible device every registration fails; on a GPU
+        // host they all succeed. Either way, every part must seal: Iterator::all
+        // short-circuits past the first failure and left the rest writable.
+        let _ = store.pin_all();
+        let last = 2;
+        let refusal = format!(
+            "{:?}",
+            store.layers[0][last]
+                .put(1, &staged)
+                .expect_err("pin_all seals every part, the last included")
+        );
+        assert!(refusal.contains("member 1"), "{refusal}");
+        assert!(refusal.contains("sealed"), "{refusal}");
     }
 }
