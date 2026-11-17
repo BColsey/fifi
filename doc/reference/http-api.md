@@ -34,7 +34,7 @@ Request fields:
 | `messages` | required | |
 | `stream` | `false` | Server-sent events, ending with `data: [DONE]`. |
 | `max_tokens` | 2,048 | Legacy field, deprecated in favor of `max_completion_tokens`. Lowered when the prompt plus the cap would pass the engine's context limit. |
-| `max_completion_tokens` | 2,048 | The current OpenAI field. Same bounds, validation and clamp as `max_tokens`. When both fields are sent, this one wins; the request log line records which field set the cap in `max_tokens_cap_field`. |
+| `max_completion_tokens` | 2,048 | The current OpenAI field. Same bounds and clamp as `max_tokens`, with one difference: a `null` here counts as absent, while a `null` `max_tokens` is refused. When both fields are sent, this one wins; the request log line records which field set the cap in `max_tokens_cap_field`. |
 | `temperature` | from the model's `generation_config.json`, else 0.7 | 0 to 2. `0` selects greedy decoding. |
 | `top_p` | from `generation_config.json`, else 1.0 | 0 to 1. |
 | `top_k` | from `generation_config.json`, else 0 | `0` turns top-k off. |

@@ -121,8 +121,9 @@ pub(super) fn requested_max_tokens(object: &Map<String, Value>) -> Result<u32, S
 /// server-schema.h resolves a field's aliases "following the order they
 /// were added", and server-schema.cpp adds `max_completion_tokens` to
 /// `n_predict` before `max_tokens`, so it is the alias that wins. A null
-/// `max_completion_tokens` counts as absent (the field was ignored before
-/// this function read it, and the OpenAI reference allows null); a null
+/// `max_completion_tokens` counts as absent, as llama.cpp treats it
+/// (server-schema.cpp:585-588: `has_value` treats a null value as absent so
+/// clients can send null to request the server default); a null
 /// `max_tokens` keeps its existing refusal.
 pub(super) fn chat_output_cap(
     object: &Map<String, Value>,
@@ -490,6 +491,22 @@ mod tests {
         let input = parse(&body).expect("valid");
         assert_eq!(input.max_tokens, 12);
         assert_eq!(input.max_tokens_source, "max_tokens");
+    }
+
+    #[test]
+    fn both_token_fields_invalid_names_max_tokens_first() {
+        let body = json!({
+            "model": "m",
+            "messages": user("hi"),
+            "max_tokens": 0,
+            "max_completion_tokens": -1
+        });
+        let message = rejected(&body);
+        assert!(message.contains("max_tokens"), "{message}");
+        assert!(
+            !message.contains("max_completion_tokens"),
+            "the refusal names the first-read field: {message}"
+        );
     }
 
     #[test]
