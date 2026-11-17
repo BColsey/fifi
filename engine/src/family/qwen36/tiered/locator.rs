@@ -724,8 +724,8 @@ pub(crate) mod tests {
         // The whole host path: a synthetic GGUF written to disk, mapped read-only
         // by `MappedFile`, indexed by the locator and run on a 3-thread Q8_K pool
         // gives the bits of the same jobs over the file's bytes held in memory.
+        use crate::family::mapped_file::MappedFile;
         use crate::family::qwen36::tiered::cpu_pool::ExpertKernel;
-        use crate::family::qwen36::tiered::mapped_file::MappedFile;
         use crate::kernels::expert_cpu_q8k::DotBackend;
         use std::io::Write;
 

@@ -57,8 +57,8 @@ use crate::kernels::mlx::native::compile::{
 };
 use crate::{
     EngError,
-    family::flash_next::stored::{self, SlicedWeight},
     family::route::check_health,
+    family::stored::{self, SlicedWeight},
     kernels::{BinaryOp, PackedWeight},
     sched::GrowthPermit,
     tensor::{Dtype, ExecutionTensor},

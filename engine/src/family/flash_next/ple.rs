@@ -1,7 +1,7 @@
 //! Flash-Next PLE n-gram decode step (design section "PLE").
 
-use super::math::{dot, expect_len, rms0, silu};
 use crate::EngError;
+use crate::family::math::{dot, expect_len, rms0, silu};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]

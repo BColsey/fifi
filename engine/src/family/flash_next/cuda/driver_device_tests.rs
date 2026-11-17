@@ -237,6 +237,7 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
         slots: None,
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+        ring_rows: 32,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
 
@@ -325,6 +326,7 @@ fn the_prefix_resume_matches_a_fresh_prefill() {
         slots: None,
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+        ring_rows: 32,
     };
     let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
@@ -506,6 +508,7 @@ fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
         slots: None,
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+        ring_rows: 32,
     };
     let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
@@ -646,6 +649,7 @@ fn the_extension_turn_after_an_off_lattice_tip_restore_matches_a_fresh_prefill()
         slots: None,
         expert_stats: None,
         prefill_rows: PIECE as u32,
+        ring_rows: 32,
     };
     let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
@@ -830,6 +834,7 @@ fn the_mid_block_resume_over_a_block_budget_matches_a_fresh_prefill() {
         slots: None,
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
+        ring_rows: 32,
     };
     let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
@@ -964,6 +969,7 @@ fn the_first_real_tokens_match_the_oracle() {
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
         prefill_rows: 1,
+        ring_rows: 32,
     };
     let began = std::time::Instant::now();
     let mut driver = build_driver(
@@ -1254,6 +1260,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(1, |v| v.parse().expect("rows")),
+        ring_rows: 32,
     };
     // `prefill_rows` picks the driver's row plan (scratch width, ring, driver class), not
     // the chunk size this harness runs: it feeds the prompt one row per `feed` call and
@@ -1620,6 +1627,7 @@ fn single_row_kernel_receipt_run() {
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: stats,
         prefill_rows: 1,
+        ring_rows: 32,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");

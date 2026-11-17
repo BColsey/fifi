@@ -177,6 +177,11 @@ impl PinnedBuf {
         self.bytes
     }
 
+    /// The id of the stream holding this buffer's outstanding copy, if any. Read-only.
+    pub(crate) fn pending_stream(&self) -> Option<u64> {
+        self.pending.map(|(id, _)| id)
+    }
+
     /// Whether a transfer is outstanding (not yet covered by a waited event). Tests only: the
     /// production paths learn the same from the refusals of `read` and `wait`.
     #[cfg(test)]

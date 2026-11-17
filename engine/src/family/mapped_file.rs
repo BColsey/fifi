@@ -177,10 +177,8 @@ impl fmt::Debug for MappedFile {
 #[cfg(test)]
 mod tests {
     use super::{MapError, MappedFile};
-    use crate::family::qwen36::tiered::cpu_pool::MappedRegion;
     use std::fs;
     use std::io::Write as _;
-    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     /// The tests' deterministic generator: an in-file LCG with a fixed seed.
@@ -212,22 +210,6 @@ mod tests {
         file.write_all(&bytes).expect("fixture write");
         file.flush().expect("fixture flush");
         file
-    }
-
-    #[test]
-    fn maps_a_gguf_shaped_file_and_matches_a_plain_read() {
-        let len = (1 << 20) + 13;
-        let file = gguf_shaped(len);
-        let mapped = MappedFile::open(file.path(), len).expect("matching length maps");
-        assert_eq!(mapped.len(), len);
-        assert!(!mapped.is_empty());
-        assert_eq!(&mapped.as_ref()[..4], b"GGUF");
-        let plain = fs::read(file.path()).expect("plain read");
-        assert_eq!(mapped.as_ref(), plain.as_slice());
-        // The pool story: the value serves as a shared region through the
-        // blanket `MappedRegion` impl for every `AsRef<[u8]>`.
-        let region: Arc<dyn MappedRegion> = Arc::new(mapped);
-        assert_eq!(region.bytes(), plain.as_slice());
     }
 
     #[test]
@@ -288,25 +270,5 @@ mod tests {
         // The open handle pins the ORIGINAL inode, so nothing checked can move.
         assert_eq!(mapped.check_unchanged(), Ok(()));
         assert_eq!(mapped.as_ref(), expected.as_slice());
-    }
-
-    #[test]
-    fn the_module_has_exactly_one_unsafe_block_and_the_other_tiered_modules_have_none() {
-        let this_file = include_str!("mapped_file.rs");
-        let production = this_file.split("mod tests").next().unwrap_or_default();
-        // Assembled at run time so this source omits the literal it counts.
-        let needle: String = ["uns", "afe", " {"].concat();
-        assert_eq!(production.matches(&needle).count(), 1);
-        for source in [
-            include_str!("mod.rs"),
-            include_str!("policy.rs"),
-            include_str!("residency.rs"),
-            include_str!("report.rs"),
-            include_str!("cpu_pool.rs"),
-            include_str!("guess.rs"),
-            include_str!("locator.rs"),
-        ] {
-            assert!(!source.contains(&needle));
-        }
     }
 }

@@ -44,15 +44,21 @@ pub mod gguf_model;
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod host_admit;
 pub mod keys;
 pub(crate) mod kv_format;
 pub mod layer_weights;
+pub mod mapped_file;
+pub(in crate::family) mod math;
 pub mod nemotron35;
 #[allow(
     dead_code,
     reason = "no engine path calls the store yet; only its tests do"
 )]
 pub(crate) mod parking;
+pub(crate) mod plan_decision;
+pub(crate) mod plan_rows;
 /// The shared prefill core promoted from the first chunked family: the admission arithmetic
 /// (device-free) and the CUDA arena-fill and chunk-driver primitives. Family plans stay with
 /// their families; nothing here names one.
@@ -89,6 +95,11 @@ pub mod spec;
 pub(crate) mod speculate;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod state_words;
+#[allow(
+    dead_code,
+    reason = "the MLX and CUDA executor paths and their tests reach these weights; the plain host build does not until the trunk is qualified"
+)]
+pub(in crate::family) mod stored;
 pub mod tier_budget;
 pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.

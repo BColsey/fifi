@@ -45,7 +45,7 @@ use super::state::{LayerState, ResidentState};
 use super::step::read_head;
 use super::weights::{RFeedForward, RMixer};
 use crate::EngError;
-use crate::family::flash_next::stored;
+use crate::family::stored;
 use crate::kernels::BinaryOp;
 use crate::kernels::QualificationTiming;
 use crate::tensor::ExecutionTensor;

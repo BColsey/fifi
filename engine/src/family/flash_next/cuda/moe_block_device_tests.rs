@@ -762,9 +762,9 @@ fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
         .collect();
     let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
     let streamed = shape.experts() - SLOTS;
-    let slots = split.plan_ring(ctx, streamed).expect("fund the ring");
+    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
-    split.begin_prefill();
+    split.begin_prefill().unwrap();
 
     // One chunk per run, every layer of it in order — the driver cadence the ring's free
     // cursor assumes.
@@ -975,9 +975,9 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
     };
     let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &two_rows).expect("split");
     let streamed = shape.experts() - SLOTS;
-    let slots = split.plan_ring(ctx, streamed).expect("fund the ring");
+    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
-    split.begin_prefill();
+    split.begin_prefill().unwrap();
     split.begin_chunk();
     let jobs_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row]).expect("rig");
     split
@@ -1475,4 +1475,146 @@ fn chunk_union_pass(m: usize, shared: bool) {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_prefill_ring_and_union_paths_cross_both_ways_without_a_copy_conflict() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let layer = moe_layer();
+    let layers = vec![layer];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    // A whole chunk at or above the threshold streams the ring; a smaller piece takes the
+    // bank's union admit. Reopening the window after a ring chunk leaves the ring's
+    // stream-ahead copies pending on the copy stream, so the next union piece must drain
+    // them before the bank admits on its own stream (ring -> union); the reverse order
+    // (union -> ring) is safe because the bank synchronizes its own admit copies first.
+    const THRESHOLD: usize = 8;
+    const BIG: usize = 16;
+    const SMALL: usize = 2;
+    let big = MoeDims {
+        rows: BIG,
+        ..one_row
+    };
+    let small = MoeDims {
+        rows: SMALL,
+        ..one_row
+    };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+    let router = Router::read(checkpoint, layer, &one_row).expect("router");
+    let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+    let keys = keys(layer);
+    let row_inputs: Vec<Vec<f32>> = (0..BIG)
+        .map(|seed| input(one_row.hidden, seed + 31))
+        .collect();
+    let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+    })
+    .expect("the all-resident block resolves");
+    let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
+    let mut residents = Vec::with_capacity(BIG);
+    for row in &row_inputs {
+        let rig = Rig::new(&projector, &one_row, row).expect("rig");
+        run_exl3_moe(
+            &launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            &one_row,
+            true,
+            None,
+            false,
+        )
+        .expect("the all-resident block");
+        launch.stream.synchronize().expect("sync");
+        residents.push(rig.out_bytes(&projector));
+    }
+    let mut held: Vec<u16> = wants[0].ids.iter().take(10).map(|&e| e as u16).collect();
+    held.extend(others(&wants[0].ids, 10));
+    let bank = build_bank(&projector, &source, &layers, &[held]);
+    let key = |role: Role| {
+        keys.iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, key)| key.as_str())
+            .unwrap_or_else(|| panic!("no key for {role:?}"))
+    };
+    let trunk = SplitMoeTrunk {
+        router: raw(&weights, key(Role::FfnGateInp)),
+        router_shared: raw(&weights, key(Role::FfnGateInpShexp)),
+        shared_gate: exl3(&weights, key(Role::FfnGateShexp)),
+        shared_up: exl3(&weights, key(Role::FfnUpShexp)),
+        shared_down: exl3(&weights, key(Role::FfnDownShexp)),
+    };
+    let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &big).expect("split");
+    let streamed = shape.experts() - SLOTS;
+    let slots = split
+        .plan_ring(ctx, streamed, THRESHOLD)
+        .expect("fund the ring");
+    assert!(slots >= streamed, "the ring holds one full streamed layer");
+    // Each window reopens (begin_prefill) and runs one chunk; no end_prefill between them,
+    // so the ring's copies stay pending across the ring -> union crossing.
+    let windows = [
+        (&big, BIG, "ring window"),
+        (&small, SMALL, "union after ring"),
+        (&big, BIG, "ring after union"),
+    ];
+    for (dims, rows, tag) in windows {
+        split.begin_prefill().unwrap();
+        split.begin_chunk();
+        let rig = RigRows::new(&projector, dims, &row_inputs[..rows]).expect("rig");
+        let admit_before = split.bank().prefill_report();
+        shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), dims);
+        stream.synchronize().expect("sync");
+        if tag == "union after ring" {
+            // The union window must really admit (not a zero-op early return): its two rows'
+            // union outgrows the 16-slot bank, so the admit copies. That copy on the bank
+            // stream is what the reopen drain made safe against the ring's pending copies.
+            let admit_after = split.bank().prefill_report();
+            assert!(
+                admit_after.passes > admit_before.passes,
+                "union after ring must run a bank admit"
+            );
+            assert!(
+                admit_after.misses > admit_before.misses,
+                "union after ring must copy (exercise the reopen drain)"
+            );
+        }
+        for r in 0..rows {
+            let got = rig.out_row(&projector, r);
+            let resident_error = relative_l2(&floats(&got), &floats_f64(&residents[r]));
+            let fp64_error = relative_l2(&floats(&got), &wants[r].out);
+            assert!(
+                resident_error < RING_BOUND,
+                "{tag}, row {r}: all-resident {resident_error}"
+            );
+            assert!(fp64_error < RING_BOUND, "{tag}, row {r}: fp64 {fp64_error}");
+        }
+    }
+    split.end_prefill().expect("hand the ring's stores back");
 }

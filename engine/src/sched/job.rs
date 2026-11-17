@@ -27,7 +27,7 @@ pub(crate) const QUEUE_CAPACITY: usize = 32;
 /// event, so the data capacity the slow-client rule sees is unchanged.
 pub(crate) const EVENT_CAPACITY: usize = 1_025;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JobUsage {
     pub(crate) prompt_tokens: u32,
     /// Tokens in the batches that the executor committed, including a final EOS token.
@@ -43,6 +43,28 @@ pub(crate) struct JobUsage {
     /// between the samples taken around the request, or `None` when the executor keeps
     /// no report — the default of `ExecutorOps::prefill_bank_report`).
     pub(crate) prefill_bank: Option<PrefillBankReport>,
+    /// The prefill piece shape of the request (log-only): how many pieces the worker fed
+    /// and the largest piece's token count. Zeros mean no piece ran (a refused, cancelled
+    /// before start, or never-started job); the request pump also falls back to zeros when
+    /// it never read the `Finished` event, so zeros alone do not distinguish those cases.
+    pub(crate) prefill_pieces: PrefillPieces,
+    /// The top-two logit margin at the request's first decode position (log-only): the gap
+    /// between the two largest logits of the row the first token came from, before
+    /// temperature, top-k and top-p. `None` when no draw happened (a refused or
+    /// cancelled-before-decode job), the row held one entry, or the CUDA device-greedy path
+    /// recorded only the selected token id (no runner-up logit). A small value is the flip
+    /// risk behind greedy divergence between serving paths.
+    pub(crate) first_token_margin: Option<f32>,
+}
+
+/// The prefill piece shape of one request, for the request log's `prefill_pieces` and
+/// `prefill_max_piece` keys: the pieces the serving run fed, and the largest piece's token
+/// count. A restart of the prefill resets the count, so the keys carry the run that served
+/// the prompt; a job cancelled between pieces keeps what ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrefillPieces {
+    pub(crate) count: u32,
+    pub(crate) max_rows: u32,
 }
 
 /// The admit-path expert-bank counters of one prefill, for the request log's `prefill_bank_*`
@@ -327,6 +349,8 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
             reused_tokens: 0,
             prefix: None,
             prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
         }),
     );
 }
@@ -334,7 +358,8 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
 #[cfg(test)]
 mod tests {
     use super::{
-        EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefillBankReport, PrefixHit, PrefixReport,
+        EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefillBankReport, PrefillPieces, PrefixHit,
+        PrefixReport,
     };
     use crate::EngError;
     use crate::family::executor::GenerationState;
@@ -355,6 +380,8 @@ mod tests {
             reused_tokens: 0,
             prefix: None,
             prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
         })
     }
 

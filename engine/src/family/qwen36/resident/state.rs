@@ -1027,7 +1027,7 @@ mod snapshot_tests {
     /// amplification of the projection.
     fn row_amp(
         cpu: &mut crate::family::qwen36::host_cpu::CpuProjector<'_>,
-        weight: &crate::family::flash_next::stored::StoredWeight,
+        weight: &crate::family::stored::StoredWeight,
         cols: usize,
     ) -> f32 {
         let mut sums = vec![0f32; 1 << 6];

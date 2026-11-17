@@ -50,12 +50,12 @@ use crate::{
             moe::{self, MoeWeights},
             qsa::{self, QsaCache, QsaWeights},
             step::ModelShape,
-            stored::host_f32,
         },
         project::{
             DenseProjector, DenseWeight, Projector,
             cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         },
+        stored::host_f32,
     },
     kernels::{
         cuda::{DeviceStream, device_present},

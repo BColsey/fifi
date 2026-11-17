@@ -91,7 +91,7 @@ const MIB: u64 = 1 << 20;
 // ---------------------------------------------------------------------------------------------
 
 /// `MemTotal` and `MemAvailable` of the machine, in bytes. `available` is the caller's minimum of
-/// the host figure and every cgroup ancestor's remaining bytes (`flint::exl3_resident::HostBudget`
+/// the host figure and every cgroup ancestor's remaining bytes (`family::host_admit::HostAdmission`
 /// reads that on the CUDA path; see [`HostPinPlan::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostMemory {
@@ -127,8 +127,8 @@ impl HostMemory {
         Ok(Self { total, available })
     }
 
-    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as Flint's
-    /// `HostBudget::from_meminfo`, which keeps it private.
+    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the
+    /// host guard's `from_meminfo`, which keeps it private.
     pub(super) fn os_floor(&self) -> u64 {
         self.total.div_ceil(10).max(8 * GIB)
     }
@@ -209,7 +209,7 @@ impl HostPinPlan {
     /// - the process and the OS floor exceed `available`, or
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
-    /// On the CUDA path the caller also runs `HostBudget::probe()?.admit_for(process_bytes, ..)`,
+    /// On the CUDA path the caller also runs the host guard's `probe()?.admit_for(process_bytes, ..)`,
     /// which applies the cgroup ancestors (and refuses a cgroup-namespace root, so run on the host).
     pub(super) fn new(
         geometry: &BankGeometry,
@@ -515,7 +515,7 @@ pub(super) mod device {
     impl DeviceBank {
         /// Allocates the buffers, writes the host places and fills every slot from `source`.
         /// Returns when the device holds the fill. `plan` is the host budget the caller admitted
-        /// (`HostPinPlan::new`, plus Flint's cgroup-aware `HostBudget::admit_for` on the CUDA path):
+        /// (`HostPinPlan::new`, plus the cgroup-aware host guard's `admit_for` on the CUDA path):
         /// it must be for this bank's mode and place count, so a store is never pinned unchecked.
         pub(in crate::family::flash_next) fn build(
             ctx: &CudaContext,
@@ -625,6 +625,17 @@ pub(super) mod device {
                 EngError::BadRequest(format!("layer {layer} is outside the bank"))
             })?;
             store.synchronize(stream)
+        }
+
+        /// The stream id holding `layer`'s pinned store copy, if any (read-only). The prefill
+        /// union admit drains a pending ring-stream copy before admitting on the bank stream.
+        pub(in crate::family::flash_next) fn store_pending_stream(
+            &self,
+            layer: usize,
+        ) -> Option<u64> {
+            self.store
+                .get(layer)
+                .and_then(|store| store.pending_stream())
         }
 
         /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).

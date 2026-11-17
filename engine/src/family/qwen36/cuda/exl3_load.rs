@@ -10,7 +10,10 @@
 use std::path::Path;
 
 use super::{
-    super::{exl3_pack::inspect_pack_split, mtp_pack::inspect_mtp_pack},
+    super::{
+        exl3_pack::{inspect_pack_split, inspect_pack_split_visits},
+        mtp_pack::inspect_mtp_pack,
+    },
     dims::StepDims,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
     exl3_source::{attention_weights, delta_weights},
@@ -82,12 +85,18 @@ pub(super) fn load_exl3_banked_dir(
         inventory: &inventory,
     };
     let reader = PackReader::new(projector, &checkpoint, reserve);
-    let report = inspect_pack_split(&checkpoint.source, &shape)?;
+    let (report, visits) = inspect_pack_split_visits(&checkpoint.source, &shape)?;
     let dense = report.device_bytes.saturating_sub(report.expert_bytes);
     reader.admit(dense)?;
     let layers = LayerTable::new(&dims, &inventory)?.len();
     let mut store = ExpertStore::with_layers(layers);
-    let weights = model_weights_admitted(&reader, &facts, Some((slots, &mut store)))?;
+    let weights = model_weights_admitted(
+        &reader,
+        &facts,
+        &visits,
+        Some((slots, &mut store)),
+        &dir.display().to_string(),
+    )?;
     // The store never changes again: page-lock it so the bank refills DMA without staging.
     // A failed pin is best-effort: refills then copy through pageable staging, and the
     // operator sees it here rather than inferring it from refill timings.
@@ -198,7 +207,7 @@ pub(super) fn load_exl3_dir_with_head(
         inventory: &inventory,
     };
     let reader = PackReader::new(projector, &checkpoint, reserve);
-    let mut weights = model_weights(&reader, &facts)?;
+    let mut weights = model_weights(&reader, &facts, &dir.display().to_string())?;
     if let Some(head_dir) = head_dir {
         let head = Checkpoint::open(head_dir)?;
         let reader = PackReader::new(projector, &head, reserve).under(Root::Mtp);
@@ -210,8 +219,9 @@ pub(super) fn load_exl3_dir_with_head(
 pub(super) fn load_exl3_model(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    pack: &str,
 ) -> Result<CudaWeights, EngError> {
-    CudaWeights::from_exl3(model_weights(reader, facts)?)
+    CudaWeights::from_exl3(model_weights(reader, facts, pack)?)
 }
 
 /// The MTP head of the pack behind `reader` (which reads the MTP root), under the names of a
@@ -259,12 +269,13 @@ fn mtp_layers(config: &[u8]) -> Result<usize, EngError> {
 fn model_weights(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    pack: &str,
 ) -> Result<Vec<CudaWeight>, EngError> {
     // Every tensor is checked against the model from the headers alone, and the whole load is
     // admitted against the free memory, before the first upload.
-    let report = inspect_pack_split(&reader.checkpoint.source, &facts.dims.shape)?;
+    let (report, visits) = inspect_pack_split_visits(&reader.checkpoint.source, &facts.dims.shape)?;
     reader.admit(report.device_bytes)?;
-    model_weights_admitted(reader, facts, None)
+    model_weights_admitted(reader, facts, &visits, None, pack)
 }
 
 /// The per-layer loads after admission (the resident arm admitted the whole pack figure, the
@@ -274,7 +285,9 @@ fn model_weights(
 fn model_weights_admitted(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
+    visits: &[crate::family::exl3_pack::Visit],
     mut banked: Option<(usize, &mut ExpertStore)>,
+    pack: &str,
 ) -> Result<Vec<CudaWeight>, EngError> {
     let model_config = &reader.checkpoint.model_config;
     if model_config.len() as u64 > crate::weights::exl3::CONFIG_LIMIT {
@@ -307,6 +320,7 @@ fn model_weights_admitted(
         }
     }
     weights.extend(global_weights(reader, facts)?);
+    reader.check_coverage(visits, pack)?;
     Ok(weights)
 }
 

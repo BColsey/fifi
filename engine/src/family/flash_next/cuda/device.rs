@@ -307,8 +307,10 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     }
 
     fn begin_prefill(&mut self) -> Result<(), EngError> {
+        // Set the window flag only once the ring's begin_prefill succeeds, so a failed
+        // reopen does not leave the window marked open for later logits/decode steps.
+        self.moe.begin_prefill()?;
         self.step.prefill_window.set(true);
-        self.moe.begin_prefill();
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 //! Flash-Next MoE decode step (design section "MoE").
 
-use super::math::{dot, expect_len, sigmoid, silu};
 use crate::EngError;
+use crate::family::math::{dot, expect_len, sigmoid, silu};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]

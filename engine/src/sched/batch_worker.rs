@@ -9,7 +9,9 @@ use super::{
 use crate::EngError;
 use crate::family::executor::ExecutorOps;
 use crate::family::session::SaveKind;
-use crate::sched::job::{Job, JobEvent, JobUsage, QUEUE_CAPACITY, send_data, send_terminal};
+use crate::sched::job::{
+    Job, JobEvent, JobUsage, PrefillPieces, QUEUE_CAPACITY, send_data, send_terminal,
+};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -159,6 +161,9 @@ fn setup_slot<E: ExecutorOps>(
     slot.usage.prompt_tokens = prompt_tokens(&slot.job.prompt);
     slot.usage.reused_tokens = u32::try_from(restored).unwrap_or(u32::MAX);
     slot.usage.prefix = prefix;
+    // A restart re-feeds from the cursor, so the piece count keeps only the run that
+    // served the prompt, never the aborted attempt's pieces (mirrors the single worker).
+    slot.usage.prefill_pieces = PrefillPieces::default();
     slot.cursor = restored;
     slot.ready = false;
     Ok(())
@@ -193,6 +198,8 @@ fn build_slot<E: ExecutorOps>(
             reused_tokens: 0,
             prefix: None,
             prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
         },
         ready: false,
         finished: false,
@@ -297,6 +304,12 @@ fn prefill<E: ExecutorOps>(
     let remaining = span(&slot.job.prompt, slot.cursor, target)?;
     let end = slot.cursor + rows.min(remaining.len());
     executor.prefill(&mut slot.session, span(&slot.job.prompt, slot.cursor, end)?)?;
+    slot.usage.prefill_pieces.count = slot.usage.prefill_pieces.count.saturating_add(1);
+    slot.usage.prefill_pieces.max_rows = slot
+        .usage
+        .prefill_pieces
+        .max_rows
+        .max(u32::try_from(end - slot.cursor).unwrap_or(u32::MAX));
     slot.cursor = end;
     if slot.job.generation.cancel.load(Ordering::SeqCst) {
         refresh_report(executor, slot);
@@ -613,6 +626,9 @@ pub(super) fn work<E: ExecutorOps>(
                 .usage
                 .completion_tokens
                 .saturating_add(u32::try_from(batch.tokens.len()).unwrap_or(u32::MAX));
+            // The sampler's first-draw latch is the request's first decode position; the
+            // served margin rides the slot usage from the window that drew it.
+            slot.usage.first_token_margin = slot.job.generation.sampler.first_top2_margin();
             slot.finished = batch.finish.is_some();
             if !send_data(&slot.job.events, JobEvent::Batch(batch)) {
                 slot.job.generation.cancel.store(true, Ordering::SeqCst);

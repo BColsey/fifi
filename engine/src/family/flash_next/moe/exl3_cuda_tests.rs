@@ -46,12 +46,10 @@ use crate::{
         exl3_pack::{
             ExpertPart, Root, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
         },
-        flash_next::{
-            load::{exl3_pack::inspect_flash_pack, model_shape},
-            stored::host_f32,
-        },
+        flash_next::load::{exl3_pack::inspect_flash_pack, model_shape},
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
+        stored::host_f32,
     },
     kernels::cuda::{
         DeviceBuffer, device_present,

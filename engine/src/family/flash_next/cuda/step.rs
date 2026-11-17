@@ -1231,8 +1231,8 @@ impl<'w> SplitMoeAt<'w> {
     }
 
     /// Re-plans the prefill ring of the inner block against the bank as decode left it.
-    pub(super) fn begin_prefill(&mut self) {
-        self.inner.begin_prefill();
+    pub(super) fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.inner.begin_prefill()
     }
 
     /// Closes the prefill window; the decode steps after it use the bank's miss path again.

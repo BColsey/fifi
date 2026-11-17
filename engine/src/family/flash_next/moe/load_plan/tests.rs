@@ -148,3 +148,33 @@ fn the_real_pack_headers_give_the_documented_plan() {
         assert!((lo..=hi).contains(&slots), "{context}: {slots}");
     }
 }
+
+#[test]
+fn the_load_line_is_one_literal_line() {
+    // The full line, as one literal, so a reworded value or unit fails
+    // rather than slipping past a contains-check.
+    let plan = FlashLoadPlan::new(&report(3_854_000_000), CONFIG, 32_640_183_408, card()).unwrap();
+    let long = plan.at_context(262_144, KvFormat::F16, 100).unwrap();
+    assert_eq!(
+        long.to_string(),
+        "Flash-Next load: context 262144 positions; K/V F16 6.38 GiB; trunk 3.59 GiB on the device; \
+         expert placement 142 of 512 experts per layer in VRAM (11.94 GiB), 31.12 GiB pinned in host RAM; \
+         embedding 1.18 GiB host; n-gram table 30.40 GiB local NVMe"
+    );
+    use crate::family::plan_decision::PlanFixity;
+    let rows = long.plan_rows();
+    let fixities: Vec<(&str, PlanFixity)> =
+        rows.iter().map(|r| (r.name.as_str(), r.fixed_at)).collect();
+    assert_eq!(
+        fixities,
+        vec![
+            ("context", PlanFixity::Start),
+            ("K/V", PlanFixity::Start),
+            ("trunk", PlanFixity::Load),
+            ("expert placement", PlanFixity::Load),
+            ("embedding", PlanFixity::Load),
+            ("n-gram table", PlanFixity::Load),
+        ]
+    );
+    assert!(rows.iter().all(|r| r.alternatives.is_empty()));
+}

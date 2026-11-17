@@ -230,7 +230,7 @@ fn bad_input(what: &str) -> BudgetError {
 
 #[cfg(test)]
 mod tests {
-    //! The Qwen3.6-35B-A3B numbers live here and only here; production code
+    //! The 35B-A3B-shape numbers live here and only here; production code
     //! takes every number as an input. GiB = 2^30 bytes throughout.
 
     use super::{

@@ -498,7 +498,7 @@ mod tests {
     use super::super::prefill::assert_parity;
     use super::*;
     use crate::{
-        family::sampler::{Sampler, SamplingParams},
+        family::sampler::{Sampler, SamplingParams, top2_margin},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
     };
     use std::sync::atomic::Ordering;
@@ -624,6 +624,19 @@ mod tests {
         (0..len)
             .map(|i| u32::try_from(i % 7).unwrap() + 1)
             .collect()
+    }
+
+    /// The piece shape the worker reports for `fed` tokens fed in pieces of `chunk` rows:
+    /// one piece per chunk-sized split, the largest piece the chunk or the final remainder.
+    /// Mirrors `prefill_chunks`; these prompts are too short for a root or periodic save
+    /// point and no tip save lies inside the fed region, so it splits as one unbroken run.
+    /// A tip save inside the fed region splits the head run there; the prefix-reuse tests
+    /// pin those per-round shapes literally instead of using this helper.
+    fn fed_pieces(fed: usize, chunk: usize) -> crate::sched::job::PrefillPieces {
+        crate::sched::job::PrefillPieces {
+            count: u32::try_from(fed.div_ceil(chunk)).unwrap(),
+            max_rows: u32::try_from(chunk.min(fed)).unwrap(),
+        }
     }
 
     /// Plans the chunk size `tokens` through the admission rule: a budget that leaves exactly the
@@ -1858,6 +1871,20 @@ mod tests {
             (&prompt_b, KEY, &want_b, 0),
             (&prompt_a, KEY, &want_a, 0),
         ];
+        // Per-round fed piece shapes (count, max_rows), pinned from the save-point plan:
+        // the tip save at 4 lies inside the fed region whenever the job restores fewer than
+        // 4 tokens, so the head run splits there (worker piece 3). A 6-token prompt feeds
+        // head 3,1 then tail 2; restored 3 feeds head 1 (3..4) then tail 2; restored 4 feeds
+        // only the tail 2; E (4 tokens, boundary 3) feeds head 3 then tail 1.
+        let piece_shapes = [
+            (3u32, 3u32), // A: head 3,1 + tail 2
+            (1, 2),       // A restored 4: tail 2
+            (1, 2),       // A restored 4: tail 2
+            (2, 3),       // E: head 3 + tail 1
+            (2, 2),       // A restored 3: head 1 + tail 2
+            (3, 3),       // B: head 3,1 + tail 2
+            (3, 3),       // A: head 3,1 + tail 2
+        ];
         for (round, (prompt, boundary, want, reused)) in rounds.into_iter().enumerate() {
             let (job, mut handle) = Job::new(prompt.clone(), seeded_generation(4)).unwrap();
             let job = job.with_prefix_boundary(boundary).unwrap();
@@ -1886,6 +1913,11 @@ mod tests {
                     // omit the four `prefix_*` keys.
                     prefix: None,
                     prefill_bank: None,
+                    prefill_pieces: crate::sched::job::PrefillPieces {
+                        count: piece_shapes[round].0,
+                        max_rows: piece_shapes[round].1,
+                    },
+                    first_token_margin: top2_margin(&logits_alone_with(table, prompt)[..VOCAB]),
                 }),
                 "round {round}: usage"
             );
@@ -2129,6 +2161,8 @@ mod tests {
         .enumerate()
         {
             let prompt_tokens = u32::try_from(prompt.len()).unwrap();
+            let oracle = logits_alone(&prompt);
+            let first_margin = top2_margin(&oracle[..VOCAB]).expect("oracle margin");
             let (job, mut handle) = Job::new(prompt, seeded_generation(8)).unwrap();
             engine.handle().try_submit(job).unwrap();
             let mut tokens = Vec::new();
@@ -2142,15 +2176,26 @@ mod tests {
                 }
             }
             assert_eq!(&tokens, want, "round {round}: tokens");
+            let usage = usage.expect("usage");
+            // The chunk path equals the step oracle only within the chunk-parity
+            // tolerance, so the margin is compared within tolerance; the rest is exact.
+            let scale = oracle[..VOCAB].iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let margin = usage.first_token_margin.expect("first-token margin");
+            assert!(
+                (margin - first_margin).abs() <= 2.0e-4 * scale,
+                "round {round}: margin {margin} vs step oracle {first_margin}"
+            );
             assert_eq!(
                 usage,
-                Some(JobUsage {
+                JobUsage {
                     prompt_tokens,
                     completion_tokens: 8,
                     reused_tokens: 0,
                     prefix: None,
                     prefill_bank: None,
-                }),
+                    prefill_pieces: fed_pieces(prompt_tokens as usize, worker_chunk),
+                    first_token_margin: Some(margin),
+                },
                 "round {round}: usage"
             );
         }
@@ -2301,7 +2346,7 @@ mod tests {
     type Counters = (
         crate::kernels::QualificationFlushStats,
         crate::kernels::QualificationTiming,
-        crate::family::flash_next::stored::ExpertReadStats,
+        crate::family::stored::ExpertReadStats,
     );
 
     #[cfg(feature = "native-fault-qualification")]
@@ -2310,7 +2355,7 @@ mod tests {
         (
             kernels.qualification_flush_stats(),
             kernels.qualification_timing(),
-            crate::family::flash_next::stored::qualification_expert_reads(),
+            crate::family::stored::qualification_expert_reads(),
         )
     }
 
@@ -2487,7 +2532,7 @@ mod tests {
             #[cfg(feature = "native-fault-qualification")]
             executor.decoder.kernels.qualification_reset_timing();
             #[cfg(feature = "native-fault-qualification")]
-            crate::family::flash_next::stored::qualification_reset_expert_reads();
+            crate::family::stored::qualification_reset_expert_reads();
             #[cfg(feature = "native-fault-qualification")]
             let flushes = executor.decoder.kernels.qualification_retire_stats().0;
             let started = std::time::Instant::now();
@@ -2568,7 +2613,7 @@ mod tests {
                     secs(timing.evaluate_ns),
                     timing.evaluate_calls,
                 ));
-                let reads = crate::family::flash_next::stored::qualification_expert_reads();
+                let reads = crate::family::stored::qualification_expert_reads();
                 lines.push_str(&format!(
                     "{run}_expert_read_seconds={}\n{run}_expert_read_bytes={}\n\
                      {run}_expert_slice_reads={}\n{run}_expert_page_imports={}\n\

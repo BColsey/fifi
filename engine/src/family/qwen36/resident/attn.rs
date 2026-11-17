@@ -929,13 +929,13 @@ mod tests {
     use super::super::ops::{assert_parity, f32_tensor, values};
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
-    use crate::family::flash_next::math::rope_half;
-    use crate::family::flash_next::stored::StoredWeight;
+    use crate::family::math::rope_half;
     use crate::family::project::Projector;
     use crate::family::qwen36::host::{self, AttnW, KvCache as HostCache, MixerW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY_GQA};
+    use crate::family::stored::StoredWeight;
     use crate::kernels::MlxKernels;
     use crate::weights::StreamedCheckpoint;
 

@@ -23,11 +23,9 @@ use crate::{
     EngError,
     family::{
         exl3_pack::Root,
-        flash_next::{
-            ple::{self, PleShape, PleState, PleWeights, RowPlan},
-            stored::{host_f32, stored_bytes},
-        },
+        flash_next::ple::{self, PleShape, PleState, PleWeights, RowPlan},
         project::Projector,
+        stored::{host_f32, stored_bytes},
     },
     tensor::Dtype,
     weights::{
