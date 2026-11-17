@@ -6,8 +6,8 @@
 //! (least significant bits first) and has the value `scale[g] * q + bias[g]` for group `g = c / group`.
 
 use crate::EngError;
-use crate::family::flash_next::stored::{self, StoredWeight};
 use crate::family::project::Projector;
+use crate::family::stored::{self, StoredWeight};
 use crate::kernels::{PackedWeight, QuantizationMode};
 use crate::tensor::{Dtype, Tensor};
 use crate::weights::StreamedCheckpoint;

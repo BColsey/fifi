@@ -365,7 +365,6 @@ pub(super) fn step(
 #[cfg(test)]
 mod tests {
     use super::super::super::load::FlashWeights;
-    use super::super::super::math::{rms0, rope_half};
     use super::super::super::mlx::MlxProjector;
     use super::super::super::mlx::tests::{
         COS_BLOCK, COS_END, Gate, REL_BLOCK, REL_END, env_path, open_checkpoint, top5, write_report,
@@ -377,6 +376,7 @@ mod tests {
     use super::super::weights::{RAttn, ResidentWeights, synthetic};
     use super::super::{ResidentDecoder, StepMode};
     use super::*;
+    use crate::family::math::{rms0, rope_half};
     use crate::family::project::Projector;
     use crate::kernels::MlxKernels;
     use crate::tensor::Dtype;

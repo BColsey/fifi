@@ -11,7 +11,9 @@ use super::reqlog::RequestLog;
 use super::sampler_trace::TraceAligner;
 use super::wire::{FinishReason, ReplyParts, ToolCall, Usage};
 use crate::EngError;
-use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefixReport};
+use crate::sched::job::{
+    JobEvent, JobHandle, JobUsage, PrefillBankReport, PrefillPieces, PrefixReport,
+};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, OutputAssembler};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +47,16 @@ pub(crate) struct RunningJob {
     /// the same fallback: it stays `None` unless the pump read the event, so a cancelled, failed,
     /// refused, or stop-string reply logs no prefix keys.
     prefix: Option<PrefixReport>,
+    /// The expert-bank counters of the job, read from the same `Finished` event: the
+    /// per-request delta of the counters (log-only `prefill_bank_*` keys); `None` keeps
+    /// them out.
+    prefill_bank: Option<PrefillBankReport>,
+    /// The prefill piece shape read from the same `Finished` event, with the same fallback
+    /// as `reused`: zeros when the pump never read the event.
+    prefill_pieces: PrefillPieces,
+    /// The top-two logit margin at the first decode position, read from the same `Finished`
+    /// event (log-only); `None` when no draw happened or the pump never read the event.
+    first_token_margin: Option<f32>,
     calls: u32,
     /// The alignment replay of a traced reply: fed every batch's tokens,
     /// finished at `Done`. `None` on every request that did not arm capture.
@@ -79,6 +91,9 @@ impl RunningJob {
             produced: 0,
             reused: 0,
             prefix: None,
+            prefill_bank: None,
+            prefill_pieces: PrefillPieces::default(),
+            first_token_margin: None,
             calls: 0,
             trace,
             log,
@@ -135,6 +150,9 @@ impl RunningJob {
                         let usage = self.read_finished().await?;
                         self.reused = usage.reused_tokens;
                         self.prefix = usage.prefix;
+                        self.prefill_bank = usage.prefill_bank;
+                        self.prefill_pieces = usage.prefill_pieces;
+                        self.first_token_margin = usage.first_token_margin;
                     }
                     if let Some(step) = self.on_batch(&batch)? {
                         return Ok(step);
@@ -158,6 +176,9 @@ impl RunningJob {
                 completion_tokens: 0,
                 reused_tokens: 0,
                 prefix: None,
+                prefill_bank: None,
+                prefill_pieces: PrefillPieces::default(),
+                first_token_margin: None,
             }),
         }
     }
@@ -183,6 +204,9 @@ impl RunningJob {
         Ok((!pieces.is_empty()).then_some(Step::Pieces(pieces)))
     }
 
+    /// Assembles the reply's final step: finishes the trace, counts the tool calls, logs the
+    /// request line (with the prefix and expert-bank reports when the pump read them) and
+    /// returns the pieces with the usage.
     fn done(&mut self, pieces: Vec<Piece>, finish: FinishReason) -> Step {
         if let Some(trace) = self.trace.as_mut() {
             trace.finish();
@@ -194,7 +218,14 @@ impl RunningJob {
             finish
         };
         let usage = Usage::new(self.prompt_tokens, self.produced, self.reused);
-        self.log.done(finish, &usage, self.prefix.as_ref());
+        self.log.done(
+            finish,
+            &usage,
+            self.prefix.as_ref(),
+            self.prefill_bank.as_ref(),
+            self.prefill_pieces,
+            self.first_token_margin,
+        );
         Step::Done {
             pieces,
             finish,
@@ -265,10 +296,10 @@ fn add_pieces(parts: &mut ReplyParts, pieces: Vec<Piece>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunningJob, Step, collect};
+    use super::{PrefillPieces, RunningJob, Step, collect};
     use crate::EngError;
     use crate::family::executor::GenerationState;
-    use crate::sched::job::{Job, JobEvent};
+    use crate::sched::job::{Job, JobEvent, JobUsage, PrefillBankReport};
     use crate::sched::worker::Engine;
     use crate::server::error::ServerError;
     use crate::server::pieces::{Piece, ReplyParser};
@@ -456,6 +487,67 @@ mod tests {
             "one entry at 1,000 bytes, {line}"
         );
         assert_eq!(line["prefix_uncached_shared"], 0, "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_hands_its_prefill_bank_report_to_the_request_log() {
+        let bundle = testkit::bundle();
+        let generation = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()));
+        let (_job, mut handle) = Job::new(PROMPT.to_vec(), generation).expect("job");
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        handle.events = receiver;
+        sender
+            .try_send(JobEvent::Batch(DecodeBatch {
+                tokens: vec![97],
+                text: "a".to_string(),
+                finish: Some(DecodeFinish::Length),
+            }))
+            .expect("terminal batch");
+        sender
+            .try_send(JobEvent::Finished(JobUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                reused_tokens: 0,
+                prefix: None,
+                prefill_bank: Some(PrefillBankReport {
+                    passes: 4,
+                    misses: 7,
+                    miss_histogram: vec![1, 2, 3],
+                    route_histogram: vec![5, 6],
+                    upload_bytes: 123_456,
+                    upload_ns: 789,
+                }),
+                prefill_pieces: PrefillPieces::default(),
+                first_token_margin: None,
+            }))
+            .expect("usage");
+        drop(sender);
+        let capture = Capture::default();
+        let mut log = RequestLog::new(
+            Arc::new(Mutex::new(capture.clone())),
+            default_clock(),
+            "m",
+            false,
+            3,
+            "GET",
+            "/v1/test",
+        );
+        log.admit();
+        let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
+        let parser = ReplyParser::new(Start::Content, &[], "call_");
+        let mut running = RunningJob::new(handle, assembler, parser, 3, log, None);
+        let (parts, finish, usage) = collect(&mut running).await.expect("collect");
+        assert_eq!(parts.content, "a");
+        assert_eq!(finish, FinishReason::Length);
+        assert_eq!(usage, Usage::new(3, 1, 0));
+        let line: serde_json::Value =
+            serde_json::from_str(capture.text().trim_end()).expect("the log line");
+        assert_eq!(line["prefill_bank_passes"], 4);
+        assert_eq!(line["prefill_bank_misses"], 7);
+        assert_eq!(line["prefill_bank_miss_histogram"], json!([1, 2, 3]));
+        assert_eq!(line["prefill_bank_route_histogram"], json!([5, 6]));
+        assert_eq!(line["prefill_bank_upload_bytes"], 123_456);
+        assert_eq!(line["prefill_bank_upload_ns"], 789);
     }
 
     #[tokio::test]

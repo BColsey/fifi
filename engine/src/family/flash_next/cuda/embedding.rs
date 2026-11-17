@@ -11,7 +11,7 @@
 
 use crate::{
     EngError,
-    family::{exl3_pack::EMBED_NAME, qwen36::exl3_tensors::widen_f32},
+    family::{exl3_pack::EMBED_NAME, exl3_tensors::widen_f32},
     tensor::{Dtype, Tensor},
     weights::StreamedCheckpoint,
 };

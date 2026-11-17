@@ -1,4 +1,6 @@
-//! Source adaptation of a stock EXL3 pack for the resident step: matrices go to the device in
+//! The Qwen3.6 mixer loaders over the shared pack reader (family::exl3::source):
+//! geometry-checked full-attention and DeltaNet weight sets read through
+//! family::exl3::source::PackReader. Matrices go to the device in
 //! their stored components, norms and small plain tensors as F32 vectors, all under the GGUF
 //! names the step looks up (`LayerTable`, `GlobalNames`).
 //!
@@ -11,34 +13,24 @@
 //! A DeltaNet layer additionally moves its value heads from the pack's grouped order into the
 //! tiled order of the kernels (see `exl3_tensors`): whole heads of every matrix, vector and conv
 //! row that carries a value-head axis.
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3_pack::{Root, layer_name};
+use crate::family::exl3_tensors::{decay_from_log, permute_blocks, tiled_head_order};
 use crate::family::project::cuda::WeightLayout;
-use crate::family::qwen36::exl3_pack::{Root, layer_name};
-use crate::family::qwen36::exl3_tensors::{
-    decay_from_log, effective_norm_bytes, f32_le_bytes, norm_layout, permute_blocks,
-    tiled_head_order, widen_f32,
-};
 
-use super::{
-    layer_table::LayerTable,
-    mixer_geometry::{DeltaGeometry, DenseSpec, MixerGeometry, RawSpec, check_dense},
-};
+use super::mixer_geometry::{DeltaGeometry, MixerGeometry, RawSpec};
+use crate::family::exl3::source::{DenseSpec, PackReader};
 use crate::{
     EngError,
-    family::{
-        AttentionKind,
-        gguf_model::Role,
-        project::cuda::{CudaProjector, CudaWeight, Reserve},
-    },
-    tensor::Tensor,
-    weights::{
-        GgufType, WeightSource,
-        exl3::{Axis, COMPONENT_SUFFIXES, Checkpoint, GROUP, Matrix},
-    },
+    family::{AttentionKind, gguf_model::Role, project::cuda::CudaWeight},
+    weights::exl3::{Axis, GROUP},
 };
-
-/// Largest stored matrix read at once: the head's trellis is the biggest, at 318 MB.
-const MATRIX_READ_LIMIT: u64 = 1 << 30;
+#[cfg(test)]
+use crate::{
+    family::project::cuda::{CudaProjector, Reserve},
+    weights::exl3::Checkpoint,
+};
 
 /// A group order that moves each of the `order` heads as `groups_per_head` whole groups.
 fn head_groups(order: &[usize], groups_per_head: usize) -> Vec<usize> {
@@ -46,182 +38,6 @@ fn head_groups(order: &[usize], groups_per_head: usize) -> Vec<usize> {
         .iter()
         .flat_map(|&head| (0..groups_per_head).map(move |g| head * groups_per_head + g))
         .collect()
-}
-
-pub(in crate::family) struct PackReader<'a> {
-    projector: &'a CudaProjector,
-    pub(in crate::family) checkpoint: &'a Checkpoint,
-    reserve: Reserve,
-    root: Root,
-}
-
-impl<'a> PackReader<'a> {
-    pub(in crate::family) fn new(
-        projector: &'a CudaProjector,
-        checkpoint: &'a Checkpoint,
-        reserve: Reserve,
-    ) -> Self {
-        Self {
-            projector,
-            checkpoint,
-            reserve,
-            root: Root::Layers,
-        }
-    }
-
-    /// Reads the layers from `root` instead of the model's own: the MTP head's block.
-    pub(in crate::family) fn under(mut self, root: Root) -> Self {
-        self.root = root;
-        self
-    }
-
-    /// Where the layers of this pack are named.
-    pub(in crate::family) fn root(&self) -> Root {
-        self.root
-    }
-
-    /// Admits `bytes` of weights against the free device memory and the reserve of the load.
-    pub(in crate::family) fn admit(&self, bytes: u64) -> Result<(), EngError> {
-        self.projector.admit(bytes, self.reserve)
-    }
-
-    /// The stored components of the matrix under `prefix`. Unsupported old representations are
-    /// selected too, so `Matrix::load` can refuse them.
-    pub(in crate::family) fn matrix(&self, prefix: &str) -> Result<Matrix, EngError> {
-        let names = COMPONENT_SUFFIXES.map(|suffix| format!("{prefix}.{suffix}"));
-        let keys = names.each_ref().map(String::as_str);
-        let selected = self
-            .checkpoint
-            .source
-            .read_selected(&keys, MATRIX_READ_LIMIT)?;
-        Matrix::load(&selected, prefix, &self.checkpoint.config)
-    }
-
-    fn plain(&self, name: &str, shape: &[u32]) -> Result<Tensor, EngError> {
-        let missing = || EngError::Checkpoint(format!("EXL3 source: missing tensor {name}"));
-        let (dtype, stored) = self.checkpoint.source.stored(name).ok_or_else(missing)?;
-        if stored != shape {
-            return Err(EngError::Checkpoint(format!(
-                "EXL3 source: {name} is stored as {stored:?}, expected {shape:?}"
-            )));
-        }
-        let values = shape.iter().map(|&dim| u64::from(dim)).product::<u64>();
-        let budget = values.saturating_mul(dtype.byte_width());
-        let selected = self.checkpoint.source.read_selected(&[name], budget)?;
-        selected.tensor(name).ok_or_else(missing)
-    }
-
-    pub(super) fn exl3(
-        &self,
-        name: String,
-        prefix: &str,
-        want: &DenseSpec,
-        reorder: Option<(Axis, &[usize])>,
-    ) -> Result<CudaWeight, EngError> {
-        let matrix = self.matrix(prefix)?;
-        let [k, n] = matrix.shape();
-        check_dense(prefix, (n, k, None), want)?;
-        let matrix = match reorder {
-            Some((axis, order)) => matrix.reorder_groups(axis, order)?,
-            None => matrix,
-        };
-        self.upload(name, &matrix)
-    }
-
-    /// Uploads `matrix` as it is stored (no geometry check, no reorder): the caller has checked
-    /// its shape, as the Flash-Next trunk does through the pack's header walk.
-    pub(in crate::family) fn upload(
-        &self,
-        name: String,
-        matrix: &Matrix,
-    ) -> Result<CudaWeight, EngError> {
-        let weight = self.projector.upload_exl3(matrix, self.reserve)?;
-        Ok(CudaWeight::Exl3 { name, weight })
-    }
-
-    pub(super) fn bank(
-        &self,
-        name: String,
-        count: usize,
-        member: impl FnMut(usize) -> Result<Matrix, EngError>,
-    ) -> Result<CudaWeight, EngError> {
-        let bank = self
-            .projector
-            .upload_exl3_bank(count, self.reserve, member)?;
-        Ok(CudaWeight::Exl3Bank { name, bank })
-    }
-
-    fn raw_bytes(&self, name: String, bytes: &[u8]) -> Result<CudaWeight, EngError> {
-        let budget = u64::try_from(bytes.len())
-            .map_err(|_| EngError::MemoryPlan("EXL3 raw upload byte count overflow".into()))?;
-        self.projector.admit(budget, self.reserve)?;
-        let buffer = self.projector.context().upload(bytes)?;
-        Ok(CudaWeight::Raw {
-            name,
-            ty: GgufType::F32,
-            buffer,
-        })
-    }
-
-    /// Uploads the zero-centered norm `source` as `name` with one added in F32.
-    pub(in crate::family) fn norm(
-        &self,
-        name: String,
-        source: &str,
-        values: usize,
-    ) -> Result<CudaWeight, EngError> {
-        let (dtype, shape) = self.checkpoint.source.stored(source).ok_or_else(|| {
-            EngError::Checkpoint(format!("EXL3 attention source: missing tensor {source}"))
-        })?;
-        // Validate the exact source shape and type before reading even a tiny norm.
-        let output_len = norm_layout(dtype, &shape, values)?;
-        let budget = u64::try_from(output_len)
-            .map_err(|_| EngError::MemoryPlan("EXL3 norm read budget overflow".into()))?;
-        let selected = self.checkpoint.source.read_selected(&[source], budget)?;
-        let tensor = selected.tensor(source).ok_or_else(|| {
-            EngError::Checkpoint(format!("EXL3 attention source: missing tensor {source}"))
-        })?;
-        self.raw_bytes(name, &effective_norm_bytes(&tensor, values)?)
-    }
-
-    pub(in crate::family) fn vector(
-        &self,
-        name: String,
-        source: &str,
-        shape: &[u32],
-        transform: impl FnOnce(Vec<f32>) -> Result<Vec<f32>, EngError>,
-    ) -> Result<CudaWeight, EngError> {
-        let tensor = self.plain(source, shape)?;
-        let values = shape.iter().map(|&dim| dim as usize).product();
-        let values = transform(widen_f32(&tensor, values, source)?)?;
-        self.raw_bytes(name, &f32_le_bytes(&values))
-    }
-
-    pub(in crate::family) fn table(
-        &self,
-        name: String,
-        source: &str,
-        shape: &[u32],
-    ) -> Result<CudaWeight, EngError> {
-        let tensor = self.plain(source, shape)?;
-        let ty = match tensor.dtype() {
-            crate::tensor::Dtype::Bf16 => GgufType::Bf16,
-            crate::tensor::Dtype::F16 => GgufType::F16,
-            other => {
-                return Err(EngError::Checkpoint(format!(
-                    "EXL3 source: table {source} has dtype {other:?}"
-                )));
-            }
-        };
-        let bytes = tensor
-            .host_bytes()
-            .ok_or_else(|| EngError::Checkpoint(format!("EXL3 table {source} needs host bytes")))?;
-        let budget = u64::try_from(bytes.len())
-            .map_err(|_| EngError::MemoryPlan("EXL3 table byte count overflow".into()))?;
-        self.projector.admit(budget, self.reserve)?;
-        let buffer = self.projector.context().upload(bytes)?;
-        Ok(CudaWeight::Raw { name, ty, buffer })
-    }
 }
 
 fn layer_kind(table: &LayerTable, layer: usize, want: AttentionKind) -> Result<(), EngError> {

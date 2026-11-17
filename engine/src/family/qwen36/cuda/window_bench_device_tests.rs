@@ -114,9 +114,9 @@ use super::{
     prefill_plan::Extra,
     start::prefill_headroom,
     state::export::ExportedState,
-    state_layout::Word,
     step::{CaptureConfig, QwenResidentStep},
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::{

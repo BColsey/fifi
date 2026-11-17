@@ -29,6 +29,81 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 }
 
 #[test]
+fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
+    let (_, g) = real();
+    assert_eq!(StepPlan::prefill_bytes(false, &g, 0, 0).unwrap(), 0);
+    for rows in [1, 64, 65, MAX_STEP_ROWS] {
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let actual = crate::kernels::cuda::plan_arena(&plan.arena_tensors())
+            .unwrap()
+            .total;
+        assert_eq!(
+            StepPlan::prefill_bytes(true, &g, rows, 32_768).unwrap(),
+            u64::try_from(actual).unwrap()
+        );
+    }
+    assert!(StepPlan::prefill_bytes(true, &g, MAX_STEP_ROWS + 1, 32_768).is_err());
+}
+
+#[test]
+fn shared_prefill_extension_replans_the_full_tensor_list() {
+    let (_, g) = real();
+    for rows in [1, 64, 65, MAX_STEP_ROWS] {
+        let old = plan_at(&g, rows, 32_768);
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        assert_eq!(plan.slots().len(), old.slots().len() + 2);
+        for entry in old.slots() {
+            assert_eq!(plan.index(entry.slot), old.index(entry.slot));
+            assert_eq!(slot(&plan, entry.slot), entry);
+        }
+        let replanned = crate::kernels::cuda::plan_arena(&plan.arena_tensors()).unwrap();
+        assert_eq!(plan.arena_bytes(), replanned.total);
+        for (index, entry) in plan.slots().iter().enumerate() {
+            assert_eq!(
+                plan.placement(entry.slot),
+                Some((replanned.offsets[index], entry.bytes))
+            );
+        }
+        assert_no_live_overlap(&plan);
+    }
+}
+
+#[test]
+fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
+    let (_, g) = real();
+    for (rows, perm_bytes) in [(1, 8288), (64, 13_472), (65, 13_568), (256, 29_312)] {
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let perm = slot(&plan, Slot::PrefillPerm);
+        assert_eq!(perm.bytes, perm_bytes);
+        assert_eq!(
+            (perm.first, perm.last),
+            (Phase::Route as usize, Phase::Down as usize)
+        );
+        let y = slot(&plan, Slot::PrefillY);
+        assert_eq!(y.bytes, rows * g.delta.value_heads * 4);
+        assert_eq!(
+            (y.first, y.last),
+            (Phase::Ple as usize, Phase::LmHead as usize)
+        );
+        assert_eq!(slot(&plan, Slot::Exl3Jobs).bytes, 16);
+        let pairs = rows * g.top_k;
+        assert!(slot(&plan, Slot::Exl3Xh).bytes >= pairs * g.hidden.max(g.inter) * 2);
+        assert!(slot(&plan, Slot::Exl3Z).bytes >= pairs * g.hidden.max(g.inter) * 4);
+    }
+}
+
+#[test]
+fn shared_prefill_extension_keeps_the_existing_bounds() {
+    let (_, g) = real();
+    let options = StepOptions::default();
+    for rows in [0, MAX_STEP_ROWS + 1, usize::MAX] {
+        assert!(StepPlan::new_prefill(&g, rows, 32_768, &options).is_err());
+    }
+    assert!(StepPlan::new_prefill(&g, 64, 0, &options).is_err());
+    assert!(StepPlan::new_prefill(&g, 64, 32_768, &StepOptions { qsa_splits: 0 }).is_err());
+}
+
+#[test]
 fn the_phase_table_is_in_order() {
     for (position, phase) in PHASES.iter().enumerate() {
         assert_eq!(*phase as usize, position);
@@ -65,6 +140,22 @@ fn the_sizes_of_one_row_follow_the_geometry() {
     assert_eq!(bytes(Slot::Exl3Xh), 20 * 2560 * 4);
     assert_eq!(bytes(Slot::Exl3Z), 248_320 * 4);
     assert_eq!(bytes(Slot::Exl3Flag), 4);
+}
+
+#[test]
+fn the_exl3_scratch_spans_the_chunk_at_every_width() {
+    let (_, g) = real();
+    // Independent of exl3_scratch's loop: at every width the rotated-input face is the routed
+    // job table's one launch over rows * 10 pairs (its input width is hidden = 2560), and the
+    // partial face is lm_head's (rows, 248_320) partial - every other launch (the shared
+    // expert's 2 * rows groups, DeltaNet's conv/value, QSA's projections, PLE's keys) stays
+    // under both at these widths. Rows 1 keeps the 20 gate/up pairs of the grouped launch.
+    for (rows, pairs) in [(1usize, 20usize), (32, 320), (64, 640)] {
+        let plan = plan_at(&g, rows, 32_768);
+        let bytes = |s| slot(&plan, s).bytes;
+        assert_eq!(bytes(Slot::Exl3Xh), pairs * 2560 * 4, "xh at rows {rows}");
+        assert_eq!(bytes(Slot::Exl3Z), rows * 248_320 * 4, "z at rows {rows}");
+    }
 }
 
 #[test]
@@ -159,25 +250,28 @@ fn lifetimes_cover_producers_and_consumers() {
     }
 }
 
+fn assert_no_live_overlap(plan: &StepPlan) {
+    let placed: Vec<(PlannedSlot, usize)> = plan
+        .slots()
+        .iter()
+        .map(|p| (*p, plan.placement(p.slot).unwrap().0))
+        .collect();
+    for (i, (a, a_off)) in placed.iter().enumerate() {
+        assert_eq!(a_off % 256, 0, "{:?}", a.slot);
+        assert!(a_off + a.bytes <= plan.arena_bytes(), "{:?}", a.slot);
+        for (b, b_off) in &placed[i + 1..] {
+            let together = a.first <= b.last && b.first <= a.last;
+            let apart = a_off + a.bytes <= *b_off || b_off + b.bytes <= *a_off;
+            assert!(!together || apart, "{:?} and {:?} overlap", a.slot, b.slot);
+        }
+    }
+}
+
 #[test]
 fn tensors_live_together_never_overlap() {
     let (_, g) = real();
     for (rows, positions) in [(1, 32_768), (1, 262_144), (8, 131_072)] {
-        let plan = plan_at(&g, rows, positions);
-        let placed: Vec<(PlannedSlot, usize)> = plan
-            .slots()
-            .iter()
-            .map(|p| (*p, plan.placement(p.slot).unwrap().0))
-            .collect();
-        for (i, (a, a_off)) in placed.iter().enumerate() {
-            assert_eq!(a_off % 256, 0, "{:?}", a.slot);
-            assert!(a_off + a.bytes <= plan.arena_bytes(), "{:?}", a.slot);
-            for (b, b_off) in &placed[i + 1..] {
-                let together = a.first <= b.last && b.first <= a.last;
-                let apart = a_off + a.bytes <= *b_off || b_off + b.bytes <= *a_off;
-                assert!(!together || apart, "{:?} and {:?} overlap", a.slot, b.slot);
-            }
-        }
+        assert_no_live_overlap(&plan_at(&g, rows, positions));
     }
 }
 

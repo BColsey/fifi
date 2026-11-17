@@ -5,6 +5,7 @@
 //! the shape the draft step needs, reports the device bytes the head added, and compares one
 //! projection of the head (`mtp.fc`, which has the head's own codebook) with the fp64 reference of
 //! the stored matrix.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::path::Path;
 
@@ -12,7 +13,6 @@ use super::{
     common_tests::{dims, inventory},
     exl3_load::load_exl3_dir_with_head,
     exl3_load_device_tests::{matrix_of, relative_l2},
-    layer_table::LayerTable,
     mtp_load::{EMBEDDING_NORM_NAME, FC_NAME, HIDDEN_NORM_NAME, OUTPUT_NORM_NAME},
 };
 use crate::{

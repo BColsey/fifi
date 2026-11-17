@@ -2,12 +2,13 @@
 //! accessor's mixed refusal and the rows % 4 / column refusals. CPU only.
 use super::common_tests::dims;
 use super::dims::KvMode;
-use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
+use super::mixer_geometry::{MixerGeometry, check_native_dense};
 use super::mixer_ops::{BlockOp, block_ops, block_ops_with, check_native_column};
 use super::step::moe_override_uniform;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
 use crate::family::AttentionKind;
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::{
     TensorKind, WeightLayout, check_sliced_override, load_layout, tiled_override_admission,
@@ -396,7 +397,7 @@ fn assert_exl3_live_slots(plan: &super::step_plan::StepPlan, ops: &[super::mixer
 /// guard with every earlier check satisfied.
 #[test]
 fn an_unsupported_type_or_row_count_is_refused_at_construction() {
-    let spec = super::mixer_geometry::DenseSpec {
+    let spec = DenseSpec {
         role: Role::AttnQkv,
         rows: 8192,
         k: 2048,

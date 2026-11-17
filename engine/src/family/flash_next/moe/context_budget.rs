@@ -25,12 +25,12 @@
 // Staged: the Flash-Next CUDA step is the first caller.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use super::tier_plan::{TierInputs, TierPlan, position_bytes};
+use super::tier_plan::{TierInputs, TierPlan, indexer_key_bytes};
 use crate::{
     EngError,
-    family::qwen36::{
+    family::{
         admission_sketch::{CONTEXT_SEARCH_STEP, largest_fitting_context},
-        tiered::budget::KvPlan,
+        device_budget::KvPlan,
     },
 };
 
@@ -88,26 +88,45 @@ pub(in crate::family::flash_next) struct KvGeometry {
 }
 
 impl KvGeometry {
-    /// Bytes one context position costs in `format`.
+    /// Bytes one context position costs in `format`. The per-layer K/V term (payload plus
+    /// scales) is the shared arithmetic; the indexer key and the layer multiply are this
+    /// family's geometry.
     pub(in crate::family::flash_next) fn position_bytes(
         &self,
         format: KvFormat,
     ) -> Result<u64, EngError> {
-        let base = position_bytes(
-            self.cached_layers,
-            self.heads_kv,
-            self.head_dim,
-            format.element_bytes(),
-            (self.idx_dim, self.ratio),
+        let kv = shared_kv_format(format, self.head_dim)?.layer_position_bytes(
+            crate::family::kv_format::KvRowShape {
+                heads_kv: self.heads_kv,
+                head_dim: self.head_dim,
+            },
         )?;
-        let scales = self
-            .cached_layers
-            .checked_mul(2 * self.heads_kv)
-            .and_then(|rows| rows.checked_mul(format.row_scale_bytes()));
-        scales
-            .and_then(|scales| base.checked_add(scales))
+        self.cached_layers
+            .checked_mul(
+                kv.checked_add(indexer_key_bytes(self.idx_dim, self.ratio)?)
+                    .ok_or_else(|| refuse("the bytes of one position overflow".into()))?,
+            )
             .ok_or_else(|| refuse("the bytes of one position overflow".into()))
     }
+}
+
+/// This family's [`KvFormat`] in the shared type: F16 direct; Int8 keeps its one f32 scale
+/// per head per plane, which the shared row states as one group the width of the head
+/// dimension.
+fn shared_kv_format(
+    format: KvFormat,
+    head_dim: u64,
+) -> Result<crate::family::kv_format::KvFormat, EngError> {
+    Ok(match format {
+        // F16 carries no group, so it keeps no head_dim limit of its own.
+        KvFormat::F16 => crate::family::kv_format::KvFormat::F16,
+        KvFormat::Int8 => crate::family::kv_format::KvFormat::Int8 {
+            group: u32::try_from(head_dim).map_err(|_| {
+                refuse("the K/V head dimension does not fit the shared format".into())
+            })?,
+            scale_bytes: 4,
+        },
+    })
 }
 
 /// A context the card can serve, with the expert placement it leaves room for.
@@ -157,7 +176,7 @@ impl ContextBudget {
     /// The longest context, a multiple of [`CONTEXT_GRANULE`] and at most `limit`, whose plan has at
     /// least `min_slots` experts per layer. `None` when not even one granule does. A longer context
     /// never has more slots, so the search is the bisection `enginesrv check` uses for its context
-    /// proposal ([`largest_fitting_context`]); `limit` itself is tried first, because that search
+    /// proposal ([`largest_fitting`]); `limit` itself is tried first, because that search
     /// never asks for its upper end.
     pub(super) fn largest_context(
         &self,
@@ -227,5 +246,7 @@ impl ContextBudget {
     }
 }
 
+#[cfg(test)]
+mod kv_bytes_golden_tests;
 #[cfg(test)]
 mod tests;

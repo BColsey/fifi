@@ -161,7 +161,7 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Result<Vec<f32>, EngError> {
     Ok(gate
         .iter()
         .zip(up)
-        .map(|(&g, &u)| crate::family::flash_next::math::silu(g) * u)
+        .map(|(&g, &u)| crate::family::math::silu(g) * u)
         .collect())
 }
 
@@ -183,7 +183,7 @@ pub fn qk_head(
             "Flint QK head/gamma must be finite D128 with positive epsilon",
         ));
     }
-    let mean = crate::family::flash_next::math::dot(values, values)? / 128.0;
+    let mean = crate::family::math::dot(values, values)? / 128.0;
     if !mean.is_finite() {
         return Err(bad("Flint QK norm overflowed"));
     }
@@ -194,7 +194,7 @@ pub fn qk_head(
         .map(|(&v, &g)| v / divisor * g)
         .collect();
     if let Some(pos) = position {
-        crate::family::flash_next::math::rope_half(&mut output, 128, pos, 10_000.0)?;
+        crate::family::math::rope_half(&mut output, 128, pos, 10_000.0)?;
     }
     Ok(output)
 }

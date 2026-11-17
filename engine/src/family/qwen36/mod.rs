@@ -14,24 +14,12 @@ mod default_path_pin_tests;
 #[cfg(test)]
 mod exl3_admission;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-#[cfg_attr(
-    not(all(feature = "native-cuda", target_os = "linux")),
-    allow(
-        dead_code,
-        reason = "the CUDA step is the caller; host builds test the plan"
-    )
-)]
-pub(in crate::family) mod exl3_merge_plan;
-#[cfg(test)]
-mod exl3_merge_plan_tests;
+pub(in crate::family) mod exl3_pack;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod exl3_pack;
+pub(crate) use self::exl3_pack::exl3_plan;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) use exl3_pack::{Exl3PackPlan, exl3_plan};
 #[cfg(test)]
 mod exl3_pack_tests;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(in crate::family) mod exl3_tensors;
 #[cfg(test)]
 mod exl3_tokenizer_tests;
 pub(crate) mod factory;

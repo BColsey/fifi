@@ -1,7 +1,7 @@
 //! The memory plan of a full Flash-Next load: what the pack's own header walk and config say about
 //! the sizes, joined to the context-aware expert budget.
 //!
-//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`FlashPackReport`), the model config
+//! WHAT: [`FlashLoadPlan::new`] takes the header-walk report (`PackReport`), the model config
 //! and the n-gram table length, and derives every number the load needs without reading a payload:
 //! the routed-expert shape, the trunk bytes on the device (everything but the experts and the
 //! embedding, which the host gathers), the DeltaNet state, the K/V geometry of the attention layers
@@ -25,11 +25,11 @@ use super::{
 };
 use crate::{
     EngError,
-    family::flash_next::{
-        deltanet::DeltaState,
-        load::{exl3_pack::FlashPackReport, model_shape},
-    },
-    family::qwen36::tiered::budget::KvPlan,
+    family::device_budget::KvPlan,
+    family::exl3_pack::PackReport,
+    family::flash_next::{deltanet::DeltaState, load::model_shape},
+    family::plan_decision::{PlanDecision, PlanFixity},
+    family::plan_rows::PlanRows,
 };
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -59,7 +59,7 @@ impl FlashLoadPlan {
     /// the cost-model fixture); its `shape`,
     /// `vram.non_expert` and `kv` fields are replaced by what the pack says.
     pub(in crate::family::flash_next) fn new(
-        report: &FlashPackReport,
+        report: &PackReport,
         model_config: &[u8],
         ngram_bytes: u64,
         card: TierInputs,
@@ -73,7 +73,6 @@ impl FlashLoadPlan {
             .checked_mul(moe.hidden as u64 * 2)
             .ok_or_else(|| refuse("the embedding size overflows".into()))?;
         let trunk_bytes = report
-            .pack
             .device_bytes
             .checked_sub(report.expert_bytes)
             .and_then(|rest| rest.checked_sub(embedding_bytes))
@@ -147,26 +146,81 @@ pub(in crate::family::flash_next) struct LoadPlan {
     pub(in crate::family::flash_next) kv_bytes: u64,
 }
 
-impl fmt::Display for LoadPlan {
-    /// The line for the load log.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl PlanRows for LoadPlan {
+    /// Every number the load log line carries, one decision row each.
+    /// The alternatives stay empty: the planner refuses a context that
+    /// does not fit rather than weighing one, so no row records a choice
+    /// among options. Context and K/V are the requested configuration,
+    /// settled at engine start; the four size rows are settled at load,
+    /// from the pack walk and file sizes for the last three and from the
+    /// measured device budget for expert placement (the Qwen3.6 rows
+    /// settle its pack-walk sizes at load too).
+    fn plan_rows(&self) -> Vec<PlanDecision> {
         let plan = &self.context.plan;
-        write!(
-            f,
-            "Flash-Next load: context {} positions, K/V {:?} {:.2} GiB; trunk {:.2} GiB on the device; \
-             {} of {} experts per layer in VRAM ({:.2} GiB), {:.2} GiB pinned in host RAM; \
-             embedding {:.2} GiB host; n-gram table {:.2} GiB local NVMe",
-            self.context.positions,
-            self.context.format,
-            self.kv_bytes as f64 / GIB,
-            self.trunk_bytes as f64 / GIB,
-            plan.slots_per_layer(),
-            plan.shape().experts,
-            plan.bank_bytes() as f64 / GIB,
-            plan.cold_bytes() as f64 / GIB,
-            self.embedding_bytes as f64 / GIB,
-            self.ngram_bytes as f64 / GIB,
-        )
+        let row = |name: &str, chosen: String, fixed_at: PlanFixity| PlanDecision {
+            name: name.to_string(),
+            chosen,
+            alternatives: Vec::new(),
+            fixed_at,
+        };
+        vec![
+            row(
+                "context",
+                format!("{} positions", self.context.positions),
+                PlanFixity::Start,
+            ),
+            row(
+                "K/V",
+                format!(
+                    "{:?} {:.2} GiB",
+                    self.context.format,
+                    self.kv_bytes as f64 / GIB
+                ),
+                PlanFixity::Start,
+            ),
+            row(
+                "trunk",
+                format!("{:.2} GiB on the device", self.trunk_bytes as f64 / GIB),
+                PlanFixity::Load,
+            ),
+            row(
+                "expert placement",
+                format!(
+                    "{} of {} experts per layer in VRAM ({:.2} GiB), {:.2} GiB pinned in host RAM",
+                    plan.slots_per_layer(),
+                    plan.shape().experts,
+                    plan.bank_bytes() as f64 / GIB,
+                    plan.cold_bytes() as f64 / GIB
+                ),
+                PlanFixity::Load,
+            ),
+            row(
+                "embedding",
+                format!("{:.2} GiB host", self.embedding_bytes as f64 / GIB),
+                PlanFixity::Load,
+            ),
+            row(
+                "n-gram table",
+                format!("{:.2} GiB local NVMe", self.ngram_bytes as f64 / GIB),
+                PlanFixity::Load,
+            ),
+        ]
+    }
+}
+
+impl fmt::Display for LoadPlan {
+    /// The line for the load log: the decision rows, joined.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Flash-Next load: ")?;
+        let mut first = true;
+        for row in self.plan_rows() {
+            if !first {
+                write!(f, "; ")?;
+            }
+            first = false;
+            write!(f, "{} {}", row.name, row.chosen)?;
+        }
+        Ok(())
     }
 }
 

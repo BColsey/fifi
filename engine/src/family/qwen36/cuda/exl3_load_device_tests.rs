@@ -5,22 +5,23 @@
 //! tensor's shape through the step's own lookups, compares the device bytes with an independent
 //! sum over the pack's headers and the free memory before and after, and then checks the moved
 //! value heads and the bank members against the fp64 reference of the pack's original matrices.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{fs, path::Path, time::Instant};
 
 use serde_json::json;
 
 use super::{
-    super::exl3_pack::{ExpertPart, Root, expert_name_in, inspect_pack_split, layer_name},
+    super::exl3_pack::inspect_pack_split,
     common_tests::{dims, inventory},
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
-    moe::MoeDims,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3_pack::{ExpertPart, Root, expert_name_in, layer_name};
 use crate::{
     family::{
         AttentionKind, QWEN3_6_35B_A3B,
@@ -83,7 +84,7 @@ fn tensor_of(checkpoint: &Checkpoint, name: &str) -> Tensor {
 pub(super) fn values_of(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
     let tensor = tensor_of(checkpoint, name);
     let count = tensor.shape().iter().map(|&d| d as usize).product();
-    crate::family::qwen36::exl3_tensors::widen_f32(&tensor, count, name).unwrap()
+    crate::family::exl3_tensors::widen_f32(&tensor, count, name).unwrap()
 }
 
 fn raw_values(projector: &CudaProjector, weights: &CudaWeights, name: &str) -> Vec<f32> {
@@ -137,9 +138,9 @@ fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
     let slots = 8usize;
     let checkpoint = Checkpoint::open(dir).expect("open the pack");
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("host shape");
-    let split = inspect_pack_split(&checkpoint.source, &shape).expect("header walk");
-    let routed = split.routed_bytes;
-    let dense = split.report.device_bytes - routed;
+    let report = inspect_pack_split(&checkpoint.source, &shape).expect("header walk");
+    let routed = report.expert_bytes;
+    let dense = report.device_bytes - routed;
     let layers = shape.kinds.len();
     let experts = shape.moe.experts;
     let per_member = routed / layers as u64 / experts as u64;
@@ -151,12 +152,10 @@ fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
         store,
         slots: got_slots,
         experts: got_experts,
-        routed_bytes,
         dense_bytes,
     } = load_exl3_banked_dir(&projector, dir, slots, Reserve::default()).expect("banked load");
     assert_eq!(got_slots, slots);
     assert_eq!(got_experts, experts);
-    assert_eq!(routed_bytes, routed);
     assert_eq!(dense_bytes, dense);
     assert_eq!(weights.device_bytes() as u64, expected_device);
     assert_eq!(store.layers(), layers);
@@ -457,7 +456,7 @@ fn real_pack_loads_every_layer_with_the_shapes_and_bytes_of_the_step() {
     let banks = check_shapes(&weights, &table, &geometry);
 
     let checkpoint = Checkpoint::open(dir).unwrap();
-    let heads = crate::family::qwen36::exl3_tensors::tiled_head_order(16, 32).unwrap();
+    let heads = crate::family::exl3_tensors::tiled_head_order(16, 32).unwrap();
     let pack = Pack {
         projector: &projector,
         checkpoint: &checkpoint,
