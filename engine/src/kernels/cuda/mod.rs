@@ -575,6 +575,50 @@ mod tests {
         host_unregister(&buffer).expect("the successful registration must release");
     }
 
+    /// The setup entries that used to pre-clear the slot silently report the
+    /// same way now; host_unregister is one of the converted entries.
+    #[test]
+    #[ignore = "needs a CUDA device; run by name with the device suites"]
+    fn sticky_prior_setup_entry_reports_the_pending_error() {
+        if !testkit::device_present("sticky_prior_setup_entry_reports_the_pending_error") {
+            return;
+        }
+        let buffer = [0u8; 4096];
+        host_register(&buffer).expect("the registration must take before the plant");
+        let planted = native::test_plant_sticky();
+        assert_ne!(
+            planted,
+            native::STATUS_OK,
+            "the planter must fail, got {planted}"
+        );
+        let before = native::sticky_prior_reports();
+        host_unregister(&buffer).expect("a non-sticky pending error is reported, not failed on");
+        assert_eq!(
+            native::sticky_prior_reports(),
+            before + 1,
+            "the converted setup entry must have reported the planted error"
+        );
+    }
+
+    /// memory_info is a converted setup entry without an out_stage; the
+    /// report goes to stderr only and the call still succeeds.
+    #[test]
+    #[ignore = "needs a CUDA device; run by name with the device suites"]
+    fn sticky_prior_memory_info_reports_the_pending_error() {
+        if !testkit::device_present("sticky_prior_memory_info_reports_the_pending_error") {
+            return;
+        }
+        let planted = native::test_plant_sticky();
+        assert_ne!(
+            planted,
+            native::STATUS_OK,
+            "the planter must fail, got {planted}"
+        );
+        let before = native::sticky_prior_reports();
+        native::memory_info().expect("a non-sticky pending error is reported, not failed on");
+        assert_eq!(native::sticky_prior_reports(), before + 1);
+    }
+
     #[test]
     fn device_query_failures_name_their_source() {
         assert_eq!(

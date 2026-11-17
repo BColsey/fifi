@@ -428,7 +428,7 @@ fn reset_propagates_cache_sync_backend_after_successful_state_reset() {
         "State reset completed before the cache fault"
     );
     assert!(
-        matches!(&reset, Err(EngError::Backend { operation: "cuda synchronize", message, .. }) if message.contains("status 700")),
+        matches!(&reset, Err(EngError::Backend { operation: "cuda sticky-prior", message, .. }) if message.contains("status 700")),
         "Step reset must propagate cache sync Backend after State reset"
     );
     assert!(

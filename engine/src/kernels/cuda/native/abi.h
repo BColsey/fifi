@@ -23,8 +23,10 @@
  * the next real CUDA call fails and surfaces the same broken context. A
  * non-sticky pending error does not change the entry's result. Lifecycle and
  * upload entries (streams, events, pinned memory, alloc/free, upload/download)
- * instead clear the pending error before and after their calls without
- * reporting, as before. Launch-only resident entries do neither and return
+ * follow the same rule: they peek at entry, report a pending error through the
+ * sticky-prior path, and consume it; after their own recorded status, a cleanup
+ * catch, or a returned status they drain the slot so the next entry starts
+ * clean. Launch-only resident entries do neither and return
  * only their own status. Entries that handle an error and continue consume it
  * at the handling point.
  */

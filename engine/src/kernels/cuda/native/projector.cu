@@ -198,7 +198,9 @@ extern "C" int inference_cuda_memory_info(size_t *out_free, size_t *out_total) {
         if (out_free == NULL || out_total == NULL) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, NULL))
+            return static_cast<int>(sticky);
         cudaError_t err = cudaMemGetInfo(out_free, out_total);
         (void)cudaGetLastError();
         return (int)err;
@@ -217,7 +219,9 @@ extern "C" int inference_cuda_alloc(size_t bytes, void **out_device, int *out_st
         if (bytes == 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         DeviceBuffer<unsigned char> buffer;
         failure.record(buffer.allocate(bytes), INFERENCE_CUDA_STAGE_ALLOCATE);
@@ -240,7 +244,9 @@ extern "C" int inference_cuda_upload_at(void *device, size_t device_bytes, size_
             bytes > device_bytes - offset) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaMemcpy((unsigned char *)device + offset, host, bytes,
                                   cudaMemcpyHostToDevice),
@@ -263,7 +269,9 @@ extern "C" int inference_cuda_upload_pinned(void *device, size_t device_bytes,
             bytes > pinned_bytes || bytes > device_bytes) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         // Host copy-in; the DMA below reads only these staged bytes.
         memcpy(pinned, host, bytes);
@@ -295,7 +303,9 @@ extern "C" int inference_cuda_upload(const void *host, size_t bytes, void **out_
         if (host == NULL || bytes == 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         DeviceBuffer<unsigned char> buffer;
         failure.record(buffer.allocate(bytes), INFERENCE_CUDA_STAGE_ALLOCATE);
@@ -331,7 +341,9 @@ extern "C" int inference_cuda_download(const void *device, void *host, size_t by
         if (device == NULL || host == NULL || bytes == 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
         if (failure.ok())
@@ -348,7 +360,9 @@ extern "C" int inference_cuda_download(const void *device, void *host, size_t by
 extern "C" int inference_cuda_device_synchronize(int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
         (void)cudaGetLastError();
@@ -365,7 +379,9 @@ extern "C" int inference_cuda_free(void *device, int *out_stage) {
         if (device == NULL) {
             return INFERENCE_CUDA_OK;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         // Failed completion must retain the allocation for process teardown.
         failure.record(cudaDeviceSynchronize(), INFERENCE_CUDA_STAGE_SYNCHRONIZE);
@@ -546,7 +562,9 @@ extern "C" int inference_cuda_allocation_calls(unsigned long long *out_mallocs,
 extern "C" int inference_cuda_fault_illegal_address(int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         write_through_null<<<1, 32>>>(NULL);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

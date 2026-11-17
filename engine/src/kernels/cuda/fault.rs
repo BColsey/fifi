@@ -144,7 +144,8 @@ pub(crate) fn assert_child_finishes(test: &str) {
 
 /// A failed destroy is terminal. The fault is not mapped through
 /// `backend_error`, so the latch is still clear when the owners drop: the first
-/// destroy runs, fails at its synchronize and latches, and the rest are skipped.
+/// destroy runs, reports the pending fault at entry (sticky-prior) and
+/// latches, and the rest are skipped.
 /// The stream is the first field of `Owners`, so it is the one dropped first.
 /// That the C destroy then frees nothing is not observable here; the test pins
 /// the Rust half (one attempt, the latch, the counts left as they were).

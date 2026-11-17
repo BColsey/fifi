@@ -337,8 +337,9 @@ fn h2d_pinned_failed_drop_leaks_and_latches_in_child() {
             let _dispatch = ctx.enter()?;
             native::fault_illegal_address()
         };
-        // Leave the native fault unmapped: pinned_free must itself wait, fail, leak,
-        // and latch. Every subsequent owner drop must avoid a native destroy.
+        // Leave the native fault unmapped: pinned_free reports the pending
+        // error at entry (sticky-prior), fails, leaks, and latches. Every
+        // subsequent owner drop must avoid a native destroy.
         drop(source);
         let after = ctx.live_owners();
         let attempts = ctx.destroy_calls();

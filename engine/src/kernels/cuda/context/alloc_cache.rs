@@ -1432,7 +1432,7 @@ mod tests {
             "the cache must map the previously unmapped native fault"
         );
         assert!(
-            matches!(&drained, Err(EngError::Backend { operation: "cuda synchronize", message, .. }) if message.contains("status 700")),
+            matches!(&drained, Err(EngError::Backend { operation: "cuda sticky-prior", message, .. }) if message.contains("status 700")),
             "failed native cache sync must return Backend"
         );
         assert_eq!(calls_after.sync_attempts, calls_before.sync_attempts + 1);
@@ -1532,7 +1532,7 @@ mod tests {
         );
         assert_eq!(two_leases, 2, "populated B stays alive across A's fault");
         assert!(
-            matches!(&drained, Err(EngError::Backend { operation: "cuda synchronize", message, .. }) if message.contains("status 700")),
+            matches!(&drained, Err(EngError::Backend { operation: "cuda sticky-prior", message, .. }) if message.contains("status 700")),
             "cache-local injected sync must return Backend"
         );
         assert!(
@@ -2203,7 +2203,7 @@ mod tests {
         let calls_before = observer.get();
         cache.arm_test_fault(TestFaultStage::BeforeOwnedCopy);
         let result = ctx.upload(&[0x5A; 16]);
-        let backend = matches!(&result, Err(EngError::Backend { operation: "cuda copy", message, .. }) if message.contains("status 700"));
+        let backend = matches!(&result, Err(EngError::Backend { operation: "cuda sticky-prior", message, .. }) if message.contains("status 700"));
         let acquired = native::allocation_calls();
         let calls_after = observer.get();
         let fired = cache.test_fault_fired.get();
@@ -2220,7 +2220,7 @@ mod tests {
         let path = if prime_hit { "hit" } else { "miss" };
         assert!(
             backend,
-            "cache upload {path} must fail at owned-copy stage with real status 700"
+            "cache upload {path} must fail at the sticky-prior report with real status 700"
         );
         assert_eq!(
             fired,

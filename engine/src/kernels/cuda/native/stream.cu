@@ -4,11 +4,12 @@
  *
  * Every exported function has C linkage, takes and returns C types only, and
  * wraps its body in try/catch, like the projector adapter. Lifecycle entries
- * clear the thread's pending non-sticky CUDA error before and after their
- * calls, without reporting; the launch entries (event record, stream wait, the
- * two host copies) and the two synchronizes do not touch the slot, so they
- * return their own status. Compute entries follow the peek-report-consume
- * rule stated in abi.h instead of clearing.
+ * peek, report and consume a pending non-sticky error at entry (the
+ * sticky-prior rule stated in abi.h), then drain the slot after their own
+ * recorded status; the launch entries (event record, stream wait, the
+ * two host copies), stream_synchronize and event_synchronize do not touch
+ * the slot, so they return their own status. Compute entries follow the
+ * same peek-report-consume rule.
  */
 #include <cuda_runtime.h>
 
@@ -35,7 +36,9 @@ extern "C" int inference_cuda_stream_create(void **out_stream, int *out_stage) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         *out_stream = NULL;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         cudaStream_t stream = NULL;
         failure.record(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
@@ -56,7 +59,9 @@ extern "C" int inference_cuda_stream_destroy(void *stream, int *out_stage) {
         if (stream == NULL) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaStreamSynchronize((cudaStream_t)stream),
                        INFERENCE_CUDA_STAGE_SYNCHRONIZE);
@@ -93,7 +98,9 @@ extern "C" int inference_cuda_event_create(void **out_event, int *out_stage) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         *out_event = NULL;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         cudaEvent_t event = NULL;
         failure.record(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
@@ -114,7 +121,9 @@ extern "C" int inference_cuda_event_destroy(void *event, int *out_stage) {
         if (event == NULL) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         // No synchronize: an event destroyed while recorded is released when it completes.
         failure.record(cudaEventDestroy((cudaEvent_t)event), INFERENCE_CUDA_STAGE_ALLOCATE);
@@ -151,7 +160,9 @@ extern "C" int inference_cuda_timing_event_create(void **out_event, int *out_sta
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         *out_event = NULL;
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         cudaEvent_t event = NULL;
         failure.record(cudaEventCreateWithFlags(&event, 0), INFERENCE_CUDA_STAGE_ALLOCATE);
@@ -255,7 +266,9 @@ extern "C" int inference_cuda_host_unregister(void *host, int *out_stage) {
         if (host == NULL) {
             return INFERENCE_CUDA_OK;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         failure.record(cudaHostUnregister(host), INFERENCE_CUDA_STAGE_ALLOCATE);
         (void)cudaGetLastError();
@@ -275,7 +288,9 @@ extern "C" int inference_cuda_pinned_alloc(size_t bytes, void **out_host, int *o
         if (bytes == 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         void *host = NULL;
         failure.record(cudaHostAlloc(&host, bytes, cudaHostAllocDefault),
@@ -296,7 +311,9 @@ extern "C" int inference_cuda_pinned_free(void *host, int *out_stage) {
         if (host == NULL) {
             return INFERENCE_CUDA_OK;
         }
-        (void)cudaGetLastError();
+        const cudaError_t sticky = cudaPeekAtLastError();
+        if (sticky != cudaSuccess && sticky_prior(sticky, out_stage))
+            return static_cast<int>(sticky);
         Failure failure;
         // A copy queued on any stream may still read or write the buffer. If the wait
         // fails the completion is unknown, so the memory is not freed.

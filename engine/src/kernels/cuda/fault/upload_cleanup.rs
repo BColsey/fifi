@@ -62,14 +62,22 @@ fn upload_allocation_fault_child() {
         panic!("real sticky fault must be a backend error");
     };
     assert_eq!(
-        operation, "cuda allocate",
-        "preserve the first failed stage"
+        operation, "cuda sticky-prior",
+        "the converted entry reports the prior sticky error before allocating"
     );
     assert!(message.contains("700"));
     assert!(TERMINAL.load(Ordering::Acquire));
-    assert_eq!(native::allocation_calls(), (before.0 + 1, before.1));
+    assert_eq!(
+        native::allocation_calls(),
+        (before.0, before.1),
+        "the sticky report fails the entry before cudaMalloc runs"
+    );
     drop(existing);
-    assert_eq!(native::allocation_calls(), (before.0 + 1, before.1));
+    assert_eq!(
+        native::allocation_calls(),
+        (before.0, before.1),
+        "a latched TERMINAL skips the native free"
+    );
     assert_eq!(ctx.live_bytes(), before_bytes);
     println!("fault child: done");
 }
