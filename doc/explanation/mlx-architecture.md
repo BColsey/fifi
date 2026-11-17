@@ -12,7 +12,7 @@ Qwen3.6, Flash-Next and Flint use the same worker and generation session on MLX.
 
 ## Serving coverage
 
-Qwen3.6 startup calls the planner when its settings specify a prefill budget. Its single-session path falls back to one-token prefill when the budget or worker cap excludes every chunk. The Flash-Next executor supports planning and chunked worker jobs. Its server factory currently opens the executor with one-token prefill. Exposing chunk admission there requires charging the session, MLX allocator cache, pressure margin, S3 cache and decode pool, and bounding the plan by the worker's configured piece size. [Qwen3.6 startup](../../engine/src/family/qwen36/start.rs) · [Flash-Next startup](../../engine/src/family/flash_next/start.rs) · [Flash-Next executor](../../engine/src/family/flash_next/resident/executor.rs)
+Both Qwen3.6 and Flash-Next request a plan at startup when their family settings specify `prefill_budget_bytes`. Each bounds the chunk by its worker piece. Flash-Next charges its own resident and cached state for the full serving context. Its startup line reports the selected chunk or the reason for one-token fallback. [Qwen3.6 startup](../../engine/src/family/qwen36/start.rs) · [Flash-Next configuration](../reference/configuration.md#flash-next-mlx-prefill)
 
 ## Measured opportunity in Qwen3.6 embedding import
 

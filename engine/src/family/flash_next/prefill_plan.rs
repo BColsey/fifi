@@ -375,8 +375,12 @@ pub(crate) struct PrefillPlan {
 }
 
 /// A chunk of one token is the one-token path, so a result of 1 is `None`.
-pub(crate) fn admitted_chunk(cost: &ChunkCost, remaining: u64) -> Result<Option<u32>, EngError> {
-    mlx::admitted_chunk(u32::MAX, remaining, |rows| cost.workspace(rows))
+pub(crate) fn admitted_chunk(
+    cost: &ChunkCost,
+    remaining: u64,
+    max_rows: u32,
+) -> Result<Option<u32>, EngError> {
+    mlx::admitted_chunk(max_rows, remaining, |rows| cost.workspace(rows))
 }
 
 /// One wave of a chunk: at most `wave_cap` consecutive ranks of the sorted union and the pairs
@@ -1436,7 +1440,7 @@ mod tests {
     #[test]
     fn the_admitted_chunk_is_the_largest_candidate_that_fits_and_one_is_no_chunk() {
         let cost = admission_cost(512, 10, 2_764_800, 16_384).unwrap();
-        let admitted = |remaining| admitted_chunk(&cost, remaining).unwrap();
+        let admitted = |remaining| admitted_chunk(&cost, remaining, u32::MAX).unwrap();
         assert_eq!(admitted(5_107_212_544), Some(2048), "exactly 2048");
         assert_eq!(admitted(5_107_212_543), Some(1024), "one byte less");
         assert_eq!(admitted(4_000_000_000), Some(512), "between 512 and 1024");

@@ -20,6 +20,7 @@ use crate::{
 /// Returns the engine and the pinned tokenizer bundle that renders and encodes its prompts.
 pub(crate) fn start(
     settings: &FlashSettings,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
     let manifest = std::fs::read(&settings.manifest).map_err(|error| {
@@ -32,20 +33,23 @@ pub(crate) fn start(
         .map_err(|_| EngError::Checkpoint("tokenizer vocabulary exceeds usize".to_string()))?;
     let prefill_chunk = usize::try_from(settings.prefill_chunk)
         .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
-    let artifact = settings.artifact.clone();
-    let cache_limit = settings.cache_limit;
+    let settings = settings.clone();
     let rules = FlashRules {
         eos,
         sampler_vocab,
         expert_prefetch: settings.expert_prefetch,
     };
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |_| {
-        let (executor, session) = FlashExecutor::open(&artifact, cache_limit, rules)?;
+        let (mut executor, session) =
+            FlashExecutor::open(&settings.artifact, settings.cache_limit, rules)?;
         if usize::try_from(CONTEXT_LIMIT).ok() != Some(executor.context_limit()) {
             return Err(EngError::Checkpoint(format!(
                 "the executor accepts {} positions, but the server reports {CONTEXT_LIMIT}",
                 executor.context_limit()
             )));
+        }
+        if let Some(line) = executor.configure_prefill(&session, &settings, prefix_reuse)? {
+            eprintln!("{line}");
         }
         Ok((executor, session))
     })?;

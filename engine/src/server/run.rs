@@ -425,13 +425,14 @@ fn start_flint(
 
 fn start_flash(
     config: &EngineConfig,
-    _prefix_reuse: bool,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     let started = factory::start_engine(
         &config.model_dir,
         &config.tokenizer_dir,
         config.flash_next.as_ref(),
+        prefix_reuse,
         ready_note,
     )?;
     Ok(StartedEngine {

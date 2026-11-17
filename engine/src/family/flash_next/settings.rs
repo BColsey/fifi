@@ -28,6 +28,8 @@ pub(crate) struct FlashOptions {
     /// The MLX allocator cache limit in bytes. Fallback: `FLASH_NEXT_CACHE_LIMIT`. There is no
     /// default.
     pub(crate) cache_limit_bytes: Option<u64>,
+    /// MLX only. Total byte budget for selecting a batched prompt path at startup.
+    pub(crate) prefill_budget_bytes: Option<u64>,
     pub(crate) tokenizer_vocab_size: Option<u32>,
     /// From 1 to 2,048.
     pub(crate) prefill_chunk: Option<u32>,
@@ -133,7 +135,7 @@ pub(crate) struct FlashEnv {
     pub(crate) cache_limit: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlashSettings {
     /// The artifact directory with the safetensors shards and `config.json`.
     pub(crate) artifact: PathBuf,
@@ -143,6 +145,7 @@ pub(crate) struct FlashSettings {
     pub(crate) manifest: PathBuf,
     /// The MLX allocator cache limit in bytes (0 with the CUDA decoder, which ignores it).
     pub(crate) cache_limit: u64,
+    pub(crate) prefill_budget: Option<u64>,
     pub(crate) tokenizer_vocab_size: u32,
     pub(crate) prefill_chunk: u32,
     /// The default-off expert hint seam. It performs no prefetch I/O in this slice.
@@ -327,6 +330,17 @@ impl FlashSettings {
         let default = FlashOptions::default();
         let options = options.unwrap_or(&default);
         let cuda = cuda_settings(options)?;
+        if let Some(budget) = options.prefill_budget_bytes {
+            if cuda.is_some() {
+                return Err(bad(
+                    "prefill_budget_bytes is an MLX key and cannot be combined with cuda_decode"
+                        .into(),
+                ));
+            }
+            if budget == 0 {
+                return Err(bad("prefill_budget_bytes must be above 0".into()));
+            }
+        }
         Ok(Self {
             artifact: model_dir.to_path_buf(),
             tokenizer_dir: tokenizer_dir.to_path_buf(),
@@ -337,6 +351,7 @@ impl FlashSettings {
             } else {
                 cache_limit(options, env)?
             },
+            prefill_budget: options.prefill_budget_bytes,
             tokenizer_vocab_size: ranged(
                 "tokenizer_vocab_size",
                 options.tokenizer_vocab_size,
@@ -472,6 +487,7 @@ mod tests {
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/art/download-manifest.json"),
                 cache_limit: 1_073_741_824,
+                prefill_budget: None,
                 tokenizer_vocab_size: 1000,
                 prefill_chunk: 8,
                 expert_prefetch: true,
@@ -494,11 +510,39 @@ mod tests {
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/env-art/download-manifest.json"),
                 cache_limit: 2048,
+                prefill_budget: None,
                 tokenizer_vocab_size: 248_077,
                 prefill_chunk: 16,
                 expert_prefetch: false,
                 cuda: None,
             }
+        );
+    }
+
+    #[test]
+    fn prefill_budget_is_an_optional_positive_mlx_byte_count() {
+        let options = serde_json::from_str::<FlashOptions>(
+            r#"{"manifest":"/m","cache_limit_bytes":1,"prefill_budget_bytes":42}"#,
+        )
+        .unwrap();
+        let env = FlashEnv::default();
+        assert_eq!(
+            settings(Some(&options), &env).unwrap().prefill_budget,
+            Some(42)
+        );
+        let zero = FlashOptions {
+            prefill_budget_bytes: Some(0),
+            ..options
+        };
+        assert!(
+            message(settings(Some(&zero), &env)).contains("prefill_budget_bytes must be above 0")
+        );
+        let cuda = FlashOptions {
+            prefill_budget_bytes: Some(42),
+            ..cuda_on()
+        };
+        assert!(
+            message(settings(Some(&cuda), &env)).contains("cannot be combined with cuda_decode")
         );
     }
 

@@ -33,13 +33,21 @@ pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,
     options: Option<&FlashOptions>,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     let env = FlashEnv {
         manifest: std::env::var("FLASH_NEXT_ARTIFACT_MANIFEST").ok(),
         cache_limit: std::env::var("FLASH_NEXT_CACHE_LIMIT").ok(),
     };
-    start_engine_with(model_dir, tokenizer_dir, options, &env, ready_note)
+    start_engine_with(
+        model_dir,
+        tokenizer_dir,
+        options,
+        &env,
+        prefix_reuse,
+        ready_note,
+    )
 }
 
 fn start_engine_with(
@@ -47,10 +55,11 @@ fn start_engine_with(
     tokenizer_dir: &Path,
     options: Option<&FlashOptions>,
     env: &FlashEnv,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
-    let (engine, bundle) = launch(&settings, ready_note)?;
+    let (engine, bundle) = launch(&settings, prefix_reuse, ready_note)?;
     // The CUDA decoder serves the positions its caches hold; the MLX one a fixed limit.
     let context_limit = settings
         .cuda
@@ -66,6 +75,7 @@ fn start_engine_with(
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn launch(
     settings: &FlashSettings,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
     if settings.cuda.is_some() {
@@ -74,7 +84,7 @@ fn launch(
                 .to_string(),
         ));
     }
-    super::start::start(settings, ready_note)
+    super::start::start(settings, prefix_reuse, ready_note)
 }
 
 /// A CUDA build serves Flash-Next only with `cuda_decode` set: the CUDA decoder is experimental
@@ -86,6 +96,7 @@ fn launch(
 ))]
 fn launch(
     settings: &FlashSettings,
+    _prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
     if settings.cuda.is_none() {
@@ -103,6 +114,7 @@ fn launch(
 )))]
 fn launch(
     _settings: &FlashSettings,
+    _prefix_reuse: bool,
     _ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
     Err(EngError::BadRequest(
@@ -126,7 +138,7 @@ mod tests {
     }
 
     fn start(options: Option<&FlashOptions>, env: &FlashEnv) -> Result<(), EngError> {
-        start_engine_with(Path::new("/a"), Path::new("/a"), options, env, None).map(|_| ())
+        start_engine_with(Path::new("/a"), Path::new("/a"), options, env, false, None).map(|_| ())
     }
 
     #[test]

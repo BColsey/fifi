@@ -368,6 +368,60 @@ impl FlashExecutor {
         prefill_plan::admission_cost(experts, top_k, set_bytes.div_ceil(u64::from(experts)), page)
     }
 
+    /// Called on the engine thread with a freshly opened session. Reserve its maximum
+    /// resident state and each prefix snapshot the worker can retain at the same time.
+    pub(crate) fn configure_prefill(
+        &mut self,
+        session: &FlashSession,
+        settings: &crate::family::flash_next::settings::FlashSettings,
+        prefix_reuse: bool,
+    ) -> Result<Option<String>> {
+        let Some(budget) = settings.prefill_budget else {
+            return Ok(None);
+        };
+        const PRESSURE_MARGIN: u64 = 1 << 30;
+        let overflow =
+            || EngError::MemoryPlan("Flash-Next prefill session reserve overflows".into());
+        let positions = u32::try_from(self.context_limit).map_err(|_| overflow())?;
+        let growth = super::state::chunk_growth_bytes(&self.decoder.weights, positions)?;
+        let state = session
+            .state
+            .byte_len()?
+            .checked_add(growth)
+            .ok_or_else(overflow)?;
+        let prefix = if prefix_reuse {
+            let limits = self.prefix.limits();
+            let slots = limits
+                .roots
+                .checked_add(limits.entries)
+                .and_then(|slots| u64::try_from(slots).ok())
+                .ok_or_else(overflow)?;
+            state.checked_mul(slots).ok_or_else(overflow)?
+        } else {
+            0
+        };
+        let reserve = state
+            .checked_add(prefix)
+            .and_then(|n| n.checked_add(settings.cache_limit))
+            .and_then(|n| n.checked_add(PRESSURE_MARGIN))
+            .ok_or_else(overflow)?;
+        // This executor streams local shards and has no S3 cache.
+        let cap = settings.prefill_chunk;
+        let plan = self.plan_prefill(budget, 0, reserve, cap)?;
+        let path = match plan.chunk {
+            Some(rows) => format!("chunk of {rows} rows"),
+            None if cap < crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS => {
+                "one-token steps (worker piece below minimum chunk)".into()
+            }
+            None => "one-token steps (insufficient workspace)".into(),
+        };
+        let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
+        Ok(Some(format!(
+            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} {terms}",
+            settings.cache_limit
+        )))
+    }
+
     /// Applies the chunk admission rule and stores the chunk size.
     ///
     /// The rule is `remaining = B - resident weights - session state - S3 cache - MLX cache limit -
@@ -393,6 +447,7 @@ impl FlashExecutor {
         budget: u64,
         s3_cache: u64,
         session_reserve: u64,
+        max_rows: u32,
     ) -> Result<PrefillPlan> {
         let terms = PrefillTerms {
             budget,
@@ -401,7 +456,8 @@ impl FlashExecutor {
             s3_cache,
             session_reserve,
         };
-        let chunk = prefill_plan::admitted_chunk(&self.prefill_cost()?, terms.remaining())?;
+        let chunk =
+            prefill_plan::admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?;
         self.close_prefill();
         self.chunk = chunk;
         Ok(PrefillPlan { chunk, terms })
@@ -644,7 +700,10 @@ mod tests {
     fn plan_chunk(executor: &mut FlashExecutor, tokens: u32) -> Option<u32> {
         let workspace = executor.prefill_cost().unwrap().workspace(tokens).unwrap();
         let held = executor.decoder.weights.byte_len().unwrap() + executor.decoder.pool_bytes();
-        executor.plan_prefill(held + workspace, 0, 0).unwrap().chunk
+        executor
+            .plan_prefill(held + workspace, 0, 0, u32::MAX)
+            .unwrap()
+            .chunk
     }
 
     /// The tokens that both sessions of the chunk parity test feed after the prompt, so the two
@@ -1269,7 +1328,9 @@ mod tests {
         );
         let w8 = workspace(&executor, 8);
         let mut plan = |budget, cache, reserve| {
-            let plan = executor.plan_prefill(budget, cache, reserve).unwrap();
+            let plan = executor
+                .plan_prefill(budget, cache, reserve, u32::MAX)
+                .unwrap();
             assert_eq!(executor.prefill_chunk(), plan.chunk, "the plan is stored");
             let terms = plan.terms;
             assert_eq!(
@@ -1297,6 +1358,63 @@ mod tests {
             "one byte less"
         );
         assert_eq!(plan(held, 0, 0), None, "no room for a chunk");
+    }
+
+    #[test]
+    fn serving_prefill_prices_the_full_context_prefix_and_worker_cap() {
+        use crate::family::flash_next::settings::{FlashEnv, FlashOptions, FlashSettings};
+        let _serial = crate::native_test_lock();
+        let (mut executor, session) = build(rules(vec![], VOCAB));
+        let options = FlashOptions {
+            manifest: Some("manifest.json".into()),
+            cache_limit_bytes: Some(1024),
+            ..FlashOptions::default()
+        };
+        let mut settings = FlashSettings::new(
+            Path::new("."),
+            Path::new("."),
+            Some(&options),
+            &FlashEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            executor
+                .configure_prefill(&session, &settings, false)
+                .unwrap(),
+            None
+        );
+        assert_eq!(executor.prefill_chunk(), None);
+        // Independent fixture sizes: one QSA layer, two KV planes of 64 and an index of 32 F32s.
+        let state = 14_336 + 640 * 32_768;
+        let held = executor.decoder.weights.byte_len().unwrap() + executor.decoder.pool_bytes();
+        let reserve = state + 1024 + (1 << 30);
+        let four = executor.prefill_cost().unwrap().workspace(4).unwrap();
+        for (budget, cap, reuse, want) in [
+            (held + reserve + four - 1, 16, false, None),
+            (held + reserve + four, 16, false, Some(4)),
+            (held + reserve + four, 16, true, None),
+            (held + reserve + state + four, 16, true, Some(4)),
+            (u64::MAX, 6, false, Some(4)),
+            (u64::MAX, 1, false, None),
+        ] {
+            settings.prefill_budget = Some(budget);
+            settings.prefill_chunk = cap;
+            let line = executor
+                .configure_prefill(&session, &settings, reuse)
+                .unwrap()
+                .unwrap();
+            assert_eq!(executor.prefill_chunk(), want, "{line}");
+            assert!(
+                line.contains(&format!("prefix_bytes={}", if reuse { state } else { 0 })),
+                "{line}"
+            );
+            assert!(line.contains("s3_cache_bytes=0"), "{line}");
+        }
+        settings.cache_limit = u64::MAX;
+        assert!(matches!(
+            executor.configure_prefill(&session, &settings, false),
+            Err(EngError::MemoryPlan(_))
+        ));
     }
 
     /// Fixture: 2 layers, so a one-token `Prompt` step makes 4 synchronizations and a chunk makes
@@ -2107,6 +2225,94 @@ mod tests {
         three_jobs_on_an_engine_thread(2, None, (&[], 0));
     }
 
+    /// Go through the public config-entry factory with a file-backed tiny checkpoint.
+    /// The native counter includes all work after Ready through worker shutdown.
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    fn flash_next_mlx_serving_prefill_runs_the_admitted_path() {
+        use crate::family::flash_next::{factory, settings::FlashOptions};
+        use crate::sched::{
+            job::{Job, JobEvent},
+            worker::EngineNote,
+        };
+        use sha2::{Digest, Sha256};
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (index, shard) = fixtures::checkpoint_files(Embedding::TokenDependent);
+        for (name, bytes) in [
+            ("model.safetensors.index.json", index),
+            ("m.safetensors", shard),
+            ("config.json", fixtures::config()),
+        ] {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        let mut manifest = serde_json::Map::new();
+        for (name, contents) in [
+            ("tokenizer.json", TOKENIZER_JSON),
+            ("tokenizer_config.json", r#"{"eos_token":"h"}"#),
+            ("generation_config.json", r#"{"eos_token_id":7}"#),
+            ("chat_template.jinja", "{{ messages[0].content }}"),
+        ] {
+            std::fs::write(root.join(name), contents).unwrap();
+            manifest.insert(
+                name.to_string(),
+                serde_json::json!({"sha256":format!("{:x}", Sha256::digest(contents.as_bytes()))}),
+            );
+        }
+        let path = root.join("download-manifest.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let counter = MlxKernels::try_new().unwrap();
+        let run = |budget| {
+            let options = FlashOptions {
+                manifest: Some(path.clone()),
+                cache_limit_bytes: Some(1 << 20),
+                tokenizer_vocab_size: Some(VOCAB as u32),
+                prefill_chunk: Some(4),
+                prefill_budget_bytes: budget,
+                ..FlashOptions::default()
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = factory::start_engine(
+                root,
+                root,
+                Some(&options),
+                false,
+                Some(Box::new(move |note| tx.send(note).unwrap())),
+            )
+            .unwrap();
+            if let EngineNote::Failed(why) = rx.recv().unwrap() {
+                panic!("Flash-Next startup failed: {why}");
+            }
+            let before = counter.qualification_sync_count();
+            let (job, mut response) = Job::new(cycle(13), seeded_generation(4)).unwrap();
+            started.engine.handle().try_submit(job).unwrap();
+            let mut tokens = Vec::new();
+            let mut finished = false;
+            while let Some(event) = response.events.blocking_recv() {
+                match event {
+                    JobEvent::Batch(batch) => tokens.extend(batch.tokens),
+                    JobEvent::Finished(_) => finished = true,
+                    JobEvent::Error(err) => panic!("{err:?}"),
+                    JobEvent::Started => {}
+                }
+            }
+            assert!(finished && !tokens.is_empty());
+            assert!(started.engine.shutdown().failure.is_none());
+            (tokens, counter.qualification_sync_count() - before)
+        };
+        let (stepped, step_syncs) = run(None);
+        let (fallback, fallback_syncs) = run(Some(1));
+        let (chunked, chunk_syncs) = run(Some(2 << 30));
+        assert_eq!(fallback, stepped);
+        assert_eq!(chunked, stepped);
+        assert_eq!(fallback_syncs, step_syncs);
+        assert!(
+            chunk_syncs < step_syncs,
+            "{chunk_syncs} chunked vs {step_syncs} stepped"
+        );
+    }
+
     /// The same flow with the batched prefill planned for chunks of 4 and worker pieces of 4. The
     /// tokens must equal the one-token oracle, and the executor log must show that the chunk path
     /// ran: prompt A (3 tokens) feeds one chunk of 2 rows. Prompt B (5 tokens) feeds one chunk of
@@ -2278,7 +2484,9 @@ mod tests {
                 let budget = budget
                     .parse()
                     .expect("FLASH_NEXT_EXECUTOR_BUDGET is not a number");
-                let plan = executor.plan_prefill(budget, 0, reserve.total()).unwrap();
+                let plan = executor
+                    .plan_prefill(budget, 0, reserve.total(), u32::MAX)
+                    .unwrap();
                 (plan.chunk, format!("{}{}", plan.terms, reserve.report()))
             }
             Err(_) => (None, "no budget: one-token steps\n".to_string()),
@@ -2468,7 +2676,9 @@ mod tests {
             env("FLASH_NEXT_EXECUTOR_S3_CACHE", Some(0)),
         );
         let reserve = Reserve::of_real_run(&executor, &session, cache_limit);
-        let plan = executor.plan_prefill(budget, s3, reserve.total()).unwrap();
+        let plan = executor
+            .plan_prefill(budget, s3, reserve.total(), u32::MAX)
+            .unwrap();
         let forced = std::env::var("FLASH_NEXT_EXECUTOR_CHUNK").ok().map(|v| {
             v.parse::<u32>()
                 .expect("FLASH_NEXT_EXECUTOR_CHUNK is not a number")
