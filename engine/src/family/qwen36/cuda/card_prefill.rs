@@ -27,12 +27,14 @@
 
 use std::ffi::OsStr;
 
+use crate::family::exl3::{launch::Launch, layer_table::LayerTable};
+use crate::family::state_words::Word;
+
 use super::{
     card_step::CardStack,
     dims::{KvMode, StepDims},
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
-    moe::{Launch, MoeLayerWeights},
+    moe::MoeLayerWeights,
     prefill::ChunkRows,
     prefill::{
         ChunkBufs, ChunkModel, ChunkRun, ChunkViews, ChunkWeights, LayerCtx, LayerMoe, Stage,
@@ -44,7 +46,6 @@ use super::{
     prefill_driver::{Kv8StagingPlan, PrefillArena, fixed_staging_rows},
     prefill_plan::{ChunkSlot, chunk_tensors_for},
     state::ResidentState,
-    state_layout::Word,
 };
 use crate::{
     EngError,
@@ -645,7 +646,9 @@ fn run_card_chunk_layer(
                         launches[card].ctx.moe_combine(
                             launches[card].stream,
                             crate::kernels::cuda::resident::moe_combine::CombineCall {
-                                shape: super::prefill::chunk_combine_shape(&io.dims, m),
+                                shape: crate::family::exl3::shapes::chunk_combine_shape(
+                                    &io.dims, m,
+                                ),
                                 res: zero,
                                 down: views[card].get(ChunkSlot::Down)?,
                                 weights: views[card].get(ChunkSlot::TopkWeight)?,

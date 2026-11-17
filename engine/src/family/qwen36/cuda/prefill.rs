@@ -1162,8 +1162,8 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         };
         let facts = model_facts_with(table, geometry, dims, &weights, table.len(), Some(host_moe))?;
         check_model(&facts, table.len())?;
-        let moe_dims = super::moe::MoeDims::new(dims, 1);
-        let moe_dims = super::moe::MoeDims {
+        let moe_dims = crate::family::exl3::launch::MoeDims::new(dims, 1);
+        let moe_dims = crate::family::exl3::launch::MoeDims {
             inter,
             shared_inter,
             ..moe_dims
