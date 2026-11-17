@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-11-17T04:35:50.032142+00:00",
+  "generated_at": "2026-11-17T04:41:17.575354+00:00",
   "purpose": "Publication inventory for all pending local commits and source WIP. Preservation, integration, measurement, qualification and default enablement are separate states.",
   "upstream_main": "3f4bd6ae71d78b4ce37a37564e6c53d71a4d49a0",
   "local_main": "48b9a62f726c8d0d4d4ab7cd02974f95e73e4544",
@@ -661,7 +661,7 @@
       "title": "WIP: supervise P2P request scopes and host observations",
       "url": "https://github.com/zbrdc/fifi/pull/53",
       "head": "wip/review-joint-supervisor-20261117",
-      "sha": "03064577262bfcb73e9bd1f99916bef4ffe8cd91",
+      "sha": "f6237ef905b9d72fb42c26233505f21e34bd003e",
       "draft": true
     },
     {
@@ -697,7 +697,7 @@
       "title": "WIP: add bounded client for concurrent P2P guard",
       "url": "https://github.com/zbrdc/fifi/pull/57",
       "head": "wip/review-concurrent-client-20261117",
-      "sha": "e15cd1a8b63a3250d8ff9cafcae6e3f5c562cffb",
+      "sha": "d89f7f174b68e523ede108d00da053ec9951d96c",
       "draft": true
     },
     {
@@ -848,7 +848,13 @@
       "cpu_lib_failed": 0,
       "cpu_lib_ignored": 60,
       "qualification_inventory": true,
-      "doc_links": true
+      "doc_links": true,
+      "local_isolated_scripts": {
+        "discovered": 274,
+        "passed": 273,
+        "skipped": 1,
+        "isolated_python": true
+      }
     },
     "handoff": {
       "sha": "61fff64942a2d3bf2b209fbadfb50c1f09c746b3",
@@ -857,15 +863,23 @@
       "skipped": 1
     },
     "supervisor": {
-      "sha": "03064577262bfcb73e9bd1f99916bef4ffe8cd91",
+      "sha": "f6237ef905b9d72fb42c26233505f21e34bd003e",
       "discovered": 104,
       "passed": 90,
-      "skipped": 14
+      "skipped": 14,
+      "local_isolated_full_suite": {
+        "discovered": 374,
+        "passed": 359,
+        "skipped": 15,
+        "isolated_python": true
+      },
+      "github_scripts_ci": "passed on f6237ef905b9d72fb42c26233505f21e34bd003e; Rust job pending at this snapshot"
     },
     "router_report": {
       "sha": "a0dfea2abfe8fd8d69d98282504a27fa62775b55",
       "discovered": 3,
-      "passed": 3
+      "passed": 3,
+      "github_portable_ci": "rust and scripts passed"
     },
     "router_upstream": {
       "sha": "663d152ebce1814eb7f6e8e4f6be767dc9f65c81",
@@ -903,6 +917,16 @@
       "owner": "2080 optimization lane",
       "next_action": "Complete exact-refreshed-tip native/device validation and adaptive staging A/B after CUDA host recovery.",
       "wake_condition": "Host recovery and normal GPU runner admission succeed."
+    },
+    {
+      "drafts": [
+        29,
+        48,
+        55
+      ],
+      "owner": "portable CI / router test fixture",
+      "next_action": "Diagnose the inherited model-router startup failures and obtain green scripts CI. Integration scripts pass locally; do not label these heads CI-green.",
+      "wake_condition": "Maintainer can rerun Actions or a reviewed fixture fix is pushed. The connected app returned 403 for Actions rerun."
     }
   ],
   "publication_status": {
@@ -911,5 +935,167 @@
     "new_gpu_qualification": false,
     "production_default_flips": false,
     "fork_pr_creation": "Connected GitHub app denied fork PR creation; all new drafts were created upstream from pushed fork heads."
-  }
+  },
+  "portable_ci": [
+    {
+      "number": 51,
+      "sha": "61fff64942a2d3bf2b209fbadfb50c1f09c746b3",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963529,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231689/job/133817963529"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963138,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231689/job/133817963138"
+        }
+      ]
+    },
+    {
+      "number": 48,
+      "sha": "24d42b229ed79dab9f9bde52c4fbf7364b0b3b29",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817964624,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232071/job/133817964624"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "failure",
+          "id": 133817964414,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232071/job/133817964414"
+        }
+      ]
+    },
+    {
+      "number": 47,
+      "sha": "726f6b374f0a5d99a4322fddf2787218c9b275a2",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817961537,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230401/job/133817961537"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817961117,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230401/job/133817961117"
+        }
+      ]
+    },
+    {
+      "number": 46,
+      "sha": "20f24ddbe63bb3d695438a948300a9e0b8398cf1",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963693,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231902/job/133817963693"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963326,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231902/job/133817963326"
+        }
+      ]
+    },
+    {
+      "number": 44,
+      "sha": "a15f2c7b5f66b9b145de90a81b612186e43c931f",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817962822,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231535/job/133817962822"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817962492,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231535/job/133817962492"
+        }
+      ]
+    },
+    {
+      "number": 43,
+      "sha": "9350300648c5d06fe66ba8264aa4f45e1cb42216",
+      "checks": [
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817959641,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230433/job/133817959641"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817959031,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017230433/job/133817959031"
+        }
+      ]
+    },
+    {
+      "number": 42,
+      "sha": "5842ffb40971665061195f008bcd00d8ee5720ad",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817966139,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232587/job/133817966139"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817965782,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017232587/job/133817965782"
+        }
+      ]
+    },
+    {
+      "number": 29,
+      "sha": "93787ceb4e61c7adf5d8f9bc25d396d69c6b6fac",
+      "checks": [
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "id": 133817963652,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231661/job/133817963652"
+        },
+        {
+          "name": "scripts",
+          "status": "completed",
+          "conclusion": "failure",
+          "id": 133817963317,
+          "url": "https://github.com/zbrdc/fifi/actions/runs/44017231661/job/133817963317"
+        }
+      ]
+    }
+  ]
 }
