@@ -9,9 +9,9 @@ use super::card_prefill::{
 };
 use super::card_session_device_tests::rig_spec;
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use crate::EngError;
 use crate::family::executor::ExecutorOps;
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::host::HostShape;
 use crate::family::session::TokenStepper;
