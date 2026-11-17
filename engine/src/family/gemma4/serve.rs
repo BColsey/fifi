@@ -114,7 +114,7 @@ mod device {
         family::{
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
-            session::{DecodeSession, Limits, TokenStepper},
+            session::{DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper},
         },
         sched::worker::{ReadyNote, spawn_engine_noted},
         tokenizer::DecodeBatch,
@@ -131,19 +131,50 @@ mod device {
     pub(crate) struct BoltServe {
         model: Bolt,
         eos: Vec<u32>,
+        /// The cell generation: advances at the attempt of every feed from
+        /// position 0, so entries saved by a prompt that was later replaced can
+        /// never match again. Mirrors the Flash driver's arena generation
+        /// (`flash_next/cuda/driver/chunk.rs`).
+        generation: u64,
+        /// One-tip prefix store (no roots, no periodic points), keyed by the
+        /// cell generation. The snapshot is the model cache position alone: the
+        /// KV8 planes are full-length planes whose cells are read only below
+        /// the position word, so a rewind re-feeds and overwrites exactly the
+        /// cells that the decode past the save point wrote.
+        prefix: PrefixStore<usize, u64>,
     }
+
+    /// The store's explicit one-tip shape (no roots, no periodic points),
+    /// shared by the executor, the start wiring and the tests.
+    const ONE_TIP: StoreLimits = StoreLimits {
+        roots: 0,
+        entries: 1,
+    };
 
     /// The model side of one session: feeds prompt rows cache-only and reads
     /// the capped logits of a decode step. The session never holds it.
     struct Step<'a> {
         model: &'a mut Bolt,
         pos: &'a mut usize,
+        generation: &'a mut u64,
+    }
+
+    impl Step<'_> {
+        /// The generation advances at the ATTEMPT of a fresh sequence's first
+        /// row, not only on success: a failed batch may still have queued the
+        /// cell writes, and a stale entry must never survive that.
+        fn note_fresh(&mut self) {
+            if *self.pos == 0 {
+                *self.generation += 1;
+            }
+        }
     }
 
     impl TokenStepper for Step<'_> {
         const OPERATION: &'static str = "gemma4_bolt";
 
         fn feed(&mut self, token: u32) -> Result<(), EngError> {
+            self.note_fresh();
             self.model.prefill_batch(&[token], *self.pos, false)?;
             *self.pos += 1;
             Ok(())
@@ -151,6 +182,7 @@ mod device {
 
         fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
             for chunk in tokens.chunks(Bolt::PREFILL_BATCH) {
+                self.note_fresh();
                 self.model.prefill_batch(chunk, *self.pos, false)?;
                 *self.pos += chunk.len();
             }
@@ -158,6 +190,7 @@ mod device {
         }
 
         fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+            self.note_fresh();
             self.model.decode(token, *self.pos)?;
             *self.pos += 1;
             self.model.capped_logits()
@@ -185,6 +218,7 @@ mod device {
             st.core.reset(&mut Step {
                 model: &mut self.model,
                 pos: &mut st.pos,
+                generation: &mut self.generation,
             })
         }
 
@@ -192,11 +226,18 @@ mod device {
             crate::family::session::check_prompt(prompt_tokens, CELLS)
         }
 
+        /// The store's explicit one-tip shape, so the worker's save-point
+        /// planning sees what the store really keeps.
+        fn prefix_limits(&self) -> StoreLimits {
+            ONE_TIP
+        }
+
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
             st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
                     pos: &mut st.pos,
+                    generation: &mut self.generation,
                 },
                 toks,
                 CELLS,
@@ -217,6 +258,7 @@ mod device {
                 &mut Step {
                     model: &mut self.model,
                     pos: &mut st.pos,
+                    generation: &mut self.generation,
                 },
                 generation,
                 &limits,
@@ -224,6 +266,47 @@ mod device {
         }
 
         fn boundary(&mut self, _st: &mut Self::Session) {}
+
+        /// Saves the cache position of the held prompt under the generation
+        /// that wrote its cells. The session rules (the pending token, the
+        /// strict key match) are `DecodeSession`'s; the model state at the save
+        /// point is the position word alone.
+        fn save_prefix(
+            &mut self,
+            st: &Self::Session,
+            key: &[u32],
+            kind: SaveKind,
+        ) -> Result<bool, EngError> {
+            let path = self.generation;
+            let fed = st.pos;
+            st.core
+                .save_prefix(&mut self.prefix, key, path, fed, kind, || Ok(st.pos))
+        }
+
+        /// Rewinds the cache position to the saved entry of the current
+        /// generation. The KV8 cells at and above it hold the decode that
+        /// followed the save; a re-feed overwrites them, so the restored state
+        /// is exact. A different prompt fed in between advanced the generation,
+        /// so its entry never matches — the stale-entry guard. The tail prefill
+        /// that follows a restore overwrites every cell above the boundary, so
+        /// every stored entry with a longer key is dropped before any row is
+        /// written (`drop_above`, as the Flash executor does).
+        fn restore_prefix(
+            &mut self,
+            st: &mut Self::Session,
+            prompt: &[u32],
+        ) -> Result<usize, EngError> {
+            let path = self.generation;
+            let BoltSession { core, pos } = st;
+            let restored = core.restore_prefix(&mut self.prefix, prompt, path, |saved| {
+                *pos = *saved;
+                Ok(())
+            })?;
+            if restored > 0 {
+                self.prefix.drop_above(restored);
+            }
+            Ok(restored)
+        }
     }
 
     pub(crate) fn start_bolt_engine(
@@ -249,6 +332,8 @@ mod device {
             let serve = BoltServe {
                 model: bolt::load(&weights, None)?,
                 eos: eos.clone(),
+                generation: 0,
+                prefix: PrefixStore::with_limits(ONE_TIP),
             };
             Ok((
                 serve,
@@ -263,6 +348,210 @@ mod device {
             bundle,
             context_limit: u32::try_from(CELLS).expect("cells fit u32"),
         })
+    }
+
+    #[cfg(test)]
+    mod prefix_tests {
+        use super::*;
+
+        /// Panics when the pinned Bolt file is not configured: an explicit
+        /// `--ignored` run without `BOLT_Q8_FILE` is a setup error, not a pass.
+        fn pinned_bolt() -> std::path::PathBuf {
+            std::env::var("BOLT_Q8_FILE")
+                .map(std::path::PathBuf::from)
+                .expect("BOLT_Q8_FILE must point at the pinned Bolt q8 file")
+        }
+
+        /// Greedy argmax of the capped logits after one decode step.
+        fn greedy_step(model: &mut Bolt, token: u32, pos: usize) -> u32 {
+            model.decode(token, pos).expect("decode");
+            let logits = model.capped_logits().expect("capped logits");
+            logits
+                .iter()
+                .enumerate()
+                .fold((0u32, logits[0]), |(best, value), (index, &other)| {
+                    if other > value {
+                        (index as u32, other)
+                    } else {
+                        (best, value)
+                    }
+                })
+                .0
+        }
+
+        /// Feeds a prompt cache-only, holding nothing pending: the model-level
+        /// control for cold runs.
+        fn feed(model: &mut Bolt, prompt: &[u32]) {
+            for (index, &token) in prompt.iter().enumerate() {
+                model
+                    .prefill_batch(&[token], index, false)
+                    .expect("prefill");
+            }
+        }
+
+        /// A true cold replay of a restore past a decode. Turn 1 decodes 48
+        /// greedy tokens past the save point (cells P..P+48 now hold turn-1
+        /// tokens); the restore rewinds to P, the tail prefill overwrites only
+        /// the first cells of that span with DIFFERENT tokens, and the drawn
+        /// chain must equal the chain a cold run of prompt + tail draws after a
+        /// reset. A cache read above the position word (or a ring-buffer
+        /// window) would leak the surviving turn-1 cells into the restored run
+        /// and break the equality. The prompt is 3,000 tokens so turn 1 crosses
+        /// the 512-cell sliding window.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn a_restore_past_a_decode_matches_the_cold_replay() {
+            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let prompt: Vec<u32> = (0..3_000u32).map(|index| 100 + (index % 977)).collect();
+            feed(&mut model, &prompt);
+            // The save point mirrors the session's: `prompt.len() - 1` tokens
+            // fed, the last token held pending.
+            let saved = prompt.len() - 1;
+            // Turn 1: 48 greedy tokens past the save point.
+            let mut token = prompt[saved];
+            for pos in (saved..).take(48) {
+                token = greedy_step(&mut model, token, pos);
+            }
+            // The restored branch: rewind to the save point, feed the held
+            // token plus an extension whose tokens differ from turn 1's drawn
+            // tokens (one PREFILL_BATCH of rows), then draw greedily.
+            let extension: Vec<u32> = (0..7).map(|index| 90_000 + index).collect();
+            let mut tail: Vec<u32> = vec![prompt[saved]];
+            tail.extend_from_slice(&extension);
+            let draw = |model: &mut Bolt| -> Vec<u32> {
+                model
+                    .prefill_batch(&tail, saved, false)
+                    .expect("tail prefill");
+                let mut token = *tail.last().expect("tail");
+                let mut drawn = Vec::new();
+                for pos in (saved + tail.len()..).take(24) {
+                    token = greedy_step(model, token, pos);
+                    drawn.push(token);
+                }
+                drawn
+            };
+            let restored = draw(&mut model);
+            // The cold control: reset (position 0), re-feed the prompt, then
+            // the same tail and greedy continuation.
+            feed(&mut model, &prompt);
+            let cold = draw(&mut model);
+            assert_eq!(restored, cold, "the restore must match the cold replay");
+            assert!(
+                restored.windows(2).any(|pair| pair[0] != pair[1]),
+                "the drawn chain must not be constant"
+            );
+        }
+
+        /// A one-token prompt feeds nothing in prefill, so its first decode
+        /// writes cell 0 through `logits`: that decode must advance the cell
+        /// generation, or a stale entry would match over the overwritten cell.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn a_one_token_prompt_advances_the_generation_before_its_first_decode() {
+            let mut serve = BoltServe {
+                model: bolt::load(&pinned_bolt(), None).expect("load"),
+                eos: vec![0],
+                generation: 0,
+                prefix: PrefixStore::with_limits(ONE_TIP),
+            };
+            let mut st = BoltSession {
+                core: DecodeSession::default(),
+                pos: 0,
+            };
+            let first: Vec<u32> = (0..64).map(|index| 100 + (index % 977)).collect();
+            let first_ext: Vec<u32> = first.iter().copied().chain(500..512).collect();
+
+            serve.reset(&mut st).expect("reset");
+            serve.prefill(&mut st, &first).expect("prefill first");
+            assert!(serve.save_prefix(&st, &first, SaveKind::Tip).expect("save"));
+
+            // The one-token prompt: prefill holds its only token pending, so
+            // nothing is fed and the position stays 0; the decode step then
+            // writes cell 0.
+            serve.reset(&mut st).expect("reset");
+            serve.prefill(&mut st, &[42]).expect("prefill one token");
+            assert_eq!(st.pos, 0, "the pending token is not fed yet");
+            let mut step = Step {
+                model: &mut serve.model,
+                pos: &mut st.pos,
+                generation: &mut serve.generation,
+            };
+            use crate::family::session::TokenStepper as _;
+            step.logits(42).expect("first decode");
+            assert!(
+                serve.generation >= 2,
+                "the first decode at position 0 must advance the generation"
+            );
+
+            // The stale entry can no longer match the overwritten cell 0.
+            let covered = serve
+                .restore_prefix(&mut st, &first_ext)
+                .expect("stale restore");
+            assert_eq!(covered, 0, "the stale entry must cover nothing");
+        }
+
+        /// The seam refuses a stale entry: after a different prompt's prefill
+        /// advanced the cell generation, restoring onto the first prompt's
+        /// extension covers nothing and leaves the session unchanged; the
+        /// current prompt's own entry still restores and rewinds.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn the_seam_refuses_a_stale_entry_and_restores_the_current_one() {
+            let mut serve = BoltServe {
+                model: bolt::load(&pinned_bolt(), None).expect("load"),
+                eos: vec![0],
+                generation: 0,
+                prefix: PrefixStore::with_limits(ONE_TIP),
+            };
+            let mut st = BoltSession {
+                core: DecodeSession::default(),
+                pos: 0,
+            };
+            let n = 64;
+            let first: Vec<u32> = (0..n as u32).map(|index| 100 + (index % 977)).collect();
+            let other: Vec<u32> = (0..n as u32).map(|index| 200 + (index % 811)).collect();
+            let first_ext: Vec<u32> = first.iter().copied().chain(500..512).collect();
+            let other_ext: Vec<u32> = other.iter().copied().chain(600..612).collect();
+
+            serve.reset(&mut st).expect("reset");
+            serve.prefill(&mut st, &first).expect("prefill first");
+            assert!(serve.save_prefix(&st, &first, SaveKind::Tip).expect("save"));
+
+            // A different prompt feeds from position 0: the generation
+            // advances and the first prompt's entry can never match again.
+            serve.reset(&mut st).expect("reset");
+            serve.prefill(&mut st, &other).expect("prefill other");
+            let covered = serve
+                .restore_prefix(&mut st, &first_ext)
+                .expect("stale restore");
+            assert_eq!(covered, 0, "the stale entry must cover nothing");
+            assert_eq!(
+                st.core.history(),
+                &other[..],
+                "the session must be unchanged"
+            );
+
+            // The current generation's entry still restores and rewinds.
+            assert!(serve.save_prefix(&st, &other, SaveKind::Tip).expect("save"));
+            serve.reset(&mut st).expect("reset");
+            let covered = serve
+                .restore_prefix(&mut st, &other_ext)
+                .expect("fresh restore");
+            assert_eq!(covered, n, "the current entry must cover the prompt");
+            assert_eq!(
+                st.pos,
+                n - 1,
+                "the cache position must rewind to the boundary"
+            );
+            serve
+                .prefill(&mut st, &other_ext[n..])
+                .expect("tail prefill");
+            assert_eq!(
+                st.core.history(),
+                &other_ext[..],
+                "the tail must continue the sequence"
+            );
+        }
     }
 }
 
