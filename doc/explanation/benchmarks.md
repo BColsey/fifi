@@ -34,6 +34,10 @@ Against MLX-LM 0.32.2 (mlx 0.32.4, `--prompt-cache`), the same 12 turns:
 The MLX-LM run with its default cache failed on the twelfth turn, so its sum covers 11 turns.
 About half of fifi's decode gap to MLX-LM comes from the 8-bit KV cache; the rest is kernel time per step.
 
+For single-layer Q8 decode and dense-prefill timings recorded by the PR author
+on his 16 GB M4 Mac mini (contributor records, not reproduced here), see the
+[M4 attention measurements](mac-m4-attention.md).
+
 ## Qwen3.6 on an RTX 3090 (24 GB)
 
 Against llama.cpp (8-bit KV cache, `-ub 1024`), same GGUF file, 131,072-token context:
