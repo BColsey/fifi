@@ -307,7 +307,9 @@ impl DeviceBuffer {
     /// moved or written until the stream's next synchronization point. The
     /// expert-bank refills rely on this: they enqueue the store's pinned record
     /// slices, and the store is immutable and process-long-lived (leaked by the
-    /// server), while tests end on readbacks that drain the stream.
+    /// server), while tests end on readbacks that drain the stream. That
+    /// immutability is enforced, not just conventional: `PartStore::pin` seals
+    /// the store and its writers refuse afterwards.
     ///
     /// Returns `BadRequest` for the conditions of [`Self::read_at`].
     pub(crate) fn write_at_enqueue(

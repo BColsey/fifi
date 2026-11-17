@@ -63,6 +63,10 @@ pub(in crate::family) struct PartStore {
     trellis: usize,
     scale_stride: usize,
     pinned: bool,
+    /// Set when [`Self::pin`] runs: the load is over and refill DMAs may read
+    /// `records` concurrently, so no write may touch it again (a pinned source
+    /// must stay valid and unmodified until its copy completes).
+    sealed: bool,
 }
 
 impl PartStore {
@@ -75,6 +79,7 @@ impl PartStore {
             trellis,
             scale_stride,
             pinned: false,
+            sealed: false,
         }
     }
 
@@ -86,6 +91,13 @@ impl PartStore {
         member: usize,
         staged: &Exl3MemberStaging,
     ) -> Result<(), EngError> {
+        if self.sealed {
+            return Err(EngError::Checkpoint(format!(
+                "EXL3 expert bank: member {member} put after the store was pinned; \
+                 a sealed store is the source of in-flight refill copies and may \
+                 not be written",
+            )));
+        }
         if staged.trellis.len() != self.trellis || staged.scales.len() != self.scale_stride {
             return Err(EngError::Checkpoint(format!(
                 "EXL3 expert bank: member {member} stages {} trellis and {} scale bytes, \
@@ -112,11 +124,20 @@ impl PartStore {
         self.records.len()
     }
 
-    /// Page-locks the record storage, best effort: a store that fails to pin stays
-    /// pageable (the refills still work, only staged). The vector never moves after
-    /// the load, so the registered pointer stays the buffer's own. Returns whether
-    /// the pin took.
+    /// Page-locks the record storage, best effort: a store that fails to pin
+    /// stays pageable, and a pageable copy source is consumed at enqueue, so the
+    /// refills still work, only staged. The vector never moves after the load, so
+    /// the registered pointer stays the buffer's own. Returns whether the pin
+    /// took. Also seals the store (see [`Self::put`]); a second call is harmless
+    /// and reports the first call's outcome without re-registering.
     pub(in crate::family) fn pin(&mut self) -> bool {
+        // The seal is set whether or not the registration takes: refills read
+        // this store either way, so the load is over the moment pin runs. A
+        // second call just reports the first outcome, never re-registering.
+        if self.sealed {
+            return self.pinned;
+        }
+        self.sealed = true;
         if host_register(&self.records).is_ok() {
             self.pinned = true;
         }
@@ -415,7 +436,8 @@ impl LayerResolver<'_, '_> {
             // both streams were quiescent at the readback that produced the picks.
             // The store is pinned, so the record must stay untouched until the
             // streams drain; the store is immutable post-load and
-            // process-long-lived, which is that invariant.
+            // process-long-lived, which is that invariant — and pin() seals the
+            // store so a post-load write refuses instead of racing this DMA.
             if let Err(err) = parts[op.part]
                 .bank
                 .write_at_enqueue(refill, op.offset(), record)
@@ -627,5 +649,40 @@ mod tests {
                 .unwrap_err()
         );
         assert!(error.contains("member 2"), "{error}");
+    }
+
+    #[test]
+    fn pin_seals_the_store_against_writes() {
+        let shape = [64usize, 32];
+        let (stride, scale_stride) = exl3_member_layout(shape, 8);
+        let staged = Exl3MemberStaging {
+            trellis: vec![7u8; stride],
+            scales: vec![8u8; scale_stride],
+        };
+        // An unsealed store accepts writes.
+        let mut fresh = PartStore::new(shape, 8, 2);
+        fresh
+            .put(0, &staged)
+            .expect("an unsealed store accepts writes");
+        // pin() seals whether or not the registration takes (a machine with no
+        // visible device refuses the register; the seal must hold regardless).
+        let _pinned = fresh.pin();
+        let refusal = format!(
+            "{:?}",
+            fresh
+                .put(1, &staged)
+                .expect_err("a pinned store refuses writes")
+        );
+        assert!(refusal.contains("member 1"), "{refusal}");
+        assert!(refusal.contains("sealed"), "{refusal}");
+        // The refused write left member 1 zeroed, and the record written before
+        // the seal is untouched: its trellis half and scale half separately,
+        // as member() returns one whole record.
+        assert!(fresh.member(1).iter().all(|&byte| byte == 0));
+        let record = fresh.member(0);
+        assert!(record[..stride].iter().all(|&byte| byte == 7));
+        assert!(record[stride..].iter().all(|&byte| byte == 8));
+        // A second pin() is harmless: same answer, no re-registration.
+        assert_eq!(fresh.pin(), fresh.pin());
     }
 }
