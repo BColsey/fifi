@@ -731,7 +731,25 @@ impl<'w> TieredRuntime<'w> {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
         });
-        let cap = limit.map_or(allocated, |limit| allocated.min(limit));
+        // Opt-in short-chunk cap: leave the ordinary limit as a hard ceiling,
+        // but avoid staging as many experts for chunks with less reuse. This
+        // changes only classification; the existing per-expert minimum-use
+        // filter, allocated bank and admission charge are unchanged.
+        static SHORT_LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let short_limit = SHORT_LIMIT.get_or_init(|| {
+            std::env::var("Q36_TIERED_COLD_SHORT_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        });
+        let cap = crate::family::qwen36::tiered::host::chunk_cold_cap(
+            allocated,
+            *limit,
+            *short_limit,
+            rows.len(),
+        );
+        if short_limit.is_some() && layer == 0 {
+            eprintln!("tiered-cold-short-limit: rows {} using {cap}", rows.len());
+        }
         if limit.is_some() && layer == 0 {
             eprintln!("tiered-cold-limit: allocated {allocated} using {cap}");
         }
