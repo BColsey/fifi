@@ -54,7 +54,16 @@ fn shared_prefill_extension_replans_the_full_tensor_list() {
         assert_eq!(plan.slots().len(), old.slots().len() + 2);
         for entry in old.slots() {
             assert_eq!(plan.index(entry.slot), old.index(entry.slot));
-            assert_eq!(slot(&plan, entry.slot), entry);
+            let actual = slot(&plan, entry.slot);
+            if entry.slot == Slot::BlockOut(Site::Mlp) {
+                // Prefill zero-copies the residual at Route and every sub-block combine reads it
+                // back, so its lifetime starts at the Route write, not the decode Combine start.
+                assert_eq!(actual.first, Phase::Route as usize);
+                assert_eq!(actual.last, entry.last);
+                assert_eq!(actual.bytes, entry.bytes);
+            } else {
+                assert_eq!(actual, entry);
+            }
         }
         let replanned = crate::kernels::cuda::plan_arena(&plan.arena_tensors()).unwrap();
         assert_eq!(plan.arena_bytes(), replanned.total);
@@ -77,7 +86,7 @@ fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
         assert_eq!(perm.bytes, perm_bytes);
         assert_eq!(
             (perm.first, perm.last),
-            (Phase::Route as usize, Phase::Down as usize)
+            (Phase::Route as usize, Phase::Combine as usize)
         );
         let y = slot(&plan, Slot::PrefillY);
         assert_eq!(y.bytes, rows * g.delta.value_heads * 4);

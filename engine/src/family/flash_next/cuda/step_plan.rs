@@ -639,8 +639,23 @@ impl StepPlan {
             .find(|entry| entry.slot == Slot::Exl3Jobs)
             .ok_or_else(|| refuse("the dense EXL3 job slot is missing".into()))?
             .bytes = dense_bytes;
+        // Prefill zero-copies the residual into BlockOut(Mlp) at Route and every sub-block's
+        // in-place combine reads it back, so its decode lifetime (Combine..HyperApplyM) is too
+        // narrow: plan_arena then aliases it with PrefillPerm and a sub-block's permutation write
+        // clobbers the residual the next combine reads. Widen BlockOut(Mlp) to its first prefill
+        // write and PrefillPerm to the last combine; the overlapping lifetimes force disjoint bytes.
+        list.slots
+            .iter_mut()
+            .find(|entry| entry.slot == Slot::BlockOut(Site::Mlp))
+            .ok_or_else(|| refuse("the MoE block output slot is missing".into()))?
+            .first = Phase::Route as usize;
         // One stream serializes dense and routed uses of the existing, pairs-sized EXL3 scratch.
-        list.add(Slot::PrefillPerm, Ok(perm_bytes), Phase::Route, Phase::Down)?;
+        list.add(
+            Slot::PrefillPerm,
+            Ok(perm_bytes),
+            Phase::Route,
+            Phase::Combine,
+        )?;
         list.add(
             Slot::PrefillY,
             product(&[rows, geometry.delta.value_heads, F32]),

@@ -1,6 +1,8 @@
 //! A declarative op table of one Flash-Next decode token (the launch order of the S4 draft, PLE
 //! at `ple_layer` between layers) replayed against the offsets the planner placed, to find a
-//! tensor whose bytes another tensor overwrites before its last read.
+//! tensor whose bytes another tensor overwrites before its last read. The same replay covers the
+//! shared-prefill MoE order (`prefill_moe_ops`); that op order is hand-written from `run_prefill`
+//! and can drift from it, so a device canary is a later item.
 //!
 //! The lifetimes in `step_plan.rs` are intervals on a one-layer phase axis. This test does not
 //! restate them: it runs the real time order (48 layers, the PLE block after layer
@@ -397,5 +399,162 @@ fn a_tensor_cut_short_is_found_in_every_mixer() {
     assert!(
         found.iter().any(|line| line.contains("Gate(Attn)")),
         "{found:#?}"
+    );
+}
+
+/// At the 256-row prefill tile, BlockOut(Mlp) is written from its Route zero-copy and read by
+/// every sub-block's in-place combine through hyper_apply_m, so it must share no byte with any
+/// slot live across that span. The decode lifetime (Combine..HyperApplyM) misses the span and
+/// would let plan_arena alias it with PrefillPerm; the widened prefill lifetime keeps it clear.
+#[test]
+fn prefill_256_row_slot_ranges() {
+    let (_, g) = real();
+    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::default()).unwrap();
+    let (bo, bb) = plan.placement(Slot::BlockOut(Site::Mlp)).unwrap();
+    let moe = plan
+        .slots()
+        .iter()
+        .find(|p| p.slot == Slot::BlockOut(Site::Mlp))
+        .expect("BlockOut(Mlp) planned");
+    // Take the slots from the plan so the check stays exhaustive as the slot set changes: any
+    // other slot live at a phase of BlockOut(Mlp)'s span must not share a byte with it.
+    for p in plan.slots() {
+        if p.slot == Slot::BlockOut(Site::Mlp) || p.first > moe.last || moe.first > p.last {
+            continue;
+        }
+        let (o, b) = plan.placement(p.slot).expect("planned");
+        let slot = p.slot;
+        let overlaps = bo < o + b && o < bo + bb;
+        assert!(
+            !overlaps,
+            "BlockOut(Mlp) [{bo}..{}] aliases {slot:?} [{o}..{}] live across its prefill span",
+            bo + bb,
+            o + b
+        );
+    }
+}
+
+/// The shared-prefill MoE op order of one layer. Unlike decode (one combine op), prefill
+/// zero-copies BlockOut(Mlp) at the start of the MoE block, then per sub-block rewrites the WHOLE
+/// PrefillPerm scratch and combines in place: `moe_combine` reads `res = hidden` (BlockOut(Mlp))
+/// and writes it back (CombineOut::InPlace). If the planner aliased BlockOut(Mlp) with
+/// PrefillPerm, a sub-block's permutation write clobbers the residual the next combine reads.
+fn prefill_moe_ops(subs: usize) -> Vec<Op> {
+    let mut ops = vec![
+        op(
+            "hyper_read mlp",
+            Phase::HyperReadM,
+            &[Slot::Stream],
+            &hyper_read(Site::Mlp),
+        ),
+        op(
+            "router",
+            Phase::Route,
+            &[Slot::Mixed(Site::Mlp)],
+            &[
+                Slot::RouterLogits,
+                Slot::TopkId,
+                Slot::TopkWeight,
+                Slot::SharedGate,
+            ],
+        ),
+        // run_prefill zero-copies resid_in -> resid_out (BlockOut(Mlp)) before run_store.
+        op(
+            "prefill zero resid_out",
+            Phase::Route,
+            &[],
+            &[Slot::BlockOut(Site::Mlp)],
+        ),
+        op(
+            "shared gate/up",
+            Phase::GateUp,
+            &[Slot::Mixed(Site::Mlp)],
+            &[Slot::SharedGu],
+        ),
+        op(
+            "shared swiglu",
+            Phase::Swiglu,
+            &[Slot::SharedGu],
+            &[Slot::SharedAct],
+        ),
+        op(
+            "shared down",
+            Phase::Down,
+            &[Slot::SharedAct],
+            &[Slot::SharedOut],
+        ),
+    ];
+    for sub_i in 0..subs {
+        let tag =
+            |s: &str| -> &'static str { Box::leak(format!("{s} sub{sub_i}").into_boxed_str()) };
+        ops.push(op(
+            tag("perm write"),
+            Phase::Route,
+            &[Slot::TopkId],
+            &[Slot::PrefillPerm],
+        ));
+        ops.push(op(
+            tag("routed gate/up"),
+            Phase::GateUp,
+            &[Slot::Mixed(Site::Mlp), Slot::PrefillPerm],
+            &[Slot::ExpertGu],
+        ));
+        ops.push(op(
+            tag("routed swiglu"),
+            Phase::Swiglu,
+            &[Slot::ExpertGu],
+            &[Slot::ExpertAct],
+        ));
+        ops.push(op(
+            tag("routed down"),
+            Phase::Down,
+            &[Slot::ExpertAct, Slot::PrefillPerm],
+            &[Slot::ExpertDown],
+        ));
+        // combine reads res = BlockOut(Mlp) and writes it in place.
+        ops.push(op(
+            tag("combine in place"),
+            Phase::Combine,
+            &[
+                Slot::BlockOut(Site::Mlp),
+                Slot::ExpertDown,
+                Slot::TopkWeight,
+                Slot::SharedOut,
+                Slot::SharedGate,
+            ],
+            &[Slot::BlockOut(Site::Mlp)],
+        ));
+    }
+    ops.push(op(
+        "hyper_apply mlp",
+        Phase::HyperApplyM,
+        &[
+            Slot::Stream,
+            Slot::Gate(Site::Mlp),
+            Slot::BlockOut(Site::Mlp),
+        ],
+        &[Slot::Stream],
+    ));
+    ops
+}
+
+/// The prefill op order must be hazard-free: BlockOut(Mlp) holds the residual from its Route
+/// zero-copy write through every sub-block's in-place combine, so no slot rewritten across that
+/// span (PrefillPerm and the MoE scratch) may share its bytes.
+#[test]
+fn the_prefill_op_order_has_no_hazard() {
+    let (_, g) = real();
+    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::default()).unwrap();
+    let placed = placed_with(&plan, |_| {});
+    // Stream must be live before the MoE reads it: the embed writes it.
+    let mut ops = vec![
+        op("feeds", Phase::StepBegin, &[], &[Slot::EmbedRow]),
+        op("embed", Phase::Embed, &[Slot::EmbedRow], &[Slot::Stream]),
+    ];
+    ops.extend(prefill_moe_ops(3));
+    let found = hazards(&placed, &ops);
+    assert!(
+        found.is_empty(),
+        "the prefill op order has hazards (BlockOut(Mlp) vs PrefillPerm alias): {found:#?}"
     );
 }
