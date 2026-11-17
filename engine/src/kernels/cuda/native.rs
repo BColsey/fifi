@@ -11,6 +11,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 pub(super) mod device_info;
 pub(super) mod nvfp4_launch;
@@ -854,9 +855,10 @@ pub(super) fn upload(host: &[u8]) -> Result<RawDevice, DeviceFailure> {
     })
 }
 
-/// Allocates `bytes` of uninitialized device memory.
+/// Allocates `bytes` of device memory, filled with 0xFF when the debug poison
+/// switch is armed; uninitialized otherwise.
 ///
-/// The adapter rejects 0 bytes. Fill the allocation with [`upload_at`].
+/// The adapter rejects 0 bytes. Fill an uninitialized allocation with [`upload_at`].
 pub(super) fn alloc(bytes: usize) -> Result<RawDevice, DeviceFailure> {
     if bytes == 0 {
         return Err(invalid_argument());
@@ -867,7 +869,129 @@ pub(super) fn alloc(bytes: usize) -> Result<RawDevice, DeviceFailure> {
     let status = unsafe { alloc_raw(bytes, &mut device, &mut stage) };
     checked(status, stage)?;
     let ptr = NonNull::new(device).ok_or_else(invalid_argument)?;
-    Ok(RawDevice { ptr, bytes })
+    let raw = RawDevice { ptr, bytes };
+    if let Err(failure) = poison_fill(&raw) {
+        // RawDevice has no Drop; free the fresh block rather than leak it.
+        let _ = free(raw);
+        return Err(failure);
+    }
+    Ok(raw)
+}
+
+/// Accepts the on-words "1", "true" and "on" (trimmed, case-insensitive); every
+/// other value, including "0", counts as off. A value someone set but that is
+/// not an on-word stays off silently, like the other runtime CUDA switches.
+pub(super) fn switch_word_on(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
+}
+
+/// Whether `FIFI_CUDA_POISON_ALLOC` is armed, read once per process.
+///
+/// Armed, every device allocation handed out by the engine — fresh ones inside
+/// [`alloc`] and reissued ones at the allocation-cache hit — is first filled
+/// with `0xFF`, so a kernel that reads memory it never wrote sees the fill
+/// instead of a previous tenant's bytes (compute-sanitizer's initcheck cannot
+/// catch a recycled block: it counts as written). Any other value, including
+/// empty and non-UTF-8, leaves it off.
+pub(super) fn poison_alloc_armed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = poison_test_hooks::forced() {
+        return forced;
+    }
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var("FIFI_CUDA_POISON_ALLOC")
+            .map(|value| switch_word_on(&value))
+            .unwrap_or(false)
+    })
+}
+
+/// Fills `raw` with `0xFF` when the debug poison is armed; a no-op otherwise.
+///
+/// Reuses the host upload path, so it adds no device entry point. The fill runs
+/// in 64 MiB chunks, so the staging cost is bounded regardless of block size; the
+/// switch exists for sanitizer legs and defect hunts, not for production.
+pub(super) fn poison_fill(raw: &RawDevice) -> Result<(), DeviceFailure> {
+    if !poison_alloc_armed() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        poison_test_hooks::count_fill();
+        if poison_test_hooks::take_fake() {
+            return Ok(());
+        }
+    }
+    const CHUNK: usize = 64 * 1024 * 1024;
+    let chunk = vec![0xFFu8; raw.bytes.min(CHUNK)];
+    for offset in (0..raw.bytes).step_by(chunk.len()) {
+        let len = (raw.bytes - offset).min(chunk.len());
+        upload_at(raw, offset, &chunk[..len])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(in crate::kernels::cuda) mod poison_test_hooks {
+    //! Host-test hooks for the poison switch: a forced decision and a counted,
+    //! device-free fill, so the fresh and reissue call sites are testable
+    //! without a GPU.
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+    static FORCE: AtomicU8 = AtomicU8::new(0);
+    static FAKE: AtomicBool = AtomicBool::new(false);
+    static FILLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Forces the switch decision for this test; `None` follows the environment.
+    pub(in crate::kernels::cuda) fn force(armed: Option<bool>) {
+        FORCE.store(
+            match armed {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(in crate::kernels::cuda) fn forced() -> Option<bool> {
+        match FORCE.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Counts fills without touching the device; `fills()` reads the count.
+    pub(in crate::kernels::cuda) fn fake_fills(enable: bool) {
+        FAKE.store(enable, Ordering::Relaxed);
+    }
+
+    pub(in crate::kernels::cuda) fn take_fake() -> bool {
+        FAKE.load(Ordering::Relaxed)
+    }
+
+    pub(in crate::kernels::cuda) fn count_fill() {
+        FILLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(in crate::kernels::cuda) fn fills() -> usize {
+        FILLS.load(Ordering::Relaxed)
+    }
+}
+
+/// A `bytes`-sized device pointer that no native call ever touches: host tests
+/// of the poison call sites use it with the fake fill armed.
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn poison_test_raw(bytes: usize) -> RawDevice {
+    let host: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+    RawDevice {
+        ptr: NonNull::from(&mut host[0]).cast(),
+        bytes,
+    }
 }
 
 /// Copies `host` into `device` at byte `offset` and waits for the copy.

@@ -198,6 +198,19 @@ impl AllocCache {
         dispatch
     }
 
+    /// The reissued-block fill, with its ordering rule: only an armed switch
+    /// pays for the settle and the host write; a served cache hit stays sync-free.
+    fn reissue_fill(&self, raw: &RawDevice) -> Result<(), EngError> {
+        if !native::poison_alloc_armed() {
+            return Ok(());
+        }
+        // A lazily returned block may still be read by the previous tenant's
+        // kernels, so settle before the host-synchronous fill - the same rule
+        // `copy` applies to its host writes.
+        self.settle()?;
+        native::poison_fill(raw).map_err(device_error)
+    }
+
     pub(super) fn allocate(self: &Rc<Self>, bytes: usize) -> Result<DeviceBuffer, EngError> {
         let _dispatch = self.enter()?;
         let mut idle = self.idle.borrow_mut();
@@ -212,6 +225,16 @@ impl AllocCache {
                     pending.swap_remove(index);
                     self.poisoned_hits.set(self.poisoned_hits.get() + 1);
                 }
+            }
+            // Dropped before the fill: its failure path returns the block through
+            // the idle list, which this borrow still holds.
+            drop(idle);
+            if let Err(error) = self.reissue_fill(&raw) {
+                self.return_block(raw);
+                if TERMINAL.load(Ordering::Acquire) {
+                    self.mark_terminal();
+                }
+                return Err(error);
             }
             raw
         } else {
@@ -675,6 +698,120 @@ mod tests {
         let cache = AllocCache::new(Rc::clone(&lease)).expect("host test cache");
         cache.fake_sync.set(true);
         (cache, lease)
+    }
+
+    /// Restores the poison test hooks when dropped, so a failed assertion cannot
+    /// leave the switch forced for other tests.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            native::poison_test_hooks::force(None);
+            native::poison_test_hooks::fake_fills(false);
+        }
+    }
+
+    /// The poison hooks are process-global; this mutex keeps the host tests that
+    /// force them from racing each other.
+    static HOOK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_cache_hit_settles_only_when_the_switch_is_armed() {
+        let _hooks = HookGuard;
+        let _locked = HOOK_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let (cache, _lease) = counting_cache(&SLOTS, &FAILED);
+        native::poison_test_hooks::fake_fills(true);
+
+        // A lazily returned block is still pending its settle; a hit with the
+        // switch off must not spend it.
+        cache.policy.set(ReturnPolicy {
+            lazy: true,
+            dirty: true,
+        });
+        native::poison_test_hooks::force(Some(false));
+        cache
+            .reissue_fill(&native::poison_test_raw(8))
+            .expect("switch off");
+        assert_eq!(cache.syncs.get(), 0, "the switch-off hit must not settle");
+
+        // Armed, the same hit settles once before its host-synchronous fill.
+        cache.policy.set(ReturnPolicy {
+            lazy: true,
+            dirty: true,
+        });
+        native::poison_test_hooks::force(Some(true));
+        cache
+            .reissue_fill(&native::poison_test_raw(8))
+            .expect("switch on");
+        assert_eq!(
+            cache.syncs.get(),
+            1,
+            "the armed hit settles before its fill"
+        );
+    }
+
+    #[test]
+    fn the_poison_switch_word_is_strict() {
+        assert!(native::switch_word_on("1"));
+        assert!(native::switch_word_on(" on "));
+        assert!(native::switch_word_on("TRUE"));
+        assert!(!native::switch_word_on(""));
+        assert!(!native::switch_word_on("0"));
+        assert!(!native::switch_word_on("yes"));
+    }
+
+    #[test]
+    fn the_poison_fill_covers_the_fresh_and_reissued_call_sites_and_is_off_by_default() {
+        let _hooks = HookGuard;
+        let _locked = HOOK_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        native::poison_test_hooks::force(Some(false));
+        native::poison_test_hooks::fake_fills(true);
+        let raw = native::poison_test_raw(8);
+        // Deltas, not absolutes: nothing here may depend on other tests' fills.
+        let before = native::poison_test_hooks::fills();
+        native::poison_fill(&raw).expect("switch off: no fill");
+        assert_eq!(native::poison_test_hooks::fills() - before, 0);
+        native::poison_test_hooks::force(Some(true));
+        native::poison_fill(&raw).expect("the fresh site (inside native::alloc)");
+        assert_eq!(native::poison_test_hooks::fills() - before, 1);
+        native::poison_fill(&raw).expect("the reissue site (the cache hit)");
+        assert_eq!(native::poison_test_hooks::fills() - before, 2);
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA and an exclusive test process (--test-threads=1)"]
+    fn the_poison_switch_fills_a_fresh_allocation_and_the_reissued_block() {
+        let _hooks = HookGuard;
+        native::poison_test_hooks::force(Some(true));
+        let caps = Activations { x: 4, xf: 4, y: 4 };
+        let ctx = CudaContext::with_workspace_cache(caps, true).expect("cache context");
+        let before = native::poison_test_hooks::fills();
+        let mut got = vec![0u8; 64];
+        let fresh = ctx.allocate(64).expect("fresh block");
+        ctx.download(&fresh, &mut got)
+            .expect("read the fresh block back");
+        assert!(
+            got.iter().all(|&b| b == 0xFF),
+            "the fresh allocation is filled"
+        );
+        drop(fresh);
+        let reissued = ctx.allocate(64).expect("reissued block");
+        ctx.download(&reissued, &mut got)
+            .expect("read the reissued block back");
+        assert!(
+            got.iter().all(|&b| b == 0xFF),
+            "the reissued block is filled"
+        );
+        drop(reissued);
+        assert!(
+            native::poison_test_hooks::fills() - before >= 2,
+            "the fresh allocation and the reissued block both filled"
+        );
     }
 
     #[test]

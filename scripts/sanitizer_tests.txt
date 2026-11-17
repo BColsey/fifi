@@ -24,3 +24,5 @@ FIFI_FLINT_CUDA_ALLOC_CACHE=0|skip:pick the exact Flint decode-step test names f
 # writes in recycled blocks (initcheck counts a recycled block as already
 # written); flip to run once the poison switch is on main.
 FIFI_FLINT_CUDA_ALLOC_CACHE=1,FIFI_CUDA_POISON_ALLOC=1|skip:until the poison switch lands on main; initcheck counts a recycled block as written, so the cache-on leg needs the poison
+# The poison device test itself (#[ignore]; the runner passes --include-ignored).
+FIFI_CUDA_POISON_ALLOC=1|run|the_poison_switch_fills_a_fresh_allocation_and_the_reissued_block

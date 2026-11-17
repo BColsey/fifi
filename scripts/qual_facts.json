@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7013,
-      "ignored": 627,
+      "test_fns": 7018,
+      "ignored": 628,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
@@ -38,6 +38,7 @@
         "FIFI_ACTIVATION_GPU_AUTH",
         "FIFI_ACTIVATION_MANIFEST",
         "FIFI_ADD_CHAIN_M",
+        "FIFI_CUDA_POISON_ALLOC",
         "FIFI_D1_CAPTURE",
         "FIFI_D1_CONTEXT",
         "FIFI_D1_KROW_GRAPH",
