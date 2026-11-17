@@ -3420,7 +3420,12 @@ mod tests {
         let before = count(&executor);
         executor.prefill(&mut session, &cycle(10)).unwrap();
         assert_eq!(take_log(&executor), vec![8], "one chunk of 8 rows");
-        assert_eq!(count(&executor) - before, 8 + 2, "chunk, then step");
+        let imports = super::super::prefill::step::fixture_embedding_imports();
+        assert_eq!(
+            count(&executor) - before,
+            imports + 5 + 2,
+            "chunk, then step"
+        );
     }
 
     static_assertions::assert_not_impl_any!(Q36Executor: Send, Sync);

@@ -35,6 +35,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `Q36_CACHE_LIMIT` | none | Fallback for `cache_limit_bytes`, in bytes. |
+| `FIFI_MLX_GROUPED_IMPORT` | off | Set to `1` to send every single packed MLX import (payload, scales, biases of one weight) through the grouped import operation, synchronizing once instead of three times. Applies to every family on Apple Silicon. Read once per process at the first packed import. |
 | `Q36_FUSED_PREFILL` | on | Fused kernels for prompt processing. Only `0` turns them off. |
 | `Q36_FLASH_PREFILL` | on | Fused flash-prefill kernel replaces the composite prefix attention; on since its default-flip gate passed (cohort 2,046 positions: dNLL -0.000080, top-1 98.045%). `0` is the kill switch. Validated at D >= 128 with the Q8 cache and REP 8. |
 | `Q36_FLASH_DELTA` | on | Flash-delta gated rule replaces the recurrent kernel in prefill: the chunked WY-form kernel (4.1x) runs for chunks of 16 rows or more, the recurrent kernel serves decode. `0` is the kill switch. |

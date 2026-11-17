@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7240,
-      "ignored": 645,
+      "test_fns": 7242,
+      "ignored": 647,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
@@ -157,6 +157,7 @@
         "FIFI_KROW_PACK_MANIFEST_SHA256",
         "FIFI_KROW_PICKS_OUT",
         "FIFI_KROW_RECEIPT",
+        "FIFI_MLX_GROUPED_IMPORT",
         "FIFI_MRV_COMMIT",
         "FIFI_MRV_IDS_SHA256",
         "FIFI_MRV_NEED",

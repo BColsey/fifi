@@ -51,9 +51,9 @@ cargo test --locked --release --features native-mlx --lib \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
-## Next checkpoint measurement
+## Checkpoint qualification
 
-The documented 4-bit Qwen3.6 profile needs a Mac with at least 36 GB. On that host, set `Q36_CKPT_DIR` to the checkpoint directory, `Q36_PROMPT_IDS` to the same file of at least 24,576 little-endian u32 token IDs for all arms, and `RUN_DIR` to a fresh writable scratch directory. From `engine/`, compare whole-decoder latency and generated token chains around the proposed cutoff. The threshold override below is available in the native library test.
+The 16 GB mini can run the attention benchmarks above and the shared-executor fixtures. The documented 4-bit Qwen3.6 profile needs at least 36 GB, so whole-model qualification is outside the mini measurements. To reproduce the checkpoint comparison on a host that meets that profile, set `Q36_CKPT_DIR` to the checkpoint directory, `Q36_PROMPT_IDS` to the same file of at least 24,576 little-endian u32 token IDs for all arms, and `RUN_DIR` to a fresh writable scratch directory. From `engine/`, compare whole-decoder latency and generated token chains around the proposed cutoff. The threshold override below is available in the native library test.
 
 ```sh
 (

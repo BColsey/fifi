@@ -97,6 +97,34 @@ fn close(actual: &[f32], expected: &[f32]) {
     }
 }
 
+/// The `FIFI_MLX_GROUPED_IMPORT` opt-in must not change bytes: the same
+/// packed weight imported through the batch form and the split form
+/// dequantizes to the same rows, bit for bit. Both family shapes the switch
+/// reaches are covered: Flint's stacked expert loads and the unstacked
+/// row form Qwen3.6's embedding import uses. Flash-Next already batches its
+/// layer imports and never takes the split form.
+#[test]
+#[ignore = "requires an explicit Mac GPU allocation; no model weights"]
+fn grouped_and_split_imports_give_bitwise_the_same_rows() {
+    let _serial = crate::native_test_lock();
+    let mut k = MlxKernels::try_new().unwrap();
+    k.allow_bf16(true);
+    for host in [packed(8, false), packed(4, true)] {
+        let grouped = k.import_packed_many(&[&host]).unwrap().pop().unwrap();
+        let split = k.import_packed_split(&host).unwrap();
+        let grouped_dense = k.dequantize(&grouped).unwrap();
+        let grouped_rows = read(&mut k, &grouped_dense);
+        let split_dense = k.dequantize(&split).unwrap();
+        let split_rows = read(&mut k, &split_dense);
+        assert_eq!(
+            grouped_rows,
+            split_rows,
+            "grouped and split imports differ for logical shape {:?}",
+            host.logical_shape()
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires an explicit Mac GPU allocation; no model weights"]
 fn f32_activation_bf16_affine_int4_int8_and_stacked_gather() {

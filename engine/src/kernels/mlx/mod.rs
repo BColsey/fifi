@@ -13,6 +13,16 @@ pub(crate) mod native;
 mod staging;
 
 /// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
+/// One MLX-wide opt-in that routes every single packed import through the grouped
+/// import operation, so payload, scales and biases synchronize once for any family
+/// (Qwen3.6 embeddings, Flash-Next embeds, Flint gathers). Read once per process.
+pub(crate) fn grouped_import() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FIFI_MLX_GROUPED_IMPORT").is_some_and(|value| value == "1")
+    })
+}
+
 pub(crate) fn dispatch_count() -> u64 {
     native::dispatch_count()
 }
@@ -849,6 +859,24 @@ impl MlxKernels {
     }
 
     pub fn import_packed(
+        &mut self,
+        weight: &PackedWeight,
+    ) -> Result<ResidentPackedWeight, EngError> {
+        if grouped_import() {
+            return self
+                .import_packed_many(&[weight])?
+                .pop()
+                .ok_or_else(|| EngError::Backend {
+                    operation: "import_many",
+                    message: "resident import returned a different tensor count".into(),
+                });
+        }
+        self.import_packed_split(weight)
+    }
+
+    /// The ungrouped form of `import_packed`: three synchronizing imports,
+    /// kept separate so the grouped-vs-split parity test can drive both.
+    pub fn import_packed_split(
         &mut self,
         weight: &PackedWeight,
     ) -> Result<ResidentPackedWeight, EngError> {

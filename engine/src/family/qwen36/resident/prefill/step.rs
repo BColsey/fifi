@@ -188,7 +188,7 @@ pub(in super::super) fn chunk_with_cap(
     }
 }
 
-/// Reads the embedding row of every token, imports the rows packed with one synchronization, and
+/// Reads the embedding row of every token, imports the packed rows, and
 /// dequantizes them to `[T, hidden]` in the activation dtype (the dequantized rows are F32 and one
 /// cast moves them to BF16). A token outside the table returns `BadRequest` from the read.
 pub(in crate::family::qwen36::resident) fn embed_rows(
@@ -207,8 +207,8 @@ pub(in crate::family::qwen36::resident) fn embed_rows(
         .map(|&token| stored::read_slice(ckpt, embed, token))
         .collect::<Result<Vec<PackedWeight>, _>>()?;
     // The batched form (Q36_FUSED_PREFILL=1): one host-side concat of the rows'
-    // payload/scales/biases bytes builds a single [T, hidden] PackedWeight, so ONE import and
-    // ONE dequantize kernel replace the T per-row kernels and the concatenate pass. The
+    // payload/scales/biases bytes builds a single [T, hidden] PackedWeight. One dequantize
+    // kernel replaces the T per-row kernels and the concatenate pass. The
     // dequantize op is the same one the per-row path runs, so the rounding is identical by
     // construction; a table whose rows lack a shared quantization or byte access falls back.
     let batched = super::super::moe::fused_prefill()
@@ -693,6 +693,20 @@ fn run(
         routes: None,
         probs: None,
     })
+}
+
+/// The tiny affine embedding has a payload, scales and biases. The fused form
+/// imports these three tensors separately by default. Both grouped paths sync once.
+#[cfg(all(test, feature = "native-fault-qualification"))]
+pub(in crate::family::qwen36::resident) fn fixture_embedding_imports() -> u64 {
+    if fused_prefill_enabled()
+        && std::env::var_os("Q36_NO_EMBEDDED").is_none()
+        && !crate::kernels::mlx::grouped_import()
+    {
+        3
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -2015,15 +2029,62 @@ mod tests {
         );
     }
 
-    /// Synchronizations on the tiny model: 4 layers, 2 DeltaNet layers. Device routing (the
-    /// default): one chunk of 8 rows makes the token-start import 1, one
-    /// cadence evaluate per layer except the last 3, the final evaluate 1, and the health readback
-    /// 1: `Prompt` 6, `Generate` 7 (plus the token), `Logits` 8 (plus the logits), `Record` 9
-    /// (plus the layer rows). The gated delta kernel makes no synchronization, so `CAP_FOR_TWO`
-    /// adds none: the counts stay `Prompt` 6 and `Record` 9. Eight rows in chunks of 3,
-    /// 3, and 2 run `Prompt`, `Prompt`, and the requested mode: `6 + 6 + 9`. Host routing (the
-    /// reference) makes more: `Prompt` 8 and `Generate`/`Logits`/`Record`
-    /// 11/12/13.
+    /// End-to-end embedding latency with a synchronous host readback and a CPU oracle.
+    /// Run the same probe in fresh processes with FIFI_MLX_GROUPED_IMPORT unset or 1.
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    #[ignore = "times a synthetic affine embedding on Apple Silicon"]
+    fn packed_embedding_import_timing() {
+        let _serial = crate::native_test_lock();
+        let ckpt = setup();
+        let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
+        let weights = &decoder.weights;
+        let mut ctx = Ctx {
+            kernels: &mut decoder.kernels,
+            consts: &weights.consts,
+            compile: false,
+        };
+        let oracle = (0..8)
+            .map(|id| {
+                let row = stored::read_slice(&ckpt, &weights.embed, id).unwrap();
+                crate::family::qwen36::host_cpu::dequantize_matrix(&row).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for rows in [8, 128] {
+            for sample in 0..36 {
+                let tokens: Vec<_> = (sample..sample + rows).map(token).collect();
+                let before = ctx.kernels.qualification_sync_count();
+                let started = std::time::Instant::now();
+                let output = embed_rows(&mut ctx, &ckpt, &weights.embed, &tokens).unwrap();
+                let host = ctx.kernels.readback(&output).unwrap();
+                let elapsed = started.elapsed();
+                let syncs = ctx.kernels.qualification_sync_count() - before;
+                assert_eq!(syncs, fixture_embedding_imports() + 1);
+                assert_eq!(host.shape(), &[rows, weights.shape.hidden as u32]);
+                let expected = tokens.iter().flat_map(|&id| &oracle[id as usize]);
+                assert!(
+                    host.host_bytes()
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .eq(expected.map(|value| value.to_bits())),
+                    "embedding differs from CPU for {rows} rows at sample {sample}"
+                );
+                if sample >= 4 {
+                    println!(
+                        "embed_sample rows={rows} sample={} syncs={syncs} ns={}",
+                        sample - 4,
+                        elapsed.as_nanos()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Four layers, two DeltaNet layers. After the embedding import a device-routed
+    /// Prompt chunk needs three layer evaluations, one final evaluation and one
+    /// health readback. Generate, Logits and Record also read their requested outputs.
+    /// The gated DeltaNet kernel adds no waits when the recurrence cap falls.
     #[cfg(feature = "native-fault-qualification")]
     #[test]
     fn each_prefill_uses_its_planned_synchronizations() {
@@ -2032,16 +2093,17 @@ mod tests {
         let (mut decoder, _) = decoder_and_oracle(&ckpt, 1024);
         let tokens: Vec<u32> = (0..8).map(token).collect();
         let syncs = |decoder: &ResidentDecoder<'_>| decoder.kernels.qualification_sync_count();
-        for (routing, budget) in [
-            (Routing::Device, [6, 7, 8, 9]),
-            (Routing::Host, [8, 11, 12, 13]),
+        let imports = fixture_embedding_imports();
+        for (routing, after_import) in [
+            (Routing::Device, [5, 6, 7, 8]),
+            (Routing::Host, [7, 10, 11, 12]),
         ] {
             decoder.set_routing(routing);
             for (mode, want) in [
-                (StepMode::Prompt, budget[0]),
-                (StepMode::Generate, budget[1]),
-                (StepMode::Logits, budget[2]),
-                (StepMode::Record, budget[3]),
+                (StepMode::Prompt, imports + after_import[0]),
+                (StepMode::Generate, imports + after_import[1]),
+                (StepMode::Logits, imports + after_import[2]),
+                (StepMode::Record, imports + after_import[3]),
             ] {
                 let mut state = decoder.zero_state().unwrap();
                 let before = syncs(&decoder);
@@ -2056,7 +2118,10 @@ mod tests {
         // The loop above ends on `Routing::Host`: the sub-chunk and three-chunk cases below count
         // the device-routed chunk, the production default, so they set it again.
         decoder.set_routing(Routing::Device);
-        for (mode, want) in [(StepMode::Prompt, 6), (StepMode::Record, 9)] {
+        for (mode, want) in [
+            (StepMode::Prompt, imports + 5),
+            (StepMode::Record, imports + 8),
+        ] {
             let mut state = decoder.zero_state().unwrap();
             let before = syncs(&decoder);
             let split = chunk_with_cap(&mut decoder, &mut state, &tokens, mode, CAP_FOR_TWO);
@@ -2068,7 +2133,11 @@ mod tests {
         let before = syncs(&decoder);
         let three = decoder.prefill(&mut state, &tokens, StepMode::Record);
         ok(three, "three chunks");
-        assert_eq!(syncs(&decoder) - before, 6 + 6 + 9, "three chunks");
+        assert_eq!(
+            syncs(&decoder) - before,
+            3 * imports + 5 + 5 + 8,
+            "three chunks"
+        );
     }
 
     /// `max|got - want| / max|want|`, the F32 gate metric, reported for the BF16 run.
