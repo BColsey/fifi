@@ -614,7 +614,21 @@ mod tests {
         }
         // The armed reply must be identical to the plain one — the e2e leg
         // of semantics preservation (the per-row proof is in sampler tests).
-        assert_eq!(replies[0], replies[1], "arming capture changed the reply");
+        // "created" is the wall-clock second the server stamps each reply
+        // with; the two requests may cross a second boundary (a real run saw
+        // 1794955634 against 1794955635), so that one field is removed before
+        // the equality. Everything else stays strict: each request builds a
+        // fresh AppState, so the per-state completion-id counter is
+        // deterministic and the ids must match.
+        let mut plain = replies[0].clone();
+        let mut armed = replies[1].clone();
+        for reply in [&mut plain, &mut armed] {
+            reply
+                .as_object_mut()
+                .expect("reply object")
+                .remove("created");
+        }
+        assert_eq!(plain, armed, "arming capture changed the reply");
     }
 
     #[test]
