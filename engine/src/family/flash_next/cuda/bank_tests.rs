@@ -928,7 +928,7 @@ fn the_exclusive_store_never_needs_more_than_one_spare_place() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn the_two_passes_split_the_router_weights_between_resident_and_missed_picks() {
+fn the_miss_pass_names_the_rank_rows_it_overwrites_and_the_slots_it_reads() {
     let plan = plan_with_slots(143);
     let counts = parse_route_counts(COUNTS, 48, 512).unwrap();
     let mut state =
@@ -960,25 +960,31 @@ fn the_two_passes_split_the_router_weights_between_resident_and_missed_picks() {
     let copies = state.begin_pass(layer, &ids).unwrap();
     assert_eq!(copies.ops.len(), 3);
     assert_eq!(copies.hits, 7);
-    let (slots2, weights2) =
-        miss_pass_inputs(&ids, &weights, &classified, state.slot_row(layer)).unwrap();
-    // The compact list carries the missed picks only, in pick order.
+    let (slots2, ranks2) = miss_pass_inputs(&ids, &classified, state.slot_row(layer)).unwrap();
+    // The compact list carries the missed picks only, in pick order; `ranks2` names the rank
+    // row each missed pick's down output overwrites in the shared down buffer.
     assert_eq!(slots2.len(), classified.misses.len());
+    let missed_ranks: Vec<u32> = ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, id)| cold.contains(id))
+        .map(|(i, _)| i as u32)
+        .collect();
+    assert_eq!(ranks2, missed_ranks);
     let mut next_miss = 0;
     for (i, &id) in ids.iter().enumerate() {
         let missed = cold.contains(&id);
         let first = classified.weights[i].to_bits();
         if missed {
-            let second = weights2[next_miss].to_bits();
-            // Each pick appears once: the resident pass carried +0.0 on the filler.
+            // The resident pass carried +0.0 on the filler; the one combine re-reads the
+            // router's true weight (kept in `weights` and the log) at this rank.
             assert_eq!(first, 0.0f32.to_bits());
-            assert_eq!(second, weights[i].to_bits());
+            assert_eq!(classified.log[i].1.to_bits(), weights[i].to_bits());
             assert_eq!(slots2[next_miss], state.slot_row(layer)[id as usize]);
             assert!(
                 slots2[next_miss] > 0,
                 "a missed pick never lands on the filler slot"
             );
-            assert_eq!(f32::from_bits(first) + f32::from_bits(second), weights[i]);
             next_miss += 1;
         } else {
             assert_eq!(first, weights[i].to_bits());
@@ -999,34 +1005,31 @@ fn the_second_pass_refuses_what_has_no_second_pass() {
     let weights = [0.5f32, 0.5];
     let classified = classify_reference(&row, 2, &ids, &weights).unwrap();
     // The missed expert 1 still has no slot after the "copy".
-    assert!(miss_pass_inputs(&ids, &weights, &classified, &row).is_err());
+    assert!(miss_pass_inputs(&ids, &classified, &row).is_err());
     let after = vec![0, 1, 2, -1];
-    let (slots, out) = miss_pass_inputs(&ids, &weights, &classified, &after).unwrap();
-    // Only the missed pick 1 (slot 1, weight 0.5) is carried; no filler pair for pick 0.
-    assert_eq!((slots, out), (vec![1], vec![0.5]));
-    assert!(miss_pass_inputs(&ids, &weights[..1], &classified, &after).is_err());
+    let (slots, ranks) = miss_pass_inputs(&ids, &classified, &after).unwrap();
+    // Only the missed pick 1 (slot 1, rank 1) is carried; no filler pair for pick 0.
+    assert_eq!((slots, ranks), (vec![1], vec![1]));
+    assert!(miss_pass_inputs(&ids[..1], &classified, &after).is_err());
     let fault = classify_reference(&row, 2, &[-1, 1], &weights).unwrap();
-    assert!(miss_pass_inputs(&[-1, 1], &weights, &fault, &after).is_err());
+    assert!(miss_pass_inputs(&[-1, 1], &fault, &after).is_err());
     let invalid = classify_reference(&row, 2, &[0, 0], &weights).unwrap();
-    assert!(miss_pass_inputs(&[0, 0], &weights, &invalid, &after).is_err());
+    assert!(miss_pass_inputs(&[0, 0], &invalid, &after).is_err());
     // A non-finite weight is flagged by the classifier (word != 0), so there is no second pass.
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let w = [0.5f32, bad];
         let flagged = classify_reference(&row, 2, &ids, &w).unwrap();
         assert_ne!(flagged.word, 0, "{bad}");
-        assert!(
-            miss_pass_inputs(&ids, &w, &flagged, &after).is_err(),
-            "{bad}"
-        );
+        assert!(miss_pass_inputs(&ids, &flagged, &after).is_err(), "{bad}");
     }
-    // -0.0 is the one finite weight whose bits change: -0.0 + 0.0 is +0.0. A router softmax cannot
-    // produce it; the second pass carries it through as given (pick 1 is the missed one, so the
-    // compact list holds it at index 0).
+    // -0.0 is the one finite weight whose bits the filler rule changes: the classified weight
+    // becomes +0.0 while the router's log (what the one rank-order combine reads) keeps the
+    // bits as given (pick 1 is the missed one, so its rank row is the overwritten one).
     let w = [0.5f32, -0.0];
     let negative = classify_reference(&row, 2, &ids, &w).unwrap();
-    let (_, second) = miss_pass_inputs(&ids, &w, &negative, &after).unwrap();
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].to_bits(), (-0.0f32).to_bits());
+    let (_, ranks) = miss_pass_inputs(&ids, &negative, &after).unwrap();
+    assert_eq!(ranks, vec![1]);
+    assert_eq!(negative.log[1].1.to_bits(), (-0.0f32).to_bits());
     assert_eq!(negative.weights[1].to_bits(), 0.0f32.to_bits());
 }
 

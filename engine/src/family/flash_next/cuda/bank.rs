@@ -12,9 +12,9 @@
 //!    [`ExpertBankState::begin_pass`] can plan the copies: every expert of the pass is protected, a
 //!    miss takes the least recently used unprotected slot, and the slot's old expert leaves the card.
 //! 3. `PassCopies` says what to move. The copy is synchronous (the missed picks wait for it).
-//! 4. The missed picks run on their new slots with their true weights — the missed picks ONLY,
-//!    no filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit
-//!    for bit.
+//! 4. The missed picks run on their new slots — the missed picks ONLY, no filler
+//!    ([`miss_pass_inputs`]): each pick's down output lands in its RANK row of the shared down
+//!    buffer, and one combine sums every pick in rank order with the router's true weights.
 //!
 //! WHY this shape:
 //!
@@ -367,20 +367,19 @@ impl ExpertBankState<ReplaceOnMissLru> {
 // ---------------------------------------------------------------------------------------------
 
 /// The slot ids and weights of the missed-pick launch, after the copies: every missed pick runs
-/// on its new slot with the router's weight — the missed picks ONLY, no +0.0 filler, so the
-/// launch carries [`Classified::misses`] entries instead of `top_k`. The resident pass
-/// (`classified.slot_ids`, `classified.weights`) carries the rest: the two passes' weights add
-/// to the router's weights bit for bit, so the combine sees each pick exactly once.
+/// on its new slot — the missed picks ONLY, no +0.0 filler, so the launch carries
+/// [`Classified::misses`] entries instead of `top_k`, and each pick's down output lands in its
+/// RANK row of the shared down buffer (overwriting the resident pass's filler row), so one
+/// final combine sums every pick in rank order with the router's true weights.
 ///
-/// Refuses a row the classifier flagged invalid, a router fault, lists of different lengths and a
-/// missed expert that still has no slot.
+/// Refuses a row the classifier flagged invalid, a router fault, lists of different lengths, a
+/// missed expert that still has no slot, and a miss list that disagrees with the classifier.
 pub(super) fn miss_pass_inputs(
     ids: &[i32],
-    weights: &[f32],
     classified: &Classified,
     slot_row_after: &[i32],
-) -> Result<(Vec<i32>, Vec<f32>), EngError> {
-    if ids.len() != weights.len() || ids.len() != classified.slot_ids.len() {
+) -> Result<(Vec<i32>, Vec<u32>), EngError> {
+    if ids.len() != classified.slot_ids.len() {
         return Err(bank_error("the pick lists differ in length".into()));
     }
     if classified.word != 0 {
@@ -389,8 +388,8 @@ pub(super) fn miss_pass_inputs(
         ));
     }
     let mut slots = Vec::with_capacity(classified.misses.len());
-    let mut out = Vec::with_capacity(classified.misses.len());
-    for (&id, &weight) in ids.iter().zip(weights) {
+    let mut ranks = Vec::with_capacity(classified.misses.len());
+    for (rank, &id) in ids.iter().enumerate() {
         if id < 0 {
             return Err(bank_error("a router fault has no second pass".into()));
         }
@@ -403,10 +402,17 @@ pub(super) fn miss_pass_inputs(
                     bank_error(format!("missed expert {id} has no slot after the copy"))
                 })?;
             slots.push(slot);
-            out.push(weight);
+            ranks.push(rank as u32);
         }
     }
-    Ok((slots, out))
+    if ranks.len() != classified.misses.len() {
+        return Err(bank_error(format!(
+            "the miss lists disagree: {} ranks against {} classified misses",
+            ranks.len(),
+            classified.misses.len()
+        )));
+    }
+    Ok((slots, ranks))
 }
 
 // ---------------------------------------------------------------------------------------------

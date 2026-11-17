@@ -8,15 +8,20 @@
 //!    slot: a resident pick to its slot, a missed pick to slot 0 with weight +0.0 (the filler
 //!    rule). The classify log (ten ids and weights, 80 bytes) comes back to the host.
 //! 3. The resident pass is queued: gate and up of the ten slots (id-indexed launches over the bank
-//!    buffer), SwiGLU, down, the shared expert, and the combine with the classified weights.
+//!    buffer), SwiGLU, down, the shared expert, and the combine when no miss will follow (see 5).
 //! 4. The bank plans and runs the copies for the picks (`DeviceBank::step`, all ten picks, hits
 //!    included, so the policy sees every use). The copies run on the bank's own stream, which is
 //!    not ordered with the block's stream: they overlap the resident pass, and the host waits for
 //!    them before it queues the miss pass.
 //! 5. With at least one miss, the miss pass is queued: the same launches over the slot row after
-//!    the copies, carrying ONLY the missed picks on their new slots at their true weights
-//!    ([`miss_pass_inputs`]) — no +0.0 filler, the launch is as wide as the miss count; the
-//!    combine adds it to the resident result.
+//!    the copies, carrying ONLY the missed picks on their new slots ([`miss_pass_inputs`]) — no
+//!    +0.0 filler, the launch is as wide as the miss count, and each missed pick's down output
+//!    lands in its RANK row of the shared down buffer, overwriting the resident pass's filler
+//!    row. The miss pass's combine is the block's only sum: every pick in rank order with the
+//!    router's true weights, the shared term, and `resid_in` — the same association one launch
+//!    over an all-resident bank has, at any slot count. The resident pass computes its filler
+//!    rows but skips its combine when a miss will follow, so no +0.0 filler product exists and a
+//!    non-finite filler expert can no longer poison the output.
 //!
 //! WHY this shape: the resident pass needs nothing a miss brings, so it runs while the host
 //! plans and waits for the copies. The overlap is safe because of one rule of the bank's policy:
@@ -24,21 +29,13 @@
 //! that neither the resident pass (the picks' slots and the filler slot 0) nor anything earlier
 //! reads. The slot-row upload at the start of the call waits for the block's stream, so no
 //! launch of an earlier layer or token is still reading this layer's slots when a copy starts.
-//! The shared expert rides in the first pass because it never misses. A layer without a miss is one pass whose result goes straight to the output. The two
-//! passes together touch every pick exactly once: the weights of the two passes add to the
-//! router's weights bit for bit.
+//! The shared expert rides in the first pass because it never misses. A layer without a miss is
+//! one pass whose result goes straight to the output; a layer with a miss sums once, at the end.
+//! Every pick contributes exactly one product to exactly one combine.
 //!
-//! The split result is not bit-identical to one launch over an all-resident bank: the resident
-//! picks and the missed picks are summed in two groups, so the floating-point association
-//! differs. Every product is the same. The tests state the tolerance.
-//!
-//! The resident pass carries a missed pick on the filler (slot 0) at +0.0 until the copies
-//! land, so the filler rule multiplies slot 0's expert output by +0.0 there. If that output
-//! held an infinity or a NaN the product would be NaN and would poison the sum. With the check
-//! off (the default) a non-finite slot 0 output turns the whole block output, and so the token,
-//! into NaN with no error; [`SplitMoe::verify_finite_filler`] reads the resident pass's filler
-//! rows back and refuses it, at the price of a wait on the stream before the copies start,
-//! which removes the overlap of step 4. The miss pass has no filler picks.
+//! The split result is bit-identical to one launch over an all-resident bank: both sum the picks
+//! in rank order in one combine, so it does not depend on which experts the bank happened to
+//! hold (the slot count or the LRU state). The tests state the equality.
 //!
 //! The pure parts (the classify oracle, the log parser, the spans of the bank buffer and the
 //! private scratch layout) are host code with host tests; the launches are native-cuda only.
@@ -96,10 +93,15 @@ pub(super) struct ScratchLayout {
     pub(super) mbox_req: usize,
     /// f32 `[hidden]`: the classify kernel copies the row here when a pick misses.
     pub(super) mbox_row: usize,
-    /// i32 `[top_k]` and f32 `[top_k]`: the miss pass's slots and weights.
+    /// i32 `[top_k]` (per chunk row): the miss pass's slot ids.
+    /// f32 `[top_k]` (per chunk row): the multi-row path's zero-weight tail combine — the one
+    /// that moves a clean row's resident result to the block output (the single-row miss pass
+    /// reads the router's device weights instead).
     pub(super) miss_ids: usize,
     pub(super) miss_weights: usize,
-    /// f32 `[hidden]`: the resident pass's result while a miss pass is still to come.
+    /// f32 `[hidden]` (per chunk row): the multi-row resident pass's result, from which the
+    /// per-row tails move clean rows to the block output (a miss row's copy is discarded; the
+    /// single-row block does not use it — its resident pass skips the combine on a miss).
     pub(super) partial: usize,
     /// i32 `[(2 + EXL3_JOB_WORDS) * routed]`: the sort lists and the job tables of the chunk's
     /// two routed job-table passes (2 list words plus one job record per pair; a source's
@@ -285,39 +287,18 @@ impl SlotSpans {
     }
 }
 
-/// The first pick whose weight is +0.0 (a filler pick) and whose down row holds an infinity or a NaN:
-/// `rows` holds `weights.len()` rows of `hidden` f32 values. The product of such a row with +0.0 is
-/// NaN, which would reach every column of the sum.
-pub(super) fn first_poisoned_filler(rows: &[u8], hidden: usize, weights: &[f32]) -> Option<usize> {
-    let width = hidden * F32;
-    if width == 0 {
-        return None;
-    }
-    rows.chunks_exact(width)
-        .zip(weights)
-        .position(|(bytes, &weight)| {
-            weight == 0.0
-                && !bytes
-                    .as_chunks::<F32>()
-                    .0
-                    .iter()
-                    .all(|b| f32::from_le_bytes(*b).is_finite())
-        })
-}
-
 /// The two passes of a layer, as the host decided them: how the router's picks split between the
 /// resident pass and the miss pass.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PassInputs {
-    /// Slots and weights of the miss pass (`None` without a miss).
-    pub(super) miss: Option<(Vec<i32>, Vec<f32>)>,
+    /// The miss pass's slots and the rank rows its down outputs overwrite (`None` without a miss).
+    pub(super) miss: Option<(Vec<i32>, Vec<u32>)>,
     pub(super) misses: usize,
 }
 
 /// The miss pass's inputs after the copies, from the classification made before them.
 pub(super) fn plan_second_pass(
     ids: &[i32],
-    weights: &[f32],
     classified: &Classified,
     slot_row_after: &[i32],
 ) -> Result<PassInputs, EngError> {
@@ -325,7 +306,7 @@ pub(super) fn plan_second_pass(
     if misses == 0 {
         return Ok(PassInputs { miss: None, misses });
     }
-    let inputs = miss_pass_inputs(ids, weights, classified, slot_row_after)?;
+    let inputs = miss_pass_inputs(ids, classified, slot_row_after)?;
     Ok(PassInputs {
         miss: Some(inputs),
         misses,
@@ -351,7 +332,7 @@ mod device {
     use super::super::step_plan::MAX_STEP_ROWS;
     use super::{
         CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
-        first_poisoned_filler, parse_log, pick_union, plan_second_pass, prof, refuse,
+        parse_log, pick_union, plan_second_pass, prof, refuse,
     };
     use crate::{
         EngError,
@@ -498,7 +479,6 @@ mod device {
         layout: ScratchLayout,
         scratch: DeviceBuffer,
         book: Codebook,
-        verify_finite_filler: bool,
         /// The prefill expert ring: `None` until [`SplitMoe::plan_ring`] funds one; the
         /// multi-row path streams through it instead of admitting into the bank.
         ring: Option<crate::family::flash_next::cuda::prefill_ring::device::PrefillRing>,
@@ -522,13 +502,23 @@ mod device {
         /// i32 `[picks]`: the bank slot of each pick of this pass — `top_k` entries for the
         /// resident pass, the missed count for the compact miss pass.
         ids: DeviceRange<'a>,
-        /// f32 `[picks]`: the combine weight of each pick (same width as `ids`).
+        /// f32 `[weights]`: the combine weights — the resident pass's slot weights, the miss
+        /// pass's slice of the router's device weights for its one rank-order combine (the
+        /// combine width is `dims.top_k` either way).
         weights: DeviceRange<'a>,
-        /// Whether the shared expert rides in this pass.
+        /// Whether the shared expert rides in this pass (computed here and added to the combine).
         shared: bool,
-        /// f32 `[hidden]`: the residual the combine adds to.
-        res: DeviceRange<'a>,
-        out: DeviceRange<'a>,
+        /// Add the shared TERM without recomputing it: the resident pass already ran the shared
+        /// expert, and the miss pass's combine is the block's only sum.
+        shared_term_only: bool,
+        /// The down row each pick of `ids` writes (`pick j` writes row `down_rows[j]`), instead
+        /// of the compact prefix. The miss pass uses it to overwrite the missed ranks' filler
+        /// rows so its combine sums every pick in rank order.
+        down_rows: Option<&'a [u32]>,
+        /// The combine's `(residual, output)`. `None` runs the expert stages only: the
+        /// resident pass of a miss layer skips its combine (the miss pass's combine is the
+        /// block's only sum, and its filler rows must not be multiplied by anything).
+        combine: Option<(DeviceRange<'a>, DeviceRange<'a>)>,
     }
 
     /// One pair of an id-indexed launch: the part, the pick whose slot id chooses the member, the
@@ -648,7 +638,6 @@ mod device {
                 layout: scratch_layout,
                 scratch,
                 book,
-                verify_finite_filler: false,
                 ring: None,
                 ring_min_rows: 1,
                 ring_engaged: false,
@@ -737,21 +726,14 @@ mod device {
             &self.bank
         }
 
-        /// When set, the RESIDENT pass reads its down rows back and refuses a filler pick
-        /// (weight +0.0, slot 0) whose expert output is not finite — the compact miss pass has
-        /// no filler picks to check. Off by default: it adds a read of `top_k * hidden` floats
-        /// to every pass.
-        pub(in crate::family::flash_next) fn verify_finite_filler(&mut self, on: bool) {
-            self.verify_finite_filler = on;
-        }
-
         /// Queues layer `layer`'s MoE block on `launch.stream`. Reads `bufs.route.norm_row` (f32
         /// `[hidden]`, the hyper-mixed row) and `bufs.route.resid_in` (a zero row); writes the
         /// block output, the weighted picks plus the gated shared expert and no residual, to
         /// `bufs.route.resid_out`. A `resid_in` that is not zero is added into the result. Returns
         /// after every launch of the block is queued. It waits on the stream for the slot row, for
-        /// the classify log and, on a miss, for the bank copies. With the filler check off, a
-        /// non-finite output of slot 0 poisons the resident pass's sum as NaN without an error.
+        /// the classify log and, on a miss, for the bank copies. A non-finite filler output of
+        /// slot 0 never reaches the sum: the miss pass overwrites its rank row before the only
+        /// combine, so the block cannot turn a torn slot-0 float into a NaN.
         pub(in crate::family::flash_next) fn run(
             &mut self,
             launch: &Launch<'_>,
@@ -791,7 +773,6 @@ mod device {
             let scratch = &self.scratch;
             let slot_ids = scratch.range(sc.slot_ids, k * I32)?;
             let slot_weights = scratch.range(sc.weights, k * F32)?;
-            let partial = scratch.range(sc.partial, h * F32)?;
 
             prof::blocked(34, profile, || {
                 scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row_before))
@@ -848,13 +829,10 @@ mod device {
             let (ids, weights) = parse_log(&raw, k)?;
             let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
 
-            // The resident pass. With a miss its result waits in the partial buffer; without one
-            // it is the block's output.
-            let first_out = if classified.misses.is_empty() {
-                bufs.route.resid_out
-            } else {
-                partial
-            };
+            // The resident pass. Without a miss its combine IS the block's output; with one it
+            // skips the combine entirely (the miss pass's combine is the block's only sum, and
+            // the filler rows must not be multiplied by anything).
+            let clean = classified.misses.is_empty();
             self.pass(
                 launch,
                 bufs,
@@ -864,24 +842,21 @@ mod device {
                     ids: slot_ids,
                     weights: slot_weights,
                     shared: true,
-                    res: bufs.route.resid_in,
-                    out: first_out,
+                    shared_term_only: false,
+                    down_rows: None,
+                    combine: clean.then_some((bufs.route.resid_in, bufs.route.resid_out)),
                 },
             )?;
-            if self.verify_finite_filler {
-                self.check_filler(launch, bufs, dims, 0, &classified.weights)?;
-            }
 
             // The copies for every pick, hits included; they run behind the resident pass.
             self.bank.step(ctx, layer, &ids)?;
             let slot_row_after = self.bank.slot_row(layer)?.to_vec();
-            let second = plan_second_pass(&ids, &weights, &classified, &slot_row_after)?;
-            if let Some((miss_slots, miss_weights)) = second.miss {
+            let second = plan_second_pass(&ids, &classified, &slot_row_after)?;
+            if let Some((miss_slots, miss_ranks)) = second.miss {
                 let n = miss_slots.len();
                 let scratch = &self.scratch;
                 prof::blocked(36, profile, || {
-                    scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))?;
-                    scratch.write_at(stream, sc.miss_weights, &le_f32(&miss_weights))
+                    scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))
                 })?;
                 self.pass(
                     launch,
@@ -890,14 +865,19 @@ mod device {
                     Pass {
                         layer,
                         ids: scratch.range(sc.miss_ids, n * I32)?,
-                        weights: scratch.range(sc.miss_weights, n * F32)?,
+                        // The router's device weights: the router wrote the renormalized
+                        // `top_k` weights to `route.weights`, and the combine reads them in
+                        // place — the classified scratch weights hold +0.0 at missed ranks and
+                        // cannot serve.
+                        weights: bufs.route.weights,
                         shared: false,
-                        res: scratch.range(sc.partial, h * F32)?,
-                        out: bufs.route.resid_out,
+                        shared_term_only: true,
+                        down_rows: Some(&miss_ranks),
+                        combine: Some((bufs.route.resid_in, bufs.route.resid_out)),
                     },
                 )?;
-                // No filler picks remain in the compact list, so there is no zero-weight
-                // row to poison the sum; the resident pass keeps its check.
+                // The missed ranks' filler rows are overwritten before the only combine reads
+                // them, so no +0.0 filler product exists anywhere in the sum.
             }
             Ok(())
         }
@@ -1194,9 +1174,9 @@ mod device {
         /// slots this chunk's own passes read; each is preceded by a full drain of this stream,
         /// which serializes execution (one drain per chunk, or per dirty row).
         /// On the fallback a pick that was a chunk-initial hit but was evicted by an earlier
-        /// row's step is re-admitted by this row's step (one wasted copy); its contribution
-        /// stays in the first pass, so the chunked sums can associate differently than the
-        /// one-row-at-a-time block — within the two-pass tolerance, like a miss.
+        /// row's step is re-admitted by this row's step (one wasted copy); one combine still
+        /// sums every pick of its row in rank order, so the chunked result equals the
+        /// one-row-at-a-time block for every row.
         pub(in crate::family::flash_next) fn run_rows(
             &mut self,
             launch: &Launch<'_>,
@@ -1350,11 +1330,6 @@ mod device {
             )?;
             self.grouped(launch, layer, &down, (slot_ids, &bufs.scratch))?;
             tick(30);
-            if self.verify_finite_filler {
-                for (r, class) in classified.iter().enumerate() {
-                    self.check_filler(launch, bufs, dims, r, &class.weights)?;
-                }
-            }
 
             // The shared expert of every row, then the first combine over the resident pass.
             shared_rows(
@@ -1442,22 +1417,12 @@ mod device {
                 launch.stream.synchronize()?;
                 self.bank.step(ctx, layer, &picks[r].0)?;
                 let slot_row_after = self.bank.slot_row(layer)?.to_vec();
-                let second =
-                    plan_second_pass(&picks[r].0, &picks[r].1, &classified[r], &slot_row_after)?;
+                let second = plan_second_pass(&picks[r].0, &classified[r], &slot_row_after)?;
                 tick(32);
-                if let Some((miss_slots, miss_weights)) = second.miss {
+                if let Some((miss_slots, miss_ranks)) = second.miss {
                     let n = miss_slots.len();
                     prof::blocked(39, profile, || {
-                        scratch.write_at(
-                            stream,
-                            sc.miss_ids + r * k * I32,
-                            &le_i32(&miss_slots),
-                        )?;
-                        scratch.write_at(
-                            stream,
-                            sc.miss_weights + r * k * F32,
-                            &le_f32(&miss_weights),
-                        )
+                        scratch.write_at(stream, sc.miss_ids + r * k * I32, &le_i32(&miss_slots))
                     })?;
                     let row_bufs = Self::row_of(bufs, dims, r)?;
                     self.pass(
@@ -1467,47 +1432,23 @@ mod device {
                         Pass {
                             layer,
                             ids: scratch.range(sc.miss_ids + r * k * I32, n * I32)?,
-                            weights: scratch.range(sc.miss_weights + r * k * F32, n * F32)?,
+                            // The router's device weights of this row: the combine reads
+                            // them in place (the classified scratch weights hold +0.0 at
+                            // missed ranks and cannot serve).
+                            weights: row_bufs.route.weights,
                             shared: false,
-                            res: row(&partial, h * F32, r)?,
-                            out: row(&bufs.route.resid_out, h * F32, r)?,
+                            shared_term_only: true,
+                            down_rows: Some(&miss_ranks),
+                            combine: Some((row_bufs.route.resid_in, row_bufs.route.resid_out)),
                         },
                     )?;
-                    // Compact list: no filler picks, so no filler check (same as `run`).
+                    // The missed ranks' filler rows are overwritten before the only combine
+                    // reads them; no +0.0 filler product exists in the sum.
                 }
             }
             tick(33);
             tick(13);
             Ok(())
-        }
-
-        /// Reads the down rows back and refuses a non-finite row whose pick weight is zero.
-        /// `r` indexes the rows of a multi-row chunk (`0` for the single-row block).
-        fn check_filler(
-            &self,
-            launch: &Launch<'_>,
-            bufs: &Exl3MoeBufs<'_>,
-            dims: &MoeDims,
-            r: usize,
-            weights: &[f32],
-        ) -> Result<(), EngError> {
-            let (h, k) = (dims.hidden, dims.top_k);
-            let profile = prof::on();
-            let mut raw = vec![0u8; k * h * F32];
-            prof::blocked(42, profile, || {
-                bufs.expert_down.buffer().read_at(
-                    launch.stream,
-                    bufs.expert_down.offset() + r * k * h * F32,
-                    &mut raw,
-                )
-            })?;
-            match first_poisoned_filler(&raw, h, weights) {
-                Some(pick) => Err(refuse(format!(
-                    "the filler expert (slot 0) gave a non-finite output on pick {pick}; \
-                     0.0 times it would poison the sum"
-                ))),
-                None => Ok(()),
-            }
         }
 
         /// The MoE block of a chunk over the prefill ring: every pick reads either its bank
@@ -1899,7 +1840,7 @@ mod device {
         }
 
         /// One pass over the bank of `pass.layer`: gate and up of the picks, SwiGLU, down, the
-        /// shared expert when asked, and the combine of `pass.weights` on top of `pass.res`.
+        /// shared expert when asked, and the combine into `pass.combine`'s output when asked.
         fn pass(
             &self,
             launch: &Launch<'_>,
@@ -1939,11 +1880,12 @@ mod device {
             )?;
             let mut items = Vec::with_capacity(k);
             for pick in 0..k {
+                let down_row = pass.down_rows.map_or(pick, |rows| rows[pick] as usize);
                 items.push(Item {
                     part: 2,
                     pick: pick as u32,
                     x: row(&bufs.expert_act, i * F32, pick)?,
-                    out: row(&bufs.expert_down, h * F32, pick)?,
+                    out: row(&bufs.expert_down, h * F32, down_row)?,
                 });
             }
             self.grouped(launch, pass.layer, &items, (pass.ids, &bufs.scratch))?;
@@ -1963,25 +1905,36 @@ mod device {
                     gate: bufs.route.shared_gate,
                     row: bufs.shared_out,
                 })
+            } else if pass.shared_term_only {
+                Some(SharedTerm {
+                    gate: bufs.route.shared_gate,
+                    row: bufs.shared_out,
+                })
             } else {
                 None
             };
-            launch.ctx.moe_combine(
-                launch.stream,
-                CombineCall {
-                    shape: CombineShape {
-                        m: 1,
-                        n: h,
-                        top_k: k,
-                        ld_down: h,
+            // The combine width is `dims.top_k` for both passes — the resident pass's slot
+            // weights and the miss pass's router weights are both `top_k` wide.
+            if let Some((res, out)) = pass.combine {
+                let cw = dims.top_k;
+                launch.ctx.moe_combine(
+                    launch.stream,
+                    CombineCall {
+                        shape: CombineShape {
+                            m: 1,
+                            n: h,
+                            top_k: cw,
+                            ld_down: h,
+                        },
+                        res,
+                        down: bufs.expert_down,
+                        weights: pass.weights,
+                        shared,
+                        out: CombineOut::To(out),
                     },
-                    res: pass.res,
-                    down: bufs.expert_down,
-                    weights: pass.weights,
-                    shared,
-                    out: CombineOut::To(pass.out),
-                },
-            )
+                )?
+            }
+            Ok(())
         }
     }
 }

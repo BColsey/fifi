@@ -15,13 +15,14 @@
 //! - a bank that holds none of the row's picks: ten misses, the resident pass is all filler, then
 //!   the same row again.
 //!
-//! Each case runs with the finite-filler check on and again, on a fresh bank, with it off. With it
-//! off the host does not read the stream between the resident pass and the bank's copies, so the
-//! copies overlap the resident pass: the default path.
+//! The default path runs with no host read between the resident pass and the bank's copies, so
+//! the copies overlap the resident pass.
 //!
-//! Checked: a layer without a miss writes the bytes of the all-resident block; a layer with misses
-//! is within a relative L2 of 1e-6 of it (the sums are associated in two groups, every product is
-//! the same); both are within the block's bound of fp64; the bank holds every pick afterwards.
+//! Checked: every run — misses or none — writes the BYTES of the all-resident block (one
+//! rank-order combine, so the output does not depend on the slot count, the miss split or the
+//! LRU state); all are within the block's bound of fp64; the bank holds every pick afterwards.
+//! The slot-count independence is pinned directly by
+//! [`the_split_output_is_identical_at_two_slot_counts`] (195 and 200 slots, byte for byte).
 //!
 //! The prefill ring has its own tests: `a_chunk_over_the_prefill_ring_matches_the_all_resident_block`
 //! (49 rows over a funded ring, RING_BOUND against the all-resident block and fp64) and
@@ -62,7 +63,8 @@ use crate::{
 
 const F32: usize = 4;
 const SLOTS: usize = 16;
-/// The two groupings of the sums differ only by association: a handful of float roundings.
+/// The union-admit chunk path's flat launch groups the rows' pairs differently than the
+/// per-row launches; the difference is a handful of float roundings.
 const SPLIT_BOUND: f64 = 1e-6;
 /// The ring branch's per-row output deviates from the all-resident block and from fp64 by
 /// 1.5e-4 to 2.9e-4 relative L2, measured on this pack at rows=49; the deviation is
@@ -368,93 +370,183 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
     let source = PackRecordSource::new(checkpoint).expect("the record source");
     let layout = source.layout().clone();
 
-    for verify in [true, false] {
-        for case in ["mixed", "one miss", "forced miss"] {
-            // Per bank layer: the experts its slots hold and the misses its row will cause.
-            let held: Vec<Vec<u16>> = prepared
-                .iter()
-                .map(|p| match case {
-                    // Six of the ten picks held, ten other experts: four misses.
-                    "mixed" => {
-                        let mut held: Vec<u16> =
-                            p.picks().iter().take(6).map(|&e| e as u16).collect();
-                        held.extend(others(p.picks(), SLOTS - 6));
-                        held
-                    }
-                    // Nine of the ten picks held: exactly one miss, the narrowest compact
-                    // miss pass (width 1 where the filler launch always carried 10).
-                    "one miss" => {
-                        let mut held: Vec<u16> =
-                            p.picks().iter().take(9).map(|&e| e as u16).collect();
-                        held.extend(others(p.picks(), SLOTS - 9));
-                        held
-                    }
-                    // None held: ten misses, the resident pass is all filler.
-                    _ => others(p.picks(), SLOTS),
-                })
-                .collect();
-            let expected_misses: Vec<usize> = prepared
-                .iter()
-                .zip(&held)
-                .map(|(p, held)| {
-                    p.picks()
-                        .iter()
-                        .filter(|&&pick| !held.contains(&(pick as u16)))
-                        .count()
-                })
-                .collect();
-            let bank = build_bank(&projector, &source, &layers, &held);
-            let trunks = prepared.iter().map(Prepared::trunk).collect();
-            let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &moe).expect("split");
-            split.verify_finite_filler(verify);
-            let mut errors = Vec::new();
-            for run in 0..2 {
-                // Bank layer 1 first, then layer 0.
-                for bank_layer in [1usize, 0] {
-                    let p = &prepared[bank_layer];
-                    let expect = if run == 0 {
-                        expected_misses[bank_layer]
-                    } else {
-                        0
-                    };
-                    let rig = Rig::new(&projector, &moe, &p.row).expect("rig");
-                    let before = split.bank().state().stats().misses;
-                    split
-                        .run(&launch, bank_layer, &rig.bufs().expect("bufs"), &moe)
-                        .expect("the split block");
-                    stream.synchronize().expect("sync");
-                    let got = rig.out_bytes(&projector);
-                    let misses = (split.bank().state().stats().misses - before) as usize;
-                    let tag = format!(
-                        "{case}, filler check {}, run {run}, bank layer {bank_layer} (pack layer {})",
-                        if verify { "on" } else { "off" },
-                        layers[bank_layer]
-                    );
-                    assert_eq!(misses, expect, "{tag}: misses");
-                    let resident_error = relative_l2(&floats(&got), &floats_f64(&p.resident));
-                    let fp64_error = relative_l2(&floats(&got), &p.want.out);
-                    println!(
-                        "{tag}: {misses} misses, vs all-resident {resident_error:.3e}, vs fp64 \
+    for case in ["mixed", "one miss", "forced miss"] {
+        // Per bank layer: the experts its slots hold and the misses its row will cause.
+        let held: Vec<Vec<u16>> = prepared
+            .iter()
+            .map(|p| match case {
+                // Six of the ten picks held, ten other experts: four misses.
+                "mixed" => {
+                    let mut held: Vec<u16> = p.picks().iter().take(6).map(|&e| e as u16).collect();
+                    held.extend(others(p.picks(), SLOTS - 6));
+                    held
+                }
+                // Nine of the ten picks held: exactly one miss, the narrowest compact
+                // miss pass (width 1 where the filler launch always carried 10).
+                "one miss" => {
+                    let mut held: Vec<u16> = p.picks().iter().take(9).map(|&e| e as u16).collect();
+                    held.extend(others(p.picks(), SLOTS - 9));
+                    held
+                }
+                // None held: ten misses, the resident pass is all filler.
+                _ => others(p.picks(), SLOTS),
+            })
+            .collect();
+        let expected_misses: Vec<usize> = prepared
+            .iter()
+            .zip(&held)
+            .map(|(p, held)| {
+                p.picks()
+                    .iter()
+                    .filter(|&&pick| !held.contains(&(pick as u16)))
+                    .count()
+            })
+            .collect();
+        let bank = build_bank(&projector, &source, &layers, &held);
+        let trunks = prepared.iter().map(Prepared::trunk).collect();
+        let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &moe).expect("split");
+        let mut errors = Vec::new();
+        for run in 0..2 {
+            // Bank layer 1 first, then layer 0.
+            for bank_layer in [1usize, 0] {
+                let p = &prepared[bank_layer];
+                let expect = if run == 0 {
+                    expected_misses[bank_layer]
+                } else {
+                    0
+                };
+                let rig = Rig::new(&projector, &moe, &p.row).expect("rig");
+                let before = split.bank().state().stats().misses;
+                split
+                    .run(&launch, bank_layer, &rig.bufs().expect("bufs"), &moe)
+                    .expect("the split block");
+                stream.synchronize().expect("sync");
+                let got = rig.out_bytes(&projector);
+                let misses = (split.bank().state().stats().misses - before) as usize;
+                let tag = format!(
+                    "{case}, run {run}, bank layer {bank_layer} (pack layer {})",
+                    layers[bank_layer]
+                );
+                assert_eq!(misses, expect, "{tag}: misses");
+                let resident_error = relative_l2(&floats(&got), &floats_f64(&p.resident));
+                let fp64_error = relative_l2(&floats(&got), &p.want.out);
+                println!(
+                    "{tag}: {misses} misses, vs all-resident {resident_error:.3e}, vs fp64 \
                          {fp64_error:.3e}"
-                    );
-                    assert!(fp64_error < OUTPUT_BOUND, "{tag}: fp64 {fp64_error}");
-                    if expect == 0 {
-                        assert_eq!(got, p.resident, "{tag}: no miss writes the resident bytes");
-                    } else {
-                        assert!(resident_error < SPLIT_BOUND, "{tag}: {resident_error}");
-                    }
-                    errors.push(resident_error);
-                }
-            }
-            for (bank_layer, p) in prepared.iter().enumerate() {
-                for &pick in p.picks() {
-                    assert!(
-                        split.bank().state().slot_row(bank_layer)[pick] >= 0,
-                        "{case}: pick {pick} of bank layer {bank_layer} is in the bank"
-                    );
-                }
+                );
+                assert!(fp64_error < OUTPUT_BOUND, "{tag}: fp64 {fp64_error}");
+                // One rank-order combine: the split writes the all-resident bytes at any
+                // miss split, so the output does not depend on the slot count.
+                assert_eq!(
+                    got, p.resident,
+                    "{tag}: the split writes the resident bytes"
+                );
+                errors.push(resident_error);
             }
         }
+        for (bank_layer, p) in prepared.iter().enumerate() {
+            for &pick in p.picks() {
+                assert!(
+                    split.bank().state().slot_row(bank_layer)[pick] >= 0,
+                    "{case}: pick {pick} of bank layer {bank_layer} is in the bank"
+                );
+            }
+        }
+    }
+}
+
+/// The split output must not depend on the bank geometry OR the miss split: the same rows over
+/// a 195-slot bank holding SIX of the ten picks (four misses) and a 200-slot bank holding NINE
+/// (one miss) write identical bytes — different miss sets, not just different eviction — and
+/// those bytes are the all-resident block's, the association prefill sums in.
+#[test]
+#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_split_output_is_identical_at_two_slot_counts() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first, first + 1];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let moe = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let prepared: Vec<Prepared> = layers
+        .iter()
+        .enumerate()
+        .map(|(index, &layer)| prepare(&projector, checkpoint, (layer, index), &moe, &launch))
+        .collect();
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // Four outputs per slot count: run 0 (mixed misses) and run 1 (all picks now resident),
+    // bank layer 1 then 0, in the same order at both counts. The two counts hold DIFFERENT
+    // miss sets: six of ten picks at 195 slots (four misses), nine of ten at 200 (one miss) —
+    // the old two-group sum gave those different associations, so this test fails on it.
+    let mut by_slots: Vec<Vec<Vec<u8>>> = Vec::new();
+    for (slots, held_picks) in [(195usize, 6usize), (200, 9)] {
+        let held: Vec<Vec<u16>> = prepared
+            .iter()
+            .map(|p| {
+                let mut held: Vec<u16> = p
+                    .picks()
+                    .iter()
+                    .take(held_picks)
+                    .map(|&e| e as u16)
+                    .collect();
+                held.extend(others(p.picks(), slots - held_picks));
+                held
+            })
+            .collect();
+        let bank = build_bank(&projector, &source, &layers, &held);
+        let trunks = prepared.iter().map(Prepared::trunk).collect();
+        let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &moe).expect("split");
+        let mut outs = Vec::new();
+        for run in 0..2 {
+            for bank_layer in [1usize, 0] {
+                let p = &prepared[bank_layer];
+                let rig = Rig::new(&projector, &moe, &p.row).expect("rig");
+                let before = split.bank().state().stats().misses;
+                split
+                    .run(&launch, bank_layer, &rig.bufs().expect("bufs"), &moe)
+                    .expect("the split block");
+                stream.synchronize().expect("sync");
+                let misses = (split.bank().state().stats().misses - before) as usize;
+                assert_eq!(
+                    misses,
+                    if run == 0 { 10 - held_picks } else { 0 },
+                    "slots {slots}, run {run}, bank layer {bank_layer}"
+                );
+                outs.push(rig.out_bytes(&projector));
+            }
+        }
+        by_slots.push(outs);
+    }
+    for (i, (a, b)) in by_slots[0].iter().zip(&by_slots[1]).enumerate() {
+        assert_eq!(a, b, "output {i} differs between 195 and 200 slots");
+    }
+    for (i, out) in by_slots[0].iter().enumerate() {
+        let bank_layer = if i % 2 == 0 { 1 } else { 0 };
+        assert_eq!(
+            out, &prepared[bank_layer].resident,
+            "output {i} is the all-resident block's bytes"
+        );
     }
 }
 
@@ -1068,6 +1160,10 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
     }
 }
 
+// Dead since 5590d49ed (2026-11-10, on main) dropped its attributes in a rename; restored
+// here because this is the only executing test of the per-row miss path in run_rows.
+#[test]
+#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
     assert!(
         device_present("Flash-Next split MoE block"),
@@ -1214,9 +1310,9 @@ fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
                     fp64_error < OUTPUT_BOUND,
                     "{tag}, row {r}: fp64 {fp64_error}"
                 );
-                assert!(
-                    resident_error < SPLIT_BOUND,
-                    "{tag}, row {r}: all-resident {resident_error}"
+                assert_eq!(
+                    got, arm.residents[r],
+                    "{tag}, row {r}: the split writes the all-resident bytes"
                 );
             }
         }

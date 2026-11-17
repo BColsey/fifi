@@ -1,11 +1,12 @@
 //! Host tests of the split MoE block's logic: the private scratch layout, the classify log, the
-//! spans of the bank buffer, and the two passes of a layer against one pass over an all-resident
-//! bank. The expert outputs are synthetic and deterministic; the device test (ignored) runs the
+//! spans of the bank buffer, and the split of a layer against one pass over an all-resident
+//! bank — which the split must equal BIT FOR BIT, at any miss split (the miss pass overwrites
+//! the missed ranks' rows and one combine sums every pick in rank order).
+//! The expert outputs are synthetic and deterministic; the device test (ignored) runs the
 //! real kernels on a real layer.
 
 use super::moe_block::{
-    PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-    pick_union, plan_second_pass,
+    PassInputs, ScratchLayout, SlotSpans, classify_picks, parse_log, pick_union, plan_second_pass,
 };
 use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
@@ -92,8 +93,10 @@ fn holders(state: &ExpertBankState<ReplaceOnMissLru>, slots: usize) -> Vec<u16> 
         .collect()
 }
 
-/// Runs the two passes of one layer on the host: the picks go through the classifier and the
-/// policy, then the combine of each pass over the experts the slots held at that moment.
+/// Runs the split of one layer on the host: the picks go through the classifier and the policy,
+/// then the device order is mirrored — the resident rows hold the pre-copy experts, the missed
+/// ranks' rows are overwritten with the post-copy experts, and one combine sums every rank with
+/// the router's weights.
 /// Returns the split result and the pass inputs.
 fn split(
     state: &mut ExpertBankState<ReplaceOnMissLru>,
@@ -105,26 +108,24 @@ fn split(
     let before = holders(state, slots);
     let row_before = state.slot_row(0).to_vec();
     let classified = classify_picks(&row_before, slots, ids, weights).unwrap();
-    // Pass one reads the slots as they are before the copies.
-    let first_down = down_rows(classified.slot_ids.iter().map(|&s| before[s as usize]));
-    let zero = vec![0.0f32; HIDDEN];
-    let shared = shared_row();
-    let first = combine_reference(
-        &zero,
-        &first_down,
-        &classified.weights,
-        Some((gate, &shared)),
-    );
     state.begin_pass(0, ids).unwrap();
     let after = holders(state, slots);
-    let second = plan_second_pass(ids, weights, &classified, state.slot_row(0)).unwrap();
-    let result = match &second.miss {
-        None => first,
-        Some((miss_slots, miss_weights)) => {
-            let down = down_rows(miss_slots.iter().map(|&s| after[s as usize]));
-            combine_reference(&first, &down, miss_weights, None)
+    let second = plan_second_pass(ids, &classified, state.slot_row(0)).unwrap();
+    // The device order, mirrored: the resident pass writes every rank row (a filler row at a
+    // missed rank), the miss pass overwrites the missed ranks' rows, and ONE combine sums every
+    // rank in pick order with the router's true weights.
+    let mut experts: Vec<u16> = classified
+        .slot_ids
+        .iter()
+        .map(|&s| before[s as usize])
+        .collect();
+    if let Some((miss_slots, miss_ranks)) = &second.miss {
+        for (j, &rank) in miss_ranks.iter().enumerate() {
+            experts[rank as usize] = after[miss_slots[j] as usize];
         }
-    };
+    }
+    let down = down_rows(experts.iter().copied());
+    let result = combine_reference(&[0.0; HIDDEN], &down, weights, Some((gate, &shared_row())));
     (result, second)
 }
 
@@ -132,16 +133,6 @@ fn split(
 fn all_resident(ids: &[i32], weights: &[f32], gate: f32) -> Vec<f32> {
     let down = down_rows(ids.iter().map(|&id| id as u16));
     combine_reference(&[0.0; HIDDEN], &down, weights, Some((gate, &shared_row())))
-}
-
-fn close(a: &[f32], b: &[f32]) -> f64 {
-    let diff: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).powi(2))
-        .sum();
-    let norm: f64 = b.iter().map(|y| f64::from(*y).powi(2)).sum();
-    (diff / norm).sqrt()
 }
 
 #[test]
@@ -359,20 +350,18 @@ fn a_miss_pass_adds_each_missed_pick_once() {
     let classified = classify_picks(state.slot_row(0), 16, &ids, &w).unwrap();
     assert_eq!(classified.misses.len(), 2);
     let (result, inputs) = split(&mut state, &ids, &w, 0.6);
-    let (slots, miss_weights) = inputs.miss.expect("two misses");
-    // The compact list carries the missed picks (rank positions 2 and 7) in pick order; every
-    // other pick contributes exactly +0.0 to the split by being absent, not by a filler entry.
+    let (slots, ranks) = inputs.miss.expect("two misses");
+    // The compact list carries the missed picks (rank positions 2 and 7) in pick order, and
+    // names the rank rows their down outputs overwrite; every other pick keeps its resident
+    // row, so the one combine sees each pick exactly once at its true weight.
     assert_eq!(slots.len(), 2);
+    assert_eq!(ranks, vec![2, 7]);
     for (pick, &weight) in w.iter().enumerate() {
         let missed = pick == 2 || pick == 7;
         assert_eq!(classified.weights[pick] != 0.0, !missed, "pick {pick}");
-        let carried = match pick {
-            2 | 7 => miss_weights[if pick == 2 { 0 } else { 1 }],
-            _ => 0.0,
-        };
-        // The weights of the two passes add to the router's weights bit for bit.
+        // The combine weight is the router's weight bit for bit at every rank.
         assert_eq!(
-            (classified.weights[pick] + carried).to_bits(),
+            classified.log[pick].1.to_bits(),
             weight.to_bits(),
             "pick {pick}"
         );
@@ -385,10 +374,8 @@ fn a_miss_pass_adds_each_missed_pick_once() {
             Some(ids[pick] as u16)
         );
     }
-    // The split equals one pass over all-resident experts up to the association of the sums.
-    let want = all_resident(&ids, &w, 0.6);
-    let error = close(&result, &want);
-    assert!(error < 1e-6, "relative L2 {error}");
+    // The split IS one pass over all-resident experts, bit for bit: one rank-order combine.
+    assert_eq!(result, all_resident(&ids, &w, 0.6));
 }
 
 #[test]
@@ -403,7 +390,7 @@ fn every_pick_missing_is_all_filler_then_all_picks() {
     assert!(classified.slot_ids.iter().all(|&s| s == 0));
     assert!(classified.weights.iter().all(|w| w.to_bits() == 0));
     let (result, inputs) = split(&mut state, &ids, &w, 0.6);
-    let (slots, miss_weights) = inputs.miss.expect("ten misses");
+    let (slots, ranks) = inputs.miss.expect("ten misses");
     assert_eq!(inputs.misses, 10);
     // Ten picks of ten distinct experts need ten slots besides slot 0.
     let mut seen = slots.clone();
@@ -411,14 +398,41 @@ fn every_pick_missing_is_all_filler_then_all_picks() {
     seen.dedup();
     assert_eq!(seen.len(), 10);
     assert!(!slots.contains(&0));
+    // Every rank row is overwritten: the all-filler resident pass contributes nothing that
+    // survives to the one combine.
+    assert_eq!(ranks, (0..10u32).collect::<Vec<u32>>());
+    assert_eq!(result, all_resident(&ids, &w, 0.6));
+}
+
+#[test]
+fn the_filler_experts_identity_cannot_reach_the_sum() {
+    // Replaces the removed filler-NaN tests. Slot 0 is the designated filler: when a pick
+    // misses, the resident pass reads slot 0's rows at the missed ranks while the copies run
+    // (plan_pass protects slot 0 for exactly that), and the miss pass overwrites those rows
+    // before the one combine. Two banks differing ONLY in slot 0's expert must therefore
+    // write identical bytes.
+    let ids: Vec<i32> = vec![3, 9, 300, 14, 1, 7, 12, 411, 2, 15];
+    let w = weights();
+    let resident: Vec<u16> = [3u16, 9, 14, 1, 7, 12, 2, 15].to_vec();
+    let tail: Vec<u16> = [101u16, 102, 103, 104, 105, 106, 107].to_vec();
+    let held_a: Vec<u16> = [vec![500u16], resident.clone(), tail.clone()].concat();
+    let held_b: Vec<u16> = [vec![501u16], resident, tail].concat();
+    let mut state_a = bank(&held_a);
+    let mut state_b = bank(&held_b);
+    let (result_a, inputs_a) = split(&mut state_a, &ids, &w, 0.6);
+    let (result_b, inputs_b) = split(&mut state_b, &ids, &w, 0.6);
+    assert_eq!(inputs_a.misses, 2);
+    assert_eq!(inputs_b.misses, 2, "the same picks miss in both banks");
     assert!(
-        miss_weights
-            .iter()
-            .zip(&w)
-            .all(|(a, b)| a.to_bits() == b.to_bits())
+        !inputs_a.miss.as_ref().unwrap().0.contains(&0)
+            && !inputs_b.miss.as_ref().unwrap().0.contains(&0),
+        "slot 0 is the protected filler, never a victim"
     );
-    let error = close(&result, &all_resident(&ids, &w, 0.6));
-    assert!(error < 1e-6, "relative L2 {error}");
+    assert_eq!(
+        result_a, result_b,
+        "the filler expert cannot change the bytes"
+    );
+    assert_eq!(result_a, all_resident(&ids, &w, 0.6));
 }
 
 #[test]
@@ -431,22 +445,10 @@ fn a_second_use_of_the_same_picks_is_one_pass() {
     assert_eq!(inputs.misses, 2);
     let (again, inputs) = split(&mut state, &ids, &w, 0.6);
     assert_eq!(inputs.misses, 0, "the missed experts now sit in the bank");
-    assert!(close(&again, &first) < 1e-6);
-}
-
-#[test]
-fn a_filler_output_that_is_not_finite_poisons_the_sum() {
-    // Why the block can verify the filler rows: +0.0 times an infinity is a NaN, and the NaN
-    // reaches every column the infinity touches.
-    let zero = vec![0.0f32; 4];
-    let mut filler = vec![1.0f32; 4];
-    filler[2] = f32::INFINITY;
-    let good = vec![0.5f32; 4];
-    let out = combine_reference(&zero, &[good.clone(), filler], &[0.5, 0.0], None);
-    assert!(out[2].is_nan());
-    assert!(out[0].is_finite() && out[1].is_finite() && out[3].is_finite());
-    let fine = combine_reference(&zero, &[good.clone(), good], &[0.5, 0.0], None);
-    assert!(fine.iter().all(|v| v.is_finite()));
+    assert_eq!(
+        again, first,
+        "a clean pass and a split pass sum identically"
+    );
 }
 
 #[test]
@@ -459,61 +461,15 @@ fn the_bank_state_after_a_pass_is_what_the_second_pass_reads() {
     let classified = classify_picks(&row_before, 11, &ids, &w).unwrap();
     let copies = state.begin_pass(0, &ids).unwrap();
     assert_eq!((copies.hits, copies.ops.len()), (9, 1));
-    let second = plan_second_pass(&ids, &w, &classified, state.slot_row(0)).unwrap();
-    let (slots, _) = second.miss.unwrap();
-    // Pick 9 is the only miss, so the compact list holds it at index 0.
+    let second = plan_second_pass(&ids, &classified, state.slot_row(0)).unwrap();
+    let (slots, ranks) = second.miss.unwrap();
+    // Pick 9 is the only miss, so the compact list holds it at index 0 and overwrites its rank.
     assert_eq!(slots[0], i32::from(copies.ops[0].slot));
+    assert_eq!(ranks, vec![9]);
     // The classification made before the copies is stale after them: a second use of the old row
     // would send the missed pick to the filler.
     assert_eq!(row_before[200], -1);
     assert!(state.slot_row(0)[200] >= 0);
-}
-
-fn le_rows(rows: &[Vec<f32>]) -> Vec<u8> {
-    rows.iter()
-        .flatten()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-#[test]
-fn a_non_finite_filler_row_is_found_by_pick() {
-    let finite = vec![0.5f32; HIDDEN];
-    let mut nan = finite.clone();
-    nan[3] = f32::NAN;
-    let mut inf = finite.clone();
-    inf[7] = f32::NEG_INFINITY;
-    // Picks 1 and 3 are fillers (weight +0.0); picks 0 and 2 are real picks.
-    let weights = [0.6f32, 0.0, 0.4, 0.0];
-    let rows = |bad1: &Vec<f32>, bad3: &Vec<f32>| {
-        le_rows(&[finite.clone(), bad1.clone(), finite.clone(), bad3.clone()])
-    };
-    assert_eq!(
-        first_poisoned_filler(&rows(&finite, &finite), HIDDEN, &weights),
-        None
-    );
-    assert_eq!(
-        first_poisoned_filler(&rows(&nan, &finite), HIDDEN, &weights),
-        Some(1),
-        "a NaN row at weight +0.0"
-    );
-    assert_eq!(
-        first_poisoned_filler(&rows(&finite, &inf), HIDDEN, &weights),
-        Some(3),
-        "an infinite row at weight +0.0"
-    );
-    assert_eq!(
-        first_poisoned_filler(&rows(&inf, &nan), HIDDEN, &weights),
-        Some(1),
-        "the first of two"
-    );
-    // A non-finite row on a real pick is not a filler problem: the sum is wrong for another reason.
-    let real_nan = le_rows(&[nan.clone(), finite.clone(), finite.clone(), finite.clone()]);
-    assert_eq!(first_poisoned_filler(&real_nan, HIDDEN, &weights), None);
-    // A negative zero is the same product: -0.0 == 0.0.
-    let negative = [-0.0f32, 0.0, 0.4, 0.0];
-    let first = le_rows(&[nan, finite.clone(), finite.clone(), finite.clone()]);
-    assert_eq!(first_poisoned_filler(&first, HIDDEN, &negative), Some(0));
 }
 
 #[test]
