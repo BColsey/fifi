@@ -84,6 +84,9 @@ struct Entry<'a> {
     /// Engine-start to first batch, on the same condition.
     prefill: Option<Duration>,
     stream: bool,
+    /// Which request field set the output cap; `None` when the log's builder
+    /// never said (a test-built log).
+    cap_source: Option<&'static str>,
     /// The HTTP status that the client got. `None` when the client got no response.
     status: Option<u16>,
     outcome: Outcome,
@@ -162,6 +165,12 @@ fn render(entry: &Entry<'_>) -> String {
         "time_to_first_token_ms": entry.first_token.map(millis),
         "decode_tokens_per_second": entry.decode.and_then(|(tokens, span)| rate(tokens, span)),
     });
+    // Only a log whose route said which field set the cap carries the key -
+    // a test-built log's line stays byte-identical to before the field
+    // existed, and the count_tokens route (which has no cap) is unchanged.
+    if let Some(source) = entry.cap_source {
+        line["max_tokens_cap_field"] = json!(source);
+    }
     if let Some(digests) = entry.digests
         && let Some(object) = line.as_object_mut()
     {
@@ -439,6 +448,9 @@ pub(crate) struct RequestLog {
     clock: Clock,
     model: String,
     stream: bool,
+    /// Which request field set the output cap (`max_completion_tokens`,
+    /// `max_tokens`, or `default`), recorded on the request line.
+    cap_source: Option<&'static str>,
     request_id: Option<String>,
     prompt_tokens: u32,
     /// Set when the queue admits the job. A stream sends its headers at that moment.
@@ -485,6 +497,7 @@ impl RequestLog {
             clock,
             model: model.to_string(),
             stream,
+            cap_source: None,
             request_id: None,
             prompt_tokens,
             admitted: None,
@@ -534,6 +547,13 @@ impl RequestLog {
 
     pub(crate) fn set_session(&mut self, id: &str) {
         self.session = Some(id.to_string());
+    }
+
+    /// Which request field set the output cap. Called by the serving routes
+    /// before any line is written; a test-built log leaves it unset and the
+    /// line omits the key entirely.
+    pub(crate) fn set_cap_source(&mut self, source: &'static str) {
+        self.cap_source = Some(source);
     }
 
     /// The engine thread started this job. First call wins.
@@ -654,6 +674,7 @@ impl RequestLog {
             queue_wait,
             prefill,
             stream: self.stream,
+            cap_source: self.cap_source,
             status,
             outcome,
             error_code,
@@ -767,10 +788,9 @@ mod tests {
 
     const CALL: &str = "<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call>";
 
-    /// The keys of every line without a prefix boundary, sorted.
-    /// The keys of a route-produced row: the serving path always sets the
-    /// prompt digests after the prompt renders.
-    const ROUTE_KEYS: [&str; 27] = [
+    /// ROUTE_KEYS minus the cap field: a count_tokens line has no output cap,
+    /// so its line never carries `max_tokens_cap_field`.
+    const COUNT_KEYS: [&str; 27] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
@@ -779,6 +799,40 @@ mod tests {
         "finish_reason",
         "first_token_margin",
         "lcp_prev_request_tokens",
+        "method",
+        "model",
+        "outcome",
+        "prefill_max_piece",
+        "prefill_ms",
+        "prefill_pieces",
+        "prompt_hash_1024",
+        "prompt_hash_4096",
+        "prompt_hash_anchors",
+        "prompt_hash_full",
+        "prompt_tokens",
+        "queue_wait_ms",
+        "request_id",
+        "reused_tokens",
+        "session",
+        "started_at_ms",
+        "status",
+        "stream",
+        "time_to_first_token_ms",
+    ];
+
+    /// The keys of every line without a prefix boundary, sorted.
+    /// The keys of a route-produced row: the serving path always sets the
+    /// prompt digests after the prompt renders.
+    const ROUTE_KEYS: [&str; 28] = [
+        "completion_tokens",
+        "decode_tokens_per_second",
+        "endpoint",
+        "engine",
+        "error_code",
+        "finish_reason",
+        "first_token_margin",
+        "lcp_prev_request_tokens",
+        "max_tokens_cap_field",
         "method",
         "model",
         "outcome",
@@ -827,7 +881,7 @@ mod tests {
 
     /// The keys of a line whose request carried a prefix boundary: the keys above plus
     /// the `prefix_*` keys, sorted.
-    const PREFIX_KEYS: [&str; 38] = [
+    const PREFIX_KEYS: [&str; 39] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
@@ -836,6 +890,7 @@ mod tests {
         "finish_reason",
         "first_token_margin",
         "lcp_prev_request_tokens",
+        "max_tokens_cap_field",
         "method",
         "model",
         "outcome",
@@ -1099,7 +1154,7 @@ mod tests {
             testkit::send(&app, testkit::post_json("/v1/messages/count_tokens", &body)).await;
         assert_eq!(status, StatusCode::OK);
         let reply = testkit::json_of(&bytes);
-        let lines = capture.lines_with_keys(&ROUTE_KEYS);
+        let lines = capture.lines_with_keys(&COUNT_KEYS);
         assert_eq!(lines.len(), 1, "one line per count_tokens request");
         let line = &lines[0];
         assert_eq!(line["status"], 200);
@@ -1116,7 +1171,7 @@ mod tests {
         );
         let (_status, _headers, _bytes) =
             testkit::send(&app, testkit::post_json("/v1/messages/count_tokens", &body)).await;
-        let lines = capture.lines_with_keys(&ROUTE_KEYS);
+        let lines = capture.lines_with_keys(&COUNT_KEYS);
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1]["lcp_prev_request_tokens"],
@@ -1222,7 +1277,7 @@ mod tests {
             PrefillPieces::default(),
             None,
         );
-        let line = &capture.lines_with_keys(&ROUTE_KEYS)[0];
+        let line = &capture.lines_with_keys(&COUNT_KEYS)[0];
         assert_eq!(line["method"], "POST");
         assert_eq!(line["endpoint"], "/v1/messages");
         assert_eq!(line["prompt_hash_1024"].as_str().map(str::len), Some(16));
@@ -1269,6 +1324,7 @@ mod tests {
             started_at_ms: 0,
             queue_wait: None,
             prefill: None,
+            cap_source: None,
             stream: false,
             first_token_margin: None,
             status: None,
@@ -1326,6 +1382,7 @@ mod tests {
             queue_wait: None,
             prefill: None,
             stream: true,
+            cap_source: Some("max_completion_tokens"),
             status: Some(200),
             outcome: Outcome::Ok,
             finish_reason: Some(FinishReason::Length),
@@ -1348,6 +1405,7 @@ mod tests {
                 "session": null,
                 "started_at_ms": 0,
                 "stream": true,
+                "max_tokens_cap_field": "max_completion_tokens",
                 "status": 200,
                 "outcome": "ok",
                 "error_code": null,
@@ -1369,6 +1427,8 @@ mod tests {
     #[test]
     fn the_line_gives_null_for_every_value_that_the_request_never_had() {
         let line: Value = serde_json::from_str(&render(&empty_entry())).expect("json");
+        // The cap key is omitted, not null, when the log never said.
+        assert!(line.get("max_tokens_cap_field").is_none(), "{line}");
         for key in [
             "request_id",
             "status",
@@ -1759,6 +1819,7 @@ mod tests {
             "prefill_ms": 2.0,
             "time_to_first_token_ms": 4.0,
             "decode_tokens_per_second": 500.0,
+            "max_tokens_cap_field": "default",
             "prefix_hit": "miss",
             "prefix_entries": 2,
             "prefix_bytes": 2_000,
@@ -1899,7 +1960,7 @@ mod tests {
         let (status, _headers, bytes) = testkit::send(&app, post).await;
         assert_eq!(status, StatusCode::OK);
         let reply = testkit::json_of(&bytes);
-        // The exact bytes of the old line: the same thirteen keys, in the render order, with
+        // The exact bytes of the old line: the same keys, in the render order, with
         // the values of this request; the stepped test clock makes the timings exact. A line
         // that gained the prefix keys of a request without a boundary fails here.
         let want = json!({
@@ -1908,6 +1969,7 @@ mod tests {
             "engine": "e1",
                 "session": null,
             "stream": false,
+            "max_tokens_cap_field": "max_tokens",
             "status": 200,
             "outcome": "ok",
             "error_code": null,
@@ -2058,6 +2120,7 @@ mod tests {
                 "prefill_ms": null,
                 "time_to_first_token_ms": null,
                 "decode_tokens_per_second": null,
+                "max_tokens_cap_field": "default",
                 "prompt_hash_1024": "ea09b61c2b659ce4",
                 "prompt_hash_4096": "ea09b61c2b659ce4",
                 "prompt_hash_full": "ea09b61c2b659ce4",

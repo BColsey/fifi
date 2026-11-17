@@ -33,7 +33,8 @@ Request fields:
 | `model` | | A name from `/v1/models`. The first engine serving it takes the request. |
 | `messages` | required | |
 | `stream` | `false` | Server-sent events, ending with `data: [DONE]`. |
-| `max_tokens` | 2,048 | Lowered when the prompt plus `max_tokens` would pass the engine's context limit. |
+| `max_tokens` | 2,048 | Legacy field, deprecated in favor of `max_completion_tokens`. Lowered when the prompt plus the cap would pass the engine's context limit. |
+| `max_completion_tokens` | 2,048 | The current OpenAI field. Same bounds, validation and clamp as `max_tokens`. When both fields are sent, this one wins; the request log line records which field set the cap in `max_tokens_cap_field`. |
 | `temperature` | from the model's `generation_config.json`, else 0.7 | 0 to 2. `0` selects greedy decoding. |
 | `top_p` | from `generation_config.json`, else 1.0 | 0 to 1. |
 | `top_k` | from `generation_config.json`, else 0 | `0` turns top-k off. |
@@ -66,7 +67,7 @@ The reply text is the generated text as it is, with no think block, tool call or
 | `model` | | As for chat completions. |
 | `prompt` | required | One non-empty string. A list of strings or of token ids returns `400`. |
 | `stream` | `false` | Server-sent events, ending with `data: [DONE]`. |
-| `max_tokens` | 2,048 | As for chat completions. |
+| `max_tokens` | 2,048 | As for chat completions. This legacy route does not read `max_completion_tokens`; the OpenAI reference defines that field only for chat completions. |
 | `temperature`, `top_p`, `top_k` | as for chat completions | Same bounds and defaults. |
 | `stop` | none | One string or an array of strings, matched on the decoded text. The stop text is not part of the reply. |
 | `x-engine`, `x-session` | none | As for chat completions. |

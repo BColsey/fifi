@@ -168,6 +168,7 @@ pub(crate) async fn submit(
         sampling,
         assembler,
         max_tokens: input.max_tokens,
+        cap_source: input.max_tokens_source,
         stream,
         sample_trace: input.sample_trace,
         reply,
@@ -194,6 +195,8 @@ pub(super) struct Admission {
     pub(super) sampling: SamplingParams,
     pub(super) assembler: OutputAssembler,
     pub(super) max_tokens: u32,
+    /// Which request field set `max_tokens`, for the request line.
+    pub(super) cap_source: &'static str,
     pub(super) stream: bool,
     /// Whether the request armed sampler-trace capture (`x-sample-trace`).
     pub(super) sample_trace: bool,
@@ -217,6 +220,7 @@ pub(super) fn admit(
         sampling,
         assembler,
         max_tokens: requested_tokens,
+        cap_source,
         stream,
         sample_trace,
         reply,
@@ -239,6 +243,7 @@ pub(super) fn admit(
     // out inside the ring, so the count route needs no wiring).
     log.set_ring(state.recent_ring());
     log.set_engine(&entry.id);
+    log.set_cap_source(cap_source);
     if let Some(id) = &session {
         log.set_session(id);
     }
@@ -576,6 +581,19 @@ mod tests {
     async fn the_context_limit_caps_the_reply_with_length() {
         let engine = testkit::engine(testkit::script("abcdefgh"));
         let (status, body) = post(&app(&engine, 24), &request(json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["choices"][0]["message"]["content"], "abc");
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_above_the_context_clamps_to_it() {
+        let engine = testkit::engine(testkit::script("abcdefgh"));
+        let (status, body) = post(
+            &app(&engine, 24),
+            &request(json!({"max_completion_tokens": 100_000})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["choices"][0]["message"]["content"], "abc");
         assert_eq!(body["choices"][0]["finish_reason"], "length");

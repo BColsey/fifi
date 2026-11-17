@@ -36,6 +36,9 @@ pub(crate) struct ChatInput {
     pub(crate) stops: Vec<String>,
     pub(crate) sampling: RequestedSampling,
     pub(crate) max_tokens: u32,
+    /// Which request field set `max_tokens` (`max_completion_tokens`,
+    /// `max_tokens`, or `default`), recorded on the request line.
+    pub(crate) max_tokens_source: &'static str,
     pub(crate) stream: bool,
     /// Arms sampler-trace capture for this reply (`x-sample-trace`). The
     /// server refuses the field with 400 unless its `sample_trace` setting
@@ -63,7 +66,7 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
     }
     check_constrained_output(object)?;
     let sampling = requested_sampling(object)?;
-    let max_tokens = requested_max_tokens(object)?;
+    let (max_tokens, max_tokens_source) = chat_output_cap(object)?;
     Ok(ChatInput {
         model: optional_string(object, "model", "")?,
         engine: optional_string(object, "x-engine", "")?,
@@ -74,6 +77,7 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
         stops: stops(object)?,
         sampling,
         max_tokens,
+        max_tokens_source,
         stream: flag(object, "stream")?,
         // A boolean extension field, absent meaning false: `flag` gives the
         // same 400 on a non-boolean value as every other boolean field.
@@ -106,6 +110,37 @@ pub(super) fn requested_max_tokens(object: &Map<String, Value>) -> Result<u32, S
     Ok(match count(object, "max_tokens", 1)? {
         None => DEFAULT_MAX_TOKENS,
         Some(limit) => u32::try_from(limit).unwrap_or(u32::MAX),
+    })
+}
+
+/// The chat route's output cap: `max_completion_tokens` (the current OpenAI
+/// field) or legacy `max_tokens`, each read with the same bounds as
+/// `requested_max_tokens` and 2,048 when both are absent, plus the name of
+/// the field that set it for the request line. When both are sent,
+/// `max_completion_tokens` wins - llama.cpp defines the same precedence:
+/// server-schema.h resolves a field's aliases "following the order they
+/// were added", and server-schema.cpp adds `max_completion_tokens` to
+/// `n_predict` before `max_tokens`, so it is the alias that wins. A null
+/// `max_completion_tokens` counts as absent (the field was ignored before
+/// this function read it, and the OpenAI reference allows null); a null
+/// `max_tokens` keeps its existing refusal.
+pub(super) fn chat_output_cap(
+    object: &Map<String, Value>,
+) -> Result<(u32, &'static str), ServerError> {
+    let legacy = count(object, "max_tokens", 1)?;
+    let current = match object.get("max_completion_tokens") {
+        Some(Value::Null) | None => None,
+        Some(_) => count(object, "max_completion_tokens", 1)?,
+    };
+    Ok(match current {
+        Some(limit) => (
+            u32::try_from(limit).unwrap_or(u32::MAX),
+            "max_completion_tokens",
+        ),
+        None => match legacy {
+            Some(limit) => (u32::try_from(limit).unwrap_or(u32::MAX), "max_tokens"),
+            None => (DEFAULT_MAX_TOKENS, "default"),
+        },
     })
 }
 
@@ -389,6 +424,117 @@ mod tests {
                 rejected(&json!({"model": "m", "messages": user("hi"), "max_tokens": bad}));
             assert!(message.contains("max_tokens"), "{bad}: {message}");
         }
+    }
+
+    #[test]
+    fn max_completion_tokens_alone_parses() {
+        let body = json!({"model": "m", "messages": user("hi"), "max_completion_tokens": 16});
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 16);
+        assert_eq!(input.max_tokens_source, "max_completion_tokens");
+    }
+
+    #[test]
+    fn max_tokens_alone_names_itself_as_the_source() {
+        let body = json!({"model": "m", "messages": user("hi"), "max_tokens": 12});
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 12);
+        assert_eq!(input.max_tokens_source, "max_tokens");
+    }
+
+    #[test]
+    fn both_token_fields_equal_uses_max_completion_tokens() {
+        let body = json!({"model": "m", "messages": user("hi"), "max_tokens": 16, "max_completion_tokens": 16});
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 16);
+        assert_eq!(input.max_tokens_source, "max_completion_tokens");
+    }
+
+    #[test]
+    fn both_token_fields_differing_takes_max_completion_tokens() {
+        let body = json!({
+            "model": "m",
+            "messages": user("hi"),
+            "max_tokens": 8,
+            "max_completion_tokens": 16
+        });
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 16);
+        assert_eq!(input.max_tokens_source, "max_completion_tokens");
+    }
+
+    #[test]
+    fn an_absent_cap_defaults_with_default_as_the_source() {
+        let body = json!({"model": "m", "messages": user("hi")});
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 2_048);
+        assert_eq!(input.max_tokens_source, "default");
+    }
+
+    #[test]
+    fn a_null_max_completion_tokens_counts_as_absent() {
+        let body = json!({"model": "m", "messages": user("hi"), "max_completion_tokens": null});
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 2_048);
+        assert_eq!(input.max_tokens_source, "default");
+    }
+
+    #[test]
+    fn a_null_max_completion_tokens_falls_back_to_max_tokens() {
+        let body = json!({
+            "model": "m",
+            "messages": user("hi"),
+            "max_tokens": 12,
+            "max_completion_tokens": null
+        });
+        let input = parse(&body).expect("valid");
+        assert_eq!(input.max_tokens, 12);
+        assert_eq!(input.max_tokens_source, "max_tokens");
+    }
+
+    #[test]
+    fn an_invalid_max_tokens_refuses_even_with_a_valid_max_completion_tokens() {
+        let body = json!({
+            "model": "m",
+            "messages": user("hi"),
+            "max_tokens": 0,
+            "max_completion_tokens": 16
+        });
+        let message = rejected(&body);
+        assert!(message.contains("max_tokens"), "{message}");
+    }
+
+    #[test]
+    fn an_invalid_max_completion_tokens_refuses_even_with_a_valid_max_tokens() {
+        let body = json!({
+            "model": "m",
+            "messages": user("hi"),
+            "max_tokens": 16,
+            "max_completion_tokens": 0
+        });
+        let message = rejected(&body);
+        assert!(message.contains("max_completion_tokens"), "{message}");
+    }
+
+    #[test]
+    fn max_completion_tokens_below_1_names_field() {
+        // null is not in the list: it counts as absent, not invalid.
+        for bad in [json!(0), json!(-3), json!(1.5), json!("8")] {
+            let message = rejected(
+                &json!({"model": "m", "messages": user("hi"), "max_completion_tokens": bad}),
+            );
+            assert!(
+                message.contains("max_completion_tokens"),
+                "{bad}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_max_completion_tokens_saturates_at_the_u32_limit() {
+        let body =
+            json!({"model": "m", "messages": user("hi"), "max_completion_tokens": 1_u64 << 40});
+        assert_eq!(parse(&body).expect("valid").max_tokens, u32::MAX);
     }
 
     #[test]

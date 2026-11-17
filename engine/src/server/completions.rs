@@ -150,6 +150,7 @@ async fn submit(state: &AppState, input: CompletionInput) -> Result<Submitted, S
         sampling,
         assembler,
         max_tokens: input.max_tokens,
+        cap_source: "max_tokens",
         stream: input.stream,
         // The raw-completions route never arms capture; the field is a
         // chat extension.

@@ -383,6 +383,7 @@ fn parse_body(body: &[u8], mode: ParseMode) -> Result<AnthropicRequest, ServerEr
             stops: stop_sequences(object.get("stop_sequences"))?,
             sampling,
             max_tokens: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+            max_tokens_source: "max_tokens",
             // A non-boolean stream is a 400 on both routes; on count_tokens
             // the value itself is ignored — it never streams.
             stream: match (mode, flag(object, "stream")?) {
