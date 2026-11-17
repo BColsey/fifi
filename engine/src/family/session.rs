@@ -6064,11 +6064,13 @@ mod tests {
                 })
                 .collect()
         };
+        // Default reuse profile mirrored locally (two pinned roots, six LRU
+        // entries; the override replaces the cap): a shared module's tests do
+        // not import a family.
+        let reuse_limits = |entries: usize| StoreLimits { roots: 2, entries };
         // The DEFAULT: the first path is wiped - the cliff, in the store itself.
         assert_eq!(
-            run_group(crate::family::qwen36::settings::prefix_store_limits_of(
-                true, None
-            )),
+            run_group(reuse_limits(6)),
             vec![
                 0,
                 anchor as usize + 2,
@@ -6079,10 +6081,7 @@ mod tests {
         );
         // The operator's exact override: every path keeps its tip.
         assert_eq!(
-            run_group(crate::family::qwen36::settings::prefix_store_limits_of(
-                true,
-                Some(16)
-            )),
+            run_group(reuse_limits(16)),
             vec![anchor as usize + 2; 4],
             "with the override every path keeps its tip: no agent re-prefills"
         );
