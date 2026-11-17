@@ -41,30 +41,32 @@
 // Staged: the executor is the first caller of the whole step.
 #![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::Cell;
 
 use crate::{
     EngError,
     family::{
+        exl3::{
+            moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
+            prefill::{Exl3Scratch, Output, Projector, write_dense_jobs},
+        },
         exl3_pack::layer_name,
         flash_next::{
             cuda::{
                 moe_block::{SplitMoe, SplitMoeTrunk},
                 state::{FlashGeometry, StatePlan, StateSlot, WORD_STEP_PARAMS},
-                step_plan::{Site, Slot, StepOptions, StepPlan},
+                step_plan::{PREFILL_TILE_ROWS, Site, Slot, StepOptions, StepPlan},
             },
             load::model_shape,
             moe::context_budget::KvFormat,
             step::ModelShape,
         },
         gguf_model::Role,
+        prefill::arena::{ArenaHooks, allocate_zeroed},
         project::cuda::{
             CudaWeight, CudaWeights,
             exl3::{Exl3Io, Exl3JobsIo, Exl3Weight},
-        },
-        qwen36::cuda::{
-            exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-            moe::{Launch, MoeDims, RouteBufs},
         },
     },
     kernels::cuda::{
@@ -109,6 +111,8 @@ pub(super) struct FlashStep<'a> {
     /// The plan's row count: every launch takes `m` rows with `m <= rows` (decode is 1, a chunk
     /// is its token count). The slots hold this many rows.
     pub(super) rows: usize,
+    /// The shared owner also serves decode: only an open prefill window uses its new launches.
+    pub(super) prefill_window: Cell<bool>,
     /// Set by any error of a launch call; cleared by [`Self::reset`].
     poisoned: Cell<bool>,
 }
@@ -125,6 +129,54 @@ impl<'a> FlashStep<'a> {
         rows: usize,
         layers: std::ops::Range<usize>,
     ) -> Result<Self, EngError> {
+        Self::build(
+            ctx,
+            stream,
+            weights,
+            model_config,
+            positions,
+            rows,
+            layers,
+            false,
+        )
+    }
+
+    /// The shared-prefill owner, with dense and routed scratch from the shared plan.
+    pub(super) fn new_prefill(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model_config: &[u8],
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::build(
+            ctx,
+            stream,
+            weights,
+            model_config,
+            positions,
+            rows,
+            layers,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor for the two arena lists"
+    )]
+    fn build(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model_config: &[u8],
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+        shared_prefill: bool,
+    ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
         let geometry = FlashGeometry::new(&model, &kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
@@ -135,9 +187,18 @@ impl<'a> FlashStep<'a> {
         }
         let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
         let options = StepOptions::default();
-        let step_plan = StepPlan::new(&geometry, rows, positions, &options)?;
+        let step_plan = if shared_prefill {
+            StepPlan::new_prefill(&geometry, rows, positions, &options)?
+        } else {
+            StepPlan::new(&geometry, rows, positions, &options)?
+        };
         let state = ctx.arena(&state_plan.arena_tensors())?;
-        let scratch = ctx.arena(&step_plan.arena_tensors())?;
+        let tensors = step_plan.arena_tensors();
+        let scratch = if shared_prefill {
+            allocate_zeroed(ctx, stream, &tensors, false, ArenaHooks::default())?
+        } else {
+            ctx.arena(&tensors)?
+        };
         let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
         let step = Self {
             ctx,
@@ -153,6 +214,7 @@ impl<'a> FlashStep<'a> {
             zeros,
             layers,
             rows,
+            prefill_window: Cell::new(false),
             poisoned: Cell::new(false),
         };
         step.reset()?;
@@ -162,19 +224,75 @@ impl<'a> FlashStep<'a> {
     /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
     /// poison: a new sequence. The device has no memset wrapper yet, so the zeros go over in chunks
     /// of 16 MiB; a state of 6 GiB (a 262,144-position context) takes about half a second.
+    ///
+    /// With the prefix-resume switch armed, only the fixed state is zeroed (the recurrent
+    /// states, the conv rings, the PLE ring, the words and the raw-key ring): the QSA planes and
+    /// the indexer keys stay in place for a restore to rewind the valid length onto (see
+    /// [`StatePlan::is_position_state`] for why a fresh sequence never observes them).
     pub(super) fn reset(&self) -> Result<(), EngError> {
+        self.prefill_window.set(false);
         let zeros = vec![0u8; 1 << 24];
-        let mut at = 0usize;
-        let total = self.state.bytes();
-        while at < total {
-            let len = zeros.len().min(total - at);
-            self.state
-                .buffer()
-                .write_at(self.stream, at, &zeros[..len])?;
-            at += len;
+        let ranges: Vec<(usize, usize)> = if crate::family::flash_next::cuda::resume::on() {
+            self.state_plan
+                .slots()
+                .iter()
+                .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+                .filter_map(|&(slot, _)| self.state_plan.placement(slot))
+                .collect()
+        } else {
+            vec![(0, self.state.bytes())]
+        };
+        for (start, bytes) in ranges {
+            let mut at = start;
+            let end = start
+                .checked_add(bytes)
+                .ok_or_else(|| refuse("state arena offset overflows".into()))?;
+            while at < end {
+                let len = zeros.len().min(end - at);
+                self.state
+                    .buffer()
+                    .write_at(self.stream, at, &zeros[..len])?;
+                at += len;
+            }
         }
         self.poisoned.set(false);
         Ok(())
+    }
+
+    /// Reads `slot` of the persistent state back as raw little-endian bytes, behind the queued
+    /// work. The prefix-resume snapshot is built from these.
+    pub(super) fn read_state_bytes(&self, slot: StateSlot) -> Result<Vec<u8>, EngError> {
+        let range = self.state_slot(slot)?;
+        let (_, bytes) = self
+            .state_plan
+            .placement(slot)
+            .ok_or_else(|| refuse(format!("the state has no slot {slot:?}")))?;
+        let mut out = vec![0u8; bytes];
+        range
+            .buffer()
+            .read_at(self.stream, range.offset(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Writes `slot` of the persistent state from raw bytes, ordered before the next launch.
+    /// A prefix restore installs its snapshot through these.
+    pub(super) fn write_state_bytes(
+        &mut self,
+        slot: StateSlot,
+        bytes: &[u8],
+    ) -> Result<(), EngError> {
+        let range = self.state_slot(slot)?;
+        let (_, want) = self
+            .state_plan
+            .placement(slot)
+            .ok_or_else(|| refuse(format!("the state has no slot {slot:?}")))?;
+        if bytes.len() != want {
+            return Err(refuse(format!(
+                "the state slot {slot:?} holds {want} bytes, not {}",
+                bytes.len()
+            )));
+        }
+        range.buffer().write_at(self.stream, range.offset(), bytes)
     }
 
     /// Refuses while the step is poisoned.
@@ -252,6 +370,39 @@ impl<'a> FlashStep<'a> {
         Ok(self.slot(slot)?.offset())
     }
 
+    /// Reads every copied slot of the persistent state (see [`StatePlan::is_position_state"])
+    /// as raw bytes, behind the queued work: the prefix-resume snapshot.
+    pub(super) fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        self.state_plan
+            .slots()
+            .iter()
+            .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+            .map(|&(slot, _)| Ok((slot, self.read_state_bytes(slot)?)))
+            .collect()
+    }
+
+    /// The bytes [`Self::read_fixed_state`] will produce, without reading them: the host charge
+    /// of one snapshot's fixed part.
+    pub(super) fn fixed_state_bytes(&self) -> u64 {
+        self.state_plan
+            .slots()
+            .iter()
+            .filter(|&&(slot, _)| !StatePlan::is_position_state(slot))
+            .map(|&(_, bytes)| bytes as u64)
+            .sum()
+    }
+
+    /// Installs a snapshot's copied slots, ordered before the next launch.
+    pub(super) fn write_fixed_state(
+        &mut self,
+        parts: &[(StateSlot, Vec<u8>)],
+    ) -> Result<(), EngError> {
+        for (slot, bytes) in parts {
+            self.write_state_bytes(*slot, bytes)?;
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ weights
 
     pub(super) fn exl3(&self, prefix: &str) -> Result<&Exl3Weight, EngError> {
@@ -288,6 +439,30 @@ impl<'a> FlashStep<'a> {
         }
     }
 
+    pub(super) fn shared_prefill(&self) -> bool {
+        self.prefill_window.get() && self.step_plan.index(Slot::PrefillPerm).is_some()
+    }
+
+    pub(super) fn prefill_projector<'b>(
+        &'b self,
+        launch: &'b Launch<'b>,
+        m: usize,
+    ) -> Result<Projector<'b>, EngError> {
+        self.check_rows(m)?;
+        Ok(Projector {
+            launch,
+            rows: m,
+            tile_rows: PREFILL_TILE_ROWS,
+            scratch: Exl3Scratch {
+                xh: self.slot(Slot::Exl3Xh)?,
+                z: self.slot(Slot::Exl3Z)?,
+                y: self.slot(Slot::PrefillY)?,
+                flag: self.slot(Slot::Exl3Flag)?,
+                jobs: self.slot(Slot::Exl3Jobs)?,
+            },
+        })
+    }
+
     // ------------------------------------------------------------------ launches
 
     /// One EXL3 projection of the row `x` into `out`. The scratch is the plan's: rotated inputs,
@@ -301,6 +476,15 @@ impl<'a> FlashStep<'a> {
     ) -> Result<(), EngError> {
         self.check_rows(m)?;
         let weight = self.exl3(prefix)?;
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return self
+                .prefill_projector(&launch, m)?
+                .project(weight, x, Output::Rows(out));
+        }
         if m == 1 {
             let view = weight.view()?;
             let io = Exl3Io {
@@ -334,6 +518,21 @@ impl<'a> FlashStep<'a> {
         ld: usize,
         m: usize,
     ) -> Result<(), EngError> {
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return self.prefill_projector(&launch, m)?.project(
+                self.exl3(prefix)?,
+                x,
+                Output::Columns {
+                    dst: row,
+                    ld,
+                    col_off,
+                },
+            );
+        }
         if m == 1 {
             let out = Self::columns(&row, col_off, n)?;
             return self.project(prefix, x, out, 1);
@@ -645,6 +844,15 @@ impl<'a> FlashStep<'a> {
             ctx: self.ctx,
             stream: self.stream,
         };
+        if self.shared_prefill() {
+            return moe.run_prefill(
+                &self.prefill_projector(&launch, m)?,
+                layer,
+                &self.moe_bufs_rows(m)?,
+                &self.moe_dims(m),
+                self.slot(Slot::PrefillPerm)?,
+            );
+        }
         // The split block takes a chunk in one call; every other block loops one row.
         if m > 1 && moe.batches_rows() {
             return moe.run_rows(&launch, layer, &self.moe_bufs_rows(m)?, &self.moe_dims(m));
@@ -670,12 +878,25 @@ impl<'a> FlashStep<'a> {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let result = (|| {
+            let profile = super::driver::chunk::prof::on();
+            let mut t = std::time::Instant::now();
+            let mut tick = |slot: usize| {
+                if profile {
+                    super::driver::chunk::prof::add(slot, t.elapsed());
+                    t = std::time::Instant::now();
+                }
+            };
             self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"), m)?;
             self.mixer(layer, pos, m)?;
+            tick(9);
             self.hyper_apply(Site::Attn, m)?;
             self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), m)?;
+            tick(8);
             self.moe_block(layer, moe, m)?;
-            self.hyper_apply(Site::Mlp, m)
+            tick(10);
+            let r = self.hyper_apply(Site::Mlp, m);
+            tick(8);
+            r
         })();
         self.poison_on(result)
     }
@@ -700,7 +921,20 @@ impl<'a> FlashStep<'a> {
     pub(super) fn begin_chunk(&self, m: usize) -> Result<(), EngError> {
         self.begin_token()?;
         self.check_rows(m)?;
-        // A chunk of at most MAX_STEP_ROWS (< 256) rows is one tile of member 0.
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return write_dense_jobs(
+                &launch,
+                &self.prefill_projector(&launch, m)?.scratch,
+                m,
+                PREFILL_TILE_ROWS,
+            );
+        }
+        // A chunk of at most MAX_STEP_ROWS rows is one dense job of member 0: the kernel's
+        // job row cap (`jobs_row_cap`, 256, exl3.cu) is wider than any planned chunk.
         let job = Exl3Job {
             member: 0,
             row0: 0,
@@ -873,6 +1107,17 @@ pub(super) trait MoeBlock {
         dims: &MoeDims,
     ) -> Result<(), EngError>;
 
+    fn run_prefill(
+        &mut self,
+        _projector: &Projector<'_>,
+        _layer: usize,
+        _bufs: &Exl3MoeBufs<'_>,
+        _dims: &MoeDims,
+        _perm: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        Err(refuse("this MoE block has no shared prefill path".into()))
+    }
+
     /// Whether [`MoeBlock::run_rows`] takes a multi-row chunk in one call.
     fn batches_rows(&self) -> bool {
         false
@@ -984,6 +1229,21 @@ impl<'w> SplitMoeAt<'w> {
     pub(super) fn bank(&self) -> &super::bank::device::DeviceBank {
         self.inner.bank()
     }
+
+    /// Re-plans the prefill ring of the inner block against the bank as decode left it.
+    pub(super) fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.inner.begin_prefill()
+    }
+
+    /// Closes the prefill window; the decode steps after it use the bank's miss path again.
+    pub(super) fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.inner.end_prefill()
+    }
+
+    /// Resets the prefill ring's per-chunk cursors.
+    pub(super) fn begin_chunk(&mut self) {
+        self.inner.begin_chunk();
+    }
 }
 
 impl MoeBlock for SplitMoeAt<'_> {
@@ -1009,6 +1269,27 @@ impl MoeBlock for SplitMoeAt<'_> {
 
     fn batches_rows(&self) -> bool {
         true
+    }
+
+    fn run_prefill(
+        &mut self,
+        projector: &Projector<'_>,
+        layer: usize,
+        bufs: &Exl3MoeBufs<'_>,
+        dims: &MoeDims,
+        perm: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let row = layer
+            .checked_sub(self.first_layer)
+            .filter(|&row| row < self.rows)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is outside the bank's layers {}..{}",
+                    self.first_layer,
+                    self.first_layer + self.rows
+                ))
+            })?;
+        self.inner.run_prefill(projector, row, bufs, dims, perm)
     }
 
     fn run_rows(

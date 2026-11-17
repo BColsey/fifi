@@ -6,10 +6,10 @@
 use super::super::{
     ple::{self, PleWeights},
     step::ModelShape,
-    stored::{self, SlicedWeight},
 };
 use super::ops::{Ctx, dim, linear, rms0_rows, short_import};
 use super::weights::{RPle, ResidentWeights};
+use crate::family::stored::{self, SlicedWeight};
 use crate::{
     EngError,
     kernels::{BinaryOp, PackedWeight, ReduceOp, UnaryOp},

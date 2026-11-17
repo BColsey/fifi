@@ -15,19 +15,20 @@
 //! expert branch) must be joined into the owning stream with [`join_branches`] first.
 //!
 //! The device is little endian, so every value is read and written as little-endian bytes.
+use crate::family::graph_state::book::{Admitted, CommitRefusal, Health, StateBook};
 
 use std::{cell::RefCell, rc::Rc};
 
 use super::{
-    book::{Admitted, CommitRefusal, Health, StateBook},
     dims::{KvMode, StepDims, StepOptions},
     paging_plan::PagingPlan,
     paging_store::{
         PagedKv,
         device_first::{DeviceCachePlan, DeviceFirstKv},
     },
-    state_layout::{Plane, StateLayout, Word},
+    state_layout::{Plane, StateLayout},
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::{AttentionKind, project::cuda::WeightLayout},

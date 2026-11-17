@@ -32,7 +32,7 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceStream, plan,
-        resident::exl3::{SINGLE_GATHER_VAR, SingleRow, single_gather_from_env},
+        resident::exl3::{SINGLE_GATHER_VAR, ServedKernels, SingleRow, single_gather_from_env},
     },
     sched::job::{PrefixHit, PrefixReport},
     tokenizer::DecodeBatch,
@@ -353,19 +353,7 @@ fn largest_resident_context(
             plan::admit(&demand, free).is_ok()
         })
     };
-    if !admits(1) {
-        return None;
-    }
-    let (mut fits, mut over) = (1, MODEL_CONTEXT_LIMIT + 1);
-    while over - fits > 1 {
-        let middle = fits + (over - fits) / 2;
-        if admits(middle) {
-            fits = middle;
-        } else {
-            over = middle;
-        }
-    }
-    Some(fits)
+    crate::family::device_budget::largest_fitting(MODEL_CONTEXT_LIMIT + 1, 1, &admits)
 }
 
 /// What to tell the operator after a refused load that the host buffer could have avoided, or
@@ -680,11 +668,14 @@ impl FlintExecutor {
         let ctx = CudaContext::with_admission_cache(&served_admission(), cache_enabled)?;
         // A Flint session runs its single-row projections on the wide kernel unless the operator
         // names another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); same bytes, faster.
-        ctx.set_single_row_default(SingleRow::Wide(1));
-        // The Qwen3.6 EXL3 start's check: a bad FIFI_EXL3_DP4A or FIFI_EXL3_INDEXED_PAIRS, or an
-        // id-indexed option with a wide kernel of two or four tiles, stops the open instead of the
-        // first routed launch.
-        ctx.check_single_gather()?;
+        // The shared applier runs the launch-switch check: a bad FIFI_EXL3_DP4A or
+        // FIFI_EXL3_INDEXED_PAIRS, or an id-indexed option with a wide kernel of two or four
+        // tiles, stops the open instead of the first routed launch.
+        ctx.register_served_kernels(ServedKernels {
+            single_row: SingleRow::Wide(1),
+            indexed: None,
+            odd_rates: false,
+        })?;
         let stream = ctx.stream()?;
         let lazy_return = cache_enabled && alloc_lazy_return_armed();
         if let (LayerMajor::Jobs, Some(rows), true) = (mode, piece_rows, cache_enabled) {
@@ -1219,6 +1210,74 @@ mod resident_advice_tests {
         plan::admit(&demand, free).is_ok()
     }
 
+    /// The private step-1 bisection the shared search replaced, kept
+    /// verbatim as the oracle: same admits predicate, same arithmetic.
+    fn legacy_largest_resident_context(
+        options: &FlintOptions,
+        free: u64,
+        resident: u64,
+        cache_bytes: u64,
+    ) -> Option<u32> {
+        let admits = |context: u32| {
+            let options = FlintOptions {
+                context_limit: context,
+                ..options.clone()
+            };
+            reserve_for(&options, cache_bytes).is_ok_and(|reserve| {
+                let demand = plan::Demand {
+                    tensors: resident,
+                    kv_cache: reserve.kv_cache,
+                    work: reserve.work,
+                    headroom: reserve.headroom,
+                };
+                plan::admit(&demand, free).is_ok()
+            })
+        };
+        if !admits(1) {
+            return None;
+        }
+        let (mut fits, mut over) = (1, MODEL_CONTEXT_LIMIT + 1);
+        while over - fits > 1 {
+            let middle = fits + (over - fits) / 2;
+            if admits(middle) {
+                fits = middle;
+            } else {
+                over = middle;
+            }
+        }
+        Some(fits)
+    }
+
+    #[test]
+    fn the_shared_search_matches_the_old_bisection_on_the_pinned_grid() {
+        let cache_bytes = CudaContext::alloc_cache_reserve(true);
+        // The pinned grid (the published-ceiling neighborhood and the tight
+        // card) plus three off-lattice arms: a step-1 cut lands between
+        // lattice points, and the two searches must agree exactly there too.
+        let mut off_lattice = 0;
+        for (profile, free) in [
+            ("f16", 24_000_000_000u64),
+            ("f16", 23_500_000_000),
+            ("f16", 22_500_000_000),
+            ("q8", 24_000_000_000),
+            ("q8", 23_000_000_000),
+        ] {
+            let base = options(1, profile);
+            let new = largest_resident_context(&base, free, RESIDENT, cache_bytes);
+            let old = legacy_largest_resident_context(&base, free, RESIDENT, cache_bytes);
+            assert_eq!(new, old, "{profile} {free}");
+            if new.is_some_and(|largest| largest % 1024 != 0) {
+                off_lattice += 1;
+            }
+        }
+        let base = options(1, "f16");
+        assert_eq!(
+            largest_resident_context(&base, RESIDENT, RESIDENT, cache_bytes),
+            legacy_largest_resident_context(&base, RESIDENT, RESIDENT, cache_bytes)
+        );
+        assert!(off_lattice >= 3, "{off_lattice} off-lattice results");
+    }
+
     #[test]
     fn the_largest_resident_context_admits_and_one_more_token_does_not() {
         let cache_bytes = CudaContext::alloc_cache_reserve(true);
@@ -1332,23 +1391,20 @@ mod open_switch_tests {
         );
     }
 
-    /// The open checks the EXL3 launch switches against the session's single-row default, before
-    /// it allocates a stream.
+    /// The open checks the EXL3 launch switches through the shared applier, before it allocates
+    /// a stream.
     #[test]
     fn the_open_checks_the_launch_switches_before_the_stream() {
         let source = include_str!("cuda_executor.rs");
         let open = source.find("    fn open_with(").expect("open_with");
         let body = &source[open..];
-        let default = body
-            .find("ctx.set_single_row_default(")
-            .expect("the single-row default in open_with");
-        let check = body
-            .find("ctx.check_single_gather()?")
-            .expect("the switch check in open_with");
+        let applier = body
+            .find("ctx.register_served_kernels(ServedKernels {")
+            .expect("the shared applier in open_with");
         let stream = body.find("ctx.stream()").expect("the stream in open_with");
         assert!(
-            default < check && check < stream,
-            "check_single_gather() must follow set_single_row_default() and precede ctx.stream()"
+            applier < stream,
+            "the shared registration must precede ctx.stream()"
         );
     }
 

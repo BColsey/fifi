@@ -231,11 +231,11 @@ impl TrunkList {
             .filter(|visit| visit.name == EMBED_NAME)
             .map(|visit| visit.bytes)
             .sum();
-        if list.bytes + report.expert_bytes + embedding != report.pack.device_bytes {
+        if list.bytes + report.expert_bytes + embedding != report.device_bytes {
             return Err(EngError::Checkpoint(format!(
                 "Flash-Next trunk: {} trunk, {} expert and {embedding} embedding bytes do not make \
                  the walk's {}",
-                list.bytes, report.expert_bytes, report.pack.device_bytes
+                list.bytes, report.expert_bytes, report.device_bytes
             )));
         }
         Ok(list)
@@ -277,9 +277,10 @@ pub(in crate::family) mod upload {
     use crate::{
         EngError,
         family::{
+            exl3::source::PackReader,
+            exl3_tensors::decay_from_log,
             flash_next::moe::load_plan::FlashLoadPlan,
             project::cuda::{CudaWeight, CudaWeights},
-            qwen36::{cuda::exl3_source::PackReader, exl3_tensors::decay_from_log},
         },
     };
 

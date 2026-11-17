@@ -223,8 +223,8 @@ class RouterFixture(unittest.TestCase):
             return json.load(response)
 
 
-class ModelRouterTests(RouterFixture):
-    close_backend_connections = True
+class RoutingBehavior:
+    """Routing, trace and error handling must not depend on the connection policy."""
 
     def test_primary_is_first_and_model_specific_routes_still_work(self):
         data = self.get("/v1/models")["data"]
@@ -340,6 +340,90 @@ class DefaultConnectionPolicyTests(RouterFixture):
         self.assertFalse(
             self.backends[1].wait_for_no_connections(timeout=0.2),
             "the default policy unexpectedly closed the model-list connection",
+        )
+
+
+class ModelRouterTests(RoutingBehavior, RouterFixture):
+    close_backend_connections = True
+
+    def test_completed_model_list_releases_backend_connections(self):
+        self.assertEqual(len(self.get("/v1/models")["data"]), 2)
+        for backend in self.backends:
+            with self.subTest(model=backend.model):
+                self.assertTrue(
+                    backend.wait_for_no_connections(),
+                    f"{backend.model} retained a completed model-list connection",
+                )
+
+    def test_completed_forwarded_request_releases_backend_connection(self):
+        backend = self.backends[1]
+        self.assertEqual(self.post(backend.model)["backend"], backend.model)
+        self.assertTrue(
+            backend.wait_for_no_connections(),
+            "the 2080 backend retained a completed forwarded connection",
+        )
+
+    def open_held_stream(self, chunked):
+        backend = self.backends[1]
+        backend.hold_stream = True
+        backend.chunked_stream = chunked
+        self.addCleanup(backend.stream_release.set)
+        body = json.dumps({"model": backend.model, "stream": True}).encode()
+        request = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = urllib.request.urlopen(request, timeout=5)
+        self.addCleanup(response.close)
+        self.assertEqual(response.read(len(b"data: first\n\n")), b"data: first\n\n")
+        self.assertTrue(backend.stream_started.wait(timeout=2))
+        return backend, response
+
+    def assert_stream_lifetime(self, chunked):
+        backend, response = self.open_held_stream(chunked)
+        with response:
+            self.assertFalse(
+                backend.wait_for_no_connections(timeout=0.2),
+                "the active stream was disconnected before its response finished",
+            )
+            backend.stream_release.set()
+            self.assertEqual(response.read(), b"data: last\n\n")
+        self.assertTrue(
+            backend.wait_for_no_connections(),
+            "the completed stream retained its backend connection",
+        )
+
+    def test_stream_stays_connected_until_its_response_finishes(self):
+        self.assert_stream_lifetime(chunked=False)
+
+    def test_chunked_stream_stays_connected_until_its_response_finishes(self):
+        self.assert_stream_lifetime(chunked=True)
+
+    def test_client_disconnect_cancels_an_active_upstream_stream(self):
+        backend, response = self.open_held_stream(chunked=True)
+        response.close()
+        self.assertTrue(
+            backend.stream_disconnected.wait(timeout=2),
+            "the upstream connection remained open after the client disconnected",
+        )
+        self.assertTrue(backend.wait_for_no_connections())
+
+
+class DefaultConnectionPolicyTests(RoutingBehavior, RouterFixture):
+    def test_default_preserves_model_list_connection_reuse(self):
+        self.assertEqual(len(self.get("/v1/models")["data"]), 2)
+        self.assertFalse(
+            self.backends[1].wait_for_no_connections(timeout=0.2),
+            "the default policy unexpectedly closed the model-list connection",
+        )
+
+    def test_default_preserves_forwarded_connection_reuse(self):
+        backend = self.backends[1]
+        self.assertEqual(self.post(backend.model)["backend"], backend.model)
+        self.assertFalse(
+            backend.wait_for_no_connections(timeout=0.2),
+            "the default policy unexpectedly closed the forwarded connection",
         )
 
 

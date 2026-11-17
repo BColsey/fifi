@@ -12,11 +12,11 @@ use super::card_block_device_tests::{FileEntry, write_gguf};
 use super::card_session::CardSession;
 use super::card_step::CardStack;
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer_geometry::MixerGeometry;
 use super::native_device_rig::{Rng, device_present, q4k_rows, raw_values};
 use super::resources::{GlobalNames, MoeSpecs};
 use super::shard::ShardTable;
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::EngError;
 use crate::family::AttentionKind;
@@ -421,6 +421,245 @@ fn card_prefix_turn_chain_restores_bitwise() {
     const NAME: &str = "card_prefix_turn_chain_restores_bitwise";
     assert!(device_present(NAME));
     run_card_prefix_turn_chain(NAME, [0, 0]);
+}
+
+/// Device proof on the 4,096-spacing family: a restored cursor off the 1,024 piece
+/// lattice - the common Tip restore at an arbitrary position, and the root restore, which
+/// moves the cursor the same way - cuts the turn's rolling block at the true boundary
+/// below the new tip; the piece that contains the cut splits and re-anchors, and the
+/// resumed turn must still match a from-scratch control bit for bit (the rig's two-GPU
+/// kernel path, the same parity class as the turn-chain test above).
+#[test]
+#[ignore = "holds CUDA adapter leases for the process lifetime; run alone"]
+fn card_cut_after_an_off_lattice_restore_matches_bitwise() {
+    const NAME: &str = "card_cut_after_an_off_lattice_restore_matches_bitwise";
+    assert!(device_present(NAME));
+    run_card_cut_chain(NAME, [0, 0]);
+}
+
+fn run_card_cut_chain(name: &'static str, devices: [usize; 2]) {
+    use crate::family::executor::ExecutorOps;
+    use crate::family::session::{DecodeSession, SaveKind, TokenStepper};
+    const PIECE: usize = 1_024;
+    const SPACING: usize = 4_096;
+    let (mut session, _stack, _loaded, _names, vocab) = build_rig_session(
+        devices,
+        5_500,
+        crate::family::session::StoreLimits {
+            roots: 1,
+            entries: 2,
+        },
+    )
+    .expect("the rig session");
+
+    // One growing conversation: the first turn ends at the off-lattice tip 2,099
+    // (2,099 = 2 x 1,024 + 51), the extension pushes the new tip to 5,000, and the plan
+    // cuts at 4,096: 4,096 - 2,099 = 1,997 leaves 973 after the piece multiples, so the
+    // cut is not a chunk end of the restored cursor and the piece containing it splits.
+    // The root phase re-renders the two tokens above the root so the tip does not match
+    // and the root (2,050 = 2 x 1,024 + 2, off the lattice too) serves instead.
+    let t1: Vec<u32> = (0..2_100).map(|i| (i * 7 + 1) % 900).collect();
+    let mut t2 = t1.clone();
+    t2.extend((0..2_901).map(|i| (i * 11 + 3) % 900));
+    let tip1 = 2_099;
+    let root = 2_050;
+    let tip2 = 5_000;
+    let cut = 4_096;
+    // The plan the worker will rule for the extension turn, taken from the projection
+    // itself: the cut keeps its true boundary, a full piece plus 973 tokens above the
+    // restored cursor, so the piece that contains it splits and re-anchors.
+    let plan = crate::sched::worker::planned_points_for_tests(
+        Some(tip2),
+        None,
+        tip1,
+        PIECE,
+        crate::family::session::StoreLimits {
+            roots: 1,
+            entries: 2,
+        },
+        Some(SPACING),
+    );
+    assert_eq!(
+        plan,
+        vec![(cut, SaveKind::Block), (tip2, SaveKind::Tip)],
+        "the ruled plan cuts at the true boundary below the new tip"
+    );
+    assert_eq!(tip1 % PIECE, 51);
+    assert_eq!(root % PIECE, 2);
+    assert_eq!(
+        (cut - tip1) % PIECE,
+        973,
+        "the cut is off both cursors' lattices"
+    );
+    assert_eq!(
+        (cut - root) % PIECE,
+        1_022,
+        "the cut is off the root's lattice too"
+    );
+    assert_eq!(t2.len(), tip2 + 1);
+
+    for phase in ["the tip restore", "the root restore"] {
+        let rooted = phase == "the root restore";
+        let mut c = t2.clone();
+        if rooted {
+            // The seam re-renders the two tokens above the root: inside t1's tip key, so
+            // only the root matches the extension prompt.
+            c[root] = (c[root] + 1) % 900;
+            c[root + 1] = (c[root + 1] + 2) % 900;
+            assert_ne!(c[root], t1[root]);
+            assert_ne!(c[root + 1], t1[root + 1]);
+        }
+        let anchor = if rooted { root } else { tip1 };
+
+        // Turn 1: prefill t1 piecewise and save the anchor - the tip, or the root with the
+        // tip saved above it (the root-bearing plan's first turn).
+        let mut st = DecodeSession::default();
+        ExecutorOps::reset(&mut session, &mut st).expect("reset 1");
+        for piece in t1[..anchor].chunks(PIECE) {
+            ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill t1");
+        }
+        let saved = ExecutorOps::save_prefix(
+            &mut session,
+            &st,
+            &t1[..anchor],
+            if rooted {
+                SaveKind::Root
+            } else {
+                SaveKind::Tip
+            },
+        )
+        .expect("the anchor save call");
+        assert!(saved, "{name}/{phase}: the anchor save must succeed");
+        if rooted {
+            for piece in t1[anchor..tip1].chunks(PIECE) {
+                ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill t1 tip");
+            }
+            let saved = ExecutorOps::save_prefix(&mut session, &st, &t1[..tip1], SaveKind::Tip)
+                .expect("the tip save call");
+            assert!(saved, "{name}/{phase}: the tip save must succeed");
+        }
+
+        // The extension turn: the anchor restores (the seam refuses the tip in the root
+        // phase), the pieces run from the off-lattice cursor, the cut's piece splits at
+        // the true boundary, and the turn's own Block and Tip save there and at the new tip.
+        ExecutorOps::reset(&mut session, &mut st).expect("reset 2");
+        let covered =
+            ExecutorOps::restore_prefix(&mut session, &mut st, &c).expect("the restore call");
+        assert_eq!(
+            covered, anchor,
+            "{name}/{phase}: the anchor serves the extension"
+        );
+        let mut pos = covered;
+        while pos < cut {
+            let end = (pos + PIECE).min(cut);
+            ExecutorOps::prefill(&mut session, &mut st, &c[pos..end]).expect("prefill to cut");
+            pos = end;
+        }
+        // The save key carries its pending token (the contract: fed + 1 == key.len()),
+        // so the mid-turn Block save at the cut keys c[..cut] exactly as the pieces left
+        // it - the state the split piece produced.
+        let saved = ExecutorOps::save_prefix(&mut session, &st, &c[..cut], SaveKind::Block)
+            .expect("the block save call");
+        assert!(saved, "{name}/{phase}: the split piece saves the cut");
+        // The tail runs to the conversation's end so the last token, c[tip2], stays
+        // pending - the position the worker's turn ends at.
+        while pos < c.len() {
+            let end = (pos + PIECE).min(c.len());
+            ExecutorOps::prefill(&mut session, &mut st, &c[pos..end]).expect("prefill to tip");
+            pos = end;
+        }
+        let saved = ExecutorOps::save_prefix(&mut session, &st, &c, SaveKind::Tip)
+            .expect("the tip save call");
+        assert!(saved, "{name}/{phase}: the turn tip saves");
+        assert_eq!(
+            st.pending(),
+            Some(c[tip2]),
+            "{name}/{phase}: restored pending token"
+        );
+        assert_eq!(
+            TokenStepper::fed(&session),
+            c.len() - 1,
+            "{name}/{phase}: restored prefill count"
+        );
+        let restored_row = TokenStepper::logits(&mut session, c[tip2]).expect("logits");
+        let restored_export = session.export_states_for_test().expect("export restored");
+
+        // Control: the same tokens fed from scratch through the conversation's end,
+        // no restore.
+        ExecutorOps::reset(&mut session, &mut st).expect("reset 3");
+        for piece in c[..c.len()].chunks(PIECE) {
+            ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill control");
+        }
+        let control_row = TokenStepper::logits(&mut session, c[tip2]).expect("logits");
+        let control_export = session.export_states_for_test().expect("export control");
+
+        assert_eq!(
+            restored_row.len(),
+            vocab,
+            "{name}/{phase}: full vocabulary row"
+        );
+        assert!(
+            restored_row.iter().all(|v| v.is_finite()),
+            "{name}/{phase}: finite logits"
+        );
+        assert_eq!(
+            restored_row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            control_row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{name}/{phase}: the restored logits match bit for bit"
+        );
+        assert_eq!(
+            restored_export.len(),
+            control_export.len(),
+            "{name}/{phase}: one export per card"
+        );
+        for (card, (got, want)) in restored_export
+            .iter()
+            .zip(control_export.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                got.identity, want.identity,
+                "{name}/{phase}: card {card} identity"
+            );
+            assert_eq!(
+                got.tokens, want.tokens,
+                "{name}/{phase}: card {card} token count"
+            );
+            assert_eq!(
+                got.tokens,
+                c.len(),
+                "{name}/{phase}: card {card} consumed every token"
+            );
+            assert_eq!(
+                got.delta.len(),
+                want.delta.len(),
+                "{name}/{phase}: card {card} DeltaNet layers"
+            );
+            assert_eq!(
+                got.kv.len(),
+                want.kv.len(),
+                "{name}/{phase}: card {card} KV layers"
+            );
+            assert_eq!(
+                got.kv, want.kv,
+                "{name}/{phase}: card {card} KV plane bytes"
+            );
+            assert_eq!(got.delta.len(), 1, "{name}/{phase}: one DeltaNet layer");
+            assert_eq!(got.kv.len(), 1, "{name}/{phase}: one attention layer");
+            for (layer, (got, want)) in got.delta.iter().zip(&want.delta).enumerate() {
+                for (field, got, want) in [
+                    ("recurrent", &got.recurrent, &want.recurrent),
+                    ("conv", &got.conv, &want.conv),
+                ] {
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{name}/{phase}: card {card} layer {layer} {field} bits"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

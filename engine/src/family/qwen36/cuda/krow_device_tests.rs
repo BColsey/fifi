@@ -13,10 +13,8 @@ use super::{
     step::{GraphStats, LayerTap},
 };
 use crate::{
-    family::qwen36::{
-        exl3_merge_plan::SHARED_IN_ROUTED_VAR,
-        krow::{RowStatus, SINGLE_GATHER_NAME, check_krow_env, rows_verdict},
-    },
+    family::exl3_merge_plan::SHARED_IN_ROUTED_VAR,
+    family::qwen36::krow::{RowStatus, SINGLE_GATHER_NAME, check_krow_env, rows_verdict},
     kernels::{
         cuda::resident::{
             argmax_rows::{

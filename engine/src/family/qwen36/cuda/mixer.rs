@@ -18,10 +18,10 @@
 //! only on a word that entry already refused. They run after `step_begin` and before the router and
 //! `argmax`, as `step_plan.rs` requires. A block takes the `Pos`, `KvLen` and `Status` words as
 //! 4-byte ranges (`ResidentState::step_field`), never the 32-byte block.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
     dims::KvMode,
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_ops::{BLOCK_ROWS, BlockOp, CardOp, block_ops, block_ops_card},
     mixer_shapes::{attn_decode_shape, attn_prep_shape, plain_shape},
@@ -32,9 +32,10 @@ use super::{
     shard::ShardTable,
     sparse_exec::SparseExec,
     state::{ResidentState, StepField},
-    state_layout::{Plane, Word},
+    state_layout::Plane,
     step_plan::{Slot, StepPlan},
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::{

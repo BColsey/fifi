@@ -1,13 +1,13 @@
 //! The device test of the MMQ facts binding: the first glue FFI child proves the glue archive
-//! links and resolves by reading the 3090's own facts through the C entry. The asserted values
-//! are the 3090's: sm_86 cubins (the built architecture the facts report, not the device's
-//! capability), 82 SMs, 99 KiB of opt-in shared memory per block.
+//! links and resolves by reading the device's own facts through the C entry. Every value is
+//! checked against its valid domain and against the device probe; the exact 3090 values are
+//! asserted only on a 3090.
 
 use crate::kernels::cuda::testkit;
 
 #[test]
-fn mmq_facts_read_the_3090() {
-    if !testkit::device_present("mmq_facts_read_the_3090") {
+fn mmq_facts_read_the_device() {
+    if !testkit::device_present("mmq_facts_read_the_device") {
         return;
     }
     let phase = || -> Result<(i32, usize, usize), crate::EngError> {
@@ -26,9 +26,23 @@ fn mmq_facts_read_the_3090() {
         (32_768..=(1 << 20)).contains(&smpbo),
         "smpbo {smpbo} is out of range"
     );
-    assert_eq!(cc, 860, "the 3090 runs the sm_86 cubins");
-    assert_eq!(nsm, 82, "the 3090 has 82 SMs");
-    assert_eq!(smpbo, 101_376, "the 3090 offers 99 KiB opt-in per block");
+    assert!(
+        [720, 860].contains(&cc),
+        "cc {cc} is not a built architecture (720 or 860)"
+    );
+    let facts = crate::kernels::cuda::peer::probe_device_set(&[0]).expect("probe device 0");
+    let probe = &facts[0];
+    assert_eq!(
+        nsm, probe.multiprocessors as usize,
+        "the facts and the probe agree on the SM count"
+    );
+    if probe.name.contains("3090") {
+        assert_eq!(cc, 860, "the 3090 runs the sm_86 cubins");
+        assert_eq!(nsm, 82, "the 3090 has 82 SMs");
+        assert_eq!(smpbo, 101_376, "the 3090 offers 99 KiB opt-in per block");
+    } else {
+        println!("not a 3090 ({}): the 3090 pins are skipped", probe.name);
+    }
     println!("MMQ facts: cc {cc}, nsm {nsm}, smpbo {smpbo}");
 }
 
@@ -52,7 +66,6 @@ fn mmq_facts_are_queried_once_per_context() {
         Ok([first, second, third, fresh])
     };
     let [first, second, third, fresh] = phase().expect("the device phase");
-    assert_eq!(first.0.cc, 860, "the 3090 runs the sm_86 cubins");
     assert_eq!(first.1, 1, "the first call queries the device");
     assert_eq!(
         (second.0, second.1),

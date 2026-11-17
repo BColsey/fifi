@@ -20,6 +20,31 @@ pub(crate) enum KvMode {
     Int8G32,
 }
 
+impl KvMode {
+    /// The name the activation execution fingerprint embeds. Stated explicitly so the
+    /// fingerprint no longer rides the `Debug` derive; the two strings are pinned
+    /// byte-identical to the previous `Debug` text by the kv-bytes golden's dtype arm.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fp16 => "Fp16",
+            Self::Int8G32 => "Int8G32",
+        }
+    }
+
+    /// The storage format in the shared byte arithmetic (`family::kv_format`):
+    /// Int8G32 keeps its one f16 scale per 32-element group (KV8_GROUP, HALF in
+    /// `state_layout`).
+    pub(crate) fn format(self) -> crate::family::kv_format::KvFormat {
+        match self {
+            Self::Fp16 => crate::family::kv_format::KvFormat::F16,
+            Self::Int8G32 => crate::family::kv_format::KvFormat::Int8 {
+                group: 32,
+                scale_bytes: 2,
+            },
+        }
+    }
+}
+
 /// What the server asks for; `Auto` is resolved once, at session admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KvRequest {

@@ -30,7 +30,7 @@ use super::super::weights::RMoe;
 use crate::{
     EngError,
     family::{
-        flash_next::math::expect_len,
+        math::expect_len,
         qwen36::host::HostShape,
         route::{Routed, route_experts},
         spec::Router,
@@ -548,7 +548,7 @@ mod tests {
     fn host_moe(
         oracle: &HostWeights,
         layer: usize,
-    ) -> MoeW<'_, crate::family::flash_next::stored::StoredWeight> {
+    ) -> MoeW<'_, crate::family::stored::StoredWeight> {
         let view = oracle.view();
         let m = view.layers[layer].as_moe().unwrap();
         MoeW {

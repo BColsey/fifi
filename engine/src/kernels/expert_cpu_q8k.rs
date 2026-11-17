@@ -1030,8 +1030,8 @@ mod tests {
                 0,
             ),
             (
-                "tiered/budget.rs",
-                include_str!("../family/qwen36/tiered/budget.rs"),
+                "tier_budget.rs",
+                include_str!("../family/tier_budget.rs"),
                 0,
             ),
             (
