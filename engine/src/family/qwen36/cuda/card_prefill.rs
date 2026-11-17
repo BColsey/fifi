@@ -183,6 +183,14 @@ pub(crate) struct CardChunk {
 }
 
 impl CardChunk {
+    pub(super) fn invalidate_staging(&self) {
+        for card in &self.cards {
+            if let Some(staging) = &card.layer_staging {
+                staging.invalidate();
+            }
+        }
+    }
+
     pub(super) fn rows(&self) -> usize {
         self.m_sess
     }
