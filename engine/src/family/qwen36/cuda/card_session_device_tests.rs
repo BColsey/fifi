@@ -557,6 +557,7 @@ fn run_card_cut_chain(name: &'static str, devices: [usize; 2]) {
             entries: 2,
         },
         None,
+        false,
     )
     .expect("the rig session");
 
