@@ -1,8 +1,6 @@
 //! Unit tests of the layer and role table (test seam U13). CPU only.
-use super::{
-    common_tests::{dims, inventory},
-    layer_table::{LayerSlot, LayerTable, layer_of},
-};
+use super::common_tests::{dims, inventory};
+use crate::family::exl3::layer_table::{LayerSlot, LayerTable, layer_of};
 use crate::family::{AttentionKind, gguf_model::Role};
 
 #[test]

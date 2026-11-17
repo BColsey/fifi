@@ -108,12 +108,30 @@ int inference_cuda_gdn_scan_seq_launch(const inference_cuda_gdn_scan_seq_args *a
 int inference_cuda_gdn_scan_seq_cols_launch(const inference_cuda_gdn_scan_seq_args *args,
                                             void *stream, int *out_stage, int block_cols);
 
+/* The same contract, limits, guards and written bytes as the entry above, with the scan
+ * kernel gdn_scan_chunk_k: the chunk-parallel WY form of the same recurrence (its scalar
+ * reference is kernels/gdn_reference.rs chunk_step), which replaces the per-token state
+ * chain with a kC-token forward substitution, a masked output sum and one state update per
+ * sub-chunk. The rounding differs from the sequential kernels' (deeper dot trees inside the
+ * solve); the state and o_out values are pinned to the same f64 reference by the Rust
+ * wrapper's tests with their own derived bounds. The gated output RMSNorm is the same
+ * kernel. Selected by the wrapper's FIFI_GDN_SCAN_CHUNK switch, never by this entry's
+ * arguments. */
+int inference_cuda_gdn_scan_chunk_launch(const inference_cuda_gdn_scan_seq_args *args,
+                                          void *stream, int *out_stage);
+
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
 /* Qualified fault path (the device re-check): validates every rule of the entry EXCEPT the
  * p0/m bound, then overrides p0 so the bound is violated, so the KERNELS' own device guard
  * (no state load, NaN rows, mask 8) is the code under test. The validating entry above can
  * never reach it with bad bounds; this entry changes no rule of that entry. */
 int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage);
+
+/* The chunk-parallel twin of the entry above: same sans-bounds validation and forced p0
+ * violation, so the CHUNK kernel's own device guard (no state load, NaN of its full o_out
+ * tile, mask 8) is the code under test. */
+int inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage);
 #endif
 

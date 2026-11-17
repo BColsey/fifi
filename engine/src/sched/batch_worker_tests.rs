@@ -8,7 +8,7 @@ use crate::exec_fake::{FakeExecutor, FakeSession};
 use crate::family::executor::{ExecutorOps, GenerationState};
 use crate::family::sampler::{Sampler, SamplingParams};
 use crate::family::session::{SaveKind, StoreLimits};
-use crate::sched::job::{Job, JobEvent, JobHandle, PrefixHit, PrefixReport};
+use crate::sched::job::{Job, JobEvent, JobHandle, PrefillBankReport, PrefixHit, PrefixReport};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
@@ -71,6 +71,7 @@ struct WindowFake {
     fail_after_emit: bool,
     draws: bool,
     report: PrefixReport,
+    bank_report: Option<PrefillBankReport>,
     /// The number of `prefill` calls so far, for the one-shot piece denial below.
     prefill_calls: usize,
     /// When set, the `prefill` call at this index returns a memory-plan denial once
@@ -118,6 +119,7 @@ impl WindowFake {
             fail_after_emit: false,
             draws: false,
             report: PrefixReport::default(),
+            bank_report: None,
             prefill_calls: 0,
             fail_prefill_piece: None,
             deny_all_prefill: false,
@@ -140,6 +142,21 @@ impl WindowFake {
         row: &mut Row,
         generation: &mut GenerationState,
     ) -> Result<DecodeBatch, EngError> {
+        // Deliberately change every counter on decode too: ready slots must keep their
+        // prefill sample, not re-sample the executor at completion.
+        if let Some(bank) = &mut self.bank_report {
+            bank.passes += 1_000;
+            bank.misses += 1_000;
+            bank.upload_bytes += 1_000;
+            bank.upload_ns += 1_000;
+            for count in bank
+                .miss_histogram
+                .iter_mut()
+                .chain(&mut bank.route_histogram)
+            {
+                *count += 1_000;
+            }
+        }
         if self.draws && !generation.cancel.load(Ordering::SeqCst) {
             let id = row.fake.history(&row.state)[0];
             let sampled = generation.sampler.sample(&[0.0, 0.0, 0.0])?;
@@ -227,7 +244,19 @@ impl ExecutorOps for WindowFake {
             self.fail_prefill_piece = None;
             return Err(EngError::MemoryPlan("piece denied".into()));
         }
-        row.fake.prefill(&mut row.state, tokens)
+        row.fake.prefill(&mut row.state, tokens)?;
+        if let Some(bank) = &mut self.bank_report {
+            let rows = tokens.len() as u64;
+            bank.passes += 1;
+            bank.misses += rows;
+            bank.miss_histogram[0] += 1;
+            bank.miss_histogram[1] += rows;
+            bank.route_histogram[0] += rows;
+            bank.route_histogram[1] += 1;
+            bank.upload_bytes += rows * 10;
+            bank.upload_ns += rows * 100;
+        }
+        Ok(())
     }
 
     fn decode(
@@ -327,6 +356,10 @@ impl ExecutorOps for WindowFake {
     fn prefix_report(&self) -> Option<PrefixReport> {
         Some(self.report)
     }
+
+    fn prefill_bank_report(&self) -> Option<PrefillBankReport> {
+        self.bank_report.clone()
+    }
 }
 
 fn native_error() -> EngError {
@@ -394,7 +427,7 @@ fn wait(condition: impl Fn() -> bool) {
 
 fn usage(events: &[JobEvent]) -> crate::sched::job::JobUsage {
     match events.last() {
-        Some(JobEvent::Finished(usage)) => *usage,
+        Some(JobEvent::Finished(usage)) => usage.clone(),
         other => panic!("missing usage: {other:?}"),
     }
 }
@@ -456,6 +489,59 @@ fn simultaneous_jobs_share_one_window_but_not_streams_limits_or_usage() {
 }
 
 #[test]
+fn prefill_bank_deltas_span_shared_slots_and_freeze_at_ready() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.bank_report = Some(PrefillBankReport {
+        passes: 10,
+        misses: 20,
+        miss_histogram: vec![30, 40],
+        route_histogram: vec![50, 60],
+        upload_bytes: 70,
+        upload_ns: 80,
+    });
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0, 0], 2);
+    let (second, second_events) = job(&[1, 1, 1], 3);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
+    let first = usage(&collect(first_events));
+    let second = usage(&collect(second_events));
+    assert_eq!(
+        first.prefill_bank,
+        Some(PrefillBankReport {
+            passes: 1,
+            misses: 2,
+            miss_histogram: vec![1, 2],
+            route_histogram: vec![2, 1],
+            upload_bytes: 20,
+            upload_ns: 200,
+        }),
+        "the first slot is ready before the second prefills"
+    );
+    assert_eq!(
+        second.prefill_bank,
+        Some(PrefillBankReport {
+            passes: 2,
+            misses: 5,
+            miss_histogram: vec![2, 5],
+            route_histogram: vec![5, 2],
+            upload_bytes: 50,
+            upload_ns: 500,
+        }),
+        "both slots sample before either prefills, so the second spans both pieces"
+    );
+    assert_eq!((first.completion_tokens, second.completion_tokens), (2, 3));
+    assert_eq!(
+        lock(&log).windows.len(),
+        3,
+        "decode changes the counters on every tick"
+    );
+    assert_eq!(engine.shutdown().state, EngineState::Stopped);
+}
+
+#[test]
 fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
@@ -474,6 +560,18 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
         "the job runs: {events:?}"
     );
     assert_eq!(usage(&events).prompt_tokens, 5, "the whole prompt re-ran");
+    // The restart resets the piece count, so the line carries only the serving run's
+    // two pieces (4 rows then 1), never the aborted attempt's two as well.
+    assert_eq!(
+        usage(&events).prefill_pieces.count,
+        2,
+        "only the serving run's pieces: {events:?}"
+    );
+    assert_eq!(
+        usage(&events).prefill_pieces.max_rows,
+        4,
+        "the largest serving piece"
+    );
     let trace = lock(&log);
     assert_eq!(
         trace.calls,
@@ -716,6 +814,72 @@ fn prefill_uses_existing_pieces_and_never_adds_prompt_rows_to_a_window() {
         ["prefill:1", "prefill:4", "prefill:4", "prefill:2"]
     );
     drop(trace);
+    engine.shutdown();
+}
+
+#[test]
+fn a_multi_piece_prompt_counts_every_piece_without_a_restart() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    // 10 tokens at worker piece 4 feed 4,4,2 with no denial: the count accumulates
+    // across the pieces (the restart test pins the reset; this pins the steady path).
+    let (long, long_events) = job(&[1; 10], 1);
+    engine.handle().try_submit(long).expect("submit");
+    release.send(()).expect("load");
+    let events = collect(long_events);
+    assert_eq!(
+        usage(&events).prefill_pieces.count,
+        3,
+        "three pieces: {events:?}"
+    );
+    assert_eq!(
+        usage(&events).prefill_pieces.max_rows,
+        4,
+        "the largest piece"
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn two_slots_count_their_own_prefill_pieces() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    let (short, short_events) = job(&[0], 1);
+    let (long, long_events) = job(&[1; 10], 1);
+    engine.handle().try_submit(short).expect("short");
+    engine.handle().try_submit(long).expect("long");
+    release.send(()).expect("load");
+    let short_usage = usage(&collect(short_events));
+    let long_usage = usage(&collect(long_events));
+    assert_eq!(
+        short_usage.prefill_pieces.count, 1,
+        "short slot: {short_usage:?}"
+    );
+    assert_eq!(short_usage.prefill_pieces.max_rows, 1);
+    assert_eq!(
+        long_usage.prefill_pieces.count, 3,
+        "long slot: {long_usage:?}"
+    );
+    assert_eq!(long_usage.prefill_pieces.max_rows, 4);
+    engine.shutdown();
+}
+
+#[test]
+fn a_batch_jobs_first_token_margin_rides_the_slot_usage() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    // The fake draws from [0,0,0]: the top two tie, so the latched margin is zero.
+    fake.draws = true;
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[7, 7, 7, 7, 7], 1);
+    engine.handle().try_submit(first).expect("submit");
+    release.send(()).expect("load");
+    let events = collect(first_events);
+    assert_eq!(
+        usage(&events).first_token_margin,
+        Some(0.0),
+        "the served margin rides the slot usage: {events:?}"
+    );
     engine.shutdown();
 }
 

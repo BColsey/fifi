@@ -43,7 +43,9 @@
 //! `FIFI_KROW_UNION_TOKENS` (3000 decoded tokens), `FIFI_KROW_CHAIN_LAYERS` (3,15,27,39),
 //! `FIFI_KROW_CHAIN_WINDOWS` (24 windows per layer), `FIFI_KROW_PICKS_OUT` (a path: the ids of
 //! every token and layer, for a rerun of the analysis on the host), `FIFI_KROW_DEADLINE_S` (780).
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::{fs, time::Instant};
 
 use serde_json::{Value, json};
@@ -54,8 +56,6 @@ use super::{
     dims::KvMode,
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, routed_on_device},
     krow_alpha_device_tests::{Flush, Stopwatch, capture_graph, emit, identity, refuse_switches},
-    layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
     window_bench_device_tests::bench_step,
 };

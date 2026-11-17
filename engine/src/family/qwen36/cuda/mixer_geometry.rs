@@ -10,6 +10,7 @@
 
 use super::dims::StepDims;
 use super::shard::ShardTable;
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::project::cuda::WeightLayout;
 use crate::{
     EngError,
@@ -71,15 +72,6 @@ const CONV_TAPS: usize = 4;
 
 /// The DeltaNet gates an EXL3 pack keeps as plain matrices (see `MixerGeometry::plain_specs`).
 const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
-
-/// A dense (tiled) mixer weight: its role, output rows and input length.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DenseSpec {
-    pub(super) role: Role,
-    pub(super) rows: usize,
-    pub(super) k: usize,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RawSpec {
@@ -377,23 +369,6 @@ pub(super) fn check_native_dense(
     if !rows.is_multiple_of(4) {
         return Err(EngError::Checkpoint(format!(
             "mixer weights: {name} has {rows} rows, the native matvec needs a multiple of 4"
-        )));
-    }
-    Ok(())
-}
-
-/// Refuses a dense weight whose shape is not the one the launch needs. `experts` is the stack
-/// depth: a dense mixer weight has none.
-pub(super) fn check_dense(
-    name: &str,
-    have: (usize, usize, Option<usize>),
-    want: &DenseSpec,
-) -> Result<(), EngError> {
-    let (rows, k, experts) = have;
-    if rows != want.rows || k != want.k || experts.is_some() {
-        return Err(EngError::Checkpoint(format!(
-            "mixer weights: {name} is {rows} rows of {k} (stack {experts:?}), the step needs {} rows of {} and no stack",
-            want.rows, want.k
         )));
     }
     Ok(())

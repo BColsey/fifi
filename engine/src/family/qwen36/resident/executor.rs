@@ -67,7 +67,7 @@
 use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PREFILL_CANDIDATES, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
-use super::state::{ResidentSnapshot, ResidentState};
+use super::state::{ResidentSnapshot, ResidentState, advance_charge};
 use crate::{
     EngError,
     family::{
@@ -121,6 +121,7 @@ pub(crate) struct Q36Rules {
     /// member, default false. When true, the decoder warms both blocks once at load, so a trace
     /// failure fails the load instead of a request.
     pub(crate) compile: bool,
+    pub(crate) compile_program_limit: crate::kernels::compile_key::ProgramLimit,
     /// The admitted concurrent sessions. One preserves the legacy solo lifecycle.
     pub(crate) max_seqs: usize,
     /// The limits of this executor's prefix store: the start maps the `prefix_reuse` flag to two
@@ -257,6 +258,109 @@ impl TokenStepper for Q36Step<'_> {
     }
 }
 
+/// Probe taps of the verify-window path (`Q36_WINDOW_TAPS=1`, one `eprintln` per committed
+/// window): the wall split of the snapshot, the window prefill (which includes the lazy graph
+/// evaluation of the logits materialization — its readback is the first sync of the call, so
+/// host taps attribute the queued GPU work to it), the host draws, and the commit replay.
+#[derive(Default)]
+struct WindowTaps {
+    calls: usize,
+    replays: usize,
+    rows: usize,
+    kept: usize,
+    discarded: usize,
+    snapshot_us: u128,
+    prefill_us: u128,
+    draw_us: u128,
+    commit_us: u128,
+    /// The native dispatch count at the start of the window (the tap prints the delta).
+    ops_base: u64,
+    /// The compiled-block call counts (delta, moe, attn) at the window start: the printed
+    /// deltas split the window's ops into compiled entries and eager glue.
+    compiled_base: (u64, u64, u64),
+}
+
+std::thread_local! {
+    static WINDOW_TAPS: std::cell::RefCell<WindowTaps> = const {
+        std::cell::RefCell::new(WindowTaps {
+            calls: 0,
+            replays: 0,
+            rows: 0,
+            kept: 0,
+            discarded: 0,
+            snapshot_us: 0,
+            prefill_us: 0,
+            draw_us: 0,
+            commit_us: 0,
+            ops_base: 0,
+            compiled_base: (0, 0, 0),
+        })
+    };
+}
+
+fn window_taps_on() -> bool {
+    std::env::var_os("Q36_WINDOW_TAPS").is_some_and(|v| v == "1")
+}
+
+/// The parity test overrides the flag through this AtomicBool instead of the
+/// environment, because edition 2024 makes `set_var` unsafe and the crate denies
+/// `unsafe_code`: the test flips it inside the native test lock, and a production build
+/// reads the variable alone. See [`compiled_layer_on`] for what the flag arms.
+#[cfg(test)]
+pub(super) static COMPILED_LAYER_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms the compiled whole-layer chunk closures (`Q36_COMPILED_LAYER=1`): the eligible
+/// layers of a device-routed chunk window with 2 to 15 rows (outside that row window,
+/// `Record` mode, host routing, and the last layer of a `Prompt` chunk stay eager) run
+/// as ONE `mlx_compile`d closure instead of the eager entry storm. A DELTA-mixer layer
+/// with a device-routed MoE becomes one closure (input norm, mixer, both residual adds
+/// and the folded MoE rows sequence); an attention layer becomes a PRE body (input norm,
+/// projections, q/k norms, gate slice) and a POST body (o_proj, mixer residual, the same
+/// folded MoE rows sequence). Both families require `fused_prefill_enabled`, so the
+/// fused-prefill kill switch disarms them together; production dims gate each body.
+/// A closure layer takes no per-layer output `evaluate` (the `EVAL_CADENCE` cadence of
+/// the eager chunk); the delta closure and the attention POST closure each return one
+/// health vector (the attention PRE closure returns none), which joins the chunk-end
+/// stack like an eager layer's. Default off; the eager chunk stays the reference and
+/// the parity oracle. Known limits while off (they block a default flip, not the
+/// flag): the BF16 cache form is excluded from the attention closures' coverage, and
+/// the closure arm borrows the layer state, so `chunk_core` appends through a share -
+/// measured cold at 0.25-0.48 GiB of peak above the eager arm and warm (after a
+/// warm-up window absorbs the one-off compile work) at about 0.05 GiB (8-row Window
+/// steps at 64K F32 fills, MLX on the 36 GB Mac Studio), while the by-value variant
+/// measured worse cold (about 0.81 GiB at a plain append). The source of the
+/// remaining transient is not settled.
+pub(super) fn compiled_layer_on() -> bool {
+    #[cfg(test)]
+    if COMPILED_LAYER_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("Q36_COMPILED_LAYER").is_some_and(|v| v == "1"))
+}
+
+/// Arms the step-window verify path (`Q36_SPEC_STEP_WINDOW`): each window row runs as ONE
+/// compiled `Logits` step instead of the eager Window chunk. `=1` takes one pre-window
+/// snapshot - the chunk window's exact charge contract - and commit replays the kept rows as
+/// compiled steps. `=2` checkpoints before every row and commit adopts the checkpoint at the
+/// kept boundary, trading T snapshot charges for zero replay; a mid-window charge refusal
+/// restores the base, drops the checkpoints (releasing their charges), and falls back to the
+/// chunk path. Default off (the chunk window stays the reference).
+fn step_window() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "1" || v == "2")
+    })
+}
+
+/// The `=2` form: a shared-handle checkpoint before every window row, so commit adopts the
+/// kept boundary instead of replaying it.
+fn checkpoint_window() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("Q36_SPEC_STEP_WINDOW").is_some_and(|v| v == "2"))
+}
+
 /// The verify-window model of one speculative decode call: the solo step plus the pending window.
 /// `run_window` feeds every row as ONE chunk (`StepMode::Window`), so a window of `k + 1` rows
 /// costs one chunk pass, not `k + 1` steps. The rollback is the shared-handle snapshot of
@@ -267,7 +371,14 @@ impl TokenStepper for Q36Step<'_> {
 struct Q36WindowStep<'a> {
     step: Q36Step<'a>,
     context_limit: usize,
+    /// The single snapshot of the chunk window path.
     snapshot: Option<ResidentSnapshot>,
+    /// Marks a window that ran the step path (`Q36_SPEC_STEP_WINDOW`): commit replays the
+    /// kept rows as compiled one-row steps instead of the eager Prompt chunk.
+    stepped_window: bool,
+    /// The `=2` per-row checkpoints: entry `i` is the state before row `i`, so commit adopts
+    /// entry `kept_rows` instead of replaying. `None` on the `=1` and chunk paths.
+    checkpoints: Option<Vec<ResidentSnapshot>>,
     inputs: Vec<u32>,
     logits: Vec<Vec<f32>>,
 }
@@ -296,12 +407,62 @@ impl TokenStepper for Q36WindowStep<'_> {
     }
 }
 
-impl WindowModel for Q36WindowStep<'_> {
-    fn run_window(&mut self, inputs: &[u32]) -> Result<()> {
+impl Q36WindowStep<'_> {
+    fn run_window_impl(&mut self, inputs: &[u32]) -> Result<()> {
         self.snapshot = None;
+        self.stepped_window = false;
+        self.checkpoints = None;
+        if window_taps_on() {
+            let stats = crate::kernels::mlx::compile_stats::read();
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.ops_base = crate::kernels::mlx::dispatch_count();
+                t.compiled_base = (stats.delta.calls, stats.moe.calls, stats.attn.calls);
+            });
+        }
         self.inputs.clear();
         self.logits.clear();
+        self.window_fits(inputs)?;
+        if step_window() && self.run_window_steps(inputs)?.is_some() {
+            return Ok(());
+        }
         let Q36Step { decoder, state, .. } = &mut self.step;
+        let snapshot = {
+            let started = std::time::Instant::now();
+            let snapshot = decoder.snapshot(state)?;
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| t.snapshot_us += started.elapsed().as_micros());
+            }
+            snapshot
+        };
+        {
+            let started = std::time::Instant::now();
+            let run = decoder.prefill(state, inputs, StepMode::Window);
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.prefill_us += started.elapsed().as_micros();
+                    t.rows = inputs.len();
+                });
+            }
+            match run {
+                Ok(result) => {
+                    self.logits = result
+                        .window_logits
+                        .ok_or_else(|| window_output_error("the window step returned no logits"))?;
+                    self.inputs = inputs.to_vec();
+                    self.snapshot = Some(snapshot);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+impl Q36WindowStep<'_> {
+    /// The host checks of one verify window: the state step-invariants and the context-limit
+    /// fit, before any snapshot or native call.
+    fn window_fits(&self, inputs: &[u32]) -> Result<()> {
+        let Q36Step { decoder, state, .. } = &self.step;
         let limit = u32::try_from(self.context_limit)
             .map_err(|_| EngError::BadRequest("context limit overflows u32".into()))?;
         let rows = u32::try_from(inputs.len())
@@ -312,31 +473,234 @@ impl WindowModel for Q36WindowStep<'_> {
                 "the verify window does not fit the context limit".into(),
             ));
         }
-        let snapshot = decoder.snapshot(state)?;
-        match decoder.prefill(state, inputs, StepMode::Window) {
-            Ok(result) => {
-                self.logits = result
-                    .window_logits
-                    .ok_or_else(|| window_output_error("the window step returned no logits"))?;
-                self.inputs = inputs.to_vec();
-                self.snapshot = Some(snapshot);
-                Ok(())
+        Ok(())
+    }
+
+    /// The step window: one compiled `Logits` step per row. `=1` takes one pre-window
+    /// snapshot (the chunk window's exact charge contract); `=2` checkpoints before every row
+    /// so commit adopts the kept boundary. Returns `Ok(Some(()))` when the window ran, and
+    /// `Ok(None)` when a `MemoryPlan` refusal sent it back to the chunk path with the state
+    /// restored to the pre-window base and every checkpoint charge released. Any other error
+    /// propagates: a native step failure poisons the state, and the worker's reset is the only
+    /// sound recovery, as in the chunk path's contract.
+    fn run_window_steps(&mut self, inputs: &[u32]) -> Result<Option<()>> {
+        let started = std::time::Instant::now();
+        let Q36Step { decoder, state, .. } = &mut self.step;
+        let checkpoints = checkpoint_window();
+        if checkpoints {
+            // Upfront admission: the checkpoint window needs T snapshots plus T one-row
+            // growths, and its commit rewinds under the FULL set of held charges - the rewind
+            // acquires the rewound KV extent before it releases the old permits - so the
+            // probe reserves that transient too. Declining BEFORE any charge leaves the
+            // budget exactly as the chunk path expects it; a mid-window fallback cannot,
+            // because restored rows keep their growth permits.
+            let per_snapshot = decoder.snapshot_bytes(state)?;
+            let per_row = advance_charge(state, &decoder.weights, 1)?;
+            let rows = u64::try_from(inputs.len())
+                .map_err(|_| EngError::BadRequest("the verify window exceeds u64 rows".into()))?;
+            // Upfront admission under the FULL set of held charges. Quantum law: the T
+            // one-row acquires plus the rewind extent at the last position. Geometric law:
+            // the T one-row acquires sum to whatever capacity the window's rows ADD (zero
+            // while they fit, the doubling they cross - `advance_charge(T)` from today's
+            // caps), and the rewind re-acquires that same capacity ON TOP of today's
+            // allocated bytes, so both terms carry it.
+            //
+            // This reserve bounds only the WINDOW's own charges: the checkpoint-window
+            // commit is deferred to the next driver cycle, and interleaved plain rows can
+            // grow the shared caches past the window's extent before it fires, so the
+            // commit's adopt-path restore acquires the checkpoint's frozen capacities -
+            // an extent no reserve taken at the window can bound. That combination is
+            // therefore REFUSED AT ENGINE OPEN (`Q36_KV_GEOMETRIC=1` together with
+            // `Q36_SPEC_STEP_WINDOW=2`, in the settings validation); this branch cannot
+            // run in a served engine while the geometric law is armed.
+            let need = if state.geometric_law() {
+                let window_rows = u32::try_from(inputs.len()).map_err(|_| {
+                    EngError::BadRequest("the verify window exceeds u32 rows".into())
+                })?;
+                let grown = advance_charge(state, &decoder.weights, window_rows)?;
+                rows.saturating_mul(per_snapshot)
+                    .saturating_add(grown)
+                    .saturating_add(grown)
+                    .saturating_add(state.allocated_kv_bytes())
+            } else {
+                let rewind = u64::from(state.pos())
+                    .saturating_add(rows)
+                    .saturating_sub(1)
+                    .saturating_mul(per_row);
+                rows.saturating_mul(per_snapshot.saturating_add(per_row))
+                    .saturating_add(rewind)
+            };
+            if decoder.budget.free() < need {
+                return Ok(None);
             }
-            // The chunk's own contract leaves the state poisoned after its first native call;
-            // the snapshot drops with its charge.
-            Err(error) => Err(error),
         }
+        let mut snaps: Vec<ResidentSnapshot> =
+            Vec::with_capacity(if checkpoints { inputs.len() } else { 1 });
+        let mut snapshot_us = 0u128;
+        let mut logits: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+        for &token in inputs {
+            // `=1` snapshots once before row 0; `=2` before every row.
+            if checkpoints || snaps.is_empty() {
+                let snap_started = std::time::Instant::now();
+                match decoder.snapshot(state) {
+                    Ok(snap) => snaps.push(snap),
+                    // A charge refusal is clean: when a row already ran, the base (row 0's
+                    // checkpoint) restores the pre-window state and every held charge releases
+                    // with the drop, so the chunk path re-runs its own one-shot admission of
+                    // the whole window. A refusal of the first charge changed nothing.
+                    Err(EngError::MemoryPlan(_)) => {
+                        if let Some(base) = snaps.first() {
+                            decoder.restore(state, base)?;
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+                snapshot_us += snap_started.elapsed().as_micros();
+            }
+            let row = decoder
+                .step(state, token, StepMode::Logits)
+                .and_then(|result| {
+                    result
+                        .logits
+                        .ok_or_else(|| window_output_error("the step window returned no logits"))
+                });
+            match row {
+                Ok(row) => logits.push(row),
+                // A growth refusal mid-window leaves the state clean: restore the base and let
+                // the chunk path try its one-shot admission of the whole window.
+                Err(EngError::MemoryPlan(_)) => {
+                    let base = snaps.first().expect("row 0 has a checkpoint");
+                    decoder.restore(state, base)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let steps_us = started.elapsed().as_micros() - snapshot_us;
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.snapshot_us += snapshot_us;
+                t.prefill_us += steps_us;
+                t.rows = inputs.len();
+            });
+        }
+        self.logits = logits;
+        self.inputs = inputs.to_vec();
+        self.stepped_window = true;
+        if checkpoints {
+            self.checkpoints = Some(snaps);
+        } else {
+            self.snapshot = Some(snaps.swap_remove(0));
+        }
+        Ok(Some(()))
+    }
+}
+
+impl WindowModel for Q36WindowStep<'_> {
+    fn run_window(&mut self, inputs: &[u32]) -> Result<()> {
+        self.run_window_impl(inputs)
     }
 
     fn draw(&mut self, row: usize, sampler: &mut Sampler, sampler_vocab: usize) -> Result<u32> {
-        let logits = self
+        let started = std::time::Instant::now();
+        let drawn = self
             .logits
             .get(row)
-            .ok_or_else(|| window_output_error("the window drew past its rows"))?;
-        sample_logits(Self::OPERATION, logits, sampler, sampler_vocab)
+            .ok_or_else(|| window_output_error("the window drew past its rows"))
+            .and_then(|logits| sample_logits(Self::OPERATION, logits, sampler, sampler_vocab));
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| t.draw_us += started.elapsed().as_micros());
+        }
+        drawn
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<()> {
+        // The `=2` window first: adopt the checkpoint at the kept boundary.
+        if let Some(checkpoints) = self.checkpoints.take() {
+            self.stepped_window = false;
+            self.logits.clear();
+            let _inputs = std::mem::take(&mut self.inputs);
+            if commit.discarded_rows == 0 {
+                return Ok(());
+            }
+            let kept = commit.kept_rows;
+            let started = std::time::Instant::now();
+            let Q36Step { decoder, state, .. } = &mut self.step;
+            // Entry `kept` is the state right before the first discarded row. No replay and no
+            // native call; the remaining checkpoints release their charges with the drop.
+            let adopted = checkpoints
+                .get(kept)
+                .ok_or_else(|| window_output_error("the kept boundary has no checkpoint"))?;
+            decoder.restore(state, adopted)?;
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.calls += 1;
+                    let commit_us = started.elapsed().as_micros();
+                    let stats = crate::kernels::mlx::compile_stats::read();
+                    let cmp = (
+                        stats.delta.calls.saturating_sub(t.compiled_base.0),
+                        stats.moe.calls.saturating_sub(t.compiled_base.1),
+                        stats.attn.calls.saturating_sub(t.compiled_base.2),
+                    );
+                    eprintln!(
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=ckpt ops={} cmp=D{}/M{}/A{}",
+                        t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                        t.draw_us, commit_us, t.replays,
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                        cmp.0, cmp.1, cmp.2
+                    );
+                    t.snapshot_us = 0;
+                    t.prefill_us = 0;
+                    t.draw_us = 0;
+                });
+            }
+            return Ok(());
+        }
+        if self.stepped_window {
+            let snapshot = self
+                .snapshot
+                .take()
+                .ok_or_else(|| window_output_error("commit without a window"))?;
+            self.stepped_window = false;
+            self.logits.clear();
+            let inputs = std::mem::take(&mut self.inputs);
+            if commit.discarded_rows == 0 {
+                return Ok(());
+            }
+            let kept = commit.kept_rows;
+            let started = std::time::Instant::now();
+            let Q36Step { decoder, state, .. } = &mut self.step;
+            // The step window replays the kept rows as compiled one-row steps; the eager
+            // `Prompt` chunk replay of the chunk path is the measured cost this removes.
+            decoder.restore(state, &snapshot)?;
+            for &token in &inputs[..kept] {
+                decoder.step(state, token, StepMode::Logits)?;
+            }
+            if window_taps_on() {
+                WINDOW_TAPS.with_borrow_mut(|t| {
+                    t.calls += 1;
+                    let commit_us = started.elapsed().as_micros();
+                    let stats = crate::kernels::mlx::compile_stats::read();
+                    let cmp = (
+                        stats.delta.calls.saturating_sub(t.compiled_base.0),
+                        stats.moe.calls.saturating_sub(t.compiled_base.1),
+                        stats.attn.calls.saturating_sub(t.compiled_base.2),
+                    );
+                    eprintln!(
+                        "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} steps=1 ops={} cmp=D{}/M{}/A{}",
+                        t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                        t.draw_us, commit_us, t.replays,
+                        crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                        cmp.0, cmp.1, cmp.2
+                    );
+                    t.snapshot_us = 0;
+                    t.prefill_us = 0;
+                    t.draw_us = 0;
+                });
+            }
+            return Ok(());
+        }
         let snapshot = self
             .snapshot
             .take()
@@ -347,11 +711,45 @@ impl WindowModel for Q36WindowStep<'_> {
             return Ok(());
         }
         let kept = commit.kept_rows;
+        let replay = commit.discarded_rows > 0;
+        let started = std::time::Instant::now();
         let Q36Step { decoder, state, .. } = &mut self.step;
-        decoder.restore(state, &snapshot)?;
-        decoder
-            .prefill(state, &inputs[..kept], StepMode::Prompt)
-            .map(|_| ())
+        if replay {
+            decoder.restore(state, &snapshot)?;
+        }
+        let run = if replay {
+            decoder
+                .prefill(state, &inputs[..kept], StepMode::Prompt)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if window_taps_on() {
+            WINDOW_TAPS.with_borrow_mut(|t| {
+                t.calls += 1;
+                t.replays += usize::from(replay);
+                t.discarded += commit.discarded_rows;
+                t.kept += kept;
+                let commit_us = started.elapsed().as_micros();
+                let stats = crate::kernels::mlx::compile_stats::read();
+                let cmp = (
+                    stats.delta.calls.saturating_sub(t.compiled_base.0),
+                    stats.moe.calls.saturating_sub(t.compiled_base.1),
+                    stats.attn.calls.saturating_sub(t.compiled_base.2),
+                );
+                eprintln!(
+                    "WINDOW_TAP call={} rows={} kept={} discarded={} snapshot_us={} prefill_us={} draw_us={} commit_us={} replays={} ops={} cmp=D{}/M{}/A{}",
+                    t.calls, t.rows, kept, commit.discarded_rows, t.snapshot_us, t.prefill_us,
+                    t.draw_us, commit_us, t.replays,
+                    crate::kernels::mlx::dispatch_count().saturating_sub(t.ops_base),
+                    cmp.0, cmp.1, cmp.2
+                );
+                t.snapshot_us = 0;
+                t.prefill_us = 0;
+                t.draw_us = 0;
+            });
+        }
+        run
     }
 }
 
@@ -462,8 +860,21 @@ fn admit(shape: &HostShape, rules: &Q36Rules) -> Result<()> {
             rules.context_limit
         )));
     }
+    // Under the geometric law the LAST capacity clamp rounds the context limit up to a
+    // KV_STEP multiple (and the first row already charges one whole step), so admission
+    // must size the cap for that rounded need - the quantum law keeps the exact product.
+    let geometric = super::state::geometric_growth()?;
+    let limit = if geometric {
+        u64::try_from(super::kv_plan::round_up(
+            rules.context_limit as usize,
+            super::kv_plan::KV_STEP,
+        )?)
+        .map_err(|_| EngError::BadRequest("context limit rounds past u64".into()))?
+    } else {
+        u64::from(rules.context_limit)
+    };
     let needed = growth_per_position(shape, rules.kv_dtype, rules.activation)?
-        .checked_mul(u64::from(rules.context_limit))
+        .checked_mul(limit)
         .ok_or_else(|| EngError::MemoryPlan("cache bytes at the limit overflow u64".to_string()))?;
     if needed > rules.session_cap {
         return Err(EngError::MemoryPlan(format!(
@@ -524,12 +935,13 @@ impl Q36Executor {
     /// Builds the executor from loaded parts. The rules are checked again before the import, so a
     /// caller that skips `open` cannot skip them.
     pub(crate) fn from_parts(
-        kernels: MlxKernels,
+        mut kernels: MlxKernels,
         ckpt: &'static StreamedCheckpoint,
         host: HostWeights,
         rules: Q36Rules,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
+        kernels.set_program_limit(rules.compile_program_limit)?;
         let fixed_state_bytes = if rules.max_seqs > 1 {
             fixed_session_bytes(host.shape())?
         } else {
@@ -784,13 +1196,14 @@ impl ExecutorOps for Q36Executor {
             let (mut step, _) = self.split(state);
             match core.prepare_decode(&mut step, generation)? {
                 DecodePreparation::Finished(batch) => results[slot] = Some(Ok(batch)),
-                DecodePreparation::Token(_) => active.push(slot),
+                DecodePreparation::Token(_) => {
+                    active.push((slot, advance_charge(state, &self.decoder.weights, 1)?))
+                }
             }
         }
-        let growth = super::state::kv_growth_bytes(&self.decoder.weights)?;
         let mut permits = Vec::new();
         let mut admitted = Vec::new();
-        for slot in active {
+        for (slot, growth) in active {
             match self.decoder.budget.acquire_growth(growth) {
                 Ok(permit) => {
                     permits.push(permit);
@@ -959,6 +1372,8 @@ impl ExecutorOps for Q36Executor {
             step,
             context_limit: limits.context_limit,
             snapshot: None,
+            stepped_window: false,
+            checkpoints: None,
             inputs: Vec::new(),
             logits: Vec::new(),
         };
@@ -1031,16 +1446,27 @@ impl ExecutorOps for Q36Executor {
 
     /// The pool-derived prompt ceiling: the free budget plus the session's own permits - which its
     /// next reset releases - over the per-position KV growth, minus the one position the first
-    /// sampled token needs.
+    /// sampled token needs. Under the geometric law the divisor is TWICE the per-position
+    /// growth: a boundary doubling can charge a whole capacity at once, so positions are
+    /// counted at their worst-case amortised cost - conservative, never under.
     ///
     /// shortcut: permits that a still-stored snapshot shares with the session (a pinned
     /// root this session saved) are counted as releasable, so the ceiling can overstate by
     /// that root's bytes; upgrade when a client compacting to exactly the ceiling still
     /// fails in practice, by tracking per-session shared charges.
     fn pool_prompt_ceiling(&self, st: &Q36Session) -> Option<u64> {
-        let growth = super::state::kv_growth_bytes(&self.decoder.weights).ok()?;
         let session = st.state.charged_bytes().ok()?;
-        Some((self.decoder.budget.free() + session).saturating_sub(growth) / growth.max(1))
+        let growth = super::state::kv_growth_bytes(&self.decoder.weights).ok()?;
+        // The next position's charge: one row under the quantum law, the pending doubling
+        // (if any) under the geometric law; the divisor doubles under the geometric law
+        // because a boundary can charge a whole capacity at once.
+        let next = advance_charge(&st.state, &self.decoder.weights, 1).ok()?;
+        let per_position = if st.state.geometric_law() {
+            growth.saturating_mul(2)
+        } else {
+            growth
+        };
+        Some((self.decoder.budget.free() + session).saturating_sub(next) / per_position.max(1))
     }
 }
 
@@ -1054,7 +1480,7 @@ mod tests {
     use crate::family::session::SaveSideTotals;
     use crate::family::speculate::driver::{Drafter, Proposal, Speculator};
     use crate::{
-        family::sampler::{Sampler, SamplingParams},
+        family::sampler::{Sampler, SamplingParams, top2_margin},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
     };
 
@@ -1076,6 +1502,7 @@ mod tests {
             sampler_vocab,
             context_limit: LIMIT,
             session_cap: u64::from(LIMIT) * GROWTH,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -1299,6 +1726,139 @@ mod tests {
         drop(replacement);
         drop(first);
         assert_eq!(executor.decoder.session_used(), 0);
+    }
+
+    /// M2 regression, geometric law + `Q36_SPEC_STEP_WINDOW=2`: a checkpoint window of
+    /// T rows whose span crosses the 256 boundary mid-window doubles the capacity to
+    /// 512. The prompt is 254 tokens (253 rows published, the last token pending), the
+    /// windows are T = 2 (max_drafts 1), and the SECOND window feeds rows 256 and 257 -
+    /// the crossing one. The budget sits exactly AT the pre-fix reserve's need for that
+    /// window (`2 x snapshot + allocated + one doubling`). The landed reserve carries
+    /// one more doubling, so it declines the crossing window up front and the chunk
+    /// window finishes the job. Every draft in this test is accepted, so the commit does
+    /// not restore; in that case the pre-fix reserve also admitted and completed the
+    /// window (measured on the Mac), and this test is a lock on the window path's
+    /// completion and charges, not a discriminator of the two formulas. The extra
+    /// doubling is the peak of a window whose draft is rejected; that case is refused
+    /// at engine open together with the geometric law (see
+    /// `geometric_checkpoint_window` in settings.rs). `windows > 0`
+    /// proves the window path ran (observe fires only after run_window and
+    /// commit_window). Ignored: it needs its own process with `Q36_KV_GEOMETRIC=1
+    /// Q36_SPEC_STEP_WINDOW=2` (both read once per process).
+    #[test]
+    #[ignore = "run in its own process: Q36_KV_GEOMETRIC=1 Q36_SPEC_STEP_WINDOW=2"]
+    fn a_geometric_checkpoint_window_crossing_a_doubling_completes_with_the_full_reserve() {
+        let geometric = crate::family::qwen36::resident::state::geometric_growth().unwrap_or(false);
+        if !checkpoint_window() || !geometric {
+            return;
+        }
+        let _serial = crate::native_test_lock();
+        let prompt: Vec<u32> = (0..254u32).map(|i| i % VOCAB as u32).collect();
+        // The prompt's first quantum: 256 rows of both layers' bytes.
+        let first_quantum = 256 * GROWTH;
+        // One doubling (256 new rows) and the per-snapshot bytes, measured off a probe
+        // session.
+        let (probe_executor, probe_session) = build(Q36Rules {
+            context_limit: 600,
+            session_cap: first_quantum * 4,
+            ..rules(vec![], VOCAB)
+        });
+        let per_snapshot = probe_executor
+            .decoder
+            .snapshot_bytes(&probe_session.state)
+            .unwrap();
+        drop(probe_session);
+        drop(probe_executor);
+        let mut big = rules(vec![], VOCAB);
+        big.context_limit = 600;
+        // The SEPARATING budget: free == the pre-fix reserve's need at the crossing
+        // window (2 snapshots + allocated + one doubling; allocated and the doubling
+        // are both one first quantum on the tiny model), so the landed reserve - one
+        // doubling higher - declines that window upfront.
+        big.session_cap = 2 * per_snapshot + 3 * first_quantum;
+        let want = oracle(&prompt, 8, &mut seeded_sampler(), VOCAB);
+        let (mut executor, mut session) = build(big);
+        executor.prefill(&mut session, &prompt).unwrap();
+        // The prompt's last token stays pending for the generation: 253 rows published,
+        // the whole prompt inside the first quantum.
+        assert_eq!(session.state.pos(), 253);
+        assert_eq!(session.state.charged_bytes().unwrap(), first_quantum);
+        let mut job = seeded_generation(8);
+        let mut speculator = Speculator::new(
+            Scripted {
+                want: want.clone(),
+                wrong: false,
+                skip: prompt.len(),
+                windows: 0,
+            },
+            1,
+        );
+        let mut batches = Vec::new();
+        for _ in 0..100 {
+            let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+            let done = batch.finish.is_some();
+            batches.push(batch);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(tokens_of(&batches), want, "every window completed");
+        assert!(
+            speculator.drafter.windows > 0,
+            "the window path must run, not the plain stand-down"
+        );
+        assert_eq!(
+            session.state.pos(),
+            261,
+            "the windows advanced past the doubling"
+        );
+        assert_eq!(
+            session.state.charged_bytes().unwrap(),
+            512 * GROWTH,
+            "the charge lands on the doubled allocation"
+        );
+    }
+
+    /// S3: under the geometric law `admit` sizes the cap for the ROUNDED context limit
+    /// (round_up(300, KV_STEP) = 512 positions), so a cap that exactly fits the
+    /// quantum-law product (300 positions of growth) is refused AT OPEN instead of
+    /// opening and failing MemoryPlan at the row-257 doubling; the rounded cap opens.
+    /// Ignored: it needs its own process with `Q36_KV_GEOMETRIC=1` (read once).
+    #[test]
+    #[ignore = "run in its own process: Q36_KV_GEOMETRIC=1"]
+    fn a_geometric_admit_sizes_the_cap_to_the_rounded_law() {
+        let geometric = crate::family::qwen36::resident::state::geometric_growth().unwrap_or(false);
+        if !geometric {
+            return;
+        }
+        // `make_host` keeps the helper callable twice: a plain `host` binding would
+        // shadow the function after the first use.
+        let make_host = host as fn(&StreamedCheckpoint) -> HostWeights;
+        let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(tiny::checkpoint(&TINY_GQA)));
+        let mut narrow = rules(vec![], VOCAB);
+        narrow.context_limit = 300;
+        narrow.session_cap = 300 * GROWTH;
+        let error = Q36Executor::from_parts(
+            MlxKernels::try_new().unwrap(),
+            ckpt,
+            make_host(ckpt),
+            narrow,
+        )
+        .err()
+        .expect("the quantum-sized cap must be refused at open, not at the doubling");
+        assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+        let mut rounded = rules(vec![], VOCAB);
+        rounded.context_limit = 300;
+        rounded.session_cap = 512 * GROWTH;
+        drop(
+            Q36Executor::from_parts(
+                MlxKernels::try_new().unwrap(),
+                ckpt,
+                make_host(ckpt),
+                rounded,
+            )
+            .expect("the rounded cap opens"),
+        );
     }
 
     #[test]
@@ -1572,6 +2132,8 @@ mod tests {
             step,
             context_limit: limits.context_limit,
             snapshot: None,
+            stepped_window: false,
+            checkpoints: None,
             inputs: Vec::new(),
             logits: Vec::new(),
         };
@@ -1581,10 +2143,14 @@ mod tests {
     }
 
     /// Proposes the oracle chain (`wrong`: every draft off by one, so no draft is ever accepted
-    /// and every window rolls back).
+    /// and every window rolls back). `skip` counts the PROMPT tokens the history carries in
+    /// front of the chain; `windows` counts the observe() calls, which fire only after a real
+    /// window ran and committed - the proof a test actually exercised the window path.
     struct Scripted {
         want: Vec<u32>,
         wrong: bool,
+        skip: usize,
+        windows: usize,
     }
 
     impl Drafter for Scripted {
@@ -1593,7 +2159,7 @@ mod tests {
             history: &[u32],
             room: usize,
         ) -> std::result::Result<Proposal, crate::EngError> {
-            let start = history.len().min(self.want.len());
+            let start = history.len().saturating_sub(self.skip).min(self.want.len());
             let take = room.min(self.want.len() - start);
             let tokens = self.want[start..start + take]
                 .iter()
@@ -1616,6 +2182,7 @@ mod tests {
             _window: &crate::family::speculate::window::Window,
             _accepted: &crate::family::speculate::accept::Accepted,
         ) -> std::result::Result<(), crate::EngError> {
+            self.windows += 1;
             Ok(())
         }
     }
@@ -1635,6 +2202,8 @@ mod tests {
                 Scripted {
                     want: want.clone(),
                     wrong,
+                    skip: PROMPT.len(),
+                    windows: 0,
                 },
                 2,
             );
@@ -1721,6 +2290,7 @@ mod tests {
             sampler_vocab: 248_077,
             context_limit: 32_768,
             session_cap: 40_960 * 32_768,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -1960,6 +2530,7 @@ mod tests {
             sampler_vocab,
             context_limit,
             session_cap,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -2039,6 +2610,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: CHUNK_LIMIT,
             session_cap: u64::from(CHUNK_LIMIT) * GROWTH,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -2054,6 +2626,19 @@ mod tests {
         (0..len)
             .map(|i| u32::try_from((i + 1) % 8).unwrap())
             .collect()
+    }
+
+    /// The piece shape the worker reports for `fed` tokens fed in pieces of `chunk` rows:
+    /// one piece per chunk-sized split, the largest piece the chunk or the final remainder.
+    /// Mirrors `prefill_chunks`; these prompts are too short for a root or periodic save
+    /// point and no tip save lies inside the fed region, so it splits as one unbroken run.
+    /// A tip save inside the fed region splits the head run there; the prefix-reuse tests
+    /// pin those per-round shapes literally instead of using this helper.
+    fn fed_pieces(fed: usize, chunk: usize) -> crate::sched::job::PrefillPieces {
+        crate::sched::job::PrefillPieces {
+            count: u32::try_from(fed.div_ceil(chunk)).unwrap(),
+            max_rows: u32::try_from(chunk.min(fed)).unwrap(),
+        }
     }
 
     /// The row count of each chunk that ran since the last call. The log is cleared.
@@ -2542,14 +3127,28 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), vec![3, 4, 2], "chunk rows");
         assert_eq!(tokens.len(), 4, "tokens");
+        let usage = usage.expect("usage");
+        // The chunk path equals the step oracle only within the chunk-parity tolerance,
+        // so the first-token margin is compared within tolerance; the rest is exact.
+        let oracle = logits_alone(&cycle(10));
+        let oracle_margin = top2_margin(&oracle[..VOCAB]).expect("oracle margin");
+        let scale = oracle[..VOCAB].iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let margin = usage.first_token_margin.expect("first-token margin");
+        assert!(
+            (margin - oracle_margin).abs() <= 2.0e-4 * scale,
+            "first-token margin {margin} vs step oracle {oracle_margin}"
+        );
         assert_eq!(
             usage,
-            Some(JobUsage {
+            JobUsage {
                 prompt_tokens: 10,
                 completion_tokens: 4,
                 reused_tokens: 0,
-                prefix: Some(PrefixReport::default())
-            }),
+                prefix: Some(PrefixReport::default()),
+                prefill_bank: None,
+                prefill_pieces: fed_pieces(10, 4),
+                first_token_margin: Some(margin),
+            },
             "usage"
         );
         assert_eq!(
@@ -2896,6 +3495,7 @@ mod tests {
         .enumerate()
         {
             let prompt_tokens = u32::try_from(prompt.len()).unwrap();
+            let first_margin = top2_margin(&logits_alone(&prompt)[..VOCAB]);
             let (job, mut handle) = Job::new(prompt, seeded_generation(4)).unwrap();
             engine.handle().try_submit(job).unwrap();
             let mut tokens = Vec::new();
@@ -2915,7 +3515,10 @@ mod tests {
                     prompt_tokens,
                     completion_tokens: 4,
                     reused_tokens: 0,
-                    prefix: Some(PrefixReport::default())
+                    prefix: Some(PrefixReport::default()),
+                    prefill_bank: None,
+                    prefill_pieces: fed_pieces(prompt_tokens as usize, 2),
+                    first_token_margin: first_margin,
                 }),
                 "round {round}: usage"
             );
@@ -2963,6 +3566,7 @@ mod tests {
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
             compile: false,
+            compile_program_limit: Default::default(),
         };
         let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
         let mut job = GenerationState::new(IncrementalDecoder::new(&tokenizer)).with_max_tokens(32);
@@ -3068,6 +3672,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 256,
             session_cap: 1 << 30,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
@@ -3188,6 +3793,7 @@ mod tests {
             sampler_vocab: 248_320,
             context_limit: 4_096,
             session_cap: 4_096 * 40_960,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: activation_from_env(),
             kv_dtype: kv_dtype_from_env(),
@@ -3310,6 +3916,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 100_000,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -3327,6 +3934,7 @@ mod tests {
             sampler_vocab: VOCAB,
             context_limit: PREFIX_LIMIT,
             session_cap: 25_000,
+            compile_program_limit: Default::default(),
             max_seqs: 1,
             activation: Activation::F32,
             kv_dtype: KvDtype::F32,
@@ -4238,6 +4846,21 @@ mod tests {
                 ),
             ),
         ];
+        // Per-round fed piece shapes (count, max_rows), pinned from the save-point plan:
+        // the tip save at 4 lies inside the fed region whenever the job restores fewer than
+        // 4 tokens, so the head run splits there (worker piece 3). A 6-token prompt feeds
+        // head 3,1 then tail 2; restored 3 feeds head 1 (3..4) then tail 2; restored 4 feeds
+        // only the tail 2; E (4 tokens, boundary 3) feeds head 3 then tail 1.
+        let piece_shapes = [
+            (3u32, 3u32), // A: head 3,1 + tail 2
+            (1, 2),       // A restored 4: tail 2
+            (1, 2),       // A restored 4: tail 2
+            (2, 3),       // E: head 3 + tail 1
+            (2, 2),       // A restored 3: head 1 + tail 2
+            (1, 2),       // A restored 4: tail 2
+            (3, 3),       // B: head 3,1 + tail 2
+            (3, 3),       // A: head 3,1 + tail 2
+        ];
         for (round, (prompt, boundary, want, reused, report)) in rounds.into_iter().enumerate() {
             let (job, mut handle) = Job::new(prompt.clone(), seeded_generation(4)).unwrap();
             let job = job.with_prefix_boundary(boundary).unwrap();
@@ -4262,6 +4885,12 @@ mod tests {
                     completion_tokens: 4,
                     reused_tokens: reused,
                     prefix: report,
+                    prefill_bank: None,
+                    prefill_pieces: crate::sched::job::PrefillPieces {
+                        count: piece_shapes[round].0,
+                        max_rows: piece_shapes[round].1,
+                    },
+                    first_token_margin: top2_margin(&logits_alone(prompt)[..VOCAB]),
                 }),
                 "round {round}: usage"
             );

@@ -7,11 +7,12 @@
 //! stage ends with `mtp.norm`. The head has no embedding table and no output head of its own: it
 //! reads the model's.
 
-use super::{
-    exl3_pack::{Inspector, PackReport, Root},
-    host::HostShape,
+use super::host::HostShape;
+use crate::{
+    EngError,
+    family::exl3_pack::{Inspector, PackReport, Root},
+    weights::StreamedCheckpoint,
 };
-use crate::{EngError, weights::StreamedCheckpoint};
 
 /// Pack name of the norm of the target hidden row.
 pub(super) const PRE_FC_NORM_HIDDEN: &str = "mtp.pre_fc_norm_hidden.weight";

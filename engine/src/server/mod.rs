@@ -23,7 +23,7 @@ mod reply;
 mod reqlog;
 mod route_trace;
 mod router;
-mod run;
+pub(crate) mod run;
 mod sampler_trace;
 mod sse;
 mod state;

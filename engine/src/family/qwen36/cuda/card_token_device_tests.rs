@@ -28,27 +28,26 @@
 use super::card_step::CardStack;
 use super::card_token::{merge_head_candidates, run_card_token};
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer::{BlockIo, CardKindOps, MixerParts, MixerViews, Mixers};
 use super::mixer_geometry::MixerGeometry;
 use super::mixer_ops::CardOp;
 use super::mixer_weights::{DenseWeight, LayerWeights, MixerWeights};
-use super::moe::{
-    ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
-    run_moe_block,
-};
+use super::moe::{ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, StackWeights, run_moe_block};
 use super::native_device_rig::{Rng, device_present, q4k_rows, raw_values};
 use super::shard::ShardTable;
 use super::state::ResidentState;
 use super::state::StepField;
-use super::state_layout::{Plane, Word};
+use super::state_layout::Plane;
 use super::step_ops::{final_resid, resid_in, resid_out};
 use super::step_plan::{KernelScratch, Slot, StepPlan};
 use crate::EngError;
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::project::cuda::served_admission;
 use crate::family::qwen36::host::HostShape;
+use crate::family::state_words::Word;
 use crate::family::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::plan::{assemble_slice, plan_slice};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;

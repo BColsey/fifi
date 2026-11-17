@@ -29,10 +29,11 @@
 //! sequence handshake).
 
 use crate::EngError;
+use crate::family::exl3::launch::Launch;
 use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
-use crate::family::qwen36::cuda::moe::{CardMoeOp, Launch, MoeBuffers, MoeLayerWeights, launch_op};
+use crate::family::qwen36::cuda::moe::{CardMoeOp, MoeBuffers, MoeLayerWeights, launch_op};
 use crate::family::qwen36::cuda::multi::fold_ring_status;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::Slot;

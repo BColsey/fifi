@@ -14,7 +14,7 @@
 //! HOST-RAM BUDGET: the snapshot pins host memory equal
 //! to the committed rows' plane bytes plus the health buffer for as long
 //! as the entry lives. The save admits that charge against the host and
-//! cgroup budget (`HostBudget`, the same admission the expert cache uses)
+//! cgroup budget (`HostAdmission`, the same admission the expert cache uses)
 //! BEFORE allocating, and the allocation is fallible; a refusal carries
 //! the planned bytes in a MemoryPlan error. Device KV is NOT doubled (a
 //! restore refills the existing planes).

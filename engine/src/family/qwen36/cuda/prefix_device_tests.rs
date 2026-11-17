@@ -21,9 +21,9 @@
 //! asserts. The seeded values of D0 are finite by construction (they come from small integers), so
 //! the float comparison of the round trip is safe; the model tests compare ids, hashes and bytes,
 //! never floats. One test per process, with the 3090 held exclusively.
+use crate::family::graph_state::book::Health;
 
 use super::super::host::HostShape;
-use super::book::Health;
 use super::dims::{KvMode, StepDims, StepOptions, TieredPlan};
 use super::exl3_load::load_exl3_dir;
 use super::native_device_rig::{Rng, device_present};

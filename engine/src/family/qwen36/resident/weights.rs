@@ -16,13 +16,13 @@ use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
 use crate::{
     EngError,
     family::{
-        flash_next::stored::{
-            RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
-            read_stacked_into, stacked_layout,
-        },
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
+        },
+        stored::{
+            RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
+            read_stacked_into, stacked_layout,
         },
     },
     kernels::{HostPages, MlxKernels, PackedPages, PackedWeight, PageRange, ResidentPackedWeight},
@@ -991,9 +991,8 @@ mod tests {
         let (ckpt, host) = load(&TINY);
         let mut kernels = MlxKernels::try_new().unwrap();
         let w = ResidentWeights::import(&mut kernels, &ckpt, host).unwrap();
-        let stored = |key: &str, len: usize| {
-            crate::family::flash_next::stored::host_f32(&ckpt, key, len).unwrap()
-        };
+        let stored =
+            |key: &str, len: usize| crate::family::stored::host_f32(&ckpt, key, len).unwrap();
         let p = "language_model.model.layers.";
         assert_eq!(
             values(&mut kernels, &w.final_norm).unwrap(),

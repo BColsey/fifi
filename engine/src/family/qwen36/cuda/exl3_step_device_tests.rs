@@ -14,6 +14,7 @@
 //! Recorded on the 4.00 bpw pack (version 0.0.29), both arenas, relative L2 0 on all 16 rows. The
 //! ids spell `<think>\nHere's a thinking process:\n\n1.  **Analyze User`:
 //! `FIFI_EXL3_GREEDY_IDS=248068,198,8160,579,264,7047,1817,25,271,16,13,220,2972,2014,53983,2570`
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::path::Path;
 
@@ -22,7 +23,6 @@ use super::{
     dims::{KvMode, StepOptions},
     exl3_load::load_exl3_dir,
     exl3_load_device_tests::relative_l2,
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     native_device_rig::device_present,
     resources::{GlobalNames, STEP_ROWS, StepResources},

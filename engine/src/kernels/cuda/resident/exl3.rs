@@ -6,6 +6,7 @@
 )]
 use crate::EngError;
 // The pure selection logic lives where the host build compiles and tests it.
+use crate::kernels::cuda::context::device_error;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
@@ -100,8 +101,11 @@ fn jobs_warp_rotate_setting() -> Result<bool, EngError> {
 
 /// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
-/// The most pairs one launch takes under the 20-pair option (Flash-Next's ten picks).
+/// The most pairs one 20-pair-option launch takes (Flash-Next's ten picks).
 const INDEXED_OPTION_CAPACITY: usize = 20;
+/// The most pairs one grouped launch takes, in local groups of 1..=8 rows
+/// (`grouped_raw`); the family-side shared expert batches its gate/up at half this width.
+pub(crate) const GROUPED_PAIRS_MAX: usize = 48;
 
 /// Opt-in switch of the DP4A decode of book 2 in the id-indexed launch: unset or `0` keeps the
 /// default decode, `1` decodes with one packed byte dot product. Same bytes. A set value wins over
@@ -112,70 +116,185 @@ pub(crate) const DP4A_VAR: &str = "FIFI_EXL3_DP4A";
 /// pairs, `20` takes up to 20 pairs in one launch. Same bytes. A set value wins over the default a
 /// session registered (the Flash-Next CUDA decode takes 20). Process-wide, read once, strict.
 pub(crate) const INDEXED_PAIRS_VAR: &str = "FIFI_EXL3_INDEXED_PAIRS";
+/// Opt-in switch of the pipelined tile loop of the id-indexed launch: unset or `0` keeps the
+/// default loop, `1` issues the next tile's loads before the current one's barriers so the load
+/// latency overlaps the decode. Same bytes. A set value wins over the default a session
+/// registered. Process-wide, read once, strict: any other value is refused.
+pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
+/// Opt-in switch of the pointer-table launch of the id-indexed kernels: unset or `0` keeps the
+/// parameter-block launches (up to 16 or 20 pairs), `1` moves the call records to a device
+/// table so one kernel per stage covers the whole batch (up to 65535 records, shapes may mix).
+/// Same bytes as the option launch of the same calls; the DP4A and pipeline options apply. The
+/// record staging copy makes this form refuse graph capture (the option launch stays
+/// capturable). The capacity is the launch's own cap: the serve-side chunkers that call
+/// `exl3_indexed_capacity` still carve their working scratch for 16 or 20 rows, so a served
+/// batch above that returns `BadRequest` until their scratch grows with the batch — the flag
+/// is for the direct launch paths (tests, benches). A set value wins over the default a session
+/// registered. Process-wide, read once, strict.
+pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
+
+/// The served-kernel profile a family start registers at open: the single-row default
+/// of the dense projections, the id-indexed default of the routed experts (`None` leaves the
+/// launch to the environment's switches, the state of a family that never chose one), and the
+/// odd-rate kernels. [`CudaContext::register_served_kernels`] applies the
+/// whole profile through one path, so a family start cannot register a subset or run the
+/// switch check before its defaults are in. `None` and `false` are values, not resets of the
+/// context: a `None` leaves any default an earlier registration set on the same context
+/// standing, and a `false` sets its switch off over an earlier `true`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServedKernels {
+    /// The default of the dense projections' one-tile wide launches.
+    pub(crate) single_row: SingleRow,
+    /// The id-indexed launch default; `None` keeps the environment's switches in charge and
+    /// leaves any default an earlier registration set on the same context in place.
+    pub(crate) indexed: Option<IndexedOptions>,
+    /// Whether the one-tile wide launches run the compile-time odd-rate body of book 2.
+    pub(crate) odd_rates: bool,
+}
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
-/// book 2 ([`DP4A_VAR`]) and one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]). Both off is
-/// the default launch, which stays the fallback. Every byte an option writes equals the default
-/// launch of the same calls; both options run one tile per block.
+/// book 2 ([`DP4A_VAR`]), one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]) and the pipelined
+/// tile loop ([`PIPE_VAR`]). All off is the default launch, which stays the fallback. Every byte
+/// an option writes equals the default launch of the same calls; every option runs one tile per
+/// block.
+///
+/// The pointer-table form ([`TABLE_VAR`]) is a fourth switch on the same launch: instead of a
+/// parameter block of up to 20 pairs, the call records ride a device table and one kernel per
+/// stage covers the whole batch, mixing shapes. It replaces the pair-count choice (`pairs20`
+/// is ignored under it) and inherits the DP4A and pipeline bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexedOptions {
     pub(crate) dp4a: bool,
     pub(crate) pairs20: bool,
+    pub(crate) pipeline: bool,
+    pub(crate) table: bool,
 }
 
 impl IndexedOptions {
     pub(crate) const OFF: Self = Self {
         dp4a: false,
         pairs20: false,
+        pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const DP4A: Self = Self {
         dp4a: true,
         pairs20: false,
+        pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const PAIRS20: Self = Self {
         dp4a: false,
         pairs20: true,
+        pipeline: false,
+        table: false,
     };
     #[cfg(test)]
     pub(crate) const BOTH: Self = Self {
         dp4a: true,
         pairs20: true,
+        pipeline: false,
+        table: false,
     };
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] = [Self::OFF, Self::DP4A, Self::PAIRS20, Self::BOTH];
+    pub(crate) const PIPE: Self = Self {
+        dp4a: false,
+        pairs20: false,
+        pipeline: true,
+        table: false,
+    };
+    #[cfg(test)]
+    pub(crate) const PAIRS20_PIPE: Self = Self {
+        dp4a: false,
+        pairs20: true,
+        pipeline: true,
+        table: false,
+    };
+    #[cfg(test)]
+    pub(crate) const BOTH_PIPE: Self = Self {
+        dp4a: true,
+        pairs20: true,
+        pipeline: true,
+        table: false,
+    };
+    /// The pointer-table launch alone: one kernel per stage over the whole batch.
+    #[cfg(test)]
+    pub(crate) const TABLE: Self = Self {
+        dp4a: false,
+        pairs20: false,
+        pipeline: false,
+        table: true,
+    };
+    /// The pointer-table launch with the DP4A decode and the pipelined tile loop.
+    #[cfg(test)]
+    pub(crate) const TABLE_ALL: Self = Self {
+        dp4a: true,
+        pairs20: false,
+        pipeline: true,
+        table: true,
+    };
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::OFF,
+        Self::DP4A,
+        Self::PAIRS20,
+        Self::BOTH,
+        Self::PIPE,
+        Self {
+            dp4a: true,
+            pairs20: false,
+            pipeline: true,
+            table: false,
+        },
+        Self::PAIRS20_PIPE,
+        Self::BOTH_PIPE,
+    ];
 
-    /// A short label for test and bench records: `off`, `dp4a`, `pairs20` or `both`.
+    /// A short label for test and bench records: `off`, `dp4a`, `pairs20`, `both`, `pipe`, or
+    /// those joined by `+`.
     #[cfg(test)]
     pub(crate) fn name(self) -> &'static str {
-        match (self.dp4a, self.pairs20) {
-            (false, false) => "off",
-            (true, false) => "dp4a",
-            (false, true) => "pairs20",
-            (true, true) => "both",
+        match (self.dp4a, self.pairs20, self.pipeline, self.table) {
+            (false, false, false, false) => "off",
+            (true, false, false, false) => "dp4a",
+            (false, true, false, false) => "pairs20",
+            (true, true, false, false) => "both",
+            (false, false, true, false) => "pipe",
+            (true, false, true, false) => "dp4a+pipe",
+            (false, true, true, false) => "pairs20+pipe",
+            (true, true, true, false) => "all",
+            (false, _, false, true) => "table",
+            (true, _, false, true) => "dp4a+table",
+            (false, _, true, true) => "table+pipe",
+            (true, _, true, true) => "dp4a+table+pipe",
         }
     }
 
-    /// The most pairs one launch takes under these options.
+    /// The most pairs one launch takes under these options. The pointer-table form reads its
+    /// records from a device table, so its cap is the grid's, not a parameter block's.
     fn capacity(self) -> usize {
-        if self.pairs20 {
+        if self.table {
+            ffi::TABLE_PAIRS_MAX
+        } else if self.pairs20 {
             INDEXED_OPTION_CAPACITY
         } else {
             INDEXED_CAPACITY
         }
     }
 
-    /// The native options for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair block), or
-    /// `None` for the default launch: the 20-pair option changes only launches of more than 16
-    /// pairs, so the launches of a 16-pair model keep the default kernels under it.
+    /// The native options for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair block,
+    /// bit 2 the pipelined tile loop), or `None` for the default launch: the 20-pair option
+    /// changes only launches of more than 16 pairs, so the launches of a 16-pair model keep the
+    /// default kernels under it.
     fn native(self, calls: usize) -> Option<u32> {
         let wide = self.pairs20 && calls > INDEXED_CAPACITY;
-        let bits = u32::from(self.dp4a) | (u32::from(wide) << 1);
+        let bits = u32::from(self.dp4a) | (u32::from(wide) << 1) | (u32::from(self.pipeline) << 2);
         (bits != 0).then_some(bits)
     }
 
-    /// The load-line suffix of the options: empty when both are off, so the default line is
+    /// The load-line suffix of the options: empty when all are off, so the default line is
     /// unchanged.
     fn suffix(self) -> String {
         let mut suffix = String::new();
@@ -184,6 +303,12 @@ impl IndexedOptions {
         }
         if self.pairs20 {
             suffix.push_str(" exl3_indexed_pairs=20");
+        }
+        if self.pipeline {
+            suffix.push_str(" exl3_pipeline=on");
+        }
+        if self.table {
+            suffix.push_str(" exl3_table=on");
         }
         suffix
     }
@@ -217,16 +342,48 @@ pub(crate) fn indexed_pairs_from_env(
     }
 }
 
-/// What the environment says about the DP4A option and the 20-pair option (`None`: unset).
-type IndexedExplicit = (Option<bool>, Option<bool>);
+/// Parses [`PIPE_VAR`]: `None` when unset, else whether the pipelined loop is on.
+pub(crate) fn pipe_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(format!("{PIPE_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
 
-/// What the values of [`DP4A_VAR`] and [`INDEXED_PAIRS_VAR`] say about each option (`None`: unset),
-/// or the refusal of the first bad value. The environment read and the tests both go through it.
+/// Parses [`TABLE_VAR`]: `None` when unset, else whether the pointer-table launch is on.
+pub(crate) fn table_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(format!("{TABLE_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
+
+/// What the environment says about each option (`None`: unset).
+type IndexedExplicit = (Option<bool>, Option<bool>, Option<bool>, Option<bool>);
+
+/// What the values of [`DP4A_VAR`], [`INDEXED_PAIRS_VAR`] and [`PIPE_VAR`] say about each option
+/// (`None`: unset), or the refusal of the first bad value. The environment read and the tests
+/// both go through it.
 fn indexed_from_env(
     dp4a: Option<&std::ffi::OsStr>,
     pairs: Option<&std::ffi::OsStr>,
+    pipe: Option<&std::ffi::OsStr>,
+    table: Option<&std::ffi::OsStr>,
 ) -> Result<IndexedExplicit, String> {
-    Ok((dp4a_from_env(dp4a)?, indexed_pairs_from_env(pairs)?))
+    Ok((
+        dp4a_from_env(dp4a)?,
+        indexed_pairs_from_env(pairs)?,
+        pipe_from_env(pipe)?,
+        table_from_env(table)?,
+    ))
 }
 
 /// What the environment says about each option, or the refusal of a bad value. Read once per
@@ -239,6 +396,8 @@ fn indexed_explicit() -> Result<IndexedExplicit, EngError> {
             indexed_from_env(
                 std::env::var_os(DP4A_VAR).as_deref(),
                 std::env::var_os(INDEXED_PAIRS_VAR).as_deref(),
+                std::env::var_os(PIPE_VAR).as_deref(),
+                std::env::var_os(TABLE_VAR).as_deref(),
             )
         })
         .clone()
@@ -251,6 +410,8 @@ fn merge_indexed(default: IndexedOptions, explicit: IndexedExplicit) -> IndexedO
     IndexedOptions {
         dp4a: explicit.0.unwrap_or(default.dp4a),
         pairs20: explicit.1.unwrap_or(default.pairs20),
+        pipeline: explicit.2.unwrap_or(default.pipeline),
+        table: explicit.3.unwrap_or(default.table),
     }
 }
 
@@ -263,6 +424,8 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     let on: Vec<String> = [
         (options.dp4a, format!("{DP4A_VAR}=1")),
         (options.pairs20, format!("{INDEXED_PAIRS_VAR}=20")),
+        (options.pipeline, format!("{PIPE_VAR}=1")),
+        (options.table, format!("{TABLE_VAR}=1")),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))
@@ -274,7 +437,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     };
     Err(EngError::BadRequest(format!(
         "{} {verb} one tile per block: set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \
-         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16)",
+         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16, {PIPE_VAR}=0, {TABLE_VAR}=0)",
         on.join(" and ")
     )))
 }
@@ -351,7 +514,10 @@ fn single_gather_explicit() -> Result<Option<SingleRow>, EngError> {
 
 impl CudaContext {
     /// The most pairs one id-indexed launch on this context takes: 16, or 20 under the 20-pair
-    /// option. A bad switch value gives 16 here; the launch itself refuses it.
+    /// option, or the table launch's record cap under its flag. A bad switch value gives 16
+    /// here; the launch itself refuses it. The table cap is the launch's own limit — callers
+    /// that carve a fixed working scratch per pair must still bound their batches by that
+    /// scratch, not by this number, or the range checks refuse the oversized rows.
     pub(crate) fn exl3_indexed_capacity(&self) -> usize {
         self.exl3_indexed_options()
             .map_or(INDEXED_CAPACITY, IndexedOptions::capacity)
@@ -375,21 +541,13 @@ impl CudaContext {
     }
 
     /// Lets the one-tile wide launches of this context run the compile-time rate 10 and rate 6 body
-    /// of book 2 where every group of a launch allows it. Set by the Flash-Next start; a context
-    /// that never calls it (Qwen3.6, Flint) runs the kernels it ran before. The body takes the DP4A
-    /// decode of book 2 when the DP4A option is on for the context. Every byte written is the same
-    /// either way.
+    /// of book 2 where every group of a launch allows it. Set by the Flash-Next start and by
+    /// family starts through their [`ServedKernels`] profile (Qwen3.6 calls it with `false`
+    /// through the applier); a context that never calls it runs the kernels it ran before. The
+    /// body takes the DP4A decode of book 2 when the DP4A option is on for the context. Every
+    /// byte written is the same either way.
     pub(crate) fn set_odd_rate_kernel(&self, on: bool) {
         self.exl3_odd_rates.set(on);
-    }
-
-    /// Lets the grouped launches of this context fuse the input rotation into the projection
-    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start;
-    /// a context that never calls it (Qwen3.6, Flint) runs the launches it ran before. Calls the
-    /// fused kernel cannot take fall back to the separate launches. Every byte written is the
-    /// same either way.
-    pub(crate) fn set_fused_in_kernel(&self, on: bool) {
-        self.exl3_fused_in.set(on);
     }
 
     /// Registers the id-indexed options an unset [`DP4A_VAR`] or [`INDEXED_PAIRS_VAR`] leaves to
@@ -398,6 +556,19 @@ impl CudaContext {
     /// unaffected.
     pub(crate) fn set_indexed_default(&self, options: IndexedOptions) {
         self.exl3_indexed_default.set(Some(options));
+    }
+
+    /// Applies a family's [`ServedKernels`] profile: the single-row and id-indexed defaults,
+    /// the odd-rate kernel switch, then the launch-switch check. A family
+    /// start registers through this one path - defaults before the check - so the setter order
+    /// and the check placement live in one place.
+    pub(crate) fn register_served_kernels(&self, profile: ServedKernels) -> Result<(), EngError> {
+        self.set_single_row_default(profile.single_row);
+        if let Some(indexed) = profile.indexed {
+            self.set_indexed_default(indexed);
+        }
+        self.set_odd_rate_kernel(profile.odd_rates);
+        self.check_single_gather()
     }
 
     /// Sets the options of this context's id-indexed launches (test builds only); `None` returns
@@ -763,30 +934,16 @@ impl CudaContext {
         self.exl3_jobs_with(stream, call, ffi::jobs)
     }
 
-    /// [`Self::exl3_jobs`] with the fused-output-rotation request made explicit, for the device
-    /// tests and the GPU qualification; `None` leaves the env default (off).
+    /// [`Self::exl3_jobs`] with the warp-wide input-rotation request made explicit, for the
+    /// device tests and the GPU qualification; it does not read the environment.
     #[cfg(test)]
-    pub(crate) fn exl3_jobs_fused_out(
+    pub(crate) fn exl3_jobs_wide(
         &self,
         stream: &DeviceStream,
         call: Exl3JobsCall<'_>,
-        fused_out: bool,
+        wide_input: bool,
     ) -> Result<(), EngError> {
-        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_fused(s, raw, fused_out))
-    }
-
-    /// [`Self::exl3_jobs`] with both requests explicit (the fused output rotation and the
-    /// warp-wide input rotation), for the device tests; neither reads the environment.
-    #[cfg(test)]
-    pub(crate) fn exl3_jobs_modes(
-        &self,
-        stream: &DeviceStream,
-        call: Exl3JobsCall<'_>,
-        (fused_out, wide_input): (bool, bool),
-    ) -> Result<(), EngError> {
-        self.exl3_jobs_with(stream, call, |s, raw| {
-            ffi::jobs_modes(s, raw, fused_out, wide_input)
-        })
+        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_wide(s, raw, wide_input))
     }
 
     /// Whether `call` would take the warp-wide input rotation under the request `enabled`: the
@@ -890,21 +1047,17 @@ impl CudaContext {
     /// with their own scales and rotated-row buffers. With `pair` set and both calls aligned for
     /// the warp-wide kernel, the rows are read and rotated once for both, then each call
     /// projects; otherwise the two calls run one after the other. The bytes are the same.
-    /// `fused_out` is the fused-output request (`None` is the environment's). Returns whether
-    /// the pair rotation ran.
+    /// Returns whether the pair rotation ran.
     pub(crate) fn exl3_jobs_pair_mode(
         &self,
         stream: &DeviceStream,
         (first, second): (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
-        (pair, fused_out): (bool, Option<bool>),
+        pair: bool,
     ) -> Result<bool, EngError> {
         if !pair || !self.pair_usable(&first, &second)? {
             jobs_warp_rotate_setting()?;
             for call in [first, second] {
-                self.exl3_jobs_with(stream, call, |s, raw| match fused_out {
-                    Some(fused) => ffi::jobs_fused(s, raw, fused),
-                    None => ffi::jobs(s, raw),
-                })?;
+                self.exl3_jobs_with(stream, call, ffi::jobs)?;
             }
             return Ok(false);
         }
@@ -912,8 +1065,8 @@ impl CudaContext {
         require_pair_apart((&first, &na), (&second, &nb))?;
         self.launch_on(stream, |s| {
             ffi::jobs_rotate_pair(s, (&ra, &rb))?;
-            ffi::jobs_rotated(s, &ra, fused_out)?;
-            ffi::jobs_rotated(s, &rb, fused_out)
+            ffi::jobs_rotated(s, &ra)?;
+            ffi::jobs_rotated(s, &rb)
         })?;
         Ok(true)
     }
@@ -1199,36 +1352,6 @@ impl CudaContext {
         self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols, odd))
     }
 
-    /// The grouped launch with the input rotation fused into the projection kernel
-    /// ([`exl3_decode_fused.h`](crate::kernels::cuda::native::resident)): two launches per group
-    /// set instead of three, no `xh` round trip. Every call must be one row, book 2 at rate 10
-    /// or 6, `n` a multiple of 16 and `k` of 512; the bytes written equal
-    /// [`Self::exl3_grouped_wide`] at `cols` 1.
-    pub(crate) fn exl3_grouped_fin(
-        &self,
-        stream: &DeviceStream,
-        calls: &[Exl3LinearCall<'_>],
-    ) -> Result<(), EngError> {
-        if calls.iter().any(|call| {
-            call.rows != 1
-                || !call.n.is_multiple_of(16)
-                || !call.k.is_multiple_of(512)
-                || call.book != Codebook::Mul1
-                || !matches!(call.bits_twice, 10 | 6)
-        }) {
-            return Err(EngError::BadRequest(
-                "EXL3 fused-input launch: every call must be one row of book 2 at rate 10 or 6, \
-                 n a multiple of 16 and k of 512"
-                    .to_string(),
-            ));
-        }
-        let raw = self.grouped_raw(calls)?;
-        #[cfg(test)]
-        self.note_exl3_launch(SingleRow::Wide(1));
-        let dp4a = self.exl3_indexed_options()?.dp4a;
-        self.launch_on(stream, |s| ffi::grouped_fin(s, &raw, dp4a))
-    }
-
     /// The grouped launch of the Qwen3.6 MoE block: the gather kernel, or the wide kernel when
     /// `FIFI_EXL3_SINGLE_GATHER` names one (`wide1`, `wide2`, `wide4`) and every call's `n` is a
     /// multiple of its tile span. Both write the same bytes.
@@ -1237,19 +1360,6 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[Exl3LinearCall<'_>],
     ) -> Result<(), EngError> {
-        // The fused-input launch replaces the separate input rotation where every call allows
-        // it; it notes its own launch, so this path must not note again.
-        if self.exl3_fused_in.get()
-            && calls.iter().all(|call| {
-                call.rows == 1
-                    && call.n.is_multiple_of(16)
-                    && call.k.is_multiple_of(512)
-                    && call.book == Codebook::Mul1
-                    && matches!(call.bits_twice, 10 | 6)
-            })
-        {
-            return self.exl3_grouped_fin(stream, calls);
-        }
         let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
         #[cfg(test)]
         self.note_exl3_launch(match kernel {
@@ -1311,6 +1421,109 @@ impl CudaContext {
         cols: u32,
     ) -> Result<(), EngError> {
         self.grouped_indexed_by(stream, calls, cols, true)
+    }
+
+    /// Cross-record isolation of the id-indexed launches, as one sorted sweep: a record's
+    /// writes — its rotated input, its split-K partial, its output and the 4-byte completion
+    /// flag — never overlap another record's reads or writes. Reads may overlap reads,
+    /// because the records of one bank share its trellis, scales and id table. The native
+    /// checks keep the same rule; refusing here keeps every deliberate refusal off the
+    /// native path, whose statuses latch the backend terminal for the rest of the process.
+    /// The sweep is O(records · log records): the table launch admits the grid's record
+    /// count, and the pairwise loop an earlier form of this check used was quadratic in it.
+    fn refuse_cross_record_overlap(
+        raw: &[ffi::LinearRaw<'_>],
+        index: &[ffi::IndexRaw<'_>],
+    ) -> Result<(), EngError> {
+        let refuse = |what: String| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
+        struct Write {
+            addr: usize,
+            bytes: usize,
+            record: usize,
+            name: &'static str,
+        }
+        let flag0 = raw[0].flag.address() as usize;
+        let mut writes: Vec<Write> = Vec::with_capacity(raw.len() * 4);
+        for (i, a) in raw.iter().enumerate() {
+            if a.flag.address() as usize != flag0 {
+                return Err(refuse("the calls must share one flag span".into()));
+            }
+            for (name, r, bytes) in [
+                ("xh", &a.xh, a.k * 4),
+                ("z", &a.z, a.n * 4),
+                ("out", &a.out, a.n * 4),
+                ("flag", &a.flag, 4),
+            ] {
+                writes.push(Write {
+                    addr: r.address() as usize,
+                    bytes,
+                    record: i,
+                    name,
+                });
+            }
+        }
+        writes.sort_unstable_by_key(|w| (w.addr, w.bytes));
+        for pair in writes.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if b.addr >= a.addr + a.bytes {
+                continue;
+            }
+            // The batch's one shared 4-byte flag is the only write two records may share
+            // (uniformity was proved above); any other same-pointer pair stays refused.
+            if a.name == "flag" && b.name == "flag" && a.bytes == 4 && b.bytes == 4 {
+                continue;
+            }
+            return Err(refuse(format!(
+                "record {}'s {} overlaps record {}'s {}",
+                a.record, a.name, b.record, b.name
+            )));
+        }
+        for (i, a) in raw.iter().enumerate() {
+            let x = &index[i];
+            let none = std::ptr::null_mut();
+            let reads: [(&str, *mut std::ffi::c_void, usize); 7] = [
+                (
+                    "trellis",
+                    a.trellis.address(),
+                    a.k * a.n / 256 * usize::from(a.bits_twice) * 16,
+                ),
+                ("suh", a.suh.address(), a.k * 4),
+                ("svh", a.svh.address(), a.n * 4),
+                (
+                    "bias",
+                    a.bias.as_ref().map_or(none, |b| b.address()),
+                    a.bias.map_or(0, |_| a.n * 4),
+                ),
+                ("x", a.x.address(), a.k * 4),
+                ("member ids", x.ids.address(), (x.slot as usize + 1) * 4),
+                (
+                    "member offsets",
+                    x.offsets.as_ref().map_or(none, |t| t.address()),
+                    x.offsets.map_or(0, |_| x.members as usize * 4),
+                ),
+            ];
+            for (name, p, bytes) in reads {
+                if bytes == 0 {
+                    continue;
+                }
+                let addr = p as usize;
+                // The write starting before `addr` may still cover it; walk while the
+                // writes start inside the read span.
+                let mut at = writes.partition_point(|w| w.addr < addr);
+                at = at.saturating_sub(1);
+                while at < writes.len() && writes[at].addr < addr + bytes {
+                    let w = &writes[at];
+                    if w.record != i && addr < w.addr + w.bytes {
+                        return Err(refuse(format!(
+                            "record {i}'s {name} overlaps record {}'s {}",
+                            w.record, w.name
+                        )));
+                    }
+                    at += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The id-indexed launch; `widen` adds the 20-pair option to the environment's options.
@@ -1425,10 +1638,17 @@ impl CudaContext {
                     .transpose()?,
             });
         }
+        Self::refuse_cross_record_overlap(&raw, &index)?;
+        if options.table {
+            if cols != 1 {
+                return Err(refuse("the pointer-table launch runs one tile per block"));
+            }
+            return self.exl3_indexed_table(stream, &raw, &index, &options);
+        }
         if let Some(native) = options.native(calls.len()) {
             if cols != 1 {
                 return Err(refuse(
-                    "the DP4A and 20-pair options run one tile per block",
+                    "the DP4A, 20-pair and pipeline options run one tile per block",
                 ));
             }
             return self.launch_on(stream, |s| {
@@ -1436,6 +1656,53 @@ impl CudaContext {
             });
         }
         self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
+    }
+
+    /// The pointer-table form of the id-indexed launch ([`TABLE_VAR`]): the per-call records
+    /// ride a device table (packed host-side by the native layer, staged through a
+    /// stream-ordered region copy) and one kernel per stage covers the whole batch, so the
+    /// parameter block's pair cap lifts to the grid's. Only the DP4A and pipeline bits apply.
+    /// Every byte written equals the option launch of the same calls. The staging copy makes
+    /// this form refuse graph capture (the option launch stays capturable).
+    fn exl3_indexed_table(
+        &self,
+        stream: &DeviceStream,
+        raw: &[ffi::LinearRaw<'_>],
+        index: &[ffi::IndexRaw<'_>],
+        options: &IndexedOptions,
+    ) -> Result<(), EngError> {
+        let records = ffi::indexed_table_records(raw, index).map_err(device_error)?;
+        // This module carries no unsafe, so the staging takes a byte copy of the packed records
+        // (2.5 KB at 20 records) instead of a raw view of the words.
+        let bytes: Vec<u8> = records.iter().flat_map(|word| word.to_le_bytes()).collect();
+        // The grid covers the batch's widest shapes; narrower records exit their extra units
+        // through the per-record k/n in the table.
+        let k_units = raw
+            .iter()
+            .map(|call| call.k.div_ceil(128))
+            .max()
+            .unwrap_or(1) as u32;
+        let n_max = raw.iter().map(|call| call.n).max().unwrap_or(16);
+        let n_tiles = (n_max / 16) as u32;
+        let n_units = n_max.div_ceil(128) as u32;
+        let native = u32::from(options.dp4a) | (u32::from(options.pipeline) << 2);
+        let fused_publish = u32::from(raw[0].fused);
+        let flag = raw[0].flag.address();
+        let table = self.stage_exl3_indexed_table(stream, &bytes)?;
+        let count = raw.len();
+        self.launch_on(stream, |s| {
+            ffi::indexed_table(
+                s,
+                table,
+                count,
+                k_units,
+                n_tiles,
+                n_units,
+                flag,
+                fused_publish,
+                native,
+            )
+        })
     }
 
     fn grouped_split_raw<'a>(
@@ -1461,15 +1728,25 @@ impl CudaContext {
     ) -> Result<Vec<ffi::LinearRaw<'a>>, EngError> {
         self.ensure_usable()?;
         if calls.is_empty()
-            || calls.len() > 48
+            || calls.len() > GROUPED_PAIRS_MAX
             || calls
                 .iter()
                 .any(|call| !(1..=8).contains(&call.rows) || call.split_k != 2)
-            || calls.iter().map(|call| call.rows).sum::<usize>() > 48
+            || calls.iter().map(|call| call.rows).sum::<usize>() > GROUPED_PAIRS_MAX
         {
-            return Err(EngError::BadRequest(
-                "EXL3 grouped needs 1..=48 pairs in local groups1..=8".into(),
-            ));
+            let rows: Vec<_> = calls.iter().map(|call| call.rows).collect();
+            // A wide refused batch prints only the head of its rows vector.
+            let head: Vec<_> = rows.iter().take(8).collect();
+            let shown = if rows.len() > 8 {
+                format!("{} calls starting {head:?}", rows.len())
+            } else {
+                format!("{rows:?}")
+            };
+            return Err(EngError::BadRequest(format!(
+                "EXL3 grouped needs 1..={GROUPED_PAIRS_MAX} pairs in local groups of 1..=8 rows \
+                 (rows {shown}, sum {})",
+                rows.iter().sum::<usize>(),
+            )));
         }
         // The native entry reads one fused-publish arm for the whole set and refuses a
         // mix; a native refusal would latch the backend, so refuse here first.
@@ -1642,6 +1919,8 @@ mod jobs_tests;
 mod linear_tests;
 #[cfg(test)]
 mod rows_wide1_tests;
+#[cfg(test)]
+mod served_order_tests;
 #[cfg(test)]
 mod single_gather_tests;
 #[cfg(test)]

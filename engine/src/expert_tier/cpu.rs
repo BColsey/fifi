@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use crate::{EngError, family::qwen36::tiered::mapped_file::MappedFile};
+use crate::{EngError, family::mapped_file::MappedFile};
 
 /// One selected expert and the router weight its output is scaled by.
 #[derive(Clone, Copy, Debug, PartialEq)]

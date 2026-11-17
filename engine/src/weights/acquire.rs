@@ -400,6 +400,12 @@ impl StreamedCheckpoint {
         self.route.contains_key(key)
     }
 
+    /// Every tensor name the checkpoint's index routes, in sorted name order (the route is a
+    /// sorted map). A coverage survey diffs this list against the names a load reads.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.route.keys().map(String::as_str)
+    }
+
     pub fn stored(&self, key: &str) -> Option<(Dtype, Vec<u32>)> {
         let index = *self.route.get(key)?;
         let entry = self.stores.get(index)?.header.entry(key)?;

@@ -1,7 +1,7 @@
 //! Flash-Next PLE n-gram decode step (design section "PLE").
 
-use super::math::{dot, expect_len, rms0, silu};
 use crate::EngError;
+use crate::family::math::{dot, expect_len, rms0, silu};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +118,27 @@ impl PleState {
 
     pub(crate) fn byte_len(&self) -> usize {
         self.history.len() * 4 + self.ring.len() * 4
+    }
+
+    /// Installs a saved `(history, ring)` pair, as a prefix restore brings the feed back to a
+    /// boundary. Refuses a ring of the wrong length; the history is whatever the boundary held.
+    pub(crate) fn resume(&mut self, history: &[u32], ring: &[f32]) -> Result<(), EngError> {
+        if ring.len() != self.ring.len() {
+            return Err(EngError::BadRequest(format!(
+                "the PLE ring holds {} values, not {}",
+                self.ring.len(),
+                ring.len()
+            )));
+        }
+        self.history.clear();
+        self.history.extend_from_slice(history);
+        self.ring.copy_from_slice(ring);
+        Ok(())
+    }
+
+    /// The ring values in host layout: the resume snapshot's host half.
+    pub(crate) fn ring_values(&self) -> &[f32] {
+        &self.ring
     }
 
     /// The convolution ring, row `c` at `c * (conv_kernel - 1) * ngram` (test observation only).
@@ -312,6 +333,14 @@ pub(crate) fn step<P: Projector>(
             "ple weight scale must be finite".to_owned(),
         ));
     }
+    let profile = step_prof::on();
+    let mut t = std::time::Instant::now();
+    let mut tick = |slot: usize| {
+        if profile {
+            step_prof::add(slot, t.elapsed());
+            t = std::time::Instant::now();
+        }
+    };
     let plan = plan_rows(shape, weights, &state.history, token)?;
     let mut emb = Vec::with_capacity(shape.embed);
     for &(table, local) in &plan.rows {
@@ -320,11 +349,14 @@ pub(crate) fn step<P: Projector>(
         emb.extend(values.iter().map(|v| v * weights.weight_scale));
     }
     let new_history = plan.history;
+    tick(16);
 
     let keys = projector.linear(weights.key, &emb)?;
     expect_len(&keys, width, "ple key")?;
+    tick(17);
     let value = projector.linear(weights.value, &emb)?;
     expect_len(&value, hidden, "ple value")?;
+    tick(18);
 
     let mut gated = vec![0.0f32; width];
     let mut normed = vec![0.0f32; width];
@@ -342,6 +374,7 @@ pub(crate) fn step<P: Projector>(
         let block = rms0(&gated[lo..hi], &weights.norm_conv[lo..hi], eps)?;
         normed[lo..hi].copy_from_slice(&block);
     }
+    tick(19);
 
     let mut out = vec![0.0f32; width];
     for (c, out_c) in out.iter_mut().enumerate() {
@@ -353,6 +386,7 @@ pub(crate) fn step<P: Projector>(
         }
         *out_c = gated[c] + silu(a);
     }
+    tick(20);
 
     let mut new_ring = vec![0.0f32; shape.ring_len];
     for (c, &n) in normed.iter().enumerate() {
@@ -364,7 +398,27 @@ pub(crate) fn step<P: Projector>(
 
     state.history = new_history;
     state.ring = new_ring;
+    tick(21);
     Ok(out)
+}
+
+/// The prefill profiler's slots, when the CUDA driver that dumps them is compiled in.
+#[cfg(feature = "native-cuda")]
+mod step_prof {
+    pub(super) fn on() -> bool {
+        crate::family::flash_next::cuda::driver::chunk::prof::on()
+    }
+    pub(super) fn add(slot: usize, spent: std::time::Duration) {
+        crate::family::flash_next::cuda::driver::chunk::prof::add(slot, spent);
+    }
+}
+
+#[cfg(not(feature = "native-cuda"))]
+mod step_prof {
+    pub(super) fn on() -> bool {
+        false
+    }
+    pub(super) fn add(_: usize, _: std::time::Duration) {}
 }
 
 #[cfg(test)]
@@ -580,6 +634,33 @@ mod tests {
             plan_chunk_rows(&shape, &w, &[1], &[]),
             Err(EngError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn resume_installs_the_saved_half_and_refuses_a_wrong_ring() {
+        let shape = PleShape::new(dims()).unwrap();
+        let mut state = PleState::new(&shape);
+        state.history.extend_from_slice(&[7, 8, 9]);
+        for (i, v) in state.ring.iter_mut().enumerate() {
+            *v = i as f32 + 0.5;
+        }
+        let (history, ring) = (state.history.clone(), state.ring.clone());
+        // A ring of the wrong length is refused and changes nothing.
+        let mut short = ring.clone();
+        short.pop();
+        assert!(state.resume(&[1], &short).is_err());
+        assert_eq!(state.history, history, "a refused resume changes nothing");
+        // A later sequence's history REPLACES the boundary's, never appends.
+        state.history.clear();
+        state.history.push(42);
+        state.resume(&history, &ring).unwrap();
+        assert_eq!(state.history, history);
+        assert_eq!(state.ring, ring);
+        assert_eq!(
+            state.ring_values(),
+            &ring[..],
+            "the snapshot reads the same values back"
+        );
     }
 
     #[test]

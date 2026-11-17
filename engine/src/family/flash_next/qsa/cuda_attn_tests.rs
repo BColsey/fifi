@@ -25,7 +25,7 @@
 use super::cuda_tests::{Rng, download, f32_bytes, uniform};
 use super::{QsaDims, attend_selected, select_positions};
 use crate::EngError;
-use crate::family::flash_next::math::{rms0, rope_half};
+use crate::family::math::{rms0, rope_half};
 use crate::kernels::cuda::resident::qsa_attn::{QsaAttnCall, QsaAttnShape};
 use crate::kernels::cuda::resident::qsa_index::QsaPosition;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, device_present};

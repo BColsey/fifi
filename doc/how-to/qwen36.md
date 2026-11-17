@@ -101,7 +101,7 @@ requirements and a method to compare placements.
 ## Keep long conversations fast
 
 All shipped CUDA profiles set `"prefix_reuse": true`: when a conversation continues, only the new messages are processed.
-The Mac profile leaves it off. To turn it on there, set `"prefix_reuse": true` at the top level and raise `session_cap_bytes` in the `qwen36` object to at least `5770117120`; startup refuses a smaller cap.
+The Mac profile sets `"prefix_reuse": false` explicitly: the Qwen3.6 MLX arm is not qualified for reuse (an omitted key already defaults to off for it, and the explicit value pins that). To turn it on there, set `"prefix_reuse": true` at the top level and raise `session_cap_bytes` in the `qwen36` object to at least `5770117120`; startup refuses a smaller cap.
 [How conversation reuse works](../explanation/prefix-reuse.md) explains the memory this takes.
 
 ## If the engine does not load

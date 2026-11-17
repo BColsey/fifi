@@ -87,6 +87,31 @@ fn the_slot_counts_track_the_cost_model_at_each_context() {
 }
 
 #[test]
+fn prefill_arena_charge_is_additive_and_off_inputs_are_identical() {
+    let base = inputs(131_072, 2);
+    assert_eq!(base.with_prefill_arena(0).unwrap(), base);
+    let bytes = base.shape.slot_cost();
+    let charged = base.with_prefill_arena(bytes).unwrap();
+    assert_eq!(charged.vram.arena, base.vram.arena + bytes);
+    let mut restored = charged;
+    restored.vram.arena -= bytes;
+    assert_eq!(restored, base);
+    assert_eq!(
+        TierPlan::new(&charged).unwrap().slots_per_layer(),
+        TierPlan::new(&base).unwrap().slots_per_layer() - 1
+    );
+}
+
+#[test]
+fn prefill_arena_charge_refuses_overflow() {
+    let base = inputs(131_072, 2);
+    assert!(matches!(
+        base.with_prefill_arena(u64::MAX),
+        Err(EngError::MemoryPlan(message)) if message.contains("prefill arena")
+    ));
+}
+
+#[test]
 fn the_plan_accounts_for_every_byte() {
     let plan = TierPlan::new(&inputs(131_072, 2)).unwrap();
     let slots = plan.slots_per_layer() as u64;
@@ -322,4 +347,38 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
     assert!(text.contains("pinned host bytes"), "{text}");
     // A quiet host keeps the 8 GiB OS floor.
     assert_eq!(measured(free, 62 * GIB).host.non_reclaimable, 8 * GIB);
+}
+
+/// c0 goldens (P4): `TierInputs::measured` as a literal struct. The part
+/// charge comes from the family admission home and the four borrowed policy
+/// constants from the family that measured them; P4 moving them must not
+/// change a byte of this table.
+#[test]
+fn tier_inputs_measured_golden_struct() {
+    let kv = KvPlan {
+        positions: 131_072,
+        bytes_per_position: 4096,
+    };
+    let inputs = TierInputs::measured(
+        shape(),
+        (7 * GIB, 512 * MIB),
+        kv,
+        22 * GIB,
+        (64 * GIB, 6 * GIB),
+    );
+    assert_eq!(inputs.vram.usable, 22 * GIB);
+    assert_eq!(inputs.vram.non_expert, 7 * GIB + 512 * MIB);
+    assert_eq!(inputs.vram.state, 64 * MIB);
+    assert_eq!(inputs.vram.arena, 384 * MIB);
+    assert_eq!(inputs.vram.desktop_reserve, (256 + 64 + 128) * MIB);
+    assert_eq!(inputs.kv.positions, 131_072);
+    assert_eq!(inputs.kv.bytes_per_position, 4096);
+    assert_eq!(inputs.host.total, 64 * GIB);
+    assert_eq!(inputs.host.non_reclaimable, 58 * GIB);
+    assert_eq!(inputs.host.engine_heap, 2 * GIB);
+    assert_eq!(inputs.host.staging, GIB);
+    assert_eq!(inputs.host.margin, GIB);
+    // The host floor: available memory cannot push non-reclaimable under 8 GiB.
+    let clamped = TierInputs::measured(shape(), (0, 0), kv, 0, (64 * GIB, 60 * GIB));
+    assert_eq!(clamped.host.non_reclaimable, 8 * GIB);
 }

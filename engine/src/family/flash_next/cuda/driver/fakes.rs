@@ -6,7 +6,9 @@
 
 use std::ops::Range;
 
+use super::super::driver::StateSlot;
 use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds, chunk::ChunkDevice};
+use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::{
     EngError,
     family::flash_next::cuda::feeds::{StartShape, StartSink},
@@ -40,6 +42,8 @@ pub(in crate::family::flash_next::cuda) struct FakeDevice {
     /// Every call, in order.
     pub(in crate::family::flash_next::cuda) log: Vec<String>,
     pub(in crate::family::flash_next::cuda) stream: Vec<f32>,
+    /// The fixed-state image a resume reads and installs (one blob; the fake has no slots).
+    pub(in crate::family::flash_next::cuda) fixed: Vec<u8>,
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
@@ -119,6 +123,25 @@ impl TokenDevice for FakeDevice {
     }
 }
 
+impl super::StateIo for FakeDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        Ok(vec![(StateSlot::PleRing, self.fixed.clone())])
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.fixed.len() as u64
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        let Some((_, bytes)) = parts.first() else {
+            return Ok(());
+        };
+        self.fixed = bytes.clone();
+        self.log.push("state_write".to_string());
+        Ok(())
+    }
+}
+
 /// The chunk fake: `m` rows of the stream; layer `l` at position `p` adds `l + 1 + p + row` to
 /// every value of row `row`, so a row carries its own index and the PLE roundtrip is checkable
 /// per row. The logits row follows the LAST row, as the head does.
@@ -127,9 +150,14 @@ pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
     /// Every call, in order.
     pub(in crate::family::flash_next::cuda) log: Vec<String>,
     pub(in crate::family::flash_next::cuda) stream: Vec<f32>,
+    /// The device PLE pairs `ple_project_chunk` returns, one per row.
+    pub(in crate::family::flash_next::cuda) ple_pairs: Option<Vec<PleKeyValue>>,
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
+    /// The last state the resume seam wrote back, as read.
+    pub(in crate::family::flash_next::cuda) state: Vec<(StateSlot, Vec<u8>)>,
+    pub(in crate::family::flash_next::cuda) track_windows: bool,
 }
 
 impl FakeChunkDevice {
@@ -143,6 +171,23 @@ impl FakeChunkDevice {
                 message: format!("{name} failed"),
             });
         }
+        Ok(())
+    }
+}
+
+impl super::StateIo for FakeChunkDevice {
+    fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
+        // read takes &self, so no log step here — the log is only for the mutable calls.
+        Ok(self.state.clone())
+    }
+
+    fn fixed_state_bytes(&self) -> u64 {
+        self.state.iter().map(|(_, bytes)| bytes.len() as u64).sum()
+    }
+
+    fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
+        self.step("write_fixed_state", String::new())?;
+        self.state = parts.to_vec();
         Ok(())
     }
 }
@@ -161,8 +206,29 @@ impl ChunkDevice for FakeChunkDevice {
         self.step("chunk_ple", String::new())
     }
 
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
+        self.step("chunk_ple_project", String::new())?;
+        self.ple_pairs
+            .clone()
+            .ok_or_else(|| EngError::BadRequest("the fake has no PLE pairs".to_string()))
+    }
+
     fn begin_chunk(&mut self) -> Result<(), EngError> {
         self.step("begin", String::new())
+    }
+
+    fn begin_prefill(&mut self) -> Result<(), EngError> {
+        if self.track_windows {
+            self.step("begin_prefill", String::new())?;
+        }
+        Ok(())
+    }
+
+    fn end_prefill(&mut self) -> Result<(), EngError> {
+        if self.track_windows {
+            self.step("end_prefill", String::new())?;
+        }
+        Ok(())
     }
 
     fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<(), EngError> {
@@ -206,6 +272,12 @@ impl ChunkDevice for FakeChunkDevice {
         self.step("health", String::new())
     }
 
+    /// Logs like every other call, so the boundary-order test can see the drain between the
+    /// phases; the `fail` mechanism covers a failing drain by name.
+    fn drain(&mut self) -> Result<(), EngError> {
+        self.step("drain", String::new())
+    }
+
     fn reset(&mut self) -> Result<(), EngError> {
         self.resets += 1;
         self.stream.clear();
@@ -217,6 +289,8 @@ impl ChunkDevice for FakeChunkDevice {
 pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     /// The updates asked for: the token and the stream it saw.
     pub(in crate::family::flash_next::cuda) updates: Vec<(u32, Vec<f32>)>,
+    /// The first key of every device pair set (the device route hands them over in order).
+    pub(in crate::family::flash_next::cuda) pairs: Vec<f32>,
     pub(in crate::family::flash_next::cuda) resets: usize,
     /// The token whose `begin` fails.
     pub(in crate::family::flash_next::cuda) fail_begin: Option<u32>,
@@ -224,6 +298,7 @@ pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     pub(in crate::family::flash_next::cuda) fail_update: bool,
     /// The width of the update (the stream's, unless a test breaks it).
     pub(in crate::family::flash_next::cuda) update_width: Option<usize>,
+    pub(in crate::family::flash_next::cuda) start_width: Option<usize>,
 }
 
 impl TokenFeeds for FakeFeeds {
@@ -232,7 +307,7 @@ impl TokenFeeds for FakeFeeds {
             return Err(EngError::Checkpoint("the pack read failed".into()));
         }
         Ok(StartVectors {
-            stream: vec![token as f32; STREAM],
+            stream: vec![token as f32; self.start_width.unwrap_or(STREAM)],
             ple_embedding: vec![token as f32; PLE_EMBED],
         })
     }
@@ -243,6 +318,12 @@ impl TokenFeeds for FakeFeeds {
         }
         self.updates.push((token, stream.to_vec()));
         Ok(vec![0.5; self.update_width.unwrap_or(stream.len())])
+    }
+
+    fn set_ple_pair(&mut self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.pairs
+            .push(pair.keys.first().copied().unwrap_or(f32::NAN));
+        Ok(())
     }
 
     fn reset(&mut self) {

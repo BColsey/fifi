@@ -26,11 +26,282 @@
 //! chunked prefill step (`step`/`mixer` at `m` rows).
 
 use std::ops::Range;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
 
-use super::{DriverShape, TokenFeeds};
-use crate::{EngError, family::session::TokenStepper};
+use super::{DriverShape, ResumeSnapshot, TokenFeeds};
+use crate::EngError;
+use crate::family::flash_next::cuda::ple_feed::{HostProjection, PleKeyValue, PleProjection};
+use crate::family::session::TokenStepper;
 
 type Result<T> = std::result::Result<T, EngError>;
+
+/// Coarse per-phase timing of the chunked prefill (INFERENCE_FLASH_NEXT_PROFILE=1): where a
+/// chunk's wall time goes, accumulated over a prompt and dumped at its sampling row.
+pub(in crate::family::flash_next) mod prof {
+    use super::*;
+
+    /// The phases of `queue` plus the inside of one layer, in call order. Slots 22-27 walk the
+    /// interior of the ring rows-block, which the one-row block's taps (slots 11-13) never
+    /// reach: the ring issues no admit and no miss pass. Slots 34-42 are the host time blocked
+    /// inside the page-io waits — the `stream_synchronize` of a pageable copy — per site,
+    /// upload and readback separately. They are nested inside the phases above them, so the
+    /// phases sum counts them twice.
+    pub(super) const NAMES: [&str; 43] = [
+        "begin(host feeds)",
+        "start writes",
+        "layers<PLE",
+        "read_stream",
+        "ple_update(host)",
+        "write_stream_back",
+        "layers>=PLE",
+        "head+read",
+        "  hyper conn",
+        "  mixer(attn)",
+        "  moe_block",
+        "    moe route",
+        "    moe admit",
+        "    moe launch",
+        "    ple ngram gather",
+        "    ple step math",
+        "      ple plan+emb",
+        "      ple key matvec",
+        "      ple value matvec",
+        "      ple branch norms",
+        "      ple conv",
+        "      ple ring",
+        "  ring issue",
+        "  ring route+drain",
+        "  ring classify+ids",
+        "  ring wait+gu",
+        "  ring swiglu+down",
+        "  ring shared+combine",
+        "  rows classify",
+        "  rows grouped gu",
+        "  rows swiglu+down",
+        "  rows shared+combine",
+        "  rows dirty sync+step",
+        "  rows miss+clean tails",
+        "blk step slot_row up",
+        "blk step log readback",
+        "blk step miss uploads",
+        "blk route picks readback",
+        "blk rows admit slot_row up",
+        "blk rows tail uploads",
+        "blk ring weights up",
+        "blk ring wait_layer",
+        "blk filler readback",
+    ];
+    pub(super) static NS: [AtomicU64; 43] = [const { AtomicU64::new(0) }; 43];
+    pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
+    /// Chunk products the batch host route ran (m >= threads), and the rows it routed to the
+    /// per-row projections instead (m < threads, decode's one-row chunks included). Counted
+    /// unconditionally — a run proves its route only from a printed counter — but only printed
+    /// under the profile switch.
+    pub(super) static PRODUCTS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FALLBACK_ROWS: AtomicU64 = AtomicU64::new(0);
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    /// The route counters of this process so far, for the chunk-driver tests.
+    pub(in crate::family::flash_next) fn route_counters() -> (u64, u64) {
+        (
+            PRODUCTS.load(AtomicOrdering::Relaxed),
+            FALLBACK_ROWS.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// Zeroes the route counters; tests call this so their reads are deltas.
+    pub(in crate::family::flash_next) fn reset_route_counters() {
+        PRODUCTS.store(0, AtomicOrdering::Relaxed);
+        FALLBACK_ROWS.store(0, AtomicOrdering::Relaxed);
+    }
+
+    pub(in crate::family::flash_next) fn on() -> bool {
+        *ON.get_or_init(|| {
+            let on = parse_switch(
+                std::env::var("INFERENCE_FLASH_NEXT_PROFILE")
+                    .ok()
+                    .as_deref(),
+            )
+            .unwrap_or(false);
+            crate::kernels::page_io_block::arm(on);
+            on
+        })
+    }
+
+    /// The strict spelling the two diagnostic switches share: `1`, `true` or `on` arm them,
+    /// unset, `0`, `false` or `off` leave them off, and anything else is refused at driver
+    /// build by `check_switch_spelling`. The fast paths call the same parser, so the value
+    /// that would be refused is never the value that arms.
+    pub(in crate::family::flash_next) fn parse_switch(
+        raw: Option<&str>,
+    ) -> std::result::Result<bool, String> {
+        match raw {
+            None | Some("0") | Some("false") | Some("off") => Ok(false),
+            Some("1") | Some("true") | Some("on") => Ok(true),
+            Some(other) => Err(other.to_string()),
+        }
+    }
+
+    pub(super) const SHARED_PREFILL: &str = "INFERENCE_FLASH_NEXT_SHARED_PREFILL";
+
+    /// The legacy prefill path's row limit: its device coverage stops at 64 rows (the widest
+    /// step exercised was 49, the qwen36 equivalence suite 64). Wider windows must run
+    /// the shared path.
+    const LEGACY_EXL3_ROWS: u32 = 64;
+
+    pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<bool> {
+        let on = parse_switch(raw).map_err(|seen| {
+            EngError::BadRequest(format!(
+                "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
+            ))
+        })?;
+        Ok(on)
+    }
+
+    pub(in crate::family::flash_next) fn check_shared_prefill_rows(
+        shared_prefill: bool,
+        rows: u32,
+    ) -> Result<()> {
+        if shared_prefill && rows <= 1 {
+            return Err(EngError::BadRequest(format!(
+                "{SHARED_PREFILL} requires prefill_rows > 1"
+            )));
+        }
+        if !shared_prefill && rows > LEGACY_EXL3_ROWS {
+            return Err(EngError::BadRequest(format!(
+                "prefill_rows > {LEGACY_EXL3_ROWS} needs {SHARED_PREFILL}=1; the legacy prefill \
+                 path is limited to {LEGACY_EXL3_ROWS} rows"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates the switches and returns the shared mode for startup's arena/owner binding.
+    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<bool> {
+        let mut shared_prefill = false;
+        for name in [
+            "INFERENCE_FLASH_NEXT_PROFILE",
+            "INFERENCE_FLASH_NEXT_DRAIN_TICK",
+            "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
+            SHARED_PREFILL,
+        ] {
+            let value = match std::env::var(name) {
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => Some("a non-unicode value".into()),
+                Ok(value) => Some(value),
+            };
+            let on = check_switch_value(name, value.as_deref())?;
+            if name == SHARED_PREFILL {
+                shared_prefill = on;
+            }
+        }
+        Ok(shared_prefill)
+    }
+
+    /// The host-stage measurement switch (`INFERENCE_FLASH_NEXT_DRAIN_TICK`): with the
+    /// profile on, every phase boundary first synchronises the step stream and then closes
+    /// the phase's slot, so a slot carries the wait that finishes its own queued work (the
+    /// queue is empty at its start; the host-only part is the slot minus that wait). Only
+    /// the step stream is drained — the prefill ring's copy stream and the expert bank's
+    /// stream keep running. The mode serialises host and device, so walls under it are
+    /// longer than without it and comparable only to each other.
+    pub(in crate::family::flash_next) fn drain_tick() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            parse_switch(
+                std::env::var("INFERENCE_FLASH_NEXT_DRAIN_TICK")
+                    .ok()
+                    .as_deref(),
+            )
+            .unwrap_or(false)
+        })
+    }
+
+    pub(in crate::family::flash_next) fn add(slot: usize, spent: std::time::Duration) {
+        NS[slot].fetch_add(spent.as_nanos() as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Runs `f`, charging its wall time to `slot` when the profile is on: the page-io
+    /// sites time a call whose internals block on the stream, so the charge is the block.
+    pub(in crate::family::flash_next) fn blocked<R>(
+        slot: usize,
+        on: bool,
+        f: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let started = on.then(std::time::Instant::now);
+        let spent = f();
+        if let Some(started) = started {
+            add(slot, started.elapsed());
+        }
+        spent
+    }
+
+    /// Prints one line per phase and resets; call once per prompt, after its sampling row.
+    pub(super) fn dump_and_reset(total_rows: u64) {
+        let spent: Vec<u64> = NS.iter().map(|n| n.load(AtomicOrdering::Relaxed)).collect();
+        let sum: u64 = spent.iter().sum();
+        if sum == 0 {
+            ROWS.store(0, AtomicOrdering::Relaxed);
+            return;
+        }
+        for (name, ns) in NAMES.iter().zip(&spent) {
+            eprintln!(
+                "flash-next chunk profile: {name:18} {:9.0} ms {:5.1}%",
+                *ns as f64 / 1e6,
+                100.0 * *ns as f64 / sum as f64
+            );
+        }
+        eprintln!(
+            "flash-next chunk profile: {total_rows} rows, phases sum {:.1} s (the sum counts the interior slots 8-33 and the nested page-io slots 34-42 twice)",
+            sum as f64 / 1e9
+        );
+        let products = PRODUCTS.load(AtomicOrdering::Relaxed);
+        let fallback = FALLBACK_ROWS.load(AtomicOrdering::Relaxed);
+        if products + fallback > 0 {
+            eprintln!(
+                "flash-next chunk profile: {products} chunk products, {fallback} per-row projection rows (chunks narrower than the projection threads)"
+            );
+        }
+        if let Some((up, down)) = crate::kernels::page_io_block::take() {
+            eprintln!(
+                "flash-next chunk profile: page-io blocked: uploads {:.0} ms, readbacks {:.0} ms",
+                up as f64 / 1e6,
+                down as f64 / 1e6
+            );
+        }
+        for n in &NS {
+            n.store(0, AtomicOrdering::Relaxed);
+        }
+        ROWS.store(0, AtomicOrdering::Relaxed);
+        PRODUCTS.store(0, AtomicOrdering::Relaxed);
+        FALLBACK_ROWS.store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+/// One phase boundary under the profile: drain first, then charge the elapsed time to
+/// the slot being closed. The drain synchronises the stream the phase just queued, so
+/// its wait belongs inside that phase's slot; draining after the reset would push it
+/// into the next phase. A free function (not the closure) so a host test can pin the
+/// order against a fake device.
+fn advance_boundary<D: ChunkDevice>(
+    dev: &mut D,
+    slot: usize,
+    t: &mut Instant,
+    profile: bool,
+    drain_on: bool,
+    add: impl FnOnce(usize, std::time::Duration),
+) -> Result<()> {
+    if drain_on {
+        dev.drain()?;
+    }
+    if profile {
+        add(slot, t.elapsed());
+        *t = Instant::now();
+    }
+    Ok(())
+}
 
 /// The device side of a chunk. The start writes are the sink of the host feeds at chunk
 /// granularity; every buffer holds `m` rows where the token step holds one.
@@ -42,9 +313,28 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn write_chunk_stream(&mut self, rows: &[f32]) -> Result<()>;
     /// Writes the `m` PLE embedding rows (`m * ple_embed`).
     fn write_chunk_ple(&mut self, rows: &[f32]) -> Result<()>;
+    /// Runs the chunk's PLE projections on the device and returns each row's keys and value,
+    /// behind the queued layers. Only a device with the PLE projections answers; the default
+    /// refuses so a driver with the device route on cannot silently fall back to the host
+    /// projections.
+    fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>> {
+        Err(EngError::BadRequest(
+            "this device has no PLE projection route".to_string(),
+        ))
+    }
     /// Clears the per-chunk flags (the EXL3 flag and the status word). Called once per chunk,
     /// after the start is written and before the first layer.
     fn begin_chunk(&mut self) -> Result<()>;
+    /// Re-plans the prefill expert ring against the bank as decode left it. Called once at the
+    /// start of a chunked prefill (a `feed_rows` call), before the first chunk.
+    fn begin_prefill(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Closes the prefill window after the sampling row ran. The single-token step of later
+    /// decode uses the bank's miss path again; a no-op when no window is open.
+    fn end_prefill(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Queues layers `range` for the chunk of `m` rows at `pos`.
     fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<()>;
     /// The `m` stream rows, read back behind the queued work.
@@ -57,13 +347,29 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn read_logits(&mut self) -> Result<Vec<f32>>;
     /// Reads the status word and the arithmetic flag; refuses a chunk that set either.
     fn check_health(&mut self) -> Result<()>;
+    /// Synchronises the step stream of this device — the only stream the host-stage
+    /// measurement mode (`INFERENCE_FLASH_NEXT_DRAIN_TICK` with the profile on) drains;
+    /// the prefill ring's copy stream and the expert bank's stream keep running. It runs
+    /// at a phase boundary before the phase's slot closes, so the slot carries the wait
+    /// that finishes its own queued work; the default does nothing.
+    fn drain(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Zeroes the persistent state: a new sequence.
     fn reset(&mut self) -> Result<()>;
     /// The bank's miss count for the per-job report, if the device has a bank.
     fn bank_misses(&self) -> Option<u64> {
         None
     }
+    /// The bank's lifetime counters for the request log's `prefill_bank_*` keys (log-only),
+    /// for a device with a bank.
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        None
+    }
 }
+
+mod shared;
+use shared::ChunkClock;
 
 /// The chunk driver: a [`ChunkDevice`] and its [`TokenFeeds`] under the token driver's rules.
 /// `feed_rows` splits the prompt into device chunks of at most `chunk_cap` rows (1 = the token
@@ -75,8 +381,22 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     /// Tokens the state has consumed: the next position.
     pos: usize,
     poisoned: bool,
+    /// Advances once per fresh sequence (at the ATTEMPT of its first row, so a failed or
+    /// partial first write also advances it; the row never needs to commit): the
+    /// in-place rows a resume leaves on the card belong to the generation that wrote them, so a
+    /// snapshot saved at another generation is structurally unusable and never matches.
+    generation: u64,
+    shared_prefill: bool,
+    shared_window: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
+    /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
+    pub(in crate::family::flash_next::cuda) ple_device: bool,
+    /// The batch host route: the projections of the whole chunk in one blocked product
+    /// (`HostProjection::project_chunk`), each row's pair then feeding the unchanged host
+    /// step through the fixed projection. `None` keeps the per-row projections of
+    /// [`TokenFeeds::ple_update`].
+    pub(in crate::family::flash_next::cuda) ple_host_batch: Option<Box<HostProjection>>,
 }
 
 impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
@@ -85,6 +405,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         feeds: F,
         shape: DriverShape,
     ) -> Result<Self> {
+        prof::check_switch_spelling()?;
         if shape.layers <= shape.ple_layer {
             return Err(EngError::BadRequest(format!(
                 "Flash-Next chunk driver: the PLE layer {} must sit inside the {} layers",
@@ -97,8 +418,24 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             shape,
             pos: 0,
             poisoned: false,
+            generation: 0,
+            shared_prefill: false,
+            shared_window: false,
             chunk_cap: 1,
+            ple_device: false,
+            ple_host_batch: None,
         })
+    }
+
+    /// Selects the shared protocol and its whole-prompt preflight.
+    pub(in crate::family::flash_next::cuda) fn new_shared(
+        device: D,
+        feeds: F,
+        shape: DriverShape,
+    ) -> Result<Self> {
+        let mut driver = Self::new(device, feeds, shape)?;
+        driver.shared_prefill = true;
+        Ok(driver)
     }
 
     /// The number of positions the caches hold, for the executor.
@@ -108,6 +445,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
 
     pub(in crate::family::flash_next::cuda) fn device(&self) -> &D {
         &self.device
+    }
+
+    /// The device for tests that arm its fakes before a run.
+    pub(in crate::family::flash_next::cuda) fn device_mut(&mut self) -> &mut D {
+        &mut self.device
     }
 
     pub(super) fn feeds(&self) -> &F {
@@ -149,7 +491,19 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             )));
         }
         // Host reads only: a failure here leaves the state as it was.
+        let t0 = Instant::now();
+        let profile = prof::on();
         let starts = self.feeds.begin_chunk(tokens)?;
+        if profile {
+            prof::add(0, t0.elapsed());
+            prof::ROWS.fetch_add(m as u64, AtomicOrdering::Relaxed);
+        }
+        // The generation advances at the ATTEMPT of a fresh sequence's first chunk, not only
+        // on success: a failed chunk that queued device work may still have written the rows,
+        // and a stale snapshot must never survive that.
+        if self.pos == 0 {
+            self.generation += 1;
+        }
         let outcome = self.queue(tokens, &starts, want_logits);
         match outcome {
             Ok(logits) => {
@@ -170,10 +524,20 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         starts: &[super::StartVectors],
         want_logits: bool,
     ) -> Result<Option<Vec<f32>>> {
+        let mut clock = ChunkClock::new();
+        let ple_rows = self.write_inputs(tokens, starts)?;
+        self.device.begin_chunk()?;
+        clock.tick(&mut self.device, 1)?;
+        self.queue_layers(self.pos, tokens, &ple_rows, &mut clock)?;
+        let logits = self.queue_head(want_logits, &mut clock)?;
+        self.device.check_health()?;
+        Ok(logits)
+    }
+
+    fn write_inputs(&mut self, tokens: &[u32], starts: &[super::StartVectors]) -> Result<Vec<f32>> {
         let m = tokens.len();
         let pos = self.pos;
         let shape = self.shape;
-
         self.device
             .write_chunk_params(tokens[0] as i32, pos as i32, m as i32)?;
         let mut stream_rows = Vec::with_capacity(m * shape.start.stream);
@@ -184,10 +548,43 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         }
         self.device.write_chunk_stream(&stream_rows)?;
         self.device.write_chunk_ple(&ple_rows)?;
-        self.device.begin_chunk()?;
+        Ok(ple_rows)
+    }
 
+    fn queue_layers(
+        &mut self,
+        pos: usize,
+        tokens: &[u32],
+        ple_rows: &[f32],
+        clock: &mut ChunkClock,
+    ) -> Result<()> {
+        let m = tokens.len();
+        let shape = self.shape;
         self.device.layers(0..shape.ple_layer, pos, m)?;
+        clock.tick(&mut self.device, 2)?;
+        // The batch host route projects the chunk's embeddings after the pre-PLE layers are
+        // queued, so the product runs while the card works (its input is the chunk's start
+        // vectors, not device output). Chunks narrower than the projection threads keep the
+        // per-row projections: a one-row product would sweep the 131 MB of weights on a single
+        // thread, while `matvec` splits the rows across all of them.
+        let host_pairs = match self.ple_host_batch.as_deref_mut() {
+            Some(host) if m >= host.threads() => {
+                prof::PRODUCTS.fetch_add(1, AtomicOrdering::Relaxed);
+                Some(host.project_chunk(ple_rows, m)?)
+            }
+            Some(host) => {
+                let embed = shape.start.ple_embed;
+                let rows = ple_rows
+                    .chunks(embed)
+                    .map(|embedding| host.project(embedding))
+                    .collect::<Result<Vec<_>>>()?;
+                prof::FALLBACK_ROWS.fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
+                Some(rows)
+            }
+            None => None,
+        };
         let mut rows = self.device.read_stream()?;
+        clock.tick(&mut self.device, 3)?;
         let width = shape.start.stream;
         if rows.len() != m * width {
             return Err(EngError::Backend {
@@ -198,31 +595,55 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 ),
             });
         }
-        for (i, token) in tokens.iter().enumerate() {
-            let update = self
-                .feeds
-                .ple_update(*token, &rows[i * width..(i + 1) * width])?;
+        // The device route projects the chunk's embeddings on the card (one m-row launch pair)
+        // and hands each row's keys/value to the host step, which then runs unchanged; the host
+        // route runs its own projections inside `ple_update`.
+        let pairs = if self.ple_device {
+            Some(self.device.ple_project_chunk()?)
+        } else {
+            host_pairs
+        };
+        if pairs.as_ref().is_some_and(|pairs| pairs.len() != m) {
+            return Err(EngError::BadRequest(format!(
+                "Flash-Next chunk driver: the PLE projection must return {m} pairs"
+            )));
+        }
+        let mut pairs = pairs.map(IntoIterator::into_iter);
+        for (token, row) in tokens.iter().zip(rows.chunks_mut(width)) {
+            if let Some(pair) = pairs.as_mut().and_then(std::iter::Iterator::next) {
+                self.feeds.set_ple_pair(pair)?;
+            }
+            let update = self.feeds.ple_update(*token, row)?;
             if update.len() != width {
                 return Err(EngError::BadRequest(format!(
                     "Flash-Next chunk driver: the PLE update has {} values for a stream of {width}",
                     update.len()
                 )));
             }
-            for (value, delta) in rows[i * width..(i + 1) * width].iter_mut().zip(&update) {
+            for (value, delta) in row.iter_mut().zip(&update) {
                 *value += delta;
             }
         }
+        clock.tick(&mut self.device, 4)?;
         self.device.write_stream_back(&rows)?;
+        clock.tick(&mut self.device, 5)?;
         self.device.layers(shape.ple_layer..shape.layers, pos, m)?;
-        let logits = if want_logits {
-            self.device.head()?;
-            let row = self.device.read_logits()?;
-            Some(row)
-        } else {
-            None
-        };
-        self.device.check_health()?;
-        Ok(logits)
+        clock.tick(&mut self.device, 6)?;
+        Ok(())
+    }
+
+    fn queue_head(
+        &mut self,
+        want_logits: bool,
+        clock: &mut ChunkClock,
+    ) -> Result<Option<Vec<f32>>> {
+        if !want_logits {
+            return Ok(None);
+        }
+        self.device.head()?;
+        let row = self.device.read_logits()?;
+        clock.tick(&mut self.device, 7)?;
+        Ok(Some(row))
     }
 }
 
@@ -245,7 +666,11 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         if tokens.is_empty() {
             return Ok(());
         }
+        if self.shared_prefill {
+            return self.feed_shared_rows(tokens);
+        }
         let cap = self.chunk_cap.max(1);
+        self.device.begin_prefill()?;
         for chunk in tokens.chunks(cap) {
             self.run_chunk(chunk, false).map(|_| ())?;
         }
@@ -253,11 +678,27 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
-        self.run_chunk(&[token], true)?
-            .ok_or_else(|| EngError::Backend {
-                operation: Self::OPERATION,
-                message: "the logits step returned no logits".to_string(),
-            })
+        let logits = (if self.shared_window {
+            self.run_shared_chunk(&[token], true, false)?
+        } else {
+            self.run_chunk(&[token], true)?
+        })
+        .ok_or_else(|| EngError::Backend {
+            operation: Self::OPERATION,
+            message: "the logits step returned no logits".to_string(),
+        })?;
+        // The sampling row closed the prefill: the ring's window ends with it, and every
+        // later single-token step takes the decode path. A failure here leaves the prefill
+        // window open on an advanced position: poison, so a reset is required.
+        if let Err(error) = self.device.end_prefill() {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.shared_window = false;
+        if prof::on() {
+            prof::dump_and_reset(prof::ROWS.load(AtomicOrdering::Relaxed));
+        }
+        Ok(logits)
     }
 
     fn fed(&self) -> usize {
@@ -269,6 +710,47 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         self.feeds.reset();
         self.pos = 0;
         self.poisoned = false;
+        self.shared_window = false;
+        Ok(())
+    }
+}
+
+impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for ChunkDriver<D, F> {
+    fn resume_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        self.device().bank_snapshot()
+    }
+
+    fn resume_host_bytes(&self) -> u64 {
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        let history = (ple_history.len() as u64) * std::mem::size_of::<u32>() as u64;
+        let ring = (ple_ring.len() as u64) * std::mem::size_of::<f32>() as u64;
+        self.device.fixed_state_bytes() + history + ring
+    }
+
+    fn save_resume(&self) -> Result<ResumeSnapshot> {
+        let parts = self.device.read_fixed_state()?;
+        let (ple_history, ple_ring) = self.feeds.ple_state().unwrap_or((&[], &[]));
+        Ok(ResumeSnapshot {
+            parts,
+            pos: self.pos,
+            ple_history: ple_history.to_vec(),
+            ple_ring: ple_ring.to_vec(),
+        })
+    }
+
+    fn restore_resume(&mut self, snapshot: &ResumeSnapshot) -> Result<()> {
+        self.device.write_fixed_state(&snapshot.parts)?;
+        if !snapshot.ple_ring.is_empty() {
+            self.feeds
+                .ple_resume(&snapshot.ple_history, &snapshot.ple_ring)?;
+        }
+        self.pos = snapshot.pos;
+        self.poisoned = false;
+        self.shared_window = false;
         Ok(())
     }
 }
