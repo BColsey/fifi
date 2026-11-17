@@ -4,6 +4,8 @@ import ctypes
 from dataclasses import replace
 import unittest
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_pair_host import nvml
 
 GPU0 = "GPU-704fef60-5280-9b88-fa3d-d11135caf576"

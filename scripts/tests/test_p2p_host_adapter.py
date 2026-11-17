@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_concurrent_guard.core import Interval, run
 from scripts.p2p_concurrent_guard.host_adapter import (
     GPU_2080,

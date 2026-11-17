@@ -15,6 +15,8 @@ import tempfile
 import time
 import unittest
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_concurrent_guard.host_attestation import _seal_pinned, sealed_gate
 from scripts.tests.p2p_scope_helpers import (
     group_populated,

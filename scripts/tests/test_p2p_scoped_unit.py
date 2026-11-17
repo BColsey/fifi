@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_pair_host.scoped_unit import ScopedUnit, ScopeUncertain
 
 UNIT = "fifi-test-123.scope"
