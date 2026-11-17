@@ -517,7 +517,7 @@ fn run_rig() -> Result<Evidence, EngError> {
         }
         let buf_sets: Vec<MoeBuffers<'_>> =
             card_bufs.iter().map(moe_bufs).collect::<Result<_, _>>()?;
-        run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
+        run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists, None)?;
         for (stream, bufs) in stack.streams().iter().zip(&card_bufs) {
             stream.synchronize()?;
             card_runs.push(read_run(stream, bufs)?);
