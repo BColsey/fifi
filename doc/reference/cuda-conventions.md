@@ -11,6 +11,30 @@ Debug tools that help while working against these rules:
 `FIFI_CUDA_POISON_ALLOC` and `FIFI_CUDA_LINEINFO` (`environment.md`), and the
 compute-sanitizer gate (`scripts/sanitizer_run.sh`).
 
+## Hidden synchronization sites
+
+Every place the engine blocks on the device without a caller-visible
+`synchronize` call, with why it exists and where the details live:
+
+- `complete_pageable_copy` (`kernels/cuda/native/resident.rs`) blocks the
+  host on `stream_synchronize` so an owned pageable buffer is handed back
+  (readback) or released (upload) only after its copy completes; the wait
+  is charged to the page-io counters when they are armed.
+- `download` (`kernels/cuda/context.rs`) calls the synchronous
+  `cudaMemcpy`: it provides the stream ordering rule 4 describes, and it
+  also blocks the host until the copy completes — every readback pays this
+  hidden sync.
+- `DeviceBuffer` upload/download (`kernels/cuda/context/buffer_io.rs`) — a
+  pageable `cudaMemcpyAsync` costs a full staged copy the caller cannot
+  see; the impl block's doc states the consumption-at-enqueue rule.
+- The allocation cache's return path (`kernels/cuda/context/alloc_cache.rs`)
+  synchronizes the device before a slot re-enters the pool: the lazy return
+  policy defers that sync until the slot is reused or drained, but it is a
+  full device sync when it fires.
+- The old projector's default-stream sync no longer exists: `engine/src/project/`
+  contains no synchronize call; the current projector build path has no
+  hidden sync.
+
 ## 1. Lazy return runs on one stream (alloc_cache.rs)
 
 `AllocCache` may defer the device sync when a block goes idle if
