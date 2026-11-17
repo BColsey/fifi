@@ -570,7 +570,8 @@ fn even_table_admission_probe() {
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, super::pinned::ROTARY_DIM).expect("shape");
     let dims = StepDims::new(&shape, &inventory).expect("dims");
-    let layers = super::layer_table::LayerTable::new(&dims, &inventory).expect("layers");
+    let layers =
+        crate::family::exl3::layer_table::LayerTable::new(&dims, &inventory).expect("layers");
     let gate = layers
         .name(0, crate::family::gguf_model::Role::FfnGateExps)
         .expect("gate");
