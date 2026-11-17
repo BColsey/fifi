@@ -1097,6 +1097,114 @@ fn quantized_attention_decode_peak_growth_stays_below_the_partials_plus_1mib() {
     );
 }
 
+/// One Qwen3.6 attention layer, with the Mac profile's BF16 activations and Q8 KV.
+/// Measure both candidates around the production dispatch boundary on identical inputs.
+#[test]
+#[ignore = "Mac GPU timing sweep, no checkpoint required"]
+fn q8_decode_dispatch_timing() {
+    let _serial = GPU_TEST.lock().unwrap_or_else(|poison| poison.into_inner());
+    let (heads, kv_heads, width, group) = (16, 2, 256, 64);
+    let shape = [1, heads, 1, width];
+    let dtype = Dtype::Bf16;
+    let scale = 1.0 / (width as f32).sqrt();
+    for len in [
+        255u32, 2047, 8191, 12287, 16383, 16384, 16385, 24575, 32767, 65535,
+    ] {
+        let cap = len.next_multiple_of(256);
+        let mut kernels = MlxKernels::try_new().unwrap();
+        kernels.allow_bf16(true);
+        let (kc, ks, kb) = quantized_capacity_of_dtype(
+            &mut kernels,
+            kv_heads,
+            cap,
+            width,
+            group,
+            dtype,
+            key_value(width, cap, true),
+        );
+        let (vc, vs, vb) = quantized_capacity_of_dtype(
+            &mut kernels,
+            kv_heads,
+            cap,
+            width,
+            group,
+            dtype,
+            value_value(width, cap, true),
+        );
+        kernels.evaluate(&[&kc, &ks, &kb, &vc, &vs, &vb]).unwrap();
+        let keys = QuantizedKv {
+            codes: &kc,
+            scales: &ks,
+            biases: &kb,
+        };
+        let values = QuantizedKv {
+            codes: &vc,
+            scales: &vs,
+            biases: &vb,
+        };
+
+        // Four warm pairs, then twenty measured pairs with balanced first-arm order.
+        // Vary the query for each pair. Input preparation and validation are untimed.
+        for pair in 0..24 {
+            let host = f32_pattern(&shape, |i| {
+                query_value()(i) + ((i + pair) % 23) as f32 / 64.0
+            });
+            let query = import(&mut kernels, &host);
+            let query = kernels.cast(&query, dtype).unwrap();
+            kernels.evaluate(&[&query]).unwrap();
+            let mut measure = |fused: bool| {
+                let start = Instant::now();
+                let out = if fused {
+                    kernels.quantized_attention_decode(&query, &keys, &values, len, scale, group, 8)
+                } else {
+                    kernels.quantized_attention_prefix(
+                        &query, &keys, &values, len, scale, false, group, 8,
+                    )
+                }
+                .unwrap();
+                let host = read(&mut kernels, &out);
+                let us = start.elapsed().as_secs_f64() * 1e6;
+                assert_eq!(host.shape(), shape);
+                assert_eq!(host.dtype(), dtype);
+                (us, decode(dtype, &host))
+            };
+            let fused_first = pair % 2 == 0;
+            let first = measure(fused_first);
+            let second = measure(!fused_first);
+            let (fused, composite) = if fused_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let mut max_diff = 0.0f32;
+            for (actual, reference) in fused
+                .1
+                .chunks_exact(width as usize)
+                .zip(composite.1.chunks_exact(width as usize))
+            {
+                let tol = bf16_tolerance(reference);
+                for (&a, &b) in actual.iter().zip(reference) {
+                    let diff = (a - b).abs();
+                    assert!(
+                        a.is_finite() && b.is_finite() && diff <= tol,
+                        "len {len}, pair {pair}: {a} vs {b}"
+                    );
+                    max_diff = max_diff.max(diff);
+                }
+            }
+            if pair >= 4 {
+                println!(
+                    "q8_decode_pair={}",
+                    serde_json::json!({
+                        "len": len, "cap": cap, "pair": pair - 4, "fused_first": fused_first,
+                        "fused_us": fused.0, "composite_us": composite.0, "max_abs_diff": max_diff,
+                    })
+                );
+            }
+        }
+    }
+}
+
 /// The operands of the negative tests below: a small pair of capacity 64 at width 64, F32
 /// scales, head-dependent rows, and an F32 query.
 fn negative_case(

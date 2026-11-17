@@ -766,8 +766,8 @@
     },
     "native_q8_decode": {
       "path": "tests/native_q8_decode.rs",
-      "test_fns": 17,
-      "ignored": 0,
+      "test_fns": 18,
+      "ignored": 1,
       "env_gates": [],
       "features": [
         "native-fault-qualification",

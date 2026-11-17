@@ -1661,7 +1661,7 @@ mod tests {
 
         // Numerics: the F32 reference in the same blocks, over the real 24 heads, on the
         // same query variant the timed arms' final outputs hold (variants[5]).
-        let mut reference: Vec<f32> = Vec::new();
+        let mut reference_blocks = Vec::new();
         let mut start = 0u32;
         while start < rows {
             let end = (start + block).min(rows);
@@ -1672,13 +1672,20 @@ mod tests {
             let out = kernels
                 .grouped_attention_prefix(&q_block, &k, &v, len_b, scale, end - start > 1)
                 .unwrap();
-            let mut block_values = values(&mut kernels, &out).unwrap();
-            reference.append(&mut block_values);
+            kernels.evaluate(&[&out]).unwrap();
+            reference_blocks.push(out);
             start = end;
         }
+        // Each block is [1, heads, block_rows, width]. Keep the heads in
+        // place while joining the row ranges, as in the composite arm.
+        let views: Vec<_> = reference_blocks.iter().collect();
+        let reference = kernels.concatenate(&views, 2).unwrap();
+        let reference = values(&mut kernels, &reference).unwrap();
         let composite_flat = values(&mut kernels, &composite).unwrap();
         let flash_flat = values(&mut kernels, &flash).unwrap();
         let max_err = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().chain(b).all(|x| x.is_finite()));
             a.iter()
                 .zip(b)
                 .map(|(x, y)| (x - y).abs())
