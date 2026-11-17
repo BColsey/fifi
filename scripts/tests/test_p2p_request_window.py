@@ -2,6 +2,8 @@ import hashlib
 import unittest
 from unittest.mock import Mock
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_concurrent_guard.request_window import measure_request
 
 REQUEST = b"fixed synthetic request"

@@ -2,7 +2,9 @@
 
 import unittest
 
-from p2p_concurrent_guard.core import Interval, intervals_overlap, run
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
+from scripts.p2p_concurrent_guard.core import Interval, intervals_overlap, run
 
 
 class FakeAdapter:

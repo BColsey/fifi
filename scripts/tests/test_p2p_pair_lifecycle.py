@@ -2,6 +2,8 @@
 
 import unittest
 
+import p2p_test_support  # noqa: F401 -- make repository packages visible under python -I
+
 from scripts.p2p_pair_host.lifecycle import Admission, PairLifecycle, UnitState
 from scripts.p2p_pair_host.observer import PairSnapshot, ProcessIdentity
 
