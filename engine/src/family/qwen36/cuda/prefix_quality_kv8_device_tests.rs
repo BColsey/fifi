@@ -1,7 +1,8 @@
 //! The three-flag KV8 route, including a valid device tip and its overwritten host fallback.
 use super::*;
+use crate::family::prefill::arena::PrefillStep;
 use crate::family::qwen36::cuda::{
-    prefill_plan::{Extra, PrefillStep, chunk_list},
+    prefill_plan::{Extra, chunk_list},
     state::pinned::PinnedSnapshot,
 };
 

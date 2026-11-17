@@ -461,6 +461,12 @@ pub(crate) type CaptureHandle = std::sync::Arc<std::sync::Mutex<CaptureBuffer>>;
 pub(crate) struct Sampler {
     params: SamplingParams,
     capture: Option<CaptureHandle>,
+    /// The top-two logit margin of this sampler's first draw (log-only): the raw row gap
+    /// before temperature, top-k and top-p. `None` until the first `sample` succeeds,
+    /// `Some(top1 - top2)` from that draw alone afterwards. One sampler belongs to one
+    /// request's generation state, so the latch reads as the margin at the request's first
+    /// decode position.
+    first_top2_margin: Option<f32>,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "staged for the CUDA device sampler")
@@ -475,6 +481,7 @@ impl Sampler {
         Self {
             params,
             capture: None,
+            first_top2_margin: None,
             seed,
             rng: SplitMix64::new(seed),
         }
@@ -516,6 +523,15 @@ impl Sampler {
         self.seed
     }
 
+    /// The top-two logit margin at the first decode position of this request (log-only).
+    /// `None` until the first draw. The host full-row `sample` and the non-greedy device
+    /// shortlist (`sample_shortlist`) both latch it from that draw's top two logits. The
+    /// greedy device argmax (`record_device_greedy`) returns only the selected token, no
+    /// runner-up logit, so that path leaves it `None`.
+    pub(crate) fn first_top2_margin(&self) -> Option<f32> {
+        self.first_top2_margin
+    }
+
     /// Returns the next token id. `logits` holds one finite value per vocabulary entry.
     /// Empty, oversized, or non-finite logits fail with `Backend`, because they mean that the
     /// forward pass produced invalid numbers.
@@ -523,12 +539,19 @@ impl Sampler {
     /// An armed sampler also records the decision (see [`Sampler::arm_capture`]);
     /// arming changes no decision and no draw.
     pub(crate) fn sample(&mut self, logits: &[f32]) -> Result<u32, EngError> {
-        if self.capture.is_some() {
+        let token = if self.capture.is_some() {
             let (token, obs) = self.sample_observed(logits)?;
             self.record(&obs);
-            return Ok(token);
+            token
+        } else {
+            self.sample_with_keep(logits)?.0
+        };
+        // Latch the request's first-decode margin after the row proved valid (empty or
+        // non-finite rows fail above and leave the latch untouched).
+        if self.first_top2_margin.is_none() {
+            self.first_top2_margin = top2_margin(logits);
         }
-        Ok(self.sample_with_keep(logits)?.0)
+        Ok(token)
     }
 
     /// The next token id and the number of kept candidates. `sample` keeps only the token; the
@@ -595,7 +618,9 @@ impl Sampler {
     }
 
     /// Records an already-selected device argmax without changing the token or RNG state.
-    /// Like host greedy sampling, this records one kept token and no probabilities.
+    /// Like host greedy sampling, this records one kept token and no probabilities. The
+    /// device argmax returns only the selected token, not the runner-up logit, so the
+    /// first-decode top-two margin stays `None` on this path (the shortlist path latches it).
     #[cfg_attr(
         not(any(test, all(feature = "native-cuda", target_os = "linux"))),
         expect(dead_code, reason = "used by the CUDA device argmax")
@@ -669,6 +694,14 @@ impl Sampler {
             ));
         }
         check_shortlist(ranked, vocab)?;
+        // The served CUDA decode draws here (non-greedy device shortlist). The device
+        // returns the row's actual top-K logits ranked descending (check_shortlist
+        // enforces it), so the first two are the full row's top two: latch the same
+        // first-decode margin the host `sample` path latches. Latch before the top_k
+        // truncation: a sampled request with top_k=1 still has a top-two gap on the row.
+        if self.first_top2_margin.is_none() && ranked.len() >= 2 {
+            self.first_top2_margin = Some(ranked[0].1 - ranked[1].1);
+        }
         let ranked = &ranked[..vocab.min(self.params.top_k as usize)];
         let top = f64::from(ranked[0].1);
         let (weights, total) = ranked_weights(ranked, top, self.params.temperature);
@@ -851,6 +884,23 @@ fn check_logits(logits: &[f32]) -> Result<(), EngError> {
         return Err(invalid_logits("logits hold a non-finite value"));
     }
     Ok(())
+}
+
+/// The gap between the two largest logits of a row, log-only. `None` for a row without
+/// two entries. Ties read as a zero margin, which is exactly the flip risk the number
+/// exists to flag.
+pub(crate) fn top2_margin(logits: &[f32]) -> Option<f32> {
+    let mut top = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
+    for &logit in logits {
+        if logit > top {
+            second = top;
+            top = logit;
+        } else if logit > second {
+            second = logit;
+        }
+    }
+    (second > f32::NEG_INFINITY).then_some(top - second)
 }
 
 /// The index of the largest logit. A tie goes to the lower index.
@@ -1112,6 +1162,63 @@ mod tests {
 
     fn params(temperature: f64, top_p: f64, top_k: u32) -> SamplingParams {
         SamplingParams::new(temperature, top_p, top_k).expect("valid params")
+    }
+
+    /// The first-decode margin latch: `None` before any draw, the first row's top-two gap
+    /// after it, unchanged by later rows, and a tie reads as zero.
+    #[test]
+    fn the_first_sample_margin_latches_the_first_row_and_survives_later_draws() {
+        let mut sampler = Sampler::new(params(1.0, 1.0, 0), 7);
+        assert_eq!(sampler.first_top2_margin(), None, "before any draw");
+        sampler.sample(&[0.0, 2.0, 1.0]).expect("draw");
+        assert_eq!(sampler.first_top2_margin(), Some(1.0));
+        sampler.sample(&[-5.0, 0.0, 4.9]).expect("draw");
+        assert_eq!(
+            sampler.first_top2_margin(),
+            Some(1.0),
+            "later draws do not move it"
+        );
+    }
+
+    /// A one-entry row has no second logit, so the latch reads `None` even after it drew.
+    #[test]
+    fn a_one_entry_row_leaves_the_first_sample_margin_absent() {
+        let mut sampler = Sampler::greedy();
+        sampler.sample(&[3.0]).expect("draw");
+        assert_eq!(sampler.first_top2_margin(), None);
+    }
+
+    /// A tied first row reports the flip risk as a zero margin.
+    #[test]
+    fn a_tied_first_row_reports_a_zero_margin() {
+        let mut sampler = Sampler::greedy();
+        sampler.sample(&[1.5, 1.5, 0.0]).expect("draw");
+        assert_eq!(sampler.first_top2_margin(), Some(0.0));
+    }
+
+    /// The served non-greedy CUDA decode draws through the device shortlist; its first
+    /// two ranked logits are the row's top two, so the shortlist latches the same margin
+    /// the host full-row `sample` latches.
+    #[test]
+    fn the_device_shortlist_latches_the_first_row_margin() {
+        let mut sampler = Sampler::new(params(1.0, 1.0, 2), 7);
+        assert_eq!(sampler.first_top2_margin(), None, "before any draw");
+        sampler
+            .sample_shortlist(&[(0, 3.0), (1, 1.0), (2, 0.5)], 3)
+            .expect("draw");
+        assert_eq!(sampler.first_top2_margin(), Some(2.0));
+    }
+
+    #[test]
+    fn the_device_shortlist_latches_the_margin_even_with_top_k_one() {
+        // top_k=1 truncates the draw to one candidate, but the row's top-two gap still
+        // exists: the latch reads the pre-truncation shortlist, like the host `sample` path.
+        let mut sampler = Sampler::new(params(1.0, 1.0, 1), 7);
+        assert_eq!(sampler.first_top2_margin(), None, "before any draw");
+        sampler
+            .sample_shortlist(&[(0, 3.0), (1, 1.0), (2, 0.5)], 3)
+            .expect("draw");
+        assert_eq!(sampler.first_top2_margin(), Some(2.0));
     }
 
     fn draws(sampler: &mut Sampler, logits: &[f32], count: usize) -> Vec<u32> {

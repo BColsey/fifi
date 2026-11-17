@@ -6,8 +6,9 @@
 //! the current component set (trellis, `suh`, `svh`, one codebook marker) and every matrix of a
 //! pack must name the same codebook. A family's own walk decides which tensors to visit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::weights::exl3::COMPONENT_SUFFIXES;
 use crate::{EngError, tensor::Dtype, weights::StreamedCheckpoint};
 
 const LAYER_ROOT: &str = "model.language_model.layers";
@@ -100,11 +101,48 @@ pub(in crate::family) struct PackReport {
     /// Device bytes the load holds: trellises as stored, scales and plain vectors widened to
     /// F32, the embedding as stored.
     pub(in crate::family) device_bytes: u64,
+    /// Device bytes of the routed experts alone, the part that expert tiers place.
+    pub(in crate::family) expert_bytes: u64,
     /// Quantized matrices (a routed expert counts one per projection).
     pub(in crate::family) matrices: usize,
     /// Matrices per rate, keyed by twice the bits per weight.
     pub(in crate::family) rates: BTreeMap<u8, usize>,
     pub(in crate::family) codebook: Marker,
+}
+
+/// The family-neutral planning summary of one pack directory: exactly the
+/// loader's own header walk, with its totals copied out for callers outside `family`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackPlan {
+    /// Device bytes the load will hold ([`PackReport::device_bytes`]).
+    pub(crate) device_bytes: u64,
+    /// Device bytes of the routed experts alone ([`PackReport::expert_bytes`]).
+    pub(crate) expert_bytes: u64,
+    /// Quantized matrices (a routed expert counts one per projection).
+    pub(crate) matrices: usize,
+    /// Matrices per rate, keyed by twice the bits per weight.
+    pub(crate) rates: BTreeMap<u8, usize>,
+    /// The codebook marker tensor every matrix of the pack carries, by name.
+    pub(crate) codebook: &'static str,
+}
+
+/// The name of the codebook marker a matrix carries, for rows that retell the walk.
+pub(in crate::family) fn codebook_name(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Mul1 => "Mul1",
+        Marker::Mcg => "Mcg",
+    }
+}
+
+/// Copies a walk report into the family-neutral plan.
+pub(in crate::family) fn plan_from_report(report: PackReport) -> PackPlan {
+    PackPlan {
+        device_bytes: report.device_bytes,
+        expert_bytes: report.expert_bytes,
+        matrices: report.matrices,
+        rates: report.rates,
+        codebook: codebook_name(report.codebook),
+    }
 }
 
 /// What kind of tensor a walk visited.
@@ -133,6 +171,138 @@ pub(in crate::family) struct Visit {
     pub(in crate::family) bytes: u64,
 }
 
+#[cfg(test)]
+impl Visit {
+    /// Every pack tensor this visit stands for: a plain or host visit is its own name; a matrix
+    /// visit under a prefix stands for that prefix's stored components, present or not, because
+    /// the reader selects the components it knows and refuses the legacy ones. The loader's
+    /// check indexes the visits instead (see [`coverage`]); this expansion is the survey's.
+    pub(in crate::family) fn tensor_names(&self) -> Vec<String> {
+        match self.kind {
+            VisitKind::Matrix { .. } => COMPONENT_SUFFIXES
+                .iter()
+                .map(|suffix| format!("{}.{suffix}", self.name))
+                .collect(),
+            VisitKind::Plain { .. } | VisitKind::Host { .. } => vec![self.name.clone()],
+        }
+    }
+}
+
+/// Splits a load's read names against the walk's visits: `unrecorded` holds reads no visit
+/// stands for (a served load refuses on them), `unread` holds visit names no read touched (the
+/// load reports them). A read `prefix.suffix` is covered by the matrix visit under `prefix`.
+/// The visits are indexed by borrowed name, never expanded into the ~9 owned names per
+/// matrix visit, because a real load holds tens of thousands of reads.
+pub(in crate::family) fn coverage(
+    reads: &BTreeSet<String>,
+    visits: &[Visit],
+) -> (Vec<String>, Vec<String>) {
+    let mut plain: HashMap<&str, usize> = HashMap::with_capacity(visits.len());
+    let mut matrices: HashMap<&str, usize> = HashMap::new();
+    for (index, visit) in visits.iter().enumerate() {
+        match visit.kind {
+            VisitKind::Matrix { .. } => {
+                matrices.insert(visit.name.as_str(), index);
+            }
+            VisitKind::Plain { .. } | VisitKind::Host { .. } => {
+                plain.insert(visit.name.as_str(), index);
+            }
+        }
+    }
+    let mut touched = vec![false; visits.len()];
+    let mut unrecorded = Vec::new();
+    for read in reads.iter().map(String::as_str) {
+        let mut covered = false;
+        if let Some(&index) = plain.get(read) {
+            touched[index] = true;
+            covered = true;
+        }
+        for suffix in COMPONENT_SUFFIXES {
+            let Some(stem) = read.strip_suffix(suffix) else {
+                continue;
+            };
+            let Some(prefix) = stem.strip_suffix('.') else {
+                continue;
+            };
+            if let Some(&index) = matrices.get(prefix) {
+                touched[index] = true;
+                covered = true;
+            }
+        }
+        if !covered {
+            unrecorded.push(read.to_owned());
+        }
+    }
+    let unread = visits
+        .iter()
+        .zip(touched)
+        .filter(|&(_, was_touched)| !was_touched)
+        .map(|(visit, _)| visit.name.clone())
+        .collect();
+    (unrecorded, unread)
+}
+
+/// Up to twenty names plus the count of the rest: a refusal or report line never carries
+/// tens of thousands of names, and a wrong root would otherwise put every pack tensor into
+/// one error.
+fn capped_names(names: &[String]) -> String {
+    let shown = names.len().min(20);
+    let shown_names = names[..shown].join(", ");
+    if names.len() > shown {
+        format!("{shown_names} (+{})", names.len() - shown)
+    } else {
+        shown_names
+    }
+}
+
+/// The load's coverage decision in printable form: the refusal for reads the walk never
+/// stood for and the report line for visits no read touched, both capped by
+/// [`capped_names`] and naming the pack. Pure over borrowed name sets, so a host test pins
+/// the words the served path prints and refuses with.
+pub(in crate::family) struct CoverageVerdict {
+    pub(in crate::family) result: Result<(), EngError>,
+    pub(in crate::family) report: Option<String>,
+}
+
+/// See [`CoverageVerdict`]. An empty `visits` is itself a refusal: only a recording walk
+/// may feed the check, and a future non-recording caller would otherwise see every read
+/// reported as unrecorded.
+pub(in crate::family) fn coverage_verdict(
+    reads: &BTreeSet<String>,
+    visits: &[Visit],
+    pack: &str,
+) -> CoverageVerdict {
+    if visits.is_empty() {
+        return CoverageVerdict {
+            result: Err(EngError::Checkpoint(format!(
+                "EXL3 load of {pack}: the coverage check ran with no recorded visits; \
+                 only a recording walk may feed it"
+            ))),
+            report: None,
+        };
+    }
+    let (unrecorded, unread) = coverage(reads, visits);
+    let result = if unrecorded.is_empty() {
+        Ok(())
+    } else {
+        Err(EngError::Checkpoint(format!(
+            "EXL3 load of {pack}: the pack walk never recorded {} read tensor{}: {}",
+            unrecorded.len(),
+            if unrecorded.len() == 1 { "" } else { "s" },
+            capped_names(&unrecorded),
+        )))
+    };
+    let report = (!unread.is_empty()).then(|| {
+        format!(
+            "EXL3 load of {pack}: {} recorded tensor{} left unread: {}",
+            unread.len(),
+            if unread.len() == 1 { "" } else { "s" },
+            capped_names(&unread),
+        )
+    });
+    CoverageVerdict { result, report }
+}
+
 /// The codebook marker tensor a matrix carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family) enum Marker {
@@ -149,6 +319,7 @@ pub(in crate::family) struct Inspector<'a> {
     source: &'a StreamedCheckpoint,
     root: Root,
     bytes: u64,
+    expert_bytes: u64,
     matrices: usize,
     rates: BTreeMap<u8, usize>,
     marker: Option<Marker>,
@@ -162,6 +333,7 @@ impl<'a> Inspector<'a> {
             source,
             root,
             bytes: 0,
+            expert_bytes: 0,
             matrices: 0,
             rates: BTreeMap::new(),
             marker: None,
@@ -195,6 +367,7 @@ impl<'a> Inspector<'a> {
     pub(in crate::family) fn report(self) -> Result<PackReport, EngError> {
         Ok(PackReport {
             device_bytes: self.bytes,
+            expert_bytes: self.expert_bytes,
             matrices: self.matrices,
             rates: self.rates,
             codebook: self
@@ -357,12 +530,12 @@ impl<'a> Inspector<'a> {
 
     /// The routed-expert block of `layer`: the router and the shared-expert gate as plain tensors
     /// (F32 on the device), the routed experts of each projection at one rate (a bank has one
-    /// stride), and the shared expert. Returns the device bytes of the routed experts alone.
+    /// stride), and the shared expert; the routed experts' bytes land in `expert_bytes`.
     pub(in crate::family) fn moe_block(
         &mut self,
         layer: usize,
         block: MoeBlock,
-    ) -> Result<u64, EngError> {
+    ) -> Result<(), EngError> {
         let MoeBlock {
             hidden: h,
             experts,
@@ -376,7 +549,6 @@ impl<'a> Inspector<'a> {
             false,
         )?;
         self.plain(&shared_gate_name_in(self.root, layer), &[1, dim(h)], false)?;
-        let mut routed = 0;
         for part in ExpertPart::ALL {
             let (k, n) = match part {
                 ExpertPart::Down => (inter, h),
@@ -392,13 +564,13 @@ impl<'a> Inspector<'a> {
                     )));
                 }
             }
-            routed += self.bytes - before;
+            self.expert_bytes += self.bytes - before;
             let (k, n) = match part {
                 ExpertPart::Down => (shared_inter, h),
                 _ => (h, shared_inter),
             };
             self.matrix(&shared_name_in(self.root, layer, part), k, n)?;
         }
-        Ok(routed)
+        Ok(())
     }
 }

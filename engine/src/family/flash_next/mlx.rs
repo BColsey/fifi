@@ -1,5 +1,5 @@
-use super::stored::{self, StoredWeight};
 use crate::family::project::Projector;
+use crate::family::stored::{self, StoredWeight};
 use crate::{
     EngError,
     kernels::{MlxKernels, PackedWeight},
@@ -130,10 +130,10 @@ pub(super) mod tests {
     use super::super::ple::{self, PleState};
     use super::super::qsa::{self, QsaCache};
     use super::super::step::{self, AttnWeights, FlashLayerWeights, ModelShape, ModelState};
-    use super::super::stored::{self, StoredWeight};
     use super::MlxProjector;
     use crate::EngError;
     use crate::family::project::Projector;
+    use crate::family::stored::{self, StoredWeight};
     use crate::kernels::{QuantizationMode, QuantizationSpec};
     use crate::weights::{ShardIo, StreamedCheckpoint};
     use std::collections::BTreeSet;

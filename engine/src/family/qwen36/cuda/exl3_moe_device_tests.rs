@@ -4,23 +4,24 @@
 //! runs the block on a fixed normalized row and residual, and compares the router's picks, their
 //! weights and the block output with a host evaluation: the router in fp64, every picked
 //! expert's projections through the fp64 reference of the stored matrices, SiLU in fp64.
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
 use super::{
-    super::exl3_pack::{ExpertPart, expert_name, router_name, shared_gate_name, shared_name},
+    super::exl3_pack::{expert_name, router_name, shared_gate_name, shared_name},
     common_tests::{dims, inventory},
-    exl3_bank::{Exl3SlotResolver, ExpertStore},
     exl3_load_device_tests::{matrix_of, relative_l2, values_of},
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
     exl3_moe_source::{moe_weights, moe_weights_banked},
-    exl3_source::PackReader,
-    layer_table::LayerTable,
-    moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
 };
+use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};
+use crate::family::exl3::source::PackReader;
+use crate::family::exl3_pack::ExpertPart;
 use crate::{
     EngError,
     family::project::cuda::{CudaProjector, CudaWeights, Reserve},
@@ -268,7 +269,7 @@ fn run_block_rounded(
     moe: &MoeDims,
     device_ids: bool,
     row: &[f32],
-    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+    bank: Option<&mut crate::family::exl3::bank::LayerResolver<'_, '_>>,
 ) -> Result<Device, EngError> {
     let (_, resid) = inputs(moe.hidden);
     let h = moe.hidden * F32;
@@ -284,7 +285,7 @@ fn run_block_rounded(
         buffers: vec![
             upload(projector, &resid),
             zeros(projector, h),
-            upload(projector, &row),
+            upload(projector, row),
             zeros(projector, logits),
             zeros(projector, moe.top_k * 4),
             zeros(projector, moe.top_k * F32),
@@ -409,21 +410,14 @@ fn banked_block_parity(overlap: bool) {
         }
         let rows = rounded_rows(&checkpoint, layer, moe.hidden, moe.top_k);
         let (mut saw_miss, mut saw_mixed) = (false, false);
-        for round in 0..rows.len() {
-            let want = run_block_rounded(&projector, &block, &moe, false, &rows[round], None)
+        for (round, row) in rows.iter().enumerate() {
+            let want = run_block_rounded(&projector, &block, &moe, false, row, None)
                 .expect("the resident block");
             let before = resolver.stats();
             let got = {
                 let mut bank = resolver.layer(0);
-                run_block_rounded(
-                    &projector,
-                    &banked_block,
-                    &moe,
-                    false,
-                    &rows[round],
-                    Some(&mut bank),
-                )
-                .expect("the banked block")
+                run_block_rounded(&projector, &banked_block, &moe, false, row, Some(&mut bank))
+                    .expect("the banked block")
             };
             assert_eq!(got.ids, want.ids, "layer {layer} round {round}: the picks");
             assert_eq!(

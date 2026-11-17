@@ -1,7 +1,7 @@
 //! Flash-Next DeltaNet decode step (design section "DeltaNet").
 
-use super::math::{expect_len, sigmoid, silu, softplus};
 use crate::EngError;
+use crate::family::math::{expect_len, sigmoid, silu, softplus};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]

@@ -23,12 +23,11 @@ use crate::{
     EngError,
     family::{
         exl3_pack::Root,
-        flash_next::{
-            ple::{self, PleShape, PleState, PleWeights, RowPlan},
-            stored::host_f32,
-        },
+        flash_next::ple::{self, PleShape, PleState, PleWeights, RowPlan},
         project::Projector,
+        stored::{host_f32, stored_bytes},
     },
+    tensor::Dtype,
     weights::{
         StreamedCheckpoint,
         exl3::ngram::{NgramAux, NgramDecoder, ROW_DIM},
@@ -38,6 +37,10 @@ use crate::{
 
 /// The scale of the n-gram rows in the step. The EXL3 table has none (see the module doc).
 const WEIGHT_SCALE: f32 = 1.0;
+
+// The batch route projects the packed start embeddings unscaled; `ple::step` scales its own
+// rows by `WEIGHT_SCALE`. They agree only while the constant is one.
+const _: () = assert!(WEIGHT_SCALE == 1.0);
 
 fn le_i64(bytes: &[u8], what: &str) -> Result<Vec<i64>, EngError> {
     let (words, rest) = bytes.as_chunks::<8>();
@@ -212,6 +215,241 @@ impl HostProjection {
             threads,
         }
     }
+
+    /// The thread count the chunk driver thresholds its small-chunk fallback against.
+    pub(in crate::family) fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// One weight row dotted against four embeddings with the four folds interleaved. Each
+    /// sum still adds its products in index order starting from `-0.0` — the identity `Sum for
+    /// f32` folds from, which [`HostMatrix::matvec`]'s `.sum()` therefore uses — so the values
+    /// are bit-identical, an all-`-0.0` row included; only the interleaving differs, and the
+    /// fold order cannot see it. Interleaving breaks the dependent-add chain that otherwise
+    /// pins one dot to one add per weight load.
+    fn row_dots(weights: &[f32], quad: [&[f32]; 4], embed: usize) -> [f32; 4] {
+        let mut sums = [-0.0f32; 4];
+        for column in 0..embed {
+            let weight = weights[column];
+            sums[0] += weight * quad[0][column];
+            sums[1] += weight * quad[1][column];
+            sums[2] += weight * quad[2][column];
+            sums[3] += weight * quad[3][column];
+        }
+        sums
+    }
+
+    /// Tokens a blocked product computes against one weight row before the next weight row
+    /// streams in. A block's embeddings stay in cache while the 131 MB of weights sweep once
+    /// per block; bigger blocks mean fewer sweeps and more residency.
+    const BLOCK: usize = 32;
+
+    /// Tokens one [`Self::row_dots`] call interleaves. Four independent folds give the
+    /// scheduler four adds per weight load instead of one dependent chain.
+    const UNROLL: usize = 4;
+
+    /// Chunk rows up to which [`Self::project_chunk`] takes the slab route. A judgement
+    /// call, not a measured crossover: the slab route streams each matrix's weights once per
+    /// chunk (split into per-thread slabs) for any row count, while the token route streams
+    /// them once per [`Self::BLOCK`]-token block per thread — fewer full sweeps once each
+    /// thread's run fits one block, which serving reaches around this width (serve chunks of
+    /// 16 rows: one sweep against eight).
+    const SLAB_ROWS: usize = 128;
+
+    /// Which `project_chunk` route `rows` takes: the slab route at or below [`Self::SLAB_ROWS`],
+    /// the token-block route above. Pure, so tests pin the threshold on it.
+    pub(in crate::family) fn uses_slab(rows: usize) -> bool {
+        rows <= Self::SLAB_ROWS
+    }
+
+    /// One thread's slab of one matrix: `run` weight rows folded against every token, results
+    /// laid out `sums[slab_row * tokens + token]`. Each weight row streams once and serves all
+    /// its tokens while hot; every element still folds its dot exactly as
+    /// [`HostMatrix::matvec`] does — the same sequential sum over the same products, only the
+    /// interleave across tokens differs, which the fold order cannot see.
+    fn project_slab(
+        matrix: &[f32],
+        matrix_rows: usize,
+        embeddings: &[f32],
+        tokens: usize,
+        run: usize,
+        first_row: usize,
+        embed: usize,
+    ) -> Vec<f32> {
+        let last = tokens - 1;
+        let quad_at = |base: usize| {
+            [
+                &embeddings[base.min(last) * embed..(base.min(last) + 1) * embed],
+                &embeddings[(base + 1).min(last) * embed..((base + 1).min(last) + 1) * embed],
+                &embeddings[(base + 2).min(last) * embed..((base + 2).min(last) + 1) * embed],
+                &embeddings[(base + 3).min(last) * embed..((base + 3).min(last) + 1) * embed],
+            ]
+        };
+        let mut sums = vec![0.0f32; run * tokens];
+        for row in first_row..(first_row + run).min(matrix_rows) {
+            let weights = &matrix[row * embed..(row + 1) * embed];
+            for quad in (0..tokens).step_by(Self::UNROLL) {
+                let dots = Self::row_dots(weights, quad_at(quad), embed);
+                for (lane, dot) in dots.iter().enumerate() {
+                    let token = quad + lane;
+                    if token < tokens {
+                        sums[(row - first_row) * tokens + token] = *dot;
+                    }
+                }
+            }
+        }
+        sums
+    }
+
+    /// The projections of a whole chunk in one product: `rows` embeddings of `key.cols`
+    /// values each, flattened. At or below [`Self::SLAB_ROWS`] each matrix's weights stream
+    /// ONCE per chunk, split into per-thread row slabs ([`Self::project_slab`]); above it the
+    /// token runs split over the projection threads (whole rows per thread, so no two threads
+    /// share an output element) and the tokens go [`Self::BLOCK`] at a time inside a run, each
+    /// weight row serving the whole block while hot. Every output element folds its dot
+    /// exactly as [`HostMatrix::matvec`] does — the same sequential `sum` over the same
+    /// products — so the pairs are bit-identical to per-token [`PleProjection::project`] calls
+    /// on both routes.
+    pub(in crate::family) fn project_chunk(
+        &self,
+        embeddings: &[f32],
+        rows: usize,
+    ) -> Result<Vec<PleKeyValue>, EngError> {
+        let embed = self.key.cols;
+        if self.value.cols != embed {
+            return Err(EngError::Checkpoint(format!(
+                "PLE projections disagree on the embedding: key {embed} values, value {}",
+                self.value.cols
+            )));
+        }
+        if embeddings.len() != rows * embed {
+            return Err(EngError::BadRequest(format!(
+                "PLE chunk projection input has {} values, expected {rows} rows of {embed}",
+                embeddings.len()
+            )));
+        }
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<PleKeyValue> = (0..rows)
+            .map(|_| PleKeyValue {
+                keys: vec![0.0; self.key.rows],
+                value: vec![0.0; self.value.rows],
+            })
+            .collect();
+        if Self::uses_slab(rows) {
+            // Slab route: each matrix streams once per chunk, split into per-thread row slabs.
+            let (key, value) = (&self.key, &self.value);
+            let threads = self.threads.max(1);
+            let key_run = key.rows.div_ceil(threads);
+            let value_run = value.rows.div_ceil(threads);
+            let mut sums: Vec<(usize, Vec<f32>, usize, Vec<f32>)> = Vec::new();
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for thread in 0..threads {
+                    let k_first = thread * key_run;
+                    let v_first = thread * value_run;
+                    if k_first >= key.rows && v_first >= value.rows {
+                        continue;
+                    }
+                    handles.push(scope.spawn(move || {
+                        (
+                            k_first,
+                            Self::project_slab(
+                                &key.data, key.rows, embeddings, rows, key_run, k_first, embed,
+                            ),
+                            v_first,
+                            Self::project_slab(
+                                &value.data,
+                                value.rows,
+                                embeddings,
+                                rows,
+                                value_run,
+                                v_first,
+                                embed,
+                            ),
+                        )
+                    }));
+                }
+                for handle in handles {
+                    sums.push(handle.join().expect("a slab projection thread panicked"));
+                }
+            });
+            for (k_first, keys_sums, v_first, value_sums) in &sums {
+                for slab_row in 0..key_run {
+                    let row = k_first + slab_row;
+                    if row >= key.rows {
+                        break;
+                    }
+                    for (token, pair) in out.iter_mut().enumerate() {
+                        pair.keys[row] = keys_sums[slab_row * rows + token];
+                    }
+                }
+                for slab_row in 0..value_run {
+                    let row = v_first + slab_row;
+                    if row >= value.rows {
+                        break;
+                    }
+                    for (token, pair) in out.iter_mut().enumerate() {
+                        pair.value[row] = value_sums[slab_row * rows + token];
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        let run = rows.div_ceil(self.threads.max(1)).max(1);
+        std::thread::scope(|scope| {
+            for (index, part) in out.chunks_mut(run).enumerate() {
+                let (key, value) = (&self.key, &self.value);
+                let first = index * run;
+                scope.spawn(move || {
+                    let embedding = |token: usize| &embeddings[token * embed..(token + 1) * embed];
+                    let last = rows - 1;
+                    let quad_at = |base: usize| {
+                        [
+                            embedding(base.min(last)),
+                            embedding((base + 1).min(last)),
+                            embedding((base + 2).min(last)),
+                            embedding((base + 3).min(last)),
+                        ]
+                    };
+                    let mut start = 0;
+                    while start < part.len() {
+                        let end = (start + Self::BLOCK).min(part.len());
+                        let block = &mut part[start..end];
+                        for row in 0..key.rows {
+                            let weights = &key.data[row * embed..(row + 1) * embed];
+                            for (group, slots) in block.chunks_mut(Self::UNROLL).enumerate() {
+                                let sums = Self::row_dots(
+                                    weights,
+                                    quad_at(first + start + group * Self::UNROLL),
+                                    embed,
+                                );
+                                for (sum, pair) in sums.iter().zip(slots.iter_mut()) {
+                                    pair.keys[row] = *sum;
+                                }
+                            }
+                        }
+                        for row in 0..value.rows {
+                            let weights = &value.data[row * embed..(row + 1) * embed];
+                            for (group, slots) in block.chunks_mut(Self::UNROLL).enumerate() {
+                                let sums = Self::row_dots(
+                                    weights,
+                                    quad_at(first + start + group * Self::UNROLL),
+                                    embed,
+                                );
+                                for (sum, pair) in sums.iter().zip(slots.iter_mut()) {
+                                    pair.value[row] = *sum;
+                                }
+                            }
+                        }
+                        start = end;
+                    }
+                });
+            }
+        });
+        Ok(out)
+    }
 }
 
 impl PleProjection for HostProjection {
@@ -342,6 +580,28 @@ impl PleVectors {
         };
         Ok((vectors, projection))
     }
+
+    /// The two projections as stored (dtype and raw bytes, no conversion): the device route
+    /// uploads them to the card as the pack holds them, F16 or BF16.
+    pub(in crate::family) fn raw_projections(
+        source: &StreamedCheckpoint,
+        layer: usize,
+        shape: &PleShape,
+    ) -> Result<(Dtype, Vec<u8>, Vec<u8>), EngError> {
+        let dims = shape.dims();
+        let width = (dims.hidden * dims.branches) as usize;
+        let embed = shape.embed();
+        let at = |suffix: &str| Root::Layers.name(layer, &format!("ple.{suffix}"));
+        let raw = |suffix: &str, rows: usize| stored_bytes(source, &at(suffix), rows * embed);
+        let (key_dtype, key) = raw("key_proj.weight", width)?;
+        let (value_dtype, value) = raw("value_proj.weight", dims.hidden as usize)?;
+        if key_dtype != value_dtype {
+            return Err(EngError::Checkpoint(format!(
+                "the PLE projections are stored as {key_dtype:?} and {value_dtype:?}"
+            )));
+        }
+        Ok((key_dtype, key, value))
+    }
 }
 
 /// The weights `ple::step` and `ple::plan_rows` read, borrowed field by field so that the
@@ -374,9 +634,59 @@ pub(in crate::family) struct PleFeed {
     rows: NgramRows,
     vectors: PleVectors,
     projection: Box<dyn PleProjection>,
+    /// The device route's hand-off: when set, [`PleFeed::set_fixed`] installs a precomputed
+    /// key/value pair and `ple_update` returns it instead of running the projection.
+    fixed: Option<std::rc::Rc<FixedProjection>>,
     table: [FeedWeight; 1],
     table_rows: [u64; 1],
     state: PleState,
+}
+
+/// A [`PleProjection`] that returns pairs set from outside: the device route computes the
+/// chunk's projections on the card and hands each row's pair over before the host step runs.
+pub(in crate::family) struct FixedProjection {
+    pair: std::cell::RefCell<Option<PleKeyValue>>,
+}
+
+impl FixedProjection {
+    pub(in crate::family) fn new() -> Self {
+        Self {
+            pair: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Installs the pair the next `project` returns; the last write wins.
+    pub(in crate::family) fn set(&self, pair: PleKeyValue) {
+        *self.pair.borrow_mut() = Some(pair);
+    }
+
+    /// Takes the installed pair (the `&self` form: the shared handle delegates here, because an
+    /// `Rc` alias is the design, not an error).
+    fn take(&self) -> Option<PleKeyValue> {
+        self.pair.borrow_mut().take()
+    }
+}
+
+impl PleProjection for FixedProjection {
+    fn project(&mut self, _embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.take().ok_or_else(|| EngError::Backend {
+            operation: "flash_next_ple_device",
+            message: "the device PLE pair was not set for this row".to_string(),
+        })
+    }
+}
+
+/// The boxed half of a [`FixedProjection`] the feed owns: delegating so the feed's `Box<dyn>` and
+/// the driver's `Rc` see the same cell.
+struct SharedFixed(std::rc::Rc<FixedProjection>);
+
+impl PleProjection for SharedFixed {
+    fn project(&mut self, _embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.0.take().ok_or_else(|| EngError::Backend {
+            operation: "flash_next_ple_device",
+            message: "the device PLE pair was not set for this row".to_string(),
+        })
+    }
 }
 
 impl PleFeed {
@@ -393,6 +703,7 @@ impl PleFeed {
             rows,
             vectors,
             projection,
+            fixed: None,
             table: [FeedWeight::Table],
             table_rows,
         }
@@ -401,6 +712,48 @@ impl PleFeed {
     /// The n-gram table, which a caller may read from another thread (`NgramRows` is `Sync`).
     pub(in crate::family) fn rows(&self) -> &NgramRows {
         &self.rows
+    }
+
+    /// A feed whose projections come from [`FixedProjection::set`]: the device route installs
+    /// each row's pair there, and the host step consumes it unchanged.
+    pub(in crate::family) fn with_fixed(
+        shape: PleShape,
+        rows: NgramRows,
+        vectors: PleVectors,
+        fixed: std::rc::Rc<FixedProjection>,
+    ) -> Self {
+        let projection = Box::new(SharedFixed(std::rc::Rc::clone(&fixed)));
+        let table_rows = [rows.rows()];
+        Self {
+            state: PleState::new(&shape),
+            shape,
+            rows,
+            vectors,
+            projection,
+            fixed: Some(fixed),
+            table: [FeedWeight::Table],
+            table_rows,
+        }
+    }
+
+    /// Whether [`Self::with_fixed`] built this feed.
+    pub(in crate::family) fn is_fixed(&self) -> bool {
+        self.fixed.is_some()
+    }
+
+    /// Installs the pair the next update of this row consumes. Only a fixed feed takes pairs.
+    pub(in crate::family) fn set_fixed(&self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.fixed.as_ref().map_or_else(
+            || {
+                Err(EngError::BadRequest(
+                    "PLE pairs can only be set on a fixed-projection feed".to_string(),
+                ))
+            },
+            |fixed| {
+                fixed.set(pair);
+                Ok(())
+            },
+        )
     }
 
     fn weights(&self) -> PleWeights<'_, FeedWeight> {
@@ -434,6 +787,30 @@ impl PleFeed {
         self.rows.gather(plan)
     }
 
+    /// The PLE embedding of `token` as the chunk feeds assemble it: planned against the
+    /// history it will have when its turn comes (the `prefix` tokens before it in the
+    /// chunk), gathered, and the gathered rows concatenated in plan order. Returns the
+    /// gathered rows too — `pack_feeds::begin_chunk` keeps them pending for the update
+    /// pass. The per-token step projects the same values (its own `plan` + `gather`, the
+    /// rows unscaled while `WEIGHT_SCALE` is one); the chunk-embeddings test pins the two
+    /// assemblies together bit for bit.
+    pub(in crate::family) fn chunk_embedding(
+        &self,
+        prefix: &[u32],
+        token: u32,
+    ) -> Result<(Vec<f32>, Gathered), EngError> {
+        let plan = self.plan_after(prefix, token)?;
+        let rows = self.gather(&plan)?;
+        let mut embedding = Vec::new();
+        for &(_, local) in &plan.rows {
+            let row = rows.get(u64::from(local)).ok_or_else(|| {
+                EngError::BadRequest(format!("n-gram row {local} was not gathered"))
+            })?;
+            embedding.extend_from_slice(row);
+        }
+        Ok((embedding, rows))
+    }
+
     /// The residual update of `token`: `stream` is the residual stream (`branches * hidden`) at the
     /// PLE layer's input, `gathered` the rows of [`Self::plan`] for the same token. Advances the
     /// history and the convolution ring. On an error the state is unchanged.
@@ -444,6 +821,8 @@ impl PleFeed {
         stream: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         let mut next = self.state.clone();
+        let profile = crate::family::flash_next::cuda::driver::chunk::prof::on();
+        let mut t = std::time::Instant::now();
         let out = {
             let mut projector = FeedProjector {
                 gathered,
@@ -451,6 +830,10 @@ impl PleFeed {
                 value: None,
             };
             let weights = step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows);
+            if profile {
+                crate::family::flash_next::cuda::driver::chunk::prof::add(14, t.elapsed());
+                t = std::time::Instant::now();
+            }
             ple::step(
                 &mut projector,
                 &self.shape,
@@ -460,6 +843,9 @@ impl PleFeed {
                 stream,
             )?
         };
+        if profile {
+            crate::family::flash_next::cuda::driver::chunk::prof::add(15, t.elapsed());
+        }
         self.state = next;
         Ok(out)
     }
@@ -467,6 +853,20 @@ impl PleFeed {
     /// Forgets the history and zeroes the ring (a new sequence).
     pub(in crate::family) fn reset(&mut self) {
         self.state = PleState::new(&self.shape);
+    }
+
+    /// The host half of a resume snapshot: the token history and the host ring mirror.
+    pub(in crate::family) fn state_parts(&self) -> (&[u32], &[f32]) {
+        (self.state.history(), self.state.ring_values())
+    }
+
+    /// Installs a saved host half, as a prefix restore brings the feed back to a boundary.
+    pub(in crate::family) fn resume(
+        &mut self,
+        history: &[u32],
+        ring: &[f32],
+    ) -> Result<(), EngError> {
+        self.state.resume(history, ring)
     }
 }
 

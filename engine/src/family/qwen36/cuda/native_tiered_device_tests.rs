@@ -10,7 +10,7 @@
 use super::moe::tiered::{
     LayerPlan, RouteRead, TieredBlock, TieredLayerHost, TieredScratch, run_moe_block_tiered,
 };
-use super::moe::{Launch, MoeLayerWeights, StackWeights};
+use super::moe::{MoeLayerWeights, StackWeights};
 use super::native_device_rig::{DIMS, Sources, device_present, host_router, rig_weights, sources};
 use super::native_device_rig::{f32_buf, zero_buf};
 use super::native_moe_device_tests::{
@@ -20,6 +20,7 @@ use super::run_report::HostSyncs;
 use super::tiered_load::tier_pool;
 use super::tiered_step::BankFill;
 use crate::EngError;
+use crate::family::exl3::launch::Launch;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertJob, MappedRegion, PendingLayer};
 use crate::family::qwen36::tiered::host::BankDevice;

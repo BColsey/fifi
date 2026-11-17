@@ -10,6 +10,7 @@
 //! The resident leg needs the whole pack on the device, so this test runs where that fits
 //! (the 3090); the block-level banked parity in `exl3_moe_device_tests` covers the same
 //! property on smaller GPUs.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{cell::RefCell, path::Path};
 
@@ -17,16 +18,15 @@ use sha2::{Digest, Sha256};
 
 use super::{
     common_tests::{dims, inventory},
-    exl3_bank::Exl3SlotResolver,
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, GENERATED, HEAD_ROWS, PROMPT, SAMPLER_VOCAB, options},
-    layer_table::LayerTable,
     native_device_rig::device_present,
     resources::{StepResources, moe_dims},
     rules::QwenRules,
     step::{CaptureConfig, QwenResidentStep},
 };
+use crate::family::exl3::bank::Exl3SlotResolver;
 use crate::{
     EngError,
     family::project::cuda::{CudaProjector, CudaWeights, Reserve},
@@ -107,7 +107,6 @@ fn banked_leg(
         store,
         slots,
         experts,
-        routed_bytes: _,
         dense_bytes: _,
     } = model;
     let table = LayerTable::new(&dims(), &inventory())?;

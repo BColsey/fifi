@@ -1,27 +1,68 @@
+pub(crate) mod admission_sketch;
 mod config;
 #[allow(
     dead_code,
     reason = "the worker and the server jobs run the seam and every family executor implements it; the allow covers the members only tests still reach"
 )]
 pub(crate) mod executor;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod exl3;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod exl3_pack;
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(
+        dead_code,
+        reason = "the CUDA step is the caller; host builds test the plan"
+    )
+)]
+pub(in crate::family) mod exl3_merge_plan;
+#[cfg(test)]
+mod exl3_merge_plan_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod exl3_pack;
 #[allow(
     dead_code,
     reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"
 )]
 pub(crate) mod flash_next;
+
+pub(crate) mod device_budget;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family) mod exl3_tensors;
+/// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
+/// the copy plan of a pass, the counters. Ungated on purpose so plain host gates compile and
+/// run the seam's tests without the card feature.
+#[allow(
+    dead_code,
+    reason = "ungated so plain host gates compile the seam; the Flash-Next bank reaches it everywhere, the flint resident cache under test or native-cuda; the allow covers the members only tests still reach"
+)]
+pub(crate) mod expert_bank;
 pub mod flint;
 pub mod gemma4;
 pub mod gguf_model;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+// Gated with the CUDA families because the book reads the kernels' resident step params
+// (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
+pub(in crate::family) mod graph_state;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod host_admit;
 pub mod keys;
+pub(crate) mod kv_format;
 pub mod layer_weights;
+pub mod mapped_file;
+pub(in crate::family) mod math;
 pub mod nemotron35;
 #[allow(
     dead_code,
     reason = "no engine path calls the store yet; only its tests do"
 )]
 pub(crate) mod parking;
+pub(crate) mod plan_decision;
+pub(crate) mod plan_rows;
+/// The shared prefill core promoted from the first chunked family: the admission arithmetic
+/// (device-free) and the CUDA arena-fill and chunk-driver primitives. Family plans stay with
+/// their families; nothing here names one.
+pub(in crate::family) mod prefill;
 #[allow(
     dead_code,
     reason = "the Qwen3.6 host and CUDA loads, the Flash-Next MoE/PLE blocks and the Nemotron host projector run the seam; the allow covers the adapters only tests still reach"
@@ -33,6 +74,7 @@ pub mod quantization;
     reason = "the Q36 host reference serves later work; until it lands, only tests and the Mac reference run call it"
 )]
 pub mod qwen36;
+pub mod raon1;
 pub mod recurrent;
 pub mod route;
 #[allow(
@@ -51,6 +93,15 @@ pub mod spec;
     reason = "the CUDA n-gram step reaches the repeat index, the accept rule, the window and the driver; the MTP chain, the calibrator and the hybrid and dynamic settings are reached only from tests until the MTP draft step exists"
 )]
 pub(crate) mod speculate;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod state_words;
+#[allow(
+    dead_code,
+    reason = "the MLX and CUDA executor paths and their tests reach these weights; the plain host build does not until the trunk is qualified"
+)]
+pub(in crate::family) mod stored;
+pub mod tier_budget;
+pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.
 #[cfg(test)]
 pub(crate) mod token_forcing;

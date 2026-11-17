@@ -17,11 +17,10 @@
 //!
 //! All the bookkeeping is `family::qwen36::rollback`, tested on the host. What only a device shows:
 //! the byte range of each copy, the slot offsets and the stream order.
+use crate::family::graph_state::book::Health;
 
 use super::{
-    super::{book::Health, state_layout::StateLayout},
-    ResidentState, StateIdentity,
-    export::IMPORT_REWRITES_WORDS,
+    super::state_layout::StateLayout, ResidentState, StateIdentity, export::IMPORT_REWRITES_WORDS,
 };
 use crate::{
     EngError,

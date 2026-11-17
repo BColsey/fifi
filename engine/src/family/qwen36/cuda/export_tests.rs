@@ -12,6 +12,7 @@ use super::{
     },
     state_layout::StateLayout,
 };
+use crate::family::graph_state::book::StateBook;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
 
@@ -191,7 +192,7 @@ fn one_position_past_the_capacity_is_a_context_limit() {
 
 #[test]
 fn the_import_flag_lets_a_poisoned_state_in() {
-    use super::{book::StateBook, state::export::IMPORT_REWRITES_WORDS};
+    use super::state::export::IMPORT_REWRITES_WORDS;
     // `import_state` does all of reset's work, so the book must take it from a `Poisoned` state;
     // the flag is what `import_state` passes, so flipping it fails here.
     let mut book = StateBook::new(8, 7);

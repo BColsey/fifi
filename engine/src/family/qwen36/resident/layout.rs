@@ -5,8 +5,8 @@
 use crate::{
     EngError,
     family::{
-        flash_next::stored::{RoleRange, StackLayout, widen_bf16_in_place},
         qwen36::host_cpu::dequantize_matrix,
+        stored::{RoleRange, StackLayout, widen_bf16_in_place},
     },
     kernels::{PackedWeight, QuantizationMode},
     tensor::{Dtype, Tensor},

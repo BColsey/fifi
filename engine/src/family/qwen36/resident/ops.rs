@@ -149,8 +149,8 @@ impl Consts {
             f32_tensor(Vec::new(), &[0.0])?,
             f32_tensor(Vec::new(), &[kd * 1e-6])?,
             f32_tensor(Vec::new(), &[kd.sqrt()])?,
-            f32_tensor(vec![key_dim as u32], &vec![q_fill; key_dim as usize])?,
-            f32_tensor(vec![key_dim as u32], &vec![k_fill; key_dim as usize])?,
+            f32_tensor(vec![key_dim as u32], &vec![q_fill; key_dim])?,
+            f32_tensor(vec![key_dim as u32], &vec![k_fill; key_dim])?,
         ];
         let refs: Vec<&Tensor> = sources.iter().collect();
         let mut got = kernels.import_many(&refs)?.into_iter();
@@ -367,7 +367,7 @@ mod tests {
         let super::super::super::host::MixerW::Delta(d) = &view.layers[0].mixer else {
             panic!("layer 0 is DeltaNet");
         };
-        let crate::family::flash_next::stored::StoredWeight::Packed(packed) = d.out else {
+        let crate::family::stored::StoredWeight::Packed(packed) = d.out else {
             panic!("out_proj is packed");
         };
         let resident = kernels.import_packed(packed).unwrap();

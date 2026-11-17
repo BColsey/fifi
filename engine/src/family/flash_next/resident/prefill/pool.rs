@@ -15,17 +15,15 @@
 //! Every byte that a chunk imports is written by that chunk. The pool never reads the S3 expert
 //! cache and never writes to it.
 
-#[cfg(feature = "native-fault-qualification")]
-use super::super::super::stored::record_page_import;
-use super::super::super::{
-    prefill_plan::{Wave, require_sorted_ranks},
-    stored::read_stack_into,
-};
+use super::super::super::prefill_plan::{Wave, require_sorted_ranks};
 use super::super::{
     ops::short_import,
     slots::{ExpertSlots, SetLayout},
     weights::RMoe,
 };
+use crate::family::stored::read_stack_into;
+#[cfg(feature = "native-fault-qualification")]
+use crate::family::stored::record_page_import;
 use crate::{
     EngError,
     kernels::{HostPages, MlxKernels, PageRange, ResidentPackedWeight},

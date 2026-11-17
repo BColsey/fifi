@@ -12,7 +12,7 @@
 
 use super::{MoeShape, route};
 use crate::EngError;
-use crate::family::flash_next::math::sigmoid;
+use crate::family::math::sigmoid;
 use crate::kernels::cuda::resident::router::{
     RouterCall, RouterOut, RouterShape, RouterWeights, router_logits_bytes,
 };

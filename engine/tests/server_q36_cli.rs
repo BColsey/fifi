@@ -25,6 +25,9 @@ fn config(listen: &str, qwen36: Option<serde_json::Value>) -> serde_json::Value 
     serde_json::json!({
         "listen": listen,
         "api_key_env": KEY_VARIABLE,
+        // Pin the stock full-prefill path: every test here checks a start rule that
+        // reuse must not shadow, whatever the per-family default resolves to.
+        "prefix_reuse": false,
         "engines": [engine]
     })
 }

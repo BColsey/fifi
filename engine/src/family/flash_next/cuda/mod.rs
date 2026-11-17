@@ -10,7 +10,14 @@
 //! Each module's own header says what it does.
 
 mod bank;
+// The resume switch: INFERENCE_FLASH_NEXT_PREFIX_RESUME, read once, strict spelling. It rides
+// the driver's cfg: the switch only matters where a driver can be built.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) mod resume;
+
 // The pack reader exists where the pack files do (`load::pack_files`): tests and native-cuda Linux.
+#[cfg(test)]
+mod bank_pick_golden_host_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod bank_source;
 #[cfg(test)]
@@ -22,6 +29,14 @@ mod moe_block;
 mod moe_block_device_tests;
 #[cfg(test)]
 mod moe_block_tests;
+mod prefill_adapter;
+#[cfg(test)]
+mod prefill_adapter_host_tests;
+mod prefill_ring;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod prefill_ring_device_tests;
+#[cfg(test)]
+mod prefill_ring_tests;
 // S3: the state and decode arena plans size device memory with the kernel wrappers, so they build
 // with the native CUDA backend only. Staged: the decode step (S4) is the first caller.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -110,7 +125,7 @@ mod step_tests;
 mod device;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
-mod driver;
+pub(in crate::family::flash_next) mod driver;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod driver_device_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
