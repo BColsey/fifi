@@ -4,8 +4,8 @@
 //! allow, an extra or missing tensor, or a wrong shape fails and names the tensor or
 //! key. There is no skip mode. This is the CPU host path: it builds the full
 //! 731-tensor inventory of the published Q4_K_M file and reads tensors back as host
-//! F32. The host reference and the serving path are not written yet; only tests call
-//! the opener, and no CUDA load path exists, so no tile rules apply.
+//! F32. The host reference (`reference.rs`) reads through this opener; the serving
+//! path is not written yet, no CUDA load path exists, so no tile rules apply.
 
 use std::path::{Path, PathBuf};
 
@@ -426,6 +426,14 @@ impl Raon1Model {
         let (ty, bytes) = self.weights.read_tensor(name)?;
         dequantize(ty, &bytes)
     }
+
+    /// One tensor dequantized to host F32 plus its file type. The host
+    /// reference needs the type to reproduce the fork's per-matmul activation
+    /// quantization.
+    pub fn read_f32_typed(&self, name: &str) -> Result<(Vec<f32>, GgufType), EngError> {
+        let (ty, bytes) = self.weights.read_tensor(name)?;
+        Ok((dequantize(ty, &bytes)?, ty))
+    }
 }
 
 /// Opens the published Raon-1-mini-preview Q4_K_M GGUF strictly: architecture,
@@ -457,8 +465,8 @@ fn reject(message: impl Into<String>) -> EngError {
 }
 
 /// The geometry keys the inventory is generated from. Hyperparameters (situ betas,
-/// epsilons, gating function) are read by the host reference when it is written,
-/// not pinned here.
+/// epsilons, gating function) are read by the host reference's `hyper()`, not
+/// pinned here.
 fn check_metadata(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
     match header.meta("general.architecture") {
         Some(MetaValue::String(found)) if found == "raon1" => {}
@@ -557,6 +565,8 @@ fn check_tensors(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
     }
     Ok(())
 }
+
+pub mod reference;
 
 #[cfg(test)]
 mod tests;

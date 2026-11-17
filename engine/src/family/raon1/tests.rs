@@ -780,3 +780,100 @@ fn a_wrong_header_hash_is_refused() {
     };
     assert!(error.to_lowercase().contains("sha256"), "{error}");
 }
+
+/// Reads a fixture file as little-endian f32 in ggml linear order.
+fn read_fixture_f32(path: &std::path::Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bytewidth = 4; // little-endian f32
+    bytes
+        .chunks_exact(bytewidth)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// `f16_roundtrip` against f16-exact and subnormal values (the Q8_0 scale
+/// rounding the fork's quantizer applies).
+#[test]
+fn f16_roundtrip_pins_known_values() {
+    assert_eq!(reference::f16_roundtrip(1.0), 1.0);
+    assert_eq!(reference::f16_roundtrip(0.1), 0.099_975_586);
+    assert_eq!(reference::f16_roundtrip(-2.5), -2.5);
+    assert_eq!(reference::f16_roundtrip(1e-5), 1.001358e-5); // subnormal
+    assert_eq!(reference::f16_roundtrip(0.0), 0.0);
+}
+
+/// The layer-1 MoE expert-124 gate column against the fork's slot dump:
+/// the dump matches the fork bit-for-bit, so this pins the engine-side expert
+/// slice + quantized dot in isolation.
+#[test]
+fn the_moe_expert_gate_column_pins_the_fork_slot() {
+    let Ok(model_path) = std::env::var("RAON_Q4_KM") else {
+        eprintln!("skipped: RAON_Q4_KM is unset");
+        return;
+    };
+    let Ok(fixtures) = std::env::var("RAON_FIXTURES1") else {
+        eprintln!("skipped: RAON_FIXTURES1 is unset");
+        return;
+    };
+    const HEADER_SHA: &str = "b8e287e3eae14db453bf8f13addace471cc2472324021369cd809dcac6cf9f17";
+    let model = open_raon_1_mini_preview(std::path::Path::new(&model_path), Some(HEADER_SHA))
+        .unwrap_or_else(|error| panic!("the published file must open: {error:?}"));
+    // layer 1 geometry: hidden 2560, moe_inter 1088, 128 experts, 6 used, 42 tokens.
+    let (gate_w, gate_ty) = model
+        .read_f32_typed("blk.1.ffn_gate_exps.weight")
+        .expect("exps gate");
+    let (h, mi, e, t, u) = (2560usize, 1088usize, 124usize, 35usize, 5usize);
+    let cur = read_fixture_f32(
+        std::path::Path::new(&fixtures)
+            .join("00062-ffn_norm-1.f32")
+            .as_path(),
+    );
+    let xt = &cur[t * h..(t + 1) * h];
+    let span = h * mi;
+    let g = reference::fork_mv(&gate_w[e * span..][..span], gate_ty, xt, h, mi);
+    let gate_fix = read_fixture_f32(
+        std::path::Path::new(&fixtures)
+            .join("00074-ffn_moe_gate-1.f32")
+            .as_path(),
+    );
+    let mut worst = 0.0f32;
+    for f in 0..mi {
+        let fork = gate_fix[f + u * mi + t * mi * 6];
+        worst = worst.max((g[f] - fork).abs());
+    }
+    eprintln!("expert-124 gate col worst diff: {worst:.3e}");
+    assert!(worst <= 5e-2, "expert gate column drifted: {worst}");
+}
+
+/// One dense-FFN gate element recomputed against the fork's Q8_K-quantized
+/// dot, pinning `fork_mm`'s numerics in isolation from the whole graph.
+/// Reference values: exact 15.113298, quantized 15.101180, fork 15.101177.
+#[test]
+fn the_dense_ffn_gate_element_pins_the_quantized_dot() {
+    let Ok(model_path) = std::env::var("RAON_Q4_KM") else {
+        eprintln!("skipped: RAON_Q4_KM is unset");
+        return;
+    };
+    let Ok(fixtures) = std::env::var("RAON_FIXTURES1") else {
+        eprintln!("skipped: RAON_FIXTURES1 is unset");
+        return;
+    };
+    const HEADER_SHA: &str = "b8e287e3eae14db453bf8f13addace471cc2472324021369cd809dcac6cf9f17";
+    let model = open_raon_1_mini_preview(std::path::Path::new(&model_path), Some(HEADER_SHA))
+        .unwrap_or_else(|error| panic!("the published file must open: {error:?}"));
+    let cur = read_fixture_f32(
+        std::path::Path::new(&fixtures)
+            .join("00027-ffn_norm-0.f32")
+            .as_path(),
+    );
+    // blk.0 geometry: hidden 2560 in, dense_inter 12032 out, 42 tokens.
+    let gate = reference::fork_mm(&model, "blk.0.ffn_gate.weight", &cur, 2560, 12032, 42)
+        .unwrap_or_else(|error| panic!("the mm must run: {error:?}"));
+    let at = 74085; // o=1893, t=6 in [n, nt] layout
+    assert_eq!(gate.len(), 12032 * 42);
+    assert!(
+        (gate[at] - 15.101_18).abs() <= 5e-3,
+        "quantized gate element: {} vs fork 15.101177",
+        gate[at]
+    );
+}
