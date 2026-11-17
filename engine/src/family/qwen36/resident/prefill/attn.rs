@@ -1523,26 +1523,54 @@ mod tests {
         );
     }
 
-    /// Dense-shape (QH 24, KVH 4, D 256, REP 6) bench: the composite Q8 prefix attention in
-    /// 256-row blocks against the flash kernel on a duplicate-padded query (24 -> 32 heads,
-    /// each kv group of 6 padded with its own first 2 heads; the pad rows' outputs are
-    /// discarded). Also checks the flash output's 24 real rows against the F32 reference.
-    /// Temporary probe for the dense prefill headroom decision: run with --ignored.
+    /// Dense 24q/4kv/256 serving shape with BF16 queries and BF16 affine Q8 metadata.
+    /// The two arms time the same candidate kernels and pad helpers as the resident
+    /// path. A separate F32 reference uses the same inputs before Q8 quantization.
     #[test]
-    #[ignore]
+    #[ignore = "Apple Silicon dense prefill sweep"]
     fn dense_rep6_flash_pad_bench() {
         let _serial = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
-        let (h, kvh, d, rows, cap) = (24u32, 4u32, 256u32, 512u32, 16_384u32);
+        kernels.allow_bf16(true);
+        let (h, kvh, d) = (24u32, 4u32, 256u32);
         let (group, bits) = (64u32, 8u32);
-        let block: u32 = 256;
-        let kv: Vec<f32> = (0..kvh * cap * d)
-            .map(|i| (((i * 37) % 509) as f32 - 254.0) / 254.0)
-            .collect();
-        let k = upload(&mut kernels, vec![1, kvh, cap, d], &kv);
-        let v = upload(&mut kernels, vec![1, kvh, cap, d], &kv);
-        let (kc, ks, kb) = kernels.quantize_rows(&k, group, bits).unwrap();
-        let (vc, vs, vb) = kernels.quantize_rows(&v, group, bits).unwrap();
+        let read = |key: &str, default| {
+            std::env::var(key).map_or(default, |value| value.parse::<u32>().expect("row count"))
+        };
+        let rows = read("FIFI_MLX_DENSE_BENCH_ROWS", 512);
+        let depth = read("FIFI_MLX_DENSE_BENCH_DEPTH", 16_384);
+        let slice = match read("FIFI_MLX_DENSE_BENCH_SLICE", 0) {
+            0 => None,
+            some => Some(some),
+        };
+        let pairs = read("FIFI_MLX_ATTN_PAIRS", 6);
+        let flash_first =
+            std::env::var_os("FIFI_MLX_ATTN_FLASH_FIRST").is_none_or(|value| value == "1");
+        assert!((2..=512).contains(&rows) && (rows..=32_768).contains(&depth) && pairs > 0);
+        let pos = depth - rows;
+        let scale = 1.0 / (d as f32).sqrt();
+        let storage_shape = vec![1, kvh, depth, d];
+        let mut make_side = |step, period, value_offset| {
+            let data: Vec<f32> = (0..kvh * depth * d)
+                .map(|i| {
+                    let head = i / (depth * d);
+                    ((i * step % period) as f32 / period as f32 - 0.5) * 2.0
+                        + head as f32 * value_offset
+                })
+                .collect();
+            let source = upload(&mut kernels, storage_shape.clone(), &data);
+            let bf16 = kernels.cast(&source, Dtype::Bf16).unwrap();
+            let (codes, scales, biases) = kernels.quantize_rows(&bf16, group, bits).unwrap();
+            let reference = kernels.cast(&bf16, Dtype::F32).unwrap();
+            assert_eq!(scales.dtype(), Dtype::Bf16);
+            assert_eq!(biases.dtype(), Dtype::Bf16);
+            kernels
+                .evaluate(&[&codes, &scales, &biases, &reference])
+                .unwrap();
+            (codes, scales, biases, reference)
+        };
+        let (kc, ks, kb, k) = make_side(37, 509, 0.0);
+        let (vc, vs, vb, v) = make_side(71, 397, 0.25);
         let keys = QuantizedKv {
             codes: &kc,
             scales: &ks,
@@ -1553,153 +1581,111 @@ mod tests {
             scales: &vs,
             biases: &vb,
         };
-        let scale = 1.0 / (d as f32).sqrt();
+        let blocks = query_block_ranges(rows, slice);
+        let oracle_blocks = query_block_ranges(rows, Some(128));
 
-        // MLX caches lazy graphs by inputs: identical iterations are free. Each timed
-        // iteration uploads a fresh distinct q so the attention really runs each time.
-        let variants: Vec<ExecutionTensor> = (0..6)
-            .map(|n| {
-                let data: Vec<f32> = (0..h * rows * d)
-                    .map(|i| (((i * 29 + n * 7) % 389) as f32 - 194.0) / 300.0)
-                    .collect();
-                upload(&mut kernels, vec![1, h, rows, d], &data)
-            })
-            .collect();
+        const WARMUP: u32 = 2;
+        for pair in 0..WARMUP + pairs {
+            let data: Vec<f32> = (0..h * rows * d)
+                .map(|i| (((i * 29 + pair * 7) % 389) as f32 - 194.0) / 300.0)
+                .collect();
+            let query = upload(&mut kernels, vec![1, h, rows, d], &data);
+            let query = kernels.cast(&query, Dtype::Bf16).unwrap();
+            kernels.evaluate(&[&query]).unwrap();
 
-        // The duplicate pad: per kv group g, [q[g*6..g*6+6], q[g*6..g*6+2]] -> 32 heads.
-        let build_pad = |kernels: &mut MlxKernels, q: &ExecutionTensor| {
-            let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(8);
-            for g in 0..kvh {
-                let base = g * 6;
-                parts.push(
-                    kernels
-                        .slice(q, &[0, base, 0, 0], &[1, base + 6, rows, d])
-                        .unwrap(),
-                );
-                parts.push(
-                    kernels
-                        .slice(q, &[0, base, 0, 0], &[1, base + 2, rows, d])
-                        .unwrap(),
-                );
-            }
-            let views: Vec<&ExecutionTensor> = parts.iter().collect();
-            kernels.concatenate(&views, 1).unwrap()
-        };
-
-        // Timing: each iteration forces the whole output to host (a full readback is an
-        // unambiguous GPU sync; evaluate alone enqueues async and a probe element did not
-        // force the producers). The readback itself (~12 MB) is inside both arms equally.
-        let sync = |kernels: &mut MlxKernels, out: &ExecutionTensor| {
-            let _ = values(kernels, out).unwrap();
-        };
-
-        let (cf, composite_ms, composite) = {
-            let mut best = f64::INFINITY;
-            let mut first = 0.0;
-            let mut whole = None;
-            for i in 0..5 {
+            let mut measure = |flash: bool| {
+                kernels.reset_peak_memory().unwrap();
+                let base = kernels.memory_stats().unwrap().active;
                 let start = std::time::Instant::now();
-                let q_i = &variants[i + 1];
-                let mut blocks: Vec<ExecutionTensor> = Vec::new();
-                let mut start_row = 0u32;
-                while start_row < rows {
-                    let end = (start_row + block).min(rows);
-                    // Tail-of-prefix causality: a block ending at row `end` of a chunk of
-                    // `rows` rows at depth `cap` sees `cap - rows + end` keys - the same
-                    // geometry the flash call gives the whole chunk.
-                    let len_b = cap - rows + end;
-                    let q_block = kernels
-                        .slice(q_i, &[0, 0, start_row, 0], &[1, h, end, d])
+                let out = if flash {
+                    let padded = pad_rep6_query(&mut kernels, &query, h, kvh).unwrap();
+                    let flash_out = kernels
+                        .q8_flash_prefill(
+                            &padded, &keys, &values_q, depth, scale, group, bits, None, 0,
+                        )
                         .unwrap();
-                    blocks.push(
-                        kernels
-                            .quantized_attention_prefix(
-                                &q_block, &keys, &values_q, len_b, scale, true, group, bits,
-                            )
-                            .unwrap(),
-                    );
-                    start_row = end;
-                }
-                let views: Vec<&ExecutionTensor> = blocks.iter().collect();
-                let out = kernels.concatenate(&views, 2).unwrap();
-                sync(&mut kernels, &out);
-                let elapsed = start.elapsed().as_secs_f64() * 1e3;
-                if i == 0 {
-                    first = elapsed;
+                    unpad_rep6_output(&mut kernels, &flash_out, h, kvh).unwrap()
                 } else {
-                    best = best.min(elapsed);
-                }
-                whole = Some(out);
-            }
-            (first, best, whole.unwrap())
-        };
-        let (ff, flash_ms, flash) = {
-            let mut best = f64::INFINITY;
-            let mut first = 0.0;
-            let mut sliced = None;
-            for i in 0..5 {
-                let start = std::time::Instant::now();
-                let pad_q = build_pad(&mut kernels, &variants[i + 1]);
-                let out = kernels
-                    .q8_flash_prefill(&pad_q, &keys, &values_q, cap, scale, group, bits, None, 0)
-                    .unwrap();
-                let out = unpad_rep6_output(&mut kernels, &out, h, kvh).unwrap();
-                sync(&mut kernels, &out);
-                let elapsed = start.elapsed().as_secs_f64() * 1e3;
-                if i == 0 {
-                    first = elapsed;
-                } else {
-                    best = best.min(elapsed);
-                }
-                sliced = Some(out);
-            }
-            (first, best, sliced.unwrap())
-        };
-        eprintln!(
-            "dense REP6 rows={rows} depth={cap}: composite {composite_ms:.1}ms (first {cf:.1}), flash+pad {flash_ms:.1}ms (first {ff:.1})"
-        );
+                    attend_blocks(&mut kernels, &query, pos, &blocks, |kernels, q, len, n| {
+                        kernels.quantized_attention_prefix(
+                            q,
+                            &keys,
+                            &values_q,
+                            len,
+                            scale,
+                            n > 1,
+                            group,
+                            bits,
+                        )
+                    })
+                    .unwrap()
+                };
+                let host = kernels.readback(&out).unwrap();
+                let ms = start.elapsed().as_secs_f64() * 1e3;
+                let growth = kernels.memory_stats().unwrap().peak.saturating_sub(base);
+                assert_eq!(host.shape(), &[1, h, rows, d]);
+                assert_eq!(host.dtype(), Dtype::Bf16);
+                let output: Vec<f32> = host
+                    .host_bytes()
+                    .unwrap()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bits| f32::from_bits(u32::from(u16::from_le_bytes(*bits)) << 16))
+                    .collect();
+                (ms, growth, output)
+            };
+            let first_is_flash = (pair % 2 == 0) == flash_first;
+            let first = measure(first_is_flash);
+            let second = measure(!first_is_flash);
+            let (flash, composite) = if first_is_flash {
+                (first, second)
+            } else {
+                (second, first)
+            };
 
-        // Numerics: the F32 reference in the same blocks, over the real 24 heads, on the
-        // same query variant the timed arms' final outputs hold (variants[5]).
-        let mut reference_blocks = Vec::new();
-        let mut start = 0u32;
-        while start < rows {
-            let end = (start + block).min(rows);
-            let len_b = cap - rows + end;
-            let q_block = kernels
-                .slice(&variants[5], &[0, 0, start, 0], &[1, h, end, d])
-                .unwrap();
-            let out = kernels
-                .grouped_attention_prefix(&q_block, &k, &v, len_b, scale, end - start > 1)
-                .unwrap();
-            kernels.evaluate(&[&out]).unwrap();
-            reference_blocks.push(out);
-            start = end;
+            let query_f32 = kernels.cast(&query, Dtype::F32).unwrap();
+            let oracle = attend_blocks(
+                &mut kernels,
+                &query_f32,
+                pos,
+                &oracle_blocks,
+                |kernels, q, len, n| {
+                    let out = kernels.grouped_attention_prefix(q, &k, &v, len, scale, n > 1)?;
+                    kernels.evaluate(&[&out])?;
+                    Ok(out)
+                },
+            )
+            .unwrap();
+            let reference = values(&mut kernels, &oracle).unwrap();
+            let max_err = |output: &[f32]| {
+                assert_eq!(output.len(), reference.len());
+                assert!(output.iter().chain(&reference).all(|x| x.is_finite()));
+                output
+                    .iter()
+                    .zip(&reference)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max)
+            };
+            let composite_err = max_err(&composite.2);
+            let flash_err = max_err(&flash.2);
+            assert!(
+                flash_err <= composite_err * 1.10 + 1e-6,
+                "rows {rows}, depth {depth}, pair {pair}: flash error {flash_err:.6} versus composite {composite_err:.6}"
+            );
+            if pair >= WARMUP {
+                println!(
+                    "dense_prefill_pair={}",
+                    serde_json::json!({
+                        "rows": rows, "depth": depth, "slice": slice.unwrap_or(0), "pair": pair - WARMUP,
+                        "flash_first": first_is_flash,
+                        "composite_ms": composite.0, "flash_ms": flash.0,
+                        "composite_peak_extra_bytes": composite.1, "flash_peak_extra_bytes": flash.1,
+                        "composite_error": composite_err, "flash_error": flash_err,
+                    })
+                );
+            }
         }
-        // Each block is [1, heads, block_rows, width]. Keep the heads in
-        // place while joining the row ranges, as in the composite arm.
-        let views: Vec<_> = reference_blocks.iter().collect();
-        let reference = kernels.concatenate(&views, 2).unwrap();
-        let reference = values(&mut kernels, &reference).unwrap();
-        let composite_flat = values(&mut kernels, &composite).unwrap();
-        let flash_flat = values(&mut kernels, &flash).unwrap();
-        let max_err = |a: &[f32], b: &[f32]| {
-            assert_eq!(a.len(), b.len());
-            assert!(a.iter().chain(b).all(|x| x.is_finite()));
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0, f32::max)
-        };
-        let composite_err = max_err(&composite_flat, &reference);
-        let flash_err = max_err(&flash_flat, &reference);
-        eprintln!(
-            "dense REP6 tolerance: composite err {composite_err:.6}, flash err {flash_err:.6}"
-        );
-        assert!(
-            flash_err <= composite_err * 1.10 + 1e-6,
-            "flash err {flash_err:.6} vs composite err {composite_err:.6}"
-        );
     }
 
     /// The flash-prefill kernel through the INTEGRATION pad path (`pad_rep6_query` + the

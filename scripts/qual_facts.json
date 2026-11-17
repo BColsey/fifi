@@ -157,6 +157,7 @@
         "FIFI_KROW_PACK_MANIFEST_SHA256",
         "FIFI_KROW_PICKS_OUT",
         "FIFI_KROW_RECEIPT",
+        "FIFI_MLX_ATTN_FLASH_FIRST",
         "FIFI_MLX_FLASH_CHUNKED",
         "FIFI_MLX_GROUPED_IMPORT",
         "FIFI_MLX_REQUEST_SAMPLES",
@@ -771,7 +772,11 @@
       "path": "tests/native_q8_decode.rs",
       "test_fns": 18,
       "ignored": 1,
-      "env_gates": [],
+      "env_gates": [
+        "FIFI_MLX_ATTN_DEPTHS",
+        "FIFI_MLX_ATTN_FLASH_FIRST",
+        "FIFI_MLX_ATTN_PAIRS"
+      ],
       "features": [
         "native-fault-qualification",
         "native-mlx"

@@ -1107,9 +1107,20 @@ fn q8_decode_dispatch_timing() {
     let shape = [1, heads, 1, width];
     let dtype = Dtype::Bf16;
     let scale = 1.0 / (width as f32).sqrt();
-    for len in [
-        255u32, 2047, 8191, 12287, 16383, 16384, 16385, 24575, 32767, 65535,
-    ] {
+    let depths = std::env::var("FIFI_MLX_ATTN_DEPTHS").unwrap_or_else(|_| {
+        "10240,11264,12287,12288,12289,13312,14336,15360,16383,16384,16385,17408".into()
+    });
+    let pairs = std::env::var("FIFI_MLX_ATTN_PAIRS").map_or(20, |value| {
+        value.parse::<usize>().expect("positive pair count")
+    });
+    let flash_first =
+        std::env::var_os("FIFI_MLX_ATTN_FLASH_FIRST").is_none_or(|value| value == "1");
+    assert!(pairs > 0);
+    for len in depths
+        .split(',')
+        .map(|depth| depth.parse::<u32>().expect("decode depth"))
+    {
+        assert!((1..=131_072).contains(&len));
         let cap = len.next_multiple_of(256);
         let mut kernels = MlxKernels::try_new().unwrap();
         kernels.allow_bf16(true);
@@ -1143,9 +1154,10 @@ fn q8_decode_dispatch_timing() {
             biases: &vb,
         };
 
-        // Four warm pairs, then twenty measured pairs with balanced first-arm order.
+        // Warm both kernels before collecting timings with alternating first-arm order.
         // Vary the query for each pair. Input preparation and validation are untimed.
-        for pair in 0..24 {
+        const WARMUP: usize = 4;
+        for pair in 0..WARMUP + pairs {
             let host = f32_pattern(&shape, |i| {
                 query_value()(i) + ((i + pair) % 23) as f32 / 64.0
             });
@@ -1153,6 +1165,8 @@ fn q8_decode_dispatch_timing() {
             let query = kernels.cast(&query, dtype).unwrap();
             kernels.evaluate(&[&query]).unwrap();
             let mut measure = |fused: bool| {
+                kernels.reset_peak_memory().unwrap();
+                let base = kernels.memory_stats().unwrap().active;
                 let start = Instant::now();
                 let out = if fused {
                     kernels.quantized_attention_decode(&query, &keys, &values, len, scale, group, 8)
@@ -1166,9 +1180,10 @@ fn q8_decode_dispatch_timing() {
                 let us = start.elapsed().as_secs_f64() * 1e6;
                 assert_eq!(host.shape(), shape);
                 assert_eq!(host.dtype(), dtype);
-                (us, decode(dtype, &host))
+                let growth = kernels.memory_stats().unwrap().peak.saturating_sub(base);
+                (us, decode(dtype, &host), growth)
             };
-            let fused_first = pair % 2 == 0;
+            let fused_first = (pair % 2 == 0) == flash_first;
             let first = measure(fused_first);
             let second = measure(!fused_first);
             let (fused, composite) = if fused_first {
@@ -1192,12 +1207,13 @@ fn q8_decode_dispatch_timing() {
                     max_diff = max_diff.max(diff);
                 }
             }
-            if pair >= 4 {
+            if pair >= WARMUP {
                 println!(
                     "q8_decode_pair={}",
                     serde_json::json!({
-                        "len": len, "cap": cap, "pair": pair - 4, "fused_first": fused_first,
+                        "len": len, "cap": cap, "pair": pair - WARMUP, "fused_first": fused_first,
                         "fused_us": fused.0, "composite_us": composite.0, "max_abs_diff": max_diff,
+                        "fused_peak_extra_bytes": fused.2, "composite_peak_extra_bytes": composite.2,
                     })
                 );
             }
