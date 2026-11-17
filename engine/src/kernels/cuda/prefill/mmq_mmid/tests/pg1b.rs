@@ -21,6 +21,7 @@ use super::rig::{
 use crate::EngError;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::prefill::mmq_mmid::MmidShape;
+use crate::kernels::cuda::prefill::mmq_mmid::set_hint_override;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::testkit::{self, Rng};
 
@@ -215,7 +216,11 @@ fn mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile() {
     }
     // A slot bank: 8 experts, every token picks experts 0 and 1, so both hold 130 columns in two
     // J = 80 tiles, and the 64 tiles over 82 SMs run stream-k with the fixup (K 2,048 gives each
-    // block a part of a tile's k range).
+    // block a part of a tile's k range). Since 3e48f7647 the default Q4_K hint clamps the tile
+    // to a tiling width, so this test forces the hint off — the rollback path of
+    // INFERENCE_CUDA_MMID_COLS_HINT=off and the only launch form that still runs grouped
+    // stream-k; the replica's `ncols_opt = m` is the un-hinted geometry.
+    set_hint_override(Some(None));
     let shape = MmidShape {
         n_experts: 8,
         m: 130,
@@ -248,6 +253,7 @@ fn mmq_mmid_pg1b_stream_k_rows_survive_a_permutation_inside_a_tile() {
         moved,
         facts,
     } = runs(&weights, &spec, &[within.clone(), across.clone()]).expect("the PG1b launches");
+    set_hint_override(None);
     let ne = shape.ne_get_rows();
     for (name, run) in [
         ("base", &base),

@@ -23,7 +23,7 @@ use super::rig::{
 use super::{device_facts, ints, read};
 use crate::EngError;
 use crate::kernels::cuda::prefill::mmq_mmid::{
-    MmidIds, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
+    MmidIds, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight, set_hint_override,
 };
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
@@ -359,6 +359,10 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
     }
     // 8 experts, the highest empty, two column tiles (J 80 at M 130), K 2,048 (eight k-blocks), 64
     // tiles over 82 SMs: stream-k with the fixup, whose ids gather has no exit for an empty tile.
+    // The hint-off override is load-bearing: since 3e48f7647 the default Q4_K hint clamps the
+    // tile to a tiling width, so without it this launches the tiling grid and the boundary below
+    // cannot exist. This is the rollback path of INFERENCE_CUDA_MMID_COLS_HINT=off.
+    set_hint_override(Some(None));
     let shape = MmidShape {
         n_experts: 8,
         m: 130,
@@ -392,6 +396,7 @@ fn mmq_mmid_tight_buffers_b2_fixup_gathers_an_empty_top_expert() {
         "tight B2: block {block} finishes tile {tile} and gathers ids_dst up to index {last} (ne_get_rows + 126 = {})",
         shape.ne_get_rows() + 126
     );
+    set_hint_override(None);
 }
 
 #[test]
