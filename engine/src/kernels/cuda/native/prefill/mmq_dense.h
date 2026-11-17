@@ -8,7 +8,8 @@
  *
  * Fill (`fill_dense_args` in the .cu, pinned field by field by the CPU test through
  * inference_cuda_mmq_dense_fill): ids_dst = expert_bounds = NULL (the kernel's dense branch
- * is exactly `ids_dst == NULL`, mmq.cuh:961/:1049), ncols_max = ncols_opt = m, one channel,
+ * is exactly `ids_dst == NULL`, mmq.cuh:961/:1049), ncols_max = m and ncols_opt = m unless a
+ * positive `cols_hint` steers the tile-width choice (the launch grid still uses ncols_max), one channel,
  * one sample, zero strides, `stride_row_x = k / qk` blocks, `nrows_dst = ld`, and
  * `dst = base + col_off` so a GEMM can write its slice of a fused [m][ld] destination.
  *
@@ -56,6 +57,7 @@ typedef struct inference_cuda_mmq_dense_args {
     int m;              /* activation columns: 1..=2048 */
     int ld;             /* floats between two dst columns: >= col_off + n */
     int col_off;        /* floats before this GEMM's slice inside a dst column */
+    int cols_hint;      /* tile-width hint for ncols_opt: 0 = stock heuristic, else clamped to m */
 } inference_cuda_mmq_dense_args;
 
 /* The vendored mmq_args as the entry fills it, field for field minus the device facts. Only
@@ -105,7 +107,7 @@ int inference_cuda_mmq_dense_fill(const inference_cuda_mmq_dense_args *a,
 #endif
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_mmq_dense_args) == 64 &&
+static_assert(sizeof(inference_cuda_mmq_dense_args) == 72 &&
                   offsetof(inference_cuda_mmq_dense_args, w) == 0 &&
                   offsetof(inference_cuda_mmq_dense_args, y) == 8 &&
                   offsetof(inference_cuda_mmq_dense_args, dst) == 16 &&
@@ -116,7 +118,8 @@ static_assert(sizeof(inference_cuda_mmq_dense_args) == 64 &&
                   offsetof(inference_cuda_mmq_dense_args, n) == 48 &&
                   offsetof(inference_cuda_mmq_dense_args, m) == 52 &&
                   offsetof(inference_cuda_mmq_dense_args, ld) == 56 &&
-                  offsetof(inference_cuda_mmq_dense_args, col_off) == 60,
+                  offsetof(inference_cuda_mmq_dense_args, col_off) == 60 &&
+                  offsetof(inference_cuda_mmq_dense_args, cols_hint) == 64,
               "inference_cuda_mmq_dense_args layout");
 static_assert(sizeof(inference_cuda_mmq_args_view) == 216 &&
                   offsetof(inference_cuda_mmq_args_view, fixup_bytes) == 56 &&
@@ -125,7 +128,7 @@ static_assert(sizeof(inference_cuda_mmq_args_view) == 216 &&
                   offsetof(inference_cuda_mmq_args_view, type_x) == 208,
               "inference_cuda_mmq_args_view layout");
 #else
-_Static_assert(sizeof(inference_cuda_mmq_dense_args) == 64, "dense args size");
+_Static_assert(sizeof(inference_cuda_mmq_dense_args) == 72, "dense args size");
 _Static_assert(sizeof(inference_cuda_mmq_args_view) == 216, "args view size");
 #endif
 

@@ -267,6 +267,18 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
                 describe(&error)
             ))
         })?;
+        // Resolve the flag once, before anything consumes it: Flint's env
+        // opt-in is checked first (it only reads the engine's own options),
+        // then the family-aware decision covers the ready note, the starter
+        // (whose Q36 session-cap rule reads the flag) and the entry.
+        let flint_opt_in = config.family == flint::FAMILY
+            && flint::prefix_reuse_entry_enabled(
+                config
+                    .flint
+                    .as_ref()
+                    .map(|options| options.kv_profile.as_str()),
+            );
+        let prefix_reuse = entry_prefix_reuse(config, file.prefix_reuse, flint_opt_in);
         // The block prefix-match state is process-wide (the env parse) but only
         // matters for engines whose store can cut a rolling Block entry. The
         // engine thread fires this note with the BUILT executor's own
@@ -279,7 +291,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
         } else {
             block_match_note(
                 &config.id,
-                file.prefix_reuse,
+                prefix_reuse,
                 // A broken stderr pipe must not turn a Ready engine into a
                 // failed one over a log line.
                 |line| {
@@ -292,7 +304,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             mut bundle,
             context_limit,
             effective,
-        } = starter(config, file.prefix_reuse, ready_note).map_err(|error| {
+        } = starter(config, prefix_reuse, ready_note).map_err(|error| {
             StartupError(format!(
                 "engine {} failed to start: {}",
                 config.id,
@@ -309,26 +321,10 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             "{}",
             defaults_line(&config.id, &generation, &loaded.values, loaded.from_file)
         );
-        // Flint snapshots are not qualified; the config flag alone never
-        // arms them. The env opt-in lifts the family exclusion for the
-        // qualification A/B so both arms run the same ELF. The entry flag
-        // resolves against the engine's kv profile
-        // (a q8 engine logs and arms OFF, not "on").
-        let flint_opt_in = config.family == flint::FAMILY
-            && flint::prefix_reuse_entry_enabled(
-                config
-                    .flint
-                    .as_ref()
-                    .map(|options| options.kv_profile.as_str()),
-            );
         if config.family == flint::FAMILY {
             eprintln!(
                 "flint prefix reuse: {}",
-                if file.prefix_reuse && flint_opt_in {
-                    "on"
-                } else {
-                    "off"
-                }
+                if prefix_reuse { "on" } else { "off" }
             );
         }
         entries.push(EngineEntry {
@@ -337,7 +333,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             handle: engine.handle(),
             bundle,
             context_limit,
-            prefix_reuse: entry_prefix_reuse(&config.family, file.prefix_reuse, flint_opt_in),
+            prefix_reuse,
             warm: std::sync::Arc::new(std::sync::Mutex::new(None)),
             defaults: loaded.values,
             effective,
@@ -542,12 +538,48 @@ const FAMILY_STARTERS: &[(&str, Starter)] = &[
 ];
 
 /// The per-entry prefix-reuse decision, pure in its inputs so the family
-/// exclusion is testable without an engine: other families follow the
-/// config flag; Flint additionally needs the env opt-in
-/// (FIFI_FLINT_PREFIX_REUSE, read once at load) because its snapshots are
-/// not qualified yet.
-fn entry_prefix_reuse(family: &str, file_flag: bool, flint_opt_in: bool) -> bool {
-    file_flag && (family != flint::FAMILY || flint_opt_in)
+/// exclusion is testable without an engine: an unset flag resolves to the
+/// family default (on only for the two qualified reuse paths, and only on
+/// the CUDA build); an explicit flag overrides for every family. Flint
+/// additionally needs the env opt-in (FIFI_FLINT_PREFIX_REUSE, read once at
+/// load) because its snapshots are not qualified yet.
+fn entry_prefix_reuse(engine: &EngineConfig, file_flag: Option<bool>, flint_opt_in: bool) -> bool {
+    let flag = file_flag.unwrap_or_else(|| default_prefix_reuse(engine));
+    flag && (engine.family != flint::FAMILY || flint_opt_in)
+}
+
+/// The unset-key default: on only where reuse is qualified - the Flash-Next
+/// CUDA resume and the Qwen3.6 CUDA serve (the 2026-11-13 qualification) -
+/// and only on the CUDA build; every other family and every other build
+/// keeps the stock full prefill, because the boundary marking alone splits
+/// the prefill and changes greedy text (measured on Flash-Next: same prompt,
+/// same token counts, divergence from about token 175 of 200; the Qwen3.6
+/// CUDA effect is unmeasured). Two Qwen3.6 CUDA modes also resolve OFF when
+/// the key is omitted - the tiered experts and the P2P store
+/// (Q36_P2P_PREFIX=1) - because they mark a boundary nothing restores:
+/// PrefixMemory stays Disabled for them, so the worker would split the
+/// prefill and save a tip it can never reuse.
+pub(crate) fn default_prefix_reuse(engine: &EngineConfig) -> bool {
+    default_prefix_reuse_with(engine, std::env::var_os("Q36_P2P_PREFIX").as_deref())
+}
+
+/// The pure core of the default, the P2P env passed in so tests pin the
+/// table without mutating the process environment.
+pub(crate) fn default_prefix_reuse_with(
+    engine: &EngineConfig,
+    p2p_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !cfg!(all(feature = "native-cuda", target_os = "linux")) {
+        return false;
+    }
+    match engine.family.as_str() {
+        factory::FAMILY => true,
+        q36_factory::FAMILY => {
+            let tiered = engine.qwen36.as_ref().is_some_and(|o| o.tiered.is_some());
+            !(tiered || p2p_env == Some(std::ffi::OsStr::new("1")))
+        }
+        _ => false,
+    }
 }
 
 /// The registry's family names, for the uniqueness pin in tests.
@@ -714,7 +746,10 @@ mod tests {
         apply_replay_overrides, block_match_line, block_match_note, defaults_line,
         entry_prefix_reuse, outcome, serve, shutdown_failure, start_engines,
     };
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    use crate::family::flash_next::factory;
     use crate::family::flash_next::settings::FlashOptions;
+    use crate::family::qwen36::factory as q36_factory;
     use crate::family::qwen36::settings::Q36Options;
     use crate::family::sampler::SamplingDefaults;
     use crate::sched::worker::PrefixCapability;
@@ -730,7 +765,7 @@ mod tests {
 
     /// A configuration file with the given engines. The listen address and the key variable are
     /// not used by `start_engines`.
-    fn file_with(engines: Vec<EngineConfig>, prefix_reuse: bool) -> Config {
+    fn file_with(engines: Vec<EngineConfig>, prefix_reuse: Option<bool>) -> Config {
         Config {
             listen: "127.0.0.1:0".to_string(),
             api_key_env: "UNUSED".to_string(),
@@ -782,43 +817,146 @@ mod tests {
         dir
     }
 
-    /// The Flint family exclusion: the config flag alone never arms Flint
-    /// prefix reuse; only the env opt-in lifts it, and other families are
-    /// unaffected. Pure in (family, file flag, env result) - no engine.
-    /// The full 2x2x2 matrix.
+    /// A test engine for the resolver: only the fields the resolver reads
+    /// (family, qwen36) vary; everything else is inert.
+    fn engine_of(family: &str, qwen36: Option<Q36Options>) -> EngineConfig {
+        EngineConfig {
+            id: "resolver-test".to_string(),
+            model_dir: std::env::temp_dir().join("resolver-test"),
+            tokenizer_dir: std::env::temp_dir().join("resolver-test"),
+            family: family.to_string(),
+            think_replay: None,
+            notice_toolwrap: None,
+            model: None,
+            context_limit: None,
+            fake: None,
+            flash_next: None,
+            qwen36,
+            nemotron: None,
+            flint: None,
+        }
+    }
+
+    /// The pinned unset-key table, by build: on the CUDA build only the two
+    /// qualified reuse paths (Flash-Next and Qwen3.6) default on; on every
+    /// other build all families default off. Pinned here so a default change
+    /// must edit this table, not ride along silently.
+    #[test]
+    fn the_unset_key_resolves_to_the_pinned_family_table() {
+        let q36_options = |tiered: bool| {
+            if !tiered {
+                return None;
+            }
+            Some(Q36Options {
+                tiered: Some(Default::default()),
+                ..Q36Options::default()
+            })
+        };
+        for family in super::family_names() {
+            let plain_q36 = q36_options(false);
+            let pinned = pinned_default(family, &plain_q36, false);
+            let engine = engine_of(
+                family,
+                if family == q36_factory::FAMILY {
+                    plain_q36
+                } else {
+                    None
+                },
+            );
+            assert_eq!(
+                super::default_prefix_reuse_with(&engine, None),
+                pinned,
+                "unset key must match the pinned table for {family} on this build"
+            );
+            assert_eq!(
+                super::entry_prefix_reuse(&engine, None, false),
+                pinned,
+                "the entry flag must match the pinned table for {family}"
+            );
+        }
+        // The Qwen3.6 containment: tiered experts and the P2P store resolve
+        // OFF when the key is omitted, whatever the build.
+        let tiered = engine_of(q36_factory::FAMILY, q36_options(true));
+        assert!(!super::default_prefix_reuse_with(&tiered, None));
+        assert!(!super::default_prefix_reuse_with(
+            &engine_of(q36_factory::FAMILY, None),
+            Some(std::ffi::OsStr::new("1"))
+        ));
+        // An explicit flag overrides the family default both ways.
+        assert!(!super::entry_prefix_reuse(
+            &engine_of(crate::family::flint::FAMILY, None),
+            Some(false),
+            true
+        ));
+        assert!(super::entry_prefix_reuse(
+            &engine_of(crate::family::flint::FAMILY, None),
+            Some(true),
+            true
+        ));
+    }
+
+    /// The pinned table itself, shared by build so the CUDA branch compiles
+    /// (and is pinned) in the container clippy run even where it cannot run.
+    fn pinned_default(family: &str, q36: &Option<Q36Options>, p2p: bool) -> bool {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        {
+            match family {
+                factory::FAMILY => true,
+                q36_factory::FAMILY => {
+                    let tiered = q36.as_ref().is_some_and(|o| o.tiered.is_some());
+                    !tiered && !p2p
+                }
+                _ => false,
+            }
+        }
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        {
+            let _ = (family, q36, p2p);
+            false
+        }
+    }
+
+    /// Flint snapshots are not qualified; the config flag alone never
+    /// arms them. The env opt-in lifts the family exclusion for the
+    /// qualification A/B so both arms run the same ELF. The entry flag
+    /// resolves against the engine's kv profile (a q8 engine logs and arms
+    /// OFF, not on).
     #[test]
     fn flint_prefix_reuse_needs_the_env_opt_in() {
-        let flint = crate::family::flint::FAMILY;
-        let other = crate::family::qwen36::factory::FAMILY;
+        let flint = &engine_of(crate::family::flint::FAMILY, None);
+        let other = &engine_of(q36_factory::FAMILY, None);
         assert!(
-            entry_prefix_reuse(other, true, false),
+            entry_prefix_reuse(other, Some(true), false),
             "other families follow the flag"
         );
         assert!(
-            entry_prefix_reuse(other, true, true),
+            entry_prefix_reuse(other, Some(true), true),
             "the opt-in is a no-op for other families"
         );
         assert!(
-            !entry_prefix_reuse(other, false, false),
+            !entry_prefix_reuse(other, Some(false), false),
             "flag off is off everywhere"
         );
         assert!(
-            !entry_prefix_reuse(other, false, true),
+            !entry_prefix_reuse(other, Some(false), true),
             "file off wins over the env everywhere"
         );
         assert!(
-            !entry_prefix_reuse(flint, true, false),
+            !entry_prefix_reuse(flint, Some(true), false),
             "Flint stays off without the env"
         );
         assert!(
-            entry_prefix_reuse(flint, true, true),
+            entry_prefix_reuse(flint, Some(true), true),
             "the opt-in arms Flint"
         );
         assert!(
-            !entry_prefix_reuse(flint, false, true),
+            !entry_prefix_reuse(flint, Some(false), true),
             "file off wins over the env"
         );
-        assert!(!entry_prefix_reuse(flint, false, false), "both off is off");
+        assert!(
+            !entry_prefix_reuse(flint, Some(false), false),
+            "both off is off"
+        );
     }
 
     /// The per-entry replay opt-out reaches the entry's bundle through
@@ -841,7 +979,7 @@ mod tests {
         let mut wrap_out = engine_config("e3", None);
         wrap_out.tokenizer_dir = dir.path().to_path_buf();
         wrap_out.notice_toolwrap = Some(false);
-        let file = file_with(vec![plain, opt_out, wrap_out], false);
+        let file = file_with(vec![plain, opt_out, wrap_out], Some(false));
         let (_engines, entries) = start_engines(&file).expect("start");
         let by_id = |id: &str| {
             entries
@@ -982,7 +1120,7 @@ mod tests {
         };
         let mut config = engine_config("live-nfs", None);
         config.model_dir = path;
-        let error = start_engines(&file_with(vec![config], false))
+        let error = start_engines(&file_with(vec![config], Some(false)))
             .err()
             .expect("refused");
         assert!(error.0.contains("must be on local storage"), "{}", error.0);
@@ -996,7 +1134,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = engine_config("nfs-engine", None);
         config.model_dir = dir.path().to_path_buf();
-        let file = file_with(vec![config], false);
+        let file = file_with(vec![config], Some(false));
         let error = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
             start_engines(&file).err().expect("refused")
         });
@@ -1080,9 +1218,11 @@ mod tests {
             reply: Some("abcdef".to_string()),
             token_delay_ms: delay_ms,
         };
-        let (engines, entries) =
-            start_engines(&file_with(vec![engine_config("e1", Some(options))], false))
-                .expect("engines");
+        let (engines, entries) = start_engines(&file_with(
+            vec![engine_config("e1", Some(options))],
+            Some(false),
+        ))
+        .expect("engines");
         let state = Arc::new(AppState::new(testkit::API_KEY, entries));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
@@ -1139,7 +1279,7 @@ mod tests {
     fn the_engines_of_the_file_become_entries_with_their_model_and_limit() {
         let (engines, entries) = start_engines(&file_with(
             vec![engine_config("e1", None), engine_config("e2", None)],
-            false,
+            Some(false),
         ))
         .expect("engines");
         assert_eq!(engines.len(), 2);
@@ -1151,14 +1291,15 @@ mod tests {
 
     #[test]
     fn the_prefix_reuse_flag_of_the_file_reaches_every_entry() {
-        for flag in [false, true] {
+        for flag in [Some(false), Some(true)] {
             let file = file_with(
                 vec![engine_config("e1", None), engine_config("e2", None)],
                 flag,
             );
             let (engines, entries) = start_engines(&file).expect("engines");
             let flags: Vec<bool> = entries.iter().map(|entry| entry.prefix_reuse).collect();
-            assert_eq!(flags, [flag, flag], "flag {flag}");
+            let want = vec![flag.unwrap_or(false); 2];
+            assert_eq!(flags, want, "flag {flag:?}");
             for engine in engines {
                 engine.shutdown();
             }
@@ -1180,7 +1321,7 @@ mod tests {
             session_cap_bytes: Some(6_000_000_000),
             ..Q36Options::default()
         };
-        let error = start_engines(&file_with(vec![q36_config(Some(options))], true))
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(true)))
             .err()
             .expect("refused");
         let text = error.to_string();
@@ -1193,7 +1334,7 @@ mod tests {
 
     #[test]
     fn prefix_reuse_is_accepted_for_other_families() {
-        let file = file_with(vec![engine_config("e1", None)], true);
+        let file = file_with(vec![engine_config("e1", None)], Some(true));
         let (engines, entries) = start_engines(&file).expect("engines");
         assert!(entries[0].prefix_reuse);
         for engine in engines {
@@ -1211,7 +1352,7 @@ mod tests {
             cache_limit_bytes: Some(1024),
             ..FlashOptions::default()
         });
-        let error = start_engines(&file_with(vec![flash], false))
+        let error = start_engines(&file_with(vec![flash], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1245,7 +1386,7 @@ mod tests {
         };
         // With the flag on, the Q36 engine start applies the session-cap rule and refuses the
         // default cap of 4 GiB before it reaches the backend.
-        let error = start_engines(&file_with(vec![q36_config(Some(options))], true))
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(true)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1261,7 +1402,7 @@ mod tests {
             cache_limit_bytes: Some(1024),
             ..Q36Options::default()
         };
-        let error = start_engines(&file_with(vec![q36_config(Some(options))], false))
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(false)))
             .err()
             .expect("error");
         assert!(
@@ -1283,7 +1424,7 @@ mod tests {
             context_limit: Some(1),
             ..Q36Options::default()
         };
-        let error = start_engines(&file_with(vec![q36_config(Some(options))], false))
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1300,7 +1441,7 @@ mod tests {
             cache_limit_bytes: Some(1024),
             ..Q36Options::default()
         };
-        let error = start_engines(&file_with(vec![q36_config(Some(options))], false))
+        let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1335,7 +1476,7 @@ mod tests {
     fn an_engine_that_cannot_start_stops_startup_and_names_the_engine() {
         let mut broken = engine_config("e7", None);
         broken.tokenizer_dir = PathBuf::from("/nonexistent/tokenizer");
-        let error = start_engines(&file_with(vec![broken], false))
+        let error = start_engines(&file_with(vec![broken], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1360,7 +1501,8 @@ mod tests {
     fn a_model_dir_with_generation_config_sets_the_defaults_of_the_entry() {
         let (dir, config) =
             entry_with_model_dir(Some(r#"{"temperature": 1.0, "top_p": 0.95, "top_k": 20}"#));
-        let (engines, entries) = start_engines(&file_with(vec![config], false)).expect("engines");
+        let (engines, entries) =
+            start_engines(&file_with(vec![config], Some(false))).expect("engines");
         assert_eq!(
             entries[0].defaults,
             SamplingDefaults {
@@ -1378,7 +1520,7 @@ mod tests {
     #[test]
     fn a_malformed_generation_config_fails_the_engine_start() {
         let (_dir, config) = entry_with_model_dir(Some("{"));
-        let error = start_engines(&file_with(vec![config], false))
+        let error = start_engines(&file_with(vec![config], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1392,7 +1534,7 @@ mod tests {
     #[test]
     fn an_out_of_range_generation_config_value_fails_the_engine_start() {
         let (_dir, config) = entry_with_model_dir(Some(r#"{"temperature": 2.5}"#));
-        let error = start_engines(&file_with(vec![config], false))
+        let error = start_engines(&file_with(vec![config], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1414,7 +1556,7 @@ mod tests {
         .expect("write generation_config.json");
         let mut config = engine_config("e1", None);
         config.model_dir = dir.path().to_path_buf();
-        let error = start_engines(&file_with(vec![config], false))
+        let error = start_engines(&file_with(vec![config], Some(false)))
             .err()
             .expect("error");
         let text = error.to_string();
@@ -1930,6 +2072,7 @@ mod tests {
                 };
                 let env = Q36Env {
                     cache_limit: Some("8589934592".to_string()),
+                    ..Q36Env::default()
                 };
                 let backend = q36_factory::backend_of_build();
                 let render = |settings: &Q36Settings| {

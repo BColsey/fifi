@@ -1,16 +1,17 @@
 //! Native state-only prefix roundtrip at a committed nonzero position, without a model.
+use crate::family::graph_state::book::Health;
 use std::cell::RefMut;
 
 use super::super::{
-    book::Health,
     common_tests::dims,
     dims::{KvMode, StepDims, StepOptions},
     paging_cow_tests::{read_page, write_page},
     paging_plan::PagingPlan,
     paging_store::PagedKv,
-    state_layout::{StateLayout, Word},
+    state_layout::StateLayout,
 };
 use super::{KvStorage, ResidentState};
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,

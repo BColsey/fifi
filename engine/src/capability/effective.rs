@@ -14,7 +14,11 @@
 //! values computed from other resolved settings by the resolver itself
 //! (today: the MLX prefill reserve and the dense session cap).
 //! `Ignored` is for members the active backend reads past, reported
-//! from the resolver's own `ignored_mlx_keys` list.
+//! from the resolver's own `ignored_mlx_keys` list. One exception is
+//! computed here rather than disclosed by the resolver: `compile_program_limit`
+//! refuses an explicit CUDA value instead of ignoring it, so it can never
+//! appear in `ignored_mlx_keys`; its row reports `IgnoredOnThisBackend` on
+//! CUDA by construction (only the default is CUDA-reachable).
 
 use serde::Serialize;
 
@@ -116,6 +120,14 @@ pub(crate) fn q36_effective(
             present(&options.weight_format),
         ),
         row(
+            "gguf_sha256",
+            settings
+                .gguf_sha256
+                .clone()
+                .unwrap_or_else(|| "off".to_string()),
+            present(&options.gguf_sha256),
+        ),
+        row(
             "context_limit",
             settings.context_limit.to_string(),
             present(&options.context_limit),
@@ -176,6 +188,15 @@ pub(crate) fn q36_effective(
             "compile",
             settings.compile.to_string(),
             on_arm("compile", present(&options.compile)),
+        ),
+        row(
+            "compile_program_limit",
+            settings.compile_program_limit.get().to_string(),
+            if backend == Backend::Cuda {
+                Origin::IgnoredOnThisBackend
+            } else {
+                present(&options.compile_program_limit)
+            },
         ),
         row(
             "capture",
@@ -387,6 +408,64 @@ mod tests {
     }
 
     #[test]
+    fn q36_program_budget_reports_the_resolved_limit_and_origin() {
+        for (limit, expected, source) in [
+            (None, "8", Origin::Default),
+            (Some(12), "12", Origin::ConfigFile),
+        ] {
+            let options = Q36Options {
+                cache_limit_bytes: Some(1024),
+                compile_program_limit: limit,
+                ..Q36Options::default()
+            };
+            let settings = resolve(&options, Backend::Mlx);
+            let rows = q36_effective(&options, None, Backend::Mlx, &settings);
+            let row = rows
+                .iter()
+                .find(|row| row.key == "compile_program_limit")
+                .unwrap();
+            assert_eq!(row.value, expected);
+            assert_eq!(row.origin, source);
+        }
+        let options = Q36Options::default();
+        let settings = resolve(&options, Backend::Cuda);
+        let rows = q36_effective(&options, None, Backend::Cuda, &settings);
+        assert_eq!(
+            origin(&rows, "compile_program_limit"),
+            Origin::IgnoredOnThisBackend
+        );
+    }
+
+    #[test]
+    fn q36_content_pin_reports_the_normalized_value_and_its_origin() {
+        for pin in [None, Some("A".repeat(64))] {
+            let options = Q36Options {
+                gguf_sha256: pin.clone(),
+                ..Q36Options::default()
+            };
+            let settings = resolve(&options, Backend::Cuda);
+            let rows = q36_effective(&options, None, Backend::Cuda, &settings);
+            let row = rows.iter().find(|row| row.key == "gguf_sha256").unwrap();
+            assert_eq!(
+                row.value,
+                if pin.is_some() {
+                    "a".repeat(64)
+                } else {
+                    "off".to_string()
+                }
+            );
+            assert_eq!(
+                row.origin,
+                if pin.is_some() {
+                    Origin::ConfigFile
+                } else {
+                    Origin::Default
+                }
+            );
+        }
+    }
+
+    #[test]
     fn flint_rows_name_config_env_and_default_origins() {
         use crate::family::flint::budget::FlintEnv;
         use crate::family::flint::settings::FlintOptions;
@@ -549,6 +628,7 @@ mod tests {
         };
         let env = Q36Env {
             cache_limit: Some("2048".to_string()),
+            ..Q36Env::default()
         };
         let settings = Q36Settings::new(
             Path::new("m"),

@@ -11,25 +11,27 @@
 //!
 //! Row counts straddle every boundary of the tiling: one row, the split-K limit of eight, the
 //! SIMT/tensor-core switch at 64, one full tile, one row over a tile and several tiles.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::path::Path;
 
-use super::{Exl3Scratch, F32, Output, Projector, write_dense_jobs};
+use super::{TILE_ROWS, write_dense_jobs};
+use crate::family::exl3::launch::Launch;
+use crate::family::exl3::prefill::{Exl3Scratch, F32, Output, Projector};
+use crate::family::exl3::source::PackReader;
 use crate::{
     family::{
         AttentionKind,
+        exl3_pack::layer_name,
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeights, Exl3MatrixView, Reserve, WeightLayout},
         qwen36::cuda::{
             common_tests::{dims, inventory},
             exl3_load_device_tests::{matrix_of, relative_l2},
-            exl3_source::{PackReader, attention_weights, delta_weights},
-            layer_table::LayerTable,
+            exl3_source::{attention_weights, delta_weights},
             mixer_geometry::MixerGeometry,
             mixer_weights::MixerWeights,
-            moe::Launch,
         },
-        qwen36::exl3_pack::layer_name,
     },
     kernels::cuda::{DeviceBuffer, DeviceRange, device_present, resident::router::RouterShape},
     weights::exl3::Checkpoint,
@@ -117,13 +119,14 @@ impl Scratch {
     /// The projector of a chunk of `rows` rows, its job table written.
     pub(super) fn chunk<'a>(
         &'a self,
-        launch: &'a crate::family::qwen36::cuda::moe::Launch<'a>,
+        launch: &'a crate::family::exl3::launch::Launch<'a>,
         rows: usize,
     ) -> Projector<'a> {
         let projector = Projector {
             launch,
             scratch: self.view(),
             rows,
+            tile_rows: TILE_ROWS,
         };
         write_dense_jobs(launch, &projector.scratch, rows).unwrap();
         projector

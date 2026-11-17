@@ -1,7 +1,7 @@
 //! Flash-Next hyper-connection read and apply (design section "Hyper-connection").
 
-use super::math::{expect_len, rms0, sigmoid, silu};
 use crate::EngError;
+use crate::family::math::{expect_len, rms0, sigmoid, silu};
 use crate::family::project::Projector;
 
 #[derive(Debug, Clone, Copy)]

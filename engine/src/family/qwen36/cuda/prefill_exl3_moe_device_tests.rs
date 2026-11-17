@@ -10,27 +10,28 @@
 //! The chunk is tall enough that the busiest experts take tensor-core tiles (64 rows or more)
 //! and the least busy take the split-K tail (8 rows or fewer), so the block crosses every tile
 //! kernel of the rows entry.
+use crate::family::exl3::layer_table::LayerTable;
 
+use crate::family::exl3::launch::{Launch, MoeDims};
 use std::path::Path;
 
-use super::{Bufs, routed_with, run, run_banked};
+use crate::family::exl3::prefill_moe::{Bufs, routed_with, run, run_banked};
+use crate::family::exl3::source::PackReader;
+use crate::family::exl3_pack::ExpertPart;
+use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
     family::{
+        exl3::bank::{Exl3SlotResolver, ExpertStore},
         project::cuda::{CudaProjector, CudaWeights, Reserve},
         qwen36::{
             cuda::{
                 common_tests::{dims, inventory},
-                exl3_bank::{Exl3SlotResolver, ExpertStore},
                 exl3_load_device_tests::{matrix_of, relative_l2, values_of},
                 exl3_moe::Exl3MoeWeights,
                 exl3_moe_source::{moe_weights, moe_weights_banked},
-                exl3_source::PackReader,
-                layer_table::LayerTable,
-                moe::{Launch, MoeDims},
                 prefill::{RouteIo, run_chunk_route},
-                prefill_plan::exl3_max_jobs,
             },
-            exl3_pack::{ExpertPart, expert_name, shared_name},
+            exl3_pack::{expert_name, shared_name},
         },
     },
     kernels::cuda::{
@@ -40,14 +41,16 @@ use crate::{
     weights::exl3::{Checkpoint, Matrix},
 };
 
-use super::super::{
-    F32,
-    device_tests::{Scratch, filled, read, upload, whole},
-};
+use super::device_tests::{Scratch, filled, read, upload, whole};
+use crate::family::exl3::prefill::F32;
 
 /// Rows of the chunk: 1,024 rows * 8 picks over 256 experts is 32 rows per expert on average.
 const ROWS: usize = 1024;
-/// Relative L2 of the block output against fp64 (measured 7.3e-6).
+/// Relative L2 of the block output against fp64 (measured 8.183e-6 at the default fixture:
+/// layer 3, 1,024 rows, this 4.00 bpw pack, the host's RTX 3090; beside it the test prints
+/// the delta-only figure, measured 3.341e-4, which is the MoE term alone — the MoE term is
+/// 2.45% of the residual stream's norm, and the whole-row figure is that delta diluted by
+/// the residual).
 const BOUND: f64 = 1e-4;
 /// The least share of rows whose picks must equal the fp64 router's.
 const PICK_AGREEMENT: f64 = 0.99;
@@ -295,6 +298,26 @@ fn moe_case(rows: usize, forced: bool) {
     let got = read(&projector, &owned[4], rows * h);
     let want = reference(&checkpoint, (layer, rows), &moe, &picks);
     let error = relative_l2(&got, &want);
+    // The whole-row figure divides the MoE delta by the residual stream's norm (the row is
+    // `resid + routed + shared` and the residual dominates), so beside it print the
+    // delta-only figure — the same comparison with the residual subtracted from both sides —
+    // which is the figure to compare with the job-table family's per-projection class.
+    {
+        let resid64: Vec<f64> = resid.iter().map(|&v| f64::from(v)).collect();
+        let got_moe: Vec<f64> = got
+            .iter()
+            .zip(&resid64)
+            .map(|(&x, &y)| f64::from(x) - y)
+            .collect();
+        let want_moe: Vec<f64> = want.iter().zip(&resid64).map(|(&x, &y)| x - y).collect();
+        let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let diff: Vec<f64> = got_moe.iter().zip(&want_moe).map(|(a, b)| a - b).collect();
+        println!(
+            "whole row {error:.3e}; moe term vs residual norm {:.3e}; delta only {:.3e}",
+            norm(&want_moe) / norm(&resid64),
+            norm(&diff) / norm(&want_moe)
+        );
+    }
     let busiest = (0..moe.n_expert)
         .map(|e| picks.ids.iter().filter(|&&p| p == e).count())
         .max()
@@ -411,7 +434,7 @@ fn banked_sub_blocked_chunk_is_byte_identical_to_the_resident_chunk() {
     // hidden rows. `bank` pairs the layer's resolver view with the sub-block plan.
     let leg = |block: &Exl3MoeWeights<'_>,
                bank: Option<(
-        &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
+        &mut crate::family::exl3::bank::LayerResolver<'_, '_>,
         &[(usize, MoeDims)],
     )>|
      -> Vec<f32> {

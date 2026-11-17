@@ -11,9 +11,9 @@ use super::super::{
     ple::PleWeights,
     qsa::QsaWeights,
     step::{AttnWeights, ModelShape},
-    stored::{SlicedWeight, StoredWeight},
 };
 use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
+use crate::family::stored::{SlicedWeight, StoredWeight};
 use crate::{
     EngError,
     kernels::{MlxKernels, PackedWeight, ResidentPackedWeight},

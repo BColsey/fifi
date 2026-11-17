@@ -21,16 +21,14 @@
 //! laid out as two K-row groups, and any row-offset mistake of the K-row body. A host without a
 //! device skips them.
 
+use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::collections::HashMap;
 
 use half::f16;
 
-use super::{
-    exl3_moe::{
-        Exl3MoeBufs, Exl3MoeWeights, Scratch, SharedRowsIo, SharedWeights, run_exl3_moe,
-        run_exl3_moe_rows, shared, shared_rows,
-    },
-    moe::{Launch, MoeDims, RouteBufs},
+use super::exl3_moe::{
+    Exl3MoeBufs, Exl3MoeWeights, GROUPED_PAIRS, Scratch, SharedRowsIo, SharedWeights, run_exl3_moe,
+    run_exl3_moe_rows, shared, shared_rows,
 };
 use crate::{
     EngError,
@@ -269,10 +267,11 @@ fn buffers(ctx: &CudaContext, rows: usize, resid: &[f32], norm: &[f32]) -> Buffe
         shared_gu: zeros(ctx, rows * 2 * INTER * F32),
         shared_act: zeros(ctx, rows * INTER * F32),
         shared_out: zeros(ctx, rows * HIDDEN * F32),
-        // The projections' scratch is reused by every launch in stream order: 20 rows of the
-        // widest side covers 16 pairs of the indexed launch and the 2K pairs of the shared gate/up.
-        xh: zeros(ctx, 20 * HIDDEN * F32),
-        z: zeros(ctx, 20 * HIDDEN * F32),
+        // The projections' scratch is reused by every launch in stream order: the indexed
+        // launch's 16 pairs, the shared gate/up's pair batches (up to GROUPED_PAIRS rows), and
+        // the down windows (up to `rows` rows of xh and z).
+        xh: zeros(ctx, GROUPED_PAIRS.max(rows) * HIDDEN * F32),
+        z: zeros(ctx, GROUPED_PAIRS.max(rows) * HIDDEN * F32),
         flag: zeros(ctx, 4),
     }
 }
@@ -448,7 +447,10 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     let w = build_weights(&projector);
     let weights = block(&w);
     let mut rng = Rng::new(0x4b52_0092);
-    for rows in 2..=8usize {
+    // 2..=8 pins the single-batch widths (one gate/up batch, one down group); 9 crosses the
+    // down-group bound; 25/33/49 cross the 24-row gate/up pair bound into two and three
+    // batches; 64 is the widest planned window (three batches).
+    for rows in [2usize, 3, 8, 9, 25, 33, 49, 64] {
         let norm = normal(&mut rng, rows * HIDDEN, 1.0);
         let batch = buffers(ctx, rows, &vec![0.0; rows * HIDDEN], &norm);
         shared_rows(
@@ -501,9 +503,10 @@ fn the_shared_expert_of_k_rows_equals_k_one_row_blocks() {
     }
 }
 
-/// The K-row shared expert refuses one row and more than eight: the one-row block is `shared()`.
+/// The K-row shared expert refuses one row and windows over `MAX_EXL3_ROWS`: the one-row
+/// block is `shared()`, and both families' planners cap at the shared bound.
 #[test]
-fn the_k_row_shared_expert_takes_two_to_eight_rows() {
+fn the_k_row_shared_expert_refuses_one_row_and_windows_over_the_shared_bound() {
     if !device_present("K-row shared expert row counts") {
         return;
     }
@@ -516,7 +519,11 @@ fn the_k_row_shared_expert_takes_two_to_eight_rows() {
     };
     let w = build_weights(&projector);
     let b = buffers(ctx, 9, &vec![0.0; 9 * HIDDEN], &vec![0.0; 9 * HIDDEN]);
-    for rows in [0usize, 1, 9] {
+    for (rows, wanted) in [
+        (0usize, "at least 2 rows"),
+        (1, "at least 2 rows"),
+        (257, "at most 256 rows"),
+    ] {
         let result = shared_rows(
             &launch,
             &SharedWeights {
@@ -534,8 +541,8 @@ fn the_k_row_shared_expert_takes_two_to_eight_rows() {
             (HIDDEN, INTER, rows),
         );
         match result {
-            Err(EngError::BadRequest(message)) if message.contains("2 to 8 rows") => {}
-            other => panic!("rows {rows}: expected the row-count refusal, got {other:?}"),
+            Err(EngError::BadRequest(message)) if message.contains(wanted) => {}
+            other => panic!("rows {rows}: expected the {wanted:?} refusal, got {other:?}"),
         }
     }
 }

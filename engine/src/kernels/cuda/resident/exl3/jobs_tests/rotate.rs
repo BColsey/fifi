@@ -488,8 +488,7 @@ enum Path {
     PerValue,
     /// The warp-wide kernel, as requested.
     Warp,
-    /// The entry that reads the environment (`FIFI_EXL3_JOBS_WARP_ROTATE`,
-    /// `FIFI_EXL3_JOBS_FUSED_OUT`).
+    /// The entry that reads the environment (`FIFI_EXL3_JOBS_WARP_ROTATE`).
     Env,
     /// A deliberately wrong variant of the warp-wide kernel, alone.
     #[cfg_attr(not(feature = "cuda-exl3-rotate-mutants"), allow(dead_code))]
@@ -510,7 +509,7 @@ fn rotate(
     (ctx, stream): (&CudaContext, &DeviceStream),
     bank: &Bank,
     case: &Case,
-    (path, fused_out, shift): (Path, bool, (usize, usize)),
+    (path, shift): (Path, (usize, usize)),
 ) -> Result<Rotated, EngError> {
     let (k, n) = (bank.k, bank.n);
     let mut x_bytes = vec![0u8; shift.0];
@@ -560,8 +559,8 @@ fn rotate(
     };
     let usable = ctx.exl3_jobs_wide_input_usable(&call, true)?;
     match path {
-        Path::PerValue => ctx.exl3_jobs_modes(stream, call, (fused_out, false))?,
-        Path::Warp => ctx.exl3_jobs_modes(stream, call, (fused_out, true))?,
+        Path::PerValue => ctx.exl3_jobs_wide(stream, call, false)?,
+        Path::Warp => ctx.exl3_jobs_wide(stream, call, true)?,
         Path::Env => ctx.exl3_jobs(stream, call)?,
         #[cfg(feature = "cuda-exl3-rotate-mutants")]
         Path::Mutant(mutant) => ctx.exl3_jobs_rotate_mutant(stream, call, mutant)?,
@@ -734,8 +733,8 @@ fn warp_rotation_is_byte_identical_to_the_per_value_kernel_over_the_grid() {
     for k in GRID {
         for (bank, _, cases) in banks_and_cases(&ctx, k, &mut rng) {
             for case in &cases {
-                let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
-                let new = rotate(rig, &bank, case, (Path::Warp, false, (0, 0))).expect("new");
+                let old = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("old");
+                let new = rotate(rig, &bank, case, (Path::Warp, (0, 0))).expect("new");
                 assert!(
                     new.usable,
                     "k={k} {}: the warp kernel must be taken",
@@ -759,7 +758,7 @@ fn the_cases_exercise_what_they_name() {
     let mut rng = testkit::Rng::new(0x5741_5251);
     for (bank, _, cases) in banks_and_cases(&ctx, 512, &mut rng) {
         for case in &cases {
-            let run = rotate(rig, &bank, case, (Path::Warp, false, (0, 0))).expect("run");
+            let run = rotate(rig, &bank, case, (Path::Warp, (0, 0))).expect("run");
             let rows_written = |row: usize| {
                 run.xh[row * 512 * 2..(row + 1) * 512 * 2]
                     .iter()
@@ -813,7 +812,7 @@ fn the_per_value_kernel_matches_the_host_reference() {
             .iter()
             .find(|case| case.awkward)
             .expect("awkward case");
-        let run = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("run");
+        let run = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("run");
         for (row, x) in case.x.chunks(k).enumerate() {
             let member = row / ROWS_PER_JOB;
             let (want, _) = reference_row(x, scales.suh(member), Fuse::Never);
@@ -932,7 +931,7 @@ fn the_device_flag_follows_the_host_reference_on_every_awkward_case() {
                 case.name
             );
             for path in [Path::PerValue, Path::Warp] {
-                let run = rotate(rig, &bank, case, (path, false, (0, 0))).expect("run");
+                let run = rotate(rig, &bank, case, (path, (0, 0))).expect("run");
                 assert_eq!(
                     run.flag & 1,
                     u32::from(want),
@@ -1008,12 +1007,7 @@ fn a_bad_warp_switch_is_refused_by_the_session_check_and_by_the_launch() {
     assert!(format!("{refusal:?}").contains(WARP_VAR), "{refusal:?}");
     let (bank, scales) = scaled_bank(&ctx, 256, false, 0x5741_525c);
     let cases = suite(256, &scales, &mut testkit::Rng::new(0x5741_525d));
-    let launch = rotate(
-        (&ctx, &stream),
-        &bank,
-        &cases[0],
-        (Path::Env, false, (0, 0)),
-    );
+    let launch = rotate((&ctx, &stream), &bank, &cases[0], (Path::Env, (0, 0)));
     let refusal = launch.err().expect("the launch is refused");
     assert!(format!("{refusal:?}").contains(WARP_VAR), "{refusal:?}");
 }
@@ -1070,8 +1064,8 @@ fn good_switch_values_pass_the_check_name_themselves_on_the_load_line_and_reach_
     let cases = suite(512, &scales, &mut testkit::Rng::new(0x5741_525f));
     let rig = (&ctx, &stream);
     for case in &cases[..4] {
-        let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
-        let env = rotate(rig, &bank, case, (Path::Env, false, (0, 0))).expect("env");
+        let old = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("old");
+        let env = rotate(rig, &bank, case, (Path::Env, (0, 0))).expect("env");
         assert_eq!(difference(&old, &env, true), None, "{}", case.name);
     }
 }
@@ -1094,8 +1088,8 @@ fn calls_the_warp_kernel_cannot_take_run_the_per_value_kernel_with_the_same_byte
         ((16, 8), true),
         ((32, 16), true),
     ] {
-        let old = rotate(rig, &bank, case, (Path::PerValue, false, shift)).expect("old");
-        let new = rotate(rig, &bank, case, (Path::Warp, false, shift)).expect("new");
+        let old = rotate(rig, &bank, case, (Path::PerValue, shift)).expect("old");
+        let new = rotate(rig, &bank, case, (Path::Warp, shift)).expect("new");
         assert_eq!(new.usable, taken, "shift {shift:?}");
         assert_eq!(difference(&old, &new, false), None, "shift {shift:?}");
     }
@@ -1112,28 +1106,19 @@ fn the_whole_projection_is_byte_identical_with_the_warp_rotation_on_and_off() {
     for k in [256, 512, 2048] {
         for (bank, _, cases) in banks_and_cases(&ctx, k, &mut rng) {
             for case in &cases {
-                for fused_out in [false, true] {
-                    let old =
-                        rotate(rig, &bank, case, (Path::PerValue, fused_out, (0, 0))).expect("old");
-                    let new =
-                        rotate(rig, &bank, case, (Path::Warp, fused_out, (0, 0))).expect("new");
-                    assert_eq!(
-                        difference(&old, &new, true),
-                        None,
-                        "k={k} {} fused_out={fused_out}",
-                        case.name
-                    );
-                    assert!(
-                        old.out.iter().any(|byte| *byte != CANARY),
-                        "k={k} {}: the projection must write",
-                        case.name
-                    );
-                    compared += 1;
-                }
+                let old = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("old");
+                let new = rotate(rig, &bank, case, (Path::Warp, (0, 0))).expect("new");
+                assert_eq!(difference(&old, &new, true), None, "k={k} {}", case.name);
+                assert!(
+                    old.out.iter().any(|byte| *byte != CANARY),
+                    "k={k} {}: the projection must write",
+                    case.name
+                );
+                compared += 1;
             }
         }
     }
-    assert_eq!(compared, 3 * CASES_PER_K * 2);
+    assert_eq!(compared, 3 * CASES_PER_K);
 }
 
 /// Whether the mutant `mutant` gives bytes different from the per-value kernel on some case of the
@@ -1146,9 +1131,8 @@ fn mutant_is_caught(mutant: i32) -> Option<bool> {
     for k in [256, 512, 2048] {
         for (bank, _, cases) in banks_and_cases(&ctx, k, &mut rng) {
             for case in &cases {
-                let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
-                let bad = rotate(rig, &bank, case, (Path::Mutant(mutant), false, (0, 0)))
-                    .expect("mutant");
+                let old = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("old");
+                let bad = rotate(rig, &bank, case, (Path::Mutant(mutant), (0, 0))).expect("mutant");
                 if difference(&old, &bad, false).is_some() {
                     return Some(true);
                 }
@@ -1227,8 +1211,8 @@ fn the_unmutated_warp_kernel_passes_the_cases_the_mutants_fail() {
     for k in [256, 512, 2048] {
         for (bank, _, cases) in banks_and_cases(&ctx, k, &mut rng) {
             for case in &cases {
-                let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
-                let new = rotate(rig, &bank, case, (Path::Warp, false, (0, 0))).expect("new");
+                let old = rotate(rig, &bank, case, (Path::PerValue, (0, 0))).expect("old");
+                let new = rotate(rig, &bank, case, (Path::Warp, (0, 0))).expect("new");
                 assert_eq!(difference(&old, &new, false), None, "k={k} {}", case.name);
             }
         }

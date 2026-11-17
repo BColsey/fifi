@@ -1,0 +1,29 @@
+//! The shared prefill core, promoted from the first chunked family: the admission arithmetic
+//! every chunked family shares, and the CUDA arena-fill and chunk-driver primitives. Family
+//! plans stay with their families; nothing here names one.
+//!
+//! The family constants are parameters, not imports: the spare minimum, the flat part charge
+//! and the ladder of chunk sizes are supplied by the calling family, so the shared arithmetic
+//! stays identical for the family whose goldens pin it while another family binds its own
+//! values.
+
+// Host (non-CUDA) builds have no production consumer yet: the promoting family's CUDA driver
+// re-exports these under native-cuda, and the second consumer imports them ungated later.
+#[allow(
+    dead_code,
+    reason = "the promoting family's CUDA driver consumes this under native-cuda; the second family's ungated planner lands in the shared-pass series"
+)]
+pub(crate) mod admission;
+
+// Both CUDA drivers consume these helpers. Host builds use them only in tests.
+#[allow(
+    dead_code,
+    reason = "the CUDA family drivers consume these helpers; host builds use them only in tests"
+)]
+pub(crate) mod steps;
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod arena;
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family) mod chunk_family;

@@ -4,9 +4,11 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <stddef.h>
 #include <stdint.h>
+#include <vector>
 #include "../abi.h"
 #include "../device.h"
 #include "exl3.h"
@@ -100,22 +102,6 @@ __device__ float rotate128(float value, float *values) {
     return values[lane] * rsqrtf(128.0f);
 }
 
-// rotate128 for a 256-thread block: two independent 128-element groups advance in lockstep
-// through the SAME butterfly network and add order per group, so each group's result is
-// bit-identical to rotate128's; the barriers are CTA-wide by necessity and harmless to a group
-// whose row is absent (its threads exchange a staged zero nobody reads).
-__device__ float rotate128_pair(float value, float *values) {
-    const unsigned lane = threadIdx.x & 127, slot = (threadIdx.x >> 7) * 128 + lane;
-    values[slot] = value;
-    __syncthreads();
-    for (unsigned step = 1; step < 128; step *= 2) {
-        const float own = values[slot], other = values[slot ^ step];
-        __syncthreads();
-        values[slot] = (lane & step) ? other - own : own + other;
-        __syncthreads();
-    }
-    return values[slot] * rsqrtf(128.0f);
-}
 __global__ void input_rotate(inference_cuda_exl3_linear_args a) {
     __shared__ float values[128];
     const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
@@ -961,7 +947,7 @@ __device__ __forceinline__ unsigned load_word(const uint16_t *tile, unsigned ind
 // (115 before): the decode of the eight weights is 64 of them, the rest is loop and address work.
 // Dp4a (the DP4A option of the id-indexed launch) decodes book 2 with decode_book2_dp4a; the
 // other books ignore it.
-template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false>
+template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void grouped_projection_one_tile(
     const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16],
     uint32_t split_k) {
@@ -984,32 +970,70 @@ __device__ __forceinline__ void grouped_projection_one_tile(
     const bool even = (bits & 1u) == 0;
     const unsigned next_lane = (lane + 1u) & 31u;
     float sums[8] = {};
+    auto word_at = [&](const uint16_t *base, unsigned w) -> unsigned {
+        if constexpr (Aligned) return *reinterpret_cast<const unsigned *>(base + 2 * w);
+        else return word32(base, w);
+    };
+    // Pipe carries the next iteration's words and input in registers, issued before the
+    // barriers of the current one, so the load latency overlaps the decode instead of stalling
+    // at each __syncwarp. The words staged and the order of every fma are those of the default
+    // loop, so the bytes written are too.
+    unsigned low_cur = 0, next_cur = 0, high_cur = 0;
+    float x_cur = 0.0f;
+    if (iterations) {
+        x_cur = *input;
+        if constexpr (Bits == 8) {
+            low_cur = word_at(packed, lane);
+            next_cur = word_at(packed, next_lane);
+        } else {
+            if (lane < words) low_cur = word_at(packed, lane);
+            if (lane + 32u < words) high_cur = word_at(packed, lane + 32u);
+        }
+    }
     for (unsigned it = 0; it < iterations; ++it) {
-        auto word = [&](unsigned w) -> unsigned {
-            if constexpr (Aligned) return *reinterpret_cast<const unsigned *>(packed + 2 * w);
-            else return word32(packed, w);
-        };
-        const float x = *input;
+        unsigned low_nxt = 0, next_nxt = 0, high_nxt = 0;
+        float x_nxt = 0.0f;
+        if constexpr (Pipe) {
+            if (it + 1 < iterations) {
+                const uint16_t *ahead = packed + tile_step;
+                x_nxt = input[128];
+                if constexpr (Bits == 8) {
+                    low_nxt = word_at(ahead, lane);
+                    next_nxt = word_at(ahead, next_lane);
+                } else {
+                    if (lane < words) low_nxt = word_at(ahead, lane);
+                    if (lane + 32u < words) high_nxt = word_at(ahead, lane + 32u);
+                }
+            }
+        } else {
+            if constexpr (Bits == 8) {
+                low_cur = word_at(packed, lane);
+                next_cur = word_at(packed, next_lane);
+            } else {
+                if (lane < words) low_cur = word_at(packed, lane);
+                if (lane + 32u < words) high_cur = word_at(packed, lane + 32u);
+            }
+            x_cur = *input;
+        }
         if constexpr (Bits == 8) {
             // 32 words per tile: entry i of the doubled table holds words i and i + 1, so one
             // 64-bit read gives the two words of a state window.
-            const unsigned low = word(lane), next = word(next_lane);
+            const uint2 staged = make_uint2(low_cur, next_cur);
             uint2 *pair = reinterpret_cast<uint2 *>(&wtab[0]);
-            pair[lane] = make_uint2(low, next);
-            pair[lane + 32] = make_uint2(low, next);
+            pair[lane] = staged;
+            pair[lane + 32] = staged;
         } else {
             if (lane < words) {
-                const unsigned low = word(lane);
-                wtab[lane] = low;
-                wtab[lane + words] = low;
+                wtab[lane] = low_cur;
+                wtab[lane + words] = low_cur;
             }
             if (lane + 32u < words) {
-                const unsigned high = word(lane + 32u);
-                wtab[lane + 32u] = high;
-                wtab[lane + 32u + words] = high;
+                wtab[lane + 32u] = high_cur;
+                wtab[lane + 32u + words] = high_cur;
             }
         }
         __syncwarp();
+        const float x = x_cur;
         #pragma unroll
         for (unsigned col = 0; col < 8; ++col) {
             unsigned index, shift;
@@ -1036,6 +1060,10 @@ __device__ __forceinline__ void grouped_projection_one_tile(
                 sums[col] = fmaf(x, decode_float<Book>(state, consts), sums[col]);
         }
         __syncwarp();
+        low_cur = low_nxt;
+        next_cur = next_nxt;
+        high_cur = high_nxt;
+        x_cur = x_nxt;
         packed += tile_step;
         input += 128;
     }
@@ -1169,20 +1197,20 @@ __device__ __forceinline__ void grouped_projection_wide(
 }
 
 // The one-tile body with the loop copy that matches the trellis alignment.
-template <int Book, int Bits, class Args, bool Dp4a = false>
+template <int Book, int Bits, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void one_tile_by_alignment(const Args &p, const GroupEntry &a,
                                                       unsigned (&wtab)[128],
                                                       float (&partial)[8][16],
                                                       uint32_t split_k) {
     if ((reinterpret_cast<uintptr_t>(a.trellis) & 3u) == 0)
-        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a>(p, a, wtab, partial, split_k);
+        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a, Pipe>(p, a, wtab, partial, split_k);
     else
-        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a>(p, a, wtab, partial, split_k);
+        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a, Pipe>(p, a, wtab, partial, split_k);
 }
 
 // 8 is 4.0 bpw (every projection of the Qwen3.6 pack except the head), 12 is 6.0 bpw (the
 // head); any other rate runs the generic body.
-template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false>
+template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false, bool Pipe = false>
 __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
                                              unsigned (&wtab)[Cols][128],
                                              float (&partial)[8][16 * Cols]) {
@@ -1190,13 +1218,13 @@ __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
     static_assert(!Dp4a || (Cols == 1 && LeanAnyRate), "the DP4A decode runs one tile per block");
     if constexpr (Cols == 1) {
         switch (a.bits_twice) {
-            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
-            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
+            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k); break;
+            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k); break;
             default:
                 // The dense kernel keeps the generic body for the rates the model does not use:
                 // the lean body at an unknown rate spills there; the indexed kernel does not.
                 if constexpr (LeanAnyRate)
-                    one_tile_by_alignment<Book, 0, Args, Dp4a>(p, a, wtab[0], partial, p.split_k);
+                    one_tile_by_alignment<Book, 0, Args, Dp4a, Pipe>(p, a, wtab[0], partial, p.split_k);
                 else
                     grouped_projection_wide<Book, 1, 0>(p, a, wtab, partial);
                 break;
@@ -1253,8 +1281,6 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) grouped_project_small
     else
         one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial, 2);
 }
-
-#include "exl3_decode_fused.h"
 
 // Whether every group of a launch is book 2 at rate 10 or 6: the launches grouped_project_small_wide_r56 runs.
 static bool wide_odd_rates(const GroupArgs &p) {
@@ -1559,15 +1585,15 @@ __device__ __forceinline__ void indexed_input_rotate_body(const P &p, float (&va
     a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
 }
 
-template <int Cols, bool Dp4a, class P>
+template <int Cols, bool Dp4a, bool Pipe, class P>
 __device__ __forceinline__ void indexed_project_body(const P &p, float (&partial)[8][16 * Cols],
                                                      unsigned (&wtab)[8][Cols][128]) {
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     switch (a.book) {
-        case 0: wide_by_rate<0, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
-        case 1: wide_by_rate<1, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
-        default: wide_by_rate<2, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 0: wide_by_rate<0, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 1: wide_by_rate<1, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        default: wide_by_rate<2, Cols, true, P, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
     }
 }
 
@@ -1596,7 +1622,7 @@ __global__ void __launch_bounds__(256, wide_min_blocks<Cols>) indexed_project_wi
     const __grid_constant__ IndexedArgs p) {
     __shared__ float partial[8][16 * Cols];
     __shared__ __align__(8) unsigned wtab[8][Cols][128];
-    indexed_project_body<Cols, false>(p, partial, wtab);
+    indexed_project_body<Cols, false, false>(p, partial, wtab);
 }
 
 __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
@@ -1613,12 +1639,126 @@ __global__ void option_input_rotate(const __grid_constant__ P p) {
     indexed_input_rotate_body(p, values);
 }
 
-template <class P, bool Dp4a>
+template <class P, bool Dp4a, bool Pipe = false>
 __global__ void __launch_bounds__(256, wide_min_blocks<1>) option_project(
     const __grid_constant__ P p) {
     __shared__ float partial[8][16];
     __shared__ __align__(8) unsigned wtab[8][1][128];
-    indexed_project_body<1, Dp4a>(p, partial, wtab);
+    indexed_project_body<1, Dp4a, Pipe>(p, partial, wtab);
+}
+
+// ---- Pointer-table batched launch (`inference_cuda_exl3_indexed_table`) ----
+// The parameter block caps one launch at 20 pairs; a routed prefill chunk wants hundreds.
+// The table launch moves the pair records to device memory: the host fills one scratch table
+// with a single copy and each stage is ONE kernel over the whole batch. The records are what
+// the option launch packs per pair, plus k and n per record because a batch may mix shapes
+// (gate/up k=hidden n=inter, down k=inter n=hidden). The grid keeps the option launch's axes -
+// x is the column unit, y the pair - so the shared bodies read their coordinates unchanged;
+// the kernel guards the units past a narrow record's shape. Bodies, arithmetic and bytes are
+// the option launch's. These three records are the C ABI of the header's table entries, so
+// they sit at global scope beside the parameter blocks the other C entries take.
+} // namespace
+struct IndexedTablePair {
+    GroupEntry entry;  // as the option launch packs it: first = the record grid row, rows = 1
+    IndexInfo info;
+    uint32_t k, n;
+};
+struct TableLaunch {
+    const IndexedTablePair *pairs;
+    uint32_t *flag;
+    uint32_t fused_publish;
+};
+static_assert(sizeof(IndexedTablePair) == 128 && sizeof(IndexedTablePair) % 8 == 0
+    && sizeof(TableLaunch) <= 32,
+    "table launch parameters: the Rust pack buffer sizes one record at 128 bytes");
+
+namespace {
+
+// The per-record view the shared bodies take where the option launch passes its parameter
+// block: shape, flag and the split-2 fold constant are the only fields the indexed bodies read.
+struct PairView {
+    uint32_t k, n;
+    uint32_t fused_publish;
+    uint32_t *flag;
+    static constexpr uint32_t split_k = 2;
+};
+
+// The resolve of the table launch: record y's entry with its bank id applied. A bad id raises
+// the flag from the block of unit 0 only, as the option launch does from x = 0, z = 0.
+template <bool Unit0Only>
+__device__ __forceinline__ bool resolve_table(const TableLaunch &l, PairView &p, GroupEntry &a) {
+    const IndexedTablePair &tp = l.pairs[blockIdx.y];
+    p = {tp.k, tp.n, l.fused_publish, l.flag};
+    a = tp.entry;
+    const IndexInfo &info = tp.info;
+    const int id = info.ids[info.slot];
+    const bool first_block = blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0;
+    if (id < 0 || uint32_t(id) >= info.members) {
+        if (Unit0Only && first_block) atomicOr(l.flag, 1u);
+        return false;
+    }
+    if (info.offsets) {
+        const uint32_t offset = info.offsets[id];
+        if (offset == absent_member) {
+            if (Unit0Only && first_block) atomicOr(l.flag, 1u);
+            return false;
+        }
+        a.trellis = reinterpret_cast<const uint16_t *>(
+            reinterpret_cast<const char *>(a.trellis) + offset);
+        a.suh += offset / 4;
+        a.svh += offset / 4;
+        return true;
+    }
+    a.trellis = reinterpret_cast<const uint16_t *>(
+        reinterpret_cast<const char *>(a.trellis) + size_t(id) * info.trellis_stride);
+    a.suh += size_t(id) * info.scale_stride;
+    a.svh += size_t(id) * info.scale_stride;
+    return true;
+}
+
+__global__ void table_input_rotate(const __grid_constant__ TableLaunch l) {
+    __shared__ float values[128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<true>(l, p, a)) return;
+    const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
+    if (index >= size_t(p.k)) return;  // k is a multiple of 128, so a whole block retires here;
+                                       // no thread diverges across rotate128's barriers
+    const float value = finite_or_flag(a.x[index] * a.suh[index % p.k], p.flag);
+    a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
+}
+
+template <bool Dp4a, bool Pipe>
+__global__ void __launch_bounds__(256, wide_min_blocks<1>) table_project(
+    const __grid_constant__ TableLaunch l) {
+    __shared__ float partial[8][16];
+    __shared__ __align__(8) unsigned wtab[8][1][128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<false>(l, p, a)) return;
+    if (size_t(blockIdx.x) * 16 >= p.n) return;
+    switch (a.book) {
+        case 0: wide_by_rate<0, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 1: wide_by_rate<1, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+        default: wide_by_rate<2, 1, true, PairView, Dp4a, Pipe>(p, a, wtab[threadIdx.x / 32], partial); break;
+    }
+}
+
+__global__ void table_output_rotate(const __grid_constant__ TableLaunch l) {
+    __shared__ float values[128];
+    PairView p;
+    GroupEntry a;
+    if (!resolve_table<true>(l, p, a)) return;
+    const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
+    if (index >= size_t(p.n)) return;
+    const size_t col = index % p.n;
+    float z = a.z[index];
+    z = finite_or_flag(z + a.out[index], p.flag);
+    const float rotated = rotate128(z, values);
+    const float value = rotated * a.svh[col] + (a.bias ? a.bias[col] : 0.0f);
+    const float stored = p.fused_publish ?
+        __bfloat162float(__float2bfloat16_rn(value)) : value;
+    a.out[index] = finite_or_flag(stored, p.flag);
 }
 
 template <class P>
@@ -1677,7 +1817,7 @@ int inference_cuda_exl3_rows_kernel(uint32_t max_rows) {
 
 // Odd: 0, or a launch with one tile per block may run grouped_project_small_wide_r56 when its groups
 // allow it (1), with the DP4A decode (2); only the entry the Flash-Next context opts into sets it.
-template<bool Observe = false, bool Gather = false, int Cols = 0, int Odd = 0, bool FinIn = false>
+template<bool Observe = false, bool Gather = false, int Cols = 0, int Odd = 0>
 static inline __attribute__((always_inline)) int grouped_launch(
     const inference_cuda_exl3_linear_args *calls, size_t count,
     void *stream, int *out_stage, uint64_t *launches = nullptr,
@@ -1686,33 +1826,16 @@ static inline __attribute__((always_inline)) int grouped_launch(
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         GroupArgs args;
         if (!stream || !group_args(calls, count, 2, args)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        if constexpr (FinIn) {
-            // The fused-input kernel stages the row half in shared memory: one row per
-            // group, the Flash-Next rates only, a half of whole 256-value rounds.
-            if (args.k % 512u) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            for (uint32_t g = 0; g < args.groups; ++g) {
-                const GroupEntry &e = args.entries[g];
-                if (e.rows != 1 || e.book != 2 ||
-                    (e.bits_twice != 10 && e.bits_twice != 6))
-                    return INFERENCE_CUDA_INVALID_ARGUMENT;
-            }
-        }
         Failure failure;
         // Whether the projection kernel the launch enqueued was grouped_project_small_wide_r56.
         bool used_odd = false;
         emit_grouped(args.pairs, args.k, args.n, 2, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
             if (e.kind == LinearKind::Input) {
-                if constexpr (FinIn)
-                    return true;  // rotated inside the projection kernel's shared half
                 grouped_input_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
             }
             else if (e.kind == LinearKind::Small) {
-                if constexpr (FinIn) {
-                    const size_t shared = size_t(args.k) / 2 * 4;
-                    grouped_project_small_wide_r56_fin<Odd == 2>
-                        <<<grid,block,shared,(cudaStream_t)stream>>>(args);
-                } else if constexpr (Cols > 0) {
+                if constexpr (Cols > 0) {
                     const dim3 wide(grid.x / Cols, grid.y, grid.z);
                     if constexpr (Cols == 1) {
                         uint32_t max_rows = 1;
@@ -1816,8 +1939,91 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
+// Packs the pointer-table records host-side and validates them for
+// inference_cuda_exl3_indexed_table: per record the option launch's geometry, view and id-index
+// checks, but shape may differ per record (k and n travel with the record) and the spans are
+// per record, so the option launch's shared-span contiguity gives way to cross-record checks:
+// every record's writes apart from every record's reads and writes, one flat flag and one
+// fused-publish arm for the batch.
+static bool table_pack(const inference_cuda_exl3_linear_args *calls,
+    const inference_cuda_exl3_index_args *index, size_t count, uint32_t split,
+    IndexedTablePair *out) {
+    if (!calls || !index || count < 1) return false;
+    struct View { const void *p; size_t bytes; };
+    for (size_t i = 0; i < count; ++i) {
+        const auto &a = calls[i];
+        if (!linear_geometry(a.rows, a.k, a.n, a.bits_twice, a.book, split, false) ||
+            a.rows != 1 || !linear_views(a, split)) return false;
+        const auto &x = index[i];
+        if (!x.ids || x.ids_bytes < (size_t(x.slot) + 1) * 4 || uintptr_t(x.ids) % 4 ||
+            !x.members ||
+            (x.offsets ? uintptr_t(x.offsets) % 4 != 0
+                       : (!x.trellis_stride || !x.scale_stride)))
+            return false;
+        if (a.flag != calls[0].flag || a.fused_publish != calls[0].fused_publish) return false;
+        out[i].entry = {a.trellis, a.suh, a.svh, a.bias, a.x, a.xh, a.z, a.out,
+            a.bits_twice, a.book, uint32_t(i), 1u};
+        out[i].info = {x.ids, x.slot, x.members, x.trellis_stride, x.scale_stride, x.offsets};
+        out[i].k = uint32_t(a.k);
+        out[i].n = uint32_t(a.n);
+    }
+    // Cross-record isolation: one record's writes never overlap another record's reads or
+    // writes. Reads may overlap reads (records of one bank share its trellis). One sorted
+    // sweep over the write spans, then each read against them: the record count is the
+    // grid's, so the pairwise loops an earlier packer used were quadratic in it.
+    struct SpanView { const void *p; size_t bytes; uint32_t record; bool flag; };
+    std::vector<SpanView> writes;
+    writes.reserve(4 * count);
+    const void *const flag0 = (const void *)calls[0].flag;
+    for (size_t i = 0; i < count; ++i) {
+        const auto &a = calls[i];
+        writes.push_back({a.xh, a.k * 4, uint32_t(i), false});
+        writes.push_back({a.z, a.n * 4, uint32_t(i), false});
+        writes.push_back({a.out, a.n * 4, uint32_t(i), false});
+        writes.push_back({a.flag, 4, uint32_t(i), true});
+    }
+    std::sort(writes.begin(), writes.end(), [](const SpanView &x, const SpanView &y) {
+        return uintptr_t(x.p) < uintptr_t(y.p) || (x.p == y.p && x.bytes < y.bytes);
+    });
+    for (size_t i = 1; i < writes.size(); ++i) {
+        const SpanView &a = writes[i - 1], &b = writes[i];
+        if (uintptr_t(b.p) >= uintptr_t(a.p) + a.bytes) continue;
+        // The batch shares one completion flag: the only alias two records may write (the
+        // pack already refused records with a different flag pointer); any other
+        // same-pointer pair stays refused, like the option launch.
+        if (a.flag && b.flag && a.bytes == 4 && b.bytes == 4 && a.p == b.p && a.p == flag0)
+            continue;
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const auto &a = calls[i];
+        const auto &x = index[i];
+        const struct { const void *p; size_t bytes; } reads[] = {
+            {a.trellis, a.k * a.n / 256 * size_t(a.bits_twice) * 16},
+            {a.suh, a.k * 4},
+            {a.svh, a.n * 4},
+            {a.bias, a.bias ? a.n * 4 : 0},
+            {a.x, a.k * 4},
+            {x.ids, size_t(x.slot + 1) * 4},
+            {x.offsets, x.offsets ? size_t(x.members) * 4 : 0}};
+        for (const auto &r : reads) {
+            if (!r.bytes) continue;
+            size_t at = size_t(std::lower_bound(writes.begin(), writes.end(), r.p,
+                [](const SpanView &w, const void *p) { return w.p < p; })
+                - writes.begin());
+            if (at) --at;  // the write starting before r may still cover it
+            for (; at < writes.size() && uintptr_t(writes[at].p) < uintptr_t(r.p) + r.bytes;
+                 ++at) {
+                if (writes[at].record == i) continue;
+                if (uintptr_t(r.p) < uintptr_t(writes[at].p) + writes[at].bytes) return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The id-indexed launch of an option on parameter block P, one tile per block.
-template <class P, bool Dp4a>
+template <class P, bool Dp4a, bool Pipe = false>
 static int option_launch(const inference_cuda_exl3_linear_args *calls,
     const inference_cuda_exl3_index_args *index, size_t count, void *stream, int *out_stage) {
     try {
@@ -1831,7 +2037,7 @@ static int option_launch(const inference_cuda_exl3_linear_args *calls,
             if (e.kind == LinearKind::Input)
                 option_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             else if (e.kind == LinearKind::Small)
-                option_project<P, Dp4a><<<grid,block,0,(cudaStream_t)stream>>>(args);
+                option_project<P, Dp4a, Pipe><<<grid,block,0,(cudaStream_t)stream>>>(args);
             else option_output_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             return failure.err == cudaSuccess;
@@ -1912,17 +2118,6 @@ extern "C" int inference_cuda_exl3_grouped_wide_odd(const inference_cuda_exl3_li
                 : grouped_launch<false, true, 1, 1>(calls, count, stream, out_stage);
 }
 
-// inference_cuda_exl3_grouped_wide_odd with the input rotation fused into the projection kernel
-// (exl3_decode_fused.h): two launches per group set instead of three, no xh round trip. Requires
-// every group to be one row of book 2 at rate 10 or 6 and k a multiple of 512; every byte written
-// equals the odd entry's.
-extern "C" int inference_cuda_exl3_grouped_wide_fin(const inference_cuda_exl3_linear_args *calls,
-    size_t count, void *stream, int *out_stage, unsigned dp4a) {
-    if (!calls || count < 1 || calls[0].n % 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
-    return dp4a ? grouped_launch<false, true, 1, 2, true>(calls, count, stream, out_stage)
-                : grouped_launch<false, true, 1, 1, true>(calls, count, stream, out_stage);
-}
-
 
 // The routed experts of one token: every call is one row of one bank member chosen on the device
 // (see IndexedArgs). Plan, grids and spans are fixed at queue time; `cols` is the wide tile count
@@ -1940,8 +2135,9 @@ extern "C" int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_lin
 }
 
 // The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
-// with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16). Options 0 is the default
-// launch (inference_cuda_exl3_grouped_indexed) and is refused here.
+// with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16); bit 2 pipelines the tile
+// loop (the next tile's loads issued before the current one's barriers; same bytes). Options 0
+// is the default launch (inference_cuda_exl3_grouped_indexed) and is refused here.
 extern "C" int inference_cuda_exl3_grouped_indexed_option(
     const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
     size_t count, void *stream, int *out_stage, unsigned options) {
@@ -1951,7 +2147,74 @@ extern "C" int inference_cuda_exl3_grouped_indexed_option(
             return option_launch<IndexedOptionArgs, false>(calls, index, count, stream, out_stage);
         case 3:
             return option_launch<IndexedOptionArgs, true>(calls, index, count, stream, out_stage);
+        case 4: return option_launch<IndexedArgs, false, true>(calls, index, count, stream, out_stage);
+        case 5: return option_launch<IndexedArgs, true, true>(calls, index, count, stream, out_stage);
+        case 6:
+            return option_launch<IndexedOptionArgs, false, true>(calls, index, count, stream, out_stage);
+        case 7:
+            return option_launch<IndexedOptionArgs, true, true>(calls, index, count, stream, out_stage);
         default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+}
+
+// The pointer-table batched launch of the id-indexed kernels: one kernel per stage over every
+// record of the batch (`pairs_count` device records, filled and validated host-side). The
+// grids take the batch's widest shape; narrow records idle their tail blocks (per-thread for
+// the rotates, per-tile for the project). `k_units` is ceil(widest k / 128), `n_tiles` the
+// widest n / 16 and `n_units` ceil(widest n / 128). Options bit 0 is the DP4A decode, bit 2
+// the pipelined tile loop; the 20-pair and pong bits do not apply (no parameter block).
+extern "C" int inference_cuda_exl3_indexed_table(
+    const IndexedTablePair *pairs, size_t pairs_count, uint32_t k_units, uint32_t n_tiles,
+    uint32_t n_units, uint32_t *flag, uint32_t fused_publish, void *stream, int *out_stage,
+    unsigned options) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !pairs || !flag || pairs_count < 1 || pairs_count > 65535 ||
+            !k_units || !n_tiles || !n_units || options & ~5u)
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const TableLaunch l{pairs, flag, fused_publish};
+        Failure failure;
+        table_input_rotate<<<dim3(k_units, unsigned(pairs_count)), 128, 0,
+            (cudaStream_t)stream>>>(l);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == cudaSuccess) {
+            const dim3 grid(n_tiles, unsigned(pairs_count), 2);
+            if (options & 1u)
+                if (options & 4u) table_project<true, true><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+                else table_project<true, false><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            else if (options & 4u) table_project<false, true><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            else table_project<false, false><<<grid, 256, 0, (cudaStream_t)stream>>>(l);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.err == cudaSuccess) {
+            table_output_rotate<<<dim3(n_units, unsigned(pairs_count)), 128, 0,
+                (cudaStream_t)stream>>>(l);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.err != cudaSuccess) return INFERENCE_CUDA_NATIVE_EXCEPTION;
+        return INFERENCE_CUDA_OK;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+// Packs `pairs_count` records into the caller's HOST buffer `out` for
+// inference_cuda_exl3_indexed_table: the option launch's per-call checks per record, shapes may
+// differ, spans per record, cross-record isolation enforced. Returns 0 on success; the caller
+// uploads the buffer and computes the widest-shape grids from its own records.
+extern "C" int inference_cuda_exl3_indexed_table_pack(
+    const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
+    size_t pairs_count, size_t out_bytes, IndexedTablePair *out) {
+    try {
+        // The Rust side sizes its buffer from its own constant; this bound makes a grown
+        // record refuse here instead of writing past it.
+        if (!out || pairs_count > out_bytes / sizeof(IndexedTablePair))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!table_pack(calls, index, pairs_count, 2, out))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        return INFERENCE_CUDA_OK;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
 
@@ -2083,12 +2346,6 @@ struct JobsTile {
     uint32_t *flag;
     size_t rows, k, n;
     int bits_twice;
-    // The fused output-rotation epilogue only: the output scale, the scatter target and
-    // the job's first row in the table (row0 plus the CTA's row block). Null/0 when unfused.
-    const float *svh;
-    const uint32_t *out_rows;
-    float *out;
-    size_t out_total_rows, out_ld, out_col, table_row0;
 };
 
 template <int Book, int W, int NT>
@@ -2242,11 +2499,6 @@ constexpr int jobs_reg_a_bytes = jobs_reg_rows * jobs_reg_stride;
 constexpr int jobs_reg_b_bytes = 8 * 2 * 16 * 16;  // 8 tiles x 2 K16 steps x 16 bytes x bits_twice
 constexpr int jobs_reg_stage_bytes = jobs_reg_a_bytes + jobs_reg_b_bytes;
 
-// The fused output-rotation epilogue stages its 32-row slab and the pair butterfly's values
-// onto the cp.async ring, which is dead once the last stage is consumed; both must fit.
-constexpr int jobs_fused_tile_bytes = 32 * 128 * int(sizeof(float));
-static_assert(jobs_reg_stages * jobs_reg_stage_bytes >= jobs_fused_tile_bytes + 1024,
-              "fused epilogue no longer fits the dead ring");
 
 // ldmatrix needs sm_75 and mma.m16n8k16 and cp.async need sm_80: an older device pass (the sm_72
 // build of aarch64) gets the kernel as a trap that the launch below never reaches.
@@ -2280,7 +2532,7 @@ __device__ __forceinline__ void cp_async_wait() {
 // The ring holds jobs_reg_stages stages of 32 values of K: the 64 F16 input rows of the job and the
 // raw trellis words of the 8 tiles of the CTA for the two K16 steps. Stage s is copied by cp.async
 // while stage s - 1 is multiplied; one barrier per stage.
-template <int Book, bool FusedOut = false>
+template <int Book>
 __device__ __forceinline__ void jobs_reg_projection(const JobsTile &a,
                                                     unsigned char (*ring)[jobs_reg_stage_bytes]) {
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -2363,71 +2615,17 @@ __device__ __forceinline__ void jobs_reg_projection(const JobsTile &a,
     }
 
     const size_t column0 = (size_t(blockIdx.x) * 8 + warp) * 16;
-    if constexpr (!FusedOut) {
+    #pragma unroll
+    for (unsigned fragment = 0; fragment < 4; ++fragment) {
         #pragma unroll
-        for (unsigned fragment = 0; fragment < 4; ++fragment) {
+        for (unsigned half_column = 0; half_column < 2; ++half_column) {
             #pragma unroll
-            for (unsigned half_column = 0; half_column < 2; ++half_column) {
-                #pragma unroll
-                for (unsigned part = 0; part < 4; ++part) {
-                    const size_t row = size_t(fragment) * 16 + group + 8 * (part >> 1);
-                    if (row >= rows) continue;
-                    a.z[row * a.n + column0 + half_column * 8 + 2 * quad + (part & 1)] =
-                        finite_or_flag(acc[fragment][half_column][part], a.flag);
-                }
+            for (unsigned part = 0; part < 4; ++part) {
+                const size_t row = size_t(fragment) * 16 + group + 8 * (part >> 1);
+                if (row >= rows) continue;
+                a.z[row * a.n + column0 + half_column * 8 + 2 * quad + (part & 1)] =
+                    finite_or_flag(acc[fragment][half_column][part], a.flag);
             }
-        }
-    } else {
-        // The output rotation of jobs_output_rotate fused into the epilogue: a CTA holds every
-        // 128-column group of its rows complete (n is a multiple of 128 and the CTA covers 128
-        // consecutive columns), so the butterfly needs no exchange beyond this block. The staged
-        // values are the same finite_or_flag(acc) the unfused store writes to z, the butterfly is
-        // the same network, and the scale, flag and scatter are the same ops in the same order, so
-        // the published bits are identical; only z itself stays unwritten.
-        //
-        // The ring is dead only AFTER this barrier: the loop's last barrier sits at the top of
-        // its final iteration, so without this one a warp leaving the loop could overwrite the
-        // slot a straggler still reads (every stages % 3 except 0 lands that slot inside the
-        // tile). The staging below aliases the ring, so the ordering lives here, not in layout.
-        __syncthreads();
-        float *const tile = reinterpret_cast<float *>(&ring[0][0]);
-        float *const values = reinterpret_cast<float *>(
-            &ring[0][0] + jobs_fused_tile_bytes);
-        const unsigned rows_u = unsigned(a.rows);
-        const size_t col0 = size_t(blockIdx.x) * 128;
-        for (unsigned base = 0; base < rows_u; base += 32) {
-            #pragma unroll
-            for (unsigned fragment = 0; fragment < 4; ++fragment) {
-                #pragma unroll
-                for (unsigned half_column = 0; half_column < 2; ++half_column) {
-                    #pragma unroll
-                    for (unsigned part = 0; part < 4; ++part) {
-                        const unsigned row = fragment * 16 + group + 8 * (part >> 1);
-                        if (row >= rows_u || row < base || row >= base + 32) continue;
-                        const unsigned col = warp * 16 + half_column * 8 + 2 * quad + (part & 1);
-                        tile[size_t(row - base) * 128 + col] =
-                            finite_or_flag(acc[fragment][half_column][part], a.flag);
-                    }
-                }
-            }
-            __syncthreads();
-            const unsigned top = base + 32 < rows_u ? base + 32 : rows_u;
-            for (unsigned row = base; row < top; row += 2) {
-                const bool live = row + (threadIdx.x >> 7) < top;
-                const float staged = live
-                    ? tile[size_t(row - base + (threadIdx.x >> 7)) * 128 + (threadIdx.x & 127)]
-                    : 0.0f;
-                const float rotated = rotate128_pair(staged, values);
-                if (live) {
-                    const unsigned col = unsigned(col0) + (threadIdx.x & 127);
-                    const size_t table_row = a.table_row0 + row + (threadIdx.x >> 7);
-                    const size_t target = a.out_rows ? size_t(a.out_rows[table_row]) : table_row;
-                    const float value = finite_or_flag(rotated * a.svh[col], a.flag);
-                    if (target >= a.out_total_rows) atomicOr(a.flag, 1u);
-                    else a.out[target * a.out_ld + a.out_col + col] = value;
-                }
-            }
-            __syncthreads();  // the next slab overwrites the tile
         }
     }
 }
@@ -2458,42 +2656,6 @@ __global__ void __launch_bounds__(256) jobs_project_reg(
         case 0: jobs_reg_projection<0>(a, ring); break;
         case 1: jobs_reg_projection<1>(a, ring); break;
         default: jobs_reg_projection<2>(a, ring); break;
-    }
-#endif
-}
-
-// The register-decode kernel with the output rotation fused into its epilogue (see the
-// FusedOut tail of jobs_reg_projection); only the launch differs from jobs_project_reg.
-__global__ void __launch_bounds__(256) jobs_project_reg_fused(
-    const __grid_constant__ inference_cuda_exl3_jobs_args p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    __trap();
-#else
-    __shared__ __align__(16) unsigned char ring[jobs_reg_stages][jobs_reg_stage_bytes];
-    const inference_cuda_exl3_job job = p.jobs[blockIdx.z];
-    if (!job_runs(p, job)) return;
-    const size_t first = size_t(blockIdx.y) * jobs_reg_rows;
-    if (first >= size_t(job.rows)) return;
-    JobsTile a{};
-    a.trellis = inference_cuda_exl3_member_trellis(p, job.member);
-    a.xh = reinterpret_cast<const unsigned *>(p.xh) + (size_t(job.row0) + first) * (p.k / 2);
-    a.z = p.z + (size_t(job.row0) + first) * p.n;
-    a.flag = p.flag;
-    a.rows = min(size_t(jobs_reg_rows), size_t(job.rows) - first);
-    a.k = p.k;
-    a.n = p.n;
-    a.bits_twice = p.bits_twice;
-    a.svh = inference_cuda_exl3_member_svh(p, job.member);
-    a.out_rows = p.out_rows;
-    a.out = p.out;
-    a.out_total_rows = p.out_total_rows;
-    a.out_ld = p.out_ld;
-    a.out_col = p.out_col;
-    a.table_row0 = size_t(job.row0) + first;
-    switch (p.book) {
-        case 0: jobs_reg_projection<0, true>(a, ring); break;
-        case 1: jobs_reg_projection<1, true>(a, ring); break;
-        default: jobs_reg_projection<2, true>(a, ring); break;
     }
 #endif
 }
@@ -2610,16 +2772,6 @@ bool jobs_registers_enabled() {
     return enabled;
 }
 
-// Whether FIFI_EXL3_JOBS_FUSED_OUT turns the fused output-rotation epilogue on (exactly "1";
-// unset or any other value keeps the separate kernel), read once. Default off.
-bool jobs_fused_out_enabled() {
-    static const bool enabled = [] {
-        const char *text = std::getenv("FIFI_EXL3_JOBS_FUSED_OUT");
-        return text && text[0] == '1' && text[1] == '\0';
-    }();
-    return enabled;
-}
-
 // Whether a call takes the register-decode kernel: the switch on, a device of compute capability 8
 // or more running code compiled for sm_80 or more (the kernel needs mma.m16n8k16 and cp.async),
 // 16-byte aligned input rows, trellis and member stride (cp.async copies 16 bytes), and K a
@@ -2633,10 +2785,9 @@ bool jobs_use_registers(const inference_cuda_exl3_jobs_args &a, DeviceSupport su
 }
 } // namespace
 
-// What a job-table call is asked to do besides the default: the fused output rotation and the
-// warp-wide input rotation, each already resolved from the environment or an explicit request.
+// What a job-table call is asked to do besides the default: the warp-wide input rotation,
+// already resolved from the environment or an explicit request.
 struct JobsModes {
-    bool fused_out;
     bool wide_input;
     // The rows of xh are already rotated (inference_cuda_exl3_jobs_rotated): skip the rotation.
     bool rotated = false;
@@ -2657,19 +2808,12 @@ static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream
                 jobs_input_rotate<<<dim3(unsigned(a->max_rows * a->k / 128), jobs), 128, 0, s>>>(*a);
         }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        // The fused epilogue exists only on the register-decode kernel; a call that falls back
-        // to the shared-memory kernels keeps the separate output rotation.
-        bool fused = false;
         if (failure.err == cudaSuccess) {
             // One CTA covers 64, 128 or 256 rows: the narrowest that holds the tallest job in one
             // row block, so a table of short jobs does not pay for wide CTAs.
             const unsigned tiles = unsigned(a->n / 16);
             if (jobs_use_registers(*a, device_support(), jobs_registers_enabled())) {
-                fused = modes.fused_out;
-                if (fused)
-                    jobs_project_reg_fused<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
-                else
-                    jobs_project_reg<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
+                jobs_project_reg<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
             } else if (a->max_rows <= 64) {
                 jobs_project<4><<<dim3(tiles / jobs_tiles<4>, 1, jobs), 128, 0, s>>>(*a);
             } else if (a->max_rows <= 128) {
@@ -2679,7 +2823,7 @@ static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream
             }
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
-        if (failure.err == cudaSuccess && !fused) {
+        if (failure.err == cudaSuccess) {
             jobs_output_rotate<<<dim3(unsigned(a->max_rows * a->n / 128), jobs), 128, 0, s>>>(*a);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
@@ -2690,30 +2834,21 @@ static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream
 
 extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
                                        void *stream, int *out_stage) {
-    return exl3_jobs_launch(a, stream, out_stage,
-                            {jobs_fused_out_enabled(), jobs_wide_input_enabled()});
+    return exl3_jobs_launch(a, stream, out_stage, {jobs_wide_input_enabled()});
 }
 
-// The same launches with an explicit fused-output request, for the device tests and the GPU
-// qualification (an env flip would race the other tests of the process).
-extern "C" int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *a,
-                                                 void *stream, int *out_stage, int fused_out) {
-    return exl3_jobs_launch(a, stream, out_stage, {fused_out != 0, jobs_wide_input_enabled()});
-}
-
-// The same launches with both requests explicit, for the device tests and the GPU qualification.
-extern "C" int inference_cuda_exl3_jobs_modes(const inference_cuda_exl3_jobs_args *a, void *stream,
-                                              int *out_stage, int fused_out, int wide_input) {
-    return exl3_jobs_launch(a, stream, out_stage, {fused_out != 0, wide_input != 0});
+// The same launches with the wide-input rotation request explicit, for the device tests and the
+// GPU qualification (an env flip would race the other tests of the process).
+extern "C" int inference_cuda_exl3_jobs_wide(const inference_cuda_exl3_jobs_args *a, void *stream,
+                                             int *out_stage, int wide_input) {
+    return exl3_jobs_launch(a, stream, out_stage, {wide_input != 0});
 }
 
 // The projection and output rotation of a call whose xh already holds the rotated rows (written
-// by inference_cuda_exl3_jobs_rotate_pair); `fused_out` is the request of the fused output
-// rotation, negative for the environment's.
+// by inference_cuda_exl3_jobs_rotate_pair).
 extern "C" int inference_cuda_exl3_jobs_rotated(const inference_cuda_exl3_jobs_args *a, void *stream,
-                                                int *out_stage, int fused_out) {
-    return exl3_jobs_launch(a, stream, out_stage,
-                            {fused_out < 0 ? jobs_fused_out_enabled() : fused_out != 0, false, true});
+                                                int *out_stage) {
+    return exl3_jobs_launch(a, stream, out_stage, {false, true});
 }
 
 // The input rotation of two calls that read the same rows, in one pass: call a into its xh by its

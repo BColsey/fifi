@@ -1,7 +1,7 @@
 //! One fixed device-side Delta snapshot; its key leases the unchanged live KV prefix.
-use super::super::book::Health;
 use super::super::state_layout::StateLayout;
 use super::{ResidentState, StateIdentity, export::IMPORT_REWRITES_WORDS};
+use crate::family::graph_state::book::Health;
 use crate::{
     EngError,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream},

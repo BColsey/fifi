@@ -12,7 +12,7 @@
 use super::{
     driver::{StartVectors, TokenFeeds},
     embedding::stream_row,
-    ple_feed::{Gathered, PleFeed},
+    ple_feed::{Gathered, PleFeed, PleKeyValue},
 };
 use crate::{EngError, weights::StreamedCheckpoint};
 
@@ -71,15 +71,7 @@ impl TokenFeeds for PackFeeds {
         let mut pending = Vec::with_capacity(tokens.len());
         for (i, &token) in tokens.iter().enumerate() {
             let stream = stream_row(self.source, token, self.hidden, self.branches)?;
-            let plan = self.ple.plan_after(&tokens[..i], token)?;
-            let rows = self.ple.gather(&plan)?;
-            let mut ple_embedding = Vec::new();
-            for &(_, local) in &plan.rows {
-                let values = rows.get(u64::from(local)).ok_or_else(|| {
-                    EngError::BadRequest(format!("n-gram row {local} was not gathered"))
-                })?;
-                ple_embedding.extend_from_slice(values);
-            }
+            let (ple_embedding, rows) = self.ple.chunk_embedding(&tokens[..i], token)?;
             starts.push(StartVectors {
                 stream,
                 ple_embedding,
@@ -95,9 +87,22 @@ impl TokenFeeds for PackFeeds {
         self.ple.update(token, &rows, stream)
     }
 
+    fn set_ple_pair(&mut self, pair: PleKeyValue) -> Result<(), EngError> {
+        self.ple.set_fixed(pair)
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
         self.ple.reset();
+    }
+
+    fn ple_state(&self) -> Option<(&[u32], &[f32])> {
+        Some(self.ple.state_parts())
+    }
+
+    fn ple_resume(&mut self, history: &[u32], ring: &[f32]) -> Result<(), EngError> {
+        self.pending.clear();
+        self.ple.resume(history, ring)
     }
 }
 

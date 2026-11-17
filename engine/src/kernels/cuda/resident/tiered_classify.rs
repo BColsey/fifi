@@ -1,6 +1,6 @@
 //! The tiered classification of one layer of the resident decode step: the router's picks mapped
 //! through the layer's slot table row, in one launch. The host oracle is
-//! `family::qwen36::tiered::classify::classify_reference`.
+//! `family::tiered_classify::classify_reference`.
 //!
 //! Original code; the kernel and its semantics are documented in
 //! `native/resident/tiered_classify.h`.

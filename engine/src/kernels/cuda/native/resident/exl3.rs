@@ -462,6 +462,25 @@ unsafe extern "C" {
         stage: *mut c_int,
         options: u32,
     ) -> c_int;
+    fn inference_cuda_exl3_indexed_table_pack(
+        args: *const LinearArgs,
+        index: *const IndexArgs,
+        count: usize,
+        out_bytes: usize,
+        out: *mut c_void,
+    ) -> c_int;
+    fn inference_cuda_exl3_indexed_table(
+        pairs: *const c_void,
+        pairs_count: usize,
+        k_units: u32,
+        n_tiles: u32,
+        n_units: u32,
+        flag: *mut c_void,
+        fused_publish: u32,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        options: u32,
+    ) -> c_int;
     #[cfg(test)]
     fn inference_cuda_exl3_book2_probe(
         words: *const c_void,
@@ -479,13 +498,6 @@ unsafe extern "C" {
         cols: u32,
     ) -> c_int;
     fn inference_cuda_exl3_grouped_wide_odd(
-        args: *const LinearArgs,
-        count: usize,
-        stream: *mut c_void,
-        stage: *mut c_int,
-        dp4a: u32,
-    ) -> c_int;
-    fn inference_cuda_exl3_grouped_wide_fin(
         args: *const LinearArgs,
         count: usize,
         stream: *mut c_void,
@@ -570,8 +582,8 @@ pub(in crate::kernels::cuda) fn grouped_indexed_option(
     options: u32,
 ) -> Result<(), DeviceFailure> {
     let limit = match options {
-        1 => 16,
-        2 | 3 => 20,
+        1 | 4 | 5 => 16,
+        2 | 3 | 6 | 7 => 20,
         _ => return Err(invalid_argument()),
     };
     let (args, indexes) = indexed_records(calls, index, limit)?;
@@ -583,6 +595,78 @@ pub(in crate::kernels::cuda) fn grouped_indexed_option(
             args.as_ptr(),
             indexes.as_ptr(),
             args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            options,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The byte size of one `IndexedTablePair` record (the C side's static_asserts fix it:
+/// 80-byte `GroupEntry` + 40-byte `IndexInfo` + 8 bytes of k and n).
+pub(in crate::kernels::cuda) const TABLE_PAIR_BYTES: usize = 128;
+/// One table launch's record cap (the grid's y axis in the C entry).
+pub(in crate::kernels::cuda) const TABLE_PAIRS_MAX: usize = 65535;
+
+/// Packs the table records host-side ([`inference_cuda_exl3_indexed_table_pack`]): the same
+/// call and index records the option entry takes, validated per record with cross-record write
+/// isolation in C (a count that does not fit the buffer is refused there, so a grown record
+/// cannot overrun a stale size constant). Returns the packed records as `u64` words (the
+/// packer writes an 8-aligned struct), `TABLE_PAIR_BYTES` per call.
+pub(in crate::kernels::cuda) fn indexed_table_records(
+    calls: &[LinearRaw<'_>],
+    index: &[IndexRaw<'_>],
+) -> Result<Vec<u64>, DeviceFailure> {
+    let (args, indexes) = indexed_records(calls, index, TABLE_PAIRS_MAX)?;
+    let mut out = vec![0u64; calls.len() * (TABLE_PAIR_BYTES / size_of::<u64>())];
+    let stage = STAGE_NONE;
+    // SAFETY: `args`/`indexes` are the arrays the option entry takes; `out` holds one record
+    // per call at the alignment the packer's struct needs, and the C side refuses a count that
+    // does not fit `out_bytes`.
+    let status = unsafe {
+        inference_cuda_exl3_indexed_table_pack(
+            args.as_ptr(),
+            indexes.as_ptr(),
+            args.len(),
+            out.len() * size_of::<u64>(),
+            out.as_mut_ptr().cast(),
+        )
+    };
+    checked(status, stage).map(|()| out)
+}
+
+/// [`grouped_indexed_option`] over a device-resident record table
+/// ([`inference_cuda_exl3_indexed_table`]): one kernel per stage for the whole batch, past the
+/// parameter block's 20-pair cap. `pairs` points at `pairs_count` packed records (upload of
+/// [`indexed_table_records`]' bytes), `k_units`/`n_tiles`/`n_units` are the batch's widest
+/// shapes and `options` carries only the DP4A and pipeline bits.
+// One flat parameter record of the C entry it wraps; grouping the scalars would invent a
+// struct the FFI does not have.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::kernels::cuda) fn indexed_table(
+    stream: &RawStream,
+    pairs: *const c_void,
+    pairs_count: usize,
+    k_units: u32,
+    n_tiles: u32,
+    n_units: u32,
+    flag: *mut c_void,
+    fused_publish: u32,
+    options: u32,
+) -> Result<(), DeviceFailure> {
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `grouped_indexed_option`; the records carry what the parameter block would,
+    // validated by the packer, and the scratch holds `pairs_count` of them.
+    let status = unsafe {
+        inference_cuda_exl3_indexed_table(
+            pairs.cast(),
+            pairs_count,
+            k_units,
+            n_tiles,
+            n_units,
+            flag.cast(),
+            fused_publish,
             stream.as_ptr(),
             &mut stage,
             options,
@@ -742,42 +826,6 @@ pub(in crate::kernels::cuda) fn grouped_wide(
     checked(status, stage)
 }
 
-/// The wide odd-rate launch with the input rotation fused into the projection kernel
-/// (`exl3_decode_fused.h`): two launches per group set instead of three. Requires one row per
-/// call, book 2 at rate 10 or 6, and `k` a multiple of 512 (C validates and refuses otherwise);
-/// every byte written equals [`grouped_wide`] at `cols` 1 with `odd`.
-pub(in crate::kernels::cuda) fn grouped_fin(
-    stream: &RawStream,
-    calls: &[LinearRaw<'_>],
-    dp4a: bool,
-) -> Result<(), DeviceFailure> {
-    if calls.is_empty() || calls.len() > 48 {
-        return Err(invalid_argument());
-    }
-    let mut pairs = 0usize;
-    let mut args = Vec::with_capacity(calls.len());
-    for call in calls {
-        pairs = pairs.checked_add(call.rows).ok_or_else(invalid_argument)?;
-        if call.rows != 1 || call.split_k != 2 || pairs > 48 {
-            return Err(invalid_argument());
-        }
-        args.push(linear_args(call, false)?);
-    }
-    let mut stage = STAGE_NONE;
-    // SAFETY: as `grouped_wide`: every record has live bounded owners and validated local
-    // extents; C validates the group shapes, the rates and the half rounding before any enqueue.
-    let status = unsafe {
-        inference_cuda_exl3_grouped_wide_fin(
-            args.as_ptr(),
-            args.len(),
-            stream.as_ptr(),
-            &mut stage,
-            u32::from(dp4a),
-        )
-    };
-    checked(status, stage)
-}
-
 pub(in crate::kernels::cuda) fn grouped(
     stream: &RawStream,
     calls: &[LinearRaw<'_>],
@@ -884,17 +932,10 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
-    fn inference_cuda_exl3_jobs_fused_out(
+    fn inference_cuda_exl3_jobs_wide(
         args: *const JobsArgs,
         stream: *mut c_void,
         stage: *mut c_int,
-        fused_out: c_int,
-    ) -> c_int;
-    fn inference_cuda_exl3_jobs_modes(
-        args: *const JobsArgs,
-        stream: *mut c_void,
-        stage: *mut c_int,
-        fused_out: c_int,
         wide_input: c_int,
     ) -> c_int;
     fn inference_cuda_exl3_jobs_wide_input_kernel(args: *const JobsArgs, enabled: c_int) -> c_int;
@@ -902,7 +943,6 @@ unsafe extern "C" {
         args: *const JobsArgs,
         stream: *mut c_void,
         stage: *mut c_int,
-        fused_out: c_int,
     ) -> c_int;
     fn inference_cuda_exl3_jobs_rotate_pair(
         first: *const JobsArgs,
@@ -1174,46 +1214,20 @@ pub(in crate::kernels::cuda) fn jobs(
     checked(status, stage)
 }
 
-/// The same launches with an explicit fused-output-rotation request (the env default is off):
-/// for the device tests and the GPU qualification, where an env flip would race the process.
-/// Production builds never call it — the env decides — so the dead code is allowed there.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::kernels::cuda) fn jobs_fused(
-    stream: &RawStream,
-    call: &JobsRaw<'_>,
-    fused_out: bool,
-) -> Result<(), DeviceFailure> {
-    let args = jobs_args(call)?;
-    let mut stage = STAGE_NONE;
-    // SAFETY: the same checked argument block as jobs; the request only selects the epilogue of
-    // the register-decode kernel.
-    let status = unsafe {
-        inference_cuda_exl3_jobs_fused_out(&args, stream.as_ptr(), &mut stage, fused_out as c_int)
-    };
-    checked(status, stage)
-}
-
-/// The same launches with the fused output rotation and the warp-wide input rotation both
-/// explicit, for the device tests.
+/// The same launches with the warp-wide input rotation request explicit, for the device tests
+/// and the GPU qualification, where an env flip would race the process.
 #[cfg(test)]
-pub(in crate::kernels::cuda) fn jobs_modes(
+pub(in crate::kernels::cuda) fn jobs_wide(
     stream: &RawStream,
     call: &JobsRaw<'_>,
-    fused_out: bool,
     wide_input: bool,
 ) -> Result<(), DeviceFailure> {
     let args = jobs_args(call)?;
     let mut stage = STAGE_NONE;
-    // SAFETY: the same checked argument block as jobs; the requests only select kernels that give
-    // the same bytes.
+    // SAFETY: the same checked argument block as jobs; the request only selects a kernel that
+    // gives the same bytes.
     let status = unsafe {
-        inference_cuda_exl3_jobs_modes(
-            &args,
-            stream.as_ptr(),
-            &mut stage,
-            fused_out as c_int,
-            wide_input as c_int,
-        )
+        inference_cuda_exl3_jobs_wide(&args, stream.as_ptr(), &mut stage, wide_input as c_int)
     };
     checked(status, stage)
 }
@@ -1233,20 +1247,16 @@ pub(in crate::kernels::cuda) fn jobs_wide_input_usable(
     }
 }
 
-/// The projection and output rotation of a call whose `xh` already holds the rotated rows;
-/// `fused_out` is the fused output rotation request, `None` for the environment's.
+/// The projection and output rotation of a call whose `xh` already holds the rotated rows.
 pub(in crate::kernels::cuda) fn jobs_rotated(
     stream: &RawStream,
     call: &JobsRaw<'_>,
-    fused_out: Option<bool>,
 ) -> Result<(), DeviceFailure> {
     let args = jobs_args(call)?;
     let mut stage = STAGE_NONE;
-    let request = fused_out.map_or(-1, c_int::from);
     // SAFETY: the same checked argument block as jobs; the entry skips the input rotation and
     // reads the rows of xh that the pair rotation of the same stream wrote.
-    let status =
-        unsafe { inference_cuda_exl3_jobs_rotated(&args, stream.as_ptr(), &mut stage, request) };
+    let status = unsafe { inference_cuda_exl3_jobs_rotated(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

@@ -32,14 +32,14 @@
 use crate::{
     EngError,
     expert_tier::{ExpertId, Placement, Residency},
-    family::qwen36::tiered::{
-        PolicyMode, TieredConfig,
-        budget::{
-            BudgetError, ExpertSize, HostBudget, HostPlan, KvPlan, VramBudget, VramPlan, plan_host,
+    family::{
+        device_budget::KvPlan,
+        qwen36::tiered::{PolicyMode, TieredConfig, policy::StaticProfile},
+        tier_budget::{
+            BudgetError, ExpertSize, HostBudget, HostPlan, VramBudget, VramPlan, plan_host,
             plan_vram,
         },
-        classify::{Classified, LengthMismatch, classify_reference},
-        policy::StaticProfile,
+        tiered_classify::{Classified, LengthMismatch, classify_reference},
     },
 };
 
@@ -58,7 +58,7 @@ pub(in crate::family::flash_next) struct TierShape {
 
 impl TierShape {
     /// The shape from the header walk: every routed expert has the same size because every bank
-    /// has one rate and the shapes are fixed (`FlashPackReport::expert_bytes` is their sum).
+    /// has one rate and the shapes are fixed (`PackReport::expert_bytes` is their sum).
     pub(in crate::family::flash_next) fn from_pack(
         layers: usize,
         experts: usize,
@@ -88,10 +88,27 @@ impl TierShape {
     }
 }
 
+/// The indexer key bytes one position carries. Refused unless the key of `idx_dim` f32
+/// values divides evenly over `ratio` positions.
+pub(in crate::family::flash_next) fn indexer_key_bytes(
+    idx_dim: u64,
+    ratio: u64,
+) -> Result<u64, EngError> {
+    if ratio == 0 || !(idx_dim * 4).is_multiple_of(ratio) {
+        return Err(refuse(format!(
+            "the indexer key of {idx_dim} f32 values does not divide over {ratio} positions"
+        )));
+    }
+    Ok(idx_dim * 4 / ratio)
+}
+
 /// K/V and indexer-key bytes of one context position: per QSA layer a K row and a V row of
 /// `heads_kv * head_dim` values of `kv_elem_bytes`, and one f32 indexer key of `idx_dim` per `ratio`
 /// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes here; `KvGeometry::position_bytes`
 /// (`context_budget.rs`) adds the f32 row scales and is what the step's budget uses.
+/// Bytes one context position costs in the raw element size `kv_elem_bytes`. The per-layer
+/// K/V payload is the shared arithmetic, mapped by element size; the indexer key and the
+/// layer multiply are this family's geometry.
 pub(in crate::family::flash_next) fn position_bytes(
     qsa_layers: u64,
     heads_kv: u64,
@@ -99,12 +116,25 @@ pub(in crate::family::flash_next) fn position_bytes(
     kv_elem_bytes: u64,
     (idx_dim, ratio): (u64, u64),
 ) -> Result<u64, EngError> {
-    if ratio == 0 || !(idx_dim * 4).is_multiple_of(ratio) {
-        return Err(refuse(format!(
-            "the indexer key of {idx_dim} f32 values does not divide over {ratio} positions"
-        )));
-    }
-    Ok(qsa_layers * (2 * heads_kv * head_dim * kv_elem_bytes + idx_dim * 4 / ratio))
+    let format = match kv_elem_bytes {
+        1 => crate::family::kv_format::KvFormat::Int8 {
+            group: 1,
+            scale_bytes: 0,
+        },
+        2 => crate::family::kv_format::KvFormat::F16,
+        4 => crate::family::kv_format::KvFormat::F32,
+        other => {
+            return Err(refuse(format!(
+                "the K/V element size {other} bytes is neither 1, 2 nor 4"
+            )));
+        }
+    };
+    let kv =
+        format.layer_position_bytes(crate::family::kv_format::KvRowShape { heads_kv, head_dim })?;
+    indexer_key_bytes(idx_dim, ratio)?
+        .checked_add(kv)
+        .and_then(|per_position| per_position.checked_mul(qsa_layers))
+        .ok_or_else(|| refuse("the bytes of one position overflow".into()))
 }
 
 /// What the plan reads. The VRAM and host fields are the caller's measurements.
@@ -128,8 +158,8 @@ impl TierInputs {
     /// "desktop reserve"), plus the ledger's 64 MiB chunked-attention part charge, which stands in for
     /// Flash-Next's own engine state until the step's arena plan supplies the real term. The host keeps the larger of
     /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
-    /// heap, 1 GiB of staging and a 1 GiB margin. Prefill transients (the hyper stream, QSA scratch
-    /// and expert streaming planes) are not charged yet; the step's arena plan supplies them.
+    /// heap, 1 GiB of staging and a 1 GiB margin. The caller adds the live shared-prefill scratch
+    /// through `with_prefill_arena` before selecting the expert slots; the legacy path adds zero.
     pub(in crate::family::flash_next) fn measured(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
@@ -137,9 +167,14 @@ impl TierInputs {
         free_vram: u64,
         (mem_total, mem_available): (u64, u64),
     ) -> Self {
+        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
+        // Borrowed policy: the four qwen36 constants below are the fixed-CUDA
+        // admission ledger that family measured; the expert budget admits
+        // against the same ledger and no Flash-server floor has been qualified.
+        // Flash-Next's own values replace the borrow when measured.
         use crate::family::qwen36::admission_sketch::{
             ADMISSION_UNCERTAINTY_BAND_BYTES, FIXED_ADMISSION_MARGIN_BYTES,
-            PREFILL_PART_CHARGE_BYTES, PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
+            PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
         };
         const GIB: u64 = 1 << 30;
         Self {
@@ -162,6 +197,20 @@ impl TierInputs {
                 margin: GIB,
             },
         }
+    }
+
+    /// Adds the live shared-prefill arena without reclaiming the measured runtime reserves.
+    /// Zero preserves the legacy inputs byte-for-byte.
+    pub(in crate::family::flash_next) fn with_prefill_arena(
+        mut self,
+        bytes: u64,
+    ) -> Result<Self, EngError> {
+        self.vram.arena = self
+            .vram
+            .arena
+            .checked_add(bytes)
+            .ok_or_else(|| refuse("prefill arena bytes overflow".into()))?;
+        Ok(self)
     }
 
     /// The cost model's card: an RTX 3090 (24 GiB) with a 62 GiB host and fixed reserves of 64 MiB of

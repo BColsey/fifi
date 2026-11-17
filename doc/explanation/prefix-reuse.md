@@ -3,7 +3,7 @@
 Chat clients send the whole conversation with every request.
 Without reuse, the engine processes every token of that history again on each turn, so replies take longer to start as the conversation grows.
 
-With `"prefix_reuse": true` in the configuration file, the engine saves its state at the end of each finished turn.
+With `"prefix_reuse": true` in the configuration file, the engine saves its state at the end of each finished turn. An omitted key resolves per family at startup: on for the qualified reuse paths (Flash-Next CUDA and Qwen3.6 CUDA on the CUDA build, since the 2026-11-13 qualification), off for every other family - the boundary marking alone would only split their prefill and change their outputs.
 When the next request starts with the same tokens, the engine restores that state and processes only the new part.
 On a long conversation this turns tens of seconds of prompt processing into a few seconds.
 
