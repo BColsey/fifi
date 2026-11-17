@@ -26,3 +26,11 @@ pub(in crate::family) mod arena;
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(in crate::family) mod chunk_family;
+
+#[cfg(all(
+    test,
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) mod mlx_request_bench;

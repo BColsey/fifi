@@ -3255,6 +3255,44 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    #[ignore = "Apple Silicon worker request timing"]
+    fn mlx_request_bench() {
+        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, PIECE};
+        use crate::sched::worker::spawn_engine_noted;
+
+        let grouped = std::env::var_os("FIFI_MLX_GROUPED_IMPORT").is_some_and(|value| value == "1");
+        let settings = serving(Q36Options {
+            prefill_chunk: Some(PIECE),
+            prefill_budget_bytes: Some(2 << 30),
+            prefill_session_reserve_bytes: Some(64 << 20),
+            ..Q36Options::default()
+        });
+        let rules = Q36Rules {
+            context_limit: 128,
+            session_cap: 128 * GROWTH,
+            activation: Activation::Bf16,
+            ..chunk_rules()
+        };
+        mlx_request_bench::measure(
+            "qwen36",
+            if grouped { "grouped" } else { "default" },
+            |note| {
+                spawn_engine_noted(PIECE as usize, note, move |_| {
+                    let (mut executor, session) = build(rules);
+                    executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
+                    plan_prefill(&mut executor, &settings)?;
+                    assert_eq!(executor.prefill_chunk(), Some(PIECE));
+                    Ok((executor, session))
+                })
+                .unwrap()
+            },
+            cycle,
+            seeded_generation,
+        );
+    }
+
     /// A serving entry with a budget plans a chunk from its settings, and the worker feeds the
     /// prompt in chunks. The settings carry the explicit F32 control (`activation_dtype`), the
     /// qualification row of the planner; the BF16 entry has its own test below. The planned chunk

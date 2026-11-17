@@ -2220,6 +2220,48 @@ mod tests {
         assert_eq!(reused, full, "32 greedy tokens with and without reuse");
     }
 
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    #[ignore = "Apple Silicon worker request timing"]
+    fn mlx_request_bench() {
+        use crate::family::flash_next::settings::{FlashEnv, FlashOptions, FlashSettings};
+        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, PIECE};
+        use crate::sched::worker::spawn_engine_noted;
+
+        let chunked = std::env::var_os("FIFI_MLX_FLASH_CHUNKED").is_some_and(|value| value == "1");
+        let options = FlashOptions {
+            manifest: Some("fixture-manifest.json".into()),
+            cache_limit_bytes: Some(CACHE_LIMIT),
+            prefill_chunk: Some(PIECE),
+            prefill_budget_bytes: chunked.then_some(2 << 30),
+            ..FlashOptions::default()
+        };
+        let settings = FlashSettings::new(
+            Path::new("."),
+            Path::new("."),
+            Some(&options),
+            &FlashEnv::default(),
+        )
+        .unwrap();
+        mlx_request_bench::measure(
+            "flash-next",
+            if chunked { "chunked" } else { "step" },
+            |note| {
+                spawn_engine_noted(PIECE as usize, note, move |_| {
+                    let (mut executor, session) =
+                        build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
+                    executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
+                    executor.configure_prefill(&session, &settings, false)?;
+                    assert_eq!(executor.prefill_chunk(), chunked.then_some(PIECE));
+                    Ok((executor, session))
+                })
+                .unwrap()
+            },
+            cycle,
+            seeded_generation,
+        );
+    }
+
     #[test]
     fn an_engine_thread_builds_the_executor_runs_two_jobs_and_shuts_down() {
         three_jobs_on_an_engine_thread(2, None, (&[], 0));
