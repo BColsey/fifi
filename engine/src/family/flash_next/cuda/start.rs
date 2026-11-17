@@ -403,8 +403,12 @@ pub(super) fn build_driver(
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
-    let shared_prefill = super::driver::chunk::prof::check_switch_spelling()?;
-    super::driver::chunk::prof::check_shared_prefill_rows(shared_prefill, wanted.prefill_rows)?;
+    let shared_mode = super::driver::chunk::prof::check_switch_spelling()?;
+    super::driver::chunk::prof::check_shared_prefill_rows(&shared_mode, wanted.prefill_rows)?;
+    // The effective path: width 1 keeps the legacy per-token prefill even under the
+    // default-on (a no-chunking config), so the arena carve and the step choice below
+    // cannot diverge from the row rule.
+    let shared_prefill = shared_mode.effective_at(wanted.prefill_rows);
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -625,7 +629,8 @@ pub(super) fn build_driver(
 
     stage("building the step");
     // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
-    // device chunks of that many rows; one (the default) is the decode shape of before.
+    // device chunks of that many rows; one is the per-token prefill of before (the unset
+    // default under the rollback), and the shared path's default width is 256.
     let stream = Box::leak(Box::new(ctx.stream()?));
     let new_step = if shared_prefill {
         FlashStep::new_prefill

@@ -33,6 +33,11 @@ pub(crate) struct RowsRequest<'a> {
     pub(crate) tokenizer_dir: &'a std::path::Path,
     pub(crate) context: Option<u32>,
     pub(crate) kv_dtype: Option<&'a str>,
+    #[allow(
+        dead_code,
+        reason = "read only by families whose settings resolution takes a prefill width"
+    )]
+    pub(crate) prefill_rows: Option<u32>,
     pub(crate) facts: &'a crate::capability::probe::HardwareFacts,
 }
 

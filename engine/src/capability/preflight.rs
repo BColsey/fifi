@@ -191,6 +191,10 @@ pub struct Candidate {
     pub family: Option<String>,
     pub context_limit: Option<u32>,
     pub kv_dtype: Option<String>,
+    /// The candidate's chunked-prefill width, when it names one; unset resolves
+    /// to the family's default exactly as at startup. Read only by families
+    /// whose settings resolve a prefill width.
+    pub prefill_rows: Option<u32>,
 }
 
 pub use crate::family::plan_decision::{PlanAlternative, PlanDecision, PlanFixity};
@@ -339,6 +343,7 @@ fn rows_arm(
         tokenizer_dir,
         context: candidate.context_limit,
         kv_dtype: candidate.kv_dtype.as_deref(),
+        prefill_rows: candidate.prefill_rows,
         facts,
     }) {
         Ok(answer) => answer,
@@ -887,6 +892,7 @@ fn q36_preflight(
             tokenizer_dir,
             context: candidate.context_limit,
             kv_dtype: candidate.kv_dtype.as_deref(),
+            prefill_rows: candidate.prefill_rows,
             facts,
         }) {
             Ok((rows, _note, _fit)) => rows,
@@ -2281,6 +2287,7 @@ mod tests {
             tokenizer_dir: &dir,
             context: Some(262_144),
             kv_dtype: None,
+            prefill_rows: None,
             facts: &facts,
         })
         .expect("the rows");

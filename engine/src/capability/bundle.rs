@@ -384,6 +384,7 @@ fn engine_input(
             .qwen36
             .as_ref()
             .and_then(|options| options.kv_dtype.clone()),
+        prefill_rows: None,
     };
     let preflight =
         preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
@@ -629,6 +630,7 @@ mod tests {
             family: Some("qwen3_6_35b_a3b".to_string()),
             context_limit: None,
             kv_dtype: None,
+            prefill_rows: None,
         };
         let preflight = preflight::preflight(dir, dir, &candidate, &synthetic_facts())
             .map_err(|error| error.describe());
@@ -883,6 +885,7 @@ mod tests {
             family: Some("qwen3_6_35b_a3b".to_string()),
             context_limit: None,
             kv_dtype: None,
+            prefill_rows: None,
         };
         let preflight =
             preflight::preflight(dir, dir, &candidate, &synthetic_facts()).expect("report");

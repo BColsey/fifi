@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7033,
-      "ignored": 635,
+      "test_fns": 7036,
+      "ignored": 636,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
@@ -270,6 +270,7 @@
         "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
         "INFERENCE_FLASH_NEXT_PROFILE",
         "INFERENCE_FLASH_NEXT_RING_BUDGET",
+        "INFERENCE_FLASH_NEXT_SHARED_PREFILL",
         "INFERENCE_GEMMA_MATVEC_FIXTURES",
         "INFERENCE_QWEN36_SPARSE_ATTN",
         "KV_F16_ENV_PROBE",

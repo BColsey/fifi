@@ -211,29 +211,33 @@ fn shared_prefill_switch_precedes_cuda_initialization() {
         .find("CudaProjector::new()")
         .expect("CUDA initialization");
     let rows_check = build
-        .find("prof::check_shared_prefill_rows(shared_prefill, wanted.prefill_rows)?")
+        .find("prof::check_shared_prefill_rows(&shared_mode, wanted.prefill_rows)?")
         .expect("shared row configuration check");
     assert!(check < rows_check && rows_check < initialize);
 }
 
 #[test]
 fn shared_prefill_startup_refuses_the_single_row_driver_only_when_enabled() {
-    use super::prof::check_shared_prefill_rows;
+    use super::prof::{SharedPrefill, check_shared_prefill_rows};
     for rows in [1, 0] {
         assert!(matches!(
-            check_shared_prefill_rows(true, rows),
+            check_shared_prefill_rows(&SharedPrefill::OnForced, rows),
             Err(EngError::BadRequest(message)) if message.contains("prefill_rows > 1")
         ));
     }
     for rows in [2, 64, 65, 256] {
-        assert!(check_shared_prefill_rows(true, rows).is_ok());
+        assert!(check_shared_prefill_rows(&SharedPrefill::OnForced, rows).is_ok());
+    }
+    // The default-on accepts width 1: that is the per-token legacy prefill.
+    for rows in [0, 1, 2, 64, 65, 256] {
+        assert!(check_shared_prefill_rows(&SharedPrefill::OnByDefault, rows).is_ok());
     }
     for rows in [0, 1, 2, 64] {
-        assert!(check_shared_prefill_rows(false, rows).is_ok());
+        assert!(check_shared_prefill_rows(&SharedPrefill::Off, rows).is_ok());
     }
     for rows in [65, 256, u32::MAX] {
         assert!(matches!(
-            check_shared_prefill_rows(false, rows),
+            check_shared_prefill_rows(&SharedPrefill::Off, rows),
             Err(EngError::BadRequest(message)) if message.contains("needs")
         ));
     }

@@ -185,6 +185,7 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         family: Some(discovered.family.clone()),
         context_limit: args.context_limit,
         kv_dtype: args.kv_dtype.clone(),
+        prefill_rows: None,
     };
     let report = preflight::preflight(
         &args.model_dir,
