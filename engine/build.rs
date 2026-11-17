@@ -293,7 +293,13 @@ fn build_cuda() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
-    for name in ["CUDA_PATH", "CXX", "INFERENCE_CUDA_ARCHS", "PATH"] {
+    for name in [
+        "CUDA_PATH",
+        "CXX",
+        "FIFI_CUDA_LINEINFO",
+        "INFERENCE_CUDA_ARCHS",
+        "PATH",
+    ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
     for name in nvcc_env_names() {
@@ -331,6 +337,15 @@ fn build_cuda() {
     // The fault entry points exist only in builds that qualify fault handling.
     if std::env::var_os("CARGO_FEATURE_CUDA_FAULT_QUALIFICATION").is_some() {
         build.define("INFERENCE_CUDA_FAULT_QUALIFICATION", None);
+    }
+    // Sanitizer and profiler source attribution (compute-sanitizer, nsight) needs
+    // -lineinfo; default off so standard builds keep their usual artifacts.
+    // Strict switch words, like the poison alloc: FIFI_CUDA_LINEINFO=0 must stay off.
+    if matches!(
+        std::env::var("FIFI_CUDA_LINEINFO").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        build.flag("-lineinfo");
     }
     // The q8 reference instantiation exists only in fixture builds.
     if std::env::var_os("CARGO_FEATURE_CUDA_Q8_REFERENCE").is_some() {
