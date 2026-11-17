@@ -1,6 +1,6 @@
 # Q8 attention on a 16 GB M4 Mac mini
 
-On this Mac, the first depth with a consistent double-digit saving from fused Q8 decode was **12,287 positions**. Production switches at 16,384. Testing a 12,288-position threshold with a full checkpoint is the first follow-up. The second is the opt-in padded flash path for dense prefill.
+On this Mac, the first depth with a consistent double-digit saving from fused Q8 decode was **12,287 positions**. Production switches at 16,384. That makes 12,288 a candidate for full-checkpoint qualification. Padded flash is a second candidate for dense prefill on the mini.
 
 Measured 17 November 2026 on a 10-GPU-core M4, macOS 26.3, with the locked release build, Rust 1.98.1, Xcode 26.5 and `native-mlx`. The engine revision was `3f4bd6ae71d78b4ce37a37564e6c53d71a4d49a0`. Benchmark commit `6b670f488308a660e690a337dba10edaef9fe2ef` adds a decode timing test and corrects the dense-prefill reference. Both benchmarks used synthetic resident inputs and timed one attention layer through a synchronized host readback. Whole-model decode throughput, time to first token and generation quality still need a checkpoint run.
 
@@ -49,9 +49,9 @@ cargo test --locked --release --features native-mlx --lib \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
-## Next checkpoint measurement
+## Checkpoint qualification
 
-The documented 4-bit Qwen3.6 profile needs a Mac with at least 36 GB. On that host, set `Q36_CKPT_DIR` to the checkpoint directory, `Q36_PROMPT_IDS` to the same file of at least 24,576 little-endian u32 token IDs for all arms, and `RUN_DIR` to a fresh writable scratch directory. From `engine/`, compare whole-decoder latency and generated token chains around the proposed cutoff. The threshold override below is available in the native library test.
+The 16 GB mini can run the attention benchmarks above and the shared-executor fixtures. The documented 4-bit Qwen3.6 profile needs at least 36 GB, so whole-model qualification is outside the mini measurements. To reproduce the checkpoint comparison on a host that meets that profile, set `Q36_CKPT_DIR` to the checkpoint directory, `Q36_PROMPT_IDS` to the same file of at least 24,576 little-endian u32 token IDs for all arms, and `RUN_DIR` to a fresh writable scratch directory. From `engine/`, compare whole-decoder latency and generated token chains around the proposed cutoff. The threshold override below is available in the native library test.
 
 ```sh
 (
