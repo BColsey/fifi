@@ -114,7 +114,10 @@ mod device {
         family::{
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
-            session::{DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper},
+            session::{
+                DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, StoreLimits,
+                TokenStepper,
+            },
         },
         sched::worker::{ReadyNote, spawn_engine_noted},
         tokenizer::DecodeBatch,
@@ -141,7 +144,13 @@ mod device {
         /// KV8 planes are full-length planes whose cells are read only below
         /// the position word, so a rewind re-feeds and overwrites exactly the
         /// cells that the decode past the save point wrote.
-        prefix: PrefixStore<usize, u64>,
+        prefix: PrefixStore<usize, (u64, PrefixIdentity)>,
+        /// The load-time identity half of the prefix path: constant for one loaded Bolt, so
+        /// live behaviour is unchanged; a persisted or cross-step store refuses entries another
+        /// load wrote. Empty for now: the Bolt loader reads the GGUF header digest at open
+        /// but does not retain it, and threading it means widening `bolt::load`'s return; this
+        /// seam takes it when that return widens.
+        identity: PrefixIdentity,
     }
 
     /// The store's explicit one-tip shape (no roots, no periodic points),
@@ -277,7 +286,7 @@ mod device {
             key: &[u32],
             kind: SaveKind,
         ) -> Result<bool, EngError> {
-            let path = self.generation;
+            let path = (self.generation, self.identity.clone());
             let fed = st.pos;
             st.core
                 .save_prefix(&mut self.prefix, key, path, fed, kind, || Ok(st.pos))
@@ -296,7 +305,7 @@ mod device {
             st: &mut Self::Session,
             prompt: &[u32],
         ) -> Result<usize, EngError> {
-            let path = self.generation;
+            let path = (self.generation, self.identity.clone());
             let BoltSession { core, pos } = st;
             let restored = core.restore_prefix(&mut self.prefix, prompt, path, |saved| {
                 *pos = *saved;
@@ -334,6 +343,7 @@ mod device {
                 eos: eos.clone(),
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
+                identity: PrefixIdentity::default(),
             };
             Ok((
                 serve,
@@ -610,6 +620,7 @@ mod device {
                 eos: vec![0],
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
+                identity: PrefixIdentity::default(),
             };
             let mut st = BoltSession {
                 core: DecodeSession::default(),
@@ -659,6 +670,7 @@ mod device {
                 eos: vec![0],
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
+                identity: PrefixIdentity::default(),
             };
             let mut st = BoltSession {
                 core: DecodeSession::default(),

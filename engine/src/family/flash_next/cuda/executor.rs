@@ -23,7 +23,8 @@ use crate::{
     family::{
         executor::{ExecutorOps, GenerationState},
         session::{
-            DecodeSession, Limits, PrefixStore, SaveKind, SnapshotBudget, StoreLimits, check_prompt,
+            DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, SnapshotBudget,
+            StoreLimits, check_prompt,
         },
     },
     tokenizer::DecodeBatch,
@@ -53,7 +54,12 @@ pub(in crate::family::flash_next) struct FlashCudaExecutor<S: ResumesState> {
     /// roots), both stamped with the arena generation that wrote their rows (the store's
     /// path) so an entry never matches after a fresh sequence overwrote them. Unarmed,
     /// nothing is saved or restored.
-    prefix: PrefixStore<ResumeSnapshot, u64>,
+    prefix: PrefixStore<ResumeSnapshot, (u64, PrefixIdentity)>,
+    /// The load-time identity half of every path: the loaded pack's metadata
+    /// digest and the pinned tokenizer digest, constant for this executor's
+    /// lifetime. In-process saves and restores always agree with it; a
+    /// persisted or cross-step store refuses entries another load wrote.
+    identity: PrefixIdentity,
     /// The host bytes the resume store may hold across its entries (see
     /// [`resume::HOST_BUDGET_BYTES`]); a save that would cross it is skipped.
     host_budget: u64,
@@ -119,6 +125,7 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
     pub(in crate::family::flash_next) fn new(
         driver: S,
         rules: CudaRules,
+        identity: PrefixIdentity,
     ) -> Result<(Self, DecodeSession)> {
         if rules.sampler_vocab == 0 {
             return Err(EngError::Checkpoint(
@@ -133,6 +140,7 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
                 // room victim of the very Block save that follows it, so a conversation's
                 // block entry survives the turn that restored the tip (S2).
                 prefix: PrefixStore::with_limits(RESUME_LIMITS).with_recent_longer_protection(),
+                identity,
                 host_budget: resume::HOST_BUDGET_BYTES,
                 block_spacing: RESUME_BLOCK_SPACING,
                 armed: resume::on(),
@@ -160,7 +168,7 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
         rules: CudaRules,
         host_budget: u64,
     ) -> Result<(Self, DecodeSession)> {
-        let (mut executor, session) = Self::new(driver, rules)?;
+        let (mut executor, session) = Self::new(driver, rules, PrefixIdentity::default())?;
         executor.host_budget = host_budget;
         Ok((executor, session))
     }
@@ -256,11 +264,15 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
             return Ok(false);
         }
         let generation = self.driver.resume_generation();
+        // The identity half of the path: constant for this load, so live behaviour is
+        // unchanged; it exists for a persisted or cross-step store that must refuse a
+        // foreign load's entry.
+        let path = (generation, self.identity.clone());
         // Dead generations first: entries of another arena generation never candidate
         // again (the restore walk matches the path exactly), so their host bytes come off
         // the line before the charge — one stale entry must not wedge the budget until
         // restart.
-        self.prefix.retain_path(&generation);
+        self.prefix.retain_path(&path);
         // Reserve against the snapshots that will coexist with the new tip during read-back.
         let budget = SnapshotBudget {
             limit: self.host_budget,
@@ -271,7 +283,7 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
         st.save_prefix_budgeted(
             &mut self.prefix,
             key,
-            generation,
+            path,
             driver.fed(),
             kind,
             budget,
@@ -288,8 +300,9 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
             return Ok(0);
         }
         let generation = self.driver.resume_generation();
+        let path = (generation, self.identity.clone());
         let driver = &mut self.driver;
-        let restored = st.restore_prefix(&mut self.prefix, prompt, generation, |snapshot| {
+        let restored = st.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
             driver.restore_resume(snapshot)
         })?;
         // The tail prefill is about to overwrite every row above the restored boundary, and a

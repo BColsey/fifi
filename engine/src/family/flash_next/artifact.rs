@@ -4,7 +4,11 @@
 //! The manifest is the authority for the tokenizer files. `TokenizerBundle::load` checks each file
 //! against the pin that `tokenizer_pin` builds, so a stepping-stone template cannot load by mistake.
 
-use crate::{EngError, tokenizer::TokenizerPin};
+use std::path::Path;
+
+use crate::{
+    EngError, family::session::PrefixIdentity, tokenizer::TokenizerPin, weights::sha256_hex,
+};
 use serde_json::Value;
 
 fn manifest_error(message: String) -> EngError {
@@ -45,9 +49,67 @@ pub(crate) fn tokenizer_pin(manifest: &[u8], vocab_size: u32) -> Result<Tokenize
     })
 }
 
+/// The load identity of the prefix store's path: the pinned `tokenizer.json`
+/// digest and a SHA-256 over the loaded EXL3 pack's own metadata —
+/// `config.json` and the weight index read verbatim, then every other
+/// regular file of the pack by name and size in sorted order. The download
+/// manifest is deliberately not an input: it names what was downloaded, not
+/// what this loader opened, and two different packs can share one manifest.
+/// Constant for one loaded pack, so folding it into a path leaves live
+/// save/restore behaviour unchanged; a persisted store refuses entries
+/// another load wrote. The weights half is layout plus sampled content —
+/// file names and sizes, then the first and last 64 KiB of every weight
+/// file — not a full digest.
+pub(crate) fn pack_identity(pack: &Path, pin: &TokenizerPin) -> Result<PrefixIdentity, EngError> {
+    use sha2::{Digest, Sha256};
+    let pack_error = |message: String| EngError::Checkpoint(format!("pack identity: {message}"));
+    let mut hasher = Sha256::new();
+    hasher.update(b"fifi-flash-pack-v1\0");
+    for name in ["config.json", "model.safetensors.index.json"] {
+        let bytes = std::fs::read(pack.join(name))
+            .map_err(|error| pack_error(format!("{name}: {error}")))?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    let mut rest: Vec<(String, u64)> = Vec::new();
+    let entries = std::fs::read_dir(pack).map_err(|error| pack_error(error.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| pack_error(error.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "config.json" || name == "model.safetensors.index.json" {
+            continue;
+        }
+        // std::fs::metadata follows symlinks: a pack whose shards are
+        // symlinks (the Hugging Face cache layout) still counts them.
+        let meta = std::fs::metadata(entry.path())
+            .map_err(|error| pack_error(format!("{name}: {error}")))?;
+        if meta.is_file() {
+            rest.push((name, meta.len()));
+        }
+    }
+    rest.sort();
+    if rest.is_empty() {
+        return Err(pack_error(
+            "no weight files beside the manifest: refusing an empty identity".into(),
+        ));
+    }
+    for (name, len) in &rest {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(len.to_le_bytes());
+        crate::weights::hash_sampled_edges(&mut hasher, &pack.join(name), 0, *len)
+            .map_err(|error| pack_error(format!("{name}: {error}")))?;
+    }
+    let weights: [u8; 32] = hasher.finalize().into();
+    Ok(PrefixIdentity {
+        weights: sha256_hex(&weights).into(),
+        tokenizer: sha256_hex(&pin.tokenizer_json).into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tokenizer_pin;
+    use super::{pack_identity, tokenizer_pin};
     use crate::EngError;
 
     /// The four tokenizer entries of the Mac artifact manifest, with one unrelated entry.
@@ -69,6 +131,96 @@ mod tests {
         assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
         assert_eq!(pin.generation_config_json[28..], [0x70, 0xbe, 0x55, 0x0e]);
+    }
+
+    #[test]
+    fn pack_identity_binds_the_loaded_pack_not_the_manifest() {
+        // Two pack directories with identical metadata and identical
+        // (name, size) lists share one identity; one byte of difference in
+        // config.json — the kind of change a requant makes — splits them.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        for pack in [&a, &b] {
+            std::fs::create_dir(pack).unwrap();
+            std::fs::write(pack.join("config.json"), b"{\"layers\": 2}").unwrap();
+            std::fs::write(pack.join("model.safetensors.index.json"), b"{\"i\": 1}").unwrap();
+            std::fs::write(pack.join("shard-0.bin"), [0u8; 64]).unwrap();
+        }
+        let pin = tokenizer_pin(MANIFEST.as_bytes(), 248_077).unwrap();
+        let ia = pack_identity(&a, &pin).unwrap();
+        let ib = pack_identity(&b, &pin).unwrap();
+        assert_eq!(ia, ib, "identical packs must share one identity");
+        std::fs::write(b.join("config.json"), b"{\"layers\": 3}").unwrap();
+        let ic = pack_identity(&b, &pin).unwrap();
+        assert_ne!(ia, ic, "a changed config must change the identity");
+        // Same content, different size: the (name, size) list splits them.
+        std::fs::write(b.join("shard-0.bin"), [0u8; 65]).unwrap();
+        assert_ne!(ic.weights, pack_identity(&b, &pin).unwrap().weights);
+        // Same size, one differing shard byte: the sampled edges split them
+        // where (name, size) alone would collide.
+        let mut same_size = [0u8; 64];
+        same_size[63] = 1;
+        std::fs::write(b.join("shard-0.bin"), same_size).unwrap();
+        assert_ne!(ic.weights, pack_identity(&b, &pin).unwrap().weights);
+        assert_eq!(
+            ic.tokenizer, ia.tokenizer,
+            "the tokenizer half comes from the pin, not the pack"
+        );
+    }
+
+    #[test]
+    fn a_pack_with_no_weight_files_refuses_an_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("empty");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::write(pack.join("config.json"), b"{}").unwrap();
+        std::fs::write(pack.join("model.safetensors.index.json"), b"{}").unwrap();
+        match pack_identity(&pack, &tokenizer_pin(MANIFEST.as_bytes(), 1).unwrap()) {
+            Err(EngError::Checkpoint(message)) => {
+                assert!(message.contains("no weight files"), "{message:?}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_symlinked_shard_is_counted_like_a_real_one() {
+        // The Hugging Face cache layout stores shards as symlinks; the
+        // identity must follow them, not skip them.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("shard-0.bin");
+        std::fs::write(&real, [7u8; 64]).unwrap();
+        let pack = dir.path().join("linked");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::write(pack.join("config.json"), b"{\"layers\": 2}").unwrap();
+        std::fs::write(pack.join("model.safetensors.index.json"), b"{\"i\": 1}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, pack.join("shard-0.bin")).unwrap();
+        let pin = tokenizer_pin(MANIFEST.as_bytes(), 248_077).unwrap();
+        let linked = pack_identity(&pack, &pin).unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("config.json"), b"{\"layers\": 2}").unwrap();
+        std::fs::write(plain.join("model.safetensors.index.json"), b"{\"i\": 1}").unwrap();
+        std::fs::write(plain.join("shard-0.bin"), [7u8; 64]).unwrap();
+        assert_eq!(
+            linked,
+            pack_identity(&plain, &pin).unwrap(),
+            "a symlinked shard must contribute exactly what a real copy does"
+        );
+    }
+
+    #[test]
+    fn a_missing_pack_metadata_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        match pack_identity(dir.path(), &tokenizer_pin(MANIFEST.as_bytes(), 1).unwrap()) {
+            Err(EngError::Checkpoint(message)) => assert!(
+                message.starts_with("pack identity: config.json"),
+                "{message:?}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]

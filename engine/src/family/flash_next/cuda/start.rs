@@ -60,7 +60,7 @@ use crate::{
         exl3::source::PackReader,
         exl3_pack::layer_name,
         flash_next::{
-            artifact::tokenizer_pin,
+            artifact::{pack_identity, tokenizer_pin},
             load::{
                 model_shape,
                 pack_files::{FlashPackFiles, NGRAM_FILE},
@@ -74,6 +74,7 @@ use crate::{
         host_admit::HostAdmission,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
         session::DecodeSession,
+        session::PrefixIdentity,
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceStream, host_register,
@@ -175,6 +176,7 @@ pub(in crate::family::flash_next) fn start(
         EngError::Checkpoint(format!("{}: {error}", settings.manifest.display()))
     })?;
     let pin = tokenizer_pin(&manifest, settings.tokenizer_vocab_size)?;
+    let identity = pack_identity(&settings.artifact, &pin)?;
     let bundle = TokenizerBundle::load(&settings.tokenizer_dir, &pin)?;
     let rules = CudaRules {
         eos: Arc::from(bundle.eos_token_ids()),
@@ -187,7 +189,7 @@ pub(in crate::family::flash_next) fn start(
     let wanted = cuda.clone();
     let guard = BuildGuard::acquire()?;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
-        make(stages, &artifact, &wanted, rules, guard)
+        make(stages, &artifact, &wanted, rules, identity, guard)
     })?;
     Ok((engine, bundle))
 }
@@ -404,6 +406,7 @@ fn make(
     artifact: &Path,
     wanted: &CudaSettings,
     rules: CudaRules,
+    identity: PrefixIdentity,
     guard: BuildGuard,
 ) -> Result<(FlashCudaExecutor<StepDriver>, DecodeSession), EngError> {
     let driver = build_driver(
@@ -413,7 +416,7 @@ fn make(
         rules.sampler_vocab,
         Some(guard),
     )?;
-    FlashCudaExecutor::new(driver, rules)
+    FlashCudaExecutor::new(driver, rules, identity)
 }
 
 /// Loads the pack and builds the token driver. `guard` pins the one-engine flag at the first leak;

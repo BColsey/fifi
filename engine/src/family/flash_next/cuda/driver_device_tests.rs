@@ -342,6 +342,7 @@ fn the_prefix_resume_matches_a_fresh_prefill() {
             eos: Arc::from(vec![]),
             sampler_vocab: actual_vocab,
         },
+        Default::default(),
     )
     .expect("executor");
 
@@ -524,6 +525,7 @@ fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
             eos: Arc::from(vec![]),
             sampler_vocab: actual_vocab,
         },
+        Default::default(),
     )
     .expect("executor");
 
@@ -665,6 +667,7 @@ fn the_extension_turn_after_an_off_lattice_tip_restore_matches_a_fresh_prefill()
             eos: Arc::from(vec![]),
             sampler_vocab: actual_vocab,
         },
+        Default::default(),
     )
     .expect("executor");
 
@@ -850,6 +853,7 @@ fn the_mid_block_resume_over_a_block_budget_matches_a_fresh_prefill() {
             eos: Arc::from(vec![]),
             sampler_vocab: actual_vocab,
         },
+        Default::default(),
     )
     .expect("executor");
 

@@ -585,6 +585,34 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     }
 }
 
+/// The persisted-identity half of a prefix path tag: the content digests of the
+/// artifacts a saved entry belongs to (the weights the loader verified, the
+/// pinned tokenizer), each 64 lowercase hex digits or empty when that family
+/// verified none. Constant for one loaded model, so folding it into a path
+/// leaves live save/restore hit behaviour unchanged — an in-process path
+/// always agrees with itself; it exists because a persisted or cross-step
+/// store must refuse an entry saved under another load, which the numeric
+/// path alone cannot express.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrefixIdentity {
+    /// The load identity of the weights — for a pack, its layout digest
+    /// (file names, sizes and bounded content samples), for a GGUF, its
+    /// header digest plus a bounded tensor-data sample; layout plus sampled
+    /// content, not a full digest. Empty when the loader pinned none.
+    pub(crate) weights: std::sync::Arc<str>,
+    /// The pinned tokenizer digest, empty when the family loads unpinned.
+    pub(crate) tokenizer: std::sync::Arc<str>,
+}
+
+impl PrefixIdentity {
+    /// Both halves are pinned. Two unpinned loads compare equal, so a
+    /// persisted store must refuse to write or restore an entry when this
+    /// is false rather than trust an empty identity's equality.
+    pub(crate) fn is_pinned(&self) -> bool {
+        !self.weights.is_empty() && !self.tokenizer.is_empty()
+    }
+}
+
 /// What kind of save produced a stored entry: a pinned root, a periodic checkpoint of a long
 /// prompt, or the tip of the last prompt. The block cut is a fourth kind: the one rolling
 /// intermediate entry per lineage that the block prefix-match flag captures at the last block
@@ -1672,8 +1700,9 @@ fn after_token(
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodePreparation, DecodeSession, Limits, PrefixStore, Result, SaveKind, ShadowReason,
-        SnapshotBudget, StoreLimits, TokenStepper, after_token, before_step, check_prompt,
+        DecodePreparation, DecodeSession, Limits, PrefixIdentity, PrefixStore, Result, SaveKind,
+        ShadowReason, SnapshotBudget, StoreLimits, TokenStepper, after_token, before_step,
+        check_prompt,
     };
     use crate::{
         EngError,
@@ -4015,6 +4044,96 @@ mod tests {
         assert_eq!(slot.key_len(), Some(4), "the entry stays for its own path");
         let same = restore(&mut session, &mut slot, &mut step, &[1, 2, 3, 4, 5], 1);
         assert_eq!(same, Ok(4), "covered tokens under the same path");
+    }
+
+    /// The replay that gates this behaviour: with one model loaded (one constant
+    /// identity component), the identity-tagged key saves, hits and misses exactly
+    /// as the plain numeric key did — the tag changes nothing live. The same
+    /// three-phase sequence (save, restore under the saving path, restore under
+    /// another path) runs against both key kinds and the outcomes compare phase
+    /// by phase.
+    #[test]
+    fn a_constant_identity_tag_replays_the_plain_paths_outcomes() {
+        fn replay<P: Clone + PartialEq>(path: P, other: P) -> Vec<(bool, usize)> {
+            let (mut step, mut session) = held(&[1, 2, 3, 4]);
+            let mut slot = PrefixStore::<Vec<u32>, P>::with_limits(StoreLimits {
+                roots: 0,
+                entries: 2,
+            });
+            let saved = session
+                .save_prefix(
+                    &mut slot,
+                    &[1, 2, 3, 4],
+                    path.clone(),
+                    step.fed(),
+                    SaveKind::Tip,
+                    || Ok(step.fed.clone()),
+                )
+                .unwrap();
+            session.reset(&mut step).unwrap();
+            let hit = session
+                .restore_prefix(&mut slot, &[1, 2, 3, 4, 5], path, |fed| {
+                    step.fed.clone_from(fed);
+                    Ok(())
+                })
+                .unwrap();
+            session.reset(&mut step).unwrap();
+            let miss = session
+                .restore_prefix(&mut slot, &[1, 2, 3, 4, 5], other, |fed| {
+                    step.fed.clone_from(fed);
+                    Ok(())
+                })
+                .unwrap();
+            vec![(saved, 0), (false, hit), (false, miss)]
+        }
+        let plain = replay(1u8, 2u8);
+        let load = PrefixIdentity::default();
+        let tagged = replay((1u8, load.clone()), (2u8, load));
+        assert_eq!(plain, tagged, "the identity tag changed a live outcome");
+        assert_eq!(plain[1].1, 4, "the same-path restore covers the key");
+        assert_eq!(plain[2].1, 0, "the other-path restore misses");
+    }
+
+    /// The persisted-store rule the tag exists for: an entry saved under one load's
+    /// identity never restores under another load's, even with the numeric path equal.
+    #[test]
+    fn a_saved_prefix_refuses_another_loads_identity() {
+        let (mut step, mut session) = held(&[1, 2, 3, 4]);
+        let load = PrefixIdentity::default();
+        let mut slot = PrefixStore::<Vec<u32>, (u8, PrefixIdentity)>::with_limits(StoreLimits {
+            roots: 0,
+            entries: 2,
+        });
+        session
+            .save_prefix(
+                &mut slot,
+                &[1, 2, 3, 4],
+                (1u8, load.clone()),
+                step.fed(),
+                SaveKind::Tip,
+                || Ok(step.fed.clone()),
+            )
+            .unwrap();
+        session.reset(&mut step).unwrap();
+        let foreign = PrefixIdentity {
+            weights: "another-load".into(),
+            tokenizer: "".into(),
+        };
+        let miss = session
+            .restore_prefix(&mut slot, &[1, 2, 3, 4, 5], (1u8, foreign), |fed| {
+                step.fed.clone_from(fed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(miss, 0, "covered tokens under another load's identity");
+        session.reset(&mut step).unwrap();
+        let hit = session
+            .restore_prefix(&mut slot, &[1, 2, 3, 4, 5], (1u8, load), |fed| {
+                step.fed.clone_from(fed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(hit, 4, "covered tokens under the saving load");
     }
 
     #[test]

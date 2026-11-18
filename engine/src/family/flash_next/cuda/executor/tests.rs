@@ -28,6 +28,7 @@ fn build(eos: &[u32]) -> (Executor, DecodeSession) {
             eos: Arc::from(eos),
             sampler_vocab: SAMPLER_VOCAB,
         },
+        crate::family::session::PrefixIdentity::default(),
     )
     .unwrap()
 }
@@ -98,7 +99,7 @@ fn a_zero_sampler_vocabulary_is_refused() {
         eos: Arc::from([]),
         sampler_vocab: 0,
     };
-    assert!(FlashCudaExecutor::new(driver, rules).is_err());
+    assert!(FlashCudaExecutor::new(driver, rules, Default::default()).is_err());
 }
 
 #[test]
@@ -147,7 +148,7 @@ fn the_trait_answers_mainline_with_the_executor_pinned_unarmed() {
         eos: Arc::from([]),
         sampler_vocab: SAMPLER_VOCAB,
     };
-    let (executor, _session) = FlashCudaExecutor::new(driver, rules).unwrap();
+    let (executor, _session) = FlashCudaExecutor::new(driver, rules, Default::default()).unwrap();
     let executor = executor.with_armed_for_tests(false);
 
     assert_eq!(

@@ -46,7 +46,8 @@ use crate::family::gguf_model::{Inventory, Role};
 use crate::family::project::cuda::{CudaWeight, CudaWeights, WeightLayout};
 use crate::family::qwen36::cuda::rules::check_token_id;
 use crate::family::session::{
-    DecodeSession, Limits, PrefixSlot, SaveKind, StoreLimits, TokenStepper, check_prompt,
+    DecodeSession, Limits, PrefixIdentity, PrefixSlot, SaveKind, StoreLimits, TokenStepper,
+    check_prompt,
 };
 use crate::kernels::cuda::resident::step_params::StepParams;
 use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
@@ -82,9 +83,14 @@ pub(crate) struct CardSession {
     /// The prefix store of the session: one entry is one `ExportedState`
     /// per card (the card's sliced KV planes plus its DeltaNet state), so
     /// an entry's host cost is one replica of cache plus two delta pools.
-    prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
+    prefix: PrefixSlot<Vec<ExportedState>, (CudaPrefillPath, PrefixIdentity)>,
     /// The numeric path every entry of this session saves and restores under.
     prefix_path: CudaPrefillPath,
+    /// The load-time identity half of every save/restore path: constant for this session's
+    /// loaded model (the GGUF header digest and the pinned tokenizer digest), so live
+    /// behaviour is unchanged; a persisted or cross-step store refuses entries another
+    /// load wrote.
+    identity: PrefixIdentity,
     /// Set by a prefix import: the word block was zeroed, so the next feed
     /// writes the full step params (token id AND position) again.
     full_params_next: bool,
@@ -110,6 +116,7 @@ impl CardSession {
         options: &StepOptions,
         eos: Arc<[u32]>,
         sampler_vocab: usize,
+        identity: PrefixIdentity,
         prefix_limits: StoreLimits,
     ) -> Result<Self, EngError> {
         let cards = stack.shards().len();
@@ -261,6 +268,7 @@ impl CardSession {
                 .is_some_and(|value| value == "1"),
             prefix: PrefixSlot::with_limits(prefix_limits),
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
+            identity,
             full_params_next: false,
             eos,
             sampler_vocab,
@@ -535,13 +543,20 @@ impl ExecutorOps for CardSession {
         }
         let fed = self.fed;
         let mut slot = std::mem::take(&mut self.prefix);
-        let saved = st.save_prefix(&mut slot, key, self.prefix_path, fed, kind, || {
-            self.states
-                .iter()
-                .enumerate()
-                .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
-                .collect()
-        });
+        let saved = st.save_prefix(
+            &mut slot,
+            key,
+            (self.prefix_path, self.identity.clone()),
+            fed,
+            kind,
+            || {
+                self.states
+                    .iter()
+                    .enumerate()
+                    .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
+                    .collect()
+            },
+        );
         self.prefix = slot;
         saved
     }
@@ -555,22 +570,29 @@ impl ExecutorOps for CardSession {
             return Ok(0);
         }
         let mut slot = std::mem::take(&mut self.prefix);
-        let covered = st.restore_prefix(&mut slot, prompt, self.prefix_path, |saved| {
-            if saved.len() != self.states.len() {
-                return Err(EngError::BadRequest(format!(
-                    "card prefix: {} saved states for {} cards",
-                    saved.len(),
-                    self.states.len()
-                )));
-            }
-            let tokens = saved[0].tokens;
-            for (card, (state, exported)) in self.states.iter_mut().zip(saved.iter()).enumerate() {
-                state.import_state(&self.stack.streams()[card], exported)?;
-            }
-            self.fed = tokens;
-            self.full_params_next = true;
-            Ok(())
-        });
+        let covered = st.restore_prefix(
+            &mut slot,
+            prompt,
+            (self.prefix_path, self.identity.clone()),
+            |saved| {
+                if saved.len() != self.states.len() {
+                    return Err(EngError::BadRequest(format!(
+                        "card prefix: {} saved states for {} cards",
+                        saved.len(),
+                        self.states.len()
+                    )));
+                }
+                let tokens = saved[0].tokens;
+                for (card, (state, exported)) in
+                    self.states.iter_mut().zip(saved.iter()).enumerate()
+                {
+                    state.import_state(&self.stack.streams()[card], exported)?;
+                }
+                self.fed = tokens;
+                self.full_params_next = true;
+                Ok(())
+            },
+        );
         self.prefix = slot;
         covered
     }

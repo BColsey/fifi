@@ -999,7 +999,7 @@ fn make_multi(
         "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full",
         settings.cuda_devices, first.cc_major, first.cc_minor
     );
-    let (model, _gguf) = open_gguf(
+    let (model, gguf) = open_gguf(
         &settings.artifact,
         plan.verify,
         plan.allow_unpinned,
@@ -1160,6 +1160,35 @@ fn make_multi(
         &options,
         rules.eos,
         rules.sampler_vocab,
+        // The identity half of the prefix path: the GGUF header digest
+        // (hashed once while the header parsed) plus a bounded sample of the
+        // tensor-data region beyond the header (first and last 64 KiB), and
+        // the pinned tokenizer digest — layout plus sampled content, not a
+        // full digest. Constant for one loaded checkpoint, so folding it
+        // into a path leaves live save/restore behaviour unchanged.
+        {
+            use sha2::{Digest, Sha256};
+            let mut weights_hasher = Sha256::new();
+            let header = model.weights.header();
+            weights_hasher.update(header.header_sha256());
+            // The tensor-data region starts at the first tensor's absolute
+            // offset; the sample skips the already-hashed header.
+            let data_start = header
+                .tensors()
+                .iter()
+                .map(|tensor| tensor.abs_offset())
+                .min()
+                .unwrap_or(0);
+            let gguf_len = std::fs::metadata(&gguf)
+                .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?
+                .len();
+            crate::weights::hash_sampled_edges(&mut weights_hasher, &gguf, data_start, gguf_len)
+                .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?;
+            crate::family::session::PrefixIdentity {
+                weights: crate::weights::sha256_hex(&weights_hasher.finalize().into()).into(),
+                tokenizer: crate::weights::sha256_hex(&tokenizer_pin()?.tokenizer_json).into(),
+            }
+        },
         // Experimental and default off: the card path's prefix save/restore
         // is wired but NOT yet qualified (the restore passed filler-agnostic
         // bench answers and failed a deeper turn-chain check; see the branch

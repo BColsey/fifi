@@ -859,6 +859,39 @@ pub fn sha256_hex(digest: &[u8; 32]) -> String {
     })
 }
 
+/// Bounded content sample for load identities: the length of the file's data
+/// region, then its first and last 64 KiB, enter `hasher` — so a same-size
+/// replacement of the region cannot collide with (name, size) alone. A region
+/// under 128 KiB is covered end to end; a longer one leaves the middle
+/// unsampled. Load cost stays bounded at 128 KiB per weight file (a
+/// 200-shard pack reads about 25 MiB).
+pub fn hash_sampled_edges(
+    hasher: &mut sha2::Sha256,
+    file: &std::path::Path,
+    data_start: u64,
+    len: u64,
+) -> Result<(), std::io::Error> {
+    use sha2::Digest;
+    use std::os::unix::fs::FileExt;
+
+    const EDGE: u64 = 64 * 1024;
+    let region = len.saturating_sub(data_start);
+    hasher.update(region.to_le_bytes());
+    let head = region.min(EDGE);
+    let mut buf = vec![0u8; head as usize];
+    let file = std::fs::File::open(file)?;
+    file.read_exact_at(&mut buf, data_start)?;
+    hasher.update(&buf);
+    let tail = region.saturating_sub(head).min(EDGE);
+    if tail > 0 {
+        buf.clear();
+        buf.resize(tail as usize, 0);
+        file.read_exact_at(&mut buf, data_start + region - tail)?;
+        hasher.update(&buf);
+    }
+    Ok(())
+}
+
 fn parse_hex_digest(hex: &str) -> Result<[u8; 32], EngError> {
     let bytes = hex.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {

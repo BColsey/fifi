@@ -32,8 +32,8 @@ pub(crate) mod acquire_read {
     pub(crate) use super::acquire::{reset, set, snapshot};
 }
 pub use gguf::{
-    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set, sha256_hex,
-    sha256_stream, verify_sha256,
+    ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set,
+    hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
 };
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
