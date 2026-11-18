@@ -1433,9 +1433,12 @@ pub(super) mod cuda {
         fn auto_cache_counts_both_copies_on_integrated_hardware() {
             let bare = CudaPlan::new(small(100), u64::MAX).unwrap();
             let wanted = 17;
-            let ceiling = bare.host_total + bare.device_peak + 2 * wanted + 1;
             let mut input = small(100);
             input.device_weight_cache_bytes = 64;
+            // This fixture stages small tensors when uncached. With caching enabled it
+            // also needs one pageable upload before the host and device cache copies.
+            let fixed_device = bare.device_peak + input.largest_tensor_bytes;
+            let ceiling = bare.host_total + fixed_device + 2 * wanted + 1;
             let mut ticket =
                 admit_cuda_plan(input, MemoryPolicy::default_share(), ceiling).unwrap();
             ticket.enable_auto_cache();
@@ -1444,7 +1447,7 @@ pub(super) mod cuda {
                 .into_cleanup_with_cache(memory(10_000), true, &mut budget)
                 .unwrap();
             assert_eq!(budget, wanted);
-            assert_eq!(held(), (ceiling - 1, bare.device_peak + wanted));
+            assert_eq!(held(), (ceiling - 1, fixed_device + wanted));
             cleanup();
         }
 
