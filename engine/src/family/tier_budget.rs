@@ -320,14 +320,15 @@ pub fn plan_store_tiers(b: &StoreTierBudget) -> Result<StoreTierPlan, BudgetErro
     };
     // Both tiers must leave the page-cache floor standing, not merely fit.
     let fits = |needed: u64| needed <= b.available && b.available - needed >= b.page_cache_min;
-    if let Some(plan) = charge(inclusive_store, 0).filter(|&needed| fits(needed)).map(|needed| {
-        StoreTierPlan {
+    if let Some(plan) = charge(inclusive_store, 0)
+        .filter(|&needed| fits(needed))
+        .map(|needed| StoreTierPlan {
             tier: StoreTier::Inclusive,
             store_bytes: inclusive_store,
             process_bytes: needed - b.os_floor,
             page_cache_left: b.available - needed,
-        }
-    }) {
+        })
+    {
         return Ok(plan);
     }
     // The ring tier: the largest resident count that fits, downward to
@@ -369,10 +370,71 @@ pub fn plan_store_tiers(b: &StoreTierBudget) -> Result<StoreTierPlan, BudgetErro
 ///
 /// `direct_bytes_per_s` is the O_DIRECT sequential rate measured once at
 /// serve start (the same ring the misses use), logged with the line below.
+pub fn expected_decode_toks(
+    resident_toks_per_s: f64,
+    miss_bytes_per_token: u64,
+    direct_bytes_per_s: f64,
+) -> f64 {
+    // A tier with no misses runs at its resident figure whatever the rate
+    // measured or not — reporting 0 tok/s there would hide a working tier.
+    if miss_bytes_per_token == 0 {
+        return resident_toks_per_s;
+    }
+    if direct_bytes_per_s <= 0.0 {
+        return 0.0;
+    }
+    let per_token = 1.0 / resident_toks_per_s + miss_bytes_per_token as f64 / direct_bytes_per_s;
+    if per_token <= 0.0 {
+        0.0
+    } else {
+        1.0 / per_token
+    }
+}
+
 /// The one serve log line that states the tier choice and its price:
 /// the tier with its resident count and ring bytes, the exact-bytes figures
 /// of the plan, the measured direct rate it was priced against, and the
 /// expected tok/s beside the resident control figure.
+pub fn serve_tier_line(
+    plan: &StoreTierPlan,
+    miss_bytes_per_token: u64,
+    direct_bytes_per_s: f64,
+    resident_toks_per_s: f64,
+) -> String {
+    let expected = expected_decode_toks(
+        resident_toks_per_s,
+        miss_bytes_per_token,
+        direct_bytes_per_s,
+    );
+    match plan.tier {
+        StoreTier::Inclusive => format!(
+            "serve tier: inclusive (every expert pinned); store {} B, process {} B; \
+             misses 0 B/token; expected {:.0} tok/s (resident control {:.0} tok/s)",
+            plan.store_bytes, plan.process_bytes, expected, resident_toks_per_s
+        ),
+        StoreTier::ExclusiveRing {
+            places_per_layer,
+            ring_bytes,
+        } => format!(
+            "serve tier: exclusive+ring; {}{}; ring {} B; store {} B, \
+             process {} B; misses {} B/token at direct rate {direct_bytes_per_s:.1e} B/s; \
+             expected {:.0} tok/s (resident control {:.0} tok/s)",
+            places_per_layer,
+            if places_per_layer == 0 {
+                " resident places/layer (all misses from disk)"
+            } else {
+                " resident places/layer"
+            },
+            ring_bytes,
+            plan.store_bytes,
+            plan.process_bytes,
+            miss_bytes_per_token,
+            expected,
+            resident_toks_per_s
+        ),
+    }
+}
+
 fn bad_input(what: &str) -> BudgetError {
     BudgetError::BadInput(String::from(what))
 }
@@ -670,7 +732,10 @@ mod store_tier_tests {
     //!     p=4 -> 15_548   p=3 -> 12_548   p=2 -> 9_548   p=1 -> 6_548
     //!     p=0 (ring only) -> 3_548
 
-    use super::{BudgetError, StoreTier, StoreTierBudget, plan_store_tiers};
+    use super::{
+        BudgetError, StoreTier, StoreTierBudget, expected_decode_toks, plan_store_tiers,
+        serve_tier_line,
+    };
 
     const INCLUSIVE_NEEDED: u64 = 31_500;
     const RING_TIER_P4: u64 = 15_548;
@@ -749,6 +814,11 @@ mod store_tier_tests {
         );
         assert_eq!(plan.store_bytes, 0);
         assert_eq!(plan.page_cache_left, 0);
+        let line = serve_tier_line(&plan, 8_000_000, 1e9, 100.0);
+        assert!(
+            line.contains("0 resident places/layer (all misses from disk)"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -756,7 +826,11 @@ mod store_tier_tests {
         // 3_547 < 3_548: not even zero places with the ring fits.
         let err = plan_store_tiers(&budget(RING_ONLY - 1)).unwrap_err();
         match err {
-            BudgetError::Overcommitted { what, needed, available } => {
+            BudgetError::Overcommitted {
+                what,
+                needed,
+                available,
+            } => {
                 assert!(what.contains("not even zero"), "{what}");
                 assert_eq!(needed, RING_ONLY);
                 assert_eq!(available, RING_ONLY - 1);
@@ -805,4 +879,37 @@ mod store_tier_tests {
         ));
     }
 
+    #[test]
+    fn the_expected_rate_adds_miss_time_to_the_resident_step() {
+        // Resident 100 tok/s = 10 ms/token; 8 MiB of misses at 1 GiB/s adds
+        // 8_388_608/1_073_741_824 = 7.8125 ms, so the expected rate is
+        // 1 / 0.0178125 s = 56.1404... -> "56".
+        let got = expected_decode_toks(100.0, 8 * 1_048_576, 1_073_741_824.0);
+        let want = 1.0 / 0.0178125;
+        assert!((got - want).abs() < 1e-9 * want, "{got} vs {want}");
+        // No misses: the resident figure, exactly — at ANY rate, measured or
+        // not, because a tier with no misses never touches the disk.
+        assert_eq!(expected_decode_toks(100.0, 0, 1e9), 100.0);
+        assert_eq!(expected_decode_toks(100.0, 0, 0.0), 100.0);
+        // Misses with no measurable rate: refuse to guess, report zero.
+        assert_eq!(expected_decode_toks(100.0, 8, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_serve_line_names_the_tier_its_figures_and_the_price() {
+        let plan = plan_store_tiers(&budget(INCLUSIVE_NEEDED)).unwrap();
+        let line = serve_tier_line(&plan, 0, 0.0, 100.0);
+        assert!(line.starts_with("serve tier: inclusive"), "{line}");
+        assert!(line.contains("store 30000 B"), "{line}");
+        // Inclusive at an unmeasured rate (0.0): the resident figure stands.
+        assert!(line.contains("expected 100 tok/s"), "{line}");
+
+        let plan = plan_store_tiers(&budget(INCLUSIVE_NEEDED - 1)).unwrap();
+        let line = serve_tier_line(&plan, 8 * 1_048_576, 1_073_741_824.0, 100.0);
+        assert!(line.starts_with("serve tier: exclusive+ring"), "{line}");
+        assert!(line.contains("4 resident places/layer"), "{line}");
+        assert!(line.contains("ring 2048 B"), "{line}");
+        assert!(line.contains("8388608 B/token"), "{line}");
+        assert!(line.contains("expected 56 tok/s"), "{line}");
+    }
 }
