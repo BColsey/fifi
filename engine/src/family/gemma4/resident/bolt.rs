@@ -41,6 +41,7 @@ use super::{
     vector_filled, zero,
 };
 use crate::EngError;
+use crate::family::gemma4::gguf::ple_rows_from_merged;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
@@ -60,6 +61,7 @@ use crate::kernels::cuda::resident::row_add::RowAddCall;
 use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
+use crate::weights::GgufType;
 
 // Geometry is read from the family descriptor, the single source of truth;
 // the executor pins only the cache cell count and the checkpoint properties
@@ -302,7 +304,7 @@ pub(crate) fn bolt_demand(
 }
 
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
-    let weights = super::super::open_bolt_weights(path, header_sha256)?;
+    let (weights, spelling) = super::super::open_bolt_weights(path, header_sha256)?;
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
     let stream = ctx.stream()?;
     // Admit the device budget before allocating: weights + KV cache + scratch
@@ -316,6 +318,27 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     let demand = bolt_demand(weights_bytes, attn_split_wanted()?)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     let mut layers = Vec::with_capacity(LAYERS);
+    // The canonical spelling's merged per_layer_token_embd is read once and
+    // sliced per layer below; the legacy spelling reads each layer's own
+    // table instead.
+    let merged = match spelling.ple_table(0) {
+        Some(_) => None,
+        None => {
+            let name = spelling.per_layer_token_embd().ok_or_else(|| {
+                EngError::Checkpoint(
+                    "gguf model: the canonical spelling carries the merged table".to_string(),
+                )
+            })?;
+            let (ty, bytes) = weights.read_tensor(name)?;
+            if ty != GgufType::Q80 {
+                return Err(EngError::Checkpoint(format!(
+                    "gguf model: tensor {name} is {}, expected Q8_0",
+                    ty.name()
+                )));
+            }
+            Some(bytes)
+        }
+    };
     for layer in 0..LAYERS {
         let global = NEMOTRON_BOLT_E4B.layers_attention[layer] == AttentionKind::Full;
         let head = if global { GLOBAL_HEAD } else { LOCAL_HEAD };
@@ -424,30 +447,45 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
             ple_gate: packed_matrix(
                 &weights,
                 &ctx,
-                &format!("{base}per_layer_gate.weight"),
+                &format!("{base}{}", spelling.ple_gate()),
                 HIDDEN,
                 PLE,
             )?,
             ple_proj: packed_matrix(
                 &weights,
                 &ctx,
-                &format!("{base}per_layer_proj.weight"),
+                &format!("{base}{}", spelling.ple_proj()),
                 PLE,
                 HIDDEN,
             )?,
             post_ple_norm: vector(
                 &weights,
                 &ctx,
-                &format!("{base}post_per_layer_input_norm.weight"),
+                &format!("{base}{}", spelling.ple_post_norm()),
                 HIDDEN,
             )?,
-            table: matrix(
-                &weights,
-                &ctx,
-                &format!("{base}per_layer_embd.weight"),
-                PLE,
-                VOCAB,
-            )?,
+            table: match spelling.ple_table(layer) {
+                Some(name) => matrix(&weights, &ctx, &name, PLE, VOCAB)?,
+                None => {
+                    let bytes = ple_rows_from_merged(
+                        merged.as_deref().ok_or_else(|| {
+                            EngError::Checkpoint(
+                                "gguf model: the merged table was hoisted for the canonical spelling"
+                                    .to_string(),
+                            )
+                        })?,
+                        layer,
+                        PLE,
+                        LAYERS,
+                        VOCAB,
+                    );
+                    Matrix {
+                        buf: ctx.upload(&bytes)?,
+                        rows: VOCAB,
+                        k: PLE,
+                    }
+                }
+            },
             scale: scalar(&weights, &format!("{base}layer_output_scale.weight"))?,
             global,
             head,
@@ -459,11 +497,11 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     let ple_model = packed_matrix(
         &weights,
         &ctx,
-        "per_layer_model_projection.weight",
+        spelling.ple_model_proj(),
         HIDDEN,
         LAYERS * PLE,
     )?;
-    let ple_model_norm = vector(&weights, &ctx, "per_layer_projection_norm.weight", PLE)?;
+    let ple_model_norm = vector(&weights, &ctx, spelling.ple_proj_norm(), PLE)?;
     let out_norm = vector(&weights, &ctx, "output_norm.weight", HIDDEN)?;
     let rope_freqs = Some(vector(&weights, &ctx, "rope_freqs.weight", 256)?);
     let eps = epsilon(&weights)?;

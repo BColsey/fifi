@@ -17,7 +17,15 @@ const ARCHITECTURE: &str = "gemma4";
 /// Reader limits: a 100-MB header cap and a 1-GiB tensor cap.
 const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 100_000_000,
+    // Humanizer's largest tensor stays under 1 GiB.
     max_tensor_bytes: 1 << 30,
+};
+const BOLT_LIMITS: GgufLimits = GgufLimits {
+    max_header_bytes: 100_000_000,
+    // The canonical spelling's merged per_layer_token_embd table holds
+    // PLE * layers rows of the vocabulary: 2_994_733_056 bytes, so the cap
+    // sits just above it (the legacy per-tensor ceiling was ~712 MiB).
+    max_tensor_bytes: 3 << 30,
 };
 const LAYERS: usize = 48;
 const HIDDEN: u64 = 3840;
@@ -406,6 +414,80 @@ const BOLT_INT_SCALARS: [(&str, u64); 16] = [
     ("tokenizer.ggml.unknown_token_id", 3),
 ];
 
+/// Which of the two accepted Bolt GGUF spellings a file uses: the legacy
+/// engine-private names the in-house converter wrote, or the canonical
+/// llama.cpp gemma4 reference names. The sharing map never depends on the
+/// spelling: it derives from `gemma4.attention.shared_kv_layers` and the
+/// sliding pattern, so both spellings resolve to the same per-layer KV
+/// sources.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BoltSpelling {
+    Canonical,
+    Legacy,
+}
+
+impl BoltSpelling {
+    /// The model-level per-layer projection onto the residual stream.
+    pub(crate) fn ple_model_proj(self) -> &'static str {
+        match self {
+            BoltSpelling::Canonical => "per_layer_model_proj.weight",
+            BoltSpelling::Legacy => "per_layer_model_projection.weight",
+        }
+    }
+
+    /// The norm over the per-layer embedding width.
+    pub(crate) fn ple_proj_norm(self) -> &'static str {
+        match self {
+            BoltSpelling::Canonical => "per_layer_proj_norm.weight",
+            BoltSpelling::Legacy => "per_layer_projection_norm.weight",
+        }
+    }
+
+    /// The suffix that gates the per-layer embedding into the layer.
+    pub(crate) fn ple_gate(self) -> &'static str {
+        match self {
+            BoltSpelling::Canonical => "inp_gate.weight",
+            BoltSpelling::Legacy => "per_layer_gate.weight",
+        }
+    }
+
+    /// The suffix of the per-layer projection back to the residual stream.
+    pub(crate) fn ple_proj(self) -> &'static str {
+        match self {
+            BoltSpelling::Canonical => "proj.weight",
+            BoltSpelling::Legacy => "per_layer_proj.weight",
+        }
+    }
+
+    /// The suffix of the post-norm after the per-layer projection.
+    pub(crate) fn ple_post_norm(self) -> &'static str {
+        match self {
+            BoltSpelling::Canonical => "post_norm.weight",
+            BoltSpelling::Legacy => "post_per_layer_input_norm.weight",
+        }
+    }
+
+    /// The merged [PLE * layers, vocab] per-layer token table of the
+    /// canonical spelling; the legacy spelling has no model-level table.
+    pub(crate) fn per_layer_token_embd(self) -> Option<&'static str> {
+        match self {
+            BoltSpelling::Canonical => Some("per_layer_token_embd.weight"),
+            BoltSpelling::Legacy => None,
+        }
+    }
+
+    /// The per-layer slice of the per-layer token table: `None` when the
+    /// spelling carries one table per layer instead of the merged one.
+    /// Only the CUDA resident load path asks for it.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn ple_table(self, layer: usize) -> Option<String> {
+        match self {
+            BoltSpelling::Canonical => None,
+            BoltSpelling::Legacy => Some(format!("blk.{layer}.per_layer_embd.weight")),
+        }
+    }
+}
+
 /// Opens the converted Bolt Q8_0 GGUF and checks its metadata and tensors.
 /// Applies the checks of open_humanizer_q8 against the Bolt geometry: two KV
 /// heads on the 24 physical layers and none on the 18 shared layers.
@@ -413,13 +495,14 @@ pub fn open_bolt_q8(path: &Path, header_sha256: Option<&str>) -> Result<(), EngE
     open_bolt_weights(path, header_sha256).map(|_| ())
 }
 
-/// Opens the converted Bolt checkpoint and returns the checked reader, for
-/// the resident loader. Applies exactly the checks of open_bolt_q8.
+/// Opens the converted Bolt checkpoint and returns the checked reader plus
+/// the spelling its tensors use, for the resident loader. Applies exactly
+/// the checks of open_bolt_q8.
 pub(crate) fn open_bolt_weights(
     path: &Path,
     header_sha256: Option<&str>,
-) -> Result<GgufWeights, EngError> {
-    let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+) -> Result<(GgufWeights, BoltSpelling), EngError> {
+    let weights = GgufWeights::open(path, BOLT_LIMITS, header_sha256)?;
     let header = weights.header();
     check_architecture(header)?;
     check_int_scalars(header, &BOLT_INT_SCALARS)?;
@@ -452,17 +535,70 @@ pub(crate) fn open_bolt_weights(
             "metadata key tokenizer.ggml.suppress_tokens is {suppressed:?}, expected {SUPPRESSED_TOKENS:?}"
         )));
     }
-    check_inventory(header, bolt_expected_inventory())?;
-    Ok(weights)
+    let spelling = bolt_spelling(header)?;
+    check_inventory(header, bolt_expected_inventory(spelling))?;
+    Ok((weights, spelling))
 }
 
-/// Builds the exact 707-tensor Bolt inventory: every layer carries its own
-/// query, output, norms, feed-forward, per-layer input gate, projection and
-/// table, and the layer output scale; the 24 physical layers additionally
-/// carry K/V projections and the K norm; the 18 shared layers carry neither
-/// K nor V. The model-level per-layer machinery - the 10752-wide projection,
-/// its norm - sits at the top level.
-fn bolt_expected_inventory() -> Vec<Expected> {
+/// Extracts one layer's PLE rows from the canonical merged
+/// per_layer_token_embd payload. The reference layout is token-major: each
+/// of the `vocab` rows carries every layer's PLE block contiguous, so a
+/// layer's slice is `width` Q8 bytes at a per-row `stride` offset.
+#[cfg(any(test, feature = "native-cuda"))]
+pub(crate) fn ple_rows_from_merged(
+    merged: &[u8],
+    layer: usize,
+    ple: usize,
+    layers: usize,
+    vocab: usize,
+) -> Vec<u8> {
+    let stride = (ple * layers / 32) * 34;
+    let width = (ple / 32) * 34;
+    let mut out = Vec::with_capacity(vocab * width);
+    for token in 0..vocab {
+        let at = token * stride + layer * width;
+        out.extend_from_slice(&merged[at..at + width]);
+    }
+    out
+}
+
+/// Resolves which tensor spelling the file carries. A file with both
+/// spellings is ambiguous and refused; a file with neither is missing its
+/// per-layer machinery entirely.
+fn bolt_spelling(header: &crate::weights::GgufHeader) -> Result<BoltSpelling, EngError> {
+    let canonical = header.tensor("per_layer_model_proj.weight").is_some();
+    let legacy = header.tensor("per_layer_model_projection.weight").is_some();
+    // Run before inventory: a legacy file with the canonical merged table
+    // appended would otherwise fail as a plain unexpected tensor.
+    if header.tensor("per_layer_token_embd.weight").is_some()
+        && header.tensor("blk.0.per_layer_embd.weight").is_some()
+    {
+        return Err(reject(
+            "per-layer embedding tables and per_layer_token_embd.weight are both present",
+        ));
+    }
+    match (canonical, legacy) {
+        (true, false) => Ok(BoltSpelling::Canonical),
+        (false, true) => Ok(BoltSpelling::Legacy),
+        (false, false) => Err(reject(
+            "missing tensor per_layer_model_proj.weight (and its legacy spelling)",
+        )),
+        (true, true) => Err(reject(
+            "tensors per_layer_model_proj.weight and per_layer_model_projection.weight are both present",
+        )),
+    }
+}
+
+/// Builds the exact Bolt inventory for one spelling: every layer carries
+/// its own query, output, norms, feed-forward, per-layer input gate,
+/// projection and post-norm, and the layer output scale; the 24 physical
+/// layers additionally carry K/V projections and the K norm; the 18 shared
+/// layers carry neither K nor V. The per-layer tables are per-layer tensors
+/// in the legacy spelling (707 tensors) and rows of one merged model-level
+/// per_layer_token_embd in the canonical spelling (666 tensors). The
+/// model-level per-layer machinery - the 10752-wide projection, its norm -
+/// sits at the top level.
+fn bolt_expected_inventory(spelling: BoltSpelling) -> Vec<Expected> {
     let mut expected = Vec::with_capacity(707);
     expected.push(Expected {
         name: "token_embd.weight".to_owned(),
@@ -480,15 +616,22 @@ fn bolt_expected_inventory() -> Vec<Expected> {
         dims: vec![BOLT_GLOBAL_HEAD / 2],
     });
     expected.push(Expected {
-        name: "per_layer_model_projection.weight".to_owned(),
+        name: spelling.ple_model_proj().to_owned(),
         ty: GgufType::Q80,
         dims: vec![BOLT_HIDDEN, BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64],
     });
     expected.push(Expected {
-        name: "per_layer_projection_norm.weight".to_owned(),
+        name: spelling.ple_proj_norm().to_owned(),
         ty: GgufType::F32,
         dims: vec![BOLT_PER_LAYER_INPUT],
     });
+    if let Some(name) = spelling.per_layer_token_embd() {
+        expected.push(Expected {
+            name: name.to_owned(),
+            ty: GgufType::Q80,
+            dims: vec![BOLT_PER_LAYER_INPUT * BOLT_LAYERS as u64, BOLT_VOCAB],
+        });
+    }
     for layer in 0..BOLT_LAYERS {
         let local = layer % 6 != 5;
         let head = if local {
@@ -532,40 +675,55 @@ fn bolt_expected_inventory() -> Vec<Expected> {
         expected.push(matrix("ffn_down.weight", BOLT_FEED_FORWARD, BOLT_HIDDEN));
         expected.push(norm("post_ffw_norm.weight", BOLT_HIDDEN));
         expected.push(matrix(
-            "per_layer_gate.weight",
+            spelling.ple_gate(),
             BOLT_HIDDEN,
             BOLT_PER_LAYER_INPUT,
         ));
         expected.push(matrix(
-            "per_layer_proj.weight",
+            spelling.ple_proj(),
             BOLT_PER_LAYER_INPUT,
             BOLT_HIDDEN,
         ));
-        expected.push(norm("post_per_layer_input_norm.weight", BOLT_HIDDEN));
-        expected.push(matrix(
-            "per_layer_embd.weight",
-            BOLT_PER_LAYER_INPUT,
-            BOLT_VOCAB,
-        ));
+        expected.push(norm(spelling.ple_post_norm(), BOLT_HIDDEN));
+        if spelling == BoltSpelling::Legacy {
+            expected.push(matrix(
+                "per_layer_embd.weight",
+                BOLT_PER_LAYER_INPUT,
+                BOLT_VOCAB,
+            ));
+        }
         expected.push(norm("layer_output_scale.weight", 1));
     }
-    debug_assert_eq!(expected.len(), 707);
+    debug_assert_eq!(
+        expected.len(),
+        match spelling {
+            BoltSpelling::Canonical => 707 - BOLT_LAYERS + 1,
+            BoltSpelling::Legacy => 707,
+        }
+    );
     expected
 }
 
-/// Checks the five-sliding, one-full pattern and the two-heads-on-physical,
-/// none-on-shared KV array of the Bolt conversion.
+/// Checks the five-sliding, one-full pattern and the KV head array. The
+/// canonical spelling writes the two KV heads on every layer (a zero head
+/// count made the reference fork SIGFPE in ggml_flash_attn_ext); the legacy
+/// spelling wrote zeros on the 18 shared layers. Both spellings resolve to
+/// the same sharing map because sharing derives from
+/// `gemma4.attention.shared_kv_layers`, never from this array: the array
+/// must simply be one of the two consistent spellings, not a per-layer mix.
 fn check_bolt_layer_pattern(kv: &[i32], pattern: &[u8]) -> Result<(), EngError> {
+    let canonical = kv.iter().all(|heads| *heads == BOLT_KV_HEADS as i32);
     for (layer, (kv_heads, sliding)) in kv.iter().zip(pattern).enumerate() {
         let local = layer % 6 != 5;
         let physical = layer < BOLT_PHYSICAL_LAYERS;
-        let want_kv = if physical { BOLT_KV_HEADS as i32 } else { 0 };
-        let want_pattern = u8::from(local);
-        if *kv_heads != want_kv {
+        let want_legacy = if physical { BOLT_KV_HEADS as i32 } else { 0 };
+        if *kv_heads != want_legacy && !canonical {
             return Err(reject(format!(
-                "metadata key gemma4.attention.head_count_kv is {kv_heads} at layer {layer}, expected {want_kv}"
+                "metadata key gemma4.attention.head_count_kv is {kv_heads} at layer {layer}, expected {want_legacy} or the all-{} canonical spelling",
+                BOLT_KV_HEADS
             )));
         }
+        let want_pattern = u8::from(local);
         if *sliding != want_pattern {
             return Err(reject(format!(
                 "metadata key gemma4.attention.sliding_window_pattern is {sliding} at layer {layer}, expected {want_pattern}"

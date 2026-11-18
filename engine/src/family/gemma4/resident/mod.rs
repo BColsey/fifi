@@ -52,8 +52,8 @@ pub(crate) const FFN: usize = 15360;
 /// One Q8_0 matrix resident on the device, raw checkpoint blocks.
 pub(crate) struct Matrix {
     pub(crate) buf: DeviceBuffer,
-    rows: usize,
-    k: usize,
+    pub(crate) rows: usize,
+    pub(crate) k: usize,
 }
 
 impl Matrix {

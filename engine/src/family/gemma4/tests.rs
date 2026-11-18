@@ -758,12 +758,14 @@ fn rejects_an_unsupported_gguf_rms_epsilon() {
 
 /// Writes a Bolt-shaped GGUF file with sparse zero payloads: the full
 /// inventory's Q8_0 matrices would otherwise occupy ~5 GiB of fixture bytes.
-fn write_bolt_gguf(
+/// `payloads` overrides tensor bytes by index; an empty entry stays zero.
+fn write_bolt_gguf_payload(
     kvs: &[Kv],
     tensors: &[(String, crate::weights::GgufType, Vec<u64>)],
+    payloads: &[Vec<u8>],
     path: &std::path::Path,
 ) {
-    use std::io::Write as _;
+    use std::io::{Seek, Write as _};
     let mut out = b"GGUF".to_vec();
     out.extend_from_slice(&3u32.to_le_bytes());
     out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
@@ -785,8 +787,30 @@ fn write_bolt_gguf(
     let data_start = out.len().div_ceil(32) * 32;
     let mut file = std::fs::File::create(path).expect("create fixture");
     file.write_all(&out).expect("write header");
+    file.seek(std::io::SeekFrom::Start(data_start as u64))
+        .expect("seek to payload");
+    for (index, (_, ty, dims)) in tensors.iter().enumerate() {
+        let padded = payload_len(*ty, dims) as u64;
+        if let Some(bytes) = payloads.get(index).filter(|bytes| !bytes.is_empty()) {
+            assert_eq!(bytes.len(), padded as usize, "payload must fill the tensor");
+            file.write_all(bytes).expect("write payload");
+            file.write_all(&vec![0u8; padded as usize - bytes.len()])
+                .expect("pad payload");
+        } else {
+            file.seek(std::io::SeekFrom::Current(padded as i64))
+                .expect("skip zero payload");
+        }
+    }
     file.set_len(data_start as u64 + offset)
         .expect("size fixture");
+}
+
+fn write_bolt_gguf(
+    kvs: &[Kv],
+    tensors: &[(String, crate::weights::GgufType, Vec<u64>)],
+    path: &std::path::Path,
+) {
+    write_bolt_gguf_payload(kvs, tensors, &[], path);
 }
 
 /// The scalar metadata of the Bolt conversion, minus excluded keys.
@@ -829,7 +853,63 @@ fn bolt_base_kvs(exclude: &[&str]) -> Vec<Kv> {
         .collect()
 }
 
-/// The 707-tensor Bolt inventory the reader expects.
+/// The same metadata with the canonical all-twos KV head array: the
+/// reference spelling carries the two heads on every layer instead of
+/// zeros on the 18 shared layers.
+fn bolt_base_kvs_canonical_heads(exclude: &[&str]) -> Vec<Kv> {
+    let mut kvs = bolt_base_kvs(exclude);
+    if let Some(at) = kvs
+        .iter()
+        .position(|kv| kv.key == "gemma4.attention.head_count_kv")
+    {
+        let heads = vec![2; 42];
+        kvs[at] = kv_i32_array("gemma4.attention.head_count_kv", &heads);
+    }
+    kvs
+}
+
+/// The canonical llama.cpp gemma4 spelling of the Bolt inventory: the six
+/// renamed per-layer tensors, no per-layer tables, and one merged
+/// [PLE * layers, vocab] per_layer_token_embd in their place.
+fn bolt_tensors_canonical() -> Vec<(String, crate::weights::GgufType, Vec<u64>)> {
+    let mut out = Vec::new();
+    for (name, ty, dims) in bolt_tensors() {
+        if name.ends_with(".per_layer_embd.weight") {
+            continue;
+        }
+        let name = match name.as_str() {
+            "per_layer_model_projection.weight" => "per_layer_model_proj.weight".to_owned(),
+            "per_layer_projection_norm.weight" => "per_layer_proj_norm.weight".to_owned(),
+            other => {
+                // Per-layer names are blk.N.suffix; split off N so the suffix
+                // match cannot confuse N with the tensor suffix.
+                match other
+                    .strip_prefix("blk.")
+                    .and_then(|rest| rest.split_once('.'))
+                {
+                    Some((index, suffix)) => match suffix {
+                        "per_layer_gate.weight" => format!("blk.{index}.inp_gate.weight"),
+                        "per_layer_proj.weight" => format!("blk.{index}.proj.weight"),
+                        "post_per_layer_input_norm.weight" => {
+                            format!("blk.{index}.post_norm.weight")
+                        }
+                        _ => other.to_owned(),
+                    },
+                    None => other.to_owned(),
+                }
+            }
+        };
+        out.push((name, ty, dims));
+    }
+    out.push((
+        "per_layer_token_embd.weight".to_owned(),
+        crate::weights::GgufType::Q80,
+        vec![256 * 42, 262_144],
+    ));
+    out
+}
+
+/// The 707-tensor legacy Bolt inventory the reader expects.
 fn bolt_tensors() -> Vec<(String, crate::weights::GgufType, Vec<u64>)> {
     use crate::weights::GgufType;
     let mut out = vec![
@@ -970,6 +1050,162 @@ fn the_bolt_converter_selfcheck_runs() {
         }
         Err(error) => panic!("python3 failed to start: {error}"),
     }
+}
+#[test]
+fn rejects_a_bolt_gguf_whose_shared_kv_layers_disagree_with_the_spec() {
+    // The resident's sharing map comes from the spec, so a file declaring a
+    // different map (19 shared layers, one off the spec's 18) must be
+    // refused: the shared layers' K/V sources are not negotiable per file.
+    let kvs: Vec<Kv> = bolt_base_kvs(&["gemma4.attention.shared_kv_layers"])
+        .into_iter()
+        .chain([kv_u32("gemma4.attention.shared_kv_layers", 19)])
+        .collect();
+    expect_rejection(open_bolt(&kvs, &bolt_tensors()), "shared_kv_layers");
+}
+
+#[test]
+fn accepts_a_canonical_bolt_q8_gguf() {
+    open_bolt(
+        &bolt_base_kvs_canonical_heads(&[]),
+        &bolt_tensors_canonical(),
+    )
+    .expect("opens");
+}
+
+/// The tensor spelling and the KV head spelling are independent: a stock
+/// reference-format file whose converter still writes legacy zeros opens
+/// too, because the sharing map derives from shared_kv_layers either way.
+#[test]
+fn accepts_canonical_tensors_with_legacy_kv_heads() {
+    open_bolt(&bolt_base_kvs(&[]), &bolt_tensors_canonical()).expect("opens");
+}
+
+/// Both spellings describe one model: the KV head arrays differ (2 versus
+/// 0 on the shared layers) yet both files validate, and the sharing map the
+/// resident builds - physical layer count and each shared layer's source,
+/// from kv_shared_layers via the descriptor - is the same constant for both.
+#[test]
+fn bolt_both_spellings_share_one_kv_map() {
+    use crate::family::spec::NEMOTRON_BOLT_E4B;
+
+    let legacy_heads: Vec<i32> = (0..42)
+        .map(|layer| if layer < 24 { 2 } else { 0 })
+        .collect();
+    let canonical_heads = [2; 42];
+    assert_ne!(legacy_heads[24], canonical_heads[24]);
+
+    open_bolt(&bolt_base_kvs(&[]), &bolt_tensors()).expect("the legacy spelling opens");
+    open_bolt(
+        &bolt_base_kvs_canonical_heads(&[]),
+        &bolt_tensors_canonical(),
+    )
+    .expect("the canonical spelling opens");
+
+    // One sharing map serves both: it never reads the KV head array.
+    assert_eq!(NEMOTRON_BOLT_E4B.first_shared_layer(), 24);
+    for layer in 24..42 {
+        let source = NEMOTRON_BOLT_E4B
+            .shared_kv_source(layer)
+            .expect("every shared layer has a source");
+        assert!(source < 24, "a shared source must be physical");
+    }
+}
+
+#[test]
+fn the_merged_table_and_per_layer_tables_carry_the_same_weights() {
+    use crate::family::gemma4::gguf::ple_rows_from_merged;
+    use crate::weights::{GgufLimits, GgufType, GgufWeights};
+
+    let ple = 256;
+    let layers = 42;
+    let vocab = 64;
+    let row = |layer: usize, token: usize| -> Vec<u8> {
+        (0..(ple / 32) * 34)
+            .map(|byte| (layer * 31 + token * 17 + byte) as u8)
+            .collect()
+    };
+
+    // Legacy spelling: one [PLE, VOCAB] table per layer, rows back to back.
+    let mut legacy_tensors = Vec::new();
+    let mut legacy_payloads = Vec::new();
+    for layer in 0..layers {
+        let mut bytes = Vec::new();
+        for token in 0..vocab {
+            bytes.extend_from_slice(&row(layer, token));
+        }
+        legacy_tensors.push((
+            format!("blk.{layer}.per_layer_embd.weight"),
+            GgufType::Q80,
+            vec![ple as u64, vocab as u64],
+        ));
+        legacy_payloads.push(bytes);
+    }
+
+    // Canonical spelling: the merged table in the reference layout — each
+    // row is one token with every layer's PLE block contiguous.
+    let mut merged_payload = Vec::new();
+    for token in 0..vocab {
+        for layer in 0..layers {
+            merged_payload.extend_from_slice(&row(layer, token));
+        }
+    }
+    let canonical_tensors = vec![(
+        "per_layer_token_embd.weight".to_owned(),
+        GgufType::Q80,
+        vec![(ple * layers) as u64, vocab as u64],
+    )];
+
+    let limits = GgufLimits {
+        max_header_bytes: 1 << 20,
+        max_tensor_bytes: 1 << 20,
+    };
+    let dir = std::env::temp_dir();
+    // fixed names would collide across parallel runs: pid + test tag keep
+    // every invocation on its own pair of scratch files.
+    let unique = format!("bolt-tables-{}-{}", std::process::id(), "gather");
+    let legacy_path = dir.join(format!("{unique}-legacy.gguf"));
+    let canonical_path = dir.join(format!("{unique}-merged.gguf"));
+    write_bolt_gguf_payload(&[], &legacy_tensors, &legacy_payloads, &legacy_path);
+    write_bolt_gguf_payload(&[], &canonical_tensors, &[merged_payload], &canonical_path);
+
+    let legacy = GgufWeights::open(&legacy_path, limits, None).expect("legacy opens");
+    let canonical = GgufWeights::open(&canonical_path, limits, None).expect("canonical opens");
+    let merged = canonical
+        .read_tensor("per_layer_token_embd.weight")
+        .expect("merged table reads");
+    for layer in [0, 5, 24, 41] {
+        let from_merged = ple_rows_from_merged(&merged.1, layer, ple, layers, vocab);
+        let (_, from_legacy) = legacy
+            .read_tensor(&format!("blk.{layer}.per_layer_embd.weight"))
+            .expect("legacy table reads");
+        let source_of_truth: Vec<u8> = (0..vocab).flat_map(|t| row(layer, t)).collect();
+        assert_eq!(
+            from_legacy, source_of_truth,
+            "layer {layer} via its own table"
+        );
+        assert_eq!(
+            from_merged, source_of_truth,
+            "layer {layer} via the merged table"
+        );
+    }
+
+    // One sharing map serves both spellings: the file's declared map is
+    // pinned to the spec by check_int_scalars (see the wrong-value test),
+    // never free to diverge per spelling.
+
+    std::fs::remove_file(&legacy_path).ok();
+    std::fs::remove_file(&canonical_path).ok();
+}
+
+#[test]
+fn rejects_a_bolt_gguf_with_both_spelling_tables() {
+    let mut tensors = bolt_tensors();
+    tensors.push((
+        "per_layer_token_embd.weight".to_owned(),
+        crate::weights::GgufType::Q80,
+        vec![256 * 42, 262_144],
+    ));
+    expect_rejection(open_bolt(&bolt_base_kvs(&[]), &tensors), "are both present");
 }
 
 #[test]
