@@ -425,17 +425,28 @@ fn a_wider_kv_group_changes_only_the_kv_projection_dims() {
 }
 
 #[test]
-fn tiled_roles_allow_only_q4_k_q6_k_and_q8_0_and_f32_roles_only_f32() {
+fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
     let inventory = Inventory::for_spec(&TWO_LAYER_SPEC)
         .unwrap_or_else(|error| panic!("two-layer inventory: {error:?}"));
     for tensor in inventory.tensors() {
         match tensor.path() {
-            TensorPath::DeviceTiled => assert_eq!(
-                tensor.allowed_types(),
-                &[GgufType::Q4K, GgufType::Q6K, GgufType::Q80],
-                "tensor {}",
-                tensor.name
-            ),
+            TensorPath::DeviceTiled => {
+                // Routed experts and the embedding gather stay on the vendored
+                // kernels; dense projections add the in-house dequant types.
+                let want: &[GgufType] = match tensor.role {
+                    Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps | Role::TokenEmbd => {
+                        &[GgufType::Q4K, GgufType::Q6K, GgufType::Q80]
+                    }
+                    _ => &[
+                        GgufType::Q4K,
+                        GgufType::Q5K,
+                        GgufType::Q40,
+                        GgufType::Q6K,
+                        GgufType::Q80,
+                    ],
+                };
+                assert_eq!(tensor.allowed_types(), want, "tensor {}", tensor.name);
+            }
             TensorPath::DeviceF32 => assert_eq!(
                 tensor.allowed_types(),
                 &[GgufType::F32],
@@ -446,11 +457,6 @@ fn tiled_roles_allow_only_q4_k_q6_k_and_q8_0_and_f32_roles_only_f32() {
         assert!(
             !tensor.allowed_types().contains(&GgufType::F16),
             "tensor {} must not allow F16",
-            tensor.name
-        );
-        assert!(
-            !tensor.allowed_types().contains(&GgufType::Q5K),
-            "tensor {} must not allow Q5_K",
             tensor.name
         );
     }

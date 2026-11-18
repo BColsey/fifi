@@ -81,10 +81,25 @@ const DELTA_ROLES: [Role; 9] = [
     Role::SsmDtBias,
     Role::SsmNorm,
 ];
-// The CUDA projector tiles only Q4_K, Q6_K and Q8_0. F16 and Q5_K are allowed nowhere: a tiled
-// tensor in either type has no tile kernel, and every other tensor is uploaded as raw F32.
-const TILED_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
+// The vendored projector tiles Q4_K, Q6_K and Q8_0; F16 is allowed nowhere: a tiled
+// tensor in it has no tile kernel, and every other tensor is uploaded as raw F32.
+// The in-house dequant types ride the dense projections only (gemm_dq prefill arm
+// plus the resident matvec decode arm): Q5_K and Q4_0 serve both, so they open.
+// Q3_K is held back until its chunk, expert and embedding wiring is qualified;
+// routed experts and the embedding gather stay on the vendored path.
+const DENSE_TILED_TYPES: [GgufType; 5] = [
+    GgufType::Q4K,
+    GgufType::Q5K,
+    GgufType::Q40,
+    GgufType::Q6K,
+    GgufType::Q80,
+];
 const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
+/// Routed experts run the vendored MMVQ path only: the in-house dequant types have no
+/// expert kernel, so they are refused at the open, naming the tensor.
+const EXPERT_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
+/// The native embedding gather reads the vendored blocks only.
+const EMBD_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
 
 impl Role {
     /// Whole tensor name for the three global roles, else the part after `blk.N.`.
@@ -145,9 +160,15 @@ impl Role {
     }
 
     fn allowed_types(self) -> &'static [GgufType] {
-        match self.path() {
-            TensorPath::DeviceTiled => &TILED_TYPES,
-            TensorPath::DeviceF32 => &RAW_TYPES,
+        match self {
+            // Routed experts: the vendored expert kernels only.
+            Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps => &EXPERT_TYPES,
+            // The embedding gather decodes Q4_K blocks natively.
+            Role::TokenEmbd => &EMBD_TYPES,
+            _ => match self.path() {
+                TensorPath::DeviceTiled => &DENSE_TILED_TYPES,
+                TensorPath::DeviceF32 => &RAW_TYPES,
+            },
         }
     }
 

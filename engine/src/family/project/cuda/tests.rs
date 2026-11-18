@@ -2229,8 +2229,8 @@ fn a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call() {
     if !device_present(NAME) {
         return;
     }
-    // The reader takes Q5_K; the native plan refuses it (no native block at this
-    // point), naming the tensor, with the device untouched.
+    // The reader and the model open take Q5_K; the native plan still refuses it
+    // (no native block until the plan commit), naming the tensor, device untouched.
     let dir = tempfile::tempdir().expect("create the fixture directory");
     let path = dir.path().join("q5.gguf");
     let payload = vec![0u8; N_ROWS * BLOCKS_PER_ROW * 176];
@@ -3301,7 +3301,7 @@ fn measure_q8_0_scale_scan_time() {
 fn trim_fixture() -> Vec<Entry> {
     vec![
         weight_entry("blk.0.q4k", GgufType::Q4K, (8, 256), filled(8 * 144, 1)),
-        weight_entry("blk.0.q5k", GgufType::Q5K, (2, 256), filled(2 * 176, 2)),
+        weight_entry("blk.0.q3k", GgufType::Q3K, (2, 256), filled(2 * 110, 2)),
         weight_entry("blk.0.q6k", GgufType::Q6K, (8, 256), filled(8 * 210, 4)),
         weight_entry("blk.0.f32", GgufType::F32, (2, 4), filled(32, 3)),
     ]
@@ -3335,14 +3335,14 @@ fn assert_payloads(weights: &GgufWeights, kept: &[&Entry]) {
 }
 
 #[test]
-fn trimmed_copy_drops_the_q5k_tensor_and_keeps_the_rest_byte_for_byte() {
+fn trimmed_copy_drops_the_q3k_tensor_and_keeps_the_rest_byte_for_byte() {
     let dir = tempfile::tempdir().expect("create the trim directory");
     let source = dir.path().join("source.gguf");
     let entries = trim_fixture();
     std::fs::write(&source, gguf_bytes(&entries)).expect("write the source fixture");
     assert!(
         GgufWeights::open(&source, MEASURE_LIMITS, None).is_ok(),
-        "the reader takes every supported type, including the Q5_K tensor"
+        "the reader takes every supported type, including the unplanned tensor"
     );
     let dest = dir.path().join("trimmed.gguf");
     let trim = write_trimmed(&source, &dest, u64::MAX);
@@ -3351,7 +3351,7 @@ fn trimmed_copy_drops_the_q5k_tensor_and_keeps_the_rest_byte_for_byte() {
         (3, 1, 0)
     );
     let weights = GgufWeights::open(&dest, MEASURE_LIMITS, None).expect("open the trimmed fixture");
-    let kept: Vec<&Entry> = entries.iter().filter(|e| e.ty != GgufType::Q5K).collect();
+    let kept: Vec<&Entry> = entries.iter().filter(|e| e.ty != GgufType::Q3K).collect();
     assert_payloads(&weights, &kept);
 }
 

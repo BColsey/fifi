@@ -283,12 +283,48 @@ fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q6_K, Q8_0"
+        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0"
     );
 }
 
 #[test]
-fn a_q5_k_tensor_fails_the_model_open_naming_the_tensor_and_type() {
+fn a_q5_k_expert_stack_fails_the_open_naming_the_tensor() {
+    let spec = TWO_LAYER_SPEC;
+    let kvs = metadata("qwen35moe", spec_counts(&spec));
+    let mut tensors = file_tensors(&spec);
+    replace(
+        &mut tensors,
+        "blk.1.ffn_gate_exps.weight",
+        GgufType::Q5K,
+        vec![512, 256, 8],
+    );
+    let message = rejection(open(&kvs, &tensors, &spec));
+    assert_eq!(
+        message,
+        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
+    );
+}
+
+#[test]
+fn an_in_house_token_embedding_fails_the_open_naming_the_tensor() {
+    let spec = TWO_LAYER_SPEC;
+    let kvs = metadata("qwen35moe", spec_counts(&spec));
+    let mut tensors = file_tensors(&spec);
+    replace(
+        &mut tensors,
+        "token_embd.weight",
+        GgufType::Q5K,
+        vec![512, 64],
+    );
+    let message = rejection(open(&kvs, &tensors, &spec));
+    assert_eq!(
+        message,
+        "gguf model: tensor token_embd.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
+    );
+}
+
+#[test]
+fn a_q5_k_tensor_opens_the_dense_projection_on_the_native_path() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
@@ -298,10 +334,25 @@ fn a_q5_k_tensor_fails_the_model_open_naming_the_tensor_and_type() {
         GgufType::Q5K,
         vec![512, 256],
     );
+    let model = open(&kvs, &tensors, &spec).expect("the Q5_K dense projection opens");
+    assert_eq!(model.plan.tensors().count(), tensors.len());
+}
+
+#[test]
+fn a_q3_k_tensor_fails_the_open_naming_the_tensor_and_type() {
+    let spec = TWO_LAYER_SPEC;
+    let kvs = metadata("qwen35moe", spec_counts(&spec));
+    let mut tensors = file_tensors(&spec);
+    replace(
+        &mut tensors,
+        "blk.1.attn_k.weight",
+        GgufType::Q3K,
+        vec![512, 256],
+    );
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
+        "gguf model: tensor blk.1.attn_k.weight has type Q3_K, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0"
     );
 }
 
