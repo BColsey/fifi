@@ -685,6 +685,14 @@ impl StreamedCheckpoint {
         Some((entry.dtype(), entry.shape().to_vec()))
     }
 
+    /// Payload length from the checked header, without reading tensor data.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn stored_byte_len(&self, key: &str) -> Option<u64> {
+        let shard = *self.route.get(key)?;
+        let offsets = self.stores.get(shard)?.header.entry(key)?.offsets();
+        offsets.end.checked_sub(offsets.start)
+    }
+
     /// Reads selected whole tensors into a resident source; absent keys are omitted.
     ///
     /// Duplicate keys count once. The aggregate stored payload must fit `max_bytes` and host

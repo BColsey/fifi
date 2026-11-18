@@ -65,7 +65,7 @@
 //! tolerance, so an entry restores only under its own path.
 
 use super::super::{
-    load::FlashWeights,
+    load::{FlashWeights, model_shape, resident_packed_payload},
     prefill_plan::{self, ChunkCost, PREFILL_WAVE_CAP, PrefillPlan, PrefillTerms},
 };
 use super::{
@@ -78,8 +78,11 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        mlx_budget::{DeviceBudget, PRESSURE_MARGIN},
         mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
-        session::{DecodeSession, Limits, PrefixSlot, SaveKind, TokenStepper, check_prompt},
+        session::{
+            DecodeSession, Limits, PrefixSlot, SaveKind, StoreLimits, TokenStepper, check_prompt,
+        },
     },
     kernels::{HostPages, MlxKernels},
     tokenizer::DecodeBatch,
@@ -247,19 +250,82 @@ fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     StreamedCheckpoint::open_local(dir, 64 << 20)
 }
 
+fn session_reserve(
+    state: u64,
+    cache_limit: u64,
+    prefix_limits: Option<StoreLimits>,
+    state_overlap: u64,
+) -> Result<(u64, u64)> {
+    let overflow = || EngError::MemoryPlan("Flash-Next prefill session reserve overflows".into());
+    let prefix = if let Some(limits) = prefix_limits {
+        let slots = limits
+            .roots
+            .checked_add(limits.entries)
+            .and_then(|slots| u64::try_from(slots).ok())
+            .ok_or_else(overflow)?;
+        state.checked_mul(slots).ok_or_else(overflow)?
+    } else {
+        0
+    };
+    let reserve = state
+        .checked_add(prefix)
+        .and_then(|n| n.checked_add(state_overlap))
+        .and_then(|n| n.checked_add(cache_limit))
+        .and_then(|n| n.checked_add(PRESSURE_MARGIN))
+        .ok_or_else(overflow)?;
+    Ok((reserve, prefix))
+}
+
 impl FlashExecutor {
     /// Call it on the engine thread. `cache_limit` is the MLX allocator cache limit in bytes.
+    #[cfg(test)]
     pub(crate) fn open(
         artifact: &Path,
         cache_limit: u64,
         rules: FlashRules,
     ) -> Result<(Self, FlashSession)> {
+        Self::open_with_admission(artifact, cache_limit, rules, None, false)
+    }
+
+    pub(in crate::family::flash_next) fn open_with_admission(
+        artifact: &Path,
+        cache_limit: u64,
+        rules: FlashRules,
+        device: Option<DeviceBudget>,
+        prefix_reuse: bool,
+    ) -> Result<(Self, FlashSession)> {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
-        let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(open_checkpoint(artifact)?));
-        let flash = FlashWeights::load(ckpt, &config)?;
+        let preflight = device
+            .map(|device| {
+                let (shape, kinds) = model_shape(&config)?;
+                let state = super::state::state_bytes_at_context(&shape, &kinds, MAX_POSITIONS)?;
+                let (reserve, _) = session_reserve(
+                    state,
+                    cache_limit,
+                    prefix_reuse.then(StoreLimits::default),
+                    state,
+                )?;
+                device.remaining(
+                    "Flash-Next MLX pre-import",
+                    &[("session_reserve_bytes", reserve)],
+                )?;
+                Ok::<_, EngError>((device, shape.ple_layer, kinds, reserve))
+            })
+            .transpose()?;
+        let ckpt = open_checkpoint(artifact)?;
+        if let Some((device, ple_layer, kinds, reserve)) = preflight {
+            device.check_packed_payload_floor(
+                "Flash-Next MLX pre-import",
+                &ckpt,
+                reserve,
+                |key| resident_packed_payload(key, &kinds, ple_layer),
+            )?;
+        }
+        let flash = FlashWeights::load(&ckpt, &config)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.set_cache_limit(cache_limit)?;
+        let ckpt = Box::leak(Box::new(ckpt));
         Self::from_parts(kernels, ckpt, &flash, rules)
     }
 
@@ -352,12 +418,9 @@ impl FlashExecutor {
         session: &FlashSession,
         settings: &crate::family::flash_next::settings::FlashSettings,
         prefix_reuse: bool,
-        device: Option<crate::family::mlx_budget::DeviceBudget>,
+        device: Option<DeviceBudget>,
     ) -> Result<Option<String>> {
-        use crate::family::{
-            mlx_budget::{DeviceBudget, PRESSURE_MARGIN},
-            prefill::mlx::MIN_PREFILL_CHUNK_ROWS,
-        };
+        use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
         let cap = settings.prefill_chunk;
         let report = |selected_rows, reason, memory| {
             MlxExecutionPlan::new(
@@ -385,25 +448,14 @@ impl FlashExecutor {
             .byte_len()?
             .checked_add(growth)
             .ok_or_else(overflow)?;
-        let prefix = if prefix_reuse {
-            let limits = self.prefix.limits();
-            let slots = limits
-                .roots
-                .checked_add(limits.entries)
-                .and_then(|slots| u64::try_from(slots).ok())
-                .ok_or_else(overflow)?;
-            state.checked_mul(slots).ok_or_else(overflow)?
-        } else {
-            0
-        };
         // The committed state remains live while the step builds its replacement arrays.
         let state_overlap = if device.is_some() { state } else { 0 };
-        let reserve = state
-            .checked_add(prefix)
-            .and_then(|n| n.checked_add(state_overlap))
-            .and_then(|n| n.checked_add(settings.cache_limit))
-            .and_then(|n| n.checked_add(PRESSURE_MARGIN))
-            .ok_or_else(overflow)?;
+        let (reserve, prefix) = session_reserve(
+            state,
+            settings.cache_limit,
+            prefix_reuse.then(|| self.prefix.limits()),
+            state_overlap,
+        )?;
         // This executor streams local shards and has no S3 cache.
         let plan = self.plan_prefill(budget, 0, reserve, cap)?;
         let charges = [
@@ -640,6 +692,51 @@ mod tests {
             Box::leak(Box::new(fixtures::checkpoint_with(embedding)));
         let flash = FlashWeights::load(ckpt, &fixtures::config()).unwrap();
         FlashExecutor::from_parts(MlxKernels::try_new().unwrap(), ckpt, &flash, rules).unwrap()
+    }
+
+    #[test]
+    fn mlx_preimport_rejects_flash_weight_floor_without_payload_reads() {
+        use crate::weights::acquire_read;
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (index, shard) = fixtures::checkpoint_files(Embedding::Flat);
+        std::fs::write(dir.path().join("config.json"), fixtures::config()).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index).unwrap();
+        std::fs::write(dir.path().join("m.safetensors"), shard).unwrap();
+        let floor: u64 = fixtures::tensors()
+            .iter()
+            .filter(|(key, dtype, _, _)| {
+                *dtype == "U32"
+                    && key.ends_with(".weight")
+                    && !key.contains(".embed_tokens.")
+                    && !key.contains(".switch_mlp.")
+                    && !key.contains(".ngram_embedding.shards.")
+            })
+            .map(|(_, _, _, bytes)| bytes.len() as u64)
+            .sum();
+        assert!(floor > 0);
+        let state = 14_336 + 640 * u64::from(MAX_POSITIONS);
+        let cache = 1024;
+        let reserve = 3 * state + cache + PRESSURE_MARGIN;
+        let build = |bytes| {
+            FlashExecutor::open_with_admission(
+                dir.path(),
+                cache,
+                rules(vec![], VOCAB),
+                Some(DeviceBudget::new(bytes).unwrap()),
+                true,
+            )
+        };
+
+        acquire_read::reset();
+        acquire_read::set(true);
+        let refused = build(reserve + floor - 1);
+        acquire_read::set(false);
+        assert_eq!(acquire_read::snapshot(), (0, 0, 0));
+        assert!(matches!(refused, Err(EngError::MemoryPlan(m))
+            if m.contains("Flash-Next MLX pre-import")
+            && m.contains(&format!("packed_weight_payload_floor_bytes={floor}"))));
+        let (_executor, _session) = build(4 << 30).unwrap();
     }
 
     /// The tokens that a `Record` chain draws from `sampler`: a path that shares no code with the

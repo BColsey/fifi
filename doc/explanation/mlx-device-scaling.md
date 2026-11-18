@@ -28,6 +28,21 @@ When a prefill budget applies, `memory` lists the base charges, bytes left befor
 
 On the M4 mini, the published Flint checkpoint with a 4 GiB device ceiling and a configured 512-row maximum started with disk-backed experts and admitted 32 prefill rows. The reported row width, placement and memory charges matched the startup log. The live settings rows also matched `config effective --json` for the same environment.
 
+## Reject oversized loads from headers
+
+With the MLX device budget enabled, Qwen3.6 MoE, Qwen3.8 dense, and Flash-Next check the full-context session reserve before opening shard headers. They then sum the raw packed payloads that must stay resident. If the reserve and that lower bound exceed the device ceiling, startup returns a memory-plan error before reading tensor payloads or creating MLX allocations. Flint already plans from shard metadata and can select its disk-backed experts at this point.
+
+Qwen counts routed expert payloads when serving requires resident banks. When disk-backed experts are enabled, the header check leaves them out and the placement planner prices resident banks and a one-token stage separately. Flash-Next includes recurrent state, full-context K/V and raw index keys, prefix retention when enabled, and capacity overlap in its session reserve. The later full planner accounts for packed scales, biases, staging and other resident allocations using the resident tensor sizes.
+
+On the mini, file-backed Flash-Next, Qwen3.6 resident and streamed-eligible MoE, and Qwen3.8 dense fixtures refused a ceiling one byte below the reserve plus packed-payload floor. The payload counter stayed at zero for each refusal. All four cases loaded with a 4 GiB ceiling. The Flash-Next serving factory also preserved its chunked and one-token fallback behavior. Both seek/read and positioned shard reads passed these checks.
+
+From `engine/` on Apple Silicon, the focused boundary check runs exactly two tests:
+
+```sh
+cargo test --locked --release --features native-mlx,native-fault-qualification \
+  --lib mlx_preimport_rejects -- --test-threads=1
+```
+
 ## Shared CPU, SSD and Metal staging
 
 The opt-in `FIFI_MLX_EXPERT_READ_RUNS=prefill` groups adjacent selected expert slices during multi-row prefill in disk-backed Flint, Flash-Next and Qwen3.6. It reads the same logical weight bytes and writes them directly into each family's admitted Metal page layout. Qwen's fused gate/up layout uses vectored reads into disjoint slots, with at most 64 destinations per call. F32 scales and biases still widen in the existing destination slots.

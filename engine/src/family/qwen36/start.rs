@@ -100,8 +100,8 @@ pub(crate) fn start(
         stages.begin("opening the model");
         let disk_experts =
             std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").is_some_and(|value| value == "1");
-        let (mut executor, session) = if let Some(device) = device.filter(|_| disk_experts) {
-            Q36Executor::open_for_device(&owned, rules, device)?
+        let (mut executor, session) = if let Some(device) = device {
+            Q36Executor::open_for_device(&owned, rules, device, disk_experts)?
         } else {
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
         };
