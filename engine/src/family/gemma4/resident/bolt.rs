@@ -33,7 +33,7 @@
 )]
 
 use super::bolt_graph::{
-    DecodeGraphFacts, DecodeGraphMode, check_decode_graph, decode_graph_wanted,
+    DecodeGraphFacts, DecodeGraphMode, check_decode_graph, decode_graph_wanted, parse_switch,
 };
 use super::step::layer_buffers;
 use super::{
@@ -45,7 +45,9 @@ use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
-use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
+use crate::kernels::cuda::resident::attn_decode_gemma::{
+    AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
+};
 use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
 use crate::kernels::cuda::resident::gemma_matvec::GemmaMatvecCall;
@@ -115,7 +117,12 @@ pub(crate) fn scratch_bytes() -> Option<u64> {
     total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, 1)? as u64)?;
     total = total.checked_add(q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS)? as u64)?;
     // ids, pos, kv_len input cells.
-    total.checked_add(12)
+    total = total.checked_add(12)?;
+    // The split partial buffer, present only when the attention split is armed.
+    if attn_split_on() {
+        total = total.checked_add(attn_part_bytes() as u64)?;
+    }
+    Some(total)
 }
 
 /// The parity dump directory, read from BOLT_TRACE_DIR once. The trace hook
@@ -125,6 +132,41 @@ fn trace_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| std::env::var("BOLT_TRACE_DIR").ok())
         .as_deref()
+}
+
+/// The environment variable that arms the split decode attention: one
+/// part+combine launch pair per attention instead of the single-pass kernel.
+/// Default off until the split output is qualified (the summation order, and
+/// therefore the bits, differ from the single-pass kernel).
+pub(crate) const ATTN_SPLIT_VAR: &str = "FIFI_BOLT_ATTN_SPLIT";
+
+/// Split policy: at most 32 splits over the visible range, at least 128 keys
+/// per split, so a short context keeps one split and a long one fills the
+/// device (8 q heads x 32 splits = 256 blocks on an 82-SM card).
+pub(crate) const ATTN_SPLIT_MAX: usize = 32;
+pub(crate) const ATTN_SPLIT_MIN_KEYS: usize = 128;
+
+/// The split partial buffer of the resident's attention: stats (max, sum) plus
+/// the accumulator vector, per (token, q head, split). Sized on the 512-dim
+/// global head and the full prefill batch, because the eager step runs the
+/// same kernels for m = 1..=PREFILL_BATCH; the 256-dim local layers need less.
+pub(crate) const fn attn_part_bytes() -> usize {
+    Bolt::PREFILL_BATCH * HEADS * ATTN_SPLIT_MAX * (2 + GLOBAL_HEAD) * 4
+}
+
+/// Whether the environment arms the attention split; a bad value fails the
+/// load instead of arming or disarming by accident.
+pub(crate) fn attn_split_wanted() -> Result<bool, EngError> {
+    parse_switch(
+        std::env::var(ATTN_SPLIT_VAR).ok().as_deref(),
+        &format!("bolt attention split: {ATTN_SPLIT_VAR}"),
+    )
+}
+
+/// Tolerant read for the budget accounting: the load refuses a bad value
+/// before any allocation, so here only the armed state matters.
+fn attn_split_on() -> bool {
+    attn_split_wanted().unwrap_or(false)
 }
 
 pub(crate) struct BoltLayer {
@@ -175,6 +217,9 @@ pub(crate) struct Scratch {
     pub(crate) ple_nrm: Vector,
     pub(crate) ple_tbl: Vector,
     pub(crate) ple_mixed: Vector,
+    /// Present only when the attention split is armed: the split partial
+    /// buffer, sized by [attn_part_bytes].
+    pub(crate) attn_part: Option<DeviceBuffer>,
     pub(crate) q8_hidden: DeviceBuffer,
     pub(crate) q8_ctx: DeviceBuffer,
     pub(crate) q8_mixed: DeviceBuffer,
@@ -419,6 +464,8 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         vector_filled(&ctx, HIDDEN, 0.0)?,
         vector_filled(&ctx, HIDDEN, 0.0)?,
     ];
+    // The attention split refuses a bad switch value before any allocation.
+    let attn_split = attn_split_wanted()?;
     let scratch = Scratch {
         h,
         nrm: vector_filled(&ctx, HIDDEN, 0.0)?,
@@ -457,6 +504,11 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         pos: zero(&ctx, 4)?,
         kv_len: zero(&ctx, 4)?,
         status: zero(&ctx, 4)?,
+        attn_part: if attn_split {
+            Some(zero(&ctx, attn_part_bytes())?)
+        } else {
+            None
+        },
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
@@ -485,6 +537,40 @@ impl Bolt {
     /// sets the load-time default; the tests flip it between runs).
     pub(crate) fn use_decode_graph(&mut self, on: bool) {
         self.graph_mode.set_on(on);
+    }
+
+    /// Arms or disarms the split decode attention for this model. The
+    /// environment sets the load-time default; the qualification tests flip
+    /// it between runs. Arming outside capture allocates the partial buffer
+    /// on first use (the env-armed load already counted it in the device
+    /// budget; this post-load path is test and qualification traffic). Any
+    /// captured decode graph is dropped: it was captured against the previous
+    /// split state, and its replay would read a freed partial buffer when the
+    /// split is disarmed (or never split at all when armed after capture).
+    pub(crate) fn use_attn_split(&mut self, on: bool) -> Result<(), EngError> {
+        self.ctx.ensure_usable()?;
+        self.ctx.ensure_uncaptured("attn split partial buffer")?;
+        self.graph = None;
+        if on {
+            if self.scratch.attn_part.is_none() {
+                self.scratch.attn_part = Some(zero(&self.ctx, attn_part_bytes())?);
+            }
+        } else {
+            self.scratch.attn_part = None;
+        }
+        Ok(())
+    }
+
+    /// Whether a captured decode graph is held (the split invalidation pin).
+    pub(crate) fn graph_captured(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// Whether the attention split is armed: the partial buffer exists. The
+    /// disarm assert pins on this, not on `graph_captured`, which the disarm
+    /// does not change (arming already dropped any graph).
+    pub(crate) fn split_armed(&self) -> bool {
+        self.scratch.attn_part.is_some()
     }
 
     /// The capped logits of the newest logits-bearing forward, for host
@@ -1076,6 +1162,15 @@ impl Bolt {
             }
         }
         self.trace(pos, &format!("L{index}_v"), &sc.v_normed, m * kv_rows * 4);
+        let attn_split = sc.attn_part.as_ref().map(|part| {
+            let bytes = attn_part_bytes();
+            AttnDecodeGemmaSplit {
+                // Sized at load for the full prefill batch; the range cannot fail.
+                part: part.range(0, bytes).expect("partial buffer"),
+                max_splits: ATTN_SPLIT_MAX,
+                min_keys: ATTN_SPLIT_MIN_KEYS,
+            }
+        });
         ctx.attn_decode_gemma(
             stream,
             AttnDecodeGemmaCall {
@@ -1094,6 +1189,7 @@ impl Bolt {
                 cells: CELLS,
                 window: if layer.global { 0 } else { LOCAL_WINDOW },
                 scale: 1.0,
+                split: attn_split,
             },
         )?;
         self.trace(pos, &format!("L{index}_ctx"), &sc.ctx_out, m * q_rows * 4);
@@ -1680,9 +1776,43 @@ mod tests {
                     cells: 32768,
                     window: if head == 512 { 0 } else { 512 },
                     scale: 1.0,
+                    split: None,
                 },
             )
             .expect("attn {head}");
+            // The split path of the same geometry: the wrapper must admit the
+            // part+combine plan at both head widths when the switch arms.
+            let part_floats = 8 * super::ATTN_SPLIT_MAX * (2 + head);
+            ctx.attn_decode_gemma(
+                &stream,
+                AttnDecodeGemmaCall {
+                    out: f32s(8 * head).range(0, 8 * head * 4).unwrap(),
+                    status: None,
+                    q: f32s(8 * head).range(0, 8 * head * 4).unwrap(),
+                    k_codes: i8s(codes).range(0, codes).unwrap(),
+                    k_scales: u16s(scales).range(0, scales * 2).unwrap(),
+                    v_codes: i8s(codes).range(0, codes).unwrap(),
+                    v_scales: u16s(scales * 2).range(0, scales * 2).unwrap(),
+                    kv_len: words.range(4, 4).unwrap(),
+                    m: 1,
+                    n_q_head: 8,
+                    n_kv_head: 2,
+                    head_dim: head,
+                    cells: 32768,
+                    window: if head == 512 { 0 } else { 512 },
+                    scale: 1.0,
+                    split: Some(AttnDecodeGemmaSplit {
+                        part: ctx
+                            .upload(&zero(part_floats * 4))
+                            .expect("part upload")
+                            .range(0, part_floats * 4)
+                            .unwrap(),
+                        max_splits: super::ATTN_SPLIT_MAX,
+                        min_keys: super::ATTN_SPLIT_MIN_KEYS,
+                    }),
+                },
+            )
+            .expect("attn split {head}");
         }
         stream.synchronize().expect("sync");
     }

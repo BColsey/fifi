@@ -515,6 +515,90 @@ mod device {
             );
         }
 
+        /// The graphed decode with the split attention armed must still draw
+        /// the identical greedy chain as the eager split run: the capture
+        /// replays the part+combine pair exactly. The same poison discipline
+        /// as the unsplit parity test, at a shorter draw to keep the suite
+        /// time bounded.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn a_graphed_split_run_matches_the_eager_split_run() {
+            let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
+            // The chain AND the logits bits per step: matching the greedy
+            // chain alone is weaker than the pin this test owes, and the
+            // bits make every replayed buffer write checkable.
+            let run = |model: &mut Bolt, prompt: &[u32]| -> (Vec<u32>, Vec<Vec<u32>>) {
+                feed(model, prompt);
+                let saved = prompt.len() - 1;
+                let mut token = prompt[saved];
+                let mut drawn = Vec::new();
+                let mut bits = Vec::new();
+                for pos in (saved..).take(24) {
+                    model.decode(token, pos).expect("decode");
+                    let logits = model.capped_logits().expect("capped logits");
+                    bits.push(logits.iter().map(|value| value.to_bits()).collect());
+                    token = logits
+                        .iter()
+                        .enumerate()
+                        .fold((0u32, logits[0]), |(best, value), (index, &other)| {
+                            if other > value {
+                                (index as u32, other)
+                            } else {
+                                (best, value)
+                            }
+                        })
+                        .0;
+                    drawn.push(token);
+                }
+                (drawn, bits)
+            };
+            // Capture a decode graph against the unsplit state first.
+            model.use_decode_graph(true);
+            let (unsplit, _) = run(&mut model, &prompt);
+            assert!(model.graph_captured(), "the graph must be captured");
+            let replays_unsplit = model.graph_mode.replays();
+            // Arming the split must drop that graph: its capture points at the
+            // pre-split launches, and a replay after the part buffer appears
+            // (or the buffer frees on disarm) would read freed or dead state.
+            model.use_attn_split(true).expect("arm split");
+            assert!(!model.graph_captured(), "arming must invalidate the graph");
+            model.use_decode_graph(false);
+            let (eager, eager_bits) = run(&mut model, &prompt);
+            assert!(
+                eager.windows(2).any(|pair| pair[0] != pair[1]),
+                "the drawn chain must not be constant"
+            );
+            let poison: Vec<u32> = (0..1_000u32).map(|index| 200_000 + (index % 891)).collect();
+            let (spoiled, _) = run(&mut model, &poison);
+            assert_ne!(eager, spoiled, "the poison run must diverge");
+            model.use_attn_split(false).expect("disarm split");
+            assert!(
+                !model.split_armed(),
+                "the disarm itself must free the partial buffer"
+            );
+            model.use_attn_split(true).expect("re-arm split");
+            model.use_decode_graph(true);
+            let (graphed, graphed_bits) = run(&mut model, &prompt);
+            assert_eq!(eager, graphed, "the graphed split chain must match");
+            assert_eq!(
+                eager_bits, graphed_bits,
+                "every replayed logits word must be bit-identical to the eager split run"
+            );
+            assert!(
+                model.graph_captured(),
+                "the graph must have recaptured after the re-arm"
+            );
+            assert!(
+                model.graph_mode.replays() > replays_unsplit + 20,
+                "the recaptured graph must replay the split steps (delta {})",
+                model.graph_mode.replays() - replays_unsplit
+            );
+            assert!(model.graph_mode.replays() > 20, "must have replayed");
+            assert_eq!(model.graph_mode.refusal(), None, "no refusal may occur");
+            let _ = unsplit;
+        }
+
         /// A one-token prompt feeds nothing in prefill, so its first decode
         /// writes cell 0 through `logits`: that decode must advance the cell
         /// generation, or a stale entry would match over the overwritten cell.

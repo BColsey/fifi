@@ -39,12 +39,12 @@ pub(crate) const DECODE_GRAPH_VAR: &str = "FIFI_BOLT_DECODE_GRAPH";
 /// Parses the arming value: absent, `0` and `off` disarm; `1` and `on` arm;
 /// anything else is an error, so a typo or an empty value refuses loudly
 /// instead of silently serving eager.
-pub(crate) fn parse_switch(value: Option<&str>) -> Result<bool, EngError> {
+pub(crate) fn parse_switch(value: Option<&str>, context: &str) -> Result<bool, EngError> {
     match value {
         None | Some("0") | Some("off") => Ok(false),
         Some("1") | Some("on") => Ok(true),
         Some(other) => Err(EngError::BadRequest(format!(
-            "bolt decode graph: {DECODE_GRAPH_VAR} accepts 1, on, 0 or off; got {other:?}"
+            "{context} accepts 1, on, 0 or off; got {other:?}"
         ))),
     }
 }
@@ -52,7 +52,10 @@ pub(crate) fn parse_switch(value: Option<&str>) -> Result<bool, EngError> {
 /// Whether the environment asks for the decode graph; a bad value fails the
 /// load instead of arming or disarming by accident.
 pub(crate) fn decode_graph_wanted() -> Result<bool, EngError> {
-    parse_switch(std::env::var(DECODE_GRAPH_VAR).ok().as_deref())
+    parse_switch(
+        std::env::var(DECODE_GRAPH_VAR).ok().as_deref(),
+        &format!("bolt decode graph: {DECODE_GRAPH_VAR}"),
+    )
 }
 
 fn refuse(why: &str) -> EngError {
@@ -206,13 +209,14 @@ mod tests {
 
     #[test]
     fn the_switch_accepts_one_and_on_only() {
-        assert!(!parse_switch(None).unwrap());
-        assert!(!parse_switch(Some("0")).unwrap());
-        assert!(!parse_switch(Some("off")).unwrap());
-        assert!(parse_switch(Some("1")).unwrap());
-        assert!(parse_switch(Some("on")).unwrap());
+        let context = "bolt decode graph: FIFI_BOLT_DECODE_GRAPH";
+        assert!(!parse_switch(None, context).unwrap());
+        assert!(!parse_switch(Some("0"), context).unwrap());
+        assert!(!parse_switch(Some("off"), context).unwrap());
+        assert!(parse_switch(Some("1"), context).unwrap());
+        assert!(parse_switch(Some("on"), context).unwrap());
         for bad in ["", "false", "yes", "ON"] {
-            let error = format!("{:?}", parse_switch(Some(bad)).unwrap_err());
+            let error = format!("{:?}", parse_switch(Some(bad), context).unwrap_err());
             assert!(
                 error.contains("got"),
                 "the refusal must quote the bad value {bad:?}"

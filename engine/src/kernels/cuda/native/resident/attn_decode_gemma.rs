@@ -24,6 +24,56 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_attn_decode_gemma_part_floats"]
+    fn attn_decode_gemma_part_floats_raw(
+        m: c_int,
+        n_q_head: c_int,
+        head_dim: c_int,
+        max_splits: c_int,
+    ) -> usize;
+    #[link_name = "inference_cuda_attn_decode_gemma_split_plan_raw"]
+    fn attn_decode_gemma_split_plan_raw(
+        n_keys: c_int,
+        max_splits: c_int,
+        min_keys: c_int,
+        chunk: *mut c_int,
+        n_active: *mut c_int,
+    ) -> c_int;
+}
+
+/// Floats of the split partial buffer: m * n_q_head * max_splits * (2 + head_dim).
+pub(in crate::kernels::cuda) fn attn_decode_gemma_part_floats(
+    m: usize,
+    n_q_head: usize,
+    head_dim: usize,
+    max_splits: usize,
+) -> Option<usize> {
+    let m = c_int::try_from(m).ok()?;
+    let n_q_head = c_int::try_from(n_q_head).ok()?;
+    let head_dim = c_int::try_from(head_dim).ok()?;
+    let max_splits = c_int::try_from(max_splits).ok()?;
+    // SAFETY: passes four plain ints; the FFI is a pure arithmetic function.
+    let floats = unsafe { attn_decode_gemma_part_floats_raw(m, n_q_head, head_dim, max_splits) };
+    (floats > 0).then_some(floats)
+}
+
+/// Host mirror of the device split plan; pins to the same (chunk, n_active) as the
+/// kernels. Returns `None` when the FFI refuses the arguments.
+pub(in crate::kernels::cuda) fn attn_decode_gemma_split_plan(
+    n_keys: usize,
+    max_splits: usize,
+    min_keys: usize,
+) -> Option<(usize, usize)> {
+    let n_keys = c_int::try_from(n_keys).ok()?;
+    let max_splits = c_int::try_from(max_splits).ok()?;
+    let min_keys = c_int::try_from(min_keys).ok()?;
+    let mut chunk = 0_i32;
+    let mut n_active = 0_i32;
+    // SAFETY: passes plain ints and pointers to two live ints.
+    let rc = unsafe {
+        attn_decode_gemma_split_plan_raw(n_keys, max_splits, min_keys, &mut chunk, &mut n_active)
+    };
+    (rc == 0).then_some((chunk.max(0) as usize, n_active.max(0) as usize))
 }
 
 /// Mirror of inference_cuda_attn_decode_gemma_args, field for field.
@@ -44,10 +94,14 @@ struct AttnDecodeGemmaArgsRepr {
     cells: c_int,
     window: c_int,
     scale: f32,
+    part: *mut c_void,
+    split: c_int,
+    max_splits: c_int,
+    min_keys: c_int,
 }
 
 const _: () = assert!(
-    size_of::<AttnDecodeGemmaArgsRepr>() == 96
+    size_of::<AttnDecodeGemmaArgsRepr>() == 120
         && offset_of!(AttnDecodeGemmaArgsRepr, out) == 0
         && offset_of!(AttnDecodeGemmaArgsRepr, status) == 8
         && offset_of!(AttnDecodeGemmaArgsRepr, q) == 16
@@ -63,6 +117,10 @@ const _: () = assert!(
         && offset_of!(AttnDecodeGemmaArgsRepr, cells) == 80
         && offset_of!(AttnDecodeGemmaArgsRepr, window) == 84
         && offset_of!(AttnDecodeGemmaArgsRepr, scale) == 88
+        && offset_of!(AttnDecodeGemmaArgsRepr, part) == 96
+        && offset_of!(AttnDecodeGemmaArgsRepr, split) == 104
+        && offset_of!(AttnDecodeGemmaArgsRepr, max_splits) == 108
+        && offset_of!(AttnDecodeGemmaArgsRepr, min_keys) == 112
 );
 
 /// One attention launch over the KV8 planes.
@@ -82,6 +140,10 @@ pub(in crate::kernels::cuda) struct AttnDecodeGemmaRaw<'a> {
     pub(in crate::kernels::cuda) cells: usize,
     pub(in crate::kernels::cuda) window: usize,
     pub(in crate::kernels::cuda) scale: f32,
+    pub(in crate::kernels::cuda) part: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) split: bool,
+    pub(in crate::kernels::cuda) max_splits: usize,
+    pub(in crate::kernels::cuda) min_keys: usize,
 }
 
 fn plane_bytes(kv_heads: usize, cells: usize, head_dim: usize) -> Option<(usize, usize)> {
@@ -145,6 +207,24 @@ fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFa
             return Err(invalid_argument());
         }
     }
+    if call.split {
+        let part = call.part.as_ref().ok_or_else(invalid_argument)?;
+        let part_floats =
+            attn_decode_gemma_part_floats(call.m, call.n_q_head, call.head_dim, call.max_splits)
+                .ok_or_else(invalid_argument)?;
+        let part_bytes = part_floats.checked_mul(4).ok_or_else(invalid_argument)?;
+        let split_dims = (1..=128).contains(&call.max_splits) && call.min_keys >= 8;
+        if !split_dims
+            || part.bytes < part_bytes
+            || !part.offset.is_multiple_of(16)
+            || reads.iter().any(|(range, bytes, _)| {
+                !Span::of(part, part_bytes).apart(&Span::of(range, *bytes))
+            })
+            || !output.apart(&Span::of(part, part_bytes))
+        {
+            return Err(invalid_argument());
+        }
+    }
     Ok(())
 }
 
@@ -173,6 +253,14 @@ pub(in crate::kernels::cuda) fn attn_decode_gemma_launch(
         cells: c_int::try_from(call.cells).map_err(|_| invalid_argument())?,
         window: c_int::try_from(call.window).map_err(|_| invalid_argument())?,
         scale: call.scale,
+        part: call
+            .part
+            .as_ref()
+            .map(|p| p.address())
+            .unwrap_or(std::ptr::null_mut()),
+        split: c_int::from(call.split),
+        max_splits: c_int::try_from(call.max_splits).map_err(|_| invalid_argument())?,
+        min_keys: c_int::try_from(call.min_keys).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: check_attn_decode_gemma proved the ranges inside their live allocations,

@@ -416,6 +416,7 @@ impl Gemma {
                 cells: CELLS,
                 window: if layer.global { 0 } else { LOCAL_WINDOW },
                 scale: 1.0,
+                split: None,
             },
         )?;
         ctx.quantize_q8_1(

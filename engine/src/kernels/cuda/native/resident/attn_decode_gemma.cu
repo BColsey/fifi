@@ -9,8 +9,25 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/attn_decode_gemma.h"
+#include "resident/attn_split_reduce.cuh"
 
 namespace {
+
+constexpr int kMaxSplits = 128;  // one thread per split in the combine statistics step
+
+// Split plan of the gemma split path: n_split = min(ceil(n_keys / min_keys), max_splits)
+// chunks of exactly ceil(n_keys / n_split) keys (no tile rounding: the kernel strides
+// cells by warp, not by tile); split s owns [s * chunk, min(n_keys, (s + 1) * chunk)).
+// inference_cuda_attn_decode_gemma_split_plan_raw is the host mirror; the Rust pin
+// test holds both to the same values.
+__device__ inline void gemma_split_plan(
+    int n_keys, int max_splits, int min_keys, int &chunk, int &n_active) {
+    const int want = (n_keys + min_keys - 1) / min_keys;
+    const int n_split = min(max(want, 1), max_splits);
+    chunk = (n_keys + n_split - 1) / n_split;
+    n_active = (n_keys + chunk - 1) / chunk;
+}
+
 
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
 bool apart(const void *a, size_t ab, const void *b, size_t bb) {
@@ -108,6 +125,150 @@ __global__ void attn_decode_gemma_kernel(
     }
 }
 
+// The split path. One block per (q head, token, split slot): the block computes the
+// same online-softmax partial as the single-pass kernel over its chunk of the visible
+// range (identical arithmetic per key), then stages the cross-warp merge the
+// single-pass kernel performs and writes ONE split partial: stats (max, sum) then the
+// accumulator vector, in the attn_decode_q8 partial order (stats region first).
+__global__ void __launch_bounds__(256) attn_decode_gemma_part_k(
+    float *part, unsigned int *status, const float *q,
+    const signed char *k_codes, const unsigned short *k_scales,
+    const signed char *v_codes, const unsigned short *v_scales, const int *kv_len_word,
+    int n_q_head, int n_kv_head, int head_dim, int cells, int window, float scale,
+    int max_splits, int min_keys) {
+    const int token = blockIdx.y;
+    const int qh = blockIdx.x;
+    const int slot = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int nwarps = (int)blockDim.x / 32;
+    const int kvh = (int)(((long long)qh * n_kv_head) / n_q_head);
+    const int64_t requested_len = (int64_t)*kv_len_word + token;
+    if (requested_len < 1 || requested_len > cells) {
+        // The combine kernel owns the NaN output and the status word; nothing to stage.
+        if (tid == 0 && status != NULL) atomicOr(status, 4u);
+        return;
+    }
+    const int kv_len = (int)requested_len;
+    const int visible = (window > 0 && window < kv_len) ? window : kv_len;
+    const int first = kv_len - visible;
+    int chunk, n_active;
+    gemma_split_plan(visible, max_splits, min_keys, chunk, n_active);
+    if (slot >= n_active) return;
+    const int begin = first + slot * chunk;
+    const int end = min(kv_len, begin + chunk);
+    const int groups = head_dim / 32;
+    const int per_lane = head_dim / 32;
+    const size_t out_base = ((size_t)token * n_q_head + qh) * (size_t)head_dim;
+    float qv[16];
+    for (int k = 0; k < per_lane; ++k) qv[k] = q[out_base + lane + 32 * k];
+    float acc[16];
+    for (int k = 0; k < per_lane; ++k) acc[k] = 0.0f;
+    float run_m = -INFINITY;
+    float run_l = 0.0f;
+    for (int cell = begin + warp; cell < end; cell += nwarps) {
+        const size_t plane = ((size_t)kvh * cells + cell) * (size_t)head_dim;
+        const size_t sbase = ((size_t)kvh * cells + cell) * (size_t)groups;
+        float partial = 0.0f;
+        for (int k = 0; k < per_lane; ++k) {
+            const float kscale = __half2float(__ushort_as_half(k_scales[sbase + k]));
+            partial += qv[k] * ((float)k_codes[plane + lane + 32 * k] * kscale);
+        }
+        float score = partial;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) score += __shfl_xor_sync(0xffffffffu, score, o);
+        score *= scale;
+        const float new_m = fmaxf(run_m, score);
+        const float p = expf(score - new_m);
+        const float correction = (run_l == 0.0f) ? 0.0f : expf(run_m - new_m);
+        run_l = run_l * correction + p;
+        for (int k = 0; k < per_lane; ++k) {
+            const float vscale = __half2float(__ushort_as_half(v_scales[sbase + k]));
+            acc[k] = acc[k] * correction + p * ((float)v_codes[plane + lane + 32 * k] * vscale);
+        }
+        run_m = new_m;
+    }
+    // The staged cross-warp merge of the single-pass kernel, verbatim: sh_m/sh_l per
+    // warp, then warp 0 combines each per-lane accumulator column in warp order.
+    __shared__ float sh_m[32];
+    __shared__ float sh_l[32];
+    __shared__ float sh_a[32][32];
+    if (lane == 0) {
+        sh_m[warp] = run_m;
+        sh_l[warp] = run_l;
+    }
+    __syncthreads();
+    float peak = 0.0f;
+    float denom = 0.0f;
+    if (warp == 0) {
+        peak = -INFINITY;
+        for (int w = 0; w < nwarps; ++w) peak = fmaxf(peak, sh_m[w]);
+        for (int w = 0; w < nwarps; ++w) {
+            const float wl = (sh_l[w] == 0.0f) ? 0.0f : expf(sh_m[w] - peak);
+            denom += sh_l[w] * wl;
+        }
+    }
+    // Partial of (token, q head, split slot): stats region first, then accumulators.
+    const size_t n_cells = (size_t)gridDim.y * (size_t)n_q_head * (size_t)max_splits;
+    const size_t cellx = ((size_t)token * n_q_head + qh) * (size_t)max_splits + slot;
+    float *ml = part + cellx * 2;
+    float *ac = part + n_cells * 2 + cellx * (size_t)head_dim;
+    for (int k = 0; k < per_lane; ++k) {
+        sh_a[warp][lane] = acc[k];
+        __syncthreads();
+        if (warp == 0) {
+            float combined = 0.0f;
+            for (int w = 0; w < nwarps; ++w) {
+                const float wl = (sh_l[w] == 0.0f) ? 0.0f : expf(sh_m[w] - peak);
+                combined += sh_a[w][lane] * wl;
+            }
+            ac[lane + 32 * k] = combined;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        ml[0] = peak;
+        ml[1] = denom;
+    }
+}
+
+template <int D>
+__global__ void __launch_bounds__(D) attn_decode_gemma_combine_k(
+    float *out, unsigned int *status, const int *kv_len_word, const float *part,
+    int n_q_head, int m, int head_dim, int cells, int window, int max_splits,
+    int min_keys) {
+    __shared__ float s_w[kMaxSplits], s_l[kMaxSplits], s_red[D / 32];
+    const int qh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    float *o = out + ((size_t)t * n_q_head + qh) * (size_t)head_dim + d;
+    const int64_t requested_len = (int64_t)*kv_len_word + t;
+    if (requested_len < 1 || requested_len > cells) {
+        // Same contract as the single-pass kernel: NaN out, status bit 4.
+        *o = __int_as_float(0x7fc00000);
+        if (d == 0 && status != NULL) atomicOr(status, 4u);
+        return;
+    }
+    const int kv_len = (int)requested_len;
+    const int visible = (window > 0 && window < kv_len) ? window : kv_len;
+    int chunk, n_active;
+    gemma_split_plan(visible, max_splits, min_keys, chunk, n_active);
+    const size_t n_cells = (size_t)m * (size_t)n_q_head * (size_t)max_splits;
+    const size_t cellx = ((size_t)t * n_q_head + qh) * (size_t)max_splits;
+    const float *ml = part + cellx * 2;
+    const float *ac = part + n_cells * 2 + cellx * (size_t)head_dim + d;
+    const size_t ml_step = 2, ac_step = (size_t)head_dim;
+    // The shared two-phase merge of attn_split_reduce.cuh; no sink, no gate: the
+    // n_active == 1 case reproduces the single-pass kernel's combined / denom.
+    const float peak = inference::attn_split_max<D>(d, n_active, ml, ml_step, s_l, s_red);
+    if (d < n_active) {
+        s_w[d] = expf(ml[d * ml_step] - peak);
+    }
+    __syncthreads();
+    float l, a;
+    inference::attn_split_sum(n_active, 0.f, s_w, s_l, ac, ac_step, l, a);
+    *o = a / l;
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_attn_decode_gemma_launch(
@@ -150,18 +311,83 @@ extern "C" int inference_cuda_attn_decode_gemma_launch(
         }
         if (args->status != NULL && !apart(args->out, out_bytes, args->status, 4))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        const dim3 grid((unsigned)args->n_q_head, (unsigned)args->m);
+        if (args->split != 0) {
+            if (args->part == NULL || args->max_splits < 1 || args->max_splits > kMaxSplits ||
+                args->min_keys < 8 || !aligned(args->part, 16))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            const size_t part_bytes = (size_t)args->m * args->n_q_head *
+                                      args->max_splits * (2 + args->head_dim) * 4;
+            for (int i = 0; i < 6; ++i) {
+                if (!apart(args->part, part_bytes, reads[i], sizes[i]))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+            if (!apart(args->out, out_bytes, args->part, part_bytes) ||
+                (args->status != NULL && !apart(args->status, 4, args->part, part_bytes)))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
         Failure failure;
-        attn_decode_gemma_kernel<<<grid, 256, 0, (cudaStream_t)stream>>>(
-            (float *)args->out, (unsigned int *)args->status, (const float *)args->q,
-            (const signed char *)args->k_codes, (const unsigned short *)args->k_scales,
-            (const signed char *)args->v_codes, (const unsigned short *)args->v_scales,
-            (const int *)args->kv_len, args->n_q_head, args->n_kv_head,
-            args->head_dim, args->cells, args->window, args->scale);
-        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        const cudaStream_t s = (cudaStream_t)stream;
+        if (args->split != 0) {
+            const dim3 part_grid((unsigned)args->n_q_head, (unsigned)args->m,
+                                 (unsigned)args->max_splits);
+            attn_decode_gemma_part_k<<<part_grid, 256, 0, s>>>(
+                (float *)args->part, (unsigned int *)args->status, (const float *)args->q,
+                (const signed char *)args->k_codes, (const unsigned short *)args->k_scales,
+                (const signed char *)args->v_codes, (const unsigned short *)args->v_scales,
+                (const int *)args->kv_len, args->n_q_head, args->n_kv_head,
+                args->head_dim, args->cells, args->window, args->scale,
+                args->max_splits, args->min_keys);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (failure.ok()) {
+                const dim3 comb_grid((unsigned)args->n_q_head, (unsigned)args->m);
+                if (args->head_dim == 512) {
+                    attn_decode_gemma_combine_k<512><<<comb_grid, 512, 0, s>>>(
+                        (float *)args->out, (unsigned int *)args->status,
+                        (const int *)args->kv_len, (const float *)args->part,
+                        args->n_q_head, args->m, args->head_dim, args->cells,
+                        args->window, args->max_splits, args->min_keys);
+                } else {
+                    attn_decode_gemma_combine_k<256><<<comb_grid, 256, 0, s>>>(
+                        (float *)args->out, (unsigned int *)args->status,
+                        (const int *)args->kv_len, (const float *)args->part,
+                        args->n_q_head, args->m, args->head_dim, args->cells,
+                        args->window, args->max_splits, args->min_keys);
+                }
+                failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            }
+        } else {
+            const dim3 grid((unsigned)args->n_q_head, (unsigned)args->m);
+            attn_decode_gemma_kernel<<<grid, 256, 0, s>>>(
+                (float *)args->out, (unsigned int *)args->status, (const float *)args->q,
+                (const signed char *)args->k_codes, (const unsigned short *)args->k_scales,
+                (const signed char *)args->v_codes, (const unsigned short *)args->v_scales,
+                (const int *)args->kv_len, args->n_q_head, args->n_kv_head,
+                args->head_dim, args->cells, args->window, args->scale);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" size_t inference_cuda_attn_decode_gemma_part_floats(
+    int m, int n_q_head, int head_dim, int max_splits) {
+    if (m < 1 || n_q_head < 1 || head_dim < 32 || max_splits < 1) return 0;
+    return (size_t)m * n_q_head * max_splits * (2 + head_dim);
+}
+
+extern "C" int inference_cuda_attn_decode_gemma_split_plan_raw(
+    int n_keys, int max_splits, int min_keys, int *chunk, int *n_active) {
+    if (chunk == NULL || n_active == NULL || n_keys < 0 || max_splits < 1 ||
+        max_splits > kMaxSplits || min_keys < 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const int want = (n_keys + min_keys - 1) / min_keys;
+    const int n_split = want < 1 ? 1 : (want > max_splits ? max_splits : want);
+    const int ch = (n_keys + n_split - 1) / n_split;
+    *chunk = ch;
+    *n_active = (n_keys + ch - 1) / ch;
+    return 0;
 }

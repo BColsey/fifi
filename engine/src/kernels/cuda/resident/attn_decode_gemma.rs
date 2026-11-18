@@ -5,7 +5,10 @@
 //! window cuts the keys to the last W positions (0 means all); the scale is a
 //! parameter (Gemma uses 1.0); there is no output gate. The device kv_len word is
 //! authoritative: token t sees keys 0..kv_len+t-1, out is NaN and status bit 4 is
-//! set when kv_len is out of range. v0 is single-pass, no split-K.
+//! set when kv_len is out of range. `split: None` runs the v0 single-pass kernel;
+//! `Some((part, max_splits, min_keys))` runs the part+combine split path over
+//! `part` (sized by attn_decode_gemma_part_floats), which changes the softmax
+//! summation order and is not bit-identical to the single-pass kernel.
 //!
 //! [CudaContext::attn_decode_gemma] queues the kernel on a [DeviceStream] and
 //! returns when it is queued. It allocates nothing, copies nothing and never
@@ -23,8 +26,18 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::resident::attn_decode_gemma::{
-    AttnDecodeGemmaRaw, attn_decode_gemma_launch,
+    AttnDecodeGemmaRaw, attn_decode_gemma_launch, attn_decode_gemma_part_floats,
 };
+
+/// The split plan of a call that opted into the split path: the partial buffer,
+/// its split capacity and the keys-per-split floor. `part` must be 16-byte
+/// aligned and sized by [attn_decode_gemma_part_floats]; the resident owns it.
+#[derive(Clone, Copy)]
+pub(crate) struct AttnDecodeGemmaSplit<'b> {
+    pub(crate) part: DeviceRange<'b>,
+    pub(crate) max_splits: usize,
+    pub(crate) min_keys: usize,
+}
 
 pub(crate) struct AttnDecodeGemmaCall<'b> {
     pub(crate) out: DeviceRange<'b>,
@@ -42,6 +55,7 @@ pub(crate) struct AttnDecodeGemmaCall<'b> {
     pub(crate) cells: usize,
     pub(crate) window: usize,
     pub(crate) scale: f32,
+    pub(crate) split: Option<AttnDecodeGemmaSplit<'b>>,
 }
 
 /// The query/kv head shapes the Gemma attention and RoPE kernels admit: 16 query
@@ -156,6 +170,38 @@ impl CudaContext {
         if let Some(status) = &call.status {
             require_apart(&Claim::of("status", status, 4), &output)?;
         }
+        let split = match &call.split {
+            None => None,
+            Some(plan) => {
+                let part_bytes = attn_decode_gemma_part_floats(
+                    call.m,
+                    call.n_q_head,
+                    call.head_dim,
+                    plan.max_splits,
+                )
+                .and_then(|floats| floats.checked_mul(4))
+                .ok_or_else(|| EngError::BadRequest("the split size overflows".to_owned()))?;
+                if !(1..=128).contains(&plan.max_splits) || plan.min_keys < 8 {
+                    return Err(EngError::BadRequest(format!(
+                        "the split plan needs max_splits 1..=128 and min_keys >= 8, \
+                         got {} and {}",
+                        plan.max_splits, plan.min_keys
+                    )));
+                }
+                require_fit("part", &plan.part, part_bytes, 16)?;
+                let partial = Claim::of("part", &plan.part, part_bytes);
+                require_apart(&partial, &output)?;
+                for (name, range, bytes) in reads {
+                    let input = Claim::of(name, range, bytes);
+                    require_apart(&partial, &input)?;
+                }
+                Some(AttnDecodeGemmaSplit {
+                    part: plan.part,
+                    max_splits: plan.max_splits,
+                    min_keys: plan.min_keys,
+                })
+            }
+        };
         Ok(AttnDecodeGemmaRaw {
             out: out_raw,
             status: status_raw,
@@ -172,6 +218,13 @@ impl CudaContext {
             cells: call.cells,
             window: call.window,
             scale: call.scale,
+            part: split
+                .as_ref()
+                .map(|plan| self.raw_range(&plan.part))
+                .transpose()?,
+            split: split.is_some(),
+            max_splits: split.as_ref().map_or(1, |plan| plan.max_splits),
+            min_keys: split.as_ref().map_or(32, |plan| plan.min_keys),
         })
     }
 }
