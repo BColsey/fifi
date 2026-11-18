@@ -288,7 +288,7 @@ fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
 }
 
 #[test]
-fn a_q5_k_tensor_fails_the_open_naming_the_tensor_and_type() {
+fn a_q5_k_tensor_fails_the_model_open_naming_the_tensor_and_type() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
@@ -301,7 +301,7 @@ fn a_q5_k_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf: tensor blk.1.attn_k.weight has unsupported type Q5_K"
+        "gguf model: tensor blk.1.attn_k.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
     );
 }
 

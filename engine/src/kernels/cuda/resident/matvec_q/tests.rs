@@ -640,6 +640,36 @@ fn matvec_q3k_refuses_bad_shapes_before_the_adapter() {
     assert_bad_request(result, "y overlaps w", "y and w ranges overlap");
 }
 
+/// The planning gate itself: main's Q3_K resident matvec must pass `plan_matvec`
+/// untouched. Guards against a rebase silently re-adding a Q3_K refusal at the
+/// plan step while the launch arm survives below it.
+#[test]
+fn matvec_q3k_plans_the_resident_matvec() {
+    if !testkit::device_present("matvec_q3k_plans_the_resident_matvec") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (w, x_q8, _row_bytes) = rig(&ctx, &stream, QuantType::Q3K, 2048, 64, 1, 0x1eaf_c0de);
+    let y = testkit::upload_filled(&ctx, 0xAA, 64 * 4);
+    let result = ctx.matvec_q(
+        &stream,
+        MatvecCall {
+            ty: QuantType::Q3K,
+            w: w.range(0, w.bytes()).expect("w"),
+            x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+            y: y.range(0, y.bytes()).expect("y"),
+            k: 2048,
+            rows: 64,
+            ncols: 1,
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "Q3_K must plan through the resident matvec: {result:?}"
+    );
+}
+
 /// The native value table (native/iq4_nl_values.cuh) is the CPU constant KVALUES_IQ4NL
 /// (weights/gguf_tables.rs), numerically: the header's 16 floats are parsed and compared,
 /// so the CUDA table cannot drift from the oracle's. No device needed. The table rides

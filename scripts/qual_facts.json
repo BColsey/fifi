@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7207,
+      "test_fns": 7209,
       "ignored": 645,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -139,6 +139,7 @@
         "FIFI_GDN_CONV_PREFILL",
         "FIFI_GDN_SCAN_CHUNK",
         "FIFI_GDN_SCAN_COLS",
+        "FIFI_GGUF_INVENTORY",
         "FIFI_GOLDEN_CAP",
         "FIFI_GOLDEN_COMMIT",
         "FIFI_GOLDEN_GPU_JSON",

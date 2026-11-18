@@ -2229,9 +2229,8 @@ fn a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call() {
     if !device_present(NAME) {
         return;
     }
-    // `GgufWeights::open` rejects Q5_K (no CPU reference decoder), so the plan's
-    // own Q5_K rejection is not reachable through `load`; `plan` tests cover it.
-    // The open names the tensor, and the device is untouched.
+    // The reader takes Q5_K; the native plan refuses it (no native block at this
+    // point), naming the tensor, with the device untouched.
     let dir = tempfile::tempdir().expect("create the fixture directory");
     let path = dir.path().join("q5.gguf");
     let payload = vec![0u8; N_ROWS * BLOCKS_PER_ROW * 176];
@@ -2239,15 +2238,19 @@ fn a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call() {
     std::fs::write(&path, gguf_bytes(&entries)).expect("write the GGUF fixture");
     let mut projector = CudaProjector::new().expect("create the CUDA projector");
     let before = projector.live_bytes();
-    let result = GgufWeights::open(&path, LIMITS, None);
-    assert_error(result, "Checkpoint", "tensor q5 has unsupported type Q5_K");
+    let weights = GgufWeights::open(&path, LIMITS, None).expect("the reader takes Q5_K");
+    assert_error(
+        planned(&weights, "q5", WeightLayout::Native).map(|(_, bytes)| bytes),
+        "Checkpoint",
+        "tensor q5 has type Q5K, which the CUDA native weights do not take",
+    );
     assert_eq!(
         projector.live_bytes(),
         before,
-        "the open touched the device"
+        "the plan touched the device"
     );
     let fixture = big_and_small_fixture();
-    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a rejected q5_k");
+    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a refused q5_k");
 }
 
 /// Q8_0 blocks whose every `d` is `d_bits` and whose quant 0 is `q`, the rest
@@ -3338,8 +3341,8 @@ fn trimmed_copy_drops_the_q5k_tensor_and_keeps_the_rest_byte_for_byte() {
     let entries = trim_fixture();
     std::fs::write(&source, gguf_bytes(&entries)).expect("write the source fixture");
     assert!(
-        GgufWeights::open(&source, MEASURE_LIMITS, None).is_err(),
-        "the source must fail the open because of its Q5_K tensor"
+        GgufWeights::open(&source, MEASURE_LIMITS, None).is_ok(),
+        "the reader takes every supported type, including the Q5_K tensor"
     );
     let dest = dir.path().join("trimmed.gguf");
     let trim = write_trimmed(&source, &dest, u64::MAX);

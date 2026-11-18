@@ -20,15 +20,19 @@ use std::{
 use super::gguf::{GgufHeader, GgufTensor, GgufType};
 use crate::EngError;
 
-/// Tensor types the CUDA path loads. Q4_K, Q6_K and Q8_0 hold the matrices; F32
-/// and F16 hold norms and small tables.
-const SUPPORTED_TYPES: [GgufType; 6] = [
+/// Tensor types the CUDA path loads. Q4_K, Q6_K, Q8_0, Q5_K, Q4_0 and Q3_K hold the
+/// matrices (the in-house dequantizing GEMM decodes the last three natively); F32 and F16
+/// hold norms and small tables.
+const SUPPORTED_TYPES: [GgufType; 9] = [
     GgufType::F32,
     GgufType::F16,
     GgufType::Q4K,
     GgufType::Q6K,
     GgufType::Q80,
     GgufType::Q50,
+    GgufType::Q5K,
+    GgufType::Q40,
+    GgufType::Q3K,
 ];
 
 /// Size limits checked before anything large is allocated.
@@ -415,17 +419,17 @@ mod tests {
 
     #[test]
     fn unsupported_tensor_types_fail_the_open_naming_the_tensor() {
-        let q5k = fixture("q5_k.blocks");
+        let blocks = fixture("q5_k.blocks");
         let f32s = fixture("f32.blocks");
         let entries = [
             entry("norm", GgufType::F32, &f32s),
-            entry("blk.0.ffn_down", GgufType::Q5K, &q5k),
+            entry("blk.0.ffn_down", GgufType::Q2K, &blocks),
         ];
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(&dir, &gguf(&[], &entries));
         expect_checkpoint(
             GgufWeights::open(&path, LIMITS, None),
-            "tensor blk.0.ffn_down has unsupported type Q5_K",
+            "tensor blk.0.ffn_down has unsupported type Q2_K",
         );
     }
 
@@ -697,5 +701,41 @@ mod tests {
         expect_checkpoint::<()>(Err(read_error("w", &error)), "tensor w ends past");
         let error = std::io::Error::other("disk");
         expect_checkpoint::<()>(Err(read_error("w", &error)), "cannot read tensor w");
+    }
+
+    /// Per-tensor type inventory of a real file, for the kernel-routing
+    /// receipts: when FIFI_GGUF_INVENTORY points at a GGUF the header opens
+    /// and the histogram prints (run with --nocapture). Skipped when unset.
+    #[test]
+    fn real_file_type_inventory() {
+        let Ok(path) = std::env::var("FIFI_GGUF_INVENTORY") else {
+            eprintln!("skipped: FIFI_GGUF_INVENTORY is unset");
+            return;
+        };
+        let limits = GgufLimits {
+            max_header_bytes: 100_000_000,
+            max_tensor_bytes: 8 << 30,
+        };
+        let weights = GgufWeights::open(std::path::Path::new(&path), limits, None)
+            .unwrap_or_else(|error| panic!("the file must open: {error:?}"));
+        let mut rows: Vec<(String, usize, u64, &str)> = Vec::new();
+        for tensor in weights.header().tensors() {
+            let ty = tensor.ggml_type();
+            let elements: u64 = tensor.dims().iter().product();
+            let blocks: u64 = elements / ty.block_elems();
+            let bytes = ty.block_bytes().checked_mul(blocks).unwrap_or(0);
+            match rows.iter_mut().find(|r| r.0 == ty.name()) {
+                Some(row) => {
+                    row.1 += 1;
+                    row.2 += bytes;
+                }
+                None => rows.push((ty.name().to_owned(), 1, bytes, tensor.name())),
+            }
+        }
+        rows.sort();
+        for (ty, count, bytes, example) in &rows {
+            println!("{ty:8} {count:4} tensors {bytes:14} bytes  e.g. {example}");
+        }
+        assert!(!rows.is_empty());
     }
 }
