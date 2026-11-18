@@ -17,6 +17,7 @@ use super::tiered_step::ColdStaging;
 use crate::EngError;
 use crate::family::device_budget::KvPlan;
 use crate::family::mapped_file::MappedFile;
+use crate::family::qwen36::settings::SlotRequest;
 use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion, PoolError};
 use crate::family::qwen36::tiered::guess::{GuessError, LayerRouter, RouterGuess};
 use crate::family::qwen36::tiered::host::TieredHost;
@@ -75,15 +76,25 @@ pub(super) fn admit_banks(
     free: u64,
     geometry: ExpertBankGeometry,
     layers: usize,
-    plan: &TieredPlan,
+    request: SlotRequest,
+    experts: usize,
     reserve: u64,
-    cold_bytes: u64,
-) -> Result<(), EngError> {
-    let top_k = u64::try_from(geometry.top_k).unwrap_or(u64::MAX);
-    let slice = ExpertBank::bytes_for(geometry, geometry.top_k)? / (3 * top_k);
+) -> Result<usize, EngError> {
+    let minimum = match request {
+        SlotRequest::Fit => geometry.top_k,
+        SlotRequest::Exactly(count) => count,
+    };
+    if minimum < geometry.top_k || minimum > experts {
+        return Err(EngError::MemoryPlan(format!(
+            "tiered: {minimum} slots per layer is outside the model range {}..={experts}",
+            geometry.top_k
+        )));
+    }
+    let minimum_bank = ExpertBank::bytes_for(geometry, geometry.top_k)?;
+    let bytes_per_slot = minimum_bank / geometry.top_k as u64;
     let budget = VramBudget {
         usable: free,
-        non_expert: cold_bytes,
+        non_expert: 0,
         state: 0,
         arena: 0,
         desktop_reserve: reserve,
@@ -94,40 +105,56 @@ pub(super) fn admit_banks(
         bytes_per_position: 1,
     };
     let expert = ExpertSize {
-        bytes: slice * 3,
+        bytes: bytes_per_slot,
         layers,
     };
-    plan_vram(&budget, &kv, &expert, plan.slots_per_layer, 0).map(drop).map_err(|error| {
+    let capacity = plan_vram(&budget, &kv, &expert, minimum, 0).map_err(|error| {
         EngError::MemoryPlan(format!(
-            "tiered: {} slots per layer of {layers} layers do not fit {free} free device bytes with {reserve} reserved: {error:?}",
-            plan.slots_per_layer
+            "tiered: {minimum} slots per layer of {layers} layers do not fit {free} free device bytes with {reserve} reserved: {error:?}"
         ))
+    })?;
+    Ok(match request {
+        SlotRequest::Fit => capacity.bank_slots_per_layer.min(experts),
+        SlotRequest::Exactly(count) => count,
     })
 }
 
-/// The cold staging depth the free device memory funds: the hottest distinct cold experts
-/// per layer top out at 78 on this model, and every cap below that pushes experts back
-/// into the 0.24 ms/pair CPU pool, so the target is 78 whenever the spare above the
-/// reserve (after every layer's banks) reaches it. A probe-ceiling config leaves less
-/// than one bank-slot-set of spare by construction (`plan_vram` floors the slots), so the
-/// formula yields 0 there and the operator funds the staging by dropping 2 slots per
-/// layer (two slot-sets free 141,557,760 B ≥ the 138,018,816 B of 78 experts).
-pub(super) fn cold_cap_for(
+/// When staged prefill can run, fund its shared cold bank before assigning surplus
+/// to all layers' resident banks. Explicit counts keep their existing staging policy.
+fn tiered_bank_depths(
     free: u64,
     geometry: ExpertBankGeometry,
     layers: usize,
-    slots_per_layer: usize,
-    reserve: u64,
-) -> usize {
-    /// The measured maximum of DISTINCT cold experts serving one layer's picks.
+    request: SlotRequest,
+    experts: usize,
+    chunk_ready: bool,
+) -> Result<(usize, usize), EngError> {
     const COLD_TARGET: usize = 78;
-    let per_expert = ExpertBank::bytes_for(geometry, geometry.top_k).unwrap_or(u64::MAX)
-        / u64::try_from(geometry.top_k).unwrap_or(1);
-    let banks = ExpertBank::bytes_for(geometry, slots_per_layer)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(u64::try_from(layers).unwrap_or(u64::MAX));
-    let spare = free.saturating_sub(reserve).saturating_sub(banks);
-    COLD_TARGET.min(usize::try_from(spare / per_expert.max(1)).unwrap_or(0))
+    let hot_minimum = match request {
+        SlotRequest::Fit => geometry.top_k,
+        SlotRequest::Exactly(count) => count,
+    };
+    let minimum_bytes = ExpertBank::bytes_for(geometry, hot_minimum)?;
+    let slot_bytes = minimum_bytes / hot_minimum as u64;
+    let banks = minimum_bytes
+        .checked_mul(layers as u64)
+        .ok_or_else(|| EngError::MemoryPlan("tiered: resident banks overflow u64".into()))?;
+    let spare = free.saturating_sub(ADMISSION_RESERVE).saturating_sub(banks);
+    let cold = if request == SlotRequest::Fit && !chunk_ready {
+        0
+    } else {
+        (spare / slot_bytes).min(COLD_TARGET.min(experts) as u64) as usize
+    };
+    let cold = if cold >= geometry.top_k { cold } else { 0 };
+    let hot = admit_banks(
+        free - cold as u64 * slot_bytes,
+        geometry,
+        layers,
+        request,
+        experts,
+        ADMISSION_RESERVE,
+    )?;
+    Ok((hot, cold))
 }
 
 pub(super) fn build_tiered(
@@ -135,6 +162,7 @@ pub(super) fn build_tiered(
     (header, gguf): (&GgufHeader, &Path),
     dims: &StepDims,
     plan: &TieredPlan,
+    slots: usize,
     cold_cap: usize,
 ) -> Result<(Vec<ExpertBank>, TieredHost, Option<ColdStaging>), EngError> {
     let moe = &dims.shape.moe;
@@ -161,7 +189,7 @@ pub(super) fn build_tiered(
         layers,
         experts: moe.experts,
         top_k: moe.top_k,
-        bank_slots_per_layer: plan.slots_per_layer,
+        bank_slots_per_layer: slots,
         mode: PolicyMode::Adaptive,
         swaps_per_token: f64::from(plan.swaps_milli) / 1000.0,
         decay: f64::from(plan.decay_milli) / 1000.0,
@@ -183,7 +211,7 @@ pub(super) fn build_tiered(
     }
     let geometry = geometry_of(dims);
     let banks = (0..layers)
-        .map(|_| ExpertBank::new(ctx, geometry, plan.slots_per_layer))
+        .map(|_| ExpertBank::new(ctx, geometry, slots))
         .collect::<Result<Vec<_>, _>>()?;
     // The staging bank follows the banks: same free pool, one shared bank for every
     // layer. A cap below top_k cannot even build a bank geometry, so it stays None.
@@ -203,30 +231,22 @@ pub(super) fn attach_tiered_parts(
     ctx: &CudaContext,
     (source, dims): ((&GgufHeader, &Path), &StepDims),
     plan: &TieredPlan,
-) -> Result<(), EngError> {
-    let (geometry, layers) = (geometry_of(dims), dims.shape.kinds.len());
+) -> Result<usize, EngError> {
     let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
-    let cold_cap = cold_cap_for(
+    let (slots, cold_cap) = tiered_bank_depths(
         free,
-        geometry,
-        layers,
-        plan.slots_per_layer,
-        ADMISSION_RESERVE,
-    );
-    // Charge the staging the plan is about to allocate, so the reserve the banks leave
-    // behind still covers the loader's headroom after the staging exists.
-    let cold_bytes = if cold_cap >= geometry.top_k {
-        ExpertBank::bytes_for(geometry, cold_cap)?
-    } else {
-        0
-    };
-    admit_banks(free, geometry, layers, plan, ADMISSION_RESERVE, cold_bytes)?;
-    let (banks, host, cold) = build_tiered(ctx, source, dims, plan, cold_cap)?;
+        geometry_of(dims),
+        dims.shape.kinds.len(),
+        plan.slots,
+        dims.shape.moe.experts,
+        matches!(step.chunk_ready(), super::step::ChunkVerdict::Ready { .. }),
+    )?;
+    let (banks, host, cold) = build_tiered(ctx, source, dims, plan, slots, cold_cap)?;
     step.attach_tiered(banks, host, cold)?;
     if plan.preload {
         step.preload_tiered()?;
     }
-    Ok(())
+    Ok(slots)
 }
 
 /// The device bytes kept free beside the banks: the loader's headroom (1 GiB).
@@ -366,15 +386,113 @@ mod tests {
     }
 
     #[test]
+    fn auto_banks_preserve_staged_prefill_only_when_the_session_can_use_it() {
+        let geometry = geometry_of(&dims());
+        let min = geometry.top_k;
+        let layers = 40;
+        let slot = ExpertBank::bytes_for(geometry, min).unwrap() / min as u64;
+        let request = |room, slots, chunk| {
+            tiered_bank_depths(
+                ADMISSION_RESERVE + room * slot,
+                geometry,
+                layers,
+                slots,
+                256,
+                chunk,
+            )
+        };
+        let min_room = min as u64 * layers as u64;
+        assert!(request(min_room - 1, SlotRequest::Fit, true).is_err());
+        assert_eq!(
+            request(min_room + min as u64 - 1, SlotRequest::Fit, true).unwrap(),
+            (min, 0)
+        );
+        assert_eq!(
+            request(min_room + min as u64, SlotRequest::Fit, true).unwrap(),
+            (min, min)
+        );
+        let room = 40 * 40 + 78;
+        assert_eq!(request(room, SlotRequest::Fit, true).unwrap(), (40, 78));
+        assert_eq!(request(room, SlotRequest::Fit, false).unwrap(), (41, 0));
+        assert_eq!(
+            request(room, SlotRequest::Exactly(39), false).unwrap(),
+            (39, 78)
+        );
+    }
+
+    #[test]
+    fn auto_slots_fit_whole_layer_sets_above_the_reserve_up_to_the_model_limit() {
+        for geometry in [
+            ExpertBankGeometry {
+                hidden: 2048,
+                inter: 512,
+                top_k: 8,
+            },
+            ExpertBankGeometry {
+                hidden: 1024,
+                inter: 256,
+                top_k: 4,
+            },
+        ] {
+            for layers in [12, 40] {
+                let minimum = geometry.top_k;
+                let experts = 32;
+                let reserve = 1 << 30;
+                let slot_set = ExpertBank::bytes_for(geometry, minimum).unwrap() / minimum as u64
+                    * layers as u64;
+                let fit =
+                    |free| admit_banks(free, geometry, layers, SlotRequest::Fit, experts, reserve);
+                assert!(fit(reserve + slot_set * minimum as u64 - 1).is_err());
+                for (sets, extra, want) in [
+                    (minimum, 0, minimum),
+                    (18, slot_set - 1, 18),
+                    (19, 0, 19),
+                    (64, 0, experts),
+                ] {
+                    let free = reserve + slot_set * sets as u64 + extra;
+                    assert_eq!(fit(free).unwrap(), want);
+                    assert!(
+                        ExpertBank::bytes_for(geometry, want).unwrap() * layers as u64
+                            <= free - reserve
+                    );
+                }
+                assert_eq!(
+                    admit_banks(
+                        reserve + 28 * slot_set,
+                        geometry,
+                        layers,
+                        SlotRequest::Exactly(16),
+                        experts,
+                        reserve
+                    )
+                    .unwrap(),
+                    16
+                );
+                assert!(
+                    admit_banks(
+                        u64::MAX,
+                        geometry,
+                        layers,
+                        SlotRequest::Exactly(experts + 1),
+                        experts,
+                        reserve
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_plan_that_does_not_fit_is_refused_naming_the_budget() {
         let geometry = geometry_of(&dims());
         let top_k = geometry.top_k as u64;
         let slot_set = ExpertBank::bytes_for(geometry, geometry.top_k).unwrap() / top_k * 40;
-        let plan = |slots| TieredPlan::new(slots, 6);
+        let plan = SlotRequest::Exactly;
         let reserve = 1 << 30;
         // 40 slots per layer need 40 sets; a card with room for 39 plus the reserve refuses.
         let free = reserve + 39 * slot_set;
-        let refusal = admit_banks(free, geometry, 40, &plan(40), reserve, 0);
+        let refusal = admit_banks(free, geometry, 40, plan(40), 256, reserve);
         match refusal {
             Err(EngError::MemoryPlan(message)) => {
                 assert!(message.contains("40 slots per layer"), "{message}");
@@ -383,8 +501,18 @@ mod tests {
             }
             other => panic!("39 slots of room must refuse 40: {other:?}"),
         }
-        assert!(admit_banks(free, geometry, 40, &plan(39), reserve, 0).is_ok());
-        assert!(admit_banks(reserve + 40 * slot_set, geometry, 40, &plan(40), reserve, 0).is_ok());
+        assert!(admit_banks(free, geometry, 40, plan(39), 256, reserve).is_ok());
+        assert!(
+            admit_banks(
+                reserve + 40 * slot_set,
+                geometry,
+                40,
+                plan(40),
+                256,
+                reserve
+            )
+            .is_ok()
+        );
     }
 
     #[test]

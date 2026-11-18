@@ -125,10 +125,12 @@ Do not modify or replace the model file while the server is running.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `slots` | required | Expert slots per layer on the GPU, 8 to 256. |
+| `slots` | required | An integer from 8 to 256 requests an exact count. `"auto"` selects the largest whole number that fits every layer after weights, KV cache and step allocations, leaving 1 GiB of free VRAM. Startup reports the selected count and refuses a load that cannot hold one token’s routed experts. |
 | `threads` | 6 | CPU worker threads, 1 to 8. |
 | `timeout_ms` | 10,000 | Longest wait for one layer's CPU experts, 1 to 600,000. |
 | `preload` | `false` | `true` fills each layer's slots with its lowest-numbered experts before the first token. By default the slots start empty and fill as experts are used. |
+
+With automatic sizing, an admitted staged-prefill session funds its shared cold-expert staging bank before spending remaining VRAM on resident experts. An eager per-token session uses the available expert budget for its resident banks.
 
 Tiered mode refuses `capture: true` and `kv_dtype: q8`.
 It processes prompts one token per step and, by default, keeps no saved prefixes in host memory.
