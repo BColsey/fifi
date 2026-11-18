@@ -116,6 +116,20 @@ impl StreamedWeights {
         })
     }
 
+    /// The absolute byte position of `key`'s data within this shard's file
+    /// and its length, for callers that re-open the shard for direct reads:
+    /// the streaming reads seek to this same position. `None` when the key
+    /// is absent from this shard's header.
+    pub fn extent(&self, key: &str) -> Option<(u64, u64)> {
+        let entry = self.header.entry(key)?;
+        let offsets = entry.offsets();
+        if offsets.end < offsets.start {
+            return None;
+        }
+        let start = self.header.data_start().checked_add(offsets.start)?;
+        Some((start, offsets.end - offsets.start))
+    }
+
     pub fn acquire(&self, request: AcquireRequest) -> Result<Ticket, EngError> {
         let outcome = match request.selection {
             Selection::Whole => self.read_whole(&request.key),
@@ -333,9 +347,22 @@ pub(crate) use read_stats::{reset, set, snapshot};
 pub struct StreamedCheckpoint {
     stores: Vec<StreamedWeights>,
     route: BTreeMap<String, usize>,
+    /// Each store's shard file name, parallel to `stores`, so an extent can
+    /// name the file its bytes live in.
+    shard_names: Vec<String>,
 }
 
 impl StreamedCheckpoint {
+    /// The shard file name, the absolute data start, and the byte length of
+    /// `key`'s data inside that shard, for callers that re-open the shard
+    /// file for direct reads: the streaming reads seek to these same file
+    /// positions. `None` when the key is absent.
+    pub fn tensor_extent(&self, key: &str) -> Option<(String, u64, u64)> {
+        let idx = *self.route.get(key)?;
+        let (start, len) = self.stores[idx].extent(key)?;
+        Some((self.shard_names[idx].clone(), start, len))
+    }
+
     pub fn open(
         index: &[u8],
         shards: Vec<(String, Box<dyn ShardIo + Send>, u64)>,
@@ -393,7 +420,16 @@ impl StreamedCheckpoint {
                 }
             }
         }
-        Ok(Self { stores, route })
+        // `shard_names[i]` names `stores[i]`, from the inverted positions map.
+        let mut shard_names = vec![String::new(); stores.len()];
+        for (name, &position) in &positions {
+            shard_names[position] = name.clone();
+        }
+        Ok(Self {
+            stores,
+            route,
+            shard_names,
+        })
     }
 
     pub fn contains(&self, key: &str) -> bool {

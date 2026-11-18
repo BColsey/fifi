@@ -10,6 +10,7 @@
 //! Each module's own header says what it does.
 
 mod bank;
+mod pack_reader;
 // The resume switch: INFERENCE_FLASH_NEXT_PREFIX_RESUME, read once, strict spelling. It rides
 // the driver's cfg: the switch only matters where a driver can be built.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
