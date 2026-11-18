@@ -106,6 +106,19 @@ fn q5_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// Q4_0: `d`, then 16 code bytes. Value `i` (0..32) is the `i / 16` nibble
+/// (low first) of code byte `i % 16`; the quant is `(0..16) - 8`, and the
+/// product is `q * d` in that order, matching the ggml reference
+/// `dequantize_row_q4_0` (`x0*d`). Each value's address comes from its
+/// index; no ggml loop nest is transcribed.
+fn q4_0(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    for (i, out) in y.iter_mut().enumerate() {
+        let nib = (b[2 + i % 16] >> (4 * (i / 16))) & 0x0f;
+        *out = (i32::from(nib) - 8) as f32 * d;
+    }
+}
+
 /// Unpacks the 6-bit scale and minimum with index `j` (0..8) of a K-quant block.
 fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
@@ -115,6 +128,40 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
             (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4),
             (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
         )
+    }
+}
+
+/// Q3_K, decoded per value index from the published block layout; no ggml
+/// loop nest or register shuffle is transcribed. The 110-byte block is 32
+/// `hmask` bytes at +0, 64 `qs` bytes at +32, 12 packed 6-bit sub-scale
+/// bytes at +96, and the f16 super-scale `d` LAST at +108.
+///
+/// Value `i` (0..256): `half = i / 128`, lane `j = (i % 128) / 32`, `r =
+/// i % 32`. Its code is bit pair `2 * j` of `qs[32 * half + r]`; its hmask
+/// bit is `1 << (4 * half + j)` of `hmask[r]` (set subtracts 0, clear 4).
+/// Sub-scale `s = 8 * half + 2 * j + r / 16` unpacks as column `s % 4`, row
+/// `s / 4` of the packed layout: the `s / 8` nibble of code byte
+/// `ks[(s % 4 + s / 4 * 4) % 8]` in the low four bits, the top two bits
+/// `2 * (s / 4)` of `ks[8 + s % 4]`. The value is `(d * (scale - 32)) * q`.
+fn q3_k(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 108);
+    let hm = &b[0..32];
+    let qs = &b[32..96];
+    let ks = &b[96..108];
+    for (i, out) in y.iter_mut().enumerate() {
+        let (half, j, r) = (i / 128, (i % 128) / 32, i % 32);
+        let s = 8 * half + 2 * j + r / 16;
+        let (row, col) = (s / 4, s % 4);
+        let nib = (ks[(col + 4 * row) % 8] >> (4 * (row / 2))) & 0x0f;
+        let h2 = (ks[8 + col] >> (2 * row)) & 3;
+        let dl = d * (i32::from(nib | (h2 << 4)) - 32) as f32;
+        let code = (qs[32 * half + r] >> (2 * j)) & 3;
+        let off = if hm[r] & (1 << (4 * half + j)) != 0 {
+            0
+        } else {
+            4
+        };
+        *out = dl * (i32::from(code) - off) as f32;
     }
 }
 
@@ -340,6 +387,8 @@ type Decoder = fn(&[u8], &mut [f32]);
 fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), EngError> {
     let decode: Decoder = match ty {
         GgufType::Q20 => q2_0,
+        GgufType::Q40 => q4_0,
+        GgufType::Q3K => q3_k,
         GgufType::Q4K => q4_k,
         GgufType::Q50 => q5_0,
         GgufType::Q5K => q5_k,
@@ -505,6 +554,169 @@ mod tests {
         assert_eq!(f16_to_f32(0x8000).to_bits(), 0x8000_0000);
         assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
         assert_eq!(f16_to_f32(0x7d55).to_bits(), 0x7fea_a000);
+    }
+
+    #[test]
+    fn q4_0_golden_fixed_block() {
+        // One Q4_0 block: d = 1.0, then 16 nibble bytes. Expected values are
+        // derived by hand from the ggml reference: element j is the LOW
+        // nibble of qs[j] minus 8, element j + 16 the HIGH nibble minus 8.
+        let mut b = [0u8; 18];
+        b[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let qs = [
+            0x10u8, 0x21, 0xf0, 0x89, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x55, 0x55, 0x55, 0x55,
+        ];
+        b[2..18].copy_from_slice(&qs);
+        let mut y = [0f32; 32];
+        q4_0(&b, &mut y);
+        let mut want = [0f32; 32];
+        for (j, &byte) in qs.iter().enumerate() {
+            want[j] = f32::from(byte & 0x0f) - 8.0;
+            want[j + 16] = f32::from(byte >> 4) - 8.0;
+        }
+        assert_eq!(y, want);
+        // Spot values pin the nibble order and the d placement.
+        assert_eq!(y[2], -8.0);
+        assert_eq!(y[18], 7.0);
+        assert_eq!(y[19], 0.0);
+    }
+
+    #[test]
+    fn q3_k_golden_fixed_block() {
+        // One Q3_K block, hand-traced against the ggml reference layout:
+        // hmask[0] = 0x03 (bits for lanes 0 and 1 of the first half),
+        // qs[0]=0, qs[1]=0, qs[16]=0xFF, qs[32]=0x01, qs[48]=0x02 (all other
+        // qs bytes 0), scales = 0x35 for the first 8 bytes and 0 for the last
+        // four, d = 1.0 stored LAST at offset 108.
+        //
+        // The 0x35/0x00 scale pack expands to sub-scale 5 for sub-blocks 0..8
+        // (dl = -27) and 3 for sub-blocks 8..16 (dl = -29): the low nibbles
+        // 0x5 land in aux lanes 0/1, the high nibbles 0x3 in lanes 2/3.
+        // Every untouched value reads q = 0 with its hmask bit clear, so q is
+        // -4: y = 108.0 in the first half and 116.0 in the second.
+        let mut b = [0u8; 110];
+        b[0] = 0x03; // hmask[0]
+        b[32 + 16] = 0xff; // qs[16]
+        b[32 + 32] = 0x01; // qs[32]
+        b[32 + 48] = 0x02; // qs[48]
+        for k in 0..8 {
+            b[96 + k] = 0x35;
+        }
+        b[108..110].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let mut y = [0f32; 256];
+        q3_k(&b, &mut y);
+
+        let mut want = [0f32; 256];
+        want.fill(0.0);
+        for v in want.iter_mut().take(128) {
+            *v = 108.0;
+        }
+        for v in want.iter_mut().skip(128) {
+            *v = 116.0;
+        }
+        // hm[0] bit 0 set: value 0 keeps q = 0 in lane 0.
+        want[0] = 0.0;
+        // hm[0] bit 1 set: value 32 (lane 1, same hmask byte) keeps q = 0.
+        want[32] = 0.0;
+        // qs[16] = 0xFF fills every lane: values 16, 48, 80 and 112 all read
+        // 3 in their lane bits, minus 4 for the clear hmask bit.
+        want[16] = 27.0;
+        want[48] = 27.0;
+        want[80] = 27.0;
+        want[112] = 27.0;
+        // qs[32] = 0x01: value 128 (second half, lane 0) reads 1, q = -3:
+        // -29 * -3.
+        want[128] = 87.0;
+        // qs[48] = 0x02: value 144 (second half, group two, lane 0) reads 2,
+        // q = -2: -29 * -2.
+        want[144] = 58.0;
+        assert_eq!(y, want);
+    }
+
+    #[test]
+    fn q3_k_golden_second_block_mixed_signs() {
+        // A second hand-traced block: qs all zero, so every value is 0 or -4
+        // by its hmask bit alone; the 16 sub-scales mix signs across all four
+        // aux rows (+17, -3, +1, -30) and every hmask byte carries both set
+        // and clear bits in both halves (0x55 on even bytes, 0xAA on odd;
+        // bits 2*half + j). Scale pack:
+        // ks[0..4] = 0x11 (row 0 low nibble 1, row 2 high nibble 1),
+        // ks[4..8] = 0x2D (row 1 low nibble 0xD, row 3 high nibble 2),
+        // ks[8..12] = 0x27 (the 2-bit high fields 3, 1, 2 of rows 0, 1, 2).
+        let mut b = [0u8; 110];
+        for (l, slot) in b.iter_mut().enumerate().take(32) {
+            *slot = if l % 2 == 0 { 0x55 } else { 0xaa };
+        }
+        for k in 0..4 {
+            b[96 + k] = 0x11;
+            b[100 + k] = 0x2d;
+            b[104 + k] = 0x27;
+        }
+        b[108..110].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let mut y = [0f32; 256];
+        q3_k(&b, &mut y);
+
+        // dl per (half, j): sub-scale is = 8*half + 2*j + g2 picks rows
+        // 0..4 -> +17, 4..8 -> -3, 8..12 -> +1, 12..16 -> -30 (both groups of
+        // a lane share one row, so dl depends on (half, j) only).
+        const DL: [[f32; 4]; 2] = [[17.0, 17.0, -3.0, -3.0], [1.0, 1.0, -30.0, -30.0]];
+        let mut want = [0f32; 256];
+        for (half, half_dl) in DL.iter().enumerate() {
+            for (j, &dl) in half_dl.iter().enumerate() {
+                // The hmask bit of (half, j) is 4*half + j: even bytes
+                // (0x55) set the even bits, odd bytes (0xAA) the odd bits,
+                // so the bit is clear exactly on l of the parity opposite
+                // the bit's, which is j % 2.
+                let clear_odd_l = j % 2 == 0;
+                for g2 in 0..2 {
+                    for l in 0..16 {
+                        let l_odd = l % 2 == 1;
+                        let clear = l_odd == clear_odd_l;
+                        if clear {
+                            let v = half * 128 + j * 32 + g2 * 16 + l;
+                            want[v] = dl * -4.0;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(y, want);
+        // Spot values pin the signs: value 1 (half 0, lane 0, odd l, clear
+        // bit) reads -68; value 64 (half 0, lane 2, even l, set bit) reads 0;
+        // value 145 (half 1, lane 0, odd l) reads -4; value 240 (half 1,
+        // lane 3, even l, clear) reads 120.
+        assert_eq!(y[1], -68.0);
+        assert_eq!(y[64], 0.0);
+        assert_eq!(y[145], -4.0);
+        assert_eq!(y[240], 120.0);
+    }
+
+    #[test]
+    fn q3_k_golden_hmask_bit_is_per_half() {
+        // Hand-derived from the layout: every sub-scale unpacks to 49 (dl =
+        // 17), every code is 0, and every hmask byte is 0xF0, whose high
+        // nibble sets bits 4-7 (half 1, lanes 0-3) while the low nibble
+        // clears bits 0-3 (half 0). Half 0 must read -68 everywhere and
+        // half 1 zero; a bit index of 2 * half + j would leave half-1 lanes
+        // 0 and 1 reading bits 2-3 (clear) and fail this golden.
+        let mut b = [0u8; 110];
+        b[0..32].fill(0xF0);
+        // qs stay 0 (code 0 everywhere).
+        for k in 0..8 {
+            b[96 + k] = 0x11; // low nibble 1 for rows 0-1, high nibble 1 for rows 2-3
+        }
+        for k in 8..12 {
+            b[96 + k] = 0xFF; // top two bits 3 for every row
+        }
+        b[108..110].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        let y = dequantize(GgufType::Q3K, &b).expect("decode");
+        let mut want = vec![-68.0f32; 128];
+        want.resize(256, 0.0);
+        assert_eq!(y, want);
+        assert_eq!(y[0], -68.0);
+        assert_eq!(y[127], -68.0);
+        assert_eq!(y[128], 0.0);
+        assert_eq!(y[255], 0.0);
     }
 
     #[test]
