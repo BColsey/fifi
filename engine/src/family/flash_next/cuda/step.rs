@@ -849,9 +849,9 @@ impl<'a> FlashStep<'a> {
                 self.slot(Slot::PrefillPerm)?,
             );
         }
-        // Outside a prefill window every block runs one row; a chunk loops it.
-        // A multi-row step outside the window cannot occur (the driver opens the
-        // window for every chunked prefill), so refuse it instead of looping.
+        // Outside a prefill window every block runs one row at a time. A multi-row
+        // step here cannot occur (the driver opens the window for every chunked
+        // prefill), so refuse it instead of looping.
         if m > 1 {
             return Err(EngError::BadRequest(format!(
                 "a multi-row MoE step ({m} rows) outside a prefill window"

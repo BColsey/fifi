@@ -4,7 +4,8 @@
 
 The shared EXL3 prefill path is the only chunked prefill path (the legacy chunk
 path and its `INFERENCE_FLASH_NEXT_SHARED_PREFILL` rollback switch were deleted
-after the flip was qualified). The per-token `prefill_rows = 1` path is the token
+after the flip was qualified). The variable is no longer read; setting it has
+no effect. The per-token `prefill_rows = 1` path is the token
 driver and remains.
 An unset `prefill_rows` resolves to 256; only width 256 is qualified (the measurements
 below). Explicit widths from 2 up to the shared bound run the shared path at that width,

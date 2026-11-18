@@ -1281,9 +1281,12 @@ fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
 #[test]
 #[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
 fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
-    // The chunked prefill contract at the step level: M rows through one rows=M step equal M
-    // launches of a rows=1 step, stream rows and DeltaNet states alike. The tolerance covers the
-    // EXL3 row-grouped launch's reduction order (the scan itself is bit-exact by contract).
+    // The chunked prefill contract at the step level: M rows through one in-window
+    // shared-pass chunk of a rows=M step equal M launches of a rows=1 decode step of
+    // the same split block (equal-start banks), stream rows and DeltaNet states alike.
+    // The tolerance covers the two MoE launch families of the split block (the
+    // decode arm's indexed launches against the shared pass's job-table tiles; the
+    // scan itself is bit-exact by contract).
     assert!(
         device_present("Flash-Next chunk parity"),
         "a GPU is required"
@@ -1310,7 +1313,7 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
         first..end,
     )
     .expect("the single-row step");
-    let chunk = FlashStep::new(
+    let chunk = FlashStep::new_prefill(
         ctx,
         &stream,
         &weights,
@@ -1320,9 +1323,22 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
         first..end,
     )
     .expect("the chunk step");
+    // Each block takes its own step's dims: the shared pass checks the chunk's rows
+    // against the dims the block was planned with (rows=1 would refuse rows=4).
+    let slots = 20;
+    let dims = single.moe_dims(1);
+    let mut singles_block = split_block(&projector, &checkpoint, &weights, &layers, slots, &dims);
+    let chunk_dims = chunk.moe_dims(m);
+    let mut chunk_block = split_block(
+        &projector,
+        &checkpoint,
+        &weights,
+        &layers,
+        slots,
+        &chunk_dims,
+    );
 
-    // One row at a time.
-    let mut moe = AllResidentMoe { weights: &weights };
+    // One row at a time, outside any prefill window (the decode arm).
     let mut singles = Vec::new();
     for token in 0..m {
         let row = input(width, hidden, token);
@@ -1330,7 +1346,7 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
         write_params(&single, 1, token as i32);
         write_stream_row(&single, &row);
         single
-            .run_layers_without_ple(token, 1, &mut moe)
+            .run_layers_without_ple(token, 1, &mut singles_block)
             .expect("the layers");
         single.finish_token().expect("a clean token");
         singles.push(
@@ -1340,17 +1356,20 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
         );
     }
 
-    // The same rows as one chunk.
+    // The same rows as one chunk, inside the prefill window (the shared pass).
     let rows: Vec<f32> = (0..m)
         .flat_map(|token| input(width, hidden, token))
         .collect();
+    chunk_block.begin_prefill().expect("open the window");
+    chunk.prefill_window.set(true);
     chunk.begin_chunk(m).expect("begin");
     write_params(&chunk, 1, 0);
     write_stream_row(&chunk, &rows);
     chunk
-        .run_layers_without_ple(0, m, &mut moe)
+        .run_layers_without_ple(0, m, &mut chunk_block)
         .expect("the layers");
     chunk.finish_token().expect("a clean chunk");
+    chunk.prefill_window.set(false);
     let chunked = chunk
         .read_f32(chunk.slot(Slot::Stream).unwrap(), m * width)
         .expect("stream");
@@ -1360,7 +1379,7 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
         let error = relative_l2(got, &singles[token]);
         println!("row {token}: relative L2 {error:.3e}");
         assert!(
-            error < 1e-4,
+            error < 4e-4,
             "row {token} of the chunk drifts from the single-row run: relative L2 {error:.3e}"
         );
     }
