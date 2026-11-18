@@ -1443,8 +1443,9 @@ pub(super) mod cuda {
                 admit_cuda_plan(input, MemoryPolicy::default_share(), ceiling).unwrap();
             ticket.enable_auto_cache();
             let mut budget = 0;
+            let device_free = ticket.plan.device_peak * 2;
             let cleanup = ticket
-                .into_cleanup_with_cache(memory(10_000), true, &mut budget)
+                .into_cleanup_with_cache(memory(device_free), true, &mut budget)
                 .unwrap();
             assert_eq!(budget, wanted);
             assert_eq!(held(), (ceiling - 1, fixed_device + wanted));
