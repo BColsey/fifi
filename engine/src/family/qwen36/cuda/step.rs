@@ -1505,6 +1505,15 @@ impl<'a> QwenResidentStep<'a> {
             )
             && (m_sess == 4096
                 || std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1"));
+        let staged_end = if wide_tiered
+            && std::env::var_os("Q36_TIERED_WIDE_STAGED").is_some_and(|v| v == "1")
+        {
+            self.prefill
+                .as_ref()
+                .map_or(0, PrefillArena::contiguous_staging_rows)
+        } else {
+            0
+        };
         let run = |step, rows: &[u32]| match step {
             PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
             PrefillStep::Feed { p0 } => {
@@ -1521,7 +1530,7 @@ impl<'a> QwenResidentStep<'a> {
             }
         };
         let result = if wide_tiered {
-            drive_tiered_wide_chunks(start, tokens, m_sess, fixed_depth, run)
+            drive_tiered_wide_chunks(start, tokens, m_sess, fixed_depth, staged_end, run)
         } else {
             drive_chunks(start, tokens, m_sess, fixed_depth, run)
         };
