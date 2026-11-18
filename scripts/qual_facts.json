@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7309,
+      "test_fns": 7312,
       "ignored": 664,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -362,6 +362,7 @@
         "Q36_P2P_HOST_EXPERT_BYTES",
         "Q36_P2P_HOST_EXPERT_BYTES_0",
         "Q36_P2P_PREFIX",
+        "Q36_P2P_ROUTER_TRACE",
         "Q36_P2P_SKIP_PREFILL_HEAD",
         "Q36_P2P_SYNC_BROADCAST",
         "Q36_P2P_WATERFILL",

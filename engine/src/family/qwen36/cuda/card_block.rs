@@ -30,10 +30,11 @@
 
 use crate::EngError;
 use crate::family::exl3::launch::Launch;
+use crate::family::qwen36::cuda::card_router_trace::RouterTrace;
 use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
-use crate::family::qwen36::cuda::moe::{CardMoeOp, MoeBuffers, MoeLayerWeights, launch_op};
+use crate::family::qwen36::cuda::moe::{CardMoeOp, MoeBuffers, MoeLayerWeights, MoeOp, launch_op};
 use crate::family::qwen36::cuda::multi::fold_ring_status;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::Slot;
@@ -191,11 +192,12 @@ pub(crate) fn run_card_block(
 ///   are full-width partials (the card's down projection covers its
 ///   intermediate slice), summed in place - the picks ride one exchange
 ///   sized `top_k` hidden rows, the shared row another.
-pub(crate) fn run_card_moe_block(
+pub(super) fn run_card_moe_block(
     stack: &CardStack,
     weights: &[MoeLayerWeights<'_>],
     bufs: &[MoeBuffers<'_>],
     ops: &[&[CardMoeOp]],
+    mut trace: Option<(&mut RouterTrace, usize)>,
 ) -> Result<(), EngError> {
     let cards = stack.shards().len();
     if weights.len() != cards || bufs.len() != cards || ops.len() != cards {
@@ -236,6 +238,12 @@ pub(crate) fn run_card_moe_block(
                     &bufs[card],
                     *local,
                 )?;
+                if card == 0
+                    && matches!(local, MoeOp::Router)
+                    && let Some((trace, layer)) = trace.as_mut()
+                {
+                    trace.observe(*layer, &stack.streams()[card], &weights[card], &bufs[card]);
+                }
                 at[card] += 1;
             }
         }

@@ -24,6 +24,7 @@ mod card_load_tests;
 #[cfg(test)]
 mod card_moe_device_tests;
 mod card_prefill;
+mod card_router_trace;
 mod card_session;
 #[cfg(test)]
 mod card_session_device_tests;
