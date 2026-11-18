@@ -401,22 +401,20 @@ mod tests {
             std::path::Path::new("/definitely/not/here"),
             "",
         )));
-        let (root, proc) = namespace_root("max", "memory\n");
+        let (_root, _keep, directory, proc_dir) = namespace_root("max", "memory\n");
         no_family(&refusal_text(cgroup_from_proc(
             LABEL,
-            root.path(),
+            &directory,
             "0::\nbroken",
             "",
             42,
         )));
-        let mounts = std::fs::read_to_string(proc.path().join("self/mountinfo")).unwrap();
-        let looped = root.path().join("cgroup.type");
+        let mounts = std::fs::read_to_string(proc_dir.join("self/mountinfo")).unwrap();
+        let looped = directory.join("cgroup.type");
         std::fs::remove_file(&looped).unwrap();
         std::os::unix::fs::symlink("cgroup.type", &looped).unwrap();
         no_family(&refusal_text(verify_cgroup_root(
-            LABEL,
-            root.path(),
-            &mounts,
+            LABEL, &directory, &mounts,
         )));
         // The no-ancestor refusal is structurally unreachable: a cgroup that
         // starts_with(root) always walks up to root, so that branch stays
@@ -430,9 +428,9 @@ mod tests {
         );
         no_family(&refusal_text(cgroup_from_proc(
             LABEL,
-            root.path(),
+            &directory,
             "0::/missing-group\n",
-            &std::fs::read_to_string(proc.path().join("self/mountinfo")).unwrap(),
+            &std::fs::read_to_string(proc_dir.join("self/mountinfo")).unwrap(),
             42,
         )));
         assert_eq!(
@@ -612,7 +610,15 @@ mod tests {
         eprintln!("captured host member: mapped=true pid={pid}");
     }
 
-    fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    /// The canonical controller root and its member group, plus the mounts that cover it.
+    /// Paths are canonical so the strict ParentDir refusal in `cgroup_from_proc` judges the
+    /// fixture tree, never the caller's `TMPDIR` spelling.
+    fn discovery_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().canonicalize().unwrap();
         let group = directory.join("work");
@@ -624,13 +630,13 @@ mod tests {
             "36 29 0:33 / {} rw - cgroup2 cgroup rw\n",
             directory.display()
         );
-        (root, group, mounts)
+        (root, directory, group, mounts)
     }
 
     #[test]
     fn cgroup_discovery_resolves_own_pid_in_global_tree() {
-        let (root, group, mounts) = discovery_fixture();
-        let resolved = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
+        let (_root, directory, group, mounts) = discovery_fixture();
+        let resolved = cgroup_from_proc(LABEL, &directory, "0::/work\n", &mounts, 42);
         assert!(
             resolved.is_ok(),
             "a complete global cgroup tree must resolve its own process group"
@@ -641,12 +647,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cgroup_discovery_matches_canonical_mount_paths() {
-        let (root, group, mounts) = discovery_fixture();
+        let (_root, directory, group, mounts) = discovery_fixture();
         let aliases = tempfile::tempdir().unwrap();
-        let alias = aliases.path().join("controller-root");
-        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+        let alias = aliases
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("controller-root");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
         let resolved = cgroup_from_proc(LABEL, &alias, "0::/work\n", &mounts, 42).unwrap();
         assert_eq!(resolved, group);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_spelled_through_parent_components_is_refused() {
+        // The strictness is the point: a root that merely RESOLVES to the fixture
+        // tree but is spelled with ".." (a TMPDIR like "/x/wt/../tmp") is refused
+        // before canonicalization, so an ambiguous tree never becomes a budget.
+        let (_root, directory, _group, mounts) = discovery_fixture();
+        let dotted = directory.join("..").join(directory.file_name().unwrap());
+        // The dotted spelling must resolve to the very fixture tree, so the
+        // refusal below can only come from the strict ParentDir check.
+        assert_eq!(
+            std::fs::canonicalize(&dotted).unwrap(),
+            std::fs::canonicalize(&directory).unwrap()
+        );
+        let result = cgroup_from_proc(LABEL, &dotted, "0::/work\n", &mounts, 42);
+        assert!(
+            matches!(&result, Err(EngError::MemoryPlan(message))
+                if message.contains("cannot map its process")),
+            "a root spelled with .. must be refused, got {result:?}"
+        );
     }
 
     #[test]
@@ -657,9 +689,9 @@ mod tests {
             ("memory.current", "0\n"),
             ("cgroup.controllers", "cpu\n"),
         ] {
-            let (root, _, mounts) = discovery_fixture();
-            std::fs::write(root.path().join(name), contents).unwrap();
-            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
+            let (_root, directory, _, mounts) = discovery_fixture();
+            std::fs::write(directory.join(name), contents).unwrap();
+            let result = cgroup_from_proc(LABEL, &directory, "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -671,13 +703,13 @@ mod tests {
             ("/", "tmpfs", 1),
             ("/", "cgroup2", 2),
         ] {
-            let (root, group, _) = discovery_fixture();
+            let (_root, directory, group, _) = discovery_fixture();
             let mounts = format!(
                 "36 29 0:33 {source} {} rw - {filesystem} cgroup rw\n",
                 group.parent().unwrap().display()
             )
             .repeat(copies);
-            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
+            let result = cgroup_from_proc(LABEL, &directory, "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -687,7 +719,17 @@ mod tests {
     }
 
     /// A container's view: the cgroup root is the container's own cgroup, with limit files.
-    fn namespace_root(maximum: &str, controllers: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+    /// Both returned paths are canonical so the strict ParentDir refusals judge the fixture
+    /// tree, never the caller's `TMPDIR` spelling; the TempDirs only keep the trees alive.
+    fn namespace_root(
+        maximum: &str,
+        controllers: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().canonicalize().unwrap();
         for (name, contents) in [
@@ -701,36 +743,35 @@ mod tests {
             std::fs::write(directory.join(name), contents).unwrap();
         }
         let proc = tempfile::tempdir().unwrap();
-        std::fs::create_dir(proc.path().join("self")).unwrap();
+        let proc_dir = proc.path().canonicalize().unwrap();
+        std::fs::create_dir(proc_dir.join("self")).unwrap();
         std::fs::write(
-            proc.path().join("meminfo"),
+            proc_dir.join("meminfo"),
             "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
         )
         .unwrap();
-        std::fs::write(proc.path().join("self/cgroup"), "0::/\n").unwrap();
+        std::fs::write(proc_dir.join("self/cgroup"), "0::/\n").unwrap();
         std::fs::write(
-            proc.path().join("self/mountinfo"),
+            proc_dir.join("self/mountinfo"),
             format!(
                 "36 29 0:33 / {} rw - cgroup2 cgroup rw\n",
                 directory.display()
             ),
         )
         .unwrap();
-        (root, proc)
+        (root, proc, directory, proc_dir)
     }
 
     #[test]
     fn a_namespace_root_applies_its_own_limit_or_falls_back_to_available_memory() {
-        let (root, proc) = namespace_root("8589934592\n", "memory\n");
-        let budget =
-            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
+        let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
+        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
         assert_eq!(budget.os_floor, 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
-        let (root, proc) = namespace_root("max\n", "memory\n");
-        let budget =
-            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
+        let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
+        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
         assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
@@ -745,13 +786,13 @@ mod tests {
             ("memory.current", "0\n"),
         ];
         for skipped in 0..files.len() {
-            let (root, _, mounts) = discovery_fixture();
+            let (_root, directory, _group, mounts) = discovery_fixture();
             for (index, (name, contents)) in files.iter().enumerate() {
                 if index != skipped {
-                    std::fs::write(root.path().join(name), contents).unwrap();
+                    std::fs::write(directory.join(name), contents).unwrap();
                 }
             }
-            let result = cgroup_from_proc(LABEL, root.path(), "0::/work\n", &mounts, 42);
+            let result = cgroup_from_proc(LABEL, &directory, "0::/work\n", &mounts, 42);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("complete cgroup2 root")),
@@ -763,8 +804,8 @@ mod tests {
 
     #[test]
     fn a_namespace_root_without_the_memory_controller_is_refused_clearly() {
-        let (root, proc) = namespace_root("max\n", "cpu\n");
-        let result = HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42);
+        let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "cpu\n");
+        let result = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42);
         assert!(matches!(result, Err(EngError::MemoryPlan(message))
                 if message.contains("complete cgroup2 root with the memory controller")));
     }
@@ -781,10 +822,10 @@ mod tests {
             ("0::/work\n", 42, "41\n42\n", "threaded"),
             ("0::/work\n", 42, "41\n42\nnot-a-pid\n", "domain"),
         ] {
-            let (root, group, mounts) = discovery_fixture();
+            let (_root, directory, group, mounts) = discovery_fixture();
             std::fs::write(group.join("cgroup.procs"), owners).unwrap();
             std::fs::write(group.join("cgroup.type"), kind).unwrap();
-            let result = cgroup_from_proc(LABEL, root.path(), membership, &mounts, pid);
+            let result = cgroup_from_proc(LABEL, &directory, membership, &mounts, pid);
             assert!(
                 matches!(result, Err(EngError::MemoryPlan(message))
                     if message.contains("cannot map its process")),
@@ -795,13 +836,14 @@ mod tests {
 
     #[test]
     fn cgroup_reader_rejects_missing_current_with_unlimited_max() {
-        let root = tempfile::tempdir().unwrap();
-        let child = root.path().join("child");
+        let _root = tempfile::tempdir().unwrap();
+        let directory = _root.path().canonicalize().unwrap();
+        let child = directory.join("child");
         std::fs::create_dir(&child).unwrap();
-        std::fs::write(root.path().join("cgroup.controllers"), "memory\n").unwrap();
-        std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
+        std::fs::write(directory.join("cgroup.controllers"), "memory\n").unwrap();
+        std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(child.join("memory.max"), "max\n").unwrap();
-        let result = cgroup_remaining_in(LABEL, root.path(), &child);
+        let result = cgroup_remaining_in(LABEL, &directory, &child);
         assert!(
             matches!(
                 result,
@@ -813,22 +855,23 @@ mod tests {
 
     #[test]
     fn cgroup_reader_applies_finite_ancestor_charges() {
-        let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("parent");
+        let _root = tempfile::tempdir().unwrap();
+        let directory = _root.path().canonicalize().unwrap();
+        let parent = directory.join("parent");
         let child = parent.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(root.path().join("cgroup.controllers"), "memory\n").unwrap();
-        for directory in [root.path(), parent.as_path()] {
-            std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
+        std::fs::write(directory.join("cgroup.controllers"), "memory\n").unwrap();
+        for dir in [directory.as_path(), parent.as_path()] {
+            std::fs::write(dir.join("cgroup.subtree_control"), "memory\n").unwrap();
         }
-        for (directory, maximum, current) in [
+        for (dir, maximum, current) in [
             (&parent, "17179869184\n", "4294967296\n"),
             (&child, "68719476736\n", "1073741824\n"),
         ] {
-            std::fs::write(directory.join("memory.max"), maximum).unwrap();
-            std::fs::write(directory.join("memory.current"), current).unwrap();
+            std::fs::write(dir.join("memory.max"), maximum).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
         }
-        let remaining = cgroup_remaining_in(LABEL, root.path(), &child);
+        let remaining = cgroup_remaining_in(LABEL, &directory, &child);
         assert!(
             remaining.is_ok(),
             "a readable hierarchy must honor finite ancestor charges"
@@ -1061,25 +1104,25 @@ mod tests {
 
     #[test]
     fn composed_host_probe_uses_verified_tree_and_fails_closed() {
-        let (root, group, mounts) = discovery_fixture();
+        let (_root, directory, group, mounts) = discovery_fixture();
         let proc = tempfile::tempdir().unwrap();
-        std::fs::create_dir(proc.path().join("self")).unwrap();
+        let proc_dir = proc.path().canonicalize().unwrap();
+        std::fs::create_dir(proc_dir.join("self")).unwrap();
         std::fs::write(
-            proc.path().join("meminfo"),
+            proc_dir.join("meminfo"),
             "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
         )
         .unwrap();
-        std::fs::write(proc.path().join("self/cgroup"), "0::/work\n").unwrap();
-        std::fs::write(proc.path().join("self/mountinfo"), mounts).unwrap();
-        std::fs::write(root.path().join("cgroup.subtree_control"), "memory\n").unwrap();
+        std::fs::write(proc_dir.join("self/cgroup"), "0::/work\n").unwrap();
+        std::fs::write(proc_dir.join("self/mountinfo"), mounts).unwrap();
+        std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(group.join("memory.max"), "17179869184\n").unwrap();
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
-        let budget =
-            HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
+        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
         assert!(budget.admit(LABEL, 7u64 << 30).is_ok());
         assert!(budget.admit(LABEL, (7u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
-        assert!(HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).is_err());
+        assert!(HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
     }
 }
