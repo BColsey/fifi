@@ -246,6 +246,10 @@ fn env_origin<T>(value: &Option<T>) -> Origin {
 
 fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>) {
     rows.push(mlx_switch("mlx_auto_budget", "FIFI_MLX_AUTO_BUDGET"));
+    rows.push(mlx_switch(
+        "mlx_positioned_reads",
+        "FIFI_MLX_POSITIONED_READS",
+    ));
     let read_runs = std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS");
     rows.push(row(
         "mlx_expert_read_runs",

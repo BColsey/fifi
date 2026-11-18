@@ -36,6 +36,21 @@ The opt-in `FIFI_MLX_OVERLAP_EXPERT_READS=1` submits the independent shared expe
 
 On the M4 mini, the published Flint checkpoint passed the shared-switch smoke test at an 8 GiB device ceiling with 256 admitted rows. The 16-token prefill used 26,244 reads with coalescing off and 20,979 with it on. Both arms read 5,159,780,352 logical prefill bytes, issued 7,614 decode reads, returned the same four-token completion and imported the staging pages without a copy fallback. The Qwen3.6 disk-backed fixture matched F32 and BF16 activations and issued 540 reads in the shared arm versus 594 in the control with 506,880 logical bytes each. Flash-Next's sparse-prefill and prefix fixtures passed with both common switches off and on. Full-checkpoint measurements on this mini cover Flint. [Flint serving comparison](mac-flint-ane-and-reads.md#balanced-serving-comparison-at-8-gib)
 
+### Positioned local shard reads
+
+`FIFI_MLX_POSITIONED_READS=1` uses `pread` for contiguous payloads and `preadv` for disjoint staging ranges in Flint, Flash-Next, Qwen3.6 and Qwen3.8 dense. The checked shard range supplies the offset. The reader advances it past partial reads and writes directly into the caller's buffers. Each operation issues the same requested byte ranges with a private offset, avoiding a shared cursor lock and the separate seek. Flash-Next and both Qwen families now share the same local indexed opener, which validates the index before opening the named shards.
+
+On the internal SSD, two balanced pairs of fresh Flint servers compared the reader against seek/read. Both arms admitted 256 rows at 8 GiB and used the same prefill coalescing and placement. All eight 12-token completions matched, as did logical read bytes and expert read counts. The arithmetic prompt reached its first token about 3% sooner and decoded 7% faster. The summarization prompt had flat first-token time and decoded 3% slower. Total process-attributed disk reads were 56.98 GB for seek/read and 56.22 GB for positioned reads. The reader remains opt-in. [Eight serving requests](../../scripts/benchmarks/mac-m4-flint-positioned-reads.csv)
+
+Two isolated warm replays each used 64 captured routes from Flint layer 24. Each arm filled the same 54 destinations four times per route with alternating arm order. Every output buffer matched. Positioned reads lowered paired median read time by 6.3% in the first replay and 0.7% in the repeat. The replays time read calls into preallocated buffers after warming each route. [Warm read measurements](../../scripts/benchmarks/mac-m4-flint-positioned-warm.csv)
+
+Run the Flint serving driver with `--expert-timing --positioned-reads --working-set-mib 8192 --pairs 2` to repeat the comparison.
+
+```sh
+python3 scripts/mac_cache_study/flint_positioned_reads.py "$CHECKPOINT" \
+  scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz "$SCRATCH/positioned-warm.csv"
+```
+
 ## KV appends and retained prefixes
 
 The M4 mini measured a single synchronized append to representative cache planes at 8,191 and 32,767 prefix tokens. Each case used six timed samples, varied arm order, and checked the old prefix row, the appended row and the retained snapshot. Input allocation and readback sit outside the timing interval. The snapshot arm shares the buffer before appending. It measures the cost of that copy-on-write boundary while a saved prefix still owns the array.

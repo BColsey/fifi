@@ -44,6 +44,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `FIFI_Q36_MLX_DISK_EXPERTS` | off | Set to `1` with MLX device sizing enabled to let Qwen3.6 stage routed experts from local shards when the full expert banks exceed the working set. The streamed path uses one session and charges one layer of expert pages to the prefill plan. [Qwen placement and limits](../explanation/mlx-device-scaling.md#disk-backed-qwen36-experts) |
 | `FIFI_MLX_EXPERT_READ_RUNS` | off | Set to `prefill` to group adjacent expert slice reads on the multi-row disk-backed paths in Flint, Flash-Next and Qwen3.6 MoE. Each run covers exactly the selected experts. Flint's legacy read policy and pipeline switches take precedence when set. |
 | `FIFI_MLX_OVERLAP_EXPERT_READS` | off | Set to `1` to submit the independent shared expert to Metal before the same layer's exact routed weights are read on the CPU. This applies to disk-backed Flint, Flash-Next and Qwen3.6 MoE. Flint's legacy pipeline switch takes precedence when set. |
+| `FIFI_MLX_POSITIONED_READS` | off | Set to `1` to read local safetensors shard ranges at explicit offsets in Flint, Flash-Next and Qwen. Contiguous and vectored reads fill the existing buffers for the same validated ranges. |
 
 ## Qwen3.6 on Apple Silicon
 

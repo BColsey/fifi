@@ -10,7 +10,7 @@ use crate::{
     kernels::{PackedWeight, QuantizationMode, QuantizationSpec},
     tensor::{Dtype, Tensor},
     weights::{
-        AcquireRequest, CancelHandle, Completion, Priority, Selection, ShardHeader, ShardIo,
+        AcquireRequest, CancelHandle, Completion, Priority, Selection, ShardHeader,
         StreamedCheckpoint,
     },
 };
@@ -58,7 +58,7 @@ impl FlintCheckpoint {
                 "requires exactly the five published safetensors shards",
             ));
         }
-        let mut shards: Vec<(String, Box<dyn ShardIo + Send>, u64)> = Vec::new();
+        let mut shards = Vec::new();
         let mut routes = BTreeMap::new();
         for path in paths {
             guard.check(&path, "model weights")?;
@@ -75,13 +75,13 @@ impl FlintCheckpoint {
                     return Err(invalid(&format!("duplicate tensor {key}")));
                 }
             }
-            shards.push((name, Box::new(file), len));
+            shards.push((name, file, len));
         }
         // The publisher has no index. Derive only routing, then let the common
         // indexed reader check the same file handles and all header membership.
         let index = serde_json::to_vec(&serde_json::json!({"weight_map": routes}))
             .map_err(|error| invalid(&format!("derived index: {error}")))?;
-        let weights = StreamedCheckpoint::open(&index, shards, HEADER_LIMIT)?;
+        let weights = StreamedCheckpoint::open_files(&index, shards, HEADER_LIMIT)?;
         let profile = Profile::pinned();
         if routes.len() != profile.tensors.len() {
             return Err(invalid(
