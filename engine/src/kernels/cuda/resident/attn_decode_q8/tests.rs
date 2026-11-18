@@ -1310,6 +1310,91 @@ fn pin_visible(spec: &Spec, t: usize) -> (i64, usize) {
 /// between the skewed split's hot key and the others' with a skew, between the hot key and the
 /// fillers of every split with `near_hot` (the filler gap the test holds above the expf
 /// underflow line), and 0.0 otherwise.
+/// The sinks launch of the same call must be bit-equal to the index-order host
+/// combine with the kernel's sink fold (attn_decode_q8.cu): the per-head sink
+/// enters the block max, then the denominator once through
+/// l_init = expf(sink - M); the accumulator chain is unchanged. The sinks are
+/// spread so some heads' sinks sit above the split maxima and some below;
+/// both fold shapes are exercised. This pins the lift's third surface: the
+/// existing combine pin covers sinks == nullptr only.
+#[test]
+fn attn_decode_q8_sinks_launch_is_bit_equal_to_the_host_fold() {
+    const NAME: &str = "attn_decode_q8_sinks_launch_is_bit_equal_to_the_host_fold";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let spec = Spec {
+        cells: 1024,
+        split: AttnSplit {
+            max_splits: 8,
+            min_keys: 64,
+        },
+        ..Spec::qwen(2, 1017)
+    };
+    let (problem, _gap) = pin_problem(&spec, None, false, 0x5A);
+    let s = &problem.spec;
+    let part_bytes =
+        attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits).expect("part bytes");
+    let out_bytes = s.m * s.n_head * s.head_dim * 4;
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let q = upload_f32(&ctx, &problem.q).expect("q");
+    let proj = upload_f32(&ctx, &problem.proj).expect("proj");
+    let k_codes = upload_bytes(&ctx, &le_i8(&problem.k_codes)).expect("k codes");
+    let k_scales = upload_bytes(&ctx, &le16(&problem.k_scales)).expect("k scales");
+    let v_codes = upload_bytes(&ctx, &le_i8(&problem.v_codes)).expect("v codes");
+    let v_scales = upload_bytes(&ctx, &le16(&problem.v_scales)).expect("v scales");
+    let word = upload_bytes(&ctx, &s.kv_len.to_le_bytes()).expect("length");
+    let part = upload_bytes(&ctx, &part_content(part_bytes, PartFill::Nan)).expect("part");
+    let out = upload_filled(&ctx, 0xFF, out_bytes).expect("out");
+    // Sixteen heads: sinks from far below to far above the split maxima.
+    let sinks: Vec<f32> = (0..s.n_head).map(|h| h as f32 * 6.0 - 40.0).collect();
+    let sinks_dev = upload_f32(&ctx, &sinks).expect("sinks");
+    ctx.attn_decode_q8_sinks(
+        &stream,
+        AttnDecodeQ8Call {
+            shape: s.shape(),
+            span: s.span(),
+            split: s.split,
+            scale: s.scale(),
+            q: whole(&q).expect("q"),
+            proj: Some(whole(&proj).expect("proj")),
+            k_codes: whole(&k_codes).expect("k"),
+            k_scales: whole(&k_scales).expect("ks"),
+            v_codes: whole(&v_codes).expect("v"),
+            v_scales: whole(&v_scales).expect("vs"),
+            kv_len: whole(&word).expect("len"),
+            part: whole(&part).expect("part"),
+            out: whole(&out).expect("out"),
+        },
+        whole(&sinks_dev).expect("sinks"),
+    )
+    .expect("sinks attention");
+    stream.synchronize().expect("completion");
+    let got = testkit::floats(&read_bytes(&ctx, &out, out_bytes).expect("out bytes"));
+    assert!(
+        got.iter().all(|value| value.is_finite()),
+        "every combined output must be finite"
+    );
+    let part_back = testkit::floats(&read_bytes(&ctx, &part, part_bytes).expect("part bytes"));
+    for t in 0..s.m {
+        for h in 0..s.n_head {
+            let want = pin_host_combine(&problem, t, h, &part_back, Some(sinks[h]));
+            let head = &got[(t * s.n_head + h) * s.head_dim..][..s.head_dim];
+            for (dim, (&device, &host)) in head.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    device.to_bits(),
+                    host.to_bits(),
+                    "token {t} head {h} dim {dim}: device {device:e} (bits {:#010x}) vs the \
+                     host sink fold {host:e} (bits {:#010x})",
+                    device.to_bits(),
+                    host.to_bits(),
+                );
+            }
+        }
+    }
+}
+
 fn pin_problem(spec: &Spec, skew: Option<usize>, near_hot: bool, seed: u64) -> (Problem, f64) {
     use std::collections::HashMap;
     let mut rng = Rng::new(seed);
@@ -1458,7 +1543,7 @@ fn pin_problem(spec: &Spec, skew: Option<usize>, near_hot: bool, seed: u64) -> (
 /// device `expf` bit for bit, `mul_add` is fmaf and `+`, `*`, `/` are IEEE on both: the replica
 /// shares every bit with the kernel and needs no ulp tolerance. Reversing the sums (m7) changes
 /// the A sum of every element by a 2^-16 step, far beyond any tolerance.
-fn pin_host_combine(p: &Problem, t: usize, h: usize, part: &[f32]) -> Vec<f32> {
+fn pin_host_combine(p: &Problem, t: usize, h: usize, part: &[f32], sink: Option<f32>) -> Vec<f32> {
     let s = &p.spec;
     let (d, kvh, g) = (s.head_dim, h / GROUP, h % GROUP);
     let (_, count) = pin_visible(s, t);
@@ -1473,8 +1558,13 @@ fn pin_host_combine(p: &Problem, t: usize, h: usize, part: &[f32]) -> Vec<f32> {
     let top = partial
         .iter()
         .fold(f32::NEG_INFINITY, |m, &(mx, _)| m.max(mx));
+    // The sinks launch folds its per-head sink into the max and starts the
+    // denominator at expf(sink - M); the zero-value sink enters once, not per
+    // split (attn_decode_q8.cu).
+    let top = sink.map_or(top, |value| top.max(value));
+    let l_init = sink.map_or(0.0f32, |value| (value - top).exp());
     let weights: Vec<f32> = partial.iter().map(|&(mx, _)| (mx - top).exp()).collect();
-    let mut total = 0.0f32;
+    let mut total = l_init;
     for (&(_, l), &w) in partial.iter().zip(&weights) {
         total = l.mul_add(w, total);
     }
@@ -1771,7 +1861,7 @@ fn attn_decode_q8_combine_is_bit_equal_to_an_index_order_host_combine_of_its_par
                 outcome.label
             );
             for h in 0..spec.n_head {
-                let want = pin_host_combine(&outcome.problem, t, h, &outcome.part);
+                let want = pin_host_combine(&outcome.problem, t, h, &outcome.part, None);
                 let got = &outcome.out[(t * spec.n_head + h) * spec.head_dim..][..spec.head_dim];
                 for (dim, (&device, &host)) in got.iter().zip(&want).enumerate() {
                     assert_eq!(

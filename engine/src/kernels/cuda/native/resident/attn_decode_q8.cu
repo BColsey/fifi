@@ -39,6 +39,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/attn_decode_q8.h"
+#include "resident/attn_split_reduce.cuh"
 
 namespace {
 
@@ -725,39 +726,22 @@ __global__ void __launch_bounds__(D) attn_q8_combine_k(Args a) {
     const float *ml = a.part + (cell0 * G + g) * 2;
     const float *ac = a.part + n_cells * G * 2 + (cell0 * G + g) * D + d;
     const size_t ml_step = (size_t)G * 2, ac_step = (size_t)G * D;
-    // Statistics: thread s < n_active reads split s; the block max is exact in any order.
-    float ms = -INFINITY;
-    if (d < n_active) {
-        ms = ml[d * ml_step];
-        s_l[d] = ml[d * ml_step + 1];
-    }
-    const float wm = warp_max_a(ms);
-    if ((d & 31) == 0) {
-        s_red[d >> 5] = wm;
-    }
-    __syncthreads();
-    float M = s_red[0];
-#pragma unroll
-    for (int i = 1; i < D / 32; ++i) {
-        M = fmaxf(M, s_red[i]);
-    }
+    // The merge of the split partials is the shared two-phase combine of
+    // attn_split_reduce.cuh; the sink terms below fold into its phases exactly
+    // as the original inline code did (same operations, same order: the weight
+    // reloads ml instead of the register copy the inline version kept).
+    float M = inference::attn_split_max<D>(d, n_active, ml, ml_step, s_l, s_red);
     if (a.sinks != nullptr) {
         M = fmaxf(M, a.sinks[h]);
     }
     if (d < n_active) {
-        s_w[d] = expf(ms - M);
+        s_w[d] = expf(ml[d * ml_step] - M);
     }
     __syncthreads();
     // The zero-value sink enters the denominator once, not once per split; no QK scaling.
-    float L = a.sinks == nullptr ? 0.f : expf(a.sinks[h] - M);
-    for (int s = 0; s < n_active; ++s) {
-        L = fmaf(s_l[s], s_w[s], L);
-    }
-    float A = 0.f;  // index order; the loads do not depend on the weights, so they overlap
-#pragma unroll 16
-    for (int s = 0; s < n_active; ++s) {
-        A = fmaf(ac[s * ac_step], s_w[s], A);
-    }
+    const float l_init = a.sinks == nullptr ? 0.f : expf(a.sinks[h] - M);
+    float L, A;
+    inference::attn_split_sum(n_active, l_init, s_w, s_l, ac, ac_step, L, A);
     const float sig = a.proj == NULL
                           ? 1.f
                           : 1.f / (1.f + expf(-a.proj[(size_t)t * a.ld + (size_t)h * 2 * D + D + d]));

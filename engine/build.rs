@@ -208,6 +208,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/attn_decode.h",
     "src/kernels/cuda/native/resident/attn_decode_q8.h",
     "src/kernels/cuda/native/resident/attn_prep.h",
+    "src/kernels/cuda/native/resident/attn_split_reduce.cuh",
     "src/kernels/cuda/native/resident/embed.h",
     "src/kernels/cuda/native/resident/embed_bf16.h",
     "src/kernels/cuda/native/resident/embed_q8.h",
