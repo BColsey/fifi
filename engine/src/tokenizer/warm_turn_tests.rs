@@ -2206,3 +2206,96 @@ fn pinned_qwen_tokenizer_stays_eligible() {
         "the pinned daily-model tokenizer must stay warm-eligible under the gate"
     );
 }
+
+#[test]
+fn switched_resends_respect_identity_content_eviction_and_budget() {
+    let (_dir, bundle) = fixture_bundle(TEMPLATE_FIELDS);
+    let (_other, other_bundle) = fixture_bundle(&format!("{TEMPLATE_FIELDS} "));
+    let a = seed_conv();
+    let mut b = a.clone();
+    b[1].content = Some("different user".into());
+    let mut c = b.clone();
+    c[0].content = Some("different system".into());
+    let mut cache = WarmTurnCache::new();
+    cache.seed_resends = true;
+    // Determine the exact live charge of the parked result at the A-to-B switch.
+    let seed_pair = |budget| {
+        let mut pair = WarmTurnCache::new();
+        pair.seed_resends = true;
+        pair.resend_extra_bytes = budget;
+        for messages in [&a, &b] {
+            bundle
+                .encode_prompt_warm(&mut pair, messages, &[], Thinking::Off)
+                .unwrap();
+        }
+        pair
+    };
+    let charge = seed_pair(usize::MAX).accounted_bytes() - seed_pair(0).accounted_bytes();
+    assert!(charge > 0);
+    for (budget, hits) in [(0, 0), (charge - 1, 0), (charge, 1)] {
+        let mut pair = seed_pair(budget);
+        let want = bundle
+            .encode_prompt_with_boundary(&a, &[], Thinking::Off)
+            .unwrap();
+        assert_eq!(
+            bundle
+                .encode_prompt_warm(&mut pair, &a, &[], Thinking::Off)
+                .unwrap(),
+            want
+        );
+        assert_eq!(pair.reuses(), hits);
+    }
+    cache.resend_extra_bytes = usize::MAX;
+    for (source, messages, hits) in [
+        (&bundle, &a, 0),
+        (&bundle, &b, 0),
+        (&bundle, &a, 1),
+        (&bundle, &c, 1),
+        (&bundle, &b, 2),
+        (&bundle, &a, 2),
+        (&other_bundle, &c, 2),
+    ] {
+        let want = source
+            .encode_prompt_with_boundary(messages, &[], Thinking::Off)
+            .unwrap();
+        assert_eq!(
+            source
+                .encode_prompt_warm(&mut cache, messages, &[], Thinking::Off)
+                .unwrap(),
+            want
+        );
+        assert_eq!(cache.reuses(), hits);
+    }
+}
+
+#[test]
+fn displaced_append_keeps_its_own_ids_and_refuses_a_stochastic_tokenizer() {
+    let (_dir, bundle) = fixture_bundle(TEMPLATE_FIELDS);
+    let mut cache = WarmTurnCache::new();
+    cache.seed_resends = true;
+    cache.resend_extra_bytes = usize::MAX;
+    let a = seed_conv();
+    let appended = flag_conv();
+    let b = vec![message(Role::User, "other session")];
+    for (messages, hits) in [(&a, 0), (&appended, 1), (&b, 1), (&appended, 2)] {
+        let want = bundle
+            .encode_prompt_with_boundary(messages, &[], Thinking::Off)
+            .unwrap();
+        assert_eq!(
+            bundle
+                .encode_prompt_warm(&mut cache, messages, &[], Thinking::Off)
+                .unwrap(),
+            want
+        );
+        assert_eq!(cache.reuses(), hits);
+    }
+    let json = TOKENIZER_JSON.replace("\"dropout\":null", "\"dropout\":0.5");
+    let (_other_dir, stochastic) = fixture_bundle_with(&json, TEMPLATE_FIELDS);
+    assert!(!stochastic.tokenizer().boundary_eligible());
+    let digests = cache.digest_calls();
+    stochastic
+        .encode_prompt_warm(&mut cache, &appended, &[], Thinking::Off)
+        .unwrap();
+    assert_eq!(cache.digest_calls(), digests);
+    assert_eq!(cache.reuses(), 2);
+}
