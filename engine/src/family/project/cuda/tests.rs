@@ -1502,14 +1502,15 @@ fn the_default_layout_is_tiled() {
 
 #[test]
 fn a_native_load_refuses_an_unsupported_type_naming_the_tensor() {
-    // The GGUF reader accepts exactly F32, F16 and the four native types (`SUPPORTED_TYPES`), so a
-    // file cannot carry a type the native plan refuses: a Q5_K tensor fails the open (see
-    // `a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call`). The plan function that
+    // The GGUF reader takes every in-house type (`SUPPORTED_TYPES`), so a file can carry
+    // a type the native plan refuses: Q3_K is held back until its chunk, expert and
+    // embedding wiring is qualified, so the model open keeps it out and the plan
+    // refuses it. The plan function that
     // `planned` calls is therefore checked directly for the refusal and its text.
-    let text = error_text(plan::native_device_bytes("odd", GgufType::Q5K, &[256, 8]));
+    let text = error_text(plan::native_device_bytes("odd", GgufType::Q3K, &[256, 8]));
     assert!(
         text.starts_with("Checkpoint")
-            && text.contains("tensor odd has type Q5K, which the CUDA native weights do not take"),
+            && text.contains("tensor odd has type Q3K, which the CUDA native weights do not take"),
         "{text}"
     );
     let mut rng = Rng(SEED);
@@ -2224,25 +2225,26 @@ fn a_native_load_skips_the_scale_scans_that_stop_the_tiled_load() {
 }
 
 #[test]
-fn a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call() {
-    const NAME: &str = "a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call";
+fn a_q3k_tensor_opens_but_the_native_plan_refuses_it_before_any_device_call() {
+    const NAME: &str = "a_q3k_tensor_opens_but_the_native_plan_refuses_it_before_any_device_call";
     if !device_present(NAME) {
         return;
     }
-    // The reader and the model open take Q5_K; the native plan still refuses it
-    // (no native block until the plan commit), naming the tensor, device untouched.
+    // The reader takes Q3_K (`SUPPORTED_TYPES`); the model open keeps it out (its
+    // chunk, expert and embedding wiring is not qualified), and the native plan
+    // refuses it the same way, naming the tensor, with the device untouched.
     let dir = tempfile::tempdir().expect("create the fixture directory");
-    let path = dir.path().join("q5.gguf");
-    let payload = vec![0u8; N_ROWS * BLOCKS_PER_ROW * 176];
-    let entries = [weight_entry("q5", GgufType::Q5K, (N_ROWS, K), payload)];
+    let path = dir.path().join("q3.gguf");
+    let payload = vec![0u8; N_ROWS * BLOCKS_PER_ROW * 110];
+    let entries = [weight_entry("q3", GgufType::Q3K, (N_ROWS, K), payload)];
     std::fs::write(&path, gguf_bytes(&entries)).expect("write the GGUF fixture");
     let mut projector = CudaProjector::new().expect("create the CUDA projector");
     let before = projector.live_bytes();
-    let weights = GgufWeights::open(&path, LIMITS, None).expect("the reader takes Q5_K");
+    let weights = GgufWeights::open(&path, LIMITS, None).expect("the reader takes Q3_K");
     assert_error(
-        planned(&weights, "q5", WeightLayout::Native).map(|(_, bytes)| bytes),
+        planned(&weights, "q3", WeightLayout::Native).map(|(_, bytes)| bytes),
         "Checkpoint",
-        "tensor q5 has type Q5K, which the CUDA native weights do not take",
+        "tensor q3 has type Q3K",
     );
     assert_eq!(
         projector.live_bytes(),
@@ -2250,7 +2252,7 @@ fn a_gguf_with_a_q5k_tensor_fails_the_open_before_any_device_call() {
         "the plan touched the device"
     );
     let fixture = big_and_small_fixture();
-    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a refused q5_k");
+    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a refused q3_k");
 }
 
 /// Q8_0 blocks whose every `d` is `d_bits` and whose quant 0 is `q`, the rest
@@ -3342,7 +3344,7 @@ fn trimmed_copy_drops_the_q3k_tensor_and_keeps_the_rest_byte_for_byte() {
     std::fs::write(&source, gguf_bytes(&entries)).expect("write the source fixture");
     assert!(
         GgufWeights::open(&source, MEASURE_LIMITS, None).is_ok(),
-        "the reader takes every supported type, including the unplanned tensor"
+        "the reader takes every supported type, including the Q3_K tensor"
     );
     let dest = dir.path().join("trimmed.gguf");
     let trim = write_trimmed(&source, &dest, u64::MAX);

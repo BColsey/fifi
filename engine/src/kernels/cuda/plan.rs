@@ -77,19 +77,22 @@ pub(crate) fn device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Result<u64
         .ok_or_else(overflow)
 }
 
-/// Values per block and bytes per block of the four native-layout types.
+/// Values per block and bytes per block of the native-layout types: the vendored four
+/// plus the in-house Q5_K (176 bytes per 256) and Q4_0 (18 bytes per 32).
 const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
     match ty {
         GgufType::Q4K => Some((256, 144)),
         GgufType::Q6K => Some((256, 210)),
         GgufType::Q80 => Some((32, 34)),
         GgufType::Q50 => Some((32, 22)),
+        GgufType::Q5K => Some((256, 176)),
+        GgufType::Q40 => Some((32, 18)),
         _ => None,
     }
 }
 
 /// Device bytes of the tensor `name` after a native upload: the file's own
-/// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K and Q8_0 only. There is no
+/// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K, Q8_0, Q5_K and Q4_0. There is no
 /// 8-row rule and no tile-column rule: any row count from one up loads, and `dims[0]` must be
 /// a positive multiple of the type's block size up to `MAX_COLS`. The count differs from the
 /// tiles only for Q6_K, which needs 1680 native against 1792 tile bytes per 8x256 rows.
@@ -503,9 +506,18 @@ mod tests {
             native_device_bytes("w", GgufType::Q80, &[MAX_COLS, 3]),
             Ok(3 * (MAX_COLS / 32) * 34)
         );
-        assert!(matches!(
+        // The in-house types take the native plan with their own block geometry.
+        assert_eq!(
             native_device_bytes("w", GgufType::Q5K, &[256, 8]),
-            Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q5K")
+            Ok(8 * 176)
+        );
+        assert_eq!(
+            native_device_bytes("w", GgufType::Q40, &[32, 5]),
+            Ok(5 * 18)
+        );
+        assert!(matches!(
+            native_device_bytes("w", GgufType::Q3K, &[256, 8]),
+            Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q3K")
         ));
         // F32 and F16 count as in the tiled plan: raw copies in both layouts.
         assert_eq!(native_device_bytes("norm", GgufType::F32, &[5]), Ok(20));
@@ -660,7 +672,7 @@ mod tests {
         // Q80 blocks are 32 wide: the same 192 cut is legal there.
         assert!(plan_slice("w", GgufType::Q80, &dims, 0..192, 0..2048).is_ok());
         // A type with no native block, and an over-rank tensor, refuse.
-        assert!(plan_slice("w", GgufType::Q5K, &dims, 0..512, 0..2048).is_err());
+        assert!(plan_slice("w", GgufType::Q2K, &dims, 0..512, 0..2048).is_err());
         assert!(plan_slice("w", GgufType::F32, &[4, 4, 4, 4], 0..4, 0..4).is_err());
     }
 
