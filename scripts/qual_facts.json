@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7118,
+      "test_fns": 7119,
       "ignored": 636,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -265,6 +265,7 @@
         "INFERENCE_CUDA_MOE_GLU_FUSE",
         "INFERENCE_CUDA_REQUIRE_DEVICE",
         "INFERENCE_CUDA_TILED_HEAD",
+        "INFERENCE_EXL3_ROWS_MAX",
         "INFERENCE_FLASH_NEXT_DRAIN_TICK",
         "INFERENCE_FLASH_NEXT_PLE_BATCH",
         "INFERENCE_FLASH_NEXT_PLE_DEVICE",

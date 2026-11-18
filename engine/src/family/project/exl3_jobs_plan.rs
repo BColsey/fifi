@@ -92,6 +92,42 @@ pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
 /// rows; the legacy path stays capped at 64.
 pub(crate) const MAX_EXL3_ROWS: usize = 256;
 
+/// The widest rows window the shared EXL3 expert machinery may plan for this session:
+/// `MAX_EXL3_ROWS` unless `INFERENCE_EXL3_ROWS_MAX` raises it for a measurement. Values
+/// above the default are measurement widths, not qualified served defaults: the tiled
+/// dense-job writer covers them, but the oracle and parity suites only pin the default.
+/// Only the Flash-Next prefill paths honour the raise (settings, the chunk plan, the
+/// shared driver and its MoE block); the K-row shared expert of `family::exl3::moe`
+/// still caps at `MAX_EXL3_ROWS`. Strict parse: digits only, 1 to 4096; anything else
+/// refuses at start. Read once per process and cached.
+pub(crate) fn exl3_rows_ceiling() -> Result<usize, String> {
+    static CEILING: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+    CEILING
+        .get_or_init(|| {
+            exl3_rows_ceiling_from(std::env::var("INFERENCE_EXL3_ROWS_MAX").ok().as_deref())
+        })
+        .clone()
+}
+
+/// [`exl3_rows_ceiling`] over an explicit raw value, for tests.
+pub(crate) fn exl3_rows_ceiling_from(spec: Option<&str>) -> Result<usize, String> {
+    const HARD_CEILING: usize = 4096;
+    let raw = match spec {
+        Some(raw) => raw,
+        None => return Ok(MAX_EXL3_ROWS),
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("INFERENCE_EXL3_ROWS_MAX must be digits only".to_string());
+    }
+    let value: usize = raw
+        .parse()
+        .map_err(|_| "INFERENCE_EXL3_ROWS_MAX does not parse".to_string())?;
+    if !(1..=HARD_CEILING).contains(&value) {
+        return Err("INFERENCE_EXL3_ROWS_MAX must be 1 to 4096".to_string());
+    }
+    Ok(value.max(MAX_EXL3_ROWS))
+}
+
 /// i32 words of one job of the device table.
 pub(crate) const EXL3_JOB_WORDS: usize = 4;
 
@@ -127,6 +163,22 @@ pub(crate) fn exl3_job_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rows_ceiling_defaults_stays_strict_and_never_lowers_the_default() {
+        use super::{MAX_EXL3_ROWS, exl3_rows_ceiling_from};
+        assert_eq!(exl3_rows_ceiling_from(None).unwrap(), MAX_EXL3_ROWS);
+        assert_eq!(exl3_rows_ceiling_from(Some("2048")).unwrap(), 2048);
+        // A measurement width below the qualified default never lowers it.
+        assert_eq!(exl3_rows_ceiling_from(Some("100")).unwrap(), MAX_EXL3_ROWS);
+        for bad in ["", "1 GiB", "-1", "0", "4097", "99999999999"] {
+            assert!(exl3_rows_ceiling_from(Some(bad)).is_err(), "{bad} took");
+        }
+        assert_eq!(
+            exl3_rows_ceiling_from(Some("x")).unwrap_err(),
+            "INFERENCE_EXL3_ROWS_MAX must be digits only"
+        );
+    }
 
     #[test]
     fn split_sources_keep_original_rows_and_scatter_with_local_member_ids() {

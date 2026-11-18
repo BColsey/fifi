@@ -357,7 +357,7 @@ mod device {
                         PairPlan, Scratch as JobScratch, pair_layout, plan_jobs, plan_pairs,
                     },
                 },
-                exl3_jobs_plan::{EXL3_JOB_WORDS, MAX_EXL3_ROWS, exl3_job_bytes},
+                exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_job_bytes, exl3_rows_ceiling},
             },
         },
         kernels::cuda::{
@@ -950,7 +950,8 @@ mod device {
             perm: DeviceRange<'_>,
         ) -> Result<(), EngError> {
             let geometry = *self.bank.geometry();
-            if !(1..=MAX_EXL3_ROWS).contains(&dims.rows)
+            let rows_ceiling = exl3_rows_ceiling().map_err(refuse)?;
+            if !(1..=rows_ceiling).contains(&dims.rows)
                 || dims.rows > self.layout.rows
                 || projector.rows != dims.rows
                 || layer >= geometry.layers

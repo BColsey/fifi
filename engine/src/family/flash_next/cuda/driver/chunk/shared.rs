@@ -8,7 +8,7 @@ use crate::{
             chunk_family::ChunkFamily,
             steps::{PrefillStep, check_chunk_start, drive_steps},
         },
-        project::exl3_jobs_plan::MAX_EXL3_ROWS,
+        project::exl3_jobs_plan::exl3_rows_ceiling,
     },
 };
 use std::{sync::atomic::Ordering, time::Instant};
@@ -145,9 +145,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
     pub(super) fn feed_shared_rows(&mut self, tokens: &[u32]) -> Result<()> {
         self.preflight_shared(tokens)?;
         let cap = self.chunk_cap.max(1);
-        if cap > MAX_EXL3_ROWS {
+        // The qualified default unless a measurement session lifted the ceiling.
+        let rows_ceiling = exl3_rows_ceiling().map_err(|d| refuse(&d))?;
+        if cap > rows_ceiling {
             return Err(refuse(
-                format!("the shared path is not qualified above {MAX_EXL3_ROWS} rows").as_str(),
+                format!("the shared path is not qualified above {rows_ceiling} rows").as_str(),
             ));
         }
         let start = self.pos;
@@ -176,9 +178,10 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
     ) -> Result<Option<Vec<f32>>> {
         self.preflight_shared(tokens)?;
         let (p0, m) = (self.pos, tokens.len());
-        if !(1..=MAX_EXL3_ROWS).contains(&m) {
+        let rows_ceiling = exl3_rows_ceiling().map_err(|d| refuse(&d))?;
+        if !(1..=rows_ceiling).contains(&m) {
             return Err(refuse(
-                format!("a chunk must hold 1 to {MAX_EXL3_ROWS} rows").as_str(),
+                format!("a chunk must hold 1 to {rows_ceiling} rows").as_str(),
             ));
         }
         let began = Instant::now();

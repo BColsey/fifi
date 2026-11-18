@@ -7,7 +7,7 @@
 
 use super::moe::context_budget::KvFormat;
 use crate::EngError;
-use crate::family::project::exl3_jobs_plan::MAX_EXL3_ROWS;
+use crate::family::project::exl3_jobs_plan::exl3_rows_ceiling;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -264,13 +264,16 @@ pub(in crate::family::flash_next) fn cuda_settings(
     }
     // The step plan refuses widths above `MAX_STEP_ROWS` (`cuda/step_plan.rs`), which equals
     // `MAX_EXL3_ROWS` of `project/exl3_jobs_plan.rs`; refusing here names `prefill_rows` at
-    // parse time instead of a plan refusal at boot.
+    // parse time instead of a plan refusal at boot. The ceiling may be raised above the
+    // qualified default by `INFERENCE_EXL3_ROWS_MAX` (a measurement width above the
+    // qualified default).
+    let rows_ceiling = exl3_rows_ceiling().map_err(EngError::BadRequest)?;
     let prefill_rows = ranged(
         "prefill_rows",
         options.prefill_rows,
         256,
         1,
-        MAX_EXL3_ROWS as u32,
+        rows_ceiling as u32,
     )?;
     // The stock threshold is 32: at 32 rows a top-10 union already outgrows a 200-slot
     // bank, so smaller chunks usually fit the bank without admission while larger ones
@@ -281,7 +284,7 @@ pub(in crate::family::flash_next) fn cuda_settings(
         "ring_rows",
         options.ring_rows.unwrap_or(DEFAULT_RING_ROWS),
         1,
-        MAX_EXL3_ROWS as u32,
+        rows_ceiling as u32,
     )?;
     Ok(Some(CudaSettings {
         context,
