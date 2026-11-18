@@ -369,7 +369,12 @@ pub(crate) fn collect(config: Option<&crate::server::config::Config>) -> BundleI
 
 /// One engine's preflight and effective rows, degraded to text on
 /// failure. The candidate mirrors the config surface: the family and
-/// the q36 context/KV members the entry carries.
+/// the context/KV/prefill-width members the entry carries — the
+/// `qwen36` object for the Qwen3.6 families, the `flash_next` object
+/// for Flash-Next, whose KV name here is the serde name the loader's
+/// own resolution parses back. Config refuses an options object on
+/// any other family (config.rs:195-206), so at most one of the two is
+/// set and the `or_else` never mixes members of both.
 fn engine_input(
     engine: &crate::server::config::EngineConfig,
     facts: &HardwareFacts,
@@ -379,12 +384,32 @@ fn engine_input(
         context_limit: engine
             .qwen36
             .as_ref()
-            .and_then(|options| options.context_limit),
+            .and_then(|options| options.context_limit)
+            .or_else(|| {
+                engine
+                    .flash_next
+                    .as_ref()
+                    .and_then(|options| options.context)
+            }),
         kv_dtype: engine
             .qwen36
             .as_ref()
-            .and_then(|options| options.kv_dtype.clone()),
-        prefill_rows: None,
+            .and_then(|options| options.kv_dtype.clone())
+            .or_else(|| {
+                engine.flash_next.as_ref().and_then(|options| {
+                    options.kv_format.map(|kv| {
+                        match kv {
+                            crate::family::flash_next::settings::KvFormatName::F16 => "f16",
+                            crate::family::flash_next::settings::KvFormatName::Int8 => "int8",
+                        }
+                        .to_string()
+                    })
+                })
+            }),
+        prefill_rows: engine
+            .flash_next
+            .as_ref()
+            .and_then(|options| options.prefill_rows),
     };
     let preflight =
         preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
@@ -909,6 +934,124 @@ mod tests {
                 .expect("checks")
                 .is_empty()
         );
+    }
+
+    /// A Flash-Next engine entry over an empty directory, with the options
+    /// the test names. The bundle's preflight must reach the loader's own
+    /// settings resolution with those options: each configured value is
+    /// proven by the loader's own refusal text for an invalid value, which
+    /// fires before any device fact or pack file is read. `cuda_decode` is
+    /// forced on for the same reason the rows arm itself forces it
+    /// (load.rs): the CUDA settings path only runs for a CUDA-decode entry,
+    /// and without it there are no device rows to plan.
+    fn flash_engine(
+        flash_next: crate::family::flash_next::settings::FlashOptions,
+    ) -> (tempfile::TempDir, crate::server::config::EngineConfig) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = crate::server::config::EngineConfig {
+            id: "flash".to_string(),
+            model_dir: dir.path().to_path_buf(),
+            tokenizer_dir: dir.path().to_path_buf(),
+            family: crate::family::flash_next::factory::FAMILY.to_string(),
+            model: None,
+            context_limit: None,
+            fake: None,
+            flash_next: Some(flash_next),
+            qwen36: None,
+            nemotron: None,
+            flint: None,
+            think_replay: None,
+            notice_toolwrap: None,
+        };
+        (dir, engine)
+    }
+
+    fn flash_load_plan_detail(engine: &crate::server::config::EngineConfig) -> String {
+        let input = super::engine_input(engine, &synthetic_facts());
+        let report = input
+            .preflight
+            .expect("a refusal is a report, not an error");
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "load plan")
+            .map(|check| check.detail.clone())
+            .expect("a load plan check")
+    }
+
+    #[test]
+    fn a_flash_entry_carries_its_configured_context_into_the_preflight() {
+        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
+            cuda_decode: Some(true),
+            context: Some(5002),
+            ..Default::default()
+        });
+        assert_eq!(
+            flash_load_plan_detail(&engine),
+            "the load would refuse this pack: engine config: context must be a multiple of 4, found 5002"
+        );
+    }
+
+    #[test]
+    fn a_flash_entry_carries_its_configured_kv_format_into_the_preflight() {
+        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
+            cuda_decode: Some(true),
+            kv_format: Some(crate::family::flash_next::settings::KvFormatName::Int8),
+            ..Default::default()
+        });
+        assert_eq!(
+            flash_load_plan_detail(&engine),
+            "the load would refuse this pack: engine config: kv_format int8 has no attention kernel yet; use f16"
+        );
+    }
+
+    #[test]
+    fn a_flash_entry_carries_its_f16_kv_format_into_the_preflight() {
+        // F16 is accepted, so the resolution must pass the KV arm and refuse
+        // on the context instead. The loader round-trips the KV name through
+        // serde before the settings run (load.rs): a mangled name would fail
+        // the parse with `kv_format: unknown variant`, not this text.
+        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
+            cuda_decode: Some(true),
+            kv_format: Some(crate::family::flash_next::settings::KvFormatName::F16),
+            context: Some(5002),
+            ..Default::default()
+        });
+        assert_eq!(
+            flash_load_plan_detail(&engine),
+            "the load would refuse this pack: engine config: context must be a multiple of 4, found 5002"
+        );
+    }
+
+    #[test]
+    fn a_flash_entry_carries_its_configured_prefill_width_into_the_preflight() {
+        let (_dir, engine) = flash_engine(crate::family::flash_next::settings::FlashOptions {
+            cuda_decode: Some(true),
+            prefill_rows: Some(9000),
+            ..Default::default()
+        });
+        assert_eq!(
+            flash_load_plan_detail(&engine),
+            "the load would refuse this pack: engine config: prefill_rows must be between 1 and 256, found 9000"
+        );
+    }
+
+    #[test]
+    fn a_flash_entry_without_options_keeps_the_default_preflight() {
+        // No options: the candidate carries no context, KV or width, so the
+        // resolution runs on the family defaults and the report says the
+        // device's memory could not be probed (the synthetic facts) — the
+        // same no-rows answer as before this wiring.
+        let (_dir, engine) =
+            flash_engine(crate::family::flash_next::settings::FlashOptions::default());
+        let input = super::engine_input(&engine, &synthetic_facts());
+        let report = input.preflight.expect("a report");
+        assert!(report.decisions.is_empty());
+        assert!(report.checks.iter().any(|check| {
+            check
+                .detail
+                .contains("the device's free memory could not be probed")
+        }));
     }
 
     #[test]
