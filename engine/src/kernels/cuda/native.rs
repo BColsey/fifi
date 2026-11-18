@@ -13,6 +13,9 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+#[cfg(test)]
+mod constant_bank_guard;
+
 pub(super) mod device_info;
 pub(super) mod nvfp4_launch;
 pub(super) mod peer_probe;
