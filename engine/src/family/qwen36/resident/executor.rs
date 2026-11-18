@@ -3300,7 +3300,7 @@ mod tests {
     #[test]
     #[ignore = "Apple Silicon worker request timing"]
     fn mlx_request_bench() {
-        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, PIECE};
+        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, Workload};
         use crate::sched::worker::spawn_engine_noted;
 
         let grouped = std::env::var_os("FIFI_MLX_GROUPED_IMPORT").is_some_and(|value| value == "1");
@@ -3309,13 +3309,24 @@ mod tests {
             std::env::var_os("FIFI_MLX_REQUEST_ADMISSION").is_some_and(|value| value == "1");
         let step = admission
             && std::env::var_os("FIFI_MLX_REQUEST_STEP").is_some_and(|value| value == "1");
-        let spec = if dense { tiny::TINY_DENSE } else { TINY_GQA };
+        let workload = Workload::from_env();
+        let large = workload.context > 128;
+        let spec = match (dense, large) {
+            (true, true) => FamilySpec {
+                head_dim: 64,
+                ..tiny::TINY_DENSE
+            },
+            (true, false) => tiny::TINY_DENSE,
+            (false, true) => TINY_KV8,
+            (false, false) => TINY_GQA,
+        };
+        let kv_dtype = std::env::var("FIFI_MLX_REQUEST_KV").unwrap_or_else(|_| "f32".into());
         let options = Q36Options {
             cache_limit_bytes: Some(CACHE_LIMIT),
-            context_limit: Some(128),
+            context_limit: Some(workload.context),
             activation_dtype: Some("bf16".into()),
-            kv_dtype: Some("f32".into()),
-            prefill_chunk: Some(PIECE),
+            kv_dtype: Some(kv_dtype.clone()),
+            prefill_chunk: Some(workload.piece),
             prefill_budget_bytes: (!step).then_some(2 << 30),
             prefill_session_reserve_bytes: (!step).then_some(64 << 20),
             ..Q36Options::default()
@@ -3330,9 +3341,14 @@ mod tests {
         )
         .unwrap();
         let rules = Q36Rules {
-            context_limit: 128,
-            session_cap: 128 * GROWTH,
+            context_limit: workload.context,
+            session_cap: if large {
+                settings.session_cap
+            } else {
+                128 * GROWTH
+            },
             activation: Activation::Bf16,
+            kv_dtype: settings.kv,
             ..chunk_rules()
         };
         mlx_request_bench::measure(
@@ -3344,8 +3360,10 @@ mod tests {
             } else {
                 "default"
             },
+            &kv_dtype,
+            workload,
             |note| {
-                spawn_engine_noted(PIECE as usize, note, move |_| {
+                spawn_engine_noted(workload.piece as usize, note, move |_| {
                     let ckpt: &'static StreamedCheckpoint =
                         Box::leak(Box::new(tiny::checkpoint(&spec)));
                     let host = HostWeights::load(ckpt, &spec, &tiny::config(&spec))?;
@@ -3361,7 +3379,7 @@ mod tests {
                         None
                     };
                     plan_prefill(&mut executor, &settings, device)?;
-                    assert_eq!(executor.prefill_chunk(), (!step).then_some(PIECE));
+                    assert_eq!(executor.prefill_chunk(), (!step).then_some(workload.piece));
                     Ok((executor, session))
                 })
                 .unwrap()

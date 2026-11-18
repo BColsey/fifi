@@ -45,6 +45,10 @@ The targeted native library suite passed eight checks in each mode. It includes 
 
 On the published Flint INT4 checkpoint, four short requests through the normal release server returned identical completions across both reshape modes and both prefill reader policies. The four requests check output parity under the production build.
 
+## Larger packed projections
+
+A separate 24-case sweep used 4,096-by-4,096 weights with 128 or 256 activation rows. It covered affine INT4 and INT8 at group sizes 32 and 64, MXFP4 and MXFP8, and F32 and BF16 activations. All 96 case records across four fresh processes matched output bytes. Same-shape reshape reuse reduced median paired host submission time by 15.5%. The synchronized median paired change was +0.1%. Larger MXFP8 cases showed a median synchronized change of +0.3%, with four of eight pairs faster. Reshape reuse remains opt-in. [All large projection measurements](../../scripts/benchmarks/mac-m4-mlx-large-projections.csv)
+
 ## Reproduce
 
 Build in `engine/` and use the two executable paths printed by Cargo. Profile on an idle Mac with a fresh scratch output directory. Use `--smoke --samples 1` for the first projection check.
@@ -58,3 +62,5 @@ python3 ../scripts/bench_mlx_requests.py "$LIB_TEST" "$RUN_DIR/requests.csv" \
 ```
 
 The request driver fixes the Flash-Next chunked and Qwen3.6 grouped-embedding configurations across both arms. It checks complete continuation token sequences and reports first-token time, steady decode and memory alongside the projection results.
+
+Pass `--large` to `bench_mlx_projections.py` for the 4,096-wide shapes. Use a distinct CSV path.

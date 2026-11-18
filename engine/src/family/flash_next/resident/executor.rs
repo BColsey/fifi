@@ -2266,16 +2266,17 @@ mod tests {
     #[ignore = "Apple Silicon worker request timing"]
     fn mlx_request_bench() {
         use crate::family::flash_next::settings::{FlashEnv, FlashOptions, FlashSettings};
-        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, PIECE};
+        use crate::family::prefill::mlx_request_bench::{self, CACHE_LIMIT, Workload};
         use crate::sched::worker::spawn_engine_noted;
 
         let chunked = std::env::var_os("FIFI_MLX_FLASH_CHUNKED").is_some_and(|value| value == "1");
         let admission =
             std::env::var_os("FIFI_MLX_REQUEST_ADMISSION").is_some_and(|value| value == "1");
+        let workload = Workload::from_env();
         let options = FlashOptions {
             manifest: Some("fixture-manifest.json".into()),
             cache_limit_bytes: Some(CACHE_LIMIT),
-            prefill_chunk: Some(PIECE),
+            prefill_chunk: Some(workload.piece),
             prefill_budget_bytes: chunked.then_some(2 << 30),
             ..FlashOptions::default()
         };
@@ -2289,8 +2290,10 @@ mod tests {
         mlx_request_bench::measure(
             "flash-next",
             if chunked { "chunked" } else { "step" },
+            "f32",
+            workload,
             |note| {
-                spawn_engine_noted(PIECE as usize, note, move |_| {
+                spawn_engine_noted(workload.piece as usize, note, move |_| {
                     let (mut executor, session) =
                         build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
@@ -2303,7 +2306,7 @@ mod tests {
                         None
                     };
                     executor.configure_prefill(&session, &settings, false, device)?;
-                    assert_eq!(executor.prefill_chunk(), chunked.then_some(PIECE));
+                    assert_eq!(executor.prefill_chunk(), chunked.then_some(workload.piece));
                     Ok((executor, session))
                 })
                 .unwrap()

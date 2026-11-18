@@ -26,6 +26,26 @@ Both Qwen3.6 arms use eight-row prefill pieces and the four-layer BF16 activatio
 - **Steady decode rate** divides the seven remaining tokens by the elapsed time from the first token to the last.
 - **Metal synchronizations** count the full worker request. The MLX peak is active allocation after resetting the process-wide counter before each request. The process footprint is the macOS high-water mark reported for the entire test process, including load and all requests.
 
+## Larger prefill pieces and KV formats
+
+The 16 GB M4 mini ran 448 measured synthetic worker requests using 65- and 257-token prompts, eight completion tokens, and 32- or 128-row prefill pieces. The Qwen3.6 MoE and Qwen3.8 dense fixtures use the same 64-lane attention shape for each of their F32, BF16, and Q8 KV comparisons and BF16 activations. Flash-Next uses its F32 QSA state and index rows. All continuations matched at both widths within each KV profile.
+
+The Qwen planner already priced composite score workspace in query blocks when `Q36_PREFILL_QUERY_SLICE` was set. The BF16 execution path used a full-chunk call in that case. It now uses the same causal query-block routine as F32. Native checks for each of the three KV forms verify that a split dispatches more than one block and matches whole-chunk output to within FP32 tolerance. The benchmark uses 16-row attention slices in both Qwen arms so the outer prefill width is the only setting changed within each profile.
+
+| Fixture | KV | First token at 257 prompt tokens, 32 → 128 rows | Paired change | Metal waits | Peak active MLX KiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen3.6 MoE | F32 | 16.32 → 6.43 ms | −61% | 83 → 47 | 2,417 → 3,922 |
+| Qwen3.6 MoE | BF16 | 16.80 → 6.02 ms | −65% | 83 → 47 | 3,167 → 3,222 |
+| Qwen3.6 MoE | Q8 | 17.49 → 7.85 ms | −55% | 83 → 47 | 2,466 → 3,488 |
+| Qwen3.8 dense | F32 | 7.78 → 2.73 ms | −65% | 59 → 41 | 682 → 1,791 |
+| Qwen3.8 dense | BF16 | 7.19 → 2.70 ms | −63% | 59 → 41 | 796 → 1,791 |
+| Qwen3.8 dense | Q8 | 7.03 → 3.08 ms | −56% | 59 → 41 | 653 → 1,791 |
+| Flash-Next | F32 | 335.73 → 339.91 ms | +1% | 993 → 993 | 1,001 → 998 |
+
+Each cell shows the median across four process medians, except the change column, which shows the median of the paired percentage changes. The raw measurements include time spent inside import, readback, evaluation, and forced retirement calls. Those wall times include synchronization and can cover queued work. Decode timings varied. [All 448 requests](../../scripts/benchmarks/mac-m4-mlx-kv-worker-matrix.csv)
+
+The Flash-Next fixture has 19 dense QSA positions. Beyond that limit, the current prefill path feeds one token per step, which accounts for the same synchronization count in both arms. The next target is a bounded multi-row sparse prefill path that preserves the selected keys and causal order. [Flash-Next prefill split](../../engine/src/family/flash_next/resident/prefill/step.rs)
+
 ## Reproduce on Apple Silicon
 
 From `engine/`, build the release library tests. Set `MLX_TEST_BINARY` to the executable path printed by Cargo and `RUN_DIR` to a writable scratch directory. The driver enumerates one exact test per family. It alternates which arm runs first in each of eight pairs per family. Each process runs two warm-ups and eight recorded samples at each prompt length, with eight generated tokens per request.
@@ -36,3 +56,10 @@ python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/requests.c
 ```
 
 Pass `--pairs 1 --samples 1` for an eight-request smoke run and use a fresh output path for the full run. A row-level embedding benchmark gives the separate measurement of the upload operation in isolation. [MLX architecture and embedding measurements](mlx-architecture.md)
+
+Use the same release harness for the larger worker comparison. A fresh output path and `--pairs 1 --samples 1` give a quick parity and dispatch check before the full run.
+
+```sh
+python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/kv-workers.csv" \
+  --kv-matrix --pairs 4 --samples 4
+```
