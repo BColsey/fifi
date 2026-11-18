@@ -382,7 +382,9 @@ extern "C" size_t inference_cuda_attn_decode_gemma_part_floats(
 
 extern "C" int inference_cuda_attn_decode_gemma_split_plan_raw(
     int n_keys, int max_splits, int min_keys, int *chunk, int *n_active) {
-    if (chunk == NULL || n_active == NULL || n_keys < 0 || max_splits < 1 ||
+    /* n_keys 0 would leave ch 0 and divide by zero below; the kernels never
+     * pass it (visible >= 1), so the export refuses it outright. */
+    if (chunk == NULL || n_active == NULL || n_keys < 1 || max_splits < 1 ||
         max_splits > kMaxSplits || min_keys < 1) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }

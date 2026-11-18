@@ -174,6 +174,9 @@ fn split_plan_pins_to_hand_values() {
         );
         assert_eq!(mirror(n_keys, max_splits, min_keys), Some(want));
     }
+    // Zero keys once reached the arithmetic and divided by its own zero
+    // chunk (SIGFPE through the export); the export now refuses it outright.
+    assert_eq!(attn_decode_gemma_split_plan(0, 32, 128), None);
 }
 
 /// The split path over the same frozen fixtures, forced to two splits by a
