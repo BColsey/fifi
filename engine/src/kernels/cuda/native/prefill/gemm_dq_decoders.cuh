@@ -112,6 +112,58 @@ struct Q40Decoder {
     }
 };
 
+/* Q3_K block layout (110 bytes for 256 values), per the CPU oracle of
+ * weights/gguf_dequant.rs (the ggml reference `dequantize_row_q3_K`): 32
+ * hmask bytes at +0, 64 qs bytes at +32, 12 packed 6-bit sub-scale bytes at
+ * +96, the f16 super scale at +108. A 256-value block is two 128-value
+ * halves; each half reads qs[32*half..) with lane j (0..4) at bit pair 2*j,
+ * groups of 16 at +16, and its hmask bit 4*half + j of hmask[r] (set
+ * subtracts 0, clear 4); the
+ * 16 sub-scales come from the aux shuffle (see `scale_of`) biased by 32. */
+struct Q3kDecoder {
+    static const int kQK = 256;
+    static const int kBlockBytes = 110;
+    static const int kChunkBlocks = 1;
+
+    __device__ static int chunk_block_off(int c) { return c >> 2; }
+
+    /* One of the 16 packed 6-bit sub-scales of the ggml aux shuffle (the CPU
+     * oracle's aux[0..3] expansion, addressed directly): scale `is` is byte
+     * is&3 of row is>>2, low nibble of ks[(row&1)*4 + byte] at shift
+     * 4*(row>>1), plus the 2-bit high field of ks[8+byte] at shift 2*row. */
+    __device__ static int scale_of(const unsigned char *ks, int is) {
+        const int row = is >> 2;
+        const int byte = is & 3;
+        const int lo = (ks[(row & 1) * 4 + byte] >> (4 * (row >> 1))) & 0x0f;
+        const int hi = ((ks[8 + byte] >> (2 * row)) & 0x03) << 4;
+        return lo | hi;
+    }
+
+    /* Chunk c carries block values [64c, 64c + 64) in the oracle's output
+     * order: half = c >> 1 owns qs[32*half..); within the half, lane j covers
+     * 32 values (qs shift 2*j, hmask bit 4*half + j: one mask byte carries
+     * all eight lanes of both halves), groups of 16 at qs+16 and hm+16; a
+     * CLEAR hmask bit subtracts 4. */
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst) {
+        c &= 3;
+        const float d = half_at(block + 108);
+        const unsigned char *hm = block;
+        const unsigned char *qs = block + 32 + 32 * (c >> 1);
+        const unsigned char *ks = block + 96;
+        #pragma unroll
+        for (int s = 0; s < 64; ++s) {
+            const int j = 2 * (c & 1) + (s >> 5);
+            const int g2 = (s >> 4) & 1;
+            const int l = s & 15;
+            const int qv =
+                (int)((qs[16 * g2 + l] >> (2 * j)) & 3) -
+                ((hm[16 * g2 + l] & (1 << (4 * (c >> 1) + j))) == 0 ? 4 : 0);
+            const float dl = d * (float)(scale_of(ks, (c >> 1) * 8 + 2 * j + g2) - 32);
+            dst[s] = __float2half(dl * (float)qv);
+        }
+    }
+};
+
 }  // namespace gemm_dq
 
 #endif /* INFERENCE_CUDA_PREFILL_GEMM_DQ_DECODERS_CUH */

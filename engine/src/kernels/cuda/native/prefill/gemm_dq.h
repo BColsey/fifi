@@ -40,6 +40,11 @@ int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_args *args, v
 int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args, void *stream,
                                       int *out_stage);
 
+/* The same launch with the Q3_K decoder: k must be a multiple of 256, w holds
+ * rows * k/256 * 110 bytes, x and y as above. */
+int inference_cuda_gemm_dq_q3k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
+                                      int *out_stage);
+
 #ifdef __cplusplus
 }
 static_assert(sizeof(inference_cuda_gemm_dq_args) == 40 &&
