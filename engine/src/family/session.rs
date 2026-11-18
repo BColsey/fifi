@@ -5348,6 +5348,34 @@ mod tests {
     }
 
     #[test]
+    fn alternating_conversations_keep_the_other_tip_when_replacing_the_restored_tip() {
+        let mut slot = store(0, 2).with_recent_longer_protection();
+        let first = [1, 2, 3, 4, 5, 6];
+        let second = [9, 8, 7, 6, 5, 4];
+        for (prompt, covered) in [
+            (&first[..4], 0),
+            (&second[..4], 0),
+            (&first[..5], 4),
+            (&second[..5], 4),
+            (&first[..], 5),
+            (&second[..], 5),
+        ] {
+            let (mut step, mut session) = held(prompt);
+            session.reset(&mut step).unwrap();
+            assert_eq!(
+                restore(&mut session, &mut slot, &mut step, prompt, 1),
+                Ok(covered)
+            );
+            session
+                .prefill(&mut step, &prompt[covered..], LIMIT)
+                .unwrap();
+            assert_eq!(save(&session, &mut slot, &step, prompt, 1), Ok(true));
+        }
+        assert_eq!(slot.entries_len(), 2);
+        assert_eq!(slot.save_side_totals().room_removals, 0);
+    }
+
+    #[test]
     fn a_shorter_conversation_is_admitted_on_turn_two_and_hits_on_turn_three() {
         let mut slot = store(0, 2).with_recent_longer_protection();
         let long = [1, 2, 3, 4, 5, 6, 7, 8];
