@@ -202,6 +202,16 @@ pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<Host
     if expert_bytes == 0 {
         return Err(bad_input("budget: expert bytes must be nonzero"));
     }
+    // The floor alone can exceed the total (a container smaller than the
+    // host's non-reclaimable memory). The general refusal below would
+    // print `needed 0 > available 0`, so this case names itself.
+    if h.total < h.non_reclaimable {
+        return Err(BudgetError::Overcommitted {
+            what: "host RAM: the non-reclaimable floor alone exceeds the total",
+            needed: 0,
+            available: 0,
+        });
+    }
     let spent = h
         .non_reclaimable
         .checked_add(h.engine_heap)
@@ -213,9 +223,17 @@ pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<Host
         .total
         .checked_sub(spent)
         .ok_or(BudgetError::Overcommitted {
-            what: "host RAM (non-reclaimable + engine heap + staging + margin + host KV)",
-            needed: spent,
-            available: h.total,
+            what: "engine heap + staging + margin + host KV against host RAM after the non-reclaimable floor",
+            // The pair nets the OS floor out of both sides so the printed
+            // `needed > available` matches the check above: the check compares
+            // `spent > total`, and subtracting the same non_reclaimable from
+            // each keeps the inequality equivalent (spent >= non_reclaimable
+            // by construction).
+            needed: spent.saturating_sub(h.non_reclaimable),
+            // `non_reclaimable` already folds the cgroup clamp in, so this is
+            // the clamped figure after the OS floor — not the raw MemTotal,
+            // which made a capped container read as if the cap were ignored.
+            available: h.total.saturating_sub(h.non_reclaimable),
         })?;
     Ok(HostPlan {
         page_cache,
@@ -539,6 +557,33 @@ mod tests {
     }
 
     #[test]
+    fn an_overcommitted_refusal_names_the_clamped_budget_not_the_raw_total() {
+        // A capped container: the raw total stays the host's, but the budget the
+        // plan can spend is what remains after the cgroup-clamped floor.
+        let mut capped = host();
+        capped.non_reclaimable = capped.total - 4 * GIB;
+        match plan_host(&capped, 5 * GIB, EXPERT_BYTES).expect_err("overcommitted") {
+            BudgetError::Overcommitted {
+                needed, available, ..
+            } => {
+                assert_eq!(
+                    available,
+                    4 * GIB,
+                    "the refusal must name the clamped budget"
+                );
+                // `needed` is pinned exactly: heap + staging + margin + host KV,
+                // the floor netted out so the pair matches the check.
+                assert_eq!(
+                    needed,
+                    capped.engine_heap + capped.staging + capped.margin + 5 * GIB
+                );
+                assert!(needed > available);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_desktop_reserve_of_one_gib_at_262k_spills_kv_to_the_host_when_a_minimum_bank_is_required()
     {
         let plan = plan_vram(&vram(GIB), &kv(262_144), &experts(), 1, GIB).unwrap();
@@ -707,7 +752,13 @@ mod tests {
                 available,
             }) => {
                 assert!(what.contains("host"), "{what}");
-                assert_eq!(available, budget.total);
+                assert_eq!(available, budget.total - budget.non_reclaimable);
+                // `needed` is pinned exactly: the commitments the plan adds,
+                // with the floor netted out.
+                assert_eq!(
+                    needed,
+                    budget.engine_heap + budget.staging + budget.margin + cache + 1
+                );
                 assert!(needed > available);
             }
             other => panic!("expected Overcommitted, got {other:?}"),
@@ -717,6 +768,29 @@ mod tests {
             (edge.page_cache, edge.cached_experts, edge.host_kv),
             (0, 0, cache)
         );
+    }
+
+    #[test]
+    fn a_floor_larger_than_the_total_names_itself() {
+        // A container smaller than the host's non-reclaimable memory: the
+        // general refusal would print `needed 0 > available 0`, so the case
+        // carries its own label instead of a puzzle.
+        let mut floored = host();
+        floored.engine_heap = 0;
+        floored.staging = 0;
+        floored.margin = 0;
+        floored.non_reclaimable = floored.total + 1;
+        match plan_host(&floored, 0, EXPERT_BYTES) {
+            Err(BudgetError::Overcommitted {
+                what,
+                needed,
+                available,
+            }) => {
+                assert!(what.contains("floor"), "{what}");
+                assert_eq!((needed, available), (0, 0));
+            }
+            other => panic!("expected Overcommitted, got {other:?}"),
+        }
     }
 }
 
