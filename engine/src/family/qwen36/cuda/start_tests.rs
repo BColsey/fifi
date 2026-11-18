@@ -534,8 +534,16 @@ fn auto_tiered_start_uses_the_space_left_by_the_requested_context() {
     let mut depths = Vec::new();
     for rows in [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144] {
         let free = after_fixed - KvPool::new(&dims, KvMode::Fp16, rows).unwrap().total as u64;
-        let slots =
-            admit_banks(free, geometry, layers, request, shape.moe.experts, reserve).unwrap();
+        let slots = admit_banks(
+            free,
+            geometry,
+            layers,
+            request,
+            shape.moe.experts,
+            reserve,
+            0,
+        )
+        .unwrap();
         assert!(slots as u64 * slot_bytes + reserve <= free);
         assert!((slots as u64 + 1) * slot_bytes + reserve > free);
         depths.push(slots);
