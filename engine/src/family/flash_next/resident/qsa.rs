@@ -118,10 +118,10 @@ pub(super) fn check_cache(len: usize, pos: u32) -> Result<(), EngError> {
 }
 
 /// The grown caches of one layer: keys and values `[1, KVH, T, D]`, raw indexer keys `[T, ID]`.
-struct Kv<'a> {
-    k: &'a ExecutionTensor,
-    v: &'a ExecutionTensor,
-    ik: &'a ExecutionTensor,
+pub(super) struct Kv<'a> {
+    pub(super) k: &'a ExecutionTensor,
+    pub(super) v: &'a ExecutionTensor,
+    pub(super) ik: &'a ExecutionTensor,
 }
 
 /// What block selection needs besides the caches: the plan, the position, and the indexer
@@ -254,6 +254,52 @@ fn attend_sparse(
     let logits = ctx.kernels.binary(BinaryOp::Add, &logits, &mask)?;
     let probs = ctx.kernels.softmax(&logits)?;
     ctx.kernels.batched_mm(&probs, kv.v)
+}
+
+/// Reuse decode selection for each query against its own causal prefix of a batched append.
+pub(super) fn attend_sparse_rows(
+    ctx: &mut Ctx<'_>,
+    shape: &QsaShape,
+    w: &RQsa,
+    pos: u32,
+    q: &ExecutionTensor,
+    ip: &ExecutionTensor,
+    kv: Kv<'_>,
+) -> Result<ExecutionTensor, EngError> {
+    let &[1, heads, rows, width] = q.shape() else {
+        return Err(mismatch());
+    };
+    let &[ip_rows, ip_width] = ip.shape() else {
+        return Err(mismatch());
+    };
+    if ip_rows != rows {
+        return Err(mismatch());
+    }
+    let d = shape.dims();
+    let mut outputs = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        let pos = pos.checked_add(row).ok_or_else(overflow)?;
+        let plan = Plan::new(&d, pos)?;
+        let q = ctx
+            .kernels
+            .slice(q, &[0, 0, row, 0], &[1, heads, row + 1, width])?;
+        let ip = ctx.kernels.slice(ip, &[row, 0], &[row + 1, ip_width])?;
+        let prefix = |kernels: &mut crate::kernels::MlxKernels, x| {
+            kernels.slice(x, &[0, 0, 0, 0], &[1, d.heads_kv, plan.visible, width])
+        };
+        let k = prefix(ctx.kernels, kv.k)?;
+        let v = prefix(ctx.kernels, kv.v)?;
+        let view = Kv {
+            k: &k,
+            v: &v,
+            ik: kv.ik,
+        };
+        let selection = Selection { plan, pos, ip: &ip };
+        let att = attend_sparse(ctx, shape, w, &selection, &q, &view)?;
+        outputs.push(ctx.kernels.reshape(&att, &[1, heads, 1, width])?);
+    }
+    ctx.kernels
+        .concatenate(&outputs.iter().collect::<Vec<_>>(), 2)
 }
 
 /// Runs one QSA decode step at `pos` on `x` (`H` values, any shape). It builds a lazy graph

@@ -39,6 +39,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `FIFI_MLX_AUTO_BUDGET` | off | Set to `1` to size Qwen3.6, Qwen3.8 dense, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. Flint streams selected routed experts from its local checkpoint when its full resident weights exceed the budget. |
 | `FIFI_MLX_WORKING_SET_MIB` | unset | A positive integer ceiling for the planned Metal working set, in MiB. Setting it activates automatic sizing and retains Metal's recommendation as an upper bound. Applies to one MLX model per server. |
 | `FIFI_MLX_REUSE_IDENTITY_RESHAPE` | off | Set to `1` to share a validated native resident tensor when the requested reshape matches its current dimensions. |
+| `FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL` | off | Set to `1` to batch sparse Flash-Next MLX prompt rows when chunked prefill has workspace left over. Each batch has up to eight rows. It shrinks as the prefix grows and takes one-token steps when fewer than two rows fit. [Sparse prefill measurements](../explanation/mac-mlx-requests.md#flash-next-sparse-prefill) |
 
 ## Qwen3.6 on Apple Silicon
 

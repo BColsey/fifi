@@ -44,7 +44,22 @@ The Qwen planner already priced composite score workspace in query blocks when `
 
 Each cell shows the median across four process medians, except the change column, which shows the median of the paired percentage changes. The raw measurements include time spent inside import, readback, evaluation, and forced retirement calls. Those wall times include synchronization and can cover queued work. Decode timings varied. [All 448 requests](../../scripts/benchmarks/mac-m4-mlx-kv-worker-matrix.csv)
 
-The Flash-Next fixture has 19 dense QSA positions. Beyond that limit, the current prefill path feeds one token per step, which accounts for the same synchronization count in both arms. The next target is a bounded multi-row sparse prefill path that preserves the selected keys and causal order. [Flash-Next prefill split](../../engine/src/family/flash_next/resident/prefill/step.rs)
+The Flash-Next fixture has 19 dense QSA positions. Both arms in the table above feed one token per step beyond that limit, which accounts for the matching synchronization counts.
+
+## Flash-Next sparse prefill
+
+With `FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL=1`, Flash-Next can use up to eight rows per batch after the dense QSA limit. Each layer batches its projections and cache append. Each row runs the decode selector against its own prefix, including the incomplete final block. Ranking still uses the decode path's stable block order and additive attention mask. Layer tests compare attention output and all three QSA cache arrays to one-token decode, and alter later rows to check that earlier rows cannot see them. [Flash-Next prefill split](../../engine/src/family/flash_next/resident/prefill/step.rs)
+
+The shared MLX planner first admits the ordinary prefill chunk. The sparse path can use up to 512 MiB of the remaining workspace for one layer's per-row graphs, including prefix slices, index scoring, sorting and masked attention. Startup reports this allowance as `sparse_workspace_bytes`. As the prefix grows, fewer rows fit in the same allowance. When fewer than two fit, execution takes one-token steps.
+
+On 18 November, the 16 GB M4 mini ran 64 timed requests through the same two-layer fixture. Both arms used 128-row worker pieces and eight completion tokens. The candidate lowered first-token latency in all four pairs at both lengths, and every continuation matched. Cells show medians across four process medians. The paired change uses each pair's relative first-token latency.
+
+| Prompt tokens | First token | Paired change | Metal waits | Peak active MLX KiB | Time for the last seven tokens |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 65 | 67.50 → 20.29 ms | −69.4% | 225 → 69 | 1,009 → 1,009 | 10.42 → 11.21 ms |
+| 257 | 336.97 → 84.18 ms | −75.0% | 993 → 169 | 1,006 → 1,119 | 10.23 → 10.97 ms |
+
+The median process peak footprint rose from 67.2 to 69.9 MiB. Decode took longer in all four pairs at both prompt lengths. The option remains off by default while full-checkpoint parity, memory and decode behavior are open. [All 64 timed requests](../../scripts/benchmarks/mac-m4-flash-next-sparse-prefill.csv)
 
 ## Reproduce on Apple Silicon
 
@@ -62,4 +77,11 @@ Use the same release harness for the larger worker comparison. A fresh output pa
 ```sh
 python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/kv-workers.csv" \
   --kv-matrix --pairs 4 --samples 4
+```
+
+Use the same harness for the sparse Flash-Next comparison, with 128-row worker pieces, a 4 GiB device ceiling and a 2 GiB family prefill budget in both arms.
+
+```sh
+python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/flash-sparse.csv" \
+  --flash-sparse-prefill --pairs 4 --samples 4
 ```

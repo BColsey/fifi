@@ -439,8 +439,8 @@ impl FlashExecutor {
             terms
         };
         Ok(Some(format!(
-            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} {terms}",
-            settings.cache_limit
+            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} sparse_workspace_bytes={} {terms}",
+            settings.cache_limit, self.decoder.sparse_prefill_bytes,
         )))
     }
 
@@ -478,10 +478,19 @@ impl FlashExecutor {
             s3_cache,
             session_reserve,
         };
-        let chunk =
-            prefill_plan::admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?;
+        let cost = self.prefill_cost()?;
+        let remaining = terms.remaining();
+        let chunk = prefill_plan::admitted_chunk(&cost, remaining, max_rows)?;
+        let sparse_enabled = std::env::var_os("FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL")
+            .is_some_and(|value| value == "1");
+        let sparse_prefill_bytes = match chunk {
+            Some(rows) if sparse_enabled => (remaining - cost.workspace(rows)?)
+                .min(crate::family::prefill::mlx::PREFILL_RETIRE_CAP),
+            _ => 0,
+        };
         self.close_prefill();
         self.chunk = chunk;
+        self.decoder.sparse_prefill_bytes = sparse_prefill_bytes;
         Ok(PrefillPlan { chunk, terms })
     }
 
@@ -2272,6 +2281,8 @@ mod tests {
         let chunked = std::env::var_os("FIFI_MLX_FLASH_CHUNKED").is_some_and(|value| value == "1");
         let admission =
             std::env::var_os("FIFI_MLX_REQUEST_ADMISSION").is_some_and(|value| value == "1");
+        let sparse = std::env::var_os("FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL")
+            .is_some_and(|value| value == "1");
         let workload = Workload::from_env();
         let options = FlashOptions {
             manifest: Some("fixture-manifest.json".into()),
@@ -2307,6 +2318,9 @@ mod tests {
                     };
                     executor.configure_prefill(&session, &settings, false, device)?;
                     assert_eq!(executor.prefill_chunk(), chunked.then_some(workload.piece));
+                    if sparse && chunked {
+                        assert!(executor.decoder.sparse_prefill_bytes > 0);
+                    }
                     Ok((executor, session))
                 })
                 .unwrap()
