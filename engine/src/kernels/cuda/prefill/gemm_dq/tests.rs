@@ -602,6 +602,205 @@ fn gemm_dq_q3k_matches_the_cpu_dequant_matmul() {
     println!("gemm dq q3k: max tolerance ratio {max_ratio:.3}");
 }
 
+fn build_weight_iq4xs(rows: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut rng = testkit::Rng::new(seed);
+    let mut bytes = vec![0u8; rows * (k / 256) * 136];
+    for block in bytes.chunks_mut(136) {
+        let d = 0.05 + rng.below(190) as f64 / 100.0;
+        block[0..2].copy_from_slice(&testkit::f64_to_f16_bits(d).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = (rng.next_u64() & 0xFF) as u8;
+        }
+    }
+    bytes
+}
+
+fn reference_iq4xs(
+    w: &[u8],
+    x: &[u16],
+    rows: usize,
+    k: usize,
+    ncols: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut dequant_row = vec![0.0f32; k];
+    let mut y = vec![0.0f64; rows * ncols];
+    let mut abs = vec![0.0f64; rows * ncols];
+    for r in 0..rows {
+        let blocks = &w[r * (k / 256) * 136..];
+        for b in 0..k / 256 {
+            let block = &blocks[b * 136..(b + 1) * 136];
+            dequant_row[b * 256..(b + 1) * 256]
+                .copy_from_slice(&dequantize(GgufType::Iq4Xs, block).expect("iq4_xs dequant"));
+        }
+        for n in 0..ncols {
+            let mut sum = 0.0f64;
+            let mut terms = 0.0f64;
+            for c in 0..k {
+                let term = f64::from(dequant_row[c]) * f64::from(f16_of(x[c * ncols + n]));
+                sum += term;
+                terms += term.abs();
+            }
+            y[r * ncols + n] = sum;
+            abs[r * ncols + n] = terms;
+        }
+    }
+    (y, abs)
+}
+
+#[test]
+fn gemm_dq_iq4xs_probe_crafted() {
+    if !testkit::device_present("gemm_dq_iq4xs_probe_crafted") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (rows, k, ncols) = (2usize, 256usize, 3usize);
+    let xval = |c: usize, col: usize| ((c % 7) as f32 - 3.0) * 0.25 + col as f32;
+    let x: Vec<u16> = (0..k * ncols)
+        .map(|i| f16_bits(xval(i / ncols, i % ncols)))
+        .collect();
+    // Sub-block column sums: the hi scale lanes cover only sub-blocks 8..15,
+    // so a craft case is a per-sub-block weight, never one uniform weight.
+    let sub_sum = |sb: usize, col: usize| -> f64 {
+        (sb * 32..sb * 32 + 32)
+            .map(|c| f64::from(xval(c, col)))
+            .sum()
+    };
+    let sub_abs = |sb: usize, col: usize| -> f64 {
+        (sb * 32..sb * 32 + 32)
+            .map(|c| f64::from(xval(c, col)).abs())
+            .sum()
+    };
+    // craft: d=1, all scales 0, qs 0 -> every weight = (0-32)*1*kv[0] = +4064
+    let craft = |scales_l: u8, scales_h: u16, qs: u8| -> Vec<u8> {
+        let mut w = vec![0u8; rows * (k / 256) * 136];
+        for b in w.chunks_mut(136) {
+            b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+            b[2..4].copy_from_slice(&scales_h.to_le_bytes());
+            for byte in &mut b[4..8] {
+                *byte = scales_l;
+            }
+            for q in &mut b[8..] {
+                *q = qs;
+            }
+        }
+        w
+    };
+    let run = |name: &str, w_bytes: &[u8], weight_of: &[f64; 16]| {
+        let w = testkit::upload_bytes(&ctx, w_bytes);
+        let xb = testkit::upload_bytes(
+            &ctx,
+            &x.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
+        ctx.gemm_dq_iq4xs(
+            &stream,
+            GemmDqIq4xsCall {
+                w: w.range(0, w_bytes.len()).expect("w"),
+                x: xb.range(0, k * ncols * 2).expect("x"),
+                y: y.range(0, rows * ncols * 4).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("gemm dq");
+        stream.synchronize().expect("drain");
+        let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+        // Every weight inside a sub-block is identical by construction, so
+        // column n must sit at sum(weight[sb] * sub_sum(sb, n)) inside the
+        // oracle test's tolerance model (f16 staging plus f32 accumulation,
+        // 4x headroom): a wrong table entry or scale moves an output past it
+        // by orders of magnitude.
+        for (i, value) in got.iter().enumerate() {
+            let col = i % ncols;
+            let mut want = 0.0f64;
+            let mut abs_terms = 0.0f64;
+            for (sb, weight) in weight_of.iter().enumerate().take(k / 32) {
+                want += weight * sub_sum(sb, col);
+                abs_terms += weight.abs() * sub_abs(sb, col);
+            }
+            let bound = 4.0 * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24)) * abs_terms;
+            assert!(
+                (f64::from(*value) - want).abs() <= bound,
+                "craft {name}: got[{i}] = {value}, want {want:.4}, bound {bound:.4}"
+            );
+        }
+    };
+    let uniform = |weight: f64| [weight; 16];
+    // scales_l feeds the low 4 bits of sub-blocks 0..7's 6-bit scales.
+    run("zero-scales", &craft(0, 0, 0), &uniform(4064.0));
+    run("lo1-scales", &craft(0x11, 0, 0), &uniform(-31.0 * -127.0));
+    // scales_h lanes 01 lift every group scale from 0 to 16.
+    run(
+        "hi1-scales",
+        &craft(0, 0x5555, 0),
+        &uniform((16.0 - 32.0) * -127.0),
+    );
+    run("qs1", &craft(0, 0, 0x11), &uniform(-32.0 * -104.0));
+    run("qs2", &craft(0, 0, 0x22), &uniform(-32.0 * -83.0));
+    run("qs4", &craft(0, 0, 0x44), &uniform(-32.0 * -49.0));
+    run("qs8", &craft(0, 0, 0x88), &uniform(-32.0 * 1.0));
+    run("qsf", &craft(0, 0, 0xff), &uniform(-32.0 * 113.0));
+    run("lo2-scales", &craft(0x22, 0, 0), &uniform(-30.0 * -127.0));
+}
+
+#[test]
+fn gemm_dq_iq4xs_matches_the_cpu_dequant_matmul() {
+    if !testkit::device_present("gemm_dq_iq4xs_matches_the_cpu_dequant_matmul") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    // rows/ncols cross the 64 tile with remainders; k spans several 256-value super-blocks.
+    for (rows, k, ncols, seed) in [
+        (64usize, 512usize, 64usize, 0x5eed_0041u64),
+        (100, 1024, 40, 0x5eed_0042),
+        (13, 256, 7, 0x5eed_0043),
+        (128, 768, 129, 0x5eed_0044),
+    ] {
+        let w_bytes = build_weight_iq4xs(rows, k, seed);
+        let mut rng = testkit::Rng::new(seed ^ 0xa5a5);
+        let x: Vec<u16> = (0..k * ncols)
+            .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+            .collect();
+        let (y_ref, abs) = reference_iq4xs(&w_bytes, &x, rows, k, ncols);
+        let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let xb = testkit::upload_bytes(&ctx, &x_bytes);
+        let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
+        ctx.gemm_dq_iq4xs(
+            &stream,
+            GemmDqIq4xsCall {
+                w: w.range(0, w_bytes.len()).expect("w"),
+                x: xb.range(0, x_bytes.len()).expect("x"),
+                y: y.range(0, rows * ncols * 4).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("gemm dq");
+        stream.synchronize().expect("drain");
+        let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+        let mut shape_ratio = 0.0f64;
+        for idx in 0..rows * ncols {
+            // The bound mirrors the Q3_K/Q5_K tests: f16 weight staging rounds each term
+            // by at most 2^-11, the f32 accumulation over k adds at most k * 2^-24 of the
+            // absolute sum, 4x headroom.
+            let tolerance =
+                4.0 * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24)) * abs[idx].max(1e-30);
+            let error = (f64::from(got[idx]) - y_ref[idx]).abs();
+            let ratio = error / tolerance;
+            max_ratio = max_ratio.max(ratio);
+            shape_ratio = shape_ratio.max(ratio);
+        }
+        eprintln!("probe shape rows {rows} k {k} ncols {ncols}: max ratio {shape_ratio:.3}");
+    }
+    println!("gemm dq iq4xs: max tolerance ratio {max_ratio:.3}");
+}
+
 /// One wrong group scale in one block must move an output past the tolerance: this pins
 /// that the bound above is tight enough to catch a single sub-block scale error.
 #[test]
@@ -646,6 +845,54 @@ fn gemm_dq_q3k_catches_one_wrong_group_scale() {
     assert!(
         caught,
         "a single wrong group scale must exceed the tolerance"
+    );
+}
+
+/// One wrong sub-block scale in one block must move an output past the tolerance: this pins
+/// that the bound above is tight enough to catch a single sub-block scale error.
+#[test]
+fn gemm_dq_iq4xs_catches_one_wrong_group_scale() {
+    if !testkit::device_present("gemm_dq_iq4xs_catches_one_wrong_group_scale") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (rows, k, ncols) = (100usize, 1024usize, 40usize);
+    let w_bytes = build_weight_iq4xs(rows, k, 0x5eed_0041);
+    let mut rng = testkit::Rng::new(0x5eed_0041 ^ 0xa5a5);
+    let x: Vec<u16> = (0..k * ncols)
+        .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+        .collect();
+    // The reference reads the original bytes; the device copy flips one bit of the high
+    // 2-bit scale lane of sub-block 1 of row 0, block 0 (a quarter of the 6-bit range,
+    // one sub-block only: bytes 2..4 hold the high lanes, byte 2 bit 2 is lane 1).
+    let (y_ref, abs) = reference_iq4xs(&w_bytes, &x, rows, k, ncols);
+    let mut w_bad = w_bytes.clone();
+    w_bad[2] ^= 0x04;
+    let w = testkit::upload_bytes(&ctx, &w_bad);
+    let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let xb = testkit::upload_bytes(&ctx, &x_bytes);
+    let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
+    ctx.gemm_dq_iq4xs(
+        &stream,
+        GemmDqIq4xsCall {
+            w: w.range(0, w_bad.len()).expect("w"),
+            x: xb.range(0, x_bytes.len()).expect("x"),
+            y: y.range(0, rows * ncols * 4).expect("y"),
+            k,
+            rows,
+            ncols,
+        },
+    )
+    .expect("gemm dq");
+    stream.synchronize().expect("drain");
+    let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+    let factor = 4.0 * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24));
+    let caught = (0..rows * ncols)
+        .any(|idx| (f64::from(got[idx]) - y_ref[idx]).abs() > factor * abs[idx].max(1e-30));
+    assert!(
+        caught,
+        "a single wrong sub-block scale must exceed the tolerance"
     );
 }
 

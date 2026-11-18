@@ -55,6 +55,13 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
     #[allow(dead_code)] // Staged until a model caller is qualified.
+    #[link_name = "inference_cuda_gemm_dq_iq4xs_launch"]
+    fn gemm_dq_iq4xs_launch_raw(
+        args: *const GemmDqArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[allow(dead_code)] // Staged until a model caller is qualified.
     #[link_name = "inference_cuda_gemm_dq_q40_launch"]
     fn gemm_dq_q40_launch_raw(
         args: *const GemmDqArgsRepr,
@@ -227,6 +234,45 @@ pub(in crate::kernels::cuda) fn gemm_dq_q3k_launch(
     // weight alignment).
     let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
     let status = unsafe { gemm_dq_q3k_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The IQ4_XS dequantizing GEMM call: `w` native super-blocks (`rows * k / 256 * 136`
+/// bytes), `x` the f16 activation row-major by `k` (`k * ncols` values), `y` the f32
+/// output row-major by `rows` (`rows * ncols` values).
+#[allow(dead_code)] // Staged until a model caller is qualified.
+pub(in crate::kernels::cuda) struct GemmDqIq4xsRaw<'a> {
+    pub(in crate::kernels::cuda) w: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ncols: usize,
+}
+
+#[allow(dead_code)] // Staged until a model caller is qualified.
+pub(in crate::kernels::cuda) fn gemm_dq_iq4xs_launch(
+    stream: &RawStream,
+    call: &GemmDqIq4xsRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_gemm_dq(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &GemmDqGeom {
+            qk: 256,
+            block_bytes: 136,
+            w_align: 2,
+        },
+    )?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gemm_dq_q5k_launch`, with the IQ4_XS geometry (136-byte super-blocks,
+    // 2-byte weight alignment).
+    let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
+    let status = unsafe { gemm_dq_iq4xs_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

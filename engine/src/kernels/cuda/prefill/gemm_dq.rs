@@ -15,8 +15,8 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gemm_dq::{
-    GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_q3k_launch, gemm_dq_q5k_launch,
-    gemm_dq_q40_launch,
+    GemmDqIq4xsRaw, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_iq4xs_launch,
+    gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
 };
 
 /// One Q5_K dequantizing GEMM: `y[r][n] = sum_k dequant(w)[r][k] * x[k][n]`, with `w` the
@@ -48,6 +48,18 @@ pub(crate) struct GemmDqQ3kCall<'b> {
 #[derive(Clone)]
 #[allow(dead_code)] // Staged until a model caller is qualified.
 pub(crate) struct GemmDqQ40Call<'b> {
+    pub(crate) w: DeviceRange<'b>,
+    pub(crate) x: DeviceRange<'b>,
+    pub(crate) y: DeviceRange<'b>,
+    pub(crate) k: usize,
+    pub(crate) rows: usize,
+    pub(crate) ncols: usize,
+}
+
+/// The same GEMM over IQ4_XS super-blocks: `w` is `[rows][k / 256]` blocks of 136 bytes.
+#[derive(Clone)]
+#[allow(dead_code)] // Staged until a model caller is qualified.
+pub(crate) struct GemmDqIq4xsCall<'b> {
     pub(crate) w: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
     pub(crate) y: DeviceRange<'b>,
@@ -121,6 +133,70 @@ impl CudaContext {
             gemm_dq_q3k_launch(
                 stream_raw,
                 &GemmDqQ3kRaw {
+                    w: w_raw,
+                    x: x_raw,
+                    y: y_raw,
+                    k: call.k,
+                    rows: call.rows,
+                    ncols: call.ncols,
+                },
+            )
+        })
+    }
+
+    #[allow(dead_code)] // Staged until a model caller is qualified.
+    pub(crate) fn gemm_dq_iq4xs(
+        &self,
+        stream: &DeviceStream,
+        call: GemmDqIq4xsCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let (w_raw, x_raw, y_raw) = (
+            self.raw_range(&call.w)?,
+            self.raw_range(&call.x)?,
+            self.raw_range(&call.y)?,
+        );
+        if call.k == 0 || !call.k.is_multiple_of(256) {
+            return Err(EngError::BadRequest(format!(
+                "the IQ4_XS dequantizing GEMM needs k as a positive multiple of 256, got {}",
+                call.k
+            )));
+        }
+        if call.rows == 0 || call.ncols == 0 {
+            return Err(EngError::BadRequest(
+                "the IQ4_XS dequantizing GEMM needs rows and columns above zero".to_owned(),
+            ));
+        }
+        let blocks = call.rows.checked_mul(call.k / 256).ok_or_else(|| {
+            EngError::BadRequest("the IQ4_XS GEMM weight size overflows".to_owned())
+        })?;
+        let need_w = blocks.checked_mul(136).ok_or_else(|| {
+            EngError::BadRequest("the IQ4_XS GEMM weight size overflows".to_owned())
+        })?;
+        let need_x = call
+            .k
+            .checked_mul(call.ncols)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| {
+                EngError::BadRequest("the IQ4_XS GEMM activation size overflows".to_owned())
+            })?;
+        let need_y = call
+            .rows
+            .checked_mul(call.ncols)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                EngError::BadRequest("the IQ4_XS GEMM output size overflows".to_owned())
+            })?;
+        require_fit("w", &call.w, need_w, 2)?;
+        require_fit("x", &call.x, need_x, 2)?;
+        require_fit("y", &call.y, need_y, 4)?;
+        let written = Claim::of("y", &call.y, need_y);
+        require_apart(&written, &Claim::of("w", &call.w, need_w))?;
+        require_apart(&written, &Claim::of("x", &call.x, need_x))?;
+        self.launch_on(stream, |stream_raw| {
+            gemm_dq_iq4xs_launch(
+                stream_raw,
+                &GemmDqIq4xsRaw {
                     w: w_raw,
                     x: x_raw,
                     y: y_raw,

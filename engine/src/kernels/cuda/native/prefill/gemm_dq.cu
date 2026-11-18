@@ -105,7 +105,7 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 template <class D>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
-                   int w_blocks) {
+                   int w_blocks, iq4nl_table iq4nl) {
     extern __shared__ __align__(16) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
     __half *a = smem;                  /* the decoded weight tile */
     __half *b = smem + kBM * kAStride; /* the activation tile */
@@ -129,7 +129,7 @@ __global__ void __launch_bounds__(kThreads, 2)
         __syncthreads();
         if (tx < kBM) {
             D::decode_chunk(stage + (size_t)tx * D::kChunkBlocks * D::kBlockBytes, c,
-                            a + tx * kAStride);
+                            a + tx * kAStride, iq4nl.v);
         } else {
             /* Activation tile: the remaining 192 threads load 4096 halves, row-major by k,
              * written at the padded stride. */
@@ -193,7 +193,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
-        w_blocks);
+        w_blocks, make_iq4nl_table());
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
@@ -227,6 +227,21 @@ extern "C" int inference_cuda_gemm_dq_q3k_launch(const inference_cuda_gemm_dq_ar
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         return launch<gemm_dq::Q3kDecoder>(args, stream, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gemm_dq_iq4xs_launch(const inference_cuda_gemm_dq_args *args,
+                                                   void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
+            args->y == NULL || !aligned(args->w, 2) || !aligned(args->x, 2) ||
+            !aligned(args->y, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return launch<gemm_dq::Iq4xsDecoder>(args, stream, out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
