@@ -42,6 +42,31 @@ The table shows medians from two fresh servers per mode. The 45-, 143-, and 557-
 
 The mode remains opt-in. Broader performance qualification requires production-serving workloads beyond these two runs per prompt. The live server uses the shared-page pipeline with coalescing off.
 
+## Expert-major storage probe
+
+A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
+
+On 18 November 2026, the M4 mini copied only Flint layer 24 into a temporary 432 MiB expert-major file on the internal SSD. Both arms filled identical destination buffers directly. They alternated order across 32 route pairs per cache mode, each reading 10,616,832 logical bytes from six experts. Every output buffer matched byte for byte. The timed interval covers file reads into the buffers. Model execution, Metal imports and conversion to the record layout are outside it.
+
+| Read mode | Median slice reads | Median expert records | Paired time change | Attributed disk bytes across the 32 pairs |
+| --- | ---: | ---: | ---: | ---: |
+| Both file handles with `F_NOCACHE` | 12.72 ms | 4.17 ms | −67.1% | 310.2 → 339.7 MB |
+| Both layouts warmed immediately before timing | 0.98 ms | 0.79 ms | −16.2% | 0 → 0 B |
+
+The file counter reflects process-attributed storage reads. The uncached arm still had file-cache effects, including two pairs with zero source bytes attributed to the sliced layout. Among the 24 pairs where both arms attributed more than 90% of the logical bytes to storage, expert records reduced total attributed bytes by 2.3% and median paired time by 67.4%. A serving trial needs to compare cumulative traffic for warm, mixed and cold requests at the same memory ceiling. [All 128 measurements](../../scripts/benchmarks/mac-m4-flint-expert-records.csv)
+
+A two-pair cleanup check immediately afterward found the original slices cached and the newly built record file still reading from storage under `F_NOCACHE`. Median time rose from 1.09 to 4.30 ms in those pairs. The buffered, immediately warmed comparison still favored the record layout.
+
+### Reproduce the expert record probe
+
+Run on Apple Silicon with Python `os.preadv` support. Use the verified local Flint checkpoint and a scratch directory on the same volume as its shards. The probe releases the temporary record file after measurement and retains the CSV.
+
+```sh
+clang -O2 scripts/mac_cache_study/proc-io.c -o "$SCRATCH/proc-io"
+python3 scripts/mac_cache_study/flint_expert_records.py "$FLINT_ARTIFACT" \
+  scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz \
+  "$SCRATCH/proc-io" "$SCRATCH/expert-records" 32
+```
 
 ## Reproduce
 
