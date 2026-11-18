@@ -504,7 +504,13 @@ fn stream_k_shape_finds_a_shape_with_the_reach_boundary_on_every_fleet_card() {
         ("82-SM desktop card", (860, 82, 101_376), (8, 512)),
         ("20-SM laptop card", (890, 20, 101_376), (8, 128)),
         ("8-SM embedded part", (720, 8, 98_304), (3, 128)),
-    ] {
+    ]
+    .into_iter()
+    .filter(|(_, (cc, _, _), _)| {
+        *cc != 720 || crate::kernels::cuda::prefill::mmq_size::arch_compiled(720)
+    }) {
+        // An sm_72 without a compiled 72 cubin sizes its launches pascal-dp4a, where no
+        // stream-k shape exists; that build skips the row instead of failing here.
         let found = stream_k_shape(facts, 130, 2);
         let Some((e, n)) = found else {
             panic!("{name}: no shape with the reach boundary")

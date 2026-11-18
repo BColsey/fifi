@@ -32,7 +32,9 @@ fn dense_shape_and_projection_factors_refuse_invalid_inputs() {
         (33024, 6144, 5),
         (2048, 0, 5),
         (2048, 6144, 0),
-        (2048, 6144, 2049),
+        // The m domain follows mmq_size::NCOLS_LIMIT (4,096 since the chunk-width
+        // raise): 2,049 is legal now, 4,097 is the first refusal.
+        (2048, 6144, 4097),
         (2048, usize::MAX, 5),
         (2048, i32::MAX as usize, 2),
     ] {

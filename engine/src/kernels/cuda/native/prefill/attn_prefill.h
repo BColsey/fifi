@@ -58,9 +58,13 @@
  * (grid (max_splits, n_kv_head, q_tiles), 128 threads), requesting 64/32 KB for D256/D128.
  * It reports an error if neither arm fits; CUDA query and opt-in errors propagate. Successful
  * selections are cached per device and model geometry. SIMT computes within the prefill-attention
- * tolerance, not bit for bit. The legacy pre-sm80 SIMT layout has been compile-only (no board run);
- * RTX 2080 Ti runs of the single-buffer arm are recorded in the
- * change's measurements.
+ * tolerance, not bit for bit. FIFI_CUDA_ATTN_PREFILL_TURING=1 opts in a Turing pilot instead:
+ * on sm_75 with the measured Qwen geometry (D256, group 8) it selects the single-stage dsplit
+ * kernel (one cp.async K/V stage plus a 32 KB score exchange, fitting the sm_75 64 KB opt-in
+ * limit); other devices and models keep their existing selection, and the switch reads once per
+ * process. The legacy pre-sm80 SIMT layout has been compile-only (no board run);
+ * RTX 2080 Ti runs of the single-buffer arm are recorded in
+ * scripts/benchmarks/qwen36-adaptive-attention-device-observations.json.
  *
  * Legacy F16 NaN isolation is per 64-row query tile, not per row: a NaN V cell inside a tile's key range
  * reaches every row of that tile (a row that does not see the key still multiplies p = 0 by
@@ -181,7 +185,8 @@ int inference_cuda_attn_prefill_launch(const inference_cuda_attn_prefill_args *a
  * with no visible keys. Absolute key_origin+key_rows <=p0+m; part_index lies in0..N-1.
  * COMBINE reads all N initialized slots in index order and applies the gate once.
  * Caller queues all parts and then combine on the same stream before reusing the partials.
- * Neither entry allocates, transfers or synchronizes. The legacy entry stays unchanged. */
+ * Neither entry allocates, transfers or synchronizes. The legacy entry now
+ * selects the shared SIMT kernel (one K and one V stage, no trap on sm_80+). */
 int inference_cuda_attn_prefill_part_launch(const inference_cuda_attn_prefill_args *args,
                                             int key_origin, int key_rows, int part_index,
                                             void *stream, int *out_stage);
