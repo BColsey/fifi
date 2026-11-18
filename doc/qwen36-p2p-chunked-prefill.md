@@ -89,6 +89,26 @@ The setting remains experimental and default off.
 
 ## Evidence needed
 
+For internal diagnostics, the `Q36_TIERED_TRACE=1` switch (added with this stack) also
+records gate, up and down routed-projection stream intervals for the first and
+last layer on each card's first prefill chunk (`p0 = 0`), deduplicating a
+single-layer model. It allocates at most twelve timing events per card for that
+chunk. A completed batch identifies card index, layer, row
+count, quantization and allocation backing (`device`, `host-mapped`, or
+`unknown`); card indices follow the serving process's device order. It emits
+no batch unless all cards have completed chunk close and every interval is
+valid. Other chunks and layers are not measured, and the selected layers need
+not contain both backing classes. The batch has no request ID or device UUID;
+run an isolated request and separately record the process's device order.
+
+The intervals include scheduling, host enqueue gaps and other-stream
+contention, and a projection can include fixup work. They do not establish
+PCIe bytes, CPU utilization or the identity of individual selected experts.
+Compare tracing on and off with the same binary and workload to measure its
+overhead and check output parity. Trace-on runs carry the timing events on the measured chunks, so their overhead is part of any traced run.
+Diagnostic
+output is not a performance qualification.
+
 An earlier, different 3060+3080 prototype produced one short cold sample
 of about 106 prompt tokens/s and an eager sample of about 40 tokens/s. Those
 observations are not measurements of this port and do not establish a

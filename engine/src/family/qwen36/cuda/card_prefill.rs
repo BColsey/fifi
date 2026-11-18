@@ -36,7 +36,9 @@ use std::ffi::OsStr;
 use crate::family::exl3::{launch::Launch, layer_table::LayerTable};
 use crate::family::state_words::Word;
 
+use super::card_expert_timing::tiered_trace;
 use super::{
+    card_expert_timing::{self, RoutedTiming},
     card_step::CardStack,
     dims::{KvMode, StepDims},
     mixer_geometry::MixerGeometry,
@@ -47,7 +49,7 @@ use super::{
         attn_flash, attn_out, attn_prep, attn_proj, chunk_attn_geometry, chunk_embed, chunk_route,
         combine_chunk_moe, delta_conv, delta_proj, delta_scan, kv8_segment_query_rows,
         kv8_use_segments, layer_stages, norm_a, norm_f, quant_a, quant_a_out, quant_d_out,
-        run_chunk_routed, run_chunk_shared, ssm_out,
+        run_chunk_routed, run_chunk_routed_timed, run_chunk_shared, ssm_out,
     },
     prefill_driver::{Kv8StagingPlan, PrefillArena, fixed_staging_rows},
     prefill_plan::{ChunkSlot, chunk_tensors_for},
@@ -67,6 +69,18 @@ use crate::{
 /// [`MAX_VALUES`] values.
 pub(crate) fn max_chunk_rows(hidden: usize) -> usize {
     (MAX_VALUES / hidden).max(1)
+}
+
+fn observe_experts(p0: usize, trace: bool) -> bool {
+    p0 == 0 && trace
+}
+
+fn observed_layers(count: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![0],
+        _ => vec![0, count - 1],
+    }
 }
 
 /// The experimental path is off when unset or zero. Reject malformed settings
@@ -497,6 +511,28 @@ pub(crate) fn run_card_chunk(
             stream: &stack.streams()[card],
         });
     }
+    // Existing internal tracing opts in to two layers of the initial chunk only.
+    // Make the bounded event set before opening any card's prefill state.
+    let table = chunk.cards[0].model.table();
+    let mut expert_timing = if observe_experts(p0, tiered_trace()) {
+        let layers = observed_layers(table.len());
+        if layers.is_empty() {
+            return Err(EngError::BadRequest(
+                "P2P expert timing: no layer to observe".into(),
+            ));
+        }
+        let mut sampled = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let mut timing = Vec::with_capacity(cards);
+            for launch in &launches {
+                timing.push(RoutedTiming::new(launch.ctx)?);
+            }
+            sampled.push((layer, timing));
+        }
+        Some(sampled)
+    } else {
+        None
+    };
     // The state prelude before any immutable borrow: begin and clear on
     // every card, then the runs borrow the states immutably.
     for (card, state) in states.iter_mut().enumerate() {
@@ -555,7 +591,6 @@ pub(crate) fn run_card_chunk(
         stack.broadcast(0, src, &outs, &status, m * hidden)?;
     }
     // The layer walk.
-    let table = chunk.cards[0].model.table();
     for layer in 0..table.len() {
         let slot = table.slot(layer)?;
         run_card_chunk_layer(
@@ -572,6 +607,12 @@ pub(crate) fn run_card_chunk(
             layer,
             slot.kind,
             slot.ordinal,
+            expert_timing.as_mut().and_then(|timings| {
+                timings
+                    .iter_mut()
+                    .find(|(sampled_layer, _)| *sampled_layer == layer)
+                    .map(|(_, cards)| cards.as_mut_slice())
+            }),
         )?;
     }
     // The close, per card: join the stream, read the prefill status word,
@@ -584,6 +625,13 @@ pub(crate) fn run_card_chunk(
         state
             .revalidate(stream, end, read)
             .inspect_err(|_| state.poison())?;
+    }
+    if let Some(timing) = expert_timing.as_deref() {
+        card_expert_timing::report(timing, m).inspect_err(|_| {
+            for state in states.iter_mut() {
+                state.poison();
+            }
+        })?;
     }
     Ok(())
 }
@@ -607,6 +655,7 @@ fn run_card_chunk_layer(
     layer: usize,
     kind: crate::family::AttentionKind,
     ordinal: usize,
+    mut timing: Option<&mut [RoutedTiming]>,
 ) -> Result<(), EngError> {
     let LayerDrive {
         stack,
@@ -666,7 +715,16 @@ fn run_card_chunk_layer(
                 for card in 0..cards {
                     let io = moe_io(&runs[card], &status[card], m)?;
                     run_chunk_shared(&launches[card], &chunk.cards[card].moe[layer], &io)?;
-                    run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)?;
+                    if let Some(timing) = timing.as_deref_mut() {
+                        run_chunk_routed_timed(
+                            &launches[card],
+                            &chunk.cards[card].moe[layer],
+                            &io,
+                            Some(&mut timing[card]),
+                        )?;
+                    } else {
+                        run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)?;
+                    }
                     if card == 0 {
                         combine_chunk_moe(&launches[card], &io)?;
                     } else {
@@ -904,9 +962,20 @@ fn moe_io<'b>(
 mod config_tests {
     use super::{
         KvMode, MAX_VALUES, card_staging_plan, chunk_budget, chunk_mailbox_values,
-        configured_chunk_rows,
+        configured_chunk_rows, observe_experts, observed_layers,
     };
     use std::ffi::OsStr;
+
+    #[test]
+    fn expert_trace_is_opt_in_and_limited_to_initial_chunk() {
+        assert!(!observe_experts(0, false));
+        assert!(observe_experts(0, true));
+        assert!(!observe_experts(1, true));
+        assert!(!observe_experts(1024, true));
+        assert_eq!(observed_layers(0), Vec::<usize>::new());
+        assert_eq!(observed_layers(1), vec![0]);
+        assert_eq!(observed_layers(60), vec![0, 59]);
+    }
 
     #[test]
     fn chunk_setting_is_explicit_and_bounded() {

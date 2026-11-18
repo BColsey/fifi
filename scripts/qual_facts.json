@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7316,
+      "test_fns": 7321,
       "ignored": 665,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -376,6 +376,7 @@
         "Q36_SPEED_8K",
         "Q36_SPEED_ROUTING",
         "Q36_THREADS",
+        "Q36_TIERED_TRACE",
         "Q36_WIDE_EQ_DUMP",
         "Q36_WINDOW_TAPS",
         "Q8_TILED_ENV_PROBE",

@@ -1168,7 +1168,9 @@ fn prefill_stages_pass_the_prefill_word() {
         );
     }
     // The ids guard takes the block's word; the router writes into it.
-    for stage in ["fn run_chunk_routed(", "fn diagnostic_routed("] {
+    // run_chunk_routed delegates to run_chunk_routed_timed, which has held
+    // the ids guard since the timing wrapper landed.
+    for stage in ["fn run_chunk_routed_timed(", "fn diagnostic_routed("] {
         let moe = body(stage);
         assert_eq!(
             count(&moe, "status:Some(io.status)"),
