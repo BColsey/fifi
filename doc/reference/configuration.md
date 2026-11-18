@@ -22,6 +22,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | --- | --- | --- |
 | `id` | yes | Engine name. Clients can select the engine with it (`x-engine`). |
 | `family` | yes | The model family; see [Models](models.md). |
+| `resource_policy` | no | Set `"auto"` to size unspecified resources with the selected family’s load-time planner. Exact counts and explicit device lists take precedence. |
 | `model_dir` | yes | Directory of the checkpoint. It must be on local storage; see [Local storage](#local-storage). |
 | `tokenizer_dir` | yes | Directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. For Qwen3.6, Flint and Nemotron, startup checks each file against the hashes of the tested release. |
 | `model` | no | The name clients send in the `model` field. Defaults to the family name. |
@@ -167,3 +168,10 @@ The `fake` family replies with fixed text and loads no model. It is for tests an
 | --- | --- | --- |
 | `reply` | `Hello from the fake engine.` | The text of every reply. |
 | `token_delay_ms` | 0 | Pause before each token, in milliseconds. |
+
+
+### Automatic resource planning
+
+Set `"resource_policy": "auto"` on an individual engine entry. The loader keeps the chosen context, backend and weight format. In standalone Qwen CUDA tiered mode, `"qwen36": {"tiered": {}}` selects a bank that fits after existing device reservations. An explicit slot count remains exact. Dense and multi-device configurations use their existing state and placement admission. Flash-Next and Flint already choose expert residency from their native memory plans when their supported automatic modes are selected.
+
+Nemotron CPU and CUDA entries can omit `nemotron.cache_entries` with this policy. The loader sizes the host cache from available RAM, decoded expert tensor sizes and cacheable tensor count after its serving reservations. The CUDA path accounts for transfer staging, then fits the optional device weight cache to the selected card’s measured free memory. On integrated hardware it also charges shared host backing. Startup logs the resolved entry count. An explicit positive count retains its existing admission checks. Unsupported model/backend combinations continue to report the loader’s refusal.
