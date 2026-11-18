@@ -3063,8 +3063,9 @@ mod tests {
                 assert!(after.slice_reads > before.slice_reads);
                 assert!(after.read_bytes > before.read_bytes);
                 println!(
-                    "{activation:?} full_expert_pages={full_pages} max_stage_bytes={decode_stage} request_expert_bytes={}",
+                    "{activation:?} full_expert_pages={full_pages} max_stage_bytes={decode_stage} request_expert_bytes={} request_slice_reads={}",
                     after.read_bytes - before.read_bytes,
+                    after.slice_reads - before.slice_reads,
                 );
             }
         }

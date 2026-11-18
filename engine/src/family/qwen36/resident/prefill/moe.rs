@@ -31,6 +31,7 @@ use crate::{
     EngError,
     family::{
         math::expect_len,
+        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
         qwen36::host::HostShape,
         route::{Routed, route_experts},
         spec::Router,
@@ -147,7 +148,13 @@ pub(super) fn chunk_with_checkpoint(
     let plan = pair_plan(&routed, m.top_k, m.experts)?;
     require_sorted_experts(&plan.experts)?;
     let pairs = dim(plan.experts.len())?;
-    let staged = w.stage_selection(ctx.kernels, ckpt, &plan.experts)?;
+    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+        let output = shared_rows(ctx, w, x)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
+    let staged = w.stage_selection(ctx.kernels, ckpt, &plan.experts, rows)?;
     let (pages, local) = if let Some((pages, local)) = &staged {
         (pages, local)
     } else {
@@ -185,7 +192,10 @@ pub(super) fn chunk_with_checkpoint(
     let ordered = ctx.kernels.take(&flat, &inverse, 0)?;
     let ordered = ctx.kernels.reshape(&ordered, &[rows, top_k, hidden])?;
     let experts = ctx.kernels.reduce(ReduceOp::Sum, &ordered, 1, false)?;
-    let shared_out = shared_rows(ctx, w, x)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared_rows(ctx, w, x)?,
+    };
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
     // As in the decode combine of `moe.rs`, the gates are F32, so the weighted expert sum and the
     // shared expert product are F32. The residual add takes the activation dtype.

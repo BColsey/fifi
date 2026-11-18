@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::prefill::mlx::{overlap_expert_reads, prefill_expert_read_runs},
     kernels::{HostPages, MlxKernels, PackedPages, PageRange, ResidentPackedWeight},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
@@ -15,7 +16,10 @@ use std::{cell::RefCell, path::Path, rc::Rc, sync::OnceLock};
 pub(super) fn expert_pipeline_flagged() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").is_some_and(|value| value == "1")
+        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").map_or_else(
+            || overlap_expert_reads() || prefill_expert_read_runs(),
+            |value| value == "1",
+        )
     })
 }
 
@@ -50,12 +54,12 @@ impl ExpertReadRuns {
 
 pub(super) fn expert_read_runs() -> ExpertReadRuns {
     static MODE: OnceLock<ExpertReadRuns> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        ExpertReadRuns::from_env(
-            std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS")
-                .ok()
-                .as_deref(),
-        )
+    *MODE.get_or_init(|| match std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS") {
+        Ok(value) => ExpertReadRuns::from_env(Some(&value)),
+        Err(std::env::VarError::NotPresent) if prefill_expert_read_runs() => {
+            ExpertReadRuns::Prefill
+        }
+        Err(_) => ExpertReadRuns::Off,
     })
 }
 

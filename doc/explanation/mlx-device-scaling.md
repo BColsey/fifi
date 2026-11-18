@@ -28,6 +28,37 @@ When a prefill budget applies, `memory` lists the base charges, bytes left befor
 
 On the M4 mini, the published Flint checkpoint with a 4 GiB device ceiling and a configured 512-row maximum started with disk-backed experts and admitted 32 prefill rows. The reported row width, placement and memory charges matched the startup log. The live settings rows also matched `config effective --json` for the same environment.
 
+## Shared CPU, SSD and Metal staging
+
+The opt-in `FIFI_MLX_EXPERT_READ_RUNS=prefill` groups adjacent selected expert slices during multi-row prefill in disk-backed Flint, Flash-Next and Qwen3.6. It reads the same logical weight bytes and writes them directly into each family's admitted Metal page layout. Qwen's fused gate/up layout uses vectored reads into disjoint slots, with at most 64 destinations per call. F32 scales and biases still widen in the existing destination slots.
+
+The opt-in `FIFI_MLX_OVERLAP_EXPERT_READS=1` submits the independent shared expert to Metal before the CPU stages the same layer's exact routed experts. The layer output depends on both computations. Each family keeps its existing page release point and staging bound. Flint uses its shared-page pipeline when either common option is enabled. Explicit Flint legacy settings can override the common choices. Resident Qwen and Qwen3.8 dense use their resident projections and share the scheduler, KV formats and prefix lifecycle. [Apple Silicon controls](../reference/environment.md#apple-silicon-device-sizing)
+
+On the M4 mini, the published Flint checkpoint passed the shared-switch smoke test at an 8 GiB device ceiling with 256 admitted rows. The 16-token prefill used 26,244 reads with coalescing off and 20,979 with it on. Both arms read 5,159,780,352 logical prefill bytes, issued 7,614 decode reads, returned the same four-token completion and imported the staging pages without a copy fallback. The Qwen3.6 disk-backed fixture matched F32 and BF16 activations and issued 540 reads in the shared arm versus 594 in the control with 506,880 logical bytes each. Flash-Next's sparse-prefill and prefix fixtures passed with both common switches off and on. Full-checkpoint measurements on this mini cover Flint. [Flint serving comparison](mac-flint-ane-and-reads.md#balanced-serving-comparison-at-8-gib)
+
+## KV appends and retained prefixes
+
+The M4 mini measured a single synchronized append to representative cache planes at 8,191 and 32,767 prefix tokens. Each case used six timed samples, varied arm order, and checked the old prefix row, the appended row and the retained snapshot. Input allocation and readback sit outside the timing interval. The snapshot arm shares the buffer before appending. It measures the cost of that copy-on-write boundary while a saved prefix still owns the array.
+
+| Plane at 32,767 prefix tokens | Unique append | Snapshot-backed append | Concatenate | Extra peak with snapshot |
+| --- | ---: | ---: | ---: | ---: |
+| Flash-Next F32 KV | 1.26 ms | 4.68 ms | 4.67 ms | 64 MiB |
+| Qwen3.6 Q8 packed codes | 0.57 ms | 1.55 ms | — | 16 MiB |
+| Qwen3.8 dense BF16 KV | 1.28 ms | 4.68 ms | 4.51 ms | 64 MiB |
+| Flint BF16 KV | 0.80 ms | 2.83 ms | 2.83 ms | 32 MiB |
+
+Unique appends took zero extra active allocation in every measured case. Each retained snapshot added one plane at peak. Qwen's Q8 row measures the packed U32 codes, with scales stored separately. Flash-Next's sample covers the F32 K plane, with its V and index-key planes accounted for separately in the serving budget. The table reports operator medians. Flint's two-turn serving test measures the net effect of retaining a real prefix, including save overhead and read savings. [132 KV measurements](../../scripts/benchmarks/mac-m4-kv-append-matrix.csv) · [Flint two-turn results](mac-flint-ane-and-reads.md#prefix-reuse-on-two-turn-requests)
+
+Run from `engine/` on Apple Silicon:
+
+```sh
+FIFI_MLX_KV_APPEND_SAMPLES=6 cargo test --locked --release \
+  --features native-mlx,native-fault-qualification --test native_kv_ops \
+  mlx_kv_append_storage_matrix -- --ignored --exact --nocapture --test-threads=1
+```
+
+The test prints 132 `kv_append_sample` records with elapsed nanoseconds and extra active peak bytes.
+
 ## Constrained-memory comparisons
 
 The adaptive Flint path prices each batch using the same context, resident weights, expert staging, and temporary attention cost as coarse admission. It uses the common resident prefill ladder and preserves one-row fallback at the bottom.

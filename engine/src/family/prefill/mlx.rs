@@ -23,6 +23,34 @@ pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [
 pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 pub(crate) const RETIRE_CAP_BASE: u64 = 64 << 20;
 
+/// Group only adjacent, exactly routed expert slices for multi-row stages.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prefill_expert_read_runs() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS").is_some_and(|value| value == "prefill")
+    })
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn overlap_expert_reads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_MLX_OVERLAP_EXPERT_READS").is_some_and(|value| value == "1")
+    })
+}
+
+/// Queue one independent GPU result while the worker reads the exact expert IDs.
+/// Its owner passes the returned tensor into the dependent output graph.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn submit_shared_expert(
+    kernels: &mut crate::kernels::MlxKernels,
+    output: crate::tensor::ExecutionTensor,
+) -> Result<crate::tensor::ExecutionTensor, EngError> {
+    kernels.evaluate_async(&[&output])?;
+    Ok(output)
+}
+
 /// Sort and deduplicate checkpoint expert IDs for shared page staging.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn sorted_expert_ids(selected: &[u32]) -> Vec<u32> {

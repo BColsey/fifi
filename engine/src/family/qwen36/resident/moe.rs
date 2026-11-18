@@ -23,7 +23,13 @@ use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values}
 use super::weights::{ExpertPages, RDense, RMoe};
 use crate::{
     EngError,
-    family::{math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router},
+    family::{
+        math::expect_len,
+        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
+        qwen36::host::HostShape,
+        route::route_experts,
+        spec::Router,
+    },
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
     tensor::{Dtype, ExecutionTensor, Tensor},
     weights::StreamedCheckpoint,
@@ -120,7 +126,13 @@ pub(super) fn step_with_checkpoint(
     // the block so the eager and compiled paths share one contract over the raw residual stream.
     let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
     let (routed, host) = route_row(ctx, shape, w, &normed)?;
-    let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices)?;
+    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+        let output = shared(ctx, w, &normed)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
+    let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices, 1)?;
     let (pages, indices) = if let Some((pages, local)) = &staged {
         (pages, local)
     } else {
@@ -130,7 +142,12 @@ pub(super) fn step_with_checkpoint(
     let bounded = ctx
         .kernels
         .bound_indices(&ids, pages.down.logical_shape()[0])?;
-    let out = combine(ctx, shape, w, pages, &normed, &bounded, &gates)?;
+    let experts = combine_core(ctx, shape, pages, &normed, &bounded, &gates)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared(ctx, w, &normed)?,
+    };
+    let out = combine_sums(ctx, &experts, &shared_out)?;
     if staged.is_some() {
         ctx.kernels.evaluate(&[&out])?;
     }
@@ -193,9 +210,17 @@ fn combine(
 ) -> Result<ExecutionTensor, EngError> {
     let experts = combine_core(ctx, shape, pages, x, ids, gates)?;
     let shared_out = shared(ctx, w, x)?;
+    combine_sums(ctx, &experts, &shared_out)
+}
+
+fn combine_sums(
+    ctx: &mut Ctx<'_>,
+    experts: &ExecutionTensor,
+    shared: &ExecutionTensor,
+) -> Result<ExecutionTensor, EngError> {
     // The gates are F32, so the weighted sum and the shared expert product are F32. The
     // residual add takes the activation dtype.
-    let total = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
+    let total = ctx.kernels.binary(BinaryOp::Add, experts, shared)?;
     to_act(ctx, &total)
 }
 

@@ -246,6 +246,21 @@ fn env_origin<T>(value: &Option<T>) -> Origin {
 
 fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>) {
     rows.push(mlx_switch("mlx_auto_budget", "FIFI_MLX_AUTO_BUDGET"));
+    let read_runs = std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS");
+    rows.push(row(
+        "mlx_expert_read_runs",
+        if read_runs.as_deref().is_some_and(|value| value == "prefill") {
+            "prefill"
+        } else {
+            "off"
+        }
+        .into(),
+        env_origin(&read_runs),
+    ));
+    rows.push(mlx_switch(
+        "mlx_overlap_expert_reads",
+        "FIFI_MLX_OVERLAP_EXPERT_READS",
+    ));
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     {
         use crate::family::mlx_budget;

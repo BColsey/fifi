@@ -42,6 +42,35 @@ The table shows medians from two fresh servers per mode. The 45-, 143-, and 557-
 
 The mode remains opt-in. Broader performance qualification requires production-serving workloads beyond these two runs per prompt. The live server uses the shared-page pipeline with coalescing off.
 
+### Balanced serving comparison at 8 GiB
+
+The same published checkpoint ran on the internal SSD under an 8 GiB device ceiling. Both arms selected 256-row prefill, so the 557-token prompt used three pieces. Three pairs of fresh servers alternated their starting arm and each answered the same five prompts with 12 greedy completion tokens. The earlier 512-row comparison used four prompts. The new set adds an independent short explanation prompt.
+
+| Prompt | Median first token | Paired change | Prefill reads | Median attributed disk reads |
+| --- | ---: | ---: | ---: | ---: |
+| 16 tokens, arithmetic | 6.13 → 5.09 s | −15.7% | 26,244 → 20,979 | 7.50 → 6.61 GB |
+| 16 tokens, explanation | 6.16 → 5.00 s | −18.9% | 27,999 → 22,257 | 7.32 → 6.22 GB |
+| 45 tokens, code review | 12.74 → 9.16 s | −26.4% | 52,821 → 29,727 | 14.81 → 12.08 GB |
+| 143 tokens, summarization | 16.69 → 11.93 s | −28.3% | 82,575 → 23,472 | 21.56 → 18.08 GB |
+| 557 tokens, multi-piece | 44.86 → 32.50 s | −27.3% | 216,099 → 66,033 | 53.83 → 45.35 GB |
+
+Every completion digest, logical byte count and one-row decode read count matched the corresponding control. Neither arm had a Metal page-copy fallback. Total process-attributed disk reads fell from 312.57 to 265.79 GB across the 15 requests per arm. Paired median decode-rate changes ranged from −1.5% to +1.5%. Median peak footprints differed by up to about 54 MB. These results cover the M4 mini and its internal checkpoint. [All 30 requests](../../scripts/benchmarks/mac-m4-flint-coalescing-8gib.csv)
+
+Run the serving driver with `--expert-timing --prefill-read-runs --working-set-mib 8192 --pairs 3` to repeat this comparison.
+
+### Prefix reuse on two-turn requests
+
+Two pairs of fresh servers compared prefix reuse off and on at the same 8 GiB ceiling and 256-row prefill width, with coalescing on in both arms. Each pair replayed two fixed transcripts with 12 greedy completion tokens per turn. The reuse arm reserved 448 MiB for snapshots and their replacement. Both arms processed the same tokenized inputs and produced identical completions on all 16 requests.
+
+| Follow-up | Reused tokens | Median first token | Paired change | Median attributed disk reads |
+| --- | ---: | ---: | ---: | ---: |
+| 61 tokens, code review | 44 | 10.24 → 5.27 s | −48.6% | 14.03 → 5.78 GB |
+| 159 tokens, summarization | 142 | 11.85 → 4.85 s | −59.1% | 18.88 → 5.59 GB |
+
+Saving the prefix increased median first-token time by 3–7% on the priming turns. Across both turns of both transcripts, total process-attributed disk reads fell from 126.12 to 84.16 GB and total request time fell from 128.38 to 104.62 seconds. The retained snapshot charge was 147 MiB for these short requests. The summarization pair's median process peak rose by about 213 MB. An initial 128 MiB reserve refused the snapshot. Flint allocates its first full-attention KV planes for 4,096 rows, even for short prompts. A restored snapshot carries one pending token, so the first suffix forward re-evaluates one of the tokens counted as reused. [All 16 requests](../../scripts/benchmarks/mac-m4-flint-prefix-448.csv)
+
+Run the serving driver with `--expert-timing --prefix-reuse --working-set-mib 8192 --pairs 2` to repeat this comparison.
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)

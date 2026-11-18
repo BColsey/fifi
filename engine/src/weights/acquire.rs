@@ -194,6 +194,21 @@ impl StreamedWeights {
         count: u32,
         dst: &mut [u8],
     ) -> Result<(), EngError> {
+        let start = self.slice_run_start(key, first, count, dst.len())?;
+        self.read_range_into(key, start, dst)
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn slice_run_start(
+        &self,
+        key: &str,
+        first: u32,
+        count: u32,
+        bytes: usize,
+    ) -> Result<u64, EngError> {
         let Some((entry, start, slice_len)) = self.slice_span(key, first)? else {
             return Err(EngError::Checkpoint(format!("missing tensor {key}")));
         };
@@ -202,14 +217,51 @@ impl StreamedWeights {
                 "tensor {key:?}: invalid run of {count} slices starting at {first}"
             )));
         }
-        let bytes = u64::from(count).checked_mul(slice_len);
-        if bytes != u64::try_from(dst.len()).ok() {
+        let expected = u64::from(count).checked_mul(slice_len);
+        if expected != u64::try_from(bytes).ok() {
             return Err(EngError::BadRequest(format!(
                 "tensor {key:?}: slice run does not fill the {}-byte destination",
-                dst.len()
+                bytes
             )));
         }
-        self.read_range_into(key, start, dst)
+        Ok(start)
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn read_slice_run_scattered(
+        &self,
+        key: &str,
+        first: u32,
+        dst: &mut [std::io::IoSliceMut<'_>],
+    ) -> Result<(), EngError> {
+        use std::io::{ErrorKind, IoSliceMut};
+        let count =
+            u32::try_from(dst.len()).map_err(|_| read_failure(key, "too many destinations"))?;
+        let bytes = dst
+            .iter()
+            .try_fold(0usize, |total, slice| total.checked_add(slice.len()))
+            .ok_or_else(|| read_failure(key, "scatter byte count overflows"))?;
+        if dst.windows(2).any(|pair| pair[0].len() != pair[1].len()) {
+            return Err(EngError::BadRequest(format!(
+                "tensor {key:?}: scatter slices have different lengths"
+            )));
+        }
+        let start = self.slice_run_start(key, first, count, bytes)?;
+        self.read_range_with(key, start, bytes, |reader| {
+            let mut remaining = dst;
+            while !remaining.is_empty() {
+                match reader.read_vectored(remaining) {
+                    Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => IoSliceMut::advance_slices(&mut remaining, n),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })
     }
 
     /// The entry, data offset, and byte length of leading slice `index` of `key`.
@@ -263,6 +315,16 @@ impl StreamedWeights {
     }
 
     fn read_range_into(&self, key: &str, start: u64, dst: &mut [u8]) -> Result<(), EngError> {
+        self.read_range_with(key, start, dst.len(), |reader| reader.read_exact(dst))
+    }
+
+    fn read_range_with(
+        &self,
+        key: &str,
+        start: u64,
+        bytes: usize,
+        read: impl FnOnce(&mut dyn ShardIo) -> std::io::Result<()>,
+    ) -> Result<(), EngError> {
         let position =
             self.header.data_start().checked_add(start).ok_or_else(|| {
                 EngError::Checkpoint(format!("tensor {key:?}: offset overflows u64"))
@@ -276,10 +338,10 @@ impl StreamedWeights {
         let clock = read_stats::now();
         let outcome = reader
             .seek(SeekFrom::Start(position))
-            .and_then(|_| reader.read_exact(dst))
+            .and_then(|_| read(reader.as_mut()))
             .map_err(|error| read_failure(key, &error.to_string()));
         if let Some(clock) = clock {
-            read_stats::record(dst.len() as u64, clock.elapsed());
+            read_stats::record(bytes as u64, clock.elapsed());
         }
         outcome
     }
@@ -577,6 +639,26 @@ impl StreamedCheckpoint {
             .get(store)
             .ok_or_else(invalid_route)?
             .read_slice_run_into(key, first, count, dst)
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn read_slice_run_scattered(
+        &self,
+        key: &str,
+        first: u32,
+        dst: &mut [std::io::IoSliceMut<'_>],
+    ) -> Result<(), EngError> {
+        let shard = *self
+            .route
+            .get(key)
+            .ok_or_else(|| EngError::Checkpoint(format!("missing tensor {key}")))?;
+        self.stores
+            .get(shard)
+            .ok_or_else(invalid_route)?
+            .read_slice_run_scattered(key, first, dst)
     }
 
     pub fn wait(&self, ticket: Ticket) -> Result<Completion, EngError> {
