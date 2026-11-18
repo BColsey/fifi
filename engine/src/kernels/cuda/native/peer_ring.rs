@@ -32,7 +32,7 @@ use super::resident::{RawRange, RawStream};
 use super::{DeviceFailure, checked, invalid_argument};
 
 /// Matches `kMaxValues` in `native/peer_ring.cu`.
-pub(in crate::kernels::cuda) const MAX_VALUES: usize = 1 << 21;
+pub(in crate::kernels::cuda) const MAX_VALUES: usize = 1 << 22;
 /// The single-block FP16 publisher retains its previously supported bound.
 pub(in crate::kernels::cuda) const MAX_F16_VALUES: usize = 1 << 20;
 /// Matches `kMaxPeers` in `native/peer_ring.cu`.

@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr int kMaxValues = 1 << 21;
+constexpr int kMaxValues = 1 << 22;
 constexpr int kMaxF16Values = 1 << 20;
 constexpr int kMaxPeers = 3;
 constexpr unsigned kStatusTimeout = 1u;
