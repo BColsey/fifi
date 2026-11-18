@@ -18,6 +18,16 @@ The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB). The implementation q
 
 Qwen3.6 and Flash-Next can fall back to one-token prefill if the workspace for a chunk does not fit. Startup logs carry the Metal recommendation, the charged resident and reserve bytes, and the selected path. [MLX budget code](../../engine/src/family/mlx_budget.rs) · [Environment reference](../reference/environment.md#apple-silicon-device-sizing)
 
+## Inspect the selected execution path
+
+Run `enginesrv config effective <path> --json` with the serving environment to inspect the resolved configuration for Flint, Flash-Next, Qwen3.6 MoE or Qwen3.8 dense. The rows show the configured prefill ceiling, backend, KV format and applicable MLX switches. The capability bundle includes these rows.
+
+Once an engine becomes ready, authenticated `GET /v1/system` includes its worker's startup decisions under `engines[].execution`. The report includes the chosen weight placement, prefill mode, reason and row ceiling. The fields `prefill_rows` and `worker_piece_rows` describe the maximum batch within the executor and the maximum input piece from the scheduler. A worker can submit a piece of 16 tokens that the executor processes one token at a time. Chunked execution can use smaller batches at request boundaries or deeper contexts.
+
+When a prefill budget applies, `memory` lists the base charges, bytes left before chunk workspace, and any separate staging charge or sparse allowance. Device sizing also records the Metal recommendation and effective device ceiling. The API reads the record from successful startup without probing Metal during the request. [System API contract](../../api/openapi.yaml)
+
+On the M4 mini, the published Flint checkpoint with a 4 GiB device ceiling and a configured 512-row maximum started with disk-backed experts and admitted 32 prefill rows. The reported row width, placement and memory charges matched the startup log. The live settings rows also matched `config effective --json` for the same environment.
+
 ## Constrained-memory comparisons
 
 The adaptive Flint path prices each batch using the same context, resident weights, expert staging, and temporary attention cost as coarse admission. It uses the common resident prefill ladder and preserves one-row fallback at the bottom.

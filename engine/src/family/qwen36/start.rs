@@ -156,6 +156,7 @@ pub(super) fn plan_prefill(
                 "concurrent serving requires a prefill budget".into(),
             ));
         }
+        executor.record_mlx_plan(settings.prefill_chunk, None, None)?;
         return Ok(None);
     };
     let max_rows = settings.prefill_chunk;
@@ -189,6 +190,7 @@ pub(super) fn plan_prefill(
             "concurrent serving requires an admitted prefill chunk above one token".into(),
         ));
     }
+    executor.record_mlx_plan(max_rows, Some(plan), device)?;
     let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
     let terms = if let Some(device) = device {
         format!("{device} {terms}")

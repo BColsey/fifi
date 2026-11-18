@@ -75,6 +75,7 @@ use crate::{
     family::{
         executor::{ExecutorOps, GenerationState},
         mlx_budget::DeviceBudget,
+        mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         qwen36::{
             host::HostShape,
             host_load::HostWeights,
@@ -172,6 +173,7 @@ pub(crate) struct Q36Executor {
     fixed_state_bytes: u64,
     /// The chunk size of the batched prefill, set only by `apply_chunk`. `None` means one-token steps.
     chunk: Option<u32>,
+    mlx_plan: Option<MlxExecutionPlan>,
     /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
     /// `Miss` until a restore takes an entry, and a reset clears it again, so the report of a job
     /// without a boundary is a miss.
@@ -1057,6 +1059,7 @@ impl Q36Executor {
             max_seqs: rules.max_seqs,
             fixed_state_bytes,
             chunk: None,
+            mlx_plan: None,
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
             prefix_shadow: None,
@@ -1204,6 +1207,58 @@ impl Q36Executor {
 
     pub(crate) fn prefill_chunk(&self) -> Option<u32> {
         self.chunk
+    }
+
+    pub(in crate::family::qwen36) fn record_mlx_plan(
+        &mut self,
+        max_rows: u32,
+        plan: Option<PrefillPlan>,
+        device: Option<DeviceBudget>,
+    ) -> Result<()> {
+        use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
+        let (placement, placement_reason) = if self.decoder.weights.streams_experts() {
+            ("disk_experts", "full expert banks exceed the device budget")
+        } else {
+            ("resident", "model weights are imported at startup")
+        };
+        let memory = plan
+            .map(|plan| {
+                let staged = self
+                    .decoder
+                    .weights
+                    .expert_stage_bytes(self.decoder.ckpt, plan.chunk.unwrap_or(1))?;
+                let mut workspace = std::collections::BTreeMap::new();
+                if staged != 0 {
+                    workspace.insert("expert_staging_bytes", staged);
+                }
+                Ok::<_, EngError>(MlxPrefillMemory {
+                    prefill_budget_bytes: plan.terms.budget,
+                    remaining_bytes: plan.terms.remaining(),
+                    device: device.map(DeviceBudget::ceiling_report),
+                    base_charges: [
+                        ("weights_bytes", plan.terms.weights),
+                        ("session_reserve_bytes", plan.terms.session_reserve),
+                    ]
+                    .into(),
+                    workspace,
+                })
+            })
+            .transpose()?;
+        let reason = match (plan, self.chunk) {
+            (None, _) => PrefillReason::NoBudget,
+            (_, Some(_)) => PrefillReason::Admitted,
+            (_, None) if max_rows < MIN_PREFILL_CHUNK_ROWS => PrefillReason::RowCeiling,
+            _ => PrefillReason::Workspace,
+        };
+        self.mlx_plan = Some(MlxExecutionPlan::new(
+            placement,
+            placement_reason,
+            max_rows as usize,
+            self.chunk.unwrap_or(1) as usize,
+            reason,
+            memory,
+        ));
+        Ok(())
     }
 
     /// The only writer of the chunk size: it sets the decoder value first, so a size that the
@@ -1428,6 +1483,10 @@ impl ExecutorOps for Q36Executor {
 
     fn prefill_piece(&self) -> Option<usize> {
         self.chunk.and_then(|rows| usize::try_from(rows).ok())
+    }
+
+    fn mlx_execution_plan(&self) -> Option<&MlxExecutionPlan> {
+        self.mlx_plan.as_ref()
     }
 
     /// The limits of this executor's prefix store: the store this executor was built with
@@ -3630,6 +3689,12 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(executor.prefill_chunk(), want, "{line}");
+            let report = executor.mlx_execution_plan().unwrap();
+            assert_eq!(report.prefill_rows, want.unwrap_or(1) as usize);
+            assert_eq!(report.decisions[0].chosen, "resident");
+            let memory = report.memory.as_ref().unwrap();
+            assert_eq!(memory.prefill_budget_bytes, budget);
+            assert_eq!(memory.remaining_bytes, budget - base);
         }
         assert!(matches!(
             plan_prefill(

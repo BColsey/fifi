@@ -32,8 +32,7 @@ impl DeviceBudget {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn detect() -> Result<Option<Self>, EngError> {
         if enabled() {
-            let ceiling = std::env::var_os(CEILING_MIB);
-            let ceiling = ceiling.as_deref().map(parse_ceiling).transpose()?;
+            let ceiling = configured_ceiling()?;
             let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
             Ok(Some(Self { ceiling, ..device }))
         } else {
@@ -43,6 +42,15 @@ impl DeviceBudget {
 
     pub(crate) fn bytes(self) -> u64 {
         self.recommended.min(self.ceiling.unwrap_or(u64::MAX))
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn ceiling_report(self) -> super::mlx_report::MlxDeviceCeiling {
+        super::mlx_report::MlxDeviceCeiling {
+            metal_working_set_bytes: self.recommended,
+            effective_device_budget_bytes: self.bytes(),
+            configured_device_ceiling_bytes: self.ceiling,
+        }
     }
 
     /// A configured upper bound can make the working set smaller.
@@ -108,6 +116,14 @@ fn parse_ceiling(value: &OsStr) -> Result<u64, EngError> {
 pub(crate) fn enabled() -> bool {
     std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
         || std::env::var_os(CEILING_MIB).is_some()
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn configured_ceiling() -> Result<Option<u64>, EngError> {
+    std::env::var_os(CEILING_MIB)
+        .as_deref()
+        .map(parse_ceiling)
+        .transpose()
 }
 
 #[cfg(test)]
