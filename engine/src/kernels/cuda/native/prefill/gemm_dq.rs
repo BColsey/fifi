@@ -31,6 +31,8 @@ struct GemmDqArgsRepr {
     x_col_stride: c_int,
     /// 0 writes y row-major by rows; otherwise y is [ncols][y_col_stride] token rows.
     y_col_stride: c_int,
+    /// 1: x holds f32 values converted on load; 0: f16.
+    x_f32: c_int,
 }
 
 const _: () = assert!(
@@ -43,6 +45,7 @@ const _: () = assert!(
         && offset_of!(GemmDqArgsRepr, ncols) == 32
         && offset_of!(GemmDqArgsRepr, x_col_stride) == 36
         && offset_of!(GemmDqArgsRepr, y_col_stride) == 40
+        && offset_of!(GemmDqArgsRepr, x_f32) == 44
 );
 
 unsafe extern "C" {
@@ -107,6 +110,8 @@ struct GemmDqGeom {
 pub(in crate::kernels::cuda) struct GemmDqLayout {
     pub(in crate::kernels::cuda) x_col_stride: usize,
     pub(in crate::kernels::cuda) y_col_stride: usize,
+    /// x holds f32 values (the prefill norm-pack buffers) instead of f16.
+    pub(in crate::kernels::cuda) x_f32: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // w/x/y plus the GEMM shape, layout, and geometry
@@ -128,6 +133,7 @@ fn check_gemm_dq(
     let GemmDqLayout {
         x_col_stride,
         y_col_stride,
+        x_f32,
     } = *layout;
     let need_w = rows
         .checked_mul(k / qk)
@@ -150,15 +156,16 @@ fn check_gemm_dq(
     let Some(need_w) = need_w else {
         return Err(invalid_argument());
     };
+    let x_unit = if x_f32 { 4 } else { 2 };
     let need_x = if x_col_stride == 0 {
-        k.checked_mul(ncols).and_then(|n| n.checked_mul(2))
+        k.checked_mul(ncols).and_then(|n| n.checked_mul(x_unit))
     } else if x_col_stride < k || ncols > i32::MAX as usize / x_col_stride {
         None
     } else {
         (ncols - 1)
             .checked_mul(x_col_stride)
             .and_then(|head| head.checked_add(k))
-            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_mul(x_unit))
     };
     let need_y = if y_col_stride == 0 {
         rows.checked_mul(ncols).and_then(|n| n.checked_mul(4))
@@ -174,7 +181,7 @@ fn check_gemm_dq(
         return Err(invalid_argument());
     };
     let aligned = w.offset().is_multiple_of(w_align)
-        && x.offset().is_multiple_of(2)
+        && x.offset().is_multiple_of(x_unit)
         && y.offset().is_multiple_of(4);
     let y_span = Span::of(y, need_y);
     let apart = y_span.apart(&Span::of(w, need_w)) && y_span.apart(&Span::of(x, need_x));
@@ -216,6 +223,7 @@ fn gemm_dq_args(
         ncols: c_int::try_from(ncols).map_err(|_| invalid_argument())?,
         x_col_stride: stride_arg(layout.x_col_stride)?,
         y_col_stride: stride_arg(layout.y_col_stride)?,
+        x_f32: i32::from(layout.x_f32),
     })
 }
 

@@ -34,6 +34,8 @@ pub(crate) struct GemmDqQ5kCall<'b> {
     pub(crate) x_col_stride: usize,
     /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
     pub(crate) y_col_stride: usize,
+    /// x holds f32 values instead of f16 (the prefill norm-pack buffers).
+    pub(crate) x_f32: bool,
 }
 
 /// The same GEMM over Q3_K blocks: `w` is `[rows][k / 256]` blocks of 110 bytes.
@@ -50,6 +52,8 @@ pub(crate) struct GemmDqQ3kCall<'b> {
     pub(crate) x_col_stride: usize,
     /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
     pub(crate) y_col_stride: usize,
+    /// x holds f32 values instead of f16 (the prefill norm-pack buffers).
+    pub(crate) x_f32: bool,
 }
 
 /// The same GEMM over Q4_0 blocks: `w` is `[rows][k / 32]` blocks of 18 bytes.
@@ -66,6 +70,8 @@ pub(crate) struct GemmDqQ40Call<'b> {
     pub(crate) x_col_stride: usize,
     /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
     pub(crate) y_col_stride: usize,
+    /// x holds f32 values instead of f16 (the prefill norm-pack buffers).
+    pub(crate) x_f32: bool,
 }
 
 /// The activation and output spans for either layout: row-major packs the full logical
@@ -76,17 +82,19 @@ fn gemm_dq_layout_spans(
     ncols: usize,
     x_col_stride: usize,
     y_col_stride: usize,
+    x_f32: bool,
 ) -> Option<(usize, usize)> {
     let cap = i32::MAX as usize;
+    let x_unit = if x_f32 { 4 } else { 2 };
     let need_x = if x_col_stride == 0 {
-        k.checked_mul(ncols)?.checked_mul(2)?
+        k.checked_mul(ncols)?.checked_mul(x_unit)?
     } else if x_col_stride < k || ncols > cap / x_col_stride {
         return None;
     } else {
         (ncols - 1)
             .checked_mul(x_col_stride)?
             .checked_add(k)?
-            .checked_mul(2)?
+            .checked_mul(x_unit)?
     };
     let need_y = if y_col_stride == 0 {
         rows.checked_mul(ncols)?.checked_mul(4)?
@@ -113,6 +121,7 @@ pub(crate) struct GemmDqIq4xsCall<'b> {
     pub(crate) ncols: usize,
     pub(crate) x_col_stride: usize,
     pub(crate) y_col_stride: usize,
+    pub(crate) x_f32: bool,
 }
 
 impl CudaContext {
@@ -162,12 +171,13 @@ impl CudaContext {
             call.ncols,
             call.x_col_stride,
             call.y_col_stride,
+            call.x_f32,
         )
         .ok_or_else(|| {
             EngError::BadRequest("the Q3_K GEMM size overflows for the layout strides".to_owned())
         })?;
         require_fit("w", &call.w, need_w, 2)?;
-        require_fit("x", &call.x, need_x, 2)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
         require_fit("y", &call.y, need_y, 4)?;
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &call.w, need_w))?;
@@ -185,6 +195,7 @@ impl CudaContext {
                     layout: GemmDqLayout {
                         x_col_stride: call.x_col_stride,
                         y_col_stride: call.y_col_stride,
+                        x_f32: call.x_f32,
                     },
                 },
             )
@@ -226,12 +237,13 @@ impl CudaContext {
             call.ncols,
             call.x_col_stride,
             call.y_col_stride,
+            call.x_f32,
         )
         .ok_or_else(|| {
             EngError::BadRequest("the IQ4_XS GEMM size overflows for the layout strides".to_owned())
         })?;
         require_fit("w", &call.w, need_w, 2)?;
-        require_fit("x", &call.x, need_x, 2)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
         require_fit("y", &call.y, need_y, 4)?;
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &call.w, need_w))?;
@@ -249,6 +261,7 @@ impl CudaContext {
                     layout: GemmDqLayout {
                         x_col_stride: call.x_col_stride,
                         y_col_stride: call.y_col_stride,
+                        x_f32: call.x_f32,
                     },
                 },
             )
@@ -290,12 +303,13 @@ impl CudaContext {
             call.ncols,
             call.x_col_stride,
             call.y_col_stride,
+            call.x_f32,
         )
         .ok_or_else(|| {
             EngError::BadRequest("the Q4_0 GEMM size overflows for the layout strides".to_owned())
         })?;
         require_fit("w", &call.w, need_w, 2)?;
-        require_fit("x", &call.x, need_x, 2)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
         require_fit("y", &call.y, need_y, 4)?;
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &call.w, need_w))?;
@@ -313,6 +327,7 @@ impl CudaContext {
                     layout: GemmDqLayout {
                         x_col_stride: call.x_col_stride,
                         y_col_stride: call.y_col_stride,
+                        x_f32: call.x_f32,
                     },
                 },
             )
@@ -349,12 +364,13 @@ impl CudaContext {
             call.ncols,
             call.x_col_stride,
             call.y_col_stride,
+            call.x_f32,
         )
         .ok_or_else(|| {
             EngError::BadRequest("the Q5_K GEMM size overflows for the layout strides".to_owned())
         })?;
         require_fit("w", &call.w, need_w, 4)?;
-        require_fit("x", &call.x, need_x, 2)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
         require_fit("y", &call.y, need_y, 4)?;
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &call.w, need_w))?;
@@ -369,6 +385,7 @@ impl CudaContext {
             layout: GemmDqLayout {
                 x_col_stride: call.x_col_stride,
                 y_col_stride: call.y_col_stride,
+                x_f32: call.x_f32,
             },
         })
     }

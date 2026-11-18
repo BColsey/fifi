@@ -106,7 +106,8 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 template <class D>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
-                   int w_blocks, int x_col_stride, int y_col_stride, iq4nl_table iq4nl) {
+                   int w_blocks, int x_col_stride, int y_col_stride, int x_f32,
+                   iq4nl_table iq4nl) {
     extern __shared__ __align__(16) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
     __half *a = smem;                  /* the decoded weight tile */
     __half *b = smem + kBM * kAStride; /* the activation tile */
@@ -138,10 +139,12 @@ __global__ void __launch_bounds__(kThreads, 2)
                 const int r = idx / kBN;
                 const int col = tile_n + idx % kBN;
                 const int row_k = c * 64 + r;
+                const size_t x_at = x_col_stride ? (size_t)col * x_col_stride + row_k
+                                                : (size_t)row_k * ncols + col;
                 b[r * kBStride + idx % kBN] =
                     (row_k < k && col < ncols)
-                        ? (x_col_stride ? x[(size_t)col * x_col_stride + row_k]
-                                        : x[(size_t)row_k * ncols + col])
+                        ? (x_f32 ? __float2half(reinterpret_cast<const float *>(x)[x_at])
+                                 : x[x_at])
                         : __float2half(0.0f);
             }
         }
@@ -184,6 +187,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     const int ncols = args->ncols;
     const int x_col_stride = args->x_col_stride;
     const int y_col_stride = args->y_col_stride;
+    const int x_f32 = args->x_f32;
     if (k <= 0 || k % D::kQK != 0 || k % 64 != 0 || rows < 1 || ncols < 1) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
@@ -200,11 +204,15 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     const size_t x_elems =
         args->x_col_stride ? (size_t)(ncols - 1) * args->x_col_stride + k
                            : (size_t)k * (size_t)ncols;
+    if (args->x_f32 != 0 && args->x_f32 != 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
     const size_t y_elems =
         args->y_col_stride ? (size_t)(ncols - 1) * args->y_col_stride + rows
                            : (size_t)rows * (size_t)ncols;
+    const size_t x_unit = args->x_f32 ? sizeof(float) : sizeof(__half);
     if (!apart(args->y, y_elems * sizeof(float), args->w, w_bytes) ||
-        !apart(args->y, y_elems * sizeof(float), args->x, x_elems * sizeof(__half))) {
+        !apart(args->y, y_elems * sizeof(float), args->x, x_elems * x_unit)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
@@ -212,7 +220,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
-        w_blocks, x_col_stride, y_col_stride, make_iq4nl_table());
+        w_blocks, x_col_stride, y_col_stride, x_f32, make_iq4nl_table());
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

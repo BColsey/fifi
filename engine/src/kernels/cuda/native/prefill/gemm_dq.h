@@ -29,6 +29,7 @@ typedef struct inference_cuda_gemm_dq_args {
     int ncols;     /* positive */
     int x_col_stride; /* 0 reads x row-major by k; else >= k: x[col][row_k] */
     int y_col_stride; /* 0 writes y row-major by rows; else >= rows: y[col][row] */
+    int x_f32;        /* 1: x holds f32 values (converted on load); 0: f16 */
 } inference_cuda_gemm_dq_args;
 
 /* One launch on stream (must not be NULL) with the Q5_K decoder: k must be a multiple of 256
@@ -64,7 +65,8 @@ static_assert(sizeof(inference_cuda_gemm_dq_args) == 48 &&
                   offsetof(inference_cuda_gemm_dq_args, rows) == 28 &&
                   offsetof(inference_cuda_gemm_dq_args, ncols) == 32 &&
                   offsetof(inference_cuda_gemm_dq_args, x_col_stride) == 36 &&
-                  offsetof(inference_cuda_gemm_dq_args, y_col_stride) == 40,
+                  offsetof(inference_cuda_gemm_dq_args, y_col_stride) == 40 &&
+                  offsetof(inference_cuda_gemm_dq_args, x_f32) == 44,
               "inference_cuda_gemm_dq_args layout");
 #endif
 
