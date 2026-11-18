@@ -165,7 +165,7 @@ impl RecordSource for PackRecordSource<'_> {
 }
 
 /// The record carries no bias (`Exl3Bank` is bias-free too), and `pack_matrices` would drop it.
-fn refuse_bias(
+pub(super) fn refuse_bias(
     matrix: &Matrix,
     layer: usize,
     expert: usize,

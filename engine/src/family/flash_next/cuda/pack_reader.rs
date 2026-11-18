@@ -34,18 +34,21 @@ pub(crate) struct MatrixSpan {
 }
 
 /// The worst-case slot span the reader needs: the record area, padded to
-/// the sector so the staging area behind it stays sector-aligned, plus each
-/// part's worst-case aligned span (a span is at most `align_up(len +
-/// SECTOR)` — an unaligned head and tail together add under one sector).
-pub(crate) fn slot_span_bytes(record_bytes: u64, part_bytes: &[u64]) -> Result<u64, EngError> {
-    if part_bytes.is_empty() {
+/// the sector so the staging area behind it stays sector-aligned, plus
+/// every span's worst-case aligned read. A span's aligned file range
+/// (`align_up(offset+len) - align_down(offset)`) can reach `len +
+/// 2·SECTOR − 2` — head and tail slack each up to a sector — and the
+/// staging walk charges that total per SPAN, so the sizing must too:
+/// charging per part undercounts a part split into several components.
+pub(crate) fn slot_span_bytes(record_bytes: u64, spans: &[MatrixSpan]) -> Result<u64, EngError> {
+    if spans.is_empty() {
         return Err(EngError::BadRequest(
-            "pack reader: an expert record needs at least one part".into(),
+            "pack reader: an expert record needs at least one span".into(),
         ));
     }
     let mut total = align_up_sector(record_bytes);
-    for &len in part_bytes {
-        let worst = align_up_sector(len.saturating_add(4096));
+    for span in spans {
+        let worst = align_up_sector(span.len.saturating_add(2 * 4096));
         total = total
             .checked_add(worst)
             .ok_or_else(|| EngError::BadRequest("pack reader: slot span overflows".into()))?;
@@ -284,10 +287,21 @@ mod tests {
 
     #[test]
     fn the_slot_span_covers_the_record_and_every_worst_case_span() {
-        // record 5000 -> 8192; parts 5000/3000/7532 -> worst spans
-        // 12288/8192/12288; total 40_960 — computed by hand.
-        let got = slot_span_bytes(5000, &[5000, 3000, 7532]).unwrap();
-        assert_eq!(got, 8192 + 12288 + 8192 + 12288);
+        // record 5000 -> 8192; spans 5000/3000/7532 -> worst aligned reads
+        // align_up(len + 2·4096) = 16384/12288/16384; total 53_248 —
+        // computed by hand.
+        let spans: Vec<MatrixSpan> = [5000u64, 3000, 7532]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| MatrixSpan {
+                shard: PathBuf::new(),
+                file_offset: 0,
+                len,
+                record_offset: i as u64,
+            })
+            .collect();
+        let got = slot_span_bytes(5000, &spans).unwrap();
+        assert_eq!(got, 8192 + 16384 + 12288 + 16384);
         assert!(matches!(
             slot_span_bytes(5000, &[]),
             Err(crate::EngError::BadRequest(_))
@@ -329,7 +343,7 @@ mod tests {
                 record_offset: (PART_C.len() + PART_A.len()) as u64,
             },
         ];
-        let span = slot_span_bytes(record_bytes, &[5000, 3000, 7532]).unwrap();
+        let span = slot_span_bytes(record_bytes, &spans).unwrap();
         let mut ring = test_ring(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(span).unwrap(),
@@ -351,11 +365,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Dummy spans of the given lengths: sizing reads only `len`.
+    fn len_spans(lens: &[u64]) -> Vec<MatrixSpan> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, &len)| MatrixSpan {
+                shard: PathBuf::new(),
+                file_offset: 0,
+                len,
+                record_offset: i as u64,
+            })
+            .collect()
+    }
+
     /// Coverage refuses a mapping with a hole BEFORE any disk I/O: the
     /// spans need not point at a real file for the refusal to fire.
     #[test]
     fn a_gap_in_the_span_coverage_is_refused_before_any_read() {
-        let span = slot_span_bytes(8192, &[4096, 4096]).unwrap();
+        let span = slot_span_bytes(8192, &len_spans(&[4096, 4096])).unwrap();
         let mut ring = test_ring(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(span).unwrap(),
@@ -386,7 +413,7 @@ mod tests {
 
     #[test]
     fn an_overlap_in_the_span_coverage_is_refused_before_any_read() {
-        let span = slot_span_bytes(8192, &[6144, 6144]).unwrap();
+        let span = slot_span_bytes(8192, &len_spans(&[6144, 6144])).unwrap();
         let mut ring = test_ring(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(span).unwrap(),
@@ -419,7 +446,7 @@ mod tests {
     /// dead slot behind, so the ring recycles it for the next expert.
     #[test]
     fn a_failed_read_returns_its_slot_to_the_free_list() {
-        let span = slot_span_bytes(8192, &[8192]).unwrap();
+        let span = slot_span_bytes(8192, &len_spans(&[8192])).unwrap();
         let mut ring = test_ring(
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(span).unwrap(),
@@ -442,5 +469,33 @@ mod tests {
             Some(slot),
             "the failed read abandoned its slot back to the free list"
         );
+    }
+
+    #[test]
+    fn the_slot_span_bounds_the_worst_aligned_file_range() {
+        use super::{align_up_sector, aligned_span};
+        use crate::family::expert_bank::host_tier::SECTOR;
+        // The charge is align_up(len + 2*SECTOR) per span; the exact
+        // staging cost at the WORST file offset (head and tail slack each
+        // a sector minus one) must never exceed it.
+        for &len in &[
+            1u64,
+            100,
+            SECTOR - 1,
+            SECTOR,
+            SECTOR + 1,
+            3 * SECTOR + 5,
+            618_496,
+        ] {
+            for residue in [0u64, 1, SECTOR / 2, SECTOR - 1] {
+                let offset = 97 * SECTOR + residue;
+                let (_, exact) = aligned_span(offset, len);
+                let charge = slot_span_bytes(0, &len_spans(&[len])).unwrap() - align_up_sector(0);
+                assert!(
+                    exact <= charge,
+                    "len {len} offset {offset}: exact {exact} exceeds the charge {charge}"
+                );
+            }
+        }
     }
 }
