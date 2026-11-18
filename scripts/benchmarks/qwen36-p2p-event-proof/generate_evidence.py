@@ -8,10 +8,11 @@ all original logs and the exact pinned binaries to remain in the scratch path.
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
-TASK = Path("/home/ben/fifi-scratch/0cae2ae995db/p2p-async-chunk")
+TASK = Path(os.environ.get("FIFI_P2P_TASK_DIR", "p2p-async-chunk"))
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE.parent / "qwen36-p2p-event-results.json"
 COMMIT = "cc635bbdf4f9adb7f261d0721b63200ea7293341"
@@ -36,6 +37,9 @@ def load(path):
 
 def import_path(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load module {name} from {path}; the receipt "
+                         "can only be rebuilt from the original campaign artifacts")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

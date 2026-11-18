@@ -3,10 +3,11 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
-TASK = Path("/home/ben/fifi-scratch/48125d3d5344/p2p-chunk2048")
+TASK = Path(os.environ.get("FIFI_P2P_TASK_DIR", "p2p-chunk2048"))
 STAMP = "1794345297907869478"
 COMMIT = "f6d1c506f4e7ebe0ad3daa69290417c8e92639f2"
 HERE = Path(__file__).resolve().parent

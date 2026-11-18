@@ -2,11 +2,13 @@
 """Rebuild the completed 128k result from a later-interrupted guarded run."""
 
 import hashlib
+import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
-ROOT = Path("/home/ben/fifi-scratch/725f186d7122/p2p-chunk1024/long1024-check")
+ROOT = Path(os.environ.get("FIFI_P2P_TASK_DIR", "p2p-chunk1024")) / "long1024-check"
 SMOKE = ROOT / "pair-reserved-qoj75kwl"
 FULL = ROOT / "pair-reserved-5r1dvd84"
 HERE = Path(__file__).resolve().parent
@@ -38,7 +40,13 @@ def clear(row):
 
 def main():
     sys.path.insert(0, str(ROOT))
-    import attention_device as long  # noqa: PLC0415
+    try:
+        long = importlib.import_module("attention_device")
+    except ModuleNotFoundError:
+        raise SystemExit(
+            f"attention_device.py is missing from {ROOT}; the receipt "
+            "can only be rebuilt from the original campaign artifacts"
+        ) from None
 
     smoke = load(SMOKE / "attention/summary.json")
     info = load(FULL / "inputs.json")["probe"]
