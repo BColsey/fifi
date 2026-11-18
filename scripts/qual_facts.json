@@ -16,13 +16,14 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7077,
+      "test_fns": 7087,
       "ignored": 640,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
         "BOLT_Q8_HEADER_SHA256",
         "BOLT_TRACE_DIR",
+        "CARGO_TARGET_TMPDIR",
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
         "DT_CLASS_PARTITION",
@@ -172,6 +173,7 @@
         "FIFI_SPEC_ROWS",
         "FIFI_SPEC_TEXT",
         "FIFI_SPEC_TOKENIZER",
+        "FIFI_TEST_DIRECT_DIR",
         "FIFI_TEST_FUSED_WALK_CHILD",
         "FIFI_TEST_GDN_PARTITIONED",
         "FIFI_TEST_REQUIRE_DATA",

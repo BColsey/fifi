@@ -8,6 +8,7 @@
 //! the state types are policy-agnostic, the trait is the four-method contract whose rules
 //! are stated there.
 
+pub(crate) mod host_tier;
 pub(crate) mod policy;
 pub(crate) use policy::ReplaceOnMissLru;
 
