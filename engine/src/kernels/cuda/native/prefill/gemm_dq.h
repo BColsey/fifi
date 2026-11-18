@@ -20,11 +20,15 @@ extern "C" {
 
 typedef struct inference_cuda_gemm_dq_args {
     const void *w; /* native blocks [rows][k / qk] of the type */
-    const void *x; /* f16 activation, row-major [k][ncols] */
-    float *y;      /* f32 out, row-major [rows][ncols] */
+    const void *x; /* f16 activation: row-major [k][ncols], or token rows
+                    * [ncols][x_col_stride] when x_col_stride is set */
+    float *y;      /* f32 out: row-major [rows][ncols], or token rows
+                    * [ncols][y_col_stride] when y_col_stride is set */
     int k;         /* a positive multiple of the type's block size */
     int rows;      /* positive */
     int ncols;     /* positive */
+    int x_col_stride; /* 0 reads x row-major by k; else >= k: x[col][row_k] */
+    int y_col_stride; /* 0 writes y row-major by rows; else >= rows: y[col][row] */
 } inference_cuda_gemm_dq_args;
 
 /* One launch on stream (must not be NULL) with the Q5_K decoder: k must be a multiple of 256
@@ -52,13 +56,15 @@ int inference_cuda_gemm_dq_iq4xs_launch(const inference_cuda_gemm_dq_args *args,
 
 #ifdef __cplusplus
 }
-static_assert(sizeof(inference_cuda_gemm_dq_args) == 40 &&
+static_assert(sizeof(inference_cuda_gemm_dq_args) == 48 &&
                   offsetof(inference_cuda_gemm_dq_args, w) == 0 &&
                   offsetof(inference_cuda_gemm_dq_args, x) == 8 &&
                   offsetof(inference_cuda_gemm_dq_args, y) == 16 &&
                   offsetof(inference_cuda_gemm_dq_args, k) == 24 &&
                   offsetof(inference_cuda_gemm_dq_args, rows) == 28 &&
-                  offsetof(inference_cuda_gemm_dq_args, ncols) == 32,
+                  offsetof(inference_cuda_gemm_dq_args, ncols) == 32 &&
+                  offsetof(inference_cuda_gemm_dq_args, x_col_stride) == 36 &&
+                  offsetof(inference_cuda_gemm_dq_args, y_col_stride) == 40,
               "inference_cuda_gemm_dq_args layout");
 #endif
 

@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -105,7 +106,7 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 template <class D>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
-                   int w_blocks, iq4nl_table iq4nl) {
+                   int w_blocks, int x_col_stride, int y_col_stride, iq4nl_table iq4nl) {
     extern __shared__ __align__(16) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
     __half *a = smem;                  /* the decoded weight tile */
     __half *b = smem + kBM * kAStride; /* the activation tile */
@@ -138,8 +139,10 @@ __global__ void __launch_bounds__(kThreads, 2)
                 const int col = tile_n + idx % kBN;
                 const int row_k = c * 64 + r;
                 b[r * kBStride + idx % kBN] =
-                    (row_k < k && col < ncols) ? x[(size_t)row_k * ncols + col]
-                                               : __float2half(0.0f);
+                    (row_k < k && col < ncols)
+                        ? (x_col_stride ? x[(size_t)col * x_col_stride + row_k]
+                                        : x[(size_t)row_k * ncols + col])
+                        : __float2half(0.0f);
             }
         }
         __syncthreads();
@@ -167,7 +170,8 @@ __global__ void __launch_bounds__(kThreads, 2)
         for (int j = 0; j < 4; ++j) {
             const int col = tile_n + out_c * 4 + j;
             if (col < ncols) {
-                y[(size_t)row * ncols + col] = acc[i][j];
+                y[y_col_stride ? (size_t)col * y_col_stride + row
+                               : (size_t)row * ncols + col] = acc[i][j];
             }
         }
     }
@@ -178,14 +182,29 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     const int k = args->k;
     const int rows = args->rows;
     const int ncols = args->ncols;
+    const int x_col_stride = args->x_col_stride;
+    const int y_col_stride = args->y_col_stride;
     if (k <= 0 || k % D::kQK != 0 || k % 64 != 0 || rows < 1 || ncols < 1) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    if (args->x_col_stride != 0 &&
+        (args->x_col_stride < k || (long long)ncols * args->x_col_stride > INT_MAX)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    if (args->y_col_stride != 0 &&
+        (args->y_col_stride < rows || (long long)ncols * args->y_col_stride > INT_MAX)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const int w_blocks = k / D::kQK;
     const size_t w_bytes = (size_t)w_blocks * (size_t)rows * D::kBlockBytes;
-    const size_t x_bytes = (size_t)k * (size_t)ncols * sizeof(__half);
-    const size_t y_bytes = (size_t)rows * (size_t)ncols * sizeof(float);
-    if (!apart(args->y, y_bytes, args->w, w_bytes) || !apart(args->y, y_bytes, args->x, x_bytes)) {
+    const size_t x_elems =
+        args->x_col_stride ? (size_t)(ncols - 1) * args->x_col_stride + k
+                           : (size_t)k * (size_t)ncols;
+    const size_t y_elems =
+        args->y_col_stride ? (size_t)(ncols - 1) * args->y_col_stride + rows
+                           : (size_t)rows * (size_t)ncols;
+    if (!apart(args->y, y_elems * sizeof(float), args->w, w_bytes) ||
+        !apart(args->y, y_elems * sizeof(float), args->x, x_elems * sizeof(__half))) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
@@ -193,7 +212,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
-        w_blocks, make_iq4nl_table());
+        w_blocks, x_col_stride, y_col_stride, make_iq4nl_table());
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);

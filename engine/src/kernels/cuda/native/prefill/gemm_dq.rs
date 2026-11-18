@@ -27,16 +27,22 @@ struct GemmDqArgsRepr {
     k: c_int,
     rows: c_int,
     ncols: c_int,
+    /// 0 reads x row-major by k; otherwise x is [ncols][x_col_stride] token rows.
+    x_col_stride: c_int,
+    /// 0 writes y row-major by rows; otherwise y is [ncols][y_col_stride] token rows.
+    y_col_stride: c_int,
 }
 
 const _: () = assert!(
-    size_of::<GemmDqArgsRepr>() == 40
+    size_of::<GemmDqArgsRepr>() == 48
         && offset_of!(GemmDqArgsRepr, w) == 0
         && offset_of!(GemmDqArgsRepr, x) == 8
         && offset_of!(GemmDqArgsRepr, y) == 16
         && offset_of!(GemmDqArgsRepr, k) == 24
         && offset_of!(GemmDqArgsRepr, rows) == 28
         && offset_of!(GemmDqArgsRepr, ncols) == 32
+        && offset_of!(GemmDqArgsRepr, x_col_stride) == 36
+        && offset_of!(GemmDqArgsRepr, y_col_stride) == 40
 );
 
 unsafe extern "C" {
@@ -81,6 +87,7 @@ pub(in crate::kernels::cuda) struct GemmDqQ5kRaw<'a> {
     pub(in crate::kernels::cuda) k: usize,
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
 /// The size/apartness contract shared by every gemm_dq type: `w` holds `rows` rows of
@@ -93,6 +100,16 @@ struct GemmDqGeom {
     w_align: usize,
 }
 
+/// The x and y layouts: 0/0 keeps the row-major [k][ncols] and [rows][ncols]
+/// forms; otherwise x holds token rows `[ncols][x_col_stride]` and y holds
+/// token rows `[ncols][y_col_stride]`, which is how the prefill buffers are
+/// cut.
+pub(in crate::kernels::cuda) struct GemmDqLayout {
+    pub(in crate::kernels::cuda) x_col_stride: usize,
+    pub(in crate::kernels::cuda) y_col_stride: usize,
+}
+
+#[allow(clippy::too_many_arguments)] // w/x/y plus the GEMM shape, layout, and geometry
 fn check_gemm_dq(
     w: &RawRange<'_>,
     x: &RawRange<'_>,
@@ -100,6 +117,7 @@ fn check_gemm_dq(
     k: usize,
     rows: usize,
     ncols: usize,
+    layout: &GemmDqLayout,
     geom: &GemmDqGeom,
 ) -> Result<(), DeviceFailure> {
     let GemmDqGeom {
@@ -107,6 +125,10 @@ fn check_gemm_dq(
         block_bytes,
         w_align,
     } = *geom;
+    let GemmDqLayout {
+        x_col_stride,
+        y_col_stride,
+    } = *layout;
     let need_w = rows
         .checked_mul(k / qk)
         .and_then(|n| n.checked_mul(block_bytes));
@@ -114,12 +136,40 @@ fn check_gemm_dq(
         c_int::try_from(k).ok(),
         c_int::try_from(rows).ok(),
         c_int::try_from(ncols).ok(),
+        if x_col_stride == 0 {
+            Some(0)
+        } else {
+            c_int::try_from(x_col_stride).ok()
+        },
+        if y_col_stride == 0 {
+            Some(0)
+        } else {
+            c_int::try_from(y_col_stride).ok()
+        },
     ];
     let Some(need_w) = need_w else {
         return Err(invalid_argument());
     };
-    let need_x = k.checked_mul(ncols).and_then(|n| n.checked_mul(2));
-    let need_y = rows.checked_mul(ncols).and_then(|n| n.checked_mul(4));
+    let need_x = if x_col_stride == 0 {
+        k.checked_mul(ncols).and_then(|n| n.checked_mul(2))
+    } else if x_col_stride < k || ncols > i32::MAX as usize / x_col_stride {
+        None
+    } else {
+        (ncols - 1)
+            .checked_mul(x_col_stride)
+            .and_then(|head| head.checked_add(k))
+            .and_then(|n| n.checked_mul(2))
+    };
+    let need_y = if y_col_stride == 0 {
+        rows.checked_mul(ncols).and_then(|n| n.checked_mul(4))
+    } else if y_col_stride < rows || ncols > i32::MAX as usize / y_col_stride {
+        None
+    } else {
+        (ncols - 1)
+            .checked_mul(y_col_stride)
+            .and_then(|head| head.checked_add(rows))
+            .and_then(|n| n.checked_mul(4))
+    };
     let (Some(need_x), Some(need_y)) = (need_x, need_y) else {
         return Err(invalid_argument());
     };
@@ -152,7 +202,11 @@ fn gemm_dq_args(
     k: usize,
     rows: usize,
     ncols: usize,
+    layout: &GemmDqLayout,
 ) -> Result<GemmDqArgsRepr, DeviceFailure> {
+    let stride_arg = |stride: usize| -> Result<c_int, DeviceFailure> {
+        c_int::try_from(stride).map_err(|_| invalid_argument())
+    };
     Ok(GemmDqArgsRepr {
         w: w.address().cast_const(),
         x: x.address().cast_const(),
@@ -160,6 +214,8 @@ fn gemm_dq_args(
         k: c_int::try_from(k).map_err(|_| invalid_argument())?,
         rows: c_int::try_from(rows).map_err(|_| invalid_argument())?,
         ncols: c_int::try_from(ncols).map_err(|_| invalid_argument())?,
+        x_col_stride: stride_arg(layout.x_col_stride)?,
+        y_col_stride: stride_arg(layout.y_col_stride)?,
     })
 }
 
@@ -174,6 +230,7 @@ pub(in crate::kernels::cuda) fn check_gemm_dq_q5k(
         call.k,
         call.rows,
         call.ncols,
+        &call.layout,
         &GemmDqGeom {
             qk: 256,
             block_bytes: 176,
@@ -193,7 +250,15 @@ pub(in crate::kernels::cuda) fn gemm_dq_q5k_launch(
     // allocations, large enough for the call, aligned, and `y` disjoint from the ranges the
     // kernel reads; the adapter repeats the checks on the addresses. `stream` is live for the
     // call.
-    let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
     let status = unsafe { gemm_dq_q5k_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
@@ -209,6 +274,7 @@ pub(in crate::kernels::cuda) struct GemmDqQ3kRaw<'a> {
     pub(in crate::kernels::cuda) k: usize,
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
 #[allow(dead_code)] // Staged until a model caller is qualified.
@@ -223,6 +289,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_q3k_launch(
         call.k,
         call.rows,
         call.ncols,
+        &call.layout,
         &GemmDqGeom {
             qk: 256,
             block_bytes: 110,
@@ -232,7 +299,15 @@ pub(in crate::kernels::cuda) fn gemm_dq_q3k_launch(
     let mut stage = STAGE_NONE;
     // SAFETY: as `gemm_dq_q5k_launch`, with the Q3_K geometry (110-byte blocks, 2-byte
     // weight alignment).
-    let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
     let status = unsafe { gemm_dq_q3k_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
@@ -248,6 +323,7 @@ pub(in crate::kernels::cuda) struct GemmDqIq4xsRaw<'a> {
     pub(in crate::kernels::cuda) k: usize,
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
 #[allow(dead_code)] // Staged until a model caller is qualified.
@@ -262,6 +338,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_iq4xs_launch(
         call.k,
         call.rows,
         call.ncols,
+        &call.layout,
         &GemmDqGeom {
             qk: 256,
             block_bytes: 136,
@@ -271,7 +348,15 @@ pub(in crate::kernels::cuda) fn gemm_dq_iq4xs_launch(
     let mut stage = STAGE_NONE;
     // SAFETY: as `gemm_dq_q5k_launch`, with the IQ4_XS geometry (136-byte super-blocks,
     // 2-byte weight alignment).
-    let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
     let status = unsafe { gemm_dq_iq4xs_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }
@@ -287,6 +372,7 @@ pub(in crate::kernels::cuda) struct GemmDqQ40Raw<'a> {
     pub(in crate::kernels::cuda) k: usize,
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
 #[allow(dead_code)] // Staged until a model caller is qualified.
@@ -301,6 +387,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_q40_launch(
         call.k,
         call.rows,
         call.ncols,
+        &call.layout,
         &GemmDqGeom {
             qk: 32,
             block_bytes: 18,
@@ -310,7 +397,15 @@ pub(in crate::kernels::cuda) fn gemm_dq_q40_launch(
     let mut stage = STAGE_NONE;
     // SAFETY: as `gemm_dq_q5k_launch`, with the Q4_0 geometry (18-byte blocks, 2-byte
     // weight alignment).
-    let args = gemm_dq_args(&call.w, &call.x, &call.y, call.k, call.rows, call.ncols)?;
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
     let status = unsafe { gemm_dq_q40_launch_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }

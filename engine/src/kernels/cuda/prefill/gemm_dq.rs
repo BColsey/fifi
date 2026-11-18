@@ -15,7 +15,7 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gemm_dq::{
-    GemmDqIq4xsRaw, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_iq4xs_launch,
+    GemmDqIq4xsRaw, GemmDqLayout, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_iq4xs_launch,
     gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
 };
 
@@ -30,6 +30,10 @@ pub(crate) struct GemmDqQ5kCall<'b> {
     pub(crate) k: usize,
     pub(crate) rows: usize,
     pub(crate) ncols: usize,
+    /// 0 keeps x row-major by k; otherwise x holds token rows `[ncols][x_col_stride]`.
+    pub(crate) x_col_stride: usize,
+    /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
+    pub(crate) y_col_stride: usize,
 }
 
 /// The same GEMM over Q3_K blocks: `w` is `[rows][k / 256]` blocks of 110 bytes.
@@ -42,6 +46,10 @@ pub(crate) struct GemmDqQ3kCall<'b> {
     pub(crate) k: usize,
     pub(crate) rows: usize,
     pub(crate) ncols: usize,
+    /// 0 keeps x row-major by k; otherwise x holds token rows `[ncols][x_col_stride]`.
+    pub(crate) x_col_stride: usize,
+    /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
+    pub(crate) y_col_stride: usize,
 }
 
 /// The same GEMM over Q4_0 blocks: `w` is `[rows][k / 32]` blocks of 18 bytes.
@@ -54,6 +62,43 @@ pub(crate) struct GemmDqQ40Call<'b> {
     pub(crate) k: usize,
     pub(crate) rows: usize,
     pub(crate) ncols: usize,
+    /// 0 keeps x row-major by k; otherwise x holds token rows `[ncols][x_col_stride]`.
+    pub(crate) x_col_stride: usize,
+    /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
+    pub(crate) y_col_stride: usize,
+}
+
+/// The activation and output spans for either layout: row-major packs the full logical
+/// rectangle, token rows need the last column's full stride head plus its tail.
+fn gemm_dq_layout_spans(
+    k: usize,
+    rows: usize,
+    ncols: usize,
+    x_col_stride: usize,
+    y_col_stride: usize,
+) -> Option<(usize, usize)> {
+    let cap = i32::MAX as usize;
+    let need_x = if x_col_stride == 0 {
+        k.checked_mul(ncols)?.checked_mul(2)?
+    } else if x_col_stride < k || ncols > cap / x_col_stride {
+        return None;
+    } else {
+        (ncols - 1)
+            .checked_mul(x_col_stride)?
+            .checked_add(k)?
+            .checked_mul(2)?
+    };
+    let need_y = if y_col_stride == 0 {
+        rows.checked_mul(ncols)?.checked_mul(4)?
+    } else if y_col_stride < rows || ncols > cap / y_col_stride {
+        return None;
+    } else {
+        (ncols - 1)
+            .checked_mul(y_col_stride)?
+            .checked_add(rows)?
+            .checked_mul(4)?
+    };
+    Some((need_x, need_y))
 }
 
 /// The same GEMM over IQ4_XS super-blocks: `w` is `[rows][k / 256]` blocks of 136 bytes.
@@ -66,6 +111,8 @@ pub(crate) struct GemmDqIq4xsCall<'b> {
     pub(crate) k: usize,
     pub(crate) rows: usize,
     pub(crate) ncols: usize,
+    pub(crate) x_col_stride: usize,
+    pub(crate) y_col_stride: usize,
 }
 
 impl CudaContext {
@@ -109,20 +156,16 @@ impl CudaContext {
         let need_w = blocks.checked_mul(110).ok_or_else(|| {
             EngError::BadRequest("the Q3_K GEMM weight size overflows".to_owned())
         })?;
-        let need_x = call
-            .k
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q3_K GEMM activation size overflows".to_owned())
-            })?;
-        let need_y = call
-            .rows
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q3_K GEMM output size overflows".to_owned())
-            })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest("the Q3_K GEMM size overflows for the layout strides".to_owned())
+        })?;
         require_fit("w", &call.w, need_w, 2)?;
         require_fit("x", &call.x, need_x, 2)?;
         require_fit("y", &call.y, need_y, 4)?;
@@ -139,6 +182,10 @@ impl CudaContext {
                     k: call.k,
                     rows: call.rows,
                     ncols: call.ncols,
+                    layout: GemmDqLayout {
+                        x_col_stride: call.x_col_stride,
+                        y_col_stride: call.y_col_stride,
+                    },
                 },
             )
         })
@@ -173,20 +220,16 @@ impl CudaContext {
         let need_w = blocks.checked_mul(136).ok_or_else(|| {
             EngError::BadRequest("the IQ4_XS GEMM weight size overflows".to_owned())
         })?;
-        let need_x = call
-            .k
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| {
-                EngError::BadRequest("the IQ4_XS GEMM activation size overflows".to_owned())
-            })?;
-        let need_y = call
-            .rows
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                EngError::BadRequest("the IQ4_XS GEMM output size overflows".to_owned())
-            })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest("the IQ4_XS GEMM size overflows for the layout strides".to_owned())
+        })?;
         require_fit("w", &call.w, need_w, 2)?;
         require_fit("x", &call.x, need_x, 2)?;
         require_fit("y", &call.y, need_y, 4)?;
@@ -203,6 +246,10 @@ impl CudaContext {
                     k: call.k,
                     rows: call.rows,
                     ncols: call.ncols,
+                    layout: GemmDqLayout {
+                        x_col_stride: call.x_col_stride,
+                        y_col_stride: call.y_col_stride,
+                    },
                 },
             )
         })
@@ -237,20 +284,16 @@ impl CudaContext {
         let need_w = blocks.checked_mul(18).ok_or_else(|| {
             EngError::BadRequest("the Q4_0 GEMM weight size overflows".to_owned())
         })?;
-        let need_x = call
-            .k
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q4_0 GEMM activation size overflows".to_owned())
-            })?;
-        let need_y = call
-            .rows
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q4_0 GEMM output size overflows".to_owned())
-            })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest("the Q4_0 GEMM size overflows for the layout strides".to_owned())
+        })?;
         require_fit("w", &call.w, need_w, 2)?;
         require_fit("x", &call.x, need_x, 2)?;
         require_fit("y", &call.y, need_y, 4)?;
@@ -267,6 +310,10 @@ impl CudaContext {
                     k: call.k,
                     rows: call.rows,
                     ncols: call.ncols,
+                    layout: GemmDqLayout {
+                        x_col_stride: call.x_col_stride,
+                        y_col_stride: call.y_col_stride,
+                    },
                 },
             )
         })
@@ -296,20 +343,16 @@ impl CudaContext {
         let need_w = blocks.checked_mul(176).ok_or_else(|| {
             EngError::BadRequest("the Q5_K GEMM weight size overflows".to_owned())
         })?;
-        let need_x = call
-            .k
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q5_K GEMM activation size overflows".to_owned())
-            })?;
-        let need_y = call
-            .rows
-            .checked_mul(call.ncols)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| {
-                EngError::BadRequest("the Q5_K GEMM output size overflows".to_owned())
-            })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest("the Q5_K GEMM size overflows for the layout strides".to_owned())
+        })?;
         require_fit("w", &call.w, need_w, 4)?;
         require_fit("x", &call.x, need_x, 2)?;
         require_fit("y", &call.y, need_y, 4)?;
@@ -323,6 +366,10 @@ impl CudaContext {
             k: call.k,
             rows: call.rows,
             ncols: call.ncols,
+            layout: GemmDqLayout {
+                x_col_stride: call.x_col_stride,
+                y_col_stride: call.y_col_stride,
+            },
         })
     }
 }

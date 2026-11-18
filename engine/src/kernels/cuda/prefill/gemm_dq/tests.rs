@@ -72,6 +72,91 @@ fn dequantize_into(block: &[u8], out: &mut [f32]) {
 }
 
 #[test]
+fn gemm_dq_q5k_token_rows_match_the_row_major_layout() {
+    if !testkit::device_present("gemm_dq_q5k_token_rows_match_the_row_major_layout") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    // The token-row strides change only the addressing: the accumulation order is
+    // identical, so the outputs must be bitwise equal to the row-major launch.
+    for (rows, k, ncols, seed) in [
+        (64usize, 512usize, 64usize, 0x7eed_0001u64),
+        (100, 1024, 40, 0x7eed_0002),
+        (13, 256, 7, 0x7eed_0003),
+    ] {
+        let w_bytes = build_weight(rows, k, seed);
+        let mut rng = testkit::Rng::new(seed ^ 0x5a5a);
+        let x: Vec<u16> = (0..k * ncols)
+            .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+            .collect();
+        let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let y = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+        ctx.gemm_dq_q5k(
+            &stream,
+            GemmDqQ5kCall {
+                w: w.range(0, w_bytes.len()).expect("w"),
+                x: testkit::upload_bytes(&ctx, &x_bytes)
+                    .range(0, x_bytes.len())
+                    .expect("x"),
+                y: y.range(0, rows * ncols * 4).expect("y"),
+                k,
+                rows,
+                ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
+            },
+        )
+        .expect("row-major gemm");
+        stream.synchronize().expect("drain");
+        let row_major = testkit::read_bytes(&ctx, &y, rows * ncols * 4);
+
+        // Token-major x: x_t[col][row_k]; token-major y: y_t[col][row].
+        let mut x_t = vec![0u16; ncols * k];
+        for c in 0..ncols {
+            for r in 0..k {
+                x_t[c * k + r] = x[r * ncols + c];
+            }
+        }
+        let x_t_bytes: Vec<u8> = x_t.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let y_t = testkit::upload_filled(&ctx, 0, ncols * rows * 4);
+        ctx.gemm_dq_q5k(
+            &stream,
+            GemmDqQ5kCall {
+                w: w.range(0, w_bytes.len()).expect("w"),
+                x: testkit::upload_bytes(&ctx, &x_t_bytes)
+                    .range(0, x_t_bytes.len())
+                    .expect("x"),
+                y: y_t.range(0, ncols * rows * 4).expect("y"),
+                k,
+                rows,
+                ncols,
+                x_col_stride: k,
+                y_col_stride: rows,
+            },
+        )
+        .expect("token-row gemm");
+        stream.synchronize().expect("drain");
+        let mut token_rows = testkit::read_bytes(&ctx, &y_t, ncols * rows * 4);
+
+        // Both layouts write the same logical rectangle; repack y_t to [rows][ncols].
+        let mut repacked = vec![0u8; rows * ncols * 4];
+        for row in 0..rows {
+            for col in 0..ncols {
+                let at = ((col * rows + row) * 4, (row * ncols + col) * 4);
+                repacked[at.1..at.1 + 4].copy_from_slice(&token_rows[at.0..at.0 + 4]);
+            }
+        }
+        let _ = &mut token_rows;
+        assert_eq!(
+            repacked, row_major,
+            "rows {rows} k {k} ncols {ncols}: token-row strides must be layout-only"
+        );
+    }
+}
+
+#[test]
 fn gemm_dq_q5k_matches_the_cpu_dequant_matmul() {
     if !testkit::device_present("gemm_dq_q5k_matches_the_cpu_dequant_matmul") {
         return;
@@ -105,6 +190,8 @@ fn gemm_dq_q5k_matches_the_cpu_dequant_matmul() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -161,6 +248,8 @@ fn gemm_dq_q5k_catches_one_wrong_group_scale() {
             k,
             rows,
             ncols,
+            x_col_stride: 0,
+            y_col_stride: 0,
         },
     )
     .expect("gemm dq");
@@ -197,6 +286,8 @@ fn gemm_dq_q5k_is_deterministic_and_refuses_bad_shapes() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -221,6 +312,8 @@ fn gemm_dq_q5k_is_deterministic_and_refuses_bad_shapes() {
                 k: k_bad,
                 rows: rows_bad,
                 ncols: ncols_bad,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         );
         let Err(error) = result else {
@@ -263,6 +356,8 @@ fn gemm_dq_q5k_profile_timing() {
         k,
         rows,
         ncols,
+        x_col_stride: 0,
+        y_col_stride: 0,
     };
     for _ in 0..3 {
         ctx.gemm_dq_q5k(&stream, call.clone()).expect("warmup");
@@ -362,6 +457,8 @@ fn gemm_dq_q40_matches_the_cpu_dequant_matmul() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -420,6 +517,8 @@ fn gemm_dq_q40_catches_one_flipped_code() {
             k,
             rows,
             ncols,
+            x_col_stride: 0,
+            y_col_stride: 0,
         },
     )
     .expect("gemm dq");
@@ -467,6 +566,8 @@ fn gemm_dq_q40_is_deterministic_and_refuses_bad_shapes() {
             k,
             rows,
             ncols,
+            x_col_stride: 0,
+            y_col_stride: 0,
         }
     }
     ctx.gemm_dq_q40(
@@ -579,6 +680,8 @@ fn gemm_dq_q3k_matches_the_cpu_dequant_matmul() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -702,6 +805,8 @@ fn gemm_dq_iq4xs_probe_crafted() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -779,6 +884,8 @@ fn gemm_dq_iq4xs_matches_the_cpu_dequant_matmul() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -834,6 +941,8 @@ fn gemm_dq_q3k_catches_one_wrong_group_scale() {
             k,
             rows,
             ncols,
+            x_col_stride: 0,
+            y_col_stride: 0,
         },
     )
     .expect("gemm dq");
@@ -882,6 +991,8 @@ fn gemm_dq_iq4xs_catches_one_wrong_group_scale() {
             k,
             rows,
             ncols,
+            x_col_stride: 0,
+            y_col_stride: 0,
         },
     )
     .expect("gemm dq");
@@ -918,6 +1029,8 @@ fn gemm_dq_q3k_is_deterministic_and_refuses_bad_shapes() {
                 k,
                 rows,
                 ncols,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         )
         .expect("gemm dq");
@@ -942,6 +1055,8 @@ fn gemm_dq_q3k_is_deterministic_and_refuses_bad_shapes() {
                 k: k_bad,
                 rows: rows_bad,
                 ncols: ncols_bad,
+                x_col_stride: 0,
+                y_col_stride: 0,
             },
         );
         let msg = format!("{result:?}");
