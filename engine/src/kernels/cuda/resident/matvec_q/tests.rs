@@ -163,6 +163,51 @@ pub(in crate::kernels::cuda) mod reference {
         }
     }
 
+    /// The Q8_0 fused form of the in-house kernel, mirrored on the host: exact
+    /// integer dp4a per 32-value block, both f16 scales folded in as one f32
+    /// multiply, one fused multiply-add per block into the b&32 split
+    /// accumulators, then the lane xor-tree reduce. `f32::mul_add` is the
+    /// single-rounding fused form the kernel pins with `__fmaf_rn`; this
+    /// function is the arithmetic contract the device test compares against
+    /// bit-for-bit, and the host golden test below pins without a card.
+    pub(super) fn q80_fused_row_dot(w_row: &[u8], x_q8_col: &[u8], k: usize) -> f32 {
+        let w_blocks = k / 32;
+        let mut lane_part = [0.0f32; 32];
+        for (lane, part) in lane_part.iter_mut().enumerate() {
+            let (mut acc0, mut acc1) = (0.0f32, 0.0f32);
+            let mut b = lane;
+            while b < w_blocks {
+                let wb = &w_row[b * 34..];
+                let d_w = half_at(wb, 0);
+                let xb = &x_q8_col[b * 36..];
+                let d_x = half_at(xb, 0);
+                let mut d = 0i32;
+                for i in 0..8 {
+                    let q = &wb[2 + i * 4..];
+                    let a = &xb[4 + i * 4..];
+                    for j in 0..4 {
+                        d += q[j] as i8 as i32 * a[j] as i8 as i32;
+                    }
+                }
+                let s = d_w * d_x;
+                if b & 32 != 0 {
+                    acc1 = f32::mul_add(s, d as f32, acc1);
+                } else {
+                    acc0 = f32::mul_add(s, d as f32, acc0);
+                }
+                b += 32;
+            }
+            *part = acc0 + acc1;
+        }
+        for o in [16usize, 8, 4, 2, 1] {
+            let prev = lane_part;
+            for l in 0..32 {
+                lane_part[l] = prev[l] + prev[l ^ o];
+            }
+        }
+        lane_part[0]
+    }
+
     /// One stored q8_1 block: (d, s, qs) of `values_per_block` 32.
     pub(super) fn q8_1_block(bytes: &[u8], at: usize) -> (f32, f32, Vec<i8>) {
         let d = half_at(bytes, at);
@@ -296,6 +341,117 @@ fn rig(
 
 fn read_f32(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Vec<f32> {
     testkit::floats(&testkit::read_bytes(ctx, buffer, len))
+}
+
+/// The column-invariant contract of `matvec_q_invariant`, pinned for every quant arm:
+/// an eight-column launch and eight one-column launches over the same weight bytes and
+/// activation rows agree bit-for-bit. The vendored MMVQ launcher alone does not promise
+/// this past four columns (its launch geometry changes with the column count — the plain
+/// entry diverged at 5.3e-4 relative, which broke the dense prefill arm), so the invariant
+/// entry routes Q8_0 to the in-house warp-per-row kernel and launches the remaining
+/// vendored arms per column when the batch is wider than four.
+#[test]
+fn matvec_invariant_columns_match_single_column_launches() {
+    if !testkit::device_present("matvec_invariant_columns_match_single_column_launches") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols) = (2560usize, 2048usize, 8usize);
+    for (ti, ty) in [
+        QuantType::Q80,
+        QuantType::Q4K,
+        QuantType::Q50,
+        QuantType::Q6K,
+        QuantType::Q5K,
+        QuantType::Q40,
+        QuantType::Q3K,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rng = testkit::Rng::new(0xB077_0000 + ti as u64);
+        let w_bytes = reference::build_weight(ty, rows, k, &mut rng);
+        let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let x: Vec<f32> = (0..ncols * k)
+            .map(|_| (rng.normal() as f32) * 0.05)
+            .collect();
+
+        // Batch: one quantize + one invariant matvec over all eight columns.
+        let x_f32 = testkit::upload_f32(&ctx, &x);
+        let x_bytes = q8_1_bytes(k, ncols).expect("size");
+        let x_q8 = testkit::upload_filled(&ctx, 0xAA, x_bytes);
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x_f32.range(0, x.len() * 4).expect("x range"),
+                y: x_q8.range(0, x_bytes).expect("y range"),
+                k,
+                ncols,
+            },
+        )
+        .expect("quantize batch");
+        let y_batch = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+        ctx.matvec_q_invariant(
+            &stream,
+            MatvecCall {
+                ty,
+                w: w.range(0, w_bytes.len()).expect("w range"),
+                x_q8: x_q8.range(0, x_bytes).expect("x range"),
+                y: y_batch.range(0, rows * ncols * 4).expect("y range"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec batch");
+        let y_batch = read_f32(&ctx, &y_batch, rows * ncols * 4);
+
+        // Single: each column alone through the same entry.
+        let one_bytes = q8_1_bytes(k, 1).expect("size");
+        for j in 0..ncols {
+            let col: Vec<f32> = x[j * k..(j + 1) * k].to_vec();
+            let col_f32 = testkit::upload_f32(&ctx, &col);
+            let col_q8 = testkit::upload_filled(&ctx, 0xAA, one_bytes);
+            ctx.quantize_q8_1(
+                &stream,
+                QuantizeCall {
+                    x: col_f32.range(0, col.len() * 4).expect("x range"),
+                    y: col_q8.range(0, one_bytes).expect("y range"),
+                    k,
+                    ncols: 1,
+                },
+            )
+            .expect("quantize single");
+            let y_one = testkit::upload_filled(&ctx, 0, rows * 4);
+            ctx.matvec_q_invariant(
+                &stream,
+                MatvecCall {
+                    ty,
+                    w: w.range(0, w_bytes.len()).expect("w range"),
+                    x_q8: col_q8.range(0, one_bytes).expect("x range"),
+                    y: y_one.range(0, rows * 4).expect("y range"),
+                    k,
+                    rows,
+                    ncols: 1,
+                },
+            )
+            .expect("matvec single");
+            let y_one = read_f32(&ctx, &y_one, rows * 4);
+            let mut worst = 0f64;
+            for r in 0..rows {
+                let (got, want) = (y_batch[j * rows + r], y_one[r]);
+                if got.to_bits() != want.to_bits() {
+                    let rel = ((got - want) as f64 / want.abs() as f64).abs();
+                    worst = worst.max(rel);
+                }
+            }
+            assert!(
+                worst == 0.0,
+                "{ty:?} column {j}: batch and single invariant launches differ, worst relative {worst:e}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2113,6 +2269,139 @@ fn matvec_q40_matches_the_integer_reference() {
         }
     }
     println!("matvec q40: max tolerance ratio {max_ratio:.3}");
+}
+
+/// The in-house Q8_0 arm against the same host reference machinery as the other in-house
+/// arms, including a row count the vendored matvec would refuse (13: no row groups) and the
+/// padded activation shape.
+#[test]
+fn matvec_q80_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q80_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ncols = 2;
+    let mut max_ratio = 0.0f64;
+    let shapes = SHAPES
+        .into_iter()
+        .chain([PADDED_SHAPE, (2048, 13)])
+        .map(|(k, rows)| {
+            // Q8_0 reads 32-value blocks: k rounds up to the 32 grid.
+            let k = k.div_ceil(32) * 32;
+            (k, rows)
+        });
+    for (k, rows) in shapes {
+        let seed = 0x5eed_2000u64 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q80, k, rows, ncols, seed);
+        let y_bytes = rows * ncols * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q_invariant(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q80,
+                w: w.range(0, QuantType::Q80.weight_bytes(rows, k).expect("size"))
+                    .expect("w"),
+                x_q8: x_q8
+                    .range(0, q8_1_bytes(k, ncols).expect("size"))
+                    .expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec q80");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(
+            &ctx,
+            &w,
+            QuantType::Q80.weight_bytes(rows, k).expect("size"),
+        );
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+        for col in 0..ncols {
+            for row in 0..rows {
+                let (reference, abs) = reference::reference_dot(
+                    QuantType::Q80,
+                    &w_bytes[row * (k / 32) * 34..],
+                    &x_bytes[col * row_bytes..],
+                    k,
+                );
+                let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                let error = (got[col * rows + row] as f64 - reference).abs();
+                let ratio = if tolerance > 0.0 {
+                    error / tolerance
+                } else {
+                    error
+                };
+                max_ratio = max_ratio.max(ratio);
+                assert!(
+                    error <= tolerance,
+                    "Q80 k {k} rows {rows} col {col} row {row}: error {error} over tol {tolerance}"
+                );
+            }
+        }
+        // The fused mirror is the arithmetic contract: at the serve shape the
+        // kernel must agree with it BIT-FIR-BIT (both use the exact dp4a
+        // integers, one fmaf per block and the xor tree, so any drift here is a
+        // real accumulation change, not quantization noise).
+        if k == 2560 {
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let fused = reference::q80_fused_row_dot(
+                        &w_bytes[row * (k / 32) * 34..],
+                        &x_bytes[col * row_bytes..],
+                        k,
+                    );
+                    assert_eq!(
+                        got[col * rows + row].to_bits(),
+                        fused.to_bits(),
+                        "fused mirror drift: k {k} rows {rows} col {col} row {row}"
+                    );
+                }
+            }
+        }
+    }
+    println!("matvec q80: max tolerance ratio {max_ratio:.3}");
+}
+
+/// The fused arithmetic contract, pinned without a card: the host mirror of the
+/// kernel (exact dp4a integers, one fmaf per block, the b&32 split, the lane
+/// xor tree) must produce these exact f32 bits on the fixed rig below. Any
+/// change to the accumulation form - unfused mul+add, a different split, a
+/// different reduce order - moves a bit and fails here before it reaches a
+/// card. The device test above asserts the kernel matches this same mirror
+/// bit-for-bit when a card exists, so the two legs pin both directions.
+#[test]
+fn matvec_q80_fused_host_golden_pins_the_accumulation_form() {
+    let (k, rows) = (2560usize, 4usize);
+    let mut rng = testkit::Rng::new(0x5eed_0800u64);
+    let w = reference::build_weight(QuantType::Q80, rows, k, &mut rng);
+    // Activation blocks from the same stream: quants are raw bytes, the scale
+    // alternates over exact f16 powers of two (2^-4, 2^-5, 2^-6) so the f16
+    // decode is exact and the bytes are reproducible without a quantizer.
+    let scales = [0x2c00u16, 0x2800, 0x2400];
+    let x: Vec<u8> = (0..k / 32)
+        .flat_map(|b| {
+            let d = scales[b % 3].to_le_bytes();
+            let mut block = vec![0u8; 36];
+            block[0] = d[0];
+            block[1] = d[1];
+            for byte in &mut block[4..] {
+                *byte = rng.next_u64() as u8;
+            }
+            block
+        })
+        .collect();
+    let got: Vec<u32> = (0..rows)
+        .map(|r| reference::q80_fused_row_dot(&w[r * (k / 32) * 34..], &x, k).to_bits())
+        .collect();
+    assert_eq!(
+        got,
+        vec![1171428372u32, 3315115459, 1141979824, 3323945475],
+        "the fused accumulation form drifted; re-derive against the kernel, not around it"
+    );
 }
 
 /// One flipped weight nibble must move an output past the stated tolerance:

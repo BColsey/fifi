@@ -24,6 +24,7 @@ use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launc
 use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
 use crate::kernels::cuda::native::resident::matvec_q40::matvec_q40_launch;
+use crate::kernels::cuda::native::resident::matvec_q80::matvec_q80_launch;
 
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
@@ -134,8 +135,70 @@ impl CudaContext {
         stream: &DeviceStream,
         call: MatvecCall<'_>,
     ) -> Result<(), EngError> {
+        self.matvec_q_impl(stream, call, false)
+    }
+
+    /// The column-invariant contract: column `j` of any launch is bit-identical to a
+    /// one-column launch over the same bytes, whatever `ncols` is. The vendored MMVQ
+    /// launcher does not promise that past four columns (its launch geometry changes with
+    /// the column count), so the arms it still serves — Q4_K, Q5_0 and Q6_K — launch per
+    /// column when the batch is wider than four, which is the documented mitigation of
+    /// this module. That costs those arms one launch per column past four (an
+    /// eight-column batch pays eight sequential launches instead of one, with no shared
+    /// read of the weight rows across columns); the in-house arms batch at every width.
+    /// Q8_0 under the contract takes the in-house warp-per-row kernel; Q5_K,
+    /// Q4_0 and Q3_K are in-house and column-invariant at every width. Callers whose
+    /// reuse promise needs a token to compute the same thing whatever batch it rode in
+    /// (a prefill batch vs a decode step) select this entry; the default entry keeps the vendored
+    /// numerics, so served defaults do not move.
+    #[cfg_attr(not(test), expect(dead_code))]
+    // No production launch takes the invariant entry yet: the speed pair
+    // measured it 21 to 26 percent slower per call on the wide launches, so
+    // every projection keeps the split-plane kernel and only the device tests
+    // call this. The expect comes off when a series routes a launch here.
+    pub(crate) fn matvec_q_invariant(
+        &self,
+        stream: &DeviceStream,
+        call: MatvecCall<'_>,
+    ) -> Result<(), EngError> {
+        if matches!(call.ty, QuantType::Q4K | QuantType::Q50 | QuantType::Q6K) && call.ncols > 4 {
+            let row_bytes = q8_1_bytes(call.k, 1).ok_or_else(|| {
+                EngError::BadRequest("the CUDA matvec activation size overflows".to_owned())
+            })?;
+            let y_bytes = call.rows.checked_mul(4).ok_or_else(|| {
+                EngError::BadRequest("the CUDA matvec out size overflows".to_owned())
+            })?;
+            for col in 0..call.ncols {
+                let single = MatvecCall {
+                    ty: call.ty,
+                    w: call.w,
+                    x_q8: call
+                        .x_q8
+                        .buffer()
+                        .range(call.x_q8.offset() + col * row_bytes, row_bytes)?,
+                    y: call
+                        .y
+                        .buffer()
+                        .range(call.y.offset() + col * y_bytes, y_bytes)?,
+                    k: call.k,
+                    rows: call.rows,
+                    ncols: 1,
+                };
+                self.matvec_q_impl(stream, single, true)?;
+            }
+            return Ok(());
+        }
+        self.matvec_q_impl(stream, call, true)
+    }
+
+    fn matvec_q_impl(
+        &self,
+        stream: &DeviceStream,
+        call: MatvecCall<'_>,
+        invariant: bool,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        let raw = self.plan_matvec(&call)?;
+        let raw = self.plan_matvec(&call, invariant)?;
         let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan_matvec");
         self.launch_on(stream, |stream_raw| match call.ty {
             // The in-house Q5_K kernel: its own ABI, native blocks, whole rows.
@@ -189,11 +252,31 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
+            // The in-house Q8_0 kernel under the column-invariant contract: its own ABI,
+            // native 34-byte blocks, whole rows, lane arithmetics independent of ncols.
+            // Without the contract the vendored launcher keeps serving Q8_0, so served
+            // defaults do not move.
+            QuantType::Q80 if invariant => matvec_q80_launch(
+                stream_raw,
+                &crate::kernels::cuda::native::resident::matvec_q80::MatvecQ80Raw {
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
             _ => matvec_q_launch(stream_raw, &raw),
         })
     }
 
-    fn plan_matvec<'b>(&self, call: &MatvecCall<'b>) -> Result<MatvecRaw<'b>, EngError> {
+    fn plan_matvec<'b>(
+        &self,
+        call: &MatvecCall<'b>,
+        invariant: bool,
+    ) -> Result<MatvecRaw<'b>, EngError> {
         let (w_raw, x_raw, y_raw) = (
             self.raw_range(&call.w)?,
             self.raw_range(&call.x_q8)?,
@@ -207,10 +290,11 @@ impl CudaContext {
             )));
         }
         if call.rows == 0
-            || (!matches!(
+            || (!(matches!(
                 call.ty,
                 QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
-            ) && !call.rows.is_multiple_of(ROWS_MULTIPLE))
+            ) || (call.ty == QuantType::Q80 && invariant))
+                && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {
             return Err(EngError::BadRequest(format!(
                 "the CUDA matvec needs rows as a positive multiple of {ROWS_MULTIPLE}, got {}",

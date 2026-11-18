@@ -80,6 +80,7 @@ pub(in crate::kernels::cuda) mod matvec_q;
 pub(in crate::kernels::cuda) mod matvec_q3k;
 pub(in crate::kernels::cuda) mod matvec_q40;
 pub(in crate::kernels::cuda) mod matvec_q5k;
+pub(in crate::kernels::cuda) mod matvec_q80;
 pub(in crate::kernels::cuda) mod moe_combine;
 pub(in crate::kernels::cuda) mod pack_rows;
 pub(in crate::kernels::cuda) mod paged_position;
