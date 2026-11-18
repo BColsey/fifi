@@ -59,6 +59,16 @@ mod alloc_cache;
 /// Adapter leases held in this process.
 static SLOTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Test-only companion of [`super::reset_terminal_latch_for_test`]: a lease
+/// dropped while the latch was set stays reserved for the process (its device
+/// memory may still be owned), so an unwound assert leaves `SLOTS` at its cap
+/// and every later device test refuses at `CudaContext::new`. Serving code
+/// never calls this; there the reservation is correct.
+#[cfg(test)]
+pub(super) fn reset_lease_slots_for_test() {
+    SLOTS.store(0, Ordering::Release);
+}
+
 /// Device bytes held by live buffers of this process. On an integrated GPU
 /// (Jetson) device memory is system RAM, so `cudaMemGetInfo` free memory moves
 /// with the host heap and page cache and cannot show a leak. Tests read this

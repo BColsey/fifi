@@ -146,6 +146,20 @@ static TERMINAL: AtomicBool = AtomicBool::new(false);
 static TERMINAL_STATUS: AtomicI32 = AtomicI32::new(NO_LATCHED_STATUS);
 const NO_LATCHED_STATUS: i32 = i32::MIN;
 
+/// Clears the terminal latch and the lease slots before the next device test.
+/// Test-only: an assert failure between native calls poisons the latch for the
+/// rest of the process (the first `DeviceBuffer` drop during the unwind latches
+/// `TERMINAL`, and the lease stays reserved), so every later device test fails
+/// at `CudaContext::new` with a failure it did not cause. Serving code never
+/// calls this: there the latch is load-bearing and stays set for the process
+/// lifetime, exactly as before.
+#[cfg(test)]
+pub(crate) fn reset_terminal_latch_for_test() {
+    TERMINAL.store(false, Ordering::Release);
+    TERMINAL_STATUS.store(NO_LATCHED_STATUS, Ordering::Release);
+    context::reset_lease_slots_for_test();
+}
+
 /// Returns the number of CUDA devices the runtime can use.
 ///
 /// A host without a GPU returns `Ok(0)`. A host whose driver is missing, too
@@ -762,5 +776,16 @@ mod tests {
             "{error:?}"
         );
         assert!(terminal.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_test_reset_clears_the_global_latch_and_leases() {
+        TERMINAL.store(true, Ordering::Release);
+        TERMINAL_STATUS.store(35, Ordering::Release);
+        // A poisoned process refuses every later context; the reset must
+        // return the backend to its fresh state before the next device test.
+        reset_terminal_latch_for_test();
+        assert!(!TERMINAL.load(Ordering::Acquire));
+        assert_eq!(TERMINAL_STATUS.load(Ordering::Acquire), NO_LATCHED_STATUS);
     }
 }
