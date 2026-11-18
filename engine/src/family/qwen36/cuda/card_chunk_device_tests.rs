@@ -7,6 +7,7 @@
 use super::card_prefill::{
     CardChunkInputs, build_card_chunk, build_card_chunk_with_stage_rows, run_card_chunk,
 };
+use super::card_session::CardSession;
 use super::card_session_device_tests::rig_spec;
 use super::dims::{KvMode, StepDims, StepOptions};
 use crate::EngError;
@@ -122,6 +123,104 @@ fn async_broadcast_chunk_matches_synchronous_on_physical_peers() {
     check_card_chunk(devices, 96, Some(32), true);
 }
 
+/// Persistent per-layer staging (the Q36_P2P_CHUNK_STAGED path) against the
+/// plain chunk over the same rows: the staged planes hold the same bytes the
+/// whole-prefix re-dequant would produce, so every logit must be bit-identical.
+/// Three consecutive chunks exercise the watermark: the first fills from
+/// zero, the later ones dequant only their new rows.
+#[test]
+#[ignore = "holds its CUDA adapter leases for the process lifetime; run alone"]
+fn staged_card_chunk_matches_the_unstaged_chunk() {
+    if !device_present("staged_card_chunk_matches_the_unstaged_chunk") {
+        return;
+    }
+    const NAME: &str = "staged_card_chunk_matches_the_unstaged_chunk";
+    let capacity = 256usize;
+    let rows = 8usize;
+    let (mut session, stack, loaded, names, _vocab) =
+        crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
+            [0, 0],
+            capacity,
+            crate::family::session::StoreLimits::default(),
+            rows,
+            false,
+            false,
+        )
+        .expect("the rig session");
+    let spec = rig_spec();
+    let inv = Inventory::for_spec(&spec).expect("inventory");
+    let shape = HostShape::from_spec(&spec, 64).expect("shape");
+    let d = StepDims::new(&shape, &inv).expect("dims");
+    let options = StepOptions {
+        kv_mode: KvMode::Int8G32,
+        context_tokens: capacity,
+        delta_slots: 1,
+        forked_experts: false,
+        tiered: None,
+        layout: crate::family::project::cuda::WeightLayout::Native,
+    };
+    let table = LayerTable::new(&d, &inv).expect("layers");
+    let inputs = || CardChunkInputs {
+        weights: loaded,
+        embed_name: Box::leak(names.embed.clone().into_boxed_str()),
+    };
+    let build = |persistent: bool| {
+        super::card_prefill::build_card_chunk_with_stage_rows(
+            stack,
+            &d,
+            &table,
+            inputs(),
+            &options,
+            rows,
+            capacity,
+            persistent,
+        )
+        .unwrap_or_else(|error| panic!("{NAME}: the chunk build refused: {error:?}"))
+    };
+    let plain = build(false);
+    let staged = build(true);
+    assert_eq!(
+        plain.layer_staged_for_test(),
+        vec![false; 2],
+        "{NAME}: the control chunk must not carry per-layer staging"
+    );
+    assert_eq!(
+        staged.layer_staged_for_test(),
+        vec![true; 2],
+        "{NAME}: the staged chunk must carry per-layer staging on both cards"
+    );
+
+    // Each pass consumes exactly `rows` tokens of its OWN slice: rows - 1
+    // through the chunk driver and one more through the logits step, so the
+    // next pass continues the same prefill job and the staging watermark
+    // crosses chunk bounds without re-feeding earlier passes.
+    let tokens: Vec<u32> = (0..(3 * rows) as u32)
+        .map(|i| (i * 37 + 11) % 900)
+        .collect();
+    let leg = |session: &mut CardSession, chunk: &super::card_prefill::CardChunk| -> Vec<_> {
+        TokenStepper::reset(session).expect("reset leg");
+        let mut out = Vec::new();
+        for pass in 0..3 {
+            let upto = (pass + 1) * rows;
+            let (chunk_rows, [last]) = tokens[pass * rows..upto].split_at(rows - 1) else {
+                unreachable!("len checked above");
+            };
+            let fed = TokenStepper::fed(session);
+            run_card_chunk(stack, session.states_mut(), chunk, chunk_rows, fed)
+                .unwrap_or_else(|error| panic!("{NAME}: chunk {pass} refused: {error:?}"));
+            session.note_chunk_rows(chunk_rows.len());
+            out.push(TokenStepper::logits(session, *last).expect("leg logits"));
+        }
+        out
+    };
+    let plain_logits = leg(&mut session, &plain);
+    let staged_logits = leg(&mut session, &staged);
+    assert_eq!(
+        plain_logits, staged_logits,
+        "{NAME}: staged logits differ from the plain chunk"
+    );
+}
+
 fn check_card_chunk(
     devices: [usize; 2],
     rows: usize,
@@ -184,6 +283,7 @@ fn check_card_chunk(
             &options,
             rows,
             stage_rows,
+            false,
         ),
         None => build_card_chunk(stack, &d, &table, inputs(), &options, rows),
     }
