@@ -131,18 +131,27 @@ mod imp {
         if !std::is_x86_feature_detected!("avx2") {
             return q4k_q8g_row_dot_scalar(row, xq);
         }
+        static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let narrow = *NARROW
+            .get_or_init(|| std::env::var_os("FIFI_CPU_Q8G_NARROW_SUM").is_some_and(|v| v == "1"));
         // SAFETY: the AVX2 feature bit was detected at runtime just above, so the
         // SAFETY: target-feature function may run on this CPU; slice lengths were
         // SAFETY: validated by the dispatching matvec before this call, and every
         // SAFETY: load inside is an unaligned `loadu` within those validated bounds.
-        unsafe { q4k_q8g_row_dot_avx2(row, xq) }
+        unsafe {
+            if narrow {
+                q4k_q8g_row_dot_avx2::<true>(row, xq)
+            } else {
+                q4k_q8g_row_dot_avx2::<false>(row, xq)
+            }
+        }
     }
 
     /// The `isum_j` of the eight sub-blocks of one block as eight exact i32 lanes: per sub-block
-    /// a `maddubs`/`madd` partial vector, then three `hadd_epi32` levels. Integer adds commute,
-    /// so the lane order of the horizontal sums cannot change a bit.
+    /// reduce product pairs at either i16 or i32 width, then combine the two 128-bit halves.
+    /// Both trees retain the original group order and compute exact integer sums.
     #[target_feature(enable = "avx2")]
-    unsafe fn sub_block_sums(blk: &[u8], q8: &[i8]) -> __m256i {
+    unsafe fn sub_block_sums<const NARROW: bool>(blk: &[u8], q8: &[i8]) -> __m256i {
         // SAFETY: called only from `q4k_q8g_row_dot_avx2` after the runtime AVX2 check; `blk`
         // SAFETY: is a whole 144-byte block and `q8` a whole 256-value block, so every 32-byte
         // SAFETY: unaligned load below stays inside them.
@@ -158,14 +167,36 @@ mod imp {
                 let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), nib);
                 let qa = _mm256_loadu_si256(qc.as_ptr() as *const __m256i);
                 let qb = _mm256_loadu_si256(qc[32..].as_ptr() as *const __m256i);
-                p[2 * c] = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, qa), ones);
-                p[2 * c + 1] = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, qb), ones);
+                let a = _mm256_maddubs_epi16(lo, qa);
+                let b = _mm256_maddubs_epi16(hi, qb);
+                if NARROW {
+                    p[2 * c] = a;
+                    p[2 * c + 1] = b;
+                } else {
+                    p[2 * c] = _mm256_madd_epi16(a, ones);
+                    p[2 * c + 1] = _mm256_madd_epi16(b, ones);
+                }
             }
-            let a = _mm256_hadd_epi32(p[0], p[1]);
-            let b = _mm256_hadd_epi32(p[2], p[3]);
-            let c = _mm256_hadd_epi32(p[4], p[5]);
-            let d = _mm256_hadd_epi32(p[6], p[7]);
-            let (ab, cd) = (_mm256_hadd_epi32(a, b), _mm256_hadd_epi32(c, d));
+            let (ab, cd) = if NARROW {
+                // Each i16 initially holds two products. After two horizontal adds
+                // it holds eight, bounded by 8 * 15 * 128 = 15360. Widen before
+                // joining the two halves of the 32-value group.
+                let four_groups = |a, b, c, d| {
+                    let ab = _mm256_hadd_epi16(a, b);
+                    let cd = _mm256_hadd_epi16(c, d);
+                    _mm256_madd_epi16(_mm256_hadd_epi16(ab, cd), ones)
+                };
+                (
+                    four_groups(p[0], p[1], p[2], p[3]),
+                    four_groups(p[4], p[5], p[6], p[7]),
+                )
+            } else {
+                let a = _mm256_hadd_epi32(p[0], p[1]);
+                let b = _mm256_hadd_epi32(p[2], p[3]);
+                let c = _mm256_hadd_epi32(p[4], p[5]);
+                let d = _mm256_hadd_epi32(p[6], p[7]);
+                (_mm256_hadd_epi32(a, b), _mm256_hadd_epi32(c, d))
+            };
             let lo = _mm_add_epi32(_mm256_castsi256_si128(ab), _mm256_extracti128_si256(ab, 1));
             let hi = _mm_add_epi32(_mm256_castsi256_si128(cd), _mm256_extracti128_si256(cd, 1));
             _mm256_set_m128i(hi, lo)
@@ -175,7 +206,7 @@ mod imp {
     /// AVX2 row dot of `n` whole Q4_K blocks with a per-32 group row: bitwise identical to
     /// `q4k_q8g_row_dot_scalar` (exact integers, the same f32 products, the `tree8` order).
     #[target_feature(enable = "avx2")]
-    unsafe fn q4k_q8g_row_dot_avx2(row: &[u8], xq: &Q8gRow) -> f32 {
+    unsafe fn q4k_q8g_row_dot_avx2<const NARROW: bool>(row: &[u8], xq: &Q8gRow) -> f32 {
         let mut acc = 0.0f32;
         for (b, blk) in row.as_chunks::<Q4K_BLOCK_BYTES>().0.iter().enumerate() {
             let d_w = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
@@ -193,7 +224,7 @@ mod imp {
             // SAFETY: 32-byte loads read inside them; the other calls take values or the
             // SAFETY: bounds-checked slices of `sub_block_sums`.
             let (t1, t2) = unsafe {
-                let isum = sub_block_sums(blk, q8);
+                let isum = sub_block_sums::<NARROW>(blk, q8);
                 let sc_v =
                     _mm256_setr_epi32(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5], sc[6], sc[7]);
                 let mn_v =
