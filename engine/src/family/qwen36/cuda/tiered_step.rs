@@ -686,6 +686,12 @@ impl<'w> TieredRuntime<'w> {
         self.cold.as_ref().map_or(0, ColdStaging::cap)
     }
 
+    /// The configured tiered pool timeout, so chunk joins wait the same budget
+    /// the decode path does (not a hard-coded wall-clock of their own).
+    pub(super) fn pool_timeout(&self) -> std::time::Duration {
+        self.host.pool_timeout()
+    }
+
     /// The checkpoint mapping the cold staging fill gathers its slices from.
     pub(super) fn cold_region(&self) -> Arc<dyn MappedRegion> {
         self.host.cold_region()

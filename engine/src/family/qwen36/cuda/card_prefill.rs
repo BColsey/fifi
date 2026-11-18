@@ -788,6 +788,19 @@ fn run_card_chunk_layer(
                         Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
                         Stage::AttnOut => attn_out(&runs[card], &ctx)?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
+                        // Tiered-chunk MoE split stages: only the single-card
+                        // Q36_TIERED_CHUNK plan names them; a P2P plan never does.
+                        Stage::MoeStart
+                        | Stage::MoeShared
+                        | Stage::MoeStage
+                        | Stage::MoeScatter
+                        | Stage::MoeBankUp
+                        | Stage::MoeColdUp
+                        | Stage::MoeSwiglu
+                        | Stage::MoeGather
+                        | Stage::MoeBankDown
+                        | Stage::MoeColdDown
+                        | Stage::MoeCombine => unreachable!("tiered chunk stage"),
                     }
                 }
             }

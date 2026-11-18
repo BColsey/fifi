@@ -21,7 +21,7 @@ use crate::family::qwen36::settings::SlotRequest;
 use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion, PoolError};
 use crate::family::qwen36::tiered::guess::{GuessError, LayerRouter, RouterGuess};
 use crate::family::qwen36::tiered::host::TieredHost;
-use crate::family::qwen36::tiered::locator::{ExpertLocator, ExpertTensorNames};
+use crate::family::qwen36::tiered::locator::{ExpertLocator, ExpertTensorNames, require_q4k_shexp};
 use crate::family::qwen36::tiered::{PolicyMode, TieredConfig};
 use crate::family::tier_budget::{ExpertSize, VramBudget, plan_vram};
 use crate::kernels::cuda::{CudaContext, ExpertBank, ExpertBankGeometry};
@@ -173,6 +173,9 @@ pub(super) fn build_tiered(
         shape,
     )
     .map_err(|error| checkpoint(format!("{error:?}")))?;
+    // The shexp refusal beside the routed one: the chunk facts assert a Q4_K
+    // shared expert, so the attach proves it before the banks exist.
+    require_q4k_shexp(header, layers).map_err(|error| checkpoint(format!("{error:?}")))?;
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
     let region: Arc<dyn MappedRegion> = Arc::new(mapped);

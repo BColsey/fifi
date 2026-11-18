@@ -447,6 +447,11 @@ impl TieredHost {
     /// with its REAL router weight, and every missed expert past `cold_cap` stays a CPU
     /// pool group with the weight-0.0 dummy of today — then stash the routes per row for
     /// the chunk boundary. `cold_cap` 0 keeps today's two-way plan exactly.
+    /// The configured pool timeout every join uses (decode and chunk alike).
+    pub fn pool_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn begin_chunk_layer(
         &mut self,
         layer: usize,
