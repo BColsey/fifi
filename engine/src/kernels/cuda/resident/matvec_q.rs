@@ -20,46 +20,56 @@ use crate::kernels::cuda::context::{
 #[cfg(test)]
 use crate::kernels::cuda::native;
 use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launch};
+use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
+
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
 use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 
-/// The four weight formats the trimmed vendored MMVQ instantiates (Qwen3.6 and Mellum). The
-/// discriminants are the `ggml_type` values of the shim `ggml.h` (`GGML_TYPE_Q4_K = 12`,
-/// `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from memory.
+/// The weight formats the matvec serves. The four `Vendored` discriminants name the trimmed
+/// vendored MMVQ instantiations (Qwen3.6 and Mellum) and are the `ggml_type` values of the shim
+/// `ggml.h` (`GGML_TYPE_Q4_K = 12`, `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from
+/// memory. `Q5K` is the in-house Q5_K kernel (`native/resident/matvec_q5k.cu`): it never
+/// enters the vendored switch and carries no `ggml_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantType {
     Q4K,
     Q50,
     Q6K,
     Q80,
+    Q5K,
 }
 
 impl QuantType {
-    /// The `ggml_type` value the vendored code switches on.
+    /// The `ggml_type` value the vendored code switches on. `Q5K` has none and never enters
+    /// the vendored switch: the dense matvec routes it to the in-house kernel first, and every
+    /// other vendored entry refuses it before this is asked.
     pub(crate) fn ggml(self) -> i32 {
         match self {
             Self::Q4K => 12,
             Self::Q50 => 6,
             Self::Q6K => 14,
             Self::Q80 => 8,
+            Self::Q5K => unreachable!("the in-house Q5_K kernel never enters the vendored switch"),
         }
     }
 
     pub(crate) fn block_size(self) -> usize {
         match self {
-            Self::Q4K | Self::Q6K => 256,
+            Self::Q4K | Self::Q6K | Self::Q5K => 256,
             Self::Q50 | Self::Q80 => 32,
         }
     }
 
-    /// Bytes per block: Q4_K 144, Q5_0 22, Q6_K 210, Q8_0 34 (ggml-common.h static_asserts).
+    /// Bytes per block: Q4_K 144, Q5_0 22, Q6_K 210, Q8_0 34 (ggml-common.h static_asserts);
+    /// Q5_K 176 (d + dmin + 12 scale bytes + 32 qh bytes + 128 qs bytes).
     pub(crate) fn block_bytes(self) -> usize {
         match self {
             Self::Q4K => 144,
             Self::Q50 => 22,
             Self::Q6K => 210,
             Self::Q80 => 34,
+            Self::Q5K => 176,
         }
     }
 
@@ -110,7 +120,23 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.plan_matvec(&call)?;
-        self.launch_on(stream, |stream_raw| matvec_q_launch(stream_raw, &raw))
+        let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan_matvec");
+        self.launch_on(stream, |stream_raw| match call.ty {
+            // The in-house Q5_K kernel: its own ABI, native blocks, whole rows.
+            QuantType::Q5K => matvec_q5k_launch(
+                stream_raw,
+                &crate::kernels::cuda::native::resident::matvec_q5k::MatvecQ5kRaw {
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
+            _ => matvec_q_launch(stream_raw, &raw),
+        })
     }
 
     fn plan_matvec<'b>(&self, call: &MatvecCall<'b>) -> Result<MatvecRaw<'b>, EngError> {
@@ -126,7 +152,8 @@ impl CudaContext {
                 call.k
             )));
         }
-        if call.rows == 0 || !call.rows.is_multiple_of(ROWS_MULTIPLE) {
+        if call.rows == 0 || (call.ty != QuantType::Q5K && !call.rows.is_multiple_of(ROWS_MULTIPLE))
+        {
             return Err(EngError::BadRequest(format!(
                 "the CUDA matvec needs rows as a positive multiple of {ROWS_MULTIPLE}, got {}",
                 call.rows

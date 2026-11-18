@@ -124,6 +124,13 @@ impl CudaContext {
                 call.k
             )));
         }
+        // The expert matvec runs the vendored MMVQ only; Q5_K experts wait for an in-house
+        // expert kernel, so they are refused here rather than reaching the discriminant.
+        if call.ty == QuantType::Q5K {
+            return Err(EngError::BadRequest(
+                "the CUDA expert matvec does not take Q5_K yet".to_owned(),
+            ));
+        }
         if call.rows == 0 || call.n_expert == 0 {
             return Err(EngError::BadRequest(
                 "the CUDA expert matvec needs rows and experts above zero".to_owned(),

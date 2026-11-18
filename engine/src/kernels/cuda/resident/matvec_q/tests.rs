@@ -99,6 +99,21 @@ pub(in crate::kernels::cuda) mod reference {
                 let q = (block[16 + 32 * j + 16 * half + l] >> (4 * nib)) & 0xF;
                 d * sc as f64 * q as f64 - dmin * m as f64
             }
+            QuantType::Q5K => {
+                let (d, dmin) = (half_at(block, 0) as f64, half_at(block, 2) as f64);
+                // 4 chunks of 64 values: [64c, 64c+32) low nibbles with qh bit 2c, [64c+32,
+                // 64c+64) high nibbles with qh bit 2c+1; the scales of the two halves are the
+                // packed 6-bit pairs of chunk c. Mirrors gguf_dequant.rs::q5_k.
+                let (chunk, half, l) = (i / 64, (i % 64) / 32, i % 32);
+                let (sc, m) = scale_min_k4(&block[4..16], 2 * chunk + half);
+                let hi = if block[16 + l] & (1u8 << (2 * chunk + half)) != 0 {
+                    16
+                } else {
+                    0
+                };
+                let q = ((block[48 + 32 * chunk + l] >> (4 * half)) & 0xF) as i32 + hi;
+                d * sc as f64 * q as f64 - dmin * m as f64
+            }
             QuantType::Q6K => {
                 let d = half_at(block, 208) as f64;
                 let sc = block[192 + i / 16] as i8;
@@ -240,6 +255,11 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(QuantType::Q6K.block_bytes(), 210);
     assert_eq!(QuantType::Q80.block_size(), 32);
     assert_eq!(QuantType::Q80.block_bytes(), 34);
+    assert_eq!(QuantType::Q5K.block_size(), 256);
+    assert_eq!(QuantType::Q5K.block_bytes(), 176);
+    assert_eq!(QuantType::Q5K.weight_bytes(64, 2048), Some(64 * 8 * 176));
+    // No ggml_type: Q5_K is served by the in-house kernel, never the vendored switch.
+    assert_eq!(QuantType::Q5K.block_bytes(), 176);
     assert_eq!(QuantType::Q4K.weight_bytes(512, 2048), Some(512 * 8 * 144));
     assert_eq!(
         QuantType::Q80.weight_bytes(8192, 2048),
@@ -249,6 +269,118 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(QuantType::Q4K.weight_bytes(usize::MAX, 256), None);
     assert_eq!(q8_1_bytes(2048, 1), Some(64 * 36));
     assert_eq!(MATRIX_ROW_PADDING, 512);
+}
+
+/// The in-house Q5_K kernel against the same host reference machinery as the vendored four,
+/// including a row count the vendored matvec would refuse (13: no row groups) and the padded
+/// activation shape (2304 pads to 2560 on the x side only).
+#[test]
+fn matvec_q5k_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q5k_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ncols = 2;
+    let mut max_ratio = 0.0f64;
+    let shapes = SHAPES
+        .into_iter()
+        .chain([PADDED_SHAPE, (2048, 13)])
+        .map(|(k, rows)| {
+            // Q5_K reads 256-value blocks: k must be a multiple of 256 (2304 is not, so the
+            // padded row rounds up on the weight side too).
+            let k = k.div_ceil(256) * 256;
+            (k, rows)
+        });
+    for (k, rows) in shapes {
+        let seed = 0x5eed_0000u64 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q5K, k, rows, ncols, seed);
+        let y_bytes = rows * ncols * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q5K,
+                w: w.range(0, QuantType::Q5K.weight_bytes(rows, k).expect("size"))
+                    .expect("w"),
+                x_q8: x_q8
+                    .range(0, q8_1_bytes(k, ncols).expect("size"))
+                    .expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec q5k");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(
+            &ctx,
+            &w,
+            QuantType::Q5K.weight_bytes(rows, k).expect("size"),
+        );
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+        for col in 0..ncols {
+            for row in 0..rows {
+                let (reference, abs) = reference::reference_dot(
+                    QuantType::Q5K,
+                    &w_bytes[row * (k / 256) * 176..],
+                    &x_bytes[col * row_bytes..],
+                    k,
+                );
+                let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                let error = (got[col * rows + row] as f64 - reference).abs();
+                let ratio = if tolerance > 0.0 {
+                    error / tolerance
+                } else {
+                    error
+                };
+                max_ratio = max_ratio.max(ratio);
+                assert!(
+                    error <= tolerance,
+                    "Q5K k {k} rows {rows} col {col} row {row}: error {error} over tol {tolerance}"
+                );
+            }
+        }
+    }
+    println!("matvec q5k: max tolerance ratio {max_ratio:.3}");
+}
+
+/// The shared pre-native refusals with Q5_K: k not a multiple of 256, and the column bound.
+/// The whole-row rule differs from the vendored four, so rows 13 is legal above, not refused.
+#[test]
+fn matvec_q5k_refuses_bad_shapes_before_the_adapter() {
+    if !testkit::device_present("matvec_q5k_refuses_bad_shapes_before_the_adapter") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (w, x_q8, _row_bytes) = rig(&ctx, &stream, QuantType::Q5K, 2048, 64, 1, 0x5eed_0001);
+    let y = testkit::upload_filled(&ctx, 0xAA, 64 * 4);
+    for (k, ncols, case) in [
+        (100usize, 1usize, "k not a multiple of 256"),
+        (2048, 9, "column bound"),
+    ] {
+        let result = ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q5K,
+                w: w.range(0, w.bytes()).expect("w"),
+                x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+                y: y.range(0, y.bytes()).expect("y"),
+                k,
+                rows: 64,
+                ncols,
+            },
+        );
+        let needle = if k != 2048 {
+            "multiple of 256"
+        } else {
+            "1 to 8 columns"
+        };
+        assert_bad_request(result, case, needle);
+    }
 }
 
 #[test]

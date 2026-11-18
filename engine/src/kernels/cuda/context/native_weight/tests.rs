@@ -32,12 +32,13 @@ fn q4k(n_rows: usize, k: usize) -> QuantTensor<'static> {
 }
 
 #[test]
-fn checked_native_takes_the_four_matvec_types_and_refuses_the_rest() {
+fn checked_native_takes_the_matvec_types_and_refuses_the_rest() {
     for (ty, quant) in [
         (GgufType::Q4K, QuantType::Q4K),
         (GgufType::Q50, QuantType::Q50),
         (GgufType::Q6K, QuantType::Q6K),
         (GgufType::Q80, QuantType::Q80),
+        (GgufType::Q5K, QuantType::Q5K),
     ] {
         let tensor = QuantTensor {
             name: "w",
@@ -51,7 +52,7 @@ fn checked_native_takes_the_four_matvec_types_and_refuses_the_rest() {
             "{ty:?}"
         );
     }
-    for ty in [GgufType::F32, GgufType::Q5K, GgufType::Q40] {
+    for ty in [GgufType::F32, GgufType::Q40, GgufType::Q2K] {
         let text = error_text(checked_native(QuantTensor {
             name: "embd",
             ty,

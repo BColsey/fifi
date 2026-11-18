@@ -226,6 +226,9 @@ fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {
         GgufType::Q50 => QuantType::Q50,
         GgufType::Q6K => QuantType::Q6K,
         GgufType::Q80 => QuantType::Q80,
+        // The in-house Q5_K matvec (native/resident/matvec_q5k.cu): native 176-byte blocks,
+        // no ggml_type discriminant.
+        GgufType::Q5K => QuantType::Q5K,
         other => {
             return Err(EngError::Checkpoint(format!(
                 "tensor {} has type {other:?}, which the CUDA native weights do not take",
