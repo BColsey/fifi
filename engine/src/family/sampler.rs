@@ -752,12 +752,7 @@ fn pick_row(
     mut obs: Option<&mut SampleObservation>,
 ) -> Result<(u32, usize), EngError> {
     if params.is_greedy() {
-        let token = if logits.len() >= GREEDY_BLOCK_SIZE && host_greedy_blocks_enabled() {
-            checked_block_argmax(logits)?
-        } else {
-            check_logits(logits)?;
-            argmax(logits)
-        };
+        let token = greedy_token(logits, host_greedy_blocks_enabled())?;
         if let Some(obs) = &mut obs {
             obs.fill_greedy(token);
         }
@@ -928,6 +923,17 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 const GREEDY_BLOCK_SIZE: usize = 256;
+
+/// The greedy token for one row. `blocks` is the cached env decision passed in so a test can
+/// pin the gated route; the `OnceLock` it comes from cannot be set from a test.
+fn greedy_token(logits: &[f32], blocks: bool) -> Result<u32, EngError> {
+    if logits.len() >= GREEDY_BLOCK_SIZE && blocks {
+        checked_block_argmax(logits)
+    } else {
+        check_logits(logits)?;
+        Ok(argmax(logits))
+    }
+}
 
 fn host_greedy_blocks_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1992,6 +1998,39 @@ mod tests {
             }
             assert_eq!(super::checked_block_argmax(&row).unwrap(), argmax(&row));
         }
+    }
+
+    #[test]
+    fn greedy_token_pins_the_gated_route_and_tie_orders() {
+        // Both routes agree on the maximum of a long row: with blocks on, the row takes
+        // the block scan the env gate cannot be made to select from a test.
+        let mut row = vec![-1.5; 600];
+        row[431] = 3.0;
+        assert_eq!(super::greedy_token(&row, true).unwrap(), 431);
+        assert_eq!(super::greedy_token(&row, false).unwrap(), 431);
+        // An all-equal row selects the first index on both routes.
+        let even = vec![2.5; 513];
+        assert_eq!(super::greedy_token(&even, true).unwrap(), 0);
+        assert_eq!(super::greedy_token(&even, false).unwrap(), 0);
+        // 0.0 before -0.0 keeps the first index: the two compare equal.
+        let mut signed = vec![0.0; 300];
+        signed[299] = -0.0;
+        assert_eq!(super::greedy_token(&signed, true).unwrap(), 0);
+        assert_eq!(super::greedy_token(&signed, false).unwrap(), 0);
+        // Positive ties across blocks and at the block boundary keep the lowest index.
+        let mut ties = vec![-2.0; 520];
+        for index in [10, 255, 300] {
+            ties[index] = 7.0;
+        }
+        assert_eq!(super::greedy_token(&ties, true).unwrap(), 10);
+        assert_eq!(super::greedy_token(&ties, false).unwrap(), 10);
+        // Both routes reject the same non-finite row with the same error.
+        let mut bad = vec![0.0; 257];
+        bad[256] = f32::NAN;
+        assert_eq!(
+            super::greedy_token(&bad, true).unwrap_err(),
+            super::greedy_token(&bad, false).unwrap_err()
+        );
     }
 
     #[test]

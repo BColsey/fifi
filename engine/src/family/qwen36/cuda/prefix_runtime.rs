@@ -68,29 +68,51 @@ fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) ->
     0
 }
 
-/// The budget covers the additional pageable snapshot payload and its token key at full
-/// context. Check space for both entries because neither has been allocated at startup.
-fn second_tiered_entry_fits(
+/// The admission probe's available budget in bytes, shared by the pinned-prefix and
+/// tiered-prefix planners. A failed probe logs `refused` (each planner states its own
+/// fallback) and reads as no budget.
+fn admission_budget(probe: &'static str, refused: &str) -> Option<usize> {
+    HostAdmission::probe(probe, "Qwen36")
+        .map(|admission| usize::try_from(admission.available_budget()).ok())
+        .inspect_err(|error| {
+            eprintln!("q36 cuda: {probe} host probe failed ({error:?}); {refused}")
+        })
+        .ok()
+        .flatten()
+}
+
+/// The budget must cover the additional pageable snapshot payload and its token key at full
+/// context, and host memory must fit both entries plus headroom because neither has been
+/// allocated at startup. Returns the refusal cause for the one-entry log, or `None` when the
+/// second entry fits.
+fn second_tiered_entry_refusal(
     payload: usize,
     capacity: usize,
     extra_budget: usize,
     available: Option<usize>,
-) -> bool {
+) -> Option<&'static str> {
+    if payload == 0 {
+        return Some("the checkpoint payload is zero");
+    }
     let Some(key) = capacity
         .checked_add(1)
         .and_then(|n| n.checked_mul(size_of::<u32>()))
     else {
-        return false;
+        return Some("the full-context token key overflows");
     };
     let Some(entry) = payload.checked_add(key) else {
-        return false;
+        return Some("the entry size overflows");
     };
-    payload > 0
-        && entry <= extra_budget
-        && entry
-            .checked_mul(2)
-            .and_then(|both| both.checked_add(PIN_MEMORY_HEADROOM))
-            .is_some_and(|required| available.is_some_and(|free| free >= required))
+    if entry > extra_budget {
+        return Some("the extra budget is below the entry size");
+    }
+    match entry
+        .checked_mul(2)
+        .and_then(|both| both.checked_add(PIN_MEMORY_HEADROOM))
+    {
+        Some(required) if available.is_some_and(|free| free >= required) => None,
+        _ => Some("available host memory is below two entries plus headroom"),
+    }
 }
 
 impl QwenResidentStep<'_> {
@@ -106,6 +128,9 @@ impl QwenResidentStep<'_> {
             return Ok(());
         };
         if self.prefix_limits().entries == 0 {
+            eprintln!(
+                "q36 cuda: {TIERED_EXTRA_BYTES_ENV} is set but ignored: tiered prefix reuse is off"
+            );
             return Ok(());
         }
         let budget = byte_limit(TIERED_EXTRA_BYTES_ENV, Some(&raw))?.unwrap_or_default();
@@ -115,14 +140,10 @@ impl QwenResidentStep<'_> {
         // The cgroup-aware admission budget, not the bare meminfo figure, for the same
         // reason as the pinned-prefix probe: a capped host must not plan a second entry
         // from memory it cannot use. A failed probe keeps the one-entry store (logged).
-        let available = HostAdmission::probe("Qwen36 tiered prefix", "Qwen36")
-            .map(|admission| usize::try_from(admission.available_budget()).ok())
-            .inspect_err(|error| {
-                eprintln!("q36 cuda: tiered prefix host probe failed ({error:?}); one entry stays")
-            })
-            .ok()
-            .flatten();
-        if second_tiered_entry_fits(payload, capacity, budget, available) {
+        let available = admission_budget("Qwen36 tiered prefix", "one entry stays");
+        if let Some(cause) = second_tiered_entry_refusal(payload, capacity, budget, available) {
+            eprintln!("q36 cuda: tiered prefix second entry refused: {cause}");
+        } else {
             self.prefix = PrefixSlot::with_limits(StoreLimits {
                 roots: 0,
                 entries: 2,
@@ -155,13 +176,7 @@ impl QwenResidentStep<'_> {
         // there is no later guard here. A failed probe plans ZERO pinned entries (logged):
         // the probe refuses on exactly the cases the clamp exists for, so falling back to the
         // unclamped figure would repeat the bug this closes.
-        let available = HostAdmission::probe("Qwen36 pinned prefix", "Qwen36")
-            .map(|admission| usize::try_from(admission.available_budget()).ok())
-            .inspect_err(|error| {
-                eprintln!("q36 cuda: pinned prefix host probe failed ({error:?}); pins stay off")
-            })
-            .ok()
-            .flatten();
+        let available = admission_budget("Qwen36 pinned prefix", "pins stay off");
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(
@@ -362,37 +377,39 @@ mod tests {
         let payload = 1024;
         let entry = payload + (capacity + 1) * size_of::<u32>();
         let available = 2 * entry + PIN_MEMORY_HEADROOM;
-        assert!(second_tiered_entry_fits(
-            payload,
-            capacity,
-            entry,
-            Some(available)
-        ));
-        assert!(!second_tiered_entry_fits(
-            payload,
-            capacity,
-            entry - 1,
-            Some(available)
-        ));
-        assert!(!second_tiered_entry_fits(
-            payload,
-            capacity,
-            entry,
-            Some(available - 1)
-        ));
-        assert!(!second_tiered_entry_fits(payload, capacity, entry, None));
+        let fits = |budget: usize, free: Option<usize>| {
+            second_tiered_entry_refusal(payload, capacity, budget, free).is_none()
+        };
+        assert!(fits(entry, Some(available)));
+        // Each refusal names its own cause.
+        assert_eq!(
+            second_tiered_entry_refusal(payload, capacity, entry - 1, Some(available)),
+            Some("the extra budget is below the entry size")
+        );
+        assert_eq!(
+            second_tiered_entry_refusal(payload, capacity, entry, Some(available - 1)),
+            Some("available host memory is below two entries plus headroom")
+        );
+        assert_eq!(
+            second_tiered_entry_refusal(payload, capacity, entry, None),
+            Some("available host memory is below two entries plus headroom")
+        );
+        assert_eq!(
+            second_tiered_entry_refusal(0, capacity, entry, Some(available)),
+            Some("the checkpoint payload is zero")
+        );
+        assert!(!fits(entry - 1, Some(available)));
+        assert!(!fits(entry, Some(available - 1)));
+        assert!(!fits(entry, None));
         for (bytes, tokens) in [
             (0, 1),
             (usize::MAX, 1),
             (usize::MAX / 2, 1),
             (1, usize::MAX),
         ] {
-            assert!(!second_tiered_entry_fits(
-                bytes,
-                tokens,
-                usize::MAX,
-                Some(usize::MAX)
-            ));
+            assert!(
+                second_tiered_entry_refusal(bytes, tokens, usize::MAX, Some(usize::MAX)).is_some()
+            );
         }
     }
 

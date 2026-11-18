@@ -21,7 +21,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FIFI_CPU_GREEDY_BLOCKS` | off | Set to `1` to scan host logits in 256-value blocks for greedy sampling. Other values use the scalar scan. Both select the first maximum and reject non-finite logits. Applies to host rows of at least 256 values. Restart the process to change the setting. |
+| `FIFI_CPU_GREEDY_BLOCKS` | off | Set to `1` to scan host logits in 256-value blocks for greedy sampling. Other values use the scalar scan. Both select the first maximum and reject non-finite logits. Applies to host rows of at least 256 values. Restart the process to change the setting. The contributor's measured draw-cost figure (0.20 to 0.03 ms) is not verified on our hosts. |
 | `ENGINESRV_WARM_TURNS` | on (switch) | With `prefix_reuse`, remember the last conversation's tokens so that the next turn only tokenizes its new messages. A request from another conversation replaces the memory. |
 | `ENGINESRV_PREFIX_BLOCK_MATCH` | on (switch) | With `prefix_reuse`, also save one block checkpoint, cut at a multiple of `ENGINESRV_PREFIX_BLOCK_TOKENS` tokens just before the end of the conversation, so a prompt that changes only near its end can still reuse most of it. Used by engines that keep at least two saved prefixes. |
 | `ENGINESRV_PREFIX_BLOCK_TOKENS` | 4,096 | Spacing of the cut points, in tokens. Values below 1 select the default. |
@@ -79,7 +79,7 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `Q36_CUDA_MIN_FREE_MIB` | admission default | MiB count | Free-after-load floor of the CUDA memory admission, the same bytes for the gate's qualified loop and the server start; parsed once so the checks cannot diverge. An out-of-range value refuses with the accepted range named. |
 | `Q36_TIERED_GUESS` | `0` | only `1` is on | Router-guess expert prefetch in the tiered token path; ships dark until qualified on a device. |
 | `Q36_TIERED_PREFIX` | `0` | only `1` is on | Tiered sessions may save and restore prefixes; default off pending device qualification. |
-| `Q36_TIERED_PREFIX_EXTRA_BYTES` | unset | unsigned byte count | With prefix reuse and `Q36_TIERED_PREFIX=1`, allows a second pageable checkpoint on single-GPU CUDA. The budget must cover its state and token key at full context. At startup, available host memory must fit both checkpoints plus 1 GiB. Otherwise the store keeps one entry. |
+| `Q36_TIERED_PREFIX_EXTRA_BYTES` | unset | unsigned byte count | With prefix reuse and `Q36_TIERED_PREFIX=1`, allows a second pageable checkpoint on single-GPU CUDA. The budget must cover its state and token key at full context. At startup, available host memory must fit both checkpoints plus 1 GiB; otherwise the store keeps one entry and names the refusing condition. A malformed value refuses the start while prefix reuse is on. The contributor's measured conversation-switch figure (22.4 s to 0.26 s on a 2080 Ti) is not verified on our hosts. |
 | `Q36_P2P_WATERFILL` | `0` | only `1` is on | Experimental multi-device GGUF path: a bandwidth-waterfill placement planner redistributes the sliceable roles instead of the even deal. |
 | `Q36_P2P_HOST_EXPERT_BYTES` | `0` | nonnegative byte count | With waterfill: per-card sliced mass moved to pinned host RAM at load (`_0` sets card 0's budget separately). An unparseable value refuses the start. |
 | `Q36_P2P_PREFIX` | `0` | only `1` is on | Experimental: prefix save/restore on the card path; wired but not yet qualified. |
