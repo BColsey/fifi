@@ -154,6 +154,19 @@ fn prefill_views_cover_every_slot_once() {
     }
 }
 
+#[test]
+fn zero_row_is_admitted_only_for_card_views() {
+    use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
+    // A single-device list carrying Zero is refused even when otherwise valid.
+    let mut native = ALL_SLOTS.to_vec();
+    native.push(ChunkSlot::Zero);
+    assert!(check_view_list(native.len(), &native, false).is_err());
+    assert!(check_view_list(native.len(), &native, true).is_ok());
+    let mut exl3 = EXL3_SLOTS.to_vec();
+    exl3.push(ChunkSlot::Zero);
+    assert!(check_view_list(exl3.len(), &exl3, true).is_err());
+}
+
 /// One row per guard of `ChunkRows::new`, each with the others satisfied, plus the accepting edges.
 #[test]
 fn chunk_rows_refuse_each_bound() {
@@ -191,13 +204,14 @@ fn view_list_checks_the_exl3_slot_set() {
     use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
     let slots = EXL3_SLOTS.to_vec();
     let text = |arena_len: usize, slots: &[ChunkSlot]| {
-        let EngError::BadRequest(text) = check_view_list(arena_len, slots).expect_err("refused")
+        let EngError::BadRequest(text) =
+            check_view_list(arena_len, slots, false).expect_err("refused")
         else {
             panic!("not a BadRequest");
         };
         text
     };
-    assert!(check_view_list(slots.len(), &slots).is_ok());
+    assert!(check_view_list(slots.len(), &slots, false).is_ok());
     let short: Vec<_> = slots
         .iter()
         .copied()
@@ -219,14 +233,14 @@ fn view_list_checks_the_exl3_slot_set() {
 fn view_list_refuses_each_guard() {
     let slots: Vec<_> = ALL_SLOTS.to_vec();
     let text = |arena_len: usize, slots: &[super::prefill_plan::ChunkSlot]| {
-        let error = check_view_list(arena_len, slots).expect_err("refused");
+        let error = check_view_list(arena_len, slots, false).expect_err("refused");
         let EngError::BadRequest(text) = &error else {
             panic!("{error:?} is not a BadRequest");
         };
         text.clone()
     };
     // The valid list (V1, V2 and V3 accept it).
-    assert!(check_view_list(35, &slots).is_ok());
+    assert!(check_view_list(35, &slots, false).is_ok());
     // V1: the arena one short of the full list.
     let v1 = text(34, &slots);
     assert!(
