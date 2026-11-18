@@ -772,7 +772,7 @@ fn sums_are_checked_not_wrapped_or_saturated() {
 const TABLE: [(S, usize, usize, Phase, Phase); 33] = [
     (S::Hidden, 8192, 0, Embed, Combine),
     (S::IdsTok, 4, 0, Embed, Embed),
-    (S::X, 8192, 0, NormA, QuantA),
+    (S::X, 8192, 0, NormA, AProj),
     (S::X2, 8192, 0, NormF, Scatter),
     (S::Q8X, 2304, Q8_1_PAD, QuantA, AProj),
     (S::Q8X2, 2304, Q8_1_PAD, Shared, Shared),

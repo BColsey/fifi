@@ -18,11 +18,30 @@ use crate::kernels::cuda::native::prefill::gemm_dq::{
     GemmDqIq4xsRaw, GemmDqLayout, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_iq4xs_launch,
     gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
 };
+use crate::kernels::cuda::resident::matvec_q::QuantType;
+
+/// The family-neutral call for [`CudaContext::gemm_dq`]: the same fields as every
+/// per-type call, because the per-type entries differ only in which block decoder the
+/// launch picks.
+#[derive(Clone)]
+pub(crate) struct GemmDqTypedCall<'b> {
+    pub(crate) w: DeviceRange<'b>,
+    pub(crate) x: DeviceRange<'b>,
+    pub(crate) y: DeviceRange<'b>,
+    pub(crate) k: usize,
+    pub(crate) rows: usize,
+    pub(crate) ncols: usize,
+    /// 0 keeps x row-major by k; otherwise x holds token rows `[ncols][x_col_stride]`.
+    pub(crate) x_col_stride: usize,
+    /// 0 keeps y row-major by rows; otherwise y holds token rows `[ncols][y_col_stride]`.
+    pub(crate) y_col_stride: usize,
+    /// x holds f32 values instead of f16 (the prefill norm-pack buffers).
+    pub(crate) x_f32: bool,
+}
 
 /// One Q5_K dequantizing GEMM: `y[r][n] = sum_k dequant(w)[r][k] * x[k][n]`, with `w` the
 /// native blocks `[rows][k / 256]`, `x` f16 row-major by `k`, `y` f32 row-major by `rows`.
 #[derive(Clone)]
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(crate) struct GemmDqQ5kCall<'b> {
     pub(crate) w: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -40,7 +59,6 @@ pub(crate) struct GemmDqQ5kCall<'b> {
 
 /// The same GEMM over Q3_K blocks: `w` is `[rows][k / 256]` blocks of 110 bytes.
 #[derive(Clone)]
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(crate) struct GemmDqQ3kCall<'b> {
     pub(crate) w: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -58,7 +76,6 @@ pub(crate) struct GemmDqQ3kCall<'b> {
 
 /// The same GEMM over Q4_0 blocks: `w` is `[rows][k / 32]` blocks of 18 bytes.
 #[derive(Clone)]
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(crate) struct GemmDqQ40Call<'b> {
     pub(crate) w: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -125,7 +142,91 @@ pub(crate) struct GemmDqIq4xsCall<'b> {
 }
 
 impl CudaContext {
-    #[allow(dead_code)] // Staged until a model caller is qualified.
+    /// The one family-neutral dispatch for the in-house dequantizing GEMM: `quant` picks
+    /// the block decoder, the field checks are the per-type entries' own, and a family
+    /// plan wires this call instead of copying a per-type match. A type without an
+    /// in-house arm is a `BadRequest` before any native call.
+    pub(crate) fn gemm_dq(
+        &self,
+        stream: &DeviceStream,
+        quant: QuantType,
+        call: GemmDqTypedCall<'_>,
+    ) -> Result<(), EngError> {
+        let GemmDqTypedCall {
+            w,
+            x,
+            y,
+            k,
+            rows,
+            ncols,
+            x_col_stride,
+            y_col_stride,
+            x_f32,
+        } = call;
+        match quant {
+            QuantType::Q5K => self.gemm_dq_q5k(
+                stream,
+                GemmDqQ5kCall {
+                    w,
+                    x,
+                    y,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride,
+                    y_col_stride,
+                    x_f32,
+                },
+            ),
+            QuantType::Q40 => self.gemm_dq_q40(
+                stream,
+                GemmDqQ40Call {
+                    w,
+                    x,
+                    y,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride,
+                    y_col_stride,
+                    x_f32,
+                },
+            ),
+            QuantType::Q3K => self.gemm_dq_q3k(
+                stream,
+                GemmDqQ3kCall {
+                    w,
+                    x,
+                    y,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride,
+                    y_col_stride,
+                    x_f32,
+                },
+            ),
+            QuantType::Iq4Xs => self.gemm_dq_iq4xs(
+                stream,
+                GemmDqIq4xsCall {
+                    w,
+                    x,
+                    y,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride,
+                    y_col_stride,
+                    x_f32,
+                },
+            ),
+            QuantType::Q80 | QuantType::Q50 | QuantType::Q4K | QuantType::Q6K => {
+                Err(EngError::BadRequest(format!(
+                    "{quant:?} rides the vendored MMQ pair, not the in-house dequantizing GEMM"
+                )))
+            }
+        }
+    }
     pub(crate) fn gemm_dq_q5k(
         &self,
         stream: &DeviceStream,
@@ -136,7 +237,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| gemm_dq_q5k_launch(stream_raw, &raw))
     }
 
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     pub(crate) fn gemm_dq_q3k(
         &self,
         stream: &DeviceStream,
@@ -268,7 +368,6 @@ impl CudaContext {
         })
     }
 
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     pub(crate) fn gemm_dq_q40(
         &self,
         stream: &DeviceStream,
@@ -334,7 +433,6 @@ impl CudaContext {
         })
     }
 
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     fn plan_gemm_dq_q5k<'b>(&self, call: &GemmDqQ5kCall<'b>) -> Result<GemmDqQ5kRaw<'b>, EngError> {
         let (w_raw, x_raw, y_raw) = (
             self.raw_range(&call.w)?,

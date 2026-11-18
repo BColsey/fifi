@@ -530,6 +530,10 @@ pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(
     for (slot, group) in groups {
         let mut first = None;
         for quant in *group {
+            if gemm_dq_ty(*quant) {
+                // The dequantizing GEMM reads the f32 rows: no q8_1 layout.
+                continue;
+            }
             let layout = mmq_type_of(*quant)
                 .map_err(|_| {
                     EngError::BadRequest(format!(
@@ -547,10 +551,16 @@ pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(
                 _ => {}
             }
         }
-        if first.is_none() {
+        if group.is_empty() {
             return Err(EngError::BadRequest(format!(
                 "prefill chunk: q8 layout: {slot:?} holds no projection"
             )));
+        }
+        if first.is_none() {
+            // Every member reads its f32 rows through the dequantizing GEMM, so
+            // the shared buffer carries no q8_1 pass at all; later groups still
+            // carry their own layout constraint.
+            continue;
         }
     }
     Ok(())
@@ -1386,6 +1396,67 @@ impl ChunkRun<'_, '_> {
     }
 }
 
+/// True when the dequantizing GEMM serves the type: it reads the f32 activation
+/// rows directly, so no q8_1 quantize pass feeds the role and it imposes no q8_1
+/// layout on a buffer it shares with vendored siblings.
+fn gemm_dq_ty(quant: crate::kernels::cuda::resident::matvec_q::QuantType) -> bool {
+    matches!(quant, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
+}
+
+/// The dequantizing-GEMM arm of a dense projection: the weight rides one of the
+/// in-house dequant types, so `gemm_dq` reads the f32 activation rows directly --
+/// no q8_1 quantize pass feeds the role -- and writes the f32 output rows in place
+/// at `col_off`.
+#[allow(clippy::too_many_arguments)] // one launch description: weight, activation, output
+fn dense_gemm_dq(
+    ctx: &crate::kernels::cuda::CudaContext,
+    stream: &crate::kernels::cuda::DeviceStream,
+    weight: &NativeWeight,
+    w_seg: Option<(usize, usize)>,
+    x: DeviceRange<'_>,
+    row_stride: usize,
+    dst: DeviceRange<'_>,
+    ld: usize,
+    col_off: usize,
+    m: usize,
+) -> Result<bool, EngError> {
+    use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
+    let quant = weight.quant();
+    if !gemm_dq_ty(quant) {
+        return Ok(false);
+    }
+    let overflow = || EngError::MemoryPlan("the dense projection size overflows".to_owned());
+    let k = weight.k();
+    let (w_off, n) = w_seg.unwrap_or_else(|| (0, weight.n_rows()));
+    let row_bytes = quant.weight_bytes(1, k).ok_or_else(overflow)?;
+    let w = weight.buffer().range(
+        w_off * row_bytes,
+        n.checked_mul(row_bytes).ok_or_else(overflow)?,
+    )?;
+    let y_span = (m - 1)
+        .checked_mul(ld)
+        .and_then(|head| head.checked_add(n))
+        .and_then(|elems| elems.checked_mul(4))
+        .ok_or_else(overflow)?;
+    let y = dst.buffer().range(dst.offset() + col_off * 4, y_span)?;
+    let launched = ctx.gemm_dq(
+        stream,
+        quant,
+        GemmDqTypedCall {
+            w,
+            x,
+            y,
+            k,
+            rows: n,
+            ncols: m,
+            x_col_stride: row_stride,
+            y_col_stride: ld,
+            x_f32: true,
+        },
+    );
+    launched.map(|()| true)
+}
+
 /// P1, the embedding.
 fn chunk_embed(
     launch: &Launch<'_>,
@@ -1445,12 +1516,26 @@ fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError
 /// Stage 2, `QuantA`: one quantize on the group representative role of the kind.
 fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
-    let rep = match ctx.kind {
-        AttentionKind::DeltaNet => Role::AttnQkv,
-        AttentionKind::Full => Role::AttnQ,
+    // The vendored members share one q8_1 buffer; the representative is the first
+    // of them, so a gemm_dq member (which reads the f32 rows) never quantizes.
+    let members: &[Role] = match ctx.kind {
+        AttentionKind::DeltaNet => &[Role::AttnQkv, Role::AttnGate, Role::SsmBeta, Role::SsmAlpha],
+        AttentionKind::Full => &[Role::AttnQ, Role::AttnK, Role::AttnV],
         AttentionKind::Qsa | AttentionKind::Sliding => {
             unreachable!("layer_stages refused the kind")
         }
+    };
+    let mut rep = None;
+    for &role in members {
+        if !gemm_dq_ty(ctx.weights.native(role)?.quant()) {
+            rep = Some(role);
+            break;
+        }
+    }
+    let Some(rep) = rep else {
+        // Every projection of the kind reads the f32 rows through the
+        // dequantizing GEMM: the shared q8_1 buffer stays unquantized.
+        return Ok(());
     };
     run.dense_input(
         launch,
@@ -1521,17 +1606,30 @@ fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
                 weight.n_rows(),
             );
         }
-        let call = MmqDenseCall {
+        if !dense_gemm_dq(
+            launch.ctx,
+            launch.stream,
             weight,
             w_seg,
-            m,
-            q8_1: run.v(ChunkSlot::Q8X)?,
-            dst: run.v(ChunkSlot::ProjD)?,
-            ld: g.delta.ld,
+            run.v(ChunkSlot::X)?,
+            g.hidden,
+            run.v(ChunkSlot::ProjD)?,
+            g.delta.ld,
             col_off,
-            fixup: run.v(ChunkSlot::Fixup)?,
-        };
-        run.dense(launch, call)?;
+            m,
+        )? {
+            let call = MmqDenseCall {
+                weight,
+                w_seg,
+                m,
+                q8_1: run.v(ChunkSlot::Q8X)?,
+                dst: run.v(ChunkSlot::ProjD)?,
+                ld: g.delta.ld,
+                col_off,
+                fixup: run.v(ChunkSlot::Fixup)?,
+            };
+            run.dense(launch, call)?;
+        }
         // Test-only ProjD hash after the launch, to bisect which launch first diverges.
         if std::env::var("FIFI_DELTA_TRACE").is_ok() {
             let dst = run.v(ChunkSlot::ProjD)?;
@@ -1598,11 +1696,16 @@ fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 /// Stage 6d, `QuantDOut`.
 fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
+    let weight = ctx.weights.native(Role::SsmOut)?;
+    if gemm_dq_ty(weight.quant()) {
+        // ssm_out reads the f32 rows through the dequantizing GEMM: Q8OD stays idle.
+        return Ok(());
+    }
     run.dense_input(
         launch,
         MmqDenseInputCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            weight: ctx.weights.native(Role::SsmOut)?,
+            weight,
             m: run.rows.m(),
             row_stride: run.model.geometry.delta.value_width,
             x: run.v(ChunkSlot::OOut)?,
@@ -1614,38 +1717,68 @@ fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 /// Stage 7d, `SsmOut`.
 fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
-    run.dense(
-        launch,
-        MmqDenseCall {
-            weight: ctx.weights.native(Role::SsmOut)?,
-            w_seg: None,
-            m: run.rows.m(),
-            q8_1: run.v(ChunkSlot::Q8OD)?,
-            dst: run.v(ChunkSlot::Delta)?,
-            ld: run.model.geometry.hidden,
-            col_off: 0,
-            fixup: run.v(ChunkSlot::Fixup)?,
-        },
-    )
+    let (m, g) = (run.rows.m(), run.model.geometry);
+    if !dense_gemm_dq(
+        launch.ctx,
+        launch.stream,
+        ctx.weights.native(Role::SsmOut)?,
+        None,
+        run.v(ChunkSlot::OOut)?,
+        g.delta.value_width,
+        run.v(ChunkSlot::Delta)?,
+        g.hidden,
+        0,
+        m,
+    )? {
+        run.dense(
+            launch,
+            MmqDenseCall {
+                weight: ctx.weights.native(Role::SsmOut)?,
+                w_seg: None,
+                m,
+                q8_1: run.v(ChunkSlot::Q8OD)?,
+                dst: run.v(ChunkSlot::Delta)?,
+                ld: g.hidden,
+                col_off: 0,
+                fixup: run.v(ChunkSlot::Fixup)?,
+            },
+        )
+    } else {
+        Ok(())
+    }
 }
 /// Stage 3a, the three attention projections.
 fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (m, g) = (run.rows.m(), run.model.geometry);
     for (role, _n, col_off) in attn_proj_cols(g) {
-        run.dense(
-            launch,
-            MmqDenseCall {
-                weight: ctx.weights.native(role)?,
-                w_seg: None,
-                m,
-                q8_1: run.v(ChunkSlot::Q8X)?,
-                dst: run.v(ChunkSlot::ProjA)?,
-                ld: g.attn.ld,
-                col_off,
-                fixup: run.v(ChunkSlot::Fixup)?,
-            },
-        )?;
+        let weight = ctx.weights.native(role)?;
+        if !dense_gemm_dq(
+            launch.ctx,
+            launch.stream,
+            weight,
+            None,
+            run.v(ChunkSlot::X)?,
+            g.hidden,
+            run.v(ChunkSlot::ProjA)?,
+            g.attn.ld,
+            col_off,
+            m,
+        )? {
+            run.dense(
+                launch,
+                MmqDenseCall {
+                    weight,
+                    w_seg: None,
+                    m,
+                    q8_1: run.v(ChunkSlot::Q8X)?,
+                    dst: run.v(ChunkSlot::ProjA)?,
+                    ld: g.attn.ld,
+                    col_off,
+                    fixup: run.v(ChunkSlot::Fixup)?,
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -2127,11 +2260,16 @@ fn attn_flash_fp16(
 /// Stage 6a, `QuantAOut`.
 fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
+    let weight = ctx.weights.native(Role::AttnOutput)?;
+    if gemm_dq_ty(weight.quant()) {
+        // attn_out reads the f32 rows through the dequantizing GEMM: Q8OA stays idle.
+        return Ok(());
+    }
     run.dense_input(
         launch,
         MmqDenseInputCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            weight: ctx.weights.native(Role::AttnOutput)?,
+            weight,
             m: run.rows.m(),
             row_stride: run.model.geometry.attn.q_width,
             x: run.v(ChunkSlot::AttnOut)?,
@@ -2143,19 +2281,35 @@ fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 /// Stage 7a, `AttnOut`.
 fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
-    run.dense(
-        launch,
-        MmqDenseCall {
-            weight: ctx.weights.native(Role::AttnOutput)?,
-            w_seg: None,
-            m: run.rows.m(),
-            q8_1: run.v(ChunkSlot::Q8OA)?,
-            dst: run.v(ChunkSlot::Delta)?,
-            ld: run.model.geometry.hidden,
-            col_off: 0,
-            fixup: run.v(ChunkSlot::Fixup)?,
-        },
-    )
+    let (m, g) = (run.rows.m(), run.model.geometry);
+    if !dense_gemm_dq(
+        launch.ctx,
+        launch.stream,
+        ctx.weights.native(Role::AttnOutput)?,
+        None,
+        run.v(ChunkSlot::AttnOut)?,
+        g.attn.q_width,
+        run.v(ChunkSlot::Delta)?,
+        g.hidden,
+        0,
+        m,
+    )? {
+        run.dense(
+            launch,
+            MmqDenseCall {
+                weight: ctx.weights.native(Role::AttnOutput)?,
+                w_seg: None,
+                m,
+                q8_1: run.v(ChunkSlot::Q8OA)?,
+                dst: run.v(ChunkSlot::Delta)?,
+                ld: g.hidden,
+                col_off: 0,
+                fixup: run.v(ChunkSlot::Fixup)?,
+            },
+        )
+    } else {
+        Ok(())
+    }
 }
 /// Stage 8, `NormF`.
 fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
@@ -2263,32 +2417,49 @@ fn run_chunk_shared(
         native_dense(&mw.shared_up)?,
         native_dense(&mw.shared_down)?,
     );
-    ctx.mmq_dense_input(
-        stream,
-        MmqDenseInputCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            weight: gate_w,
-            m,
-            row_stride: dims.hidden,
-            x: io.x2,
-            y: d.get(ChunkSlot::Q8X2)?,
-        },
-    )?;
-    let cols = shared_cols(dims);
-    for (weight, (_, col_off)) in [(gate_w, cols[0]), (up_w, cols[1])] {
-        ctx.mmq_dense(
+    if let Some(&quant_rep) = [gate_w, up_w].iter().find(|w| !gemm_dq_ty(w.quant())) {
+        // The vendored halves share one q8_1 buffer; a gemm_dq half reads the
+        // f32 rows and imposes nothing on it.
+        ctx.mmq_dense_input(
             stream,
-            MmqDenseCall {
-                weight,
-                w_seg: None,
+            MmqDenseInputCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                weight: quant_rep,
                 m,
-                q8_1: d.get(ChunkSlot::Q8X2)?,
-                dst: d.get(ChunkSlot::GuSh)?,
-                ld: 2 * dims.shared_inter,
-                col_off,
-                fixup: d.get(ChunkSlot::Fixup)?,
+                row_stride: dims.hidden,
+                x: io.x2,
+                y: d.get(ChunkSlot::Q8X2)?,
             },
         )?;
+    }
+    let cols = shared_cols(dims);
+    for (weight, (_, col_off)) in [(gate_w, cols[0]), (up_w, cols[1])] {
+        if !dense_gemm_dq(
+            ctx,
+            stream,
+            weight,
+            None,
+            io.x2,
+            dims.hidden,
+            d.get(ChunkSlot::GuSh)?,
+            2 * dims.shared_inter,
+            col_off,
+            m,
+        )? {
+            ctx.mmq_dense(
+                stream,
+                MmqDenseCall {
+                    weight,
+                    w_seg: None,
+                    m,
+                    q8_1: d.get(ChunkSlot::Q8X2)?,
+                    dst: d.get(ChunkSlot::GuSh)?,
+                    ld: 2 * dims.shared_inter,
+                    col_off,
+                    fixup: d.get(ChunkSlot::Fixup)?,
+                },
+            )?;
+        }
     }
     ctx.swiglu_rows(
         stream,
@@ -2298,30 +2469,46 @@ fn run_chunk_shared(
             act: d.get(ChunkSlot::ActSh)?,
         },
     )?;
-    ctx.mmq_dense_input(
+    if !gemm_dq_ty(down_w.quant()) {
+        ctx.mmq_dense_input(
+            stream,
+            MmqDenseInputCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                weight: down_w,
+                m,
+                row_stride: dims.shared_inter,
+                x: d.get(ChunkSlot::ActSh)?,
+                y: d.get(ChunkSlot::Q8Ash)?,
+            },
+        )?;
+    }
+    if !dense_gemm_dq(
+        ctx,
         stream,
-        MmqDenseInputCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            weight: down_w,
-            m,
-            row_stride: dims.shared_inter,
-            x: d.get(ChunkSlot::ActSh)?,
-            y: d.get(ChunkSlot::Q8Ash)?,
-        },
-    )?;
-    ctx.mmq_dense(
-        stream,
-        MmqDenseCall {
-            weight: down_w,
-            w_seg: None,
-            m,
-            q8_1: d.get(ChunkSlot::Q8Ash)?,
-            dst: d.get(ChunkSlot::ShOut)?,
-            ld: dims.hidden,
-            col_off: 0,
-            fixup: d.get(ChunkSlot::Fixup)?,
-        },
-    )
+        down_w,
+        None,
+        d.get(ChunkSlot::ActSh)?,
+        dims.shared_inter,
+        d.get(ChunkSlot::ShOut)?,
+        dims.hidden,
+        0,
+        m,
+    )? {
+        ctx.mmq_dense(
+            stream,
+            MmqDenseCall {
+                weight: down_w,
+                w_seg: None,
+                m,
+                q8_1: d.get(ChunkSlot::Q8Ash)?,
+                dst: d.get(ChunkSlot::ShOut)?,
+                ld: dims.hidden,
+                col_off: 0,
+                fixup: d.get(ChunkSlot::Fixup)?,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Stages 11-16, the grouped routed projections and their existing nonlinear operation.

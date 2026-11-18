@@ -295,7 +295,11 @@ fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngE
     Ok(vec![
         (S::Hidden, hidden, Embed, Combine),
         (S::IdsTok, word_bytes(&[m])?, Embed, Embed),
-        (S::X, hidden, NormA, QuantA),
+        // X stays live through the projections: the dequantizing GEMM (the in-house
+        // dense types) reads the f32 activation rows directly at DProj/AProj, so its
+        // output slots (ProjD, ProjA) must never share X's arena span — which the
+        // mmq protocol (X dead after the QuantA quantize) otherwise allows.
+        (S::X, hidden, NormA, AProj),
         (S::XfA, xf, NormA, NormA),
         (S::Q8X, q8_1_bytes(g.hidden, m)?, QuantA, AProj),
         (S::Delta, hidden, DOut, NormF),

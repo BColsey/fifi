@@ -435,6 +435,15 @@ fn q8_layouts_refuse_a_mixed_buffer() {
         "{error:?} does not refuse the mixed buffer"
     );
     assert!(check_q8_layouts(&[(ChunkSlot::Q8S, &[QuantType::Q4K, QuantType::Q4K])]).is_ok());
+    // A gemm_dq member imposes no q8_1 layout, even against a vendored sibling,
+    // and a group that is entirely gemm_dq never quantizes the buffer at all.
+    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q80, QuantType::Q5K])]).is_ok());
+    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q5K, QuantType::Q40])]).is_ok());
+    let error = check_q8_layouts(&[(q8x, &[])]).expect_err("refused");
+    assert!(
+        matches!(&error, EngError::BadRequest(text) if text.contains("holds no projection")),
+        "{error:?} does not refuse the empty group"
+    );
 }
 
 /// The up-half sub-view follows `dims.inter`, never a literal column.

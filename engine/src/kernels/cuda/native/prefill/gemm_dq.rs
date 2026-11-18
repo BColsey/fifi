@@ -49,14 +49,12 @@ const _: () = assert!(
 );
 
 unsafe extern "C" {
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     #[link_name = "inference_cuda_gemm_dq_q5k_launch"]
     fn gemm_dq_q5k_launch_raw(
         args: *const GemmDqArgsRepr,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     #[link_name = "inference_cuda_gemm_dq_q3k_launch"]
     fn gemm_dq_q3k_launch_raw(
         args: *const GemmDqArgsRepr,
@@ -70,7 +68,6 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
-    #[allow(dead_code)] // Staged until a model caller is qualified.
     #[link_name = "inference_cuda_gemm_dq_q40_launch"]
     fn gemm_dq_q40_launch_raw(
         args: *const GemmDqArgsRepr,
@@ -82,7 +79,6 @@ unsafe extern "C" {
 /// The Q5_K dequantizing GEMM call: `w` native blocks (`rows * k / 256 * 176` bytes), `x` the
 /// f16 activation row-major by `k` (`k * ncols` values), `y` the f32 output row-major by
 /// `rows` (`rows * ncols` values).
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) struct GemmDqQ5kRaw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -227,7 +223,6 @@ fn gemm_dq_args(
     })
 }
 
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) fn check_gemm_dq_q5k(
     call: &GemmDqQ5kRaw<'_>,
 ) -> Result<(), DeviceFailure> {
@@ -247,7 +242,6 @@ pub(in crate::kernels::cuda) fn check_gemm_dq_q5k(
     )
 }
 
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) fn gemm_dq_q5k_launch(
     stream: &RawStream,
     call: &GemmDqQ5kRaw<'_>,
@@ -274,7 +268,6 @@ pub(in crate::kernels::cuda) fn gemm_dq_q5k_launch(
 /// The Q3_K dequantizing GEMM call: `w` native blocks (`rows * k / 256 * 110` bytes), `x`
 /// the f16 activation row-major by `k` (`k * ncols` values), `y` the f32 output row-major by
 /// `rows` (`rows * ncols` values).
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) struct GemmDqQ3kRaw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -285,7 +278,6 @@ pub(in crate::kernels::cuda) struct GemmDqQ3kRaw<'a> {
     pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) fn gemm_dq_q3k_launch(
     stream: &RawStream,
     call: &GemmDqQ3kRaw<'_>,
@@ -372,7 +364,6 @@ pub(in crate::kernels::cuda) fn gemm_dq_iq4xs_launch(
 /// The Q4_0 dequantizing GEMM call: `w` native blocks (`rows * k / 32 * 18` bytes), `x` the
 /// f16 activation row-major by `k` (`k * ncols` values), `y` the f32 output row-major by
 /// `rows` (`rows * ncols` values).
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) struct GemmDqQ40Raw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -383,7 +374,6 @@ pub(in crate::kernels::cuda) struct GemmDqQ40Raw<'a> {
     pub(in crate::kernels::cuda) layout: GemmDqLayout,
 }
 
-#[allow(dead_code)] // Staged until a model caller is qualified.
 pub(in crate::kernels::cuda) fn gemm_dq_q40_launch(
     stream: &RawStream,
     call: &GemmDqQ40Raw<'_>,
