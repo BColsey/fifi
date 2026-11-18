@@ -40,6 +40,7 @@ fn checked_native_takes_the_matvec_types_and_refuses_the_rest() {
         (GgufType::Q80, QuantType::Q80),
         (GgufType::Q5K, QuantType::Q5K),
         (GgufType::Q40, QuantType::Q40),
+        (GgufType::Q3K, QuantType::Q3K),
     ] {
         let tensor = QuantTensor {
             name: "w",

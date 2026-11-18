@@ -75,6 +75,17 @@ pub(in crate::kernels::cuda) mod reference {
         (lo4 as i32) | ((((qh >> (2 * quarter)) & 3) as i32) << 4)
     }
 
+    /// One of the 16 packed 6-bit sub-scales of the ggml aux shuffle, mirroring
+    /// `Q3kDecoder::scale_of` (prefill/gemm_dq_decoders.cuh) and the CPU oracle: scale `is`
+    /// is byte is&3 of row is>>2, low nibble of ks[(row&1)*4 + byte] at shift 4*(row>>1),
+    /// plus the 2-bit high field of ks[8+byte] at shift 2*row.
+    fn q3k_scale_of(ks: &[u8], is: usize) -> i32 {
+        let (row, byte) = (is >> 2, is & 3);
+        let lo = ((ks[(row & 1) * 4 + byte] >> (4 * (row >> 1))) & 0x0f) as i32;
+        let hi = (((ks[8 + byte] >> (2 * row)) & 0x03) as i32) << 4;
+        lo | hi
+    }
+
     pub(super) fn weight_value(ty: QuantType, block: &[u8], i: usize) -> f64 {
         match ty {
             QuantType::Q80 => half_at(block, 0) as f64 * (block[2 + i] as i8) as f64,
@@ -119,6 +130,23 @@ pub(in crate::kernels::cuda) mod reference {
                 };
                 let q = ((block[48 + 32 * chunk + l] >> (4 * half)) & 0xF) as i32 + hi;
                 d * sc as f64 * q as f64 - dmin * m as f64
+            }
+            QuantType::Q3K => {
+                let d = half_at(block, 108) as f64;
+                // Mirrors Q3kDecoder and the CPU oracle: value i lives in chunk c = i/64,
+                // reads qs bit pair 2*j and hmask bit 4*(c>>1) + j with j = 2*(c&1) +
+                // (i%64)/32, at group g2 = (i%32)/16 and low nibble l = i%16; a CLEAR
+                // hmask bit subtracts 4, and the sub-scale is biased by 32.
+                let (c, jp, g2, l) = (i / 64, (i % 64) / 32, (i % 32) / 16, i % 16);
+                let j = 2 * (c & 1) + jp;
+                let qv = ((block[32 + 32 * (c >> 1) + 16 * g2 + l] >> (2 * j)) & 3) as i32
+                    - if block[16 * g2 + l] & (1 << (4 * (c >> 1) + j)) == 0 {
+                        4
+                    } else {
+                        0
+                    };
+                let sc = q3k_scale_of(&block[96..108], (c >> 1) * 8 + 2 * j + g2) - 32;
+                d * sc as f64 * qv as f64
             }
             QuantType::Q6K => {
                 let d = half_at(block, 208) as f64;
@@ -208,6 +236,11 @@ pub(in crate::kernels::cuda) mod reference {
                 let d6 = testkit::f64_to_f16_bits(0.05 + rng.below(190) as f64 / 100.0);
                 block[208..210].copy_from_slice(&d6.to_le_bytes());
             }
+            if ty == QuantType::Q3K {
+                // Same for Q3_K's d half at 108, over the hmask/qs/scales fill.
+                let d3 = testkit::f64_to_f16_bits(0.05 + rng.below(190) as f64 / 100.0);
+                block[108..110].copy_from_slice(&d3.to_le_bytes());
+            }
         }
         bytes
     }
@@ -266,6 +299,9 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(QuantType::Q5K.weight_bytes(64, 2048), Some(64 * 8 * 176));
     // No ggml_type: Q5_K is served by the in-house kernel, never the vendored switch.
     assert_eq!(QuantType::Q5K.block_bytes(), 176);
+    assert_eq!(QuantType::Q3K.block_size(), 256);
+    assert_eq!(QuantType::Q3K.block_bytes(), 110);
+    assert_eq!(QuantType::Q3K.weight_bytes(64, 2048), Some(64 * 8 * 110));
     assert_eq!(QuantType::Q4K.weight_bytes(512, 2048), Some(512 * 8 * 144));
     assert_eq!(
         QuantType::Q80.weight_bytes(8192, 2048),
@@ -387,6 +423,204 @@ fn matvec_q5k_refuses_bad_shapes_before_the_adapter() {
         };
         assert_bad_request(result, case, needle);
     }
+}
+
+/// The in-house Q3_K kernel against the same host reference machinery, at the plan
+/// line's shapes: k 256/512/1024, rows 13 as a non-multiple (the whole-row exemption),
+/// and both column bounds 1 and 8. k 2304 pins the padded column stride: x pads to 2560
+/// (80 q8_1 blocks per column, 72 weight blocks).
+#[test]
+fn matvec_q3k_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q3k_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    for (k, rows) in [(256usize, 512usize), (512, 2048), (1024, 13), (2304, 64)] {
+        for &ncols in &[1usize, 8usize] {
+            let seed = 0x5eed_2000u64 + k as u64 + rows as u64 + ncols as u64;
+            let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q3K, k, rows, ncols, seed);
+            let y_bytes = rows * ncols * 4;
+            let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+            ctx.matvec_q(
+                &stream,
+                MatvecCall {
+                    ty: QuantType::Q3K,
+                    w: w.range(0, QuantType::Q3K.weight_bytes(rows, k).expect("size"))
+                        .expect("w"),
+                    x_q8: x_q8
+                        .range(0, q8_1_bytes(k, ncols).expect("size"))
+                        .expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols,
+                },
+            )
+            .expect("matvec q3k");
+            stream.synchronize().expect("drain");
+            let got = read_f32(&ctx, &y, y_bytes);
+            let w_bytes = testkit::read_bytes(
+                &ctx,
+                &w,
+                QuantType::Q3K.weight_bytes(rows, k).expect("size"),
+            );
+            let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let (reference, abs) = reference::reference_dot(
+                        QuantType::Q3K,
+                        &w_bytes[row * (k / 256) * 110..],
+                        &x_bytes[col * row_bytes..],
+                        k,
+                    );
+                    let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                    let error = (got[col * rows + row] as f64 - reference).abs();
+                    let ratio = if tolerance > 0.0 {
+                        error / tolerance
+                    } else {
+                        error
+                    };
+                    max_ratio = max_ratio.max(ratio);
+                    assert!(
+                        error <= tolerance,
+                        "Q3K k {k} rows {rows} ncols {ncols} col {col} row {row}: \
+                         error {error} over tol {tolerance}"
+                    );
+                }
+            }
+        }
+    }
+    println!("matvec q3k: max tolerance ratio {max_ratio:.3}");
+}
+
+/// One flipped bit per field — an hmask bit, a qs pair, a scale nibble — must each
+/// move an output: this pins that every field of the 110-byte block feeds the dot.
+#[test]
+fn matvec_q3k_catches_one_flipped_field() {
+    if !testkit::device_present("matvec_q3k_catches_one_flipped_field") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols, seed) = (512usize, 64usize, 2usize, 0x5eed_2004u64);
+    let (w, x_q8, x_row_bytes) = rig(&ctx, &stream, QuantType::Q3K, k, rows, ncols, seed);
+    let w_bytes_len = QuantType::Q3K.weight_bytes(rows, k).expect("size");
+    let y_bytes = rows * ncols * 4;
+    let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+    let run = |w: &DeviceBuffer, y: &DeviceBuffer| {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q3K,
+                w: w.range(0, w_bytes_len).expect("w"),
+                x_q8: x_q8.range(0, x_row_bytes * ncols).expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec");
+        stream.synchronize().expect("drain");
+        testkit::read_bytes(&ctx, y, y_bytes)
+    };
+    let clean = run(&w, &y);
+    let host_w = testkit::read_bytes(&ctx, &w, w_bytes_len);
+    // Row 3, block 1: three single-byte flips, one per field — hmask byte 0's bit 0
+    // (value 0's high bit), qs byte 32's pair 2*j, and the high scale bits of ks[8].
+    let base = 3 * (k / 256) * 110 + 110;
+    for (at, mask, field) in [
+        (base, 0x01u8, "hmask"),
+        (base + 32, 0x03, "qs"),
+        (base + 96 + 8, 0x10, "scale"),
+    ] {
+        let mut flipped = host_w.clone();
+        flipped[at] ^= mask;
+        let w2 = testkit::upload_bytes(&ctx, &flipped);
+        let dirty = run(&w2, &y);
+        let mut worst = 0.0f64;
+        for col in 0..ncols {
+            // y is [col][row]: row 3's outputs sit at col * rows + 3.
+            let at = 4 * (col * rows + 3);
+            let want = f32::from_le_bytes(clean[at..at + 4].try_into().unwrap());
+            let got = f32::from_le_bytes(dirty[at..at + 4].try_into().unwrap());
+            worst = worst.max(((want - got) as f64).abs());
+        }
+        assert!(
+            worst > 0.0,
+            "one flipped {field} byte must move row 3's output (worst delta {worst})"
+        );
+    }
+}
+
+/// The pre-native refusals with Q3_K: k off the 256 grid, the column bound, zero rows,
+/// and y overlapping w. rows 13 is legal above, not refused (the kernel owns whole rows).
+#[test]
+fn matvec_q3k_refuses_bad_shapes_before_the_adapter() {
+    if !testkit::device_present("matvec_q3k_refuses_bad_shapes_before_the_adapter") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (w, x_q8, _row_bytes) = rig(&ctx, &stream, QuantType::Q3K, 2048, 64, 1, 0x5eed_2001);
+    let y = testkit::upload_filled(&ctx, 0xAA, 64 * 4);
+    for (k, rows, ncols, case, needle) in [
+        (
+            100usize,
+            64usize,
+            1usize,
+            "k not a multiple of 256",
+            "multiple of 256",
+        ),
+        (2048, 64, 9, "column bound", "1 to 8 columns"),
+        (2048, 0, 1, "zero rows", "positive multiple of 4"),
+    ] {
+        let result = ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q3K,
+                w: w.range(0, w.bytes()).expect("w"),
+                x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+                y: y.range(0, y.bytes()).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        );
+        assert_bad_request(result, case, needle);
+    }
+    // The activation storage must cover the blocks: one q8_1 block where the call needs
+    // the padded 64 (the Rust twin of the adapter's new x_row_bytes floor).
+    let result = ctx.matvec_q(
+        &stream,
+        MatvecCall {
+            ty: QuantType::Q3K,
+            w: w.range(0, w.bytes()).expect("w"),
+            x_q8: x_q8.range(0, 36).expect("x"),
+            y: y.range(0, y.bytes()).expect("y"),
+            k: 2048,
+            rows: 64,
+            ncols: 1,
+        },
+    );
+    assert_bad_request(result, "undersized x_q8", "but the call needs");
+    // y inside w: the written range may share no byte with the weights.
+    let need = QuantType::Q3K.weight_bytes(64, 2048).expect("size");
+    let result = ctx.matvec_q(
+        &stream,
+        MatvecCall {
+            ty: QuantType::Q3K,
+            w: w.range(0, need).expect("w"),
+            x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+            y: w.range(0, 64 * 4).expect("y inside w"),
+            k: 2048,
+            rows: 64,
+            ncols: 1,
+        },
+    );
+    assert_bad_request(result, "y overlaps w", "y and w ranges overlap");
 }
 
 #[test]

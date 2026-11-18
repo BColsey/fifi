@@ -258,6 +258,7 @@ fn mmq_type_of(ty: QuantType) -> Result<MmqType, EngError> {
         QuantType::Q50 => Err(rule("type", "Q5_0 has no dense case")),
         QuantType::Q5K => Err(rule("type", "Q5_K has no dense case")),
         QuantType::Q40 => Err(rule("type", "Q4_0 has no dense case")),
+        QuantType::Q3K => Err(rule("type", "Q3_K has no dense case")),
     }
 }
 

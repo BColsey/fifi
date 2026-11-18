@@ -182,9 +182,10 @@ pub(crate) fn mmq_type_of(quant: QuantType) -> Result<MmqType, EngError> {
         QuantType::Q50 => Ok(MmqType::Q50),
         QuantType::Q4K => Ok(MmqType::Q4K),
         QuantType::Q6K => Ok(MmqType::Q6K),
-        // Q5_K and Q4_0 ride the dequantizing GEMM, never the mmq pair.
+        // Q5_K, Q4_0 and Q3_K ride the dequantizing GEMM, never the mmq pair.
         QuantType::Q5K => Err(rule("type", "Q5_K has no mmq case")),
         QuantType::Q40 => Err(rule("type", "Q4_0 has no mmq case")),
+        QuantType::Q3K => Err(rule("type", "Q3_K has no mmq case")),
     }
 }
 

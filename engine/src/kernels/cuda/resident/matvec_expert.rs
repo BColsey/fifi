@@ -125,9 +125,9 @@ impl CudaContext {
             )));
         }
         // The expert matvec runs the vendored MMVQ only; the in-house types (Q5_K,
-        // Q4_0) wait for an in-house expert kernel, so every type without a vendored
+        // Q4_0, Q3_K) wait for an in-house expert kernel, so every type without a vendored
         // arm is refused here rather than reaching the discriminant.
-        if matches!(call.ty, QuantType::Q5K | QuantType::Q40) {
+        if matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K) {
             return Err(EngError::BadRequest(format!(
                 "the CUDA expert matvec does not take {:?} yet",
                 call.ty

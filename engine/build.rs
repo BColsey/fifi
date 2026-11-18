@@ -112,6 +112,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/paged_position.cu",
     "src/kernels/cuda/native/resident/matvec_q5k.cu",
     "src/kernels/cuda/native/resident/matvec_q40.cu",
+    "src/kernels/cuda/native/resident/matvec_q3k.cu",
     "src/kernels/cuda/native/prefill/gemm_dq.cu",
     "src/kernels/cuda/native/resident/top_logits.cu",
     "src/kernels/cuda/native/prefill/kv8_dequant.cu",
