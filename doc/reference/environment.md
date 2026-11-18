@@ -21,6 +21,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ENGINESRV_WARM_TURNS` | on (switch) | With `prefix_reuse`, remember the last conversation's tokens so that the next turn only tokenizes its new messages. A request from another conversation replaces the memory. |
+| `ENGINESRV_SEED_RESENDS` | off (only `1` enables) | With warm turns enabled, retain the token IDs of a freshly seeded deterministic prompt so an immediate identical retry can skip rendering and tokenization. The seeded slot retains only the generation suffix beyond its existing head tokens and the 32-byte digest. |
 | `ENGINESRV_PREFIX_BLOCK_MATCH` | on (switch) | With `prefix_reuse`, also save one block checkpoint, cut at a multiple of `ENGINESRV_PREFIX_BLOCK_TOKENS` tokens just before the end of the conversation, so a prompt that changes only near its end can still reuse most of it. Used by engines that keep at least two saved prefixes. |
 | `ENGINESRV_PREFIX_BLOCK_TOKENS` | 4,096 | Spacing of the cut points, in tokens. Values below 1 select the default. |
 | `ENGINESRV_CACHE_USAGE` | on | Report reused prompt tokens in the API usage fields. Once set, only the exact values `1`, `true` and `on` keep it on. |
