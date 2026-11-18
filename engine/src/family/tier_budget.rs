@@ -224,6 +224,155 @@ pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<Host
     })
 }
 
+// ===== Store tiers =====
+
+/// The tiers an expert store can be admitted to, in admission order. The
+/// inclusive store pins every expert place, so a miss copies one way only;
+/// the ring tier pins only some spare places and streams each miss through a
+/// pinned ring. A host that cannot take either refuses — there is no third
+/// downshift, so refusal is never silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreTier {
+    /// Every expert place stays pinned in host RAM.
+    Inclusive,
+    /// `places_per_layer` spare places stay pinned (zero is valid: every
+    /// miss streams from disk, nothing is resident); each miss reads its
+    /// expert through `ring_bytes` of pinned ring slots charged to the
+    /// process budget, so the page cache holds no second copy of expert
+    /// bytes.
+    ExclusiveRing {
+        places_per_layer: usize,
+        ring_bytes: u64,
+    },
+}
+
+/// What a store-tier admission knows. Every figure comes from the caller
+/// (geometry, one host admission snapshot, the ring the exclusive tier
+/// wants); none is guessed here. All fields are bytes unless named otherwise.
+pub struct StoreTierBudget {
+    pub layers: u64,
+    pub record_bytes: u64,
+    /// Places per layer the inclusive tier pins: one per expert.
+    pub inclusive_places_per_layer: u64,
+    /// The UPPER BOUND on resident places per layer (the bank's spare
+    /// count). The planner itself picks the largest count that fits —
+    /// zero is a valid outcome (all misses from disk) — so this field is
+    /// a ceiling, never the answer.
+    pub max_places_per_layer: u64,
+    /// Pinned ring bytes the exclusive tier charges itself (slot count times
+    /// slot bytes, sector-aligned; the caller computes the product).
+    pub ring_bytes: u64,
+    /// What the process may take now (the `MemAvailable`-style snapshot).
+    pub available: u64,
+    /// Every fixed term besides the store and ring: stream scratch, n-gram
+    /// staging, engine heap, margin.
+    pub fixed_terms: u64,
+    /// The OS floor the plan must leave standing.
+    pub os_floor: u64,
+    /// The page-cache floor both tiers honour (the n-gram cache minimum).
+    pub page_cache_min: u64,
+}
+
+/// The chosen tier and its exact byte accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreTierPlan {
+    pub tier: StoreTier,
+    /// Pinned store bytes of the chosen tier.
+    pub store_bytes: u64,
+    /// Store, plus the ring on the exclusive tier, plus the fixed terms:
+    /// what this process takes.
+    pub process_bytes: u64,
+    /// `available` minus `process_bytes` and the OS floor: the page cache
+    /// left for everything else.
+    pub page_cache_left: u64,
+}
+
+/// WHY the order is fixed: the inclusive store removes a write-back from
+/// every miss, so it goes first when the host can pin every place; the
+/// moment it cannot, the ring is required (some expert then lives only on
+/// disk), so the ring tier is planned WITH its ring bytes, never without —
+/// and at the largest resident count that fits, searched downward to zero,
+/// because a smaller resident set is always better than a refusal. A host
+/// that cannot even carry the ring with zero resident places cannot serve
+/// the model at all, which is the only refusal left.
+pub fn plan_store_tiers(b: &StoreTierBudget) -> Result<StoreTierPlan, BudgetError> {
+    if b.layers == 0 {
+        return Err(bad_input("store tiers: layers must be nonzero"));
+    }
+    if b.record_bytes == 0 {
+        return Err(bad_input("store tiers: record bytes must be nonzero"));
+    }
+    if b.inclusive_places_per_layer == 0 {
+        return Err(bad_input("store tiers: the inclusive pin must be nonzero"));
+    }
+    let store_bytes = |places: u64| {
+        b.layers
+            .checked_mul(places)
+            .and_then(|p| p.checked_mul(b.record_bytes))
+            .ok_or_else(|| bad_input("store tiers: store bytes overflow u64"))
+    };
+    let inclusive_store = store_bytes(b.inclusive_places_per_layer)?;
+    let charge = |store: u64, ring: u64| -> Option<u64> {
+        store
+            .checked_add(ring)
+            .and_then(|sum| sum.checked_add(b.fixed_terms))
+            .and_then(|sum| sum.checked_add(b.os_floor))
+    };
+    // Both tiers must leave the page-cache floor standing, not merely fit.
+    let fits = |needed: u64| needed <= b.available && b.available - needed >= b.page_cache_min;
+    if let Some(plan) = charge(inclusive_store, 0).filter(|&needed| fits(needed)).map(|needed| {
+        StoreTierPlan {
+            tier: StoreTier::Inclusive,
+            store_bytes: inclusive_store,
+            process_bytes: needed - b.os_floor,
+            page_cache_left: b.available - needed,
+        }
+    }) {
+        return Ok(plan);
+    }
+    // The ring tier: the largest resident count that fits, downward to
+    // zero (all misses from disk). The zero-place charge — ring + terms +
+    // floor — is the last resort the refusal names when nothing fits.
+    for places in (0..=b.max_places_per_layer).rev() {
+        let store = store_bytes(places)?;
+        let Some(needed) = charge(store, b.ring_bytes) else {
+            return Err(bad_input("store tiers: ring-tier charge overflow u64"));
+        };
+        if needed <= b.available && b.available - needed >= b.page_cache_min {
+            return Ok(StoreTierPlan {
+                tier: StoreTier::ExclusiveRing {
+                    places_per_layer: usize::try_from(places).map_err(|_| {
+                        bad_input("store tiers: places per layer does not fit usize")
+                    })?,
+                    ring_bytes: b.ring_bytes,
+                },
+                store_bytes: store,
+                process_bytes: needed - b.os_floor,
+                page_cache_left: b.available - needed,
+            });
+        }
+    }
+    let ring_only = charge(0, b.ring_bytes)
+        .ok_or_else(|| bad_input("store tiers: ring-only charge overflow u64"))?;
+    Err(BudgetError::Overcommitted {
+        what: "expert ring tier (the last tier: no resident count fits, not even zero places with the ring alone)",
+        needed: ring_only,
+        available: b.available,
+    })
+}
+
+/// The steady-state decode rate a tier can hold, from its parts: the
+/// resident figure (measured or the control number) and the direct-read
+/// bandwidth the misses consume. Per-token time is the resident step plus
+/// the miss bytes over the measured rate, so the exclusive tier's cost is
+/// additive, never hidden.
+///
+/// `direct_bytes_per_s` is the O_DIRECT sequential rate measured once at
+/// serve start (the same ring the misses use), logged with the line below.
+/// The one serve log line that states the tier choice and its price:
+/// the tier with its resident count and ring bytes, the exact-bytes figures
+/// of the plan, the measured direct rate it was priced against, and the
+/// expected tok/s beside the resident control figure.
 fn bad_input(what: &str) -> BudgetError {
     BudgetError::BadInput(String::from(what))
 }
@@ -507,4 +656,153 @@ mod tests {
             (0, 0, cache)
         );
     }
+}
+
+#[cfg(test)]
+mod store_tier_tests {
+    //! Exact-bytes boundaries for `plan_store_tiers`. Fixture: 3 layers, one
+    //! 1000-byte record, 10 experts, a 4-place ceiling, a 2048-byte ring,
+    //! 1000 bytes of fixed terms and a 500-byte OS floor. Every expected
+    //! number below is computed by hand:
+    //!
+    //!   inclusive charge      = 3*10*1000          + 1000 + 500 = 31_500
+    //!   ring-tier charge(p)   = 3*p*1000 + 2048    + 1000 + 500 = 3000*p + 3_548
+    //!     p=4 -> 15_548   p=3 -> 12_548   p=2 -> 9_548   p=1 -> 6_548
+    //!     p=0 (ring only) -> 3_548
+
+    use super::{BudgetError, StoreTier, StoreTierBudget, plan_store_tiers};
+
+    const INCLUSIVE_NEEDED: u64 = 31_500;
+    const RING_TIER_P4: u64 = 15_548;
+    const RING_TIER_P3: u64 = 12_548;
+    const RING_ONLY: u64 = 3_548;
+
+    fn budget(available: u64) -> StoreTierBudget {
+        StoreTierBudget {
+            layers: 3,
+            record_bytes: 1_000,
+            inclusive_places_per_layer: 10,
+            max_places_per_layer: 4,
+            ring_bytes: 2_048,
+            available,
+            fixed_terms: 1_000,
+            os_floor: 500,
+            page_cache_min: 0,
+        }
+    }
+
+    #[test]
+    fn the_exact_inclusive_boundary_is_inclusive() {
+        let plan = plan_store_tiers(&budget(INCLUSIVE_NEEDED)).unwrap();
+        assert_eq!(plan.tier, StoreTier::Inclusive);
+        assert_eq!(plan.store_bytes, 30_000);
+        assert_eq!(plan.process_bytes, 30_000 + 1_000);
+        assert_eq!(plan.page_cache_left, 0);
+    }
+
+    #[test]
+    fn one_byte_short_of_inclusive_picks_the_largest_ring_count() {
+        // 31_499 < 31_500, so inclusive is out; the downward search starts
+        // at 4 places (15_548 <= 31_499) and stops there.
+        let plan = plan_store_tiers(&budget(INCLUSIVE_NEEDED - 1)).unwrap();
+        assert_eq!(
+            plan.tier,
+            StoreTier::ExclusiveRing {
+                places_per_layer: 4,
+                ring_bytes: 2_048,
+            }
+        );
+        assert_eq!(plan.store_bytes, 12_000);
+        assert_eq!(plan.process_bytes, 12_000 + 2_048 + 1_000);
+        // Hand-computed: 31_499 - 15_548 = 15_951.
+        assert_eq!(plan.page_cache_left, 15_951);
+    }
+
+    #[test]
+    fn one_byte_short_of_the_ceiling_drops_one_place_not_to_refusal() {
+        // 15_547 < 15_548 (4 places), so the search drops to 3 places
+        // (12_548 <= 15_547) — a smaller resident set, never a refusal.
+        let plan = plan_store_tiers(&budget(RING_TIER_P4 - 1)).unwrap();
+        assert_eq!(
+            plan.tier,
+            StoreTier::ExclusiveRing {
+                places_per_layer: 3,
+                ring_bytes: 2_048,
+            }
+        );
+        // Hand-computed: 15_547 - 12_548 = 2_999.
+        assert_eq!(plan.page_cache_left, (RING_TIER_P4 - 1) - RING_TIER_P3);
+    }
+
+    #[test]
+    fn a_zero_ceiling_is_a_valid_all_from_disk_tier() {
+        // Nothing resident: the ring alone (3_548) carries every miss.
+        let mut b = budget(RING_ONLY);
+        b.max_places_per_layer = 0;
+        let plan = plan_store_tiers(&b).unwrap();
+        assert_eq!(
+            plan.tier,
+            StoreTier::ExclusiveRing {
+                places_per_layer: 0,
+                ring_bytes: 2_048,
+            }
+        );
+        assert_eq!(plan.store_bytes, 0);
+        assert_eq!(plan.page_cache_left, 0);
+    }
+
+    #[test]
+    fn the_refusal_names_the_ring_only_last_resort() {
+        // 3_547 < 3_548: not even zero places with the ring fits.
+        let err = plan_store_tiers(&budget(RING_ONLY - 1)).unwrap_err();
+        match err {
+            BudgetError::Overcommitted { what, needed, available } => {
+                assert!(what.contains("not even zero"), "{what}");
+                assert_eq!(needed, RING_ONLY);
+                assert_eq!(available, RING_ONLY - 1);
+            }
+            other => panic!("expected Overcommitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_page_cache_floor_below_one_byte_refuses_inclusive_for_the_ring_tier() {
+        // Available 32_499: inclusive needs 31_500 but leaves 999 < 1000,
+        // so the floor pushes it out; 4 places leave
+        // 32_499 - 15_548 = 16_951 >= 1000 (hand-computed).
+        let mut b = budget(INCLUSIVE_NEEDED + 999);
+        b.page_cache_min = 1_000;
+        let plan = plan_store_tiers(&b).unwrap();
+        assert_eq!(
+            plan.tier,
+            StoreTier::ExclusiveRing {
+                places_per_layer: 4,
+                ring_bytes: 2_048,
+            }
+        );
+        assert_eq!(plan.page_cache_left, 16_951);
+    }
+
+    #[test]
+    fn the_page_cache_floor_refuses_the_last_tier_too() {
+        // Ring-only leaves 999 < 1000 even though it fits without the floor.
+        let mut b = budget(RING_ONLY + 999);
+        b.max_places_per_layer = 0;
+        b.page_cache_min = 1_000;
+        assert!(matches!(
+            plan_store_tiers(&b),
+            Err(BudgetError::Overcommitted { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_geometry_is_bad_input() {
+        let mut b = budget(RING_TIER_P4);
+        b.record_bytes = 0;
+        assert!(matches!(
+            plan_store_tiers(&b),
+            Err(BudgetError::BadInput(_))
+        ));
+    }
+
 }
