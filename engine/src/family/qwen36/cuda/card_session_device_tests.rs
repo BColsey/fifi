@@ -383,6 +383,26 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     let optimized_next = session.logits(4)?;
     assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
 
+    // Compare consecutive greedy draws through the same session. The first draw
+    // must latch the full-row margin before the following draws use shard winners.
+    let mut draws = |enabled| -> Result<_, EngError> {
+        TokenStepper::reset(&mut session)?;
+        session.set_compact_greedy_for_test(enabled);
+        let mut sampler = crate::family::sampler::Sampler::greedy();
+        let before = session.compact_draws;
+        let mut token = 0;
+        let mut tokens = Vec::new();
+        for _ in 0..4 {
+            token = session.next_token(token, &mut sampler, vocab)?;
+            tokens.push(token);
+        }
+        assert_eq!(session.fed(), 4);
+        assert_eq!(session.compact_draws - before, if enabled { 3 } else { 0 });
+        Ok((tokens, sampler.first_top2_margin()))
+    };
+    assert_eq!(draws(false)?, draws(true)?);
+    session.set_compact_greedy_for_test(false);
+
     // A corrupt head makes a logits-producing step fail. A prompt-only feed
     // must still succeed with that head, proving that it was not launched.
     let head = match loaded[0].get(&names.head) {
