@@ -31,6 +31,7 @@ use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub(crate) const DEFAULT_TEMPERATURE: f64 = 0.7;
 
@@ -750,14 +751,19 @@ fn pick_row(
     draw: impl FnOnce() -> f64,
     mut obs: Option<&mut SampleObservation>,
 ) -> Result<(u32, usize), EngError> {
-    check_logits(logits)?;
     if params.is_greedy() {
-        let token = argmax(logits);
+        let token = if logits.len() >= GREEDY_BLOCK_SIZE && host_greedy_blocks_enabled() {
+            checked_block_argmax(logits)?
+        } else {
+            check_logits(logits)?;
+            argmax(logits)
+        };
         if let Some(obs) = &mut obs {
             obs.fill_greedy(token);
         }
         return Ok((token, 1));
     }
+    check_logits(logits)?;
     let temperature = params.temperature;
     let top = top_logit(logits);
     let top_k = usize::try_from(params.top_k).unwrap_or(usize::MAX);
@@ -873,13 +879,18 @@ fn invalid_logits(message: &str) -> EngError {
     }
 }
 
-fn check_logits(logits: &[f32]) -> Result<(), EngError> {
+fn check_logits_width(logits: &[f32]) -> Result<(), EngError> {
     if logits.is_empty() {
         return Err(invalid_logits("logits are empty"));
     }
     if u32::try_from(logits.len()).is_err() {
         return Err(invalid_logits("logits are longer than u32::MAX"));
     }
+    Ok(())
+}
+
+fn check_logits(logits: &[f32]) -> Result<(), EngError> {
+    check_logits_width(logits)?;
     if logits.iter().any(|logit| !logit.is_finite()) {
         return Err(invalid_logits("logits hold a non-finite value"));
     }
@@ -914,6 +925,53 @@ fn argmax(logits: &[f32]) -> u32 {
         }
     }
     best_index as u32
+}
+
+const GREEDY_BLOCK_SIZE: usize = 256;
+
+fn host_greedy_blocks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FIFI_CPU_GREEDY_BLOCKS").as_deref() == Ok("1"))
+}
+
+/// Independent lanes let the compiler vectorize each block. Tracking the first block
+/// with the largest value bounds the final scan and preserves the lowest-index tie rule.
+fn checked_block_argmax(logits: &[f32]) -> Result<u32, EngError> {
+    check_logits_width(logits)?;
+    // Accumulate all flags so validation can also process multiple values per iteration.
+    if logits.iter().fold(false, |bad, x| bad | !x.is_finite()) {
+        return Err(invalid_logits("logits hold a non-finite value"));
+    }
+
+    let mut maximum = f32::NEG_INFINITY;
+    let mut winning_block = 0;
+    for (index, block) in logits.chunks(GREEDY_BLOCK_SIZE).enumerate() {
+        let (groups, tail) = block.as_chunks::<8>();
+        let mut maxima = [f32::NEG_INFINITY; 8];
+        for group in groups {
+            for (best, &value) in maxima.iter_mut().zip(group) {
+                if value > *best {
+                    *best = value;
+                }
+            }
+        }
+        let block_max = maxima
+            .iter()
+            .chain(tail)
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if block_max > maximum {
+            maximum = block_max;
+            winning_block = index;
+        }
+    }
+    let start = winning_block * GREEDY_BLOCK_SIZE;
+    let winner = &logits[start..];
+    let offset = winner[..winner.len().min(GREEDY_BLOCK_SIZE)]
+        .iter()
+        .position(|&value| value == maximum)
+        .expect("winning finite block contains its maximum");
+    Ok((start + offset) as u32)
 }
 
 /// The largest `top_k` the bounded heap takes. Above it the heap's `O(n log top_k)` churn costs
@@ -1913,6 +1971,48 @@ mod tests {
         let mut sampler = Sampler::greedy();
         assert_eq!(draws(&mut sampler, &[-5.0, -1.0, -3.0], 1), [1]);
         assert_eq!(draws(&mut sampler, &[0.5], 1), [0]);
+    }
+
+    #[test]
+    fn block_greedy_matches_scalar_at_lane_and_block_boundaries() {
+        for len in [1, 7, 8, 9, 255, 256, 257, 511, 512, 513, 248_320] {
+            let mut row: Vec<_> = (0..len).map(|i| -((i % 17 + 1) as f32)).collect();
+            for first in [0, 7, 8, 254, 255, 256, len - 1] {
+                if first >= len {
+                    continue;
+                }
+                let last = len - 1;
+                let (old_first, old_last) = (row[first], row[last]);
+                row[first] = -0.0;
+                row[last] = 0.0;
+                assert_eq!(super::checked_block_argmax(&row).unwrap(), first as u32);
+                assert_eq!(Sampler::greedy().sample(&row).unwrap(), first as u32);
+                row[first] = old_first;
+                row[last] = old_last;
+            }
+            assert_eq!(super::checked_block_argmax(&row).unwrap(), argmax(&row));
+        }
+    }
+
+    #[test]
+    fn block_greedy_rejects_invalid_rows_even_after_the_winner() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut row = [0.0; 513];
+            row[0] = f32::MAX;
+            row[512] = value;
+            assert_eq!(
+                super::checked_block_argmax(&row).unwrap_err(),
+                check_logits(&row).unwrap_err()
+            );
+            assert_eq!(
+                Sampler::greedy().sample(&row).unwrap_err(),
+                check_logits(&row).unwrap_err()
+            );
+        }
+        assert_eq!(
+            super::checked_block_argmax(&[]).unwrap_err(),
+            check_logits(&[]).unwrap_err()
+        );
     }
 
     // Seed 0 gives the units 0.8833, 0.4315, and 0.0264. Four equal logits split [0, 1) into four

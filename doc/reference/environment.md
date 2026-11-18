@@ -21,6 +21,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FIFI_CPU_GREEDY_BLOCKS` | off | Set to `1` to scan host logits in 256-value blocks for greedy sampling. Other values use the scalar scan. Both select the first maximum and reject non-finite logits. Applies to host rows of at least 256 values. Restart the process to change the setting. |
 | `ENGINESRV_WARM_TURNS` | on (switch) | With `prefix_reuse`, remember the last conversation's tokens so that the next turn only tokenizes its new messages. A request from another conversation replaces the memory. |
 | `ENGINESRV_PREFIX_BLOCK_MATCH` | on (switch) | With `prefix_reuse`, also save one block checkpoint, cut at a multiple of `ENGINESRV_PREFIX_BLOCK_TOKENS` tokens just before the end of the conversation, so a prompt that changes only near its end can still reuse most of it. Used by engines that keep at least two saved prefixes. |
 | `ENGINESRV_PREFIX_BLOCK_TOKENS` | 4,096 | Spacing of the cut points, in tokens. Values below 1 select the default. |
