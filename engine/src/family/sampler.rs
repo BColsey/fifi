@@ -550,7 +550,14 @@ impl Sampler {
         // Latch the request's first-decode margin after the row proved valid (empty or
         // non-finite rows fail above and leave the latch untouched).
         if self.first_top2_margin.is_none() {
-            self.first_top2_margin = top2_margin(logits);
+            self.first_top2_margin = if self.params.is_greedy()
+                && logits.len() >= GREEDY_BLOCK_SIZE
+                && host_greedy_blocks_enabled()
+            {
+                Some(greedy_margin(logits, token as usize))
+            } else {
+                top2_margin(logits)
+            };
         }
         Ok(token)
     }
@@ -934,6 +941,38 @@ fn host_greedy_blocks_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FIFI_CPU_GREEDY_BLOCKS").as_deref() == Ok("1"))
 }
 
+/// Maximum of a previously validated slice, or negative infinity for an empty slice.
+#[inline]
+fn finite_max(values: &[f32]) -> f32 {
+    let (groups, tail) = values.as_chunks::<8>();
+    let mut maxima = [f32::NEG_INFINITY; 8];
+    for group in groups {
+        for (best, &value) in maxima.iter_mut().zip(group) {
+            if value > *best {
+                *best = value;
+            }
+        }
+    }
+    maxima
+        .iter()
+        .chain(tail)
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// The greedy draw already found the first maximum and validated the whole row.
+/// Its runner-up is the maximum on either side of the winning index.
+fn greedy_margin(logits: &[f32], winner: usize) -> f32 {
+    let top = logits[winner];
+    if top == 0.0 {
+        // Equal signed zeros can give the reported margin a negative sign.
+        return top2_margin(logits).expect("a block-sized finite row has a runner-up");
+    }
+    let left = finite_max(&logits[..winner]);
+    let right = finite_max(&logits[winner + 1..]);
+    top - left.max(right)
+}
+
 /// Independent lanes let the compiler vectorize each block. Tracking the first block
 /// with the largest value bounds the final scan and preserves the lowest-index tie rule.
 fn checked_block_argmax(logits: &[f32]) -> Result<u32, EngError> {
@@ -946,20 +985,7 @@ fn checked_block_argmax(logits: &[f32]) -> Result<u32, EngError> {
     let mut maximum = f32::NEG_INFINITY;
     let mut winning_block = 0;
     for (index, block) in logits.chunks(GREEDY_BLOCK_SIZE).enumerate() {
-        let (groups, tail) = block.as_chunks::<8>();
-        let mut maxima = [f32::NEG_INFINITY; 8];
-        for group in groups {
-            for (best, &value) in maxima.iter_mut().zip(group) {
-                if value > *best {
-                    *best = value;
-                }
-            }
-        }
-        let block_max = maxima
-            .iter()
-            .chain(tail)
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let block_max = finite_max(block);
         if block_max > maximum {
             maximum = block_max;
             winning_block = index;
@@ -1991,6 +2017,32 @@ mod tests {
                 row[last] = old_last;
             }
             assert_eq!(super::checked_block_argmax(&row).unwrap(), argmax(&row));
+        }
+    }
+
+    #[test]
+    fn block_greedy_first_margin_matches_the_ordered_scan_bit_for_bit() {
+        for n in [256, 257, 511, 512, 513, 248_077] {
+            for (a, b) in [(0, 7), (7, 8), (255, n - 1), (n - 1, 0)] {
+                for (first, second) in [
+                    (3.0, 1.0),
+                    (-1.0, -2.0),
+                    (3.0, 3.0),
+                    (-0.0, 0.0),
+                    (0.0, -0.0),
+                    (f32::MAX, -f32::MAX),
+                ] {
+                    let mut row = vec![-f32::MAX; n];
+                    row[a] = first;
+                    row[b] = second;
+                    let id = argmax(&row);
+                    let margin = super::top2_margin(&row).unwrap().to_bits();
+                    assert_eq!(super::greedy_margin(&row, id as usize).to_bits(), margin);
+                    let mut sampler = Sampler::greedy();
+                    assert_eq!(sampler.sample(&row).unwrap(), id);
+                    assert_eq!(sampler.first_top2_margin().unwrap().to_bits(), margin);
+                }
+            }
         }
     }
 
