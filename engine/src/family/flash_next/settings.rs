@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_VOCAB_SIZE: u32 = 248_077;
 /// Prompt tokens per `prefill` call. At 0.246 s per token a chunk of 16 takes about 4 s, which
 /// bounds how long a cancellation waits.
 pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 16;
-pub(crate) const MAX_PREFILL_CHUNK: u32 = 512;
+pub(crate) const MAX_PREFILL_CHUNK: u32 = 2048;
 
 /// The `flash_next` object of an engine entry. Every member is optional.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -578,14 +578,14 @@ mod tests {
                     prefill_chunk: Some(0),
                     ..full()
                 },
-                "prefill_chunk must be between 1 and 512, found 0",
+                "prefill_chunk must be between 1 and 2048, found 0",
             ),
             (
                 FlashOptions {
-                    prefill_chunk: Some(513),
+                    prefill_chunk: Some(2049),
                     ..full()
                 },
-                "prefill_chunk must be between 1 and 512, found 513",
+                "prefill_chunk must be between 1 and 2048, found 2049",
             ),
             (
                 FlashOptions {

@@ -547,10 +547,10 @@ fn swiglu_rows_refuses_shapes_the_kernel_refuses() {
     const BIG: usize = 1 << 31;
     let tag = |rule: &str, detail: &str| format!("swiglu_rows: {rule}: {detail}");
     let cases = vec![
-        case("rows 0", &tag("rows", "rows is 0, not 1 to 16384"), |r| {
+        case("rows 0", &tag("rows", "rows is 0, not 1 to 32768"), |r| {
             r.shape.rows = 0
         }),
-        case("rows 16385", &tag("rows", "rows is 16385, not 1 to"), |r| {
+        case("rows 32769", &tag("rows", "rows is 32769, not 1 to"), |r| {
             r.shape.rows = MAX_ROWS + 1
         }),
         case("n_ff 0", &tag("n_ff", "n_ff is 0, not 4 to 32768"), |r| {
@@ -971,12 +971,12 @@ fn swiglu_rows_passes_nan_and_inf_through() {
 
 #[test]
 fn swiglu_rows_needs_are_exact() {
-    // The Qwen MoE shape at the 16,384-row cap: the whole [rows][1,024] gu and [rows][512] act.
+    // The Qwen MoE shape at the 32,768-row cap: the whole [rows][1,024] gu and [rows][512] act.
     assert_eq!(
         swiglu_rows_needs(&qwen(MAX_ROWS)),
         Some(SwigluRowsNeeds {
-            gu: 67_108_864,
-            act: 33_554_432
+            gu: 134_217_728,
+            act: 67_108_864
         })
     );
     // The layout shape of test 2: the last row ends at its up half (6 * 88 + 80 floats) and at

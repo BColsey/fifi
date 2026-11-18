@@ -32,18 +32,16 @@
 //! mix — rows 1.. keep the default split in every arm.
 //!
 //! The wide oracle runs read three test-only variables: `FIFI_RING_ORACLE_ROWS` sets the
-//! row count (required by the wide oracle; the measured legs are 49 and 1,024 rows —
-//! 2,048 is refused at this commit),
+//! row count (required by the wide oracle; the measured legs are 49, 1,024 and
+//! 2,048 rows — the cap lifted below admits 2,048),
 //! `FIFI_RING_REF_CACHE` names a
 //! directory where the fp64 references are cached by input hash — computed host-side before any
 //! device work, so a warm oracle leg holds the card for its launches only — and
 //! `FIFI_RING_CONTROL_STRIDE` runs the same-family control on every Nth row (default 1: every
 //! row; a stride also keeps the last row and the two rows either side of the midpoint).
-//! The oracle covers up to 1,024 rows: at 2,048 the grouped pass refuses, because one
-//! routed group hands swiglu_rows up to about ten expert rows per prompt row (18,779
-//! at 2,048) over its 16,384-row cap (swiglu_rows MAX_ROWS) — a real limit of the
-//! shared prefill (widest piece today ~16,384/top_k rows), recorded as a finding, not
-//! patched around. At
+//! The oracle covers 1,024 rows under the shared 16,384-row cap (swiglu_rows
+//! MAX_ROWS); this commit lifts that cap to 32,768, so 2,048 prompt rows (up to
+//! 18,779 expert rows per group) are admitted. At
 //! 1,024 rows the all-resident reference is launched row by row, which costs about 19 minutes
 //! of card for the comparisons alone — measured 2026-11-18, every-row control would add ~62
 //! min per layer at ~1.8 s a row, hence the stride (131 rows per layer at stride 8: 231 s and

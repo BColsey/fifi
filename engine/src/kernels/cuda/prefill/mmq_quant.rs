@@ -52,7 +52,7 @@ pub(crate) const K_MAX: usize = 32_768;
 const ROW_STRIDE_MAX: usize = 1 << 30;
 /// The gathered/scattered column bound: `ne_get_rows = M * top_k` at top_k 8 and the 2,048
 /// chunk cap.
-const ROWS_LIMIT: usize = 16_384;
+const ROWS_LIMIT: usize = 32_768;
 /// The top_k bound (the ids guard's own rule).
 const TOP_K_LIMIT: usize = 32;
 
