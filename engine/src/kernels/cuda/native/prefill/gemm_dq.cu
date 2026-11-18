@@ -50,32 +50,51 @@ const int kThreads = 256; /* 16 x 16 grid of 4 x 4 micro-tiles */
 const int kAStride = kBK + 10;
 const int kBStride = kBN + 8;
 
-/* Wide-load staging of one tile's raw blocks: threads stride the (row, 16-byte piece)
- * space in address order, so adjacent lanes hit adjacent 16-byte words. Tail rows beyond
- * `rows` stage zeros, which decode to zeroes like the old explicit fill. */
-template <int kBlockBytes>
+/* Wide staging of one tile's raw chunk bytes (kChunkBytes per row, the kChunkBlocks blocks
+ * the chunk decodes): threads stride the (row, 16-byte piece) space in address order, so
+ * adjacent lanes hit adjacent 16-byte words — a warp-cooperative sweep of 16-byte loads
+ * when the chunk size is a multiple of 16, else of byte loads over the same layout (one
+ * warp's 32 consecutive bytes still land in one sector). Tail rows beyond `rows` stage
+ * zeros, which decode to zeroes like the old explicit fill. The quad path needs `w` itself
+ * 16-byte aligned; the entry enforces it for the types that take that path. */
+template <int kBlockBytes, int kChunkBytes>
 __device__ __forceinline__ void stage_blocks(const unsigned char *w, int tile_m, int rows,
-                                             int w_blocks, int c, unsigned char *stage) {
-    static_assert(kBlockBytes % 16 == 0, "uint4 staging needs a block size that is a multiple of 16");
-    constexpr int kQuads = kBM * kBlockBytes / 16;
-    const int quads_per_row = kBlockBytes / 16;
-    #pragma unroll 4
-    for (int idx = threadIdx.x; idx < kQuads; idx += kThreads) {
-        const int row = idx / quads_per_row;
-        const int q = idx - row * quads_per_row;
-        uint4 v = make_uint4(0, 0, 0, 0);
-        const int grow = tile_m + row;
-        if (grow < rows) {
-            const unsigned char *block =
-                w + ((size_t)grow * w_blocks + (c >> 2)) * kBlockBytes;
-            v = *reinterpret_cast<const uint4 *>(block + q * 16);
+                                             int w_blocks, int c, int chunk_block_off,
+                                             unsigned char *stage) {
+    const size_t chunk_off = (size_t)chunk_block_off * kBlockBytes;
+    if constexpr ((kChunkBytes & 15) == 0) {
+        static_assert(kChunkBytes % 16 == 0, "uint4 staging needs a 16-byte-multiple chunk");
+        constexpr int kQuads = kBM * kChunkBytes / 16;
+        const int quads_per_row = kChunkBytes / 16;
+        #pragma unroll 4
+        for (int idx = threadIdx.x; idx < kQuads; idx += kThreads) {
+            const int row = idx / quads_per_row;
+            const int q = idx - row * quads_per_row;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            const int grow = tile_m + row;
+            if (grow < rows) {
+                v = *reinterpret_cast<const uint4 *>(
+                    w + (size_t)grow * w_blocks * kBlockBytes + chunk_off + q * 16);
+            }
+            *reinterpret_cast<uint4 *>(stage + idx * 16) = v;
         }
-        *reinterpret_cast<uint4 *>(stage + idx * 16) = v;
+    } else {
+        #pragma unroll 8
+        for (int idx = threadIdx.x; idx < kBM * kChunkBytes; idx += kThreads) {
+            const int row = idx / kChunkBytes;
+            const int o = idx - row * kChunkBytes;
+            unsigned char v = 0;
+            const int grow = tile_m + row;
+            if (grow < rows) {
+                v = w[(size_t)grow * w_blocks * kBlockBytes + chunk_off + o];
+            }
+            stage[idx] = v;
+        }
     }
 }
 
 template <class D>
-constexpr int stage_quads_of = kBM * D::kBlockBytes / 16;
+constexpr int stage_bytes_of = kBM * D::kChunkBlocks * D::kBlockBytes;
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
 
@@ -102,13 +121,15 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int chunks = k / 64;
     for (int c = 0; c < chunks; ++c) {
         __syncthreads();
-        /* Weight tile: the tile's raw blocks first move into shared memory as 16-byte loads
-         * (one warp-wide coalesced sweep), then one thread per tile row decodes its row's
-         * 64-value chunk slice from shared into the f16 tile. */
-        stage_blocks<D::kBlockBytes>(w, tile_m, rows, w_blocks, c, stage);
+        /* Weight tile: the chunk's raw blocks first move into shared memory as one
+         * warp-cooperative sweep, then one thread per tile row decodes its row's 64-value
+         * chunk slice from shared into the f16 tile. */
+        stage_blocks<D::kBlockBytes, D::kChunkBlocks * D::kBlockBytes>(
+            w, tile_m, rows, w_blocks, c, D::chunk_block_off(c), stage);
         __syncthreads();
         if (tx < kBM) {
-            D::decode_chunk(stage + (size_t)tx * D::kBlockBytes, c & 3, a + tx * kAStride);
+            D::decode_chunk(stage + (size_t)tx * D::kChunkBlocks * D::kBlockBytes, c,
+                            a + tx * kAStride);
         } else {
             /* Activation tile: the remaining 192 threads load 4096 halves, row-major by k,
              * written at the padded stride. */
@@ -157,7 +178,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     const int k = args->k;
     const int rows = args->rows;
     const int ncols = args->ncols;
-    if (k <= 0 || k % D::kQK != 0 || rows < 1 || ncols < 1) {
+    if (k <= 0 || k % D::kQK != 0 || k % 64 != 0 || rows < 1 || ncols < 1) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const int w_blocks = k / D::kQK;
@@ -168,8 +189,8 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
-    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) +
-                       (size_t)stage_quads_of<D> * 16;
+    const size_t smem =
+        (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
         w_blocks);
@@ -191,6 +212,21 @@ extern "C" int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_ar
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         return launch<gemm_dq::Q5kDecoder>(args, stream, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args,
+                                                 void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
+            args->y == NULL || !aligned(args->w, 2) || !aligned(args->x, 2) ||
+            !aligned(args->y, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return launch<gemm_dq::Q40Decoder>(args, stream, out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }

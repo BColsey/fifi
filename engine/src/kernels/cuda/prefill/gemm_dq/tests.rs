@@ -284,3 +284,221 @@ fn gemm_dq_q5k_profile_timing() {
         samples[samples.len() - 1]
     );
 }
+
+/// The Q4_0 decoder of the same GEMM against the CPU oracle: the same GGUF
+/// blocks through `weights::dequantize`, whose Q4_0 arm is written from the
+/// ggml reference layout (low nibbles of `qs[0..16]` are values 0..16,
+/// high nibbles values 16..32).
+fn build_weight_q40(rows: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut rng = testkit::Rng::new(seed);
+    let mut bytes = vec![0u8; rows * (k / 32) * 18];
+    for block in bytes.chunks_mut(18) {
+        let d = 0.05 + rng.below(190) as f64 / 100.0;
+        block[0..2].copy_from_slice(&testkit::f64_to_f16_bits(d).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = (rng.next_u64() & 0xFF) as u8;
+        }
+    }
+    bytes
+}
+
+fn reference_q40(w: &[u8], x: &[u16], rows: usize, k: usize, ncols: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut dequant_row = vec![0.0f32; k];
+    let mut y = vec![0.0f64; rows * ncols];
+    let mut abs = vec![0.0f64; rows * ncols];
+    for r in 0..rows {
+        let blocks = &w[r * (k / 32) * 18..];
+        for b in 0..k / 32 {
+            let block = &blocks[b * 18..(b + 1) * 18];
+            dequant_row[b * 32..(b + 1) * 32]
+                .copy_from_slice(&dequantize(GgufType::Q40, block).expect("q4_0 dequant"));
+        }
+        for n in 0..ncols {
+            let mut sum = 0.0f64;
+            let mut terms = 0.0f64;
+            for c in 0..k {
+                let term = f64::from(dequant_row[c]) * f64::from(f16_of(x[c * ncols + n]));
+                sum += term;
+                terms += term.abs();
+            }
+            y[r * ncols + n] = sum;
+            abs[r * ncols + n] = terms;
+        }
+    }
+    (y, abs)
+}
+
+#[test]
+fn gemm_dq_q40_matches_the_cpu_dequant_matmul() {
+    if !testkit::device_present("gemm_dq_q40_matches_the_cpu_dequant_matmul") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    // k stays a multiple of 64 (the chunk); rows/ncols cross the 64 tile with remainders.
+    for (rows, k, ncols, seed) in [
+        (64usize, 512usize, 64usize, 0x5eed_0011u64),
+        (100, 1024, 40, 0x5eed_0012),
+        (13, 256, 7, 0x5eed_0013),
+        (128, 768, 129, 0x5eed_0014),
+    ] {
+        let w_bytes = build_weight_q40(rows, k, seed);
+        let mut rng = testkit::Rng::new(seed ^ 0xa5a5);
+        let x: Vec<u16> = (0..k * ncols)
+            .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+            .collect();
+        let (y_ref, abs) = reference_q40(&w_bytes, &x, rows, k, ncols);
+        let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let xb = testkit::upload_bytes(&ctx, &x_bytes);
+        let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
+        ctx.gemm_dq_q40(
+            &stream,
+            GemmDqQ40Call {
+                w: w.range(0, w_bytes.len()).expect("w"),
+                x: xb.range(0, x_bytes.len()).expect("x"),
+                y: y.range(0, rows * ncols * 4).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("gemm dq");
+        stream.synchronize().expect("drain");
+        let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+        for idx in 0..rows * ncols {
+            // The bound mirrors the Q5_K test: f16 weight staging rounds each term by at
+            // most 2^-11, the f32 accumulation over k adds at most k * 2^-24 of the
+            // absolute sum, 4x headroom.
+            let tolerance =
+                4.0 * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24)) * abs[idx].max(1e-30);
+            let error = (f64::from(got[idx]) - y_ref[idx]).abs();
+            let ratio = error / tolerance;
+            max_ratio = max_ratio.max(ratio);
+            assert!(
+                error <= tolerance,
+                "rows {rows} k {k} ncols {ncols} idx {idx}: error {error} over tol {tolerance}"
+            );
+        }
+    }
+    println!("gemm dq q40: max tolerance ratio {max_ratio:.3}");
+}
+
+/// One flipped code nibble in one block must move an output past the tolerance: the value
+/// shifts by 8 * d * x, which the absolute-term bound cannot hide.
+#[test]
+fn gemm_dq_q40_catches_one_flipped_code() {
+    if !testkit::device_present("gemm_dq_q40_catches_one_flipped_code") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rows = 64usize;
+    let k = 512usize;
+    let ncols = 64usize;
+    let mut w_bytes = build_weight_q40(rows, k, 0x5eed_0021);
+    let mut rng = testkit::Rng::new(0x5eed_0021);
+    let x: Vec<u16> = (0..k * ncols)
+        .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+        .collect();
+    let (y_ref, abs) = reference_q40(&w_bytes, &x, rows, k, ncols);
+    // Row 3, block 1, the high nibble of its first code byte: ^0xF0 flips the code of the
+    // block's value 16 by up to 15, a swing of 15 * d * x per output that the bound cannot
+    // hide.
+    w_bytes[(3 * (k / 32) + 1) * 18 + 2] ^= 0xF0;
+    let w = testkit::upload_bytes(&ctx, &w_bytes);
+    let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let xb = testkit::upload_bytes(&ctx, &x_bytes);
+    let y = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+    ctx.gemm_dq_q40(
+        &stream,
+        GemmDqQ40Call {
+            w: w.range(0, w_bytes.len()).expect("w"),
+            x: xb.range(0, x_bytes.len()).expect("x"),
+            y: y.range(0, rows * ncols * 4).expect("y"),
+            k,
+            rows,
+            ncols,
+        },
+    )
+    .expect("gemm dq");
+    stream.synchronize().expect("drain");
+    let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
+    let tolerance = 4.0 * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24));
+    let moved = (0..rows * ncols)
+        .filter(|idx| {
+            ((f64::from(got[*idx]) - y_ref[*idx]).abs()) > tolerance * abs[*idx].max(1e-30)
+        })
+        .count();
+    assert!(moved > 0, "a flipped code nibble must move some output");
+}
+
+#[test]
+fn gemm_dq_q40_is_deterministic_and_refuses_bad_shapes() {
+    if !testkit::device_present("gemm_dq_q40_is_deterministic_and_refuses_bad_shapes") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rows = 70usize;
+    let k = 256usize;
+    let ncols = 70usize;
+    let w_bytes = build_weight_q40(rows, k, 0x5eed_0031);
+    let x_bytes = vec![0x11u8; k * ncols * 2];
+    let w = testkit::upload_bytes(&ctx, &w_bytes);
+    let xb = testkit::upload_bytes(&ctx, &x_bytes);
+    let y1 = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+    let y2 = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+    // The sizes come from the enclosing buffers, so the closure takes only the ranges.
+    fn call<'b>(
+        w: &'b crate::kernels::cuda::DeviceBuffer,
+        xb: &'b crate::kernels::cuda::DeviceBuffer,
+        y: &'b crate::kernels::cuda::DeviceBuffer,
+        shape: (usize, usize, usize),
+        w_len: usize,
+        x_len: usize,
+    ) -> GemmDqQ40Call<'b> {
+        let (k, rows, ncols) = shape;
+        GemmDqQ40Call {
+            w: w.range(0, w_len).expect("w"),
+            x: xb.range(0, x_len).expect("x"),
+            y: y.range(0, rows * ncols * 4).expect("y"),
+            k,
+            rows,
+            ncols,
+        }
+    }
+    ctx.gemm_dq_q40(
+        &stream,
+        call(&w, &xb, &y1, (k, rows, ncols), w_bytes.len(), x_bytes.len()),
+    )
+    .expect("first");
+    ctx.gemm_dq_q40(
+        &stream,
+        call(&w, &xb, &y2, (k, rows, ncols), w_bytes.len(), x_bytes.len()),
+    )
+    .expect("second");
+    stream.synchronize().expect("drain");
+    assert_eq!(
+        testkit::read_bytes(&ctx, &y1, rows * ncols * 4),
+        testkit::read_bytes(&ctx, &y2, rows * ncols * 4),
+        "the same call twice must write identical bytes"
+    );
+    // k not a multiple of 64, and a y overlapping x, are refused before any launch.
+    let bad_k = GemmDqQ40Call {
+        k: 96,
+        ..call(&w, &xb, &y1, (k, rows, ncols), w_bytes.len(), x_bytes.len())
+    };
+    assert!(ctx.gemm_dq_q40(&stream, bad_k).is_err());
+    let overlap = GemmDqQ40Call {
+        y: xb.range(0, rows * ncols * 4).expect("y"),
+        ..call(&w, &xb, &y1, (k, rows, ncols), w_bytes.len(), x_bytes.len())
+    };
+    assert!(ctx.gemm_dq_q40(&stream, overlap).is_err());
+    let short_w = GemmDqQ40Call {
+        w: w.range(0, w_bytes.len() - 18).expect("w short"),
+        ..call(&w, &xb, &y1, (k, rows, ncols), w_bytes.len(), x_bytes.len())
+    };
+    assert!(ctx.gemm_dq_q40(&stream, short_w).is_err());
+}

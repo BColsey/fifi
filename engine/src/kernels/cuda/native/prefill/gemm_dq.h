@@ -29,9 +29,15 @@ typedef struct inference_cuda_gemm_dq_args {
 
 /* One launch on stream (must not be NULL) with the Q5_K decoder: k must be a multiple of 256
  * (refused with INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA call otherwise, as is any
- * other bad argument), w holds rows * k/256 * 176 bytes, x holds k * ncols f16 values, y
- * holds rows * ncols floats and shares no byte with w or x. Returns the launch status. */
+ * other bad argument), w holds rows * k/256 * 176 bytes and must be 16-byte aligned (the
+ * staging moves blocks as 16-byte words), x holds k * ncols f16 values, y holds rows * ncols
+ * floats and shares no byte with w or x. Returns the launch status. */
 int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
+                                      int *out_stage);
+
+/* The same launch with the Q4_0 decoder: k must be a multiple of 64, w holds
+ * rows * k/32 * 18 bytes (2-byte aligned is enough), x and y as above. */
+int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args, void *stream,
                                       int *out_stage);
 
 #ifdef __cplusplus

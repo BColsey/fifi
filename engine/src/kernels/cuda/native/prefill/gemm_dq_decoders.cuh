@@ -47,12 +47,19 @@ __device__ __forceinline__ void q5k_group_factors(const unsigned char *raw, floa
 
 /* Chunk c (0..3) of a Q5_K block carries values [64c, 64c+64): the low code nibbles of
  * bytes [48+32c, 48+32c+32) with high bit 2c, then the high nibbles with high bit 2c+1,
- * each half against its own group pair from q5k_group_factors. */
+ * each half against its own group pair from q5k_group_factors. A chunk is a quarter block,
+ * so the row's chunk-c blocks start at block c/4. */
 struct Q5kDecoder {
     static const int kQK = 256;
     static const int kBlockBytes = 176;
+    static const int kChunkBlocks = 1;
 
+    __device__ static int chunk_block_off(int c) { return c >> 2; }
+
+    /* c is the raw 64-value chunk index along k (0..k/64); the slice inside this block is
+     * c mod 4, because four chunks share one 256-value block. */
     __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst) {
+        c &= 3;
         const float d = half_at(block);
         const float dmin = half_at(block + 2);
         float mult[8];
@@ -73,6 +80,34 @@ struct Q5kDecoder {
             const float v2 = (float)((code >> 4) + ((h & bit2) ? 16 : 0));
             dst[l] = __float2half(fmaf(mul1, v1, -off1));
             dst[32 + l] = __float2half(fmaf(mul2, v2, -off2));
+        }
+    }
+};
+
+/* Q4_0 block layout (18 bytes for 32 values): an f16 scale d at +0, then 16 code bytes at
+ * +2 whose byte j holds the codes of values j (low nibble) and j + 16 (high nibble); value i
+ * of the block is d * (code_i - 8). A 64-value chunk is exactly two whole blocks, so the
+ * row's chunk-c blocks start at block 2c. */
+struct Q40Decoder {
+    static const int kQK = 32;
+    static const int kBlockBytes = 18;
+    static const int kChunkBlocks = 2;
+
+    __device__ static int chunk_block_off(int c) { return 2 * c; }
+
+    /* A block's 32 values, in GGUF order: value j (0..16) is the LOW nibble of
+     * qs[j], value j + 16 the HIGH nibble (the layout weights/gguf_dequant.rs
+     * q4_0 decodes and the ggml reference pins). */
+    __device__ static void decode_chunk(const unsigned char *chunk, int c, __half *dst) {
+        (void)c;
+        for (int b = 0; b < 2; ++b) {
+            const unsigned char *blk = chunk + 18 * b;
+            const float d = half_at(blk);
+            for (int j = 0; j < 16; ++j) {
+                const unsigned char code = blk[2 + j];
+                dst[32 * b + j] = __float2half(d * (float)((code & 0x0f) - 8));
+                dst[32 * b + 16 + j] = __float2half(d * (float)((code >> 4) - 8));
+            }
         }
     }
 };
