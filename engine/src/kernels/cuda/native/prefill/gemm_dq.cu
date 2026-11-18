@@ -218,6 +218,10 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
     const size_t smem =
         (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
+    // The IQ4_NL table rides a kernel argument, never a per-TU __constant__
+    // array: the at-load constant bank of this multi-cubin .so aliases those
+    // by position (2026-11-18, 3090). The tree-wide guard that keeps new
+    // initialized __constant__ tables out is native/constant_bank_guard.rs.
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
         w_blocks, x_col_stride, y_col_stride, x_f32, make_iq4nl_table());

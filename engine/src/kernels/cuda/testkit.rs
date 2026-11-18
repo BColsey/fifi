@@ -156,7 +156,9 @@ static DEVICE_PROBE: ProbeCache = ProbeCache::new();
 pub(crate) fn device_present(test: &str) -> bool {
     // Before anything else: an earlier test's assert failure must not fail this
     // one (the unwind latched TERMINAL and left its lease reserved). The reset
-    // is test-only; serving keeps the latch for the process lifetime.
+    // is test-only; serving keeps the latch for the process lifetime. It does
+    // NOT make multi-threaded device runs safe: keep --test-threads=1 on the
+    // card — the leases and the context are still single-owner.
     super::reset_terminal_latch_for_test();
     let probed = DEVICE_PROBE.decision(probe_count);
     // The count line prints for every `Ok` on record, as before the cache: a runtime

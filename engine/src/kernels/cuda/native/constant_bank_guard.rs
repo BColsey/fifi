@@ -137,14 +137,92 @@ fn parse_floats(body: &str) -> Vec<f32> {
         if term.is_empty() {
             continue; // trailing comma
         }
-        // A non-numeric initializer (macro, expression) is beyond this guard: empty
-        // return makes the caller treat it as initializer-less, same as before.
+        // A non-numeric term (macro, expression) reads as no values: the caller
+        // refuses the declaration rather than skipping it.
         match term.parse::<f32>() {
             Ok(value) => out.push(value),
             Err(_) => return Vec::new(),
         }
     }
     out
+}
+
+/// Fixture classifier tests: the exact behaviors the tree scan relies on.
+/// Written after the 2026-11-18 rewrite bug (body slice started on the '{',
+/// every literal read as non-literal) — these pin each classification so a
+/// rewrite cannot pass the tree test vacuously.
+#[test]
+fn the_classifier_reads_the_declaration_forms() {
+    // A literal table on one line reads as its values.
+    let one_line = "__constant__ float t[2] = { 0.5f, -1.0f };";
+    let at = one_line.find("__constant__").unwrap();
+    assert_eq!(
+        initializer_values(one_line, at),
+        Ok(Some(vec![0.5, -1.0])),
+        "a one-line literal initializer must read as values"
+    );
+
+    // The brace may open on a later line than the declaration.
+    let next_line = "__constant__ float t[2] =\n    { 0.5f, -1.0f };";
+    let at = next_line.find("__constant__").unwrap();
+    assert_eq!(
+        initializer_values(next_line, at),
+        Ok(Some(vec![0.5, -1.0])),
+        "a brace on the next line must read as values"
+    );
+
+    // A macro initializer is initialized but not pinnable: refused, not skipped.
+    let macro_init = "__constant__ float t[16] = KVALUES;";
+    let at = macro_init.find("__constant__").unwrap();
+    assert_eq!(
+        initializer_values(macro_init, at),
+        Err(()),
+        "a macro initializer must be refused"
+    );
+
+    // A declaration with no initializer is runtime symbol init: None.
+    let no_init = "__constant__ float t[16];";
+    let at = no_init.find("__constant__").unwrap();
+    assert_eq!(
+        initializer_values(no_init, at),
+        Ok(None),
+        "no initializer must classify as runtime symbol init"
+    );
+
+    // A __constant__ inside a comment disappears under strip_comments.
+    let commented = "/* __constant__ float t[16] = { 0.f }; */\nint x;";
+    assert!(
+        !strip_comments(commented).contains("__constant__"),
+        "strip_comments must remove commented declarations"
+    );
+}
+
+/// The classifier must read the two pinned declarations as allowed literals
+/// (regression guard for the 2026-11-18 rewrite bug). Feeding the real files
+/// keeps this test from drifting from what the scan sees.
+#[test]
+fn the_classifier_accepts_the_two_pinned_declarations() {
+    for file in ["nvfp4_gemv.cu", "nvfp4_gemv_batch.cu"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/kernels/cuda/native")
+            .join(file);
+        let raw = std::fs::read_to_string(&path).expect("the pinned twin is readable");
+        let text = strip_comments(&raw);
+        let Some(at) = text.find("__constant__") else {
+            panic!("{file} carries no __constant__ declaration");
+        };
+        match initializer_values(&text, at) {
+            Ok(Some(values)) => assert_eq!(
+                values.as_slice(),
+                &KE2M1[..],
+                "{file} must classify as the pinned allowed literal table"
+            ),
+            Ok(None) => panic!("{file}: the pinned declaration must carry an initializer"),
+            Err(()) => {
+                panic!("{file}: the classifier must read the pinned initializer as literal floats")
+            }
+        }
+    }
 }
 
 #[test]
@@ -160,6 +238,7 @@ fn cuda_sources_add_no_initialized_constant_tables() {
     );
 
     let mut offenders = Vec::new();
+    let mut pinned_seen: Vec<&str> = Vec::new();
     for path in &files {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let raw = std::fs::read_to_string(path).expect("CUDA source is readable");
@@ -173,7 +252,7 @@ fn cuda_sources_add_no_initialized_constant_tables() {
             match initializer_values(&text, at) {
                 Ok(None) => continue, // no initializer: runtime symbol init
                 Ok(Some(values)) => match ALLOWED.iter().find(|(file, _)| *file == name) {
-                    Some((file, pinned)) if values == *pinned => (),
+                    Some((file, pinned)) if values == *pinned => pinned_seen.push(file),
                     Some((file, pinned)) => offenders.push(format!(
                         "{site}: {file} carries {} values, pinned {pinned:?}",
                         values.len()
@@ -190,6 +269,17 @@ fn cuda_sources_add_no_initialized_constant_tables() {
             }
         }
     }
+    // The scan must actually see the pinned twins: a form change in their
+    // declarations would otherwise make this test pass while pinning nothing.
+    let mut want: Vec<&str> = ALLOWED.iter().map(|(file, _)| *file).collect();
+    let mut got = pinned_seen;
+    want.sort_unstable();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got, want,
+        "the pinned tables must each be found exactly once in the scan"
+    );
     assert!(
         offenders.is_empty(),
         "initialized __constant__ arrays alias by position in this multi-cubin .so \

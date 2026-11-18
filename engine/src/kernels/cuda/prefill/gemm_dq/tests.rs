@@ -802,8 +802,12 @@ fn gemm_dq_iq4xs_probe_crafted() {
     let x: Vec<u16> = (0..k * ncols)
         .map(|i| f16_bits(xval(i / ncols, i % ncols)))
         .collect();
-    // Sub-block column sums: the hi scale lanes cover only sub-blocks 8..15,
-    // so a craft case is a per-sub-block weight, never one uniform weight.
+    // Group column sums: a 136-byte block is EIGHT 32-value groups, each with
+    // its own 6-bit signed scale — the low nibble in bytes 4..8, the high 2
+    // bits in the scales_h lanes of the SAME group (the decoder indexes
+    // ib = 2c + s/32; the hi lanes are not sub-blocks 8..15, and there are no
+    // sixteen sub-blocks). A uniform craft cannot see a scale land in the wrong
+    // group; the non-uniform case below can.
     let sub_sum = |sb: usize, col: usize| -> f64 {
         (sb * 32..sb * 32 + 32)
             .map(|c| f64::from(xval(c, col)))
@@ -829,7 +833,7 @@ fn gemm_dq_iq4xs_probe_crafted() {
         }
         w
     };
-    let run = |name: &str, w_bytes: &[u8], weight_of: &[f64; 16]| {
+    let run = |name: &str, w_bytes: &[u8], weight_of: &[f64]| {
         let w = testkit::upload_bytes(&ctx, w_bytes);
         let xb = testkit::upload_bytes(
             &ctx,
@@ -853,8 +857,8 @@ fn gemm_dq_iq4xs_probe_crafted() {
         .expect("gemm dq");
         stream.synchronize().expect("drain");
         let got = testkit::floats(&testkit::read_bytes(&ctx, &y, rows * ncols * 4));
-        // Every weight inside a sub-block is identical by construction, so
-        // column n must sit at sum(weight[sb] * sub_sum(sb, n)) inside the
+        // Every weight inside a group is identical by construction, so
+        // column n must sit at sum(weight[g] * sub_sum(g, n)) inside the
         // oracle test's tolerance model (f16 staging plus f32 accumulation,
         // 4x headroom): a wrong table entry or scale moves an output past it
         // by orders of magnitude.
@@ -873,8 +877,8 @@ fn gemm_dq_iq4xs_probe_crafted() {
             );
         }
     };
-    let uniform = |weight: f64| [weight; 16];
-    // scales_l feeds the low 4 bits of sub-blocks 0..7's 6-bit scales.
+    let uniform = |weight: f64| [weight; 8];
+    // scales_l feeds the low 4 bits of each group's 6-bit scale.
     run("zero-scales", &craft(0, 0, 0), &uniform(4064.0));
     run("lo1-scales", &craft(0x11, 0, 0), &uniform(-31.0 * -127.0));
     // scales_h lanes 01 lift every group scale from 0 to 16.
@@ -889,6 +893,19 @@ fn gemm_dq_iq4xs_probe_crafted() {
     run("qs8", &craft(0, 0, 0x88), &uniform(-32.0 * 1.0));
     run("qsf", &craft(0, 0, 0xff), &uniform(-32.0 * 113.0));
     run("lo2-scales", &craft(0x22, 0, 0), &uniform(-30.0 * -127.0));
+    // Non-uniform per group: byte j packs the low nibbles of groups 2j (low)
+    // and 2j+1 (high), so group g carries scale g and weight (g-32)*kv[0].
+    // A scale landing in the wrong group swaps two different weights against
+    // two different column sums and moves the output past the bound.
+    let mut mixed = vec![0u8; rows * (k / 256) * 136];
+    for b in mixed.chunks_mut(136) {
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        for j in 0u8..4 {
+            b[4 + j as usize] = ((2 * j + 1) << 4) | (2 * j);
+        }
+    }
+    let stepped: Vec<f64> = (0..8).map(|g| f64::from((g - 32) as i8) * -127.0).collect();
+    run("non-uniform-group-scales", &mixed, &stepped);
 }
 
 #[test]
