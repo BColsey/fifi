@@ -34,13 +34,13 @@ pub(crate) struct EngineEntry {
     /// True when the chat handler sends the prompt boundary of each job to the engine
     /// (`prefix_reuse` in the configuration file).
     pub(crate) prefix_reuse: bool,
-    /// The per-engine warm-turn tokenization cache (one slot: this is a
-    /// single-conversation-stream deployment; an interleaved conversation
-    /// fails the render-prefix check, falls back to the derived path, and
-    /// reseeds — always exact, never a cross-session reuse). None until
-    /// the first eligible turn seeds it. Bounded by the longest turn:
-    /// head render + head ids + the kept last-turn result and digest
-    /// (~1.5 MB at 128K tokens), all reported by `accounted_bytes()`.
+    /// The warm tokenizer keeps the active conversation's rendered head and IDs.
+    /// A proven turn can serve an exact retry when its inputs and tokenizer match.
+    /// With seeded retries and an extra byte budget, one displaced turn may also
+    /// retain its IDs for a retry after another conversation has used this engine.
+    /// An edited history goes through the normal append or full-encode checks.
+    /// The tokenizer reports its retained allocations through `accounted_bytes()`.
+    /// The first eligible request initializes this cache.
     pub(crate) warm: std::sync::Arc<std::sync::Mutex<Option<crate::tokenizer::WarmTurnCache>>>,
     /// The sampling defaults of this engine: the `temperature`, `top_p`, and `top_k` that its
     /// `model_dir/generation_config.json` sets, with the contract default for an absent file or
