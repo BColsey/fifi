@@ -17,12 +17,30 @@ The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). The completion,
 | `POST /v1/token/encode` | yes | Token ids of a text, or of chat messages after the chat template. No generation runs. |
 | `POST /v1/token/decode` | yes | Text of a list of token ids. No generation runs. |
 | `POST /v1/apply-template` | yes | The prompt text that the chat template makes of chat messages. No generation runs. |
+| `GET /v1/sampler-trace` | yes | One reply's armed sampler-trace packet, as `?id=<reply id>`. See [Sampler trace](#sampler-trace). |
 
 ## Authentication
 
 Send the API key as `Authorization: Bearer <key>`.
 The `/v1/messages` routes also accept `x-api-key: <key>`; when that header is present it must match, and the bearer header is not checked.
 A missing or wrong key returns `401`.
+
+## Sampler trace
+
+`POST /v1/chat/completions` accepts the request-body property `x-sample-trace`
+(boolean, default `false`). It is a body property, not an HTTP header — a
+header of that name is ignored. Setting it `true` arms capture for that
+reply: the server records each sampled token's kept candidates and their
+probabilities, and serves the packet at `GET /v1/sampler-trace?id=<reply id>`
+with `Cache-Control: no-store`. Only the chat route arms capture;
+`/v1/completions` and `/v1/messages` do not.
+
+Capture is opt-in twice: the server's `sample_trace` setting must permit it,
+and the request must arm it. Without the setting, an armed request is
+refused with `400`. The ring keeps the last four replies' traces under a
+global position budget (drop-oldest); an unknown or evicted id reports
+`404`, so a dropped trace is explicit. Nothing is captured retroactively:
+arming happens before generation begins.
 
 ## Chat completions
 

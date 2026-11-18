@@ -1,7 +1,8 @@
 //! The per-request sampler-trace ring, its wire packet, and the read route.
 //!
 //! Contract: capture is opt-in twice — the process setting `sample_trace`
-//! permits it, and a request arms it with `x-sample-trace: true` before
+//! permits it, and a request arms it with the `x-sample-trace` request-BODY
+//! property (boolean, default false; not an HTTP header) before
 //! generation begins; nothing is recorded retroactively. Buffers register in
 //! the ring at submit with their reply's metadata, so in-progress captures
 //! count against the global budget. The ring keeps the last

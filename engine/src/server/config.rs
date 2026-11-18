@@ -58,8 +58,9 @@ pub(crate) struct Config {
     /// One value serves every engine of the process.
     #[serde(default)]
     pub(crate) prefix_reuse: Option<bool>,
-    /// True when requests may arm sampler-trace capture with `x-sample-trace:
-    /// true`. The default is false: no request is traced, and the field is
+    /// True when requests may arm sampler-trace capture with the
+    /// `x-sample-trace` request-body property (boolean, default false).
+    /// The default is false: no request is traced, and the field is
     /// refused (400) at submit unless this setting permits it. One value
     /// serves every engine of the process; the trace route and budgets are
     /// `sampler_trace.rs`'s contract.
