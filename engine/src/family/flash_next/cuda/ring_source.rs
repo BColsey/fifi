@@ -22,15 +22,16 @@
 //!
 //! WHY: the buffered path holds a whole record's components in flight per
 //! read with no placement control; the ring pins the staging memory once
-//! through the context's pinned allocator (cudaHostAlloc, so the async H2D
-//! from it is truly async — the host_tier contract), checks every slot
+//! (the serve path leaks a plain heap allocation and registers it with
+//! `cudaHostRegister` best-effort — pinned when registration answers, a
+//! staged window when it refuses — so the async H2D from it is truly
+//! async, the host_tier contract), checks every slot
 //! state transition, and hands the record to its consumer read-only while
 //! the copy fence is outstanding. This module is the reader's first
 //! production caller (`FIFI_FLASH_NEXT_PACK_RING=1`, default off).
 //!
-//! The ring memory is handed in by the caller: the serve path passes the
-//! context's cudaHostAlloc memory, leaked for the process lifetime like
-//! the rest of the serve-start state; the host tests pass their own
+//! The ring memory is handed in by the caller: the serve path passes that
+//! leaked, registered heap buffer; the host tests pass their own
 //! sector-carved buffer. The constructor opens the first shard with
 //! O_DIRECT eagerly, so a filesystem that will not answer it refuses the
 //! start. The planner's tier line decided that the ring variant runs at
@@ -38,7 +39,7 @@
 
 use super::bank::RecordSource;
 use super::bank_source::{PackRecordSource, refuse_bias};
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
 use crate::family::expert_bank::host_tier::Slot;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
@@ -116,12 +117,23 @@ impl CopyFence for UploadFence {
     }
 }
 
+/// A span's destination inside its part's row region.
+enum Region {
+    /// The bytes DMA verbatim into the region: the trellis, and scale
+    /// spans the pack already stores as F32.
+    Verbatim,
+    /// F16 scales widen to F32 host-side (the one named host exception).
+    WidenF16,
+}
+
 /// One parked upload: the slot stays `Copying` (its window read-only for
 /// the DMA) until the event's completion is observed and the fence is
-/// marked, at which point the ring takes the slot back.
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+/// marked, at which point the ring takes the slot back. Test builds (no
+/// card) carry no event — the fence alone plays the completion.
+#[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
 struct ParkedUpload {
     slot: Slot,
+    #[cfg(feature = "native-cuda")]
     event: crate::kernels::cuda::DeviceEvent,
     fence: Arc<UploadFence>,
 }
@@ -140,7 +152,7 @@ pub(in crate::family::flash_next) struct RingRecordSource<'a> {
     record_bytes: usize,
     ring: Mutex<(RingReader, ODirectRing)>,
     /// The uploads whose fence is still outstanding.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
     parked: Mutex<Vec<ParkedUpload>>,
 }
 
@@ -189,7 +201,7 @@ impl<'a> RingRecordSource<'a> {
             experts,
             record_bytes,
             ring: Mutex::new((RingReader::new(), ring)),
-            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            #[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
             parked: Mutex::new(Vec::new()),
         })
     }
@@ -227,8 +239,8 @@ impl<'a> RingRecordSource<'a> {
 
 /// Carves the sector-aligned exact sub-slice out of `backing`: a plain
 /// allocation's own pointer is only 16-byte aligned, so the head up to the
-/// first sector boundary is skipped. cudaHostAlloc memory is page-aligned,
-/// making this a no-op there.
+/// first sector boundary is skipped (this is what the serve path hands
+/// over — a leaked, best-effort-registered heap buffer).
 fn carve(backing: &'static mut [u8], bytes: usize) -> Result<&'static mut [u8], EngError> {
     use crate::family::expert_bank::host_tier::SECTOR;
     let start = backing.as_ptr() as usize;
@@ -259,10 +271,11 @@ impl RecordSource for RingRecordSource<'_> {
         if slot.is_none() {
             // A parked upload holds every slot: wait it out exactly as a
             // slot-starved upload does — layer 1's first record must
-            // succeed after layer 0's last upload. Host builds never
-            // park (only uploads park, and they are native-only).
+            // succeed after layer 0's last upload. Only uploads park in
+            // production (native-only); the host test parks through its
+            // fence-only seam below.
             drop(guard);
-            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            #[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
             self.wait_out_parked()?;
             guard = lock_or(&self.ring, "the ring source's ring")?;
             slot = guard.1.acquire();
@@ -306,9 +319,103 @@ impl RecordSource for RingRecordSource<'_> {
         out.copy_from_slice(&packed);
         Ok(())
     }
+
+    /// The direct-upload lane: one H2D enqueue per span straight from the
+    /// pinned slot window, an event recorded after the last enqueue, and
+    /// the slot released only on that event. The F16 scale spans widen on
+    /// the host inside the same fence window. Answers `false` — the
+    /// caller falls back to `record` — where the pack carries components
+    /// beyond trellis/suh/svh that this lane has no placement for.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn upload(
+        &self,
+        layer: usize,
+        expert: u16,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        dst: &DeviceBuffer,
+        offset: usize,
+    ) -> Result<bool, EngError> {
+        if layer >= self.layers || usize::from(expert) >= self.experts {
+            return Err(ring_error(format!(
+                "layer {layer} expert {expert} is outside {} layers of {} experts",
+                self.layers, self.experts
+            )));
+        }
+        self.release_completed()?;
+        let (spans, raw_bytes) =
+            expert_spans(self.checkpoint, &self.dir, layer, usize::from(expert))?;
+        let placements = match span_placements(&spans, &self.layout)? {
+            Some(placements) => placements,
+            None => return Ok(false),
+        };
+        let mut guard = lock_or(&self.ring, "the ring source's ring")?;
+        let mut slot = guard.1.acquire();
+        if slot.is_none() {
+            // With fewer slots than in-flight uploads (the one-slot serve
+            // ring), the previous upload's event is waited out here: its
+            // H2D enqueues are microseconds against the fill's
+            // milliseconds, so the wait is noise.
+            drop(guard);
+            self.wait_out_parked()?;
+            guard = lock_or(&self.ring, "the ring source's ring")?;
+            slot = guard.1.acquire();
+        }
+        let Some(slot) = slot else {
+            return Err(ring_error("every ring slot is outstanding".into()));
+        };
+        let fence = Arc::new(UploadFence::new());
+        {
+            let (reader, ring) = &mut *guard;
+            reader.read_expert(ring, &span_matrix_spans(&spans), raw_bytes, slot)?;
+        }
+        // Arm the copy before the window exists, with this upload's own
+        // fence — exactly one begin_copy on this path too.
+        guard
+            .1
+            .begin_copy(slot, fence.clone())
+            .map_err(ring_error)?;
+        let window = guard
+            .1
+            .slot_window(slot, 0, raw_bytes)
+            .map_err(ring_error)?;
+        for placement in &placements {
+            let span = &spans[placement.span];
+            let start = span.matrix.record_offset as usize;
+            let bytes = &window[start..start + span.matrix.len as usize];
+            match placement.region {
+                Region::Verbatim => {
+                    dst.write_at_enqueue(stream, offset + placement.range.start, bytes)?
+                }
+                Region::WidenF16 => {
+                    let widened = widen_f16(bytes)?;
+                    dst.write_at_enqueue(stream, offset + placement.range.start, &widened)?
+                }
+            }
+        }
+        // The event is recorded only now, after the last enqueue, so its
+        // completion covers every copy of this upload.
+        let event = ctx.event()?;
+        stream.record(&event)?;
+        drop(guard);
+        lock_or(&self.parked, "the ring source's parked list")?.push(ParkedUpload {
+            slot,
+            event,
+            fence,
+        });
+        Ok(true)
+    }
+
+    /// Waits out every outstanding upload: each event is synchronized (the
+    /// wait makes the fence's cached completion true for good), then the
+    /// slot returns.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn drain(&self, _stream: &DeviceStream) -> Result<(), EngError> {
+        self.wait_out_parked()
+    }
 }
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(feature = "native-cuda", test)))]
 impl RingRecordSource<'_> {
     /// Waits out every outstanding upload: each event is synchronized
     /// (the wait makes the fence's cached completion true for good), then
@@ -321,11 +428,66 @@ impl RingRecordSource<'_> {
         )?);
         let mut guard = lock_or(&self.ring, "the ring source's ring")?;
         for upload in parked {
+            #[cfg(feature = "native-cuda")]
             upload.event.synchronize()?;
             upload.fence.mark_complete();
             guard.1.release(upload.slot).map_err(ring_error)?;
         }
         Ok(())
+    }
+
+    /// Parks the ring's only free slot with an already-complete fence: the
+    /// fake the host N3 test needs to drive a slot-starved `record`
+    /// without the card (test builds carry no event).
+    #[cfg(all(test, target_os = "linux", not(feature = "native-cuda")))]
+    pub(in crate::family::flash_next) fn park_for_test(&self) -> Result<(), EngError> {
+        let fence = Arc::new(UploadFence::new());
+        let mut guard = lock_or(&self.ring, "the ring source's ring")?;
+        let slot = guard
+            .1
+            .acquire()
+            .ok_or_else(|| ring_error("no free slot to park".into()))?;
+        guard
+            .1
+            .begin_copy(slot, fence.clone())
+            .map_err(ring_error)?;
+        drop(guard);
+        fence.mark_complete();
+        lock_or(&self.parked, "the ring source's parked list")?.push(ParkedUpload { slot, fence });
+        Ok(())
+    }
+
+    /// Releases the uploads whose event already answered complete: the
+    /// fence is marked from THIS thread's own query (the invariant the
+    /// fence carries), then the ring takes the slot back.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn release_completed(&self) -> Result<(), EngError> {
+        let mut parked = lock_or(&self.parked, "the ring source's parked list")?;
+        let mut ring = lock_or(&self.ring, "the ring source's ring")?;
+        let mut failure = None;
+        parked.retain_mut(|upload| match upload.event.query() {
+            Ok(true) => {
+                upload.fence.mark_complete();
+                match ring.1.release(upload.slot) {
+                    // Released: the park entry goes. A refusal keeps the
+                    // entry (drain surfaces it) and the error is returned.
+                    Ok(()) => false,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        true
+                    }
+                }
+            }
+            // In flight, or a query error: either way the fence stays
+            // incomplete — never free memory the DMA may still be reading.
+            Ok(false) | Err(_) => true,
+        });
+        match failure {
+            Some(error) => Err(ring_error(format!(
+                "a completed upload's slot refused release: {error}"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -334,15 +496,138 @@ impl RingRecordSource<'_> {
 /// the serve path must refuse rather than take the process down.
 fn lock_or<'a, T>(
     lock: &'a std::sync::Mutex<T>,
-    what: &str,
+    what: &'static str,
 ) -> Result<std::sync::MutexGuard<'a, T>, EngError> {
-    lock.lock()
-        .map_err(|_| ring_error(format!("{what} is poisoned")))
+    lock.lock().map_err(|_| EngError::Backend {
+        operation: "flash_next pack ring",
+        message: format!("{what}: the lock is poisoned"),
+    })
 }
 
 /// The span view the reader takes.
 fn span_matrix_spans(spans: &[Span]) -> Vec<MatrixSpan> {
     spans.iter().map(|span| span.matrix.clone()).collect()
+}
+
+/// Widens an F16 scale span to F32 host-side (the one named host copy of
+/// the direct lane; an F32 span passes through unchanged).
+fn widen_f16(bytes: &[u8]) -> Result<Vec<u8>, EngError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(ring_error("an F16 scale span of odd length".into()));
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|pair| half::f16::from_le_bytes(*pair).to_f32().to_le_bytes())
+        .collect())
+}
+
+/// Where each span lands in the packed row: the trellis span of part `i`
+/// covers `layout.part(i).trellis` verbatim, the suh/svh spans widen into
+/// their regions, each with the index of the span it places (skipped
+/// spans — `mul1` — place nothing, so a plain zip of spans against
+/// placements would mispair after the first skip). `None` when the pack
+/// carries a component this lane has no placement for (the caller falls
+/// back to the `record` path), or a span length disagrees with the
+/// layout's region (never a wrong-bytes upload).
+pub(in crate::family::flash_next) struct Placement {
+    pub(in crate::family::flash_next) span: usize,
+    region: Region,
+    pub(in crate::family::flash_next) range: std::ops::Range<usize>,
+}
+
+pub(in crate::family::flash_next) fn span_placements(
+    spans: &[Span],
+    layout: &SlotBankLayout,
+) -> Result<Option<Vec<Placement>>, EngError> {
+    let mut placements = Vec::with_capacity(spans.len());
+    for (span_index, span) in spans.iter().enumerate() {
+        // The span walk enumerates parts in ExpertPart::ALL order and the
+        // layout in the same (gate, up, down) order; every span carries
+        // the part it belongs to.
+        let index = match span.part {
+            ExpertPart::Gate => 0,
+            ExpertPart::Up => 1,
+            ExpertPart::Down => 2,
+        };
+        let part = layout.part(index);
+        let suffix = span.key.rsplit('.').next().unwrap_or_default();
+        // The stored DTYPE — never the span length alone — decides the
+        // scale contract: an F16 span widens into the region's half, an
+        // F32 span covers the region verbatim, the trellis is always
+        // verbatim. A component this lane cannot place exactly makes the
+        // whole answer None — the caller falls back to the record path,
+        // never a wrong-bytes upload.
+        let (region, range, want_len) = match suffix {
+            "trellis" => (Region::Verbatim, part.trellis.clone(), part.trellis.len()),
+            "suh" | "svh" => {
+                let range = if suffix == "suh" {
+                    part.suh.clone()
+                } else {
+                    part.svh.clone()
+                };
+                match span.dtype {
+                    Dtype::F16 if range.len() % 2 == 0 => {
+                        (Region::WidenF16, range.clone(), range.len() / 2)
+                    }
+                    Dtype::F32 => (Region::Verbatim, range.clone(), range.len()),
+                    _ => return Ok(None),
+                }
+            }
+            // The per-expert multiplier never enters the row (the
+            // buffered packer drops it in `pack_matrices`); the direct
+            // lane drops it too, so it is not a step-aside.
+            "mul1" => continue,
+            // A component the row has no region for: this lane steps
+            // aside, the record path answers.
+            _ => return Ok(None),
+        };
+        // A span whose stored bytes cannot land exactly in its region is a
+        // pack/layout disagreement, never a step-aside: the buffered packer
+        // would build the same mismatched row. Named, so the caller's log
+        // says which span and which two numbers disagreed.
+        if span.matrix.len as usize != want_len {
+            return Err(ring_error(format!(
+                "layer span {} carries {} bytes for a region of {want_len}",
+                span.key, span.matrix.len
+            )));
+        }
+        placements.push(Placement {
+            span: span_index,
+            region,
+            range,
+        });
+    }
+    // The placements must tile the record row exactly — fit AND cover,
+    // no gap, no overlap. The silent-overflow bug lived in exactly this
+    // mapping, so the production path re-derives the check the pack's
+    // own tests assert; a mismatch is an error, never a wrong upload.
+    let mut covered: Vec<std::ops::Range<usize>> = placements
+        .iter()
+        .map(|placement| placement.range.clone())
+        .collect();
+    covered.sort_by_key(|range| range.start);
+    let record_bytes = layout.record_bytes();
+    let mut next = 0;
+    for range in covered {
+        if range.start != next || range.end > record_bytes {
+            return Err(ring_error(format!(
+                "the span placements do not tile the record row at {}..{} \
+                 (row {} bytes)",
+                range.start, range.end, record_bytes
+            )));
+        }
+        next = range.end;
+    }
+    if next != record_bytes {
+        return Err(ring_error(format!(
+            "the span placements leave {} of {} record bytes uncovered",
+            record_bytes - next,
+            record_bytes
+        )));
+    }
+    Ok(Some(placements))
 }
 
 /// Parses the staged spans of the slot window into the three matrices: the

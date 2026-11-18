@@ -310,3 +310,55 @@ fn pinned_copies_refuse_exhausted_sequence_before_dma() {
     assert_eq!(sequence, u64::MAX);
     assert_eq!(bytes, [7; 8]);
 }
+
+/// The completion query answers the record order, not the record's absence: `false` while the
+/// stream is still behind the recorded copy (a 256 MiB pinned H2D, tens of milliseconds at
+/// bus speed, asked within microseconds of the record), `true` once the wait drained the
+/// stream, and an event that was never recorded is refused instead of answering `true`
+/// (`cudaEventQuery` on an unrecorded event answers success — "already complete" — the wrong
+/// answer for a fence, which is why the guard lives in the query itself).
+#[test]
+fn an_event_query_answers_the_record_order_and_refuses_an_unrecorded_event() {
+    if !testkit::device_present(
+        "an_event_query_answers_the_record_order_and_refuses_an_unrecorded_event",
+    ) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let event = ctx.event().expect("event");
+    let never = ctx.event().expect("never recorded event");
+    assert_bad_request(
+        never.query(),
+        "the query of a never recorded event",
+        "never recorded",
+    );
+    let bytes = 256 * 1024 * 1024;
+    let mut source = vec![0x5Au8; bytes];
+    for (index, byte) in source.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let mut pinned = ctx.pinned_buf(bytes).expect("pinned source");
+    pinned.write(0, &source).expect("the pinned fill");
+    let device = ctx.allocate(bytes).expect("device destination");
+    ctx.copy_from_pinned(
+        &stream,
+        &mut pinned,
+        0,
+        device.range(0, bytes).expect("the range"),
+    )
+    .expect("the pinned H2D enqueue");
+    stream.record(&event).expect("the record behind the copy");
+    let behind = event
+        .query()
+        .expect("the query of the recorded event behind the copy");
+    assert!(!behind, "the query must see the 256 MiB copy as in flight");
+    stream.synchronize().expect("the stream wait");
+    let after = event
+        .query()
+        .expect("the query of the recorded event after the wait");
+    assert!(
+        after,
+        "the wait drained the copy, so the query must answer true"
+    );
+}

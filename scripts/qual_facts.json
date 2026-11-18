@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7125,
-      "ignored": 640,
+      "test_fns": 7132,
+      "ignored": 643,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
@@ -83,6 +83,7 @@
         "FIFI_FLASH_NEXT_EXPERT_STATS",
         "FIFI_FLASH_NEXT_EXPERT_USAGE_OUT",
         "FIFI_FLASH_NEXT_MISS_TRACES",
+        "FIFI_FLASH_NEXT_PACK_RING",
         "FIFI_FLASH_NEXT_RING_HELD",
         "FIFI_FLASH_NEXT_ROUTE_TRACE",
         "FIFI_FLASH_NEXT_STEP_HEAD",

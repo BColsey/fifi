@@ -149,6 +149,33 @@ extern "C" int inference_cuda_event_record(void *event, void *stream, int *out_s
     }
 }
 
+/* The copy fence's completion question. cudaEventQuery answers cudaSuccess once the
+ * event's recorded work is done and cudaErrorNotReady while the stream is still behind
+ * it; both are ordinary answers, everything else is an error. An event that was never
+ * recorded answers cudaSuccess, which is why the Rust side refuses to build an unrecorded
+ * fence in the first place. */
+extern "C" int inference_cuda_event_query(void *event, int *out_done, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (event == NULL || out_done == NULL) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        *out_done = 0;
+        cudaError_t state = cudaEventQuery((cudaEvent_t)event);
+        if (state == cudaErrorNotReady) {
+            return INFERENCE_CUDA_OK;
+        }
+        Failure failure;
+        failure.record(state, INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == INFERENCE_CUDA_OK) {
+            *out_done = 1;
+        }
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
 /* The graph-timer trio: a timing-enabled event, an external-record that a stream capture
  * turns into an event-record node of the captured graph, and the host-side elapsed query. The
  * external-record flag and the node behavior are DeepInfer's graph-timer idea; the elapsed

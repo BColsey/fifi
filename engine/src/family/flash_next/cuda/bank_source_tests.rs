@@ -114,7 +114,7 @@ fn the_records_equal_the_pack_bytes_at_the_offsets_of_the_shard_headers() {
 // A small synthetic pack: 2 layers of 3 experts, 128 x 128 matrices, one in-memory shard.
 // ---------------------------------------------------------------------------------------------
 
-mod synthetic {
+pub(in crate::family::flash_next) mod synthetic {
     use std::{
         io::{Cursor, Read, Seek, SeekFrom},
         sync::{
@@ -142,7 +142,7 @@ mod synthetic {
 
     /// What a matrix of the pack differs in from the normal one.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Tweak {
+    pub(in crate::family::flash_next) enum Tweak {
         Normal,
         /// Another rate: this many u16 words per tile.
         Words(usize),
@@ -247,9 +247,18 @@ mod synthetic {
 
     /// The checkpoint of the pack, the layout of its normal matrices, and the switch that breaks
     /// the shard's reads. `tweak(layer, expert, part)` changes one matrix.
-    pub(super) fn checkpoint(
+    pub(in crate::family::flash_next) fn checkpoint(
         tweak: &dyn Fn(usize, usize, usize) -> Tweak,
     ) -> (Checkpoint, SlotBankLayout, Arc<AtomicBool>) {
+        let (checkpoint, layout, broken, _image) = checkpoint_with_image(tweak);
+        (checkpoint, layout, broken)
+    }
+
+    /// [`checkpoint`] plus the shard file's exact bytes, so a caller can
+    /// mirror the pack onto disk for the O_DIRECT ring.
+    pub(in crate::family::flash_next) fn checkpoint_with_image(
+        tweak: &dyn Fn(usize, usize, usize) -> Tweak,
+    ) -> (Checkpoint, SlotBankLayout, Arc<AtomicBool>, Vec<u8>) {
         let mut entries: Vec<Entry> = Vec::new();
         for layer in 0..LAYERS {
             for expert in 0..EXPERTS {
@@ -283,7 +292,7 @@ mod synthetic {
         let index = serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap();
         let broken = Arc::new(AtomicBool::new(false));
         let shard = Flaky {
-            inner: Cursor::new(file),
+            inner: Cursor::new(file.clone()),
             broken: Arc::clone(&broken),
         };
         let source = StreamedCheckpoint::open(
@@ -300,10 +309,16 @@ mod synthetic {
         let checkpoint = Checkpoint {
             source,
             config,
-            model_config: b"{}".to_vec(),
+            // The real Flash-Next config: `PackRecordSource::new` parses it
+            // for the layer and expert counts. Its counts only widen the
+            // bounds; the tensors above answer every key the sources read.
+            model_config: include_bytes!(
+                "../../../../tests/fixtures/qwen3_8_flash_next_config.json"
+            )
+            .to_vec(),
         };
         let layout = SlotBankLayout::new(WIDTH, WIDTH, [WORDS; 3]).unwrap();
-        (checkpoint, layout, broken)
+        (checkpoint, layout, broken, file)
     }
 
     pub(super) fn source<'a>(

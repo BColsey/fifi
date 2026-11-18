@@ -185,6 +185,8 @@ unsafe extern "C" {
     fn event_destroy_raw(event: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_event_record"]
     fn event_record_raw(event: *mut c_void, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_event_query"]
+    fn event_query_raw(event: *mut c_void, out_done: *mut c_int, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_timing_event_create"]
     fn event_create_timing_raw(out_event: *mut *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_timing_event_record_external"]
@@ -342,7 +344,19 @@ pub(in crate::kernels::cuda) fn event_record(
     checked(status, stage)
 }
 
-/// Creates a timing-enabled event (the graph timer).
+/// Asks the event's completion question without blocking: `true` once the recorded work
+/// is done, `false` while the stream is still behind it. A never-recorded event answers
+/// `true`, which is why the callers that need the guarantee build the record and the
+/// query as one operation (see `DeviceEvent::query`).
+pub(in crate::kernels::cuda) fn event_query(event: &RawEvent) -> Result<bool, DeviceFailure> {
+    let mut done: c_int = 0;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the handle is live for the whole call; `done` and `stage` are live,
+    // writable c_ints. The call only reads the event's state.
+    let status = unsafe { event_query_raw(event.0.as_ptr(), &mut done, &mut stage) };
+    checked(status, stage)?;
+    Ok(done != 0)
+}
 pub(in crate::kernels::cuda) fn event_create_timing() -> Result<RawEvent, DeviceFailure> {
     let mut handle: *mut c_void = std::ptr::null_mut();
     let mut stage = STAGE_NONE;

@@ -216,6 +216,25 @@ impl DeviceEvent {
         resident::event_synchronize(raw).map_err(device_error)
     }
 
+    /// Asks the completion question without blocking: `true` once the last record's work is
+    /// done, `false` while the stream is still behind it. An event that was never recorded
+    /// would answer `true` (an unrecorded event is already complete), which is exactly the
+    /// wrong answer for a fence, so a record is required here — the callers that need a
+    /// record-then-query pairing cannot build the unrecorded case.
+    pub(crate) fn query(&self) -> Result<bool, EngError> {
+        ensure_usable(&TERMINAL)?;
+        ensure_closed("an event query")?;
+        self.ensure_host_waitable()?;
+        if self.mark.get().is_none() {
+            return Err(EngError::BadRequest(
+                "the CUDA event was never recorded, so its completion cannot be asked".to_owned(),
+            ));
+        }
+        let raw = self.raw()?;
+        let _dispatch = enter_on(self.lease.device())?;
+        resident::event_query(raw).map_err(device_error)
+    }
+
     /// `BadRequest` when the last record was made inside a capture window: that record is a graph
     /// node that has not run, and a host wait (or a wait outside a window) on it is a CUDA error (status 1 on the
     /// 12.2 runtime) that latches the backend.

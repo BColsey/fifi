@@ -45,6 +45,8 @@
 //!
 //! The decode step is the first caller (start.rs wires ExpertBankState with the policy).
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 use crate::{
     EngError,
     family::{
@@ -401,6 +403,30 @@ pub(super) fn miss_pass_inputs(
 pub(in crate::family::flash_next) trait RecordSource {
     /// Writes the record of `expert` in `layer` into `out` (exactly one record).
     fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError>;
+
+    /// Issues the record's upload itself: `dst` at byte `offset` behind the work queued on
+    /// `stream`. `true` means the source took the upload and keeps its own staging memory
+    /// behind the copy until a waited completion; `false` (the default) means the source
+    /// cannot, and the caller must `record` into its own buffer and upload that.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn upload(
+        &self,
+        _layer: usize,
+        _expert: u16,
+        _ctx: &CudaContext,
+        _stream: &DeviceStream,
+        _dst: &DeviceBuffer,
+        _offset: usize,
+    ) -> Result<bool, EngError> {
+        Ok(false)
+    }
+
+    /// Waits out every upload a source issued itself. The caller runs this after its last
+    /// use of `stream`, so the source's staging is free when the fill returns.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn drain(&self, _stream: &DeviceStream) -> Result<(), EngError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -537,11 +563,21 @@ pub(super) mod device {
                     let expert = state.expert_in_slot(layer, slot).ok_or_else(|| {
                         EngError::BadRequest("a slot of the filled bank is empty".into())
                     })?;
-                    source.record(layer, expert, &mut record)?;
-                    slots[layer].write_at(&stream, geometry.offset(slot), &record)?;
+                    if !source.upload(
+                        layer,
+                        expert,
+                        ctx,
+                        &stream,
+                        &slots[layer],
+                        geometry.offset(slot),
+                    )? {
+                        source.record(layer, expert, &mut record)?;
+                        slots[layer].write_at(&stream, geometry.offset(slot), &record)?;
+                    }
                 }
             }
             stream.synchronize()?;
+            source.drain(&stream)?;
             let experts = geometry.experts;
             Ok(Self {
                 state,

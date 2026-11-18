@@ -31,7 +31,7 @@ use std::{
 
 use super::{
     bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
-    bank_source::PackRecordSource,
+    bank_source::{self, PackRecordSource},
     device::{CardChunkDevice, CardDevice},
     driver::chunk::ChunkDriver,
     driver::{
@@ -44,6 +44,7 @@ use super::{
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
     ple_feed::{FixedProjection, NgramRows, PleFeed, PleVectors},
+    ring_source,
     state::FlashGeometry,
     step::{FlashStep, SplitMoeAt},
     step_plan::StepPlan,
@@ -73,7 +74,7 @@ use crate::{
         session::DecodeSession,
     },
     kernels::cuda::{
-        CudaContext, DeviceBuffer,
+        CudaContext, DeviceBuffer, DeviceStream, host_register,
         resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW, ServedKernels},
     },
     sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
@@ -229,7 +230,7 @@ fn moe_trunks(
 /// A record source that adds up the time spent reading and packing records from the pack, so the
 /// load log can split the bank fill into the pack read and the pin and upload.
 struct TimedSource<'a> {
-    inner: &'a PackRecordSource<'a>,
+    inner: &'a dyn RecordSource,
     spent: Cell<Duration>,
     records: Cell<u64>,
 }
@@ -241,6 +242,32 @@ impl RecordSource for TimedSource<'_> {
         self.spent.set(self.spent.get() + opened.elapsed());
         self.records.set(self.records.get() + 1);
         result
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn upload(
+        &self,
+        layer: usize,
+        expert: u16,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        dst: &DeviceBuffer,
+        offset: usize,
+    ) -> Result<bool, EngError> {
+        let opened = Instant::now();
+        let result = self.inner.upload(layer, expert, ctx, stream, dst, offset);
+        self.spent.set(self.spent.get() + opened.elapsed());
+        // Count only an ENGAGED upload: a `false` answer falls back to
+        // `record`, which counts the expert there — once, either way.
+        if matches!(result, Ok(true)) {
+            self.records.set(self.records.get() + 1);
+        }
+        result
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn drain(&self, stream: &DeviceStream) -> Result<(), EngError> {
+        self.inner.drain(stream)
     }
 }
 
@@ -345,7 +372,7 @@ fn build_bank(
     plan: &HostPinPlan,
     profile: Option<&[Vec<f64>]>,
     usage_out: Option<&std::path::Path>,
-    source: &PackRecordSource<'_>,
+    source: &dyn RecordSource,
 ) -> Result<DeviceBank, EngError> {
     let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
@@ -574,7 +601,48 @@ pub(super) fn build_driver(
     );
 
     stage("filling the expert bank");
-    let source = PackRecordSource::new(checkpoint)?;
+    // The record source: the buffered pack reader, or — behind
+    // FIFI_FLASH_NEXT_PACK_RING=1, default off — the O_DIRECT ring reader
+    // (the landed pack reader's first production caller). Strict spelling:
+    // any other value refuses the start, like the resume switch. The ring
+    // fills sequentially, so one slot bounds it.
+    let source: Box<dyn RecordSource>;
+    let layout: crate::family::flash_next::moe::slot_bank::SlotBankLayout;
+    match std::env::var("FIFI_FLASH_NEXT_PACK_RING") {
+        Ok(value) if value == "1" => {
+            let slots = std::num::NonZeroUsize::MIN;
+            let bytes = ring_source::RingRecordSource::backing_bytes(checkpoint, artifact, slots)?;
+            let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+            // The serve-state pattern of the exl3 bank: register the plain
+            // bytes so the H2D from the slot windows is truly async. Best-
+            // effort — an unregistered window still answers correctly, it
+            // only loses the async copy.
+            match host_register(backing) {
+                Ok(()) => {}
+                Err(error) => eprintln!(
+                    "flash-next cuda: ring unpinned, staged copies (host_register refused: {error:?})"
+                ),
+            }
+            let staged = ring_source::RingRecordSource::new(checkpoint, artifact, slots, backing)?;
+            layout = staged.layout_ref().clone();
+            source = Box::new(staged);
+        }
+        Ok(other) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {other:?}"
+            )));
+        }
+        Err(std::env::VarError::NotPresent) => {
+            let staged = bank_source::PackRecordSource::new(checkpoint)?;
+            layout = staged.layout().clone();
+            source = Box::new(staged);
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {value:?}"
+            )));
+        }
+    };
     // Optional popularity profile, an exllamav3 expert_stats JSON:
     // {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}. Sources,
     // in order: the engine's `expert_stats` key (which also takes the usage dump, so the next
@@ -618,7 +686,7 @@ pub(super) fn build_driver(
         &host_plan,
         profile.as_deref(),
         usage_out.as_deref(),
-        &source,
+        source.as_ref(),
     )?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
@@ -648,7 +716,7 @@ pub(super) fn build_driver(
         ctx,
         moe_trunks(weights, layers)?,
         bank,
-        source.layout(),
+        &layout,
         &step.moe_dims(rows),
     )?;
     if rows > 1 && ring_budget > 0 {

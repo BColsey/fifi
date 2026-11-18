@@ -623,7 +623,7 @@ impl HostTierLru {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Exact-byte and exact-order checks, host only. The direct-read test
     //! needs a filesystem that answers O_DIRECT: it prefers
     //! `FIFI_TEST_DIRECT_DIR`, then `CARGO_TARGET_TMPDIR`, then the temp
@@ -831,13 +831,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_direct_span_read_stages_and_places_exact_bytes() {
+    /// The directory O_DIRECT tests write their scratch shard into, and
+    /// its filesystem type for the log: an env override first, then the
+    /// cargo tmp, then the plain temp dir. One choice shared by every
+    /// direct-reading test so the override reaches them all.
+    pub(crate) fn direct_test_dir() -> (std::path::PathBuf, String) {
         let dir = std::env::var("FIFI_TEST_DIRECT_DIR")
             .map(std::path::PathBuf::from)
             .or_else(|_| std::env::var("CARGO_TARGET_TMPDIR").map(std::path::PathBuf::from))
             .unwrap_or_else(|_| std::env::temp_dir());
-        eprintln!("direct-read test: {dir:?} on {}", filesystem_of(&dir));
+        let filesystem = filesystem_of(&dir);
+        (dir, filesystem)
+    }
+
+    #[test]
+    fn a_direct_span_read_stages_and_places_exact_bytes() {
+        let (dir, filesystem) = direct_test_dir();
+        eprintln!("direct-read test: {dir:?} on {filesystem}");
         let path = dir.join(format!("odirect-ring-test-{}.bin", std::process::id()));
         if let Err(e) = write_pattern(&path) {
             eprintln!(
