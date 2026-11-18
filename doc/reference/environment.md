@@ -79,6 +79,7 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `Q36_CUDA_MIN_FREE_MIB` | admission default | MiB count | Free-after-load floor of the CUDA memory admission, the same bytes for the gate's qualified loop and the server start; parsed once so the checks cannot diverge. An out-of-range value refuses with the accepted range named. |
 | `Q36_TIERED_GUESS` | `0` | only `1` is on | Router-guess expert prefetch in the tiered token path; ships dark until qualified on a device. |
 | `Q36_TIERED_PREFIX` | `0` | only `1` is on | Tiered sessions may save and restore prefixes; default off pending device qualification. |
+| `Q36_TIERED_PREFIX_EXTRA_BYTES` | unset | unsigned byte count | With prefix reuse and `Q36_TIERED_PREFIX=1`, allows a second pageable checkpoint on single-GPU CUDA. The budget must cover its state and token key at full context. At startup, available host memory must fit both checkpoints plus 1 GiB. Otherwise the store keeps one entry. |
 | `Q36_P2P_WATERFILL` | `0` | only `1` is on | Experimental multi-device GGUF path: a bandwidth-waterfill placement planner redistributes the sliceable roles instead of the even deal. |
 | `Q36_P2P_HOST_EXPERT_BYTES` | `0` | nonnegative byte count | With waterfill: per-card sliced mass moved to pinned host RAM at load (`_0` sets card 0's budget separately). An unparseable value refuses the start. |
 | `Q36_P2P_PREFIX` | `0` | only `1` is on | Experimental: prefix save/restore on the card path; wired but not yet qualified. |

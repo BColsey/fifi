@@ -1527,6 +1527,9 @@ fn make(
             ((model.weights.header(), gguf), &res.dims),
             &plan,
         )?;
+        if settings.prefix_reuse {
+            step.configure_tiered_prefix_store()?;
+        }
         eprintln!(
             "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
             plan.slots_per_layer, plan.threads, plan.timeout_ms

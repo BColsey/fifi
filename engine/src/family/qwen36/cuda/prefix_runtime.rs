@@ -7,7 +7,7 @@ use super::super::{
     },
 };
 use super::QwenResidentStep;
-use crate::family::graph_state::book::Health;
+use crate::family::{executor::ExecutorOps, graph_state::book::Health};
 use crate::{
     EngError,
     family::host_admit::HostAdmission,
@@ -16,6 +16,7 @@ use crate::{
 };
 use std::time::Instant;
 
+const TIERED_EXTRA_BYTES_ENV: &str = "Q36_TIERED_PREFIX_EXTRA_BYTES";
 const PIN_BYTES_ENV: &str = "Q36_CUDA_PINNED_PREFIX_BYTES";
 const DEFAULT_PIN_BYTES_MAX: usize = 8usize << 30;
 const PIN_MEMORY_HEADROOM: usize = 1usize << 30;
@@ -67,11 +68,72 @@ fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) ->
     0
 }
 
+/// The budget covers the additional pageable snapshot payload and its token key at full
+/// context. Check space for both entries because neither has been allocated at startup.
+fn second_tiered_entry_fits(
+    payload: usize,
+    capacity: usize,
+    extra_budget: usize,
+    available: Option<usize>,
+) -> bool {
+    let Some(key) = capacity
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(size_of::<u32>()))
+    else {
+        return false;
+    };
+    let Some(entry) = payload.checked_add(key) else {
+        return false;
+    };
+    payload > 0
+        && entry <= extra_budget
+        && entry
+            .checked_mul(2)
+            .and_then(|both| both.checked_add(PIN_MEMORY_HEADROOM))
+            .is_some_and(|required| available.is_some_and(|free| free >= required))
+}
+
 impl QwenResidentStep<'_> {
     /// Import refills the report; freeze lookup facts afterward, before later saves replace it.
     pub(crate) fn record_prefix_lookup(&mut self, prompt: &[u32], covered: usize) {
         self.prefill_report
             .observe_prefix_lookup(&self.prefix, prompt, covered);
+    }
+
+    /// Called once after tiered banks are attached and serving has enabled prefix reuse.
+    pub(crate) fn configure_tiered_prefix_store(&mut self) -> Result<(), EngError> {
+        let Some(raw) = std::env::var_os(TIERED_EXTRA_BYTES_ENV) else {
+            return Ok(());
+        };
+        if self.prefix_limits().entries == 0 {
+            return Ok(());
+        }
+        let budget = byte_limit(TIERED_EXTRA_BYTES_ENV, Some(&raw))?.unwrap_or_default();
+        let layout = self.state.layout();
+        let capacity = layout.kv.capacity;
+        let payload = entry_bytes(layout, capacity)?;
+        // The cgroup-aware admission budget, not the bare meminfo figure, for the same
+        // reason as the pinned-prefix probe: a capped host must not plan a second entry
+        // from memory it cannot use. A failed probe keeps the one-entry store (logged).
+        let available = HostAdmission::probe("Qwen36 tiered prefix", "Qwen36")
+            .map(|admission| usize::try_from(admission.available_budget()).ok())
+            .inspect_err(|error| {
+                eprintln!("q36 cuda: tiered prefix host probe failed ({error:?}); one entry stays")
+            })
+            .ok()
+            .flatten();
+        if second_tiered_entry_fits(payload, capacity, budget, available) {
+            self.prefix = PrefixSlot::with_limits(StoreLimits {
+                roots: 0,
+                entries: 2,
+            })
+            .with_recent_longer_protection();
+        }
+        eprintln!(
+            "q36 cuda: tiered prefix store, {} entries, extra budget {budget} B",
+            self.prefix.limits().entries
+        );
+        Ok(())
     }
 
     pub(crate) fn enable_pinned_prefix(&mut self) -> Result<(), EngError> {
@@ -293,6 +355,46 @@ mod tests {
         },
     };
     use std::ffi::OsStr;
+
+    #[test]
+    fn second_tiered_entry_requires_its_full_key_and_payload_and_host_headroom() {
+        let capacity = 128;
+        let payload = 1024;
+        let entry = payload + (capacity + 1) * size_of::<u32>();
+        let available = 2 * entry + PIN_MEMORY_HEADROOM;
+        assert!(second_tiered_entry_fits(
+            payload,
+            capacity,
+            entry,
+            Some(available)
+        ));
+        assert!(!second_tiered_entry_fits(
+            payload,
+            capacity,
+            entry - 1,
+            Some(available)
+        ));
+        assert!(!second_tiered_entry_fits(
+            payload,
+            capacity,
+            entry,
+            Some(available - 1)
+        ));
+        assert!(!second_tiered_entry_fits(payload, capacity, entry, None));
+        for (bytes, tokens) in [
+            (0, 1),
+            (usize::MAX, 1),
+            (usize::MAX / 2, 1),
+            (1, usize::MAX),
+        ] {
+            assert!(!second_tiered_entry_fits(
+                bytes,
+                tokens,
+                usize::MAX,
+                Some(usize::MAX)
+            ));
+        }
+    }
 
     #[test]
     fn pin_admission_keeps_one_retained_entry_when_two_do_not_fit_host_memory() {
