@@ -931,6 +931,47 @@ fn rejects_bolt_kv_heads_on_a_shared_layer() {
     );
 }
 
+/// Runs the converter's in-tree self-check so the battery exercises the
+/// Python layout code too. Skips (printed) when no python3 or no numpy is
+/// present; otherwise the self-check's exit code is the test's verdict.
+#[test]
+fn the_bolt_converter_selfcheck_runs() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // numpy is the self-check's only third-party need; probe it so a host
+    // without the module skips instead of failing for a missing tool.
+    let probe = std::process::Command::new("python3")
+        .args(["-c", "import numpy"])
+        .output();
+    match probe {
+        Ok(check) if check.status.success() => {}
+        Ok(_) => {
+            println!("SKIPPED: python3 present without numpy");
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("SKIPPED: python3 not present");
+            return;
+        }
+        Err(error) => panic!("python3 failed to start: {error}"),
+    }
+    let output = std::process::Command::new("python3")
+        .arg("scripts/convert_bolt_gguf_selfcheck.py")
+        .current_dir(&root)
+        .output();
+    match output {
+        Ok(run) if run.status.success() => {}
+        Ok(run) => panic!(
+            "convert_bolt_gguf_selfcheck failed:\n{}\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("SKIPPED: python3 not present");
+        }
+        Err(error) => panic!("python3 failed to start: {error}"),
+    }
+}
+
 #[test]
 fn rejects_a_missing_attn_v_on_a_physical_bolt_layer() {
     let tensors: Vec<_> = bolt_tensors()
