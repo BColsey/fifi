@@ -18,14 +18,16 @@ constexpr int kMaxSplits = 128;  // one thread per split in the combine statisti
 // Split plan of the gemma split path: n_split = min(ceil(n_keys / min_keys), max_splits)
 // chunks of exactly ceil(n_keys / n_split) keys (no tile rounding: the kernel strides
 // cells by warp, not by tile); split s owns [s * chunk, min(n_keys, (s + 1) * chunk)).
-// inference_cuda_attn_decode_gemma_split_plan_raw is the host mirror; the Rust pin
-// test holds both to the same values.
-__device__ inline void gemma_split_plan(
+// One __host__ __device__ definition serves the kernels and the extern-C
+// split_plan_raw export, so the Rust pin test checks the very arithmetic the
+// device runs.
+__host__ __device__ inline void gemma_split_plan(
     int n_keys, int max_splits, int min_keys, int &chunk, int &n_active) {
     const int want = (n_keys + min_keys - 1) / min_keys;
-    const int n_split = min(max(want, 1), max_splits);
-    chunk = (n_keys + n_split - 1) / n_split;
-    n_active = (n_keys + chunk - 1) / chunk;
+    const int n_split = want < 1 ? 1 : (want > max_splits ? max_splits : want);
+    const int ch = (n_keys + n_split - 1) / n_split;
+    chunk = ch;
+    n_active = (n_keys + ch - 1) / ch;
 }
 
 
@@ -384,10 +386,6 @@ extern "C" int inference_cuda_attn_decode_gemma_split_plan_raw(
         max_splits > kMaxSplits || min_keys < 1) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    const int want = (n_keys + min_keys - 1) / min_keys;
-    const int n_split = want < 1 ? 1 : (want > max_splits ? max_splits : want);
-    const int ch = (n_keys + n_split - 1) / n_split;
-    *chunk = ch;
-    *n_active = (n_keys + ch - 1) / ch;
+    gemma_split_plan(n_keys, max_splits, min_keys, *chunk, *n_active);
     return 0;
 }
