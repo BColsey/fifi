@@ -450,6 +450,42 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
         ("sm_89 class, shared memory skips J >= 120", 890, 20, 56_000),
         ("no tile width fits", 890, 82, 1_000),
     ];
+    // Arch-independent rows: the SM-count and shared-memory variations must run in EVERY
+    // build, so their cc follows the first compiled fleet arch instead of a literal. A
+    // single-arch build still sweeps its own class at 20 and 1 SMs and under a tight
+    // shared-memory cap.
+    let fleet_smpbo = [(860, 101_376usize), (890, 102_400), (720, 98_304)];
+    let built = compiled_archs();
+    let Some((base_cc, base_smpbo)) = fleet_smpbo
+        .iter()
+        .find(|(cc, _)| built.contains(cc))
+        .map(|(a, b)| (*a, *b))
+    else {
+        panic!("no compiled fleet arch in {built:?}");
+    };
+    let sets: Vec<(&str, i32, i32, usize)> = sets
+        .into_iter()
+        .chain([
+            (
+                "first built class, 20 SMs (arch-independent)",
+                base_cc,
+                20,
+                base_smpbo,
+            ),
+            (
+                "first built class, 1 SM (arch-independent)",
+                base_cc,
+                1,
+                base_smpbo,
+            ),
+            (
+                "first built class, shared memory skips J >= 120 (arch-independent)",
+                base_cc,
+                82,
+                56_000,
+            ),
+        ])
+        .collect();
     let types = [(8, MmqType::Q80), (12, MmqType::Q4K), (14, MmqType::Q6K)];
     // The rows include the column counts the dense sizing search can pick (2048 and 5248
     // are the historical 3090 shapes, 128 * b the searched ones at b 1, 2, 9), so the
@@ -458,7 +494,7 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
         8192usize, 4096, 2048, 512, 5248, 1152, 256, 128, 4160, 160, 32, 8,
     ];
     let (mut zero, mut nonzero, mut compared) = (0usize, 0usize, 0usize);
-    let built = compiled_archs();
+    // (`built` bound above with the arch-independent rows.)
     for (name, cc, nsm, smpbo) in sets {
         if !built.contains(&cc) {
             println!("fixup-need cross-pin: skipped {name}: {cc} is not in this build {built:?}");

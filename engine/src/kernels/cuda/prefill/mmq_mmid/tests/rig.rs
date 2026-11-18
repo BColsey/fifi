@@ -497,15 +497,19 @@ fn stream_k_shape_finds_a_shape_with_the_reach_boundary_on_every_fleet_card() {
     // top expert's tile) must be satisfiable on every card the fleet runs, with the facts
     // of the parts that own those SM counts. This runs on every build, so a search-space
     // edit that strands a card fails here without needing the device.
-    for (name, facts) in [
-        ("82-SM desktop card", (860, 82, 101_376)),
-        ("20-SM laptop card", (890, 20, 101_376)),
-        ("8-SM embedded part", (720, 8, 98_304)),
+    for (name, facts, expected) in [
+        ("82-SM desktop card", (860, 82, 101_376), (8, 512)),
+        ("20-SM laptop card", (890, 20, 101_376), (8, 128)),
+        ("8-SM embedded part", (720, 8, 98_304), (3, 128)),
     ] {
         let found = stream_k_shape(facts, 130, 2);
         let Some((e, n)) = found else {
             panic!("{name}: no shape with the reach boundary")
         };
+        // The exact shapes are pinned, not just `is_some`: the 82-SM card keeps the
+        // historical literals (8 experts, 64 tiles), and a search-space edit that shifts
+        // ANY card's shape shows up here as a diff to review, not a silent change.
+        assert_eq!(found, Some(expected), "{name}: shape drifted");
         // The chosen shape, re-derived: still stream-k with the fixup and at least two
         // column tiles, and its bounds really cut a fixup boundary past `ne_get_rows + 126`.
         let shape = MmidShape {
