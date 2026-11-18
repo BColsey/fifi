@@ -49,7 +49,9 @@ use super::{
     step::{FlashStep, SplitMoeAt},
     step_plan::StepPlan,
 };
-use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
+use crate::family::expert_bank::{
+    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_tier::TierChoice,
+};
 use crate::family::flash_next::settings::{ple_batch, ple_device};
 use crate::{
     EngError,
@@ -538,40 +540,43 @@ pub(super) fn build_driver(
         slots,
         record_bytes,
     )?;
-    // The store mode: an inclusive store holds every expert pinned, so a miss copies one way
-    // only (the D2H write-back of the evicted expert disappears); it needs every record's bytes
-    // of host RAM (43.07 GiB on this pack), so `auto` takes it only when the plan admits it and
-    // falls back to the exclusive store of spare places. `FIFI_FLASH_NEXT_BANK_MODE` forces a
-    // mode (`inclusive` or `exclusive`); anything else is refused, never a silent fallback.
+    // The store tier: the shared ladder takes inclusive while the one host budget carries it,
+    // then the exclusive store of spare places (exactly today's auto), then the disk tier through
+    // the staging ring — which is not wired at start yet, so its choice refuses with the plan's
+    // own byte counts, never a silent fallback (the ring-only bank is the next slice).
+    // `FIFI_FLASH_NEXT_BANK_MODE` forces a tier (`inclusive` or `exclusive`); anything else is
+    // refused, never a silent fallback.
     let memory = HostMemory {
         total: mem_total,
         available: mem_available,
     };
-    let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
-        Err(_) | Ok("") | Ok("auto") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms).or_else(
-                |inclusive| {
-                    eprintln!(
-                        "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
-                    );
-                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
-                },
-            )?
+    // The staging ring's own floor: two records in flight. A placeholder until the ring-only
+    // slice lands; only the not-yet-wired disk rung reads it, and only its refusal text shows
+    // it, so a start that never chooses disk never charges it.
+    let ring_bytes = 2 * record_bytes as u64;
+    let tier = HostPinPlan::bank_mode_tier(
+        std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok().as_deref(),
+        &geometry,
+        &memory,
+        &terms,
+        ring_bytes,
+    )?;
+    let host_plan = match tier {
+        TierChoice::Inclusive => HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms)?,
+        TierChoice::Exclusive { spare_places: 1 } => {
+            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)?
         }
-        Ok("inclusive") => HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms)?,
-        Ok("exclusive") => HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)?,
-        Ok(other) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+        TierChoice::Exclusive { spare_places } => {
+            return Err(EngError::MemoryPlan(format!(
+                "an exclusive store of {spare_places} spare places per layer is not wired: \
+                 today's exclusive store pins exactly one"
             )));
         }
+        TierChoice::Disk => return Err(HostPinPlan::disk_tier_refusal(&geometry, &memory, &terms)),
     };
+    let (tier_name, speed_class) = tier.describe();
     eprintln!(
-        "flash-next cuda: {} store, {} pinned host bytes",
-        match host_plan.mode {
-            HostMode::Inclusive => "inclusive",
-            HostMode::Exclusive => "exclusive",
-        },
+        "flash-next cuda: {tier_name} ({speed_class}), {} pinned host bytes",
         host_plan.store_bytes
     );
     // The guard reads the same snapshot the plan sized from, and the PLE bytes already ride
@@ -1019,8 +1024,35 @@ impl StepDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::{BankGeometry, fill_from_profile, read_expert_stats};
+    use super::{
+        BankGeometry, HostMemory, HostMode, HostPinPlan, HostTerms, fill_from_profile,
+        read_expert_stats,
+    };
     use std::io::Write as _;
+
+    /// The Disk rung's refusal is the exclusive plan's own byte counts under the not-wired
+    /// headline: a budget that cannot carry the exclusive store gets the plan's exact
+    /// refusal text, never a silent fallback.
+    #[test]
+    fn the_disk_rung_refuses_with_the_exclusive_plans_own_counts() {
+        let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
+        let terms = HostTerms::DEFAULT;
+        let memory = HostMemory {
+            total: 1 << 30,
+            available: 1,
+        };
+        let refused = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
+            .expect_err("the exclusive store cannot fit one byte");
+        let error = HostPinPlan::disk_tier_refusal(&geometry, &memory, &terms);
+        assert_eq!(
+            error.describe(),
+            format!(
+                "disk tier not wired yet (the ring-only bank is the next slice); the host \
+                 budget cannot carry the exclusive store either: {}",
+                refused.describe()
+            )
+        );
+    }
 
     /// A profile fills the slots in weight rank order (ties by id) and scales the weights to
     /// counts; the same bank without one keeps the id-ordered fill and the reversed-id counts.
