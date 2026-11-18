@@ -43,6 +43,11 @@ The initial slice passed 58 selected host tests and 115 selected MLX tests on th
 - [x] **Attribute cache costs on internal storage.** Restored the live Flint checkpoint to a durable internal copy. Compared cache-off with 512 MiB, 1 GiB, and 2 GiB. Reads occupied 74–77% of decode forward time with the cache off. Metal imports stayed under 1%. Cached modes reduced logical reads and showed mixed request latency. [Internal sweep](../explanation/mac-flint-resident-cache.md#internal-ssd-timing)
 - [x] **Measure prefill-only contiguous reads.** Added the opt-in multi-row mode and compared four prompt lengths from 16 to 557 tokens on the verified internal checkpoint. Median time to first token fell by 26–29% on the three longer prompts. All 16 responses matched, and decode rates stayed within 1%. [Prefill-only A/B](../explanation/mac-flint-ane-and-reads.md#coalescing-multi-row-prefill-on-internal-storage)
 
+## Cross-family and quantization study
+
+- [x] **Measure shared packed projections across MLX formats.** Added an 80-case matrix covering six affine bit widths at three group sizes, MXFP4, MXFP8, F32 and BF16 activations, and one and 32 rows. Evaluated bypassing same-shape reshapes and passed output parity across all cases. Request timing showed a gain on the 33-token Qwen3.6 fixture and mixed Flash-Next results. [Coverage and measurements](../explanation/mac-mlx-projection-matrix.md)
+- [ ] **Expand full-request attribution across model paths.** Add a timed dense Qwen3.8 worker fixture alongside MoE Qwen3.6 and Flash-Next. Exercise larger packed shapes and each family's KV dtype, and compare host submission, memory, and synchronized wall time. Keep the Nemotron CPU reference timings independent of the MLX cases.
+
 ## Qualification boundary
 
 The mini's Metal working set is 11.84 GiB. The documented Qwen3.6 MLX checkpoint is 20.4 GB and Flint is 22.6 GB before serving memory. The Mac lane can measure full requests when a supported, pinned checkpoint is available locally and the resident or disk-backed placement is admitted. The published Flint checkpoint ran on the mini in disk-backed mode. Representative quality and full-context memory measurements are open. [Qwen3.6 requirements](../how-to/qwen36.md#on-a-mac) · [Flint requirements](../how-to/flint.md#on-a-mac)
