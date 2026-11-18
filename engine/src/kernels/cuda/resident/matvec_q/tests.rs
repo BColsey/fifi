@@ -153,6 +153,13 @@ pub(in crate::kernels::cuda) mod reference {
                 let sc = block[192 + i / 16] as i8;
                 d * sc as f64 * (q6_of(block, i) - 32) as f64
             }
+            // IQ4_XS reads the CPU oracle (weights/gguf_dequant.rs) directly, like Q4_0:
+            // the value table and the packed 6-bit scales belong to the oracle, not to a
+            // formula beside the kernel.
+            QuantType::Iq4Xs => f64::from(
+                crate::weights::dequantize(crate::weights::GgufType::Iq4Xs, block)
+                    .expect("iq4_xs dequant")[i],
+            ),
         }
     }
 
@@ -241,6 +248,13 @@ pub(in crate::kernels::cuda) mod reference {
                 let d3 = testkit::f64_to_f16_bits(0.05 + rng.below(190) as f64 / 100.0);
                 block[108..110].copy_from_slice(&d3.to_le_bytes());
             }
+            if ty == QuantType::Iq4Xs {
+                // IQ4_XS keeps a u16 of 2-bit high scale fields at 2; the Q5_K-shaped
+                // dmin write above must not stand in for it, or parity never covers
+                // random high scale bits.
+                block[2] = (rng.next_u64() & 0xFF) as u8;
+                block[3] = (rng.next_u64() & 0xFF) as u8;
+            }
         }
         bytes
     }
@@ -302,6 +316,9 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(QuantType::Q3K.block_size(), 256);
     assert_eq!(QuantType::Q3K.block_bytes(), 110);
     assert_eq!(QuantType::Q3K.weight_bytes(64, 2048), Some(64 * 8 * 110));
+    assert_eq!(QuantType::Iq4Xs.block_size(), 256);
+    assert_eq!(QuantType::Iq4Xs.block_bytes(), 136);
+    assert_eq!(QuantType::Iq4Xs.weight_bytes(64, 2048), Some(64 * 8 * 136));
     assert_eq!(QuantType::Q4K.weight_bytes(512, 2048), Some(512 * 8 * 144));
     assert_eq!(
         QuantType::Q80.weight_bytes(8192, 2048),
@@ -612,6 +629,237 @@ fn matvec_q3k_refuses_bad_shapes_before_the_adapter() {
         &stream,
         MatvecCall {
             ty: QuantType::Q3K,
+            w: w.range(0, need).expect("w"),
+            x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+            y: w.range(0, 64 * 4).expect("y inside w"),
+            k: 2048,
+            rows: 64,
+            ncols: 1,
+        },
+    );
+    assert_bad_request(result, "y overlaps w", "y and w ranges overlap");
+}
+
+/// The native value table (native/iq4_nl_values.cuh) is the CPU constant KVALUES_IQ4NL
+/// (weights/gguf_tables.rs), numerically: the header's 16 floats are parsed and compared,
+/// so the CUDA table cannot drift from the oracle's. No device needed. The table rides
+/// kernel arguments (make_iq4nl_table); it is deliberately NOT a __constant__ array.
+#[test]
+fn iq4xs_value_table_pins_to_the_cpu_constant() {
+    let header = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/kernels/cuda/native/iq4_nl_values.cuh"
+    ))
+    .expect("the native value header exists");
+    let body = header
+        .split_once("const float values[16] = {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .expect("the kvalues table");
+    let numbers: Vec<f32> = body
+        .0
+        .split(',')
+        .filter_map(|token| token.trim().trim_end_matches('f').parse::<f32>().ok())
+        .collect();
+    let want: Vec<f32> = crate::weights::KVALUES_IQ4NL
+        .iter()
+        .map(|&v| f32::from(v))
+        .collect();
+    assert_eq!(
+        numbers, want,
+        "the native value table must equal KVALUES_IQ4NL"
+    );
+}
+
+/// The in-house IQ4_XS kernel against the CPU oracle through the same host reference
+/// machinery: k on and off the padded grid, a row count no vendored matvec takes (13), and
+/// ncols 1 and 8.
+#[test]
+fn matvec_iq4xs_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_iq4xs_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut max_ratio = 0.0f64;
+    for (k, rows) in [(256usize, 512usize), (512, 2048), (1024, 13), (2304, 64)] {
+        for &ncols in &[1usize, 8usize] {
+            let seed = 0x5eed_3000u64 + k as u64 + rows as u64 + ncols as u64;
+            let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Iq4Xs, k, rows, ncols, seed);
+            let y_bytes = rows * ncols * 4;
+            let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+            ctx.matvec_q(
+                &stream,
+                MatvecCall {
+                    ty: QuantType::Iq4Xs,
+                    w: w.range(0, QuantType::Iq4Xs.weight_bytes(rows, k).expect("size"))
+                        .expect("w"),
+                    x_q8: x_q8
+                        .range(0, q8_1_bytes(k, ncols).expect("size"))
+                        .expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols,
+                },
+            )
+            .expect("matvec iq4xs");
+            stream.synchronize().expect("drain");
+            let got = read_f32(&ctx, &y, y_bytes);
+            let w_bytes = testkit::read_bytes(
+                &ctx,
+                &w,
+                QuantType::Iq4Xs.weight_bytes(rows, k).expect("size"),
+            );
+            let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let (reference, abs) = reference::reference_dot(
+                        QuantType::Iq4Xs,
+                        &w_bytes[row * (k / 256) * 136..],
+                        &x_bytes[col * row_bytes..],
+                        k,
+                    );
+                    let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                    let error = (got[col * rows + row] as f64 - reference).abs();
+                    let ratio = if tolerance > 0.0 {
+                        error / tolerance
+                    } else {
+                        error
+                    };
+                    max_ratio = max_ratio.max(ratio);
+                    assert!(
+                        error <= tolerance,
+                        "IQ4_XS k {k} rows {rows} ncols {ncols} col {col} row {row}: \
+                         error {error} over tol {tolerance}"
+                    );
+                }
+            }
+        }
+    }
+    println!("matvec iq4xs: max tolerance ratio {max_ratio:.3}");
+}
+
+/// One flipped bit per field — the super scale d, both scale fields, and one qs nibble (a
+/// table index) — must each move an output: this pins that every field of the 136-byte
+/// super-block feeds the dot.
+#[test]
+fn matvec_iq4xs_catches_one_flipped_field() {
+    if !testkit::device_present("matvec_iq4xs_catches_one_flipped_field") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols, seed) = (512usize, 64usize, 2usize, 0x5eed_3004u64);
+    let (w, x_q8, x_row_bytes) = rig(&ctx, &stream, QuantType::Iq4Xs, k, rows, ncols, seed);
+    let w_bytes_len = QuantType::Iq4Xs.weight_bytes(rows, k).expect("size");
+    let y_bytes = rows * ncols * 4;
+    let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+    let run = |w: &DeviceBuffer, y: &DeviceBuffer| {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Iq4Xs,
+                w: w.range(0, w_bytes_len).expect("w"),
+                x_q8: x_q8.range(0, x_row_bytes * ncols).expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec");
+        stream.synchronize().expect("drain");
+        testkit::read_bytes(&ctx, y, y_bytes)
+    };
+    let clean = run(&w, &y);
+    let host_w = testkit::read_bytes(&ctx, &w, w_bytes_len);
+    // Row 3, block 1: four single-bit flips, one per field — d bit 0, scales_h bit 0
+    // (sub-block 0's high field), scales_l byte 0 bit 0, and qs byte 0 bit 0 (the table
+    // index of value 0).
+    let base = 3 * (k / 256) * 136 + 136;
+    for (at, mask, field) in [
+        (base, 0x01u8, "d"),
+        (base + 2, 0x01, "scales_h"),
+        (base + 4, 0x01, "scales_l"),
+        (base + 8, 0x01, "table index"),
+    ] {
+        let mut flipped = host_w.clone();
+        flipped[at] ^= mask;
+        let w2 = testkit::upload_bytes(&ctx, &flipped);
+        let dirty = run(&w2, &y);
+        let mut worst = 0.0f64;
+        for col in 0..ncols {
+            // y is [col][row]: row 3's outputs sit at col * rows + 3.
+            let at = 4 * (col * rows + 3);
+            let want = f32::from_le_bytes(clean[at..at + 4].try_into().unwrap());
+            let got = f32::from_le_bytes(dirty[at..at + 4].try_into().unwrap());
+            worst = worst.max(((want - got) as f64).abs());
+        }
+        assert!(
+            worst > 0.0,
+            "one flipped {field} byte must move row 3's output (worst delta {worst})"
+        );
+    }
+}
+
+/// The pre-native refusals with IQ4_XS: k off the 256 grid, the column bound, zero rows,
+/// the undersized activation floor, and y overlapping w. rows 13 is legal above, not
+/// refused (the kernel owns whole rows).
+#[test]
+fn matvec_iq4xs_refuses_bad_shapes_before_the_adapter() {
+    if !testkit::device_present("matvec_iq4xs_refuses_bad_shapes_before_the_adapter") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (w, x_q8, _row_bytes) = rig(&ctx, &stream, QuantType::Iq4Xs, 2048, 64, 1, 0x5eed_3001);
+    let y = testkit::upload_filled(&ctx, 0xAA, 64 * 4);
+    for (k, rows, ncols, case, needle) in [
+        (
+            100usize,
+            64usize,
+            1usize,
+            "k not a multiple of 256",
+            "multiple of 256",
+        ),
+        (2048, 64, 9, "column bound", "1 to 8 columns"),
+        (2048, 0, 1, "zero rows", "positive multiple of 4"),
+    ] {
+        let result = ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Iq4Xs,
+                w: w.range(0, w.bytes()).expect("w"),
+                x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+                y: y.range(0, y.bytes()).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        );
+        assert_bad_request(result, case, needle);
+    }
+    // The activation storage must cover the blocks: one q8_1 block where the call needs
+    // the padded 64 (the Rust twin of the adapter's x_row_bytes floor).
+    let result = ctx.matvec_q(
+        &stream,
+        MatvecCall {
+            ty: QuantType::Iq4Xs,
+            w: w.range(0, w.bytes()).expect("w"),
+            x_q8: x_q8.range(0, 36).expect("x"),
+            y: y.range(0, y.bytes()).expect("y"),
+            k: 2048,
+            rows: 64,
+            ncols: 1,
+        },
+    );
+    assert_bad_request(result, "undersized x_q8", "but the call needs");
+    // y inside w: the written range may share no byte with the weights.
+    let need = QuantType::Iq4Xs.weight_bytes(64, 2048).expect("size");
+    let result = ctx.matvec_q(
+        &stream,
+        MatvecCall {
+            ty: QuantType::Iq4Xs,
             w: w.range(0, need).expect("w"),
             x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
             y: w.range(0, 64 * 4).expect("y inside w"),

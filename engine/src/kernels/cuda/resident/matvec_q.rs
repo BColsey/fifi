@@ -19,6 +19,7 @@ use crate::kernels::cuda::context::{
 };
 #[cfg(test)]
 use crate::kernels::cuda::native;
+use crate::kernels::cuda::native::resident::matvec_iq4xs::matvec_iq4xs_launch;
 use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launch};
 use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
@@ -31,8 +32,9 @@ use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 /// The weight formats the matvec serves. The four `Vendored` discriminants name the trimmed
 /// vendored MMVQ instantiations (Qwen3.6 and Mellum) and are the `ggml_type` values of the shim
 /// `ggml.h` (`GGML_TYPE_Q4_K = 12`, `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from
-/// memory. `Q5K`/`Q3K` are the in-house Q5_K/Q3_K kernels
-/// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`): they never enter the
+/// memory. `Q5K`/`Q3K`/`Iq4Xs` are the in-house Q5_K/Q3_K/IQ4_XS kernels
+/// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`,
+/// `native/resident/matvec_iq4xs.cu`): they never enter the
 /// vendored switch and carry no `ggml_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantType {
@@ -43,19 +45,21 @@ pub(crate) enum QuantType {
     Q5K,
     Q40,
     Q3K,
+    Iq4Xs,
 }
 
 impl QuantType {
-    /// The `ggml_type` value the vendored code switches on. `Q5K` and `Q3K` have none and
-    /// never enter the vendored switch: the dense matvec routes them to the in-house kernels
-    /// first, and every other vendored entry refuses them before this is asked.
+    /// The `ggml_type` value the vendored code switches on. `Q5K`, `Q3K` and `Iq4Xs` have
+    /// none and never enter the vendored switch: the dense matvec routes them to the
+    /// in-house kernels first, and every other vendored entry refuses them before this is
+    /// asked.
     pub(crate) fn ggml(self) -> i32 {
         match self {
             Self::Q4K => 12,
             Self::Q50 => 6,
             Self::Q6K => 14,
             Self::Q80 => 8,
-            Self::Q5K | Self::Q40 | Self::Q3K => {
+            Self::Q5K | Self::Q40 | Self::Q3K | Self::Iq4Xs => {
                 unreachable!("the in-house kernels never enter the vendored switch")
             }
         }
@@ -63,14 +67,15 @@ impl QuantType {
 
     pub(crate) fn block_size(self) -> usize {
         match self {
-            Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K => 256,
+            Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K | Self::Iq4Xs => 256,
             Self::Q50 | Self::Q80 | Self::Q40 => 32,
         }
     }
 
     /// Bytes per block: Q4_K 144, Q5_0 22, Q6_K 210, Q8_0 34 (ggml-common.h static_asserts);
     /// Q5_K 176 (d + dmin + 12 scale bytes + 32 qh bytes + 128 qs bytes); Q4_0 18 (f16 scale
-    /// + 16 code bytes); Q3_K 110 (32 hmask + 64 qs + 12 packed 6-bit scales + f16 d).
+    /// + 16 code bytes); Q3_K 110 (32 hmask + 64 qs + 12 packed 6-bit scales + f16 d);
+    ///   IQ4_XS 136 (f16 d + u16 scales_h + scales_l[4] + 128 qs).
     pub(crate) fn block_bytes(self) -> usize {
         match self {
             Self::Q4K => 144,
@@ -80,6 +85,7 @@ impl QuantType {
             Self::Q5K => 176,
             Self::Q40 => 18,
             Self::Q3K => 110,
+            Self::Iq4Xs => 136,
         }
     }
 
@@ -170,6 +176,19 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
+            // The in-house IQ4_XS kernel: its own ABI, native 136-byte super-blocks.
+            QuantType::Iq4Xs => matvec_iq4xs_launch(
+                stream_raw,
+                &crate::kernels::cuda::native::resident::matvec_iq4xs::MatvecIq4xsRaw {
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
             _ => matvec_q_launch(stream_raw, &raw),
         })
     }
@@ -188,8 +207,10 @@ impl CudaContext {
             )));
         }
         if call.rows == 0
-            || (!matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
-                && !call.rows.is_multiple_of(ROWS_MULTIPLE))
+            || (!matches!(
+                call.ty,
+                QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
+            ) && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {
             return Err(EngError::BadRequest(format!(
                 "the CUDA matvec needs rows as a positive multiple of {ROWS_MULTIPLE}, got {}",

@@ -3,6 +3,10 @@ pub mod exl3;
 mod gguf;
 mod gguf_dequant;
 mod gguf_tables;
+/// The IQ4_NL value table, re-exported for the native table pin test
+/// (kernels/cuda/resident/matvec_q/tests.rs): the CUDA copy must equal these bytes.
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) use gguf_tables::KVALUES_IQ4NL;
 mod gguf_weights;
 mod header;
 mod indexed;
