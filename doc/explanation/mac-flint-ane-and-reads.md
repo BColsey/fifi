@@ -25,6 +25,24 @@ The 143-token request cut prefill by 24.6% and total latency by 22.3%. At 16 tok
 
 The option is `FIFI_FLINT_MLX_EXPERT_READ_RUNS=1` with `FIFI_FLINT_MLX_EXPERT_PIPELINE=1`. The production defaults are off. The already measured shared-page pipeline was enabled on the live server as a local runtime opt-in. The GUI returned ready and listed Flint after that restart. The separate contiguous-read switch remains off on the live instance. [Shared-page pipeline study](mac-flint-expert-pipeline.md)
 
+## Coalescing multi-row prefill on internal storage
+
+`FIFI_FLINT_MLX_EXPERT_READ_RUNS=prefill` applies contiguous reads to transient expert staging whenever a Flint forward has more than one row and shared-page staging is active. Single-row forwards use the per-slice reader, including the final prompt token and every decode step. The existing `1` setting also coalesces single-row transient staging.
+
+The comparison uses the pinned Flint INT4 checkpoint on the M4 mini's verified internal APFS copy. Both modes use shared pages, 512-row admission, and 12 greedy completion tokens per request. Prefix reuse and the expert cache are off. Each fresh server handles the same prompts in order, with servers running in control, candidate, candidate, control order. The 557-token chunk-boundary fixture repeats the same maintenance bulletin for four branches to exercise a full 512-row piece and its tail.
+
+| Prompt tokens | Prefill read calls, control → coalesced | Time to first token, control → coalesced | Full request, control → coalesced |
+| ---: | ---: | ---: | ---: |
+| 16 | 26,244 → 20,979 | 5.96 → 5.50 s | 11.68 → 11.22 s |
+| 45 | 52,821 → 29,727 | 13.47 → 9.58 s | 19.53 → 15.69 s |
+| 143 | 82,575 → 23,472 | 17.01 → 12.07 s | 22.16 → 17.27 s |
+| 557 | 142,722 → 40,392 | 28.65 → 21.23 s | 34.61 → 27.19 s |
+
+The table shows medians from two fresh servers per mode. The 45-, 143-, and 557-token prompts reached their first token 26–29% sooner. The 16-token prompt improved 7.6% at the median, with more variation between its two control runs. The server requested the same logical bytes on every match, and all 16 completion digests matched their controls. Every run issued 27,918 single-row decode reads. Corresponding median decode rates were within 1%, and the median peak process footprint rose by at most 120 MB. The startup logs and full timing records confirm the multi-row path on the two-piece fixture. [All 16 requests](../../scripts/benchmarks/mac-m4-flint-prefill-read-runs.csv)
+
+The mode remains opt-in. Broader performance qualification requires production-serving workloads beyond these two runs per prompt. The live server uses the shared-page pipeline with coalescing off.
+
+
 ## Reproduce
 
 From the repository root, build the public device probe in scratch.
@@ -47,4 +65,11 @@ The Flint driver keeps the shared-page pipeline on and varies only read coalesci
 ```sh
 python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   "$ENGINESRV" "$CHECKPOINT" "$PROC_IO" "$RUN_DIR" --read-runs
+```
+
+To reproduce the prefill-only comparison, build the release server from `engine/` with `cargo build --locked --release --features native-mlx,native-fault-qualification --bin enginesrv`. Use the verified internal checkpoint and a fresh output directory. Add `--smoke` for the short parity check.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$CHECKPOINT" "$PROC_IO" "$RUN_DIR" --expert-timing --prefill-read-runs
 ```
