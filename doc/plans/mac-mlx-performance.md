@@ -36,6 +36,7 @@ The initial slice passed 58 selected host tests and 115 selected MLX tests on th
 
 - [x] **Measure hardware and expert weight cache effects on the M4 mini.** Collected 408 CPU cache-latency observations, 48 paired file reads, 81 Metal staging samples, and three repeated live requests. All five shards of the published Flint checkpoint were verified. The live disk-backed server generated a complete visible answer. [Cache study and reproduction](../explanation/mac-m4-cache-study.md)
 - [x] **Measure resident expert cache hit rates.** Traced 64,260 layer-expert accesses across six live requests. A 1 GiB per-layer LRU replay hit 15.97% overall and 24.01% on single-row stages. [Trace, replay and reproduction](../explanation/mac-flint-expert-reuse.md)
+- [x] **Overlap independent Metal work with disk staging.** Added an opt-in Flint path that runs its shared expert while the host fills pages for routed experts. On the published checkpoint, both prompts returned the same output across eight runs. Prefill fell about 20% and decode throughput rose 20–23%. [Pipeline A/B and reproduction](../explanation/mac-flint-expert-pipeline.md)
 - [ ] **Prototype the byte-bounded resident expert cache.** A/B 1 GiB per-layer LRU with the disk-backed baseline and 512 MiB and 2 GiB controls. Charge real cache bytes alongside session state and prefill staging. Compare output, read bytes, latency, throughput and peak memory.
 
 ## Qualification boundary
