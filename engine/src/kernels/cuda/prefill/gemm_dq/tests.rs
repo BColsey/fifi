@@ -1112,3 +1112,134 @@ fn gemm_dq_q3k_is_deterministic_and_refuses_bad_shapes() {
         );
     }
 }
+
+/// The serve-path offsets: the fused in-projection reads its weight SEGMENT at a
+/// non-zero row offset and writes its output at a non-zero column offset inside the
+/// destination slot, with the f32 activation rows (x_f32) the family caller feeds.
+/// Both in-house dense types must match the CPU reference there.
+#[test]
+fn gemm_dq_inhouse_matches_the_reference_at_serve_offsets() {
+    const NAME: &str = "gemm_dq_inhouse_matches_the_reference_at_serve_offsets";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    // One fused buffer: 8 canary rows before the segment under test, and the y
+    // slot starts 16 floats in, so a wrong offset cannot pass by luck.
+    let (seg_rows, k, ncols) = (72usize, 512usize, 24usize);
+    let lead_rows = 8usize;
+    let y_lead = 16usize;
+    // The y column stride of the serve slot is at least the weight-row count
+    // (a token column holds all `rows` results), padded past it.
+    let ld = seg_rows + 12;
+    for q5k in [true, false] {
+        let w_all = if q5k {
+            build_weight(seg_rows + lead_rows, k, 0x6eed_0001)
+        } else {
+            build_weight_q40(seg_rows + lead_rows, k, 0x6eed_0002)
+        };
+        let seg_bytes = if q5k { 22 * (k / 32) } else { 18 * (k / 32) };
+        let seg = &w_all[lead_rows * seg_bytes..];
+        let mut rng = testkit::Rng::new(0x6eed_0003);
+        // The serve x layout: token column c at c*x_stride with x_stride >= k
+        // (hidden-strided rows), padded past k to prove the stride is honored.
+        let x_stride = k + 8;
+        let mut x: Vec<f32> = vec![0.0; (ncols - 1) * x_stride + k];
+        for c in 0..ncols {
+            for i in 0..k {
+                x[c * x_stride + i] = rng.normal() as f32 * 0.05;
+            }
+        }
+        // The CPU reference speaks the zero-stride layout: x k-major as
+        // [row_k * ncols + col], y row-major as [row * ncols + col]. Plain
+        // loops: nested closures cannot borrow the outer index under -D warnings.
+        let mut x_kmajor = vec![0.0_f32; k * ncols];
+        for i in 0..k {
+            for c in 0..ncols {
+                x_kmajor[i * ncols + c] = x[c * x_stride + i];
+            }
+        }
+        let (y_ref, abs) = if q5k {
+            reference(
+                seg,
+                &x_kmajor.iter().map(|v| f16_bits(*v)).collect::<Vec<_>>(),
+                seg_rows,
+                k,
+                ncols,
+            )
+        } else {
+            reference_q40(
+                seg,
+                &x_kmajor.iter().map(|v| f16_bits(*v)).collect::<Vec<_>>(),
+                seg_rows,
+                k,
+                ncols,
+            )
+        };
+        let w = testkit::upload_bytes(&ctx, &w_all);
+        let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let xb = testkit::upload_bytes(&ctx, &x_bytes);
+        // The y slot is column-major per the serve layout: token column c at
+        // c*y_col_stride, weight row r within it, so the span is
+        // (ncols-1)*ld + seg_rows floats past the canary head.
+        let y_span = (ncols - 1) * ld + seg_rows;
+        let y_bytes = (y_lead + y_span) * 4;
+        let y = testkit::upload_filled(&ctx, 0xEE, y_bytes);
+        let call = GemmDqQ5kCall {
+            w: w.range(lead_rows * seg_bytes, seg_rows * seg_bytes)
+                .expect("w seg"),
+            x: xb.range(0, x_bytes.len()).expect("x"),
+            y: y.range(y_lead * 4, y_span * 4).expect("y slot"),
+            k,
+            rows: seg_rows,
+            ncols,
+            x_col_stride: x_stride,
+            y_col_stride: ld,
+            x_f32: true,
+        };
+        if q5k {
+            ctx.gemm_dq_q5k(&stream, call).expect("gemm dq q5k");
+        } else {
+            ctx.gemm_dq_q40(
+                &stream,
+                GemmDqQ40Call {
+                    w: w.range(lead_rows * seg_bytes, seg_rows * seg_bytes)
+                        .expect("w seg"),
+                    x: xb.range(0, x_bytes.len()).expect("x"),
+                    y: y.range(y_lead * 4, y_span * 4).expect("y slot"),
+                    k,
+                    rows: seg_rows,
+                    ncols,
+                    x_col_stride: x_stride,
+                    y_col_stride: ld,
+                    x_f32: true,
+                },
+            )
+            .expect("gemm dq q40");
+        }
+        stream.synchronize().expect("drain");
+        let got_all = testkit::read_bytes(&ctx, &y, y_bytes);
+        // The canary head of the slot survives untouched.
+        for byte in &got_all[..y_lead * 4] {
+            assert_eq!(*byte, 0xEE, "the slot head canary must survive");
+        }
+        let got = testkit::floats(&got_all[y_lead * 4..]);
+        for row in 0..seg_rows {
+            for col in 0..ncols {
+                let idx = col * ld + row;
+                let ridx = row * ncols + col;
+                let tolerance = 4.0
+                    * (2f64.powi(-11) + f64::from(k as u32) * 2f64.powi(-24))
+                    * abs[ridx].max(1e-30);
+                let error = (f64::from(got[idx]) - y_ref[ridx]).abs();
+                assert!(
+                    error <= tolerance,
+                    "{} row {row} col {col}: error {error} over tol {tolerance}",
+                    if q5k { "q5k" } else { "q40" }
+                );
+            }
+        }
+    }
+    println!("{NAME}: q5k and q40 match the CPU reference at serve offsets");
+}

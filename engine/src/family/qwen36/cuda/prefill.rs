@@ -1425,9 +1425,14 @@ fn dense_gemm_dq(
     if !gemm_dq_ty(quant) {
         return Ok(false);
     }
+    // Which-kernel-ran proof: with FIFI_DELTA_TRACE set, every projection the
+    // dequantizing GEMM takes names the type and the fused segment offset.
+    let (w_off, n) = w_seg.unwrap_or((0, weight.n_rows()));
+    if std::env::var("FIFI_DELTA_TRACE").is_ok() {
+        eprintln!("DELTA_TRACE GEMM_DQ quant {quant:?} w_off {w_off} n {n} col_off {col_off}");
+    }
     let overflow = || EngError::MemoryPlan("the dense projection size overflows".to_owned());
     let k = weight.k();
-    let (w_off, n) = w_seg.unwrap_or_else(|| (0, weight.n_rows()));
     let row_bytes = quant.weight_bytes(1, k).ok_or_else(overflow)?;
     let w = weight.buffer().range(
         w_off * row_bytes,
