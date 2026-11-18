@@ -78,6 +78,12 @@ pub(in crate::kernels::cuda) mod reference {
     pub(super) fn weight_value(ty: QuantType, block: &[u8], i: usize) -> f64 {
         match ty {
             QuantType::Q80 => half_at(block, 0) as f64 * (block[2 + i] as i8) as f64,
+            // Q4_0 reads the CPU oracle (weights/gguf_dequant.rs), written from the
+            // ggml reference layout, not a formula beside the kernel.
+            QuantType::Q40 => f64::from(
+                crate::weights::dequantize(crate::weights::GgufType::Q40, block)
+                    .expect("q4_0 dequant")[i],
+            ),
             QuantType::Q50 => {
                 let d = half_at(block, 0) as f64;
                 let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
@@ -1522,4 +1528,169 @@ fn matvec_q_gdn_sibling_fusion_ab_bench() {
         b_ms[0],
         b_ms[b_ms.len() - 1]
     );
+}
+
+#[test]
+fn matvec_q40_matches_the_integer_reference() {
+    if !testkit::device_present("matvec_q40_matches_the_integer_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ncols = 2;
+    let mut max_ratio = 0.0f64;
+    let shapes = SHAPES
+        .into_iter()
+        .chain([PADDED_SHAPE, (2048, 13)])
+        .map(|(k, rows)| {
+            // Q4_0 reads 32-value blocks: k rounds up to the 32 grid (2304 already is on
+            // it, so the padded row keeps its weight side exact).
+            let k = k.div_ceil(32) * 32;
+            (k, rows)
+        });
+    for (k, rows) in shapes {
+        let seed = 0x5eed_1000u64 + k as u64 + rows as u64;
+        let (w, x_q8, row_bytes) = rig(&ctx, &stream, QuantType::Q40, k, rows, ncols, seed);
+        let y_bytes = rows * ncols * 4;
+        let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q40,
+                w: w.range(0, QuantType::Q40.weight_bytes(rows, k).expect("size"))
+                    .expect("w"),
+                x_q8: x_q8
+                    .range(0, q8_1_bytes(k, ncols).expect("size"))
+                    .expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec q40");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, y_bytes);
+        let w_bytes = testkit::read_bytes(
+            &ctx,
+            &w,
+            QuantType::Q40.weight_bytes(rows, k).expect("size"),
+        );
+        let x_bytes = testkit::read_bytes(&ctx, &x_q8, row_bytes * ncols);
+        for col in 0..ncols {
+            for row in 0..rows {
+                let (reference, abs) = reference::reference_dot(
+                    QuantType::Q40,
+                    &w_bytes[row * (k / 32) * 18..],
+                    &x_bytes[col * row_bytes..],
+                    k,
+                );
+                let tolerance = 64.0 * 2f64.powi(-24) * abs;
+                let error = (got[col * rows + row] as f64 - reference).abs();
+                let ratio = if tolerance > 0.0 {
+                    error / tolerance
+                } else {
+                    error
+                };
+                max_ratio = max_ratio.max(ratio);
+                assert!(
+                    error <= tolerance,
+                    "Q40 k {k} rows {rows} col {col} row {row}: error {error} over tol {tolerance}"
+                );
+            }
+        }
+    }
+    println!("matvec q40: max tolerance ratio {max_ratio:.3}");
+}
+
+/// One flipped weight nibble must move an output past the stated tolerance:
+/// this pins that the bound of the match test is tight enough to catch a
+/// single decoded value, not just gross layout errors.
+#[test]
+fn matvec_q40_catches_one_flipped_code() {
+    if !testkit::device_present("matvec_q40_catches_one_flipped_code") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols, seed) = (512usize, 64usize, 2usize, 0x5eed_1004u64);
+    let (w, x_q8, x_row_bytes) = rig(&ctx, &stream, QuantType::Q40, k, rows, ncols, seed);
+    let w_bytes_len = QuantType::Q40.weight_bytes(rows, k).expect("size");
+    let y_bytes = rows * ncols * 4;
+    let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+    let run = |w: &DeviceBuffer, y: &DeviceBuffer| {
+        ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q40,
+                w: w.range(0, w_bytes_len).expect("w"),
+                x_q8: x_q8.range(0, x_row_bytes * ncols).expect("x"),
+                y: y.range(0, y_bytes).expect("y"),
+                k,
+                rows,
+                ncols,
+            },
+        )
+        .expect("matvec");
+        stream.synchronize().expect("drain");
+        testkit::read_bytes(&ctx, y, y_bytes)
+    };
+    let clean = run(&w, &y);
+    // Row 3, block 1, the low nibble of its first code byte: ^0x05 flips the
+    // code of the block's value 0 by up to 15, a swing of 15 * d * x per
+    // output that the bound cannot hide.
+    let host_w = testkit::read_bytes(&ctx, &w, w_bytes_len);
+    let at = 3 * (k / 32) * 18 + 18 + 2;
+    let mut flipped = host_w.clone();
+    flipped[at] ^= 0x05;
+    let w2 = testkit::upload_bytes(&ctx, &flipped);
+    let dirty = run(&w2, &y);
+    let mut worst = 0.0f64;
+    for col in 0..ncols {
+        // y is [col][row]: row 3's outputs sit at col * rows + 3.
+        let at = 4 * (col * rows + 3);
+        let want = f32::from_le_bytes(clean[at..at + 4].try_into().unwrap());
+        let got = f32::from_le_bytes(dirty[at..at + 4].try_into().unwrap());
+        worst = worst.max(((want - got) as f64).abs());
+    }
+    assert!(
+        worst > 0.0,
+        "one flipped nibble must move row 3's output (worst delta {worst})"
+    );
+}
+
+/// The shared pre-native refusals with Q4_0: k not a multiple of 32, and the column bound.
+/// The whole-row rule differs from the vendored four, so rows 13 is legal above, not refused.
+#[test]
+fn matvec_q40_refuses_bad_shapes_before_the_adapter() {
+    if !testkit::device_present("matvec_q40_refuses_bad_shapes_before_the_adapter") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (w, x_q8, _row_bytes) = rig(&ctx, &stream, QuantType::Q40, 2048, 64, 1, 0x5eed_1001);
+    let y = testkit::upload_filled(&ctx, 0xAA, 64 * 4);
+    for (k, ncols, case) in [
+        (100usize, 1usize, "k not a multiple of 32"),
+        (2048, 9, "column bound"),
+    ] {
+        let result = ctx.matvec_q(
+            &stream,
+            MatvecCall {
+                ty: QuantType::Q40,
+                w: w.range(0, w.bytes()).expect("w"),
+                x_q8: x_q8.range(0, x_q8.bytes()).expect("x"),
+                y: y.range(0, y.bytes()).expect("y"),
+                k,
+                rows: 64,
+                ncols,
+            },
+        );
+        let needle = if k != 2048 {
+            "multiple of 32"
+        } else {
+            "1 to 8 columns"
+        };
+        assert_bad_request(result, case, needle);
+    }
 }

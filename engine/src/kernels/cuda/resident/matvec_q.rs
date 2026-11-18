@@ -21,6 +21,7 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::native;
 use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launch};
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
+use crate::kernels::cuda::native::resident::matvec_q40::matvec_q40_launch;
 
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub(crate) enum QuantType {
     Q6K,
     Q80,
     Q5K,
+    Q40,
 }
 
 impl QuantType {
@@ -50,19 +52,22 @@ impl QuantType {
             Self::Q50 => 6,
             Self::Q6K => 14,
             Self::Q80 => 8,
-            Self::Q5K => unreachable!("the in-house Q5_K kernel never enters the vendored switch"),
+            Self::Q5K | Self::Q40 => {
+                unreachable!("the in-house kernels never enter the vendored switch")
+            }
         }
     }
 
     pub(crate) fn block_size(self) -> usize {
         match self {
             Self::Q4K | Self::Q6K | Self::Q5K => 256,
-            Self::Q50 | Self::Q80 => 32,
+            Self::Q50 | Self::Q80 | Self::Q40 => 32,
         }
     }
 
     /// Bytes per block: Q4_K 144, Q5_0 22, Q6_K 210, Q8_0 34 (ggml-common.h static_asserts);
-    /// Q5_K 176 (d + dmin + 12 scale bytes + 32 qh bytes + 128 qs bytes).
+    /// Q5_K 176 (d + dmin + 12 scale bytes + 32 qh bytes + 128 qs bytes); Q4_0 18 (f16 scale
+    /// + 16 code bytes).
     pub(crate) fn block_bytes(self) -> usize {
         match self {
             Self::Q4K => 144,
@@ -70,6 +75,7 @@ impl QuantType {
             Self::Q6K => 210,
             Self::Q80 => 34,
             Self::Q5K => 176,
+            Self::Q40 => 18,
         }
     }
 
@@ -135,6 +141,18 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
+            QuantType::Q40 => matvec_q40_launch(
+                stream_raw,
+                &crate::kernels::cuda::native::resident::matvec_q40::MatvecQ40Raw {
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
             _ => matvec_q_launch(stream_raw, &raw),
         })
     }
@@ -152,7 +170,9 @@ impl CudaContext {
                 call.k
             )));
         }
-        if call.rows == 0 || (call.ty != QuantType::Q5K && !call.rows.is_multiple_of(ROWS_MULTIPLE))
+        if call.rows == 0
+            || (!matches!(call.ty, QuantType::Q5K | QuantType::Q40)
+                && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {
             return Err(EngError::BadRequest(format!(
                 "the CUDA matvec needs rows as a positive multiple of {ROWS_MULTIPLE}, got {}",

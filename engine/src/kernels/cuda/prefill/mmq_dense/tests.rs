@@ -304,6 +304,7 @@ fn gguf_of(ty: QuantType) -> GgufType {
         QuantType::Q4K => GgufType::Q4K,
         QuantType::Q6K => GgufType::Q6K,
         QuantType::Q5K => GgufType::Q5K,
+        QuantType::Q40 => GgufType::Q40,
     }
 }
 
@@ -498,9 +499,10 @@ fn mmq_type_of(ty: QuantType) -> MmqType {
         QuantType::Q50 => MmqType::Q50,
         QuantType::Q4K => MmqType::Q4K,
         QuantType::Q6K => MmqType::Q6K,
-        // Q5_K never reaches the mmq path: the dense GEMM rows below take the four mmq
-        // types only, and this mapping exists for those rows.
+        // Q5_K and Q4_0 never reach the mmq path: the dense GEMM rows below take the four
+        // mmq types only, and this mapping exists for those rows.
         QuantType::Q5K => unreachable!("Q5_K has no mmq type"),
+        QuantType::Q40 => unreachable!("Q4_0 has no mmq type"),
     }
 }
 

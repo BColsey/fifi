@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7101,
+      "test_fns": 7104,
       "ignored": 636,
       "env_gates": [
         "BOLT_DUMP_LOGITS",

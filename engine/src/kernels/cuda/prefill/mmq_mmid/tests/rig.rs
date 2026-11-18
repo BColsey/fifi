@@ -144,6 +144,7 @@ fn gguf_of(quant: QuantType) -> GgufType {
         QuantType::Q80 => GgufType::Q80,
         QuantType::Q50 => GgufType::Q50,
         QuantType::Q5K => GgufType::Q5K,
+        QuantType::Q40 => GgufType::Q40,
     }
 }
 
