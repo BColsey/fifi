@@ -428,3 +428,12 @@ fn invalid(message: &str) -> EngError {
 #[cfg(test)]
 #[path = "weights_tests.rs"]
 mod tests;
+
+#[cfg(all(
+    test,
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "weights_cache_bench.rs"]
+mod cache_bench;

@@ -32,9 +32,14 @@ cargo test --locked --release --features native-mlx,native-fault-qualification -
 
 The initial slice passed 58 selected host tests and 115 selected MLX tests on the mini. The release server built. Chunked startup is an opt-in and is fixture-validated. Full-checkpoint performance and qualification are open.
 
+## Cache study
+
+- [x] **Measure hardware and expert weight cache effects on the M4 mini.** Collected 408 CPU cache-latency observations, 48 paired file reads, 81 Metal staging samples, and three repeated live requests. All five shards of the published Flint checkpoint were verified. The live disk-backed server generated a complete visible answer. [Cache study and reproduction](../explanation/mac-m4-cache-study.md)
+- [ ] **Measure resident expert cache hit rates.** Trace routing across representative prompts and replay it against a bounded cache. Account for its bytes alongside the KV cache and prefill staging, then measure real request speed and peak memory.
+
 ## Qualification boundary
 
-The mini's Metal working set is 11.84 GiB. The documented Qwen3.6 MLX checkpoint is 20.4 GB and Flint is 22.6 GB before serving memory. The Mac lane can measure full requests when a supported, pinned checkpoint is available locally and the resident or disk-backed placement is admitted. Flint's oversized sparse fixture exercises the placement before the published checkpoint is available. [Qwen3.6 requirements](../how-to/qwen36.md#on-a-mac) · [Flint requirements](../how-to/flint.md#on-a-mac)
+The mini's Metal working set is 11.84 GiB. The documented Qwen3.6 MLX checkpoint is 20.4 GB and Flint is 22.6 GB before serving memory. The Mac lane can measure full requests when a supported, pinned checkpoint is available locally and the resident or disk-backed placement is admitted. The published Flint checkpoint ran on the mini in disk-backed mode. Representative quality and full-context memory measurements are open. [Qwen3.6 requirements](../how-to/qwen36.md#on-a-mac) · [Flint requirements](../how-to/flint.md#on-a-mac)
 
 - [ ] **35B whole-checkpoint throughput, quality and cutoff decision.** The documented 4-bit profile requires at least 36 GB. The Mac performance lane can resume if a supported profile and pinned checkpoint fit this mini. Until then use the layer and small executor fixtures above and keep the production cutoff at 16,384.
 - [ ] **Default decisions.** The integration coordinator can revisit each opt-in when representative checkpoint output, memory and performance evidence exists for that path or Dan explicitly makes a default decision. The mini's microbenchmarks characterize individual operations.
