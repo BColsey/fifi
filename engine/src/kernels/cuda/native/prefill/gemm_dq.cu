@@ -50,6 +50,33 @@ const int kThreads = 256; /* 16 x 16 grid of 4 x 4 micro-tiles */
 const int kAStride = kBK + 10;
 const int kBStride = kBN + 8;
 
+/* Wide-load staging of one tile's raw blocks: threads stride the (row, 16-byte piece)
+ * space in address order, so adjacent lanes hit adjacent 16-byte words. Tail rows beyond
+ * `rows` stage zeros, which decode to zeroes like the old explicit fill. */
+template <int kBlockBytes>
+__device__ __forceinline__ void stage_blocks(const unsigned char *w, int tile_m, int rows,
+                                             int w_blocks, int c, unsigned char *stage) {
+    static_assert(kBlockBytes % 16 == 0, "uint4 staging needs a block size that is a multiple of 16");
+    constexpr int kQuads = kBM * kBlockBytes / 16;
+    const int quads_per_row = kBlockBytes / 16;
+    #pragma unroll 4
+    for (int idx = threadIdx.x; idx < kQuads; idx += kThreads) {
+        const int row = idx / quads_per_row;
+        const int q = idx - row * quads_per_row;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        const int grow = tile_m + row;
+        if (grow < rows) {
+            const unsigned char *block =
+                w + ((size_t)grow * w_blocks + (c >> 2)) * kBlockBytes;
+            v = *reinterpret_cast<const uint4 *>(block + q * 16);
+        }
+        *reinterpret_cast<uint4 *>(stage + idx * 16) = v;
+    }
+}
+
+template <class D>
+constexpr int stage_quads_of = kBM * D::kBlockBytes / 16;
+
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
 
 bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
@@ -60,9 +87,11 @@ template <class D>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
                    int w_blocks) {
-    extern __shared__ __half smem[]; /* [kBM][kAStride] A then [kBK][kBStride] B */
-    __half *a = smem;                /* the decoded weight tile */
+    extern __shared__ __align__(16) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
+    __half *a = smem;                  /* the decoded weight tile */
     __half *b = smem + kBM * kAStride; /* the activation tile */
+    unsigned char *stage =
+        reinterpret_cast<unsigned char *>(smem + kBM * kAStride + kBK * kBStride);
     const int tile_m = blockIdx.x * kBM;
     const int tile_n = blockIdx.y * kBN;
     const int tx = threadIdx.x;      /* 0..255 */
@@ -73,21 +102,13 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int chunks = k / 64;
     for (int c = 0; c < chunks; ++c) {
         __syncthreads();
-        /* Weight tile: one thread per tile row decodes the row's whole 64-value chunk slice
-         * in a single decode_chunk call, straight into shared memory (zero-filled past the
-         * weight's tail rows). */
+        /* Weight tile: the tile's raw blocks first move into shared memory as 16-byte loads
+         * (one warp-wide coalesced sweep), then one thread per tile row decodes its row's
+         * 64-value chunk slice from shared into the f16 tile. */
+        stage_blocks<D::kBlockBytes>(w, tile_m, rows, w_blocks, c, stage);
+        __syncthreads();
         if (tx < kBM) {
-            const int row = tile_m + tx;
-            if (row < rows) {
-                /* chunk c of block c / 4 of the row. */
-                const unsigned char *block =
-                    w + ((size_t)row * w_blocks + (c / 4)) * D::kBlockBytes;
-                D::decode_chunk(block, c % 4, a + tx * kAStride);
-            } else {
-                for (int e = 0; e < kBK; ++e) {
-                    a[tx * kAStride + e] = __float2half(0.0f);
-                }
-            }
+            D::decode_chunk(stage + (size_t)tx * D::kBlockBytes, c & 3, a + tx * kAStride);
         } else {
             /* Activation tile: the remaining 192 threads load 4096 halves, row-major by k,
              * written at the padded stride. */
@@ -147,7 +168,8 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
-    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half);
+    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) +
+                       (size_t)stage_quads_of<D> * 16;
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
         w_blocks);
@@ -164,7 +186,7 @@ extern "C" int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_ar
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
-            args->y == NULL || !aligned(args->w, 4) || !aligned(args->x, 2) ||
+            args->y == NULL || !aligned(args->w, 16) || !aligned(args->x, 2) ||
             !aligned(args->y, 4)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }

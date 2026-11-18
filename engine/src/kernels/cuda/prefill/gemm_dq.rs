@@ -7,7 +7,7 @@
 //!
 //! Every refusal is a `BadRequest` and happens before any native call: `k` must be a positive
 //! multiple of 256 (the Q5_K block), `rows` and `ncols` positive, `w`/`x`/`y` exactly the byte
-//! counts of the call and aligned (w, y to 4; x to 2), and `y` overlaps neither `w` nor `x`.
+//! counts of the call and aligned (w to 16, the uint4 staging loads; y to 4; x to 2), and `y` overlaps neither `w` nor `x`.
 //! A refused call changes nothing.
 
 use crate::EngError;
@@ -19,6 +19,7 @@ use crate::kernels::cuda::native::prefill::gemm_dq::{GemmDqQ5kRaw, gemm_dq_q5k_l
 /// One Q5_K dequantizing GEMM: `y[r][n] = sum_k dequant(w)[r][k] * x[k][n]`, with `w` the
 /// native blocks `[rows][k / 256]`, `x` f16 row-major by `k`, `y` f32 row-major by `rows`.
 #[allow(dead_code)] // Staged until a model caller is qualified.
+#[derive(Clone)]
 pub(crate) struct GemmDqQ5kCall<'b> {
     pub(crate) w: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,

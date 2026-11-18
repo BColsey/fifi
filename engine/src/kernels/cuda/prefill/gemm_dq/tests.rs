@@ -232,3 +232,55 @@ fn gemm_dq_q5k_is_deterministic_and_refuses_bad_shapes() {
         );
     }
 }
+
+/// Kernel-only timing rig for the load-path follow-ups: builds the buffers once and
+/// times [queue + sync] of the GEMM alone on one prefill-shaped problem
+/// (rows 4096, k 4096, ncols 512 => 17.2 GFLOP per launch). `--ignored` only.
+#[test]
+#[ignore = "profile timing rig"]
+fn gemm_dq_q5k_profile_timing() {
+    if !testkit::device_present("gemm_dq_q5k_profile_timing") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rows = 4096usize;
+    let k = 4096usize;
+    let ncols = 512usize;
+    let w_bytes = build_weight(rows, k, 0x5eed_beef);
+    let mut rng = testkit::Rng::new(0x5eed_beef);
+    let x: Vec<u16> = (0..k * ncols)
+        .map(|_| f16_bits((rng.normal() * 0.05) as f32))
+        .collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let w = testkit::upload_bytes(&ctx, &w_bytes);
+    let xb = testkit::upload_bytes(&ctx, &x_bytes);
+    let y = testkit::upload_filled(&ctx, 0, rows * ncols * 4);
+    let call = GemmDqQ5kCall {
+        w: w.range(0, w_bytes.len()).expect("w"),
+        x: xb.range(0, x_bytes.len()).expect("x"),
+        y: y.range(0, rows * ncols * 4).expect("y"),
+        k,
+        rows,
+        ncols,
+    };
+    for _ in 0..3 {
+        ctx.gemm_dq_q5k(&stream, call.clone()).expect("warmup");
+    }
+    stream.synchronize().expect("drain");
+    let mut samples = Vec::new();
+    for _ in 0..20 {
+        let started = std::time::Instant::now();
+        ctx.gemm_dq_q5k(&stream, call.clone()).expect("gemm");
+        stream.synchronize().expect("drain");
+        samples.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let median = samples[samples.len() / 2];
+    let gflops = 2.0 * rows as f64 * k as f64 * ncols as f64 / (median * 1e-3) / 1e9;
+    println!(
+        "PROFILE-TIMING gemm_dq q5k rows {rows} k {k} ncols {ncols}: median {median:.3} ms, {gflops:.0} GFLOP/s, spread [{:.3} .. {:.3}]",
+        samples[0],
+        samples[samples.len() - 1]
+    );
+}

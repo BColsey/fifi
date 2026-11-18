@@ -81,7 +81,7 @@ pub(in crate::kernels::cuda) fn check_gemm_dq_q5k(
     let (Some(need_x), Some(need_y)) = (need_x, need_y) else {
         return Err(invalid_argument());
     };
-    let aligned = call.w.offset().is_multiple_of(4)
+    let aligned = call.w.offset().is_multiple_of(16)
         && call.x.offset().is_multiple_of(2)
         && call.y.offset().is_multiple_of(4);
     let y = Span::of(&call.y, need_y);
