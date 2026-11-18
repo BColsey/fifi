@@ -63,7 +63,7 @@ A separate Metal test used layer 24 of the published checkpoint, the same BF16 i
 
 This isolates the cost of staging one layer. The live server still reads its routed weights from local shards and stages them for each invocation. Both host-backed and Metal-resident caches draw from the same unified memory, so their capacity must share the serving budget. [All 81 Metal samples](../../scripts/benchmarks/mac-m4-flint-cache-staging.csv)
 
-The next experiment is to trace layer and expert IDs across representative prompts and replay that order against a byte-bounded resident cache. Use the traces to compare hit rates and evicted bytes at several capacities. The measured round trips and staging costs can then be compared with end-to-end first-token latency, decode throughput and peak memory.
+A follow-up traced six live requests and replayed their selected experts against byte-bounded caches. The next experiment is an end-to-end A/B with a 1 GiB per-layer resident cache and smaller and larger capacity controls. [Flint expert reuse and cache sizing](mac-flint-expert-reuse.md)
 
 ## Reproduce
 

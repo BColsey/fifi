@@ -777,7 +777,24 @@ fn stage_disk_experts(
     let rows = grouped_experts(k, &stack, x, &local)?;
     // Retire this layer's staged arrays before opening the next disk bank.
     k.evaluate(&[&rows])?;
+    #[cfg(feature = "native-fault-qualification")]
+    trace_expert_accesses(stem, x.shape()[0], &experts);
     Ok((rows, shared))
+}
+
+/// The disk path already has the sorted, distinct checkpoint IDs on the host.
+/// Recording a completed stage adds no GPU readback and exposes no prompt text.
+#[cfg(feature = "native-fault-qualification")]
+fn trace_expert_accesses(stem: &str, rows: u32, experts: &[u32]) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLINT_EXPERT_TRACE").is_some_and(|value| value == "1")
+    }) {
+        eprintln!(
+            "flint_expert_access {}",
+            serde_json::json!({"stem": stem, "rows": rows, "experts": experts})
+        );
+    }
 }
 
 pub(super) fn grouped_experts(
