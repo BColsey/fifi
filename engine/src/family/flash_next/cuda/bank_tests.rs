@@ -4,6 +4,7 @@
 //! the device bank. Host tests need no model and no GPU.
 
 use super::bank::*;
+use crate::family::expert_bank::bank_tier::TierChoice;
 use crate::family::expert_bank::*;
 use crate::{
     EngError,
@@ -1322,6 +1323,229 @@ mod device_tests {
             ctx.live_owners().pinned,
             pinned_before,
             "the pinned store was freed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The store-tier choice (`HostPinPlan::choose_store_tier`, the shared ladder under this plan's
+// cost model). Pure host arithmetic: no model, no GPU.
+// ---------------------------------------------------------------------------------------------
+
+/// The plan's fixed overhead beside the store, in the same arithmetic `HostPinPlan::new` charges
+/// (including the OS floor `needed_now` adds on top of `process_bytes`).
+fn overhead_of(geometry: &BankGeometry, terms: &HostTerms, memory: &HostMemory) -> u64 {
+    HostPinPlan::new(geometry, HostMode::Exclusive, memory, terms)
+        .map(|plan| plan.process_bytes - plan.store_bytes + memory.os_floor())
+        .expect("the exclusive plan always fits a 62 GiB host")
+}
+
+#[test]
+fn the_adapter_picks_exactly_todays_tier_wherever_todays_auto_succeeds() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms::DEFAULT;
+    let memory = host(HOST_TOTAL);
+    let overhead = overhead_of(&geometry, &terms, &memory);
+    let inclusive_store = 48 * 512 * EXPERT_BYTES;
+    let exclusive_store = 48 * (512 - 143 + 1) * EXPERT_BYTES;
+    let ring = 4 * MIB;
+    // Cross both boundaries: the inclusive need, the exclusive need, and the ring-only floor.
+    let inclusive_need = inclusive_store + overhead;
+    let exclusive_need = exclusive_store + overhead;
+    let step = 8 * MIB;
+    let start = exclusive_need.saturating_sub(2 * GIB);
+    let end = inclusive_need + 2 * GIB;
+    let mut budget = start;
+    while budget <= end {
+        let memory = host(budget);
+        let inclusive_ok =
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms).is_ok();
+        let exclusive_ok =
+            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms).is_ok();
+        let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring)
+            .unwrap_or_else(|error| panic!("at {budget} bytes: {}", error.describe()));
+        match (inclusive_ok, exclusive_ok) {
+            (true, _) => assert_eq!(tier, TierChoice::Inclusive, "at {budget} bytes"),
+            (false, true) => assert_eq!(
+                tier,
+                TierChoice::Exclusive { spare_places: 1 },
+                "at {budget} bytes"
+            ),
+            (false, false) => assert_eq!(tier, TierChoice::Disk, "at {budget} bytes"),
+        }
+        budget += step;
+    }
+}
+
+#[test]
+fn below_the_ring_minimum_the_choice_refuses_by_name() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms::DEFAULT;
+    let ring = 4 * MIB;
+    // The ring plus the overhead is the disk tier's minimum; below it nothing carries.
+    let overhead = overhead_of(&geometry, &terms, &host(HOST_TOTAL));
+    let memory = host(ring + overhead - 1);
+    let error = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring)
+        .expect_err("refused below the ring minimum");
+    let text = error.describe();
+    assert!(text.contains("staging ring"), "{text}");
+}
+
+/// The hand-off start makes, pure: a budget whose ladder answer is Disk carries the same
+/// choice `bank_mode_tier` returns, and the Disk rung's refusal is the exclusive plan's own
+/// byte counts - never a silent fallback and never less than the plan's own text.
+#[test]
+fn a_disk_budget_through_the_start_path_refuses_with_the_plans_counts() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms::DEFAULT;
+    let ring = 4 * MIB;
+    let overhead = overhead_of(&geometry, &terms, &host(HOST_TOTAL));
+    // One byte below the exclusive boundary: inclusive does not fit, exclusive does not
+    // fit, the ring floor does - the ladder answers Disk.
+    let need = exclusive_boundary(&geometry, &terms, overhead);
+    let memory = host(need - 1);
+    let tier = HostPinPlan::bank_mode_tier(None, &geometry, &memory, &terms, ring)
+        .expect("the ladder answers, it does not refuse here");
+    assert_eq!(tier, TierChoice::Disk);
+    let refused = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
+        .expect_err("below the exclusive boundary the plan refuses");
+    let error = HostPinPlan::disk_tier_refusal(&geometry, &memory, &terms);
+    assert_eq!(
+        error.describe(),
+        format!(
+            "disk tier not wired yet (the ring-only bank is the next slice); the host \
+                 budget cannot carry the exclusive store either: {}",
+            refused.describe()
+        )
+    );
+}
+
+/// Below the ring minimum the ladder's own refusal carries the exclusive plan's counts
+/// too, so the below-minimum refusal says no less than main's pre-ladder one did.
+#[test]
+fn a_below_minimum_refusal_carries_the_exclusive_plans_counts() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms::DEFAULT;
+    let ring = 4 * MIB;
+    let overhead = overhead_of(&geometry, &terms, &host(HOST_TOTAL));
+    let memory = host(ring + overhead - 1);
+    let error = HostPinPlan::bank_mode_tier(None, &geometry, &memory, &terms, ring)
+        .expect_err("refused below the ring minimum");
+    let text = error.describe();
+    assert!(text.contains("staging ring"), "{text}");
+    let refused = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
+        .expect_err("the plan refuses below the minimum too");
+    assert!(
+        text.contains(&refused.describe()),
+        "the refusal must carry the plan's counts: {text}"
+    );
+}
+
+#[test]
+fn a_cache_floor_moves_the_disk_boundary_not_the_parity() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms {
+        ngram_cache_min: 2 * GIB,
+        ..HostTerms::DEFAULT
+    };
+    let memory = host(HOST_TOTAL);
+    let overhead = overhead_of(&geometry, &terms, &memory);
+    let ring = 4 * MIB;
+    // The exclusive store's exact need: one byte below it only the ring carries; at it, the
+    // store fits again. The floor moved the boundary, not the parity.
+    let need = exclusive_boundary(&geometry, &terms, overhead);
+    let memory = host(need - 1);
+    let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring).unwrap();
+    assert_eq!(tier, TierChoice::Disk);
+    let memory = host(need);
+    let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring).unwrap();
+    assert_eq!(tier, TierChoice::Exclusive { spare_places: 1 });
+}
+
+/// The exact budget at which the exclusive store stops fitting: its need plus one byte less than
+/// the cache floor is still fine, so the boundary is the need plus the floor.
+fn exclusive_boundary(geometry: &BankGeometry, terms: &HostTerms, overhead: u64) -> u64 {
+    let store =
+        (geometry.layers as u64) * ((geometry.experts - geometry.slots + 1) as u64) * EXPERT_BYTES;
+    store + overhead + terms.ngram_cache_min
+}
+
+#[test]
+fn the_tier_agrees_with_the_plan_at_each_boundary_byte() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let ring = 4 * MIB;
+    for floor in [0, 2 * GIB] {
+        let terms = HostTerms {
+            ngram_cache_min: floor,
+            ..HostTerms::DEFAULT
+        };
+        let overhead = overhead_of(&geometry, &terms, &host(HOST_TOTAL));
+        for (mode, store) in [
+            (HostMode::Inclusive, 48 * 512 * EXPERT_BYTES),
+            (HostMode::Exclusive, 48 * (512 - 143 + 1) * EXPERT_BYTES),
+        ] {
+            let need = store + overhead + floor;
+            // One byte under: the plan refuses and the ladder picks the next rung (the
+            // exclusive store under inclusive, the ring under exclusive).
+            let memory = host(need - 1);
+            assert!(
+                HostPinPlan::new(&geometry, mode, &memory, &terms).is_err(),
+                "{mode:?} at {} of {need}",
+                need - 1
+            );
+            let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring).unwrap();
+            assert_ne!(
+                tier,
+                TierChoice::Inclusive,
+                "{mode:?} at {} of {need}",
+                need - 1
+            );
+            // Exactly the need: the plan admits and the ladder pins the same store.
+            let memory = host(need);
+            assert!(HostPinPlan::new(&geometry, mode, &memory, &terms).is_ok());
+            let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring).unwrap();
+            match mode {
+                HostMode::Inclusive => assert_eq!(tier, TierChoice::Inclusive),
+                HostMode::Exclusive => {
+                    assert_eq!(tier, TierChoice::Exclusive { spare_places: 1 })
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_mode_override_forces_or_refuses_and_never_falls_back() {
+    let geometry = geometry_of(&plan_with_slots(143));
+    let terms = HostTerms::DEFAULT;
+    let generous = host(HOST_TOTAL);
+    let ring = 4 * MIB;
+    // Unset, empty and auto all take the ladder's answer.
+    for mode in [None, Some(""), Some("auto")] {
+        assert_eq!(
+            HostPinPlan::bank_mode_tier(mode, &geometry, &generous, &terms, ring).unwrap(),
+            TierChoice::Inclusive,
+            "{mode:?} on a generous budget"
+        );
+    }
+    // The forced tiers are exactly the two plans that exist.
+    assert_eq!(
+        HostPinPlan::bank_mode_tier(Some("inclusive"), &geometry, &generous, &terms, ring).unwrap(),
+        TierChoice::Inclusive
+    );
+    assert_eq!(
+        HostPinPlan::bank_mode_tier(Some("exclusive"), &geometry, &generous, &terms, ring).unwrap(),
+        TierChoice::Exclusive { spare_places: 1 }
+    );
+    // `disk` is a real rung of the ladder but no start wiring serves it yet; garbage likewise.
+    // Both refuse with the same text as before the ladder existed.
+    for bad in ["disk", "inclusive ", "DISK", "ring"] {
+        let error = HostPinPlan::bank_mode_tier(Some(bad), &geometry, &generous, &terms, ring)
+            .expect_err("refused");
+        let text = error.describe();
+        assert!(
+            text.contains("FIFI_FLASH_NEXT_BANK_MODE") && text.contains("only auto"),
+            "{bad}: {text}"
         );
     }
 }

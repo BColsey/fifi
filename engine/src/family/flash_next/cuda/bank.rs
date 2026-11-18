@@ -56,7 +56,9 @@ use crate::{
 };
 
 use crate::family::expert_bank::{
-    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_error, plan_error,
+    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_error,
+    bank_tier::{TierBudget, TierChoice, choose_tier},
+    plan_error,
 };
 
 impl BankGeometry {
@@ -236,6 +238,106 @@ impl HostPinPlan {
             process_bytes,
             page_cache_left,
         })
+    }
+
+    /// Maps this plan's cost model onto the shared store-tier ladder and chooses the tier from the
+    /// one host budget: inclusive while it fits, then the exclusive store at today's one spare
+    /// place per layer, then the disk tier (`ring_bytes` is the staging ring's backing, the disk
+    /// tier's own minimum beside the fixed overhead). `new` stays the cost model of one mode;
+    /// this is the choice among modes, so an `auto` start never changes what today's `auto`
+    /// carries (the ladder's exclusive rung is exactly today's exclusive store) and only adds the
+    /// disk tier below today's refusal floor.
+    pub(super) fn choose_store_tier(
+        geometry: &BankGeometry,
+        memory: &HostMemory,
+        terms: &HostTerms,
+        ring_bytes: u64,
+    ) -> Result<TierChoice, EngError> {
+        let overflow = || plan_error("the host byte counts overflow".into());
+        let record = geometry.record_bytes as u64;
+        // Everything but the store: the same sum `new` charges beside the pins, so the ladder's
+        // arithmetic and the plan's stay one arithmetic.
+        let slot = record
+            .checked_add(terms.stream_slot_metadata)
+            .ok_or_else(overflow)?;
+        let staging = terms.ngram_staging_bytes().ok_or_else(overflow)?;
+        let overhead_bytes = slot
+            .checked_mul(2)
+            .and_then(|scratch| scratch.checked_add(staging))
+            .and_then(|sum| sum.checked_add(terms.engine_heap))
+            .and_then(|sum| sum.checked_add(terms.margin))
+            .and_then(|sum| sum.checked_add(memory.os_floor()))
+            .ok_or_else(overflow)?;
+        choose_tier(&TierBudget {
+            record_bytes: record,
+            layers: geometry.layers,
+            experts: geometry.experts,
+            slots: geometry.slots,
+            // Today's exclusive store: the cold experts plus one spare place per layer, and the
+            // policy cannot go below one.
+            max_spare_places: 1,
+            min_spare_places: 1,
+            overhead_bytes,
+            cache_floor: terms.ngram_cache_min,
+            ring_bytes,
+            available: memory.available,
+        })
+        .map_err(|ladder| {
+            // Below the minimum the ladder's own text used to replace the plan's counts; carry
+            // them so the refusal says no less than main's pre-ladder one did.
+            match Self::new(geometry, HostMode::Exclusive, memory, terms) {
+                Err(refused) => EngError::MemoryPlan(format!(
+                    "{}; the host budget cannot carry the exclusive store either: {}",
+                    ladder.describe(),
+                    refused.describe()
+                )),
+                // The exclusive store fitting means the ladder did not refuse on the budget
+                // (overflow arithmetic); keep the ladder's own text.
+                Ok(_) => ladder,
+            }
+        })
+    }
+
+    /// The start's tier choice from `FIFI_FLASH_NEXT_BANK_MODE` (`None` = unset): `auto` takes
+    /// the ladder, `inclusive` and `exclusive` force their tier, and any other value - including
+    /// `disk`, which no tier wiring serves yet - is refused, never a silent fallback. The start
+    /// maps the chosen tier onto `HostPinPlan::new`, so a forced tier that does not fit still
+    /// refuses with the plan's own byte counts.
+    pub(super) fn bank_mode_tier(
+        mode: Option<&str>,
+        geometry: &BankGeometry,
+        memory: &HostMemory,
+        terms: &HostTerms,
+        ring_bytes: u64,
+    ) -> Result<TierChoice, EngError> {
+        match mode {
+            None | Some("") | Some("auto") => {
+                Self::choose_store_tier(geometry, memory, terms, ring_bytes)
+            }
+            Some("inclusive") => Ok(TierChoice::Inclusive),
+            Some("exclusive") => Ok(TierChoice::Exclusive { spare_places: 1 }),
+            Some(other) => Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+            ))),
+        }
+    }
+
+    /// The Disk rung's refusal, pure over the budget so it is testable without a driver: the
+    /// ladder chose disk only because the exclusive store does not fit, so the refusal is the
+    /// exclusive plan's own byte counts (store, scratch, staging, heap, margin, OS floor,
+    /// needed, available) under the disk-not-wired headline, exactly as the pre-ladder auto did.
+    pub(super) fn disk_tier_refusal(
+        geometry: &BankGeometry,
+        memory: &HostMemory,
+        terms: &HostTerms,
+    ) -> EngError {
+        let refused = Self::new(geometry, HostMode::Exclusive, memory, terms)
+            .expect_err("the ladder's disk rung implies the exclusive store does not fit");
+        EngError::MemoryPlan(format!(
+            "disk tier not wired yet (the ring-only bank is the next slice); the host \
+             budget cannot carry the exclusive store either: {}",
+            refused.describe()
+        ))
     }
 }
 
