@@ -19,6 +19,28 @@ The short request took 14.6% longer, and the longer request finished in the same
 
 The native regression suite passed 38 selected tests, including byte-for-byte grouped expert parity on reused slots. The oversized sparse checkpoint separately passed with the 1 GiB cache enabled.
 
+## Internal SSD timing
+
+The qualification build records completed forward passes for the disk-backed route. The reader counts exact checkpoint bytes requested and wall time inside the file reads. The importer times the host call that validates and wraps packed pages for MLX, and the native counter records any copy fallback. Forward time includes attention, routed and shared experts, and synchronization. File reads can overlap the shared expert on the GPU.
+
+The A/B driver separates prompt forwards from decode using the reported token positions. The final prompt row belongs to prefill. It checks that every forward and routed layer appears in the counters and that output digests agree across modes.
+
+On 18 November 2026, we hash-checked a durable internal APFS copy of the same Flint INT4 revision. The live API resumed on the internal copy after a verified external fallback and produced the same completion. The sweep ran separately while live Flint was idle. Eight fresh benchmark servers ran cache-off, 512 MiB, 1 GiB, and 2 GiB, then repeated the order in reverse. Each server answered two greedy prompts with 12 completion tokens each. Prefix reuse and contiguous-read coalescing were off throughout. All output digests matched, all modes admitted 512 prefill rows, and MLX reported zero page-copy fallbacks.
+
+| Prompt tokens | Expert cache | Decode tokens/s | Logical decode reads | Time in decode file reads | Time in decode page imports | Full request | Peak footprint |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | Off | 1.91 | 5.49 GB | 4.50 s | 38 ms | 12.22 s | 1.83 GB |
+| 16 | 512 MiB | 1.58 | 4.44 GB | 5.02 s | 55 ms | 14.75 s | 2.28 GB |
+| 16 | 1 GiB | 1.60 | 4.12 GB | 4.71 s | 59 ms | 14.08 s | 2.81 GB |
+| 16 | 2 GiB | 1.41 | 3.78 GB | 4.78 s | 60 ms | 15.14 s | 3.89 GB |
+| 45 | Off | 1.43 | 5.49 GB | 5.80 s | 56 ms | 21.02 s | 1.96 GB |
+| 45 | 512 MiB | 1.72 | 4.52 GB | 4.68 s | 53 ms | 20.63 s | 2.50 GB |
+| 45 | 1 GiB | 1.54 | 4.14 GB | 4.96 s | 56 ms | 21.68 s | 3.04 GB |
+| 45 | 2 GiB | 1.44 | 3.53 GB | 4.47 s | 60 ms | 22.46 s | 4.11 GB |
+
+The table gives medians from two runs per prompt and budget. With the cache off, checkpoint reads occupied 91–92% of prefill and 74–77% of decode forward wall time. Page imports occupied under 1% of decode in every run. The 2 GiB bank saved 31–36% of exact decode read bytes yet raised total request time on both prompts. The 512 MiB bank cut 45-token request time by 1.9% and raised 16-token request time by 20.7%. The process-wide disk-read counter, which includes prefill and file-system caching effects, increased in every cached median. The cache remains experimental and default-off. [All 16 requests and phase counters](../../scripts/benchmarks/mac-m4-flint-internal-expert-timing.csv)
+
+
 ## Held-out next-token read-ahead
 
 We replayed the six previously captured requests, with all instances of one prompt family held out in each fold. Training included only the distinct prompts in the other three families. Predictions could use the preceding token's same-layer route and choose only experts absent from a demand-only 1 GiB LRU. Multi-row stages bypassed that cache. The first one-row stage of each request could warm the cache, and later stages supplied the 25,894 eligible demand misses.
@@ -43,4 +65,12 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
 python3 scripts/mac_cache_study/flint_read_ahead.py --self-test
 python3 scripts/mac_cache_study/flint_read_ahead.py \
   scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz "$RUN_DIR/read-ahead.csv"
+```
+
+For the internal-storage attribution sweep, build with `cargo build --locked --release --features native-mlx,native-fault-qualification --bin enginesrv` from `engine/`. Point `CHECKPOINT` at the verified internal copy and use a fresh `RUN_DIR`. Run on an idle Mac.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$CHECKPOINT" "$PROC_IO" "$RUN_DIR" --expert-timing \
+  --cache-mib 512 --cache-mib 1024 --cache-mib 2048
 ```
