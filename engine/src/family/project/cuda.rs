@@ -649,21 +649,7 @@ impl CudaProjector {
             )));
         }
         let parts = [qkv, sibs[0], sibs[1], sibs[2]];
-        let (mut rows, k) = matrix_shape(qkv)?;
-        for part in &parts[1..] {
-            let (part_rows, part_k) = matrix_shape(part)?;
-            if part_k != k || part.ggml_type() != qkv.ggml_type() {
-                return Err(EngError::Checkpoint(format!(
-                    "tensor {}: the GDN input-projection fusion needs {} siblings of the same \
-                     type and input width, found {} of {:?}",
-                    qkv.name(),
-                    k,
-                    part.name(),
-                    part.ggml_type()
-                )));
-            }
-            rows += part_rows;
-        }
+        let (rows, k) = fused_inproj_shape(qkv, [sibs[0], sibs[1], sibs[2]])?;
         let sources: Vec<(&str, u64)> = parts
             .iter()
             .map(|part| (part.name(), part.byte_len()))
@@ -730,9 +716,15 @@ impl CudaProjector {
     ) -> Result<CudaWeight, EngError> {
         let name = tensor.name();
         match (tensor.ggml_type(), layout) {
-            (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
-                self.upload_quant(weights, tensor, name, ty, layout)
-            }
+            (
+                ty @ (GgufType::Q4K
+                | GgufType::Q6K
+                | GgufType::Q80
+                | GgufType::Q50
+                | GgufType::Q5K
+                | GgufType::Q40),
+                layout,
+            ) => self.upload_quant(weights, tensor, name, ty, layout),
             (ty @ (GgufType::F32 | GgufType::F16), _) => {
                 let (_, bytes) = weights.read_tensor(name)?;
                 Ok(CudaWeight::Raw {
@@ -1128,6 +1120,32 @@ fn stack_depth(tensor: &GgufTensor) -> Result<Option<usize>, EngError> {
 }
 
 /// Returns `(n_rows, k)` of a tensor whose GGUF `dims[0]` is the row length.
+/// The fused in-projection is ONE native matrix under the qkv name, so every sibling
+/// segment is decoded by the qkv part's quant type: a mixed-type group (a stock Q5_K_M
+/// file mixes Q5_K with Q6_K) must refuse here, naming the part. Returns the fused
+/// row count and input width.
+fn fused_inproj_shape(
+    qkv: &GgufTensor,
+    parts: [&GgufTensor; 3],
+) -> Result<(usize, usize), EngError> {
+    let (mut rows, k) = matrix_shape(qkv)?;
+    for part in parts {
+        let (part_rows, part_k) = matrix_shape(part)?;
+        if part_k != k || part.ggml_type() != qkv.ggml_type() {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {}: the GDN input-projection fusion needs {} siblings of the same \
+                 type and input width, found {} of {:?}",
+                qkv.name(),
+                k,
+                part.name(),
+                part.ggml_type()
+            )));
+        }
+        rows += part_rows;
+    }
+    Ok((rows, k))
+}
+
 fn matrix_shape(tensor: &GgufTensor) -> Result<(usize, usize), EngError> {
     let shape_error =
         || EngError::Checkpoint(format!("tensor {} has an unusable shape", tensor.name()));
@@ -1493,21 +1511,7 @@ fn upload_fused_inproj(
         )));
     }
     let parts = [qkv, sibs[0], sibs[1], sibs[2]];
-    let (mut rows, k) = matrix_shape(qkv)?;
-    for part in &parts[1..] {
-        let (part_rows, part_k) = matrix_shape(part)?;
-        if part_k != k || part.ggml_type() != qkv.ggml_type() {
-            return Err(EngError::Checkpoint(format!(
-                "tensor {}: the GDN input-projection fusion needs {} siblings of the same \
-                 type and input width, found {} of {:?}",
-                qkv.name(),
-                k,
-                part.name(),
-                part.ggml_type()
-            )));
-        }
-        rows += part_rows;
-    }
+    let (rows, k) = fused_inproj_shape(qkv, [sibs[0], sibs[1], sibs[2]])?;
     let sources: Vec<(&str, u64)> = parts
         .iter()
         .map(|part| (part.name(), part.byte_len()))
@@ -1576,9 +1580,15 @@ fn upload(
 ) -> Result<CudaWeight, EngError> {
     let name = tensor.name();
     match (tensor.ggml_type(), layout) {
-        (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
-            upload_quant(knobs, weights, tensor, ty, layout, slice, mapped)
-        }
+        (
+            ty @ (GgufType::Q4K
+            | GgufType::Q6K
+            | GgufType::Q80
+            | GgufType::Q50
+            | GgufType::Q5K
+            | GgufType::Q40),
+            layout,
+        ) => upload_quant(knobs, weights, tensor, ty, layout, slice, mapped),
         (ty @ (GgufType::F32 | GgufType::F16), _) => {
             let (_, bytes) = weights.read_tensor(name)?;
             let bytes = match slice {

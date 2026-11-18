@@ -4214,3 +4214,52 @@ fn fused_gdn_inproj_device_bytes_are_the_concatenated_sources_at_no_extra_vram()
         live = projector.live_bytes()
     );
 }
+
+/// The fused in-projection guard, host-side: a mixed-type group (a stock Q5_K_M file
+/// mixes Q5_K with Q6_K) refuses at the shape step, naming the part, because the fused
+/// launch would decode the Q6_K segment with the qkv part's decoder.
+#[test]
+fn fused_gdn_inproj_refuses_mixed_sibling_types_by_name() {
+    let entries = [
+        weight_entry(
+            "blk.0.attn_qkv.weight",
+            GgufType::Q5K,
+            (256, K),
+            vec![0u8; 22 * 256 * K / 32],
+        ),
+        weight_entry(
+            "blk.0.attn_gate.weight",
+            GgufType::Q6K,
+            (128, K),
+            vec![0u8; 210 * 128 * K / 256],
+        ),
+        weight_entry(
+            "blk.0.ssm_beta.weight",
+            GgufType::Q5K,
+            (32, K),
+            vec![0u8; 22 * 32 * K / 32],
+        ),
+        weight_entry(
+            "blk.0.ssm_alpha.weight",
+            GgufType::Q5K,
+            (32, K),
+            vec![0u8; 22 * 32 * K / 32],
+        ),
+    ];
+    let (_dir, weights) = open_fixture(&entries);
+    let get = |name: &str| weights.header().tensor(name).expect(name);
+    let error = fused_inproj_shape(
+        get("blk.0.attn_qkv.weight"),
+        [
+            get("blk.0.attn_gate.weight"),
+            get("blk.0.ssm_beta.weight"),
+            get("blk.0.ssm_alpha.weight"),
+        ],
+    )
+    .expect_err("mixed sibling types must refuse");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("blk.0.attn_gate.weight") && text.contains("same type and input width"),
+        "{text}"
+    );
+}
