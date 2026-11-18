@@ -68,15 +68,19 @@ use super::attn::growth_bytes;
 use super::chunk_plan::{ChunkCost, PrefillPlan, PrefillTerms, admitted_chunk};
 use super::decoder::{MAX_CHUNK_ROWS, ResidentDecoder, StepMode};
 use super::state::{ResidentSnapshot, ResidentState, advance_charge};
+use super::weights::ExpertDevicePlan;
 use crate::family::prefill::mlx::PREFILL_CANDIDATES;
 use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        mlx_budget::DeviceBudget,
         qwen36::{
             host::HostShape,
             host_load::HostWeights,
-            settings::{Activation, KvDtype, chunked_prefill_allowed, shape_of, speculator_of},
+            settings::{
+                Activation, KvDtype, Q36Settings, chunked_prefill_allowed, shape_of, speculator_of,
+            },
         },
         sampler::Sampler,
         session::{
@@ -921,25 +925,83 @@ impl Q36Executor {
         rules: Q36Rules,
         spec: &FamilySpec,
     ) -> Result<(Self, Q36Session)> {
+        Self::open_with_placement(artifact, cache_limit, rules, spec, None)
+    }
+
+    pub(crate) fn open_for_device(
+        settings: &Q36Settings,
+        rules: Q36Rules,
+        device: DeviceBudget,
+    ) -> Result<(Self, Q36Session)> {
+        Self::open_with_placement(
+            &settings.artifact,
+            settings.cache_limit,
+            rules,
+            &settings.spec,
+            Some((device, settings)),
+        )
+    }
+
+    fn open_with_placement(
+        artifact: &Path,
+        cache_limit: u64,
+        rules: Q36Rules,
+        spec: &FamilySpec,
+        placement: Option<(DeviceBudget, &Q36Settings)>,
+    ) -> Result<(Self, Q36Session)> {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
         // The rules are checked against the shape from `config.json` before any shard opens, so a
         // refused rule costs no load (the project rules: enforce the memory plan at engine load).
-        admit(&shape_of(&config, spec)?, &rules)?;
+        let shape = shape_of(&config, spec)?;
+        admit(&shape, &rules)?;
+        let plan = placement
+            .map(|(device, settings)| {
+                let retained =
+                    (settings.prefix_reuse || rules.max_seqs > 1).then_some(rules.session_cap);
+                let context = usize::try_from(rules.context_limit)
+                    .map_err(|_| EngError::MemoryPlan("context exceeds platform size".into()))?;
+                let reserve = device_reserve(
+                    &shape,
+                    rules.activation,
+                    rules.kv_dtype,
+                    context,
+                    cache_limit,
+                    retained,
+                )?
+                .max(settings.prefill_reserve);
+                Ok::<_, EngError>(ExpertDevicePlan {
+                    device,
+                    reserve,
+                    max_seqs: rules.max_seqs,
+                })
+            })
+            .transpose()?;
         let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(open_checkpoint(artifact)?));
         let host = HostWeights::load(ckpt, spec, &config)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.set_cache_limit(cache_limit)?;
-        Self::from_parts(kernels, ckpt, host, rules)
+        Self::from_parts_with_placement(kernels, ckpt, host, rules, plan)
     }
 
     /// Builds the executor from loaded parts. The rules are checked again before the import, so a
     /// caller that skips `open` cannot skip them.
+    #[cfg(test)]
     pub(crate) fn from_parts(
+        kernels: MlxKernels,
+        ckpt: &'static StreamedCheckpoint,
+        host: HostWeights,
+        rules: Q36Rules,
+    ) -> Result<(Self, Q36Session)> {
+        Self::from_parts_with_placement(kernels, ckpt, host, rules, None)
+    }
+
+    fn from_parts_with_placement(
         mut kernels: MlxKernels,
         ckpt: &'static StreamedCheckpoint,
         host: HostWeights,
         rules: Q36Rules,
+        device_plan: Option<ExpertDevicePlan>,
     ) -> Result<(Self, Q36Session)> {
         admit(host.shape(), &rules)?;
         kernels.set_program_limit(rules.compile_program_limit)?;
@@ -950,13 +1012,14 @@ impl Q36Executor {
         };
         let context_limit = usize::try_from(rules.context_limit)
             .map_err(|_| EngError::BadRequest("context limit overflows".to_string()))?;
-        let mut decoder = ResidentDecoder::new_with_kv(
+        let mut decoder = ResidentDecoder::new_with_placement(
             kernels,
             ckpt,
             host,
             rules.context_limit,
             rules.activation,
             rules.kv_dtype,
+            device_plan,
         )?;
         // The compile seam admits the whole model and warms one layer per distinct program HERE,
         // before the first state exists: a plan refusal or a trace failure is a typed load error,
@@ -1069,37 +1132,18 @@ impl Q36Executor {
         prefix_reuse: bool,
         session_cap: u64,
     ) -> Result<u64> {
-        let overflow =
-            || EngError::MemoryPlan("Qwen3.6 MLX device prefill reserve overflows".into());
-        let shape = &self.decoder.weights.shape;
-        let positions = super::kv_plan::round_up(self.context_limit, super::kv_plan::KV_STEP)?;
         let activation =
             Activation::of_dtype(self.decoder.weights.consts.act).ok_or_else(|| {
                 EngError::MemoryPlan("unexpected Qwen3.6 resident activation dtype".into())
             })?;
-        let positions = u64::try_from(positions).map_err(|_| overflow())?;
-        let kv = growth_per_position(shape, self.decoder.weights.kv, activation)?
-            .checked_mul(positions)
-            .ok_or_else(overflow)?;
-        // The cache result holds the new allocation while the layer's old allocation retires.
-        let growth_overlap = kv.min(
-            growth_bytes(shape, self.decoder.weights.kv, activation)?
-                .checked_mul(positions)
-                .ok_or_else(overflow)?,
-        );
-        let session = kv
-            .checked_add(fixed_session_bytes(shape)?)
-            .ok_or_else(overflow)?;
-        let session = if prefix_reuse || self.max_seqs > 1 {
-            session.max(session_cap)
-        } else {
-            session
-        };
-        session
-            .checked_add(cache_limit)
-            .and_then(|n| n.checked_add(growth_overlap))
-            .and_then(|n| n.checked_add(crate::family::mlx_budget::PRESSURE_MARGIN))
-            .ok_or_else(overflow)
+        device_reserve(
+            &self.decoder.weights.shape,
+            activation,
+            self.decoder.weights.kv,
+            self.context_limit,
+            cache_limit,
+            (prefix_reuse || self.max_seqs > 1).then_some(session_cap),
+        )
     }
 
     /// Applies the chunk admission rule and stores the chunk size.
@@ -1132,7 +1176,20 @@ impl Q36Executor {
         // dtype aware, so both activation dtypes reach `admitted_chunk`, and a dtype the rule does
         // not know still plans no chunk.
         let chunk = if chunked_prefill_allowed(self.decoder.weights.consts.act) {
-            admitted_chunk(&self.prefill_cost()?, terms.remaining(), max_rows)?
+            let cost = self.prefill_cost()?;
+            if self.decoder.weights.streams_experts() {
+                crate::family::prefill::mlx::admitted_chunk(max_rows, terms.remaining(), |rows| {
+                    let staged = self
+                        .decoder
+                        .weights
+                        .expert_stage_bytes(self.decoder.ckpt, rows)?;
+                    cost.workspace(rows)?.checked_add(staged).ok_or_else(|| {
+                        EngError::MemoryPlan("Qwen MLX prefill plus expert stage overflows".into())
+                    })
+                })?
+            } else {
+                admitted_chunk(&cost, terms.remaining(), max_rows)?
+            }
         } else {
             None
         };
@@ -1171,6 +1228,37 @@ impl Q36Executor {
     fn force_chunk(&mut self, chunk: Option<u32>) {
         self.apply_chunk(chunk).unwrap();
     }
+}
+
+fn device_reserve(
+    shape: &HostShape,
+    activation: Activation,
+    cache: KvDtype,
+    context: usize,
+    cache_limit: u64,
+    retained: Option<u64>,
+) -> Result<u64> {
+    let overflow = || EngError::MemoryPlan("Qwen MLX device prefill reserve overflows".into());
+    let positions = super::kv_plan::round_up(context, super::kv_plan::KV_STEP)?;
+    let positions = u64::try_from(positions).map_err(|_| overflow())?;
+    let kv = growth_per_position(shape, cache, activation)?
+        .checked_mul(positions)
+        .ok_or_else(overflow)?;
+    // The cache result holds the new allocation while the layer's old allocation retires.
+    let growth_overlap = kv.min(
+        growth_bytes(shape, cache, activation)?
+            .checked_mul(positions)
+            .ok_or_else(overflow)?,
+    );
+    let session = kv
+        .checked_add(fixed_session_bytes(shape)?)
+        .ok_or_else(overflow)?;
+    session
+        .max(retained.unwrap_or(0))
+        .checked_add(cache_limit)
+        .and_then(|n| n.checked_add(growth_overlap))
+        .and_then(|n| n.checked_add(crate::family::mlx_budget::PRESSURE_MARGIN))
+        .ok_or_else(overflow)
 }
 
 impl ExecutorOps for Q36Executor {
@@ -2796,6 +2884,130 @@ mod tests {
             pending: Some(pending),
             used,
             rows,
+        }
+    }
+
+    #[test]
+    fn capped_qwen_streams_selected_experts_from_a_file_backed_checkpoint() {
+        use super::super::ops::Bytes;
+        use super::super::weights::ResidentWeights;
+        use crate::family::qwen36::fixtures::checkpoint_files;
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let spec = &TINY_GQA;
+        let (index, shard) = checkpoint_files(tiny::entries(spec));
+        let config = tiny::config(spec);
+        for (name, bytes) in [
+            ("config.json", config.clone()),
+            ("model.safetensors.index.json", index),
+            ("m.safetensors", shard),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let ckpt = Box::leak(Box::new(open_checkpoint(dir.path()).unwrap()));
+        let prompt = cycle(10);
+        for activation in [Activation::F32, Activation::Bf16] {
+            // Read both the exact page footprint and the tensors charged to
+            // the non-expert base before activation-specific norm conversion.
+            let mut kernels = MlxKernels::try_new().unwrap();
+            let weights = ResidentWeights::import_with(
+                &mut kernels,
+                ckpt,
+                host(ckpt),
+                activation == Activation::F32,
+                None,
+            )
+            .unwrap();
+            let mut routed_bytes = Bytes::default();
+            let mut decode_stage = 0;
+            for layer in &weights.layers {
+                let pages = layer.as_moe().unwrap().expert_pages().unwrap();
+                routed_bytes.packed(&pages.gate_up).unwrap();
+                routed_bytes.packed(&pages.down).unwrap();
+                decode_stage = decode_stage.max(pages.page_bytes().unwrap());
+            }
+            let full_pages = weights.expert_page_bytes().unwrap();
+            let base = weights.byte_len().unwrap() - routed_bytes.total();
+            assert!(full_pages > decode_stage);
+            // Every role of a tiny stack takes one page for either two or
+            // four experts, so its full-stack footprint equals its decode stage.
+            drop(weights);
+            drop(kernels);
+            let build_for = |bytes| {
+                Q36Executor::from_parts_with_placement(
+                    MlxKernels::try_new().unwrap(),
+                    ckpt,
+                    host(ckpt),
+                    Q36Rules {
+                        activation,
+                        ..chunk_rules()
+                    },
+                    Some(ExpertDevicePlan {
+                        device: DeviceBudget::new(bytes).unwrap(),
+                        reserve: 0,
+                        max_seqs: 1,
+                    }),
+                )
+            };
+            assert!(matches!(
+                build_for(base + decode_stage - 1),
+                Err(EngError::MemoryPlan(message)) if message.contains("stage one token")
+            ));
+            let (mut resident, mut resident_session) = build_for(base + full_pages).unwrap();
+            assert!(!resident.decoder.weights.streams_experts());
+            let (mut disk, mut disk_session) = build_for(base + decode_stage).unwrap();
+            assert!(disk.decoder.weights.streams_experts());
+            assert_eq!(disk.decoder.weights.expert_page_bytes().unwrap(), 0);
+            assert_eq!(
+                disk.decoder.weights.expert_stage_bytes(ckpt, 1).unwrap(),
+                decode_stage
+            );
+            assert_eq!(
+                disk.plan_prefill(base + decode_stage, 0, 4).unwrap().chunk,
+                None
+            );
+            // The tiny artifact is smaller than the fixed production chunk
+            // workspace. Test the chunk boundary on the same loaded executor.
+            let chunk_stage = disk.decoder.weights.expert_stage_bytes(ckpt, 4).unwrap();
+            assert_eq!(chunk_stage, decode_stage);
+            let chunk_budget = disk.decoder.weights.byte_len().unwrap()
+                + disk.prefill_cost().unwrap().workspace(4).unwrap()
+                + chunk_stage;
+            assert_eq!(
+                disk.plan_prefill(chunk_budget - 1, 0, 4).unwrap().chunk,
+                None
+            );
+            assert_eq!(
+                disk.plan_prefill(chunk_budget, 0, 4).unwrap().chunk,
+                Some(4)
+            );
+            resident.force_chunk(Some(4));
+            let want = run_job(&mut resident, &mut resident_session, &prompt, 4);
+            #[cfg(feature = "native-fault-qualification")]
+            let before = crate::family::stored::qualification_expert_reads();
+            let got = run_job(&mut disk, &mut disk_session, &prompt, 4);
+            assert_eq!(
+                (got.pending, got.history, got.pos),
+                (want.pending, want.history, want.pos)
+            );
+            assert_eq!(got.rows.len(), want.rows.len());
+            for (i, (actual, reference)) in got.rows.iter().zip(&want.rows).enumerate() {
+                assert_parity(
+                    actual,
+                    reference,
+                    &format!("{activation:?}, streamed logits {i}"),
+                );
+            }
+            #[cfg(feature = "native-fault-qualification")]
+            {
+                let after = crate::family::stored::qualification_expert_reads();
+                assert!(after.slice_reads > before.slice_reads);
+                assert!(after.read_bytes > before.read_bytes);
+                println!(
+                    "{activation:?} full_expert_pages={full_pages} max_stage_bytes={decode_stage} request_expert_bytes={}",
+                    after.read_bytes - before.read_bytes,
+                );
+            }
         }
     }
 

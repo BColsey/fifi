@@ -383,7 +383,7 @@ fn run(
                 router_t: &moe_w.router_t,
                 shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
                 shared_scalar_t: &moe_w.shared_scalar_t,
-                stacks: [&moe_w.gate_up, &moe_w.down],
+                stacks: [&moe_w.expert_pages()?.gate_up, &moe_w.expert_pages()?.down],
                 hidden: shape.hidden as u32,
                 experts: shape.moe.experts as u32,
                 top_k: shape.moe.top_k as u32,
@@ -476,7 +476,7 @@ fn run(
                     router_t: &moe_w.router_t,
                     shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
                     shared_scalar_t: &moe_w.shared_scalar_t,
-                    stacks: [&moe_w.gate_up, &moe_w.down],
+                    stacks: [&moe_w.expert_pages()?.gate_up, &moe_w.expert_pages()?.down],
                     hidden: shape.hidden as u32,
                     heads: a.heads_q as u32,
                     width: a.head_dim as u32,
@@ -537,7 +537,9 @@ fn run(
                 skip_add = true;
                 super::super::moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
-            (RFeedForward::Moe(w), Routing::Host) => moe::chunk(&mut ctx, shape, w, &normed)?.0,
+            (RFeedForward::Moe(w), Routing::Host) => {
+                moe::chunk_with_checkpoint(&mut ctx, shape, w, &normed, Some(ckpt))?.0
+            }
             (RFeedForward::Moe(w), Routing::Device) => {
                 let device = moe::chunk_device(&mut ctx, shape, w, &normed)?;
                 healths.push(device.health);

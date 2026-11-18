@@ -52,7 +52,7 @@ With automatic sizing enabled, Flint checks the checkpoint headers and serving r
 
 The planner charges both the host staging buffers and their Metal copies. Flint reduces prefill rows when that staging space and attention workspace do not fit together. It refuses startup before weight import when the resident core and one token of expert staging exceed the budget. The startup log reports `weight placement=disk-experts` or `weight placement=resident` and the selected prefill width. With Flint prefix reuse explicitly enabled, an oversized checkpoint also needs an explicit `FIFI_FLINT_PREFIX_BUDGET_BYTES` because the legacy cap derivation charges the entire checkpoint.
 
-Flash-Next already reads routed experts from disk and stages them in bounded page sets. Qwen3.6 still loads its expert banks into unified memory. Qwen dense models would need layer streaming to serve checkpoints whose resident core exceeds the budget.
+Flash-Next reads routed experts from disk and stages them in bounded page sets. Qwen dense models would need layer streaming to serve checkpoints whose resident core exceeds the budget.
 
 On the 16 GB M4 mini, a sparse zero-weight fixture with Flint's full tensor layout selected disk-backed experts under a 2 GiB weight budget. Its 22.24 GB resident-weight estimate includes all expert banks. The disk-backed path estimated 952 MB of resident weights and peaked at 1.04 GiB of MLX allocations during two prefill rows and one decode step. A separate nonzero fixture compared the disk-backed and resident expert outputs bit for bit for one and two rows, with repeated and nonconsecutive expert IDs. The published checkpoint was separately measured with the internal SSD and shared-page staging. [Flint measurements](mac-flint-resident-cache.md#internal-ssd-timing)
 
@@ -64,13 +64,29 @@ cargo test --locked --release --features native-mlx,native-fault-qualification -
   sparse_oversized_flint_checkpoint_streams_and_decodes_on_mlx --nocapture --test-threads=1
 ```
 
+## Disk-backed Qwen3.6 experts
+
+Enable `FIFI_Q36_MLX_DISK_EXPERTS=1` with `FIFI_MLX_AUTO_BUDGET=1` or a positive `FIFI_MLX_WORKING_SET_MIB` ceiling. The loader imports the non-routed weights first and prices the full set of expert pages against the working set after the serving reserve. If the full set fits, the engine uses its resident routing, prefill and compilation. If only a layer's selected experts fit, the engine uses host routing for one session and reads the selected weights from the original local shards. Startup prints the selected placement and the charged bytes.
+
+The compact IDs keep the original route and rank order. Qwen uses the same packed gate/up and down layout for both placements. F32 activation widens the BF16 scales and biases in place while reading the selected pages. The engine evaluates each routed layer before releasing those pages. The chunk planner prices the largest layer's stage for up to `rows × top_k` distinct experts, capped at the layer's expert count. If no chunk above one row fits, the worker uses one-token prefill. Startup returns a memory error when one row of staging cannot fit or the engine would need streamed experts for concurrent serving. [Qwen weight placement](../../engine/src/family/qwen36/resident/weights.rs)
+
+On the 16 GB M4 mini, a four-layer file-backed fixture priced 384 KiB for the resident expert banks and 96 KiB for a one-layer stage in both activation modes. The staged path kept zero resident expert pages and read 495 KiB of expert data across 10 prompt tokens and the test's forced decode steps. It matched the resident token and compared logits within the existing parity tolerance. The test checks admission one byte below and exactly at the one-row stage and four-row chunk boundaries. Full-checkpoint throughput and peak memory still need measurement.
+
+Run the file-backed checkpoint test from `engine/` on Apple Silicon.
+
+```sh
+cargo test --locked --release --features native-mlx,native-fault-qualification --lib \
+  family::qwen36::resident::executor::tests::capped_qwen_streams_selected_experts_from_a_file_backed_checkpoint \
+  -- --exact --nocapture --test-threads=1
+```
+
 ## CUDA and MLX interfaces
 
 | Responsibility | CUDA | MLX |
 | --- | --- | --- |
 | Device budget | Device memory and arena admission use the shared byte-reserve and fitting-candidate arithmetic. [CUDA admission](../../engine/src/family/prefill/admission.rs) | Metal supplies one unified-memory working set. The same byte-reserve arithmetic checks family charges and the MLX chunk chooser sizes prefill. [Shared reserve](../../engine/src/family/device_budget.rs) · [MLX planner](../../engine/src/family/prefill/mlx.rs) |
 | KV format | KV row math accounts for plain and packed cache planes and their auxiliary values. | Qwen3.6 prices F32, BF16 and Q8 with the same KV row math. Flint uses BF16 KV and separate capacities for full and sliding layers. Flash-Next adds a separate F32 index row to its F32 KV cost. [KV formats](../../engine/src/family/kv_format.rs) |
-| Expert staging | The expert bank tracks reusable slots and staged copies. [Expert bank](../../engine/src/family/expert_bank/mod.rs) | Flash-Next lends expert page sets through their synchronization point, Qwen3.6 holds resident packed experts, and Flint can stage selected experts from disk. The adapters share MLX's packed matmul. [Flash-Next slots](../../engine/src/family/flash_next/resident/slots.rs) |
+| Expert staging | The expert bank tracks reusable slots and staged copies. [Expert bank](../../engine/src/family/expert_bank/mod.rs) | Flash-Next lends expert page sets through their synchronization point. Qwen3.6 and Flint can stage selected experts from disk and share the compact expert-ID mapping. The adapters share MLX's packed matmul. [Flash-Next slots](../../engine/src/family/flash_next/resident/slots.rs) |
 | Kernel selection | The serving profile registers CUDA kernels for the engine. [CUDA serving kernels](../../engine/src/kernels/cuda/resident/exl3.rs) | Shared attention checks tensor dtype, shape and Metal threadgroup capacity. The families supply Qwen3.6's decode cutoffs, Flash-Next's sparse QSA and Flint's sink and ring rules. [MLX kernels](../../engine/src/kernels/mlx/mod.rs) |
 
 ## Verification on the mini

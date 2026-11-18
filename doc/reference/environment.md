@@ -40,6 +40,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `FIFI_MLX_WORKING_SET_MIB` | unset | A positive integer ceiling for the planned Metal working set, in MiB. Setting it activates automatic sizing and retains Metal's recommendation as an upper bound. Applies to one MLX model per server. |
 | `FIFI_MLX_REUSE_IDENTITY_RESHAPE` | off | Set to `1` to share a validated native resident tensor when the requested reshape matches its current dimensions. |
 | `FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL` | off | Set to `1` to batch sparse Flash-Next MLX prompt rows when chunked prefill has workspace left over. Each batch has up to eight rows. It shrinks as the prefix grows and takes one-token steps when fewer than two rows fit. [Sparse prefill measurements](../explanation/mac-mlx-requests.md#flash-next-sparse-prefill) |
+| `FIFI_Q36_MLX_DISK_EXPERTS` | off | Set to `1` with MLX device sizing enabled to let Qwen3.6 stage routed experts from local shards when the full expert banks exceed the working set. The streamed path uses one session and charges one layer of expert pages to the prefill plan. [Qwen placement and limits](../explanation/mlx-device-scaling.md#disk-backed-qwen36-experts) |
 
 ## Qwen3.6 on Apple Silicon
 
