@@ -176,12 +176,14 @@ impl MmidIds<'_> {
 /// the launch-side weight type and the quantize-side type; the typed scatter and gather
 /// wrappers call the quantize entries through it). The four glued types map one for one, so
 /// the D4/DS4 scale layout of every q8_1 buffer follows its weight (mmq.cuh:61-101).
-pub(crate) fn mmq_type_of(quant: QuantType) -> MmqType {
+pub(crate) fn mmq_type_of(quant: QuantType) -> Result<MmqType, EngError> {
     match quant {
-        QuantType::Q80 => MmqType::Q80,
-        QuantType::Q50 => MmqType::Q50,
-        QuantType::Q4K => MmqType::Q4K,
-        QuantType::Q6K => MmqType::Q6K,
+        QuantType::Q80 => Ok(MmqType::Q80),
+        QuantType::Q50 => Ok(MmqType::Q50),
+        QuantType::Q4K => Ok(MmqType::Q4K),
+        QuantType::Q6K => Ok(MmqType::Q6K),
+        // Q5_K rides the dequantizing GEMM, never the mmq pair.
+        QuantType::Q5K => Err(rule("type", "Q5_K has no mmq case")),
     }
 }
 
@@ -656,7 +658,7 @@ impl CudaContext {
             stream,
             MmqQuantizeScatterCall {
                 packing: call.packing,
-                ty: mmq_type_of(call.quant),
+                ty: mmq_type_of(call.quant)?,
                 k: call.k,
                 row_stride: call.row_stride,
                 m,
@@ -681,7 +683,7 @@ impl CudaContext {
             stream,
             MmqQuantizeCall {
                 packing: call.packing,
-                ty: mmq_type_of(call.quant),
+                ty: mmq_type_of(call.quant)?,
                 k: call.k,
                 row_stride: call.row_stride,
                 ncols: ids.shape.ne_get_rows(),

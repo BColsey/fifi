@@ -528,15 +528,28 @@ pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'stati
 /// the buffer.
 pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(), EngError> {
     for (slot, group) in groups {
-        let mut layouts = group.iter().map(|quant| mmq_type_of(*quant).q8_1_layout());
-        let Some(first) = layouts.next() else {
+        let mut first = None;
+        for quant in *group {
+            let layout = mmq_type_of(*quant)
+                .map_err(|_| {
+                    EngError::BadRequest(format!(
+                        "prefill chunk: q8 layout: {slot:?} holds a non-mmq type"
+                    ))
+                })?
+                .q8_1_layout();
+            match first {
+                None => first = Some(layout),
+                Some(seen) if seen != layout => {
+                    return Err(EngError::BadRequest(format!(
+                        "prefill chunk: q8 layout: {slot:?} is quantized once but read at mixed layouts"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if first.is_none() {
             return Err(EngError::BadRequest(format!(
                 "prefill chunk: q8 layout: {slot:?} holds no projection"
-            )));
-        };
-        if layouts.any(|layout| layout != first) {
-            return Err(EngError::BadRequest(format!(
-                "prefill chunk: q8 layout: {slot:?} is quantized once but read at mixed layouts"
             )));
         }
     }

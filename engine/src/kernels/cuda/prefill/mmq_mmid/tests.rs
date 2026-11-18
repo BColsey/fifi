@@ -630,7 +630,7 @@ fn mmq_type_of_pins_the_weight_type_mapping() {
         (QuantType::Q6K, MmqType::Q6K),
     ];
     for (quant, want) in rows {
-        assert_eq!(mmq_type_of(quant), want, "{quant:?}");
+        assert_eq!(mmq_type_of(quant).expect("an mmq type"), want, "{quant:?}");
     }
 }
 

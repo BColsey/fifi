@@ -28,6 +28,7 @@ pub(crate) mod attn_prefill;
 pub(crate) mod attn_prep_chunk;
 pub(crate) mod flint_qk;
 pub(crate) mod gdn_scan_seq;
+pub(crate) mod gemm_dq;
 pub(crate) mod kv8_dequant;
 pub(crate) mod mmq_dense;
 pub(crate) mod mmq_facts;

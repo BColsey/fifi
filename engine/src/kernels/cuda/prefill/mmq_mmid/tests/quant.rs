@@ -77,7 +77,7 @@ fn plain_phase(quant: QuantType, k: usize, x: &[f32]) -> Result<Vec<u8>, EngErro
         &stream,
         MmqQuantizeCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-            ty: mmq_type_of(quant),
+            ty: mmq_type_of(quant).expect("an mmq type"),
             k,
             row_stride: k,
             ncols,

@@ -41,6 +41,7 @@ pub(in crate::kernels::cuda) mod attn_prefill;
 pub(in crate::kernels::cuda) mod attn_prep_chunk;
 pub(in crate::kernels::cuda) mod flint_qk;
 pub(in crate::kernels::cuda) mod gdn_scan_seq;
+pub(in crate::kernels::cuda) mod gemm_dq;
 pub(in crate::kernels::cuda) mod kv8_dequant;
 pub(in crate::kernels::cuda) mod mmq_dense;
 pub(in crate::kernels::cuda) mod mmq_facts;

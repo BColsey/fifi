@@ -419,7 +419,11 @@ fn q8_layouts_refuse_a_mixed_buffer() {
         (QuantType::Q6K, Q8_1Layout::D4),
         (QuantType::Q4K, Q8_1Layout::Ds4),
     ] {
-        assert_eq!(mmq_type_of(quant).q8_1_layout(), want, "{quant:?}");
+        assert_eq!(
+            mmq_type_of(quant).expect("mmq type").q8_1_layout(),
+            want,
+            "{quant:?}"
+        );
     }
     use super::prefill_plan::ChunkSlot;
     let q8x = ChunkSlot::Q8X;

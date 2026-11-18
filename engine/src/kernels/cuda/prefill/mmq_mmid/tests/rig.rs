@@ -143,6 +143,7 @@ fn gguf_of(quant: QuantType) -> GgufType {
         QuantType::Q6K => GgufType::Q6K,
         QuantType::Q80 => GgufType::Q80,
         QuantType::Q50 => GgufType::Q50,
+        QuantType::Q5K => GgufType::Q5K,
     }
 }
 
@@ -417,7 +418,14 @@ pub(super) fn launch_mode(
 ) -> Mode {
     let (cc, nsm, smpbo) = facts;
     let fallback = !n.is_multiple_of(128);
-    let j = j_best(mmq_type_of(quant), fallback, cc, smpbo, shape.m).expect("a tile width fits");
+    let j = j_best(
+        mmq_type_of(quant).expect("an mmq type"),
+        fallback,
+        cc,
+        smpbo,
+        shape.m,
+    )
+    .expect("a tile width fits");
     let ntx = shape.m.div_ceil(j);
     let ntiles = ntx * n.div_ceil(128) * shape.n_experts;
     let waves = ntiles.div_ceil(nsm);
