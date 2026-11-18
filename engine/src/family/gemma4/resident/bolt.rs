@@ -92,8 +92,10 @@ const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
 /// `grow_scratch` allocates), plus the fixed ones/logits/head/qk buffers and
 /// the three input cells. The starter admits this against free memory before
 /// loading. `None` on overflow. Mirrors `grow_scratch` so the charge cannot
-/// undercount the prefill working set.
-pub(crate) fn scratch_bytes() -> Option<u64> {
+/// undercount the prefill working set. The attention split's partial buffer
+/// is charged only when `attn_split_armed` (the split is the default since it
+/// landed; the admission must refuse an armed load before allocating).
+pub(crate) fn scratch_bytes(attn_split_armed: bool) -> Option<u64> {
     let rows = Bolt::PREFILL_BATCH as u64;
     let growable_f32 = [
         8 * HIDDEN,                 // h[4], nrm, nrm2, proj, down
@@ -119,7 +121,7 @@ pub(crate) fn scratch_bytes() -> Option<u64> {
     // ids, pos, kv_len input cells.
     total = total.checked_add(12)?;
     // The split partial buffer, present only when the attention split is armed.
-    if attn_split_on() {
+    if attn_split_armed {
         total = total.checked_add(attn_part_bytes() as u64)?;
     }
     Some(total)
@@ -134,10 +136,13 @@ fn trace_dir() -> Option<&'static str> {
         .as_deref()
 }
 
-/// The environment variable that arms the split decode attention: one
+/// The environment variable that selects the split decode attention: one
 /// part+combine launch pair per attention instead of the single-pass kernel.
-/// Default off until the split output is qualified (the summation order, and
-/// therefore the bits, differ from the single-pass kernel).
+/// The split changes the summation order, matches the f64 reference within
+/// its tolerance, and is bit-identical only between its eager and graphed
+/// runs (the KV8 combine lift is the bit-identical piece). Armed by default
+/// since it qualified (11.7x on the full-attention call at 30K depth);
+/// `0` or `off` is the rollback to the single-pass summation order.
 pub(crate) const ATTN_SPLIT_VAR: &str = "FIFI_BOLT_ATTN_SPLIT";
 
 /// Split policy: at most 32 splits over the visible range, at least 128 keys
@@ -154,19 +159,22 @@ pub(crate) const fn attn_part_bytes() -> usize {
     Bolt::PREFILL_BATCH * HEADS * ATTN_SPLIT_MAX * (2 + GLOBAL_HEAD) * 4
 }
 
+/// The armed state the environment text selects: unset arms the qualified
+/// split (the default); `0`/`off` disarms it, `1`/`on` arms it, and anything
+/// else is refused. Split from the env read so the default rule has a
+/// portable test: edition 2024 makes `std::env::set_var` unsafe and the crate
+/// denies `unsafe_code`, so a test cannot carry the variable into the read.
+pub(crate) fn split_armed_from(raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        None => Ok(true),
+        Some(v) => parse_switch(Some(v), &format!("bolt attention split: {ATTN_SPLIT_VAR}")),
+    }
+}
+
 /// Whether the environment arms the attention split; a bad value fails the
 /// load instead of arming or disarming by accident.
 pub(crate) fn attn_split_wanted() -> Result<bool, EngError> {
-    parse_switch(
-        std::env::var(ATTN_SPLIT_VAR).ok().as_deref(),
-        &format!("bolt attention split: {ATTN_SPLIT_VAR}"),
-    )
-}
-
-/// Tolerant read for the budget accounting: the load refuses a bad value
-/// before any allocation, so here only the armed state matters.
-fn attn_split_on() -> bool {
-    attn_split_wanted().unwrap_or(false)
+    split_armed_from(std::env::var(ATTN_SPLIT_VAR).ok().as_deref())
 }
 
 pub(crate) struct BoltLayer {
@@ -275,6 +283,7 @@ fn embed_scale() -> f32 {
 /// testable on the host without a device.
 pub(crate) fn bolt_demand(
     weights_bytes: u64,
+    attn_split_armed: bool,
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
     let kv = super::super::budget::bolt_kv_plan(CELLS as u64)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
@@ -282,7 +291,7 @@ pub(crate) fn bolt_demand(
         .positions
         .checked_mul(kv.bytes_per_position)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
-    let scratch = scratch_bytes()
+    let scratch = scratch_bytes(attn_split_armed)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     Ok(crate::kernels::cuda::plan::Demand {
         tensors: weights_bytes,
@@ -304,7 +313,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     let weights_bytes = std::fs::metadata(path)
         .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
         .len();
-    let demand = bolt_demand(weights_bytes)?;
+    let demand = bolt_demand(weights_bytes, attn_split_wanted()?)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     let mut layers = Vec::with_capacity(LAYERS);
     for layer in 0..LAYERS {
@@ -1490,11 +1499,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_split_default_is_armed_and_zero_disarms() {
+        // Unset arms the qualified split; `0`/`off` is the rollback to the
+        // single-pass summation order; any other spelling refuses the load.
+        assert!(split_armed_from(None).expect("unset arms"));
+        assert!(split_armed_from(Some("1")).expect("1 arms"));
+        assert!(!split_armed_from(Some("0")).expect("zero disarms"));
+        assert!(!split_armed_from(Some("off")).expect("off disarms"));
+        assert!(split_armed_from(Some("yes")).is_err());
+    }
+
+    #[test]
     fn scratch_bytes_charges_the_prefill_maximum() {
         // Growable f32 vectors at PREFILL_BATCH rows (89,856 elements x 8 x 4),
         // fixed f32 ones + two logits rows (524,800 x 4), growable q8 at eight
-        // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes.
-        assert_eq!(scratch_bytes(), Some(5_168_716));
+        // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes;
+        // the armed split adds its partial buffer on top.
+        let disarmed = scratch_bytes(false).expect("the disarmed scratch computes");
+        let armed = scratch_bytes(true).expect("the armed scratch computes");
+        assert_eq!(disarmed, 5_168_716);
+        assert_eq!(armed, 9_379_404);
+        assert_eq!(armed - disarmed, attn_part_bytes() as u64);
     }
 
     #[test]
@@ -1503,7 +1528,7 @@ mod tests {
         // no room for the headroom reserve must be refused by the shared admit;
         // the same demand fits once the reserve is included.
         let weights_bytes = 3_000_000_000u64;
-        let demand = bolt_demand(weights_bytes).expect("the Bolt demand computes");
+        let demand = bolt_demand(weights_bytes, true).expect("the Bolt demand computes");
         assert_eq!(demand.tensors, weights_bytes);
         assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
         let allocations = demand.tensors + demand.kv_cache + demand.work;

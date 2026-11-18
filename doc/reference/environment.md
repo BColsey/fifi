@@ -176,6 +176,12 @@ Nemotron serves greedy requests only on CUDA (sampled requests are refused). The
 | `NEM35_SUBOP_TIMING` | off | Time the sub-operations of the MoE CPU routed path. |
 | `NEM35_TOKEN_TIMING` | off | Print each step's timing split to stderr as it closes, so a run cut short keeps the steps it finished. |
 
+## Bolt (Gemma4) on NVIDIA CUDA
+
+| Variable | Default | Accepted values | Meaning |
+| --- | --- | --- | --- |
+| `FIFI_BOLT_ATTN_SPLIT` | on (switch) | `1`, `on`, `0`, `off` | Selects the split decode attention of the Bolt resident step: one partial+combine launch pair per attention instead of the single-pass kernel. The split changes the summation order, matches the f64 reference within its tolerance, and is bit-identical only between its eager and graphed runs (the KV8 combine lift into the shared reducer is the bit-identical piece). Unset arms it (the default since the split landed: the full-attention call is 11.7x faster at 30K depth, and served decode goes from 6.8 to 43 tok/s there, greedy output unchanged over 96 tokens at all four bench depths); `0` or `off` is the rollback to the single-pass summation order. Any other value is refused at load. Read once per process; restart to change. |
+
 ## Tests
 
 These are read by `cargo test`, not by `enginesrv`. A test that needs recorded data finds each location by name: the environment variable first, then the same key in the JSON object `~/.config/fifi/test-paths.json`. The tests that read them skip when a location is unset, and fail instead when `FIFI_TEST_REQUIRE_DATA` is exactly `1`. A deliberate `#[ignore]`d run always fails on a missing value. The qualification, benchmark and oracle harnesses read further variables (`FLINT_QUAL_*`, `DT_*`, `FIFI_GRAPH_BENCH_*`, `FIFI_FLINT_*_ORACLE*`, `FLINT_PROBE_*`, the `*_CHILD` child-process fault harnesses and the like); those are inputs of the harnesses, not serving switches.
