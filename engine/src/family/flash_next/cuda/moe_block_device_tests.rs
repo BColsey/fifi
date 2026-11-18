@@ -30,6 +30,26 @@
 //! A/B behind that bound). `FIFI_FLASH_NEXT_RING_HELD` (test-only, read by the ring test) picks how
 //! many of ROW 0's picks the bank holds — 0 the all-ring arm, 10 the all-bank arm, 6 the default
 //! mix — rows 1.. keep the default split in every arm.
+//!
+//! The wide oracle runs read three test-only variables: `FIFI_RING_ORACLE_ROWS` sets the
+//! row count (required by the wide oracle; the measured legs are 49 and 1,024 rows —
+//! 2,048 is refused at this commit),
+//! `FIFI_RING_REF_CACHE` names a
+//! directory where the fp64 references are cached by input hash — computed host-side before any
+//! device work, so a warm oracle leg holds the card for its launches only — and
+//! `FIFI_RING_CONTROL_STRIDE` runs the same-family control on every Nth row (default 1: every
+//! row; a stride also keeps the last row and the two rows either side of the midpoint).
+//! The oracle covers up to 1,024 rows: at 2,048 the grouped pass refuses, because one
+//! routed group hands swiglu_rows up to about ten expert rows per prompt row (18,779
+//! at 2,048) over its 16,384-row cap (swiglu_rows MAX_ROWS) — a real limit of the
+//! shared prefill (widest piece today ~16,384/top_k rows), recorded as a finding, not
+//! patched around. At
+//! 1,024 rows the all-resident reference is launched row by row, which costs about 19 minutes
+//! of card for the comparisons alone — measured 2026-11-18, every-row control would add ~62
+//! min per layer at ~1.8 s a row, hence the stride (131 rows per layer at stride 8: 231 s and
+//! 228 s, max 0.000e0 on both layers). Batching that reference into grouped launches is a
+//! follow-up, not done here. `prime_ring_reference_cache` fills or verifies that cache
+//! without a GPU.
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::PathBuf;
@@ -66,22 +86,37 @@ const SLOTS: usize = 16;
 /// The union-admit chunk path's flat launch groups the rows' pairs differently than the
 /// per-row launches; the difference is a handful of float roundings.
 const SPLIT_BOUND: f64 = 1e-6;
-/// The ring branch's per-row output deviates from the all-resident block and from fp64 by
-/// 1.5e-4 to 2.9e-4 relative L2, measured on this pack at rows=49; the deviation is
-/// identical with the fused pair launch on and off and with all, none or some of row 0's
-/// picks held in the bank (FIFI_FLASH_NEXT_RING_HELD arms those variants; the knob moves
-/// row 0 only — the fixture's other rows keep the default split), so sum order and that
-/// source split are excluded. The per-projection device test
-/// ([`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`])
-/// separates the families' arithmetic: the job-table tile kernels stage the activations as
-/// F16 operands (`exl3.cu`'s
-/// jobs_input_rotate rounds to F16 where it writes the rotated rows; JobsTile multiplies
-/// F16 halves) while the flat indexed launches read their F32 staging — giving 1.9-3.9e-4
-/// per projection against fp64 where the indexed family sits at 1.5-3.0e-7 — the block
-/// deviation is that launch-family arithmetic, not a defect of the ring branch.
-/// The bound covers the block-level combine (1.4x headroom over the 2.9e-4 maximum); the
-/// per-projection figures are bounded separately at `GATE_UP_BOUND`/`DOWN_BOUND`.
-const RING_BOUND: f64 = 4e-4;
+/// The ring oracle's tolerance is a chosen ceiling, not a derived invariant: 2^-11
+/// sits about 1.2x above the largest deviation measured on this pack — 3.846e-4
+/// relative L2 at 49 rows (max over both layers) and 4.038e-4 at 1,024 rows; the
+/// maximum grows with the row count, as a max over draws does. The deviation is identical with the fused pair launch on and off
+/// and with all, none or some of row 0's picks held in the bank
+/// (FIFI_FLASH_NEXT_RING_HELD arms those variants; the knob moves row 0 only), so sum
+/// order and that source split are excluded. The cause is the launch family, not the
+/// ring: the job-table tile kernels stage activations as F16 operands (`exl3.cu`'s
+/// jobs_input_rotate rounds on write, JobsTile multiplies the halves) while the fp64
+/// and all-resident references carry no such rounding — the per-projection split is
+/// measured by [`each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row`]
+/// at 1.9-3.9e-4 (bounded at GATE_UP_BOUND/DOWN_BOUND). 2^-11 = 4.88e-4, the F16 unit
+/// roundoff, is adopted as the ceiling: about 1.2 times the 1,024-row maximum, so a
+/// width change needs no re-measurement, while a real ring defect (a wrong expert
+/// record, an off-by-one slot: 1e-1 to 1e-3 scale) still fails by orders of magnitude.
+/// The same-family control inside the oracle (the ring against an all-resident launch
+/// of the SAME jobs family, bit-identical) is what proves the ring adds nothing;
+/// this bound only fixes the launch-family difference. The per-layer mean is guarded
+/// separately at MEAN_BOUND.
+/// The ceiling catches any real defect class the measurement campaign has shown
+/// (a wrong slot row, a torn scale, an off-by-one slot record: 1e-1 to 1e-3 scale,
+/// orders of magnitude above it) while absorbing the rounding-scale floor the
+/// measurements sit on; it would NOT catch a defect that lands inside ~20% of the
+/// measured maximum — that is what the bit-identity control and the mean guard
+/// are for.
+const RING_BOUND: f64 = 1.0 / 2048.0; // 2^-11, a chosen ceiling (see above)
+
+/// The per-layer mean guard: measured means are 3.219e-4 and 3.290e-4 at 49 rows
+/// and 3.212e-4 and 3.321e-4 at 1,024 rows (both layers, both widths); 3.6e-4
+/// catches a uniform uplift (one more rounding stage) while sitting above those.
+const MEAN_BOUND: f64 = 3.6e-4;
 
 fn pack_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"))
@@ -704,11 +739,171 @@ fn threaded_references(
     })
 }
 
+/// The pack's identity for the cache key: every file under the pack directory with its
+/// size and mtime, sorted by path. A rebuilt or edited pack changes the key even when
+/// the directory path does not.
+fn pack_identity(hasher: &mut std::collections::hash_map::DefaultHasher) {
+    fn walk(dir: &std::path::Path, depth: usize, hasher: &mut impl std::hash::Hasher) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            hasher.write(path.file_name().unwrap_or_default().as_encoded_bytes());
+            hasher.write(&meta.len().to_le_bytes());
+            if let Some(secs) = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                hasher.write(&secs.as_secs().to_le_bytes());
+            }
+            if path.is_dir() && depth < 3 {
+                walk(&path, depth + 1, hasher);
+            }
+        }
+    }
+    walk(&pack_dir(), 0, hasher);
+}
+
+/// One layer's cached-reference file, keyed by everything the fixture feeds the fp64
+/// computation: the tag (bump it when the seeding formula changes), the pack's path AND
+/// per-file identity, the MoE shapes, the layer's POSITION in the bank pair (rows are
+/// seeded `seed + 7 * (index + 1)`, so the layer number alone is not the input), the
+/// layer number and the row count. `DefaultHasher` is stable within one toolchain; a
+/// toolchain change only misses the cache (a safe recompute).
+fn ring_ref_cache_path(
+    dir: &std::path::Path,
+    dims: &MoeDims,
+    index: usize,
+    layer: usize,
+    m: usize,
+) -> PathBuf {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(b"ring-refs-v2");
+    hasher.write(pack_dir().to_string_lossy().as_bytes());
+    pack_identity(&mut hasher);
+    for field in [
+        dims.hidden,
+        dims.n_expert,
+        dims.top_k,
+        dims.inter,
+        dims.shared_inter,
+    ] {
+        hasher.write(&(field as u64).to_le_bytes());
+    }
+    hasher.write(&(index as u64).to_le_bytes());
+    hasher.write(&(layer as u64).to_le_bytes());
+    hasher.write(&(m as u64).to_le_bytes());
+    hasher.write(&((7 * (index + 1)) as u64).to_le_bytes());
+    dir.join(format!("ring-refs-{:016x}.json", hasher.finish()))
+}
+
+/// The chunk fixture's fp64 references, computed on the host before any device work
+/// (~0.23 s per row per layer on this pack) and cached under `FIFI_RING_REF_CACHE` when
+/// set, so a warm oracle leg holds the card for its launches only. A cache hit is
+/// length-checked against the fixture (`m` rows, `top_k` picks, `hidden` outputs); a
+/// corrupt, truncated or stale file fails the check and recomputes. Writes are atomic
+/// (temp file + rename), so a concurrent leg never reads a half-written file.
+fn ring_host_references(
+    files: &FlashPackFiles,
+    dims: &MoeDims,
+    layers: &[usize],
+    m: usize,
+) -> Vec<Vec<Reference>> {
+    let cache_dir = std::env::var_os("FIFI_RING_REF_CACHE").map(PathBuf::from);
+    let checkpoint = &files.checkpoint;
+    let mut all = Vec::with_capacity(layers.len());
+    for (index, &layer) in layers.iter().enumerate() {
+        let router = Router::read(checkpoint, layer, dims).expect("router");
+        let row_inputs: Vec<Vec<f32>> = (0..m)
+            .map(|seed| input(dims.hidden, seed + 7 * (index + 1)))
+            .collect();
+        let path = cache_dir
+            .as_ref()
+            .map(|dir| ring_ref_cache_path(dir, dims, index, layer, m));
+        let cached = path.as_ref().and_then(|path| {
+            let wants: Vec<Reference> =
+                serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+            (wants.len() == m
+                && wants
+                    .iter()
+                    .all(|w| w.ids.len() == dims.top_k && w.out.len() == dims.hidden))
+            .then_some(wants)
+        });
+        match cached {
+            Some(wants) => {
+                println!("layer {layer}: fp64 references from cache ({m} rows)");
+                all.push(wants);
+            }
+            None => {
+                let started = std::time::Instant::now();
+                let computed = threaded_references(checkpoint, (layer, &router), dims, &row_inputs);
+                println!(
+                    "layer {layer}: fp64 references computed in {:.1?} ({m} rows)",
+                    started.elapsed()
+                );
+                if let Some(path) = path.as_ref() {
+                    let dir = path.parent().expect("the cache file's directory");
+                    std::fs::create_dir_all(dir).expect("create the reference cache dir");
+                    let tmp = dir.join(format!(
+                        ".{}.tmp{}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        std::process::id()
+                    ));
+                    std::fs::write(
+                        &tmp,
+                        serde_json::to_string(&computed).expect("serialize the references"),
+                    )
+                    .expect("write the reference cache's temp file");
+                    std::fs::rename(&tmp, path).expect("publish the reference cache atomically");
+                }
+                all.push(computed);
+            }
+        }
+    }
+    all
+}
+
+/// One bank layer's fixture inside [`ring_chunk_pass`]: the uploads, the chunk's rows,
+/// and the per-row references (fp64 from the host phase, all-resident from the card).
+struct Arm {
+    row_inputs: Vec<Vec<f32>>,
+    weights: CudaWeights,
+    keys: Vec<(Role, String)>,
+    wants: Vec<Reference>,
+    residents: Vec<Vec<u8>>,
+}
+
+/// The bank layers' trunks over the arms' uploads (raw router weights, exl3 shared
+/// experts). Used by the main split and, per row, by the same-family control's split.
+fn arm_trunks(arms: &[Arm]) -> Vec<SplitMoeTrunk<'_>> {
+    arms.iter()
+        .map(|arm| {
+            let key = |role: Role| {
+                arm.keys
+                    .iter()
+                    .find(|(candidate, _)| *candidate == role)
+                    .map(|(_, key)| key.as_str())
+                    .unwrap_or_else(|| panic!("no key for {role:?}"))
+            };
+            SplitMoeTrunk {
+                router: raw(&arm.weights, key(Role::FfnGateInp)),
+                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
+                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
+                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
+                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
+            }
+        })
+        .collect()
+}
+
 fn ring_chunk_pass(m: usize, held: Option<usize>) {
-    assert!(
-        device_present("Flash-Next split MoE block"),
-        "a GPU is required"
-    );
     let first = moe_layer();
     let layers = vec![first, first + 1];
     let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
@@ -728,6 +923,15 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
     // The legacy oracle uses 49 rows; the promoted-store arms also cover the full tile,
     // a short tail and the active prefill's trailing one-row window.
     let chunk = MoeDims { rows: m, ..one_row };
+
+    // Host phase first, no device taken: see `ring_host_references` — with a primed
+    // cache the card phase is uploads and launches only.
+    let cached_wants = ring_host_references(&files, &one_row, &layers, m);
+
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
     let stream = ctx.stream().expect("stream");
@@ -739,15 +943,8 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
     let layout = source.layout().clone();
 
     // Per bank layer: uploads, the chunk's rows, and per-row fp64 and all-resident references.
-    struct Arm {
-        row_inputs: Vec<Vec<f32>>,
-        weights: CudaWeights,
-        keys: Vec<(Role, String)>,
-        wants: Vec<Reference>,
-        residents: Vec<Vec<u8>>,
-    }
     let mut arms: Vec<Arm> = Vec::with_capacity(layers.len());
-    for (index, &layer) in layers.iter().enumerate() {
+    for ((index, &layer), wants) in layers.iter().enumerate().zip(cached_wants) {
         let router = Router::read(checkpoint, layer, &one_row).expect("router");
         let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
         let keys = keys(layer);
@@ -762,11 +959,8 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
         })
         .expect("the all-resident block resolves");
         // The all-resident reference is the oracle: one launch per row, exactly as before
-        // the widening; only its fp64 sibling is threaded. The two elapsed prints give
-        // the per-layer split.
-        let started = std::time::Instant::now();
-        let wants = threaded_references(checkpoint, (layer, &router), &one_row, &row_inputs);
-        let references_elapsed = started.elapsed();
+        // the widening. Its fp64 sibling moved to the host phase above (cached); only the
+        // launches remain here, timed on their own.
         let started = std::time::Instant::now();
         let mut residents = Vec::with_capacity(m);
         for row in &row_inputs {
@@ -785,8 +979,7 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
             residents.push(rig.out_bytes(&projector));
         }
         println!(
-            "layer {layer} over {m} rows: fp64 references {references_elapsed:.1?}, \
-             all-resident launches {:.1?}",
+            "layer {layer} over {m} rows: all-resident launches {:.1?}",
             started.elapsed()
         );
         arms.push(Arm {
@@ -820,25 +1013,7 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
         })
         .collect();
     let bank = build_bank(&projector, &source, &layers, &held);
-    let trunks: Vec<SplitMoeTrunk<'_>> = arms
-        .iter()
-        .map(|arm| {
-            let key = |role: Role| {
-                arm.keys
-                    .iter()
-                    .find(|(candidate, _)| *candidate == role)
-                    .map(|(_, key)| key.as_str())
-                    .unwrap_or_else(|| panic!("no key for {role:?}"))
-            };
-            SplitMoeTrunk {
-                router: raw(&arm.weights, key(Role::FfnGateInp)),
-                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
-                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
-                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
-                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
-            }
-        })
-        .collect();
+    let trunks = arm_trunks(&arms);
     let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
     let streamed = shape.experts() - SLOTS;
     let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
@@ -846,7 +1021,10 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
     split.begin_prefill().unwrap();
 
     // One chunk per run, every layer of it in order — the driver cadence the ring's free
-    // cursor assumes.
+    // cursor assumes. Run 1's row outputs are kept byte for byte: against run 0 (both runs
+    // identical) and for the same-family control after the loop.
+    let mut first_run: Vec<Vec<Vec<u8>>> = vec![Vec::new(); arms.len()];
+    let mut last_run: Vec<Vec<Vec<u8>>> = vec![Vec::new(); arms.len()];
     for run in 0..2 {
         for (bank_layer, arm) in arms.iter().enumerate() {
             if bank_layer == 0 {
@@ -878,8 +1056,19 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
                 frozen,
                 "{tag}: frozen bank"
             );
+            let mut fp64_errors = Vec::with_capacity(m);
+            let mut resident_errors = Vec::with_capacity(m);
             for r in 0..m {
                 let got = rig.out_row(&projector, r);
+                if run == 0 {
+                    first_run[bank_layer].push(got.clone());
+                } else {
+                    assert_eq!(
+                        &got, &first_run[bank_layer][r],
+                        "{tag}, row {r}: run 1 differs from run 0 (determinism)"
+                    );
+                    last_run[bank_layer].push(got.clone());
+                }
                 let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
                 let fp64_error = relative_l2(&floats(&got), &arm.wants[r].out);
                 println!(
@@ -890,10 +1079,187 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
                     resident_error < RING_BOUND,
                     "{tag}, row {r}: all-resident {resident_error}"
                 );
+                // The all-resident reference is itself within ~3e-7 of fp64 (the indexed
+                // family's class), so the two error series must agree; a disagreement is
+                // a broken reference, not tolerance.
+                assert!(
+                    (fp64_error - resident_error).abs() < 1e-5,
+                    "{tag}, row {r}: the references disagree \
+                     (fp64 {fp64_error} vs all-resident {resident_error})"
+                );
+                fp64_errors.push(fp64_error);
+                resident_errors.push(resident_error);
             }
+            // The run criteria: per-row max under RING_BOUND (asserted above) plus a
+            // per-layer mean guard — a uniform uplift (one more rounding stage) moves the
+            // mean while leaving most rows under the max bound.
+            let stats = |errors: &[f64]| {
+                let max = errors.iter().copied().fold(f64::MIN, f64::max);
+                let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+                let var = errors.iter().map(|e| (e - mean) * (e - mean)).sum::<f64>()
+                    / errors.len() as f64;
+                (
+                    max,
+                    mean,
+                    var.sqrt(),
+                    errors.iter().filter(|&&e| e > 3.5e-4).count(),
+                    errors.iter().filter(|&&e| e > 4.0e-4).count(),
+                )
+            };
+            let (fmax, fmean, fsigma, f35, f40) = stats(&fp64_errors);
+            let (rmax, rmean, _, _, _) = stats(&resident_errors);
+            println!(
+                "{tag}: fp64 max {fmax:.3e} mean {fmean:.3e} sigma {fsigma:.3e} \
+                 rows>3.5e-4 {f35} rows>4.0e-4 {f40}; all-resident max {rmax:.3e} mean {rmean:.3e}"
+            );
+            assert!(
+                fmean < MEAN_BOUND,
+                "{tag}: fp64 mean {fmean} exceeds the mean guard {MEAN_BOUND}"
+            );
+            assert!(
+                rmean < MEAN_BOUND,
+                "{tag}: all-resident mean {rmean} exceeds the mean guard {MEAN_BOUND}"
+            );
         }
     }
     split.end_prefill().expect("hand the ring's stores back");
+
+    // Same-family control: every Nth row (FIFI_RING_CONTROL_STRIDE, default 1: every row)
+    // again through the SAME jobs family, but with a bank holding that row's own ten
+    // picks — all-resident, no ring traffic for the row — while the main arm streamed
+    // most of its experts through the ring. The family's F16 arithmetic is identical in
+    // both arms, so anything above the indexed family's 1e-6 scale is the ring's, not
+    // the launch family's. This is the test that proves the ring adds nothing; the
+    // RING_BOUND comparisons above only fix the family difference.
+    let stride: usize = std::env::var("FIFI_RING_CONTROL_STRIDE")
+        .ok()
+        .map(|v| v.parse().expect("a stride"))
+        .unwrap_or(1)
+        .max(1);
+    assert!(
+        stride <= m,
+        "FIFI_RING_CONTROL_STRIDE {stride} exceeds the row count {m}: \
+         a control that skips every row is not a control"
+    );
+    let one_row_chunk = MoeDims { rows: 1, ..chunk };
+    let mut control_max = 0.0f64;
+    // Stride rows plus the boundaries the stride can miss: the last row and the two
+    // rows either side of the midpoint (at 1,024 rows: 0, 511, 512, 513 and 1,023).
+    let control_rows: Vec<usize> = (0..m)
+        .filter(|&r| r % stride == 0 || r + 1 == m || r.abs_diff(m / 2) <= 1)
+        .collect();
+    for (bank_layer, arm) in arms.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let mut layer_max = 0.0f64;
+        for r in control_rows.iter().copied() {
+            // The control bank holds row r's ten picks in BOTH bank layers.
+            let held: Vec<Vec<u16>> = arms
+                .iter()
+                .map(|a| {
+                    let mut picks: Vec<u16> = a.wants[r].ids.iter().map(|&e| e as u16).collect();
+                    picks.extend(others(&a.wants[r].ids, SLOTS - picks.len()));
+                    picks
+                })
+                .collect();
+            let bank = build_bank(&projector, &source, &layers, &held);
+            let mut control = SplitMoe::new(ctx, arm_trunks(&arms), bank, &layout, &one_row_chunk)
+                .expect("the control split");
+            control
+                .plan_ring(ctx, shape.experts() - SLOTS, 1)
+                .expect("fund the control's ring");
+            control.begin_prefill().unwrap();
+            control.begin_chunk();
+            let rig = RigRows::new(&projector, &one_row_chunk, &[arm.row_inputs[r].clone()])
+                .expect("rig");
+            // The ring frees layers strictly in order (0, 1, ...), so a control that
+            // runs only bank layer b must first walk the lower layers' one-row passes
+            // to free them; their outputs are discarded, only b's row is compared.
+            for l in 0..=bank_layer {
+                shared_prefill_pass(
+                    &mut control,
+                    &launch,
+                    l,
+                    &rig.bufs().expect("bufs"),
+                    &one_row_chunk,
+                );
+            }
+            stream.synchronize().expect("sync");
+            let got = rig.out_row(&projector, 0);
+            let error = relative_l2(&floats(&got), &floats_f64(&last_run[bank_layer][r]));
+            assert!(
+                error == 0.0,
+                "bank layer {bank_layer} (pack layer {}), row {r}: \
+                 same-family control error {error} — the ring must be bit-identical \
+                 to the resident pass, not merely small",
+                layers[bank_layer]
+            );
+            layer_max = layer_max.max(error);
+            control
+                .end_prefill()
+                .expect("hand the control's stores back");
+        }
+        control_max = control_max.max(layer_max);
+        println!(
+            "bank layer {bank_layer} control over {} rows: max {layer_max:.3e} in {:.1?}",
+            control_rows.len(),
+            started.elapsed()
+        );
+    }
+    println!(
+        "same-family control: max over both layers {control_max:.3e} (bit-identity, 0.0 required)"
+    );
+}
+
+/// Fills or verifies the fp64 reference cache without a GPU: `FIFI_RING_REF_CACHE`
+/// names the directory, `FIFI_RING_ORACLE_ROWS` the row count (1,024 by default, the
+/// oracle's measurement width). Cold, it computes and writes the cache; then, in both
+/// cases, it reads the files back and asserts they round-trip to exactly what the host
+/// phase produced — so a prime run is a checked statement, never a silent pass.
+#[test]
+#[ignore = "set FIFI_RING_REF_CACHE (and optionally FIFI_RING_ORACLE_ROWS) to prime the fp64 reference cache"]
+fn prime_ring_reference_cache() {
+    let cache_dir = PathBuf::from(
+        std::env::var_os("FIFI_RING_REF_CACHE").expect("FIFI_RING_REF_CACHE names the cache dir"),
+    );
+    let rows: usize = std::env::var("FIFI_RING_ORACLE_ROWS")
+        .ok()
+        .map(|v| v.parse().expect("a row count"))
+        .unwrap_or(1024);
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let first = moe_layer();
+    let layers = vec![first, first + 1];
+    let (model, _) = model_shape(&files.checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let dims = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let wants = ring_host_references(&files, &dims, &layers, rows);
+    for (index, &layer) in layers.iter().enumerate() {
+        let path = ring_ref_cache_path(&cache_dir, &dims, index, layer, rows);
+        let loaded: Vec<Reference> = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("the cache file after priming"),
+        )
+        .expect("deserialize the cache file");
+        assert_eq!(
+            loaded.len(),
+            rows,
+            "layer {layer}: the cache holds {rows} rows"
+        );
+        assert_eq!(
+            loaded, wants[index],
+            "layer {layer}: the cache file round-trips to what the host phase produced"
+        );
+    }
+    println!(
+        "prime: {} layers x {rows} rows verified under {}",
+        layers.len(),
+        cache_dir.display()
+    );
 }
 
 /// Prints the CPU cost of the fp64 references for a row count (no GPU).
@@ -935,8 +1301,10 @@ fn ring_reference_cpu_cost() {
 /// The job-table family's per-projection bounds against fp64, split by projection and
 /// measured on this pack (Qwen3.8-Flash-Next exl3 3.05bpw h5 ng5, pack layer 3 — the
 /// `FIFI_FLASH_NEXT_EXL3_MOE_LAYER` default — its ten picks of one deterministic row, seed 9;
-/// 3090): gate/up 1.9-2.2e-4 and down 2.9-3.9e-4, the F16 activation operand class
-/// (2^-11 = 4.88e-4; the down bound keeps 1.3x headroom over its 3.9e-4 maximum).
+/// 3090): gate/up 1.9-2.2e-4 and down 2.9-3.9e-4. Both bounds are empirical ceilings
+/// (the down bound keeps 1.3x headroom over its 3.9e-4 maximum), not figures derived
+/// from the F16 unit roundoff: a projection of an F16-rounded operand has no
+/// `at most u` theorem, and the chained roundings of the block can and do land above u.
 const GATE_UP_BOUND: f64 = 3e-4;
 const DOWN_BOUND: f64 = 5e-4;
 /// The flat indexed family reads F32 operands: 1.5-3.0e-7 against fp64 on the same row

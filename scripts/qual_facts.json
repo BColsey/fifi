@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7150,
-      "ignored": 644,
+      "test_fns": 7151,
+      "ignored": 645,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
@@ -169,7 +169,9 @@
         "FIFI_PF_SPLIT",
         "FIFI_PF_TIMING_ONLY",
         "FIFI_Q36_SERVE_PHASE",
+        "FIFI_RING_CONTROL_STRIDE",
         "FIFI_RING_ORACLE_ROWS",
+        "FIFI_RING_REF_CACHE",
         "FIFI_RING_REF_TIMING",
         "FIFI_SCRATCH_ROOT",
         "FIFI_SPEC_ROWS",

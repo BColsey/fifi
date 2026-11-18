@@ -205,6 +205,7 @@ fn expert(parts: &[Matrix], x: &[f64]) -> Result<[Vec<f64>; 3], EngError> {
     Ok([gate, up, down])
 }
 
+#[derive(serde::Deserialize, serde::Serialize, PartialEq, Debug)]
 pub(in crate::family::flash_next) struct Reference {
     pub(in crate::family::flash_next) ids: Vec<usize>,
     pub(in crate::family::flash_next) weights: Vec<f64>,
