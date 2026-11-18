@@ -59,6 +59,24 @@ FIFI_MLX_KV_APPEND_SAMPLES=6 cargo test --locked --release \
 
 The test prints 132 `kv_append_sample` records with elapsed nanoseconds and extra active peak bytes.
 
+### Capacity-backed Flash-Next QSA
+
+With `FIFI_FLASH_NEXT_MLX_CAPACITY_KV=1`, Flash-Next decode and batched prefill use the same 256-row minimum and power-of-two growth policy as compact Flint KV. QSA keeps separate buffers for F32 keys, values and raw index keys. The worker budgets the full allocated rows before advancing. Attention and the indexer see only the valid prefix. Writes to a uniquely owned buffer can reuse its storage. A retained snapshot keeps the previous values through copy-on-write, and the worker charges the snapshot independently.
+
+The file-layout worker fixture compared both paths at a 4 GiB device ceiling with 128-row prefill and sparse batching enabled. Four pairs of fresh processes ran four requests per length and arm. All 64 requests produced identical eight-token continuations. A separate test restored a snapshot, appended a decode token without changing the saved arrays, and verified that insufficient room blocked the next growth before mutating the state. The same growth succeeded after releasing the saved snapshot and produced matching logits. [Worker samples](../../scripts/benchmarks/mac-m4-flash-next-capacity-kv.csv)
+
+| Prompt | Median first token | Paired TTFT change | Median decode interval | Paired decode change | Median MLX peak active |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 65 tokens | 20.56 → 19.94 ms | −8.7% | 10.97 → 11.81 ms | +9.6% | 1.04 → 1.31 MB |
+| 257 tokens | 86.43 → 88.93 ms | +2.5% | 13.17 → 10.84 ms | −12.3% | 1.15 → 1.29 MB |
+
+The 257-token request crosses the initial capacity boundary as generation starts. Both arms performed the same number of Metal synchronizations at each length. The new buffers are opt-in while full-checkpoint and longer-context timings are open. Use the worker driver on the release MLX library test executable to reproduce the comparison:
+
+```sh
+python3 scripts/bench_mlx_requests.py "$MLX_LIB_TEST" "$SCRATCH/flash-capacity.csv" \
+  --flash-capacity-kv --pairs 4 --samples 4
+```
+
 ## Constrained-memory comparisons
 
 The adaptive Flint path prices each batch using the same context, resident weights, expert staging, and temporary attention cost as coarse admission. It uses the common resident prefill ladder and preserves one-row fallback at the bottom.

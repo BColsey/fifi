@@ -311,6 +311,7 @@ pub(crate) fn flash_mlx_effective(
             present(&options.prefill_chunk),
         ),
         mlx_switch("mlx_sparse_prefill", "FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL"),
+        mlx_switch("mlx_capacity_kv", "FIFI_FLASH_NEXT_MLX_CAPACITY_KV"),
     ];
     append_mlx_inputs(&mut rows);
     rows
@@ -365,6 +366,7 @@ pub(crate) fn flint_effective_for_build(
                 factory::cache_limit_with(factory::os_setting(cache.as_deref())).to_string(),
                 env_origin(&cache),
             ),
+            mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
         ];
         append_mlx_inputs(&mut result);
         let _ = served;

@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::ops::{Ctx, dim, linear, values};
 use super::super::qsa::MAX_POSITIONS;
-use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
+use super::super::state::{LayerState, ResidentState, qsa_append_growth};
 use super::super::step::{read_token, split_rows};
 use super::super::weights::{RAttn, RDelta};
 use super::super::{ResidentDecoder, StepMode, StepResult, hyper as decode_hyper};
@@ -282,7 +282,7 @@ fn chunk_with_qsa(
     let rows = row_count(tokens)?;
     check_open(decoder, rows)?;
     state.check_chunk(&decoder.weights, rows, batch)?;
-    let growth = chunk_growth_bytes(&decoder.weights, rows)?;
+    let growth = qsa_append_growth(&decoder.weights, state.pos(), rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     let result = match decoder.kernels.set_retire_cap(cap) {
@@ -435,7 +435,7 @@ fn run(
                 )
             }
             (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-                let s = qsa::chunk(&mut ctx, &shape.qsa, w, &cache, pos, &read.mixed, batch)?;
+                let s = qsa::chunk(&mut ctx, &shape.qsa, w, cache, pos, &read.mixed, batch)?;
                 (s.out, s.state)
             }
             _ => return Err(bad("layer state kind does not match its weights")),

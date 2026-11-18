@@ -71,6 +71,14 @@ Saving the prefix increased median first-token time by 3–7% on the priming tur
 
 Run the serving driver with `--expert-timing --prefix-reuse --working-set-mib 8192 --pairs 2` to repeat this comparison.
 
+### Compact Flint KV at 128 MiB
+
+With `FIFI_FLINT_MLX_COMPACT_KV=1`, each full-attention KV plane starts at 256 rows or the next power of two covering the first piece. The planes grow geometrically up to the context limit. The 513-row sliding-window planes keep their allocation. The budget still reserves the declared full context and the prefix store charges the bytes it actually retains.
+
+Both arms enabled prefix reuse and reserved 128 MiB under the same 8 GiB device ceiling. The control refused each save. Compact KV retained about 42 MiB per snapshot, down from the 147 MiB charge with the original capacity. All eight completions matched. The follow-ups reused 44 and 142 tokens, reaching the first token in 5.36 and 4.99 seconds from 10.59 and 12.43 seconds. Across priming and follow-up, attributed SSD reads fell from 64.88 to 42.81 GB. The result compares one request per turn and arm, with a separate four-request smoke test. [Eight serving requests](../../scripts/benchmarks/mac-m4-flint-compact-kv-128.csv)
+
+Run the serving driver with `--expert-timing --compact-flint-kv --working-set-mib 8192 --pairs 1` to repeat the comparison.
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)

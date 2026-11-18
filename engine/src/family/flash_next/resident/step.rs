@@ -20,7 +20,7 @@
 
 use super::ops::{Ctx, linear, values};
 use super::prefetch::TokenIdentity;
-use super::state::{LayerState, ResidentState, qsa_growth_bytes};
+use super::state::{LayerState, ResidentState, qsa_append_growth};
 use super::weights::RAttn;
 use super::{ResidentDecoder, StepMode, StepResult, deltanet, hyper, moe, ple, qsa};
 use crate::{
@@ -40,7 +40,7 @@ pub(super) fn step(
     mode: StepMode,
 ) -> Result<StepResult, EngError> {
     state.check_step(&decoder.weights)?;
-    let growth = qsa_growth_bytes(&decoder.weights)?;
+    let growth = qsa_append_growth(&decoder.weights, state.pos(), 1)?;
     let permit = decoder.budget.acquire_growth(growth)?;
     let old = state.begin();
     let result = run(decoder, state, old, permit, token, mode);
@@ -103,7 +103,7 @@ fn run(
                 )
             }
             (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-                let s = qsa::step(&mut ctx, &shape.qsa, w, &cache, pos, &read.mixed)?;
+                let s = qsa::step(&mut ctx, &shape.qsa, w, cache, pos, &read.mixed)?;
                 (s.out, s.state)
             }
             _ => {
