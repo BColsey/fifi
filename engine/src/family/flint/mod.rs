@@ -266,6 +266,8 @@ mod mlx_executor;
 ))]
 mod mlx_expert_timing;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod mlx_expert_cache;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx_forward;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod mlx_math;

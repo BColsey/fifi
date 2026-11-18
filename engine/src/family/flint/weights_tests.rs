@@ -287,6 +287,7 @@ fn open_checks_complete_profile_without_reading_payloads() {
 #[test]
 fn disk_experts_match_resident_grouped_predictions() {
     use super::super::{
+        mlx_expert_cache::LayerExpertCache,
         mlx_forward::{disk_experts, grouped_experts},
         mlx_model::SwiGlu,
     };
@@ -389,6 +390,32 @@ fn disk_experts_match_resident_grouped_predictions() {
             expected.host_bytes().unwrap()
         );
         assert!(streamed.host_bytes().unwrap().iter().any(|&byte| byte != 0));
+    }
+
+    let x = k
+        .import_tensor(&Tensor::try_from_host(Dtype::Bf16, vec![1, 64], bf16(0.375, 64)).unwrap())
+        .unwrap();
+    let mut cache = LayerExpertCache::new(&checkpoint, "experts", 6).unwrap();
+    // First fill, a repeat with different ranks, an eviction, and a read of the old victim.
+    for experts in [
+        [19_u32, 255, 8, 0, 3, 42],
+        [42, 3, 0, 8, 255, 19],
+        [91, 3, 0, 8, 255, 19],
+        [42, 3, 0, 8, 255, 19],
+    ] {
+        let ids = Tensor::try_from_host(
+            Dtype::U32,
+            vec![6],
+            experts.iter().flat_map(|id| id.to_le_bytes()).collect(),
+        )
+        .unwrap();
+        let ids = k.import_tensor(&ids).unwrap();
+        let ids = k.bound_indices(&ids, 256).unwrap();
+        let expected = grouped_experts(&mut k, &full, &x, &ids).unwrap();
+        let expected = k.readback(&expected).unwrap();
+        let cached = cache.evaluate(&mut k, &checkpoint, &x, &experts).unwrap();
+        let cached = k.readback(&cached).unwrap();
+        assert_eq!(cached.host_bytes(), expected.host_bytes());
     }
 }
 

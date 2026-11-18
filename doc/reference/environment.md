@@ -150,6 +150,7 @@ On Apple Silicon:
 | `FIFI_FLINT_PREFIX_REUSE` | off | switch | Experimental: keep prefix snapshots between turns. Also needs `"prefix_reuse": true`. |
 | `FIFI_FLINT_PREFIX_BUDGET_BYTES` | physical memory minus weights and a system reserve | positive byte count | Memory cap for prefix snapshots. `0` or an unreadable value refuses startup. |
 | `FIFI_FLINT_MLX_COMPILE_LAYER` | off | switch | Run the layer tail through one compiled MLX closure (graph cache). Fail-safe polarity: absent, non-UTF-8 or any value other than the explicit enable words keeps the eager tail. Read once per process. |
+| `FIFI_FLINT_MLX_EXPERT_CACHE_MIB` | off | positive MiB, `0` | Reserve per-layer unified-memory slots for packed experts in one-row Flint forwards with automatic device sizing and disk-backed weights. The configured MiB caps the allocation, which is also limited by the remaining Metal budget. |
 | `FIFI_FLINT_MLX_PREFILL_CHAIN` | off | switch | Chained multi-row prefill groups (graph-ordered, fence-free). Default off until an A/B proves at least +10% pp4096 tok/s; any non-enable value is the rollback. |
 
 On NVIDIA CUDA:

@@ -2,6 +2,7 @@
 
 use super::{
     factory::context_limit,
+    mlx_expert_cache::LayerExpertCache,
     mlx_model::{Ffn, Layer, Model, Routed, SwiGlu, expert_pipeline_flagged, expert_read_runs},
     mlx_route,
     mlx_state::{ChunkCachePlan, Plane, State, WINDOW},
@@ -683,7 +684,11 @@ fn ffn(
             let span = Span::begin("ffn_experts", 0, None, Some((x.dtype(), x.shape())));
             let (rows, shared_in_flight) = match routed {
                 Routed::Resident(weights) => (grouped_experts(k, weights, x, &route.ids)?, None),
-                Routed::Disk { source, stem } => stage_disk_experts(
+                Routed::Disk {
+                    source,
+                    stem,
+                    cache,
+                } => stage_disk_experts(
                     k,
                     source,
                     stem,
@@ -691,6 +696,7 @@ fn ffn(
                     &route.ids,
                     Some(shared),
                     expert_pipeline_flagged(),
+                    cache.as_deref(),
                 )?,
             };
             #[cfg(test)]
@@ -720,7 +726,7 @@ pub(super) fn disk_experts(
     ids: &BoundedIndices,
     pipeline: bool,
 ) -> Result<ExecutionTensor> {
-    stage_disk_experts(k, source, stem, x, ids, None, pipeline).map(|(rows, _)| rows)
+    stage_disk_experts(k, source, stem, x, ids, None, pipeline, None).map(|(rows, _)| rows)
 }
 
 fn stage_disk_experts(
@@ -731,12 +737,14 @@ fn stage_disk_experts(
     ids: &BoundedIndices,
     shared: Option<&SwiGlu>,
     pipeline: bool,
+    cache: Option<&std::cell::RefCell<LayerExpertCache>>,
 ) -> Result<(ExecutionTensor, Option<ExecutionTensor>)> {
+    let cache = cache.filter(|_| x.shape()[0] == 1);
     let host = k.readback(ids.ids())?;
     // The router results are available now. The shared expert only needs
     // the same input and can run while the host stages the routed experts.
     let shared = shared
-        .filter(|_| pipeline)
+        .filter(|_| pipeline || cache.is_some())
         .map(|shared| {
             let output = shared.apply(k, x)?;
             k.evaluate_async(&[&output])?;
@@ -756,6 +764,14 @@ fn stage_disk_experts(
     let mut experts = selected.clone();
     experts.sort_unstable();
     experts.dedup();
+    if let Some(cache) = cache.filter(|_| experts.len() == 6)
+        && let Ok(route) = <&[u32; 6]>::try_from(selected.as_slice())
+    {
+        let rows = cache.borrow_mut().evaluate(k, source, x, route)?;
+        #[cfg(feature = "native-fault-qualification")]
+        trace_expert_accesses(stem, 1, &experts);
+        return Ok((rows, shared));
+    }
     let mut remapped = Vec::with_capacity(bytes.len());
     for id in selected {
         let slot = experts

@@ -512,6 +512,38 @@ impl StackLayout {
     }
 }
 
+/// Fill selected positions of a persistent page bank with exact checkpoint slices.
+/// Callers own the mappings and publish a slot only after all of its roles have loaded.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn read_stack_slots_into(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    slots: &[(u32, usize)],
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
+    if layout.end > dst.len()
+        || slots
+            .iter()
+            .any(|&(id, rank)| id >= weight.slices || rank >= layout.count as usize)
+    {
+        return Err(EngError::BadRequest(
+            "expert cache slot outside its checked layout".into(),
+        ));
+    }
+    for (role, range) in layout.roles() {
+        let key = format!("{}.{role}", weight.stem);
+        for &(id, rank) in slots {
+            let start = range.offset + rank * range.slice_len;
+            let end = start + range.slice_len;
+            counted_read(range.slice_len, || {
+                ckpt.read_slice_into(&key, id, &mut dst[start..end])
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Expert slice reads and page imports since the last reset (qualification builds only).
 /// Process-wide. Page-based expert banks and staging record imports through `record_page_import`.
 #[cfg(feature = "native-fault-qualification")]

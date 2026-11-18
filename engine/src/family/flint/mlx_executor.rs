@@ -319,6 +319,9 @@ fn device_prefill_piece(
     let per_expert = model.streamed_expert_bytes;
     let mut charges = session.to_vec();
     charges.push(("resident_active_bytes", weights));
+    if model.cached_expert_bytes != 0 {
+        charges.push(("resident_expert_cache_bytes", model.cached_expert_bytes));
+    }
     charges.push((
         "decode_expert_staging_bytes",
         expert_staging_bytes(per_expert, 1),
