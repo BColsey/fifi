@@ -452,3 +452,32 @@ fn scalar_and_avx2_expert_forward_are_bitwise_equal() {
         );
     }
 }
+
+#[test]
+fn fast_round_matches_reference_at_every_half_boundary_and_extreme_scale() {
+    use super::{Q8gRow, fill_groups, round_quantized};
+    for n in -128..=128 {
+        let half = n as f32 + 0.5;
+        for x in [half.next_down(), half, half.next_up(), n as f32] {
+            assert_eq!(round_quantized(x), x.round().clamp(-127.0, 127.0) as i8);
+        }
+    }
+    for scale in [0.0, f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX] {
+        let input: Vec<_> = (0..256)
+            .map(|i| ((i % 33) as f32 / 16.0 - 1.0) * scale)
+            .collect();
+        let mut reference = Q8gRow::zeros(input.len()).unwrap();
+        let mut fast = Q8gRow::zeros(input.len()).unwrap();
+        fill_groups::<false>(&input, &mut reference);
+        fill_groups::<true>(&input, &mut fast);
+        assert_eq!(reference.q, fast.q);
+        assert_eq!(reference.s, fast.s);
+        assert!(
+            reference
+                .d
+                .iter()
+                .zip(fast.d)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+}

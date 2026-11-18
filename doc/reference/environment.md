@@ -74,6 +74,7 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `INFERENCE_QWEN36_SPARSE_ATTN` | `0` | only `1` is on | Arm the sparse decode attention path (bounded admission; unsupported heads fall back to dense). Read once per process. |
 | `Q36_CUDA_BANK_OVERLAP` | `0` | only `1` is on | EXL3 expert-bank miss overlap: a miss refill enqueues on a copy stream while resident-expert groups launch before the wait. A bad value stops the start, not the first token. |
 | `Q36_CUDA_MIN_FREE_MIB` | admission default | MiB count | Free-after-load floor of the CUDA memory admission, the same bytes for the gate's qualified loop and the server start; parsed once so the checks cannot diverge. An out-of-range value refuses with the accepted range named. |
+| `FIFI_CPU_Q8G_FAST_QUANT` | `0` | only `1` is on | Use integer magnitude reduction and signed half comparisons for Q8g CPU expert activation quantization. Restart to change. |
 | `Q36_TIERED_GUESS` | `0` | only `1` is on | Router-guess expert prefetch in the tiered token path; ships dark until qualified on a device. |
 | `Q36_TIERED_PREFIX` | `0` | only `1` is on | Tiered sessions may save and restore prefixes; default off pending device qualification. |
 | `Q36_P2P_WATERFILL` | `0` | only `1` is on | Experimental multi-device GGUF path: a bandwidth-waterfill placement planner redistributes the sliceable roles instead of the even deal. |
