@@ -301,6 +301,37 @@ fn embed_reads_every_row_slot() {
     }
 }
 
+/// One gather of eight ids must write the same rows as eight single-id
+/// gathers: the dense resident's prefill batch feeds m tokens through this kernel, and
+/// the batch and single-step arms compare logits at 2e-5.
+#[test]
+fn embed_batch_rows_match_single_token_gathers() {
+    if !testkit::device_present("embed_batch_rows_match_single_token_gathers") {
+        return;
+    }
+    let rig = Rig::new();
+    let ids = [5i32, 17, 3, 33, 61, 0, 8, 42];
+    for ty in [GgufType::Q4K, GgufType::Q80] {
+        for (n_rows, k) in [(64usize, 256usize), (520, 768)] {
+            let table = Table::new(&rig.ctx, ty, (n_rows, k), Scales::Mixed, 0x4c09);
+            let (batch, _) = rig.gather(&table, &ids, 0);
+            for (j, &id) in ids.iter().enumerate() {
+                let (single, _) = rig.gather(&table, &[id], 0);
+                let (got, want) = (&batch[j * k..(j + 1) * k], &single[..k]);
+                let bad = got
+                    .iter()
+                    .zip(want)
+                    .filter(|(g, w)| g.to_bits() != w.to_bits())
+                    .count();
+                assert_eq!(
+                    bad, 0,
+                    "{ty:?} k={k} row {j} (id {id}): {bad} of {k} values differ between the batch and single gathers"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn embed_x_bytes_pins_the_size_rule() {
     assert_eq!(embed_x_bytes(1, 2048).expect("one row"), 8192);
