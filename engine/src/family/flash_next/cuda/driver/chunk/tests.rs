@@ -19,7 +19,7 @@ fn shared_prefill_opens_once_for_two_chunks_and_closes_after_sampling() {
         track_windows: true,
         ..Default::default()
     };
-    let mut driver = ChunkDriver::new_shared(device, FakeFeeds::default(), shape()).unwrap();
+    let mut driver = ChunkDriver::new(device, FakeFeeds::default(), shape()).unwrap();
     driver.chunk_cap = 2;
     driver.feed_rows(&[1, 2, 3]).unwrap();
     assert_eq!(driver.fed(), 3);
@@ -65,7 +65,7 @@ fn shared_driver(feeds: FakeFeeds) -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
         track_windows: true,
         ..Default::default()
     };
-    let mut driver = ChunkDriver::new_shared(device, feeds, shape()).unwrap();
+    let mut driver = ChunkDriver::new(device, feeds, shape()).unwrap();
     driver.chunk_cap = 2;
     driver
 }
@@ -210,64 +210,7 @@ fn shared_prefill_switch_precedes_cuda_initialization() {
     let initialize = build
         .find("CudaProjector::new()")
         .expect("CUDA initialization");
-    let rows_check = build
-        .find("prof::check_shared_prefill_rows(&shared_mode, wanted.prefill_rows)?")
-        .expect("shared row configuration check");
-    assert!(check < rows_check && rows_check < initialize);
-}
-
-#[test]
-fn shared_prefill_startup_refuses_the_single_row_driver_only_when_enabled() {
-    use super::prof::{SharedPrefill, check_shared_prefill_rows};
-    for rows in [1, 0] {
-        assert!(matches!(
-            check_shared_prefill_rows(&SharedPrefill::OnForced, rows),
-            Err(EngError::BadRequest(message)) if message.contains("prefill_rows > 1")
-        ));
-    }
-    for rows in [2, 64, 65, 256] {
-        assert!(check_shared_prefill_rows(&SharedPrefill::OnForced, rows).is_ok());
-    }
-    // The default-on accepts width 1: that is the per-token legacy prefill.
-    for rows in [0, 1, 2, 64, 65, 256] {
-        assert!(check_shared_prefill_rows(&SharedPrefill::OnByDefault, rows).is_ok());
-    }
-    for rows in [0, 1, 2, 64] {
-        assert!(check_shared_prefill_rows(&SharedPrefill::Off, rows).is_ok());
-    }
-    for rows in [65, 256, u32::MAX] {
-        assert!(matches!(
-            check_shared_prefill_rows(&SharedPrefill::Off, rows),
-            Err(EngError::BadRequest(message)) if message.contains("needs")
-        ));
-    }
-}
-
-#[test]
-fn shared_prefill_startup_selects_the_shared_driver_only_when_enabled() {
-    let source = include_str!("../../start.rs");
-    let selection = source
-        .split_once("let mut chunked = if shared_prefill {")
-        .expect("startup shared-driver branch")
-        .1;
-    let (shared, rest) = selection.split_once("} else {").expect("legacy branch");
-    let legacy = rest.split_once("chunked.chunk_cap").expect("chunk setup").0;
-    assert!(shared.contains("ChunkDriver::new_shared(device, feeds, shape)?"));
-    assert!(legacy.contains("ChunkDriver::new(device, feeds, shape)?"));
-    assert!(!legacy.contains("new_shared"));
-}
-
-#[test]
-fn shared_prefill_geometry_is_constructed_only_on_the_enabled_branch() {
-    let source = include_str!("../../start.rs");
-    let start = source
-        .find("let prefill_arena_bytes = if shared_prefill {")
-        .expect("enabled scratch branch");
-    let body = &source[start..source[start..].find("// The prefill ring").unwrap() + start];
-    let geometry = body.find("FlashGeometry::new").expect("enabled geometry");
-    let disabled = body.find("} else {").expect("disabled scratch branch");
-    assert!(geometry < disabled);
-    assert!(!body[disabled..].contains("FlashGeometry"));
+    assert!(check < initialize);
 }
 
 /// The route counters are process globals: every test that reads them serialises here, so an
@@ -503,24 +446,6 @@ fn feed_rows_with_the_default_cap_feeds_one_token_at_a_time() {
         params,
         ["chunk_params 1 0 1", "chunk_params 2 1 1"].map(String::from)
     );
-}
-
-#[test]
-fn shared_prefill_switch_accepts_connected_startup_with_strict_spelling() {
-    use super::prof::{SHARED_PREFILL, check_switch_value};
-    for off in [None, Some("0"), Some("false"), Some("off")] {
-        assert!(!check_switch_value(SHARED_PREFILL, off).unwrap());
-    }
-    for on in ["1", "true", "on"] {
-        assert!(check_switch_value(SHARED_PREFILL, Some(on)).unwrap());
-    }
-    for bad in ["", "2", "TRUE", " on", "a non-unicode value"] {
-        assert!(matches!(
-            check_switch_value(SHARED_PREFILL, Some(bad)),
-            Err(EngError::BadRequest(message)) if message.contains("must be")
-        ));
-    }
-    assert!(check_switch_value("INFERENCE_FLASH_NEXT_PROFILE", Some("on")).unwrap());
 }
 
 #[test]

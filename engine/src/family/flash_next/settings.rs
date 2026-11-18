@@ -47,15 +47,9 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill. With `INFERENCE_FLASH_NEXT_SHARED_PREFILL=1`
-    /// the bound is 2 to 256; without it, 1 to 64 — the legacy path's device coverage stops at 64
-    /// rows. The unset default follows the shared-prefill switch: 256, the qualified
-    /// shared width, on the shared path (the default); the pre-flip 1 under the
-    /// rollback, so `INFERENCE_FLASH_NEXT_SHARED_PREFILL=0` with an unset width
-    /// reproduces the pre-flip load exactly. An explicit `1` selects the per-token
-    /// prefill (the decode shape, exactly as before the default changed), served by
-    /// the legacy path even under the shared-prefill default-on — the shared path
-    /// cannot run at width 1.
+    /// CUDA only: rows of one device step during prefill, 1 to 256. The unset default is
+    /// 256, the qualified shared width; an explicit `1` selects the per-token prefill
+    /// (the decode shape, served by the single-row path).
     pub(crate) prefill_rows: Option<u32>,
     /// CUDA only, shared prefill path only: the chunked-prefill row count at and above which
     /// an active prefill ring serves the whole chunk; below it the bank's union-admit path
@@ -274,7 +268,7 @@ pub(in crate::family::flash_next) fn cuda_settings(
     let prefill_rows = ranged(
         "prefill_rows",
         options.prefill_rows,
-        shared_prefill_default_rows(),
+        256,
         1,
         MAX_EXL3_ROWS as u32,
     )?;
@@ -365,33 +359,6 @@ impl FlashSettings {
 /// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's
 /// 131 MB DRAM sweep per token; the rest of the PLE block stays on the host. Strict: any set
 /// value other than `1` is refused.
-/// The unset `prefill_rows` default, as a text core so the rule is testable: this
-/// crate denies `unsafe_code`, so a test cannot carry the variable into the env
-/// reader itself (the [`super::settings::ple_device_text`] pattern). 256, the
-/// qualified shared width, on the shared path (the default); the pre-flip 1 under
-/// the rollback, so `INFERENCE_FLASH_NEXT_SHARED_PREFILL=0` with an unset width
-/// reproduces the pre-flip load exactly. A bad spelling takes 256 here and still
-/// refuses at driver build.
-pub(in crate::family::flash_next) fn shared_prefill_default_rows_text(raw: Option<&str>) -> u32 {
-    match raw {
-        Some("0") | Some("false") | Some("off") => 1,
-        _ => 256,
-    }
-}
-
-/// The env reader of [`shared_prefill_default_rows_text`].
-pub(in crate::family::flash_next) fn shared_prefill_default_rows() -> u32 {
-    #[cfg(test)]
-    if let Some(on) = crate::family::flash_next::cuda::driver::chunk::prof::switch_override() {
-        return shared_prefill_default_rows_text(if on { None } else { Some("0") });
-    }
-    shared_prefill_default_rows_text(
-        std::env::var("INFERENCE_FLASH_NEXT_SHARED_PREFILL")
-            .ok()
-            .as_deref(),
-    )
-}
-
 pub(in crate::family::flash_next) fn ple_device() -> Result<bool, EngError> {
     ple_device_text(
         std::env::var("INFERENCE_FLASH_NEXT_PLE_DEVICE")
@@ -810,7 +777,6 @@ mod tests {
     fn the_cuda_decoder_takes_defaults_and_needs_no_cache_limit() {
         // Pin the shared mode: the default-rows expectation must hold whatever
         // the shell exported.
-        let _pin = crate::family::flash_next::cuda::driver::chunk::prof::pin_shared(true);
         let got = settings(Some(&cuda_on()), &FlashEnv::default()).unwrap();
         assert_eq!(got.cache_limit, 0);
         assert_eq!(
@@ -839,7 +805,6 @@ mod tests {
 
     #[test]
     fn the_cuda_keys_are_read_checked_and_bounded() {
-        let _pin = crate::family::flash_next::cuda::driver::chunk::prof::pin_shared(true);
         let env = FlashEnv::default();
         let options: FlashOptions = serde_json::from_str(
             r#"{"manifest": "/m.json", "cuda_decode": true, "context": 65536,

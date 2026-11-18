@@ -1,10 +1,9 @@
 //! The chunk-facing contract over the bank: what a prefill chunk does to the expert bank,
 //! formalized as one type so the chunked prefill paths of both families code against the same
-//! shape. The served path of Flash-Next (`moe_block::run_rows`) still carries its own inline
-//! copy of this sequence; the two can drift until the shared prefill pass routes `run_rows`
-//! through the adapter. The adapter changes nothing that runs today.
+//! shape. The served path of Flash-Next is the shared prefill pass (`moe_block::run_prefill`)
+//! and both families code against this contract.
 //!
-//! The sequence of one chunk, per `run_rows`:
+//! The sequence of one chunk:
 //!
 //! 1. The router runs over every row and its picks come back to the host once (the readback
 //!    the chunk path already pays for its own classify work).

@@ -794,7 +794,7 @@ impl<'a> FlashStep<'a> {
 
     /// The buffers of the MoE block over all `m` rows at once: every slot spans `m` rows and
     /// the residual input is the plan's zero rows. The batched block
-    /// ([`MoeBlock::run_rows`]); `m` must match the plan's row count.
+    /// of the prefill pass; `m` must match the plan's row count.
     pub(super) fn moe_bufs_rows(&self, m: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
         let g = &self.geometry;
         let at = |slot: Slot, width: usize| -> Result<DeviceRange<'_>, EngError> {
@@ -849,11 +849,14 @@ impl<'a> FlashStep<'a> {
                 self.slot(Slot::PrefillPerm)?,
             );
         }
-        // The split block takes a chunk in one call; every other block loops one row.
-        if m > 1 && moe.batches_rows() {
-            return moe.run_rows(&launch, layer, &self.moe_bufs_rows(m)?, &self.moe_dims(m));
+        // Outside a prefill window every block runs one row; a chunk loops it.
+        // A multi-row step outside the window cannot occur (the driver opens the
+        // window for every chunked prefill), so refuse it instead of looping.
+        if m > 1 {
+            return Err(EngError::BadRequest(format!(
+                "a multi-row MoE step ({m} rows) outside a prefill window"
+            )));
         }
-        // The split block runs one row; a chunk loops it over its rows.
         let dims = self.moe_dims(1);
         for r in 0..m {
             moe.run(&launch, layer, &self.moe_bufs_at(r)?, &dims)?;
@@ -1113,25 +1116,6 @@ pub(super) trait MoeBlock {
     ) -> Result<(), EngError> {
         Err(refuse("this MoE block has no shared prefill path".into()))
     }
-
-    /// Whether [`MoeBlock::run_rows`] takes a multi-row chunk in one call.
-    fn batches_rows(&self) -> bool {
-        false
-    }
-
-    /// The block over `dims.rows` rows of `bufs` (every buffer spans that many rows). Only
-    /// called when [`MoeBlock::batches_rows`] says so.
-    fn run_rows(
-        &mut self,
-        _launch: &Launch<'_>,
-        _layer: usize,
-        _bufs: &Exl3MoeBufs<'_>,
-        _dims: &MoeDims,
-    ) -> Result<(), EngError> {
-        Err(EngError::BadRequest(
-            "this MoE block has no multi-row path".into(),
-        ))
-    }
 }
 
 /// The stand-in until the split block lands: Qwen3.6's EXL3 MoE block over routed experts that
@@ -1263,10 +1247,6 @@ impl MoeBlock for SplitMoeAt<'_> {
         self.inner.run(launch, row, bufs, dims)
     }
 
-    fn batches_rows(&self) -> bool {
-        true
-    }
-
     fn run_prefill(
         &mut self,
         projector: &Projector<'_>,
@@ -1286,25 +1266,5 @@ impl MoeBlock for SplitMoeAt<'_> {
                 ))
             })?;
         self.inner.run_prefill(projector, row, bufs, dims, perm)
-    }
-
-    fn run_rows(
-        &mut self,
-        launch: &Launch<'_>,
-        layer: usize,
-        bufs: &Exl3MoeBufs<'_>,
-        dims: &MoeDims,
-    ) -> Result<(), EngError> {
-        let row = layer
-            .checked_sub(self.first_layer)
-            .filter(|&row| row < self.rows)
-            .ok_or_else(|| {
-                refuse(format!(
-                    "layer {layer} is outside the bank's layers {}..{}",
-                    self.first_layer,
-                    self.first_layer + self.rows
-                ))
-            })?;
-        self.inner.run_rows(launch, row, bufs, dims)
     }
 }

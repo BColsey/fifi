@@ -895,17 +895,8 @@ pub(crate) fn preflight_rows(
         }
     };
 
-    // The loader's own switch checks, called the same way `build_driver`
-    // calls them: the spelling pass over the Flash-Next environment
-    // switches, then the shared-prefill row rule against the same resolved
-    // `prefill_rows` (the default when the candidate says nothing). The
-    // effective path feeds the note below exactly as startup's carve does.
-    let shared_mode = super::cuda::driver::chunk::prof::check_switch_spelling()?;
-    super::cuda::driver::chunk::prof::check_shared_prefill_rows(
-        &shared_mode,
-        settings.prefill_rows,
-    )?;
-    let shared_prefill = shared_mode.effective_at(settings.prefill_rows);
+    // The loader's own switch check, called the same way `build_driver` calls it.
+    super::cuda::driver::chunk::prof::check_switch_spelling()?;
     // The two PLE switches refuse on spelling the same way at start; their
     // values change no row, so only their refusal is shared.
     super::settings::ple_device()?;
@@ -974,11 +965,7 @@ pub(crate) fn preflight_rows(
     let requested = u64::from(settings.context);
     let kv = settings.kv_format.format();
     let min_slots = model.moe.top_k() + 1;
-    let note = if shared_prefill {
-        "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
-    } else {
-        "the rows assume cuda_decode: true and a manifest in the config; shared prefill is off, so the load carves no prefill arena; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them"
-    };
+    let note = "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them";
     match plan.at_context(requested, kv, min_slots) {
         Ok(load) => Ok((load.plan_rows(), note.to_string(), RowsFit::Fits)),
         Err(refusal) => {
@@ -1263,56 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn the_prefill_rows_load_matrix_reproduces_the_rollback_and_changes_only_the_flip_cells() {
-        use super::super::cuda::driver::chunk::prof::{SharedPrefill, check_shared_prefill_rows};
-        use super::super::settings::shared_prefill_default_rows_text;
-        // (env value, candidate width) -> (loads, shared path). The =0 column
-        // reproduces the pre-flip behavior cell for cell; only three cells of the
-        // other columns change against 95365bbea, each named in the commit message.
-        let cells: [(Option<&str>, Option<u32>, bool, bool); 18] = [
-            (Some("0"), None, true, false),
-            (Some("0"), Some(1), true, false),
-            (Some("0"), Some(8), true, false),
-            (Some("0"), Some(64), true, false),
-            (Some("0"), Some(65), false, false),
-            (Some("0"), Some(256), false, false),
-            (None, None, true, true),
-            (None, Some(1), true, false),
-            (None, Some(8), true, true),
-            (None, Some(64), true, true),
-            (None, Some(65), true, true),
-            (None, Some(256), true, true),
-            (Some("1"), None, true, true),
-            (Some("1"), Some(1), false, false),
-            (Some("1"), Some(8), true, true),
-            (Some("1"), Some(64), true, true),
-            (Some("1"), Some(65), true, true),
-            (Some("1"), Some(256), true, true),
-        ];
-        for (env, raw, loads, shared) in cells {
-            let mode = match env {
-                Some("0") => SharedPrefill::Off,
-                Some("1") => SharedPrefill::OnForced,
-                _ => SharedPrefill::OnByDefault,
-            };
-            let resolved = raw.unwrap_or_else(|| shared_prefill_default_rows_text(env));
-            let outcome = check_shared_prefill_rows(&mode, resolved);
-            assert_eq!(
-                outcome.is_ok(),
-                loads,
-                "env {env:?} rows {raw:?} -> {resolved}"
-            );
-            assert_eq!(
-                mode.effective_at(resolved),
-                shared,
-                "env {env:?} rows {raw:?} -> {resolved}"
-            );
-        }
-    }
-
-    #[test]
     fn preflight_rows_render_the_loaders_plan_from_probed_facts() {
-        let _pin = crate::family::flash_next::cuda::driver::chunk::prof::pin_shared(true);
         let dir = pack_dir();
         let (rows, note, fit) = preflight_rows(&rows_request(
             dir.path(),
@@ -1356,7 +1294,6 @@ mod tests {
         // bounds; an invalid one is refused THERE, naming prefill_rows with the
         // same rule startup uses — the width demonstrably reaches the loader's
         // resolution, not a shallow echo of the default.
-        let _pin = crate::family::flash_next::cuda::driver::chunk::prof::pin_shared(true);
         let dir = pack_dir();
         let facts = flash_facts(24 << 30);
         let mut request = rows_request(dir.path(), None, None, &facts);
@@ -1380,7 +1317,6 @@ mod tests {
 
     #[test]
     fn preflight_rows_name_the_largest_fitting_context_when_the_card_is_small() {
-        let _pin = crate::family::flash_next::cuda::driver::chunk::prof::pin_shared(true);
         let dir = pack_dir();
         let (rows, _note, fit) = preflight_rows(&rows_request(
             dir.path(),
@@ -1423,41 +1359,15 @@ mod tests {
 
     #[test]
     fn the_switch_checks_the_loader_runs_are_the_preflight_runs_too() {
-        use super::super::cuda::driver::chunk::prof::{
-            SharedPrefill, check_shared_prefill_rows, check_switch_value,
-        };
+        use super::super::cuda::driver::chunk::prof::check_switch_value;
         // A value the switches do not read, with the loader's own text.
-        let error = check_switch_value("INFERENCE_FLASH_NEXT_SHARED_PREFILL", Some("yes"))
+        let error = check_switch_value("INFERENCE_FLASH_NEXT_PROFILE", Some("yes"))
             .unwrap_err()
             .describe();
         assert!(
             error.contains("must be 1, true, on, 0, false or off, not yes"),
             "{error}"
         );
-        // The shared-prefill row rule against the resolved modes: forcing ON at
-        // width 1 refuses, the default-on accepts width 1 (the per-token legacy
-        // prefill), and the rollback caps the legacy path at 64 rows.
-        let error = check_shared_prefill_rows(&SharedPrefill::OnForced, 1)
-            .unwrap_err()
-            .describe();
-        assert!(
-            error.contains("INFERENCE_FLASH_NEXT_SHARED_PREFILL=1 requires prefill_rows > 1"),
-            "{error}"
-        );
-        assert!(check_shared_prefill_rows(&SharedPrefill::OnForced, 2).is_ok());
-        assert!(check_shared_prefill_rows(&SharedPrefill::OnByDefault, 1).is_ok());
-        assert!(check_shared_prefill_rows(&SharedPrefill::OnByDefault, 256).is_ok());
-        assert!(!SharedPrefill::OnByDefault.effective_at(1));
-        assert!(SharedPrefill::OnByDefault.effective_at(2));
-        let error = check_shared_prefill_rows(&SharedPrefill::Off, 65)
-            .unwrap_err()
-            .describe();
-        assert!(
-            error.contains("needs INFERENCE_FLASH_NEXT_SHARED_PREFILL=1"),
-            "{error}"
-        );
-        assert!(check_shared_prefill_rows(&SharedPrefill::Off, 64).is_ok());
-        assert!(!SharedPrefill::Off.effective_at(256));
     }
 
     #[test]
@@ -1536,9 +1446,6 @@ mod tests {
         let spelling = entry
             .find("prof::check_switch_spelling()?")
             .expect("switch spelling check");
-        let rows_check = entry
-            .find("prof::check_shared_prefill_rows(")
-            .expect("shared row configuration check");
         let ple_device = entry
             .find("super::settings::ple_device()?")
             .expect("PLE device switch check");
@@ -1548,9 +1455,8 @@ mod tests {
         let probe = entry
             .find("facts.cuda.first_device_free_bytes")
             .expect("the card probe read");
-        assert!(settings < spelling && spelling < rows_check);
-        assert!(rows_check < ple_device && ple_device < ple_batch);
-        assert!(ple_batch < probe);
+        assert!(settings < spelling && spelling < ple_device);
+        assert!(ple_device < ple_batch && ple_batch < probe);
     }
 
     #[test]

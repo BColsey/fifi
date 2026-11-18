@@ -57,7 +57,6 @@ use std::time::Duration;
 
 use super::{
     driver::TokenTimes,
-    driver::chunk::prof,
     executor::{CudaRules, FlashCudaExecutor},
     resume,
     start::{StepDriver, build_driver},
@@ -189,14 +188,12 @@ fn sample(driver: &StepDriver, wall: Duration, argmax: Duration, before: u64) ->
     }
 }
 
-/// The chunked-driver oracle arms: the prompt runs as device chunks of `default_rows` rows
+/// The chunked-driver oracle arm: the prompt runs as device chunks of `default_rows` rows
 /// through `feed_rows`, then decode continues one row at a time, and the greedy tokens
-/// still match the oracle run. Two pinned arms cover both paths — the rollback (legacy,
-/// rows 64) and the shared default (rows 256) — so the flip's default keeps an oracle test
-/// and neither arm can drift with a later default change. This is the settings-to-driver
-/// wiring proof; the m-row kernel math is proven by
+/// still match the oracle run. This is the settings-to-driver wiring proof; the m-row
+/// kernel math is proven by
 /// `step_tests::a_chunk_of_rows_matches_the_same_rows_one_at_a_time`.
-fn chunked_prefill_matches_oracle(shared: bool, default_rows: u32) {
+fn chunked_prefill_matches_oracle(default_rows: u32) {
     assert!(
         device_present("Flash-Next chunked driver"),
         "this test needs a CUDA card"
@@ -233,10 +230,6 @@ fn chunked_prefill_matches_oracle(shared: bool, default_rows: u32) {
         prompt.len() + steps < context as usize,
         "the context is too small"
     );
-    // The arm under test, pinned through the guard so process env cannot move it; the
-    // assertion is a leading-8 greedy agreement with the oracle, so the width change
-    // from the stock 4 does not make the comparison brittle.
-    let _pin = prof::pin_shared(shared);
     let wanted = CudaSettings {
         context,
         kv_format: KvFormatName::F16,
@@ -288,20 +281,11 @@ fn chunked_prefill_matches_oracle(shared: bool, default_rows: u32) {
     );
 }
 
-/// The rollback arm: the legacy path at its 64-row cap, pinned off so the flip's
-/// shared default cannot move this test.
-#[test]
-#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
-fn the_chunked_prefill_driver_matches_the_oracle() {
-    chunked_prefill_matches_oracle(false, 64);
-}
-
-/// The default arm: the shared path at its 256-row default, pinned on so a
-/// later default change cannot move this test either.
+/// The shared path at its 256-row default.
 #[test]
 #[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
 fn the_shared_chunked_prefill_driver_matches_the_oracle() {
-    chunked_prefill_matches_oracle(true, 256);
+    chunked_prefill_matches_oracle(256);
 }
 
 /// The prefix resume on the real pack: a fresh prefill of prompt B is the reference, then a
@@ -994,11 +978,6 @@ fn the_first_real_tokens_match_the_oracle() {
         prefill_rows: 1,
         ring_rows: 32,
     };
-    // The shared-prefill default is ON since the flip; this token driver runs at
-    // prefill_rows: 1, where the effective path stays legacy (width 1 is the
-    // per-token prefill). The pin holds the rollback for the build and drops
-    // (restoring the environment) even on a panic.
-    let _pin = prof::pin_shared(false);
     let began = std::time::Instant::now();
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
@@ -1657,11 +1636,6 @@ fn single_row_kernel_receipt_run() {
         prefill_rows: 1,
         ring_rows: 32,
     };
-    // Same as the token-driver test above: the default is ON, this driver runs at
-    // prefill_rows: 1, so the effective path stays legacy; pinned explicitly.
-    // Same as the token-driver test above: the default is ON, this driver runs at
-    // prefill_rows: 1, so the effective path stays legacy; pinned through the guard.
-    let _pin = prof::pin_shared(false);
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");
     // The placement the run's logits hashes compare at. Read now: the usage profile moves

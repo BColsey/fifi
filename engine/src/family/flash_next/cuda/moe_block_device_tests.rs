@@ -554,7 +554,7 @@ fn floats_f64(bytes: &[u8]) -> Vec<f64> {
     floats(bytes).into_iter().map(f64::from).collect()
 }
 
-/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. A
+/// The buffers of one multi-row block call, zeroed, with `rows` as the normalized inputs. A
 /// source's gate/up launch stages one `xh` row per pair and the whole chunk can be one
 /// source's, so the scratch staging is sized `m·k` rows (the F32 byte sizing also covers
 /// the F16 staging the job-table family writes into the same ranges).
@@ -656,19 +656,6 @@ impl RigRows {
     }
 }
 
-/// `run_rows` with the prefill ring funded: every pick reads its bank slot or its ring slot,
-/// the bank's miss counter stays flat (the ring path never steps or admits the bank), and
-/// every row matches the all-resident block and fp64 within RING_BOUND run after run (the
-/// ring re-arms per chunk like the driver cadence). RING_BOUND, not SPLIT_BOUND, because the
-/// ring branch's job-table tile launches are not the flat indexed launches of the reference
-/// — see RING_BOUND's doc and the per-projection device test that separates the two
-/// families' arithmetic.
-#[test]
-#[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
-fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
-    ring_chunk_pass(49, false, None);
-}
-
 #[test]
 #[ignore = "needs a GPU (about 3 GiB), pinned host memory, FIFI_FLASH_NEXT_EXL3_PACK and FIFI_RING_ORACLE_ROWS for the row count"]
 fn the_shared_prefill_ring_matches_the_oracle_for_full_tiles_tails_and_one_row() {
@@ -678,14 +665,14 @@ fn the_shared_prefill_ring_matches_the_oracle_for_full_tiles_tails_and_one_row()
         .expect("FIFI_RING_ORACLE_ROWS selects this oracle's row count")
         .parse()
         .expect("a row count");
-    ring_chunk_pass(rows, true, Some(6));
+    ring_chunk_pass(rows, Some(6));
 }
 
 #[test]
 #[ignore = "needs a GPU (about 3 GiB), pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn the_shared_prefill_ring_handles_an_empty_bank_or_ring_pair_subset() {
     for held in [0, 10] {
-        ring_chunk_pass(1, true, Some(held));
+        ring_chunk_pass(1, Some(held));
     }
 }
 
@@ -717,7 +704,7 @@ fn threaded_references(
     })
 }
 
-fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
+fn ring_chunk_pass(m: usize, held: Option<usize>) {
     assert!(
         device_present("Flash-Next split MoE block"),
         "a GPU is required"
@@ -868,19 +855,13 @@ fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
             let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
             let before = split.bank().state().stats().clone();
             let frozen = split.bank().state().slot_row(bank_layer).to_vec();
-            if shared {
-                shared_prefill_pass(
-                    &mut split,
-                    &launch,
-                    bank_layer,
-                    &rig.bufs().expect("bufs"),
-                    &chunk,
-                );
-            } else {
-                split
-                    .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
-                    .expect("the ring block");
-            }
+            shared_prefill_pass(
+                &mut split,
+                &launch,
+                bank_layer,
+                &rig.bufs().expect("bufs"),
+                &chunk,
+            );
             stream.synchronize().expect("sync");
             let tag = format!(
                 "bank layer {bank_layer} (pack layer {}), run {run}",
@@ -1072,9 +1053,13 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
     split.begin_prefill().unwrap();
     split.begin_chunk();
     let jobs_rig = RigRows::new(&projector, &two_rows, &[row.clone(), row]).expect("rig");
-    split
-        .run_rows(&launch, 0, &jobs_rig.bufs().expect("bufs"), &two_rows)
-        .expect("the ring block");
+    shared_prefill_pass(
+        &mut split,
+        &launch,
+        0,
+        &jobs_rig.bufs().expect("bufs"),
+        &two_rows,
+    );
     stream.synchronize().expect("sync");
     let (jobs_gu, jobs_down, jobs_ids) = jobs_rig.expert_bytes(&projector);
 
@@ -1161,175 +1146,6 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
 }
 
 // Dead since 5590d49ed (2026-11-10, on main) dropped its attributes in a rename; restored
-// here because this is the only executing test of the per-row miss path in run_rows.
-#[test]
-#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
-fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
-    assert!(
-        device_present("Flash-Next split MoE block"),
-        "a GPU is required"
-    );
-    let first = moe_layer();
-    let layers = vec![first, first + 1];
-    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
-    let checkpoint = &files.checkpoint;
-    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
-        .expect("the pack matches its config");
-    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
-    let shape = model.moe;
-    let one_row = MoeDims {
-        rows: 1,
-        hidden: model.hyper.hidden(),
-        n_expert: shape.experts(),
-        top_k: shape.top_k(),
-        inter: shape.inter(),
-        shared_inter: shape.shared_inter(),
-    };
-    let m = 8;
-    let chunk = MoeDims { rows: m, ..one_row };
-    let projector = CudaProjector::new().expect("projector");
-    let ctx = projector.context();
-    let stream = ctx.stream().expect("stream");
-    let launch = Launch {
-        ctx,
-        stream: &stream,
-    };
-    let source = PackRecordSource::new(checkpoint).expect("the record source");
-    let layout = source.layout().clone();
-
-    // Per bank layer: uploads, the chunk's rows, and per-row fp64 and all-resident references.
-    struct Arm {
-        row_inputs: Vec<Vec<f32>>,
-        weights: CudaWeights,
-        keys: Vec<(Role, String)>,
-        wants: Vec<Reference>,
-        residents: Vec<Vec<u8>>,
-    }
-    let mut arms: Vec<Arm> = Vec::with_capacity(layers.len());
-    for (index, &layer) in layers.iter().enumerate() {
-        let router = Router::read(checkpoint, layer, &one_row).expect("router");
-        let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
-        let keys = keys(layer);
-        let row_inputs: Vec<Vec<f32>> = (0..m)
-            .map(|seed| input(one_row.hidden, seed + 7 * (index + 1)))
-            .collect();
-        let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
-            keys.iter()
-                .find(|(candidate, _)| *candidate == role)
-                .map(|(_, key)| key.as_str())
-                .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
-        })
-        .expect("the all-resident block resolves");
-        let mut wants = Vec::with_capacity(m);
-        let mut residents = Vec::with_capacity(m);
-        for row in &row_inputs {
-            wants.push(
-                reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"),
-            );
-            let rig = Rig::new(&projector, &one_row, row).expect("rig");
-            run_exl3_moe(
-                &launch,
-                &block,
-                &rig.bufs().expect("bufs"),
-                &one_row,
-                true,
-                None,
-                false,
-            )
-            .expect("the all-resident block");
-            launch.stream.synchronize().expect("sync");
-            residents.push(rig.out_bytes(&projector));
-        }
-        arms.push(Arm {
-            row_inputs,
-            weights,
-            keys,
-            wants,
-            residents,
-        });
-    }
-
-    // The bank holds six of row 0's picks per layer: row 0 is mixed, every later row misses.
-    let held: Vec<Vec<u16>> = arms
-        .iter()
-        .map(|arm| {
-            let mut held: Vec<u16> = arm.wants[0].ids.iter().take(6).map(|&e| e as u16).collect();
-            held.extend(others(&arm.wants[0].ids, SLOTS - 6));
-            held
-        })
-        .collect();
-    let bank = build_bank(&projector, &source, &layers, &held);
-    let trunks: Vec<SplitMoeTrunk<'_>> = arms
-        .iter()
-        .map(|arm| {
-            let key = |role: Role| {
-                arm.keys
-                    .iter()
-                    .find(|(candidate, _)| *candidate == role)
-                    .map(|(_, key)| key.as_str())
-                    .unwrap_or_else(|| panic!("no key for {role:?}"))
-            };
-            SplitMoeTrunk {
-                router: raw(&arm.weights, key(Role::FfnGateInp)),
-                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
-                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
-                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
-                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
-            }
-        })
-        .collect();
-    let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
-
-    for (bank_layer, arm) in arms.iter().enumerate() {
-        for run in 0..2 {
-            let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
-            let before = split.bank().state().stats().misses;
-            split
-                .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
-                .expect("the chunked block");
-            stream.synchronize().expect("sync");
-            let misses = (split.bank().state().stats().misses - before) as usize;
-            let tag = format!(
-                "bank layer {bank_layer} (pack layer {}), run {run}",
-                layers[bank_layer]
-            );
-            // With about `m * top_k` distinct picks against `SLOTS` slots, BOTH chunks miss:
-            // even the second finds most picks evicted by the last rows of the first.
-            assert!(
-                misses > 0,
-                "{tag}: the chunk misses under eviction pressure"
-            );
-            for r in 0..m {
-                let got = rig.out_row(&projector, r);
-                let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
-                let fp64_error = relative_l2(&floats(&got), &arm.wants[r].out);
-                println!(
-                    "{tag}, row {r}: vs all-resident {resident_error:.3e}, vs fp64 {fp64_error:.3e}"
-                );
-                assert!(
-                    fp64_error < OUTPUT_BOUND,
-                    "{tag}, row {r}: fp64 {fp64_error}"
-                );
-                assert_eq!(
-                    got, arm.residents[r],
-                    "{tag}, row {r}: the split writes the all-resident bytes"
-                );
-            }
-        }
-    }
-}
-
-/// `run_rows` when the chunk's distinct picks fit the bank (2 rows against 20 slots): the
-/// union admit runs and every row rides the flat resident pass — no per-row `step`, which the
-/// pass counter proves (decode passes stay flat). Every row matches the all-resident block
-/// within the split bound, every pick of the union is resident afterwards, and the same chunk
-/// again changes nothing.
-#[test]
-#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
-fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
-    chunk_union_pass(2, false);
-}
-
 #[test]
 #[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
@@ -1340,7 +1156,7 @@ fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
         .map(|value| vec![value.parse().expect("a row count")])
         .unwrap_or_else(|_| vec![1, 3, 65, 256]);
     for rows in ladder {
-        chunk_union_pass(rows, true);
+        chunk_union_pass(rows);
     }
 }
 
@@ -1419,7 +1235,7 @@ fn shared_prefill_pass(
     assert_eq!(&bytes[8 + perm_bytes..], &[0xA5; 8]);
 }
 
-fn chunk_union_pass(m: usize, shared: bool) {
+fn chunk_union_pass(m: usize) {
     assert!(
         device_present("Flash-Next split MoE block"),
         "a GPU is required"
@@ -1487,7 +1303,7 @@ fn chunk_union_pass(m: usize, shared: bool) {
     }
 
     // The fill holds all 10 of row 0's picks of 20 slots; the chunk's union (at most 20
-    // distinct) always fits, so run_rows takes the union-admit path, never the per-row tail.
+    // distinct) always fits, so the union admit covers the chunk, never the per-row tail.
     let mut held: Vec<u16> = wants[0].ids.iter().take(10).map(|&e| e as u16).collect();
     held.extend(others(&wants[0].ids, 10));
     let bank = build_bank(&projector, &source, &layers, &[held]);
@@ -1506,35 +1322,10 @@ fn chunk_union_pass(m: usize, shared: bool) {
     };
     let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &chunk).expect("split");
 
-    let union: Vec<u16> = {
-        let mut seen = [false; 512];
-        let mut union = Vec::new();
-        for want in &wants {
-            for &id in &want.ids {
-                if !seen[id] {
-                    seen[id] = true;
-                    union.push(id as u16);
-                }
-            }
-        }
-        union
-    };
-    if !shared {
-        assert!(
-            union.len() <= 20,
-            "the two rows pick at most 20 distinct experts"
-        );
-    }
     for run in 0..2 {
         let rig = RigRows::new(&projector, &chunk, &row_inputs).expect("rig");
         let passes = split.bank().state().stats().passes;
-        if shared {
-            shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), &chunk);
-        } else {
-            split
-                .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)
-                .expect("the chunked block");
-        }
+        shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), &chunk);
         stream.synchronize().expect("sync");
         let tag = format!("run {run}");
         // The admit is not decode traffic and never moves the pass counter; a per-row `step`
@@ -1544,12 +1335,8 @@ fn chunk_union_pass(m: usize, shared: bool) {
             passes,
             "{tag}: no per-row bank steps"
         );
-        // The promoted pass uses the same FP16 job family as the measured ring path.
-        let (resident_bound, oracle_bound) = if shared {
-            (RING_BOUND, RING_BOUND)
-        } else {
-            (SPLIT_BOUND, OUTPUT_BOUND)
-        };
+        // The promoted pass uses the FP16 job family.
+        let (resident_bound, oracle_bound) = (RING_BOUND, RING_BOUND);
         for r in 0..m {
             let got = rig.out_row(&projector, r);
             assert!(
@@ -1561,7 +1348,7 @@ fn chunk_union_pass(m: usize, shared: bool) {
                 "{tag}, row {r}: the fp64 bound"
             );
         }
-        let last_window = if shared { (m - 1) / 2 * 2 } else { 0 };
+        let last_window = (m - 1) / 2 * 2;
         for want in &wants[last_window..] {
             for &pick in &want.ids {
                 assert!(

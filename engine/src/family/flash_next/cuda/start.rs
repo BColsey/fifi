@@ -396,12 +396,7 @@ pub(super) fn build_driver(
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
-    let shared_mode = super::driver::chunk::prof::check_switch_spelling()?;
-    super::driver::chunk::prof::check_shared_prefill_rows(&shared_mode, wanted.prefill_rows)?;
-    // The effective path: width 1 keeps the legacy per-token prefill even under the
-    // default-on (a no-chunking config), so the arena carve and the step choice below
-    // cannot diverge from the row rule.
-    let shared_prefill = shared_mode.effective_at(wanted.prefill_rows);
+    super::driver::chunk::prof::check_switch_spelling()?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -435,7 +430,9 @@ pub(super) fn build_driver(
     let host_admission = HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?;
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
-    let prefill_arena_bytes = if shared_prefill {
+    // The shared prefill arena serves chunked prefill only; `prefill_rows = 1` is the
+    // per-token driver and keeps the pre-switch charge of zero.
+    let prefill_arena_bytes = if rows > 1 {
         StepPlan::prefill_bytes(
             true,
             &FlashGeometry::new(&model, &kinds)?,
@@ -629,11 +626,11 @@ pub(super) fn build_driver(
     );
 
     stage("building the step");
-    // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
-    // device chunks of that many rows; one is the per-token prefill of before (the unset
-    // default under the rollback), and the shared path's default width is 256.
+    // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs
+    // as device chunks of that many rows; one keeps the per-token prefill. The default
+    // width is 256 (the only qualified one).
     let stream = Box::leak(Box::new(ctx.stream()?));
-    let new_step = if shared_prefill {
+    let new_step = if rows > 1 {
         FlashStep::new_prefill
     } else {
         FlashStep::new
@@ -669,7 +666,7 @@ pub(super) fn build_driver(
         } else {
             eprintln!(
                 "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank; \
-                 shared prefill whole-chunk at {} rows and above (legacy path always streams)",
+                 shared prefill whole-chunk at {} rows and above",
                 slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 wanted.ring_rows
             );
@@ -780,11 +777,7 @@ pub(super) fn build_driver(
         let ple_route = device_ple;
         let ple_on_card = ple_route.is_some();
         let device = CardChunkDevice::with_ple(step, moe, ple_route);
-        let mut chunked = if shared_prefill {
-            ChunkDriver::new_shared(device, feeds, shape)?
-        } else {
-            ChunkDriver::new(device, feeds, shape)?
-        };
+        let mut chunked = ChunkDriver::new(device, feeds, shape)?;
         chunked.chunk_cap = rows;
         chunked.ple_device = ple_on_card;
         let route_note = if ple_on_card {

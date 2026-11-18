@@ -144,13 +144,6 @@ pub(in crate::family::flash_next) mod prof {
         }
     }
 
-    pub(super) const SHARED_PREFILL: &str = "INFERENCE_FLASH_NEXT_SHARED_PREFILL";
-
-    /// The legacy prefill path's row limit: its device coverage stops at 64 rows (the widest
-    /// step exercised was 49, the qwen36 equivalence suite 64). Wider windows must run
-    /// the shared path.
-    const LEGACY_EXL3_ROWS: u32 = 64;
-
     pub(in crate::family::flash_next) fn check_switch_value(
         name: &str,
         raw: Option<&str>,
@@ -163,83 +156,6 @@ pub(in crate::family::flash_next) mod prof {
         Ok(on)
     }
 
-    pub(in crate::family::flash_next) fn check_shared_prefill_rows(
-        mode: &SharedPrefill,
-        rows: u32,
-    ) -> Result<()> {
-        if matches!(mode, SharedPrefill::OnForced) && rows <= 1 {
-            return Err(EngError::BadRequest(format!(
-                "{SHARED_PREFILL}=1 requires prefill_rows > 1; width 1 is the token driver, \
-                 not a shared chunk width"
-            )));
-        }
-        if matches!(mode, SharedPrefill::Off) && rows > LEGACY_EXL3_ROWS {
-            return Err(EngError::BadRequest(format!(
-                "prefill_rows > {LEGACY_EXL3_ROWS} needs {SHARED_PREFILL}=1; the legacy prefill \
-                 path is limited to {LEGACY_EXL3_ROWS} rows"
-            )));
-        }
-        Ok(())
-    }
-
-    /// The resolved shared-prefill mode: unset defaults the shared path ON, `0`, `false`
-    /// or `off` roll back to the legacy path for one release (the deletion commit removes
-    /// the switch with the legacy path), and an explicit `1`, `true` or `on` forces it.
-    /// Forcing matters at width 1: the default lets a no-chunking config (`prefill_rows` 1)
-    /// silently run the legacy per-token prefill — the only path that serves width 1 —
-    /// while forcing shared ON against that width is an operator error the row rule names.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(in crate::family::flash_next) enum SharedPrefill {
-        Off,
-        OnByDefault,
-        OnForced,
-    }
-
-    impl SharedPrefill {
-        /// Whether the shared path actually runs at `rows`: width 1 stays legacy even
-        /// under the default-on. Startup resolves the effective path exactly once here
-        /// and threads the result, so the arena carve and the step choice cannot diverge.
-        pub(in crate::family::flash_next) fn effective_at(self, rows: u32) -> bool {
-            !matches!(self, SharedPrefill::Off) && rows > 1
-        }
-    }
-
-    #[cfg(test)]
-    thread_local! {
-        static SWITCH_OVERRIDE: std::cell::Cell<Option<bool>> =
-            const { std::cell::Cell::new(None) };
-    }
-
-    /// Pins the shared-prefill mode for device tests without touching the process
-    /// environment (edition 2024 denies `std::env::set_var`); dropping the pin (or a
-    /// panic unwinding through it) restores the environment. A pinned mode reads as
-    /// forced, and the other switches still validate through the environment only when
-    /// no override is set — the tests that pin set no other switch.
-    #[cfg(test)]
-    pub(in crate::family::flash_next) struct SwitchPin;
-
-    #[cfg(test)]
-    impl Drop for SwitchPin {
-        fn drop(&mut self) {
-            SWITCH_OVERRIDE.with(|cell| cell.set(None));
-        }
-    }
-
-    /// Pins the shared-prefill mode: `pin_shared(false)` holds the rollback for the
-    /// guard's scope, `pin_shared(true)` forces the shared path.
-    #[cfg(test)]
-    pub(in crate::family::flash_next) fn pin_shared(on: bool) -> SwitchPin {
-        SWITCH_OVERRIDE.with(|cell| cell.set(Some(on)));
-        SwitchPin
-    }
-
-    /// The pinned mode, `None` when no test pin holds: settings-level tests read
-    /// this so their default-rows expectations never depend on the process env.
-    #[cfg(test)]
-    pub(in crate::family::flash_next) fn switch_override() -> Option<bool> {
-        SWITCH_OVERRIDE.with(std::cell::Cell::get)
-    }
-
     fn read_switch_env(name: &str) -> Option<String> {
         match std::env::var(name) {
             Err(std::env::VarError::NotPresent) => None,
@@ -248,37 +164,17 @@ pub(in crate::family::flash_next) mod prof {
         }
     }
 
-    /// Validates the switches and returns the shared mode for startup's arena/owner binding.
-    /// `INFERENCE_FLASH_NEXT_SHARED_PREFILL` defaults to ON: unset selects the shared
-    /// path; `0`, `false` or `off` roll back to the legacy path until the deletion commit
-    /// removes the switch with the legacy path itself.
-    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<SharedPrefill> {
-        #[cfg(test)]
-        if let Some(on) = SWITCH_OVERRIDE.with(std::cell::Cell::get) {
-            return Ok(if on {
-                SharedPrefill::OnForced
-            } else {
-                SharedPrefill::Off
-            });
-        }
-        let mut mode = SharedPrefill::OnByDefault;
+    /// Validates the switches for startup's arena/owner binding.
+    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
         for name in [
             "INFERENCE_FLASH_NEXT_PROFILE",
             "INFERENCE_FLASH_NEXT_DRAIN_TICK",
             "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
-            SHARED_PREFILL,
         ] {
             let value = read_switch_env(name);
-            let on = check_switch_value(name, value.as_deref())?;
-            if name == SHARED_PREFILL && value.is_some() {
-                mode = if on {
-                    SharedPrefill::OnForced
-                } else {
-                    SharedPrefill::Off
-                };
-            }
+            check_switch_value(name, value.as_deref())?;
         }
-        Ok(mode)
+        Ok(())
     }
 
     /// The host-stage measurement switch (`INFERENCE_FLASH_NEXT_DRAIN_TICK`): with the
@@ -467,7 +363,6 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     /// in-place rows a resume leaves on the card belong to the generation that wrote them, so a
     /// snapshot saved at another generation is structurally unusable and never matches.
     generation: u64,
-    shared_prefill: bool,
     shared_window: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
@@ -500,23 +395,11 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             pos: 0,
             poisoned: false,
             generation: 0,
-            shared_prefill: false,
             shared_window: false,
             chunk_cap: 1,
             ple_device: false,
             ple_host_batch: None,
         })
-    }
-
-    /// Selects the shared protocol and its whole-prompt preflight.
-    pub(in crate::family::flash_next::cuda) fn new_shared(
-        device: D,
-        feeds: F,
-        shape: DriverShape,
-    ) -> Result<Self> {
-        let mut driver = Self::new(device, feeds, shape)?;
-        driver.shared_prefill = true;
-        Ok(driver)
     }
 
     /// The number of positions the caches hold, for the executor.
@@ -747,15 +630,7 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         if tokens.is_empty() {
             return Ok(());
         }
-        if self.shared_prefill {
-            return self.feed_shared_rows(tokens);
-        }
-        let cap = self.chunk_cap.max(1);
-        self.device.begin_prefill()?;
-        for chunk in tokens.chunks(cap) {
-            self.run_chunk(chunk, false).map(|_| ())?;
-        }
-        Ok(())
+        self.feed_shared_rows(tokens)
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
