@@ -452,3 +452,51 @@ fn scalar_and_avx2_expert_forward_are_bitwise_equal() {
         );
     }
 }
+
+#[test]
+fn narrow_sum_preserves_each_group_at_signed_byte_extremes() {
+    if DotBackend::detect() == DotBackend::scalar() {
+        return;
+    }
+    // The selector is cached once per process. Exercise the opt-in under
+    // ordinary CI as well as when the entire test binary runs with it set.
+    if std::env::var_os("FIFI_CPU_Q8G_NARROW_SUM").is_none_or(|v| v != "1") {
+        let case = "kernels::expert_cpu_q8g::tests::narrow_sum_preserves_each_group_at_signed_byte_extremes";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case])
+            .env("FIFI_CPU_Q8G_NARROW_SUM", "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && log.contains("1 passed"), "{log}");
+        return;
+    }
+
+    let (mut row, _) = extreme_rows(Q4K_BLOCK_VALUES, 1);
+    row[2..4].fill(0); // Isolate the product sum from the minimum correction.
+    let mut xq = Q8gRow::zeros(Q4K_BLOCK_VALUES).unwrap();
+    for active in 0..GROUPS_PER_BLOCK {
+        xq.d.fill(0.0);
+        xq.d[active] = 1.0;
+        for extreme in [i8::MIN, i8::MAX] {
+            xq.q.fill(0);
+            xq.q[active * GROUP..(active + 1) * GROUP].fill(extreme);
+            let mut got = [0.0];
+            q4k_q8g_matvec(
+                DotBackend::detect(),
+                &row,
+                1,
+                Q4K_BLOCK_VALUES,
+                &xq,
+                &mut got,
+            )
+            .unwrap();
+            let expected = f32::from(extreme) * (32 * 15 * 63) as f32;
+            assert_eq!(
+                got[0].to_bits(),
+                expected.to_bits(),
+                "group {active}, q {extreme}"
+            );
+        }
+    }
+}
