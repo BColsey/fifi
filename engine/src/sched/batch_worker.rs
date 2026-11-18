@@ -27,10 +27,8 @@ struct Slot<S> {
     ready: bool,
     finished: bool,
     slow: bool,
-    /// The admit-path bank counters as they stood when the slot was built, so the ready
-    /// transition can log this slot's prefill delta once (the slots share one executor, so
-    /// the delta spans the pieces other ready slots prefilled alongside it).
-    bank_before: Option<crate::sched::job::PrefillBankReport>,
+    /// Keep attempted work across prefill retries. Publish once the slot becomes ready.
+    prefill_bank: Option<crate::sched::job::PrefillBankReport>,
     /// Whether the eviction restart already ran for this slot: a restarted slot saves
     /// nothing. Later denials are NOT final by that alone: they evict one more entry and
     /// restart again - final only through `exhausted_restart` below, the classify gate, or
@@ -204,7 +202,7 @@ fn build_slot<E: ExecutorOps>(
         ready: false,
         finished: false,
         slow: false,
-        bank_before: executor.prefill_bank_report(),
+        prefill_bank: None,
         retried: false,
         exhausted_restart: false,
     };
@@ -303,7 +301,17 @@ fn prefill<E: ExecutorOps>(
         .map_or(slot.job.prompt.len(), |point| point.0);
     let remaining = span(&slot.job.prompt, slot.cursor, target)?;
     let end = slot.cursor + rows.min(remaining.len());
-    executor.prefill(&mut slot.session, span(&slot.job.prompt, slot.cursor, end)?)?;
+    let piece = span(&slot.job.prompt, slot.cursor, end)?;
+    let before = executor.prefill_bank_report();
+    let result = executor.prefill(&mut slot.session, piece);
+    if let Some(before) = before
+        && let Some(after) = executor.prefill_bank_report()
+    {
+        slot.prefill_bank
+            .get_or_insert_default()
+            .add_delta(&before, &after);
+    }
+    result?;
     slot.usage.prefill_pieces.count = slot.usage.prefill_pieces.count.saturating_add(1);
     slot.usage.prefill_pieces.max_rows = slot
         .usage
@@ -321,12 +329,7 @@ fn prefill<E: ExecutorOps>(
     refresh_report(executor, slot);
     if slot.cursor == slot.job.prompt.len() {
         slot.ready = true;
-        // The bank counters land once, at the ready transition, as this slot's prefill
-        // delta (log-only; `None` is the report of an executor without an expert bank).
-        slot.usage.prefill_bank = match (executor.prefill_bank_report(), slot.bank_before.take()) {
-            (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
-            _ => None,
-        };
+        slot.usage.prefill_bank = slot.prefill_bank.take();
     }
     Ok(())
 }
