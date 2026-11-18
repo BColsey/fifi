@@ -2,11 +2,15 @@
 """Rebuild a host-specific two-turn coding receipt from guarded scratch artifacts."""
 
 import hashlib
+import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
-TASK = Path("/home/ben/fifi-scratch/0cae2ae995db/p2p-async-chunk")
+# Host-specific: the guarded scratch task root on the pair host that produced
+# the artifacts. FIFI_P2P_TASK_DIR names it; a rerun needs the original files.
+TASK = Path(os.environ.get("FIFI_P2P_TASK_DIR", "p2p-async-chunk"))
 ROOT = TASK / "ring-coding-256-check"
 SMOKE = ROOT / "pair-reserved-3wt6megz"
 FULL = ROOT / "pair-reserved-kxe5pjoy"
@@ -67,7 +71,13 @@ def restored(campaign, kind):
 
 def main():
     sys.path.insert(0, str(ROOT))
-    import attention_device as long  # noqa: PLC0415
+    try:
+        long = importlib.import_module("attention_device")
+    except ModuleNotFoundError:
+        raise SystemExit(
+            f"attention_device.py is missing from {ROOT}; "
+            "the receipt can only be rebuilt from the original campaign artifacts"
+        ) from None
 
     smoke, full = (
         load(SMOKE / "attention/summary.json"),
