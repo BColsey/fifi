@@ -2270,6 +2270,8 @@ mod tests {
         use crate::sched::worker::spawn_engine_noted;
 
         let chunked = std::env::var_os("FIFI_MLX_FLASH_CHUNKED").is_some_and(|value| value == "1");
+        let admission =
+            std::env::var_os("FIFI_MLX_REQUEST_ADMISSION").is_some_and(|value| value == "1");
         let options = FlashOptions {
             manifest: Some("fixture-manifest.json".into()),
             cache_limit_bytes: Some(CACHE_LIMIT),
@@ -2292,7 +2294,15 @@ mod tests {
                     let (mut executor, session) =
                         build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
-                    executor.configure_prefill(&session, &settings, false, None)?;
+                    let device = if admission && chunked {
+                        Some(
+                            crate::family::mlx_budget::DeviceBudget::detect()?
+                                .expect("benchmark Metal ceiling"),
+                        )
+                    } else {
+                        None
+                    };
+                    executor.configure_prefill(&session, &settings, false, device)?;
                     assert_eq!(executor.prefill_chunk(), chunked.then_some(PIECE));
                     Ok((executor, session))
                 })

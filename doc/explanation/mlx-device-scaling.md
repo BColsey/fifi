@@ -1,6 +1,6 @@
 # Device-aware MLX prefill
 
-Qwen3.6, Flash-Next and Flint can size their prefill work to the Apple Silicon GPU from the same startup policy. Metal supplies `recommendedMaxWorkingSetSize` in bytes. Each executor accounts for its resident weights and session memory, then uses the remaining budget and its configured row ceiling to select a chunk. All three use the same largest-fitting-chunk rule.
+Qwen3.6, Qwen3.8 dense, Flash-Next and Flint can size their prefill work to the Apple Silicon GPU from the same startup policy. Metal supplies `recommendedMaxWorkingSetSize` in bytes. Each executor accounts for its resident weights and session memory, then uses the remaining budget and its configured row ceiling to select a chunk. All four use the same largest-fitting-chunk rule.
 
 ```sh
 FIFI_MLX_AUTO_BUDGET=1 enginesrv --config /path/to/config.json
@@ -8,15 +8,43 @@ FIFI_MLX_AUTO_BUDGET=1 enginesrv --config /path/to/config.json
 
 Use an Apple Silicon build with the `native-mlx` feature. The option is off by default. When enabled, it applies to one MLX model per server because the device reports one shared working set. Metal's recommendation is a sizing input for the total working set. Other apps, other server processes and allocation peaks during weight import can put additional pressure on memory. The policy checks resident memory and serving reserves before accepting jobs. Flint also uses a header-based estimate to choose where to keep its weights before import.
 
-The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB); that figure and the verification numbers below were recorded by the PR author (zbrdc/fifi#62, commit 88374d1c5) on his own machine and are carried as a contributor record, not reproduced here. The implementation queries Metal on every opted-in model startup and uses the resulting byte count. FIFI_MLX_WORKING_SET_MIB also activates automatic sizing and caps the plan at the lower of the configured ceiling and Metal's recommendation. Context length and KV format come from the family's configuration.
+The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB); that figure and the verification numbers below were recorded by the PR author (zbrdc/fifi#62, commit 88374d1c5) on his own machine and are carried as a contributor record, not reproduced here. The implementation queries Metal on every opted-in model startup and uses the resulting byte count. FIFI_MLX_WORKING_SET_MIB also activates automatic sizing and caps the plan at the lower of the configured ceiling and Metal's recommendation. A family-specific `prefill_budget_bytes` can bound its prefill workspace further. Context length and KV format come from the family's configuration.
 
 | Family | Sizing inputs in addition to resident weights and allocator headroom | Selection |
 | --- | --- | --- |
-| Qwen3.6 | Full-context KV capacity at the selected dtype, DeltaNet state, a layer's cache growth overlap and the aggregate session cap when prefix reuse or concurrency applies | Uses the existing chunk cost model and worker row ceiling. An explicit `prefill_budget_bytes` supplies a further upper bound. Concurrent serving requires an explicit byte budget and a fitting chunk. |
+| Qwen3.6 and Qwen3.8 dense | Full-context KV capacity at the selected dtype, DeltaNet state, a layer's cache growth overlap and the aggregate session cap when prefix reuse or concurrency applies | Uses the existing chunk cost model and worker row ceiling. An explicit `prefill_budget_bytes` supplies a further upper bound. Qwen3.6 concurrent serving requires an explicit byte budget and a fitting chunk. |
 | Flash-Next | Decode pool, full-context QSA including index keys, DeltaNet and PLE state, overlap while replacing session arrays, and configured prefix slots | Uses the existing expert-wave workspace model and worker row ceiling. An explicit `prefill_budget_bytes` supplies a further upper bound. |
 | Flint | Full KV planes, 513-position sliding rings, one layer's KV growth overlap, bounded prefix retention and a conservative upper estimate of the full-attention score, mask and softmax workspace | Walks the widest fitting rung from 1,024 down to 4 rows within the ceiling set by `FIFI_FLINT_MLX_BATCH_PREFILL`, one row only when even four do not fit. The prefix cache records the selected width. |
 
 Qwen3.6 and Flash-Next can fall back to one-token prefill if the workspace for a chunk does not fit. Startup logs carry the Metal recommendation, the charged resident and reserve bytes, and the selected path; the logs distinguish the Metal recommendation from the effective budget and, when set, the configured ceiling. [MLX budget code](../../engine/src/family/mlx_budget.rs) · [Environment reference](../reference/environment.md#apple-silicon-device-sizing)
+
+## Constrained-memory comparisons
+
+The shared Flint ladder prices each batch using the same context, resident weights, expert staging, and temporary attention cost as coarse admission. It walks the common prefill rungs and keeps the one-row fallback at the bottom.
+
+For the real-model comparison, the driver supplied a 4,096 MiB budget ceiling on the same 16 GB M4 mini. Both arms used the pinned internal-SSD Flint INT4 checkpoint, a 32,768-token limit, shared-page expert staging, prefix reuse off and 12 greedy completion tokens. The control walked only the coarse 1,024/512/one-row rungs; the candidate walked the shared ladder. The worker reported the admitted width and the width it actually ran. This measured a constrained serving plan on the M4, with the full 16 GB still physically available.
+
+Four fresh servers ran in control, candidate, candidate, control order. The coarse path admitted one row. The shared ladder admitted 32. Every completion matched, and the 45-token prompt ran as two worker pieces with the ladder enabled. The table shows medians from two servers per mode.
+
+| Prompt tokens | Time to first token, one-row → adaptive | Logical prefill reads | Full request | Peak process footprint |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 7.90 → 6.69 s | 7.98 → 5.16 GB | 13.40 → 12.63 s | 1.73 → 1.82 GB |
+| 45 | 23.28 → 16.27 s | 22.45 → 12.86 GB | 29.53 → 22.43 s | 1.73 → 1.92 GB |
+
+Flint reached its first token 15% and 30% sooner on these prompts. The worker reused each staged expert across the rows that selected it. Decode still issued the same number of slice reads. In these short runs, measured decode throughput varied from 7% slower to 1% faster, and peak process footprint increased by up to 0.19 GB at the median. The raw sample CSVs live in the PR branch (`scripts/benchmarks/mac-m4-flint-adaptive-prefill.csv`), not in this tree.
+
+The Flash-Next, Qwen3.6 MoE and Qwen3.8 dense worker fixtures compared their one-row execution routes with device-budgeted eight-row prefill (`scripts/bench_mlx_requests.py --prefill-admission`). The candidate arms used the same 4,096 MiB Metal ceiling along with the fixtures' explicit 2 GiB prefill budget. The worker used the same eight-row submission piece in both arms, and the correct internal route was checked at startup. These are synthetic models. The Qwen fixtures used BF16 activations and F32 KV. All 192 continuation sequences matched.
+
+| Fixture | Prompt tokens | Time to first token, one-row → chunked | Paired change | Metal waits, one-row → chunked |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.6 MoE | 8 | 8.14 → 3.45 ms | −53% | 47 → 39 |
+| Qwen3.6 MoE | 33 | 31.73 → 11.18 ms | −65% | 97 → 59 |
+| Qwen3.8 dense | 8 | 3.89 → 1.45 ms | −63% | 47 → 36 |
+| Qwen3.8 dense | 33 | 14.64 → 3.68 ms | −75% | 97 → 47 |
+| Flash-Next | 8 | 11.07 → 3.18 ms | −72% | 69 → 45 |
+| Flash-Next | 33 | 44.29 → 24.69 ms | −43% | 169 → 105 |
+
+The timings used four fresh process pairs in each family and four recorded samples per row in each process. Latency columns report medians of process medians. The percentage column reports the median of the four paired changes. Decode timing varied by case. The 33-token dense fixture's median active MLX peak rose from 143 to 225 KiB. The raw worker CSV lives in the PR branch (`scripts/benchmarks/mac-m4-mlx-capped-worker-requests.csv`), not in this tree.
 
 ## Disk-backed Flint experts
 

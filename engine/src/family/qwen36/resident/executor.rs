@@ -3304,12 +3304,31 @@ mod tests {
         use crate::sched::worker::spawn_engine_noted;
 
         let grouped = std::env::var_os("FIFI_MLX_GROUPED_IMPORT").is_some_and(|value| value == "1");
-        let settings = serving(Q36Options {
+        let dense = std::env::var_os("FIFI_MLX_REQUEST_DENSE").is_some_and(|value| value == "1");
+        let admission =
+            std::env::var_os("FIFI_MLX_REQUEST_ADMISSION").is_some_and(|value| value == "1");
+        let step = admission
+            && std::env::var_os("FIFI_MLX_REQUEST_STEP").is_some_and(|value| value == "1");
+        let spec = if dense { tiny::TINY_DENSE } else { TINY_GQA };
+        let options = Q36Options {
+            cache_limit_bytes: Some(CACHE_LIMIT),
+            context_limit: Some(128),
+            activation_dtype: Some("bf16".into()),
+            kv_dtype: Some("f32".into()),
             prefill_chunk: Some(PIECE),
-            prefill_budget_bytes: Some(2 << 30),
-            prefill_session_reserve_bytes: Some(64 << 20),
+            prefill_budget_bytes: (!step).then_some(2 << 30),
+            prefill_session_reserve_bytes: (!step).then_some(64 << 20),
             ..Q36Options::default()
-        });
+        };
+        let settings = Q36Settings::new_for_family(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+            spec,
+        )
+        .unwrap();
         let rules = Q36Rules {
             context_limit: 128,
             session_cap: 128 * GROWTH,
@@ -3317,14 +3336,32 @@ mod tests {
             ..chunk_rules()
         };
         mlx_request_bench::measure(
-            "qwen36",
-            if grouped { "grouped" } else { "default" },
+            if dense { "qwen38-dense" } else { "qwen36" },
+            if step {
+                "step"
+            } else if grouped {
+                "grouped"
+            } else {
+                "default"
+            },
             |note| {
                 spawn_engine_noted(PIECE as usize, note, move |_| {
-                    let (mut executor, session) = build(rules);
+                    let ckpt: &'static StreamedCheckpoint =
+                        Box::leak(Box::new(tiny::checkpoint(&spec)));
+                    let host = HostWeights::load(ckpt, &spec, &tiny::config(&spec))?;
+                    let (mut executor, session) =
+                        Q36Executor::from_parts(MlxKernels::try_new()?, ckpt, host, rules)?;
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
-                    plan_prefill(&mut executor, &settings, None)?;
-                    assert_eq!(executor.prefill_chunk(), Some(PIECE));
+                    let device = if admission && !step {
+                        Some(
+                            crate::family::mlx_budget::DeviceBudget::detect()?
+                                .expect("benchmark Metal ceiling"),
+                        )
+                    } else {
+                        None
+                    };
+                    plan_prefill(&mut executor, &settings, device)?;
+                    assert_eq!(executor.prefill_chunk(), (!step).then_some(PIECE));
                     Ok((executor, session))
                 })
                 .unwrap()
