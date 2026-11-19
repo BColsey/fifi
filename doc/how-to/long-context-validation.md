@@ -113,6 +113,23 @@ limit and skips generation at that depth. Exit status 2 covers a failed check,
 a refused depth, or missing required timings. An interrupted or invalid stream
 leaves evidence in the corresponding `.partial` file.
 
+### Record committed checkpoint bytes
+
+Retain the engine log from each server process that ran the comparison.
+Join the finished benchmark to that process's log by request ID.
+
+```sh
+python3 scripts/record_prefix_checkpoint_bytes.py \
+  --benchmark "$TMPDIR/one-entry.json" --request-log "$TMPDIR/engine.log" \
+  --output "$TMPDIR/one-entry-checkpoint-bytes.json"
+```
+
+The report contains the checkpoint entry count and committed payload bytes
+sampled by the engine for each verified turn. It also lists depths refused by
+the advertised context limit. Allocator reserves, temporary copy buffers and
+GPU memory high-water marks need separate measurements. Keep one log per server
+process because request IDs can repeat after restart.
+
 ## Read the result
 
 The JSON result records the counted prompt and completion tokens, prefix reuse,
