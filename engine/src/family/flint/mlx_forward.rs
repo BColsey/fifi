@@ -683,9 +683,15 @@ fn ffn(
             let span = Span::begin("ffn_experts", 0, None, Some((x.dtype(), x.shape())));
             let (rows, shared_in_flight) = match routed {
                 Routed::Resident(weights) => (grouped_experts(k, weights, x, &route.ids)?, None),
-                Routed::Disk { source, stem } => {
-                    stage_disk_experts(k, source, stem, x, &route.ids, Some(shared))?
-                }
+                Routed::Disk { source, stem } => stage_disk_experts(
+                    k,
+                    source,
+                    stem,
+                    x,
+                    &route.ids,
+                    Some(shared),
+                    expert_pipeline_flagged(),
+                )?,
             };
             #[cfg(test)]
             span.finish(Some((rows.dtype(), rows.shape())));
@@ -712,8 +718,9 @@ pub(super) fn disk_experts(
     stem: &str,
     x: &ExecutionTensor,
     ids: &BoundedIndices,
+    pipeline: bool,
 ) -> Result<ExecutionTensor> {
-    stage_disk_experts(k, source, stem, x, ids, None).map(|(rows, _)| rows)
+    stage_disk_experts(k, source, stem, x, ids, None, pipeline).map(|(rows, _)| rows)
 }
 
 fn stage_disk_experts(
@@ -723,8 +730,8 @@ fn stage_disk_experts(
     x: &ExecutionTensor,
     ids: &BoundedIndices,
     shared: Option<&SwiGlu>,
+    pipeline: bool,
 ) -> Result<(ExecutionTensor, Option<ExecutionTensor>)> {
-    let pipeline = expert_pipeline_flagged();
     let host = k.readback(ids.ids())?;
     // The router results are available now. The shared expert only needs
     // the same input and can run while the host stages the routed experts.

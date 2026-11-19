@@ -420,8 +420,9 @@ impl StackLayout {
         let word_shape = match (layout.payload.dtype, layout.payload.shape.as_mut_slice()) {
             (Dtype::U8, [_, _, width]) if *width > 0 && width.is_multiple_of(4) => width,
             _ => {
+                let width = layout.payload.shape.get(2).copied().unwrap_or(0);
                 return Err(EngError::Checkpoint(format!(
-                    "{stem} has invalid packed byte rows"
+                    "{stem} has invalid packed byte rows: {width} not a multiple of four"
                 )));
             }
         };

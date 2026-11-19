@@ -382,7 +382,7 @@ fn disk_experts_match_resident_grouped_predictions() {
         let ids = k.bound_indices(&ids, 256).unwrap();
         let expected = grouped_experts(&mut k, &full, &x, &ids).unwrap();
         let expected = k.readback(&expected).unwrap();
-        let streamed = disk_experts(&mut k, &checkpoint, "experts", &x, &ids).unwrap();
+        let streamed = disk_experts(&mut k, &checkpoint, "experts", &x, &ids, false).unwrap();
         let streamed = k.readback(&streamed).unwrap();
         assert_eq!(
             streamed.host_bytes().unwrap(),
@@ -426,6 +426,155 @@ fn sparse_oversized_flint_checkpoint_streams_and_decodes_on_mlx() {
         "Flint sparse fixture prefill and decode allocator peak {} bytes",
         memory.peak
     );
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn expert_page_staging_matches_the_packed_experts_path() {
+    use super::super::{
+        mlx_forward::{disk_experts, grouped_experts},
+        mlx_model::SwiGlu,
+    };
+    use crate::kernels::MlxKernels;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("experts.safetensors");
+    let mut profile = Profile::default();
+    let mut entries = Vec::new();
+    for (projection, shift) in [("gate_proj", 1), ("up_proj", 3), ("down_proj", 5)] {
+        let stem = format!("experts.{projection}");
+        profile.packed.insert(stem.clone(), (vec![256, 64, 64], 4));
+        let payload = (0..256 * 64 * 32)
+            .map(|i| ((i + i / 2048 + shift) % 256) as u8)
+            .collect();
+        entries.push((
+            format!("{stem}.weight"),
+            Dtype::U8,
+            vec![256, 64, 32],
+            payload,
+        ));
+        entries.push((
+            format!("{stem}.scales"),
+            Dtype::Bf16,
+            vec![256, 64, 1],
+            bf16(0.125, 256 * 64),
+        ));
+        entries.push((
+            format!("{stem}.biases"),
+            Dtype::Bf16,
+            vec![256, 64, 1],
+            bf16(-0.5, 256 * 64),
+        ));
+    }
+    // Only the width is wrong: the bad stem carries well-formed scales and
+    // biases, so the layout reaches the word check and refuses 33 there.
+    profile
+        .packed
+        .insert("experts.bad_proj".into(), (vec![256, 64, 33], 4));
+    entries.push((
+        "experts.bad_proj.weight".to_string(),
+        Dtype::U8,
+        vec![256, 64, 33],
+        vec![0_u8; 256 * 64 * 33],
+    ));
+    entries.push((
+        "experts.bad_proj.scales".to_string(),
+        Dtype::Bf16,
+        vec![256, 64, 1],
+        bf16(0.125, 256 * 64),
+    ));
+    entries.push((
+        "experts.bad_proj.biases".to_string(),
+        Dtype::Bf16,
+        vec![256, 64, 1],
+        bf16(-0.5, 256 * 64),
+    ));
+    let index = serde_json::to_vec(&json!({"weight_map": entries.iter()
+        .map(|(name, _, _, _)| (name.as_str(), "experts.safetensors")).collect::<BTreeMap<_, _>>() }))
+        .unwrap();
+    let bytes = shard(
+        entries
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.as_str(), *dtype, shape.clone(), bytes.clone())
+            })
+            .collect(),
+    );
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let weights = StreamedCheckpoint::open(
+        &index,
+        vec![(
+            "experts.safetensors".into(),
+            Box::new(file),
+            bytes.len() as u64,
+        )],
+        HEADER_LIMIT,
+    )
+    .unwrap();
+    let checkpoint = FlintCheckpoint { profile, weights };
+    let page = crate::kernels::HostPages::page_size();
+    let refused = crate::family::stored::StackLayout::for_byte_payload(
+        &checkpoint.weights,
+        "experts.bad_proj",
+        affine(4),
+        &[256, 64, 33],
+        3,
+        0,
+        page,
+    );
+    let message = format!("{:?}", refused.expect_err("width 33 must be refused"));
+    assert!(
+        message.contains("33") && message.contains("not a multiple of four"),
+        "{message}"
+    );
+
+    let _serial = crate::native_test_lock();
+    let mut k = MlxKernels::try_new().unwrap();
+    k.allow_bf16(true);
+    let selected = [19_u32, 3, 40, 2, 41, 3];
+    let mut experts = selected.to_vec();
+    experts.sort_unstable();
+    experts.dedup();
+    let remapped: Vec<u8> = selected
+        .iter()
+        .map(|&id| experts.binary_search(&id).unwrap() as u32)
+        .flat_map(|slot| slot.to_le_bytes())
+        .collect();
+    let remapped =
+        Tensor::try_from_host(Dtype::U32, vec![selected.len() as u32], remapped).unwrap();
+    let (paged, staged_ids, _pages) =
+        SwiGlu::load_expert_pages(&mut k, &checkpoint, "experts", &experts, &remapped, false)
+            .unwrap();
+    let (whole, packed_ids) =
+        SwiGlu::load_experts(&mut k, &checkpoint, "experts", &experts, &remapped).unwrap();
+    let x = k
+        .import_tensor(&Tensor::try_from_host(Dtype::Bf16, vec![1, 64], bf16(0.375, 64)).unwrap())
+        .unwrap();
+    let staged_ids = k.bound_indices(&staged_ids, experts.len() as u32).unwrap();
+    let rows = grouped_experts(&mut k, &paged, &x, &staged_ids).unwrap();
+    let staged = k.readback(&rows).unwrap().host_bytes().unwrap().to_vec();
+    let packed_ids = k.bound_indices(&packed_ids, experts.len() as u32).unwrap();
+    let rows = grouped_experts(&mut k, &whole, &x, &packed_ids).unwrap();
+    let packed_path = k.readback(&rows).unwrap().host_bytes().unwrap().to_vec();
+    assert_eq!(staged, packed_path);
+    assert!(staged.iter().any(|&byte| byte != 0));
+    let ids = Tensor::try_from_host(
+        Dtype::U32,
+        vec![selected.len() as u32],
+        selected.iter().flat_map(|id| id.to_le_bytes()).collect(),
+    )
+    .unwrap();
+    let ids = k.import_tensor(&ids).unwrap();
+    let ids = k.bound_indices(&ids, 256).unwrap();
+    let streamed = disk_experts(&mut k, &checkpoint, "experts", &x, &ids, false).unwrap();
+    let streamed = k
+        .readback(&streamed)
+        .unwrap()
+        .host_bytes()
+        .unwrap()
+        .to_vec();
+    assert_eq!(streamed, staged);
 }
 
 #[test]
