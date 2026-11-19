@@ -856,6 +856,20 @@ fn save_points(
     points
 }
 
+/// A failed allocation can return after the client has cancelled. Check the
+/// request again before spending another conversation's cached state on a retry.
+fn evict_for_retry<E: ExecutorOps>(
+    executor: &mut E,
+    session: Option<&E::Session>,
+    prompt: &[u32],
+    cancel: &AtomicBool,
+) -> bool {
+    let protect = session
+        .and_then(|session| executor.restored_anchor_of(session))
+        .or_else(|| executor.restore_candidate(prompt));
+    !cancel.load(Ordering::SeqCst) && executor.evict_one_prefix_entry(protect).is_some()
+}
+
 /// Runs one job and returns the state of the engine after it. The first call is the prompt
 /// check: a prompt that the executor refuses ends the job with the executor's error before any
 /// state changes, so the session stays as the last job left it, a saved prefix survives for the
@@ -921,13 +935,11 @@ fn run_job<E: ExecutorOps>(
             // admission loop does the same).
             let mut terminal = false;
             loop {
-                let protect = match executor.restored_anchor_of(&*session) {
-                    Some(id) => Some(id),
-                    // No restore ran yet (an admission refusal inside `start`): the
-                    // entry this restart would restore goes last.
-                    None => executor.restore_candidate(plan.tokens),
-                };
-                if executor.evict_one_prefix_entry(protect).is_none() {
+                if !evict_for_retry(executor, Some(session), plan.tokens, &generation.cancel) {
+                    if generation.cancel.load(Ordering::SeqCst) {
+                        send_cancelled(events, prompt_tokens);
+                        return reset_state(executor, session, shared);
+                    }
                     terminal = true;
                     break;
                 }
@@ -966,11 +978,11 @@ fn run_job<E: ExecutorOps>(
                 true,
             );
             while let Err(EngError::MemoryPlan(_)) = retried {
-                let protect = match executor.restored_anchor_of(&*session) {
-                    Some(id) => Some(id),
-                    None => executor.restore_candidate(plan.tokens),
-                };
-                if executor.evict_one_prefix_entry(protect).is_none() {
+                if !evict_for_retry(executor, Some(session), plan.tokens, &generation.cancel) {
+                    if generation.cancel.load(Ordering::SeqCst) {
+                        send_cancelled(events, prompt_tokens);
+                        return reset_state(executor, session, shared);
+                    }
                     break;
                 }
                 retried = start(

@@ -4,13 +4,14 @@
 
 use super::{
     ActiveJob, EngineState, Message, PromptPlan, Shared, cancel_unstarted, classified, drain,
-    engine_error, lock, prompt_tokens, reject, save_points, span,
+    engine_error, evict_for_retry, lock, prompt_tokens, reject, save_points, span,
 };
 use crate::EngError;
 use crate::family::executor::ExecutorOps;
 use crate::family::session::SaveKind;
 use crate::sched::job::{
-    Job, JobEvent, JobUsage, PrefillPieces, QUEUE_CAPACITY, send_data, send_terminal,
+    Job, JobEvent, JobUsage, PrefillPieces, QUEUE_CAPACITY, send_cancelled, send_data,
+    send_terminal,
 };
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
@@ -113,6 +114,16 @@ fn cancelled<S>(slot: &mut Slot<S>) {
         }
         Err(error) => send_terminal(&slot.job.events, JobEvent::Error(error)),
     }
+}
+
+fn remove_cancelled<S>(slots: &mut Vec<Slot<S>>, index: usize, shared: &Shared) -> bool {
+    if !slots[index].job.generation.cancel.load(Ordering::SeqCst) {
+        return false;
+    }
+    let mut slot = slots.remove(index);
+    cancelled(&mut slot);
+    unregister(shared, &slot.job);
+    true
 }
 
 /// Rebuilds a slot's prefill state from a reset session: restore, boundary, save points,
@@ -238,10 +249,14 @@ fn admit<E: ExecutorOps>(
             // protects the entry THIS prompt would restore next - never the store-global
             // last-restore marker, which names ANOTHER conversation in an interleaved
             // batch.
-            let protect = executor.restore_candidate(&job_back.prompt);
             // Terminal when nothing can be freed: an empty store cannot admit a rebuild
             // either, so the refusal stands as-is instead of one dead `build_slot`.
-            if executor.evict_one_prefix_entry(protect).is_none() {
+            if !evict_for_retry(
+                executor,
+                None,
+                &job_back.prompt,
+                &job_back.generation.cancel,
+            ) {
                 return Err(EngError::MemoryPlan(message));
             }
             job = *job_back;
@@ -260,8 +275,7 @@ fn admit<E: ExecutorOps>(
                         });
                     }
                     Err((EngError::MemoryPlan(message), back)) => {
-                        let protect = executor.restore_candidate(&back.prompt);
-                        if executor.evict_one_prefix_entry(protect).is_none() {
+                        if !evict_for_retry(executor, None, &back.prompt, &back.generation.cancel) {
                             return Err(EngError::MemoryPlan(message));
                         }
                         retried = build_slot(executor, seed, *back, prefill_chunk);
@@ -394,6 +408,7 @@ pub(super) fn work<E: ExecutorOps>(
             // Keep portable handles registered even if session allocation or restore panics.
             let events = job.events.clone();
             let cancel = Arc::clone(&job.generation.cancel);
+            let prompt_len = prompt_tokens(&job.prompt);
             match admit(executor, &mut seed, job, prefill_chunk) {
                 Ok(slot) => slots.push(slot),
                 Err(error) => {
@@ -401,7 +416,11 @@ pub(super) fn work<E: ExecutorOps>(
                         native_failed(shared, jobs, &error);
                         return;
                     }
-                    send_terminal(&events, JobEvent::Error(error));
+                    if matches!(error, EngError::MemoryPlan(_)) && cancel.load(Ordering::SeqCst) {
+                        send_cancelled(&events, prompt_len);
+                    } else {
+                        send_terminal(&events, JobEvent::Error(error));
+                    }
                     lock(&shared.active).retain(|entry| !Arc::ptr_eq(&entry.cancel, &cancel));
                 }
             }
@@ -412,10 +431,7 @@ pub(super) fn work<E: ExecutorOps>(
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
-                if slots[index].job.generation.cancel.load(Ordering::SeqCst) {
-                    let mut slot = slots.remove(index);
-                    cancelled(&mut slot);
-                    unregister(shared, &slot.job);
+                if remove_cancelled(&mut slots, index, shared) {
                     continue;
                 }
                 if let Err(error) = prefill(executor, &mut slots[index], prefill_chunk) {
@@ -463,11 +479,13 @@ pub(super) fn work<E: ExecutorOps>(
                         // explains nothing - the single worker's fallback shape.
                         let exhausted_once = slots[index].exhausted_restart;
                         loop {
-                            let protect = match executor.restored_anchor_of(&slots[index].session) {
-                                Some(id) => Some(id),
-                                None => executor.restore_candidate(&slots[index].job.prompt),
-                            };
-                            if executor.evict_one_prefix_entry(protect).is_none() {
+                            let slot = &slots[index];
+                            if !evict_for_retry(
+                                executor,
+                                Some(&slot.session),
+                                &slot.job.prompt,
+                                &slot.job.generation.cancel,
+                            ) {
                                 terminal = true;
                                 break;
                             }
@@ -485,6 +503,9 @@ pub(super) fn work<E: ExecutorOps>(
                             }
                         }
                         if terminal {
+                            if remove_cancelled(&mut slots, index, shared) {
+                                continue;
+                            }
                             // Classify only when the ceiling PROVES the piece cannot fit
                             // (the honest over-length form); an exhausted store whose
                             // denial was a save charge with room to grow still takes the
@@ -516,11 +537,13 @@ pub(super) fn work<E: ExecutorOps>(
                         }
                         let mut retried = setup_slot(executor, &mut slots[index], prefill_chunk);
                         while let Err(EngError::MemoryPlan(_)) = &retried {
-                            let protect = match executor.restored_anchor_of(&slots[index].session) {
-                                Some(id) => Some(id),
-                                None => executor.restore_candidate(&slots[index].job.prompt),
-                            };
-                            if executor.evict_one_prefix_entry(protect).is_none() {
+                            let slot = &slots[index];
+                            if !evict_for_retry(
+                                executor,
+                                Some(&slot.session),
+                                &slot.job.prompt,
+                                &slot.job.generation.cancel,
+                            ) {
                                 break;
                             }
                             retried = setup_slot(executor, &mut slots[index], prefill_chunk);
@@ -532,6 +555,9 @@ pub(super) fn work<E: ExecutorOps>(
                                 return;
                             }
                             Err(EngError::MemoryPlan(message)) => {
+                                if remove_cancelled(&mut slots, index, shared) {
+                                    continue;
+                                }
                                 let slot = slots.remove(index);
                                 let error = classified(
                                     executor,
