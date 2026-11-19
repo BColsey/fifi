@@ -450,19 +450,6 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const FLOOR: u64 = 20 * GIB;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
-    fn process_memory_limit_512_mib() {
-        let available = super::host_available_bytes().unwrap();
-        assert!((1..=512 << 20).contains(&available), "{available}");
-        let policy = MemoryPolicy::default_share();
-        assert_eq!(admission_ceiling(policy, available), available);
-        assert!(check_memory(plan(available), policy, available).is_ok());
-        assert!(check_memory(plan(available + 1), policy, available).is_err());
-        eprintln!("Nemotron host budget {available}: exact fit admitted, one extra byte refused");
-    }
-
     fn plan(total_bytes: u64) -> MemoryComponents {
         let quarter = total_bytes / 4;
         MemoryComponents {
@@ -724,6 +711,30 @@ mod tests {
             )
             .expect_err("the expert cache product must refuse overflow");
             assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+        fn process_memory_limit_512_mib() {
+            let (dir, descriptor, spec) = fixture();
+            let available = super::super::host_available_bytes().unwrap();
+            assert!((1..=512 << 20).contains(&available), "{available}");
+            let policy = MemoryPolicy::default_share();
+            let payload = checkpoint_payloads(dir.path(), &descriptor).unwrap();
+            let entries =
+                usize::try_from((512u64 << 20) / payload.largest_expert_entry_bytes + 1).unwrap();
+            let (components, _) =
+                serving_plan(dir.path(), &descriptor, &spec, 16, entries).unwrap();
+            let required =
+                super::super::check_serving_memory(components, policy, 20 << 30).unwrap();
+            let admit =
+                |limit| admit_serving(dir.path(), &descriptor, &spec, 16, entries, policy, limit);
+            admit(required).unwrap();
+            assert!(admit(required - 1).is_err());
+            let error = admit(available).unwrap_err();
+            assert!(error.describe().contains("ceiling"), "{error:?}");
+            eprintln!("Nemotron serving needs {required} bytes, process has {available}: refused");
         }
 
         #[test]

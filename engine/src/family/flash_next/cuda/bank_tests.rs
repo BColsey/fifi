@@ -150,6 +150,29 @@ fn process_memory_limit_512_mib() {
     eprintln!("Flash-Next {memory:?}: inclusive and exclusive expert storage refused");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a 20 GiB memory cgroup on a host with an 8 GiB OS floor"]
+fn process_memory_limit_20_gib_selects_exclusive() {
+    let memory = HostPinPlan::probe_host().unwrap();
+    assert!(
+        (19 * GIB..=20 * GIB).contains(&memory.available),
+        "{memory:?}"
+    );
+    assert_eq!(memory.os_floor(), 8 * GIB);
+    let geometry = BankGeometry::new(4, 8, 2, 6, 256 << 20).unwrap();
+    let ple = GIB;
+    assert!(HostPinPlan::for_load(&geometry, Some("inclusive"), &memory, ple).is_err());
+    let plan = HostPinPlan::for_load(&geometry, None, &memory, ple).unwrap();
+    assert_eq!(plan.mode, HostMode::Exclusive);
+    let forced = HostPinPlan::for_load(&geometry, Some("exclusive"), &memory, ple).unwrap();
+    assert_eq!(plan.process_bytes, forced.process_bytes);
+    eprintln!(
+        "Flash-Next {memory:?}: auto chose exclusive, process plan {} bytes",
+        plan.process_bytes
+    );
+}
+
 #[test]
 fn auto_store_falls_back_after_charging_ple_and_preserves_forced_modes() {
     let geometry = geometry_of(&plan_with_slots(143));
