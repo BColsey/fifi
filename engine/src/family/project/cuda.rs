@@ -1119,11 +1119,10 @@ fn stack_depth(tensor: &GgufTensor) -> Result<Option<usize>, EngError> {
     })
 }
 
-/// Returns `(n_rows, k)` of a tensor whose GGUF `dims[0]` is the row length.
-/// The fused in-projection is ONE native matrix under the qkv name, so every sibling
-/// segment is decoded by the qkv part's quant type: a mixed-type group (a stock Q5_K_M
-/// file mixes Q5_K with Q6_K) must refuse here, naming the part. Returns the fused
-/// row count and input width.
+/// Returns `(rows, k)` of the fused in-projection: the qkv matrix's own shape plus
+/// one row count per sibling segment, which must share the qkv part's quant type and
+/// input width -- a mixed-type group refuses here, naming the part (once fused, every
+/// segment is decoded by the qkv part's type).
 fn fused_inproj_shape(
     qkv: &GgufTensor,
     parts: [&GgufTensor; 3],
@@ -1146,6 +1145,8 @@ fn fused_inproj_shape(
     Ok((rows, k))
 }
 
+/// Returns `(n_rows, k)` of a tensor whose GGUF `dims[0]` is the row length and
+/// the product of the remaining dims is the row count.
 fn matrix_shape(tensor: &GgufTensor) -> Result<(usize, usize), EngError> {
     let shape_error =
         || EngError::Checkpoint(format!("tensor {} has an unusable shape", tensor.name()));
