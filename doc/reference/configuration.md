@@ -30,7 +30,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | `nemotron` | `nemotron35` only, required | [Nemotron options](#nemotron). |
 | `fake` | no | [Test engine options](#fake). |
 | `context_limit` | no | `fake` only: context limit in tokens. Default 4,096. |
-| `flash_next` | no | Options of `qwen3_8_flash_next`, which is not validated end to end. |
+| `flash_next` | no | [Flash-Next options](#flash-next). The family is not validated end to end. |
 | `think_replay` | no | `false` drops the reasoning that clients resend with earlier assistant turns from the prompt, for this engine only. `true` is refused; leave the key out for the default. |
 | `notice_toolwrap` | no | `false` renders system messages that follow an assistant turn as plain system text, for this engine only. `true` is refused. See `ENGINESRV_NOTICE_TOOLWRAP`. |
 
@@ -147,6 +147,20 @@ Optional for Flint on CUDA; refused on Apple Silicon. Without it the engine uses
 | `cpu_moe_threads` | no | 0 to 256, default 0 (6) | Threads for the CPU experts, the engine thread included. The CPU expert kernel is limited by memory bandwidth; on a Ryzen 9 7900X 6 threads already read 45 GB/s, and more did not help. |
 
 CPU experts trade decode speed for GPU memory and for PCIe traffic. On an RTX 3090 with the EXL3 4.0 pack, a 4,096-token context, greedy decoding, one run each: with 128 experts per layer on the GPU (6.9 GiB less GPU memory than 224), serving the other picks from the host buffer by copying them in decoded 36.0 tokens/s after a 51.9 s first token and copied 339 GB in the 4,000-token prompt, while `cpu_moe_split_experts` 128 decoded 32.9 tokens/s after a 56.9 s first token and copied nothing. `cpu_moe_offload_layers` 8 freed 2.7 GiB and decoded 37.7 tokens/s against 39.8 with all layers on the GPU (224 experts per layer). The CPU path rounds its intermediate values to bf16 where the GPU kernels publish them, but it does not round each weight to FP16 as they do, so a greedy run can diverge from the GPU run at a close call between two tokens. Prefill with CPU experts is slower because each row-expert pair is computed on its own.
+
+## `flash_next`
+
+The `flash_next` object of one engine entry for `qwen3_8_flash_next`. Every key is optional. The
+keys below are the CUDA prefill keys; they need a `native-cuda` Linux build and `cuda_decode:
+true` (without it the entry serves through the MLX path and the CUDA keys are refused).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cuda_decode` | `false` | Serves the model on a CUDA card. The CUDA decoder is experimental. |
+| `prefill_chunk` | 16 | Rows per chunked-prefill piece, 1 to 2,048. A piece wider than `prefill_rows` is streamed in `prefill_rows`-row device chunks (four per 1,024-row piece at the supported `prefill_rows` ceiling of 256). Wide pieces need the prefill ring (`INFERENCE_FLASH_NEXT_RING_BUDGET`) to be useful. Single measured runs on the RTX 3090 EXL3 pack, a 28,916-token prompt, ring on: 479 s without the ring budget and 148 s with it, both with the measurement-only `INFERENCE_EXL3_ROWS_MAX` widening the device step to 1,024 rows; the supported `prefill_rows` ceiling is 256. |
+| `prefill_rows` | 256 | Rows of one device prefill step, 1 to 256. `1` selects the per-token prefill. |
+| `context` | 4,096 | K/V positions, a multiple of 4 from 4 to 262,144. The load refuses a context the card cannot hold next to the trunk. |
+| `kv_format` | `f16` | K/V storage on the card. `int8` has no attention kernel yet and is refused. |
 
 ## `nemotron`
 

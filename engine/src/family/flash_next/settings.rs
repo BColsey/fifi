@@ -29,7 +29,7 @@ pub(crate) struct FlashOptions {
     /// default.
     pub(crate) cache_limit_bytes: Option<u64>,
     pub(crate) tokenizer_vocab_size: Option<u32>,
-    /// From 1 to 512.
+    /// From 1 to 2,048.
     pub(crate) prefill_chunk: Option<u32>,
     /// Records speculative next-layer expert hints in one-token steps. The default is false.
     /// Hints do not stage storage or change routing.
