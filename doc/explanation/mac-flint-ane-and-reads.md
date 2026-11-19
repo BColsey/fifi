@@ -125,6 +125,40 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --compact-kv-decode-growth --expert-timing --working-set-mib 8192 --pairs 2
 ```
 
+### Flint KV growth at 2,048 rows
+
+The pinned tokenizer renders the deeper prompt to 2,041 tokens. Both arms use the original checkpoint on the mini's internal SSD, an 8 GiB Metal ceiling, 256 admitted prefill rows, prefill read coalescing, and 24 greedy completion tokens. Expert caching and prefix reuse are off. One pair of fresh servers limits SSD traffic. The control runs first and starts at 4,096 full-attention rows. Geometric compact KV reaches 2,048 during prefill and grows to 4,096 on the eighth decode forward, at absolute position 2,048.
+
+The trace measures the timed expert reads and the complete forward independently. At the growth step, the remaining elapsed time includes model work, KV growth, and synchronization outside the measured read intervals. The driver also records expert-read and whole-forward p95 for the 23 decode forwards and for the seven- and 15-forward windows around the growth step.
+
+Both continuations, logical read bytes, and slice counts matched. Each request scheduled eight prefill pieces and produced nine model forwards, including the one-row pending prompt token. Expert staging read 126.44 GB logically in prefill and 11.48 GB in decode. Both arms reported zero staging-page copy fallbacks.
+
+| Serving measurement | Baseline | Compact |
+| --- | ---: | ---: |
+| Time to first token | 107.90 s | 104.49 s |
+| Decode throughput | 1.47 tok/s | 1.76 tok/s |
+| Decode forward p95, all 23 steps | 752 ms | 700 ms |
+| Expert-read p95, all 23 steps | 545 ms | 517 ms |
+| Full forward at position 2,048 | 719 ms | 700 ms |
+| Expert reads at position 2,048 | 496 ms | 517 ms |
+| Elapsed time outside expert reads at position 2,048 | 223 ms | 183 ms |
+| Forward p95 in the 15 steps after growth | 762 ms | 613 ms |
+| Expert-read p95 in the 15 steps after growth | 570 ms | 475 ms |
+| Process peak footprint | 2.216 GB | 2.125 GB |
+| Attributed SSD reads | 136.09 GB | 135.59 GB |
+| Process page-ins | 44 | 65 |
+
+Compact KV used 91 MB less peak process memory. Timing at position 2,048 moved in opposite directions for the whole forward and the expert reads. The lower post-growth forward tail coincided with lower expert-read tails. Both runs spent about 86.6 seconds in timed prefill expert reads. The single pair used one prompt and the OS file cache stayed in place, so the latency and I/O comparisons are specific to these runs. [Two serving measurements](../../scripts/benchmarks/mac-m4-flint-kv-decode-growth-2041.csv) · [All 46 decode forwards](../../scripts/benchmarks/mac-m4-flint-kv-decode-forwards-2041.csv)
+
+Build the server with `native-mlx,native-fault-qualification`. The trial used the qualification build from commit `4ed2b37d1c114f8ee92f1e39ed859b09326273df`. The driver verifies the tokenizer count before starting inference.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/decode-growth-2048" \
+  --compact-kv-decode-growth --growth-position 2048 --expert-timing \
+  --working-set-mib 8192 --pairs 1
+```
+
 ### Request-sized Flint KV
 
 With compact KV and a Metal working-set budget enabled, `FIFI_FLINT_MLX_REQUEST_KV=1` sets the initial full-attention capacity for a fresh request with an admitted generation limit. The expected fed rows are the prompt length plus the generation allowance minus the final pending token. The shared compact capacity policy rounds those rows up to a power of two with a 256-row floor, capped by the admitted context. The startup plan still reserves the full context. The first forward allocates each plane on demand, and the original growth path remains available. Requests with prefix boundaries or an unbounded generation allowance keep geometric growth and its existing snapshot charges.
