@@ -593,26 +593,29 @@ fn a_worker_panic_answers_worker_lost_and_the_next_request_is_served() {
 
 #[test]
 fn server_shutdown_joins_within_the_timeout_while_busy() {
-    // A one-thread pool over a wide shape keeps the request in `finish` for a real
-    // stretch, and the port's row delay flags that the thread is inside the request;
-    // shutdown is called then and must join within timeout + 1 s plus slack, leaving
-    // no thread behind (the port it owns is dropped).
-    const WIDE: ExpertShape = ExpertShape {
-        hidden: 2048,
-        inter: 2048,
-    };
+    // A one-thread pool keeps the request in `finish`, and the port's row delay - a
+    // sleep, which CPU load does not stretch - is what holds it there: the shape is the
+    // small one so the compute around the sleep is milliseconds even on a loaded host.
+    // That is the load-independence contract of this test: entry is gated by a
+    // generous 30 s (scheduling under load 20 has lagged seconds), and the server's 5 s
+    // timeout is real for its purpose - only the mock's own 40 ms sleep and millisecond
+    // compute stand inside it - so a busy host cannot turn shutdown into `Err(Dead)`.
+    // Shutdown is called while the thread is inside the request and must join within
+    // timeout + slack, leaving no thread behind (the port it owns is dropped).
     let mut rng = Lcg(0x5EED_C0C5_0000_0005);
-    let ((bytes, _), _) = expert_file(&mut rng, 1, 8, WIDE);
+    let ((bytes, _), _) = expert_file(&mut rng, 1, 8, SHAPE);
     let header = parse(&bytes);
-    let locator = ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 1, 8, WIDE).unwrap();
-    let row: Vec<f32> = (0..WIDE.hidden)
+    let locator =
+        ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 1, 8, SHAPE).unwrap();
+    let row: Vec<f32> = (0..SHAPE.hidden)
         .map(|_| rng.f32_between(-1.0, 1.0))
         .collect();
     let region: Arc<dyn MappedRegion> = Arc::new(bytes);
-    let pool = CpuPool::new(1, WIDE).unwrap();
+    let pool = CpuPool::new(1, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row);
     inner.row_delay_ms.store(40, Ordering::Relaxed);
-    // Five seconds: the compute of this request is about 0.8 s in a debug build, which an 800 ms timeout would cut.
+    // Five seconds: the only wait inside the request is the mock's 40 ms sleep plus
+    // millisecond compute, so the timeout is generous on any host, busy or not.
     let timeout = Duration::from_secs(5);
     let server = LayerServer::spawn(port, locator, region, pool, timeout).unwrap();
     server.arm();
@@ -620,7 +623,7 @@ fn server_shutdown_joins_within_the_timeout_while_busy() {
     let gate = Instant::now();
     while !inner.row_entered.load(Ordering::Relaxed) {
         assert!(
-            gate.elapsed() < Duration::from_secs(2),
+            gate.elapsed() < Duration::from_secs(30),
             "the server never entered the request"
         );
         std::thread::sleep(Duration::from_millis(1));

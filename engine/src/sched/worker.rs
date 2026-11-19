@@ -2148,7 +2148,20 @@ mod tests {
             vec![
                 batch(&[0], "a", None),
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished(&log, 1, 2),
+                // The piece shape is pinned, not read back from the live log: the worker
+                // resets the next job's spy while this assert runs, and a delayed read of
+                // the shared log would see the next job's reset instead of this job's
+                // pieces (a delayed read of the shared log; the worker's order is innocent).
+                finished_pieces(
+                    1,
+                    2,
+                    0,
+                    Some(PrefixReport::default()),
+                    PrefillPieces {
+                        count: 1,
+                        max_rows: 1,
+                    },
+                ),
             ]
         );
         assert_eq!(
@@ -2156,7 +2169,16 @@ mod tests {
             vec![
                 batch(&[1], "b", None),
                 batch(&[EOS], "", Some(DecodeFinish::Stop)),
-                finished(&log, 1, 2),
+                finished_pieces(
+                    1,
+                    2,
+                    0,
+                    Some(PrefixReport::default()),
+                    PrefillPieces {
+                        count: 1,
+                        max_rows: 1,
+                    },
+                ),
             ]
         );
         drop(handle);
