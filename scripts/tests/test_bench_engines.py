@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -129,6 +130,74 @@ class StreamTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BENCH.reused_tokens({"prompt_tokens": 10, "reused_tokens": 11})
 
+    def test_conflicting_or_malformed_reuse_cannot_qualify_a_cold_prompt(self):
+        for flat, details in [
+            (0, {"cached_tokens": 2047}),
+            (-1, {"cached_tokens": 0}),
+            (False, {"cached_tokens": 0}),
+            (0, {"cached_tokens": 1.5}),
+            (0, {"cached_tokens": 2049}),
+            (0, []),
+        ]:
+            with (
+                self.subTest(flat=flat, details=details),
+                self.assertRaises(ValueError),
+            ):
+                BENCH.reused_tokens(
+                    {
+                        "prompt_tokens": 2048,
+                        "reused_tokens": flat,
+                        "prompt_tokens_details": details,
+                    }
+                )
+
+    def test_first_request_rate_counts_new_tokens_and_keeps_missing_reuse_unknown(self):
+        for reused, count, rate in [
+            (0, 100, 50),
+            (20, 80, 40),
+            (100, 0, 0),
+            (None, None, None),
+        ]:
+            usage = {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "reused_tokens": reused,
+            }
+            replies = [
+                io.BytesIO(json.dumps({"usage": usage}).encode()),
+                io.BytesIO(b"".join(stream_lines())),
+            ]
+            with (
+                self.subTest(reused=reused),
+                mock.patch.object(BENCH.urllib.request, "urlopen", side_effect=replies),
+                mock.patch.object(BENCH.time, "monotonic", side_effect=[10, 12, 13]),
+                mock.patch.object(BENCH, "recent_server_rate", return_value=None),
+            ):
+                result = BENCH.bench("http://localhost", "test-key", "fifi-q36", 100)
+                self.assertEqual(result["estimated_prefill_tps"], 50)
+                self.assertEqual(result["first_request_new_tokens"], count)
+                self.assertEqual(result["estimated_new_prefill_tps"], rate)
+
+    def test_valid_and_absent_reuse_fields(self):
+        for flat, nested, expected in [
+            (0, 0, 0),
+            (3, 3, 3),
+            (None, 10, 10),
+            (4, None, 4),
+            (None, None, None),
+        ]:
+            with self.subTest(flat=flat, nested=nested):
+                self.assertEqual(
+                    BENCH.reused_tokens(
+                        {
+                            "prompt_tokens": 10,
+                            "reused_tokens": flat,
+                            "prompt_tokens_details": {"cached_tokens": nested},
+                        }
+                    ),
+                    expected,
+                )
+
 
 class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -198,7 +267,7 @@ class IntegrationTests(unittest.TestCase):
     def test_cli_correlates_server_rate_and_reports_reuse(self):
         result = self.run_cli()
         self.assertIn("server decode t/s", result.stdout)
-        self.assertIn("| 20 |", result.stdout)
+        self.assertIn("| 20 | 80 |", result.stdout)
         self.assertIn("| 30 | 96 | length | 37.25 |", result.stdout)
 
     def test_cli_reports_na_when_server_telemetry_is_unavailable(self):
