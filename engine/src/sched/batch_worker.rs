@@ -28,10 +28,6 @@ struct Slot<S> {
     ready: bool,
     finished: bool,
     slow: bool,
-    /// The admit-path bank counters as they stood when the slot was built, so the ready
-    /// transition can log this slot's prefill delta once (the slots share one executor, so
-    /// the delta spans the pieces other ready slots prefilled alongside it).
-    bank_before: Option<crate::sched::job::PrefillBankReport>,
     /// Whether the eviction restart already ran for this slot: a restarted slot saves
     /// nothing. Later denials are NOT final by that alone: they evict one more entry and
     /// restart again - final only through `exhausted_restart` below, the classify gate, or
@@ -214,14 +210,13 @@ fn build_slot<E: ExecutorOps>(
             completion_tokens: 0,
             reused_tokens: 0,
             prefix: None,
-            prefill_bank: None,
+            prefill_bank: executor.prefill_bank_report().map(|_| Default::default()),
             prefill_pieces: PrefillPieces::default(),
             first_token_margin: None,
         },
         ready: false,
         finished: false,
         slow: false,
-        bank_before: executor.prefill_bank_report(),
         retried: false,
         exhausted_restart: false,
     };
@@ -302,6 +297,27 @@ fn refresh_report<E: ExecutorOps>(executor: &E, slot: &mut Slot<E::Session>) {
     }
 }
 
+/// Account even a denied piece: the bank may have moved experts before the failure.
+fn feed_piece<E: ExecutorOps>(
+    executor: &mut E,
+    session: &mut E::Session,
+    tokens: &[u32],
+    bank: &mut Option<crate::sched::job::PrefillBankReport>,
+) -> Result<(), EngError> {
+    let Some(total) = bank else {
+        return executor.prefill(session, tokens);
+    };
+    let before = executor.prefill_bank_report();
+    let result = executor.prefill(session, tokens);
+    if let (Some(before), Some(after)) = (before, executor.prefill_bank_report()) {
+        total.add_interval(&before, &after);
+    } else {
+        // Losing the meter mid-job leaves an incomplete total.
+        *bank = None;
+    }
+    result
+}
+
 /// Feed at most the slot's grant, respecting the executor's piece limit and save points.
 fn prefill<E: ExecutorOps>(
     executor: &mut E,
@@ -323,7 +339,12 @@ fn prefill<E: ExecutorOps>(
         .map_or(slot.job.prompt.len(), |point| point.0);
     let remaining = span(&slot.job.prompt, slot.cursor, target)?;
     let end = slot.cursor + rows.min(remaining.len());
-    executor.prefill(&mut slot.session, span(&slot.job.prompt, slot.cursor, end)?)?;
+    feed_piece(
+        executor,
+        &mut slot.session,
+        span(&slot.job.prompt, slot.cursor, end)?,
+        &mut slot.usage.prefill_bank,
+    )?;
     slot.usage.prefill_pieces.count = slot.usage.prefill_pieces.count.saturating_add(1);
     slot.usage.prefill_pieces.max_rows = slot
         .usage
@@ -339,14 +360,6 @@ fn prefill<E: ExecutorOps>(
         executor.save_prefix(&slot.session, span(&slot.job.prompt, 0, end)?, kind)?;
     }
     refresh_report(executor, slot);
-    if slot.cursor == slot.job.prompt.len() {
-        // The bank counters land once, at the ready transition, as this slot's prefill
-        // delta (log-only; `None` is the report of an executor without an expert bank).
-        slot.usage.prefill_bank = match (executor.prefill_bank_report(), slot.bank_before.take()) {
-            (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
-            _ => None,
-        };
-    }
     Ok(())
 }
 

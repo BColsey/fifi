@@ -247,6 +247,18 @@ impl ExecutorOps for WindowFake {
         }
         let call = self.prefill_calls;
         self.prefill_calls += 1;
+        // Simulate an expert upload that can precede a later allocation denial.
+        if let Some(bank) = &mut self.bank_report {
+            let rows = tokens.len() as u64;
+            bank.passes += 1;
+            bank.misses += rows;
+            bank.miss_histogram[0] += 1;
+            bank.miss_histogram[1] += rows;
+            bank.route_histogram[0] += rows;
+            bank.route_histogram[1] += 1;
+            bank.upload_bytes += rows * 10;
+            bank.upload_ns += rows * 100;
+        }
         if self
             .deny_prefill_token
             .is_some_and(|marker| tokens.contains(&marker))
@@ -259,19 +271,7 @@ impl ExecutorOps for WindowFake {
             self.fail_prefill_piece = None;
             return Err(EngError::MemoryPlan("piece denied".into()));
         }
-        row.fake.prefill(&mut row.state, tokens)?;
-        if let Some(bank) = &mut self.bank_report {
-            let rows = tokens.len() as u64;
-            bank.passes += 1;
-            bank.misses += rows;
-            bank.miss_histogram[0] += 1;
-            bank.miss_histogram[1] += rows;
-            bank.route_histogram[0] += rows;
-            bank.route_histogram[1] += 1;
-            bank.upload_bytes += rows * 10;
-            bank.upload_ns += rows * 100;
-        }
-        Ok(())
+        row.fake.prefill(&mut row.state, tokens)
     }
 
     fn decode(
@@ -508,56 +508,45 @@ fn simultaneous_jobs_share_one_window_but_not_streams_limits_or_usage() {
 }
 
 #[test]
-fn prefill_bank_deltas_span_shared_slots_and_freeze_at_ready() {
-    let log = Log::default();
-    let mut fake = WindowFake::new(&log);
-    fake.bank_report = Some(PrefillBankReport {
-        passes: 10,
-        misses: 20,
-        miss_histogram: vec![30, 40],
-        route_histogram: vec![50, 60],
-        upload_bytes: 70,
-        upload_ns: 80,
-    });
-    let (engine, release) = start(fake);
-    let (first, first_events) = job(&[0, 0], 2);
-    let (second, second_events) = job(&[1, 1, 1], 3);
-    engine.handle().try_submit(first).expect("first");
-    engine.handle().try_submit(second).expect("second");
-    release.send(()).expect("load");
-    let first = usage(&collect(first_events));
-    let second = usage(&collect(second_events));
-    assert_eq!(
-        first.prefill_bank,
-        Some(PrefillBankReport {
-            passes: 1,
-            misses: 2,
-            miss_histogram: vec![1, 2],
-            route_histogram: vec![2, 1],
-            upload_bytes: 20,
-            upload_ns: 200,
-        }),
-        "the first slot is ready before the second prefills"
-    );
-    assert_eq!(
-        second.prefill_bank,
-        Some(PrefillBankReport {
-            passes: 2,
-            misses: 5,
-            miss_histogram: vec![2, 5],
-            route_histogram: vec![5, 2],
-            upload_bytes: 50,
-            upload_ns: 500,
-        }),
-        "both slots sample before either prefills, so the second spans both pieces"
-    );
-    assert_eq!((first.completion_tokens, second.completion_tokens), (2, 3));
-    assert_eq!(
-        lock(&log).windows.len(),
-        3,
-        "decode changes the counters on every tick"
-    );
-    assert_eq!(engine.shutdown().state, EngineState::Stopped);
+fn prefill_bank_counts_only_the_owning_slots_pieces_in_both_arrival_orders() {
+    for lengths in [[2, 9], [9, 2]] {
+        let log = Log::default();
+        let mut fake = WindowFake::new(&log);
+        fake.bank_report = Some(PrefillBankReport {
+            passes: 10,
+            misses: 20,
+            miss_histogram: vec![30, 40],
+            route_histogram: vec![50, 60],
+            upload_bytes: 70,
+            upload_ns: 80,
+        });
+        let (engine, release) = start(fake);
+        let events = lengths.map(|len| {
+            let (request, events) = job(&vec![1; len], 4);
+            engine.handle().try_submit(request).expect("submit");
+            events
+        });
+        release.send(()).expect("load");
+        for (len, handle) in lengths.into_iter().zip(events) {
+            let usage = usage(&collect(handle));
+            let pieces = u64::from(usage.prefill_pieces.count);
+            let rows = len as u64;
+            assert_eq!(usage.completion_tokens, 4);
+            assert_eq!(
+                usage.prefill_bank,
+                Some(PrefillBankReport {
+                    passes: pieces,
+                    misses: rows,
+                    miss_histogram: vec![pieces, rows],
+                    route_histogram: vec![rows, pieces],
+                    upload_bytes: rows * 10,
+                    upload_ns: rows * 100,
+                }),
+                "{len}-row request in order {lengths:?}"
+            );
+        }
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
+    }
 }
 
 #[test]
@@ -567,6 +556,11 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
     // Piece 0 (4 tokens) succeeds; piece 1 is denied after it, which is the case the
     // restart exists for: re-feeding the denied piece would corrupt the partially fed
     // session, so the slot must be rebuilt from a reset session instead.
+    fake.bank_report = Some(PrefillBankReport {
+        miss_histogram: vec![0; 2],
+        route_histogram: vec![0; 2],
+        ..Default::default()
+    });
     fake.fail_prefill_piece = Some(1);
     let (engine, release) = start(fake);
     let (first, first_events) = job(&[7, 7, 7, 7, 7], 1);
@@ -590,6 +584,12 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
         usage(&events).prefill_pieces.max_rows,
         4,
         "the largest serving piece"
+    );
+    let bank = usage(&events).prefill_bank.unwrap();
+    assert_eq!(
+        (bank.passes, bank.misses, bank.upload_bytes),
+        (4, 10, 100),
+        "include the attempted 4+1 rows and the 4+1 rows on retry"
     );
     let trace = lock(&log);
     assert_eq!(

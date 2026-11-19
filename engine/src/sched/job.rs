@@ -67,14 +67,10 @@ pub(crate) struct PrefillPieces {
     pub(crate) max_rows: u32,
 }
 
-/// The admit-path expert-bank counters of one prefill, for the request log's `prefill_bank_*`
-/// keys. The worker snapshots the executor's report before and after the prefill and logs the
-/// delta ([`PrefillBankReport::saturating_sub`]), so the keys carry THIS request's prefill
-/// admits, never other requests' decode traffic. The batch worker's slots share one executor,
-/// so a slot's delta spans the pieces other ready slots prefilled alongside it. `None` keeps
-/// the keys out of the line (an executor without an expert bank reports nothing; no false
-/// zeros).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Per-request expert-bank work during prefill, including work spent on retried pieces.
+/// The serial worker measures the prefill as one interval. The batch worker measures each
+/// call to the shared executor separately. Engines without a bank omit the request-log keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrefillBankReport {
     /// Admit passes: the layer resolves whose experts the bank moved in.
     pub(crate) passes: u64,
@@ -99,21 +95,47 @@ impl PrefillBankReport {
     /// The per-request view of `self` given the pre-prefill snapshot `before`: every counter
     /// element-wise, saturating (a bank rebuild between the samples reads as zero).
     pub(crate) fn saturating_sub(&self, before: &Self) -> Self {
-        fn histogram_delta(after: &[u64], before: &[u64]) -> Vec<u64> {
-            after
-                .iter()
-                .zip(before.iter().chain(std::iter::repeat(&0)))
-                .map(|(a, b)| a.saturating_sub(*b))
-                .collect()
+        let mut delta = Self::default();
+        delta.add_interval(before, self);
+        delta
+    }
+
+    /// Add one interval of monotonic executor counters. A rebuilt bank may change
+    /// histogram widths. Keep previously attributed buckets when its report narrows.
+    pub(super) fn add_interval(&mut self, before: &Self, after: &Self) {
+        fn add(total: &mut u64, before: u64, after: u64) {
+            *total = total.saturating_add(after.saturating_sub(before));
         }
-        Self {
-            passes: self.passes.saturating_sub(before.passes),
-            misses: self.misses.saturating_sub(before.misses),
-            miss_histogram: histogram_delta(&self.miss_histogram, &before.miss_histogram),
-            route_histogram: histogram_delta(&self.route_histogram, &before.route_histogram),
-            upload_bytes: self.upload_bytes.saturating_sub(before.upload_bytes),
-            upload_ns: self.upload_ns.saturating_sub(before.upload_ns),
+        fn histogram(total: &mut Vec<u64>, before: &[u64], after: &[u64]) {
+            if total.len() < after.len() {
+                total.resize(after.len(), 0);
+            }
+            for (index, &current) in after.iter().enumerate() {
+                add(
+                    &mut total[index],
+                    before.get(index).copied().unwrap_or(0),
+                    current,
+                );
+            }
         }
+        add(&mut self.passes, before.passes, after.passes);
+        add(&mut self.misses, before.misses, after.misses);
+        histogram(
+            &mut self.miss_histogram,
+            &before.miss_histogram,
+            &after.miss_histogram,
+        );
+        histogram(
+            &mut self.route_histogram,
+            &before.route_histogram,
+            &after.route_histogram,
+        );
+        add(
+            &mut self.upload_bytes,
+            before.upload_bytes,
+            after.upload_bytes,
+        );
+        add(&mut self.upload_ns, before.upload_ns, after.upload_ns);
     }
 }
 
