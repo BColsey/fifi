@@ -819,6 +819,74 @@ mod tests {
             assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+        fn process_memory_limit_512_mib() {
+            let (dir, descriptor, spec) = fixture();
+            let available = super::super::host_available_bytes().unwrap();
+            assert!((1..=512 << 20).contains(&available), "{available}");
+            let policy = MemoryPolicy::default_share();
+            let payload = checkpoint_payloads(dir.path(), &descriptor).unwrap();
+            let entries =
+                usize::try_from((512u64 << 20) / payload.largest_expert_entry_bytes + 1).unwrap();
+            let (components, _) =
+                serving_plan(dir.path(), &descriptor, &spec, 16, entries).unwrap();
+            let required =
+                super::super::check_serving_memory(components, policy, 20 << 30).unwrap();
+            let admit = |limit| {
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    Some(entries),
+                    policy,
+                    limit,
+                )
+            };
+            assert_eq!(admit(required).unwrap(), entries);
+            assert!(admit(required - 1).is_err());
+            let error = admit(available).unwrap_err();
+            assert!(error.describe().contains("ceiling"), "{error:?}");
+            assert!(
+                admit_serving(dir.path(), &descriptor, &spec, 16, None, policy, available).is_err()
+            );
+            eprintln!("Nemotron serving needs {required} bytes, process has {available}: refused");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires a Linux process with a 2 GiB memory cgroup"]
+        fn process_memory_limit_2_gib_auto_cache() {
+            let (dir, descriptor, spec) = fixture();
+            let available = super::super::host_available_bytes().unwrap();
+            assert!((1 << 30..=2 << 30).contains(&available), "{available}");
+            let policy = MemoryPolicy::default_share();
+            let payload = checkpoint_payloads(dir.path(), &descriptor).unwrap();
+            let admit = |entries| {
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    entries,
+                    policy,
+                    available,
+                )
+            };
+            let automatic = admit(None).unwrap();
+            assert!(automatic > 0);
+            assert_eq!(automatic, payload.expert_entries);
+            assert_eq!(admit(Some(1)).unwrap(), 1);
+            let oversized =
+                usize::try_from(available / payload.cache_entry_bytes().unwrap() + 1).unwrap();
+            assert!(admit(Some(oversized)).is_err());
+            eprintln!(
+                "Nemotron auto admitted {automatic} checkpoint entries at {available} available bytes; explicit one-entry cache admitted"
+            );
+        }
+
         #[test]
         fn admit_serving_accepts_the_exact_total_and_refuses_one_byte_less() {
             let (dir, descriptor, spec) = fixture();
