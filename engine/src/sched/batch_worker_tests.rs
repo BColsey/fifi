@@ -489,7 +489,7 @@ fn simultaneous_jobs_share_one_window_but_not_streams_limits_or_usage() {
 }
 
 #[test]
-fn prefill_bank_deltas_span_shared_slots_and_freeze_at_ready() {
+fn prefill_bank_counts_only_the_slots_own_pieces() {
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.bank_report = Some(PrefillBankReport {
@@ -501,8 +501,8 @@ fn prefill_bank_deltas_span_shared_slots_and_freeze_at_ready() {
         upload_ns: 80,
     });
     let (engine, release) = start(fake);
-    let (first, first_events) = job(&[0, 0], 2);
-    let (second, second_events) = job(&[1, 1, 1], 3);
+    let (first, first_events) = job(&[0; 6], 2);
+    let (second, second_events) = job(&[1; 10], 3);
     engine.handle().try_submit(first).expect("first");
     engine.handle().try_submit(second).expect("second");
     release.send(()).expect("load");
@@ -511,31 +511,31 @@ fn prefill_bank_deltas_span_shared_slots_and_freeze_at_ready() {
     assert_eq!(
         first.prefill_bank,
         Some(PrefillBankReport {
-            passes: 1,
-            misses: 2,
-            miss_histogram: vec![1, 2],
-            route_histogram: vec![2, 1],
-            upload_bytes: 20,
-            upload_ns: 200,
+            passes: 2,
+            misses: 6,
+            miss_histogram: vec![2, 6],
+            route_histogram: vec![6, 2],
+            upload_bytes: 60,
+            upload_ns: 600,
         }),
-        "the first slot is ready before the second prefills"
+        "only the first slot's two pieces"
     );
     assert_eq!(
         second.prefill_bank,
         Some(PrefillBankReport {
-            passes: 2,
-            misses: 5,
-            miss_histogram: vec![2, 5],
-            route_histogram: vec![5, 2],
-            upload_bytes: 50,
-            upload_ns: 500,
+            passes: 3,
+            misses: 10,
+            miss_histogram: vec![3, 10],
+            route_histogram: vec![10, 3],
+            upload_bytes: 100,
+            upload_ns: 1000,
         }),
-        "both slots sample before either prefills, so the second spans both pieces"
+        "only the second slot's three pieces, excluding the first slot's decode"
     );
     assert_eq!((first.completion_tokens, second.completion_tokens), (2, 3));
     assert_eq!(
         lock(&log).windows.len(),
-        3,
+        4,
         "decode changes the counters on every tick"
     );
     assert_eq!(engine.shutdown().state, EngineState::Stopped);
