@@ -202,40 +202,26 @@ pub(super) fn build_rig_session_for_chunk(
     )
 }
 
-fn build_rig_session(
-    devices: [usize; 2],
-    context_tokens: usize,
-    prefix_limits: crate::family::session::StoreLimits,
-    chunk_rows: Option<usize>,
-    centered_weights: bool,
-    prepare_async: bool,
-) -> Result<
-    (
-        CardSession,
-        &'static CardStack,
-        &'static [&'static crate::family::project::cuda::CudaWeights],
-        GlobalNames,
-        usize,
-    ),
-    EngError,
-> {
-    let spec = rig_spec();
-    let inv = Inventory::for_spec(&spec)?;
-    let shape = HostShape::from_spec(&spec, 64)?;
-    let d = StepDims::new(&shape, &inv)?;
-    let options = StepOptions {
+pub(super) fn rig_options(context_tokens: usize) -> StepOptions {
+    StepOptions {
         kv_mode: KvMode::Int8G32,
         context_tokens,
         delta_slots: 1,
         forked_experts: false,
         tiered: None,
         layout: WeightLayout::Native,
-    };
-    let table_layers = LayerTable::new(&d, &inv)?;
+    }
+}
 
+pub(super) fn rig_weights(
+    d: &StepDims,
+    inv: &Inventory,
+    table_layers: &LayerTable,
+    centered_weights: bool,
+) -> Result<(tempfile::TempDir, GgufWeights, GlobalNames), EngError> {
     // The file: every mixer, MoE and global tensor of the spec, full-width.
-    let geometry = MixerGeometry::new(&d)?;
-    let moe_specs = MoeSpecs::new(&d)?;
+    let geometry = MixerGeometry::new(d)?;
+    let moe_specs = MoeSpecs::new(d)?;
     let mut rng = Rng::new(0x5E55);
     let mut entries: Vec<FileEntry> = Vec::new();
     for layer in 0..table_layers.len() {
@@ -341,7 +327,7 @@ fn build_rig_session(
     }
     // The globals: the q4_k embedding (card 0), the full head (sliced per
     // card at load), and the replicated final norm.
-    let names = GlobalNames::new(&inv)?;
+    let names = GlobalNames::new(inv)?;
     let (h, vocab) = (d.shape.hidden, d.shape.vocab);
     entries.push(FileEntry {
         name: names.embed.clone(),
@@ -383,6 +369,36 @@ fn build_rig_session(
         },
         None,
     )?;
+
+    Ok((dir, weights, names))
+}
+
+pub(super) fn build_rig_session(
+    devices: [usize; 2],
+    context_tokens: usize,
+    prefix_limits: crate::family::session::StoreLimits,
+    chunk_rows: Option<usize>,
+    centered_weights: bool,
+    prepare_async: bool,
+) -> Result<
+    (
+        CardSession,
+        &'static CardStack,
+        &'static [&'static crate::family::project::cuda::CudaWeights],
+        GlobalNames,
+        usize,
+    ),
+    EngError,
+> {
+    let spec = rig_spec();
+    let inv = Inventory::for_spec(&spec)?;
+    let shape = HostShape::from_spec(&spec, 64)?;
+    let d = StepDims::new(&shape, &inv)?;
+    let options = rig_options(context_tokens);
+    let table_layers = LayerTable::new(&d, &inv)?;
+
+    let (_dir, weights, names) = rig_weights(&d, &inv, &table_layers, centered_weights)?;
+    let vocab = d.shape.vocab;
 
     // The stack and the per-card loads, through the production loaders on
     // the cards' own contexts.
