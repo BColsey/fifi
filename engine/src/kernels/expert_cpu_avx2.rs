@@ -125,19 +125,26 @@ mod imp {
         acc
     }
 
-    /// Safe entry to the per-32 AVX2 dot: the same runtime re-check and scalar fallback as
-    /// [`q4k_q8k_row_dot`]; `row` and `xq` lengths are the dispatching matvec's contract.
-    pub(crate) fn q4k_q8g_row_dot(row: &[u8], xq: &Q8gRow) -> f32 {
-        if !std::is_x86_feature_detected!("avx2") {
-            return q4k_q8g_row_dot_scalar(row, xq);
-        }
+    /// `FIFI_CPU_Q8G_NARROW_SUM` rolls the default back through the shared fail-safe
+    /// switch (`env_switch::env_allows_default_on`): absent takes the narrow 16-bit
+    /// lane sums; once set, only the enable words ("1", "true", "on") keep them, and
+    /// every other value — "0", "off", "false", garbage, non-UTF-8 — returns to the
+    /// widened path. Both paths are exact integer sums of the same products and are
+    /// pinned bit-equal by test.
+    fn narrow_sum_default() -> bool {
+        crate::env_switch::env_allows_default_on("FIFI_CPU_Q8G_NARROW_SUM")
+    }
+
+    /// Inner dispatch shared by the production and test-forced entries: the narrow
+    /// default from the environment unless a test forces a path. The single unsafe
+    /// block below is the module's only way into the target-feature dot.
+    fn q4k_q8g_row_dot_dispatch(row: &[u8], xq: &Q8gRow, forced: Option<bool>) -> f32 {
         static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let narrow = *NARROW
-            .get_or_init(|| std::env::var_os("FIFI_CPU_Q8G_NARROW_SUM").is_some_and(|v| v == "1"));
-        // SAFETY: the AVX2 feature bit was detected at runtime just above, so the
-        // SAFETY: target-feature function may run on this CPU; slice lengths were
-        // SAFETY: validated by the dispatching matvec before this call, and every
-        // SAFETY: load inside is an unaligned `loadu` within those validated bounds.
+        let narrow = forced.unwrap_or_else(|| *NARROW.get_or_init(narrow_sum_default));
+        // SAFETY: the AVX2 feature bit was detected by the caller just above, so
+        // SAFETY: the target-feature function may run on this CPU; slice lengths
+        // SAFETY: were validated by the dispatching matvec before this call, and
+        // SAFETY: every load inside is an unaligned `loadu` within those bounds.
         unsafe {
             if narrow {
                 q4k_q8g_row_dot_avx2::<true>(row, xq)
@@ -145,6 +152,27 @@ mod imp {
                 q4k_q8g_row_dot_avx2::<false>(row, xq)
             }
         }
+    }
+
+    /// Safe entry to the per-32 AVX2 dot: the same runtime re-check and scalar fallback as
+    /// [`q4k_q8k_row_dot`]; `row` and `xq` lengths are the dispatching matvec's contract.
+    pub(crate) fn q4k_q8g_row_dot(row: &[u8], xq: &Q8gRow) -> f32 {
+        if !std::is_x86_feature_detected!("avx2") {
+            return q4k_q8g_row_dot_scalar(row, xq);
+        }
+        q4k_q8g_row_dot_dispatch(row, xq, None)
+    }
+
+    /// Test-only forced-path entry for the q8g bit-equality sweep: the same
+    /// runtime AVX2 re-check and scalar fallback as the production entry, with
+    /// the narrow path forced instead of read from the environment. It routes
+    /// through the production dispatch's single unsafe block.
+    #[cfg(test)]
+    pub(crate) fn q4k_q8g_row_dot_forced<const NARROW: bool>(row: &[u8], xq: &Q8gRow) -> f32 {
+        if !std::is_x86_feature_detected!("avx2") {
+            return q4k_q8g_row_dot_scalar(row, xq);
+        }
+        q4k_q8g_row_dot_dispatch(row, xq, Some(NARROW))
     }
 
     /// The `isum_j` of the eight sub-blocks of one block as eight exact i32 lanes: per sub-block
@@ -246,3 +274,8 @@ mod imp {
         acc
     }
 }
+
+/// Test-only re-export of the forced-path dot so the q8g sweep (a sibling
+/// module's tests) can force both paths.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) use imp::q4k_q8g_row_dot_forced;

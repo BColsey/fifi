@@ -734,3 +734,127 @@ fn fast_quantizer_default_matches_forced_path_in_a_child_process() {
         );
     }
 }
+
+/// Seeded random sweep: the narrow default against the forced-wide path over full-range
+/// quantized activations and full-range weight bytes, compared across two processes (the
+/// selector caches once per process): this process runs the default (narrow), a child
+/// with FIFI_CPU_Q8G_NARROW_SUM=0 runs the wide path, and both print the same digest of
+/// every result. Both are exact integer sums of the same products, so the digests match.
+#[test]
+fn narrow_default_matches_forced_wide_over_random_sweep() {
+    if DotBackend::detect() == DotBackend::scalar() {
+        return;
+    }
+    let digest_of = || {
+        let mut lcg = Lcg(0xD1B5_4A32_D192_ED03);
+        let mut hasher: [u64; 4] = [0; 4];
+        let mut row = vec![0u8; Q4K_BLOCK_BYTES];
+        let mut xq = Q8gRow::zeros(Q4K_BLOCK_VALUES).unwrap();
+        let mut out = [0.0f32; 1];
+        let groups = Q4K_BLOCK_VALUES / GROUP;
+        for _ in 0..2_000 {
+            for b in &mut row {
+                *b = (lcg.next() >> 24) as u8;
+            }
+            for g in 0..groups {
+                xq.d[g] = ((lcg.next() % 2001) as f32 - 1000.0) / 1_000_000.0;
+                for q in &mut xq.q[g * GROUP..(g + 1) * GROUP] {
+                    *q = (lcg.next() >> 56) as i8;
+                }
+                xq.s[g] = xq.q[g * GROUP..(g + 1) * GROUP]
+                    .iter()
+                    .map(|&q| i32::from(q))
+                    .sum();
+            }
+            q4k_q8g_matvec(
+                DotBackend::detect(),
+                &row,
+                1,
+                Q4K_BLOCK_VALUES,
+                &xq,
+                &mut out,
+            )
+            .unwrap();
+            for (h, bytes) in hasher.iter_mut().zip(out[0].to_le_bytes().chunks(2)) {
+                *h = h
+                    .rotate_left(17)
+                    .wrapping_add(u64::from(bytes[0]) | (u64::from(bytes[1]) << 8));
+            }
+        }
+        hasher
+    };
+    let here = digest_of();
+    let own = format!("{here:02x?}");
+    if let Some(reply) = std::env::var_os("Q8G_SWEEP_REPLY") {
+        // Child with FIFI_CPU_Q8G_NARROW_SUM=0: hand the digest back through the file
+        // the parent named, immune to the harness output capture.
+        std::fs::write(reply, &own).unwrap();
+        return;
+    }
+    if std::env::var_os("FIFI_CPU_Q8G_NARROW_SUM").is_none_or(|v| v != "0") {
+        let case =
+            "kernels::expert_cpu_q8g::tests::narrow_default_matches_forced_wide_over_random_sweep";
+        let reply = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::current_dir().unwrap())
+            .join(format!("q8g-sweep-{}.txt", std::process::id()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case])
+            .env("FIFI_CPU_Q8G_NARROW_SUM", "0")
+            .env("Q8G_SWEEP_REPLY", &reply)
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{log}");
+        let forced = std::fs::read_to_string(&reply).unwrap_or_default();
+        let _ = std::fs::remove_file(&reply);
+        assert_eq!(
+            own,
+            forced.trim(),
+            "narrow default and forced-wide digests differ; child log: {log}"
+        );
+    }
+}
+
+/// Both dot paths FORCED and compared bit for bit: a vacuous comparison
+/// (wide with wide, which happens if the kernel default never flips) cannot
+/// pass here. Random full-range rows and quantized activations through
+/// `q4k_q8g_row_dot_forced::<true>` and `::<false>`, equal `to_bits`. Runs on
+/// every x86_64 host (the helper falls back to the scalar dot without AVX2,
+/// where both sides are the same scalar call by construction); the AVX2
+/// module compiles to an empty stub on other targets, where both paths are
+/// the scalar reference.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn narrow_and_wide_forced_paths_are_bit_identical_over_random_rows() {
+    use crate::kernels::expert_cpu_avx2::q4k_q8g_row_dot_forced;
+    let mut lcg = Lcg(0xA5A5_5A5A_1234_9876);
+    let mut row = vec![0u8; Q4K_BLOCK_BYTES];
+    let mut xq = Q8gRow::zeros(Q4K_BLOCK_VALUES).unwrap();
+    let groups = Q4K_BLOCK_VALUES / GROUP;
+    for _ in 0..4_000 {
+        for b in &mut row {
+            *b = (lcg.next() >> 24) as u8;
+        }
+        for g in 0..groups {
+            xq.d[g] = ((lcg.next() % 2001) as f32 - 1000.0) / 1_000_000.0;
+            for q in &mut xq.q[g * GROUP..(g + 1) * GROUP] {
+                *q = (lcg.next() >> 56) as i8;
+            }
+            xq.s[g] = xq.q[g * GROUP..(g + 1) * GROUP]
+                .iter()
+                .map(|&q| i32::from(q))
+                .sum();
+        }
+        let narrow = q4k_q8g_row_dot_forced::<true>(&row, &xq);
+        let wide = q4k_q8g_row_dot_forced::<false>(&row, &xq);
+        assert_eq!(
+            narrow.to_bits(),
+            wide.to_bits(),
+            "forced paths differ on row {row:?}"
+        );
+    }
+}

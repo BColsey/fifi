@@ -83,7 +83,7 @@ mod tests {
         assert!(!allows(Some("flase")), "typos roll back, fail safe");
     }
 
-    /// The lifted default-on reader is pinned by REAL environment rows in
+    /// The default-on environment reader is pinned by REAL environment rows in
     /// child processes (the parent re-execs the test binary per case):
     /// absent keeps the default; `0`/`off`/padded/empty/non-UTF-8 roll
     /// back; the enable words keep it on. This is the rollback authority
