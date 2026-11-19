@@ -61,6 +61,31 @@ On 18 November, the 16 GB M4 mini ran 64 timed requests through the same two-lay
 
 The median process peak footprint rose from 67.2 to 69.9 MiB. Decode took longer in all four pairs at both prompt lengths. The option remains off by default while full-checkpoint parity, memory and decode behavior are open. [All 64 timed requests](../../scripts/benchmarks/mac-m4-flash-next-sparse-prefill.csv)
 
+## Flash-Next sparse prefill with retained prefixes
+
+The Flash-Next worker fixture compares allocating QSA with capacity-backed QSA while sparse prefill is enabled in both arms. Each pair primes a new retained prefix and repeats the same prompt to restore it. The 385- and 641-token prompts save boundaries at 257 and 513 tokens, leaving 256 and 512 tokens of committed KV in the snapshot. The pending token and suffix advance the restored cache to the next capacity. Both arms use 128-row worker pieces, a 1,024-token context limit, a 4 GiB device ceiling and a 2 GiB prefill budget. The driver checks each restored prefix length, piece count and sampled token sequence.
+
+| Prompt | QSA | First token, prime → restore | Metal waits, prime → restore | Peak active MLX on restore |
+| --- | --- | ---: | ---: | ---: |
+| 385 | Allocating | 128.95 → 44.74 ms | 233 → 105 | 1.66 MiB |
+| 385 | Capacity-backed | 124.87 → 43.70 ms | 233 → 105 | 2.03 MiB |
+| 641 | Allocating | 213.85 → 45.56 ms | 361 → 105 | 2.87 MiB |
+| 641 | Capacity-backed | 220.48 → 43.24 ms | 361 → 105 | 3.15 MiB |
+
+The 16 GB M4 mini recorded 128 requests in four alternating process pairs, with 16 samples per table cell. The table shows medians. All eight sampled tokens per request matched between prime and restore and between QSA policies. Restoring a prefix left one 128-row worker piece. Capacity-backed QSA added 376 KiB at the shorter restored peak and 287 KiB at the longer peak. The two policies had the same wait counts and similar restored first-token times. [Flash-Next measurements](../../scripts/benchmarks/mac-m4-flash-next-retained-prefix.csv)
+
+## Dense Qwen prefill and KV on longer prompts
+
+The two-layer dense Qwen worker fixture uses BF16 activations, 64-lane attention and the same 16-row query slice in every arm. It compares 32- and 128-row prefill on 257- and 1,025-token prompts under a 4 GiB device ceiling and 2 GiB prefill budget. The driver records F32, BF16 and Q8 KV figures and checks the sampled continuation across repeats. The archive also compares tokens across widths and against the corresponding F32 run. The measurements cover the worker fixture and include the active MLX allocation peak for each request.
+
+| KV format at 1,025 tokens | First token, 32 → 128 rows | Peak active MLX, 32 → 128 rows | Metal waits, 32 → 128 rows |
+| --- | ---: | ---: | ---: |
+| F32 | 24.69 → 7.45 ms | 1.34 → 2.07 MiB | 131 → 59 |
+| BF16 | 24.75 → 7.56 ms | 1.90 → 1.90 MiB | 131 → 59 |
+| Q8 | 25.39 → 8.21 ms | 1.58 → 1.75 MiB | 131 → 59 |
+
+The mini recorded 192 timed requests across four alternating process pairs per format. All eight sampled tokens matched across formats and prefill widths for both prompt lengths. At 1,025 tokens, 128-row Q8 used about 16% less peak active allocation than 128-row F32 and took 0.76 ms longer to the first token. At 32 rows, F32 had the lowest prefill peak for that prompt. The measurements support pricing the per-request workspace with the KV format and piece width together. [Dense Qwen measurements](../../scripts/benchmarks/mac-m4-qwen38-dense-long-kv.csv)
+
 ## Reproduce on Apple Silicon
 
 From `engine/`, build the release library tests. Set `MLX_TEST_BINARY` to the executable path printed by Cargo and `RUN_DIR` to a writable scratch directory. The driver enumerates one exact test per family. It alternates which arm runs first in each of eight pairs per family. Each process runs two warm-ups and eight recorded samples at each prompt length, with eight generated tokens per request.
@@ -84,4 +109,13 @@ Use the same harness for the sparse Flash-Next comparison, with 128-row worker p
 ```sh
 python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/flash-sparse.csv" \
   --flash-sparse-prefill --pairs 4 --samples 4
+```
+
+Use the same harness for the retained-prefix and dense long-prompt studies. Pass `--pairs 1 --samples 1` for smoke coverage.
+
+```sh
+python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/flash-retained.csv" \
+  --flash-retained-prefix --pairs 4 --samples 4
+python3 ../scripts/bench_mlx_requests.py "$MLX_TEST_BINARY" "$RUN_DIR/dense-long-kv.csv" \
+  --dense-long-kv --pairs 4 --samples 4
 ```

@@ -2415,6 +2415,9 @@ mod tests {
                 spawn_engine_noted(workload.piece as usize, note, move |_| {
                     let (mut executor, session) =
                         build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
+                    if workload.prefix {
+                        executor.context_limit = workload.context as usize;
+                    }
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
                     let device = if admission && chunked {
                         Some(
@@ -2424,7 +2427,7 @@ mod tests {
                     } else {
                         None
                     };
-                    executor.configure_prefill(&session, &settings, false, device)?;
+                    executor.configure_prefill(&session, &settings, workload.prefix, device)?;
                     assert_eq!(executor.prefill_chunk(), chunked.then_some(workload.piece));
                     if sparse && chunked {
                         assert!(executor.decoder.sparse_prefill_bytes > 0);
