@@ -211,7 +211,7 @@ impl WarmTurnCache {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
-            seed_resends: std::env::var_os("ENGINESRV_SEED_RESENDS").is_some_and(|v| v == "1"),
+            seed_resends: crate::env_switch::env_allows_default_on("ENGINESRV_SEED_RESENDS"),
             last_turn: None,
             #[cfg(test)]
             digest_calls,

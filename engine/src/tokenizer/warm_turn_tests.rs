@@ -952,6 +952,9 @@ fn warm_names_a_resend_and_a_truncated_history() {
         return;
     };
     let mut cache = WarmTurnCache::new();
+    // Naming of the UNSEEDED prefix shapes; with the seeded default an identical
+    // re-post is a seed hit instead, which the default-run test covers.
+    cache.seed_resends = false;
     let tools = Vec::new();
     let turn = msgs(&[
         ("system", "You are careful."),
@@ -1725,6 +1728,9 @@ fn warm_digest_is_computed_only_for_eligible_key_matched_requests() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_FIELDS);
     let tools = Vec::new();
     let mut cache = WarmTurnCache::new();
+    // This test pins the UNSEEDED warm digest gate; the seeded default's
+    // digest-on-seed is covered by seeded_retry_defaults_on_and_changed_inputs_miss.
+    cache.seed_resends = false;
     assert_eq!(cache.digest_calls(), 0, "counter starts at zero");
 
     bundle
@@ -2298,4 +2304,121 @@ fn displaced_append_keeps_its_own_ids_and_refuses_a_stochastic_tokenizer() {
         .unwrap();
     assert_eq!(cache.digest_calls(), digests);
     assert_eq!(cache.reuses(), 2);
+}
+
+/// The seeded-retry DEFAULT: on with the environment unset, off with `0`, and a
+/// changed message, tool, or thinking block is a miss even though the switch is on
+/// (the identical retry hits). The `0` polarity runs in a child process because the
+/// flag caches once per process.
+#[test]
+fn seeded_retry_defaults_on_and_changed_inputs_miss() {
+    let (_dir, bundle) = fixture_bundle(TEMPLATE_FIELDS);
+    let a = seed_conv();
+    if std::env::var_os("ENGINESRV_SEED_RESENDS").as_deref() == Some(std::ffi::OsStr::new("0")) {
+        assert!(
+            !WarmTurnCache::new().seed_resends,
+            "0 must force the switch off"
+        );
+        return;
+    }
+    assert!(
+        WarmTurnCache::new().seed_resends,
+        "the default with the environment unset is on"
+    );
+    let mut cache = WarmTurnCache::new();
+    bundle
+        .encode_prompt_warm(&mut cache, &a, &[], Thinking::Off)
+        .unwrap();
+    let want = bundle
+        .encode_prompt_with_boundary(&a, &[], Thinking::Off)
+        .unwrap();
+    assert_eq!(
+        bundle
+            .encode_prompt_warm(&mut cache, &a, &[], Thinking::Off)
+            .unwrap(),
+        want
+    );
+    assert_eq!(
+        cache.reuses(),
+        1,
+        "the identical retry hits under the default"
+    );
+    let mut changed = a.clone();
+    changed[1].content = Some("an edited user turn".into());
+    let with_tool = bundle
+        .encode_prompt_with_boundary(&a, &[tool_named("read_source")], Thinking::Off)
+        .unwrap();
+    for (label, messages, tools, thinking) in [
+        (
+            "changed message",
+            &changed as &[_],
+            &[] as &[_],
+            Thinking::Off,
+        ),
+        (
+            "added tool",
+            &a,
+            &[tool_named("read_source")],
+            Thinking::Off,
+        ),
+        ("thinking on", &a, &[], Thinking::On),
+    ] {
+        let want = bundle
+            .encode_prompt_with_boundary(messages, tools, thinking)
+            .unwrap();
+        assert_eq!(
+            bundle
+                .encode_prompt_warm(&mut cache, messages, tools, thinking)
+                .unwrap(),
+            want,
+            "{label} must produce the same ids"
+        );
+    }
+    assert_eq!(
+        cache.reuses(),
+        1,
+        "changed message, tool, or thinking is a miss under the default; tool-variant ids {with_tool:?}"
+    );
+    // The `0` polarity in a child: 0 forces the switch off at construction.
+    let case = "tokenizer::warm_turn_tests::seeded_retry_defaults_on_and_changed_inputs_miss";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case])
+        .env("ENGINESRV_SEED_RESENDS", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// ENGINESRV_SEED_RESENDS follows the repository's fail-safe switch rule
+/// through the shared helper: unset keeps the default ON; set, it is on only
+/// for 1/true/on (spaces and case ignored); every other set value — 0, off,
+/// false, garbage, non-UTF-8 — disables. No value that is not exactly an
+/// enable word can leave the seed on.
+#[test]
+fn seed_resends_follows_the_repository_switch_rule() {
+    use crate::env_switch::{env_allows_value, env_result_allows_default_on};
+    assert!(
+        env_result_allows_default_on(Err(std::env::VarError::NotPresent)),
+        "unset keeps the default on"
+    );
+    for off in ["0", " 0 ", "false", "off", "OFF", "garbage", ""] {
+        assert!(
+            !env_allows_value(Some(off)),
+            "{off:?} must disable the seed"
+        );
+    }
+    for on in ["1", "true", "on", "On", " TRUE "] {
+        assert!(env_allows_value(Some(on)), "{on:?} must keep the seed on");
+    }
+    assert!(
+        !env_result_allows_default_on(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::new()
+        ))),
+        "a non-UTF-8 value disables (fail-safe)"
+    );
 }

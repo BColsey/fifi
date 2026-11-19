@@ -115,6 +115,19 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
             eprintln!("warm turns: {warm_state} (ENGINESRV_WARM_TURNS is not valid UTF-8)");
         }
     }
+    // The seeded-retry flip reports next to it, from the SAME function the cache
+    // constructor uses, so the banner can never disagree with the requests.
+    let seed_on = crate::env_switch::env_allows_default_on("ENGINESRV_SEED_RESENDS");
+    let seed_state = if seed_on { "ON" } else { "OFF" };
+    match std::env::var("ENGINESRV_SEED_RESENDS") {
+        Ok(value) => eprintln!("seeded retries: {seed_state} (ENGINESRV_SEED_RESENDS={value})"),
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("seeded retries: {seed_state} (default; ENGINESRV_SEED_RESENDS=0 disables)");
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("seeded retries: {seed_state} (ENGINESRV_SEED_RESENDS is not valid UTF-8)");
+        }
+    }
     println!("enginesrv listening on {bound}");
     let served = runtime.block_on(serve(listener, state, shutdown));
     let mut failures = Vec::new();
