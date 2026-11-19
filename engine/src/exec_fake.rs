@@ -168,6 +168,7 @@ pub(crate) struct FakeExecutor {
     /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`.
     prefix_uncached: u32,
     budget: Option<TestBudget>,
+    pub(crate) cancel_on_prefill_denial: Option<Arc<std::sync::atomic::AtomicBool>>,
     token_bytes: u64,
     entry_bytes: u64,
     shadow_block_lcp: bool,
@@ -201,6 +202,7 @@ impl FakeExecutor {
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
             budget: None,
+            cancel_on_prefill_denial: None,
             token_bytes: 0,
             entry_bytes: 0,
             shadow_block_lcp: false,
@@ -361,7 +363,11 @@ impl ExecutorOps for FakeExecutor {
         let bytes = u64::try_from(toks.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(self.token_bytes);
-        let permit = self.charge(bytes)?;
+        let permit = self.charge(bytes).inspect_err(|_| {
+            if let Some(cancel) = &self.cancel_on_prefill_denial {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        })?;
         if let Some(permit) = permit {
             st.permits.push(permit);
         }

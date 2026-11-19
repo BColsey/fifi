@@ -65,6 +65,7 @@ struct WindowFake {
     hold: Option<Gate>,
     failure: Option<Failure>,
     deny_session: bool,
+    cancel_denied_session: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The fake's pool-derived ceiling, which classifies a final denial on the batch path:
     /// `None` means no budget to report, like the default executor.
     ceiling: Option<u64>,
@@ -115,6 +116,7 @@ impl WindowFake {
             hold: None,
             failure: None,
             deny_session: false,
+            cancel_denied_session: None,
             ceiling: None,
             fail_after_emit: false,
             draws: false,
@@ -176,6 +178,9 @@ impl ExecutorOps for WindowFake {
     fn new_session(&mut self) -> Result<Row, EngError> {
         self.note("new_session");
         if std::mem::take(&mut self.deny_session) {
+            if let Some(cancel) = &self.cancel_denied_session {
+                cancel.store(true, Ordering::SeqCst);
+            }
             return Err(EngError::MemoryPlan("session admission denied".into()));
         }
         Ok(Row::new(self.script_tokens))
@@ -1228,6 +1233,75 @@ fn a_persistent_denial_without_a_ceiling_takes_one_restart_then_classifies() {
         "exactly one no-save recovery after exhaustion: {calls:?}"
     );
     engine.shutdown();
+}
+
+#[test]
+fn cancellation_during_session_admission_spends_no_cache_entry() {
+    let log = Log::default();
+    let (first, first_events) = job(&[0], 2);
+    let (second, second_events) = job(&[1], 1);
+    let mut fake = WindowFake::new(&log);
+    fake.deny_session = true;
+    fake.cancel_denied_session = Some(Arc::clone(&second.generation.cancel));
+    let (engine, release) = start(fake);
+    engine.handle().try_submit(first).unwrap();
+    engine.handle().try_submit(second).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(finish(&collect(second_events)), DecodeFinish::Cancelled);
+    assert_eq!(usage(&collect(first_events)).completion_tokens, 2);
+    engine.shutdown();
+    let trace = lock(&log);
+    assert!(!trace.calls.iter().any(|call| call == "evict"));
+    assert_eq!(
+        trace
+            .calls
+            .iter()
+            .filter(|call| *call == "new_session")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_cancelled_growth_denial_returns_its_permits_and_keeps_an_independent_checkpoint() {
+    for max_seqs in [1, 2] {
+        let (incoming, cancelled) = job(&[1; 12], 1);
+        let mut fake = FakeExecutor::new(vec![vec![0]; 3], &[EOS], 32);
+        fake.with_session_budget(12, 1, 4);
+        fake.with_prefix_limits(0, 2);
+        fake.with_max_seqs(max_seqs);
+        fake.cancel_on_prefill_denial = Some(Arc::clone(&incoming.generation.cancel));
+        let engine = spawn_engine(4, move |_| Ok((fake, FakeSession::default()))).unwrap();
+        let handle = engine.handle();
+
+        let (seed, seed_events) = job(&[2; 3], 1);
+        handle
+            .try_submit(seed.with_prefix_boundary(2).unwrap())
+            .unwrap();
+        assert_eq!(usage(&collect(seed_events)).completion_tokens, 1);
+
+        // The checkpoint holds four bytes. Two four-row grants fit for A before
+        // the third is denied. Cancellation arrives inside that failed call.
+        handle.try_submit(incoming).unwrap();
+        let events = collect(cancelled);
+
+        // A's eight bytes must be available again: B restores its two-token
+        // prefix and uses the remaining eight bytes for seven prompt rows and decode.
+        let (follow, follow_events) = job(&[2; 9], 1);
+        handle
+            .try_submit(follow.with_prefix_boundary(2).unwrap())
+            .unwrap();
+        let follow = collect(follow_events);
+        assert_eq!(output(&follow), "a");
+        assert_eq!(
+            usage(&follow).reused_tokens,
+            2,
+            "lost checkpoint at max_seqs={max_seqs}"
+        );
+        assert_eq!(finish(&events), DecodeFinish::Cancelled);
+        assert_eq!(usage(&events).completion_tokens, 0);
+        assert_eq!(engine.shutdown().state, EngineState::Stopped);
+    }
 }
 
 #[test]
