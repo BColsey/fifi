@@ -9,6 +9,7 @@
 
 use std::ffi::CString;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use super::super::{
     QuantArgs, QuantizedKv, ResidentPackedWeight, bad_request, matrix_shape, quant_args,
@@ -31,6 +32,13 @@ use crate::{
     },
     tensor::{Dtype, ExecutionTensor},
 };
+
+fn reuse_identity_reshape() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_MLX_REUSE_IDENTITY_RESHAPE").is_some_and(|value| value == "1")
+    })
+}
 
 /// The NUL-terminated Metal source of the gated delta kernel. The file is the text that
 /// `engine/vendor/mlx-lm-gated-delta/extract_kernel.py` derives from mlx-lm 0.31.0.
@@ -339,8 +347,21 @@ impl Context {
         x: &ExecutionTensor,
         target: &[u32],
     ) -> Result<ExecutionTensor, EngError> {
+        self.reshape_with(x, target, reuse_identity_reshape())
+    }
+
+    /// The reshape above with an explicit reuse decision, so the
+    /// same-shape reuse branch is testable in-process without the env
+    /// switch (the switch only picks between the two paths).
+    pub(in crate::kernels::mlx) fn reshape_with(
+        &mut self,
+        x: &ExecutionTensor,
+        target: &[u32],
+        reuse: bool,
+    ) -> Result<ExecutionTensor, EngError> {
         let label = "reshape";
-        let _dispatch = DispatchGuard::enter();
+        let reuse = target == x.shape() && reuse;
+        let _dispatch = (!reuse).then(DispatchGuard::enter);
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         // A U32 input keeps its dtype, as `slice` does, and the layout's 4-byte elements are
@@ -353,6 +374,13 @@ impl Context {
             check_owner(label, state, x)?;
         } else {
             check_operand(label, state, x)?;
+        }
+        if reuse {
+            // MLX returns the same array for this shape. Keep the resident and
+            // its owner after applying the existing reshape validation.
+            elementwise::check_shape(label, target, AxisRule::Any)?;
+            output_bytes(label, target)?;
+            return Ok(x.share());
         }
         let layout = shape::reshape(label, x.shape(), target)?;
         let native_shape = native_ints(label, target)?;
@@ -3962,6 +3990,25 @@ mod cast_tests {
 
     /// Values that BF16 holds exactly, so a round trip through BF16 must return them unchanged.
     const BF16_EXACT: [f32; 4] = [0.5, 2.0, -0.25, 8.0];
+
+    #[test]
+    fn identity_reshape_reuse_is_the_input_resident_itself() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let x = f32_resident(&mut kernels, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let reused = kernels.context.reshape_with(&x, x.shape(), true).unwrap();
+        assert!(
+            reused.shares_storage_with(&x),
+            "the reuse branch returns the same resident"
+        );
+        let dispatched = kernels.context.reshape_with(&x, x.shape(), false).unwrap();
+        assert!(
+            !dispatched.shares_storage_with(&x),
+            "the dispatched path builds a new resident"
+        );
+        // The reuse branch still runs the reshape validation.
+        assert!(kernels.context.reshape_with(&x, &[7], true).is_err());
+    }
 
     #[test]
     fn cast_round_trips_f32_through_bf16_and_back() {

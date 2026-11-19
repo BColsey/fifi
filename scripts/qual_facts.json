@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7281,
+      "test_fns": 7282,
       "ignored": 651,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -162,6 +162,7 @@
         "FIFI_MLX_FLASH_CHUNKED",
         "FIFI_MLX_GROUPED_IMPORT",
         "FIFI_MLX_REQUEST_SAMPLES",
+        "FIFI_MLX_REUSE_IDENTITY_RESHAPE",
         "FIFI_MRV_COMMIT",
         "FIFI_MRV_IDS_SHA256",
         "FIFI_MRV_NEED",
@@ -630,6 +631,18 @@
       "env_gates": [
         "LAYER_PARITY_FIXTURES",
         "LAYER_PARITY_REPORT"
+      ],
+      "features": [
+        "native-mlx"
+      ],
+      "fixtures": {}
+    },
+    "mlx_projection_matrix": {
+      "path": "tests/mlx_projection_matrix.rs",
+      "test_fns": 2,
+      "ignored": 1,
+      "env_gates": [
+        "FIFI_MLX_PROJECTION_SAMPLES"
       ],
       "features": [
         "native-mlx"

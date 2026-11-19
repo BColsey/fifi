@@ -41,7 +41,7 @@ def samples_from(log, family, arm, samples):
     return rows
 
 
-def collect(binary, pairs, samples):
+def collect(binary, pairs, samples, identity_reshape):
     listed = subprocess.run(
         [binary, "--ignored", "--list"], cwd=ENGINE, check=True, capture_output=True, text=True
     ).stdout.splitlines()
@@ -54,14 +54,17 @@ def collect(binary, pairs, samples):
         for pair in range(pairs):
             order = (0, 1) if pair % 2 == 0 else (1, 0)
             for position, mode in enumerate(order, start=1):
-                arm = arms[mode]
+                family_mode = 1 if identity_reshape else mode
+                arm = arms[family_mode]
                 env = os.environ.copy()
                 env.pop("Q36_NO_EMBEDDED", None)
                 env.update(
                     Q36_FUSED_PREFILL="1",
                     FIFI_MLX_REQUEST_SAMPLES=str(samples),
-                    **{flag: str(mode)},
+                    **{flag: str(family_mode)},
                 )
+                if identity_reshape:
+                    env["FIFI_MLX_REUSE_IDENTITY_RESHAPE"] = str(mode)
                 run = subprocess.run(
                     ["/usr/bin/time", "-l", binary, "--ignored", "--exact", "--nocapture",
                      "--test-threads=1", test],
@@ -78,6 +81,8 @@ def collect(binary, pairs, samples):
                     if row["tokens"] != references.setdefault(key, row["tokens"]):
                         raise RuntimeError(f"{family} {arm}, pair {pair + 1}: token chain differs")
                     row["tokens"] = json.dumps(row["tokens"], separators=(",", ":"))
+                    if identity_reshape:
+                        row["reuse_identity_reshape"] = mode
                     records.append({
                         "pair": pair + 1, "order": position, **row,
                         "process_peak_footprint_bytes": int(peak[1]),
@@ -92,12 +97,14 @@ def main():
     parser.add_argument("output", type=Path, help="new CSV file for validated samples")
     parser.add_argument("--pairs", type=int, default=8)
     parser.add_argument("--samples", type=int, default=8, help="timed requests per prompt and process")
+    parser.add_argument("--identity-reshape", action="store_true",
+                        help="compare reshape reuse with each family's tuned fixture enabled")
     args = parser.parse_args()
     if args.pairs < 1 or args.samples < 1:
         parser.error("pairs and samples must be positive")
     if args.output.exists():
         parser.error("output already exists")
-    records = collect(args.binary.resolve(), args.pairs, args.samples)
+    records = collect(args.binary.resolve(), args.pairs, args.samples, args.identity_reshape)
     with args.output.open("x", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=list(records[0]), lineterminator="\n")
         writer.writeheader()
