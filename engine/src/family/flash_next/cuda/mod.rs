@@ -42,6 +42,8 @@ mod prefill_ring_tests;
 mod ring_source;
 #[cfg(test)]
 mod ring_source_tests;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod rung_device_tests;
 // S3: the state and decode arena plans size device memory with the kernel wrappers, so they build
 // with the native CUDA backend only. Staged: the decode step (S4) is the first caller.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

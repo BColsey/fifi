@@ -37,7 +37,12 @@ impl TierChoice {
         match self {
             Self::Inclusive => ("inclusive store", "no write-back, fastest"),
             Self::Exclusive { .. } => ("exclusive store", "write-back on eviction"),
-            Self::Disk => ("disk tier", "staging-ring reads on every miss, slowest"),
+            Self::Disk => (
+                "disk tier",
+                "one record at a time through the staging ring: about 99 ms per decode step \
+                 fully cold on the measured drive; on a copy-on-write filesystem O_DIRECT reads \
+                 go through the page cache; prefill rides the union-admit path",
+            ),
         }
     }
 }

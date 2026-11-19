@@ -678,6 +678,7 @@ fn split_block<'w>(
             layers: layers.to_vec(),
         },
         &plan,
+        None,
     )
     .expect("build the bank");
     let trunks = layers

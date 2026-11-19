@@ -107,6 +107,10 @@ pub(crate) enum HostMode {
     Exclusive,
     /// Every expert of every layer: eviction is free, and the store is 43 GiB.
     Inclusive,
+    /// No pinned host store at all: every cold record is read through the staging ring on
+    /// demand (the disk rung). An eviction needs no write-back — the disk holds the bytes —
+    /// which makes it cheaper per eviction than the exclusive store, not dearer.
+    Disk,
 }
 
 impl HostMode {
@@ -114,6 +118,7 @@ impl HostMode {
         match self {
             Self::Exclusive => geometry.experts - geometry.slots + 1,
             Self::Inclusive => geometry.experts,
+            Self::Disk => 0,
         }
     }
 }
@@ -192,6 +197,10 @@ impl HostPlaces {
                     place_of: (0..geometry.experts as u32).collect(),
                     free: Vec::new(),
                 },
+                HostMode::Disk => LayerPlaces {
+                    place_of: vec![NO_PLACE; geometry.experts],
+                    free: Vec::new(),
+                },
                 HostMode::Exclusive => {
                     let mut place_of = vec![NO_PLACE; geometry.experts];
                     let mut next = 0u32;
@@ -231,9 +240,11 @@ impl HostPlaces {
         held
     }
 
-    /// An expert leaves a slot: Exclusive gives it a free place (the one to write it back to).
+    /// An expert leaves a slot: Exclusive gives it a free place (the one to write it back
+    /// to). Inclusive and Disk never write back: Inclusive holds every expert anyway, and
+    /// Disk's bytes live on the disk, which is what makes its evictions free.
     fn demote(&mut self, layer: usize, expert: u16) -> Result<Option<u32>, EngError> {
-        if self.mode == HostMode::Inclusive {
+        if matches!(self.mode, HostMode::Inclusive | HostMode::Disk) {
             return Ok(None);
         }
         let places = self
@@ -255,7 +266,11 @@ impl HostPlaces {
     }
 
     /// An expert enters a slot: its place is where the copy reads, and Exclusive frees it.
-    fn promote(&mut self, layer: usize, expert: u16) -> Result<u32, EngError> {
+    /// Disk has no places: None says the copy reads the record from the source instead.
+    fn promote(&mut self, layer: usize, expert: u16) -> Result<Option<u32>, EngError> {
+        if self.mode == HostMode::Disk {
+            return Ok(None);
+        }
         let places = self
             .layers
             .get_mut(layer)
@@ -268,7 +283,7 @@ impl HostPlaces {
             places.place_of[usize::from(expert)] = NO_PLACE;
             places.free.push(place);
         }
-        Ok(place)
+        Ok(Some(place))
     }
 }
 
@@ -281,6 +296,8 @@ pub(crate) struct Demote {
 }
 
 /// One slot refill, in stream order: the optional write-back, then the H2D of `src_place`.
+/// `src_place == NO_PLACE` (the disk rung only): the copy reads the record from the bank's
+/// source instead of the host store — the rung's every-miss staging-ring read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CopyOp {
     pub(crate) slot: u16,
@@ -460,6 +477,9 @@ impl<P: SlotPolicy> ExpertBankState<P> {
                 .demote(layer, mv.outgoing)
                 .and_then(|demote| Ok((demote, self.places.promote(layer, mv.incoming)?)));
             let (demote, src_place) = step.inspect_err(|_| self.poisoned = true)?;
+            // Disk has no host place: the sentinel says the copy reads the record from the
+            // bank's source, which is the disk rung's every-miss staging-ring read.
+            let src_place = src_place.unwrap_or(NO_PLACE);
             ops.push(CopyOp {
                 slot: mv.slot,
                 incoming: mv.incoming,

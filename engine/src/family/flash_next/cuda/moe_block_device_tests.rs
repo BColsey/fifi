@@ -273,6 +273,7 @@ fn build_bank(
             layers: layers.to_vec(),
         },
         &plan,
+        None,
     )
     .expect("build the bank")
 }

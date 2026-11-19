@@ -377,6 +377,7 @@ fn build_bank(
     profile: Option<&[Vec<f64>]>,
     usage_out: Option<&std::path::Path>,
     source: &dyn RecordSource,
+    retained: Option<&'static dyn RecordSource>,
 ) -> Result<DeviceBank, EngError> {
     let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
@@ -389,7 +390,7 @@ fn build_bank(
         records: Cell::new(0),
     };
     let opened = Instant::now();
-    let bank = DeviceBank::build(projector.context(), state, &timed, plan)?;
+    let bank = DeviceBank::build(projector.context(), state, &timed, plan, retained)?;
     let total = opened.elapsed();
     eprintln!(
         "flash-next cuda: expert bank: {} records, pack read and pack {:.1} s, pin and upload {:.1} s, total {:.1} s",
@@ -544,26 +545,50 @@ pub(super) fn build_driver(
         record_bytes,
     )?;
     // The store tier: the shared ladder takes inclusive while the one host budget carries it,
-    // then the exclusive store of spare places (exactly today's auto), then the disk tier through
-    // the staging ring — which is not wired at start yet, so its choice refuses with the plan's
-    // own byte counts, never a silent fallback (the ring-only bank is the next slice).
-    // `FIFI_FLASH_NEXT_BANK_MODE` forces a tier (`inclusive` or `exclusive`); anything else is
-    // refused, never a silent fallback.
+    // then the exclusive store of spare places (exactly today's auto), then the disk tier —
+    // no pinned store, every cold record read through the staging ring on demand (the disk
+    // rung; below ring + overhead + cache floor the refusal stays, the honest minimum tier).
+    // `FIFI_FLASH_NEXT_BANK_MODE` forces a tier (`inclusive`, `exclusive` or `disk`);
+    // anything else is refused, never a silent fallback.
     let memory = HostMemory {
         total: mem_total,
         available: mem_available,
     };
-    // The staging ring's own floor: two records in flight. A placeholder until the ring-only
-    // slice lands; only the not-yet-wired disk rung reads it, and only its refusal text shows
-    // it, so a start that never chooses disk never charges it.
-    let ring_bytes = 2 * record_bytes as u64;
+    // The staging ring's own backing — the disk rung's read path and its budget floor.
+    // Sizing is two-phase so every non-disk start stays byte-for-byte the pre-rung start:
+    // the first pass charges the infallible placeholder (two records in flight) and never
+    // touches the pack; only when that already points at the disk tier is the real figure
+    // read from the ring source (one slot: the ring fills sequentially) and the choice made
+    // once more with it — so the ladder, the disk plan and the source that serves the rung
+    // all charge one number, and a non-disk answer is never revised.
+    let mode = std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok();
+    let ring_placeholder = 2 * record_bytes as u64;
     let tier = HostPinPlan::bank_mode_tier(
-        std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok().as_deref(),
+        mode.as_deref(),
         &geometry,
         &memory,
         &terms,
-        ring_bytes,
+        ring_placeholder,
     )?;
+    let (tier, ring_bytes) = match tier {
+        TierChoice::Disk => {
+            let real = ring_source::RingRecordSource::backing_bytes(
+                &checkpoint,
+                artifact,
+                std::num::NonZeroUsize::MIN,
+            )? as u64;
+            let tier =
+                HostPinPlan::bank_mode_tier(mode.as_deref(), &geometry, &memory, &terms, real)?;
+            if !matches!(tier, TierChoice::Disk) {
+                return Err(EngError::MemoryPlan(format!(
+                    "the disk tier's real ring backing ({real} B) no longer fits where the \
+                     two-record placeholder did"
+                )));
+            }
+            (tier, real)
+        }
+        other => (other, ring_placeholder),
+    };
     let host_plan = match tier {
         TierChoice::Inclusive => HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms)?,
         TierChoice::Exclusive { spare_places: 1 } => {
@@ -575,7 +600,7 @@ pub(super) fn build_driver(
                  today's exclusive store pins exactly one"
             )));
         }
-        TierChoice::Disk => return Err(HostPinPlan::disk_tier_refusal(&geometry, &memory, &terms)),
+        TierChoice::Disk => HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes)?,
     };
     let (tier_name, speed_class) = tier.describe();
     eprintln!(
@@ -611,39 +636,19 @@ pub(super) fn build_driver(
     stage("filling the expert bank");
     // The record source: the buffered pack reader, or — behind
     // FIFI_FLASH_NEXT_PACK_RING=1, default off — the O_DIRECT ring reader
-    // (the landed pack reader's first production caller). Strict spelling:
-    // any other value refuses the start, like the resume switch. The ring
-    // fills sequentially, so one slot bounds it.
-    let source: Box<dyn RecordSource>;
-    let layout: crate::family::flash_next::moe::slot_bank::SlotBankLayout;
-    match std::env::var("FIFI_FLASH_NEXT_PACK_RING") {
-        Ok(value) if value == "1" => {
-            let slots = std::num::NonZeroUsize::MIN;
-            let bytes = ring_source::RingRecordSource::backing_bytes(checkpoint, artifact, slots)?;
-            let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
-            // The serve-state pattern of the exl3 bank: register the plain
-            // bytes so the H2D from the slot windows is truly async. Best-
-            // effort — an unregistered window still answers correctly, it
-            // only loses the async copy.
-            match host_register(backing) {
-                Ok(()) => {}
-                Err(error) => eprintln!(
-                    "flash-next cuda: ring unpinned, staged copies (host_register refused: {error:?})"
-                ),
-            }
-            let staged = ring_source::RingRecordSource::new(checkpoint, artifact, slots, backing)?;
-            layout = staged.layout_ref().clone();
-            source = Box::new(staged);
-        }
+    // (the landed pack reader's first production caller). The disk tier forces
+    // the ring reader regardless of the switch: the rung's every-miss read IS
+    // the ring. Strict spelling for the other tiers: any other value refuses
+    // the start, like the resume switch. The ring fills sequentially, so one
+    // slot bounds it.
+    let ring_reader = match std::env::var("FIFI_FLASH_NEXT_PACK_RING") {
+        Ok(value) if value == "1" => true,
+        Err(std::env::VarError::NotPresent) => matches!(tier, TierChoice::Disk),
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) if matches!(tier, TierChoice::Disk) => true,
         Ok(other) => {
             return Err(EngError::BadRequest(format!(
                 "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {other:?}"
             )));
-        }
-        Err(std::env::VarError::NotPresent) => {
-            let staged = bank_source::PackRecordSource::new(checkpoint)?;
-            layout = staged.layout().clone();
-            source = Box::new(staged);
         }
         Err(std::env::VarError::NotUnicode(value)) => {
             return Err(EngError::BadRequest(format!(
@@ -651,6 +656,41 @@ pub(super) fn build_driver(
             )));
         }
     };
+    let layout: crate::family::flash_next::moe::slot_bank::SlotBankLayout;
+    let source: Box<dyn RecordSource> = if ring_reader {
+        let slots = std::num::NonZeroUsize::MIN;
+        let bytes = ring_source::RingRecordSource::backing_bytes(checkpoint, artifact, slots)?;
+        let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        // The serve-state pattern of the exl3 bank: register the plain
+        // bytes so the H2D from the slot windows is truly async. Best-
+        // effort — an unregistered window still answers correctly, it
+        // only loses the async copy.
+        match host_register(backing) {
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "flash-next cuda: ring unpinned, staged copies (host_register refused: {error:?})"
+            ),
+        }
+        let staged = ring_source::RingRecordSource::new(checkpoint, artifact, slots, backing)?;
+        layout = staged.layout_ref().clone();
+        eprintln!("flash-next cuda: record source: the O_DIRECT ring reader");
+        Box::new(staged)
+    } else {
+        let staged = bank_source::PackRecordSource::new(checkpoint)?;
+        layout = staged.layout().clone();
+        Box::new(staged)
+    };
+    // LEAK: only the disk rung keeps its source for the process lifetime — its every-miss
+    // reads outlive this start, and the `static borrow reaches the step. Every other tier
+    // fills from the source at the start below and drops it with this call, byte-for-byte
+    // the pre-rung start.
+    let (fill_source, retained_source): (&dyn RecordSource, Option<&'static dyn RecordSource>) =
+        if matches!(tier, TierChoice::Disk) {
+            let leaked: &'static dyn RecordSource = Box::leak(source);
+            (leaked, Some(leaked))
+        } else {
+            (source.as_ref(), None)
+        };
     // Optional popularity profile, an exllamav3 expert_stats JSON:
     // {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}. Sources,
     // in order: the engine's `expert_stats` key (which also takes the usage dump, so the next
@@ -694,7 +734,8 @@ pub(super) fn build_driver(
         &host_plan,
         profile.as_deref(),
         usage_out.as_deref(),
-        source.as_ref(),
+        fill_source,
+        retained_source,
     )?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
@@ -727,7 +768,10 @@ pub(super) fn build_driver(
         &layout,
         &step.moe_dims(rows),
     )?;
-    if rows > 1 && ring_budget > 0 {
+    // The prefill streaming ring refills its slots from the bank's store (demotion); the
+    // disk rung has no store to stream from, so funding the ring under it would strand the
+    // slots — every whole-chunk expert serves as a no-ring-entry through the rung's reads.
+    if rows > 1 && ring_budget > 0 && !matches!(host_plan.mode, HostMode::Disk) {
         let slots = block.plan_ring(
             ctx,
             (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
@@ -1028,31 +1072,58 @@ impl StepDriver {
 #[cfg(test)]
 mod tests {
     use super::{
-        BankGeometry, HostMemory, HostMode, HostPinPlan, HostTerms, fill_from_profile,
-        read_expert_stats,
+        BankGeometry, HostMemory, HostPinPlan, HostTerms, fill_from_profile, read_expert_stats,
     };
     use std::io::Write as _;
 
-    /// The Disk rung's refusal is the exclusive plan's own byte counts under the not-wired
-    /// headline: a budget that cannot carry the exclusive store gets the plan's exact
-    /// refusal text, never a silent fallback.
+    /// The Disk rung's refusals carry the plan's own byte counts, computed here from the same
+    /// terms the plan uses: the floor refusal names every term, and the page-cache refusal names
+    /// its leftover — both asserted exactly, never by substring.
     #[test]
-    fn the_disk_rung_refuses_with_the_exclusive_plans_own_counts() {
+    fn the_disk_rung_refuses_below_its_own_floor_with_the_plans_counts() {
         let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
         let terms = HostTerms::DEFAULT;
         let memory = HostMemory {
             total: 1 << 30,
             available: 1,
         };
-        let refused = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)
-            .expect_err("the exclusive store cannot fit one byte");
-        let error = HostPinPlan::disk_tier_refusal(&geometry, &memory, &terms);
+        let ring = 4096u64;
+        let scratch = 2 * (8 + terms.stream_slot_metadata);
+        let staging = terms.ngram_staging_bytes().expect("the staging bytes");
+        let os_floor = memory.os_floor();
+        let process = ring + scratch + staging + terms.engine_heap + terms.margin;
+        let needed = process + os_floor;
+        let error = HostPinPlan::new_disk(&geometry, &memory, &terms, ring)
+            .expect_err("one available byte cannot carry the ring plus the floor");
         assert_eq!(
             error.describe(),
             format!(
-                "disk tier not wired yet (the ring-only bank is the next slice); the host \
-                 budget cannot carry the exclusive store either: {}",
-                refused.describe()
+                "Flash-Next expert bank: {ring} staging-ring bytes, {scratch} stream scratch, \
+                 {staging} n-gram staging, \
+                 {} heap and {} margin plus the {os_floor} byte OS floor need {needed} bytes, \
+                 {} are available",
+                terms.engine_heap, terms.margin, memory.available
+            )
+        );
+        // The page-cache refusal: the floor fits, one byte of the cache floor does not.
+        let memory = HostMemory {
+            total: 1 << 30,
+            available: needed + (4u64 << 30) - 1,
+        };
+        let terms = HostTerms {
+            ngram_cache_min: 4u64 << 30,
+            ..HostTerms::DEFAULT
+        };
+        let error = HostPinPlan::new_disk(&geometry, &memory, &terms, ring)
+            .expect_err("the page-cache floor is short by one byte");
+        assert_eq!(
+            error.describe(),
+            format!(
+                "Flash-Next expert bank: {} bytes of page cache are left of {} available; \
+                 the n-gram page-cache floor is {}",
+                terms.ngram_cache_min - 1,
+                memory.available,
+                terms.ngram_cache_min
             )
         );
     }

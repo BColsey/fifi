@@ -240,6 +240,57 @@ impl HostPinPlan {
         })
     }
 
+    /// The disk rung's plan: no pinned store at all — `ring_bytes` (the staging ring's backing)
+    /// replaces the store term while everything else charges exactly as `new` does, so the
+    /// ladder's disk arm (`ring + overhead + cache_floor <= available`) and this admission stay
+    /// one arithmetic: a choice the ladder admits is a plan this constructor admits. Below that
+    /// floor the refusal carries this plan's own byte counts — the honest minimum tier.
+    pub(super) fn new_disk(
+        geometry: &BankGeometry,
+        memory: &HostMemory,
+        terms: &HostTerms,
+        ring_bytes: u64,
+    ) -> Result<Self, EngError> {
+        let overflow = || plan_error("the host byte counts overflow".into());
+        let scratch_bytes = 2 * (geometry.record_bytes as u64 + terms.stream_slot_metadata);
+        let os_floor = memory.os_floor();
+        let ngram_staging_bytes = terms.ngram_staging_bytes().ok_or_else(overflow)?;
+        let process_bytes = ring_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|sum| sum.checked_add(ngram_staging_bytes))
+            .and_then(|sum| sum.checked_add(terms.engine_heap))
+            .and_then(|sum| sum.checked_add(terms.margin))
+            .ok_or_else(overflow)?;
+        let needed_now = process_bytes.checked_add(os_floor).ok_or_else(overflow)?;
+        if needed_now > memory.available {
+            return Err(plan_error(format!(
+                "{ring_bytes} staging-ring bytes, {scratch_bytes} stream scratch, \
+                 {ngram_staging_bytes} n-gram staging, {} heap and {} margin plus the {os_floor} \
+                 byte OS floor need {needed_now} bytes, {} are available",
+                terms.engine_heap, terms.margin, memory.available
+            )));
+        }
+        // Cannot underflow: `needed_now <= available` above.
+        let page_cache_left = memory.available - needed_now;
+        if page_cache_left < terms.ngram_cache_min {
+            return Err(plan_error(format!(
+                "{page_cache_left} bytes of page cache are left of {} available; the n-gram \
+                 page-cache floor is {}",
+                memory.available, terms.ngram_cache_min
+            )));
+        }
+        Ok(Self {
+            mode: HostMode::Disk,
+            places_per_layer: 0,
+            store_bytes: 0,
+            scratch_bytes,
+            ngram_staging_bytes,
+            os_floor,
+            process_bytes,
+            page_cache_left,
+        })
+    }
+
     /// Maps this plan's cost model onto the shared store-tier ladder and chooses the tier from the
     /// one host budget: inclusive while it fits, then the exclusive store at today's one spare
     /// place per layer, then the disk tier (`ring_bytes` is the staging ring's backing, the disk
@@ -299,10 +350,10 @@ impl HostPinPlan {
     }
 
     /// The start's tier choice from `FIFI_FLASH_NEXT_BANK_MODE` (`None` = unset): `auto` takes
-    /// the ladder, `inclusive` and `exclusive` force their tier, and any other value - including
-    /// `disk`, which no tier wiring serves yet - is refused, never a silent fallback. The start
-    /// maps the chosen tier onto `HostPinPlan::new`, so a forced tier that does not fit still
-    /// refuses with the plan's own byte counts.
+    /// the ladder, `inclusive`, `exclusive` and `disk` force their tier, and any other value is
+    /// refused, never a silent fallback. The start maps the chosen tier onto `HostPinPlan::new`
+    /// (disk: `new_disk`), so a forced tier that does not fit still refuses with the plan's own
+    /// byte counts.
     pub(super) fn bank_mode_tier(
         mode: Option<&str>,
         geometry: &BankGeometry,
@@ -316,28 +367,12 @@ impl HostPinPlan {
             }
             Some("inclusive") => Ok(TierChoice::Inclusive),
             Some("exclusive") => Ok(TierChoice::Exclusive { spare_places: 1 }),
+            Some("disk") => Ok(TierChoice::Disk),
             Some(other) => Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive, exclusive and disk are \
+                 valid"
             ))),
         }
-    }
-
-    /// The Disk rung's refusal, pure over the budget so it is testable without a driver: the
-    /// ladder chose disk only because the exclusive store does not fit, so the refusal is the
-    /// exclusive plan's own byte counts (store, scratch, staging, heap, margin, OS floor,
-    /// needed, available) under the disk-not-wired headline, exactly as the pre-ladder auto did.
-    pub(super) fn disk_tier_refusal(
-        geometry: &BankGeometry,
-        memory: &HostMemory,
-        terms: &HostTerms,
-    ) -> EngError {
-        let refused = Self::new(geometry, HostMode::Exclusive, memory, terms)
-            .expect_err("the ladder's disk rung implies the exclusive store does not fit");
-        EngError::MemoryPlan(format!(
-            "disk tier not wired yet (the ring-only bank is the next slice); the host \
-             budget cannot carry the exclusive store either: {}",
-            refused.describe()
-        ))
     }
 }
 
@@ -600,6 +635,14 @@ pub(super) mod device {
         state: ExpertBankState<ReplaceOnMissLru>,
         slots: Vec<DeviceBuffer>,
         store: Vec<PinnedBuf>,
+        /// The record source, kept only under the disk rung for its every-miss reads
+        /// (`run_copies`'s `NO_PLACE` arm reads the record and uploads it) — the same source
+        /// that filled the slots at build. Every other mode leaves it absent, as before the
+        /// rung: those tiers never read a record after the fill.
+        source: Option<&'static dyn RecordSource>,
+        /// One record's staging bytes for the disk rung's source reads; plain memory, the
+        /// upload stages it (exactly the build fallback's pattern).
+        staging: Vec<u8>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -630,6 +673,7 @@ pub(super) mod device {
             state: ExpertBankState<ReplaceOnMissLru>,
             source: &dyn RecordSource,
             plan: &HostPinPlan,
+            retained: Option<&'static dyn RecordSource>,
         ) -> Result<Self, EngError> {
             let geometry: BankGeometry = *state.geometry();
             let places = state.mode().places_per_layer(&geometry);
@@ -655,12 +699,16 @@ pub(super) mod device {
             let mut record = vec![0u8; geometry.record_bytes];
             for layer in 0..geometry.layers {
                 slots.push(ctx.allocate(geometry.slots * geometry.record_bytes)?);
-                let mut pinned = ctx.pinned_buf(places * geometry.record_bytes)?;
-                for (place, expert) in state.places().occupied(layer) {
-                    source.record(layer, expert, &mut record)?;
-                    pinned.write(geometry.offset(place as usize), &record)?;
+                // The disk rung pins no store: the layer's entry stays absent, which is what
+                // tells `run_copies` its copies read from the source.
+                if places > 0 {
+                    let mut pinned = ctx.pinned_buf(places * geometry.record_bytes)?;
+                    for (place, expert) in state.places().occupied(layer) {
+                        source.record(layer, expert, &mut record)?;
+                        pinned.write(geometry.offset(place as usize), &record)?;
+                    }
+                    store.push(pinned);
                 }
-                store.push(pinned);
                 for slot in 0..geometry.slots {
                     let expert = state.expert_in_slot(layer, slot).ok_or_else(|| {
                         EngError::BadRequest("a slot of the filled bank is empty".into())
@@ -681,10 +729,20 @@ pub(super) mod device {
             stream.synchronize()?;
             source.drain(&stream)?;
             let experts = geometry.experts;
+            // Staging is the rung's read buffer, so only the disk answer allocates it: a
+            // zero-place plan is exactly that answer (one pinned buffer per layer otherwise),
+            // and the store-backed tiers never reach the staged-read arm below.
+            let staging = if places > 0 {
+                Vec::new()
+            } else {
+                vec![0u8; geometry.record_bytes]
+            };
             Ok(Self {
                 state,
                 slots,
                 store,
+                source: retained,
+                staging,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -936,22 +994,35 @@ pub(super) mod device {
 
         /// Runs the copies of `copies` on the bank's stream, in order, and returns when they have
         /// finished: per op the write-back (D2H) into the host place, then the H2D into the slot.
+        /// A `NO_PLACE` src (the disk rung) reads the record from the source and uploads the
+        /// staged bytes instead — the rung's every-miss staging-ring read.
         fn run_copies(&mut self, ctx: &CudaContext, copies: &PassCopies) -> Result<(), EngError> {
             if copies.ops.is_empty() {
                 return Ok(());
             }
             let geometry: BankGeometry = *self.state.geometry();
+            // Scope-local: the no-place arm below is compiled only in the native-cuda
+            // view, and a module-level import reads as unused where it is not.
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            use crate::family::expert_bank::NO_PLACE;
             let layer = copies.layer;
-            let (Some(bank), Some(store)) = (self.slots.get(layer), self.store.get_mut(layer))
-            else {
+            let Some(bank) = self.slots.get(layer) else {
                 return Err(EngError::BadRequest(format!(
                     "layer {layer} is outside the bank"
                 )));
             };
             let record = geometry.record_bytes;
+            let mut store = self.store.get_mut(layer);
             for op in &copies.ops {
                 let slot = bank.range(geometry.offset(usize::from(op.slot)), record)?;
                 if let Some(demote) = op.demote {
+                    let Some(store) = store.as_mut() else {
+                        return Err(EngError::BadRequest(
+                            "a write-back without a host store (the disk rung never writes \
+                             back)"
+                                .into(),
+                        ));
+                    };
                     ctx.copy_to_pinned(
                         &self.stream,
                         bank.range(geometry.offset(usize::from(op.slot)), record)?,
@@ -959,14 +1030,45 @@ pub(super) mod device {
                         geometry.offset(demote.dst_place as usize),
                     )?;
                 }
-                ctx.copy_from_pinned(
-                    &self.stream,
-                    store,
-                    geometry.offset(op.src_place as usize),
-                    slot,
-                )?;
+                if op.src_place == NO_PLACE {
+                    let Some(source) = self.source else {
+                        return Err(EngError::BadRequest(
+                            "a no-place copy needs the disk rung's retained record source".into(),
+                        ));
+                    };
+                    source.record(layer, op.incoming, &mut self.staging)?;
+                    bank.write_at(
+                        &self.stream,
+                        geometry.offset(usize::from(op.slot)),
+                        &self.staging,
+                    )?;
+                } else {
+                    let Some(store) = store.as_deref_mut() else {
+                        return Err(EngError::BadRequest(format!(
+                            "layer {layer} has no host store for place {}",
+                            op.src_place
+                        )));
+                    };
+                    ctx.copy_from_pinned(
+                        &self.stream,
+                        store,
+                        geometry.offset(op.src_place as usize),
+                        slot,
+                    )?;
+                }
             }
-            store.synchronize(&self.stream)
+            // The loop's `store` (the layer's `&mut` place) still owns the borrow: reuse it,
+            // so the pinned buffer's synchronize mutates the same handle the copies wrote.
+            match store {
+                Some(store) => store.synchronize(&self.stream),
+                None => {
+                    self.stream.synchronize()?;
+                    match &self.source {
+                        Some(source) => source.drain(&self.stream),
+                        None => Ok(()),
+                    }
+                }
+            }
         }
 
         /// Reads one host place back (tests): the pinned buffer must have no copy outstanding.

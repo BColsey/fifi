@@ -135,8 +135,8 @@ pub(in crate::family::flash_next) mod synthetic {
         },
     };
 
-    pub(super) const LAYERS: usize = 2;
-    pub(super) const EXPERTS: usize = 3;
+    pub(in crate::family::flash_next) const LAYERS: usize = 2;
+    pub(in crate::family::flash_next) const EXPERTS: usize = 3;
     pub(super) const WORDS: usize = 16;
     const WIDTH: usize = 128;
 
@@ -321,7 +321,7 @@ pub(in crate::family::flash_next) mod synthetic {
         (checkpoint, layout, broken, file)
     }
 
-    pub(super) fn source<'a>(
+    pub(in crate::family::flash_next) fn source<'a>(
         checkpoint: &'a Checkpoint,
         layout: &SlotBankLayout,
     ) -> PackRecordSource<'a> {
@@ -528,6 +528,7 @@ mod device_tests {
                 layer,
             },
             &plan,
+            None,
         )
         .expect("build");
         let pinned_built = ctx.live_owners().pinned;
