@@ -54,7 +54,7 @@ pub(super) fn admit_checkpoint(
     let cache_entries = u64::try_from(cache_entries)
         .map_err(|_| memory_error("expert cache entry count exceeds u64"))?;
     let expert_cache_bytes = cache_entries
-        .checked_mul(largest_expert_entry_bytes)
+        .checked_mul(payloads.cache_entry_bytes()?)
         .ok_or_else(|| memory_error("expert cache bytes overflow u64"))?;
     // A cache miss peaks at one extra worst-entry payload: the loader documents a 2x-entry
     // decode peak. The fixed 256 MiB covers logits (~512 KiB at vocab 131072), attention
@@ -78,6 +78,7 @@ pub(super) fn admit_checkpoint(
 /// Decoded payload sizes the admission checks share, taken from one header scan.
 #[derive(Debug, Clone, Copy)]
 struct Payloads {
+    expert_entries: usize,
     dense_payload_bytes: u64,
     largest_dense_tensor_bytes: u64,
     largest_routed_entry_bytes: u64,
@@ -85,6 +86,14 @@ struct Payloads {
     largest_expert_entry_bytes: u64,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     cuda: CudaPayloads,
+}
+
+impl Payloads {
+    fn cache_entry_bytes(&self) -> Result<u64, EngError> {
+        self.largest_expert_entry_bytes
+            .checked_add(super::loader::NemotronLoader::CACHE_INDEX_ENTRY_BYTES as u64)
+            .ok_or_else(|| memory_error("expert cache payload and index bytes overflow u64"))
+    }
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -133,6 +142,7 @@ fn checkpoint_payloads(
     }
 
     let mut payloads = Payloads {
+        expert_entries: 0,
         dense_payload_bytes: 0,
         largest_dense_tensor_bytes: 0,
         largest_routed_entry_bytes: 0,
@@ -157,6 +167,7 @@ fn checkpoint_payloads(
                 if plan.part != NemotronTensorPart::Weight {
                     continue;
                 }
+                payloads.expert_entries += 1;
                 let entry = expert_entry_payload_bytes(name, metadata.dtype(), metadata.shape())?;
                 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
                 {
@@ -359,12 +370,43 @@ pub(super) fn admit_serving(
     descriptor: &NemotronTextSpec,
     spec: &NemotronExecSpec,
     capacity: u32,
-    cache_entries: usize,
+    cache_entries: Option<usize>,
     policy: MemoryPolicy,
-    available_bytes: u64,
-) -> Result<(), EngError> {
-    let (components, _) = serving_plan(directory, descriptor, spec, capacity, cache_entries)?;
-    check_serving_memory(components, policy, available_bytes).map(|_| ())
+    available: u64,
+) -> Result<usize, EngError> {
+    let (components, payloads) = serving_plan(
+        directory,
+        descriptor,
+        spec,
+        capacity,
+        cache_entries.unwrap_or(0),
+    )?;
+    let fixed = check_serving_memory(components, policy, available)?;
+    match cache_entries {
+        Some(entries) => Ok(entries),
+        None => fit_cache_entries(
+            &payloads,
+            admission_ceiling(policy, available).saturating_sub(fixed),
+        ),
+    }
+}
+
+/// All decoded entries fit within the largest entry charged by the existing admission ledger.
+fn fit_cache_entries(payloads: &Payloads, bytes: u64) -> Result<usize, EngError> {
+    let entry_bytes = payloads.cache_entry_bytes()?;
+    let count = bytes
+        .checked_div(entry_bytes)
+        .ok_or_else(|| memory_error("automatic expert cache needs a nonempty expert"))?;
+    let entries = payloads
+        .expert_entries
+        .min(usize::try_from(count).unwrap_or(usize::MAX));
+    if entries == 0 {
+        return Err(memory_error(format!(
+            "automatic expert cache needs {} bytes for one entry, {bytes} available",
+            entry_bytes
+        )));
+    }
+    Ok(entries)
 }
 
 /// One header scan supplies both the retained serving plan and its tensor maxima.
@@ -393,7 +435,7 @@ fn serving_plan(
         .checked_mul(3)
         .ok_or_else(|| memory_error("three state payloads overflow u64"))?;
     let expert_cache = cache_entries
-        .checked_mul(payloads.largest_expert_entry_bytes)
+        .checked_mul(payloads.cache_entry_bytes()?)
         .ok_or_else(|| memory_error("expert cache bytes overflow u64"))?;
     let retained = retained_selected_bytes(
         routed_pairs,
@@ -664,7 +706,10 @@ mod tests {
         ) -> u64 {
             let payloads = checkpoint_payloads(dir, descriptor).unwrap();
             let state = NemotronState::planned_bytes(spec, 16).unwrap();
-            let cache = 4u64 * payloads.largest_expert_entry_bytes;
+            let cache = 4u64
+                * (payloads.largest_expert_entry_bytes
+                    + crate::family::nemotron35::loader::NemotronLoader::CACHE_INDEX_ENTRY_BYTES
+                        as u64);
             let transient = payloads.largest_expert_entry_bytes + ACTIVATION_WORKSPACE_BYTES;
             payloads.dense_payload_bytes + state + cache + transient
         }
@@ -754,17 +799,58 @@ mod tests {
                 &descriptor,
                 &spec,
                 16,
-                4,
+                Some(4),
                 MemoryPolicy::default_share(),
                 total,
             )
             .expect("the exact serving total fits the measured ceiling");
+            let stride = components.expert_cache_bytes / 4;
+            let one_entry = total - 3 * stride;
+            assert_eq!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    one_entry
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    one_entry - 1
+                )
+                .is_err()
+            );
+            let (_, payloads) = serving_plan(dir.path(), &descriptor, &spec, 16, 0).unwrap();
+            assert_eq!(
+                admit_serving(
+                    dir.path(),
+                    &descriptor,
+                    &spec,
+                    16,
+                    None,
+                    MemoryPolicy::default_share(),
+                    u64::MAX
+                )
+                .unwrap(),
+                payloads.expert_entries
+            );
             let error = admit_serving(
                 dir.path(),
                 &descriptor,
                 &spec,
                 16,
-                4,
+                Some(4),
                 MemoryPolicy::default_share(),
                 total - 1,
             )

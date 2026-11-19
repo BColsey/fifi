@@ -125,7 +125,7 @@ pub(crate) fn start_engine(
                     &descriptor,
                     &spec,
                     owned.context_limit,
-                    owned.cache_entries,
+                    Some(owned.cache_entries),
                     MemoryPolicy::default_share(),
                     available,
                 )?;
