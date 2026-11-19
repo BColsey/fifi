@@ -31,11 +31,18 @@ pub(crate) const FAMILY: &str = "nemotron35";
 pub(crate) struct NemotronOptions {
     backend: String,
     context_limit: u32,
-    cache_entries: usize,
+    /// Omitted means the host cache is fitted to the measured budget at load.
+    #[serde(default)]
+    cache_entries: Option<usize>,
     prefill_chunk: u32,
 }
 
 impl NemotronOptions {
+    /// The explicit entry count, or None when the fit is selected by omission.
+    pub(crate) fn cache_entries(&self) -> Option<usize> {
+        self.cache_entries
+    }
+
     /// Rejects every unsupported setting before a file or a device is touched.
     fn check(&self) -> Result<(), EngError> {
         match self.backend.as_str() {
@@ -55,8 +62,10 @@ impl NemotronOptions {
         if self.context_limit == 0 {
             return Err(config_error("context_limit must be positive"));
         }
-        if self.cache_entries == 0 {
-            return Err(config_error("cache_entries must be positive"));
+        if self.cache_entries == Some(0) {
+            return Err(config_error(
+                "cache_entries must be positive when given; omit it to fit the host cache",
+            ));
         }
         if self.prefill_chunk == 0 || self.prefill_chunk > self.context_limit {
             return Err(config_error(
@@ -108,35 +117,49 @@ pub(crate) fn start_engine(
                 "nemotron35 admission: available host memory is unavailable".to_string(),
             )
         })?;
+        let auto_cache;
+        let cache_entries;
         let admitted = match owned.backend.as_str() {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             "cuda" => {
-                let (ticket, _) = admission::cuda::admit_cuda_serving(
+                let (mut ticket, entries) = admission::cuda::admit_cuda_serving(
                     &model,
                     &descriptor,
                     &spec,
                     owned.context_limit,
-                    Some(owned.cache_entries),
+                    owned.cache_entries,
                     MemoryPolicy::default_share(),
                     available,
                 )?;
+                auto_cache = owned.cache_entries.is_none();
+                if auto_cache {
+                    ticket.enable_auto_cache();
+                }
+                cache_entries = entries;
                 StackAdmission::Cuda(ticket)
             }
             _ => {
-                admission::admit_serving(
+                cache_entries = admission::admit_serving(
                     &model,
                     &descriptor,
                     &spec,
                     owned.context_limit,
-                    Some(owned.cache_entries),
+                    owned.cache_entries,
                     MemoryPolicy::default_share(),
                     available,
                 )?;
+                auto_cache = owned.cache_entries.is_none();
                 StackAdmission::Cpu
             }
         };
+        if auto_cache {
+            eprintln!(
+                "nemotron35: admitted {cache_entries} host expert cache entries at context {}",
+                owned.context_limit
+            );
+        }
         let state = NemotronState::new(&spec, owned.context_limit)?;
-        let source = LoaderWeightSource::open(&model, owned.cache_entries)?;
+        let source = LoaderWeightSource::open(&model, cache_entries)?;
         let stack = build_stack(admitted, spec, source, state)?;
         NemotronExecutor::new(stack, eos)
     })?;
@@ -207,6 +230,14 @@ mod tests {
         assert!(serde_json::from_str::<NemotronOptions>(unknown).is_err());
         let missing = r#"{"backend":"cpu_reference","context_limit":64}"#;
         assert!(serde_json::from_str::<NemotronOptions>(missing).is_err());
+    }
+
+    #[test]
+    fn an_omitted_cache_entries_selects_the_fit_and_zero_stays_refused() {
+        // Omission means the fit; an explicit count stays an exact override.
+        let json = r#"{"backend":"cpu_reference","context_limit":64,"prefill_chunk":1}"#;
+        let parsed = options(json);
+        parsed.check().expect("omission selects the fit");
     }
 
     #[test]

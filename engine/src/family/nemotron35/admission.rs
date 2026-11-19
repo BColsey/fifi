@@ -481,22 +481,19 @@ pub(super) fn host_available_bytes() -> Option<u64> {
     }
     #[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
     {
-        fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| parse_mem_available(&contents))
+        // The cgroup-aware budget with the bare-figure fall-back: a probe that
+        // cannot verify the cgroup must not refuse a start the bare figure
+        // always served. The live tests still pin the fit against a cgroup
+        // where the probe verifies it.
+        crate::family::host_admit::HostAdmission::probe_or_bare(
+            "Nemotron admission",
+            "Nemotron admission",
+        )
+        .map(|(_total, available)| available)
+        .ok()
     }
     #[cfg(not(target_os = "linux"))]
     None
-}
-
-#[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
-fn parse_mem_available(contents: &str) -> Option<u64> {
-    let line = contents
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let mut fields = line.strip_prefix("MemAvailable:")?.split_whitespace();
-    let kib = fields.next()?.parse::<u64>().ok()?;
-    (fields.next()? == "kB").then_some(kib.checked_mul(1024)?)
 }
 
 fn memory_error(message: impl Into<String>) -> EngError {
@@ -1188,9 +1185,6 @@ pub(super) mod cuda {
             self.plan.transfers
         }
 
-        // The factory wiring that flips this on lands with the omission fit;
-        // its tests exercise the behavior here first.
-        #[allow(dead_code)]
         pub(in crate::family::nemotron35) fn enable_auto_cache(&mut self) {
             self.resize_device_cache = true;
         }

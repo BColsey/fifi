@@ -362,6 +362,44 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             }));
             continue;
         }
+        if engine.family == crate::family::nemotron35::factory::FAMILY {
+            use super::effective::{EffectiveSetting, Origin};
+            let (value, origin) = match engine
+                .nemotron
+                .as_ref()
+                .map(|options| options.cache_entries())
+            {
+                Some(Some(count)) => (count.to_string(), Origin::ConfigFile),
+                _ => ("fit at load".to_string(), Origin::Default),
+            };
+            let rows = vec![EffectiveSetting {
+                key: "cache_entries",
+                value,
+                origin,
+            }];
+            rendered.push_str(&format!(
+                "engine {} ({}, model {}):\n",
+                engine.id,
+                engine.family,
+                engine.model_name()
+            ));
+            for row in &rows {
+                rendered.push_str(&format!(
+                    "  {:32} {:>16}  ({})\n",
+                    row.key,
+                    row.value,
+                    row.origin.name()
+                ));
+            }
+            json_engines.push(serde_json::json!({
+                "id": engine.id,
+                "family": engine.family,
+                "settings": rows.iter().map(|row| serde_json::json!({
+                    "key": row.key, "value": row.value, "origin": row.origin.name()
+                })).collect::<Vec<_>>(),
+            }));
+            continue;
+        }
         if !is_q36_family {
             rendered.push_str(&format!(
                 "engine {} ({}): per-key origins are composed for the Qwen3.6 families only so far; model_dir {}\n",

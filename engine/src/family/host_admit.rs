@@ -8,17 +8,22 @@
 use crate::EngError;
 
 pub(crate) struct HostAdmission {
+    // The total and the floor are read by the CUDA-build facts paths
+    // (probe_or_bare and the admit pair); the plain host build only asks
+    // for the available budget.
+    #[allow(dead_code)]
     mem_total: u64,
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
+    #[allow(dead_code)]
     os_floor: u64,
 }
 
 impl HostAdmission {
     #[allow(
         dead_code,
-        reason = "the callers live on the CUDA executor paths; host tests exercise probe_in"
+        reason = "the callers are Linux-only; the macOS test build exercises probe_in"
     )]
     pub(crate) fn probe(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
         Self::probe_in(
@@ -34,9 +39,14 @@ impl HostAdmission {
     /// cgroup probe refuses (a namespace root, for example), the pair falls back to the bare
     /// `/proc/meminfo` figures and logs the refusal — those callers worked on the bare figure
     /// before, so they keep it. Planning that sizes memory uses [`HostAdmission::probe`] and
-    /// refuses instead; an optional feature may plan zero on the refusal. Gated like its two
-    /// callers (the CUDA-build facts paths): the plain host build never compiles it.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    /// refuses instead; an optional feature may plan zero on the refusal. The plain Linux
+    /// build's Nemotron fit is one of these fall-back callers: a default start must keep
+    /// serving where the bare figure always served.
+    #[cfg(any(test, target_os = "linux"))]
+    #[allow(
+        dead_code,
+        reason = "the callers are Linux-only; the macOS test build keeps the pair compiled"
+    )]
     pub(crate) fn probe_or_bare(
         label: &'static str,
         root_label: &'static str,
@@ -57,7 +67,11 @@ impl HostAdmission {
     /// The bare path of [`probe_or_bare`]: the machine-wide figures of the given meminfo
     /// text, with one log line naming the refusal it replaced. Split out so a test can pin
     /// that an unverified budget falls back to a figure instead of refusing.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(any(test, target_os = "linux"))]
+    #[allow(
+        dead_code,
+        reason = "the callers are Linux-only; the macOS test build keeps the pair compiled"
+    )]
     pub(crate) fn bare_fallback(
         label: &'static str,
         root_label: &'static str,
@@ -122,11 +136,19 @@ impl HostAdmission {
 
     /// `MemTotal` paired with [`HostAdmission::available_budget`], for host plans that carry
     /// both figures (the tier and bank plans read them as a pair).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the CUDA-build facts paths read the pair")
+    )]
     pub(crate) fn host_memory(&self) -> (u64, u64) {
         (self.mem_total, self.available_budget())
     }
 
     /// [`admit_for`] with the caller's label as the refusing name.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the refusals are pinned by this module's tests")
+    )]
     pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
         self.admit_for(required, label)
     }
@@ -134,6 +156,10 @@ impl HostAdmission {
     /// The admission check with the caller's name in the refusal, so a prefix
     /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the refusals are pinned by this module's tests")
+    )]
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
         let available = self.available_budget();
         if required

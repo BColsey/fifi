@@ -48,8 +48,8 @@ You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
    }
    ```
 
-   All four `nemotron` keys are required. The values are an example, not a tuned profile.
-   `cache_entries` is the number of expert weight tensors kept decoded in host memory.
+   The three `nemotron` keys besides `cache_entries` are required; the values are an example, not a tuned profile.
+   `cache_entries` is the number of expert weight tensors kept decoded in host memory; admission charges each entry as the largest entry's payload bytes plus the loader's per-entry index, 96 bytes per entry on 64-bit targets. Omit the key and the loader fits the count from 850 permille of the measured host budget (the cgroup-aware figure on Linux) minus the fixed serving charges; a remainder below one entry refuses the load rather than starting with an empty cache, and one log line states the chosen count. An explicit number is honoured verbatim: a card too small for it refuses the load - omit the key, because only the fit trims the 12 GiB device request down to what the card holds.
 
 4. Start the server and wait for `/ready`:
 
@@ -58,7 +58,7 @@ You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
    target/release/enginesrv --config nemotron.json
    ```
 
-   Startup checks host and GPU memory and refuses the load if either is short; the log names the part that does not fit.
+   Startup checks host and GPU memory and refuses the load if either is short; the log names the part that does not fit. On CUDA the optional device weight cache requests 12 GiB; when the cache count is fitted rather than explicit, the admission trims that request to what the measured card holds free after the required device charge.
 
 5. Send requests with `"temperature": 0`:
 

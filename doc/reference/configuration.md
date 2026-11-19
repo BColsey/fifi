@@ -170,13 +170,13 @@ true` (without it the entry serves through the MLX path and the CUDA keys are re
 
 ## `nemotron`
 
-Required for `nemotron35`. All four keys are required.
+Required for `nemotron35`. `cache_entries` may be omitted; the other three keys are required.
 
 | Key | Values | Meaning |
 | --- | --- | --- |
 | `backend` | `"cuda"`, `"cpu_reference"` | `cuda` needs a Linux build with `--features native-cuda` and accepts greedy decoding only. `cpu_reference` runs on the CPU and is slow. |
 | `context_limit` | 1 or more | Context limit in tokens. |
-| `cache_entries` | 1 or more | Expert weight tensors kept decoded in host memory. |
+| `cache_entries` | 1 or more, or omitted | Expert weight tensors kept decoded in host memory. Admission charges each entry as the largest entry's payload bytes plus the loader's per-entry index, 96 bytes per entry on 64-bit targets. Omitting the key fits the count from 850 permille of the measured host budget (the cgroup-aware figure on Linux) minus the fixed serving charges; a remainder below one entry refuses the load, and one log line states the chosen count. An explicit number is honoured verbatim: a card too small for it refuses the load - omit the key, because only the fit trims the 12 GiB device request down to what the card holds. |
 | `prefill_chunk` | 1 to `context_limit` | Prompt tokens per step. |
 
 ## `fake`

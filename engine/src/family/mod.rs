@@ -44,7 +44,9 @@ pub mod gguf_model;
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+// Pure host bookkeeping, compiled wherever it has a caller: every Linux
+// build (the admission fits need the cgroup-aware probe) and the test build.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) mod host_admit;
 pub mod keys;
 pub(crate) mod kv_format;

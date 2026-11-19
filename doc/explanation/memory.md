@@ -69,3 +69,4 @@ On CUDA the plan is fixed at startup:
 
 The checkpoint stays on disk and is read as needed.
 Startup plans host memory for the dense weights, the session state, `cache_entries` decoded expert tensors and working buffers, and checks GPU memory for the CUDA buffers.
+When `cache_entries` is omitted, the loader fits the entry count to the measured available host memory instead (the cgroup-aware budget on Linux, with a fall-back to the machine figure when the cgroup cannot be verified); one log line states the chosen count.
