@@ -93,8 +93,39 @@ pub fn quantize_q8g(x: &[f32], out: &mut Q8gRow) -> Result<(), ExpertCpuError> {
             x.len()
         )));
     }
+    static FAST_QUANT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FAST_QUANT
+        .get_or_init(|| std::env::var_os("FIFI_CPU_Q8G_FAST_QUANT").is_some_and(|v| v == "1"))
+    {
+        fill_groups::<true>(x, out);
+    } else {
+        fill_groups::<false>(x, out);
+    }
+    Ok(())
+}
+
+// For finite scaled values, truncation leaves a signed remainder in (-1, 1).
+// Only remainders with magnitude at least one half round away from zero.
+fn round_quantized(scaled: f32) -> i8 {
+    let whole = scaled as i32;
+    let fraction = scaled - whole as f32;
+    (whole + i32::from(fraction >= 0.5) - i32::from(fraction <= -0.5)).clamp(-127, 127) as i8
+}
+
+fn fill_groups<const FAST: bool>(x: &[f32], out: &mut Q8gRow) {
     for (g, xs) in x.as_chunks::<GROUP>().0.iter().enumerate() {
-        let amax = xs.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let amax = if FAST {
+            // Positive finite IEEE-754 encodings have the same order as their values.
+            // The caller has already checked the entire input for non-finite values.
+            let bits = xs
+                .iter()
+                .map(|v| v.to_bits() & 0x7fff_ffff)
+                .max()
+                .unwrap_or(0);
+            f32::from_bits(bits)
+        } else {
+            xs.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        };
         let qs = &mut out.q[g * GROUP..][..GROUP];
         if amax == 0.0 {
             out.d[g] = 0.0;
@@ -104,12 +135,18 @@ pub fn quantize_q8g(x: &[f32], out: &mut Q8gRow) -> Result<(), ExpertCpuError> {
         }
         let (d, inv) = (amax / 127.0, 127.0 / amax);
         out.d[g] = d;
-        for (q, &v) in qs.iter_mut().zip(xs) {
-            *q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        if FAST && inv.is_finite() {
+            for (q, &v) in qs.iter_mut().zip(xs) {
+                *q = round_quantized(v * inv);
+            }
+        } else {
+            // Very small nonzero groups can overflow the reciprocal.
+            for (q, &v) in qs.iter_mut().zip(xs) {
+                *q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
         }
         out.s[g] = qs.iter().map(|&q| i32::from(q)).sum();
     }
-    Ok(())
 }
 
 /// The AVX2 path produces this order with two `hadd` steps and one lane add.

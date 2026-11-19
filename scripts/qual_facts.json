@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7340,
+      "test_fns": 7341,
       "ignored": 665,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -41,6 +41,7 @@
         "FIFI_ACTIVATION_MANIFEST",
         "FIFI_ADD_CHAIN_M",
         "FIFI_CPU_GREEDY_BLOCKS",
+        "FIFI_CPU_Q8G_FAST_QUANT",
         "FIFI_CUDA_ATTN_PREFILL_ADAPT",
         "FIFI_CUDA_POISON_ALLOC",
         "FIFI_D1_CAPTURE",
