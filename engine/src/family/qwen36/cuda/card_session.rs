@@ -31,13 +31,15 @@ use super::mixer_ops::CardOp;
 use super::mixer_weights::MixerWeights;
 use super::moe::MoeLayerWeights;
 use super::multi::fold_ring_status;
-use super::prefix::CudaPrefillPath;
+use super::prefix::{CudaPrefillPath, stored_prefix_report};
 use super::resources::{GlobalNames, MoeSpecs, check_native_embed, moe_layer_weights, raw_buffer};
+use super::run_report::prefix_lookup;
 use super::state::export::ExportedState;
 use super::state::{ResidentState, StepField};
 use super::step_plan::Slot;
 use crate::family::exl3::layer_table::LayerTable;
 use crate::family::exl3::source::DenseSpec;
+use crate::sched::job::PrefixReport;
 
 use crate::EngError;
 use crate::family::AttentionKind;
@@ -85,6 +87,7 @@ pub(crate) struct CardSession {
     prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
     /// The numeric path every entry of this session saves and restores under.
     prefix_path: CudaPrefillPath,
+    prefix_lookup: PrefixReport,
     /// Set by a prefix import: the word block was zeroed, so the next feed
     /// writes the full step params (token id AND position) again.
     full_params_next: bool,
@@ -261,6 +264,7 @@ impl CardSession {
                 .is_some_and(|value| value == "1"),
             prefix: PrefixSlot::with_limits(prefix_limits),
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
+            prefix_lookup: PrefixReport::default(),
             full_params_next: false,
             eos,
             sampler_vocab,
@@ -472,6 +476,7 @@ impl TokenStepper for CardSession {
     fn reset(&mut self) -> Result<(), EngError> {
         // The streams are joined inside; the fed book restarts.
         self.stack.reset_states_and_ring(&mut self.states)?;
+        self.prefix_lookup = PrefixReport::default();
         self.fed = 0;
         self.poisoned = false;
         self.full_params_next = false;
@@ -518,6 +523,11 @@ impl ExecutorOps for CardSession {
 
     fn prefix_limits(&self) -> StoreLimits {
         self.prefix.limits()
+    }
+
+    fn prefix_report(&self) -> Option<PrefixReport> {
+        (self.prefix.limits().entries > 0)
+            .then(|| stored_prefix_report(&self.prefix, self.prefix_lookup))
     }
 
     /// Snapshots every card's state (its sliced KV planes plus its DeltaNet
@@ -572,7 +582,9 @@ impl ExecutorOps for CardSession {
             Ok(())
         });
         self.prefix = slot;
-        covered
+        let covered = covered?;
+        self.prefix_lookup = prefix_lookup(&self.prefix, prompt, covered);
+        Ok(covered)
     }
 }
 
@@ -658,6 +670,13 @@ impl ExecutorOps for Q36CudaStep {
         match self {
             Self::Single(step) => step.decode(st, generation),
             Self::Cards(session) => session.decode(st, generation),
+        }
+    }
+
+    fn prefix_report(&self) -> Option<PrefixReport> {
+        match self {
+            Self::Single(step) => step.prefix_report(),
+            Self::Cards(session) => session.prefix_report(),
         }
     }
 

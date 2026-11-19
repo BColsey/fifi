@@ -1,6 +1,4 @@
-//! The pure pieces of the one-entry prefix reuse of the CUDA arm: the numeric path tag a saved
-//! entry carries, and the host-byte charge of an entry. The glue itself lives in `executor.rs` (the
-//! two closures around the shared session rules); the device behaviour is `prefix_device_tests.rs`.
+//! Committed checkpoint payloads and numerical path identity for Qwen CUDA prefix reuse.
 
 use super::state::{
     export::ExportedState,
@@ -9,12 +7,51 @@ use super::state::{
 use super::{dims::KvMode, state::export::plane_sizes, state_layout::StateLayout};
 use crate::{
     EngError,
-    family::session::{DecodeSession, SaveKind},
+    family::session::{DecodeSession, PrefixSlot, SaveKind},
+    sched::job::PrefixReport,
 };
 
 pub(super) enum CudaSavedPrefix {
     Pageable(ExportedState),
-    Pinned(PinnedSnapshot),
+    Pinned {
+        state: PinnedSnapshot,
+        payload_bytes: usize,
+    },
+}
+
+pub(super) trait CheckpointPayload {
+    fn payload_bytes(&self) -> u64;
+}
+
+impl CheckpointPayload for CudaSavedPrefix {
+    fn payload_bytes(&self) -> u64 {
+        match self {
+            Self::Pageable(state) => state.payload_bytes(),
+            Self::Pinned { payload_bytes, .. } => *payload_bytes as u64,
+        }
+    }
+}
+
+impl CheckpointPayload for Vec<ExportedState> {
+    fn payload_bytes(&self) -> u64 {
+        self.iter().map(ExportedState::payload_bytes).sum()
+    }
+}
+
+/// Only published roots and LRU entries contribute. Reading the report never completes a copy.
+pub(super) fn stored_prefix_report<S: CheckpointPayload, P>(
+    store: &PrefixSlot<S, P>,
+    lookup: PrefixReport,
+) -> PrefixReport {
+    PrefixReport {
+        entries: u32::try_from(store.entries_len().saturating_add(store.roots_len()))
+            .unwrap_or(u32::MAX),
+        bytes: store
+            .snapshots()
+            .map(CheckpointPayload::payload_bytes)
+            .sum(),
+        ..lookup
+    }
 }
 
 pub(super) struct PendingPrefix {

@@ -32,7 +32,7 @@
 //! addresses, not positions, and the next token rewrites the `pos`/`kv_len` words from the
 //! imported `tokens` count.
 
-use super::prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes};
+use super::prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes, stored_prefix_report};
 use super::step::{ChunkVerdict, QwenResidentStep};
 use crate::{
     EngError,
@@ -256,16 +256,10 @@ impl ExecutorOps for QwenResidentStep<'_> {
     }
 
     fn prefix_report(&self) -> Option<PrefixReport> {
-        Some(PrefixReport {
-            entries: u32::try_from(
-                self.prefix
-                    .entries_len()
-                    .saturating_add(self.prefix.roots_len()),
-            )
-            .unwrap_or(u32::MAX),
-            bytes: 0,
-            ..self.last_prefill_report().prefix_lookup
-        })
+        Some(stored_prefix_report(
+            &self.prefix,
+            self.last_prefill_report().prefix_lookup,
+        ))
     }
 
     /// Copies the saved entry into the reset state when the session rules accept the prompt.
@@ -280,7 +274,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
             self.prefill_path(),
             |saved| match saved {
                 CudaSavedPrefix::Pageable(saved) => self.import_state(saved),
-                CudaSavedPrefix::Pinned(saved) => self.restore_pinned_prefix(saved),
+                CudaSavedPrefix::Pinned { state, .. } => self.restore_pinned_prefix(state),
             },
         );
         self.prefix = slot;
