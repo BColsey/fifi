@@ -26,7 +26,7 @@ use crate::{
     family::{executor::GenerationState, sampler::Sampler},
     tokenizer::{DecodeBatch, DecodeFinish},
 };
-use std::{cmp::Reverse, sync::atomic::Ordering};
+use std::{cmp::Reverse, ops::ControlFlow, sync::atomic::Ordering};
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -165,6 +165,20 @@ impl DecodeSession {
         toks: &[u32],
         context_limit: usize,
     ) -> Result<()> {
+        let _ = self.prefill_with(toks, context_limit, |rows| {
+            step.feed_rows(rows)?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    }
+
+    /// Commits the prompt only after its forward completes. A break requires a session reset.
+    pub(crate) fn prefill_with(
+        &mut self,
+        toks: &[u32],
+        context_limit: usize,
+        feed_rows: impl FnOnce(&[u32]) -> Result<ControlFlow<()>>,
+    ) -> Result<ControlFlow<()>> {
         let Some((&last, head)) = toks.split_last() else {
             return Err(EngError::BadRequest("empty prefill chunk".to_string()));
         };
@@ -181,13 +195,13 @@ impl DecodeSession {
         let mut rows = Vec::with_capacity(toks.len());
         rows.extend(self.pending.take());
         rows.extend_from_slice(head);
-        if !rows.is_empty() {
-            step.feed_rows(&rows)?;
+        if !rows.is_empty() && feed_rows(&rows)?.is_break() {
+            return Ok(ControlFlow::Break(()));
         }
         self.history.extend_from_slice(toks);
         self.prompt_len = self.history.len();
         self.pending = Some(last);
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Commits one batch of tokens: feeds the pending token through `TokenStepper::next_token`,

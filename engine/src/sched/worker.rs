@@ -28,10 +28,11 @@ use super::job::{
     send_terminal,
 };
 use crate::EngError;
-use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::executor::{ExecutorOps, GenerationState, PrefillPairOutcome};
 use crate::family::mlx_report::LoadedMlxExecution;
 use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
+use std::ops::ControlFlow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -930,7 +931,7 @@ fn run_job<E: ExecutorOps>(
     // `None` is the report of an executor without an expert bank, and the delta stays `None`).
     let bank_before = executor.prefill_bank_report();
     let mut pieces = PrefillPieces::default();
-    let reused = match start(
+    let prefill = match start(
         executor,
         session,
         plan,
@@ -1045,6 +1046,10 @@ fn run_job<E: ExecutorOps>(
         }
         Err(error) => return fail(executor, session, events, error, shared),
     };
+    let ControlFlow::Continue(reused) = prefill else {
+        send_cancelled(events, prompt_tokens);
+        return reset_state(executor, session, shared);
+    };
     let reused_tokens = u32::try_from(reused).unwrap_or(u32::MAX);
     // The report of the job's prefix store, taken after the prefill and before the first decode:
     // the entries and bytes then include this job's save points. `None` is the report of an
@@ -1116,7 +1121,8 @@ fn classified<E: ExecutorOps>(
 /// in turn (the root, the periodic entries, then the tip) and saves the prefix state at each
 /// point. Each segment is chunked from its own start, which is the cursor that `save_points`
 /// moved to the previous point, so the chunk sequence of the prefill is the one that
-/// `save_points` assumed. Returns the number of prompt tokens that the restore covered.
+/// `save_points` assumed. Returns the number of prompt tokens that the restore covered,
+/// or breaks if a paired forward stopped mid-layer schedule and the session needs a reset.
 ///
 /// `retrying` marks the eviction retry, which runs with no save points at all: a snapshot that
 /// charges successfully at its own point can still starve the prefill tail that follows it, so
@@ -1130,7 +1136,7 @@ fn start<E: ExecutorOps>(
     generation: &GenerationState,
     pieces: &mut PrefillPieces,
     retrying: bool,
-) -> Result<usize, EngError> {
+) -> Result<ControlFlow<(), usize>, EngError> {
     // A restart re-feeds from the cursor, so the log keeps only the run that served the
     // prompt, never the aborted attempt's pieces.
     *pieces = PrefillPieces::default();
@@ -1166,19 +1172,23 @@ fn start<E: ExecutorOps>(
     };
     for (point, kind) in points {
         let head = span(plan.tokens, next, point)?;
-        if !prefill_chunks(executor, session, head, prefill_chunk, cancel, pieces)? {
-            return Ok(restored);
+        if let ControlFlow::Break(()) =
+            prefill_chunks(executor, session, head, prefill_chunk, cancel, pieces)?
+        {
+            return Ok(ControlFlow::Break(()));
         }
         if cancel.load(Ordering::SeqCst) {
-            return Ok(restored);
+            return Ok(ControlFlow::Continue(restored));
         }
         // The head fed through `point`; the save that follows it cannot change what was fed.
         next = point;
         executor.save_prefix(session, span(plan.tokens, 0, point)?, kind)?;
     }
     let tail = span(plan.tokens, next, plan.tokens.len())?;
-    prefill_chunks(executor, session, tail, prefill_chunk, cancel, pieces)?;
-    Ok(restored)
+    Ok(
+        prefill_chunks(executor, session, tail, prefill_chunk, cancel, pieces)?
+            .map_continue(|()| restored),
+    )
 }
 
 fn request_prefill_chunk<E: ExecutorOps>(
@@ -1197,8 +1207,8 @@ fn span(tokens: &[u32], from: usize, to: usize) -> Result<&[u32], EngError> {
         .ok_or_else(|| EngError::BadRequest("prompt span is outside the prompt".to_string()))
 }
 
-/// The cancel flag stops it between two chunks, never before the first chunk of the job.
-/// Returns false when it stopped early.
+/// Cancellation between finished pieces leaves a session that can finish through decode.
+/// A cancelled paired forward breaks with a partial session that needs a reset.
 fn prefill_chunks<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -1206,11 +1216,11 @@ fn prefill_chunks<E: ExecutorOps>(
     prefill_chunk: usize,
     cancel: &AtomicBool,
     pieces: &mut PrefillPieces,
-) -> Result<bool, EngError> {
+) -> Result<ControlFlow<()>, EngError> {
     let mut remaining = tokens;
     while !remaining.is_empty() {
         if pieces.count > 0 && cancel.load(Ordering::SeqCst) {
-            return Ok(false);
+            return Ok(ControlFlow::Continue(()));
         }
         let rows = executor
             .prefill_piece()
@@ -1226,11 +1236,16 @@ fn prefill_chunks<E: ExecutorOps>(
             && piece.len() >= 3
             && (2..=rows).contains(&rest.len())
             && !cancel.load(Ordering::SeqCst)
-            && executor.try_prefill_pair(session, remaining, piece.len())?
         {
-            pieces.count = 2;
-            pieces.max_rows = u32::try_from(piece.len()).unwrap_or(u32::MAX);
-            return Ok(true);
+            match executor.try_prefill_pair(session, remaining, piece.len(), cancel)? {
+                PrefillPairOutcome::Declined => {}
+                PrefillPairOutcome::Completed => {
+                    pieces.count = 2;
+                    pieces.max_rows = u32::try_from(piece.len()).unwrap_or(u32::MAX);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                PrefillPairOutcome::Cancelled => return Ok(ControlFlow::Break(())),
+            }
         }
         // The executor's prefill error passes through unchanged: this is shared scheduler
         // code, and a piece-index prefix would reach HTTP 400 clients of every family on
@@ -1242,7 +1257,7 @@ fn prefill_chunks<E: ExecutorOps>(
             .max(u32::try_from(piece.len()).unwrap_or(u32::MAX));
         remaining = rest;
     }
-    Ok(true)
+    Ok(ControlFlow::Continue(()))
 }
 
 fn reset_state<E: ExecutorOps>(
@@ -1352,7 +1367,9 @@ mod tests {
         assert_eq!(config.retry, RetryClass::AfterCorrection);
     }
 
-    use super::{EngineHandle, EngineState, ShutdownReport, SubmitError, spawn_engine};
+    use super::{
+        EngineHandle, EngineState, PrefillPairOutcome, ShutdownReport, SubmitError, spawn_engine,
+    };
     use crate::EngError;
     use crate::exec_fake::FakeExecutor;
     use crate::family::executor::{ExecutorOps, GenerationState};
@@ -1409,6 +1426,7 @@ mod tests {
         piece_after_prefill: Option<usize>,
         request_piece: Option<std::num::NonZeroUsize>,
         prefill_pair: bool,
+        cancel_prefill_pair: bool,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
         /// The admit-path bank reports the spy answers: the `before` sample until the first
@@ -1446,6 +1464,7 @@ mod tests {
                 piece_after_prefill: None,
                 request_piece: None,
                 prefill_pair: false,
+                cancel_prefill_pair: false,
                 context_limit: None,
                 bank_reports: None,
             }
@@ -1558,16 +1577,21 @@ mod tests {
             st: &mut Self::Session,
             tokens: &[u32],
             first_piece: usize,
-        ) -> Result<bool, EngError> {
+            cancel: &AtomicBool,
+        ) -> Result<PrefillPairOutcome, EngError> {
             if !self.prefill_pair {
-                return Ok(false);
+                return Ok(PrefillPairOutcome::Declined);
             }
             self.note(format!("pair:{first_piece}+{}", tokens.len() - first_piece));
+            if self.cancel_prefill_pair {
+                cancel.store(true, Ordering::SeqCst);
+                return Ok(PrefillPairOutcome::Cancelled);
+            }
             self.inner.prefill(st, tokens)?;
             if let Some(flag) = self.cancel_after_prefill.take() {
                 flag.store(true, Ordering::SeqCst);
             }
-            Ok(true)
+            Ok(PrefillPairOutcome::Completed)
         }
 
         fn decode(
@@ -2288,6 +2312,7 @@ mod tests {
                     &mut pieces,
                 )
                 .unwrap()
+                .is_continue()
             );
             assert_eq!(calls(&log), strings(calls_expected));
             assert_eq!(spy.history(&session), tokens);
@@ -2350,6 +2375,59 @@ mod tests {
             assert_eq!(handle.state(), EngineState::Ready);
             engine.shutdown();
         }
+    }
+
+    #[test]
+    fn aborting_in_flight_pair_resets_without_decoding_and_keeps_the_worker_ready() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![0], vec![EOS]], &log);
+        spy.prefill_pair = true;
+        spy.cancel_prefill_pair = true;
+        let engine = start_spy(512, spy);
+        let handle = engine.handle();
+        let (cancelled, events) = job(&[1; 514]);
+        handle.try_submit(cancelled).expect("submit");
+        assert_eq!(
+            collect(events),
+            vec![
+                batch(&[], "", Some(DecodeFinish::Cancelled)),
+                JobEvent::Finished(JobUsage {
+                    prompt_tokens: 514,
+                    completion_tokens: 0,
+                    reused_tokens: 0,
+                    prefix: None,
+                    prefill_bank: None,
+                    prefill_pieces: PrefillPieces::default(),
+                    first_token_margin: None,
+                }),
+            ]
+        );
+        let (next, events) = job(&[2]);
+        handle.try_submit(next).expect("submit following job");
+        assert_eq!(
+            collect(events),
+            vec![
+                batch(&[0], "a", None),
+                batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                finished(&log, 1, 2),
+            ]
+        );
+        assert_eq!(
+            calls(&log),
+            strings(&[
+                "reset",
+                "boundary",
+                "pair:512+2",
+                "reset",
+                "reset",
+                "boundary",
+                "prefill:1",
+                "decode",
+                "decode",
+            ])
+        );
+        assert_eq!(handle.state(), EngineState::Ready);
+        engine.shutdown();
     }
 
     #[test]

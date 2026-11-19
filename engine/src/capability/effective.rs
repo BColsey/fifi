@@ -394,6 +394,10 @@ pub(crate) fn flint_effective_for_build(
                 pair_policy.label().into(),
                 env_origin(&prefill_pair),
             ),
+            mlx_switch(
+                "mlx_cancel_prefill_pair",
+                "FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR",
+            ),
             mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
             row(
                 "mlx_request_kv",

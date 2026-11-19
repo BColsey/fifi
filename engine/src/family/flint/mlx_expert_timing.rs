@@ -30,6 +30,8 @@ pub(super) struct PairTiming {
     pub(super) stage_slots: usize,
     pub(super) peak_experts: usize,
     pub(super) peak_mapped_bytes: usize,
+    pub(super) completed_layers: usize,
+    pub(super) cancelled: bool,
 }
 
 impl ForwardTiming {
@@ -77,6 +79,8 @@ impl ForwardTiming {
             event["expert_stage_slots"] = serde_json::json!(pair.stage_slots);
             event["peak_stage_experts"] = serde_json::json!(pair.peak_experts);
             event["peak_stage_mapped_bytes"] = serde_json::json!(pair.peak_mapped_bytes);
+            event["completed_layers"] = serde_json::json!(pair.completed_layers);
+            event["cancelled"] = serde_json::json!(pair.cancelled);
         }
         eprintln!("{EVENT} {event}");
     }
