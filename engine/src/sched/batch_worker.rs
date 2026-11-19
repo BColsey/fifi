@@ -44,6 +44,12 @@ struct Slot<S> {
     exhausted_restart: bool,
 }
 
+impl<S> Slot<S> {
+    fn can_start_decode(&self) -> bool {
+        self.cursor == self.job.prompt.len() && !self.job.generation.cancel.load(Ordering::SeqCst)
+    }
+}
+
 fn register(shared: &Shared, job: &Job) {
     lock(&shared.active).push(ActiveJob {
         cancel: Arc::clone(&job.generation.cancel),
@@ -282,7 +288,7 @@ fn refresh_report<E: ExecutorOps>(executor: &E, slot: &mut Slot<E::Session>) {
     }
 }
 
-/// One existing-sized prefill piece per slot per tick. Prompt rows never enter decode_window.
+/// Feed at most the slot's grant, respecting the executor's piece limit and save points.
 fn prefill<E: ExecutorOps>(
     executor: &mut E,
     slot: &mut Slot<E::Session>,
@@ -320,7 +326,6 @@ fn prefill<E: ExecutorOps>(
     }
     refresh_report(executor, slot);
     if slot.cursor == slot.job.prompt.len() {
-        slot.ready = true;
         // The bank counters land once, at the ready transition, as this slot's prefill
         // delta (log-only; `None` is the report of an executor without an expert bank).
         slot.usage.prefill_bank = match (executor.prefill_bank_report(), slot.bank_before.take()) {
@@ -352,6 +357,7 @@ pub(super) fn work<E: ExecutorOps>(
     jobs: &Receiver<Message>,
     shared: &Shared,
     prefill_chunk: usize,
+    iteration_rows: usize,
     max_seqs: usize,
 ) {
     let mut seed = Some(session);
@@ -409,16 +415,37 @@ pub(super) fn work<E: ExecutorOps>(
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
+        // A decode row advances one sequence. A prefill row feeds one prompt token.
+        // Reserve the ready rows first, then share the remaining rows among cold slots.
+        // One row per live slot is the minimum that guarantees progress in both phases.
+        let mut prompt_slots = 0;
+        for slot in &mut slots {
+            slot.ready |= slot.can_start_decode();
+            prompt_slots += usize::from(!slot.ready);
+        }
+        let decode_rows = slots.len() - prompt_slots;
+        let mut prompt_rows = iteration_rows.max(slots.len()) - decode_rows;
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
+                let grant = prompt_rows.div_ceil(prompt_slots).min(prefill_chunk);
+                prompt_slots -= 1;
                 if slots[index].job.generation.cancel.load(Ordering::SeqCst) {
                     let mut slot = slots.remove(index);
                     cancelled(&mut slot);
                     unregister(shared, &slot.job);
                     continue;
                 }
-                if let Err(error) = prefill(executor, &mut slots[index], prefill_chunk) {
+                let cursor = slots[index].cursor;
+                let result = prefill(executor, &mut slots[index], grant);
+                // A denied call can already have fed rows. Charge its grant and retry
+                // on a later tick. Successful short pieces return unused rows immediately.
+                prompt_rows -= if result.is_ok() {
+                    slots[index].cursor - cursor
+                } else {
+                    grant
+                };
+                if let Err(error) = result {
                     if matches!(error, EngError::Backend { .. }) {
                         native_failed(shared, jobs, &error);
                         return;
@@ -564,6 +591,16 @@ pub(super) fn work<E: ExecutorOps>(
         }
         if shared.stop.load(Ordering::SeqCst) {
             break;
+        }
+        // A prompt that finished this tick can join the same window if a row remains.
+        for slot in &mut slots {
+            if prompt_rows == 0 {
+                break;
+            }
+            if !slot.ready && slot.can_start_decode() {
+                slot.ready = true;
+                prompt_rows -= 1;
+            }
         }
         let count = slots.iter().filter(|slot| slot.ready).count();
         if count == 0 {

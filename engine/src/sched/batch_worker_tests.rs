@@ -63,6 +63,7 @@ struct WindowFake {
     context_limit: Option<usize>,
     log: Log,
     hold: Option<Gate>,
+    hold_prefill: Option<Gate>,
     failure: Option<Failure>,
     deny_session: bool,
     /// The fake's pool-derived ceiling, which classifies a final denial on the batch path:
@@ -113,6 +114,7 @@ impl WindowFake {
             context_limit: None,
             log: Arc::clone(log),
             hold: None,
+            hold_prefill: None,
             failure: None,
             deny_session: false,
             ceiling: None,
@@ -168,6 +170,10 @@ impl WindowFake {
 
 impl ExecutorOps for WindowFake {
     type Session = Row;
+
+    fn prefill_piece(&self) -> Option<usize> {
+        Some(4)
+    }
 
     fn max_seqs(&self) -> usize {
         self.max
@@ -230,6 +236,10 @@ impl ExecutorOps for WindowFake {
 
     fn prefill(&mut self, row: &mut Row, tokens: &[u32]) -> Result<(), EngError> {
         self.note(&format!("prefill:{}", tokens.len()));
+        if let Some((entered, release)) = self.hold_prefill.take() {
+            entered.send(()).expect("signal prefill");
+            release.recv_timeout(WAIT).expect("release prefill");
+        }
         let call = self.prefill_calls;
         self.prefill_calls += 1;
         if self
@@ -386,8 +396,12 @@ fn gate() -> (Gate, mpsc::Receiver<()>, mpsc::Sender<()>) {
 
 /// Hold factory completion until all initial jobs have entered the bounded queue.
 fn start(fake: WindowFake) -> (Engine, mpsc::Sender<()>) {
+    start_with_budget(fake, 8)
+}
+
+fn start_with_budget(fake: WindowFake, rows: usize) -> (Engine, mpsc::Sender<()>) {
     let (release, held) = mpsc::channel();
-    let engine = spawn_engine(4, move |_| {
+    let engine = spawn_engine(rows, move |_| {
         held.recv_timeout(WAIT).expect("release load");
         let session = Row::new(fake.script_tokens);
         Ok((fake, session))
@@ -815,6 +829,102 @@ fn prefill_uses_existing_pieces_and_never_adds_prompt_rows_to_a_window() {
     );
     drop(trace);
     engine.shutdown();
+}
+
+#[test]
+fn a_cold_prompt_and_a_stream_share_the_iteration_budget_in_either_arrival_order() {
+    for cold_first in [false, true] {
+        let log = Log::default();
+        let (hold, entered, unblock) = gate();
+        let mut fake = WindowFake::new(&log);
+        if cold_first {
+            fake.hold_prefill = Some(hold);
+        } else {
+            fake.hold = Some(hold);
+        }
+        let (engine, release) = start_with_budget(fake, 4);
+        let (stream, stream_events) = job(&[0], 16);
+        let (cold, cold_events) = job(&[1; 24], 1);
+        let (first, second) = if cold_first {
+            (cold, stream)
+        } else {
+            (stream, cold)
+        };
+        engine.handle().try_submit(first).unwrap();
+        release.send(()).unwrap();
+        entered.recv_timeout(WAIT).unwrap();
+        engine.handle().try_submit(second).unwrap();
+        unblock.send(()).unwrap();
+        assert_eq!(usage(&collect(stream_events)).completion_tokens, 16);
+        assert_eq!(usage(&collect(cold_events)).completion_tokens, 1);
+        engine.shutdown();
+
+        let trace = lock(&log);
+        let mut windows = trace.windows.iter();
+        let mut rows = 0;
+        let mut streaming = false;
+        let mut shared_ticks = 0;
+        let mut cold_decoded = false;
+        for call in &trace.calls {
+            if let Some(piece) = call.strip_prefix("prefill:") {
+                rows += piece.parse::<usize>().unwrap();
+            } else if call == "window" {
+                let window = windows.next().unwrap();
+                if streaming && !cold_decoded {
+                    assert!(rows + window.len() <= 4, "over budget in {window:?}");
+                    if window.iter().any(|history| history[0] == 1) {
+                        cold_decoded = true;
+                        assert_eq!(window.len(), 2, "cold client finished during streaming");
+                    } else {
+                        assert!(rows > 0, "cold prompt starved");
+                        shared_ticks += 1;
+                    }
+                }
+                streaming = true;
+                rows = 0;
+            }
+        }
+        assert!(shared_ticks > 0 && cold_decoded);
+    }
+}
+
+#[test]
+fn cancelling_the_last_prefill_piece_keeps_the_row_out_of_decode() {
+    let log = Log::default();
+    let (hold, entered, unblock) = gate();
+    let mut fake = WindowFake::new(&log);
+    fake.hold_prefill = Some(hold);
+    let (engine, release) = start_with_budget(fake, 4);
+    let (request, events) = job(&[1; 3], 2);
+    engine.handle().try_submit(request).unwrap();
+    release.send(()).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    events.cancel();
+    unblock.send(()).unwrap();
+    let result = collect(events);
+    assert_eq!(finish(&result), DecodeFinish::Cancelled);
+    assert_eq!(usage(&result).completion_tokens, 0);
+    engine.shutdown();
+    assert!(lock(&log).windows.is_empty());
+}
+
+#[test]
+fn a_one_row_budget_gives_each_live_sequence_progress() {
+    let log = Log::default();
+    let (engine, release) = start_with_budget(WindowFake::new(&log), 1);
+    let (first, first_events) = job(&[0; 3], 2);
+    let (second, second_events) = job(&[1; 3], 2);
+    engine.handle().try_submit(first).unwrap();
+    engine.handle().try_submit(second).unwrap();
+    release.send(()).unwrap();
+    for events in [first_events, second_events] {
+        let result = usage(&collect(events));
+        assert_eq!(result.prefill_pieces.count, 3);
+        assert_eq!(result.prefill_pieces.max_rows, 1);
+        assert_eq!(result.completion_tokens, 2);
+    }
+    engine.shutdown();
+    assert_eq!(lock(&log).windows[0], [vec![0; 3], vec![1; 3]]);
 }
 
 #[test]
