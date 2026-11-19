@@ -341,6 +341,29 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --prefill-pair-waves wide --expert-timing --working-set-mib 8192 --pairs 2
 ```
 
+### Flint pair boundaries, retained prefixes and cancellation
+
+The pinned Flint checkpoint ran with an 8 GiB ceiling, request-sized prefill, and pair mode off or set to `auto`. The server verified each rendered prompt's exact token count. All five control and opt-in pairs matched both sampled tokens and the response hash.
+
+| Worker ceiling | Prompt tokens | Observed prefill with pair mode enabled |
+| ---: | ---: | --- |
+| 512 | 513 | Two regular pieces |
+| 512 | 514 | Paired forward with 511 and two rows, followed by the pending prompt token |
+| 1,024 | 1,025 | Two regular pieces |
+| 1,024 | 1,026 | Paired forward with 1,023 and two rows, followed by the pending prompt token |
+| 1,024 | 2,049 | Three regular pieces |
+
+With the 448 MiB prefix reserve and compact KV, the follow-up reused 517 of 526 prompt tokens. The priming and follow-up jobs both used regular prefill with pair mode enabled.
+
+The cancellation run closed the stream after the first routed-layer event for the 514-token request. It returned zero completion tokens. The already-started pair ran for 21.42 s and read 10.49 GB of logical expert data across the whole forward. The driver waited for the pair's completion event before sending the follow-up. The follow-up matched the 514-token control and used the same paired widths. Polling cancellation between safe layer boundaries would reduce this trailing work. [Thirteen responses and cancellation timing](../../scripts/benchmarks/mac-m4-flint-prefill-pair-boundaries.csv)
+
+Run the Apple Silicon release server built with `native-mlx,native-fault-qualification` and supply the pinned checkpoint and [process I/O counter](mac-flint-expert-pipeline.md#reproduce).
+
+```sh
+python3 scripts/mac_cache_study/flint_prefill_pair_boundaries.py \
+  "$ENGINESRV" "$FLINT_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/flint-pair-boundaries"
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
