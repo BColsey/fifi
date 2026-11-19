@@ -1,18 +1,20 @@
 //! The K/V bytes golden of the device-side planning arithmetic: the pool's per-token figure for
 //! both modes, the prefill window bytes, the loader's admission term at real contexts, the
-//! placement stride and cache figures, and the `KvMode::name()` text the activation fingerprint
+//! placement commitments for one and two cards, and the `KvMode::name()` text the activation fingerprint
 //! embeds (`step_activation.rs`). A change that moves any of these numbers must re-capture
 //! deliberately and name the move in the commit message. `FIFI_GOLDEN_UPDATE=1` rewrites this
 //! family's golden file beside the module.
 
+use super::placement::{PlacementPolicy, PlacementRequest};
+use super::shard::ShardTable;
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::cuda::dims::{KvMode, StepDims};
-use crate::family::qwen36::cuda::placement;
 use crate::family::qwen36::cuda::prefill_plan;
 use crate::family::qwen36::cuda::start;
 use crate::family::qwen36::cuda::state_layout::KvPool;
 use crate::family::qwen36::host::HostShape;
 use crate::family::spec::QWEN3_6_35B_A3B;
+use crate::weights::GgufType;
 use std::fmt::Write as _;
 
 fn dims() -> StepDims {
@@ -84,15 +86,30 @@ fn admission_text() -> String {
     text
 }
 
-/// The placement stride and whole-cache figures the placement plan charges.
+/// The placement cache charge for a whole model and for one card of an even split.
 fn placement_text() -> String {
     let mut text = String::new();
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).expect("real shape");
-    let stride = placement::kv_layer_stride_bytes(&shape).unwrap();
-    let _ = writeln!(text, "stride_bytes={stride}");
-    for capacity in [16_384usize, 45_056] {
-        let bytes = placement::kv_cache_bytes(&shape, 40, capacity).unwrap();
-        let _ = writeln!(text, "layers 40 capacity {capacity} kv_cache_bytes={bytes}");
+    let dims = dims();
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
+    for cards in [1, 2] {
+        let table = ShardTable::new(&dims.shape, cards, 256).unwrap();
+        for capacity in [16_384, 45_056] {
+            let req = PlacementRequest {
+                dims: &dims,
+                inventory: &inventory,
+                quant: GgufType::Q4K,
+                kv_mode: KvMode::Int8G32,
+                kv_capacity_rows: capacity,
+                delta_slots: 1,
+                profiles: &[],
+                policy: &PlacementPolicy::default(),
+            };
+            let bytes = req.kv_bytes(&table, 0).unwrap();
+            let _ = writeln!(
+                text,
+                "cards {cards} capacity {capacity} card_0_kv_bytes={bytes}"
+            );
+        }
     }
     text
 }

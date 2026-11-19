@@ -10,6 +10,8 @@
 //! evidence class behind its choice; no estimate here is ever labeled a
 //! measurement.
 
+use super::dims::{KvMode, StepDims};
+use super::state_layout::{DeltaPool, KvPool};
 use crate::EngError;
 use crate::family::gguf_model::{Inventory, Role};
 use crate::family::qwen36::cuda::shard::{
@@ -20,8 +22,6 @@ use crate::kernels::cuda::peer::DeviceFacts;
 use crate::weights::GgufType;
 
 const MIB: u64 = 1024 * 1024;
-/// Mirrors `state_layout`'s per-region alignment.
-const REGION_ALIGN: u64 = 256;
 
 fn refuse(message: String) -> EngError {
     EngError::BadRequest(format!("multi-GPU placement: {message}"))
@@ -29,10 +29,6 @@ fn refuse(message: String) -> EngError {
 
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / MIB as f64)
-}
-
-fn align_up(value: u64) -> u64 {
-    value.div_ceil(REGION_ALIGN) * REGION_ALIGN
 }
 
 /// What one card offers, as probed (or injected by tests). `free_bytes`
@@ -147,11 +143,11 @@ impl Default for PlacementPolicy {
 /// Everything the planner needs, borrowed. `quant` is the type the file
 /// is planned as; the load-time check owns the file's real types.
 pub(crate) struct PlacementRequest<'a> {
-    pub(crate) shape: &'a HostShape,
+    pub(crate) dims: &'a StepDims,
     pub(crate) inventory: &'a Inventory,
     pub(crate) quant: GgufType,
-    /// KV capacity positions; the Int8G32 cache is the only qualified KV
-    /// layout, so its plane math is what v1 budgets.
+    pub(crate) kv_mode: KvMode,
+    /// Positions reserved in each card's local KV planes.
     pub(crate) kv_capacity_rows: usize,
     /// Delta state slots (one per live sequence plus headroom).
     pub(crate) delta_slots: usize,
@@ -377,45 +373,12 @@ pub(crate) struct PlacementPlan {
 
 // ---- exact byte accounting ------------------------------------------------
 
-/// One full-attention layer's KV stride, `[K | K scales | V | V scales]`,
-/// mirroring `state_layout`'s KvPool math for the Int8G32 layout.
-pub(super) fn kv_layer_stride_bytes(shape: &HostShape) -> Result<u64, EngError> {
-    let attn = &shape.attn;
-    if !attn.head_dim.is_multiple_of(32) {
-        return Err(refuse(format!(
-            "attention head_dim {} has no Int8G32 scale groups",
-            attn.head_dim
-        )));
+impl PlacementRequest<'_> {
+    pub(super) fn kv_bytes(&self, table: &ShardTable, card: usize) -> Result<u64, EngError> {
+        let heads = table.kv_rows(card)?.len() / self.dims.shape.attn.head_dim;
+        let pool = KvPool::new_with_heads(self.dims, self.kv_mode, self.kv_capacity_rows, heads)?;
+        Ok(pool.total as u64)
     }
-    let rows = attn.heads_kv as u64 * attn.head_dim as u64;
-    let scales = rows / 32 * 2;
-    Ok(align_up(rows + scales + rows + scales))
-}
-
-pub(super) fn kv_cache_bytes(
-    shape: &HostShape,
-    layers: usize,
-    capacity: usize,
-) -> Result<u64, EngError> {
-    let stride = kv_layer_stride_bytes(shape)?;
-    stride
-        .checked_mul(layers as u64)
-        .and_then(|v| v.checked_mul(capacity as u64))
-        .ok_or_else(|| refuse("KV cache size overflows u64".to_owned()))
-}
-
-/// The DeltaNet recurrent+conv state pool, FULL-SIZE per card: that is
-/// what ResidentState allocates today (rigs verify this), so that is what
-/// v1 budgets. Mirrors `state_layout`'s DeltaPool math.
-fn delta_state_bytes(shape: &HostShape, layers: usize, slots: usize) -> Result<u64, EngError> {
-    let d = &shape.delta;
-    let rec = (d.value_heads * d.key_dim * d.value_dim) as u64 * 4;
-    let conv = ((d.conv_kernel - 1) * d.conv_dim()) as u64 * 4;
-    let stride = align_up(rec) + align_up(conv);
-    stride
-        .checked_mul(layers as u64)
-        .and_then(|v| v.checked_mul(slots as u64))
-        .ok_or_else(|| refuse("delta state size overflows u64".to_owned()))
 }
 
 /// The type a tensor is planned at: the file quant where the role allows
@@ -474,20 +437,6 @@ fn card_weight_bytes(
         }
     }
     Ok((sliced, replicated, embedding))
-}
-
-/// Layer counts straight from the inventory: the file is the truth.
-fn layer_counts(inventory: &Inventory) -> (usize, usize) {
-    let mut full = 0;
-    let mut delta = 0;
-    for tensor in inventory.tensors() {
-        match tensor.role {
-            Role::AttnK => full += 1,
-            Role::SsmA => delta += 1,
-            _ => {}
-        }
-    }
-    (full, delta)
 }
 
 // ---- run construction -----------------------------------------------------
@@ -756,14 +705,14 @@ fn realize(
     caps: &[u64],
     dim_masses: &[u64; 6],
 ) -> Result<(ShardTable, ShardRuns, Vec<u64>), String> {
-    let dims = dims(req.shape, req.quant.block_elems() as usize);
+    let dims = dims(&req.dims.shape, req.quant.block_elems() as usize);
     let mut counts: Vec<Vec<usize>> = Vec::with_capacity(dims.len());
     for (di, dim) in dims.iter().enumerate() {
         // K/V rows are not dealt independently: the card holding a
         // query group stores, and decodes against, that group's K/V
         // head, so dim 2 always follows dim 1.
         if di == 2 {
-            counts.push(kv_counts_from_q(&counts[1], req.shape.attn.head_dim));
+            counts.push(kv_counts_from_q(&counts[1], req.dims.shape.attn.head_dim));
             continue;
         }
         let blocks = dim.total / dim.block;
@@ -789,7 +738,7 @@ fn realize(
             &counts[0], &counts[1], &counts[2], &counts[3], &counts[4], &counts[5],
         ];
         let runs = runs_from_counts(refs);
-        let table = ShardTable::from_runs(req.shape, req.quant.block_elems() as usize, &runs)
+        let table = ShardTable::from_runs(&req.dims.shape, req.quant.block_elems() as usize, &runs)
             .map_err(|e| format!("runs rejected: {e:?}"))?;
         let sliced: Vec<u64> = (0..cand.shares.len())
             .map(|card| {
@@ -797,20 +746,31 @@ fn realize(
             })
             .collect::<Result<_, _>>()
             .map_err(|e| format!("accounting failed: {e:?}"))?;
-        let over = (0..sliced.len())
-            .filter(|&i| sliced[i] > caps[i])
-            .max_by_key(|&i| sliced[i].saturating_sub(caps[i]));
+        let used: Vec<u64> = sliced
+            .iter()
+            .enumerate()
+            .map(|(card, bytes)| {
+                let kv = req.kv_bytes(&table, card)?;
+                bytes
+                    .checked_add(kv)
+                    .ok_or_else(|| refuse("sliced weights and KV overflow".into()))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("accounting failed: {e:?}"))?;
+        let over = (0..used.len())
+            .filter(|&i| used[i] > caps[i])
+            .max_by_key(|&i| used[i] - caps[i]);
         let Some(over) = over else {
             return Ok((table, runs, sliced));
         };
-        let slack = |i: usize| caps[i].saturating_sub(sliced[i]);
+        let slack = |i: usize| caps[i].saturating_sub(used[i]);
         let recipient = (0..sliced.len())
             .filter(|&i| i != over)
             .max_by_key(|&i| slack(i));
         let Some(recipient) = recipient else {
             return Err(format!(
                 "card {over} exceeds its budget by {} and no card has slack",
-                mib(sliced[over] - caps[over])
+                mib(used[over] - caps[over])
             ));
         };
         // Shed from the fattest dim where the card has more than one grain.
@@ -828,7 +788,7 @@ fn realize(
                 counts[di][over] -= dims[di].block;
                 counts[di][recipient] += dims[di].block;
                 if di == 1 {
-                    counts[2] = kv_counts_from_q(&counts[1], req.shape.attn.head_dim);
+                    counts[2] = kv_counts_from_q(&counts[1], req.dims.shape.attn.head_dim);
                 }
                 moved = true;
                 break;
@@ -837,7 +797,7 @@ fn realize(
         if !moved {
             return Err(format!(
                 "card {over} exceeds its budget by {} and every dim is at one grain",
-                mib(sliced[over] - caps[over])
+                mib(used[over] - caps[over])
             ));
         }
     }
@@ -878,17 +838,15 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
             }
         }
     }
-    let (full_layers, delta_layers) = layer_counts(req.inventory);
-    if full_layers + delta_layers == 0 {
+    if req.dims.shape.kinds.is_empty() {
         return Err(refuse("the inventory holds no layers".to_owned()));
     }
-    let kv = kv_cache_bytes(req.shape, full_layers, req.kv_capacity_rows)?;
-    let delta = delta_state_bytes(req.shape, delta_layers, req.delta_slots)?;
+    let delta = DeltaPool::new(req.dims, req.delta_slots)?.total as u64;
 
-    // Per-card budgets for sliced weights: free minus every fixed cost,
+    // Per-card budgets for sliced weights and local KV: free minus the fixed costs,
     // the reserve, and card 0's embedding. The even table is only the
     // accounting reference here.
-    let even_table = ShardTable::new(req.shape, n, req.quant.block_elems() as usize)?;
+    let even_table = ShardTable::new(&req.dims.shape, n, req.quant.block_elems() as usize)?;
     let per_card: Vec<(u64, u64, u64)> = (0..n)
         .map(|card| card_weight_bytes(&even_table, req.inventory, req.quant, card))
         .collect::<Result<_, EngError>>()?;
@@ -897,7 +855,6 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
             let (_, replicated, embed) = per_card[i];
             profiles[i].free_bytes.saturating_sub(
                 replicated
-                    + kv
                     + delta
                     + req.policy.cuda_overhead_bytes
                     + req.policy.safety_reserve_bytes
@@ -908,12 +865,11 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
     for i in 0..n {
         if caps[i] == 0 {
             return Err(refuse(format!(
-                "device {} ({}) has no room for sliced weights: free {} against replicated {} + KV {} + delta {} + overhead {} + reserve {}{}",
+                "device {} ({}) has no room for sliced weights: free {} against replicated {} + delta {} + overhead {} + reserve {}{}",
                 profiles[i].device,
                 profiles[i].name,
                 mib(profiles[i].free_bytes),
                 mib(per_card[i].1),
-                mib(kv),
                 mib(delta),
                 mib(req.policy.cuda_overhead_bytes),
                 mib(req.policy.safety_reserve_bytes),
@@ -945,6 +901,13 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
         dim_masses[di] += bytes;
     }
 
+    // Seed bandwidth shares with the even deal's KV cost. Rounding and repair
+    // can change KV ownership, so each realized table is checked again below.
+    let weight_caps = caps
+        .iter()
+        .enumerate()
+        .map(|(card, cap)| Ok(cap.saturating_sub(req.kv_bytes(&even_table, card)?)))
+        .collect::<Result<Vec<_>, EngError>>()?;
     let bw: Vec<u64> = profiles.iter().map(|p| p.memory_bandwidth_bytes).collect();
     let mut refusals: Vec<String> = Vec::new();
     let mut chosen: Option<(Candidate, ShardTable, ShardRuns, Vec<u64>, String)> = None;
@@ -957,14 +920,12 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
         };
         let (table, runs, sliced) = realize(req, &cand, &caps, &dim_masses).map_err(refuse)?;
         let reason = "single card: whole ranges, no placement decision to make".to_owned();
-        return Ok(finish(
-            req, cand, table, runs, sliced, kv, delta, reason, refusals,
-        ));
+        return finish(req, cand, table, runs, sliced, delta, reason, refusals);
     }
 
     let indistinguishable = bw.iter().all(|b| *b == bw[0]);
     if !indistinguishable {
-        if let Some((shares, clamped)) = waterfill(&caps, mass, &bw) {
+        if let Some((shares, clamped)) = waterfill(&weight_caps, mass, &bw) {
             let cand = Candidate {
                 name: "bandwidth-waterfill",
                 shares,
@@ -1053,9 +1014,7 @@ pub(crate) fn plan_placement(req: &PlacementRequest) -> Result<PlacementPlan, En
             refusals.join(" | ")
         )));
     };
-    Ok(finish(
-        req, cand, table, runs, sliced, kv, delta, reason, refusals,
-    ))
+    finish(req, cand, table, runs, sliced, delta, reason, refusals)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,16 +1024,15 @@ fn finish(
     table: ShardTable,
     runs: ShardRuns,
     sliced: Vec<u64>,
-    kv: u64,
     delta: u64,
     reason: String,
     refusals: Vec<String>,
-) -> PlacementPlan {
+) -> Result<PlacementPlan, EngError> {
     let total_sliced: u64 = sliced.iter().sum();
     let cards: Vec<CardCommitment> = (0..req.profiles.len())
         .map(|i| {
-            let (s, r, e) =
-                card_weight_bytes(&table, req.inventory, req.quant, i).unwrap_or((0, 0, 0));
+            let (s, r, e) = card_weight_bytes(&table, req.inventory, req.quant, i)?;
+            let kv = req.kv_bytes(&table, i)?;
             let planned = s + r + e + kv + delta + req.policy.cuda_overhead_bytes;
             // A card is capacity-clamped when waterfill clamped it OR its
             // realized share came in below the candidate's target: repair
@@ -1086,7 +1044,7 @@ fn finish(
             };
             let clamped = cand.clamped.get(i).copied().unwrap_or(false)
                 || (cand.shares.len() > 1 && realized < cand.shares[i] - 1e-9);
-            CardCommitment {
+            Ok(CardCommitment {
                 device: req.profiles[i].device,
                 name: req.profiles[i].name.clone(),
                 free_bytes: req.profiles[i].free_bytes,
@@ -1106,9 +1064,9 @@ fn finish(
                 },
                 clamped,
                 peer_access: req.profiles[i].can_access.clone(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, EngError>>()?;
     // Dims whose realized split deviates from the candidate's target
     // beyond rounding: the legal grain (quantization blocks, the decode
     // kernel's whole 8-head query groups) — not bandwidth — fixed the
@@ -1117,7 +1075,7 @@ fn finish(
     // of share is far beyond any block rounding the fine-grained dims can
     // produce, and well inside the 0.18 a forced two-group 50/50 sits from
     // a 0.68 bandwidth target.
-    let dims = dims(req.shape, req.quant.block_elems() as usize);
+    let dims = dims(&req.dims.shape, req.quant.block_elems() as usize);
     let run_lens: [Vec<usize>; 6] = [
         runs.value_heads.iter().map(|r| r.len()).collect(),
         runs.query_heads.iter().map(|r| r.len()).collect(),
@@ -1169,9 +1127,9 @@ fn finish(
         policy_cuda_overhead_bytes: req.policy.cuda_overhead_bytes,
         cards,
     };
-    PlacementPlan {
+    Ok(PlacementPlan {
         runs,
         table,
         receipt,
-    }
+    })
 }

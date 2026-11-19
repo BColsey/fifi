@@ -102,7 +102,7 @@ pub(crate) struct DeltaPool {
 }
 
 impl DeltaPool {
-    fn new(dims: &StepDims, slots: usize) -> Result<Self, EngError> {
+    pub(super) fn new(dims: &StepDims, slots: usize) -> Result<Self, EngError> {
         let d = &dims.shape.delta;
         let layers = dims.layers_of(AttentionKind::DeltaNet);
         let rec_values = mul(mul(d.value_heads, d.key_dim)?, d.value_dim)?;
