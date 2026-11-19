@@ -355,13 +355,28 @@ The pinned Flint checkpoint ran with an 8 GiB ceiling, request-sized prefill, an
 
 With the 448 MiB prefix reserve and compact KV, the follow-up reused 517 of 526 prompt tokens. The priming and follow-up jobs both used regular prefill with pair mode enabled.
 
-The cancellation run closed the stream after the first routed-layer event for the 514-token request. It returned zero completion tokens. The already-started pair ran for 21.42 s and read 10.49 GB of logical expert data across the whole forward. The driver waited for the pair's completion event before sending the follow-up. The follow-up matched the 514-token control and used the same paired widths. Polling cancellation between safe layer boundaries would reduce this trailing work. [Thirteen responses and cancellation timing](../../scripts/benchmarks/mac-m4-flint-prefill-pair-boundaries.csv)
+The original boundary sweep also closed the 514-token stream during prefill. The worker finished the entire pair before the next job ran. [Thirteen responses and original cancellation timing](../../scripts/benchmarks/mac-m4-flint-prefill-pair-boundaries.csv)
+
+`FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR=1` checks for cancellation between layers of an admitted pair. Each routed stage finishes its GPU outputs and releases its expert pages before the next check. The worker discards the partial session without committing prompt history or decoding.
+
+A follow-up comparison on the same 16 GB M4 mini used an 8 GiB ceiling and the shared-stage path for the 514-token request. After the first routed-layer event, the driver closed the stream and waited for both HTTP cancellation and the terminal paired-forward record. Both streams returned zero completion tokens. The time and reads below cover the entire interrupted forward, including work before the disconnect.
+
+| Layer check | Layers finished | Pair wall time | Logical expert reads | Process-attributed SSD reads |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 49 | 21.83 s | 10.49 GB | 10.67 GB |
+| On | 4 | 0.97 s | 0.31 GB | 0.32 GB |
+
+The layer check cut logical expert reads by 97% in this comparison. All four complete responses, including the two submitted after disconnect, matched in sampled tokens and response hash. The measurements cover one disconnect per arm. The check is opt-in. [Six request and disconnect records](../../scripts/benchmarks/mac-m4-flint-prefill-pair-cancellation.csv)
 
 Run the Apple Silicon release server built with `native-mlx,native-fault-qualification` and supply the pinned checkpoint and [process I/O counter](mac-flint-expert-pipeline.md#reproduce).
 
 ```sh
 python3 scripts/mac_cache_study/flint_prefill_pair_boundaries.py \
   "$ENGINESRV" "$FLINT_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/flint-pair-boundaries"
+
+python3 scripts/mac_cache_study/flint_prefill_pair_boundaries.py \
+  "$ENGINESRV" "$FLINT_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/flint-pair-cancellation" \
+  --cancellation-only
 ```
 
 ## Expert-major storage probe
