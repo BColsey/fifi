@@ -833,6 +833,21 @@ pub(crate) struct SnapshotBudget<'a, S> {
     pub(crate) size: &'a dyn Fn(&S) -> u64,
 }
 
+/// What `reserve_tip` did to make a budgeted tip fit. Counters are deferred:
+/// the replacement counts only after the read-back succeeded (`save_charged`);
+/// a failed read-back counts the spent entry as a plain drop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TipReserve {
+    /// The budget refused the save; nothing changed.
+    Refused,
+    /// The restored ancestor was retired to fit the new tip.
+    SpentAncestor,
+    /// Another entry was retired for the slot or the bytes.
+    SpentOther,
+    /// Nothing needed retiring.
+    Kept,
+}
+
 impl<S> SnapshotBudget<'_, S> {
     fn remaining_after<'a>(&self, mut snapshots: impl Iterator<Item = &'a S>) -> Option<u64>
     where
@@ -952,8 +967,9 @@ impl<S, P> PrefixStore<S, P> {
         self.shadow
     }
 
-    /// Every stored state, roots first, each list from the least to the most recently used. The
-    /// store never sizes a state: the executor sums the charge of its own snapshots.
+    /// Every stored state, roots first, each list from the least to the most recently used.
+    /// The store never sizes a state itself: the executor sums the charge of its own
+    /// snapshots, and a save budget sizes them through its `size` function.
     pub(crate) fn snapshots(&self) -> impl Iterator<Item = &S> {
         self.roots
             .iter()
@@ -1059,12 +1075,21 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
             }
             return Ok(done);
         }
-        if let Some(budget) = &budget
-            && (budget.incoming > budget.limit
-                || (kind == SaveKind::Tip && !self.reserve_tip(key, budget)))
-        {
-            self.save_refusals += 1;
-            return Ok(false);
+        let mut tip_reserve: Option<TipReserve> = None;
+        if let Some(budget) = &budget {
+            if budget.incoming > budget.limit {
+                self.save_refusals += 1;
+                return Ok(false);
+            }
+            if kind == SaveKind::Tip {
+                match self.reserve_tip(key, budget) {
+                    TipReserve::Refused => {
+                        self.save_refusals += 1;
+                        return Ok(false);
+                    }
+                    reserved => tip_reserve = Some(reserved),
+                }
+            }
         }
         // (b) An entry with the same key and another path is replaced.
         let other_path =
@@ -1174,6 +1199,11 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                             if self.drop_restored_ancestor(key) {
                                 self.restored_replaces += 1;
                             }
+                            match tip_reserve {
+                                Some(TipReserve::SpentAncestor) => self.restored_replaces += 1,
+                                Some(TipReserve::SpentOther) => self.room_removals += 1,
+                                _ => {}
+                            }
                         }
                     }
                     return Ok(true);
@@ -1197,11 +1227,28 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                     }
                     None => {
                         self.save_refusals += 1; // no victim is left
+                        self.account_failed_tip_reserve(tip_reserve);
                         return Ok(false);
                     }
                 },
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.account_failed_tip_reserve(tip_reserve);
+                    return Err(error);
+                }
             }
+        }
+    }
+
+    /// A read-back that failed after the reserve step spent an entry leaves the store with
+    /// no replacement for it: the spend counts as a plain drop, so the request's prefix
+    /// report shows a `room_removals` rise with no new entry, and its next restore is a
+    /// cold prefill.
+    fn account_failed_tip_reserve(&mut self, tip_reserve: Option<TipReserve>) {
+        match tip_reserve {
+            Some(TipReserve::SpentAncestor) | Some(TipReserve::SpentOther) => {
+                self.room_removals += 1;
+            }
+            _ => {}
         }
     }
 
@@ -1389,15 +1436,23 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     }
 
     /// Choose space for a budgeted tip without evicting a warm conversation on a byte refusal.
-    fn reserve_tip(&mut self, key: &[u32], budget: &SnapshotBudget<'_, S>) -> bool {
+    /// May retire one entry — the restored ancestor (an extension under a one-snapshot budget
+    /// gives up the old tip before the new one is secured) or, when a slot is needed, a
+    /// victim — but takes no counter: `save_charged` counts a replacement only after the
+    /// read-back succeeded, and counts the retire as a plain drop when it failed.
+    fn reserve_tip(&mut self, key: &[u32], budget: &SnapshotBudget<'_, S>) -> TipReserve {
         let ancestor = self.restored_tip_ancestor(key);
         // A same-key entry here has another path (duplicate uses already returned), so
         // the normal path replacement will free its slot before the snapshot.
         let needs_slot = self.lru.len() >= self.limits.entries
             && !self.lru.iter().any(|stored| stored.saved.key == key);
         let victim = if needs_slot {
+            // The ancestor is spent first even without protect_recent_longer: spending the
+            // superseded tip is the only choice that can never evict a warm conversation to
+            // fit an over-budget tip (an unprotected entry is the fallback when there is no
+            // ancestor to spend).
             let Some(pos) = ancestor.or_else(|| self.first_unprotected(key.len())) else {
-                return false;
+                return TipReserve::Refused;
             };
             Some(pos)
         } else {
@@ -1411,19 +1466,18 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
             .filter(|stored| Some(stored.id) != victim_id && stored.saved.key != key)
             .map(|stored| &stored.saved.state);
         let Some(remaining) = budget.remaining_after(survivors) else {
-            return false;
+            return TipReserve::Refused;
         };
         if let Some(pos) = victim
             && (needs_slot || (budget.size)(&self.lru[pos].saved.state) > remaining)
         {
             self.lru.remove(pos);
             if Some(pos) == ancestor {
-                self.restored_replaces += 1;
-            } else {
-                self.room_removals += 1;
+                return TipReserve::SpentAncestor;
             }
+            return TipReserve::SpentOther;
         }
-        true
+        TipReserve::Kept
     }
 
     /// The restore candidates for `prompt` under `path`: every stored entry whose path equals
@@ -2939,6 +2993,109 @@ mod tests {
                 .unwrap(),
             a.len()
         );
+    }
+
+    #[test]
+    fn a_failed_read_back_after_the_reserve_counts_the_spend_as_a_drop() {
+        use std::rc::Rc;
+
+        let mut store = PrefixStore::with_limits(StoreLimits {
+            roots: 0,
+            entries: 2,
+        });
+        let a = [1, 2, 3, 4];
+        let b = [5, 6];
+        let old = Rc::new(());
+        let ancestor = Rc::downgrade(&old);
+        store
+            .save(&b, 6, 1, SaveKind::Tip, &mut || Ok((3_u64, Rc::new(()))))
+            .unwrap();
+        store
+            .save(&a[..3], 3, 1, SaveKind::Tip, &mut || {
+                Ok((2, Rc::clone(&old)))
+            })
+            .unwrap();
+        drop(old);
+
+        let size = |s: &(u64, Rc<()>)| s.0;
+        let mut row = DecodeSession::default();
+        assert_eq!(
+            row.restore_prefix(&mut store, &a, 1, |_| Ok(())).unwrap(),
+            3
+        );
+        row.prefill(&mut Fake::new(), &a[3..], LIMIT).unwrap();
+        // incoming 2 spends the ancestor's 2 bytes to fit beside B's 3 (limit 5);
+        // the read-back then fails after the spend.
+        let failed = row
+            .save_prefix_budgeted(
+                &mut store,
+                &a,
+                1,
+                a.len() - 1,
+                SaveKind::Tip,
+                SnapshotBudget {
+                    limit: 5,
+                    incoming: 2,
+                    size: &size,
+                },
+                || Err(EngError::Checkpoint("read-back failed".to_string())),
+            )
+            .unwrap_err();
+        assert!(matches!(failed, EngError::Checkpoint(_)), "{failed:?}");
+        // The spend counts as a plain drop; no replacement is recorded.
+        assert_eq!(store.save_side_totals().room_removals, 1);
+        assert_eq!(store.save_side_totals().restored_replaces, 0);
+        // The ancestor is gone and nothing dangles beside B.
+        assert!(ancestor.upgrade().is_none());
+        assert_eq!(store.snapshots().count(), 1);
+        // The next restore of A's lineage is a cold prefill: nothing matches.
+        assert_eq!(
+            row.restore_prefix(&mut store, &a, 1, |_| Ok(())).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_budget_refusal_of_a_block_root_or_periodic_save_takes_no_snapshot() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 2,
+            entries: 1,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Root, &mut || Ok(6_u64))
+            .unwrap();
+        slot.save(&[2], 2, 1, SaveKind::Root, &mut || Ok(6))
+            .unwrap();
+        slot.save(&[3], 3, 1, SaveKind::Periodic, &mut || Ok(4))
+            .unwrap();
+        // incoming 6 with 12+ bytes of roots beside the entry: every non-tip
+        // kind must refuse at the budget gate, before any read-back.
+        for kind in [SaveKind::Block, SaveKind::Periodic] {
+            let budget = SnapshotBudget {
+                limit: 10,
+                incoming: 6,
+                size: &|bytes| *bytes,
+            };
+            let saved = slot
+                .save_charged(&[4], 4, 1, kind, Some(budget), &mut || {
+                    panic!("a refused {kind:?} save must not read back")
+                })
+                .unwrap();
+            assert!(!saved, "{kind:?}");
+        }
+        let budget = SnapshotBudget {
+            limit: 10,
+            incoming: 6,
+            size: &|bytes| *bytes,
+        };
+        assert!(
+            !slot
+                .save_charged(&[5], 5, 1, SaveKind::Root, Some(budget), &mut || {
+                    panic!("a refused Root save must not read back")
+                })
+                .unwrap()
+        );
+        assert!(slot.snapshots().count() <= 3);
+        assert_eq!(slot.save_side_totals().save_refusals, 3);
     }
 
     #[test]
