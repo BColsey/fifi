@@ -198,6 +198,12 @@ On NVIDIA CUDA:
 
 The startup line reports `alloc_cache=`, `late_health=`, `token_health=`, `packed_pointwise=`, `grouped_gather=`, `q8_tiled=`, `kv_device_f16=` and `fused_publish=` (the q8-tile route resolves off on f16 engines). When armed it also ends with `alloc_return=lazy`.
 
+## Nemotron 3.5 on Apple Silicon
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_NEM35_CPU_NEON` | off | Set to `1` to use the Arm NEON NVFP4 dot product in the mapped CPU expert pool on Apple Silicon. The pool reads it at construction. [Mapped expert profiling](../how-to/nemotron.md#profile-mapped-experts-on-apple-silicon) |
+
 ## Nemotron 3.5 on NVIDIA CUDA
 
 Nemotron serves greedy requests only on CUDA (sampled requests are refused). These switches select kernels and diagnostics; all default off unless noted:

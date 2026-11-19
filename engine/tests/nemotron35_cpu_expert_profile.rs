@@ -1,9 +1,6 @@
 //! Opt-in benchmark of the production mapped NVFP4 expert pool.
 
-use inference_engine::{
-    family::nemotron35::runner::{CpuLayerTiming, time_cpu_experts},
-    kernels::nvfp4_cpu::Isa,
-};
+use inference_engine::family::nemotron35::runner::{CpuLayerTiming, time_cpu_experts};
 use std::{env, path::PathBuf, process::Command};
 
 #[test]
@@ -43,7 +40,7 @@ fn profile_pinned_nemotron_mapped_experts() {
             "layer": timing.layer,
             "threads": threads,
             "samples": timing.warm_ms.len(),
-            "isa": format!("{:?}", Isa::detect()),
+            "isa": format!("{:?}", timing.isa),
             "first_ms": timing.first.as_secs_f64() * 1e3,
             "p50_ms": timing.p50_ms(),
             "p90_ms": timing.p90_ms(),
