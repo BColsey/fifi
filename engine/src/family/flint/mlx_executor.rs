@@ -1,7 +1,8 @@
 //! Worker adapter. Shared DecodeSession owns EOS, sampling, cancellation and token publication.
 
 use super::{
-    factory::context_limit,
+    factory::{PrefillPairPolicy, context_limit, prefill_pair_policy},
+    mlx_forward::{PairPlan, PairStaging},
     mlx_model::{Model, expert_staging_bytes},
     mlx_state::PrefixSnapshot,
     mlx_state::State,
@@ -42,7 +43,7 @@ pub(super) struct FlintExecutor {
     mlx_plan: MlxExecutionPlan,
     request_sized_kv: bool,
     request_prefill: bool,
-    prefill_pair: bool,
+    prefill_pair: PrefillPairPolicy,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -92,7 +93,7 @@ impl FlintSession {
 pub(super) struct Step<'a> {
     model: &'a mut Model,
     state: &'a mut State,
-    pair_split: Option<usize>,
+    pair: Option<PairPlan>,
 }
 
 impl<'a> Step<'a> {
@@ -100,7 +101,7 @@ impl<'a> Step<'a> {
         Self {
             model,
             state,
-            pair_split: None,
+            pair: None,
         }
     }
 }
@@ -113,8 +114,8 @@ impl TokenStepper for Step<'_> {
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
-        if let Some(split) = self.pair_split {
-            return self.model.prefill_pair(self.state, tokens, split);
+        if let Some(plan) = self.pair {
+            return self.model.prefill_pair(self.state, tokens, plan);
         }
         self.model
             .prefill_rows(self.state, tokens, false)
@@ -219,12 +220,14 @@ impl FlintExecutor {
             && super::factory::request_prefill_enabled(
                 std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref(),
             );
-        let prefill_pair = request_prefill
-            && super::factory::prefill_pair_enabled(
-                std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR").as_deref(),
-            )
+        let prefill_pair = if request_prefill
             && model.streamed_expert_bytes != 0
-            && super::mlx_model::expert_pipeline_flagged();
+            && super::mlx_model::expert_pipeline_flagged()
+        {
+            prefill_pair_policy(std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR").as_deref())
+        } else {
+            PrefillPairPolicy::Off
+        };
         let mlx_plan = MlxExecutionPlan::new(
             placement,
             placement_reason,
@@ -344,38 +347,81 @@ fn fitting_prefill_piece(
     Ok(rows.unwrap_or(1) as usize)
 }
 
-fn pair_workspace(first: u32, second: u32, per_expert: u64) -> u64 {
+fn pair_workspace(first: u32, second: u32, per_expert: u64, staging: PairStaging) -> u64 {
     let (first, second) = (u64::from(first), u64::from(second));
     let total = first + second;
     // Price both attention workspaces, one maximally populated stage, and
     // the hidden, projection and routed-pair buffers across both pieces.
     let scores = 3 * 32 * 4 * (first * first + second * total);
-    scores + expert_staging_bytes(per_expert, 1024) + 32 * total * 2048 * 2
+    let stage = 2 * per_expert * staging.slots() as u64;
+    // Waves keep projected pairs while concatenating outputs and restoring rank order.
+    let restore = match staging {
+        PairStaging::Shared => 0,
+        PairStaging::Waves64 => 12 * total * 2048 * 2 + (256 << 10),
+    };
+    scores + stage + 32 * total * 2048 * 2 + restore
 }
 
-fn admitted_pair_split(
+fn admitted_pair_plan(
     prompt_rows: usize,
     first_piece: usize,
     remaining_bytes: u64,
     per_expert: u64,
-) -> Option<usize> {
+    policy: PrefillPairPolicy,
+) -> Option<PairPlan> {
     let second = prompt_rows.checked_sub(first_piece)?;
     if !(3..=1024).contains(&first_piece) || !(2..=first_piece).contains(&second) {
         return None;
     }
     let split = first_piece - 1;
-    (pair_workspace(split as u32, second as u32, per_expert) <= remaining_bytes).then_some(split)
+    let candidates: &[PairStaging] = match policy {
+        PrefillPairPolicy::Off => &[],
+        PrefillPairPolicy::Shared => &[PairStaging::Shared],
+        PrefillPairPolicy::Auto => &[PairStaging::Shared, PairStaging::Waves64],
+        PrefillPairPolicy::Waves64 => &[PairStaging::Waves64],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|&staging| {
+            pair_workspace(split as u32, second as u32, per_expert, staging) <= remaining_bytes
+        })
+        .map(|staging| PairPlan { split, staging })
 }
 
 #[test]
 fn prefill_pair_admission_accounts_for_both_pieces_before_mutation() {
     let expert = 1_769_472;
-    let budget = pair_workspace(1023, 1017, expert);
-    assert_eq!(admitted_pair_split(2041, 1024, budget, expert), Some(1023));
-    assert_eq!(admitted_pair_split(2041, 1024, budget - 1, expert), None);
-    assert_eq!(admitted_pair_split(2049, 1024, u64::MAX, expert), None);
-    assert_eq!(admitted_pair_split(1025, 1024, u64::MAX, expert), None);
-    assert_eq!(admitted_pair_split(2, 1024, u64::MAX, expert), None);
+    let shared = pair_workspace(1023, 1017, expert, PairStaging::Shared);
+    let waves = pair_workspace(1023, 1017, expert, PairStaging::Waves64);
+    let plan = |budget, policy| admitted_pair_plan(2041, 1024, budget, expert, policy);
+    assert_eq!(
+        plan(shared, PrefillPairPolicy::Auto),
+        Some(PairPlan {
+            split: 1023,
+            staging: PairStaging::Shared
+        }),
+    );
+    assert_eq!(
+        plan(waves, PrefillPairPolicy::Auto),
+        Some(PairPlan {
+            split: 1023,
+            staging: PairStaging::Waves64
+        }),
+    );
+    assert_eq!(plan(waves - 1, PrefillPairPolicy::Auto), None);
+    assert_eq!(plan(shared - 1, PrefillPairPolicy::Shared), None);
+    assert_eq!(
+        plan(u64::MAX, PrefillPairPolicy::Waves64).unwrap().staging,
+        PairStaging::Waves64
+    );
+    assert_eq!(plan(u64::MAX, PrefillPairPolicy::Off), None);
+    for rows in [2, 1025, 2049] {
+        assert_eq!(
+            admitted_pair_plan(rows, 1024, u64::MAX, expert, PrefillPairPolicy::Auto),
+            None
+        );
+    }
 }
 
 fn device_session_charges(retention_cap: u64) -> Result<[(&'static str, u64); 5]> {
@@ -640,7 +686,7 @@ impl ExecutorOps for FlintExecutor {
         has_prefix_boundary: bool,
     ) -> Result<()> {
         self.reset(st)?;
-        st.prefill_pair = self.prefill_pair && !has_prefix_boundary;
+        st.prefill_pair = self.prefill_pair != PrefillPairPolicy::Off && !has_prefix_boundary;
         if self.request_prefill {
             let mut rows = self.prefill_piece;
             // Prefix snapshots keep their established chunk tiling.
@@ -689,11 +735,12 @@ impl ExecutorOps for FlintExecutor {
         if first_piece != piece.get() {
             return Ok(false);
         }
-        let Some(split) = admitted_pair_split(
+        let Some(plan) = admitted_pair_plan(
             tokens.len(),
             first_piece,
             memory.remaining_bytes,
             self.model.streamed_expert_bytes,
+            self.prefill_pair,
         ) else {
             return Ok(false);
         };
@@ -703,7 +750,7 @@ impl ExecutorOps for FlintExecutor {
             &mut Step {
                 model: &mut self.model,
                 state: &mut st.state,
-                pair_split: Some(split),
+                pair: Some(plan),
             },
             tokens,
             context_limit() as usize,

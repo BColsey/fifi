@@ -34,6 +34,7 @@ type Result<T> = std::result::Result<T, EngError>;
 
 #[path = "mlx_prefill_pair.rs"]
 mod prefill_pair;
+pub(super) use prefill_pair::{PairPlan, PairStaging};
 
 /// pp attribution probe (test builds): under FLINT_QUAL_STAGE_SYNC, fence
 /// `tensor` (evaluate + synchronize) so the enclosing span's elapsed time

@@ -314,6 +314,33 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --prefill-pair --expert-timing --working-set-mib 8192 --pairs 2
 ```
 
+### Bounded expert waves in Flint serving
+
+`FIFI_FLINT_MLX_PREFILL_PAIR=auto` first checks admission for a single shared stage. If that charge exceeds the remaining workspace, it prices a 64-expert stage plus the buffers that restore the routed outputs to their original order. The worker falls back to separate pieces if neither charge fits. The `1` setting requests the single stage. The `waves64` setting requests waves directly for comparisons at a ceiling that fits both.
+
+Each wave loads the next group from the sorted union of both pieces' expert IDs, then projects both pieces' pairs that selected those experts. The stage retires before the next read. The worker restores every projected pair to its original token and rank before the existing weighted reduction. The layer fixture exercises this same wave implementation with the real sliding-window and full-attention weights.
+
+The tight comparison uses the 557-token prompt at 4,000 MiB with `1` and `auto`. It checks that the single-stage request runs separately and that `auto` selects waves. The wide comparison uses the 557- and 2,041-token prompts at 8 GiB with `1` and `waves64`. Both comparisons use the original piece widths, check output hashes and sampled tokens, and report the largest actual expert staging mapping separately from the process footprint.
+
+At 4,000 MiB the mini reported 1.058 GB of remaining workspace. The two-piece plan charged 1.089 GB for the single stage and 0.437 GB for waves. All four requests matched the output hash and 24 sampled token IDs. The wave path used a peak staging mapping of 108.02 MiB. Logical expert reads fell from 28.06 to 19.35 GB, and slice reads fell from 40,392 to 14,904.
+
+| Budget and prompt | Control | First token, control → waves | Attributed SSD reads | Peak footprint | Decode forward p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4,000 MiB, 557 tokens | Separate stages | 22.27 → 14.63 s | 35.83 → 26.65 GB | 2.151 → 1.877 GB | 624 → 634 ms |
+| 8 GiB, 557 tokens | One shared stage | 13.82 → 14.51 s | 26.51 → 26.71 GB | 2.192 → 1.875 GB | 614 → 620 ms |
+| 8 GiB, 2,041 tokens | One shared stage | 15.74 → 17.82 s | 27.00 → 26.96 GB | 2.327 → 1.875 GB | 606 → 606 ms |
+
+Each row reports medians from two pairs with alternating control and wave order. Each arm starts a fresh server, and the operating system retains its file cache. In the 8 GiB arms the server handles the 557-token prompt before the 2,041-token prompt, so its lifetime peak footprint includes the earlier request. All 12 requests matched the control output hash and all 24 sampled token IDs for their prompt. Both arms at 8 GiB read the same logical bytes for each prompt. Waves cut the peak staging mapping from about 407–427 MiB to 108 MiB and increased prefill slice reads by 8% and 15% on the two prompts. Time to first token rose by 5% and 13% at 8 GiB. The `auto` policy keeps the faster single stage when that plan fits. [Serving and smoke measurements](../../scripts/benchmarks/mac-m4-flint-prefill-waves-serving.csv)
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/prefill-waves-tight" \
+  --prefill-pair-waves tight --expert-timing --working-set-mib 4000 --pairs 2
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/prefill-waves-wide" \
+  --prefill-pair-waves wide --expert-timing --working-set-mib 8192 --pairs 2
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
