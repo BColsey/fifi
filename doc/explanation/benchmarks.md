@@ -34,6 +34,10 @@ Against MLX-LM 0.32.2 (mlx 0.32.4, `--prompt-cache`), the same 12 turns:
 The MLX-LM run with its default cache failed on the twelfth turn, so its sum covers 11 turns.
 About half of fifi's decode gap to MLX-LM comes from the 8-bit KV cache; the rest is kernel time per step.
 
+## Qwen3.6 on a standalone RTX 2080 Ti (11 GB)
+
+With Qwen3.6-35B-A3B Q4_K_M, Q8 KV and one saved conversation, a 65,351-token prompt took 834.27 seconds to first token. An immediate repeat reused 65,344 tokens and took 0.87 seconds. After a different conversation displaced the checkpoint, the original prompt took 836.37 seconds. Each figure is one observation. Separate 128-token counting continuations decoded at 80.19 tokens/s near 2K and 66.77 tokens/s near 64K. [Workload and measurements](https://github.com/zbrdc/fifi/pull/89)
+
 ## Qwen3.6 on an RTX 3090 (24 GB)
 
 Against llama.cpp (8-bit KV cache, `-ub 1024`), same GGUF file, 131,072-token context:
