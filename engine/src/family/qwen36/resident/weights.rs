@@ -8,6 +8,7 @@
 //! engine. The embedding table stays in the checkpoint; the token start reads one row per token.
 
 use super::super::settings::{Activation, scale_pairing_error};
+use super::dense_stage::DenseStage;
 use super::layout::{
     neg_exp, router_transposed, scalar_gate, split_conv, widen_layout, widen_stack_scales,
     with_f32_scales,
@@ -268,7 +269,14 @@ impl RDense {
 
 pub(super) enum RFeedForward {
     Dense(Box<RDense>),
+    StagedDense(Box<DenseStage>),
     Moe(Box<RMoe>),
+}
+
+impl RFeedForward {
+    pub(super) fn is_dense(&self) -> bool {
+        matches!(self, Self::Dense(_) | Self::StagedDense(_))
+    }
 }
 
 struct MoeFront {
@@ -557,8 +565,8 @@ impl RLayer {
     pub(super) fn as_moe(&self) -> Result<&RMoe, EngError> {
         match &self.feed_forward {
             RFeedForward::Moe(moe) => Ok(moe),
-            RFeedForward::Dense(_) => Err(EngError::BadRequest(
-                "dense execution is not implemented yet".into(),
+            RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => Err(EngError::BadRequest(
+                "a dense layer has no routed experts".into(),
             )),
         }
     }
@@ -567,6 +575,7 @@ impl RLayer {
 /// Only MoE layers retain sliced stacks for phase 2.
 enum FeedForwardFront {
     Dense(Box<RDense>),
+    StagedDense(Box<DenseStage>),
     Moe {
         front: Box<MoeFront>,
         stacks: Box<[SlicedWeight; 3]>,
@@ -645,17 +654,15 @@ impl ResidentWeights {
         let final_norm = got.plain()?;
         got.finish()?;
         let embed = sliced_of(view.embed)?;
-        let mut fronts = Vec::with_capacity(view.layers.len());
-        for layer in &view.layers {
-            fronts.push(import_layer_front(kernels, layer, &shape, f32_scales)?);
-        }
         drop(view);
-        drop(host);
+        let fronts = host
+            .import_layers(|layer| import_layer_front(kernels, ckpt, layer, &shape, f32_scales))?;
         let consts = Consts::import(kernels, &shape)?;
         let mut layers = Vec::with_capacity(fronts.len());
         for front in fronts {
             let feed_forward = match front.feed_forward {
                 FeedForwardFront::Dense(dense) => RFeedForward::Dense(dense),
+                FeedForwardFront::StagedDense(dense) => RFeedForward::StagedDense(dense),
                 FeedForwardFront::Moe { front, stacks } => {
                     RFeedForward::Moe(Box::new(RMoe::new(*front, *stacks, f32_scales)))
                 }
@@ -762,12 +769,21 @@ impl ResidentWeights {
             .iter()
             .filter_map(|layer| match &layer.feed_forward {
                 RFeedForward::Moe(moe) => moe.disk(),
-                RFeedForward::Dense(_) => None,
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
             })
     }
 
     pub(super) fn streams_experts(&self) -> bool {
         self.disk_layers().next().is_some()
+    }
+
+    pub(super) fn dense_stage_bytes(&self) -> Result<u64, EngError> {
+        self.layers
+            .iter()
+            .try_fold(0u64, |peak, layer| match &layer.feed_forward {
+                RFeedForward::StagedDense(stage) => Ok(peak.max(stage.charge()?)),
+                _ => Ok(peak),
+            })
     }
 
     /// Upper bound for one layer's distinct selected experts. The other
@@ -849,6 +865,7 @@ impl ResidentWeights {
             }
             match &layer.feed_forward {
                 RFeedForward::Dense(dense) => dense.bytes(&mut total)?,
+                RFeedForward::StagedDense(_) => {}
                 RFeedForward::Moe(moe) => moe.bytes(&mut total)?,
             }
         }
@@ -894,6 +911,7 @@ impl ResidentWeights {
                 RFeedForward::Dense(dense) => [&dense.gate, &dense.up, &dense.down]
                     .into_iter()
                     .for_each(&mut visit),
+                RFeedForward::StagedDense(_) => {}
                 RFeedForward::Moe(moe) => {
                     [&moe.shared_gate, &moe.shared_up, &moe.shared_down]
                         .into_iter()
@@ -930,6 +948,7 @@ pub(super) struct ScaleCensus {
 /// Imports the non-expert tensors of one layer with one synchronization.
 fn import_layer_front(
     kernels: &mut MlxKernels,
+    ckpt: &StreamedCheckpoint,
     layer: &LayerW<'_, StoredWeight>,
     shape: &HostShape,
     f32_scales: bool,
@@ -941,7 +960,22 @@ fn import_layer_front(
         MixerW::Delta(w) => RDelta::queue(&mut batch, w, shape)?,
         MixerW::Attn(w) => RAttn::queue(&mut batch, w)?,
     }
+    let staged = match &layer.feed_forward {
+        FeedForwardW::Dense(dense) if matches!(dense.gate, StoredWeight::Sliced(_)) => {
+            Some(DenseStage::new(
+                ckpt,
+                [
+                    sliced_of(dense.gate)?,
+                    sliced_of(dense.up)?,
+                    sliced_of(dense.down)?,
+                ],
+                f32_scales,
+            )?)
+        }
+        _ => None,
+    };
     match &layer.feed_forward {
+        FeedForwardW::Dense(_) if staged.is_some() => {}
         FeedForwardW::Dense(dense) => RDense::queue(&mut batch, dense)?,
         FeedForwardW::Moe(moe) => MoeFront::queue(&mut batch, moe, shape)?,
     }
@@ -952,9 +986,12 @@ fn import_layer_front(
         MixerW::Delta(_) => RMixer::Delta(RDelta::take(&mut got)?),
         MixerW::Attn(_) => RMixer::Attn(RAttn::take(&mut got)?),
     };
-    let feed_forward = match &layer.feed_forward {
-        FeedForwardW::Dense(_) => FeedForwardFront::Dense(Box::new(RDense::take(&mut got)?)),
-        FeedForwardW::Moe(moe) => FeedForwardFront::Moe {
+    let feed_forward = match (&layer.feed_forward, staged) {
+        (FeedForwardW::Dense(_), Some(stage)) => FeedForwardFront::StagedDense(Box::new(stage)),
+        (FeedForwardW::Dense(_), None) => {
+            FeedForwardFront::Dense(Box::new(RDense::take(&mut got)?))
+        }
+        (FeedForwardW::Moe(moe), _) => FeedForwardFront::Moe {
             front: Box::new(MoeFront::take(&mut got)?),
             stacks: Box::new([
                 sliced_of(moe.gate)?,

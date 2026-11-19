@@ -91,6 +91,7 @@ mod decode_timing;
 mod decoder;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod delta;
+mod dense_stage;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
 /// The primitive-histogram diagnostic. `cfg(test)` like `route_parity`:

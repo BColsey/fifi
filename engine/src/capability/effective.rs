@@ -222,6 +222,11 @@ pub(crate) fn q36_effective(
         append_mlx_inputs(&mut rows);
         if !dense {
             rows.push(mlx_switch("mlx_disk_experts", "FIFI_Q36_MLX_DISK_EXPERTS"));
+        } else {
+            rows.push(mlx_switch(
+                "mlx_disk_dense_ffn",
+                "FIFI_Q36_MLX_DISK_DENSE_FFN",
+            ));
         }
     }
     rows

@@ -537,6 +537,10 @@ fn run(
                 skip_add = true;
                 super::super::moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
+            (RFeedForward::StagedDense(stage), _) => {
+                skip_add = true;
+                stage.evaluate(&mut ctx, ckpt, shape, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => {
                 moe::chunk_with_checkpoint(&mut ctx, shape, w, &normed, Some(ckpt))?.0
             }

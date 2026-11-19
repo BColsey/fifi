@@ -47,7 +47,7 @@ cargo test --locked --release --features native-mlx,native-fault-qualification \
 
 The opt-in `FIFI_MLX_EXPERT_READ_RUNS=prefill` groups adjacent selected expert slices during multi-row prefill in disk-backed Flint, Flash-Next and Qwen3.6. It reads the same logical weight bytes and writes them directly into each family's admitted Metal page layout. Qwen's fused gate/up layout uses vectored reads into disjoint slots, with at most 64 destinations per call. F32 scales and biases still widen in the existing destination slots.
 
-The opt-in `FIFI_MLX_OVERLAP_EXPERT_READS=1` submits the independent shared expert to Metal before the CPU stages the same layer's exact routed experts. The layer output depends on both computations. Each family keeps its existing page release point and staging bound. Flint uses its shared-page pipeline when either common option is enabled. Explicit Flint legacy settings can override the common choices. Resident Qwen and Qwen3.8 dense use their resident projections and share the scheduler, KV formats and prefix lifecycle. [Apple Silicon controls](../reference/environment.md#apple-silicon-device-sizing)
+The opt-in `FIFI_MLX_OVERLAP_EXPERT_READS=1` submits the independent shared expert to Metal before the CPU stages the same layer's exact routed experts. The layer output depends on both computations. Each family keeps its existing page release point and staging bound. Flint uses its shared-page pipeline when either common option is enabled. Explicit Flint legacy settings can override the common choices. The Qwen executors share the scheduler, KV formats and prefix lifecycle. Dense Qwen can also stage its feed-forward weights under the device budget. [Apple Silicon controls](../reference/environment.md#apple-silicon-device-sizing)
 
 On the M4 mini, the published Flint checkpoint passed the shared-switch smoke test at an 8 GiB device ceiling with 256 admitted rows. The 16-token prefill used 26,244 reads with coalescing off and 20,979 with it on. Both arms read 5,159,780,352 logical prefill bytes, issued 7,614 decode reads, returned the same four-token completion and imported the staging pages without a copy fallback. The Qwen3.6 disk-backed fixture matched F32 and BF16 activations and issued 540 reads in the shared arm versus 594 in the control with 506,880 logical bytes each. Flash-Next's sparse-prefill and prefix fixtures passed with both common switches off and on. [Flint serving comparison](mac-flint-ane-and-reads.md#balanced-serving-comparison-at-8-gib) · [Full Qwen3.6 checkpoint](#full-qwen36-checkpoint-on-the-m4-mini)
 
@@ -141,7 +141,7 @@ With automatic sizing enabled, Flint checks the checkpoint headers and serving r
 
 The planner charges both the host staging buffers and their Metal copies. Flint reduces prefill rows when that staging space and attention workspace do not fit together. It refuses startup before weight import when the resident core and one token of expert staging exceed the budget. The startup log reports `weight placement=disk-experts` or `weight placement=resident` and the selected prefill width. With Flint prefix reuse explicitly enabled, an oversized checkpoint also needs an explicit `FIFI_FLINT_PREFIX_BUDGET_BYTES` because the legacy cap derivation charges the entire checkpoint.
 
-Flash-Next reads routed experts from disk and stages them in bounded page sets. Qwen dense models would need layer streaming to serve checkpoints whose resident core exceeds the budget.
+Flash-Next reads routed experts from disk and stages them in bounded page sets. The dense Qwen prototype stages packed feed-forward matrices under the same Metal budget.
 
 On the 16 GB M4 mini, a sparse zero-weight fixture with Flint's full tensor layout selected disk-backed experts under a 2 GiB weight budget. Its 22.24 GB resident-weight estimate includes all expert banks. The disk-backed path estimated 952 MB of resident weights and peaked at 1.04 GiB of MLX allocations during two prefill rows and one decode step. A separate nonzero fixture compared the disk-backed and resident expert outputs bit for bit for one and two rows, with repeated and nonconsecutive expert IDs. The published checkpoint was separately measured with the internal SSD and shared-page staging. [Flint measurements](mac-flint-resident-cache.md#internal-ssd-timing)
 
@@ -189,6 +189,24 @@ Build the Apple Silicon server with `native-mlx,native-fault-qualification`. Use
 ```sh
 python3 scripts/mac_cache_study/qwen36_streamed_ab.py \
   "$ENGINESRV" "$QWEN36_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/qwen36-stream-smoke" --smoke
+```
+
+## Disk-backed dense Qwen feed-forward weights
+
+Set `FIFI_Q36_MLX_DISK_DENSE_FFN=1` with `FIFI_MLX_AUTO_BUDGET=1` or a positive `FIFI_MLX_WORKING_SET_MIB` to try the dense Qwen3.8 path. It retains the attention and recurrent mixer weights, norms and output head in Metal. The loader reads the feed-forward matrix metadata at startup and releases each layer's host buffers as its resident weights import. Decode and chunked prefill read the gate, up and down matrices for one layer, evaluate the existing SwiGLU on Metal and retire the stage before the next layer.
+
+The device plan charges the largest stage, including space for a possible Metal import copy, alongside resident weights and the full serving reserve. Chunk admission adds the same stage to the row workspace. The authenticated execution report shows `weight_placement=disk_dense_ffn` and `memory.workspace.dense_ffn_stage_bytes`. Every forward rereads these logical weight bytes. Wider prefill chunks amortize them over more tokens.
+
+A file-backed fixture on the M4 mini matched resident prefill and decode logits bit for bit across F32/F32, BF16/F32, BF16/BF16 and BF16/Q8 activation/KV profiles. It checked the startup and four-row prefill admission boundaries to one byte. Each profile reserved a 288 KiB stage and read 172,800 logical bytes in 135 contiguous reads, with zero Metal import copies.
+
+The pinned 27B 6-bit pack's headers put 13.90 GB in the deferred feed-forward matrices, 217.25 MB per layer. The inventory counts 6.92 GB of remaining resident weight payloads before conversion and serving reserves. It excludes the file-backed token embedding and unused vision and MTP tensors. The full checkpoint needs a server admission and performance measurement. [Pinned Qwen3.8 weights](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-6bit/tree/e05430e1ab7050b0b809a56ed2fdfe09570d4449)
+
+Run the file-backed checkpoint test from `engine/` on Apple Silicon.
+
+```sh
+cargo test --locked --release --features native-mlx,native-fault-qualification --lib \
+  family::qwen36::resident::executor::tests::capped_dense_qwen_stages_one_file_backed_ffn_at_a_time \
+  -- --exact --nocapture --test-threads=1
 ```
 
 ## CUDA and MLX interfaces

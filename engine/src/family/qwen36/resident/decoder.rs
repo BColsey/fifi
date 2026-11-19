@@ -495,7 +495,7 @@ impl<'c> ResidentDecoder<'c> {
             .enumerate()
             .filter_map(|(layer, current)| match &current.feed_forward {
                 RFeedForward::Moe(w) => Some(super::compiled::moe_facts(layer, &shape, w, act)),
-                RFeedForward::Dense(_) => None,
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
             })
             .collect::<Result<_, EngError>>()?;
         let plan = super::compile_plan::model_warmup(
@@ -637,7 +637,7 @@ impl<'c> ResidentDecoder<'c> {
             .filter(|_| resident_experts)
             .filter_map(|(layer, current)| match &current.feed_forward {
                 RFeedForward::Moe(w) => Some(super::compiled::moe_facts(layer, &shape, w, act)),
-                RFeedForward::Dense(_) => None,
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => None,
             })
             .collect::<Result<Vec<_>, EngError>>()?;
         let attn_facts: Vec<super::compile_plan::AttnLayerFacts> = self
@@ -759,7 +759,7 @@ impl<'c> ResidentDecoder<'c> {
                     ])?;
                     moe_seconds.push(started.elapsed().as_secs_f64());
                 }
-                RFeedForward::Dense(_) => {}
+                RFeedForward::Dense(_) | RFeedForward::StagedDense(_) => {}
             }
         }
         for (layer, _id) in &plan.attn {
