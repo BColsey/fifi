@@ -65,13 +65,13 @@ pub struct TokenizerBundle {
 ///
 /// Bounded memory: `accounted_bytes()` is the live cost — the head
 /// render string, the cached head ids, and the completed turn's kept
-/// result and digest (`LastTurn`: a second ids copy a resend reuses),
+/// result and digest (the seed can share its head IDs with that result),
 /// roughly 1.5 MB at 128K tokens per session. The caller owns the cache
 /// (one per session) and its eviction.
 pub struct WarmTurnCache {
     /// Test-only: digest invocations charged to THIS cache — pins that
-    /// the call site computes at most one digest and only for an
-    /// eligible, key-matched request (per-cache so parallel tests
+    /// the call site computes at most one digest per eligible request
+    /// (per-cache so parallel tests
     /// cannot pollute each other's counts).
     #[cfg(test)]
     pub(crate) digest_calls: usize,
@@ -106,6 +106,7 @@ pub struct WarmTurnCache {
     /// selector included.
     boundary_whole_head: bool,
     self_check: bool,
+    pub(super) seed_resends: bool,
     /// The last completed turn's ids and boundaries plus the SHA-256 of
     /// the exact request (messages, tools, thinking) that produced them —
     /// one unit, dropped together whenever the slot reseeds or empties,
@@ -120,7 +121,10 @@ pub struct WarmTurnCache {
 /// One completed warm turn: the answer a resend reuses and the digest
 /// of the request that produced it.
 struct LastTurn {
-    ids: Vec<u32>,
+    // A proven seed shares its head with the cache and owns only the generation
+    // suffix. An appended turn already owns its full result (shared_head = 0).
+    shared_head: usize,
+    tail_ids: Vec<u32>,
     bounds: PromptBoundaries,
     inputs: [u8; 32],
 }
@@ -174,10 +178,24 @@ impl WarmTurnCache {
             first_head_end: None,
             boundary_whole_head: false,
             self_check: false,
+            seed_resends: std::env::var_os("ENGINESRV_SEED_RESENDS").is_some_and(|v| v == "1"),
             last_turn: None,
             #[cfg(test)]
             digest_calls,
         }
+    }
+
+    fn request_digest(
+        &mut self,
+        msgs: &[PromptMessage],
+        tools_json: &str,
+        thinking: Thinking,
+    ) -> [u8; 32] {
+        #[cfg(test)]
+        {
+            self.digest_calls += 1;
+        }
+        resend_digest(msgs, tools_json, thinking)
     }
 
     /// A clone of the last completed warm turn's result. Cloned, not
@@ -189,7 +207,10 @@ impl WarmTurnCache {
             .last_turn
             .as_ref()
             .expect("a completed turn always stores its result");
-        (last.ids.clone(), last.bounds)
+        let mut ids = Vec::with_capacity(last.shared_head + last.tail_ids.len());
+        ids.extend_from_slice(&self.head_ids[..last.shared_head]);
+        ids.extend_from_slice(&last.tail_ids);
+        (ids, last.bounds)
     }
 
     /// Same as [`Self::new`], but every warm turn cross-checks its ids
@@ -259,7 +280,7 @@ impl WarmTurnCache {
     pub fn last_turn_bytes(&self) -> usize {
         self.last_turn
             .as_ref()
-            .map_or(0, |t| 4 * t.ids.capacity() + 32)
+            .map_or(0, |t| 4 * t.tail_ids.capacity() + 32)
     }
 
     /// Test-only: the head-and-key part of the footprint, recomputed
@@ -287,7 +308,7 @@ impl WarmTurnCache {
             + self
                 .last_turn
                 .as_ref()
-                .map_or(0, |t| 4 * t.ids.capacity() + 32)
+                .map_or(0, |t| 4 * t.tail_ids.capacity() + 32)
     }
 }
 
@@ -584,21 +605,10 @@ impl TokenizerBundle {
         // against a 3.3 ms measured warm turn).
         let tools_json = serde_json::to_string(tools).unwrap_or_default();
         let key = warm_key(msgs, thinking, self.identity_fold(), &tools_json);
-        // The digest only matters when the key already matches AND the
-        // tokenizer is eligible (an ineligible slot can never store or
-        // serve a last turn, so its same-key requests would only compute
-        // and discard the whole-conversation hash). Exact accounting:
-        // cold, key-changed, and ineligible requests compute NO digest;
-        // a key-matched request computes exactly one — an append misses
-        // it and proceeds, a resend hits it and returns the stored ids.
-        let digest =
-            (cache.key.as_ref() == Some(&key) && self.tokenizer.boundary_eligible()).then(|| {
-                #[cfg(test)]
-                {
-                    cache.digest_calls += 1;
-                }
-                resend_digest(msgs, &tools_json, thinking)
-            });
+        // Only a matching, deterministic slot can serve its stored result. A
+        // newly seeded slot optionally computes its digest after the head proof.
+        let digest = (cache.key.as_ref() == Some(&key) && self.tokenizer.boundary_eligible())
+            .then(|| cache.request_digest(msgs, &tools_json, thinking));
         // Resend-HIT (an agent's repeat turn): byte-identical
         // render inputs to the request that filled `last_turn`. The key
         // above pins system + tools + thinking + bundle identity and
@@ -688,8 +698,7 @@ impl TokenizerBundle {
         } else {
             cache.cause_of(&refusal)
         });
-        let (ids, bounds) = self.warm_fallback(cache, msgs, tools, thinking, key)?;
-        Ok((ids, bounds))
+        self.warm_fallback(cache, msgs, tools, thinking, key, digest)
     }
 
     /// The warm attempt itself: renders full and head, proves both
@@ -775,7 +784,8 @@ impl TokenizerBundle {
         cache.head_render = head;
         cache.head_ids = head_ids;
         cache.last_turn = Some(LastTurn {
-            ids,
+            shared_head: 0,
+            tail_ids: ids,
             bounds,
             inputs: resend_inputs,
         });
@@ -824,6 +834,7 @@ impl TokenizerBundle {
         tools: &[ToolSpec],
         thinking: Thinking,
         key: WarmKey,
+        digest: Option<[u8; 32]>,
     ) -> Result<(Vec<u32>, PromptBoundaries), EngError> {
         let (ids, bounds, _exact) =
             self.encode_prompt_with_derived_boundary(msgs, tools, thinking)?;
@@ -878,11 +889,18 @@ impl TokenizerBundle {
                     cache.boundary_whole_head = whole_head;
                     cache.head_render = head_render;
                     cache.head_ids = ids[..tip].to_vec();
+                    // Drop the previous fingerprint and its ids together. A
+                    // deterministic reseed may retain its own exact result.
+                    cache.last_turn = (cache.seed_resends && self.tokenizer.boundary_eligible())
+                        .then(|| LastTurn {
+                            inputs: digest.unwrap_or_else(|| {
+                                cache.request_digest(msgs, &key.tools, thinking)
+                            }),
+                            shared_head: tip,
+                            tail_ids: ids[tip..].to_vec(),
+                            bounds,
+                        });
                     cache.key = Some(key);
-                    // The resend state belongs to the hit that filled it;
-                    // a reseed starts a fresh conversation — result AND
-                    // digest drop together.
-                    cache.last_turn = None;
                 }
             }
             _ => {
@@ -896,9 +914,6 @@ impl TokenizerBundle {
                 cache.head_ids = Vec::new();
             }
         }
-        // No last_turn store here: the fallback's own return carries the
-        // ids, and only a warm success (or a resend of one) ever reads
-        // the stored copy.
         Ok((ids, bounds))
     }
 

@@ -1766,6 +1766,48 @@ fn warm_digest_is_computed_only_for_eligible_key_matched_requests() {
     );
 }
 
+#[test]
+fn enabled_seed_resends_track_only_the_current_proven_result() {
+    let (_dir, bundle) = fixture_bundle(TEMPLATE_FIELDS);
+    let mut cache = WarmTurnCache::new();
+    cache.seed_resends = true;
+    let mut edited = seed_conv();
+    edited[1].content = Some("other user".into());
+    for (index, (msgs, thinking, reuses)) in [
+        (seed_conv(), Thinking::Off, 0),
+        (seed_conv(), Thinking::Off, 1),
+        (edited.clone(), Thinking::Off, 1),
+        (edited.clone(), Thinking::Off, 2),
+        (edited.clone(), Thinking::On, 2),
+        (edited, Thinking::On, 3),
+        (seed_conv(), Thinking::Off, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (ids, bounds, _) = bundle
+            .encode_prompt_with_derived_boundary(&msgs, &[], thinking)
+            .unwrap();
+        assert!(bounds.tip.is_some());
+        assert_eq!(
+            bundle
+                .encode_prompt_warm(&mut cache, &msgs, &[], thinking)
+                .unwrap(),
+            (ids.clone(), bounds)
+        );
+        assert_eq!(cache.reuses(), reuses);
+        assert_eq!(cache.digest_calls(), index + 1);
+        assert_eq!(
+            cache.last_turn_bytes(),
+            4 * (ids.len() - bounds.tip.unwrap()) + 32
+        );
+        assert_eq!(
+            cache.accounted_bytes(),
+            cache.head_and_key_bytes() + cache.last_turn_bytes()
+        );
+    }
+}
+
 /// Identity: SAME template bytes and SAME flags, DIFFERENT tokenizer
 /// bytes — only the tokenizer pins in the identity fold keep the two
 /// bundles apart, so replacing `identity.hash` with a template-only
