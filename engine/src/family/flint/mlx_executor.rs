@@ -18,7 +18,10 @@ use crate::{
     },
     tokenizer::DecodeBatch,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -38,6 +41,7 @@ pub(super) struct FlintExecutor {
     prefill_piece: usize,
     mlx_plan: MlxExecutionPlan,
     request_sized_kv: bool,
+    request_prefill: bool,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -63,6 +67,7 @@ pub(super) struct FlintExecutor {
 pub(super) struct FlintSession {
     state: State,
     core: DecodeSession,
+    request_prefill_piece: Option<NonZeroUsize>,
 }
 
 impl FlintSession {
@@ -197,6 +202,10 @@ impl FlintExecutor {
             && super::factory::request_sized_kv_enabled(
                 std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV").as_deref(),
             );
+        let request_prefill = memory.is_some()
+            && super::factory::request_prefill_enabled(
+                std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref(),
+            );
         let mlx_plan = MlxExecutionPlan::new(
             placement,
             placement_reason,
@@ -211,6 +220,7 @@ impl FlintExecutor {
                 prefill_piece,
                 mlx_plan,
                 request_sized_kv,
+                request_prefill,
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -225,6 +235,7 @@ impl FlintExecutor {
             FlintSession {
                 state: State::new(),
                 core: DecodeSession::default(),
+                request_prefill_piece: None,
             },
         ))
     }
@@ -521,6 +532,29 @@ fn device_prefill_does_not_cliff_on_the_measured_working_set() {
     assert_eq!(selected, 1024);
 }
 
+#[test]
+fn request_span_admits_a_wider_piece_at_the_same_budget() {
+    let expert = 1_769_472;
+    let remaining = 5_453_957_568;
+    assert_eq!(
+        fitting_prefill_piece(1024, 32768, remaining, expert).unwrap(),
+        256
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, remaining, expert).unwrap(),
+        1024
+    );
+    let just_fits = 3 * 32 * 4 * 2041 * 1024 + expert_staging_bytes(expert, 1024);
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, just_fits, expert).unwrap(),
+        1024
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, just_fits - 1, expert).unwrap(),
+        512
+    );
+}
+
 impl ExecutorOps for FlintExecutor {
     type Session = FlintSession;
 
@@ -537,6 +571,7 @@ impl ExecutorOps for FlintExecutor {
         // a restore never reports the job before it.
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached_shared = 0;
+        st.request_prefill_piece = None;
         st.core.reset(&mut Step {
             model: &mut self.model,
             state: &mut st.state,
@@ -551,6 +586,20 @@ impl ExecutorOps for FlintExecutor {
         has_prefix_boundary: bool,
     ) -> Result<()> {
         self.reset(st)?;
+        if self.request_prefill {
+            let mut rows = self.prefill_piece;
+            // Prefix snapshots keep their established chunk tiling.
+            if !has_prefix_boundary && let Some(memory) = &self.mlx_plan.memory {
+                let prompt_rows = prompt_tokens.min(context_limit() as usize);
+                rows = rows.max(fitting_prefill_piece(
+                    self.mlx_plan.configured_prefill_rows.min(prompt_rows),
+                    prompt_rows as u32,
+                    memory.remaining_bytes,
+                    self.model.streamed_expert_bytes,
+                )?);
+            }
+            st.request_prefill_piece = NonZeroUsize::new(rows);
+        }
         // Prefix jobs keep geometric growth and its existing snapshot charges.
         if self.request_sized_kv && !has_prefix_boundary {
             st.state.full_capacity = super::mlx_state::initial_request_capacity(
@@ -596,7 +645,15 @@ impl ExecutorOps for FlintExecutor {
     fn boundary(&mut self, _st: &mut FlintSession) {}
 
     fn prefill_piece(&self) -> Option<usize> {
-        Some(self.prefill_piece)
+        if self.request_prefill {
+            Some(self.mlx_plan.configured_prefill_rows)
+        } else {
+            Some(self.prefill_piece)
+        }
+    }
+
+    fn request_prefill_piece(&self, st: &FlintSession) -> Option<NonZeroUsize> {
+        st.request_prefill_piece
     }
 
     fn mlx_execution_plan(&self) -> Option<&MlxExecutionPlan> {

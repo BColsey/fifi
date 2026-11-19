@@ -173,7 +173,7 @@ fn setup_slot<E: ExecutorOps>(
             &plan,
             restored,
             executor.prefix_limits(),
-            prefill_chunk,
+            super::request_prefill_chunk(executor, &slot.session, prefill_chunk),
             executor.prefix_block_spacing(),
         )
         .into()
@@ -311,6 +311,7 @@ fn prefill<E: ExecutorOps>(
     slot: &mut Slot<E::Session>,
     prefill_chunk: usize,
 ) -> Result<(), EngError> {
+    let prefill_chunk = super::request_prefill_chunk(executor, &slot.session, prefill_chunk);
     let rows = executor
         .prefill_piece()
         .unwrap_or(prefill_chunk)

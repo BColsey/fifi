@@ -118,6 +118,11 @@ pub(crate) trait ExecutorOps {
     fn prefill_piece(&self) -> Option<usize> {
         None
     }
+    /// A request's prefill width after reset. The worker bounds it by the startup ceiling
+    /// and applies it to save points and every prefill piece of this session.
+    fn request_prefill_piece(&self, _st: &Self::Session) -> Option<std::num::NonZeroUsize> {
+        None
+    }
     /// An optional report from startup after the executor has applied its plan.
     fn mlx_execution_plan(&self) -> Option<&super::mlx_report::MlxExecutionPlan> {
         None

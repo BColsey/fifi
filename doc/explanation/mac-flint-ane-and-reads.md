@@ -190,6 +190,37 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --compact-kv-request --expert-timing --working-set-mib 8192 --pairs 2
 ```
 
+### Request-aware Flint prefill
+
+With Metal budgeting and adaptive prefill enabled, `FIFI_FLINT_MLX_REQUEST_PREFILL=1` prices full-attention scratch from the admitted prompt span. The full-context KV, prefix, cache, pressure and layer-growth charges stay in the startup reserve. Every candidate still pays its full expert staging charge. The worker can admit a wider piece up to the configured ceiling. Prefix-marked jobs keep their existing tiling, and chained prefill uses the startup plan.
+
+The serving comparison uses the 2,041-token prompt and 24 greedy completion tokens, geometric compact KV, an 8 GiB Metal ceiling and prefill expert read coalescing in both arms. Prefix reuse and the expert cache are off. The driver validates the effective flags and equality of the startup memory plan, then records actual prefill pieces, expert traffic and sampled token IDs. Changing the chunk width can change floating-point results, so the driver records the number of leading tokens that match as well as the output hash.
+
+The control used eight 256-row pieces. The request-sized workspace admitted 1,024 rows and used two pieces. The actual prefill forwards were 255 rows, six 256-row forwards, 249 rows and one pending token in the control, and 1,023, 1,017 and one in the request-aware arm. The startup memory charges, output hash and all 24 sampled token IDs matched. Both arms reported zero staging-page copy fallbacks.
+
+| Serving measurement | Startup width | Request-aware width |
+| --- | ---: | ---: |
+| Time to first token | 108.21 s | 31.40 s |
+| Timed prefill expert reads | 93.83 s | 23.22 s |
+| Logical prefill expert reads | 126.44 GB | 38.87 GB |
+| Prefill slice read calls | 166,680 | 22,239 |
+| Attributed SSD reads for the request | 135.63 GB | 45.98 GB |
+| Process peak footprint | 2.121 GB | 2.297 GB |
+| Decode forward p95 | 616 ms | 773 ms |
+| Request wall time | 120.48 s | 46.49 s |
+
+The wider pieces reduced logical prefill bytes by 69%, total attributed SSD bytes by 66%, and first-token latency by 71%. Peak footprint rose by 176 MB. The fixed-order pair used one prompt, with sampler tracing on in both arms. It also recorded a slower decode tail with the wider prefill, so the option remains experimental. [Two serving measurements](../../scripts/benchmarks/mac-m4-flint-request-prefill-2041.csv)
+
+The routed banks hold at most 12,032 distinct layer-expert records. The measured prefill read 71,458 and 21,967 record-equivalents respectively, including the pending token. That gives approximate lower bounds of **5.94 and 1.83 logical reads per distinct record**. Exact expert identities across pieces would let us measure how much additional reuse a bounded per-layer schedule could capture. [TokenWing's layer-major prefill and waves](https://github.com/runmyai/tokenwing/blob/main/docs/how-it-works.md#11-prefill)
+
+Build the server with `native-mlx,native-fault-qualification` and run one pair on the pinned local checkpoint.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/request-prefill" \
+  --request-prefill --expert-timing --working-set-mib 8192 --pairs 1
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
