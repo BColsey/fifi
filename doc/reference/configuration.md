@@ -42,7 +42,7 @@ Model weights must be on local storage; network storage is not a tier or a fallb
 
 FP16 prefill attention retains the existing PTX-based launch path by default. Set [`FIFI_CUDA_ATTN_PREFILL_ADAPT=1`](environment.md#cuda) before engine startup to opt into selection for the current CUDA device and model geometry. The adaptive path uses the loaded kernel's PTX version, the device's per-block shared-memory limit and the device and kernel thread limits. It selects the tensor-core arm when it fits and its loaded code supports it, otherwise the compact SIMT arm when that fits. If neither fits, or a device query or shared-memory opt-in fails, the launch returns an error. Successful adaptive selections are cached per device and geometry.
 
-This selection applies to the FP16 attention part kernel, not every model kernel or the q8 attention path. It does not establish correctness or performance for every GPU and model. Device qualification of the selection across RTX 20, 30, 40 and 50 series remains open; see the [evidence and its limits](../explanation/adaptive-attention-evidence.md). The build must also contain compatible device code; see [`INFERENCE_CUDA_ARCHS`](environment.md#build).
+This selection applies to the FP16 attention part kernel, not every model kernel or the q8 attention path. It does not establish correctness or performance for every GPU and model. Device qualification of the selection across RTX 20, 30, 40 and 50 series remains open. The build must also contain compatible device code; see [`INFERENCE_CUDA_ARCHS`](environment.md#build).
 
 ## Flash-Next MLX prefill
 
@@ -65,7 +65,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `prefill_session_reserve_bytes` | MLX | derived | Memory that prompt processing leaves free. With `prefill_budget_bytes` and no reserve member, it is derived: the attention cache at `context_limit`, plus the DeltaNet state, plus `cache_limit_bytes`, plus a 1 GiB pressure margin (the shipped Mac profile's composition). An explicit value always wins. Refused without `prefill_budget_bytes`. |
 | `prefill_chunk` | MLX | 256 | Largest prompt chunk, 1 to 2,048 rows. The engine picks the largest chunk that fits the budget. |
 | `compile` | MLX | `false` | Compile the decode step with `mlx_compile`: 9.6 to 13% faster decoding. Logits differ from the uncompiled path by at most 5e-5. |
-| `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. See [compiled-program budgets](../mlx-compile-program-budget.md). |
+| `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. |
 | `max_seqs` | MLX | 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
 | `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file; with `Q36_ALLOW_UNPINNED_GGUF=1`, the directory's single `.gguf` of the family, validated at open) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
