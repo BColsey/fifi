@@ -233,6 +233,27 @@ fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
 /// and the sampling defaults that its `generation_config.json` sets together with the flag of
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    if crate::family::mlx_budget::enabled()
+        && file
+            .engines
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.family.as_str(),
+                    flint::FAMILY
+                        | factory::FAMILY
+                        | q36_factory::FAMILY
+                        | q36_factory::DENSE_FAMILY
+                )
+            })
+            .count()
+            > 1
+    {
+        return Err(StartupError(
+            "FIFI_MLX_AUTO_BUDGET=1 requires one MLX model per server. Metal reports one shared working set".into(),
+        ));
+    }
     let mut engines = Vec::new();
     let mut entries = Vec::new();
     for config in &file.engines {

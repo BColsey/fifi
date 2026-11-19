@@ -375,11 +375,15 @@ impl FlashExecutor {
         session: &FlashSession,
         settings: &crate::family::flash_next::settings::FlashSettings,
         prefix_reuse: bool,
+        device: Option<crate::family::mlx_budget::DeviceBudget>,
     ) -> Result<Option<String>> {
-        let Some(budget) = settings.prefill_budget else {
+        use crate::family::mlx_budget::PRESSURE_MARGIN;
+        let budget = device
+            .map(|device| device.prefill(settings.prefill_budget))
+            .or(settings.prefill_budget);
+        let Some(budget) = budget else {
             return Ok(None);
         };
-        const PRESSURE_MARGIN: u64 = 1 << 30;
         let overflow =
             || EngError::MemoryPlan("Flash-Next prefill session reserve overflows".into());
         let positions = u32::try_from(self.context_limit).map_err(|_| overflow())?;
@@ -400,14 +404,27 @@ impl FlashExecutor {
         } else {
             0
         };
+        // The committed state remains live while the step builds its replacement arrays.
+        let state_overlap = if device.is_some() { state } else { 0 };
         let reserve = state
             .checked_add(prefix)
+            .and_then(|n| n.checked_add(state_overlap))
             .and_then(|n| n.checked_add(settings.cache_limit))
             .and_then(|n| n.checked_add(PRESSURE_MARGIN))
             .ok_or_else(overflow)?;
         // This executor streams local shards and has no S3 cache.
         let cap = settings.prefill_chunk;
         let plan = self.plan_prefill(budget, 0, reserve, cap)?;
+        if let Some(device) = device {
+            device.remaining(
+                "Flash-Next MLX",
+                &[
+                    ("weights_bytes", plan.terms.weights),
+                    ("decode_pool_bytes", plan.terms.decode_pool),
+                    ("session_reserve_bytes", reserve),
+                ],
+            )?;
+        }
         let path = match plan.chunk {
             Some(rows) => format!("chunk of {rows} rows"),
             None if cap < crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS => {
@@ -416,6 +433,14 @@ impl FlashExecutor {
             None => "one-token steps (insufficient workspace)".into(),
         };
         let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
+        let terms = if let Some(device) = device {
+            format!(
+                "metal_working_set_bytes={} state_overlap_bytes={state_overlap} {terms}",
+                device.bytes()
+            )
+        } else {
+            terms
+        };
         Ok(Some(format!(
             "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} {terms}",
             settings.cache_limit
@@ -1379,7 +1404,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             executor
-                .configure_prefill(&session, &settings, false)
+                .configure_prefill(&session, &settings, false, None)
                 .unwrap(),
             None
         );
@@ -1400,7 +1425,7 @@ mod tests {
             settings.prefill_budget = Some(budget);
             settings.prefill_chunk = cap;
             let line = executor
-                .configure_prefill(&session, &settings, reuse)
+                .configure_prefill(&session, &settings, reuse, None)
                 .unwrap()
                 .unwrap();
             assert_eq!(executor.prefill_chunk(), want, "{line}");
@@ -1410,9 +1435,28 @@ mod tests {
             );
             assert!(line.contains("s3_cache_bytes=0"), "{line}");
         }
+        settings.prefill_chunk = 4;
+        let auto_base = held + reserve + state;
+        for (bytes, want) in [(auto_base + four - 1, None), (auto_base + four, Some(4))] {
+            let device = crate::family::mlx_budget::DeviceBudget::new(bytes).unwrap();
+            let line = executor
+                .configure_prefill(&session, &settings, false, Some(device))
+                .unwrap()
+                .unwrap();
+            assert_eq!(executor.prefill_chunk(), want, "{line}");
+            assert!(
+                line.contains(&format!("state_overlap_bytes={state}")),
+                "{line}"
+            );
+        }
+        let device = crate::family::mlx_budget::DeviceBudget::new(auto_base - 1).unwrap();
+        assert!(matches!(
+            executor.configure_prefill(&session, &settings, false, Some(device)),
+            Err(EngError::MemoryPlan(_))
+        ));
         settings.cache_limit = u64::MAX;
         assert!(matches!(
-            executor.configure_prefill(&session, &settings, false),
+            executor.configure_prefill(&session, &settings, false, None),
             Err(EngError::MemoryPlan(_))
         ));
     }
@@ -2251,7 +2295,7 @@ mod tests {
                     let (mut executor, session) =
                         build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
-                    executor.configure_prefill(&session, &settings, false)?;
+                    executor.configure_prefill(&session, &settings, false, None)?;
                     assert_eq!(executor.prefill_chunk(), chunked.then_some(PIECE));
                     Ok((executor, session))
                 })
@@ -2348,10 +2392,17 @@ mod tests {
         let (chunked, chunk_syncs) = run(Some(2 << 30));
         assert_eq!(fallback, stepped);
         assert_eq!(chunked, stepped);
-        assert_eq!(fallback_syncs, step_syncs);
+        if crate::family::mlx_budget::enabled() {
+            assert_eq!(
+                step_syncs, chunk_syncs,
+                "auto sizing admits the configured four rows"
+            );
+        } else {
+            assert_eq!(step_syncs, fallback_syncs);
+        }
         assert!(
-            chunk_syncs < step_syncs,
-            "{chunk_syncs} chunked vs {step_syncs} stepped"
+            chunk_syncs < fallback_syncs,
+            "{chunk_syncs} chunked vs {fallback_syncs} stepped"
         );
     }
 

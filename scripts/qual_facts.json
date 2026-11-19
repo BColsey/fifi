@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7275,
+      "test_fns": 7279,
       "ignored": 651,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -158,6 +158,7 @@
         "FIFI_KROW_PICKS_OUT",
         "FIFI_KROW_RECEIPT",
         "FIFI_MLX_ATTN_FLASH_FIRST",
+        "FIFI_MLX_AUTO_BUDGET",
         "FIFI_MLX_FLASH_CHUNKED",
         "FIFI_MLX_GROUPED_IMPORT",
         "FIFI_MLX_REQUEST_SAMPLES",

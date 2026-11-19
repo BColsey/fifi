@@ -709,6 +709,47 @@ impl MlxKernels {
         self.context.qualification_graph_text(outputs)
     }
 
+    /// Sample a native fixture through its existing synchronization, with the worker timing counters.
+    #[cfg(test)]
+    pub(crate) fn profile_fixture<T>(
+        &mut self,
+        _label: &str,
+        work: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        #[cfg(feature = "native-fault-qualification")]
+        {
+            self.reset_peak_memory().unwrap();
+            self.qualification_reset_timing();
+            let base = self.memory_stats().unwrap().active;
+            let syncs = self.qualification_sync_count();
+            let start = std::time::Instant::now();
+            let value = work(self);
+            let elapsed = start.elapsed().as_nanos();
+            let timing = self.qualification_timing();
+            let peak = self.memory_stats().unwrap().peak;
+            println!(
+                "mlx_fixture {}",
+                serde_json::json!({
+                    "case": _label,
+                    "wall_ns": elapsed,
+                    "metal_syncs": self.qualification_sync_count() - syncs,
+                    "import_calls": timing.import_calls,
+                    "readback_calls": timing.readback_calls,
+                    "evaluate_calls": timing.evaluate_calls,
+                    "extra_peak_bytes": peak.saturating_sub(base),
+                })
+            );
+            value
+        }
+        #[cfg(not(feature = "native-fault-qualification"))]
+        work(self)
+    }
+
+    /// Metal's recommended total working set for the GPU used by this backend.
+    pub(crate) fn recommended_working_set_bytes() -> u64 {
+        native::recommended_working_set_bytes()
+    }
+
     pub fn memory_stats(&self) -> Result<MemoryStats, EngError> {
         let (active, cache, peak) = self.context.memory_stats()?;
         let wide = |value: usize| {

@@ -48,6 +48,12 @@ pub(in crate::family) mod graph_state;
 pub(crate) mod host_admit;
 pub mod keys;
 pub(crate) mod kv_format;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) mod mlx_budget;
+
 pub mod layer_weights;
 pub mod mapped_file;
 pub(in crate::family) mod math;

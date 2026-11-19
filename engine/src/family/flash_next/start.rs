@@ -40,6 +40,7 @@ pub(crate) fn start(
         expert_prefetch: settings.expert_prefetch,
     };
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |_| {
+        let device = crate::family::mlx_budget::DeviceBudget::detect()?;
         let (mut executor, session) =
             FlashExecutor::open(&settings.artifact, settings.cache_limit, rules)?;
         if usize::try_from(CONTEXT_LIMIT).ok() != Some(executor.context_limit()) {
@@ -48,7 +49,7 @@ pub(crate) fn start(
                 executor.context_limit()
             )));
         }
-        if let Some(line) = executor.configure_prefill(&session, &settings, prefix_reuse)? {
+        if let Some(line) = executor.configure_prefill(&session, &settings, prefix_reuse, device)? {
             eprintln!("{line}");
         }
         Ok((executor, session))

@@ -25,16 +25,18 @@ pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngErro
         .iter()
         .filter(|layer| matches!(layer.attn, RAttn::Qsa(_)))
         .count();
-    u64::try_from(layers)
-        .ok()
-        .zip(
-            u64::from(d.heads_kv)
-                .checked_mul(u64::from(d.head_dim))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_add(u64::from(d.idx_dim))),
-        )
-        .and_then(|(layers, values)| values.checked_mul(F32_BYTES)?.checked_mul(layers))
-        .ok_or_else(|| EngError::MemoryPlan("qsa growth bytes overflow u64".into()))
+    use crate::family::kv_format::{KvFormat, KvRowShape};
+    let overflow = || EngError::MemoryPlan("qsa growth bytes overflow u64".into());
+    let kv = KvFormat::F32
+        .layer_position_bytes(KvRowShape {
+            heads_kv: u64::from(d.heads_kv),
+            head_dim: u64::from(d.head_dim),
+        })
+        .map_err(|_| overflow())?;
+    let index = u64::from(d.idx_dim) * F32_BYTES;
+    kv.checked_add(index)
+        .and_then(|bytes| bytes.checked_mul(u64::try_from(layers).ok()?))
+        .ok_or_else(overflow)
 }
 
 /// Bytes that a chunk of `rows` tokens adds to the stored QSA caches: `rows` positions of
@@ -442,6 +444,25 @@ mod tests {
     use super::super::{ResidentDecoder, StepMode};
     use super::*;
     use crate::sched::SessionBudget;
+
+    #[test]
+    fn qsa_growth_bytes_matches_the_direct_formula() {
+        // Pins the shared KvFormat arithmetic to the pre-port formula:
+        // layers * ((heads_kv * head_dim * 2 + idx_dim) * F32), with every
+        // budget switch unset (the charge must not depend on them).
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let weights = super::super::weights::synthetic(&mut kernels);
+        let d = weights.shape.qsa.dims();
+        let layers = weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.attn, RAttn::Qsa(_)))
+            .count() as u64;
+        let direct =
+            (u64::from(d.heads_kv) * u64::from(d.head_dim) * 2 + u64::from(d.idx_dim)) * 4 * layers;
+        assert_eq!(qsa_growth_bytes(&weights).unwrap(), direct);
+    }
 
     #[test]
     fn zero_state_uses_the_host_layouts() {

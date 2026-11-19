@@ -23,6 +23,8 @@ pub(super) fn optional_int(value: Option<i32>) -> mlx_optional_int {
 unsafe extern "C" {
     #[link_name = "inference_mlx_max_threadgroup_memory"]
     pub(super) fn mlx_max_threadgroup_memory() -> usize;
+    #[link_name = "inference_mlx_recommended_working_set"]
+    pub(super) fn mlx_recommended_working_set() -> usize;
     #[link_name = "inference_mlx_set_error_handler"]
     pub(super) fn mlx_set_error_handler(
         handler: mlx_error_handler_func,

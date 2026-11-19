@@ -30,6 +30,12 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `ENGINESRV_NOTICE_TOOLWRAP` | on (switch) | Qwen3.6 only, with think replay on: render system messages that follow an assistant turn as tool responses, so that the chat template keeps the reasoning of earlier tool-calling turns. |
 | `ENGINESRV_SHADOW_BLOCK_LCP` | off (switch) | Read-only observation for the request log: report the longest common prefix the saved block checkpoint would have matched. Never changes restore or save behavior. |
 
+## Apple Silicon device sizing
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FIFI_MLX_AUTO_BUDGET` | off | Set to `1` to size Qwen3.6, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. [Sizing and memory charges](../explanation/mlx-device-scaling.md) |
+
 ## Qwen3.6 on Apple Silicon
 
 | Variable | Default | Meaning |

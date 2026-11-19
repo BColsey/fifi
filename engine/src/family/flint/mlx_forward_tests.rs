@@ -129,10 +129,12 @@ fn batch_grouped_experts_match_row_reference_without_half_overflow() {
             .collect();
         let x = import_f32(&mut k, &[count, 64], &values).unwrap();
         let x = k.cast(&x, Dtype::Bf16).unwrap();
-        let (actual, health) = ffn(&mut k, &w, &x).unwrap();
-        assert_eq!(actual.shape(), [count, 64]);
-        assert_eq!(actual.dtype(), Dtype::Bf16);
-        let actual = read(&mut k, &actual);
+        let (actual, health) = k.profile_fixture(&format!("flint_grouped_ffn_{count}"), |k| {
+            let (out, health) = ffn(k, &w, &x).unwrap();
+            assert_eq!(out.shape(), [count, 64]);
+            assert_eq!(out.dtype(), Dtype::Bf16);
+            (read(k, &out), health)
+        });
         assert!(actual.iter().all(|v| v.is_finite()));
         assert!(actual.iter().any(|v| v.abs() > 65_504.0));
         // The token loop is an independent test oracle, never the production prefill path.

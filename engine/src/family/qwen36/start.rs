@@ -21,6 +21,7 @@
 
 use super::resident::executor::{Q36Executor, Q36Rules};
 use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin_for_spec};
+use crate::family::mlx_budget::DeviceBudget;
 use crate::{
     EngError,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
@@ -92,6 +93,7 @@ pub(crate) fn start(
         );
     }
     let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
+        let device = DeviceBudget::detect()?;
         stages.begin("opening the model");
         let (mut executor, session) =
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?;
@@ -117,7 +119,7 @@ pub(crate) fn start(
                 total(attn_warmup)
             );
         }
-        if let Some(line) = plan_prefill(&mut executor, &owned)? {
+        if let Some(line) = plan_prefill(&mut executor, &owned, device)? {
             eprintln!("{line}");
         }
         Ok((executor, session))
@@ -125,17 +127,22 @@ pub(crate) fn start(
     Ok((engine, bundle))
 }
 
-/// Plans the chunked prefill of `executor` from the settings and returns the line to log. Without
-/// `prefill_budget` it does nothing and returns `None`, and the executor stays on one-token steps.
-/// With a budget, a single-session plan that admits no chunk also succeeds. Concurrent serving
+/// Plans the chunked prefill of `executor` and returns the line to log. The budget comes from
+/// the device, explicit settings, or the lower of the two when both are present. Without a budget
+/// the executor uses one-token steps. A single-session plan that admits no chunk also succeeds.
+/// Concurrent serving
 /// requires an admitted chunk; it never falls back to single-token prefill. Both activation dtypes
 /// plan a chunk: the chunk path is dtype aware, and only the budget or the largest chunk can keep a
 /// chunk out.
 pub(super) fn plan_prefill(
     executor: &mut Q36Executor,
     settings: &Q36Settings,
+    device: Option<DeviceBudget>,
 ) -> Result<Option<String>, EngError> {
-    let Some(budget) = settings.prefill_budget else {
+    let budget = device
+        .map(|device| device.prefill(settings.prefill_budget))
+        .or(settings.prefill_budget);
+    let Some(budget) = budget else {
         if settings.max_seqs > 1 {
             return Err(EngError::BadRequest(
                 "concurrent serving requires a prefill budget".into(),
@@ -150,13 +157,36 @@ pub(super) fn plan_prefill(
     } else {
         settings.prefill_reserve
     };
+    let reserve = if device.is_some() {
+        reserve.max(executor.device_prefill_reserve(
+            settings.cache_limit,
+            settings.prefix_reuse,
+            settings.session_cap,
+        )?)
+    } else {
+        reserve
+    };
     let plan = executor.plan_prefill(budget, reserve, max_rows)?;
+    if let Some(device) = device {
+        device.remaining(
+            "Qwen3.6 MLX",
+            &[
+                ("weights_bytes", plan.terms.weights),
+                ("session_reserve_bytes", reserve),
+            ],
+        )?;
+    }
     if settings.max_seqs > 1 && plan.chunk.is_none() {
         return Err(EngError::MemoryPlan(
             "concurrent serving requires an admitted prefill chunk above one token".into(),
         ));
     }
     let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
+    let terms = if let Some(device) = device {
+        format!("metal_working_set_bytes={} {terms}", device.bytes())
+    } else {
+        terms
+    };
     Ok(Some(match plan.chunk {
         Some(rows) => {
             format!("q36 prefill: chunk of {rows} rows planned (largest {max_rows}); {terms}")
@@ -280,14 +310,14 @@ mod tests {
         )
         .unwrap();
         settings.max_seqs = 1;
-        super::plan_prefill(&mut executor, &settings).unwrap();
+        super::plan_prefill(&mut executor, &settings, None).unwrap();
         assert!(
             executor.prefill_chunk().is_some(),
             "the solo control must admit a chunk"
         );
         settings.max_seqs = 4;
         assert!(matches!(
-            super::plan_prefill(&mut executor, &settings),
+            super::plan_prefill(&mut executor, &settings, None),
             Err(crate::EngError::MemoryPlan(_))
         ));
         assert_eq!(

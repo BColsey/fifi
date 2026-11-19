@@ -184,12 +184,16 @@ impl Model {
                 super::factory::context_limit()
             );
         }
-        eprintln!(
-            "flint: MLX prefill piece size {} rows",
-            super::factory::prefill_chunk_rows(super::factory::os_setting(
-                std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
-            ))
-        );
+        // Default-off neutrality: the budget-off arm keeps main's text
+        // verbatim; the reworded line prints only when device sizing is on.
+        let ceiling = super::factory::prefill_chunk_rows(super::factory::os_setting(
+            std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
+        ));
+        if crate::family::mlx_budget::enabled() {
+            eprintln!("flint: MLX configured prefill ceiling {ceiling} rows");
+        } else {
+            eprintln!("flint: MLX prefill piece size {ceiling} rows");
+        }
         let mut source = FlintCheckpoint::open(root)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.allow_bf16(true);

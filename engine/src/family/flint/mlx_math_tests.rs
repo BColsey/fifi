@@ -67,8 +67,11 @@ fn native_sinks_gqa_and_window_edges_match_scalar() {
         let scores = import(&mut k, &[32, 2, slots as u32], &scores);
         let values = import(&mut k, &[4, slots as u32, 128], &values);
         let sink = import(&mut k, &[32], &sinks);
-        let output = sink_attention(&mut k, &scores, &values, &sink).unwrap();
-        for (actual, expected) in read(&mut k, &output).iter().zip(expected) {
+        let output = k.profile_fixture(&format!("flint_sinks_{slots}"), |k| {
+            let out = sink_attention(k, &scores, &values, &sink).unwrap();
+            read(k, &out)
+        });
+        for (actual, expected) in output.iter().zip(expected) {
             assert!(
                 (*actual as f64 - expected).abs() < 2e-6,
                 "{actual} vs {expected}"

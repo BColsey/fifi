@@ -31,6 +31,7 @@ pub(super) struct FlintExecutor {
     // (the Flash/Q36 field order).
     prefix: PrefixStore<PrefixSnapshot, FlintPath>,
     model: Model,
+    prefill_piece: usize,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -154,10 +155,20 @@ impl FlintExecutor {
         if retention_cap > 0 {
             eprintln!("flint prefix retention cap {retention_cap} bytes");
         }
+        let device = crate::family::mlx_budget::DeviceBudget::detect()?;
         let model = Model::open(root)?;
+        let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
+            std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
+        ));
+        let prefill_piece = if let Some(device) = device {
+            device_prefill_piece(device, &model, max_rows, retention_cap)?
+        } else {
+            max_rows
+        };
         Ok((
             Self {
                 model,
+                prefill_piece,
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -175,6 +186,82 @@ impl FlintExecutor {
             },
         ))
     }
+}
+
+/// The two batched widths supported by the serving options. Price the full-attention score,
+/// mask and softmax matrices for the composite fallback. The streaming kernel can use less.
+fn fitting_prefill_piece(max_rows: usize, context: u32, remaining: u64) -> Result<usize> {
+    let score_bytes_per_row = 3 * 32 * u64::from(context) * 4;
+    let candidates = [1024_u32, 512]
+        .into_iter()
+        .filter(|&rows| rows as usize <= max_rows);
+    let rows = crate::family::prefill::mlx::largest_fitting_chunk(candidates, remaining, |rows| {
+        Ok(u64::from(rows) * score_bytes_per_row)
+    })?;
+    Ok(rows.unwrap_or(1) as usize)
+}
+
+fn device_prefill_piece(
+    device: crate::family::mlx_budget::DeviceBudget,
+    model: &Model,
+    max_rows: usize,
+    retention_cap: u64,
+) -> Result<usize> {
+    use crate::family::{
+        kv_format::{KvFormat, KvRowShape},
+        mlx_budget::PRESSURE_MARGIN,
+    };
+
+    // Model::open has imported its resident arrays. The allocator count includes those arrays;
+    // the prefill reserve separately prices the whole session including the fixed-size rings.
+    let weights = model.kernels.memory_stats()?.active;
+    let context = context_limit();
+    let full = super::config::FULL_LAYERS.len() as u64;
+    let sliding = model.layers.len() as u64 - full;
+    let row_bytes = KvFormat::Bf16.layer_position_bytes(KvRowShape {
+        heads_kv: 4,
+        head_dim: 128,
+    })?;
+    let full_plane_bytes = u64::from(context) * row_bytes;
+    let state = full * full_plane_bytes + sliding * u64::from(super::mlx_state::WINDOW) * row_bytes;
+    let retained = retention_cap.min(state * 3);
+    let cache = super::mlx_model::cache_limit_bytes();
+    let remaining = device.remaining(
+        "Flint MLX",
+        &[
+            ("resident_active_bytes", weights),
+            ("session_state_bytes", state),
+            ("prefix_reserve_bytes", retained),
+            ("mlx_cache_limit_bytes", cache),
+            ("one_full_layer_growth_bytes", full_plane_bytes),
+            ("pressure_margin_bytes", PRESSURE_MARGIN),
+        ],
+    )?;
+    let rows = fitting_prefill_piece(max_rows, context, remaining)?;
+    eprintln!(
+        "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); metal_working_set_bytes={} resident_active_bytes={weights} session_state_bytes={state} prefix_reserve_bytes={retained} mlx_cache_limit_bytes={cache} growth_bytes={full_plane_bytes} pressure_margin_bytes={PRESSURE_MARGIN} remaining_bytes={remaining}",
+        device.bytes(),
+    );
+    Ok(rows)
+}
+
+#[cfg(test)]
+#[test]
+fn device_prefill_uses_only_supported_widths_and_respects_the_ceiling() {
+    let context = 32768;
+    let floor = 3 * 32 * u64::from(context) * 4 * 512;
+    assert_eq!(fitting_prefill_piece(1024, context, floor - 1).unwrap(), 1);
+    assert_eq!(fitting_prefill_piece(1024, context, floor).unwrap(), 512);
+    assert_eq!(
+        fitting_prefill_piece(1024, context, floor * 2).unwrap(),
+        1024
+    );
+    assert_eq!(fitting_prefill_piece(512, context, u64::MAX).unwrap(), 512);
+    assert_eq!(fitting_prefill_piece(1, context, u64::MAX).unwrap(), 1);
+    assert_eq!(
+        fitting_prefill_piece(1024, context / 4, floor).unwrap(),
+        1024
+    );
 }
 
 impl ExecutorOps for FlintExecutor {
@@ -233,9 +320,7 @@ impl ExecutorOps for FlintExecutor {
     fn boundary(&mut self, _st: &mut FlintSession) {}
 
     fn prefill_piece(&self) -> Option<usize> {
-        Some(super::factory::prefill_chunk_rows(
-            super::factory::os_setting(std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref()),
-        ))
+        Some(self.prefill_piece)
     }
 
     fn prefix_limits(&self) -> StoreLimits {
@@ -271,7 +356,7 @@ impl ExecutorOps for FlintExecutor {
             );
             return Ok(false);
         }
-        let path = FlintPath::now(&self.root);
+        let path = FlintPath::now(&self.root, self.prefill_piece);
         let fed = st.state.pos as usize;
         st.core
             .save_prefix(&mut self.prefix, key, path, fed, kind, || {
@@ -280,7 +365,7 @@ impl ExecutorOps for FlintExecutor {
     }
 
     fn restore_prefix(&mut self, st: &mut FlintSession, prompt: &[u32]) -> Result<usize> {
-        let path = FlintPath::now(&self.root);
+        let path = FlintPath::now(&self.root, self.prefill_piece);
         let state = &mut st.state;
         let restored = st
             .core
@@ -419,7 +504,7 @@ pub(super) struct FlintPath {
 }
 
 impl FlintPath {
-    pub(super) fn now(root: &Path) -> Self {
+    pub(super) fn now(root: &Path, prefill_piece: usize) -> Self {
         use crate::kernels::mlx;
         Self::from_env_values(
             root,
@@ -427,9 +512,7 @@ impl FlintPath {
             FlintEnv {
                 // The same resolvers the serving path uses, so the
                 // fingerprint can never disagree with the route.
-                batch_prefill: super::factory::prefill_chunk_rows(super::factory::os_setting(
-                    std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
-                )),
+                batch_prefill: prefill_piece,
                 decode_attn: mlx::decode_attn_flagged(),
                 ring_view: super::mlx_forward::ring_view_flagged(),
                 prefill_chain: super::mlx_forward::prefill_chain_flagged(),

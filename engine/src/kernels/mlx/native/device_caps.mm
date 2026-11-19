@@ -10,3 +10,13 @@ extern "C" std::size_t inference_mlx_max_threadgroup_memory() {
     return bytes;
   }
 }
+
+extern "C" std::size_t inference_mlx_recommended_working_set() {
+  @autoreleasepool {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil) return 0;
+    const std::size_t bytes = device.recommendedMaxWorkingSetSize;
+    [device release];
+    return bytes;
+  }
+}

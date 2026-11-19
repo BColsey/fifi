@@ -1061,6 +1061,47 @@ impl Q36Executor {
         ChunkCost::new(heads_q, self.decoder.context_limit)
     }
 
+    /// Reserve the full cache capacity, recurrent state, cached allocator bytes and headroom.
+    /// The session cap already bounds retained prefixes and concurrent session growth.
+    pub(in crate::family::qwen36) fn device_prefill_reserve(
+        &self,
+        cache_limit: u64,
+        prefix_reuse: bool,
+        session_cap: u64,
+    ) -> Result<u64> {
+        let overflow =
+            || EngError::MemoryPlan("Qwen3.6 MLX device prefill reserve overflows".into());
+        let shape = &self.decoder.weights.shape;
+        let positions = super::kv_plan::round_up(self.context_limit, super::kv_plan::KV_STEP)?;
+        let activation =
+            Activation::of_dtype(self.decoder.weights.consts.act).ok_or_else(|| {
+                EngError::MemoryPlan("unexpected Qwen3.6 resident activation dtype".into())
+            })?;
+        let positions = u64::try_from(positions).map_err(|_| overflow())?;
+        let kv = growth_per_position(shape, self.decoder.weights.kv, activation)?
+            .checked_mul(positions)
+            .ok_or_else(overflow)?;
+        // The cache result holds the new allocation while the layer's old allocation retires.
+        let growth_overlap = kv.min(
+            growth_bytes(shape, self.decoder.weights.kv, activation)?
+                .checked_mul(positions)
+                .ok_or_else(overflow)?,
+        );
+        let session = kv
+            .checked_add(fixed_session_bytes(shape)?)
+            .ok_or_else(overflow)?;
+        let session = if prefix_reuse || self.max_seqs > 1 {
+            session.max(session_cap)
+        } else {
+            session
+        };
+        session
+            .checked_add(cache_limit)
+            .and_then(|n| n.checked_add(growth_overlap))
+            .and_then(|n| n.checked_add(crate::family::mlx_budget::PRESSURE_MARGIN))
+            .ok_or_else(overflow)
+    }
+
     /// Applies the chunk admission rule and stores the chunk size.
     ///
     /// `remaining = budget - resident weights - session_reserve`. The weights come from this
@@ -3221,7 +3262,7 @@ mod tests {
         let fallback = usize::try_from(NO_BUDGET_PIECE).unwrap();
         let engine = spawn_engine(fallback, move |_| {
             let (mut executor, session) = build(rules);
-            let line = plan_prefill(&mut executor, &settings)?;
+            let line = plan_prefill(&mut executor, &settings, None)?;
             *thread_seen.lock().unwrap() = (line, executor.prefill_chunk());
             executor.log = thread_log;
             Ok((executor, session))
@@ -3282,7 +3323,7 @@ mod tests {
                 spawn_engine_noted(PIECE as usize, note, move |_| {
                     let (mut executor, session) = build(rules);
                     executor.decoder.kernels.set_cache_limit(CACHE_LIMIT)?;
-                    plan_prefill(&mut executor, &settings)?;
+                    plan_prefill(&mut executor, &settings, None)?;
                     assert_eq!(executor.prefill_chunk(), Some(PIECE));
                     Ok((executor, session))
                 })
@@ -3291,6 +3332,46 @@ mod tests {
             cycle,
             seeded_generation,
         );
+    }
+
+    #[test]
+    fn auto_device_prefill_selects_a_larger_chunk_on_the_larger_budget() {
+        use crate::family::mlx_budget::DeviceBudget;
+
+        let _serial = crate::native_test_lock();
+        let (mut executor, _) = build(chunk_rules());
+        let settings = serving(Q36Options {
+            prefill_chunk: Some(8),
+            ..Q36Options::default()
+        });
+        assert_eq!(plan_prefill(&mut executor, &settings, None).unwrap(), None);
+        let reserve = executor
+            .device_prefill_reserve(settings.cache_limit, false, settings.session_cap)
+            .unwrap();
+        let base = held(&executor) + reserve;
+        let cost = executor.prefill_cost().unwrap();
+        for (budget, want) in [
+            (base + cost.workspace(4).unwrap() - 1, None),
+            (base + cost.workspace(4).unwrap(), Some(4)),
+            (base + cost.workspace(8).unwrap(), Some(8)),
+        ] {
+            let line = plan_prefill(
+                &mut executor,
+                &settings,
+                Some(DeviceBudget::new(budget).unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(executor.prefill_chunk(), want, "{line}");
+        }
+        assert!(matches!(
+            plan_prefill(
+                &mut executor,
+                &settings,
+                Some(DeviceBudget::new(base - 1).unwrap())
+            ),
+            Err(EngError::MemoryPlan(_))
+        ));
     }
 
     /// A serving entry with a budget plans a chunk from its settings, and the worker feeds the

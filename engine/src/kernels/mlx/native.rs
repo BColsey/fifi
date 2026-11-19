@@ -32,6 +32,11 @@ pub(crate) mod compile;
 mod ffi;
 mod guard;
 
+pub(super) fn recommended_working_set_bytes() -> u64 {
+    // The bridge queries the default Metal device without creating an MLX adapter.
+    unsafe { ffi::mlx_recommended_working_set() as u64 }
+}
+
 /// The calling thread's native-dispatch count (the `Q36_WINDOW_TAPS` probe).
 pub(crate) fn dispatch_count() -> u64 {
     guard::dispatch_count()

@@ -534,57 +534,67 @@ fn chained_commit_matches_fenced_bytes_across_the_swa_wrap() {
                 put(&mut k, held_plane, &plan);
             }
         }
-        let mut heads = Vec::new();
-        for step in 510_u32..517 {
-            let mut roots: Vec<ExecutionTensor> = Vec::new();
-            for (plane, held_plane) in held.iter_mut().enumerate() {
-                let plan = ChunkCachePlan::new(plane, step, 1, 8192).unwrap();
-                let keys = input(&mut k, step, 1, false);
-                let values = input(&mut k, step, 1, true);
-                let (union_keys, union_values, guard) =
-                    Plane::prepare_chunk(&mut k, held_plane, &plan, &keys, &values, chained)
+        let case = if chained {
+            "flint_wrap_chained"
+        } else {
+            "flint_wrap_fenced"
+        };
+        let heads = k.profile_fixture(case, |k| {
+            let mut heads = Vec::new();
+            for step in 510_u32..517 {
+                let mut roots: Vec<ExecutionTensor> = Vec::new();
+                for (plane, held_plane) in held.iter_mut().enumerate() {
+                    let plan = ChunkCachePlan::new(plane, step, 1, 8192).unwrap();
+                    let keys = input(k, step, 1, false);
+                    let values = input(k, step, 1, true);
+                    let (union_keys, union_values, guard) =
+                        Plane::prepare_chunk(k, held_plane, &plan, &keys, &values, chained)
+                            .unwrap();
+                    // Same armed-process guard as the fenced-bytes test: the
+                    // consumer reads only the visible rows of the union.
+                    let visible = plan.p0 + plan.rows;
+                    let (consumer_keys, consumer_values) = if union_keys.shape()[1] > visible {
+                        (
+                            k.slice(&union_keys, &[0, 0, 0], &[4, visible, 128])
+                                .unwrap(),
+                            k.slice(&union_values, &[0, 0, 0], &[4, visible, 128])
+                                .unwrap(),
+                        )
+                    } else {
+                        (union_keys.share(), union_values.share())
+                    };
+                    let output = consumer(k, &consumer_keys, &consumer_values);
+                    if chained {
+                        Plane::commit_chunk_chained(
+                            k,
+                            held_plane,
+                            guard,
+                            &union_keys,
+                            &union_values,
+                        )
                         .unwrap();
-                // Same armed-process guard as the fenced-bytes test: the
-                // consumer reads only the visible rows of the union.
-                let visible = plan.p0 + plan.rows;
-                let (consumer_keys, consumer_values) = if union_keys.shape()[1] > visible {
-                    (
-                        k.slice(&union_keys, &[0, 0, 0], &[4, visible, 128])
-                            .unwrap(),
-                        k.slice(&union_values, &[0, 0, 0], &[4, visible, 128])
-                            .unwrap(),
-                    )
-                } else {
-                    (union_keys.share(), union_values.share())
-                };
-                let output = consumer(&mut k, &consumer_keys, &consumer_values);
-                if chained {
-                    Plane::commit_chunk_chained(
-                        &mut k,
-                        held_plane,
-                        guard,
-                        &union_keys,
-                        &union_values,
-                    )
-                    .unwrap();
-                    roots.extend(
-                        held_plane
-                            .as_ref()
-                            .unwrap()
-                            .append_roots()
-                            .map(|t| t.share()),
-                    );
-                } else {
-                    Plane::commit_chunk(&mut k, held_plane, guard, &output).unwrap();
+                        roots.extend(
+                            held_plane
+                                .as_ref()
+                                .unwrap()
+                                .append_roots()
+                                .map(|t| t.share()),
+                        );
+                    } else {
+                        Plane::commit_chunk(k, held_plane, guard, &output).unwrap();
+                    }
+                    heads.push(output);
                 }
-                heads.push(output);
+                if chained {
+                    roots.push(heads.last().unwrap().share());
+                    let refs: Vec<&ExecutionTensor> = roots.iter().collect();
+                    k.evaluate(&refs).unwrap();
+                }
             }
-            if chained {
-                roots.push(heads.last().unwrap().share());
-                let refs: Vec<&ExecutionTensor> = roots.iter().collect();
-                k.evaluate(&refs).unwrap();
-            }
-        }
+            let outputs: Vec<_> = heads.iter().collect();
+            k.evaluate(&outputs).unwrap();
+            heads
+        });
         let mut bytes = Vec::new();
         for plane in held.each_ref() {
             let (keys, values) = plane.as_ref().unwrap().snapshot(&mut k).unwrap();
