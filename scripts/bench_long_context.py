@@ -190,19 +190,7 @@ def measure(client: Client, model: str, prompt: str, count: int, limit: int,
     chunks: list[str] = []
     started = time.monotonic()
     with client.request("/v1/chat/completions", body) as response:
-        def capture():
-            for raw in response:
-                line = raw.decode("utf-8").strip()
-                if line.startswith("data: ") and line[6:] != "[DONE]":
-                    obj = json.loads(line[6:])
-                    for choice in obj.get("choices") or []:
-                        content = (choice.get("delta") or {}).get("content")
-                        if content is not None:
-                            if not isinstance(content, str):
-                                raise ValueError("stream content is not text")
-                            chunks.append(content)
-                yield raw
-        stream = bench.parse_stream(capture(), started)
+        stream = bench.parse_stream(response, started, on_content=chunks.append)
     usage = stream["usage"]
     if usage["prompt_tokens"] != count or not 1 <= usage["completion_tokens"] <= max_tokens:
         raise ValueError("the completed response usage does not match the counted prompt")

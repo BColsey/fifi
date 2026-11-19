@@ -77,6 +77,15 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(BENCH.matching_server_rate([row()], "fifi-q36", stream), 37.25)
         self.assertEqual(BENCH.reused_tokens(stream["usage"]), 30)
 
+    def test_content_observer_receives_only_valid_visible_text(self):
+        seen = []
+        stream = BENCH.parse_stream(stream_lines(), 10.0, lambda: 11.25, on_content=seen.append)
+        self.assertEqual(seen, ["several tokens together", "more tokens"])
+        self.assertEqual(stream["usage"]["completion_tokens"], 96)
+        bad = [line({"choices": [{"delta": {"content": False}}]})] + stream_lines()
+        with self.assertRaisesRegex(ValueError, "content is not text"):
+            BENCH.parse_stream(bad, 10.0, on_content=seen.append)
+
     def test_rejects_incomplete_and_inconsistent_streams(self):
         cases = [
             stream_lines()[:-1],
