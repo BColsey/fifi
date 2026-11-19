@@ -1332,11 +1332,10 @@ fn load_inner(
         tensor.mapped = mapped;
     }
     if host_bytes != 0 {
-        let available = crate::family::host_admit::HostAdmission::probe(
+        let (_, available) = crate::family::host_admit::HostAdmission::probe_or_bare(
             "cuda mapped experts",
             "cuda mapped experts",
-        )?
-        .available_budget();
+        )?;
         admit_mapped_experts(host_bytes, available)?;
         eprintln!(
             "cuda mapped experts: placing {host_bytes} bytes in host memory (available host/cgroup bytes {available})"

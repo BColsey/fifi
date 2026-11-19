@@ -49,13 +49,26 @@ impl HostAdmission {
                         "{label} cannot read /proc/meminfo for the bare fallback: {error}"
                     ))
                 })?;
-                let bare = Self::from_meminfo(label, &text, None)?;
-                eprintln!(
-                    "{root_label}: cgroup budget unknown ({refusal:?}); using the bare MemAvailable figure"
-                );
-                Ok(bare.host_memory())
+                Self::bare_fallback(label, root_label, &refusal, &text)
             }
         }
+    }
+
+    /// The bare path of [`probe_or_bare`]: the machine-wide figures of the given meminfo
+    /// text, with one log line naming the refusal it replaced. Split out so a test can pin
+    /// that an unverified budget falls back to a figure instead of refusing.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn bare_fallback(
+        label: &'static str,
+        root_label: &'static str,
+        refusal: &EngError,
+        meminfo: &str,
+    ) -> Result<(u64, u64), EngError> {
+        let bare = Self::from_meminfo(label, meminfo, None)?;
+        eprintln!(
+            "{root_label}: cgroup budget unknown ({refusal:?}); using the bare MemAvailable figure"
+        );
+        Ok(bare.host_memory())
     }
 
     fn probe_in(
@@ -590,6 +603,21 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    fn an_unverified_budget_falls_back_to_the_bare_figure() {
+        let refusal = EngError::MemoryPlan(String::from("admission: cannot map its process"));
+        let (total, available) = HostAdmission::bare_fallback(
+            LABEL,
+            ROOT_LABEL,
+            &refusal,
+            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
+        )
+        .unwrap();
+        // The bare figures: machine-wide, no cgroup minimum applied.
+        assert_eq!((total, available), (32u64 << 30, 24u64 << 30));
+    }
+
     #[test]
     fn captured_jetson_layout_refuses_cleanly_to_the_bare_fallback() {
         // The Xavier (L4T) runs hybrid cgroup v1 with a controller-less unified tree: the
@@ -858,7 +886,13 @@ mod tests {
     #[test]
     fn hybrid_membership_uses_the_unified_memory_budget_in_either_order() {
         let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
-        for membership in ["1:net_cls:/\n0::/\n", "0::/\n2:cpu,cpuacct:/work:bench\n"] {
+        for membership in [
+            "1:net_cls:/\n0::/\n",
+            "0::/\n2:cpu,cpuacct:/work:bench\n",
+            // A v1 line for a different controller whose path differs from the unified
+            // path must not change which cgroup's limit is read.
+            "0::/\n1:devices:/elsewhere\n",
+        ] {
             std::fs::write(proc_dir.join("self/cgroup"), membership).unwrap();
             let budget =
                 HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
