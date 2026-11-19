@@ -245,9 +245,16 @@ impl ExecutorOps for QwenResidentStep<'_> {
         let began = Instant::now();
         // The slot leaves the step for the call, so the snapshot closure can borrow the step.
         let mut slot = std::mem::take(&mut self.prefix);
-        let saved = st.save_prefix(&mut slot, key, self.prefill_path(), fed, kind, || {
-            self.export_state().map(CudaSavedPrefix::Pageable)
-        });
+        let admit = || super::prefix::admit_pageable(std::iter::once((self.state_layout(), fed)));
+        let saved = st.save_prefix_if(
+            &mut slot,
+            key,
+            self.prefill_path(),
+            fed,
+            kind,
+            Some(&admit),
+            || self.export_state().map(CudaSavedPrefix::Pageable),
+        );
         self.prefix = slot;
         if matches!(saved, Ok(true)) {
             self.log_prefix("saved", began);

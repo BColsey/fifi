@@ -722,12 +722,20 @@ impl ExecutorOps for CardSession {
         }
         let fed = self.fed;
         let mut slot = std::mem::take(&mut self.prefix);
-        let saved = st.save_prefix(
+        let admit = || {
+            super::prefix::admit_pageable(
+                self.states
+                    .iter()
+                    .map(|state| (state.layout(), state.tokens())),
+            )
+        };
+        let saved = st.save_prefix_if(
             &mut slot,
             key,
             (self.prefix_path, self.identity.clone()),
             fed,
             kind,
+            Some(&admit),
             || {
                 self.states
                     .iter()

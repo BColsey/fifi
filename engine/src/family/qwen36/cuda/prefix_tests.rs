@@ -102,3 +102,52 @@ fn an_absurd_positions_count_is_a_refusal_not_a_panic() {
     let layout = StateLayout::new(&d, &options(KvMode::Fp16, 1_024)).expect("layout");
     assert!(entry_bytes(&layout, usize::MAX).is_err());
 }
+
+#[test]
+fn pageable_peak_sums_shards_and_reserves_only_one_copy_temporary() {
+    use super::prefix::{HOST_HEADROOM, pageable_required};
+    for mode in [KvMode::Fp16, KvMode::Int8G32] {
+        let layout = StateLayout::new(&dims(), &options(mode, 40_960)).unwrap();
+        for n in [0, 1, 32_767] {
+            let one = pageable_required([(&layout, n)].into_iter()).unwrap();
+            let two = pageable_required([(&layout, n), (&layout, n)].into_iter()).unwrap();
+            let payload = entry_bytes(&layout, n).unwrap();
+            assert_eq!(two - one, payload);
+            let conversion =
+                layout.delta.rec_values.max(layout.delta.conv_values) * size_of::<f32>();
+            let readback = layout
+                .kv
+                .prefix_ranges(0, n)
+                .unwrap()
+                .iter()
+                .map(|run| run.bytes.min(crate::kernels::CHUNK_LIMIT))
+                .max()
+                .unwrap();
+            assert_eq!(one, HOST_HEADROOM + payload + conversion.max(readback));
+        }
+        let narrow = StateLayout::new_with_kv_heads(&dims(), &options(mode, 40_960), 1).unwrap();
+        let n = 32_767;
+        for (first, second) in [(&narrow, &layout), (&layout, &narrow)] {
+            let first_peak = pageable_required([(first, n)].into_iter()).unwrap();
+            let second_peak = pageable_required([(second, n)].into_iter()).unwrap();
+            let peak = pageable_required([(first, n), (second, n)].into_iter()).unwrap();
+            assert_eq!(
+                peak,
+                first_peak.max(entry_bytes(first, n).unwrap() + second_peak)
+            );
+        }
+        assert!(pageable_required([(&layout, usize::MAX)].into_iter()).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires a Linux process with MemoryMax=2G and more than 1.8 GiB initially available"]
+fn process_memory_limit_2_gib_admits_one_large_pageable_shard_and_refuses_two() {
+    let budget = crate::family::host_admit::HostAdmission::probe("test", "test").unwrap();
+    assert!(budget.available_budget() > 0);
+    let layout = StateLayout::new(&dims(), &options(KvMode::Fp16, 40_960)).unwrap();
+    assert!(super::prefix::admit_pageable([(&layout, 32_767)].into_iter()).unwrap());
+    assert!(
+        !super::prefix::admit_pageable([(&layout, 32_767), (&layout, 32_767)].into_iter()).unwrap()
+    );
+}

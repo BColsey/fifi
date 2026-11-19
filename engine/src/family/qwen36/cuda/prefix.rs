@@ -4,7 +4,7 @@ use super::state::{
     export::ExportedState,
     pinned::{PendingPinned, PinnedSnapshot},
 };
-use super::{dims::KvMode, state::export::plane_sizes, state_layout::StateLayout};
+use super::{dims::KvMode, state_layout::StateLayout};
 use crate::{
     EngError,
     family::session::{DecodeSession, PrefixSlot, SaveKind},
@@ -87,6 +87,12 @@ fn overflow() -> EngError {
 /// planes of the first `positions` rows of every attention layer. Checked arithmetic only: an
 /// absurd count is a `MemoryPlan` refusal, never a panic.
 pub(super) fn entry_bytes(layout: &StateLayout, positions: usize) -> Result<usize, EngError> {
+    Ok(export_bytes(layout, positions)?.0)
+}
+
+// A pageable export retains the committed payload plus one live temporary. DeltaNet
+// converts each byte vector to f32. KV readback stages one transfer range at a time.
+fn export_bytes(layout: &StateLayout, positions: usize) -> Result<(usize, usize), EngError> {
     let pool = layout.delta;
     let per_layer = pool
         .rec_values
@@ -95,10 +101,54 @@ pub(super) fn entry_bytes(layout: &StateLayout, positions: usize) -> Result<usiz
         .and_then(|bytes| bytes.checked_mul(pool.layers))
         .ok_or_else(overflow)?;
     let mut total = per_layer;
+    let mut temporary = if pool.layers == 0 {
+        0
+    } else {
+        pool.rec_values
+            .max(pool.conv_values)
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(overflow)?
+    };
     for ordinal in 0..layout.kv.layers {
-        for bytes in plane_sizes(&layout.kv, ordinal, positions)? {
-            total = total.checked_add(bytes).ok_or_else(overflow)?;
+        for range in layout.kv.prefix_ranges(ordinal, positions)? {
+            total = total.checked_add(range.bytes).ok_or_else(overflow)?;
+            temporary = temporary.max(range.bytes.min(crate::kernels::CHUNK_LIMIT));
         }
     }
-    Ok(total)
+    Ok((total, temporary))
+}
+
+pub(super) const HOST_HEADROOM: usize = 1 << 30;
+
+pub(super) fn pageable_required<'a>(
+    states: impl Iterator<Item = (&'a StateLayout, usize)>,
+) -> Result<usize, EngError> {
+    let mut payload = 0usize;
+    let mut peak = 0;
+    for (layout, positions) in states {
+        let (bytes, temporary) = export_bytes(layout, positions)?;
+        payload = payload.checked_add(bytes).ok_or_else(overflow)?;
+        // Card exports run in order. Only earlier exports remain live beside this shard.
+        peak = peak.max(payload.checked_add(temporary).ok_or_else(overflow)?);
+    }
+    peak.checked_add(HOST_HEADROOM).ok_or_else(overflow)
+}
+
+pub(super) fn admit_pageable<'a>(
+    states: impl Iterator<Item = (&'a StateLayout, usize)>,
+) -> Result<bool, EngError> {
+    let required = pageable_required(states)?;
+    let available = crate::family::host_admit::HostAdmission::probe(
+        "q36 pageable prefix",
+        "q36 pageable prefix",
+    )
+    .inspect_err(|error| {
+        eprintln!(
+            "q36 cuda: pageable prefix host budget: {}",
+            error.describe()
+        )
+    })
+    .ok()
+    .and_then(|budget| usize::try_from(budget.available_budget()).ok());
+    Ok(available.is_some_and(|bytes| required <= bytes))
 }

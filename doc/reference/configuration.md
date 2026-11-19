@@ -91,6 +91,8 @@ MLX ignores `capture` with a log line, and refuses `tiered`.
 The `draft_*`, `num_draft_tokens`, `hybrid_draft_tokens`, `ngram_match_min` and `mtp_model_dir` keys are checked at start. A `draft_mode` other than `disabled` is refused on MLX and with GGUF weights, because nothing there can run a window. (EXL3 weights already refuse `kv_offload_host_bytes`, the one KV cache a window cannot export.) `mtp` is refused with EXL3 weights because its draft step does not exist. `ngram` works with EXL3 weights, and the output is the same as with `disabled` for any sampler. A window feeds its rows one at a time and first copies the whole committed session state to the host, so each window costs time proportional to the context and `ngram` is slower than `disabled`: use it to check output, not to serve long contexts.
 `prefix_store_entries` is ignored with a log line when `prefix_reuse` is off.
 
+Before saving a new host-backed pageable prefix (the opt-in pageable path; the default pinned-prefix path is unchanged), the CUDA engine checks live host and process-cgroup memory. The check covers the committed KV and recurrent state on every participating card, the largest temporary copy buffer, and 1 GiB of headroom. If that space is unavailable, the engine skips the optional save and keeps the already-cached prefixes available for later requests. Reusing an existing checkpoint requires no new allocation and passes without a probe.
+
 ### GGUF content pinning (CUDA)
 
 Set `qwen36.gguf_sha256` to a trusted full-file SHA-256 to bind startup to specific checkpoint bytes.
