@@ -255,7 +255,18 @@ pub fn generate_cuda(
         max_tokens,
         cache_entries,
         probed_available_bytes()?,
-        admission::cuda::admit_cuda_serving,
+        |directory, descriptor, spec, capacity, entries, policy, free| {
+            admission::cuda::admit_cuda_serving(
+                directory,
+                descriptor,
+                spec,
+                capacity,
+                Some(entries),
+                policy,
+                free,
+            )
+            .map(|(ticket, _)| ticket)
+        },
         move |spec, source, state, admitted| match hybrid {
             Some(config) => NemotronStack::<LoaderWeightSource>::new_cuda_hybrid(
                 spec, source, state, admitted, config,

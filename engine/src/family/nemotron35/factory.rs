@@ -110,15 +110,18 @@ pub(crate) fn start_engine(
         })?;
         let admitted = match owned.backend.as_str() {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            "cuda" => StackAdmission::Cuda(admission::cuda::admit_cuda_serving(
-                &model,
-                &descriptor,
-                &spec,
-                owned.context_limit,
-                owned.cache_entries,
-                MemoryPolicy::default_share(),
-                available,
-            )?),
+            "cuda" => {
+                let (ticket, _) = admission::cuda::admit_cuda_serving(
+                    &model,
+                    &descriptor,
+                    &spec,
+                    owned.context_limit,
+                    Some(owned.cache_entries),
+                    MemoryPolicy::default_share(),
+                    available,
+                )?;
+                StackAdmission::Cuda(ticket)
+            }
             _ => {
                 admission::admit_serving(
                     &model,
