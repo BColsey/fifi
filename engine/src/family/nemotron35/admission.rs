@@ -505,7 +505,7 @@ fn checkpoint_error(message: impl Into<String>) -> EngError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{MemoryComponents, admission_ceiling, check_memory};
     use crate::{EngError, memory::MemoryPolicy};
 
@@ -584,7 +584,7 @@ mod tests {
     }
 
     // CPU entrypoint regression tests: user-approved bounded fixtures through real readers.
-    mod cpu_entrypoints {
+    pub(crate) mod cpu_entrypoints {
         use std::{collections::BTreeMap, fs, path::Path};
 
         use serde_json::{Value, json};
@@ -641,7 +641,7 @@ mod tests {
             }
         }
 
-        fn fixture() -> (TempDir, NemotronTextSpec, NemotronExecSpec) {
+        pub(crate) fn fixture() -> (TempDir, NemotronTextSpec, NemotronExecSpec) {
             let dir = tempfile::tempdir().unwrap();
             fs::write(
                 dir.path().join("config.json"),
@@ -2111,6 +2111,105 @@ pub(super) mod cuda {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 println!("reservation case={case} passed");
+            }
+        }
+
+        /// A full CUDA admission through admit_cuda_serving on the card,
+        /// once with an explicit cache count and once with the count
+        /// omitted so the budget-fit plumbing (measured host bytes, entry
+        /// choice, device weight-cache trim and its log line) runs for
+        /// real; a third case passes a smaller measured-card figure to the
+        /// same admission, which is the only way the trim runs on a card
+        /// with more free memory than the request. The ledger is
+        /// process-global and a served admission deliberately retains its
+        /// host credit (the documented release shortcut), so each mode runs
+        /// in a fresh child process, like the reservation contract cases.
+        const CARD_CASE: &str = "INFERENCE_TEST_NEM35_CARD_ADMISSION_CASE";
+        const CARD_NAME: &str = "family::nemotron35::admission::cuda::tests::the_card_admits_the_expert_cache_explicit_then_fitted";
+
+        fn card_memory() -> MemoryInfo {
+            let (free, total) = crate::kernels::cuda::memory_info_first_device().unwrap();
+            MemoryInfo { free, total }
+        }
+
+        fn card_admission_case(mode: &str) {
+            let (dir, descriptor, spec) = super::super::tests::cpu_entrypoints::fixture();
+            let available = super::super::host_available_bytes()
+                .expect("admission requires measurable host memory");
+            let policy = MemoryPolicy::default_share();
+            let cache_entries = (mode == "explicit").then_some(2usize);
+            let (mut ticket, entries) = admit_cuda_serving(
+                dir.path(),
+                &descriptor,
+                &spec,
+                16,
+                cache_entries,
+                policy,
+                available,
+            )
+            .unwrap();
+            match cache_entries {
+                Some(wanted) => {
+                    assert_eq!(entries, wanted, "an explicit count is admitted verbatim")
+                }
+                None => assert!(entries >= 1, "the fitted cache admits at least one entry"),
+            }
+            if cache_entries.is_none() {
+                ticket.enable_auto_cache();
+            }
+            // The small-card case feeds the trim a figure the request
+            // exceeds, so the trim path runs without a real small card.
+            let memory = match mode {
+                "fitted-small-card" => MemoryInfo {
+                    free: 2 << 30,
+                    total: 24 << 30,
+                },
+                _ => card_memory(),
+            };
+            let mut budget = 0;
+            let release = ticket
+                .into_cleanup_with_cache(memory, false, &mut budget)
+                .unwrap();
+            if mode == "fitted-small-card" {
+                assert!(
+                    budget < 12 << 30,
+                    "a measured card below the request must trim the weight cache (budget={budget})"
+                );
+            }
+            release();
+            let (host, device) = held();
+            assert_eq!(device, 0, "the device ledger is clean after release");
+            println!(
+                "card_admission mode={mode} entries={entries} weight_cache={budget} \
+                 host_credit_retained={host}"
+            );
+        }
+
+        #[test]
+        fn the_card_admits_the_expert_cache_explicit_then_fitted() {
+            if !crate::kernels::cuda::device_present(CARD_NAME) {
+                eprintln!("{CARD_NAME}: no CUDA device, skipped");
+                return;
+            }
+            if let Ok(case) = std::env::var(CARD_CASE) {
+                card_admission_case(&case);
+                return;
+            }
+            for case in ["explicit", "fitted", "fitted-small-card"] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", CARD_NAME, "--nocapture"])
+                    .env(CARD_CASE, case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "case={case} status={} stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
             }
         }
     }
