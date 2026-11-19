@@ -239,8 +239,7 @@ fn device_prefill_piece(
     )?;
     let rows = fitting_prefill_piece(max_rows, context, remaining)?;
     eprintln!(
-        "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); metal_working_set_bytes={} resident_active_bytes={weights} session_state_bytes={state} prefix_reserve_bytes={retained} mlx_cache_limit_bytes={cache} growth_bytes={full_plane_bytes} pressure_margin_bytes={PRESSURE_MARGIN} remaining_bytes={remaining}",
-        device.bytes(),
+        "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); {device} resident_active_bytes={weights} session_state_bytes={state} prefix_reserve_bytes={retained} mlx_cache_limit_bytes={cache} growth_bytes={full_plane_bytes} pressure_margin_bytes={PRESSURE_MARGIN} remaining_bytes={remaining}",
     );
     Ok(rows)
 }

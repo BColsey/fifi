@@ -183,7 +183,7 @@ pub(super) fn plan_prefill(
     }
     let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
     let terms = if let Some(device) = device {
-        format!("metal_working_set_bytes={} {terms}", device.bytes())
+        format!("{device} {terms}")
     } else {
         terms
     };

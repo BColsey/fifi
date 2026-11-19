@@ -434,10 +434,7 @@ impl FlashExecutor {
         };
         let terms = plan.terms.to_string().lines().collect::<Vec<_>>().join(" ");
         let terms = if let Some(device) = device {
-            format!(
-                "metal_working_set_bytes={} state_overlap_bytes={state_overlap} {terms}",
-                device.bytes()
-            )
+            format!("{device} state_overlap_bytes={state_overlap} {terms}")
         } else {
             terms
         };
