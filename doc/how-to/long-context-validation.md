@@ -85,6 +85,34 @@ uses the engine-start-to-first-batch interval when it is available.
 The generated project and edits are synthetic: passing checks a narrow coding
 interaction and does not establish general coding quality.
 
+## Compare prefix retention after a competing request
+
+Use the same binary, model, tokenizer, seed and context limit for both runs.
+Start each run with an empty prefix store on an isolated endpoint. Run the
+following command with one cache entry, then reload with two entries and repeat
+with `--expect-return retained` and a separate output path.
+
+```sh
+python3 scripts/bench_prefix_returns.py \
+  --url http://127.0.0.1:18792 --model fifi-q36 \
+  --seed prefix-return-01 --expect-return evicted \
+  --output "$TMPDIR/one-entry.json"
+```
+
+At each of eight total context sizes from 2,048 to 262,144 tokens, the driver
+reserves reply space and sends A, repeats A, sends a different archive B,
+then returns to A. Use `--contexts 2048` for a smoke test. Every answer must
+contain its archive's three codes in order. The adjacent repeat must reuse
+tokens beyond the prefix common to A and B. A retained return must recover at
+least the adjacent repeat's reuse. Compare prompt token hashes across both runs.
+
+The JSON records cached and newly processed tokens, time to first visible
+content, and request-matched server timings. Prefill rate estimates count
+only newly processed tokens. A capacity refusal records the engine's advertised
+limit and skips generation at that depth. Exit status 2 covers a failed check,
+a refused depth, or missing required timings. An interrupted or invalid stream
+leaves evidence in the corresponding `.partial` file.
+
 ## Read the result
 
 The JSON result records the counted prompt and completion tokens, prefix reuse,

@@ -76,16 +76,21 @@ class Client:
             raise ValueError(f"{path} did not return an object")
         return value
 
-    def encode(self, model: str, **source) -> int:
+    def encode_ids(self, model: str, **source) -> list[int]:
         value = self.json("/v1/token/encode", {"model": model, **source})
         count, ids = value.get("length"), value.get("tokens")
         if not bench.nonnegative_int(count) or not isinstance(ids, list) or len(ids) != count:
             raise ValueError("server tokenization returned an inconsistent count")
-        return count
+        if any(not bench.nonnegative_int(token) or token > 0xffffffff for token in ids):
+            raise ValueError("server tokenization returned an invalid token ID")
+        return ids
+
+    def encode(self, model: str, **source) -> int:
+        return len(self.encode_ids(model, **source))
 
 
 def size_prompt(client: Client, model: str, target: int, tolerance: int,
-                nonce: str, values: tuple[str, str, str]) -> tuple[str, int, int]:
+                nonce: str, values: tuple[str, str, str], *, render=messages) -> tuple[str, int, int]:
     per = client.encode(model, text=FILLER * 3) - client.encode(model, text=FILLER * 2)
     if per <= 0:
         raise ValueError("the server tokenizer did not advance on the filler")
@@ -96,7 +101,7 @@ def size_prompt(client: Client, model: str, target: int, tolerance: int,
             break
         visited.add(repeats)
         prompt = prompt_text(repeats, nonce, values)
-        count = client.encode(model, messages=messages(prompt), **{"x-thinking": "off"})
+        count = client.encode(model, messages=render(prompt), **{"x-thinking": "off"})
         if target <= count <= target + tolerance:
             return prompt, count, repeats
         change = max(1, abs(target - count) // per)
@@ -148,6 +153,7 @@ def matching_server_metrics(rows, model: str, stream: dict) -> dict | None:
 
     prefill_ms = milliseconds(row.get("prefill_ms"), allow_zero=False)
     return {
+        "server_time_to_first_token_ms": milliseconds(row.get("time_to_first_token_ms"), allow_zero=True),
         "server_queue_wait_ms": milliseconds(row.get("queue_wait_ms"), allow_zero=True),
         "server_prefill_ms": prefill_ms,
         "server_prompt_tokens_per_second": (1000 * usage["prompt_tokens"] / prefill_ms
@@ -159,7 +165,7 @@ def matching_server_metrics(rows, model: str, stream: dict) -> dict | None:
 def recent_server_metrics(client: Client, model: str, stream: dict) -> dict:
     """The request log may arrive just after the final SSE event."""
     deadline = time.monotonic() + 5
-    empty = {"server_queue_wait_ms": None, "server_prefill_ms": None,
+    empty = {"server_time_to_first_token_ms": None, "server_queue_wait_ms": None, "server_prefill_ms": None,
              "server_prompt_tokens_per_second": None,
              "server_decode_tokens_per_second": None}
     while True:
@@ -176,10 +182,10 @@ def recent_server_metrics(client: Client, model: str, stream: dict) -> dict:
 
 
 def measure(client: Client, model: str, prompt: str, count: int, limit: int,
-            max_tokens: int, expected: str) -> dict:
+            max_tokens: int, expected: str, *, render=messages, require_cold=True) -> dict:
     if count + max_tokens > limit:
         raise ValueError("the counted prompt and reserved reply exceed the context limit")
-    body = {"model": model, "messages": messages(prompt), "max_tokens": max_tokens,
+    body = {"model": model, "messages": render(prompt), "max_tokens": max_tokens,
             "temperature": 0, "stream": True, "x-thinking": "off"}
     chunks: list[str] = []
     started = time.monotonic()
@@ -201,8 +207,10 @@ def measure(client: Client, model: str, prompt: str, count: int, limit: int,
     if usage["prompt_tokens"] != count or not 1 <= usage["completion_tokens"] <= max_tokens:
         raise ValueError("the completed response usage does not match the counted prompt")
     reused = bench.reused_tokens(usage)
-    if reused != 0:
+    if require_cold and reused != 0:
         raise ValueError("the server did not confirm a cold prompt with zero reused tokens")
+    if reused is None:
+        raise ValueError("the server did not report prefix reuse")
     first = stream["first_delta_seconds"]
     if first is None or not math.isfinite(first) or first <= 0:
         raise ValueError("the response did not contain a timed visible delta")
