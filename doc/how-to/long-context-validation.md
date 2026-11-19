@@ -88,9 +88,16 @@ interaction and does not establish general coding quality.
 ## Compare prefix retention after a competing request
 
 Use the same binary, model, tokenizer, seed and context limit for both runs.
-Start each run with an empty prefix store on an isolated endpoint. Run the
-following command with one cache entry, then reload with two entries and repeat
-with `--expect-return retained` and a separate output path.
+For a controlled comparison, start each run with an empty prefix store. Run
+the following command with one cache entry, then reload with two entries and
+repeat with `--expect-return retained` and a separate output path.
+
+A running endpoint can also supply a baseline when its serving window allows
+inference traffic. Check the model, the serving binary and the request queue,
+then use a fresh seed. The driver requires zero reused tokens on the first
+request at each depth. Check the server request log for competing traffic
+before interpreting the timings. Changing the server or cache configuration
+uses the [GPU service handoff procedure](second-gpu-instance.md#gpu-test-coordination).
 
 ```sh
 python3 scripts/bench_prefix_returns.py \
@@ -112,6 +119,8 @@ only newly processed tokens. A capacity refusal records the engine's advertised
 limit and skips generation at that depth. Exit status 2 covers a failed check,
 a refused depth, or missing required timings. An interrupted or invalid stream
 leaves evidence in the corresponding `.partial` file.
+
+An [RTX 2080 Ti measurement](../../scripts/benchmarks/qwen36-prefix-returns-2080.json) records all four turns at each admitted depth, fixed-length decode controls, and the server’s responses to over-limit requests.
 
 ## Read the result
 
