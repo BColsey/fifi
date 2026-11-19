@@ -135,6 +135,22 @@ The Flash-Next, Qwen3.6 MoE and Qwen3.8 dense worker fixtures compared their one
 
 The timings use four fresh process pairs in each family and four recorded samples per row in each process. Latency columns report medians of process medians. The percentage column reports the median of the four paired changes. Decode timing varied by case. The 33-token dense fixture's median active MLX peak rose from 143 to 225 KiB. [Worker measurements](../../scripts/benchmarks/mac-m4-mlx-capped-worker-requests.csv)
 
+## Full Flash-Next checkpoint on the M4 mini
+
+The mini served the pinned Flash-Next oQ4e checkpoint from the external SSD. The audit matched 3,339 expected keys, shapes and dtypes in its 21 safetensors headers. All 107.67 GB of checkpoint files were subsequently checked against the publisher's digests. The server used the four pinned tokenizer files described in the [dense Qwen study](#full-qwen38-dense-checkpoint-on-the-m4-mini). [Pinned Flash-Next oQ4e checkpoint](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ4e-mtp/tree/b1fed839da5132038abb0e09ebf626064b7f8e21)
+
+The normal MLX server admitted the model at an 11 GiB Metal ceiling with 32K serving context, a 256 MiB allocator cache and prefix reuse off. It kept 4,766,514,252 bytes of weights resident, charged 83,214,336 bytes of decode staging and reserved 5,202,132,992 bytes for serving state and headroom. The worker could submit up to 32 rows per piece and the executor admitted 16-row chunks. Routed experts streamed from disk with positioned reads and prefill coalescing enabled.
+
+The server was ready in 11.90 s. Its 36-token arithmetic-sequence prompt produced four tokens starting with `10,`. First-token latency was 72.99 s and decode reached 0.30 tok/s. The request attributed 26.78 GB of reads to the external SSD. Lifetime process peak was 11.63 GB, including startup. This run establishes full-checkpoint admission and short-request behavior. Full sparse-context performance, prefix retention, parity and defaults each need further evidence. [Serving measurements](../../scripts/benchmarks/mac-m4-flash-next-oq4e-smoke.csv)
+
+Run the following with a release Apple Silicon server built with `native-mlx`. Use the process I/O counter from the [staging study](mac-flint-expert-pipeline.md#reproduce).
+
+```sh
+python3 scripts/mac_cache_study/flash_next_oq4e_smoke.py \
+  "$ENGINESRV" "$FLASH_NEXT_CHECKPOINT" "$QWEN38_TOKENIZER" "$SCRATCH/proc-io" \
+  "$SCRATCH/flash-next-oq4e"
+```
+
 ## Disk-backed Flint experts
 
 With automatic sizing enabled, Flint checks the checkpoint headers and serving reserves before importing weights. If the full resident model fits, Flint loads it as before. Otherwise it keeps attention, routers, shared experts, and the output head in memory and reads the routed experts by ID from the existing local safetensors files. Each layer imports only the experts selected for the current rows, restores the original routing order, and releases its staged weights after Metal completes the grouped projection. The model files stay on the local drive and the KV cache stays in unified memory.
