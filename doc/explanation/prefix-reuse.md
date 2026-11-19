@@ -35,3 +35,11 @@ Up to two saved prefixes are also kept in pinned host memory; see [How fifi plan
 ## Seeing it work
 
 The `usage` of each reply reports how many prompt tokens came from a saved prefix: `reused_tokens` and `prompt_tokens_details.cached_tokens` on the OpenAI API, `cache_read_input_tokens` on the Anthropic API.
+
+The request-log line and `/v1/recent-requests` also carry the engine's own
+prefix report: `prefix_entries` and `prefix_bytes`, the stored snapshots the
+executor holds for the request's engine. On Qwen3.6 with CUDA,
+`prefix_bytes` is the committed payload of those entries. The RAM the prefix
+store actually holds is larger: pinned slots are allocated at capacity, so a
+half-full entry still occupies its full slot. Read `prefix_bytes` as the
+payload figure, not as the store's memory footprint.

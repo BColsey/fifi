@@ -182,7 +182,9 @@ pub(crate) struct PrefixReport {
     /// The charged bytes of the stored snapshots (the measured cost, report M0): each entry
     /// charges the KV bytes of its positions plus its fixed state bytes, and the executor sums
     /// the charge of its own entries. The store never sizes a snapshot, and an executor
-    /// without a charge reports 0.
+    /// without a charge reports 0. It is a payload figure, not a footprint:
+    /// pinned slots are allocated at capacity, so the RAM the store holds is
+    /// larger than this sum.
     pub(crate) bytes: u64,
     pub(crate) hit: PrefixHit,
     /// Prompt tokens shared with the longest stored key beyond the restored prefix: tokens
