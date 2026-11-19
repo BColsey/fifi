@@ -55,10 +55,7 @@ use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
 /// the card op lists, and the token book.
 pub(crate) struct CardSession {
     stack: &'static CardStack,
-    /// The per-card resident states, owned mutably beside the shared
-    /// stack: the single-device split (leaked shared resources, step-owned
-    /// state) applied to the cards.
-    states: Vec<ResidentState>,
+    sequence: CardSequence,
     /// The per-card mixers, one per card over every layer.
     mixers: Vec<Mixers<'static>>,
     /// The MoE weights, one set per layer: `[layer][card]`.
@@ -77,7 +74,6 @@ pub(crate) struct CardSession {
     vocab: usize,
     eps: f32,
     context_limit: usize,
-    fed: usize,
     poisoned: bool,
     /// The prefix store of the session: one entry is one `ExportedState`
     /// per card (the card's sliced KV planes plus its DeltaNet state), so
@@ -85,13 +81,29 @@ pub(crate) struct CardSession {
     prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
     /// The numeric path every entry of this session saves and restores under.
     prefix_path: CudaPrefillPath,
-    /// Set by a prefix import: the word block was zeroed, so the next feed
-    /// writes the full step params (token id AND position) again.
-    full_params_next: bool,
     /// Experimental: prompt-only feeds need state, not the vocabulary row.
     skip_prefill_head: bool,
     eos: Arc<[u32]>,
     sampler_vocab: usize,
+}
+
+/// Mutable inference state for one sequence across all peer shards. Weights, streams,
+/// scratch, the ring and the prefix index belong to the executor.
+struct CardSequence {
+    states: Vec<ResidentState>,
+    fed: usize,
+    /// An import clears the word block. The next token must restore its position word.
+    full_params_next: bool,
+}
+
+impl CardSequence {
+    fn new(states: Vec<ResidentState>) -> Self {
+        Self {
+            states,
+            fed: 0,
+            full_params_next: false,
+        }
+    }
 }
 
 impl CardSession {
@@ -117,6 +129,12 @@ impl CardSession {
             return Err(EngError::BadRequest(format!(
                 "card session: {cards} cards, {} weight sets",
                 weights.len()
+            )));
+        }
+        if states.len() != cards {
+            return Err(EngError::BadRequest(format!(
+                "card session: {cards} cards, {} states",
+                states.len()
             )));
         }
         let shard = stack.table();
@@ -233,15 +251,9 @@ impl CardSession {
             .ok_or_else(|| {
                 EngError::Checkpoint("card session: the head shards overflow usize".into())
             })?;
-        if states.len() != cards {
-            return Err(EngError::BadRequest(format!(
-                "card session: {cards} cards, {} states",
-                states.len()
-            )));
-        }
         Ok(Self {
             stack,
-            states,
+            sequence: CardSequence::new(states),
             mixers,
             moe,
             card_ops,
@@ -255,13 +267,11 @@ impl CardSession {
             vocab,
             eps: dims.shape.eps,
             context_limit,
-            fed: 0,
             poisoned: false,
             skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
                 .is_some_and(|value| value == "1"),
             prefix: PrefixSlot::with_limits(prefix_limits),
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
-            full_params_next: false,
             eos,
             sampler_vocab,
         })
@@ -276,13 +286,45 @@ impl CardSession {
         self.skip_prefill_head = enabled;
     }
 
+    fn require_healthy(&self) -> Result<(), EngError> {
+        if self.poisoned {
+            return Err(EngError::Backend {
+                operation: "qwen36_cards",
+                message: "the multi-device session is poisoned after an earlier failure".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject inconsistent snapshots before the first peer write. Once a native copy starts,
+    /// a failure requires a full reset because earlier peers may already hold the new state.
+    fn import_prefix_shards(&mut self, saved: &[ExportedState]) -> Result<(), EngError> {
+        self.require_healthy()?;
+        let tokens = prefix_shard_depth(saved, self.sequence.states.len())?;
+        let imports = self
+            .sequence
+            .states
+            .iter_mut()
+            .zip(self.stack.streams())
+            .zip(saved)
+            .map(|((state, stream), snapshot)| state.prepare_import(stream, snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        for import in imports {
+            import.apply().inspect_err(|_| self.poisoned = true)?;
+        }
+        self.sequence.fed = tokens;
+        self.sequence.full_params_next = true;
+        Ok(())
+    }
+
     /// The prefix rig's comparison vehicle: one export per card of the
     /// committed state (sliced KV planes plus DeltaNet slots).
     #[cfg(test)]
     pub(super) fn export_states_for_test(
         &self,
     ) -> Result<Vec<crate::family::qwen36::cuda::state::export::ExportedState>, EngError> {
-        self.states
+        self.sequence
+            .states
             .iter()
             .enumerate()
             .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
@@ -293,32 +335,28 @@ impl CardSession {
     /// the status words, and optionally read the concatenated logits row.
     /// `fed` advances only when the token ran clean.
     fn run_token(&mut self, token: u32, read_logits: bool) -> Result<Vec<f32>, EngError> {
-        if self.poisoned {
-            return Err(EngError::Backend {
-                operation: "qwen36_cards",
-                message: "the multi-device session is poisoned after an earlier failure".to_owned(),
-            });
-        }
+        self.require_healthy()?;
         check_token_id(token, self.sampler_vocab)?;
-        if self.fed >= self.context_limit {
+        if self.sequence.fed >= self.context_limit {
             return Err(EngError::BadRequest(format!(
                 "card session: position {} reaches the context limit {}",
-                self.fed, self.context_limit
+                self.sequence.fed, self.context_limit
             )));
         }
-        if self.fed == 0 || self.full_params_next {
+        if self.sequence.fed == 0 || self.sequence.full_params_next {
             // The cleared word block takes the full params: the token id
             // and the position. After a fresh reset the position is 0; after
             // a prefix import the word block was zeroed by the import and
             // the position restarts at the restored token count.
-            let pos = i32::try_from(self.fed).map_err(|_| {
+            let pos = i32::try_from(self.sequence.fed).map_err(|_| {
                 EngError::BadRequest("card session: position overflows i32".to_owned())
             })?;
             let params = StepParams::new(card_token_id(token)?, pos)?;
             for card in 0..self.stack.shards().len() {
-                self.states[card].write_step_params(&self.stack.streams()[card], &params)?;
+                self.sequence.states[card]
+                    .write_step_params(&self.stack.streams()[card], &params)?;
             }
-            self.full_params_next = false;
+            self.sequence.full_params_next = false;
         } else {
             // The next token comes from the HOST draw over the folded
             // logits row, so the global id is injected explicitly on every
@@ -333,14 +371,14 @@ impl CardSession {
                 .collect::<Result<Vec<_>, EngError>>()?;
             layer_ops.push(list);
         }
-        for state in &mut self.states {
+        for state in &mut self.sequence.states {
             state.enqueue_step(1)?;
         }
         let ops: Vec<&[&[CardOp]]> = layer_ops.iter().map(|list| list.as_slice()).collect();
         let moe_sets: Vec<&[MoeLayerWeights]> = self.moe.iter().map(|set| set.as_slice()).collect();
         run_card_token(
             self.stack,
-            &self.states,
+            &self.sequence.states,
             &self.kinds,
             &self.ordinals,
             &ops,
@@ -351,7 +389,7 @@ impl CardSession {
             &self.output_norms,
             &self.heads,
             self.eps,
-            self.fed,
+            self.sequence.fed,
             read_logits || !self.skip_prefill_head,
         )?;
         // The read-back: every stream joined, then every status word folded
@@ -362,7 +400,7 @@ impl CardSession {
         self.fold_statuses()?;
         // The step committed one clean position on every card; the books
         // carry the count the prefix export reads.
-        for state in &mut self.states {
+        for state in &mut self.sequence.states {
             state.commit_step(1, 0)?;
         }
         let logits = if read_logits {
@@ -370,7 +408,7 @@ impl CardSession {
         } else {
             Vec::new()
         };
-        self.fed += 1;
+        self.sequence.fed += 1;
         Ok(logits)
     }
 
@@ -379,7 +417,7 @@ impl CardSession {
         let bytes = card_token_id(token)?.to_le_bytes();
         for card in 0..self.stack.shards().len() {
             let stream = &self.stack.streams()[card];
-            let word = self.states[card].step_field(StepField::TokenId)?;
+            let word = self.sequence.states[card].step_field(StepField::TokenId)?;
             word.buffer().write_at(stream, word.offset(), &bytes)?;
         }
         Ok(())
@@ -395,7 +433,7 @@ impl CardSession {
         for card in 0..cards {
             let stream = &self.stack.streams()[card];
             let mut bytes = [0u8; 4];
-            let step = self.states[card].step_status()?;
+            let step = self.sequence.states[card].step_status()?;
             step.buffer().read_at(stream, step.offset(), &mut bytes)?;
             step_words.push(u32::from_le_bytes(bytes));
             self.stack.shards()[card]
@@ -448,6 +486,21 @@ impl CardSession {
     }
 }
 
+fn prefix_shard_depth(saved: &[ExportedState], cards: usize) -> Result<usize, EngError> {
+    let Some(first) = saved.first().filter(|_| saved.len() == cards) else {
+        return Err(EngError::BadRequest(format!(
+            "card prefix: {} saved states for {cards} cards",
+            saved.len()
+        )));
+    };
+    if saved.iter().any(|snapshot| snapshot.tokens != first.tokens) {
+        return Err(EngError::Checkpoint(
+            "card prefix: shard token counts differ".into(),
+        ));
+    }
+    Ok(first.tokens)
+}
+
 /// The token id as the step word wants it: non-negative and i32-wide.
 fn card_token_id(token: u32) -> Result<i32, EngError> {
     i32::try_from(token)
@@ -466,15 +519,17 @@ impl TokenStepper for CardSession {
     }
 
     fn fed(&self) -> usize {
-        self.fed
+        self.sequence.fed
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
         // The streams are joined inside; the fed book restarts.
-        self.stack.reset_states_and_ring(&mut self.states)?;
-        self.fed = 0;
+        self.stack
+            .reset_states_and_ring(&mut self.sequence.states)
+            .inspect_err(|_| self.poisoned = true)?;
+        self.sequence.fed = 0;
         self.poisoned = false;
-        self.full_params_next = false;
+        self.sequence.full_params_next = false;
         Ok(())
     }
 }
@@ -533,10 +588,23 @@ impl ExecutorOps for CardSession {
         if self.prefix.limits().entries == 0 {
             return Ok(false);
         }
-        let fed = self.fed;
+        let fed = self.sequence.fed;
+        if self.poisoned
+            || self
+                .sequence
+                .states
+                .iter()
+                .any(|state| state.tokens() != fed)
+        {
+            return Err(EngError::Backend {
+                operation: "qwen36_cards",
+                message: "cannot save a poisoned or position-inconsistent peer session".into(),
+            });
+        }
         let mut slot = std::mem::take(&mut self.prefix);
         let saved = st.save_prefix(&mut slot, key, self.prefix_path, fed, kind, || {
-            self.states
+            self.sequence
+                .states
                 .iter()
                 .enumerate()
                 .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
@@ -556,20 +624,7 @@ impl ExecutorOps for CardSession {
         }
         let mut slot = std::mem::take(&mut self.prefix);
         let covered = st.restore_prefix(&mut slot, prompt, self.prefix_path, |saved| {
-            if saved.len() != self.states.len() {
-                return Err(EngError::BadRequest(format!(
-                    "card prefix: {} saved states for {} cards",
-                    saved.len(),
-                    self.states.len()
-                )));
-            }
-            let tokens = saved[0].tokens;
-            for (card, (state, exported)) in self.states.iter_mut().zip(saved.iter()).enumerate() {
-                state.import_state(&self.stack.streams()[card], exported)?;
-            }
-            self.fed = tokens;
-            self.full_params_next = true;
-            Ok(())
+            self.import_prefix_shards(saved)
         });
         self.prefix = slot;
         covered
@@ -698,3 +753,7 @@ impl ExecutorOps for Q36CudaStep {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "card_session_isolation_tests.rs"]
+mod isolation_tests;

@@ -42,6 +42,19 @@ pub(crate) struct ExportedState {
     pub(crate) kv: Vec<KvExport>,
 }
 
+/// Exclusive access keeps the validated stream, destination and snapshot paired until the copy.
+pub(in crate::family::qwen36::cuda) struct PreparedImport<'a> {
+    state: &'a mut ResidentState,
+    stream: &'a DeviceStream,
+    snapshot: &'a ExportedState,
+}
+
+impl PreparedImport<'_> {
+    pub(in crate::family::qwen36::cuda) fn apply(self) -> Result<(), EngError> {
+        self.state.import_validated(self.stream, self.snapshot)
+    }
+}
+
 // The checkpoint store keeps exports on another thread than the device owner.
 const _: () = {
     const fn assert_send<T: Send>() {}
@@ -205,8 +218,29 @@ impl ResidentState {
         stream: &DeviceStream,
         exported: &ExportedState,
     ) -> Result<(), EngError> {
-        check_import(&self.layout, &self.identity, exported)?;
-        self.resident_kv()?; // Refuse this staged mode before any device state write.
+        self.prepare_import(stream, exported)?.apply()
+    }
+
+    pub(in crate::family::qwen36::cuda) fn prepare_import<'a>(
+        &'a mut self,
+        stream: &'a DeviceStream,
+        exported: &'a ExportedState,
+    ) -> Result<PreparedImport<'a>, EngError> {
+        self.check_exported(exported)?;
+        self.check_resident_kv()?;
+        self.book.check_import(stream.id(), IMPORT_REWRITES_WORDS)?;
+        Ok(PreparedImport {
+            state: self,
+            stream,
+            snapshot: exported,
+        })
+    }
+
+    fn import_validated(
+        &mut self,
+        stream: &DeviceStream,
+        exported: &ExportedState,
+    ) -> Result<(), EngError> {
         self.book.begin_import(stream.id(), IMPORT_REWRITES_WORDS)?;
         self.resident_tip = None;
         self.clear_words(stream)?;
