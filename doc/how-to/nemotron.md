@@ -76,6 +76,33 @@ You need Linux with the CUDA 12 toolkit and about 76 GB of free disk space.
 `"backend": "cpu_reference"` runs the whole model on the CPU.
 It is much slower and exists to check the CUDA results. It needs no CUDA build and accepts any sampling settings.
 
+### Profile mapped experts on Apple Silicon
+
+The CPU profiler calls the same NVFP4 pool that serves mapped routed experts in the hybrid engine. It can open one layer with the pinned `config.json`, safetensors index and the one shard that contains that layer's routed experts. The layer 1 study uses `model-00002-of-00088.safetensors` from the NVIDIA revision above. Its 512 experts map directly from the 1.63 GB shard. Each call routes 22 experts with 1,024 latent and 2,688 intermediate values.
+
+The 16 GB M4 mini has four performance cores and six efficiency cores. The pool selected the portable scalar kernel. After a sequential pass over the shard, two sweeps used the same deterministic calls in opposite thread-count order, with 31 timed calls per arm. All 12 warmed arms recorded zero process-attributed disk reads and page-ins.
+
+| Threads | Median of per-run p50 | Median of per-run p90 |
+| ---: | ---: | ---: |
+| 1 | 59.62 ms | 70.95 ms |
+| 2 | 35.99 ms | 45.46 ms |
+| 4 | 22.87 ms | 34.75 ms |
+| 6 | 24.71 ms | 35.64 ms |
+| 8 | 27.46 ms | 37.26 ms |
+| 10 | 25.93 ms | 38.79 ms |
+
+The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts. [Sample times and I/O measurements](../../scripts/benchmarks/mac-m4-nemotron35-cpu-layer.csv)
+
+Build the ignored test on Apple Silicon, then run its separate processes with the driver below. Use the process I/O counter from the [Mac staging study](../explanation/mac-flint-expert-pipeline.md#reproduce). The test prints the runner path after compilation.
+
+```sh
+cd engine
+cargo test --locked --release --test nemotron35_cpu_expert_profile --no-run
+cd ..
+python3 scripts/mac_cache_study/nemotron35_cpu_profile.py \
+  "$NEM35_PROFILE_RUNNER" "$NEM35_LAYER1_DIR" "$SCRATCH/proc-io" "$SCRATCH/nemotron35-profile"
+```
+
 ## See also
 
 - [`nemotron` options](../reference/configuration.md#nemotron)
