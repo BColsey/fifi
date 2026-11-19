@@ -52,9 +52,9 @@ impl ForwardTiming {
                 "page_imports": end.page_imports - self.stats.page_imports,
                 "import_ns": end.import_ns - self.stats.import_ns,
                 "page_copies": k.qualification_page_copies() - self.page_copies,
-                "layer24_read_ns": layer.read_ns - self.layer.read_ns,
-                "layer24_stages": layer.stages - self.layer.stages,
-                "layer24_record_stages": layer.record_stages - self.layer.record_stages,
+                "expert_probe_read_ns": layer.read_ns - self.layer.read_ns,
+                "expert_probe_stages": layer.stages - self.layer.stages,
+                "expert_record_stages": layer.record_stages - self.layer.record_stages,
             })
         );
     }

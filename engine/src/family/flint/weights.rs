@@ -37,7 +37,7 @@ pub(super) struct FlintCheckpoint {
         target_os = "macos",
         target_arch = "aarch64"
     ))]
-    records: Option<records::ExpertRecords>,
+    records: Option<records::RecordSet>,
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -136,7 +136,11 @@ impl FlintCheckpoint {
         ))]
         let records = records
             .as_deref()
-            .map(|path| records::ExpertRecords::open(Path::new(path), &stamps))
+            .map(|path| {
+                let control = std::env::var_os("FIFI_FLINT_EXPERT_RECORDS_CONTROL")
+                    .is_some_and(|value| value == "1");
+                records::RecordSet::open(Path::new(path), &stamps, !control)
+            })
             .transpose()?;
         Ok(Self {
             weights,
@@ -155,8 +159,8 @@ impl FlintCheckpoint {
         target_os = "macos",
         target_arch = "aarch64"
     ))]
-    pub(super) fn has_records(&self) -> bool {
-        self.records.is_some()
+    pub(super) fn expert_record_description(&self) -> Option<String> {
+        self.records.as_ref().map(records::RecordSet::describe)
     }
 
     pub(super) fn tensor(&self, name: &str) -> Result<Tensor, EngError> {
@@ -327,12 +331,17 @@ impl FlintCheckpoint {
             read_stack_into
         };
         #[cfg(feature = "native-fault-qualification")]
-        let probe = stem == records::STEM && remapped.shape() == [6];
+        let probe = self
+            .records
+            .as_ref()
+            .filter(|_| remapped.shape() == [6])
+            .and_then(|records| records.for_stem(stem));
         #[cfg(feature = "native-fault-qualification")]
-        let started = (probe && super::mlx_expert_timing::enabled()).then(std::time::Instant::now);
+        let started =
+            (probe.is_some() && super::mlx_expert_timing::enabled()).then(std::time::Instant::now);
         #[cfg(feature = "native-fault-qualification")]
-        let records_used = if let Some(records) = self.records.as_ref().filter(|_| probe) {
-            records.read(&layout, ids, dst)?;
+        let records_used = if let Some((record, true)) = probe {
+            record.read(&layout, ids, dst)?;
             true
         } else {
             false

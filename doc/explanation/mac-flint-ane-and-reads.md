@@ -134,6 +134,34 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --working-set-mib 8192 --pairs 2
 ```
 
+### Four-layer Flint serving trial
+
+The sidecar reader accepts a local directory with up to four routed layers. Each file binds one layer to the same source shard identities and has a fixed record width and exact file size. A four-file set adds 1.69 GiB on disk. Both arms open and validate the same four files. The control reads expert weights from the original shards and the candidate reads the sidecars only for single-row stages in the selected layers. Both use the same shared Metal staging path and leave the expert cache disabled.
+
+We ranked layers by hits in a 12-expert LRU per layer over 96 single-row stages from the published trace, with both arithmetic requests excluded. We added the least-reused layer from each depth range to the existing layer 24. Those were layer 2 for layers 2–16, layer 30 for layers 17–32, and layer 47 for layers 33–48. Their hit rates were 4.34%, 15.62%, and 15.62%. Layer 24 had a 19.97% hit rate. The serving trial used the excluded arithmetic prompt. [Published trace](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
+
+At the 8 GiB ceiling, the worker admitted 256 prefill rows and exercised all four sidecars on each single-row stage. The eight output hashes matched, with 5.16 GB of logical prefill reads and 5.49 GB of logical decode reads per request in both arms. Decode read calls fell from 27,918 to 25,806 per request and Metal page-copy fallbacks stayed at zero.
+
+| Request | Selected layer read time per decode step | Decode tokens/s | Per-request decode forward p95 | Attributed SSD reads |
+| --- | ---: | ---: | ---: | ---: |
+| First after startup | 52.84 → 18.78 ms | 1.325 → 1.345 | 819.94 → 850.17 ms | 10.01 → 9.90 GB |
+| Immediate repeat | 53.80 → 18.71 ms | 1.280 → 1.370 | 870.44 → 794.54 ms | 9.96 → 9.96 GB |
+
+The table shows medians for each arm and visit. The p95 uses nearest rank over 11 decode forwards per request. Across all visits, attributed SSD reads totaled 39.95 → 39.72 GB and process page-ins rose from 155 to 206, with individual runs ranging from 0 to 86. Process peak stayed near 1.82 GB. The selected reads took about 65% less time, with a 7% increase in repeat decode throughput and a 3.7% increase in first-request p95. The mixed tails, extra page-ins and storage cost keep this path limited to qualification builds. [Eight serving measurements](../../scripts/benchmarks/mac-m4-flint-four-records-serving.csv)
+
+Build the server and run the same two-pair comparison as above. Each process answers the 16-token prompt twice with 12 completion tokens. The OS file cache stays in place. Keep the sidecars on the same local volume as the verified checkpoint so the comparison uses the same SSD.
+
+```sh
+mkdir "$SCRATCH/records"
+for layer in 2 24 30 47; do
+  python3 scripts/mac_cache_study/build_flint_layer24_records.py \
+    "$FLINT_ARTIFACT" "$SCRATCH/records/layer-$layer.records" --layer "$layer"
+done
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/four-records-serving" \
+  --expert-records "$SCRATCH/records" --expert-timing --working-set-mib 8192 --pairs 2
+```
+
 ### Reproduce the expert record probe
 
 Run on Apple Silicon with Python `os.preadv` support. Use the verified local Flint checkpoint and a scratch directory on the same volume as its shards. The probe releases the temporary record file after measurement and retains the CSV.

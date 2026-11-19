@@ -1,8 +1,9 @@
-//! One-layer expert-major sidecar for the native qualification runner.
+//! Bounded expert-major sidecars for the native qualification runner.
 
 use std::{
     cell::Cell,
-    fs::{File, Metadata},
+    collections::BTreeMap,
+    fs::{self, File, Metadata},
     io::{IoSliceMut, Read},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -13,7 +14,7 @@ use crate::{EngError, family::stored::counted_read, weights::read_all_vectored_a
 
 use super::ExpertPageLayout;
 
-pub(super) const STEM: &str = "model.layers.24.mlp.switch_mlp";
+const MAX_LAYERS: usize = 4;
 const EXPERTS: u32 = 256;
 const RECORD_BYTES: usize = 1_769_472;
 
@@ -42,12 +43,68 @@ impl From<&Metadata> for ShardStamp {
 #[serde(deny_unknown_fields)]
 struct Header {
     format: String,
-    layer: u32,
+    layer: usize,
     shards: Vec<ShardStamp>,
     role_bytes: [usize; 9],
 }
 
+pub(super) struct RecordSet {
+    layers: BTreeMap<usize, ExpertRecords>,
+    enabled: bool,
+}
+
+impl RecordSet {
+    pub(super) fn open(
+        path: &Path,
+        shards: &[ShardStamp],
+        enabled: bool,
+    ) -> Result<Self, EngError> {
+        let guard = crate::storage_guard::LocalGuard::new()?;
+        guard.check(path, "Flint expert records")?;
+        let mut layers = BTreeMap::new();
+        if fs::metadata(path).map_err(io)?.is_dir() {
+            for entry in fs::read_dir(path).map_err(io)? {
+                let file = entry.map_err(io)?.path();
+                if !file.extension().is_some_and(|ext| ext == "records") {
+                    continue;
+                }
+                if layers.len() == MAX_LAYERS {
+                    return Err(invalid("a sidecar set is limited to four layers"));
+                }
+                guard.check(&file, "Flint expert records")?;
+                let layer = ExpertRecords::open(&file, shards)?;
+                if layers.insert(layer.layer, layer).is_some() {
+                    return Err(invalid("duplicate layer in sidecar directory"));
+                }
+            }
+        } else {
+            let layer = ExpertRecords::open(path, shards)?;
+            layers.insert(layer.layer, layer);
+        }
+        if layers.is_empty() {
+            return Err(invalid("no .records files in sidecar directory"));
+        }
+        Ok(Self { layers, enabled })
+    }
+
+    pub(super) fn for_stem(&self, stem: &str) -> Option<(&ExpertRecords, bool)> {
+        let layer = stem
+            .strip_prefix("model.layers.")?
+            .strip_suffix(".mlp.switch_mlp")?
+            .parse::<usize>()
+            .ok()?;
+        self.layers.get(&layer).map(|file| (file, self.enabled))
+    }
+
+    pub(super) fn describe(&self) -> String {
+        let layers = self.layers.keys().map(usize::to_string).collect::<Vec<_>>();
+        let mode = if self.enabled { "records" } else { "shards" };
+        format!("layers={} mode={mode}", layers.join(","))
+    }
+}
+
 pub(super) struct ExpertRecords {
+    layer: usize,
     file: File,
     data_start: u64,
     role_bytes: [usize; 9],
@@ -55,7 +112,9 @@ pub(super) struct ExpertRecords {
 
 impl ExpertRecords {
     pub(super) fn open(path: &Path, shards: &[ShardStamp]) -> Result<Self, EngError> {
-        crate::storage_guard::require_local(path, "Flint expert records")?;
+        if !fs::metadata(path).map_err(io)?.is_file() {
+            return Err(invalid("sidecar must be a regular file"));
+        }
         let mut file = File::open(path).map_err(io)?;
         let mut length = [0; 8];
         file.read_exact(&mut length).map_err(io)?;
@@ -68,7 +127,7 @@ impl ExpertRecords {
         let header: Header =
             serde_json::from_slice(&header).map_err(|cause| invalid(&cause.to_string()))?;
         if header.format != "fifi-flint-expert-records-v1"
-            || header.layer != 24
+            || !(2..super::super::config::LAYERS).contains(&header.layer)
             || header.shards != shards
         {
             return Err(invalid("layout or source shards differ"));
@@ -88,6 +147,7 @@ impl ExpertRecords {
             return Err(invalid("file length differs from the declared layout"));
         }
         Ok(Self {
+            layer: header.layer,
             file,
             data_start,
             role_bytes: header.role_bytes,
