@@ -141,7 +141,7 @@ The mini served the pinned Flash-Next oQ4e checkpoint from the external SSD. The
 
 The normal MLX server admitted the model at an 11 GiB Metal ceiling with 32K serving context, a 256 MiB allocator cache and prefix reuse off. It kept 4,766,514,252 bytes of weights resident, charged 83,214,336 bytes of decode staging and reserved 5,202,132,992 bytes for serving state and headroom. The worker could submit up to 32 rows per piece and the executor admitted 16-row chunks. Routed experts streamed from disk with positioned reads and prefill coalescing enabled.
 
-The server was ready in 11.90 s. Its 36-token arithmetic-sequence prompt produced four tokens starting with `10,`. First-token latency was 72.99 s and decode reached 0.30 tok/s. The request attributed 26.78 GB of reads to the external SSD. Lifetime process peak was 11.63 GB, including startup. This run establishes full-checkpoint admission and short-request behavior. Full sparse-context performance, prefix retention, parity and defaults each need further evidence. [Serving measurements](../../scripts/benchmarks/mac-m4-flash-next-oq4e-smoke.csv)
+The server was ready in 11.90 s. Its 36-token arithmetic-sequence prompt produced four tokens starting with `10,`. First-token latency was 72.99 s and decode reached 0.30 tok/s. The request attributed 26.78 GB of reads to the external SSD. Lifetime process peak was 11.63 GB, including startup. This run establishes full-checkpoint admission and short-request behavior. Full sparse-context performance, long-prefix retention and defaults need further evidence. [Serving measurements](../../scripts/benchmarks/mac-m4-flash-next-oq4e-smoke.csv)
 
 Run the following with a release Apple Silicon server built with `native-mlx`. Use the process I/O counter from the [staging study](mac-flint-expert-pipeline.md#reproduce).
 
@@ -165,6 +165,28 @@ The 16 GB mini ran the same 36-token request at two working-set ceilings in two 
 At the higher ceiling, logical prefill reads fell 20% and first-token time fell 17%. Prefill slice calls dropped from 64,899 to 49,410, and page imports dropped from 192 to 144. Every forward used zero page copies. The median time inside prefill shard reads fell from 43.61 to 35.65 s. It accounted for 88–89% of first-token time across the arms. Decode read the same 3.98 GB of logical data in every request and had lower measured throughput at the higher ceiling. The comparison covers one short prompt. [Requests](../../scripts/benchmarks/mac-m4-flash-next-attribution-requests.csv) · [26 forwards](../../scripts/benchmarks/mac-m4-flash-next-attribution-forwards.csv)
 
 Use a release build with `native-mlx,native-fault-qualification` and add `--attribute` to the smoke command to capture the per-forward records. Use a new output directory and `--working-set-mib 12100` for the higher ceiling.
+
+### Flash-Next retained-prefix admission
+
+At the 12,100 MiB ceiling, enabling prefix reuse reserves 1.93 GB for one snapshot at the 32K context limit. A 256 MiB allocator cache left 706 MB for prefill workspace and the planner selected one-token steps. A 64 MiB cache left 907 MB and admitted four-row chunks within the same 32-row worker piece.
+
+The 16 GB mini served a cold continuation, primed the preceding turn, and served the same continuation again. Both 85-token requests returned the same three sampled IDs and response hash. The restored request reused 37 prompt tokens. All three requests ran in one process with the OS file cache retained. The priming request had 44 prompt tokens and reached its first token in 93.18 s.
+
+| Continuation | Reused tokens | Prefill forwards | Logical prefill reads | First token | Request SSD reads | Decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold | 0 | 23 | 78.07 GB | 210.78 s | 71.68 GB | 0.32 tok/s |
+| Restored | 37 | 14 | 46.33 GB | 116.51 s | 44.97 GB | 0.31 tok/s |
+
+The process lifetime peak was 10.91 GB. Both continuations read 2.65 GB of logical expert weights during decode. This covers one short continuation and its preceding turn. The pinned model starts sparse attention after 2,051 positions, so qualifying the sparse prefill route and longer retained prefixes requires longer prompts. [Requests, memory plan and attribution](../../scripts/benchmarks/mac-m4-flash-next-oq4e-retained-prefix.csv)
+
+Use a release Apple Silicon server built with `native-mlx,native-fault-qualification`.
+
+```sh
+python3 scripts/mac_cache_study/flash_next_oq4e_smoke.py \
+  "$ENGINESRV" "$FLASH_NEXT_CHECKPOINT" "$QWEN38_TOKENIZER" "$SCRATCH/proc-io" \
+  "$SCRATCH/flash-next-retained-prefix" --attribute --retained-prefix \
+  --working-set-mib 12100 --cache-limit-mib 64
+```
 
 ## Disk-backed Flint experts
 

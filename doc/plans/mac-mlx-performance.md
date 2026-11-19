@@ -4,7 +4,7 @@ Use the 16 GB M4 Mac mini for this work. The baseline is `58a997309a7a425c08ed2b
 
 ## Closeout order
 
-1. **Measure sparse prefill on the admitted Flash-Next checkpoint.** The pinned oQ4e pack served a short request on the mini with a 32K capacity plan. The short attribution study isolated logical expert reads and Metal wait costs. Extend it to longer sparse prompts and reduced expert rereads across chunks. At 11 GiB the current plan lacks room for one full 32K retained snapshot. Test the larger Metal-recommended ceiling or a bounded prefix reserve before measuring retained prefixes. [Flash-Next admission](../explanation/mlx-device-scaling.md#full-flash-next-checkpoint-on-the-m4-mini)
+1. **Measure sparse prefill on the admitted Flash-Next checkpoint.** Use the pinned oQ4e pack and prompts that cross the 2,051-position dense cutoff. Compare sparse batching with one-row suffix execution at the same budget and record token agreement and expert reads. The short retained-prefix trial passed at 12,100 MiB with a 64 MiB allocator cache. Measure longer retained prefixes under the same ceiling. [Flash-Next admission](../explanation/mlx-device-scaling.md#flash-next-retained-prefix-admission)
 2. **Review integration and defaults separately.** Review the exact upstream draft head with the tests and data attached. Compare token or logit parity, first-token latency, decode tails, peak memory and SSD bytes before qualifying a setting. Record a default decision for each qualified path. The 35B whole-model cutoff needs a supported checkpoint that fits the available runner.
 
 ## Family coverage on the mini
@@ -13,7 +13,7 @@ Use the 16 GB M4 Mac mini for this work. The baseline is `58a997309a7a425c08ed2b
 | --- | --- | --- |
 | Flint, native MLX | Full disk-streamed checkpoint, paired prefill boundary checks and cancellation A/B. | Measure repeated disconnects and the 64-expert staging path before qualifying the layer check. |
 | Qwen3.6 MoE, native MLX | Full disk-streamed checkpoint at 8 GiB, resident parity fixtures and a four-arm serving comparison with per-forward attribution. | Reduce logical expert rereads across chunks and measure decode tail cost. |
-| Flash-Next, native MLX | Pinned oQ4e checkpoint served at 11 GiB and 12,100 MiB with per-forward attribution. Sparse prefill and retained prefixes measured on fixtures. | Measure sparse prefill and longer decode on the pinned pack, then qualify retained-prefix admission. |
+| Flash-Next, native MLX | Pinned oQ4e checkpoint served at 11 GiB and 12,100 MiB with per-forward attribution and one short retained-prefix comparison. Sparse batching passed fixtures. | Compare sparse prefill on the pinned pack and test longer retained prefixes. |
 | Qwen3.8 dense, native MLX | Native staging fixtures with bitwise logit parity, plus full 27B 6-bit streamed serving at 10 GiB. | Reduce repeat FFN scans at the prompt boundary and measure partial weight residency. |
 | Nemotron 3.5, CPU experts | Mapped NVFP4 parity fixtures and paired scalar and NEON timings on a pinned 512-expert layer. | Check representative full-model output before qualifying the NEON path. |
 
@@ -23,6 +23,7 @@ The refreshed worker checks completed 156 requests across Qwen3.6 MoE, Qwen3.8 d
 
 ## Completed on the mini
 
+- [x] Serve a retained Flash-Next prefix on the pinned oQ4e checkpoint. At 12,100 MiB with a 64 MiB allocator cache, the restored continuation reused 37 of 85 tokens and matched the cold response. Logical prefill reads fell from 78.07 to 46.33 GB. [Flash-Next retained-prefix trial](../explanation/mlx-device-scaling.md#flash-next-retained-prefix-admission)
 - [x] Bound Flint paired prefill work after cancellation. The opt-in layer check cut logical reads from 10.49 to 0.31 GB in the disconnect comparison. The next request matched the control. [Cancellation and recovery](../explanation/mac-flint-ane-and-reads.md#flint-pair-boundaries-retained-prefixes-and-cancellation)
 - [x] Map the common worker, generation session and native MLX entry points for Qwen3.6, Flash-Next and Flint. Share Qwen3.6 and Flash-Next chunk admission, DeltaNet memory arithmetic and single-row packed projection. [Architecture map](../explanation/mlx-architecture.md)
 - [x] Establish Q8 decode and dense-prefill attention baselines at production layer dimensions. Archive paired Q8 timings and check the dense reference. [Attention results](../explanation/mac-m4-attention.md)
