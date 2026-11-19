@@ -221,6 +221,36 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --request-prefill --expert-timing --working-set-mib 8192 --pairs 1
 ```
 
+### Exact expert reuse across Flint prefill pieces
+
+A second 2,041-token pair enabled the existing qualification route trace on the internal SSD. The server records the sorted expert IDs for each routed layer and forward. The analyzer verifies the row sequence and checks each forward's logical bytes against its expert count before archiving the prefill routes. Output and decode timing come from the two serving requests with tracing enabled.
+
+The replay uses unions of expert IDs separately for each layer over contiguous groups of recorded pieces. It charges one read per layer-expert per group, with the pending one-row prompt forward kept separate. The distinct-record count includes that pending row. Each group reports the storage for two BF16 hidden-state buffers, one group-wide BF16 routed-output buffer in token and rank order, the largest layer's staging charge, and how many 64-slot waves that layer would require. These are storage and logical-read estimates. A serving prototype still needs to account for attention and other activation scratch, preserve state and accumulation order, and measure output and decode tails under the new schedule.
+
+Both arms reproduced the preceding benchmark's 24 sampled token IDs, prefill widths and logical read counts. The traced requests attributed 136.02 and 45.61 GB to SSD reads and reached their first token in 126.16 and 36.02 seconds. Measured decode forward p95 rose from 822 to 1,447 ms in this fixed-order traced pair. The slowest wider-arm decode forward spent 1.48 of 1.67 seconds in expert reads. [Captured prefill routes and serving counters](../../scripts/benchmarks/mac-m4-flint-prefill-routes-2041.jsonl.gz)
+
+The eight-piece control read **71,458 records for 11,407 distinct layer-experts**. The two-piece arm read **21,967 records for 11,426 distinct layer-experts**. Every one of the 47 routed layers repeated reads in both captures. Each layer in the wider arm used between 222 and 253 distinct experts across the prompt. The replay holds each arm's own recorded routes fixed.
+
+| Observed piece width | Pieces per replay group | Largest group | Logical prefill reads | Reads per distinct record |
+| --- | ---: | ---: | ---: | ---: |
+| 256 | 1 | 256 rows | 126.44 GB | 6.264 |
+| 256 | 2 | 512 rows | 69.92 GB | 3.464 |
+| 256 | 4 | 1,023 rows | 38.79 GB | 1.922 |
+| 256 | 8 | 2,040 rows | 20.67 GB | 1.024 |
+| 1,024 | 1 | 1,023 rows | 38.87 GB | 1.923 |
+| 1,024 | 2 | 2,040 rows | 20.70 GB | 1.024 |
+
+Grouping the two wide pieces saves **18.17 GB of logical reads in replay**. The largest layer has 253 records in that group. Staging them all at once charges 854 MiB using the existing two-copy estimate. Four waves of up to 64 records would bound that charge at 216 MiB. Two BF16 hidden buffers and one group-wide routed-output buffer together account for 63.75 MiB at 2,040 rows. The routed-output buffer keeps token and expert rank order for the existing weighted reduction. [All six replay cases](../../scripts/benchmarks/mac-m4-flint-prefill-reuse-2041.csv)
+
+Reproduce with the request-aware prefill command above and `FIFI_FLINT_EXPERT_TRACE=1` in the benchmark process environment. Capture or replay the routes with the same analyzer.
+
+```sh
+python3 scripts/mac_cache_study/flint_prefill_reuse.py "$SCRATCH/request-prefill" \
+  "$SCRATCH/prefill-reuse.csv" --archive "$SCRATCH/prefill-routes.jsonl.gz"
+python3 scripts/mac_cache_study/flint_prefill_reuse.py \
+  "$SCRATCH/prefill-routes.jsonl.gz" "$SCRATCH/prefill-reuse-replay.csv"
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
