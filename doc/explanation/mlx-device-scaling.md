@@ -199,6 +199,23 @@ The profiler measures CPU top-k selection and multi-row scheduling after the rou
 
 On the pinned Qwen3.6 checkpoint, the 27-token smoke produced the same four sampled tokens with the combined switches on or off. Prefill reads went from 30,447 calls to 22,041 at 5.99 GB of logical expert data in each arm. The profiler accounted for two prefill forwards and three decode forwards per request, with zero Metal page copies.
 
+The four-arm comparison ran twice in opposite order with a fresh server per arm. Both prompts produced the same four sampled tokens and response hash in all 16 requests. Every arm admitted 128 rows at 8 GiB. All 88 forwards imported their expert pages with zero fallback copies.
+
+| Prompt | Shared expert overlap | Read coalescing | Median first token | Prefill read calls | Median time in shard reads | Request SSD reads |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 27 tokens | Off | Off | 18.08 s | 30,447 | 16.82 s | 7.05 GB |
+| 27 tokens | Off | On | 13.86 s | 22,041 | 13.06 s | 5.44 GB |
+| 27 tokens | On | Off | 14.62 s | 30,447 | 13.86 s | 4.98 GB |
+| 27 tokens | On | On | 13.79 s | 22,041 | 13.01 s | 5.39 GB |
+| 157 tokens | Off | Off | 41.08 s | 74,403 | 38.88 s | 14.35 GB |
+| 157 tokens | Off | On | 31.41 s | 43,407 | 29.51 s | 12.63 GB |
+| 157 tokens | On | Off | 38.52 s | 74,403 | 36.64 s | 12.59 GB |
+| 157 tokens | On | On | 31.65 s | 43,407 | 29.81 s | 12.71 GB |
+
+Coalescing alone cut the longer prompt's first-token time by 24% and read calls by 42%. Its logical prefill reads stayed at 14.63 GB. Adding shared-expert overlap to coalescing changed median first-token time by less than 1% on either prompt. The runs kept the OS file cache between arms, so the observed overlap-only differences also reflect cache state.
+
+Across the longer prompt's four arms, median host routing took 45–48 ms and page imports took 11–12 ms. Median wall inside native readback was 0.61–0.73 s and explicit evaluation was 0.99–1.20 s. The host read calls occupied approximately 94–95% of the time to first token. Decode stayed at 8,640 slice reads and 1.70 GB of logical expert data over its three forwards for the longer prompt in every arm. Its median throughput ranged from 1.24 to 1.42 tokens/s. The study leaves qualification and defaults open. [Request measurements](../../scripts/benchmarks/mac-m4-qwen36-attribution-requests.csv) · [Per-forward measurements](../../scripts/benchmarks/mac-m4-qwen36-attribution-forwards.csv)
+
 Run the qualified server comparison with both switches independently under one device plan. The driver checks response and token identity, verifies every event from prefill through decode, and preserves raw per-forward timings in the output directory.
 
 ```sh
