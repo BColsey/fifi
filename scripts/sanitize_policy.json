@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "version": 4,
+ "version": 5,
  "description": "Authoritative public-vocabulary policy shared by the publisher sanitizer and the published_text gate. Every entry is classified; additions require a classification receipt.",
  "allowed_tags": [
   {
@@ -667,6 +667,26 @@
    "tag": "P0A-01",
    "class": "fixture-data",
    "origin": "task identifier recorded inside the published test fixture engine/testdata/mac-phase0a.json"
+  },
+  {
+   "tag": "E4B-BF16",
+   "class": "model",
+   "origin": "public model: part of the Hugging Face repository id nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16, cited in THIRD_PARTY_NOTICES.md, engine/src/family/spec.rs, engine/src/family/gemma4/config.rs, engine/src/tokenizer/gemma.rs, engine/testdata/gemma4/README.md, scripts/convert_bolt_gguf.py"
+  },
+  {
+   "tag": "EXACT-TIP",
+   "class": "technical-english",
+   "origin": "receipt header word printed by scripts/exact-tip-gates.sh"
+  },
+  {
+   "tag": "NOT-RUN",
+   "class": "technical-english",
+   "origin": "arm status word printed by scripts/exact-tip-gates.sh"
+  },
+  {
+   "tag": "NOT-COLLECTED",
+   "class": "technical-english",
+   "origin": "arm status word printed by scripts/exact-tip-gates.sh"
   }
  ],
  "exceptions": []
