@@ -53,6 +53,9 @@ __pycache__/
 !/qualification/token-forcing/
 # The MTP acceptance collector is tracked in place as well.
 !/qualification/mtp-acceptance/
+# The flash-next quality corpus is tracked in place: moved out of the engine
+# testdata (dead data in the published tree) and kept for reuse, never published.
+!/qualification/flash-next-quality-corpus/
 .pi-dsh/
 .pi-glla/
 engine/.pi-dsh/
