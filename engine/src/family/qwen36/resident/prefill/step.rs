@@ -48,6 +48,7 @@ use super::super::moe::Routing;
 use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, advance_charge};
 use super::super::step::{check_dtype, read_token, split_rows};
+use super::super::stream_timing::ForwardTiming;
 use super::super::weights::{RFeedForward, RMixer};
 use super::delta::fused_prefill_enabled;
 use super::{attn, delta, moe};
@@ -307,6 +308,7 @@ fn run(
     let weights = &decoder.weights;
     let shape = &weights.shape;
     let pos = state.pos();
+    let mut timing = ForwardTiming::begin(&decoder.kernels, weights, pos);
     let hidden = dim(shape.hidden)?;
     let per_token = delta_retire_per_token(
         dim(shape.delta.value_heads)?,
@@ -542,7 +544,7 @@ fn run(
                 stage.evaluate(&mut ctx, ckpt, shape, &mid, &layer.post_norm)?
             }
             (RFeedForward::Moe(w), Routing::Host) => {
-                moe::chunk_with_checkpoint(&mut ctx, shape, w, &normed, Some(ckpt))?.0
+                moe::chunk_with_checkpoint(&mut ctx, shape, w, &normed, Some(ckpt), &mut timing)?.0
             }
             (RFeedForward::Moe(w), Routing::Device) => {
                 let device = moe::chunk_device(&mut ctx, shape, w, &normed)?;
@@ -691,6 +693,9 @@ fn run(
         None => None,
     };
     state.commit_rows(rows, layers, permit)?;
+    if let Some(timing) = timing {
+        timing.finish(ctx.kernels, rows, mode);
+    }
     Ok(StepResult {
         window_logits,
         token: token_out,

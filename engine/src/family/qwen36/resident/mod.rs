@@ -175,6 +175,8 @@ mod scale_knob;
 mod state;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod step;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod stream_timing;
 #[cfg(all(
     test,
     feature = "native-mlx",

@@ -191,6 +191,25 @@ python3 scripts/mac_cache_study/qwen36_streamed_ab.py \
   "$ENGINESRV" "$QWEN36_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/qwen36-stream-smoke" --smoke
 ```
 
+### Qwen3.6 streaming attribution
+
+Set `FIFI_Q36_MLX_STREAM_TIMING=1` in a `native-mlx,native-fault-qualification` Apple Silicon build to capture one `qwen36_stream_timing` event per successful disk-backed MoE forward. The event records its position and row count. Logging is opt-in and uses the worker's existing synchronization points.
+
+The profiler measures CPU top-k selection and multi-row scheduling after the router readback. It also records the logical expert reads, their call time, the highest mapped stage, page-import copies, and how long each stage spans from selection and allocation through its final evaluate. The existing MLX counters cover wall time inside imports, readbacks and explicit evaluations. Readback can execute already queued Metal work. Stage fill includes shard reads and page import, and the stage lifetime includes the evaluation that makes its output safe to keep. These nested intervals describe the work and waits along the forward.
+
+On the pinned Qwen3.6 checkpoint, the 27-token smoke produced the same four sampled tokens with the combined switches on or off. Prefill reads went from 30,447 calls to 22,041 at 5.99 GB of logical expert data in each arm. The profiler accounted for two prefill forwards and three decode forwards per request, with zero Metal page copies.
+
+Run the qualified server comparison with both switches independently under one device plan. The driver checks response and token identity, verifies every event from prefill through decode, and preserves raw per-forward timings in the output directory.
+
+```sh
+python3 scripts/mac_cache_study/qwen36_streamed_ab.py \
+  "$ENGINESRV" "$QWEN36_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/qwen36-attribution-smoke" \
+  --attribute --smoke
+python3 scripts/mac_cache_study/qwen36_streamed_ab.py \
+  "$ENGINESRV" "$QWEN36_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/qwen36-attribution" \
+  --attribute --pairs 2
+```
+
 ## Disk-backed dense Qwen feed-forward weights
 
 Set `FIFI_Q36_MLX_DISK_DENSE_FFN=1` with `FIFI_MLX_AUTO_BUDGET=1` or a positive `FIFI_MLX_WORKING_SET_MIB` to try the dense Qwen3.8 path. It retains the attention and recurrent mixer weights, norms and output head in Metal. The loader reads the feed-forward matrix metadata at startup and releases each layer's host buffers as its resident weights import. Decode and chunked prefill read the gate, up and down matrices for one layer, evaluate the existing SwiGLU on Metal and retire the stage before the next layer.
