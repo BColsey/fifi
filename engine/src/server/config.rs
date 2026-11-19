@@ -133,6 +133,11 @@ impl EngineConfig {
                 ))
             })?;
         }
+        if auto && matches!(self.family.as_str(), Q36_FAMILY | DENSE_FAMILY) {
+            self.qwen36
+                .get_or_insert_with(Default::default)
+                .auto_pageable_prefix = true;
+        }
         if auto
             && self.family == Q36_FAMILY
             && let Some(tier) = self
@@ -819,6 +824,32 @@ mod tests {
     }
 
     const NEMOTRON: &str = r#""family": "nemotron35""#;
+
+    #[test]
+    fn both_qwen_families_derive_pageable_admission_from_the_engine_policy() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID).unwrap();
+        for family in [super::Q36_FAMILY, super::DENSE_FAMILY] {
+            let engine = &mut value["engines"][0];
+            engine["family"] = family.into();
+            engine.as_object_mut().unwrap().remove("resource_policy");
+            let config = load(&value.to_string()).unwrap();
+            assert!(
+                !config.engines[0]
+                    .qwen36
+                    .as_ref()
+                    .is_some_and(|q| q.auto_pageable_prefix)
+            );
+            value["engines"][0]["resource_policy"] = "auto".into();
+            let config = load(&value.to_string()).unwrap();
+            assert!(
+                config.engines[0]
+                    .qwen36
+                    .as_ref()
+                    .unwrap()
+                    .auto_pageable_prefix
+            );
+        }
+    }
 
     #[test]
     fn engine_resource_policy_defers_to_the_selected_loader_and_preserves_pins() {

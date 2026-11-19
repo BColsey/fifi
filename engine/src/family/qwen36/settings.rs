@@ -121,6 +121,9 @@ pub(crate) fn prefix_store_limits_of(
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Q36Options {
+    /// Derived from the engine-level resource policy during config loading.
+    #[serde(skip)]
+    pub(crate) auto_pageable_prefix: bool,
     /// Optional content pin for the selected CUDA GGUF file: exactly 64 hex digits.
     pub(crate) gguf_sha256: Option<String>,
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
@@ -959,6 +962,7 @@ pub(crate) struct Q36Settings {
     /// store (zero roots, one entry). No config member reads it: the flag belongs to the server
     /// configuration file, and `new` leaves it false.
     pub(crate) prefix_reuse: bool,
+    pub(crate) auto_pageable_prefix: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
     /// The banked EXL3 expert mode, or `None` for the resident engine.
@@ -1531,6 +1535,7 @@ impl Q36Settings {
             prefix_store_entries,
             backend,
             prefix_reuse: false,
+            auto_pageable_prefix: options.auto_pageable_prefix,
             tiered,
             expert_bank,
             weights,
@@ -2838,6 +2843,7 @@ mod tests {
                 prefix_store_entries: None,
                 backend: Backend::Mlx,
                 prefix_reuse: false,
+                auto_pageable_prefix: false,
                 tiered: None,
                 expert_bank: None,
                 weights: super::WeightFormat::Gguf,

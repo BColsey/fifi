@@ -402,9 +402,36 @@ impl DecodeSession {
         path: P,
         fed: usize,
         kind: SaveKind,
+        snapshot: impl FnMut() -> Result<S>,
+    ) -> Result<bool> {
+        self.save_prefix_if(store, key, path, fed, kind, None, snapshot)
+    }
+
+    /// Consult a live resource budget only for a new copy, before evicting any warm state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn save_prefix_if<S, P: PartialEq>(
+        &self,
+        store: &mut PrefixStore<S, P>,
+        key: &[u32],
+        path: P,
+        fed: usize,
+        kind: SaveKind,
+        admit: Option<&dyn Fn() -> Result<bool>>,
         mut snapshot: impl FnMut() -> Result<S>,
     ) -> Result<bool> {
         let pending = self.prefix_save_pending(key, fed)?;
+        if let Some(admit) = admit {
+            // An exact match can be reused or promoted without a copy or a memory probe.
+            let duplicate = store
+                .roots
+                .iter()
+                .chain(&store.lru)
+                .any(|entry| entry.saved.path == path && entry.saved.key == key);
+            if !duplicate && !admit()? {
+                store.save_refusals += 1;
+                return Ok(false);
+            }
+        }
         // The store keeps the last restore for reports. Only this save uses our own lineage,
         // including when a denied snapshot evicts entries or returns an error.
         let observed = std::mem::replace(&mut store.restored, self.restored_prefix);
@@ -3436,6 +3463,79 @@ mod tests {
         );
         assert!(!ran.get(), "{what}: the snapshot ran");
         assert_eq!(slot.key_len(), Some(3), "{what}: the earlier entry");
+    }
+
+    #[test]
+    fn live_budget_refusal_preserves_warm_state_and_duplicate_uses_skip_admission() {
+        let a = [1, 2, 3];
+        let b = [4, 5, 6];
+        let (mut step, mut session) = held(&a);
+        let mut slot = store(1, 1);
+        assert!(save(&session, &mut slot, &step, &a, 1).unwrap());
+        let (other, incoming) = held(&b);
+        for kind in [
+            SaveKind::Root,
+            SaveKind::Periodic,
+            SaveKind::Block,
+            SaveKind::Tip,
+        ] {
+            assert!(
+                !incoming
+                    .save_prefix_if(
+                        &mut slot,
+                        &b,
+                        1,
+                        other.fed(),
+                        kind,
+                        Some(&|| Ok(false)),
+                        || panic!("denied copy")
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            !session
+                .save_prefix_if(
+                    &mut slot,
+                    &a,
+                    2,
+                    step.fed(),
+                    SaveKind::Tip,
+                    Some(&|| Ok(false)),
+                    || panic!("denied path replacement")
+                )
+                .unwrap()
+        );
+        assert_eq!(slot.save_refusals, 5);
+        assert!(
+            session
+                .save_prefix_if(
+                    &mut slot,
+                    &a,
+                    1,
+                    step.fed(),
+                    SaveKind::Tip,
+                    Some(&|| panic!("duplicate probe")),
+                    || panic!("duplicate copy")
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            session.save_prefix_if(
+                &mut slot,
+                &b,
+                1,
+                step.fed(),
+                SaveKind::Tip,
+                Some(&|| panic!("invalid probe")),
+                || panic!("invalid copy")
+            ),
+            Err(EngError::BadRequest(_))
+        ));
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &[1, 2, 3, 9], 1).unwrap(),
+            a.len()
+        );
     }
 
     #[test]

@@ -39,6 +39,8 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 
 Set `"resource_policy": "auto"` on an individual engine entry. The loader keeps the chosen context, backend and weight format. In standalone Qwen CUDA tiered mode, `"qwen36": {"tiered": {}}` selects a bank that fits after existing device reservations. An explicit slot count remains exact. Dense and multi-device configurations use their existing state and placement admission. Flash-Next and Flint already choose expert residency from their native memory plans when their supported automatic modes are selected.
 
+On Qwen3.6 CUDA, including the dense family, the same policy checks live host and process-cgroup memory before saving a new pageable prefix. The check covers the committed KV and recurrent state on every participating card, the largest temporary copy buffer, and 1 GiB of headroom. If that space is unavailable, the engine skips the optional save and keeps the cached prefixes available for later requests. Reusing an existing checkpoint requires no new allocation.
+
 Nemotron CPU and CUDA entries can omit `nemotron.cache_entries` with this policy. The loader sizes the host cache from available RAM, decoded expert tensor sizes and cacheable tensor count after its serving reservations. The CUDA path accounts for transfer staging, then fits the optional device weight cache to the selected card’s measured free memory. On integrated hardware it also charges shared host backing. Startup logs the resolved entry count. An explicit positive count retains its existing admission checks. Unsupported model/backend combinations continue to report the loader’s refusal.
 
 ### Local storage

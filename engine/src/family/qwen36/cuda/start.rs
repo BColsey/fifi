@@ -1150,7 +1150,7 @@ fn make_multi(
     let weights: &'static [&'static CudaWeights] =
         Box::leak(loaded.iter().collect::<Vec<_>>().into_boxed_slice());
     guard.commit();
-    let session = CardSession::new(
+    let mut session = CardSession::new(
         stack,
         states,
         weights,
@@ -1176,6 +1176,7 @@ fn make_multi(
             }
         },
     )?;
+    session.auto_pageable_prefix = settings.auto_pageable_prefix;
     Ok((
         Q36CudaStep::Cards(Box::new(session)),
         DecodeSession::default(),
@@ -1546,6 +1547,7 @@ fn make(
         if settings.capture { "on" } else { "off" },
         projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
     );
+    step.auto_pageable_prefix = settings.auto_pageable_prefix;
     Ok((step, DecodeSession::default()))
 }
 

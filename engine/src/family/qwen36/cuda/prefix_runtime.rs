@@ -1,6 +1,6 @@
 //! The step's deferred prefix lifecycle. This is a child of step, so device owners stay private.
 use super::super::{
-    prefix::{CudaSavedPrefix, PendingPrefix, entry_bytes},
+    prefix::{CudaSavedPrefix, HOST_HEADROOM, PendingPrefix, entry_bytes},
     state::{
         device_tip::DeviceTip,
         pinned::{PinnedSnapshot, PrefixPinPool},
@@ -17,7 +17,6 @@ use std::time::Instant;
 
 const PIN_BYTES_ENV: &str = "Q36_CUDA_PINNED_PREFIX_BYTES";
 const DEFAULT_PIN_BYTES_MAX: usize = 8usize << 30;
-const PIN_MEMORY_HEADROOM: usize = 1usize << 30;
 
 fn byte_limit(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<usize>, EngError> {
     let Some(value) = value else { return Ok(None) };
@@ -43,7 +42,7 @@ fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) ->
     for retained in (1..=retained).rev() {
         let required = checkpoint
             .checked_mul(retained + 1)
-            .and_then(|bytes| bytes.checked_add(PIN_MEMORY_HEADROOM));
+            .and_then(|bytes| bytes.checked_add(HOST_HEADROOM));
         if required.is_some_and(|bytes| available.is_some_and(|free| free >= bytes)) {
             return retained;
         }
@@ -82,7 +81,7 @@ impl QwenResidentStep<'_> {
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(
-                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {PIN_MEMORY_HEADROOM} B, available host/cgroup bytes {available:?}; retained entries 0, bytes 0"
+                "q36 cuda: pinned prefix refused, checkpoint {checkpoint} B, cap {limit} B, host headroom {HOST_HEADROOM} B, available host/cgroup bytes {available:?}; retained entries 0, bytes 0"
             );
             return Ok(());
         }
@@ -277,14 +276,11 @@ mod tests {
     fn pin_admission_keeps_one_retained_entry_when_two_do_not_fit_host_memory() {
         let size = 1024;
         let limit = 3 * size;
-        for available in [
-            PIN_MEMORY_HEADROOM + 2 * size,
-            PIN_MEMORY_HEADROOM + limit - 1,
-        ] {
+        for available in [HOST_HEADROOM + 2 * size, HOST_HEADROOM + limit - 1] {
             assert_eq!(planned_entries(size, limit, Some(available)), 1);
         }
         assert_eq!(
-            planned_entries(size, limit, Some(PIN_MEMORY_HEADROOM + 2 * size - 1)),
+            planned_entries(size, limit, Some(HOST_HEADROOM + 2 * size - 1)),
             0
         );
     }
@@ -295,7 +291,7 @@ mod tests {
         assert_eq!(default_pin_bytes(size), 3 * size);
         assert_eq!(default_pin_bytes(4usize << 30), DEFAULT_PIN_BYTES_MAX);
         assert_eq!(default_pin_bytes(usize::MAX), DEFAULT_PIN_BYTES_MAX);
-        let margin = PIN_MEMORY_HEADROOM;
+        let margin = HOST_HEADROOM;
         for (limit, available, expected) in [
             (0, Some(margin + 3 * size), 0),
             (2 * size - 1, Some(margin + 3 * size), 0),

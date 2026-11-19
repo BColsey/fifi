@@ -524,6 +524,7 @@ pub(crate) struct QwenResidentStep<'a> {
     prefill_report: PrefillReport,
     /// The engine's one host-backed prefix entry.
     /// The pinned pool keeps its backing alive across entry eviction.
+    pub(super) auto_pageable_prefix: bool,
     pub(super) prefix: PrefixSlot<CudaSavedPrefix, CudaPrefillPath>,
     prefix_pins: Option<super::state::pinned::PrefixPinPool>,
     device_tip: Option<super::state::device_tip::DeviceTip>,
@@ -1009,6 +1010,7 @@ impl<'a> QwenResidentStep<'a> {
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
             prefix: PrefixSlot::default(),
+            auto_pageable_prefix: false,
             prefix_pins: None,
             device_tip: None,
             #[cfg(test)]

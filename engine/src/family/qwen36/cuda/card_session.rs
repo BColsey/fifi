@@ -82,6 +82,7 @@ pub(crate) struct CardSession {
     /// The prefix store of the session: one entry is one `ExportedState`
     /// per card (the card's sliced KV planes plus its DeltaNet state), so
     /// an entry's host cost is one replica of cache plus two delta pools.
+    pub(super) auto_pageable_prefix: bool,
     prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
     /// The numeric path every entry of this session saves and restores under.
     prefix_path: CudaPrefillPath,
@@ -260,6 +261,7 @@ impl CardSession {
             skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
                 .is_some_and(|value| value == "1"),
             prefix: PrefixSlot::with_limits(prefix_limits),
+            auto_pageable_prefix: false,
             prefix_path: CudaPrefillPath::Steps(options.kv_mode),
             full_params_next: false,
             eos,
@@ -535,13 +537,28 @@ impl ExecutorOps for CardSession {
         }
         let fed = self.fed;
         let mut slot = std::mem::take(&mut self.prefix);
-        let saved = st.save_prefix(&mut slot, key, self.prefix_path, fed, kind, || {
-            self.states
-                .iter()
-                .enumerate()
-                .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
-                .collect()
-        });
+        let admit = || {
+            super::prefix::admit_pageable(
+                self.states
+                    .iter()
+                    .map(|state| (state.layout(), state.tokens())),
+            )
+        };
+        let saved = st.save_prefix_if(
+            &mut slot,
+            key,
+            self.prefix_path,
+            fed,
+            kind,
+            self.auto_pageable_prefix.then_some(&admit),
+            || {
+                self.states
+                    .iter()
+                    .enumerate()
+                    .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
+                    .collect()
+            },
+        );
         self.prefix = slot;
         saved
     }
