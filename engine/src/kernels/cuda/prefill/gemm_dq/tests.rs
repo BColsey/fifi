@@ -410,7 +410,7 @@ fn gemm_dq_q5k_profile_timing() {
     let median = samples[samples.len() / 2];
     let gflops = 2.0 * rows as f64 * k as f64 * ncols as f64 / (median * 1e-3) / 1e9;
     println!(
-        "PROFILE-TIMING gemm_dq q5k rows {rows} k {k} ncols {ncols}: median {median:.3} ms, {gflops:.0} GFLOP/s, spread [{:.3} .. {:.3}]",
+        "profile-timing gemm_dq q5k rows {rows} k {k} ncols {ncols}: median {median:.3} ms, {gflops:.0} GFLOP/s, spread [{:.3} .. {:.3}]",
         samples[0],
         samples[samples.len() - 1]
     );

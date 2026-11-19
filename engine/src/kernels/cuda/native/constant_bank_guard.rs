@@ -4,7 +4,7 @@
 //! initialized `__constant__` arrays by position, not by name or linkage. Observed
 //! 2026-11-18 on the 3090: the gemm_dq TU's uniquely named IQ4_NL table read nvfp4
 //! kE2M1's initializer, and renaming and external linkage both still aliased. The
-//! fix pattern is a BY-VALUE kernel argument (iq4_nl_values.cuh's
+//! fix pattern is a by-value kernel argument (iq4_nl_values.cuh's
 //! `make_iq4nl_table`); no cardless gate can see this class of bug once it is in
 //! the tree, so this test keeps the tree free of new instances of it.
 //!

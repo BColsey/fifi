@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-/* The IQ4_NL decode table rides a BY-VALUE kernel argument whose carrier and host
+/* The IQ4_NL decode table rides a by-value kernel argument whose carrier and host
  * factory live in the shared iq4_nl_values.cuh — never a __constant__ definition in
  * any TU of this .so: the at-load constant-bank layout aliases per-TU initialized
  * constants (observed on the 3090, 2026-11-18: this TU's uniquely named table read

@@ -869,7 +869,7 @@ fn chain_tolerance(base: &str) -> f32 {
     if is_bound1(base) { 3e-2 } else { 5e-2 }
 }
 
-/// Tolerance for the TEACHER-FORCED pass (stage B), ~10x above the worst
+/// Tolerance for the teacher-forced pass (stage B), ~10x above the worst
 /// measured diff/range per class over all of fixtures1 (the `measure ...`
 /// lines print when the test runs with the env pair set):
 /// - bound-1 stages: worst 2.7e-4 of range (rda_beta); the class is 37x
