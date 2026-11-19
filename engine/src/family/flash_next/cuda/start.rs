@@ -189,7 +189,15 @@ pub(in crate::family::flash_next) fn start(
     let wanted = cuda.clone();
     let guard = BuildGuard::acquire()?;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
-        make(stages, &artifact, &wanted, rules, identity, guard)
+        make(
+            stages,
+            &artifact,
+            &wanted,
+            rules,
+            identity,
+            prefill_chunk as u32,
+            guard,
+        )
     })?;
     Ok((engine, bundle))
 }
@@ -408,6 +416,7 @@ fn make(
     wanted: &CudaSettings,
     rules: CudaRules,
     identity: PrefixIdentity,
+    prefill_chunk: u32,
     guard: BuildGuard,
 ) -> Result<(FlashCudaExecutor<StepDriver>, DecodeSession), EngError> {
     let driver = build_driver(
@@ -415,9 +424,119 @@ fn make(
         artifact,
         wanted,
         rules.sampler_vocab,
+        prefill_chunk,
         Some(guard),
     )?;
     FlashCudaExecutor::new(driver, rules, identity)
+}
+
+/// The figures one `tuning plan` line reports.
+struct TuningCall<'a> {
+    projector: &'a CudaProjector,
+    free_vram: u64,
+    vram_total: u64,
+    experts: u64,
+    record_bytes: u64,
+    ring_budget: u64,
+    ring_is_setting: bool,
+    piece_rows: u64,
+    row_window: u64,
+    host_budget_bytes: u64,
+    /// Streamed experts per layer; the loader's ring horizon is twice this.
+    streamed_records: u64,
+}
+
+/// Prints the tuner's one `tuning plan` line: what it would pick beside
+/// the values the start uses, every value with its source. A diagnostic
+/// only — no value is applied, and a refused query degrades to zero
+/// facts without latching the backend.
+fn log_tuning_line(call: &TuningCall<'_>) {
+    use crate::capability::tuning::{
+        Decision, DeviceFacts, HardwareFacts, MemoryTopology, TuningInput, TuningMode,
+        TuningOverrides, decide, log_line,
+    };
+    let (sm_count, compute_capability, pcie_link) =
+        match call.projector.context().device_attributes() {
+            Ok(attributes) => (
+                attributes.sm_count,
+                attributes.compute_capability,
+                HardwareFacts::pcie_link_of(
+                    &attributes.bus_id,
+                    std::path::Path::new("/sys/bus/pci/devices"),
+                ),
+            ),
+            Err(_) => (0, (0, 0), (0, 0)),
+        };
+    let (cpu_threads, cpu_isa) = HardwareFacts::host_side();
+    let facts = HardwareFacts {
+        topology: MemoryTopology::Discrete {
+            host_budget_bytes: call.host_budget_bytes,
+            devices: vec![DeviceFacts {
+                vram_free_bytes: call.free_vram,
+                vram_total_bytes: call.vram_total,
+                sm_count,
+                compute_capability,
+                pcie_link,
+            }],
+        },
+        cpu_threads,
+        cpu_isa,
+        drive: None,
+    };
+    // The ring candidate is the loader's own capped rule over the free
+    // VRAM: whole expert records, never more than twice the streamed
+    // experts; a dense model (no experts) offers none.
+    let ring_candidates = if call.experts > 0 && call.record_bytes > 0 {
+        let records = crate::family::flash_next::settings::ring_record_count(
+            call.free_vram,
+            call.record_bytes,
+            2 * call.streamed_records,
+        );
+        vec![(
+            records * call.record_bytes,
+            "loader rule: whole records, capped at twice the streamed experts".to_string(),
+        )]
+    } else {
+        Vec::new()
+    };
+    let decisions = [
+        Decision {
+            name: "piece",
+            // No measured basis yet; the piece decision commit adds one.
+            candidates: Vec::new(),
+            in_use: (call.piece_rows, "resolved setting"),
+        },
+        Decision {
+            name: "rows",
+            // The row decision commit builds it from the prefill byte cost.
+            candidates: Vec::new(),
+            in_use: (call.row_window, "resolved setting"),
+        },
+        Decision {
+            name: "ring",
+            candidates: ring_candidates,
+            in_use: (
+                call.ring_budget,
+                if call.ring_is_setting {
+                    "setting"
+                } else {
+                    "default off"
+                },
+            ),
+        },
+    ];
+    let mode = match std::env::var("INFERENCE_TUNER").ok().as_deref() {
+        Some("off") => TuningMode::Off,
+        _ => TuningMode::Auto,
+    };
+    let overrides = TuningOverrides::default();
+    let input = TuningInput {
+        mode,
+        overrides: &overrides,
+        facts: &facts,
+        decisions: &decisions,
+    };
+    eprintln!("{}", log_line(&decide(&input), &input, false));
 }
 
 /// Loads the pack and builds the token driver. `guard` pins the one-engine flag at the first leak;
@@ -427,6 +546,7 @@ pub(super) fn build_driver(
     artifact: &Path,
     wanted: &CudaSettings,
     sampler_vocab: usize,
+    prefill_chunk: u32,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
     super::driver::chunk::prof::check_switch_spelling()?;
@@ -434,7 +554,9 @@ pub(super) fn build_driver(
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
     register_served_kernels(projector.context())?;
-    let free_vram = projector.memory_info()?.free as u64;
+    let card_memory = projector.memory_info()?;
+    let free_vram = card_memory.free as u64;
+    let vram_total = card_memory.total as u64;
 
     stage("opening the pack");
     let files = FlashPackFiles::open(artifact)?;
@@ -484,11 +606,11 @@ pub(super) fn build_driver(
     // regression today (it re-issues its copies every chunk while the union-admit path
     // copies once), so the default is off; the flag keeps the lane's experiments open.
     // A budget above the free VRAM is clamped, not wrapped: the plan then fits the card.
-    let ring_budget = crate::family::flash_next::settings::ring_budget_bytes(
-        std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
-            .ok()
-            .as_deref(),
-    )?;
+    let ring_spec = std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET").ok();
+    let ring_budget = crate::family::flash_next::settings::ring_budget_bytes(ring_spec.as_deref())?;
+    // The tuner's line prints after the ring build below, so its ring
+    // horizon is the loader's own, not an independent guess.
+
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
     // placeholder positions) with the numbers the pack and the context give.
     let card = TierInputs::measured(
@@ -761,6 +883,13 @@ pub(super) fn build_driver(
         rows,
         0..layers,
     )?;
+    // The streamed experts per layer — the loader's ring horizon is twice
+    // this, and the tuner's line below reports the same capped rule.
+    let bank_geometry = *bank.geometry();
+    let streamed = bank_geometry
+        .experts
+        .checked_sub(bank_geometry.slots)
+        .unwrap_or(bank_geometry.experts) as u64;
     let mut block = SplitMoe::new(
         ctx,
         moe_trunks(weights, layers)?,
@@ -774,7 +903,11 @@ pub(super) fn build_driver(
     if rows > 1 && ring_budget > 0 && !matches!(host_plan.mode, HostMode::Disk) {
         let slots = block.plan_ring(
             ctx,
-            (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
+            crate::family::flash_next::settings::ring_record_count(
+                ring_budget,
+                record_bytes as u64,
+                2 * streamed,
+            ) as usize,
             wanted.ring_rows as usize,
         )?;
         if slots == 0 {
@@ -792,6 +925,24 @@ pub(super) fn build_driver(
             );
         }
     }
+    // The tuner's line, after the ring build so its ring horizon is the
+    // loader's own (twice the streamed experts). A diagnostic only; no
+    // value is applied.
+    log_tuning_line(&TuningCall {
+        projector,
+        free_vram,
+        vram_total,
+        experts: model.moe.experts() as u64,
+        record_bytes: record_bytes as u64,
+        ring_budget,
+        ring_is_setting: ring_spec.is_some(),
+        // The piece is the device chunk (16 by default); the window is
+        // the operator-reachable row width (to 2,048).
+        piece_rows: prefill_chunk as u64,
+        row_window: wanted.prefill_rows as u64,
+        host_budget_bytes: mem_available,
+        streamed_records: streamed,
+    });
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
 

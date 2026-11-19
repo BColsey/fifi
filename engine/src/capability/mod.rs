@@ -28,6 +28,11 @@ pub mod effective;
 pub mod inspect;
 pub mod preflight;
 pub mod probe;
+// Gates with its caller: the one load-time tuner is read on the CUDA
+// start path; without it the module is tests-only, like the carve rule
+// in `flash_next::settings`.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub mod tuning;
 
 use serde::Serialize;
 

@@ -211,6 +211,24 @@ pub(in crate::family::flash_next) fn ring_budget_bytes(
     }
 }
 
+/// The one whole-record rule both the loader's ring build and the tuner's
+/// ring candidate read: how many whole expert records a byte budget buys,
+/// capped at `cap_records` — the loader's twice-the-streamed horizon. The
+/// loader sizes the ring's slots with it; the tuner shows the same capped
+/// rule over the free VRAM, so the plan and the start cannot disagree on
+/// the arithmetic.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) fn ring_record_count(
+    budget_bytes: u64,
+    record_bytes: u64,
+    cap_records: u64,
+) -> u64 {
+    budget_bytes
+        .checked_div(record_bytes)
+        .unwrap_or(0)
+        .min(cap_records)
+}
+
 /// The CUDA keys. Absent when `cuda_decode` is off; the keys are then refused if present, so a
 /// misspelt switch cannot leave an operator believing the card is in use.
 pub(in crate::family::flash_next) fn cuda_settings(
@@ -454,6 +472,25 @@ mod tests {
             Err(EngError::BadRequest(text)) => text,
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ring_record_count_buys_whole_records_on_real_geometry() {
+        use super::ring_record_count;
+        // The pack's real geometry: a 1,881,600-byte expert record, the
+        // free VRAM of a 24 GB card, and the loader's horizon of twice the
+        // 512 streamed experts per layer.
+        const RECORD: u64 = 1_881_600;
+        let records = ring_record_count(22_000_000_000, RECORD, 1_024);
+        assert!(records > 0, "a 24 GB card budgets whole records: {records}");
+        // The pack's 512 streamed experts all fit under the cap with room.
+        assert!(records >= 512, "512 experts of this record fit: {records}");
+        // The cap is the loader's horizon: twice the streamed experts.
+        assert_eq!(ring_record_count(22_000_000_000, RECORD, 8), 8);
+        // A budget short of one record buys none, and no record size buys none.
+        assert_eq!(ring_record_count(RECORD - 1, RECORD, 1_024), 0);
+        assert_eq!(ring_record_count(22_000_000_000, 0, 1_024), 0);
+        assert_eq!(ring_record_count(0, RECORD, 1_024), 0);
     }
 
     #[test]

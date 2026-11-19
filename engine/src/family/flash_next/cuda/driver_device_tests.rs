@@ -239,7 +239,7 @@ fn chunked_prefill_matches_oracle(default_rows: u32) {
             .map_or(default_rows, |v| v.parse().expect("rows")),
         ring_rows: 32,
     };
-    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
 
     // The prompt (its last token included) through the chunked feed.
     let began = std::time::Instant::now();
@@ -335,7 +335,7 @@ fn the_prefix_resume_matches_a_fresh_prefill() {
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
         ring_rows: 32,
     };
-    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
         driver,
         CudaRules {
@@ -518,7 +518,7 @@ fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
         ring_rows: 32,
     };
-    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
         driver,
         CudaRules {
@@ -660,7 +660,7 @@ fn the_extension_turn_after_an_off_lattice_tip_restore_matches_a_fresh_prefill()
         prefill_rows: PIECE as u32,
         ring_rows: 32,
     };
-    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
         driver,
         CudaRules {
@@ -846,7 +846,7 @@ fn the_mid_block_resume_over_a_block_budget_matches_a_fresh_prefill() {
         prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
         ring_rows: 32,
     };
-    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
     let (mut executor, mut session) = FlashCudaExecutor::new(
         driver,
         CudaRules {
@@ -988,6 +988,7 @@ fn the_first_real_tokens_match_the_oracle() {
         &pack,
         &wanted,
         actual_vocab,
+        16,
         None,
     )
     .expect("build the driver");
@@ -1282,6 +1283,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         &pack,
         &wanted,
         actual_vocab,
+        16,
         None,
     )
     .expect("build the driver");
@@ -1640,7 +1642,7 @@ fn single_row_kernel_receipt_run() {
         prefill_rows: 1,
         ring_rows: 32,
     };
-    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, 16, None).expect("driver");
     let kernel = driver.single_row_kernel_name().expect("kernel name");
     // The placement the run's logits hashes compare at. Read now: the usage profile moves
     // residents as the run feeds experts, and the driver's drop writes the usage dump after

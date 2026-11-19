@@ -16,13 +16,14 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7329,
+      "test_fns": 7340,
       "ignored": 665,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
         "BOLT_Q8_FILE",
         "BOLT_Q8_HEADER_SHA256",
         "BOLT_TRACE_DIR",
+        "CARGO_TARGET_DIR",
         "CARGO_TARGET_TMPDIR",
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -287,6 +288,7 @@
         "INFERENCE_FLASH_NEXT_RING_BUDGET",
         "INFERENCE_GEMMA_MATVEC_FIXTURES",
         "INFERENCE_QWEN36_SPARSE_ATTN",
+        "INFERENCE_TUNER",
         "KV_F16_ENV_PROBE",
         "KV_GUARD_SCRATCH_PROBE",
         "LC_COMPARE_BUILD",
