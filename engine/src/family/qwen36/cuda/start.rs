@@ -1049,7 +1049,8 @@ fn make_multi(
         }
         let policy = PlacementPolicy::default();
         let request = PlacementRequest {
-            shape: &shape,
+            dims: &dims,
+            kv_mode,
             inventory: &inventory,
             quant,
             kv_capacity_rows: settings.context_limit as usize,

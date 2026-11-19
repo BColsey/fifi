@@ -2,6 +2,7 @@
 //! 10 GB RTX 3080 and 12 GB RTX 3060 pair), overcommitment refusal, and
 //! conservative tie-breaks. No GPU needed: profiles are injected.
 
+use super::dims::{KvMode, StepDims};
 use crate::EngError;
 use crate::family::qwen36::cuda::placement::{
     DeviceProfile, PlacementPlan, PlacementPolicy, PlacementRequest, plan_placement,
@@ -70,7 +71,8 @@ fn plan_for(
     let inventory = Inventory::for_spec(spec)?;
     let policy = PlacementPolicy::default();
     let request = PlacementRequest {
-        shape: &shape,
+        dims: &StepDims::new(&shape, &inventory).unwrap(),
+        kv_mode: KvMode::Int8G32,
         inventory: &inventory,
         quant,
         kv_capacity_rows: 4096,
@@ -436,7 +438,8 @@ fn the_real_shape_deals_rows_the_native_matvec_accepts() {
     let profiles = [p0, p1];
     let policy = PlacementPolicy::default();
     let req = PlacementRequest {
-        shape: &shape,
+        dims: &StepDims::new(&shape, &inventory).unwrap(),
+        kv_mode: KvMode::Int8G32,
         inventory: &inventory,
         quant: GgufType::Q4K,
         kv_capacity_rows: 131072,
@@ -476,4 +479,114 @@ fn the_real_shape_deals_rows_the_native_matvec_accepts() {
         let vh = table.value_heads(card).expect("value heads").len();
         assert_eq!(vh % 4, 0, "card {card} beta/alpha rows {vh}");
     }
+}
+
+#[test]
+fn long_context_receipt_charges_the_kv_heads_held_by_each_card() {
+    use super::state_layout::KvPool;
+
+    let spec = FamilySpec {
+        heads_q: 32,
+        heads_kv: 4,
+        ..scaled_spec()
+    };
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let inventory = Inventory::for_spec(&spec).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    let profiles = [rtx_3080_10g(16 * GIB), rtx_3060_12g(16 * GIB)].map(|p| DeviceProfile {
+        total_bytes: 24 * GIB,
+        name: "test GPU".into(),
+        ..p
+    });
+    for mode in [KvMode::Int8G32, KvMode::Fp16] {
+        for capacity in [2_049, 262_144] {
+            let req = PlacementRequest {
+                dims: &dims,
+                inventory: &inventory,
+                quant: GgufType::Q80,
+                kv_mode: mode,
+                kv_capacity_rows: capacity,
+                delta_slots: 1,
+                profiles: &profiles,
+                policy: &PlacementPolicy::default(),
+            };
+            let plan = plan_placement(&req).unwrap();
+            assert_ne!(plan.runs.kv_rows[0].len(), plan.runs.kv_rows[1].len());
+            for (card, receipt) in plan.receipt.cards.iter().enumerate() {
+                let heads = plan.table.kv_rows(card).unwrap().len() / shape.attn.head_dim;
+                let actual = KvPool::new_with_heads(&dims, mode, capacity, heads).unwrap();
+                assert_eq!(
+                    receipt.kv_cache_bytes, actual.total as u64,
+                    "card {card}, {heads} heads"
+                );
+            }
+            assert_no_overcommit(&plan);
+        }
+    }
+}
+
+#[test]
+fn peer_placement_admits_when_each_local_cache_fits_the_card_exactly() {
+    let spec = scaled_spec();
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let inventory = Inventory::for_spec(&spec).unwrap();
+    let dims = StepDims::new(&shape, &inventory).unwrap();
+    let profiles = [rtx_3060_12g(11_000 * MIB), rtx_3060_12g(11_000 * MIB)];
+    let policy = PlacementPolicy::default();
+    let request = |profiles| PlacementRequest {
+        dims: &dims,
+        inventory: &inventory,
+        quant: GgufType::Q4K,
+        kv_mode: KvMode::Int8G32,
+        kv_capacity_rows: 262_144,
+        delta_slots: 1,
+        profiles,
+        policy: &policy,
+    };
+    let base = plan_placement(&request(&profiles)).unwrap();
+    let mut tight = profiles.clone();
+    for (profile, card) in tight.iter_mut().zip(&base.receipt.cards) {
+        profile.free_bytes = card.planned_bytes + card.safety_reserve_bytes;
+    }
+    let exact = plan_placement(&request(&tight)).unwrap();
+    assert_eq!(base.runs, exact.runs);
+    for card in exact.receipt.cards {
+        assert_eq!(
+            card.planned_bytes + card.safety_reserve_bytes,
+            card.free_bytes
+        );
+    }
+    // No alternate split can recover space when both devices have no room for KV.
+    let mut starved = tight.clone();
+    for profile in &mut starved {
+        profile.free_bytes = policy.safety_reserve_bytes + policy.cuda_overhead_bytes;
+    }
+    assert!(plan_placement(&request(&starved)).is_err());
+}
+
+#[test]
+fn the_35b_256k_plan_charges_1360_mib_of_kv_per_peer() {
+    let spec = QWEN3_6_35B_A3B;
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let inventory = Inventory::for_spec(&spec).unwrap();
+    let profiles = [rtx_3080_10g(20 * GIB), rtx_3060_12g(20 * GIB)].map(|p| DeviceProfile {
+        total_bytes: 24 * GIB,
+        name: "test GPU".into(),
+        ..p
+    });
+    let request = PlacementRequest {
+        dims: &StepDims::new(&shape, &inventory).unwrap(),
+        inventory: &inventory,
+        quant: GgufType::Q4K,
+        kv_mode: KvMode::Int8G32,
+        kv_capacity_rows: 262_144,
+        delta_slots: 1,
+        profiles: &profiles,
+        policy: &PlacementPolicy::default(),
+    };
+    let plan = plan_placement(&request).unwrap();
+    for card in &plan.receipt.cards {
+        assert_eq!(card.kv_cache_bytes, 1360 * MIB);
+    }
+    assert_no_overcommit(&plan);
 }
