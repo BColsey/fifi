@@ -1080,9 +1080,6 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         self.save_charged(key, pending, path, kind, None, snapshot)
     }
 
-    /// Duplicate uses need no allocation. New entries must fit beside the surviving snapshots.
-    /// Choose the same replacement and capacity victim for admission and eviction.
-    /// Keep both alive until the incoming snapshot fits beside every survivor.
     fn make_checkpoint_room(
         &mut self,
         key: &[u32],
@@ -1140,6 +1137,7 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         true
     }
 
+    /// Duplicate uses need no allocation. New entries must fit beside the surviving snapshots.
     fn save_charged(
         &mut self,
         key: &[u32],
@@ -1195,10 +1193,7 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
             }
             while self.lru.len() >= self.limits.entries {
                 // Keep a new boundary Block when its restored Tip is superseded.
-                if self.protect_recent_longer
-                    && kind == SaveKind::Tip
-                    && self.drop_restored_ancestor(key)
-                {
+                if self.protect_recent_longer && self.drop_restored_ancestor(key) {
                     self.restored_replaces += 1;
                     continue;
                 }
@@ -1210,7 +1205,7 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                     None => {
                         // Last resort: the restored entry goes, before the snapshot, when the
                         // tip extends it.
-                        if kind == SaveKind::Tip && self.drop_restored_ancestor(key) {
+                        if self.drop_restored_ancestor(key) {
                             self.restored_replaces += 1;
                             continue;
                         }
@@ -3143,6 +3138,300 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_budget_refusal_keeps_the_entries_the_save_would_have_evicted() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 2,
+            entries: 2,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Block, &mut || Ok(4_u64))
+            .unwrap();
+        slot.save(&[2], 2, 3, SaveKind::Block, &mut || Ok(4))
+            .unwrap();
+        // incoming 9, limit 10: even after rolling the same-path block
+        // (4 bytes), the surviving block (4 bytes) leaves the save unable
+        // to fit, so the rolled block must survive the refusal.
+        let budget = SnapshotBudget {
+            limit: 10,
+            incoming: 9,
+            size: &|bytes| *bytes,
+        };
+        assert!(
+            !slot
+                .save_charged(&[3], 3, 1, SaveKind::Block, Some(budget), &mut || {
+                    panic!("a refused save must not read back")
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            slot.snapshots().count(),
+            2,
+            "the rolled block must survive the refusal"
+        );
+        // The other-path replace suffers the same loss: an entry with the
+        // same key under another path is removed before the byte refusal.
+        let budget = SnapshotBudget {
+            limit: 10,
+            incoming: 9,
+            size: &|bytes| *bytes,
+        };
+        assert!(
+            !slot
+                .save_charged(&[1], 1, 2, SaveKind::Periodic, Some(budget), &mut || {
+                    panic!("a refused save must not read back")
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            slot.snapshots().count(),
+            2,
+            "the replaced entry must survive the refusal"
+        );
+        assert_eq!(slot.save_side_totals().save_refusals, 2);
+    }
+
+    #[test]
+    fn a_budget_refusal_of_a_block_root_or_periodic_save_takes_no_snapshot() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 2,
+            entries: 1,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Root, &mut || Ok(6_u64))
+            .unwrap();
+        slot.save(&[2], 2, 1, SaveKind::Root, &mut || Ok(6))
+            .unwrap();
+        slot.save(&[3], 3, 1, SaveKind::Periodic, &mut || Ok(4))
+            .unwrap();
+        // incoming 6 with 12+ bytes of roots beside the entry: every non-tip
+        // kind must refuse at the budget gate, before any read-back.
+        for kind in [SaveKind::Block, SaveKind::Periodic] {
+            let budget = SnapshotBudget {
+                limit: 10,
+                incoming: 6,
+                size: &|bytes| *bytes,
+            };
+            let saved = slot
+                .save_charged(&[4], 4, 1, kind, Some(budget), &mut || {
+                    panic!("a refused {kind:?} save must not read back")
+                })
+                .unwrap();
+            assert!(!saved, "{kind:?}");
+        }
+        let budget = SnapshotBudget {
+            limit: 10,
+            incoming: 6,
+            size: &|bytes| *bytes,
+        };
+        assert!(
+            !slot
+                .save_charged(&[5], 5, 1, SaveKind::Root, Some(budget), &mut || {
+                    panic!("a refused Root save must not read back")
+                })
+                .unwrap()
+        );
+        assert_eq!(slot.snapshots().count(), 3);
+        assert_eq!(slot.roots_len(), 2);
+        assert_eq!(slot.entries_len(), 1);
+        assert_eq!(slot.save_side_totals().save_refusals, 3);
+    }
+
+    #[test]
+    fn a_denied_new_tip_keeps_both_restorable_checkpoints() {
+        let tokens: Vec<u32> = (0..9_000).collect();
+        let mut slot = store(0, 2);
+        for len in [3_000, 5_000] {
+            let (step, session) = held(&tokens[..len]);
+            assert_eq!(
+                save(&session, &mut slot, &step, &tokens[..len], 1),
+                Ok(true)
+            );
+        }
+        let incoming = vec![2; 7_000];
+        let (step, session) = held(&incoming);
+        let mut took_snapshot = false;
+        let refused = session
+            .save_prefix_budgeted(
+                &mut slot,
+                &incoming,
+                1,
+                step.fed(),
+                SaveKind::Tip,
+                SnapshotBudget {
+                    limit: 10_000,
+                    incoming: 6_999,
+                    size: &|fed: &Vec<u32>| fed.len() as u64,
+                },
+                || {
+                    took_snapshot = true;
+                    Ok(step.fed.clone())
+                },
+            )
+            .unwrap();
+        assert!(!refused, "the refusing charge answers false");
+        assert!(!took_snapshot, "no snapshot was taken");
+        assert_eq!(
+            slot.save_side_totals().save_refusals,
+            1,
+            "one refusal counted"
+        );
+        assert_eq!(
+            slot.save_side_totals().room_removals,
+            0,
+            "a refused new tip must not consume a checkpoint"
+        );
+        let (mut step, mut session) = held(&tokens[..4_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..4_000], 1),
+            Ok(3_000)
+        );
+        let (mut step, mut session) = held(&tokens[..8_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..8_000], 1),
+            Ok(5_000)
+        );
+        // Once the replacement fits beside the surviving 4,999-byte entry, spend just
+        // the ordinary LRU victim and publish the new tip.
+        let (step, session) = held(&incoming);
+        assert!(
+            session
+                .save_prefix_budgeted(
+                    &mut slot,
+                    &incoming,
+                    1,
+                    step.fed(),
+                    SaveKind::Tip,
+                    SnapshotBudget {
+                        limit: 11_998,
+                        incoming: 6_999,
+                        size: &|fed: &Vec<u32>| fed.len() as u64
+                    },
+                    || Ok(step.fed.clone()),
+                )
+                .unwrap()
+        );
+        assert_eq!(slot.keys(), [(5_000, false), (7_000, false)]);
+        assert_eq!(slot.save_side_totals().room_removals, 1);
+    }
+
+    #[test]
+    fn a_root_save_replaces_the_same_key_root_of_another_path() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 2,
+            entries: 1,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Root, &mut || Ok(4_u64))
+            .unwrap();
+        slot.save(&[2], 2, 1, SaveKind::Root, &mut || Ok(4))
+            .unwrap();
+        // The roots list is full, but the same-key root of the other path is
+        // the replacement, so the save fits with no capacity victim.
+        assert!(
+            slot.save(&[1], 1, 2, SaveKind::Root, &mut || Ok(5))
+                .unwrap()
+        );
+        assert_eq!(slot.roots_len(), 2);
+        let totals = slot.save_side_totals();
+        assert_eq!(totals.room_removals, 0);
+        assert_eq!(totals.save_refusals, 0);
+        // The other-path root is gone; the untouched root survives.
+        assert_eq!(slot.snapshots().copied().collect::<Vec<_>>(), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_victim_only_cut_removes_exactly_one_entry() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 1,
+            entries: 1,
+        });
+        slot.save(&[3], 3, 1, SaveKind::Periodic, &mut || Ok(4_u64))
+            .unwrap();
+        // No same-key entry anywhere: the single cut is the capacity victim.
+        assert!(
+            slot.save(&[4], 4, 1, SaveKind::Periodic, &mut || Ok(5))
+                .unwrap()
+        );
+        assert_eq!(slot.entries_len(), 1);
+        assert_eq!(slot.snapshots().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(slot.save_side_totals().room_removals, 1);
+        assert_eq!(slot.save_side_totals().block_rolls, 0);
+    }
+
+    #[test]
+    fn a_combined_cut_removes_the_same_key_entry_and_one_victim() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 1,
+            entries: 1,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Periodic, &mut || Ok(4_u64))
+            .unwrap();
+        slot.save(&[2], 2, 1, SaveKind::Root, &mut || Ok(4))
+            .unwrap();
+        // The roots list is full with no same-key entry, so its cut needs a
+        // capacity victim; the same-key Periodic entry sits in the LRU list
+        // and is replaced in the same plan - two cut sources, one save.
+        assert!(
+            slot.save(&[1], 1, 2, SaveKind::Root, &mut || Ok(6))
+                .unwrap()
+        );
+        assert_eq!(slot.roots_len(), 1);
+        assert_eq!(slot.entries_len(), 0);
+        assert_eq!(slot.snapshots().copied().collect::<Vec<_>>(), vec![6]);
+        let totals = slot.save_side_totals();
+        assert_eq!(totals.room_removals, 1);
+        assert_eq!(totals.block_rolls, 0);
+    }
+
+    #[test]
+    fn an_exact_fit_replacement_retires_only_the_selected_entry() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 1,
+            entries: 2,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Periodic, &mut || Ok(4_u64))
+            .unwrap();
+        // The list is not full: replacing the same-key entry of the other
+        // path retires exactly that entry, with no victim and no refusal.
+        assert!(
+            slot.save(&[1], 1, 2, SaveKind::Periodic, &mut || Ok(5))
+                .unwrap()
+        );
+        assert_eq!(slot.entries_len(), 1);
+        assert_eq!(slot.snapshots().copied().collect::<Vec<_>>(), vec![5]);
+        let totals = slot.save_side_totals();
+        assert_eq!(totals.room_removals, 0);
+        assert_eq!(totals.save_refusals, 0);
+    }
+
+    #[test]
+    fn a_successful_charged_save_reports_exact_room_counters() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 2,
+            entries: 2,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Block, &mut || Ok(4_u64))
+            .unwrap();
+        slot.save(&[2], 2, 3, SaveKind::Block, &mut || Ok(4))
+            .unwrap();
+        // incoming 5 beside the surviving 4 fits the limit: the same-path
+        // block rolls, the other survives, no victim, no refusal.
+        let budget = SnapshotBudget {
+            limit: 10,
+            incoming: 5,
+            size: &|bytes| *bytes,
+        };
+        assert!(
+            slot.save_charged(&[3], 3, 1, SaveKind::Block, Some(budget), &mut || Ok(5))
+                .unwrap()
+        );
+        assert_eq!(slot.snapshots().copied().collect::<Vec<_>>(), vec![4, 5]);
+        let totals = slot.save_side_totals();
+        assert_eq!(totals.block_rolls, 1);
+        assert_eq!(totals.room_removals, 0);
+        assert_eq!(totals.save_refusals, 0);
     }
 
     #[test]
