@@ -597,6 +597,7 @@ mod tests {
             ACTIVATION_WORKSPACE_BYTES, admit_checkpoint, admit_serving, checkpoint_payloads,
             serving_plan,
         };
+        use crate::family::nemotron35::loader::NemotronLoader;
         use crate::{
             EngError,
             family::nemotron35::NemotronTextSpec,
@@ -778,6 +779,43 @@ mod tests {
                 u64::MAX,
             )
             .expect_err("the expert cache product must refuse overflow");
+            assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+        }
+
+        #[test]
+        fn admission_counts_the_index_slots_that_the_loader_reserves() {
+            // Before this change, admission's expert cache
+            // charge was cache_entries * largest decoded payload per entry;
+            // the loader additionally reserves one index slot per entry
+            // (loader.rs, size_of::<(ExpertKey, Tensor)>()), which admission
+            // never counted, so the exact payload-only ceiling admitted and
+            // then allocated past the budget it certified. With the index
+            // bytes charged per entry, that same ceiling now refuses, and
+            // the corrected total admits: this pins the corrected
+            // accounting at its exact margin.
+            let (dir, descriptor, spec) = fixture();
+            let total = checkpoint_total(dir.path(), &descriptor, &spec);
+            admit_checkpoint(
+                dir.path(),
+                &descriptor,
+                &spec,
+                16,
+                4,
+                MemoryPolicy::default_share(),
+                total,
+            )
+            .expect("the corrected total includes the index charge");
+            let under = total - 4 * u64::try_from(NemotronLoader::CACHE_INDEX_ENTRY_BYTES).unwrap();
+            let error = admit_checkpoint(
+                dir.path(),
+                &descriptor,
+                &spec,
+                16,
+                4,
+                MemoryPolicy::default_share(),
+                under,
+            )
+            .expect_err("dropping the index charge must refuse");
             assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
         }
 
