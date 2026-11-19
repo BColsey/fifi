@@ -2,6 +2,11 @@ use serde_json::{Value, json};
 
 use crate::{EngError, checkpoint_json::UniqueValue};
 
+/// The head dim of the sink-bearing float-flash prefill route. The load
+/// check below pins the checkpoint geometry to it, so the planner's flash
+/// price and the forward's dispatch agree on the same head dim.
+pub(crate) const PREFILL_FLASH_HEAD_DIM: u32 = 128;
+
 pub(super) const LAYERS: usize = 49;
 pub(super) const FULL_LAYERS: [u64; 14] = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48];
 
@@ -31,7 +36,7 @@ fn check_dimensions(root: &Value) -> Result<(), EngError> {
     for (name, wanted) in [
         ("hidden_size", 2048_u64),
         ("intermediate_size", 6144),
-        ("head_dim", 128),
+        ("head_dim", u64::from(PREFILL_FLASH_HEAD_DIM)),
         ("num_hidden_layers", LAYERS as u64),
         ("num_attention_heads", 32),
         ("num_key_value_heads", 4),

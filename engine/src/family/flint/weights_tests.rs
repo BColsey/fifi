@@ -430,6 +430,89 @@ fn sparse_oversized_flint_checkpoint_streams_and_decodes_on_mlx() {
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn planner_flash_price_uses_the_forwards_geometry() {
+    use super::super::{config, mlx_model::Model};
+    let root = sparse_checkpoint(|_| {});
+    drop(FlintCheckpoint::open(root.path()).unwrap());
+    let _serial = crate::native_test_lock();
+    // The load check pins the checkpoint's head_dim to PREFILL_FLASH_HEAD_DIM,
+    // so the pair the planner prices flash by is the pair the forward's
+    // request tensors carry; assert the pair opens the route on this device.
+    let model = Model::open_for_budget(root.path(), Some(2 << 30)).unwrap();
+    assert!(
+        model
+            .kernels
+            .float_flash_prefill_available(
+                super::super::mlx_executor::PREFILL_FLASH_DTYPE,
+                config::PREFILL_FLASH_HEAD_DIM
+            )
+            .unwrap()
+    );
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn flash_prefill_peak_stays_within_the_ladder_charge() {
+    use super::super::{mlx_model::Model, mlx_state::State};
+    let root = sparse_checkpoint(|_| {});
+    drop(FlintCheckpoint::open(root.path()).unwrap());
+    // The resident fixture plus the prefill charge needs ~24 GB of device
+    // working set; skip on a host without room instead of driving it into
+    // swap, unless the repository's require-data variable is set.
+    let recommended = crate::kernels::MlxKernels::recommended_working_set_bytes();
+    let need = 24 << 30;
+    if recommended < need && std::env::var_os("FIFI_TEST_REQUIRE_DATA").is_none() {
+        eprintln!(
+            "skipped: resident fixture needs ~{need} bytes, device working set {recommended}"
+        );
+        return;
+    }
+    let _serial = crate::native_test_lock();
+    // All experts resident: the bound carries no staging slack, so the
+    // measured flash charge alone must cover the prefill.
+    let mut model = Model::open_for_budget(root.path(), None).unwrap();
+    assert_eq!(model.streamed_expert_bytes, 0);
+    model.kernels.reset_peak_memory().unwrap();
+    let active = model.kernels.memory_stats().unwrap().active;
+    // ~29K tokens: the last chunks run near the family's 32K context limit,
+    // so a composite dispatch there (rows*32*32K*4 bytes, 12+ GiB at 1,024
+    // rows) cannot hide under the bound. This pins the route the planner
+    // priced to the route the executor dispatches.
+    let rows = 29 * 1024;
+    let tokens: Vec<u32> = (0..rows).map(|i| (i % 140_000) as u32).collect();
+    let mut state = State::new();
+    for piece in tokens.chunks(1024) {
+        assert!(
+            model
+                .prefill_rows(&mut state, piece, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let growth = model.kernels.memory_stats().unwrap().peak - active;
+    // The KV planes this prefill materializes are growth the allocator sees
+    // but the session charges, not the ladder, price; attribute them here so
+    // the bound still pins the flash route alone.
+    use crate::family::kv_format::{KvFormat, KvRowShape};
+    let row_bytes = KvFormat::Bf16
+        .layer_position_bytes(KvRowShape {
+            heads_kv: 4,
+            head_dim: 128,
+        })
+        .unwrap();
+    let kv_state = 14 * rows as u64 * row_bytes + 35 * 513 * row_bytes;
+    let charge = super::super::mlx_executor::FLASH_PREFILL_BASE_BYTES
+        + super::super::mlx_executor::FLASH_PREFILL_ROW_BYTES * 1024
+        + kv_state;
+    assert!(
+        growth <= charge,
+        "flash prefill allocator growth {growth} exceeds the ladder charge plus KV planes {charge}: \
+         the executor left the priced flash route or the kernel outgrew the measured terms"
+    );
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn expert_page_staging_matches_the_packed_experts_path() {
     use super::super::{
         mlx_forward::{disk_experts, grouped_experts},

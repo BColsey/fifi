@@ -750,6 +750,19 @@ impl MlxKernels {
         native::recommended_working_set_bytes()
     }
 
+    /// Whether the sink-bearing float-flash prefill kernel is dispatchable
+    /// for this dtype and head dim on the live device. This is a device
+    /// property (threadgroup staging limit), not a per-call one, so the
+    /// budget planner asks it once to price the prefill ladder by the route
+    /// that will actually run.
+    pub fn float_flash_prefill_available(
+        &self,
+        dtype: crate::tensor::Dtype,
+        head_dim: u32,
+    ) -> Result<bool, EngError> {
+        self.context.float_flash_fits(dtype, head_dim)
+    }
+
     pub fn memory_stats(&self) -> Result<MemoryStats, EngError> {
         let (active, cache, peak) = self.context.memory_stats()?;
         let wide = |value: usize| {

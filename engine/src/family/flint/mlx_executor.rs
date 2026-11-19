@@ -209,29 +209,74 @@ impl FlintExecutor {
 /// constraint, and the switch's fail-safe (unrecognized -> 512) does not
 /// apply to planner results.
 ///
-/// Pricing: the per-row charge is the composite attention fallback's
-/// score+mask+softmax materialization (3 x [rows*32, context] F32). The
-/// kernel that actually runs for a multi-row chunk is the sink-bearing
-/// float-flash prefill, whose per-row allocator cost is the Q projection
-/// plus the attention output (2 x 32 x 128 x 4 B ~= 32 KiB F32, two orders
-/// below the composite at 32K context), so the charge is a conservative
-/// upper bound that also covers the composite route the runtime flags can
-/// still select. Without the sub-512 rungs this charge cliffs to ONE row
-/// whenever under ~6.4 GiB remain at 32K context - the slowest path there
-/// is - which is why the ladder walks down to 4 instead.
+/// Flash prefill pricing, measured on one M3 Ultra host with 128 GB
+/// (medians of three fresh boots per width, 2026-11-19). At a 3,601-token
+/// prompt the allocator peak over the resident base grows a ~182 MB base
+/// plus ~260-264 KB per row, linear from 1 to 1,024 rows. At a 28,842-token
+/// prompt the same widths grow 1,224 MB (512 rows) and 1,350 MB (1,024
+/// rows), but ~864 MB of that is the KV planes the prefill materializes,
+/// which the session charges price (session_state_bytes), not this ladder;
+/// net of the planes the flash terms grow only +44 MB (512 rows) and
+/// +37 MB (1,024 rows) between the two depths (~316/449 MB shallow,
+/// ~360/486 MB deep), so the charge carries no context term. Both
+/// terms carry a 2x margin: the measurement is one device and the margin
+/// covers kernel and driver variance across widths and machines; even at 2x
+/// the flash charge stays ~24x below the composite per-row charge at 32K
+/// context.
+///
+/// Chunked prefill is not bit-identical across row widths: greedy
+/// decoding is deterministic within a width (three runs per width,
+/// identical), and identical across widths for roughly the first 69
+/// tokens before the chunk-boundary numerics diverge — so a user's
+/// output can depend on the row width the budget selects. No
+/// teacher-forced quality arm (NLL, top-1) across widths exists on
+/// record yet; that comparison is a listed gap.
+///
+/// Infeasible case: below the base term (~384 MiB charged, ~182 MB
+/// measured) no multi-row piece fits, and the ladder floors at one row —
+/// a one-row piece still materializes the base, so the tightest budgets
+/// overshoot their remainder by ~176 MB at the minimum rung. The base
+/// belongs in the resident plan; that move is deliberately not part of
+/// this commit.
+/// The query dtype of the sink-bearing float-flash prefill route; priced
+/// here with the head dim the checkpoint load check pins
+/// (config::PREFILL_FLASH_HEAD_DIM), so the ladder buys the route the
+/// forward dispatches.
+pub(crate) const PREFILL_FLASH_DTYPE: crate::tensor::Dtype = crate::tensor::Dtype::Bf16;
+pub(crate) const FLASH_PREFILL_BASE_BYTES: u64 = 384 * 1024 * 1024;
+pub(crate) const FLASH_PREFILL_ROW_BYTES: u64 = 512 * 1024;
+
+/// Pricing: two routes price the ladder. The kernel that runs for a
+/// multi-row chunk on a device that can dispatch it is the sink-bearing
+/// float-flash prefill, charged by the measured base-plus-per-row terms
+/// above. The composite attention fallback (the explicit [T, S] additive
+/// mask tail in `shared_attention`, reached when the device refuses the
+/// flash threadgroup staging, and the small-block vendor SDPA route that
+/// serves chunks the flash predicate skips) materializes 3 x
+/// [rows*32, context] F32 score+mask+softmax workspaces and keeps the
+/// 3*32*context*4 per-row charge. Without the sub-512 rungs the composite
+/// charge cliffs to ONE row whenever under ~6.4 GiB remain at 32K context
+/// (the slowest path there is), which is why the ladder walks down to 4
+/// instead.
 fn fitting_prefill_piece(
     max_rows: usize,
     context: u32,
     remaining: u64,
     streamed_expert_bytes: u64,
+    flash_prefill: bool,
 ) -> Result<usize> {
-    let score_bytes_per_row = 3 * 32 * u64::from(context) * 4;
+    let composite_bytes_per_row = 3 * 32 * u64::from(context) * 4;
+    let charge = |rows: u32| {
+        let kernel = if flash_prefill {
+            FLASH_PREFILL_BASE_BYTES + FLASH_PREFILL_ROW_BYTES * u64::from(rows)
+        } else {
+            u64::from(rows) * composite_bytes_per_row
+        };
+        Ok(kernel + expert_staging_bytes(streamed_expert_bytes, rows))
+    };
     let max_rows = u32::try_from(max_rows)
         .map_err(|_| EngError::BadRequest("Flint prefill ceiling exceeds u32".into()))?;
-    let rows = crate::family::prefill::mlx::admitted_chunk(max_rows, remaining, |rows| {
-        Ok(u64::from(rows) * score_bytes_per_row
-            + expert_staging_bytes(streamed_expert_bytes, rows))
-    })?;
+    let rows = crate::family::prefill::mlx::admitted_chunk(max_rows, remaining, charge)?;
     Ok(rows.unwrap_or(1) as usize)
 }
 
@@ -282,7 +327,19 @@ fn device_prefill_piece(
     // Each batched candidate charges the whole staging set for its own row count.
     charges.pop();
     let remaining = device.remaining("Flint MLX", &charges)?;
-    let rows = fitting_prefill_piece(max_rows, context_limit(), remaining, per_expert)?;
+    // Price by the route the chunk will take: the sink-bearing float-flash
+    // kernel unless the live device refuses its threadgroup staging.
+    let flash_prefill = model.kernels.float_flash_prefill_available(
+        PREFILL_FLASH_DTYPE,
+        super::config::PREFILL_FLASH_HEAD_DIM,
+    )?;
+    let rows = fitting_prefill_piece(
+        max_rows,
+        context_limit(),
+        remaining,
+        per_expert,
+        flash_prefill,
+    )?;
     let terms = charges
         .iter()
         .map(|(name, bytes)| format!("{name}={bytes}"))
@@ -300,57 +357,108 @@ fn device_prefill_piece(
 fn device_prefill_walks_the_ladder_and_respects_the_ceiling() {
     let context = 32768;
     let row = 3 * 32 * u64::from(context) * 4;
-    // Each rung is the largest whose whole-row charge fits; the rung below
-    // takes over where the old two-rung ladder cliffed to one row.
+    // Composite pricing (flash unavailable): each rung is the largest whose
+    // whole-row charge fits; the rung below takes over where the old
+    // two-rung ladder cliffed to one row.
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512 - 1, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512 - 1, 0, false).unwrap(),
         256
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512, 0, false).unwrap(),
         512
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 1024, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 1024, 0, false).unwrap(),
         1024
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 256 - 1, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 256 - 1, 0, false).unwrap(),
         128
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 4 - 1, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 4 - 1, 0, false).unwrap(),
         // Below four rows' worth of workspace no multi-row rung fits; the
         // ladder has no 2 rung, so the planner falls to one row.
         1
     );
-    assert_eq!(fitting_prefill_piece(1024, context, row * 4, 0).unwrap(), 4);
-    assert_eq!(fitting_prefill_piece(1024, context, row - 1, 0).unwrap(), 1);
     assert_eq!(
-        fitting_prefill_piece(512, context, u64::MAX, 0).unwrap(),
+        fitting_prefill_piece(1024, context, row * 4, 0, false).unwrap(),
+        4
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row - 1, 0, false).unwrap(),
+        1
+    );
+    assert_eq!(
+        fitting_prefill_piece(512, context, u64::MAX, 0, false).unwrap(),
         512
     );
-    assert_eq!(fitting_prefill_piece(1, context, u64::MAX, 0).unwrap(), 1);
     assert_eq!(
-        fitting_prefill_piece(1024, context / 4, row * 512, 0).unwrap(),
+        fitting_prefill_piece(1, context, u64::MAX, 0, false).unwrap(),
+        1
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context / 4, row * 512, 0, false).unwrap(),
         1024
     );
     // Streamed experts add a per-row staging charge to every candidate.
     let expert = 1 << 20;
     let staged = expert_staging_bytes(expert, 512);
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512 + staged - 1, expert).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512 + staged - 1, expert, false).unwrap(),
         256
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512 + staged, expert).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512 + staged, expert, false).unwrap(),
         512
     );
 }
 
 #[cfg(test)]
 #[test]
-fn device_prefill_does_not_cliff_on_the_studio_working_set() {
+fn device_prefill_flash_pricing_uses_the_measured_charge() {
+    let context = 32768;
+    let base = FLASH_PREFILL_BASE_BYTES;
+    let row = FLASH_PREFILL_ROW_BYTES;
+    // Flash pricing: the same ladder over the measured base+per-row charge;
+    // the ~12 MiB composite row becomes ~0.5 MiB, so the same remaining
+    // budget that bought 256 composite rows buys the ceiling.
+    assert_eq!(
+        fitting_prefill_piece(1024, context, base + row * 1024, 0, true).unwrap(),
+        1024
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, base + row * 1024 - 1, 0, true).unwrap(),
+        512
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, base + row * 4, 0, true).unwrap(),
+        4
+    );
+    // Below the base term even one row does not fit; the planner still
+    // returns one row (the floor), never zero.
+    assert_eq!(
+        fitting_prefill_piece(1024, context, base - 1, 0, true).unwrap(),
+        1
+    );
+    // At a 30,064 MiB device ceiling the session and resident charges
+    // leave ~8.86 GB; composite pricing bought 512 rows there, flash
+    // pricing buys the 1024 ceiling.
+    let remaining = 8_859_732_416_u64;
+    assert_eq!(
+        fitting_prefill_piece(1024, context, remaining, 0, true).unwrap(),
+        1024
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, remaining, 0, false).unwrap(),
+        512
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn device_prefill_does_not_cliff_on_the_measured_working_set() {
     // The Mac Studio on-leg numbers from the S1 serve proof: a 28 GiB
     // FIFI_MLX_WORKING_SET_MIB cap left exactly 5,638,506,944 bytes after
     // resident weights, session state, reserves and the pressure margin.
@@ -358,9 +466,14 @@ fn device_prefill_does_not_cliff_on_the_studio_working_set() {
     // 6,442,450,944); the walked ladder must not.
     let context = 32768;
     let remaining = 5_638_506_944_u64;
-    let selected = fitting_prefill_piece(1024, context, remaining, 0).unwrap();
+    let selected = fitting_prefill_piece(1024, context, remaining, 0, false).unwrap();
     assert!(selected > 1, "cliffed to one row: {selected}");
     assert_eq!(selected, 256);
+    // Flash pricing on the same remaining budget selects the ceiling: the
+    // measured charge (base + 512 KiB/row) fits 1,024 rows in 5.6 GB many
+    // times over.
+    let selected = fitting_prefill_piece(1024, context, remaining, 0, true).unwrap();
+    assert_eq!(selected, 1024);
 }
 
 impl ExecutorOps for FlintExecutor {
