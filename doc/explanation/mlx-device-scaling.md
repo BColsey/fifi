@@ -6,7 +6,7 @@ Qwen3.6, Flash-Next and Flint can size their prefill work to the Apple Silicon G
 FIFI_MLX_AUTO_BUDGET=1 enginesrv --config /path/to/config.json
 ```
 
-Use an Apple Silicon build with the `native-mlx` feature. The option is off by default. When enabled, it applies to one MLX model per server because the device reports one shared working set. Metal's recommendation is a sizing input for the total working set. Other apps, other server processes and allocation peaks during weight import can put additional pressure on memory. The policy validates the resident model and serving reserve after import, before the worker accepts jobs. An over-budget resident model and reserve fail startup with the charged terms.
+Use an Apple Silicon build with the `native-mlx` feature. The option is off by default. When enabled, it applies to one MLX model per server because the device reports one shared working set. Metal's recommendation is a sizing input for the total working set. Other apps, other server processes and allocation peaks during weight import can put additional pressure on memory. The policy checks resident memory and serving reserves before accepting jobs. Flint also uses a header-based estimate to choose where to keep its weights before import.
 
 The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB); that figure and the verification numbers below were recorded by the PR author (zbrdc/fifi#62, commit 88374d1c5) on his own machine and are carried as a contributor record, not reproduced here. The implementation queries Metal on every opted-in model startup and uses the resulting byte count. FIFI_MLX_WORKING_SET_MIB also activates automatic sizing and caps the plan at the lower of the configured ceiling and Metal's recommendation. Context length and KV format come from the family's configuration.
 
@@ -17,6 +17,24 @@ The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB); that figure and the 
 | Flint | Full KV planes, 513-position sliding rings, one layer's KV growth overlap, bounded prefix retention and a conservative upper estimate of the full-attention score, mask and softmax workspace | Walks the widest fitting rung from 1,024 down to 4 rows within the ceiling set by `FIFI_FLINT_MLX_BATCH_PREFILL`, one row only when even four do not fit. The prefix cache records the selected width. |
 
 Qwen3.6 and Flash-Next can fall back to one-token prefill if the workspace for a chunk does not fit. Startup logs carry the Metal recommendation, the charged resident and reserve bytes, and the selected path; the logs distinguish the Metal recommendation from the effective budget and, when set, the configured ceiling. [MLX budget code](../../engine/src/family/mlx_budget.rs) · [Environment reference](../reference/environment.md#apple-silicon-device-sizing)
+
+## Disk-backed Flint experts
+
+With automatic sizing enabled, Flint checks the checkpoint headers and serving reserves before importing weights. If the full resident model fits, Flint loads it as before. Otherwise it keeps attention, routers, shared experts, and the output head in memory and reads the routed experts by ID from the existing local safetensors files. Each layer imports only the experts selected for the current rows, restores the original routing order, and releases its staged weights after Metal completes the grouped projection. The model files stay on the local drive and the KV cache stays in unified memory.
+
+The planner charges both the host staging buffers and their Metal copies. Flint reduces prefill rows when that staging space and attention workspace do not fit together. It refuses startup before weight import when the resident core and one token of expert staging exceed the budget. The startup log reports `weight placement=disk-experts` or `weight placement=resident` and the selected prefill width. With Flint prefix reuse explicitly enabled, an oversized checkpoint also needs an explicit `FIFI_FLINT_PREFIX_BUDGET_BYTES` because the legacy cap derivation charges the entire checkpoint.
+
+Flash-Next already reads routed experts from disk and stages them in bounded page sets. Qwen3.6 still loads its expert banks into unified memory. Qwen dense models would need layer streaming to serve checkpoints whose resident core exceeds the budget.
+
+On the 16 GB M4 mini, a sparse zero-weight fixture with Flint's full tensor layout selected disk-backed experts under a 2 GiB weight budget (contributor record, zbrdc/fifi#62 commit 6c2a1e19d, not reproduced here at port time). Its 22.24 GB resident-weight estimate includes all expert banks. The disk-backed path estimated 952 MB of resident weights and peaked at 1.04 GiB of MLX allocations during two prefill rows and one decode step. A separate nonzero fixture compared the disk-backed and resident expert outputs bit for bit for one and two rows, with repeated and nonconsecutive expert IDs. The published checkpoint's latency, memory peak, and output agreement are still open.
+
+Run these two tests from `engine/` on Apple Silicon:
+
+```sh
+cargo test --locked --release --features native-mlx,native-fault-qualification --lib -- \
+  disk_experts_match_resident_grouped_predictions \
+  sparse_oversized_flint_checkpoint_streams_and_decodes_on_mlx --nocapture --test-threads=1
+```
 
 ## CUDA and MLX interfaces
 

@@ -16,7 +16,7 @@ impl Profile {
         profile.matrix("model.embed_tokens", &[150144, 2048], 8);
         profile.matrix("lm_head", &[150144, 2048], 4);
         profile.plain("model.norm.weight", &[2048]);
-        for layer in 0..49 {
+        for layer in 0..super::super::config::LAYERS {
             let prefix = format!("model.layers.{layer}");
             for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
                 profile.plain(&format!("{prefix}.{name}"), &[2048]);

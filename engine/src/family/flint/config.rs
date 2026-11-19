@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{EngError, checkpoint_json::UniqueValue};
 
+pub(super) const LAYERS: usize = 49;
 pub(super) const FULL_LAYERS: [u64; 14] = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48];
 
 /// Checks the pinned Flint inference metadata, not weights or backend availability.
@@ -31,7 +32,7 @@ fn check_dimensions(root: &Value) -> Result<(), EngError> {
         ("hidden_size", 2048_u64),
         ("intermediate_size", 6144),
         ("head_dim", 128),
-        ("num_hidden_layers", 49),
+        ("num_hidden_layers", LAYERS as u64),
         ("num_attention_heads", 32),
         ("num_key_value_heads", 4),
         ("num_experts", 256),
@@ -95,7 +96,7 @@ fn check_layers(root: &Value) -> Result<(), EngError> {
     let layers = root
         .get("layer_types")
         .and_then(Value::as_array)
-        .filter(|layers| layers.len() == 49)
+        .filter(|layers| layers.len() == LAYERS)
         .ok_or_else(|| mismatch("layer_types"))?;
     for (index, layer) in layers.iter().enumerate() {
         let wanted = if FULL_LAYERS.contains(&(index as u64)) {

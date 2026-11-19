@@ -88,7 +88,7 @@ impl FlintCheckpoint {
         Ok(Self { weights, profile })
     }
 
-    pub(super) fn tensor(&mut self, name: &str) -> Result<Tensor, EngError> {
+    pub(super) fn tensor(&self, name: &str) -> Result<Tensor, EngError> {
         if let Some((dtype, _)) = self.weights.stored(name)
             && !matches!(dtype, Dtype::Bf16 | Dtype::F32)
         {
@@ -97,7 +97,7 @@ impl FlintCheckpoint {
         self.read(name)
     }
 
-    pub(super) fn packed(&mut self, stem: &str) -> Result<PackedWeight, EngError> {
+    pub(super) fn packed(&self, stem: &str) -> Result<PackedWeight, EngError> {
         let (logical, bits) = self
             .profile
             .packed
@@ -110,7 +110,41 @@ impl FlintCheckpoint {
         PackedWeight::try_new(payload, scales, Some(biases), logical, affine(bits))
     }
 
-    pub(super) fn embedding_rows(&mut self, ids: &[u32]) -> Result<PackedWeight, EngError> {
+    /// Read only the requested expert slices. The publisher uses U8 for the
+    /// payload's bytes. The staging buffer views those same bytes as U32 words.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn packed_experts(&self, stem: &str, ids: &[u32]) -> Result<PackedWeight, EngError> {
+        let (logical, bits) = self
+            .profile
+            .packed
+            .get(stem)
+            .ok_or_else(|| invalid(&format!("unknown packed stem {stem}")))?;
+        let &[experts, rows, input] = logical.as_slice() else {
+            return Err(invalid("expected a rank-three Flint expert stack"));
+        };
+        if ids.is_empty() || ids.iter().any(|&id| id >= experts) {
+            return Err(invalid("expert IDs outside the Flint stack"));
+        }
+        let slices = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
+        let payload = self.gather_slices(
+            &format!("{stem}.weight"),
+            ids,
+            &[slices, rows, input / 32 * u32::from(*bits)],
+            Dtype::U32,
+        )?;
+        let aux = [slices, rows, input / 64];
+        let scales = self.gather_slices(&format!("{stem}.scales"), ids, &aux, Dtype::Bf16)?;
+        let biases = self.gather_slices(&format!("{stem}.biases"), ids, &aux, Dtype::Bf16)?;
+        PackedWeight::try_new(
+            payload,
+            scales,
+            Some(biases),
+            vec![slices, rows, input],
+            affine(*bits),
+        )
+    }
+
+    pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<PackedWeight, EngError> {
         let (shape, bits) = self
             .profile
             .packed
@@ -158,23 +192,68 @@ impl FlintCheckpoint {
         width: u32,
         dtype: Dtype,
     ) -> Result<Tensor, EngError> {
-        let row_bytes = usize::try_from(u64::from(width) * dtype.byte_width())
-            .map_err(|_| invalid("embedding row bytes exceed usize"))?;
+        let rows =
+            u32::try_from(ids.len()).map_err(|_| invalid("embedding row count exceeds u32"))?;
+        self.gather_slices(name, ids, &[rows, width], dtype)
+    }
+
+    fn gather_slices(
+        &self,
+        name: &str,
+        ids: &[u32],
+        shape: &[u32],
+        dtype: Dtype,
+    ) -> Result<Tensor, EngError> {
+        let row_bytes = shape[1..]
+            .iter()
+            .try_fold(dtype.byte_width() as usize, |bytes, &dim| {
+                bytes.checked_mul(dim as usize).filter(|&size| size != 0)
+            })
+            .ok_or_else(|| invalid("invalid Flint packed slice size"))?;
         let len = ids
             .len()
             .checked_mul(row_bytes)
-            .ok_or_else(|| invalid("embedding byte count overflows"))?;
+            .ok_or_else(|| invalid("Flint packed staging byte count overflows"))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(len)
-            .map_err(|_| EngError::MemoryPlan("Flint embedding gather allocation failed".into()))?;
+            .map_err(|_| EngError::MemoryPlan("Flint packed staging allocation failed".into()))?;
         bytes.resize(len, 0);
         for (&id, row) in ids.iter().zip(bytes.chunks_exact_mut(row_bytes)) {
             self.weights.read_slice_into(name, id, row)?;
         }
-        let rows =
-            u32::try_from(ids.len()).map_err(|_| invalid("embedding row count exceeds u32"))?;
-        Tensor::try_from_host(dtype, vec![rows, width], bytes)
+        Tensor::try_from_host(dtype, shape.to_vec(), bytes)
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn mlx_weight_bytes(&self, stream_experts: bool) -> u64 {
+        self.profile
+            .tensors
+            .iter()
+            .filter(|(key, _)| {
+                !key.starts_with(EMBEDDING) && !(stream_experts && key.contains(".mlp.switch_mlp."))
+            })
+            .map(|(_, (dtype, shape))| {
+                shape.iter().map(|&dim| u64::from(dim)).product::<u64>() * dtype.byte_width()
+            })
+            .sum()
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn bytes_per_routed_expert(&self) -> u64 {
+        // All 47 routed layers share their checked packing and shape.
+        self.profile
+            .tensors
+            .iter()
+            .filter(|(key, _)| key.starts_with("model.layers.2.mlp.switch_mlp."))
+            .map(|(_, (dtype, shape))| {
+                shape[1..]
+                    .iter()
+                    .map(|&dim| u64::from(dim))
+                    .product::<u64>()
+                    * dtype.byte_width()
+            })
+            .sum()
     }
 }
 

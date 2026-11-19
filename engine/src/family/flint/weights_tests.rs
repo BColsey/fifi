@@ -98,7 +98,7 @@ fn tiny(logical: Vec<u32>, bits: u8) -> (FlintCheckpoint, Vec<u8>) {
 #[test]
 fn packed_api_preserves_2d_and_3d_bytes_and_affine_metadata() {
     for shape in [vec![2, 64], vec![2, 3, 128]] {
-        let (mut checkpoint, bytes) = tiny(shape.clone(), 4);
+        let (checkpoint, bytes) = tiny(shape.clone(), 4);
         let packed = checkpoint.packed("model.embed_tokens").unwrap();
         assert_eq!(packed.logical_shape(), shape);
         assert_eq!(packed.payload().dtype(), Dtype::U32);
@@ -123,7 +123,7 @@ fn packed_api_preserves_2d_and_3d_bytes_and_affine_metadata() {
 
 #[test]
 fn embedding_api_gathers_int8_rows_in_request_order() {
-    let (mut checkpoint, bytes) = tiny(vec![4, 2048], 8);
+    let (checkpoint, bytes) = tiny(vec![4, 2048], 8);
     let rows = checkpoint.embedding_rows(&[3, 0, 3]).unwrap();
     assert_eq!(rows.logical_shape(), [3, 2048]);
     assert_eq!(rows.payload().shape(), [3, 512]);
@@ -269,7 +269,7 @@ fn open_refuses_a_shard_linked_into_a_network_mount() {
 #[test]
 fn open_checks_complete_profile_without_reading_payloads() {
     let root = sparse_checkpoint(|_| {});
-    let mut checkpoint = FlintCheckpoint::open(root.path()).unwrap();
+    let checkpoint = FlintCheckpoint::open(root.path()).unwrap();
     let norm = checkpoint.tensor("model.norm.weight").unwrap();
     assert_eq!(norm.shape(), [2048]);
     assert_eq!(norm.dtype(), Dtype::Bf16);
@@ -281,6 +281,151 @@ fn open_checks_complete_profile_without_reading_payloads() {
     assert_eq!(embedding.logical_shape(), [2, 2048]);
     assert_eq!(embedding.quantization().bits, 8);
     assert!(checkpoint.tensor("model.embed_tokens.weight").is_err());
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn disk_experts_match_resident_grouped_predictions() {
+    use super::super::{
+        mlx_forward::{disk_experts, grouped_experts},
+        mlx_model::SwiGlu,
+    };
+    use crate::kernels::MlxKernels;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("experts.safetensors");
+    let mut profile = Profile::default();
+    let mut entries = Vec::new();
+    for (projection, shift) in [("gate_proj", 1), ("up_proj", 3), ("down_proj", 5)] {
+        let stem = format!("experts.{projection}");
+        profile.packed.insert(stem.clone(), (vec![256, 64, 64], 4));
+        let payload = (0..256 * 64 * 32)
+            .map(|i| ((i + i / 2048 + shift) % 256) as u8)
+            .collect();
+        entries.push((
+            format!("{stem}.weight"),
+            Dtype::U8,
+            vec![256, 64, 32],
+            payload,
+        ));
+        entries.push((
+            format!("{stem}.scales"),
+            Dtype::Bf16,
+            vec![256, 64, 1],
+            bf16(0.125, 256 * 64),
+        ));
+        entries.push((
+            format!("{stem}.biases"),
+            Dtype::Bf16,
+            vec![256, 64, 1],
+            bf16(-0.5, 256 * 64),
+        ));
+    }
+    let index = serde_json::to_vec(&json!({"weight_map": entries.iter()
+        .map(|(name, _, _, _)| (name.as_str(), "experts.safetensors")).collect::<BTreeMap<_, _>>() }))
+        .unwrap();
+    let bytes = shard(
+        entries
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.as_str(), *dtype, shape.clone(), bytes.clone())
+            })
+            .collect(),
+    );
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let weights = StreamedCheckpoint::open(
+        &index,
+        vec![(
+            "experts.safetensors".into(),
+            Box::new(file),
+            bytes.len() as u64,
+        )],
+        HEADER_LIMIT,
+    )
+    .unwrap();
+    let checkpoint = FlintCheckpoint { profile, weights };
+    let _serial = crate::native_test_lock();
+    let mut k = MlxKernels::try_new().unwrap();
+    k.allow_bf16(true);
+    let mut load = |projection| {
+        k.import_packed(&checkpoint.packed(&format!("experts.{projection}")).unwrap())
+            .unwrap()
+    };
+    let full = SwiGlu {
+        gate: load("gate_proj"),
+        up: load("up_proj"),
+        down: load("down_proj"),
+    };
+    for rows in [1, 2] {
+        let x = k
+            .import_tensor(
+                &Tensor::try_from_host(
+                    Dtype::Bf16,
+                    vec![rows, 64],
+                    bf16(0.375, rows as usize * 64),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let ids = [19_u32, 255, 8, 0, 3, 42, 255, 91, 2, 42, 17, 19];
+        let ids = Tensor::try_from_host(
+            Dtype::U32,
+            vec![6 * rows],
+            ids[..6 * rows as usize]
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect(),
+        )
+        .unwrap();
+        let ids = k.import_tensor(&ids).unwrap();
+        let ids = k.bound_indices(&ids, 256).unwrap();
+        let expected = grouped_experts(&mut k, &full, &x, &ids).unwrap();
+        let expected = k.readback(&expected).unwrap();
+        let streamed = disk_experts(&mut k, &checkpoint, "experts", &x, &ids).unwrap();
+        let streamed = k.readback(&streamed).unwrap();
+        assert_eq!(
+            streamed.host_bytes().unwrap(),
+            expected.host_bytes().unwrap()
+        );
+        assert!(streamed.host_bytes().unwrap().iter().any(|&byte| byte != 0));
+    }
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn sparse_oversized_flint_checkpoint_streams_and_decodes_on_mlx() {
+    use super::super::{mlx_model::Model, mlx_state::State};
+    let root = sparse_checkpoint(|_| {});
+    let source = FlintCheckpoint::open(root.path()).unwrap();
+    let weights_budget = 2 << 30;
+    assert!(source.mlx_weight_bytes(false) > weights_budget);
+    assert!(
+        super::super::mlx_model::expert_staging_bytes(source.bytes_per_routed_expert(), 1)
+            + source.mlx_weight_bytes(true)
+            < weights_budget
+    );
+    drop(source);
+    let _serial = crate::native_test_lock();
+    let mut model = Model::open_for_budget(root.path(), Some(weights_budget)).unwrap();
+    assert_eq!(model.streamed_expert_bytes, 1_769_472);
+    model.kernels.reset_peak_memory().unwrap();
+    let mut state = State::new();
+    assert!(
+        model
+            .prefill_rows(&mut state, &[1, 5], false)
+            .unwrap()
+            .is_none()
+    );
+    let logits = model.step(&mut state, 8, true).unwrap().unwrap();
+    assert_eq!(logits.len(), 150_144);
+    assert!(logits.iter().all(|&value| value == 0.0));
+    let memory = model.kernels.memory_stats().unwrap();
+    assert!(memory.peak < weights_budget, "{memory:?}");
+    eprintln!(
+        "Flint sparse fixture prefill and decode allocator peak {} bytes",
+        memory.peak
+    );
 }
 
 #[test]
@@ -364,7 +509,7 @@ fn packed_api_rejects_incomplete_words_and_wrong_storage() {
         .unwrap();
         let mut profile = Profile::default();
         profile.packed.insert("x".into(), (vec![2, 64], 4));
-        let mut checkpoint = FlintCheckpoint { weights, profile };
+        let checkpoint = FlintCheckpoint { weights, profile };
         let error = checkpoint.packed("x").unwrap_err();
         assert!(
             matches!(error, EngError::Checkpoint(message) if message.contains("payload") || message.contains("words"))
@@ -417,7 +562,7 @@ fn open_rejects_malformed_ranges_duplicate_members_and_truncated_files() {
 #[test]
 fn reads_propagate_truncation_after_header_validation() {
     let root = sparse_checkpoint(|_| {});
-    let mut checkpoint = FlintCheckpoint::open(root.path()).unwrap();
+    let checkpoint = FlintCheckpoint::open(root.path()).unwrap();
     for index in 0..5 {
         std::fs::OpenOptions::new()
             .write(true)
@@ -554,7 +699,7 @@ fn publisher_cpu_fixture_matches_checkpoint_api() {
     assert_eq!(proof["full_model_loaded"], false);
     let root = sparse_checkpoint(|_| {});
     inject_fixture_tensors(root.path(), &fixture, &proof["tensors"]);
-    let mut checkpoint = FlintCheckpoint::open(root.path()).unwrap();
+    let checkpoint = FlintCheckpoint::open(root.path()).unwrap();
     let attention = checkpoint
         .packed("model.layers.0.self_attn.k_proj")
         .unwrap();

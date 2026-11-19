@@ -7,9 +7,9 @@ use super::{
 use crate::{
     EngError,
     kernels::{MlxKernels, ResidentPackedWeight},
-    tensor::{Dtype, ExecutionTensor},
+    tensor::{Dtype, ExecutionTensor, Tensor},
 };
-use std::path::Path;
+use std::{path::Path, rc::Rc};
 
 /// Mac MLX freed-buffer cache limit. Default 64 MiB: bounded reuse keeps
 /// per-step freed buffers on the device instead of paying a driver
@@ -42,12 +42,32 @@ pub(super) struct SwiGlu {
 }
 
 impl SwiGlu {
-    fn load(k: &mut MlxKernels, source: &mut FlintCheckpoint, stem: &str) -> Result<Self> {
+    fn load(k: &mut MlxKernels, source: &FlintCheckpoint, stem: &str) -> Result<Self> {
         Ok(Self {
             gate: packed(k, source, &format!("{stem}.gate_proj"))?,
             up: packed(k, source, &format!("{stem}.up_proj"))?,
             down: packed(k, source, &format!("{stem}.down_proj"))?,
         })
+    }
+
+    pub(super) fn load_experts(
+        k: &mut MlxKernels,
+        source: &FlintCheckpoint,
+        stem: &str,
+        experts: &[u32],
+        remapped: &Tensor,
+    ) -> Result<(Self, ExecutionTensor)> {
+        let gate = source.packed_experts(&format!("{stem}.gate_proj"), experts)?;
+        let up = source.packed_experts(&format!("{stem}.up_proj"), experts)?;
+        let down = source.packed_experts(&format!("{stem}.down_proj"), experts)?;
+        let (weights, ids) = k.import_packed_many_with(&[&gate, &up, &down], &[remapped])?;
+        let [gate, up, down] = weights
+            .try_into()
+            .map_err(|_| EngError::Checkpoint("short Flint expert import".into()))?;
+        let [ids] = ids
+            .try_into()
+            .map_err(|_| EngError::Checkpoint("short Flint expert ID import".into()))?;
+        Ok((Self { gate, up, down }, ids))
     }
 
     pub(super) fn apply(&self, k: &mut MlxKernels, x: &ExecutionTensor) -> Result<ExecutionTensor> {
@@ -63,11 +83,19 @@ impl SwiGlu {
     }
 }
 
+pub(super) enum Routed {
+    Resident(SwiGlu),
+    Disk {
+        source: Rc<FlintCheckpoint>,
+        stem: String,
+    },
+}
+
 pub(super) enum Ffn {
     Dense(SwiGlu),
     Moe {
         router: ExecutionTensor,
-        routed: SwiGlu,
+        routed: Routed,
         shared: Box<SwiGlu>,
     },
 }
@@ -86,7 +114,12 @@ pub(super) struct Layer {
 }
 
 impl Layer {
-    fn load(k: &mut MlxKernels, source: &mut FlintCheckpoint, index: usize) -> Result<Self> {
+    fn load(
+        k: &mut MlxKernels,
+        source: &Rc<FlintCheckpoint>,
+        index: usize,
+        disk: bool,
+    ) -> Result<Self> {
         let stem = format!("model.layers.{index}");
         let ffn = if index < 2 {
             Ffn::Dense(SwiGlu::load(k, source, &format!("{stem}.mlp"))?)
@@ -96,7 +129,14 @@ impl Layer {
             k.evaluate(&[&router])?;
             Ffn::Moe {
                 router,
-                routed: SwiGlu::load(k, source, &format!("{stem}.mlp.switch_mlp"))?,
+                routed: if disk {
+                    Routed::Disk {
+                        source: Rc::clone(source),
+                        stem: format!("{stem}.mlp.switch_mlp"),
+                    }
+                } else {
+                    Routed::Resident(SwiGlu::load(k, source, &format!("{stem}.mlp.switch_mlp"))?)
+                },
                 shared: Box::new(SwiGlu::load(
                     k,
                     source,
@@ -155,12 +195,18 @@ pub(super) struct Model {
     pub(super) layers: Vec<Layer>,
     pub(super) norm: ExecutionTensor,
     pub(super) head: ResidentPackedWeight,
-    pub(super) source: FlintCheckpoint,
+    pub(super) source: Rc<FlintCheckpoint>,
+    pub(super) streamed_expert_bytes: u64,
     pub(super) kernels: MlxKernels,
 }
 
 impl Model {
+    #[cfg(test)]
     pub(super) fn open(root: &Path) -> Result<Self> {
+        Self::open_for_budget(root, None)
+    }
+
+    pub(super) fn open_for_budget(root: &Path, available: Option<u64>) -> Result<Self> {
         // Freeze and log the family's default-on switches at engine start
         // (one load line each; the OnceLocks keep every later read identical).
         let _ = super::mlx_forward::async_chain_flagged();
@@ -194,39 +240,70 @@ impl Model {
         } else {
             eprintln!("flint: MLX prefill piece size {ceiling} rows");
         }
-        let mut source = FlintCheckpoint::open(root)?;
+        let source = Rc::new(FlintCheckpoint::open(root)?);
+        let streamed_expert_bytes = match available {
+            Some(bytes) => plan_weight_placement(&source, bytes)?,
+            None => 0,
+        };
+        let disk = streamed_expert_bytes != 0;
+        if let Some(bytes) = available {
+            eprintln!(
+                "flint: MLX weight placement={} weight_budget_bytes={bytes} resident_estimate_bytes={} streamed_bytes_per_expert={streamed_expert_bytes}",
+                if disk { "disk-experts" } else { "resident" },
+                source.mlx_weight_bytes(disk),
+            );
+        }
         let mut kernels = MlxKernels::try_new()?;
         kernels.allow_bf16(true);
         // Bounded freed-buffer reuse: without a cache every per-step
         // free/malloc pair pays a driver round-trip. 64 MiB covers the
         // measured decode churn envelope.
         kernels.set_cache_limit(cache_limit_bytes())?;
-        let mut layers = Vec::with_capacity(49);
-        for index in 0..49 {
-            layers.push(Layer::load(&mut kernels, &mut source, index)?);
+        let mut layers = Vec::with_capacity(super::config::LAYERS);
+        for index in 0..super::config::LAYERS {
+            layers.push(Layer::load(&mut kernels, &source, index, disk)?);
         }
-        let norm = plain(&mut kernels, &mut source, "model.norm.weight")?;
-        let head = packed(&mut kernels, &mut source, "lm_head")?;
+        let norm = plain(&mut kernels, &source, "model.norm.weight")?;
+        let head = packed(&mut kernels, &source, "lm_head")?;
         Ok(Self {
             layers,
             norm,
             head,
             source,
+            streamed_expert_bytes,
             kernels,
         })
     }
 }
 
+pub(super) fn expert_staging_bytes(bytes_per_expert: u64, rows: u32) -> u64 {
+    2 * bytes_per_expert * u64::from(rows.saturating_mul(6).min(256))
+}
+
+fn plan_weight_placement(source: &FlintCheckpoint, available: u64) -> Result<u64> {
+    if source.mlx_weight_bytes(false) <= available {
+        return Ok(0);
+    }
+    let per_expert = source.bytes_per_routed_expert();
+    let minimum = source.mlx_weight_bytes(true) + expert_staging_bytes(per_expert, 1);
+    if minimum > available {
+        return Err(EngError::MemoryPlan(format!(
+            "Flint disk-backed experts require {minimum} bytes for resident weights and one token of staging, with {available} bytes left after serving reserves"
+        )));
+    }
+    Ok(per_expert)
+}
+
 fn packed(
     k: &mut MlxKernels,
-    source: &mut FlintCheckpoint,
+    source: &FlintCheckpoint,
     stem: &str,
 ) -> Result<ResidentPackedWeight> {
     let host = source.packed(stem)?;
     k.import_packed(&host)
 }
 
-fn plain(k: &mut MlxKernels, source: &mut FlintCheckpoint, name: &str) -> Result<ExecutionTensor> {
+fn plain(k: &mut MlxKernels, source: &FlintCheckpoint, name: &str) -> Result<ExecutionTensor> {
     let host = source.tensor(name)?;
     // Preserve publisher BF16 norm/router parameters; the sink alone is
     // widened at its layer load site, then rounded to query dtype at use.

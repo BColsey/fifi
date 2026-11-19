@@ -68,7 +68,7 @@ fn read(k: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
 fn row_reference(k: &mut MlxKernels, w: &Ffn, x: &ExecutionTensor) -> ExecutionTensor {
     let Ffn::Moe {
         router,
-        routed,
+        routed: Routed::Resident(routed),
         shared,
     } = w
     else {
@@ -112,7 +112,7 @@ fn batch_grouped_experts_match_row_reference_without_half_overflow() {
     let router = k.cast(&router, Dtype::Bf16).unwrap();
     let w = Ffn::Moe {
         router,
-        routed: swiglu(&mut k, true),
+        routed: Routed::Resident(swiglu(&mut k, true)),
         shared: Box::new(swiglu(&mut k, false)),
     };
     for count in [2, 7, 17] {

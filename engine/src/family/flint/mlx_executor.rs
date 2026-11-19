@@ -1,7 +1,10 @@
 //! Worker adapter. Shared DecodeSession owns EOS, sampling, cancellation and token publication.
 
 use super::{
-    factory::context_limit, mlx_model::Model, mlx_state::PrefixSnapshot, mlx_state::State,
+    factory::context_limit,
+    mlx_model::{Model, expert_staging_bytes},
+    mlx_state::PrefixSnapshot,
+    mlx_state::State,
 };
 use crate::sched::job::{PrefixHit, PrefixReport};
 use crate::{
@@ -156,12 +159,19 @@ impl FlintExecutor {
             eprintln!("flint prefix retention cap {retention_cap} bytes");
         }
         let device = crate::family::mlx_budget::DeviceBudget::detect()?;
-        let model = Model::open(root)?;
+        let reserve = device
+            .map(|device| {
+                let charges = device_session_charges(retention_cap)?;
+                let weights = device.remaining("Flint MLX", &charges)?;
+                Ok::<_, EngError>((device, charges, weights))
+            })
+            .transpose()?;
+        let model = Model::open_for_budget(root, reserve.as_ref().map(|(_, _, bytes)| *bytes))?;
         let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
             std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
         ));
-        let prefill_piece = if let Some(device) = device {
-            device_prefill_piece(device, &model, max_rows, retention_cap)?
+        let prefill_piece = if let Some((device, charges, _)) = reserve {
+            device_prefill_piece(device, &model, max_rows, &charges)?
         } else {
             max_rows
         };
@@ -209,33 +219,31 @@ impl FlintExecutor {
 /// still select. Without the sub-512 rungs this charge cliffs to ONE row
 /// whenever under ~6.4 GiB remain at 32K context - the slowest path there
 /// is - which is why the ladder walks down to 4 instead.
-fn fitting_prefill_piece(max_rows: usize, context: u32, remaining: u64) -> Result<usize> {
+fn fitting_prefill_piece(
+    max_rows: usize,
+    context: u32,
+    remaining: u64,
+    streamed_expert_bytes: u64,
+) -> Result<usize> {
     let score_bytes_per_row = 3 * 32 * u64::from(context) * 4;
     let max_rows = u32::try_from(max_rows)
         .map_err(|_| EngError::BadRequest("Flint prefill ceiling exceeds u32".into()))?;
     let rows = crate::family::prefill::mlx::admitted_chunk(max_rows, remaining, |rows| {
-        Ok(u64::from(rows) * score_bytes_per_row)
+        Ok(u64::from(rows) * score_bytes_per_row
+            + expert_staging_bytes(streamed_expert_bytes, rows))
     })?;
     Ok(rows.unwrap_or(1) as usize)
 }
 
-fn device_prefill_piece(
-    device: crate::family::mlx_budget::DeviceBudget,
-    model: &Model,
-    max_rows: usize,
-    retention_cap: u64,
-) -> Result<usize> {
+fn device_session_charges(retention_cap: u64) -> Result<[(&'static str, u64); 5]> {
     use crate::family::{
         kv_format::{KvFormat, KvRowShape},
         mlx_budget::PRESSURE_MARGIN,
     };
 
-    // Model::open has imported its resident arrays. The allocator count includes those arrays;
-    // the prefill reserve separately prices the whole session including the fixed-size rings.
-    let weights = model.kernels.memory_stats()?.active;
     let context = context_limit();
     let full = super::config::FULL_LAYERS.len() as u64;
-    let sliding = model.layers.len() as u64 - full;
+    let sliding = super::config::LAYERS as u64 - full;
     let row_bytes = KvFormat::Bf16.layer_position_bytes(KvRowShape {
         heads_kv: 4,
         head_dim: 128,
@@ -244,20 +252,45 @@ fn device_prefill_piece(
     let state = full * full_plane_bytes + sliding * u64::from(super::mlx_state::WINDOW) * row_bytes;
     let retained = retention_cap.min(state * 3);
     let cache = super::mlx_model::cache_limit_bytes();
-    let remaining = device.remaining(
-        "Flint MLX",
-        &[
-            ("resident_active_bytes", weights),
-            ("session_state_bytes", state),
-            ("prefix_reserve_bytes", retained),
-            ("mlx_cache_limit_bytes", cache),
-            ("one_full_layer_growth_bytes", full_plane_bytes),
-            ("pressure_margin_bytes", PRESSURE_MARGIN),
-        ],
-    )?;
-    let rows = fitting_prefill_piece(max_rows, context, remaining)?;
+    Ok([
+        ("session_state_bytes", state),
+        ("prefix_reserve_bytes", retained),
+        ("mlx_cache_limit_bytes", cache),
+        ("one_full_layer_growth_bytes", full_plane_bytes),
+        ("pressure_margin_bytes", PRESSURE_MARGIN),
+    ])
+}
+
+fn device_prefill_piece(
+    device: crate::family::mlx_budget::DeviceBudget,
+    model: &Model,
+    max_rows: usize,
+    session: &[(&'static str, u64)],
+) -> Result<usize> {
+    // Model::open_for_budget has imported its resident arrays. The allocator
+    // count includes those arrays; the prefill reserve separately prices the
+    // whole session including the fixed-size rings.
+    let weights = model.kernels.memory_stats()?.active;
+    let per_expert = model.streamed_expert_bytes;
+    let mut charges = session.to_vec();
+    charges.push(("resident_active_bytes", weights));
+    charges.push((
+        "decode_expert_staging_bytes",
+        expert_staging_bytes(per_expert, 1),
+    ));
+    device.remaining("Flint MLX", &charges)?;
+    // Each batched candidate charges the whole staging set for its own row count.
+    charges.pop();
+    let remaining = device.remaining("Flint MLX", &charges)?;
+    let rows = fitting_prefill_piece(max_rows, context_limit(), remaining, per_expert)?;
+    let terms = charges
+        .iter()
+        .map(|(name, bytes)| format!("{name}={bytes}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     eprintln!(
-        "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); {device} resident_active_bytes={weights} session_state_bytes={state} prefix_reserve_bytes={retained} mlx_cache_limit_bytes={cache} growth_bytes={full_plane_bytes} pressure_margin_bytes={PRESSURE_MARGIN} remaining_bytes={remaining}",
+        "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); {device} {terms} expert_staging_bytes={} remaining_bytes={remaining}",
+        expert_staging_bytes(per_expert, rows as u32),
     );
     Ok(rows)
 }
@@ -270,34 +303,48 @@ fn device_prefill_walks_the_ladder_and_respects_the_ceiling() {
     // Each rung is the largest whose whole-row charge fits; the rung below
     // takes over where the old two-rung ladder cliffed to one row.
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512 - 1).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512 - 1, 0).unwrap(),
         256
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 512).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512, 0).unwrap(),
         512
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 1024).unwrap(),
+        fitting_prefill_piece(1024, context, row * 1024, 0).unwrap(),
         1024
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 256 - 1).unwrap(),
+        fitting_prefill_piece(1024, context, row * 256 - 1, 0).unwrap(),
         128
     );
     assert_eq!(
-        fitting_prefill_piece(1024, context, row * 4 - 1).unwrap(),
+        fitting_prefill_piece(1024, context, row * 4 - 1, 0).unwrap(),
         // Below four rows' worth of workspace no multi-row rung fits; the
         // ladder has no 2 rung, so the planner falls to one row.
         1
     );
-    assert_eq!(fitting_prefill_piece(1024, context, row * 4).unwrap(), 4);
-    assert_eq!(fitting_prefill_piece(1024, context, row - 1).unwrap(), 1);
-    assert_eq!(fitting_prefill_piece(512, context, u64::MAX).unwrap(), 512);
-    assert_eq!(fitting_prefill_piece(1, context, u64::MAX).unwrap(), 1);
+    assert_eq!(fitting_prefill_piece(1024, context, row * 4, 0).unwrap(), 4);
+    assert_eq!(fitting_prefill_piece(1024, context, row - 1, 0).unwrap(), 1);
     assert_eq!(
-        fitting_prefill_piece(1024, context / 4, row * 512).unwrap(),
+        fitting_prefill_piece(512, context, u64::MAX, 0).unwrap(),
+        512
+    );
+    assert_eq!(fitting_prefill_piece(1, context, u64::MAX, 0).unwrap(), 1);
+    assert_eq!(
+        fitting_prefill_piece(1024, context / 4, row * 512, 0).unwrap(),
         1024
+    );
+    // Streamed experts add a per-row staging charge to every candidate.
+    let expert = 1 << 20;
+    let staged = expert_staging_bytes(expert, 512);
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 512 + staged - 1, expert).unwrap(),
+        256
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 512 + staged, expert).unwrap(),
+        512
     );
 }
 
@@ -311,7 +358,7 @@ fn device_prefill_does_not_cliff_on_the_studio_working_set() {
     // 6,442,450,944); the walked ladder must not.
     let context = 32768;
     let remaining = 5_638_506_944_u64;
-    let selected = fitting_prefill_piece(1024, context, remaining).unwrap();
+    let selected = fitting_prefill_piece(1024, context, remaining, 0).unwrap();
     assert!(selected > 1, "cliffed to one row: {selected}");
     assert_eq!(selected, 256);
 }

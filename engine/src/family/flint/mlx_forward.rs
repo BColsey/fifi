@@ -2,7 +2,7 @@
 
 use super::{
     factory::context_limit,
-    mlx_model::{Ffn, Layer, Model},
+    mlx_model::{Ffn, Layer, Model, Routed, SwiGlu},
     mlx_route,
     mlx_state::{ChunkCachePlan, Plane, State, WINDOW},
     precision_native,
@@ -13,7 +13,7 @@ use crate::{
         BinaryOp, BoundedIndices, MlxKernels,
         mlx::{KvBlock, SharedAttention, native::compile::FlintTailArgs},
     },
-    tensor::ExecutionTensor,
+    tensor::{Dtype, ExecutionTensor, Tensor},
 };
 
 /// Graph-cache routing: the compiled tail serves only one-row chunks (decode steps and
@@ -28,8 +28,6 @@ use super::{
     mlx_math,
     mlx_qualification::{Span, capture, injected_input, wanted},
 };
-#[cfg(test)]
-use crate::tensor::{Dtype, Tensor};
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -675,7 +673,10 @@ fn ffn(
             span.finish(Some((logits.dtype(), logits.shape())));
             #[cfg(test)]
             let span = Span::begin("ffn_experts", 0, None, Some((x.dtype(), x.shape())));
-            let rows = grouped_experts(k, routed, x, &route.ids)?;
+            let rows = match routed {
+                Routed::Resident(weights) => grouped_experts(k, weights, x, &route.ids)?,
+                Routed::Disk { source, stem } => disk_experts(k, source, stem, x, &route.ids)?,
+            };
             #[cfg(test)]
             span.finish(Some((rows.dtype(), rows.shape())));
             #[cfg(test)]
@@ -691,9 +692,46 @@ fn ffn(
     }
 }
 
-fn grouped_experts(
+pub(super) fn disk_experts(
     k: &mut MlxKernels,
-    w: &super::mlx_model::SwiGlu,
+    source: &super::weights::FlintCheckpoint,
+    stem: &str,
+    x: &ExecutionTensor,
+    ids: &BoundedIndices,
+) -> Result<ExecutionTensor> {
+    let host = k.readback(ids.ids())?;
+    let bytes = host
+        .host_bytes()
+        .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
+    let selected: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| u32::from_le_bytes(bytes))
+        .collect();
+    // Preserve the group order while remapping the expert IDs into the compact stack.
+    let mut experts = selected.clone();
+    experts.sort_unstable();
+    experts.dedup();
+    let mut remapped = Vec::with_capacity(bytes.len());
+    for id in selected {
+        let slot = experts
+            .binary_search(&id)
+            .map_err(|_| EngError::Checkpoint("Flint expert remap lost a selected ID".into()))?;
+        remapped.extend_from_slice(&(slot as u32).to_le_bytes());
+    }
+    let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
+    let (stack, local) = SwiGlu::load_experts(k, source, stem, &experts, &local)?;
+    let local = k.bound_indices(&local, experts.len() as u32)?;
+    let rows = grouped_experts(k, &stack, x, &local)?;
+    // Retire this layer's staged arrays before opening the next disk bank.
+    k.evaluate(&[&rows])?;
+    Ok(rows)
+}
+
+pub(super) fn grouped_experts(
+    k: &mut MlxKernels,
+    w: &SwiGlu,
     x: &ExecutionTensor,
     ids: &BoundedIndices,
 ) -> Result<ExecutionTensor> {

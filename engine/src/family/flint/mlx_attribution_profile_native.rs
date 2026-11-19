@@ -5,7 +5,7 @@
 //! test-only replica of `mlx_forward.rs` at this commit; it issues the same
 //! kernels in the same order with one extra evaluate at each class boundary.
 use super::{Model, State, clean_observation, git, metadata, qualification_paths};
-use crate::family::flint::mlx_model::Ffn;
+use crate::family::flint::mlx_model::{Ffn, Routed};
 use crate::family::flint::mlx_route::{self, Route};
 use crate::family::flint::mlx_state::{ChunkCachePlan, Plane, WINDOW};
 use crate::family::flint::precision;
@@ -494,6 +494,11 @@ fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value, depth: usize)
                     routed,
                     shared,
                 } => {
+                    let Routed::Resident(routed) = routed else {
+                        return Err(io::Error::other(
+                            "the attribution fixture requires resident experts",
+                        ));
+                    };
                     let route = classes.hit(&mut model.kernels, "router", |k| {
                         let logits = k.mm(&normalized, router)?;
                         mlx_route::select(k, &logits)
