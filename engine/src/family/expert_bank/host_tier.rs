@@ -133,7 +133,7 @@ pub(crate) fn aligned_span(offset: u64, len: u64) -> (u64, u64) {
 /// A pinned slot handle. Freed by [`ODirectRing::release`], which only the
 /// completion of the slot's recorded copy fence may call; never outlives
 /// the ring because it is only handed out by the ring's free list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Slot(pub(crate) usize);
 
 /// The copy-completion fence recorded at `begin_copy`. The ring stays
@@ -177,7 +177,12 @@ enum SlotState {
 /// before anything was armed. Nothing here knows about layers, experts or
 /// record layouts; the pack reader owns that mapping.
 pub(crate) struct ODirectRing {
-    mem: &'static mut [u8],
+    /// One sector-aligned span per slot, split at construction. `None`
+    /// while the span is ON LOAN to a read pool's outside-the-lock read
+    /// ([`Self::loan_span`]): the Option, not the type system, enforces the
+    /// one-reader-per-slot rule, so a double loan is a runtime error, never
+    /// undefined behavior.
+    slots_mem: Vec<Option<&'static mut [u8]>>,
     slot_span: NonZeroU64,
     slots: NonZeroUsize,
     free: Vec<usize>,
@@ -238,8 +243,15 @@ impl ODirectRing {
         let fences = (0..slots.get())
             .map(|_| std::cell::RefCell::new(None))
             .collect();
+        let mut rest = mem;
+        let mut slots_mem = Vec::with_capacity(slots.get());
+        for _ in 0..slots.get() {
+            let (span, tail) = rest.split_at_mut(slot_span.get() as usize);
+            slots_mem.push(Some(span));
+            rest = tail;
+        }
         Ok(Self {
-            mem,
+            slots_mem,
             slot_span,
             slots,
             free,
@@ -355,11 +367,10 @@ impl ODirectRing {
         len: u64,
     ) -> Result<std::ops::Range<usize>, String> {
         self.state(slot)?;
-        let start = slot.0 as u64 * self.slot_span.get() + offset;
-        let end = start
+        let end = offset
             .checked_add(len)
             .ok_or_else(|| "ring: the range overflows".to_string())?;
-        if end > (slot.0 as u64 + 1) * self.slot_span.get() {
+        if end > self.slot_span.get() {
             return Err(format!(
                 "ring: {} bytes at +{offset} escape slot {}'s {}-byte span",
                 len,
@@ -367,7 +378,7 @@ impl ODirectRing {
                 self.slot_span.get()
             ));
         }
-        Ok(start as usize..end as usize)
+        Ok(offset as usize..end as usize)
     }
 
     /// Stages one aligned span of the file into the slot at `stage_offset`,
@@ -403,7 +414,11 @@ impl ODirectRing {
         // A span's padding may run past EOF when the shard ends unaligned:
         // read what exists, then require the WANTED bytes to be covered.
         // The padding tail beyond the record is never read by anyone.
-        let got = pread_at_most(file, &mut self.mem[range], start)?;
+        let got = pread_at_most(
+            file,
+            &mut self.span_slice(slot).map_err(io::Error::other)?[range],
+            start,
+        )?;
         let want_start = (file_offset - start) as usize;
         if got < want_start + len as usize {
             return Err(io::Error::new(
@@ -427,8 +442,56 @@ impl ODirectRing {
         let len_usize = len as usize;
         let src = self.checked_range(slot, from, len)?.start;
         let dst = self.checked_range(slot, to, len)?.start;
-        self.mem.copy_within(src..src + len_usize, dst);
+        self.span_slice(slot)?
+            .copy_within(src..src + len_usize, dst);
         Ok(())
+    }
+
+    /// The slot's span, exclusively, for a read issued OUTSIDE the ring
+    /// lock by a read pool. The slice is `'static` (the pinned memory is
+    /// process-static) and disjoint from every other slot by construction;
+    /// the loan makes the slot's span invisible to the ring's own methods
+    /// until [`Self::return_span`] puts it back, so a loaned span cannot
+    /// race the in-ring paths. Sound only while the caller owns the slot
+    /// (acquired, not yet released or abandoned).
+    pub(crate) fn loan_span(&mut self, slot: Slot) -> Result<&'static mut [u8], String> {
+        if self.state(slot)? != SlotState::Reading {
+            return Err(format!(
+                "ring: slot {} is not reading; an outside read needs the acquired slot",
+                slot.0
+            ));
+        }
+        self.slots_mem
+            .get_mut(slot.0)
+            .and_then(|span| span.take())
+            .ok_or_else(|| format!("ring: slot {}'s span is already on loan", slot.0))
+    }
+
+    /// Puts a loaned span back. The slot's in-ring paths (place, copy,
+    /// window) refuse while the span is out, so the loan discipline is: loan,
+    /// read outside the lock, return, then assemble.
+    pub(crate) fn return_span(
+        &mut self,
+        slot: Slot,
+        span: &'static mut [u8],
+    ) -> Result<(), String> {
+        match self.slots_mem.get_mut(slot.0) {
+            Some(hole @ None) => {
+                *hole = Some(span);
+                Ok(())
+            }
+            Some(Some(_)) => Err(format!("ring: slot {}'s span was not on loan", slot.0)),
+            None => Err(format!("ring: slot {} is outside the ring", slot.0)),
+        }
+    }
+
+    /// The slot's span for an in-ring read or copy. Refuses while the span
+    /// is on loan to an outside read.
+    fn span_slice(&mut self, slot: Slot) -> Result<&mut [u8], String> {
+        self.slots_mem
+            .get_mut(slot.0)
+            .and_then(|span| span.as_deref_mut())
+            .ok_or_else(|| format!("ring: slot {}'s span is on loan to an outside read", slot.0))
     }
 
     /// The exact record bytes at `offset..offset+len` of the slot, for the
@@ -446,7 +509,7 @@ impl ODirectRing {
         match self.state(slot)? {
             SlotState::Reading => {
                 let range = self.checked_range(slot, offset, len)?;
-                Ok(&mut self.mem[range])
+                Ok(&mut self.span_slice(slot)?[range])
             }
             SlotState::Copying => Err(format!(
                 "ring: slot {} is Copying; a mutable range would race the DMA read - use slot_window",
@@ -466,7 +529,13 @@ impl ODirectRing {
         match self.state(slot)? {
             SlotState::Copying => {
                 let range = self.checked_range(slot, offset, len)?;
-                Ok(&self.mem[range])
+                self.slots_mem
+                    .get(slot.0)
+                    .and_then(|span| span.as_deref())
+                    .ok_or_else(|| {
+                        format!("ring: slot {}'s span is on loan to an outside read", slot.0)
+                    })
+                    .map(|span| &span[range])
             }
             other => Err(format!(
                 "ring: slot {} is {other:?}; the read-only window exists only while Copying",
