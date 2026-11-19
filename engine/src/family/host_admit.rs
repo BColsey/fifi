@@ -5,19 +5,19 @@
 //! limit. Every refusal names the caller that refused; the frozen
 //! families' exact texts are pinned by the full-text tests in this module.
 
-use crate::EngError;
+use crate::{EngError, memory::HostMemory};
 
 pub(crate) struct HostAdmission {
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
-    os_floor: u64,
+    mem_total: u64,
 }
 
 impl HostAdmission {
     #[allow(
         dead_code,
-        reason = "the callers live on the CUDA executor paths; host tests exercise probe_in"
+        reason = "non-Linux host tests exercise probe_in instead of live procfs"
     )]
     pub(crate) fn probe(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
         Self::probe_in(
@@ -59,35 +59,45 @@ impl HostAdmission {
         Ok(Self {
             mem_available: available,
             cgroup_remaining,
-            os_floor: total.div_ceil(10).max(8u64 << 30),
+            mem_total: total,
         })
     }
 
-    /// [`admit_for`] with the caller's label as the refusing name.
-    pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
-        self.admit_for(required, label)
+    pub(crate) fn memory(&self) -> HostMemory {
+        HostMemory {
+            total: self.mem_total,
+            available: self
+                .cgroup_remaining
+                .map_or(self.mem_available, |remaining| {
+                    remaining.min(self.mem_available)
+                }),
+        }
     }
 
-    /// Bounds host availability by every verified enclosing memory limit, before caller headroom.
     pub(crate) fn available_bytes(&self) -> u64 {
-        self.cgroup_remaining
-            .map_or(self.mem_available, |remaining| {
-                remaining.min(self.mem_available)
-            })
+        self.memory().available
+    }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl HostAdmission {
+    pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
+        self.admit_for(required, label)
     }
 
     /// The admission check with the caller's name in the refusal, so a prefix
     /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self.available_bytes();
+        let memory = self.memory();
+        let available = memory.available;
+        let os_floor = memory.os_floor();
         if required
-            .checked_add(self.os_floor)
+            .checked_add(os_floor)
             .is_none_or(|needed| needed > available)
         {
             return Err(EngError::MemoryPlan(format!(
-                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
-                self.os_floor
+                "{what} needs {required} bytes plus {os_floor} bytes for the OS floor. Available host/cgroup budget: {available} bytes."
             )));
         }
         Ok(())
@@ -698,7 +708,7 @@ mod tests {
         let budget =
             HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.available_bytes(), 6u64 << 30);
-        assert_eq!(budget.os_floor, 8u64 << 30);
+        assert_eq!(budget.memory().os_floor(), 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
         let (root, proc) = namespace_root("max\n", "memory\n");
@@ -910,7 +920,7 @@ mod tests {
         );
         let budget = result.unwrap();
         assert_eq!(budget.mem_available, 48u64 << 30);
-        assert_eq!(budget.os_floor, 27_487_790_695);
+        assert_eq!(budget.memory().os_floor(), 27_487_790_695);
         assert_eq!(budget.cgroup_remaining, None);
         assert!(budget.admit(LABEL, 256 * 47 * 1_603_584u64).is_ok());
     }
@@ -920,7 +930,7 @@ mod tests {
         let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
         let floor = 8u64 << 30;
         let budget = HostAdmission::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
-        assert_eq!(budget.os_floor, floor);
+        assert_eq!(budget.memory().os_floor(), floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
         assert!(budget.admit(LABEL, 1).is_ok());
         assert!(budget.admit(LABEL, 2).is_err());
@@ -967,10 +977,14 @@ mod tests {
         let budget = HostAdmission {
             mem_available: u64::MAX,
             cgroup_remaining: None,
-            os_floor: 1,
+            mem_total: u64::MAX,
         };
         assert!(budget.admit(LABEL, u64::MAX).is_err());
-        assert!(budget.admit(LABEL, u64::MAX - 1).is_ok());
+        assert!(
+            budget
+                .admit(LABEL, u64::MAX - budget.memory().os_floor())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -980,7 +994,7 @@ mod tests {
         let exact = HostAdmission {
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
-            os_floor: floor,
+            mem_total: 64 << 30,
         };
         assert!(
             exact.admit(LABEL, required).is_ok(),

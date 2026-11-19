@@ -422,25 +422,16 @@ fn serving_plan(
     ))
 }
 
-pub(super) fn host_available_bytes() -> Option<u64> {
+pub(super) fn host_available_bytes() -> Result<u64, EngError> {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| parse_mem_available(&contents))
+        crate::family::host_admit::HostAdmission::probe("Nemotron admission", "Nemotron admission")
+            .map(|budget| budget.available_bytes())
     }
     #[cfg(not(target_os = "linux"))]
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn parse_mem_available(contents: &str) -> Option<u64> {
-    let line = contents
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let mut fields = line.strip_prefix("MemAvailable:")?.split_whitespace();
-    let kib = fields.next()?.parse::<u64>().ok()?;
-    (fields.next()? == "kB").then_some(kib.checked_mul(1024)?)
+    Err(memory_error(
+        "host availability probe requires Linux; use generate_with_admission with an explicit available-byte budget",
+    ))
 }
 
 fn memory_error(message: impl Into<String>) -> EngError {
@@ -458,6 +449,19 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const FLOOR: u64 = 20 * GIB;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux process with a 512 MiB memory cgroup"]
+    fn process_memory_limit_512_mib() {
+        let available = super::host_available_bytes().unwrap();
+        assert!((1..=512 << 20).contains(&available), "{available}");
+        let policy = MemoryPolicy::default_share();
+        assert_eq!(admission_ceiling(policy, available), available);
+        assert!(check_memory(plan(available), policy, available).is_ok());
+        assert!(check_memory(plan(available + 1), policy, available).is_err());
+        eprintln!("Nemotron host budget {available}: exact fit admitted, one extra byte refused");
+    }
 
     fn plan(total_bytes: u64) -> MemoryComponents {
         let quarter = total_bytes / 4;
