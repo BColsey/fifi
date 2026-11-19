@@ -3,9 +3,10 @@
 
 Usage: bench_engines.py BASE_URL API_KEY MODEL PROMPT_TOKENS [PROMPT_TOKENS ...]
 
-For each size, the first request generates one token. Prompt tokens divided by
-its full wall time is an estimate that also includes tokenization, queueing,
-reply work and any prefix reuse; it is not necessarily a cold-prefill rate.
+For each size, the first request generates one token. The two prompt rates use
+the same full wall time, including queueing, cache restore and generation.
+The new-token rate counts only the prompt tokens the engine had to process.
+It is available when the server reports consistent cache reuse.
 The second request streams a reply. Its first visible content/reasoning delta
 measures client-observed latency, not necessarily the first generated token.
 Decode throughput comes only from a matching server recent-request record.
@@ -144,15 +145,20 @@ def recent_server_rate(
 
 
 def reused_tokens(usage: dict) -> int | None:
-    cached = usage.get("reused_tokens")
-    if not nonnegative_int(cached):
-        details = usage.get("prompt_tokens_details")
-        cached = details.get("cached_tokens") if isinstance(details, dict) else None
-    if not nonnegative_int(cached):
-        return None
-    if cached > usage["prompt_tokens"]:
-        raise ValueError("reused token count exceeds prompt token count")
-    return cached
+    """Read either usage representation and require agreement when both are present."""
+    details = usage.get("prompt_tokens_details")
+    if details is not None and not isinstance(details, dict):
+        raise ValueError("prompt_tokens_details must be an object or null")
+    flat = usage.get("reused_tokens")
+    nested = details.get("cached_tokens") if details is not None else None
+    for count in (flat, nested):
+        if count is not None and (
+            not nonnegative_int(count) or count > usage["prompt_tokens"]
+        ):
+            raise ValueError("reused tokens must be an integer within the prompt")
+    if flat is not None and nested is not None and flat != nested:
+        raise ValueError("reported reused token counts disagree")
+    return flat if flat is not None else nested
 
 
 def bench(base: str, key: str, model: str, approx_tokens: int) -> dict:
@@ -187,6 +193,7 @@ def bench(base: str, key: str, model: str, approx_tokens: int) -> dict:
     ):
         raise ValueError("the first request did not report valid prompt token usage")
     cached = reused_tokens(usage)
+    new_tokens = usage["prompt_tokens"] - cached if cached is not None else None
 
     started = time.monotonic()
     req = urllib.request.Request(
@@ -202,6 +209,10 @@ def bench(base: str, key: str, model: str, approx_tokens: int) -> dict:
     return {
         "prompt_tokens": usage["prompt_tokens"],
         "estimated_prefill_tps": usage["prompt_tokens"] / prefill_s,
+        "first_request_new_tokens": new_tokens,
+        "estimated_new_prefill_tps": new_tokens / prefill_s
+        if new_tokens is not None
+        else None,
         "first_request_seconds": prefill_s,
         "first_request_reused_tokens": cached,
         "first_visible_seconds": stream["first_delta_seconds"],
@@ -217,9 +228,9 @@ def main() -> None:
         sys.exit(__doc__)
     base, key, model = sys.argv[1:4]
     print(
-        "| prompt tokens | estimated prefill t/s | first request | first reuse | first visible | stream reuse | completion tokens | finish | server decode t/s |"
+        "| prompt tokens | all prompt t/s (wall) | first request | first reuse | new prompt tokens | new prompt t/s (wall) | first visible | stream reuse | completion tokens | finish | server decode t/s |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---|---:|")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|")
     for size in [int(x) for x in sys.argv[4:]]:
         result = bench(base, key, model, size)
         reused = (
@@ -227,6 +238,9 @@ def main() -> None:
             if result["first_request_reused_tokens"] is not None
             else "n/a"
         )
+        new_count = result["first_request_new_tokens"]
+        new_rate = result["estimated_new_prefill_tps"]
+        new_text = "n/a | n/a" if new_count is None else f"{new_count} | {new_rate:.2f}"
         stream_reused = (
             str(result["stream_reused_tokens"])
             if result["stream_reused_tokens"] is not None
@@ -244,7 +258,7 @@ def main() -> None:
         )
         print(
             f"| {result['prompt_tokens']} | {result['estimated_prefill_tps']:.2f} | "
-            f"{result['first_request_seconds']:.2f}s | {reused} | {first} | {stream_reused} | "
+            f"{result['first_request_seconds']:.2f}s | {reused} | {new_text} | {first} | {stream_reused} | "
             f"{result['completion_tokens']} | {result['finish_reason']} | {decode} |"
         )
 
