@@ -40,7 +40,9 @@ pub(crate) struct EngineEntry {
     /// retain its IDs for a retry after another conversation has used this engine.
     /// An edited history goes through the normal append or full-encode checks.
     /// The tokenizer reports its retained allocations through `accounted_bytes()`.
-    /// The first eligible request initializes this cache.
+    /// The cache is per engine, keyed by content and not per session:
+    /// one active slot plus one displaced slot. The first eligible
+    /// request initializes this cache.
     pub(crate) warm: std::sync::Arc<std::sync::Mutex<Option<crate::tokenizer::WarmTurnCache>>>,
     /// The sampling defaults of this engine: the `temperature`, `top_p`, and `top_k` that its
     /// `model_dir/generation_config.json` sets, with the contract default for an absent file or
