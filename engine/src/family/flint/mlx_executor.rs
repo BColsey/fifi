@@ -416,11 +416,22 @@ fn prefill_pair_admission_accounts_for_both_pieces_before_mutation() {
         PairStaging::Waves64
     );
     assert_eq!(plan(u64::MAX, PrefillPairPolicy::Off), None);
-    for rows in [2, 1025, 2049] {
-        assert_eq!(
-            admitted_pair_plan(rows, 1024, u64::MAX, expert, PrefillPairPolicy::Auto),
-            None
-        );
+    for first in [512, 1024] {
+        let plan =
+            |rows| admitted_pair_plan(rows, first, u64::MAX, expert, PrefillPairPolicy::Auto);
+        for rows in [first - 1, first, first + 1, 2 * first + 1, 3 * first] {
+            assert_eq!(plan(rows), None, "first piece {first}, prompt {rows}");
+        }
+        for rows in [first + 2, 2 * first] {
+            assert_eq!(
+                plan(rows),
+                Some(PairPlan {
+                    split: first - 1,
+                    staging: PairStaging::Shared,
+                }),
+                "first piece {first}, prompt {rows}",
+            );
+        }
     }
 }
 
