@@ -4,7 +4,12 @@
 
 use std::{fs::File, os::unix::fs::FileExt, path::PathBuf};
 
-use super::{bank::RecordSource, bank_source::PackRecordSource};
+use super::{
+    bank::RecordSource,
+    bank_source::{PackRecordSource, RungReadMode},
+};
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+use crate::weights::expert_store::ring::SpanRead;
 use crate::{
     EngError,
     family::{
@@ -633,5 +638,465 @@ mod device_tests {
             "pinned owners after the drop: {pinned_after} (before the build: {pinned_before})"
         );
         assert_eq!(pinned_after, pinned_before, "the pinned store was freed");
+    }
+}
+
+/// --- The rung source (the pooled O_DIRECT store) -------------------------
+use super::bank_source::{RungSource, expert_spans, merge_abutting};
+use crate::weights::exl3::Checkpoint;
+
+fn opened_checkpoint() -> &'static Checkpoint {
+    Box::leak(Box::new(
+        Checkpoint::open(&pack_dir()).expect("the pack opens"),
+    ))
+}
+
+#[test]
+fn merge_abutting_coalesces_only_what_the_pack_wrote_contiguously() {
+    let matrix =
+        |shard: &str, file_offset: u64, len: u64, record_offset: u64| super::bank_source::Span {
+            matrix: super::bank_source::MatrixSpan {
+                shard: PathBuf::from(shard),
+                file_offset,
+                len,
+                record_offset,
+            },
+            key: format!("t{record_offset}"),
+            part: ExpertPart::ALL[0],
+            dtype: Dtype::F32,
+        };
+    let spans = vec![
+        matrix("a", 0, 4096, 0),
+        // Same shard, abutting in file AND record order: one read.
+        matrix("a", 4096, 4096, 4096),
+        // A file gap splits the read even though the record tiles on.
+        matrix("a", 16384, 4096, 8192),
+        // A record gap splits the read even though the file tiles on.
+        matrix("a", 20480, 4096, 20480),
+        // Another shard is always a new read.
+        matrix("b", 0, 4096, 24576),
+    ];
+    let shape = |read: &crate::weights::expert_store::ring::SpanRead| {
+        (
+            read.shard.display().to_string(),
+            read.file_offset,
+            read.len,
+            read.record_offset,
+        )
+    };
+    assert_eq!(
+        merge_abutting(&spans).iter().map(shape).collect::<Vec<_>>(),
+        vec![
+            ("a".into(), 0, 8192, 0),
+            ("a".into(), 16384, 4096, 8192),
+            ("a".into(), 20480, 4096, 20480),
+            ("b".into(), 0, 4096, 24576),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "reads the real pack in FIFI_FLASH_NEXT_EXL3_PACK through the pooled O_DIRECT store"]
+fn the_rung_records_match_the_buffered_records_byte_for_byte() {
+    let dir = pack_dir();
+    let checkpoint = opened_checkpoint();
+    let buffered = PackRecordSource::new(checkpoint).expect("the buffered source derives");
+    let record_bytes = buffered.layout().record_bytes();
+    let rung = || {
+        let bytes = RungSource::backing_bytes(checkpoint, &dir, 2).expect("the backing sizes");
+        let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        let mode = RungSource::probe_read_mode(checkpoint, &dir).expect("the mode probes");
+        RungSource::new(checkpoint, &dir, 2, mode, backing)
+    };
+    let rung = match rung() {
+        Ok(rung) => rung,
+        // A broken pack still refuses; a filesystem that refuses O_DIRECT
+        // no longer does — the rung serves buffered there.
+        Err(error) => {
+            eprintln!("rung test: the store refuses this pack: {error:?}");
+            return;
+        }
+    };
+    for layer in [0usize, 3, 47] {
+        for expert in [0usize, 1, 255, 256, 510, 511] {
+            let want = buffered
+                .read_record(layer, expert)
+                .expect("the buffered record");
+            let got = &rung
+                .read_packed(layer, &[expert as u16])
+                .expect("the rung record")[0];
+            assert_eq!(got.len(), record_bytes);
+            assert_eq!(got, &want, "layer {layer} expert {expert}");
+        }
+    }
+    // One batch of mixed experts in one call: the step's miss shape.
+    let misses: Vec<u16> = [0u16, 5, 17, 300, 511].to_vec();
+    let batch = rung.read_packed(3, &misses).expect("the batch");
+    for (expert, got) in misses.iter().zip(&batch) {
+        assert_eq!(
+            got,
+            &buffered
+                .read_record(3, usize::from(*expert))
+                .expect("the buffered record"),
+            "batch expert {expert}"
+        );
+    }
+}
+
+/// The bench's step: two seeded-random experts per layer, truncated to
+/// 78 sites — the shape of one decode step's misses.
+fn step_picks(layers: usize, experts: usize) -> Vec<Vec<u16>> {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut picks = Vec::with_capacity(layers);
+    for _ in 0..layers {
+        let mut layer_picks = Vec::new();
+        for _ in 0..2 {
+            layer_picks.push((next() % experts as u64) as u16);
+        }
+        picks.push(layer_picks);
+    }
+    picks.truncate(39);
+    picks
+}
+
+/// Writes a sparse skeleton of the pack into `FIFI_SPAN_SINK` (a fresh
+/// directory): every small file copied whole, and every shard a SPARSE
+/// file carrying only its header windows and the bench picks' merged
+/// extents at their true offsets. The parity test reads the real pack
+/// (content); the bench reads the skeleton on a direct-capable
+/// filesystem, where its reads are the production pattern, cold by
+/// construction, without a 100 GiB copy.
+#[test]
+#[ignore = "writes the sparse bench skeleton of FIFI_FLASH_NEXT_EXL3_PACK into FIFI_SPAN_SINK"]
+fn write_the_sparse_pack_skeleton() {
+    use std::{collections::BTreeMap, os::unix::fs::FileExt};
+    let dir = pack_dir();
+    let sink = PathBuf::from(
+        std::env::var_os("FIFI_SPAN_SINK").expect("FIFI_SPAN_SINK names the sink directory"),
+    );
+    std::fs::create_dir_all(&sink).expect("the sink directory");
+    let checkpoint = opened_checkpoint();
+    let buffered = PackRecordSource::new(checkpoint).expect("the buffered source derives");
+    let picks = step_picks(buffered.layers(), buffered.experts());
+    let mut extents: BTreeMap<std::ffi::OsString, Vec<(u64, u64)>> = BTreeMap::new();
+    // The layout derivation reads layer 0's first expert; the skeleton
+    // carries that record too.
+    for (layer, expert) in
+        std::iter::once((0usize, 0usize)).chain(picks.iter().enumerate().flat_map(
+            |(layer, layer_picks)| layer_picks.iter().map(move |&e| (layer, usize::from(e))),
+        ))
+    {
+        let (spans, _) = expert_spans(checkpoint, &dir, layer, expert).expect("the extents");
+        for read in merge_abutting(&spans) {
+            extents
+                .entry(read.shard.file_name().expect("a file name").to_os_string())
+                .or_default()
+                .push((read.file_offset, read.len));
+        }
+    }
+    for entry in std::fs::read_dir(&dir).expect("the pack directory") {
+        let entry = entry.expect("an entry");
+        let meta = entry.metadata().expect("the entry metadata");
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let source = entry.path();
+        let target = sink.join(&name);
+        if !name.to_string_lossy().ends_with(".safetensors") {
+            std::fs::copy(&source, &target).expect("copy a small file");
+            continue;
+        }
+        let file_len = meta.len();
+        let input = std::fs::File::open(&source).expect("open the shard");
+        let out = std::fs::File::create(&target).expect("create the shard skeleton");
+        out.set_len(file_len).expect("the shard length");
+        // Header windows (whichever end the format keeps) plus the picks'
+        // extents, at their true offsets: sparse elsewhere.
+        let mut ranges: Vec<(u64, u64)> = vec![(0, 16 << 20)];
+        ranges.push((file_len.saturating_sub(16 << 20), 16 << 20));
+        ranges.extend(
+            extents
+                .get(&name)
+                .map_or([].as_slice(), |list| list.as_slice())
+                .iter()
+                .copied(),
+        );
+        let mut copied = 0u64;
+        for (offset, len) in ranges {
+            // A window can run past a small file's end; carry what is there.
+            let len = len.min(file_len.saturating_sub(offset));
+            let mut window = vec![0u8; len as usize];
+            input
+                .read_exact_at(&mut window, offset)
+                .expect("a source window");
+            out.write_all_at(&window, offset).expect("place the window");
+            copied += len;
+        }
+        eprintln!(
+            "skeleton: {} — {file_len} bytes long, {copied} real",
+            name.to_string_lossy()
+        );
+    }
+}
+
+/// A test that runs in the battery and exercises
+/// RungSource's own read path — the synthetic pack (real extents, real
+/// bytes, no holes) mirrored onto disk, read through the rung's pooled
+/// span store, compared with the buffered source record for record,
+/// in BOTH shard-open modes. The probed mode is checked against an
+/// independent fact: a raw O_DIRECT open of the mirrored shard made
+/// here in the test, not the probe under test. The real pack needs an
+/// env var and the container; this one runs wherever the battery runs.
+#[test]
+fn the_rung_reads_the_synthetic_pack_like_the_buffered_source() {
+    let (checkpoint, _layout, _broken, image) =
+        synthetic::checkpoint_with_image(&|_, _, _| synthetic::Tweak::Normal);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard = dir.path().join("m.safetensors");
+    std::fs::write(&shard, &image).expect("the shard mirrors");
+    let checkpoint: &'static crate::weights::exl3::Checkpoint = Box::leak(Box::new(checkpoint));
+    let buffered = PackRecordSource::new(checkpoint).expect("the buffered source derives");
+    let slots = 2;
+    let bytes = RungSource::backing_bytes(checkpoint, dir.path(), slots).expect("the backing size");
+    let probed = RungSource::probe_read_mode(checkpoint, dir.path()).expect("the mode probes");
+    // The independent fact this test owns: its own raw O_DIRECT open of
+    // the same shard answers Direct exactly when the probe says so.
+    let answers_direct = crate::family::expert_bank::host_tier::open_direct(&shard).is_ok();
+    let probe_says_direct = matches!(probed, RungReadMode::Direct { .. });
+    assert_eq!(
+        probe_says_direct, answers_direct,
+        "the probe's answer matches a raw O_DIRECT open of the same shard"
+    );
+    // Parity must hold in either mode: the probed one, and a forced
+    // buffered leg — the mode a refusing filesystem lands in.
+    let modes = [
+        probed,
+        RungReadMode::Buffered {
+            refused: "the forced parity leg".into(),
+            probes: 1,
+        },
+    ];
+    for mode in modes {
+        let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        let rung = RungSource::new(checkpoint, dir.path(), slots, mode.clone(), backing)
+            .expect("the rung builds");
+        assert_eq!(
+            rung.read_mode(),
+            &mode,
+            "the rung states its start-decided mode"
+        );
+        for layer in 0..synthetic::LAYERS {
+            let misses: Vec<u16> = (0..synthetic::EXPERTS as u16).collect();
+            let records = rung.read_packed(layer, &misses).expect("the batch reads");
+            for (expert, record) in misses.iter().zip(&records) {
+                let mut want = vec![0u8; record.len()];
+                buffered
+                    .record(layer, *expert, &mut want)
+                    .expect("the buffered record");
+                assert_eq!(record, &want, "layer {layer} expert {expert}");
+            }
+        }
+    }
+}
+
+/// The probe's policy on an already-collected shard set: every shard is
+/// examined before the mode is named, and a missing shard refuses the
+/// start whatever else refused — here an unreadable shard (any error
+/// that is not NotFound counts as a refusal) sits next to a missing
+/// one, and the missing one wins.
+#[test]
+fn a_missing_shard_refuses_even_when_another_shard_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let refusing = dir.path().join("a.safetensors");
+    std::fs::write(&refusing, b"shard").expect("write the shard");
+    std::fs::set_permissions(
+        &refusing,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .expect("make the shard unreadable");
+    let missing = dir.path().join("b.safetensors");
+    let error = RungSource::probe_shards(&[refusing, missing])
+        .expect_err("the missing shard refuses the start");
+    assert!(
+        format!("{error:?}").contains("missing"),
+        "the refusal names the missing shard: {error:?}"
+    );
+}
+
+/// A multi-span pack opens one file per DISTINCT shard at the probe,
+/// never one per span: the synthetic pack's two layers of three experts
+/// (many spans) name one shard, and the probe reports exactly that one
+/// open; a hand-made set of three distinct shards reports three.
+#[test]
+fn the_probe_opens_one_file_per_distinct_shard() {
+    let (checkpoint, _layout, _broken, image) =
+        synthetic::checkpoint_with_image(&|_, _, _| synthetic::Tweak::Normal);
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("m.safetensors"), &image).expect("the shard mirrors");
+    let checkpoint: &'static crate::weights::exl3::Checkpoint = Box::leak(Box::new(checkpoint));
+    let one = RungSource::probe_read_mode(checkpoint, dir.path()).expect("the mode probes");
+    let other = tempfile::tempdir().expect("tempdir");
+    let shards: Vec<std::path::PathBuf> = ["a", "b", "c"]
+        .iter()
+        .map(|name| other.path().join(format!("{name}.safetensors")))
+        .collect();
+    for shard in &shards {
+        std::fs::write(shard, b"shard").expect("write the shard");
+    }
+    let three = RungSource::probe_shards(&shards).expect("three shards answer");
+    let count = |mode: &RungReadMode| match mode {
+        RungReadMode::Direct { probes, .. } | RungReadMode::Buffered { probes, .. } => *probes,
+    };
+    assert_eq!(count(&one), 1, "many spans, one shard: one open");
+    assert_eq!(count(&three), 3, "three distinct shards: three opens");
+}
+
+/// The rung's read pattern measured over the pack's REAL extent lists:
+/// one decode step = every layer's miss list read as one `read_packed`
+/// batch (the exact call `run_copies` makes), cold by construction — the
+/// store reads O_DIRECT, which on a direct-capable filesystem bypasses
+/// the page cache. Depths 1 (one record at a time — what main served
+/// before), 4 and 8 (the pool), plus the per-miss read shape after
+/// coalescing. This is the bench the tier line's figure and
+/// `RUNG_RING_SLOTS` cite. Native-view only: cold cells evict through the
+/// tree's own fadvise, which lives behind the CUDA backend.
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+#[test]
+#[ignore = "bench: reads the real pack's real extent lists cold at depths 1/4/8"]
+fn span_bench_depths_over_the_real_packs_extent_lists() {
+    let dir = pack_dir();
+    let checkpoint = opened_checkpoint();
+    // The probe's own cost, measured on the same real pack before any
+    // cell: distinct shards only, so a big pack's span count cannot
+    // multiply it.
+    let probe_at = std::time::Instant::now();
+    let probed = RungSource::probe_read_mode(checkpoint, &dir).expect("the mode probes");
+    let probe_elapsed = probe_at.elapsed();
+    let probe_count = match &probed {
+        RungReadMode::Direct { probes, .. } | RungReadMode::Buffered { probes, .. } => *probes,
+    };
+    eprintln!(
+        "probe: {:?} in {probe_elapsed:?} ({probe_count} distinct shards)",
+        probed
+    );
+    let buffered = PackRecordSource::new(checkpoint).expect("the buffered source derives");
+    let (layers, experts) = (buffered.layers(), buffered.experts());
+    let picks = step_picks(layers, experts);
+    let mut raw_spans = Vec::new();
+    let mut merged_spans = Vec::new();
+    let mut merged_bytes = Vec::new();
+    // The merged reads of every site the step reads, for the per-cell evict.
+    let mut site_merged: Vec<Vec<SpanRead>> = Vec::new();
+    for (layer, layer_picks) in picks.iter().enumerate() {
+        for &expert in layer_picks {
+            let (spans, raw) =
+                expert_spans(checkpoint, &dir, layer, usize::from(expert)).expect("the extents");
+            raw_spans.push(spans.len() as u64);
+            let merged = merge_abutting(&spans);
+            merged_bytes.push(merged.iter().map(|read| read.len).sum::<u64>());
+            merged_spans.push(merged.len() as u64);
+            assert_eq!(raw, merged_bytes.last().copied().unwrap_or(0));
+            site_merged.push(merged);
+        }
+    }
+    let median = |mut values: Vec<u64>| {
+        values.sort_unstable();
+        values[values.len() / 2]
+    };
+    eprintln!(
+        "span bench: per miss, components {}..={} (median {}), reads after coalescing {}..={} \
+         (median {}), bytes {}..={} (median {})",
+        raw_spans.iter().copied().min().unwrap(),
+        raw_spans.iter().copied().max().unwrap(),
+        median(raw_spans.clone()),
+        merged_spans.iter().copied().min().unwrap(),
+        merged_spans.iter().copied().max().unwrap(),
+        median(merged_spans.clone()),
+        merged_bytes.iter().copied().min().unwrap(),
+        merged_bytes.iter().copied().max().unwrap(),
+        median(merged_bytes.clone()),
+    );
+    eprintln!(
+        "span bench: coalescing turns {} component reads into {} reads across the step",
+        raw_spans.iter().copied().sum::<u64>(),
+        merged_spans.iter().copied().sum::<u64>(),
+    );
+    // Cache eviction for cold cells, through the tree's fadvise helper
+    // (unsafe is forbidden crate-wide). On a copy-on-write filesystem
+    // (btrfs) O_DIRECT is served through the page cache, so "cold" means
+    // DONTNEED-evicted ranges re-read through the cache — not true DIO. On
+    // a NOCOW/ext4 file the same evict gives the same cold state.
+    let evict = |site_merged: &[Vec<SpanRead>]| {
+        use std::collections::BTreeMap;
+        let mut by_shard: BTreeMap<&std::path::Path, Vec<(u64, u64)>> = BTreeMap::new();
+        for reads in site_merged {
+            for read in reads {
+                by_shard
+                    .entry(read.shard.as_path())
+                    .or_default()
+                    .push((read.file_offset, read.len));
+            }
+        }
+        for (shard, ranges) in by_shard {
+            let file = File::open(shard).expect("the shard opens read-only");
+            for (offset, len) in ranges {
+                crate::kernels::cuda::drop_page_cache(&file, offset, len).unwrap_or_else(|error| {
+                    panic!("the evict of {shard:?} at {offset}: {error:?}")
+                });
+            }
+        }
+    };
+    eprintln!(
+        "span bench: cells are DONTNEED-evicted then re-read cold; pack at {:?} is on btrfs, \
+         so O_DIRECT rides the page cache (CoW): these are cold page-cache reads, not true DIO",
+        dir
+    );
+    for depth in [1usize, 4, 8] {
+        let bytes = RungSource::backing_bytes(checkpoint, &dir, depth).expect("the backing sizes");
+        let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        let mode = RungSource::probe_read_mode(checkpoint, &dir).expect("the mode probes");
+        let rung = match RungSource::new(checkpoint, &dir, depth, mode, backing) {
+            Ok(rung) => rung,
+            Err(error) => {
+                eprintln!("span bench: depth {depth} refuses this pack: {error:?}");
+                return;
+            }
+        };
+        // Phase split via the bench-only method: reads on the pool's worker
+        // threads inside read_records, parse (F16 widening) and pack on this
+        // caller thread after each chunk's leases return.
+        let mut reads_ms = Vec::new();
+        let mut parse_ms = Vec::new();
+        let mut pack_ms = Vec::new();
+        let mut total_ms = Vec::new();
+        for _ in 0..5 {
+            evict(&site_merged);
+            let start = std::time::Instant::now();
+            let (in_reads, in_parse, in_pack) = rung.phase_costs(&picks).expect("the phases");
+            total_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            reads_ms.push(in_reads);
+            parse_ms.push(in_parse);
+            pack_ms.push(in_pack);
+        }
+        let median = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted[sorted.len() / 2]
+        };
+        eprintln!(
+            "span bench: depth {depth}: per step reads {:.1} / parse {:.1} / pack {:.1} / \
+             total {:.1} ms (median of 5; reads on the pool's threads, parse+pack on the caller)",
+            median(&reads_ms),
+            median(&parse_ms),
+            median(&pack_ms),
+            median(&total_ms),
+        );
     }
 }

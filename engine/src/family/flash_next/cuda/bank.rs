@@ -635,14 +635,12 @@ pub(super) mod device {
         state: ExpertBankState<ReplaceOnMissLru>,
         slots: Vec<DeviceBuffer>,
         store: Vec<PinnedBuf>,
-        /// The record source, kept only under the disk rung for its every-miss reads
-        /// (`run_copies`'s `NO_PLACE` arm reads the record and uploads it) — the same source
-        /// that filled the slots at build. Every other mode leaves it absent, as before the
-        /// rung: those tiers never read a record after the fill.
-        source: Option<&'static dyn RecordSource>,
-        /// One record's staging bytes for the disk rung's source reads; plain memory, the
-        /// upload stages it (exactly the build fallback's pattern).
-        staging: Vec<u8>,
+        /// The rung's pooled reader, kept only under the disk rung for its every-miss reads
+        /// (`run_copies`'s `NO_PLACE` arm reads the step's misses as ONE store batch at the
+        /// pool's depth and uploads the packed records) — the same reader the fill used
+        /// through the trait. Every other mode leaves it absent, as before the rung: those
+        /// tiers never read a record after the fill.
+        source: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -673,7 +671,7 @@ pub(super) mod device {
             state: ExpertBankState<ReplaceOnMissLru>,
             source: &dyn RecordSource,
             plan: &HostPinPlan,
-            retained: Option<&'static dyn RecordSource>,
+            retained: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
         ) -> Result<Self, EngError> {
             let geometry: BankGeometry = *state.geometry();
             let places = state.mode().places_per_layer(&geometry);
@@ -729,20 +727,11 @@ pub(super) mod device {
             stream.synchronize()?;
             source.drain(&stream)?;
             let experts = geometry.experts;
-            // Staging is the rung's read buffer, so only the disk answer allocates it: a
-            // zero-place plan is exactly that answer (one pinned buffer per layer otherwise),
-            // and the store-backed tiers never reach the staged-read arm below.
-            let staging = if places > 0 {
-                Vec::new()
-            } else {
-                vec![0u8; geometry.record_bytes]
-            };
             Ok(Self {
                 state,
                 slots,
                 store,
                 source: retained,
-                staging,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1012,6 +1001,24 @@ pub(super) mod device {
                 )));
             };
             let record = geometry.record_bytes;
+            // The disk rung's misses read as ONE store batch at the pool's
+            // depth; the packed records upload in op order below.
+            let misses_exist = copies.ops.iter().any(|op| op.src_place == NO_PLACE);
+            let mut packed_misses: std::vec::IntoIter<Vec<u8>> = Vec::new().into_iter();
+            if misses_exist {
+                let Some(source) = self.source else {
+                    return Err(EngError::BadRequest(
+                        "a no-place copy needs the disk rung's retained record source".into(),
+                    ));
+                };
+                let misses: Vec<u16> = copies
+                    .ops
+                    .iter()
+                    .filter(|op| op.src_place == NO_PLACE)
+                    .map(|op| op.incoming)
+                    .collect();
+                packed_misses = source.read_packed(layer, &misses)?.into_iter();
+            }
             let mut store = self.store.get_mut(layer);
             for op in &copies.ops {
                 let slot = bank.range(geometry.offset(usize::from(op.slot)), record)?;
@@ -1031,17 +1038,10 @@ pub(super) mod device {
                     )?;
                 }
                 if op.src_place == NO_PLACE {
-                    let Some(source) = self.source else {
-                        return Err(EngError::BadRequest(
-                            "a no-place copy needs the disk rung's retained record source".into(),
-                        ));
-                    };
-                    source.record(layer, op.incoming, &mut self.staging)?;
-                    bank.write_at(
-                        &self.stream,
-                        geometry.offset(usize::from(op.slot)),
-                        &self.staging,
-                    )?;
+                    let record = packed_misses
+                        .next()
+                        .expect("one packed record a no-place op");
+                    bank.write_at(&self.stream, geometry.offset(usize::from(op.slot)), &record)?;
                 } else {
                     let Some(store) = store.as_deref_mut() else {
                         return Err(EngError::BadRequest(format!(

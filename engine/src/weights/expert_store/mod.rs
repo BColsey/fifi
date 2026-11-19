@@ -8,7 +8,7 @@
 //! that ring itself, and only `pread_at_most` is shared with it).
 
 mod buffered;
-mod ring;
+pub(crate) mod ring;
 
 // `pread_at_most` is the tree's one positioned-read retry loop; the
 // expert-bank host tier reads through it. The store types are re-exported

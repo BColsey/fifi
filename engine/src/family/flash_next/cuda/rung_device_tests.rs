@@ -1,13 +1,13 @@
 //! The disk rung on the device: a Disk-mode bank over a synthetic pack file serves its
-//! misses through the one-slot O_DIRECT staging ring, and the bytes that land in the
+//! misses through the pooled O_DIRECT ring store, and the bytes that land in the
 //! device slots are exactly the pack's records for that (layer, expert) - the same bytes
 //! an Exclusive-mode bank holds for the same experts. An eviction and a second miss of
 //! the same expert reads the file again (this tier never writes back) and lands the same
 //! bytes again.
 
 use super::bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank};
+use super::bank_source::RungSource;
 use super::bank_source_tests::synthetic;
-use super::ring_source::RingRecordSource;
 use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::kernels::cuda::device_present;
 
@@ -35,13 +35,14 @@ fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
     // 1, 2, 0, 1 hit, evict 1, hit, and re-miss 1 after its eviction: two ring reads per
     // layer, and expert 1 re-reads the file after its own eviction.
     let geometry = BankGeometry::new(synthetic::LAYERS, synthetic::EXPERTS, 1, 2, record).unwrap();
-    let ring_slots = std::num::NonZeroUsize::MIN;
-    let ring_bytes =
-        RingRecordSource::backing_bytes(checkpoint, &dir, ring_slots).expect("the backing sizes");
-    let backing: &'static mut [u8] = Box::leak(vec![0u8; ring_bytes].into_boxed_slice());
-    let ring = RingRecordSource::new(checkpoint, &dir, ring_slots, backing)
-        .expect("the ring source derives");
-    let retained: &'static dyn RecordSource = Box::leak(Box::new(ring));
+    let rung_bytes = RungSource::backing_bytes(checkpoint, &dir, 1).expect("the backing sizes");
+    let backing: &'static mut [u8] = Box::leak(vec![0u8; rung_bytes].into_boxed_slice());
+    let mode = RungSource::probe_read_mode(checkpoint, &dir).expect("the mode probes");
+    let rung =
+        RungSource::new(checkpoint, &dir, 1, mode, backing).expect("the rung source derives");
+    // The rung source borrows its checkpoint for the rest of the process (the bank keeps it
+    // as the retained reader), so it lives leaked.
+    let retained: &'static RungSource = Box::leak(Box::new(rung));
 
     let row: Vec<i32> = vec![0, 1, -1];
     let rows: Vec<&[i32]> = vec![row.as_slice(); synthetic::LAYERS];
@@ -56,7 +57,7 @@ fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
     let excl_policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     let excl_state =
         ExpertBankState::with_policy(geometry, HostMode::Exclusive, excl_policy).unwrap();
-    let disk_plan = HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes as u64)
+    let disk_plan = HostPinPlan::new_disk(&geometry, &memory, &terms, rung_bytes as u64)
         .expect("the rung plan admits");
     let excl_plan =
         HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms).expect("the plan");

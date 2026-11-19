@@ -44,7 +44,6 @@ use super::{
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
     ple_feed::{FixedProjection, NgramRows, PleFeed, PleVectors},
-    ring_source,
     state::FlashGeometry,
     step::{FlashStep, SplitMoeAt},
     step_plan::StepPlan,
@@ -385,7 +384,7 @@ fn build_bank(
     profile: Option<&[Vec<f64>]>,
     usage_out: Option<&std::path::Path>,
     source: &dyn RecordSource,
-    retained: Option<&'static dyn RecordSource>,
+    retained: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
 ) -> Result<DeviceBank, EngError> {
     let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
@@ -676,15 +675,20 @@ pub(super) fn build_driver(
         total: mem_total,
         available: mem_available,
     };
+    // The rung's pooled read depth: one worker per slot, one RECORD per
+    // job. The span bench's step cells issue two records per layer, so
+    // it cannot separate depth 4 from depth 8; 4 is provisional.
+    const RUNG_RING_SLOTS: usize = 4;
     // The staging ring's own backing — the disk rung's read path and its budget floor.
     // Sizing is two-phase so every non-disk start stays byte-for-byte the pre-rung start:
-    // the first pass charges the infallible placeholder (two records in flight) and never
-    // touches the pack; only when that already points at the disk tier is the real figure
-    // read from the ring source (one slot: the ring fills sequentially) and the choice made
-    // once more with it — so the ladder, the disk plan and the source that serves the rung
-    // all charge one number, and a non-disk answer is never revised.
+    // the first pass charges the infallible placeholder (the full pooled depth's
+    // records in flight) and never touches the pack; only when that already points at
+    // the disk tier is the real figure read from the ring source and the choice made
+    // once more with it — so the ladder, the disk plan and the source that serves the
+    // rung all charge one number (the allocated slots), and a non-disk answer is never
+    // revised.
     let mode = std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok();
-    let ring_placeholder = 2 * record_bytes as u64;
+    let ring_placeholder = RUNG_RING_SLOTS as u64 * record_bytes as u64;
     let tier = HostPinPlan::bank_mode_tier(
         mode.as_deref(),
         &geometry,
@@ -694,11 +698,9 @@ pub(super) fn build_driver(
     )?;
     let (tier, ring_bytes) = match tier {
         TierChoice::Disk => {
-            let real = ring_source::RingRecordSource::backing_bytes(
-                &checkpoint,
-                artifact,
-                std::num::NonZeroUsize::MIN,
-            )? as u64;
+            let real =
+                bank_source::RungSource::backing_bytes(&checkpoint, artifact, RUNG_RING_SLOTS)?
+                    as u64;
             let tier =
                 HostPinPlan::bank_mode_tier(mode.as_deref(), &geometry, &memory, &terms, real)?;
             if !matches!(tier, TierChoice::Disk) {
@@ -725,8 +727,39 @@ pub(super) fn build_driver(
         TierChoice::Disk => HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes)?,
     };
     let (tier_name, speed_class) = tier.describe();
+    // The rung reader is chosen and its read mode decided ONCE, here —
+    // before the trunk upload — so a filesystem that refuses O_DIRECT
+    // serves buffered instead of failing the start after the trunk is
+    // already loaded. Strict spelling, like the resume switch.
+    let ring_reader = match std::env::var("FIFI_FLASH_NEXT_PACK_RING") {
+        Ok(value) if value == "1" => true,
+        Err(std::env::VarError::NotPresent) => matches!(tier, TierChoice::Disk),
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) if matches!(tier, TierChoice::Disk) => true,
+        Ok(other) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {other:?}"
+            )));
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {value:?}"
+            )));
+        }
+    };
+    let rung_mode = if ring_reader {
+        Some(bank_source::RungSource::probe_read_mode(
+            &checkpoint,
+            artifact,
+        )?)
+    } else {
+        None
+    };
+    let rung_word = match &rung_mode {
+        Some(mode) => format!(", rung mode: {}", mode.plain()),
+        None => String::new(),
+    };
     eprintln!(
-        "flash-next cuda: {tier_name} ({speed_class}), {} pinned host bytes",
+        "flash-next cuda: {tier_name} ({speed_class}){rung_word}, {} pinned host bytes",
         host_plan.store_bytes
     );
     // The guard reads the same snapshot the plan sized from, and the PLE bytes already ride
@@ -757,31 +790,17 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     // The record source: the buffered pack reader, or — behind
-    // FIFI_FLASH_NEXT_PACK_RING=1, default off — the O_DIRECT ring reader
-    // (the landed pack reader's first production caller). The disk tier forces
-    // the ring reader regardless of the switch: the rung's every-miss read IS
-    // the ring. Strict spelling for the other tiers: any other value refuses
-    // the start, like the resume switch. The ring fills sequentially, so one
-    // slot bounds it.
-    let ring_reader = match std::env::var("FIFI_FLASH_NEXT_PACK_RING") {
-        Ok(value) if value == "1" => true,
-        Err(std::env::VarError::NotPresent) => matches!(tier, TierChoice::Disk),
-        Ok(_) | Err(std::env::VarError::NotUnicode(_)) if matches!(tier, TierChoice::Disk) => true,
-        Ok(other) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {other:?}"
-            )));
-        }
-        Err(std::env::VarError::NotUnicode(value)) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_PACK_RING must be 1 or unset, found {value:?}"
-            )));
-        }
-    };
+    // FIFI_FLASH_NEXT_PACK_RING=1, default off — the pooled ring reader,
+    // decided with its read mode at the tier line above. The disk tier
+    // forces the ring reader regardless of the switch: the rung's
+    // every-miss read IS the ring.
     let layout: crate::family::flash_next::moe::slot_bank::SlotBankLayout;
-    let source: Box<dyn RecordSource> = if ring_reader {
-        let slots = std::num::NonZeroUsize::MIN;
-        let bytes = ring_source::RingRecordSource::backing_bytes(checkpoint, artifact, slots)?;
+    enum Source {
+        Buffered(Box<dyn RecordSource>),
+        Rung(Box<bank_source::RungSource>),
+    }
+    let source = if ring_reader {
+        let bytes = bank_source::RungSource::backing_bytes(checkpoint, artifact, RUNG_RING_SLOTS)?;
         let backing: &'static mut [u8] = Box::leak(vec![0u8; bytes].into_boxed_slice());
         // The serve-state pattern of the exl3 bank: register the plain
         // bytes so the H2D from the slot windows is truly async. Best-
@@ -793,26 +812,46 @@ pub(super) fn build_driver(
                 "flash-next cuda: ring unpinned, staged copies (host_register refused: {error:?})"
             ),
         }
-        let staged = ring_source::RingRecordSource::new(checkpoint, artifact, slots, backing)?;
-        layout = staged.layout_ref().clone();
-        eprintln!("flash-next cuda: record source: the O_DIRECT ring reader");
-        Box::new(staged)
+        let mode = rung_mode.expect("the ring reader was probed at the tier line");
+        let staged =
+            bank_source::RungSource::new(checkpoint, artifact, RUNG_RING_SLOTS, mode, backing)?;
+        layout = staged.layout().clone();
+        eprintln!(
+            "flash-next cuda: record source: the pooled ring store, {}",
+            staged.read_mode().plain()
+        );
+        Source::Rung(Box::new(staged))
     } else {
         let staged = bank_source::PackRecordSource::new(checkpoint)?;
         layout = staged.layout().clone();
-        Box::new(staged)
+        Source::Buffered(Box::new(staged))
     };
-    // LEAK: only the disk rung keeps its source for the process lifetime — its every-miss
+    // LEAK: only the disk rung keeps its reader for the process lifetime — its every-miss
     // reads outlive this start, and the `static borrow reaches the step. Every other tier
     // fills from the source at the start below and drops it with this call, byte-for-byte
     // the pre-rung start.
-    let (fill_source, retained_source): (&dyn RecordSource, Option<&'static dyn RecordSource>) =
-        if matches!(tier, TierChoice::Disk) {
-            let leaked: &'static dyn RecordSource = Box::leak(source);
-            (leaked, Some(leaked))
-        } else {
-            (source.as_ref(), None)
+    let (fill_source, retained_source): (
+        &dyn RecordSource,
+        Option<&'static bank_source::RungSource>,
+    ) = if matches!(tier, TierChoice::Disk) {
+        let Source::Rung(boxed) = source else {
+            // The disk tier forces the ring reader above, so this arm
+            // cannot happen; refuse rather than leak the wrong type.
+            return Err(EngError::BadRequest(
+                "the disk tier requires the ring reader".into(),
+            ));
         };
+        let leaked: &'static bank_source::RungSource = Box::leak(boxed);
+        (leaked, Some(leaked))
+    } else {
+        // The fill borrows the enum: either source drops with this call,
+        // byte-for-byte the pre-rung start.
+        let fill: &dyn RecordSource = match &source {
+            Source::Rung(rung) => rung.as_ref(),
+            Source::Buffered(buffered) => buffered.as_ref(),
+        };
+        (fill, None)
+    };
     // Optional popularity profile, an exllamav3 expert_stats JSON:
     // {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}. Sources,
     // in order: the engine's `expert_stats` key (which also takes the usage dump, so the next

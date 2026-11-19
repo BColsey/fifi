@@ -48,7 +48,7 @@ use rustix::fs::OFlags;
 /// The filesystem type holding `path`, by longest mount-point prefix of
 /// `/proc/self/mounts` — the name the refusal carries so an O_DIRECT
 /// rejection on tmpfs says tmpfs instead of a bare errno.
-fn filesystem_of(path: &Path) -> Option<String> {
+pub(crate) fn filesystem_of(path: &Path) -> Option<String> {
     let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut best: Option<(usize, String)> = None;

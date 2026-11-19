@@ -10,7 +10,6 @@
 //! Each module's own header says what it does.
 
 mod bank;
-mod pack_reader;
 // The resume switch: INFERENCE_FLASH_NEXT_PREFIX_RESUME, read once, strict spelling. It rides
 // the driver's cfg: the switch only matters where a driver can be built.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
@@ -39,9 +38,7 @@ mod prefill_ring_device_tests;
 #[cfg(test)]
 mod prefill_ring_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod ring_source;
 #[cfg(test)]
-mod ring_source_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod rung_device_tests;
 // S3: the state and decode arena plans size device memory with the kernel wrappers, so they build

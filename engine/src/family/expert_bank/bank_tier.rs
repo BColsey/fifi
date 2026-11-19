@@ -39,9 +39,10 @@ impl TierChoice {
             Self::Exclusive { .. } => ("exclusive store", "write-back on eviction"),
             Self::Disk => (
                 "disk tier",
-                "one record at a time through the staging ring: about 99 ms per decode step \
-                 fully cold on the measured drive; on a copy-on-write filesystem O_DIRECT reads \
-                 go through the page cache; prefill rides the union-admit path",
+                "no pinned store: every miss read through the pooled ring, about 0.12 s per \
+                 decode step fully cold (span bench, pooled depth 4, DONTNEED-evicted cells \
+                 of the real pack); the rung's read mode — O_DIRECT or buffered — is decided \
+                 once at start and stated on the tier line; prefill rides the union-admit path",
             ),
         }
     }

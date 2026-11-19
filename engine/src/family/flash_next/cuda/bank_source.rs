@@ -24,13 +24,35 @@ use crate::{
     EngError,
     family::{
         exl3_pack::{ExpertPart, Root, expert_name_in},
+        expert_bank::host_tier::{SECTOR, align_up_sector, filesystem_of, open_direct},
         flash_next::{
             load::{model_shape, pack_files::FlashPackFiles},
             moe::slot_bank::SlotBankLayout,
         },
     },
-    weights::exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
+    tensor::{Dtype, Tensor},
+    weights::{
+        Tier, WeightSource,
+        exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
+        expert_store::{ExpertRecordStore, RecordSite, ring::RingRecords, ring::ShardOpen},
+    },
 };
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// One component extent: the shard file it lives in, the exact extent
+/// inside that file, and where the bytes land in the packed record.
+#[derive(Clone, Debug)]
+pub(in crate::family::flash_next) struct MatrixSpan {
+    pub(in crate::family::flash_next) shard: PathBuf,
+    pub(in crate::family::flash_next) file_offset: u64,
+    pub(in crate::family::flash_next) len: u64,
+    pub(in crate::family::flash_next) record_offset: u64,
+}
 
 /// Bytes one matrix read may take (the components of one matrix are well under 1 MiB at 3 bpw).
 const MATRIX_READ_BUDGET: u64 = 1 << 30;
@@ -185,4 +207,526 @@ fn load_matrix(checkpoint: &Checkpoint, prefix: &str) -> Result<Matrix, EngError
     let keys = names.each_ref().map(String::as_str);
     let selected = checkpoint.source.read_selected(&keys, MATRIX_READ_BUDGET)?;
     Matrix::load(&selected, prefix, &checkpoint.config)
+}
+
+/// A component extent the pack's tensors own: where its bytes live, the
+/// key and part it answers to, and the dtype the store recorded. The
+/// parse walk below reads these; the pooled store never sees anything
+/// but (file, offset, length, destination).
+pub(in crate::family::flash_next) struct Span {
+    pub(in crate::family::flash_next) matrix: MatrixSpan,
+    pub(in crate::family::flash_next) key: String,
+    pub(in crate::family::flash_next) part: ExpertPart,
+    pub(in crate::family::flash_next) dtype: Dtype,
+}
+
+/// One expert's component extents: for each of the three parts, every
+/// present component of the nine becomes one span, tiled by record offset
+/// in the order `load_matrix` reads them. Absent components contribute
+/// nothing, exactly as the buffered `read_selected` omits them.
+pub(in crate::family::flash_next) fn expert_spans(
+    checkpoint: &Checkpoint,
+    dir: &Path,
+    layer: usize,
+    expert: usize,
+) -> Result<(Vec<Span>, u64), EngError> {
+    let mut spans = Vec::new();
+    let mut cursor = 0u64;
+    for part in ExpertPart::ALL {
+        let prefix = expert_name_in(Root::Layers, layer, expert, part);
+        for suffix in COMPONENT_SUFFIXES {
+            let key = format!("{prefix}.{suffix}");
+            let Some((shard, start, len)) = checkpoint.source.tensor_extent(&key) else {
+                continue;
+            };
+            let dtype = checkpoint
+                .source
+                .stored(&key)
+                .map(|(dtype, _)| dtype)
+                .ok_or_else(|| pack_error(format!("{key}: stored metadata vanished")))?;
+            spans.push(Span {
+                matrix: MatrixSpan {
+                    shard: dir.join(shard),
+                    file_offset: start,
+                    len,
+                    record_offset: cursor,
+                },
+                key,
+                part,
+                dtype,
+            });
+            cursor += len;
+        }
+    }
+    Ok((spans, cursor))
+}
+
+/// The tensors staged in one slot, keyed as `Matrix::load` asks for them,
+/// and nothing more.
+#[derive(Default)]
+struct SlotSource {
+    tensors: HashMap<String, Tensor>,
+    bytes: u64,
+}
+
+impl SlotSource {
+    fn push(&mut self, key: String, tensor: Tensor) {
+        self.bytes += tensor.byte_len();
+        self.tensors.insert(key, tensor);
+    }
+}
+
+impl WeightSource for SlotSource {
+    fn tensor(&self, key: &str) -> Option<Tensor> {
+        self.tensors.get(key).cloned()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::Resident
+    }
+}
+
+/// Parses one record's staged spans into its three matrices: the
+/// buffered source's own walk (`Tensor::try_from_host`, `Matrix::load`,
+/// the bias refusal).
+pub(in crate::family::flash_next) fn parse_spans(
+    window: &[u8],
+    spans: &[Span],
+    checkpoint: &Checkpoint,
+    layer: usize,
+    expert: u16,
+) -> Result<[Matrix; 3], EngError> {
+    let mut source = SlotSource::default();
+    let mut cursor = 0u64;
+    for span in spans {
+        let key = &span.key;
+        let (dtype, shape) = checkpoint
+            .source
+            .stored(key)
+            .ok_or_else(|| pack_error(format!("{key}: stored metadata vanished")))?;
+        let start = cursor as usize;
+        cursor += span.matrix.len;
+        let bytes = window[start..cursor as usize].to_vec();
+        let tensor = Tensor::try_from_host(dtype, shape, bytes).map_err(|error| {
+            pack_error(format!(
+                "layer {layer} expert {expert} {key}: {}",
+                error.describe()
+            ))
+        })?;
+        source.push(key.clone(), tensor);
+    }
+    let mut matrices = Vec::with_capacity(3);
+    for part in ExpertPart::ALL {
+        let prefix = expert_name_in(Root::Layers, layer, usize::from(expert), part);
+        let matrix = Matrix::load(&source, &prefix, &checkpoint.config).map_err(|error| {
+            pack_error(format!(
+                "layer {layer} expert {expert}: {}",
+                error.describe()
+            ))
+        })?;
+        refuse_bias(&matrix, layer, usize::from(expert), part)?;
+        matrices.push(matrix);
+    }
+    Ok([
+        matrices[0].clone(),
+        matrices[1].clone(),
+        matrices[2].clone(),
+    ])
+}
+
+/// Merges a site's extents where the pack wrote them contiguously: same
+/// shard, file offsets abutting, record offsets abutting — one read
+/// serves what one write laid down. `expert_spans` emits the extents in
+/// record order already.
+pub(in crate::family::flash_next) fn merge_abutting(
+    spans: &[Span],
+) -> Vec<crate::weights::expert_store::ring::SpanRead> {
+    let mut merged: Vec<crate::weights::expert_store::ring::SpanRead> = Vec::new();
+    for span in spans {
+        let matrix = &span.matrix;
+        match merged.last_mut() {
+            // The merged payload lands at one destination, so only
+            // extents whose destinations also abut can share a read.
+            Some(last)
+                if last.shard == matrix.shard
+                    && last.file_offset + last.len == matrix.file_offset
+                    && last.record_offset + last.len == matrix.record_offset =>
+            {
+                last.len += matrix.len;
+            }
+            _ => merged.push(crate::weights::expert_store::ring::SpanRead {
+                shard: matrix.shard.clone(),
+                file_offset: matrix.file_offset,
+                len: matrix.len,
+                record_offset: matrix.record_offset,
+            }),
+        }
+    }
+    merged
+}
+
+/// The rung's shard-open mode, decided ONCE at start: O_DIRECT where
+/// every shard of the pack answers the probe read, buffered where any
+/// refuses. Decided before the trunk upload so a refusing filesystem
+/// serves slower instead of refusing the start, stated in the tier line,
+/// and never re-decided per read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::family::flash_next) enum RungReadMode {
+    /// Every distinct shard answered the O_DIRECT probe; `on` names the
+    /// filesystem(s) the pack lives on, `probes` is how many distinct
+    /// shards were opened — one per shard, never one per span.
+    Direct { on: String, probes: usize },
+    /// The first refusing shard (lexicographically first of the sorted
+    /// distinct set) and its error, with the refusing count, for the
+    /// tier line's plain words.
+    Buffered { refused: String, probes: usize },
+}
+
+impl RungReadMode {
+    /// The mode in plain words, for the tier line and the source line:
+    /// what was requested and granted, and the filesystem it was granted
+    /// on — no claim about any cache beyond that.
+    pub(in crate::family::flash_next) fn plain(&self) -> String {
+        match self {
+            Self::Direct { on, .. } => format!("O_DIRECT granted on {on}"),
+            Self::Buffered { refused, .. } => format!("buffered ({refused})"),
+        }
+    }
+}
+
+/// The pack's expert records through the pooled O_DIRECT store: the
+/// disk rung's reader. One `read_records` batch serves a step's misses
+/// at the pool's depth; each lease's raw span window is parsed and
+/// packed into the bank's record bytes HERE — the store stays
+/// family-neutral, owning nothing the pack format owns.
+pub(in crate::family::flash_next) struct RungSource {
+    store: RingRecords,
+    /// The site's UNMERGED spans, for the parse walk (one tensor a span).
+    spans: Vec<Vec<Span>>,
+    checkpoint: &'static Checkpoint,
+    layout: SlotBankLayout,
+    layers: usize,
+    experts: usize,
+    /// The pool's depth: `read_records` cannot check out more leases than
+    /// the pool has slots, so a longer miss list reads in chunks of this.
+    slots: usize,
+    mode: RungReadMode,
+}
+
+/// The pool's checkout bound: leases live only inside one step's miss
+/// batch, so a wait anywhere near this bound means a lease leaked —
+/// better the refusal than the hang.
+const RUNG_MAX_WAIT: Duration = Duration::from_secs(30);
+
+impl RungSource {
+    /// Probes every distinct shard of the pack once: O_DIRECT where all
+    /// answer (including the probe read), buffered where the first
+    /// refuses. A shard that is MISSING is not a refusal — the pack is
+    /// broken and the start refuses.
+    /// Decides the rung's shard-open mode once, at start: the pack's
+    /// DISTINCT shards are collected first (sorted, so "first" is
+    /// deterministic), each is probed exactly once — a multi-span pack
+    /// opens one file per shard here, never one per span — and every
+    /// answer is examined before the mode is named: a missing shard
+    /// refuses the start whatever else refused, and the first O_DIRECT
+    /// refusal otherwise puts the whole rung on buffered reads, named
+    /// with its shard and the refusing count.
+    pub(in crate::family::flash_next) fn probe_read_mode(
+        checkpoint: &Checkpoint,
+        dir: &Path,
+    ) -> Result<RungReadMode, EngError> {
+        let buffered = PackRecordSource::new(checkpoint)?;
+        let (layers, experts) = (buffered.layers(), buffered.experts());
+        let mut shards: Vec<std::path::PathBuf> = Vec::new();
+        for layer in 0..layers {
+            for expert in 0..experts {
+                let (spans, _) = expert_spans(checkpoint, dir, layer, expert)?;
+                for span in &spans {
+                    let shard = &span.matrix.shard;
+                    if !shards.contains(shard) {
+                        shards.push(shard.clone());
+                    }
+                }
+            }
+        }
+        shards.sort();
+        Self::probe_shards(&shards)
+    }
+
+    /// The probe's core over the already-collected distinct shards, so
+    /// the policy — every shard examined, missing beats refusal — tests
+    /// without a pack.
+    pub(in crate::family::flash_next) fn probe_shards(
+        shards: &[std::path::PathBuf],
+    ) -> Result<RungReadMode, EngError> {
+        let probes = shards.len();
+        let mut missing: Option<&std::path::Path> = None;
+        let mut first_refusal: Option<String> = None;
+        let mut refused = 0usize;
+        for shard in shards {
+            match open_direct(shard) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing = missing.or(Some(shard.as_path()));
+                }
+                Err(error) => {
+                    refused += 1;
+                    if first_refusal.is_none() {
+                        first_refusal = Some(format!("{} ({error})", shard.display()));
+                    }
+                }
+            }
+        }
+        if let Some(missing) = missing {
+            return Err(pack_error(format!(
+                "the pack is missing {}",
+                missing.display()
+            )));
+        }
+        match first_refusal {
+            None => {
+                let mut on: Vec<String> = Vec::new();
+                for shard in shards {
+                    let fs = filesystem_of(shard).unwrap_or_else(|| "unknown".into());
+                    if !on.contains(&fs) {
+                        on.push(fs);
+                    }
+                }
+                Ok(RungReadMode::Direct {
+                    on: on.join("+"),
+                    probes,
+                })
+            }
+            Some(first) => Ok(RungReadMode::Buffered {
+                refused: format!("{first}; {refused} of {probes} shards refuse O_DIRECT"),
+                probes,
+            }),
+        }
+    }
+
+    /// The mode this rung serves in — for the tier line and the tests.
+    pub(in crate::family::flash_next) fn read_mode(&self) -> &RungReadMode {
+        &self.mode
+    }
+
+    /// Derives the layout and counts exactly as the buffered source
+    /// does, walks every site's extents once (merging what the pack wrote
+    /// contiguously), and builds the pooled store over them, opening
+    /// shards in the start-decided `mode`.
+    pub(in crate::family::flash_next) fn new(
+        checkpoint: &'static Checkpoint,
+        dir: &Path,
+        slots: usize,
+        mode: RungReadMode,
+        backing: &'static mut [u8],
+    ) -> Result<Self, EngError> {
+        let buffered = PackRecordSource::new(checkpoint)?;
+        let (layout, layers, experts) = (
+            buffered.layout().clone(),
+            buffered.layers(),
+            buffered.experts(),
+        );
+        let (first, _) = expert_spans(checkpoint, dir, 0, 0)?;
+        if first.is_empty() {
+            return Err(pack_error("the pack exposes no expert components".into()));
+        }
+        let mut spans_by_site = Vec::with_capacity(layers * experts);
+        let mut sites = Vec::with_capacity(layers * experts);
+        let mut record_bytes = 0u64;
+        for layer in 0..layers {
+            for expert in 0..experts {
+                let (spans, raw) = expert_spans(checkpoint, dir, layer, expert)?;
+                record_bytes = record_bytes.max(raw);
+                sites.push(merge_abutting(&spans));
+                spans_by_site.push(spans);
+            }
+        }
+        let shard_open = match mode {
+            RungReadMode::Direct { .. } => ShardOpen::Direct,
+            RungReadMode::Buffered { .. } => ShardOpen::Buffered,
+        };
+        let slot_span = align_up_sector(record_bytes) + SECTOR;
+        let bytes = slots
+            .checked_mul(slot_span as usize)
+            .ok_or_else(|| pack_error("the ring sizing overflows".into()))?;
+        let store = RingRecords::new_span_addressed(
+            sites,
+            layers,
+            experts,
+            record_bytes,
+            slots,
+            shard_open,
+            carve(backing, bytes)?,
+            RUNG_MAX_WAIT,
+        )?;
+        Ok(Self {
+            store,
+            spans: spans_by_site,
+            checkpoint,
+            layout,
+            layers,
+            experts,
+            slots,
+            mode,
+        })
+    }
+
+    /// The byte size `backing` must carry for [`Self::new`]: the exact
+    /// ring bytes plus one sector of carve slack, because a plain
+    /// allocation is only 16-byte aligned.
+    pub(in crate::family::flash_next) fn backing_bytes(
+        checkpoint: &Checkpoint,
+        dir: &Path,
+        slots: usize,
+    ) -> Result<usize, EngError> {
+        let (first, raw) = expert_spans(checkpoint, dir, 0, 0)?;
+        if first.is_empty() {
+            return Err(pack_error("the pack exposes no expert components".into()));
+        }
+        let slot_span = align_up_sector(
+            raw.max(
+                first
+                    .iter()
+                    .map(|span| span.matrix.record_offset + span.matrix.len)
+                    .max()
+                    .unwrap_or(0),
+            ),
+        ) + SECTOR;
+        let slots = NonZeroUsize::new(slots)
+            .ok_or_else(|| pack_error("a slot pool needs at least one slot".into()))?;
+        let total = slots
+            .get()
+            .checked_mul(slot_span as usize)
+            .ok_or_else(|| pack_error("the ring sizing overflows".into()))?;
+        Ok(total + SECTOR as usize)
+    }
+
+    pub(in crate::family::flash_next) fn layout(&self) -> &SlotBankLayout {
+        &self.layout
+    }
+
+    /// One miss list as one store batch (in pool-sized chunks, because a
+    /// checkout cannot exceed the pool): the raw leases come back in
+    /// order, each is parsed and packed into the bank's record bytes, and
+    /// the lease (the slot) returns with the packed record. Duplicate
+    /// experts read twice — the callers' lists are the step's misses,
+    /// which do not repeat.
+    pub(in crate::family::flash_next) fn read_packed(
+        &self,
+        layer: usize,
+        experts: &[u16],
+    ) -> Result<Vec<Vec<u8>>, EngError> {
+        let mut packed = Vec::with_capacity(experts.len());
+        for chunk in experts.chunks(self.slots.max(1)) {
+            let sites: Vec<RecordSite> = chunk
+                .iter()
+                .map(|&expert| RecordSite { layer, expert })
+                .collect();
+            let leases = self.store.read_records(&sites)?;
+            packed.extend(
+                chunk
+                    .iter()
+                    .zip(leases)
+                    .map(|(&expert, lease)| {
+                        let index = self.site_index(layer, expert);
+                        let matrices = parse_spans(
+                            &lease,
+                            &self.spans[index],
+                            self.checkpoint,
+                            layer,
+                            expert,
+                        )?;
+                        self.layout
+                            .pack_matrices([&matrices[0], &matrices[1], &matrices[2]])
+                            .map_err(|error| {
+                                pack_error(format!(
+                                    "layer {layer} expert {expert}: {}",
+                                    error.describe()
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(packed)
+    }
+
+    fn site_index(&self, layer: usize, expert: u16) -> usize {
+        // The store's sites are layer-major, the buffered source's order.
+        layer * self.experts + usize::from(expert)
+    }
+
+    /// The phase split of one bench step, in milliseconds: (reads, parse,
+    /// pack). The reads run on the pool's worker threads inside
+    /// `read_records`; parse (the F16 widening) and pack run on the caller
+    /// thread after each chunk's leases return. Bench-only: the span bench
+    /// uses this to say where a miss spends its time.
+    #[cfg(test)]
+    pub(in crate::family::flash_next) fn phase_costs(
+        &self,
+        step: &[Vec<u16>],
+    ) -> Result<(f64, f64, f64), EngError> {
+        let (mut in_reads, mut in_parse, mut in_pack) = (0.0f64, 0.0f64, 0.0f64);
+        for (layer, misses) in step.iter().enumerate() {
+            for chunk in misses.chunks(self.slots.max(1)) {
+                let sites: Vec<RecordSite> = chunk
+                    .iter()
+                    .map(|&expert| RecordSite { layer, expert })
+                    .collect();
+                let phase = std::time::Instant::now();
+                let leases = self.store.read_records(&sites)?;
+                in_reads += phase.elapsed().as_secs_f64() * 1000.0;
+                for (&expert, lease) in chunk.iter().zip(leases) {
+                    let index = self.site_index(layer, expert);
+                    let phase = std::time::Instant::now();
+                    let matrices =
+                        parse_spans(&lease, &self.spans[index], self.checkpoint, layer, expert)?;
+                    in_parse += phase.elapsed().as_secs_f64() * 1000.0;
+                    let phase = std::time::Instant::now();
+                    self.layout
+                        .pack_matrices([&matrices[0], &matrices[1], &matrices[2]])?;
+                    in_pack += phase.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+        }
+        Ok((in_reads, in_parse, in_pack))
+    }
+}
+
+impl RecordSource for RungSource {
+    fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError> {
+        let mut packed = self.read_packed(layer, &[expert])?;
+        let record = packed.pop().expect("one expert, one record");
+        if out.len() != record.len() {
+            return Err(pack_error(format!(
+                "a record is {} bytes, the buffer has {}",
+                record.len(),
+                out.len()
+            )));
+        }
+        out.copy_from_slice(&record);
+        Ok(())
+    }
+}
+
+/// Carves the sector-aligned exact sub-slice out of `backing`: a plain
+/// allocation's own pointer is only 16-byte aligned, so the head up to
+/// the first sector boundary is skipped (this is what the serve path
+/// hands over — a leaked, best-effort-registered heap buffer).
+fn carve(backing: &'static mut [u8], bytes: usize) -> Result<&'static mut [u8], EngError> {
+    let start = backing.as_ptr() as usize;
+    let skipped = start.div_ceil(SECTOR as usize) * SECTOR as usize - start;
+    if backing.len() < skipped || backing.len() - skipped < bytes {
+        return Err(pack_error(format!(
+            "the ring backing carries {} bytes, the ring needs {bytes} at a sector boundary",
+            backing.len()
+        )));
+    }
+    let (_, aligned) = backing.split_at_mut(skipped);
+    let (exact, _) = aligned.split_at_mut(bytes);
+    Ok(exact)
 }
