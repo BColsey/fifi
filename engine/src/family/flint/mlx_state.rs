@@ -210,9 +210,8 @@ mod native {
         pub(in crate::family::flint) planes: Vec<Option<Plane>>,
         pub(in crate::family::flint) pos: u32,
         pub(in crate::family::flint) valid: bool,
-        /// Grown full-attention capacity: full planes start at the rounded-up
-        /// prompt need, not the context limit, and double as chunks cross it.
-        /// Ring planes stay at WINDOW and never grow.
+        /// Full-attention capacity used to allocate the first planes and track
+        /// subsequent growth. Ring planes stay at WINDOW and never grow.
         pub(in crate::family::flint) full_capacity: u32,
     }
 
@@ -718,6 +717,34 @@ mod native {
 pub(in crate::family::flint) fn capacity_target(need_end: u32, current: u32, limit: u32) -> u32 {
     let rounded = need_end.div_ceil(4096) * 4096;
     rounded.max(current.max(1) * 2).min(limit)
+}
+
+/// Capacity for a fresh request with a known output limit. The final token is
+/// pending, so it never enters the KV planes unless a later request feeds it.
+pub(super) fn initial_request_capacity(
+    prompt_tokens: usize,
+    completion_limit: Option<u32>,
+    context_limit: u32,
+) -> u32 {
+    let Some(completion_limit) = completion_limit else {
+        return 0;
+    };
+    let prompt_tokens = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+    let rows = prompt_tokens
+        .saturating_add(completion_limit)
+        .saturating_sub(1);
+    crate::family::mlx_kv::compact_capacity(rows, context_limit)
+}
+
+#[test]
+fn request_capacity_covers_fed_rows_within_context() {
+    assert_eq!(initial_request_capacity(1, Some(0), 32768), 0);
+    assert_eq!(initial_request_capacity(256, None, 32768), 0);
+    assert_eq!(initial_request_capacity(257, Some(0), 32768), 256);
+    assert_eq!(initial_request_capacity(1017, Some(8), 32768), 1024);
+    assert_eq!(initial_request_capacity(1017, Some(9), 32768), 2048);
+    assert_eq!(initial_request_capacity(1017, Some(24), 32768), 2048);
+    assert_eq!(initial_request_capacity(1017, Some(u32::MAX), 8192), 8192);
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

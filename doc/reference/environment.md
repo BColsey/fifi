@@ -146,6 +146,7 @@ On Apple Silicon:
 | `FIFI_FLINT_MLX_CONTEXT_LIMIT` | `32768` | `32768`, `8192` | Context limit. Any other value selects 8,192. |
 | `FIFI_FLINT_MLX_BATCH_PREFILL` | `1024` | `1024`, `512`, `0` | Prompt chunk size. `0` processes one token at a time, 50 to 70 times slower. Any other value selects 512. |
 | `FIFI_FLINT_MLX_COMPACT_KV` | off | `1` | Start Flint's full-attention KV planes at 256 rows or the capacity of the first prefill piece, whichever is larger after rounding to a power of two. Double capacity as needed up to the context limit. Sliding-window planes keep their 513 rows. [Flint prefix measurements](../explanation/mac-flint-ane-and-reads.md#compact-flint-kv-at-128-mib) |
+| `FIFI_FLINT_MLX_REQUEST_KV` | off | `1` | Size the initial full-attention KV allocation from the admitted prompt and generation limit. Requires compact KV and an active Metal working-set budget. Requests with prefix boundaries or without a generation limit keep geometric growth. [Serving comparison](../explanation/mac-flint-ane-and-reads.md#request-sized-flint-kv) |
 | `FIFI_FLINT_MLX_CACHE_LIMIT` | `67108864` | `67108864`, `0` | MLX freed-buffer cache in bytes. `0` restores the no-cache behavior (a driver round-trip per freed buffer). Any other value selects `0`. |
 | `FIFI_FLINT_MLX_ASYNC_CHAIN` | on | switch | Evaluate decode work in chains of 4 layers instead of synchronizing after every layer. |
 | `FIFI_FLINT_MLX_COALESCE_RESIDUAL` | on | switch | Merge the residual updates of a decode step. |

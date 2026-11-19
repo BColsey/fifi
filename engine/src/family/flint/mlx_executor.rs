@@ -37,6 +37,7 @@ pub(super) struct FlintExecutor {
     model: Model,
     prefill_piece: usize,
     mlx_plan: MlxExecutionPlan,
+    request_sized_kv: bool,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -192,6 +193,10 @@ impl FlintExecutor {
         } else {
             PrefillReason::Admitted
         };
+        let request_sized_kv = memory.is_some()
+            && super::factory::request_sized_kv_enabled(
+                std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV").as_deref(),
+            );
         let mlx_plan = MlxExecutionPlan::new(
             placement,
             placement_reason,
@@ -205,6 +210,7 @@ impl FlintExecutor {
                 model,
                 prefill_piece,
                 mlx_plan,
+                request_sized_kv,
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -535,6 +541,25 @@ impl ExecutorOps for FlintExecutor {
             model: &mut self.model,
             state: &mut st.state,
         })
+    }
+
+    fn reset_for_request(
+        &mut self,
+        st: &mut FlintSession,
+        prompt_tokens: usize,
+        completion_limit: Option<u32>,
+        has_prefix_boundary: bool,
+    ) -> Result<()> {
+        self.reset(st)?;
+        // Prefix jobs keep geometric growth and its existing snapshot charges.
+        if self.request_sized_kv && !has_prefix_boundary {
+            st.state.full_capacity = super::mlx_state::initial_request_capacity(
+                prompt_tokens,
+                completion_limit,
+                context_limit(),
+            );
+        }
+        Ok(())
     }
 
     fn prefill(&mut self, st: &mut FlintSession, tokens: &[u32]) -> Result<()> {

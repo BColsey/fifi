@@ -87,6 +87,17 @@ pub(crate) trait ExecutorOps {
     /// The committed tokens of the session.
     fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32];
     fn reset(&mut self, st: &mut Self::Session) -> Result<()>;
+    /// Resets a session for an admitted request before any prefix restore or prefill.
+    /// A fresh request with a known generation limit may size its initial buffers here.
+    fn reset_for_request(
+        &mut self,
+        st: &mut Self::Session,
+        _prompt_tokens: usize,
+        _completion_limit: Option<u32>,
+        _has_prefix_boundary: bool,
+    ) -> Result<()> {
+        self.reset(st)
+    }
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
     /// Commits one batch of tokens, or reports `Cancelled`.

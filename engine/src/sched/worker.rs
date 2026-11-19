@@ -935,7 +935,7 @@ fn run_job<E: ExecutorOps>(
         session,
         plan,
         prefill_chunk,
-        &generation.cancel,
+        &generation,
         &mut pieces,
         false,
     ) {
@@ -1003,7 +1003,7 @@ fn run_job<E: ExecutorOps>(
                 session,
                 plan,
                 prefill_chunk,
-                &generation.cancel,
+                &generation,
                 &mut pieces,
                 true,
             );
@@ -1020,7 +1020,7 @@ fn run_job<E: ExecutorOps>(
                     session,
                     plan,
                     prefill_chunk,
-                    &generation.cancel,
+                    &generation,
                     &mut pieces,
                     true,
                 );
@@ -1127,14 +1127,20 @@ fn start<E: ExecutorOps>(
     session: &mut E::Session,
     plan: &PromptPlan<'_>,
     prefill_chunk: usize,
-    cancel: &AtomicBool,
+    generation: &GenerationState,
     pieces: &mut PrefillPieces,
     retrying: bool,
 ) -> Result<usize, EngError> {
     // A restart re-feeds from the cursor, so the log keeps only the run that served the
     // prompt, never the aborted attempt's pieces.
     *pieces = PrefillPieces::default();
-    executor.reset(session)?;
+    executor.reset_for_request(
+        session,
+        plan.tokens.len(),
+        generation.remaining_tokens(),
+        plan.boundary.is_some(),
+    )?;
+    let cancel = &generation.cancel;
     let restored = match plan.boundary {
         Some(_) => executor.restore_prefix(session, plan.tokens)?,
         None => 0,

@@ -125,6 +125,37 @@ python3 scripts/mac_cache_study/flint_pipeline_ab.py \
   --compact-kv-decode-growth --expert-timing --working-set-mib 8192 --pairs 2
 ```
 
+### Request-sized Flint KV
+
+With compact KV and a Metal working-set budget enabled, `FIFI_FLINT_MLX_REQUEST_KV=1` sets the initial full-attention capacity for a fresh request with an admitted generation limit. The expected fed rows are the prompt length plus the generation allowance minus the final pending token. The shared compact capacity policy rounds those rows up to a power of two with a 256-row floor, capped by the admitted context. The startup plan still reserves the full context. The first forward allocates each plane on demand, and the original growth path remains available. Requests with prefix boundaries or an unbounded generation allowance keep geometric growth and its existing snapshot charges.
+
+Both arms used compact KV on the same 1,017-token prompt from the decode-growth trial, with 24 greedy completion tokens and an 8 GiB ceiling. The trace requires geometric growth from 256 to 512, 1,024, and 2,048 rows in the control. The request-sized arm must start at 2,048 rows and hold that capacity across prefill and decode. Both arms leave the sliding-window capacity at 513 rows.
+
+The two balanced pairs matched all four greedy outputs, logical expert bytes, and slice read counts. Both arms reported zero Metal staging-page copy fallbacks. The pre-sized arm held 2,048 rows throughout and eliminated all three measured growth events.
+
+| Serving measurement | Geometric growth | Request-sized |
+| --- | ---: | ---: |
+| Median time to first token | 58.39 s | 54.67 s |
+| Median decode throughput | 1.635 tok/s | 1.460 tok/s |
+| Median per-request decode forward p95 | 683 ms | 1,031 ms |
+| Median forward at position 1,024 | 695 ms | 796 ms |
+| Median timed expert reads at position 1,024 | 527 ms | 637 ms |
+| Median process peak footprint | 2.110 GB | 2.162 GB |
+| Total attributed SSD reads | 147.07 GB | 147.40 GB |
+| Total process page-ins | 327 | 48 |
+
+First-token latency moved in opposite directions across the two pairs. Decode p95 went from 637 to 1,320 ms in the first pair and 730 to 743 ms in the reverse-order pair. The slowest request-sized forward took 2.22 seconds, including 2.07 seconds in timed expert reads. Peak footprint rose by 39–66 MB. The sample covers one prompt and leaves the OS file cache in place. The flag remains experimental. [Four serving measurements](../../scripts/benchmarks/mac-m4-flint-request-kv-1017.csv)
+
+A two-turn check ran both configurations with prefix reuse and a 128 MiB reserve. Each 16-token priming request asked for 256 output tokens and stopped after three. Both kept 256 full-attention rows through the prime and follow-up. The 33-token follow-ups reused 15 tokens, reported the same 44,111,872-byte snapshot charge, and returned the same completions.
+
+Rebuild the qualification server and run the same driver with the request-sized mode.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/request-kv" \
+  --compact-kv-request --expert-timing --working-set-mib 8192 --pairs 2
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
