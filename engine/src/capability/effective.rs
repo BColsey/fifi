@@ -354,6 +354,7 @@ pub(crate) fn flint_effective_for_build(
         let cache = std::env::var_os("FIFI_FLINT_MLX_CACHE_LIMIT");
         let request_kv = std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV");
         let request_prefill = std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL");
+        let prefill_pair = std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR");
         let mut result = vec![
             row("backend", "mlx".into(), Origin::Derived),
             row(
@@ -376,6 +377,11 @@ pub(crate) fn flint_effective_for_build(
                 "mlx_request_prefill",
                 factory::request_prefill_enabled(request_prefill.as_deref()).to_string(),
                 env_origin(&request_prefill),
+            ),
+            row(
+                "mlx_prefill_pair",
+                factory::prefill_pair_enabled(prefill_pair.as_deref()).to_string(),
+                env_origin(&prefill_pair),
             ),
             mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
             row(

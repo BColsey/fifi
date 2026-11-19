@@ -283,6 +283,37 @@ cargo test --locked --offline --release --features native-mlx,native-fault-quali
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
+### Opt-in two-piece Flint serving
+
+`FIFI_FLINT_MLX_PREFILL_PAIR=1` arms the shared-stage path for disk-backed Flint with the shared-page pipeline, adaptive device budgeting, and request-aware prefill. It groups a fresh prompt when the normal worker plan has exactly two multi-row forwards and no prefix boundary. The memory admission covers both attention workspaces, both pieces' activation buffers, and one full expert stage. A declined group leaves the session untouched and the worker feeds its pieces separately. Cancellation is checked before the group is dispatched.
+
+Each layer appends the first piece's KV rows before attending the second piece. The full-attention planes allocate the group's final capacity before the first append. Each attention call uses its original piece width and visible KV span. The router selects experts independently for each piece. Their union is staged once, and each piece uses the existing sorted expert projections and weighted reduction at its original width. The stage retires before the next read. The session keeps the final prompt token pending for the first decode forward.
+
+The comparison uses the same binary, pinned checkpoint, two-piece geometry, greedy sampler, and 8 GiB Metal ceiling in both arms. It checks worker piece reports, all sampled token IDs, request output hashes, and logical decode traffic. The smoke also covers a 16-token request that takes the regular path with the switch armed. The serving trial uses a single stage per layer, capped at 256 experts. The bounded layer fixture above records the smaller mapping and additional reads from 64-expert waves.
+
+On the 16 GB M4 mini, two pairs alternated the order of the arms, with a fresh server for every run. The OS file cache stayed in place. The 2,041-token prompt kept its 1,023- and 1,017-row prefill forwards and one pending token. All four requests matched the same output hash and all 24 sampled token IDs. The shared path needed 94 page imports including the pending token, down from 141, and both arms reported zero staging-copy fallbacks.
+
+| Serving measurement | Separate stages | Shared stage |
+| --- | ---: | ---: |
+| Time to first token | 28.06 s | 16.18 s |
+| Timed prefill expert reads | 21.04 s | 10.49 s |
+| Logical prefill expert reads | 38.87 GB | 20.70 GB |
+| Prefill slice read calls | 22,239 | 8,037 |
+| Attributed SSD reads for the request | 45.95 GB | 27.56 GB |
+| Process peak footprint | 2.297 GB | 2.489 GB |
+| Decode forward p95 | 621 ms | 621 ms |
+| Request wall time | 40.90 s | 28.98 s |
+
+The table reports medians of two runs per arm. Logical prefill traffic matched the earlier route replay exactly. First-token latency fell 42% and attributed SSD traffic fell 40%. Peak footprint rose by 192 MB. Decode p95 ranged from 615 to 626 ms over the four requests, and all four read 11.48 GB of logical expert bytes during decode. The 557-token smoke also matched sampled tokens and output while reducing logical prefill reads from 28.06 GB to 19.35 GB. The path remains opt-in. [Serving and smoke measurements](../../scripts/benchmarks/mac-m4-flint-prefill-pair-serving.csv)
+
+The 557-token request also completed at a 4,000 MiB ceiling with the option armed. The remaining workspace was 1,058,326,976 bytes against a group charge of 1,088,723,840 bytes. The worker kept the separate 511- and 45-row forwards and one pending token, with the expected 141 page imports, logical read bytes, and all four sampled tokens.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/prefill-pair" \
+  --prefill-pair --expert-timing --working-set-mib 8192 --pairs 2
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)

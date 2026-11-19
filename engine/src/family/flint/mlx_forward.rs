@@ -32,6 +32,9 @@ use super::{
 
 type Result<T> = std::result::Result<T, EngError>;
 
+#[path = "mlx_prefill_pair.rs"]
+mod prefill_pair;
+
 /// pp attribution probe (test builds): under FLINT_QUAL_STAGE_SYNC, fence
 /// `tensor` (evaluate + synchronize) so the enclosing span's elapsed time
 /// includes the GPU work instead of only host submission. Perturbs the
@@ -750,15 +753,7 @@ fn stage_disk_experts(
             crate::family::prefill::mlx::submit_shared_expert(k, output)
         })
         .transpose()?;
-    let bytes = host
-        .host_bytes()
-        .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
-    let selected: Vec<u32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&bytes| u32::from_le_bytes(bytes))
-        .collect();
+    let selected = host_expert_ids(&host)?;
     // Preserve the group order while remapping the expert IDs into the compact stack.
     use crate::family::prefill::mlx::{local_expert_ids, sorted_expert_ids};
     let experts = sorted_expert_ids(&selected);
@@ -791,6 +786,18 @@ fn stage_disk_experts(
     #[cfg(feature = "native-fault-qualification")]
     trace_expert_accesses(stem, x.shape()[0], &experts);
     Ok((rows, shared))
+}
+
+fn host_expert_ids(host: &Tensor) -> Result<Vec<u32>> {
+    let bytes = host
+        .host_bytes()
+        .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| u32::from_le_bytes(bytes))
+        .collect())
 }
 
 /// The disk path already has the sorted, distinct checkpoint IDs on the host.
