@@ -199,7 +199,7 @@ The device plan charges the largest stage, including space for a possible Metal 
 
 A file-backed fixture on the M4 mini matched resident prefill and decode logits bit for bit across F32/F32, BF16/F32, BF16/BF16 and BF16/Q8 activation/KV profiles. It checked the startup and four-row prefill admission boundaries to one byte. Each profile reserved a 288 KiB stage and read 172,800 logical bytes in 135 contiguous reads, with zero Metal import copies.
 
-The pinned 27B 6-bit pack's headers put 13.90 GB in the deferred feed-forward matrices, 217.25 MB per layer. The inventory counts 6.92 GB of remaining resident weight payloads before conversion and serving reserves. It excludes the file-backed token embedding and unused vision and MTP tensors. The full checkpoint needs a server admission and performance measurement. [Pinned Qwen3.8 weights](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-6bit/tree/e05430e1ab7050b0b809a56ed2fdfe09570d4449)
+The pinned 27B 6-bit pack's headers put 13.90 GB in the deferred feed-forward matrices, 217.25 MB per layer. The inventory counts 6.92 GB of remaining resident weight payloads before conversion and serving reserves. It excludes the file-backed token embedding and unused vision and MTP tensors. [Pinned Qwen3.8 weights](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-6bit/tree/e05430e1ab7050b0b809a56ed2fdfe09570d4449)
 
 Run the file-backed checkpoint test from `engine/` on Apple Silicon.
 
@@ -207,6 +207,31 @@ Run the file-backed checkpoint test from `engine/` on Apple Silicon.
 cargo test --locked --release --features native-mlx,native-fault-qualification --lib \
   family::qwen36::resident::executor::tests::capped_dense_qwen_stages_one_file_backed_ffn_at_a_time \
   -- --exact --nocapture --test-threads=1
+```
+
+### Full Qwen3.8 dense checkpoint on the M4 mini
+
+The external SSD held all five verified shards from the pinned 27B 6-bit pack. The server used a separate tokenizer directory containing the exact engine-pinned files. The weights publisher's chat template and generation config matched the pins. The tokenizer JSON and tokenizer config came from two official Qwen revisions. [Weight pack and templates](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-6bit/tree/e05430e1ab7050b0b809a56ed2fdfe09570d4449) · [Tokenizer JSON](https://huggingface.co/Qwen/Qwen3.8-27B/blob/37561816e66b5b9153b1b64c10968c18c1e6f4a0/tokenizer.json) · [Tokenizer config](https://huggingface.co/Qwen/Qwen3.8-27B/blob/8c0b3d30f3ae96f5c7f774de704bf0ada83e422a/tokenizer_config.json)
+
+The resident header check required 20,657,078,272 bytes under the 10 GiB Metal ceiling and refused startup. Staged startup admitted 128 prefill rows with BF16 activations, Q8 KV, a 2,048-token context and 128 MiB of allocator cache. The server reported 6,922,976,268 bytes of resident weights, a 1,440,612,352-byte session reserve and 434,503,680 bytes for the largest FFN stage. Prefix reuse and compilation were off.
+
+Both runs answered the 28-token arithmetic prompt with `42` and matched the two sampled token IDs and result hash.
+
+| Run | Ready | First token | Decode | Request SSD reads | Lifetime process peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Initial | 17.27 s | 34.37 s | 0.06 tok/s | 41.54 GB | 10.82 GB |
+| Reproduction | 19.17 s | 33.85 s | 0.06 tok/s | 41.53 GB | 10.82 GB |
+
+The runs used the same checkpoint and serving settings without flushing the OS file cache between them. The process I/O counter covers each request after the server was ready. [Raw measurements](../../scripts/benchmarks/mac-m4-qwen38-dense-smoke.csv)
+
+The token scheduler prefills 27 prompt rows, runs the pending prompt token to sample the first output token, then runs one decode step. Those three forwards imply 41.50 GB of logical FFN reads from this pack. The prompt-only forward skips the final layer's FFN. Wider prompts can amortize their chunk reads, while reducing first-token latency here requires reducing the number or size of the scans. The device ceiling covers the Metal plan. Process peak also includes host startup allocations.
+
+Build the Apple Silicon server with `native-mlx,native-fault-qualification`. Use the pinned checkpoint, tokenizer directory and process I/O counter from the [staging study](mac-flint-expert-pipeline.md#reproduce).
+
+```sh
+python3 scripts/mac_cache_study/qwen38_dense_smoke.py \
+  "$ENGINESRV" "$QWEN38_CHECKPOINT" "$QWEN38_TOKENIZER" "$SCRATCH/proc-io" \
+  "$SCRATCH/qwen38-dense-smoke"
 ```
 
 ## CUDA and MLX interfaces
