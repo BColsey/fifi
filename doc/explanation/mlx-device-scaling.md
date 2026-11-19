@@ -8,7 +8,7 @@ FIFI_MLX_AUTO_BUDGET=1 enginesrv --config /path/to/config.json
 
 Use an Apple Silicon build with the `native-mlx` feature. The option is off by default. When enabled, it applies to one MLX model per server because the device reports one shared working set. Metal's recommendation is a sizing input for the total working set. Other apps, other server processes and allocation peaks during weight import can put additional pressure on memory. The policy validates the resident model and serving reserve after import, before the worker accepts jobs. An over-budget resident model and reserve fail startup with the charged terms.
 
-The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB). The implementation queries Metal on every opted-in model startup and uses the resulting byte count. Context length and KV format come from the family's configuration.
+The 16 GB M4 mini reports 12,713,115,648 bytes (11.84 GiB). The implementation queries Metal on every opted-in model startup and uses the resulting byte count. `FIFI_MLX_WORKING_SET_MIB` also activates automatic sizing and caps the plan at the lower of the configured ceiling and Metal's recommendation. Context length and KV format come from the family's configuration.
 
 | Family | Sizing inputs in addition to resident weights and allocator headroom | Selection |
 | --- | --- | --- |

@@ -35,6 +35,7 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FIFI_MLX_AUTO_BUDGET` | off | Set to `1` to size Qwen3.6, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. [Sizing and memory charges](../explanation/mlx-device-scaling.md) |
+| `FIFI_MLX_WORKING_SET_MIB` | unset | A positive integer ceiling for the planned Metal working set, in MiB. Setting it activates automatic sizing and retains Metal's recommendation as an upper bound. Applies to one MLX model per server. |
 
 ## Qwen3.6 on Apple Silicon
 

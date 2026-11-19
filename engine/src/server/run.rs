@@ -247,7 +247,10 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             > 1
     {
         return Err(StartupError(
-            "FIFI_MLX_AUTO_BUDGET=1 requires one MLX model per server. Metal reports one shared working set".into(),
+            "FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB requires one MLX model per \
+             server; either variable alone activates automatic sizing, and Metal reports one \
+             shared working set"
+                .into(),
         ));
     }
     let mut engines = Vec::new();

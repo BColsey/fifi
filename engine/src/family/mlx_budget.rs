@@ -1,6 +1,10 @@
 //! Startup working-set budget for an opted-in Apple Silicon model.
 
+use std::{ffi::OsStr, fmt};
+
 use crate::{EngError, family::device_budget::DeviceReserve};
+
+const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -8,7 +12,8 @@ pub(crate) const PRESSURE_MARGIN: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceBudget {
-    bytes: u64,
+    recommended: u64,
+    ceiling: Option<u64>,
 }
 
 impl DeviceBudget {
@@ -18,25 +23,31 @@ impl DeviceBudget {
                 "Metal did not report a recommended working set".into(),
             ));
         }
-        Ok(Self { bytes })
+        Ok(Self {
+            recommended: bytes,
+            ceiling: None,
+        })
     }
 
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn detect() -> Result<Option<Self>, EngError> {
         if enabled() {
-            Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes()).map(Some)
+            let ceiling = std::env::var_os(CEILING_MIB);
+            let ceiling = ceiling.as_deref().map(parse_ceiling).transpose()?;
+            let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
+            Ok(Some(Self { ceiling, ..device }))
         } else {
             Ok(None)
         }
     }
 
     pub(crate) fn bytes(self) -> u64 {
-        self.bytes
+        self.recommended.min(self.ceiling.unwrap_or(u64::MAX))
     }
 
     /// A configured upper bound can make the working set smaller.
     pub(crate) fn prefill(self, configured: Option<u64>) -> u64 {
-        self.bytes.min(configured.unwrap_or(self.bytes))
+        self.bytes().min(configured.unwrap_or(u64::MAX))
     }
 
     /// The space left after the resident charges and the family's reserve.
@@ -53,20 +64,50 @@ impl DeviceBudget {
         let total = reserve.checked_total().ok_or_else(|| {
             EngError::MemoryPlan(format!("{family} MLX startup charges overflow u64"))
         })?;
-        self.bytes.checked_sub(total).ok_or_else(|| {
+        self.bytes().checked_sub(total).ok_or_else(|| {
             let terms = reserve.charges().iter().map(|(name, bytes)| format!("{name}={bytes}"))
                 .collect::<Vec<_>>().join(" ");
             EngError::MemoryPlan(format!(
-                "{family} requires {total} bytes for the resident model and session reserve. Metal recommends {} bytes ({terms})",
-                self.bytes
+                "{family} requires {total} bytes for the resident model and session reserve. Metal recommends {} bytes, with {} bytes admitted ({terms})",
+                self.recommended,
+                self.bytes(),
             ))
         })
     }
 }
 
+impl fmt::Display for DeviceBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "metal_working_set_bytes={} effective_device_budget_bytes={}",
+            self.recommended,
+            self.bytes()
+        )?;
+        if let Some(ceiling) = self.ceiling {
+            write!(f, " configured_device_ceiling_bytes={ceiling}")?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_ceiling(value: &OsStr) -> Result<u64, EngError> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .filter(|&bytes| bytes != 0)
+        .ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "{CEILING_MIB} must be a positive whole number of MiB that fits in u64 bytes"
+            ))
+        })
+}
+
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled() -> bool {
     std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
+        || std::env::var_os(CEILING_MIB).is_some()
 }
 
 #[cfg(test)]
@@ -92,5 +133,30 @@ mod tests {
                 .is_err()
         );
         assert!(DeviceBudget::new(0).is_err());
+    }
+    #[test]
+    fn explicit_ceiling_bounds_every_family_without_overriding_metal() {
+        let ceiling = |mib| Some(parse_ceiling(OsStr::new(mib)).unwrap());
+        let device = DeviceBudget::new(12 << 30).unwrap();
+        let constrained = DeviceBudget {
+            ceiling: ceiling("4096"),
+            ..device
+        };
+        assert_eq!(constrained.bytes(), 4 << 30);
+        assert_eq!(constrained.prefill(Some(2 << 30)), 2 << 30);
+        assert_eq!(constrained.prefill(Some(8 << 30)), 4 << 30);
+        assert!(
+            constrained
+                .remaining("fixture", &[("weights", 5 << 30)])
+                .is_err()
+        );
+        let larger = DeviceBudget {
+            ceiling: ceiling("16384"),
+            ..device
+        };
+        assert_eq!(larger.bytes(), device.bytes());
+        for invalid in ["", "0", "-1", "4.5", "17592186044416"] {
+            assert!(parse_ceiling(OsStr::new(invalid)).is_err(), "{invalid}");
+        }
     }
 }
