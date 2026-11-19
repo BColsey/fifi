@@ -158,9 +158,10 @@ impl TokenDevice for CardDevice {
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
-        // A reset ends whatever decode step was open — aborted by an
-        // error or a cancel — so its partial counts drop, not carry.
-        self.moe.bank().discard_decode_step();
+        // A reset ends the turn's rung accounting whole — open step and
+        // bins — so a turn that never printed its line leaves nothing
+        // for the next one.
+        self.moe.bank().reset_decode_misses();
         self.step.reset()
     }
 
@@ -377,9 +378,10 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         if let Err(error) = self.moe.end_prefill() {
             eprintln!("flash-next cuda: ending the prefill window on reset failed: {error:?}");
         }
-        // A reset ends whatever decode step was open — aborted by an
-        // error or a cancel — so its partial counts drop, not carry.
-        self.moe.bank().discard_decode_step();
+        // A reset ends the turn's rung accounting whole — open step and
+        // bins — so a turn that never printed its line leaves nothing
+        // for the next one.
+        self.moe.bank().reset_decode_misses();
         self.step.reset()
     }
 

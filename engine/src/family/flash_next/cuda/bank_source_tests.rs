@@ -528,6 +528,52 @@ fn a_rung_decode_never_used_prints_no_line() {
     assert!(DecodeMisses::new(2, 8).line(4).is_none());
 }
 
+/// A cancelled turn keeps its fully observed last step: the cancel
+/// arrived after the step's last layer, not during it, so the step
+/// counts and the turn's line does not under-report.
+#[test]
+fn a_discarded_fully_observed_step_still_counts() {
+    use super::bank_source::DecodeMisses;
+    let misses = DecodeMisses::new(2, 8);
+    misses.observe(1, 0, 4);
+    misses.observe(1, 1, 1);
+    // The turn is cancelled after the step's last layer: the step is
+    // whole, so the discard keeps it.
+    misses.discard_open();
+    let line = misses.line(4).expect("the line");
+    assert!(line.contains("1 step"), "{line}");
+    // The kept step's layers missed 4 and 1.
+    assert!(
+        line.contains("misses per layer min 1 / median 1 / max 4"),
+        "{line}"
+    );
+}
+
+/// A device reset zeroes everything: a turn that ended without another
+/// decode call — no line ever printed — leaves nothing for the next
+/// turn's line.
+#[test]
+fn a_reset_zeroes_a_turn_that_never_printed() {
+    use super::bank_source::DecodeMisses;
+    let misses = DecodeMisses::new(2, 8);
+    // One committed step (closed by the next position) plus one open.
+    misses.observe(1, 0, 4);
+    misses.observe(1, 1, 1);
+    misses.observe(2, 0, 2);
+    // The turn ends without a line; the reset clears bins and open step.
+    misses.reset();
+    assert!(misses.line(4).is_none());
+    // The next turn reports only its own steps.
+    misses.observe(3, 0, 1);
+    misses.observe(3, 1, 1);
+    let line = misses.line(4).expect("the line");
+    assert!(line.contains("1 step"), "{line}");
+    assert!(
+        line.contains("misses per layer min 1 / median 1 / max 1"),
+        "{line}"
+    );
+}
+
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::*;

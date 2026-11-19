@@ -957,10 +957,18 @@ pub(super) mod device {
             self.source?.decode_miss_line()
         }
 
-        /// Drops a decode step aborted by an error or a cancel, whole.
+        /// Ends a decode step aborted by an error or a cancel: a fully
+        /// observed step still counts, a half-observed one drops.
         pub(in crate::family::flash_next) fn discard_decode_step(&self) {
             if let Some(source) = self.source {
                 source.discard_decode_step();
+            }
+        }
+
+        /// Zeroes the rung's decode miss state for a device reset.
+        pub(in crate::family::flash_next) fn reset_decode_misses(&self) {
+            if let Some(source) = self.source {
+                source.reset_decode_misses();
             }
         }
 

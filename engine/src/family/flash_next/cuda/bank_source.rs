@@ -443,6 +443,9 @@ pub(in crate::family::flash_next) struct DecodeMisses {
 struct PendingStep {
     pos: u64,
     misses: Vec<u32>,
+    /// Which layers reported for this step: a discard keeps the
+    /// step only when every layer did (see [`DecodeMisses::discard_open`]).
+    seen: Vec<bool>,
     /// The last layer observed: the same position run again (a rollback
     /// or a retry) restarts at a layer at or before this one, which
     /// closes the first run as its own step.
@@ -479,17 +482,41 @@ impl DecodeMisses {
             *pending = Some(PendingStep {
                 pos,
                 misses: vec![0; self.layers],
+                seen: vec![false; self.layers],
                 last_layer: 0,
             });
         }
         let step = pending.as_mut().expect("a pending step just opened");
         step.misses[layer] = misses as u32;
+        step.seen[layer] = true;
         step.last_layer = layer;
     }
 
-    /// Drops an aborted step whole: nothing it observed enters the bins.
+    /// Ends an aborted step: only a step that is really half-observed
+    /// drops — one whose every layer reported counts, because the cancel
+    /// arrived after its last layer, not during it.
     pub(in crate::family::flash_next) fn discard_open(&self) {
+        let mut pending = self.pending.lock().expect("the decode miss pending");
+        if let Some(step) = pending.take()
+            && step.seen.iter().all(|&saw| saw)
+        {
+            self.commit(&step);
+        }
+    }
+
+    /// Zeroes everything for a device reset: the open step and the
+    /// bins, so a turn that ended without another decode call (no
+    /// finish line ever printed) leaves nothing for the next turn's
+    /// line.
+    pub(in crate::family::flash_next) fn reset(&self) {
         *self.pending.lock().expect("the decode miss pending") = None;
+        for bin in &self.per_layer {
+            bin.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for bin in &self.per_step {
+            bin.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.steps.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The one-line report for the turn boundary, as a take: the open
@@ -753,9 +780,16 @@ impl RungSource {
         self.decode_misses.line(self.slots)
     }
 
-    /// Drops a decode step aborted by an error or a cancel, whole.
+    /// Ends a decode step aborted by an error or a cancel: a fully
+    /// observed step still counts, a half-observed one drops.
     pub(in crate::family::flash_next) fn discard_decode_step(&self) {
         self.decode_misses.discard_open();
+    }
+
+    /// Zeroes the decode miss state for a device reset, so a turn that
+    /// ended without its line leaves nothing for the next turn.
+    pub(in crate::family::flash_next) fn reset_decode_misses(&self) {
+        self.decode_misses.reset();
     }
 
     /// The byte size `backing` must carry for [`Self::new`]: the exact
