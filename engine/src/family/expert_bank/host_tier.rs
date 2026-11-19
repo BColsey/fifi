@@ -37,11 +37,13 @@ use std::path::Path;
 /// ext4 both accept.
 pub(crate) const SECTOR: u64 = 4096;
 
-/// `O_DIRECT` (0o040000) is the generic Linux value; x86_64 and aarch64
-/// both carry it. The engine's CUDA paths are Linux-only, and this constant
-/// exists only for them.
+/// The direct-read open flag comes from rustix's per-target tables:
+/// the numeric `O_DIRECT` value differs between Linux archs (x86_64
+/// 0o040000, aarch64 0o200000), so no literal is written here. The
+/// engine's CUDA paths are Linux-only, and this alias exists only for
+/// them.
 #[cfg(target_os = "linux")]
-const O_DIRECT: i32 = 0o040000;
+use rustix::fs::OFlags;
 
 /// The filesystem type holding `path`, by longest mount-point prefix of
 /// `/proc/self/mounts` — the name the refusal carries so an O_DIRECT
@@ -75,7 +77,7 @@ pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
     {
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(O_DIRECT)
+            .custom_flags((OFlags::DIRECT).bits() as i32)
             .open(path)
             .map_err(|error| {
                 io::Error::new(
@@ -623,6 +625,23 @@ pub(crate) mod tests {
     //! O_DIRECT from kernel 6.6 on, so only the printed fs name says what
     //! was proven), and skips, with a printed note, where the directory is
     //! unwritable or O_DIRECT is refused there.
+
+    /// The ring opens with rustix's `O_DIRECT`; this pins the per-target
+    /// value against the arch's known number, so a rustix table change or
+    /// a cross-arch mixup cannot pass silently. The values themselves are
+    /// why the production code takes the flag from rustix: x86_64 and
+    /// aarch64 Linux disagree on every one of them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_direct_flag_matches_the_platform_o_direct() {
+        #[cfg(target_arch = "x86_64")]
+        const EXPECTED: u32 = 0o040000;
+        #[cfg(target_arch = "aarch64")]
+        const EXPECTED: u32 = 0o200000;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        const EXPECTED: u32 = 0;
+        assert_eq!(rustix::fs::OFlags::DIRECT.bits(), EXPECTED);
+    }
 
     use super::{
         AdmitOutcome, CopyFence, HostTierLru, ImmediateFence, ODirectRing, SECTOR,
