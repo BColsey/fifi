@@ -65,6 +65,8 @@ struct WindowFake {
     hold: Option<Gate>,
     failure: Option<Failure>,
     deny_session: bool,
+    /// When set, the denied `new_session` marks this flag cancelled first: the test hook
+    /// for a client that gives up exactly when admission refuses.
     cancel_denied_session: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The fake's pool-derived ceiling, which classifies a final denial on the batch path:
     /// `None` means no budget to report, like the default executor.
@@ -964,6 +966,43 @@ fn session_admission_denial_evicts_and_retries() {
     assert_eq!(lock(&log).windows[0], vec![vec![0], vec![1]]);
     assert_eq!(lock(&log).windows[1], vec![vec![2]]);
     engine.shutdown();
+}
+
+#[test]
+fn a_cancelled_session_admission_denial_spends_no_checkpoint() {
+    let log = Log::default();
+    let (running, running_events) = job(&[0], 1);
+    let (cancelled, cancelled_events) = job(&[1], 1);
+    let mut fake = WindowFake::new(&log);
+    fake.deny_session = true;
+    fake.cancel_denied_session = Some(Arc::clone(&cancelled.generation.cancel));
+    let (engine, release) = start(fake);
+    engine.handle().try_submit(running).expect("submit running");
+    engine
+        .handle()
+        .try_submit(cancelled)
+        .expect("submit cancelled");
+    release.send(()).expect("load");
+    assert_eq!(finish(&collect(cancelled_events)), DecodeFinish::Cancelled);
+    assert_eq!(usage(&collect(running_events)).completion_tokens, 1);
+    engine.shutdown();
+    // A job that was already cancelled when its admission was denied must not evict
+    // another conversation's checkpoint to retry an admission that can no longer matter.
+    let trace = lock(&log);
+    assert_eq!(
+        trace.calls.iter().filter(|call| **call == "evict").count(),
+        0,
+        "a cancelled denial evicted a checkpoint: {:?}",
+        trace.calls
+    );
+    assert_eq!(
+        trace
+            .calls
+            .iter()
+            .filter(|call| **call == "new_session")
+            .count(),
+        1
+    );
 }
 
 #[test]
