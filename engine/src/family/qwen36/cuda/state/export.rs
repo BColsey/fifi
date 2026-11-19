@@ -18,6 +18,7 @@ use super::{
     F32, ResidentState, StateIdentity,
 };
 use crate::{EngError, kernels::cuda::DeviceStream};
+use std::mem::size_of_val;
 
 /// One DeltaNet layer: recurrent `[value head][key row][value column]` and convolution
 /// `[tap][channel]`, both f32.
@@ -40,6 +41,20 @@ pub(crate) struct ExportedState {
     pub(crate) tokens: usize,
     pub(crate) delta: Vec<DeltaExport>,
     pub(crate) kv: Vec<KvExport>,
+}
+
+impl ExportedState {
+    /// Committed host payload, including every retained KV plane and both DeltaNet tensors.
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        let delta = self.delta.iter().map(|layer| {
+            (size_of_val(layer.recurrent.as_slice()) + size_of_val(layer.conv.as_slice())) as u64
+        });
+        let kv = self
+            .kv
+            .iter()
+            .flat_map(|layer| layer.planes.iter().map(|plane| plane.len() as u64));
+        delta.chain(kv).sum()
+    }
 }
 
 // The checkpoint store keeps exports on another thread than the device owner.

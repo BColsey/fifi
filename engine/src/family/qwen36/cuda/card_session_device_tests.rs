@@ -861,12 +861,19 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
     let saved = ExecutorOps::save_prefix(&mut session, &st, &t1[..59], SaveKind::Tip)
         .expect("the save call itself");
     assert!(saved, "{name}: the boundary save must succeed");
+    let shards = session.export_states_for_test().expect("two card exports");
+    let committed_bytes: u64 = shards.iter().map(|state| state.payload_bytes()).sum();
+    assert!(shards.iter().all(|state| state.payload_bytes() > 0));
 
     // Turn 2 through the restore: same tokens, covered prefix.
     ExecutorOps::reset(&mut session, &mut st).expect("reset 2");
     let covered =
         ExecutorOps::restore_prefix(&mut session, &mut st, &t2).expect("the restore call itself");
     assert_eq!(covered, 59, "{name}: the restore covers t1's saved prefix");
+    assert_eq!(
+        session.prefix_report().unwrap().hit,
+        crate::sched::job::PrefixHit::Tip
+    );
     for piece in t2[covered..].chunks(16) {
         ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill t2 tail");
     }
@@ -900,6 +907,14 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
     );
     let control_row = TokenStepper::logits(&mut session, t2[t2.len() - 1]).expect("logits");
     let control_export = session.export_states_for_test().expect("export control");
+    let served = super::card_session::Q36CudaStep::Cards(Box::new(session));
+    let report = served.prefix_report().expect("served peer-prefix report");
+    assert_eq!((report.entries, report.bytes), (1, committed_bytes));
+    assert_eq!(
+        report.hit,
+        crate::sched::job::PrefixHit::Miss,
+        "reset clears the prior request's hit"
+    );
 
     assert_eq!(restored_row.len(), vocab, "{name}: full vocabulary row");
     assert!(

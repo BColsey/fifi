@@ -223,6 +223,14 @@ fn turn(
             &prompt[..boundary],
             SaveKind::Tip,
         )?);
+        if saved == Some(true) && !step.pinned_prefix_enabled() {
+            let report = step.prefix_report().expect("pageable prefix report");
+            let payload = super::prefix::entry_bytes(step.state_layout(), step.tokens())? as u64;
+            assert!(report.bytes >= payload);
+            if report.entries == 1 {
+                assert_eq!(report.bytes, payload);
+            }
+        }
         next = boundary;
     }
     for piece in prompt[next..].chunks(PIECE) {
@@ -990,6 +998,8 @@ fn a_tiered_step_never_saves() {
 struct PinnedSaveObs {
     accepted: bool,
     before_publish: usize,
+    payload_before: u64,
+    payload_after: u64,
     ready: usize,
     pinned_ready: usize,
     no_export: bool,
@@ -1051,17 +1061,19 @@ fn pinned_ready_phase() -> Result<(Vec<u32>, Vec<PinnedReadyObs>), EngError> {
             ExecutorOps::prefill(&mut step, &mut session, range_of(&ids, start..end)?)?;
             let sequence = step.stream_for_tests().enqueued();
             let accepted = ExecutorOps::save_prefix(&mut step, &session, head(&ids, end)?, kind)?;
-            let before_publish = step.prefix.entries_len() + step.prefix.roots_len();
+            let before_publish = step.prefix_report().unwrap();
             ExecutorOps::after_emit(&mut step)?;
             saves.push(PinnedSaveObs {
                 accepted,
-                before_publish,
+                before_publish: before_publish.entries as usize,
+                payload_before: before_publish.bytes,
+                payload_after: step.prefix_report().unwrap().bytes,
                 ready: step.prefix.entries_len() + step.prefix.roots_len(),
                 pinned_ready: step
                     .prefix
                     .snapshots()
                     .filter(|snapshot| {
-                        matches!(snapshot, super::prefix::CudaSavedPrefix::Pinned(_))
+                        matches!(snapshot, super::prefix::CudaSavedPrefix::Pinned { .. })
                     })
                     .count(),
                 no_export: step.stream_for_tests().enqueued() == sequence,
@@ -1134,6 +1146,28 @@ fn assert_pinned_ready(expected: usize) {
             let ready = (index + 1).min(expected);
             assert_eq!(save.accepted, expected > 0);
             assert!(save.before_publish <= index);
+            let per_token: u64 = match mode {
+                KvMode::Fp16 => 20_480,
+                KvMode::Int8G32 => 10_880,
+            };
+            let payload = |committed: u64| 65_863_680_u64 + per_token * committed;
+            assert_eq!(
+                save.payload_before,
+                if index == 1 && expected > 0 {
+                    payload(4)
+                } else {
+                    0
+                }
+            );
+            let rows = [4, 8];
+            assert_eq!(
+                save.payload_after,
+                rows[index + 1 - ready..index + 1]
+                    .iter()
+                    .copied()
+                    .map(payload)
+                    .sum::<u64>()
+            );
             assert_eq!(save.ready, ready);
             assert_eq!(save.pinned_ready, ready);
             assert_eq!(save.no_export, expected == 0);

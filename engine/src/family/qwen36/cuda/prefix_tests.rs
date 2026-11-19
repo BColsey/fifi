@@ -2,7 +2,7 @@
 //! modes and its refusal on an absurd count. The device round trips are `prefix_device_tests.rs`.
 use super::super::host::HostShape;
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::prefix::entry_bytes;
+use super::prefix::{CheckpointPayload, CudaSavedPrefix, entry_bytes};
 use super::state::{
     StateIdentity,
     export::{DeltaExport, ExportedState, KvExport, plane_sizes},
@@ -88,6 +88,10 @@ fn entry_bytes_equals_the_summed_lengths_of_a_zero_export() {
             entry_bytes(&layout, t).expect("entry bytes"),
             delta + kv,
             "{mode:?}: the charge equals the export's own bytes"
+        );
+        assert_eq!(
+            CudaSavedPrefix::Pageable(exported).payload_bytes(),
+            (delta + kv) as u64
         );
     }
 }

@@ -257,7 +257,7 @@ impl QwenResidentStep<'_> {
             .ok_or_else(|| EngError::BadRequest("pinned prefix was not enabled".into()))?;
         let recycled = if kind == SaveKind::Tip {
             self.prefix.take_tip_if(key, &path, |saved| match saved {
-                CudaSavedPrefix::Pinned(saved) => {
+                CudaSavedPrefix::Pinned { state: saved, .. } => {
                     pool.can_recycle(&self.stream, &self.state, saved)
                 }
                 _ => false,
@@ -266,7 +266,7 @@ impl QwenResidentStep<'_> {
             None
         };
         let recycled = match recycled {
-            Some(CudaSavedPrefix::Pinned(saved)) => Some(saved),
+            Some(CudaSavedPrefix::Pinned { state: saved, .. }) => Some(saved),
             _ => None,
         };
         let mut state = match pool.begin(self.context, &self.stream, &self.state, recycled) {
@@ -306,8 +306,12 @@ impl QwenResidentStep<'_> {
             .ok_or_else(|| EngError::BadRequest("pending prefix lost its pool".into()))?;
         let state = pool.finish(self.context, &self.stream, &self.state, pending.state)?;
         let positions = state.tokens();
+        let charge = entry_bytes(self.state.layout(), positions)?;
         let copied_kv_bytes = state.copied_kv_bytes();
-        let mut ready = Some(CudaSavedPrefix::Pinned(state));
+        let mut ready = Some(CudaSavedPrefix::Pinned {
+            state,
+            payload_bytes: charge,
+        });
         let saved = pending.session.save_prefix(
             &mut self.prefix,
             pending.session.history(),
@@ -321,10 +325,8 @@ impl QwenResidentStep<'_> {
             },
         )?;
         if saved {
-            let charge = entry_bytes(self.state.layout(), positions)
-                .map_or_else(|error| format!("{error:?}"), |bytes| format!("{bytes} B"));
             eprintln!(
-                "q36 cuda: prefix saved {positions} positions, {charge}, {:.1} ms, KV copied {copied_kv_bytes} B",
+                "q36 cuda: prefix saved {positions} positions, {charge} B, {:.1} ms, KV copied {copied_kv_bytes} B",
                 began.elapsed().as_secs_f64() * 1000.0
             );
         }

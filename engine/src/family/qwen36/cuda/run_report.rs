@@ -176,6 +176,21 @@ pub(crate) struct PrefillReport {
     logged: bool,
 }
 
+/// Capture lookup facts before this request's saves and evictions can change them.
+pub(super) fn prefix_lookup<S, P>(
+    prefix: &PrefixSlot<S, P>,
+    prompt: &[u32],
+    covered: usize,
+) -> PrefixReport {
+    PrefixReport {
+        hit: prefix.restored_kind().into(),
+        uncached_shared: prefix.uncached_shared(prompt, covered),
+        shadow: prefix.shadow_report(),
+        save_side: prefix.save_side_totals(),
+        ..PrefixReport::default()
+    }
+}
+
 impl PrefillReport {
     pub(super) fn observe_prefix_lookup<S, P>(
         &mut self,
@@ -183,15 +198,7 @@ impl PrefillReport {
         prompt: &[u32],
         covered: usize,
     ) {
-        self.prefix_lookup = PrefixReport {
-            hit: prefix.restored_kind().into(),
-            uncached_shared: prefix.uncached_shared(prompt, covered),
-            shadow: prefix.shadow_report(),
-            // The save-side lifetime totals, sampled at lookup. The resident executor
-            // samples at report time; the difference is this job's own saves.
-            save_side: prefix.save_side_totals(),
-            ..PrefixReport::default()
-        };
+        self.prefix_lookup = prefix_lookup(prefix, prompt, covered);
     }
 
     /// A step whose status word was non-zero is still recorded: the record is pushed before

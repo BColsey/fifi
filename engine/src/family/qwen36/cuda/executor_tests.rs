@@ -423,9 +423,10 @@ fn c1_cuda_executor_emits_the_job_local_prefix_report() {
         body.contains("self.last_prefill_report().prefix_lookup"),
         "{body}"
     );
-    assert!(body.contains("self.prefix.entries_len()"), "{body}");
-    assert!(body.contains("self.prefix.roots_len()"), "{body}");
-    assert!(body.contains("Some(PrefixReport{"), "{body}");
+    assert!(
+        body.contains("Some(stored_prefix_report(&self.prefix,"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -485,11 +486,9 @@ fn c2_staging_preserves_store_and_reporting_is_read_only() {
         "fn prefix_report(",
     ));
     assert!(
-        report.contains("entries_len().saturating_add(self.prefix.roots_len())"),
+        report.contains("stored_prefix_report(&self.prefix,"),
         "{report}"
     );
-    assert!(report.contains(".unwrap_or(u32::MAX)"), "{report}");
-    assert!(report.contains("bytes:0,"), "{report}");
     assert!(
         !report.contains("complete_prefix_save("),
         "report must not publish pending saves"
@@ -650,4 +649,21 @@ fn the_worker_piece_follows_the_verdict() {
             Some(m_sess)
         );
     }
+}
+
+#[test]
+fn served_peer_executor_forwards_the_prefix_report() {
+    let source = include_str!("card_session.rs");
+    let (_, wrapper) = source
+        .split_once("impl ExecutorOps for Q36CudaStep")
+        .unwrap();
+    let report = pinned(section_of(wrapper, "card_session.rs", "fn prefix_report("));
+    assert!(
+        report.contains("Self::Cards(session)=>session.prefix_report()"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Self::Single(step)=>step.prefix_report()"),
+        "{report}"
+    );
 }
