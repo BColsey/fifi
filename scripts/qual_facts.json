@@ -16,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 7343,
+      "test_fns": 7346,
       "ignored": 665,
       "env_gates": [
         "BOLT_DUMP_LOGITS",
@@ -122,6 +122,7 @@
         "FIFI_FLINT_MLX_CONTEXT_LIMIT",
         "FIFI_FLINT_MLX_DECODE_ATTN",
         "FIFI_FLINT_MLX_EXPERT_PIPELINE",
+        "FIFI_FLINT_MLX_EXPERT_READ_RUNS",
         "FIFI_FLINT_MLX_PREFILL_CHAIN",
         "FIFI_FLINT_MLX_RING_VIEW",
         "FIFI_FLINT_MLX_T1_FLASH",

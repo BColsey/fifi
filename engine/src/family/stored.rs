@@ -611,6 +611,31 @@ pub(crate) fn read_stack_into(
     dst: &mut [u8],
     layout: &StackLayout,
 ) -> Result<(), EngError> {
+    read_stack_to_pages::<false>(ckpt, weight, indices, dst, layout)
+}
+
+/// Coalesces adjacent source slices that also occupy adjacent stack slots.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn read_stack_runs_into(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
+    read_stack_to_pages::<true>(ckpt, weight, indices, dst, layout)
+}
+
+fn read_stack_to_pages<const COALESCE: bool>(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
     if indices.is_empty() || u32::try_from(indices.len()).ok() != Some(layout.count) {
         return Err(EngError::BadRequest(format!(
             "expert stack of {} needs {} slices, received {}",
@@ -635,18 +660,42 @@ pub(crate) fn read_stack_into(
     }
     for (role, range) in layout.roles() {
         let key = format!("{}.{role}", weight.stem);
-        for (rank, &index) in indices.iter().enumerate() {
+        let mut rank = 0;
+        while rank < indices.len() {
+            let index = indices[rank];
+            let count = if COALESCE {
+                1 + indices[rank..]
+                    .windows(2)
+                    .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
+                    .count()
+            } else {
+                1
+            };
             let start = rank
                 .checked_mul(range.slice_len)
                 .and_then(|offset| range.offset.checked_add(offset))
                 .ok_or_else(|| EngError::BadRequest(format!("{key} offset overflows")))?;
-            let end = start
-                .checked_add(range.slice_len)
+            let end = count
+                .checked_mul(range.slice_len)
+                .and_then(|bytes| start.checked_add(bytes))
                 .filter(|&end| end <= dst.len())
                 .ok_or_else(|| EngError::BadRequest(format!("{key} range passes the end")))?;
-            counted_read(range.slice_len, || {
+            counted_read(end - start, || {
+                #[cfg(any(
+                    test,
+                    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+                ))]
+                if COALESCE && count > 1 {
+                    return ckpt.read_slice_run_into(
+                        &key,
+                        index,
+                        count as u32,
+                        &mut dst[start..end],
+                    );
+                }
                 ckpt.read_slice_into(&key, index, &mut dst[start..end])
             })?;
+            rank += count;
         }
     }
     Ok(())
@@ -1282,6 +1331,20 @@ mod tests {
             StackLayout::new(&ckpt, &w, 0, 0, page),
             Err(EngError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn read_stack_runs_preserve_mixed_slices_and_padding() {
+        let checkpoint = expert_checkpoint();
+        let weight = sliced(&checkpoint, "e", spec4(), 2, 32).unwrap();
+        let indices = [0, 1, 1, 0, 1];
+        let layout = StackLayout::new(&checkpoint, &weight, indices.len() as u32, 64, 64).unwrap();
+        let untouched = vec![0xA5; layout.end + 64];
+        let mut ordinary = untouched.clone();
+        let mut grouped = untouched;
+        read_stack_into(&checkpoint, &weight, &indices, &mut ordinary, &layout).unwrap();
+        read_stack_runs_into(&checkpoint, &weight, &indices, &mut grouped, &layout).unwrap();
+        assert_eq!(grouped, ordinary);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use super::{
     factory::context_limit,
-    mlx_model::{Ffn, Layer, Model, Routed, SwiGlu, expert_pipeline_flagged},
+    mlx_model::{Ffn, Layer, Model, Routed, SwiGlu, expert_pipeline_flagged, expert_read_runs},
     mlx_route,
     mlx_state::{ChunkCachePlan, Plane, State, WINDOW},
     precision_native,
@@ -750,7 +750,9 @@ fn stage_disk_experts(
     }
     let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
     let (stack, local, _pages) = if pipeline {
-        let (stack, local, pages) = SwiGlu::load_expert_pages(k, source, stem, &experts, &local)?;
+        let coalesce_reads = expert_read_runs().coalesce(x.shape()[0]);
+        let (stack, local, pages) =
+            SwiGlu::load_expert_pages(k, source, stem, &experts, &local, coalesce_reads)?;
         (stack, local, Some(pages))
     } else {
         let (stack, local) = SwiGlu::load_experts(k, source, stem, &experts, &local)?;

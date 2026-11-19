@@ -158,6 +158,7 @@ impl FlintCheckpoint {
         stem: &str,
         ids: &[u32],
         remapped: &Tensor,
+        coalesce_reads: bool,
     ) -> Result<
         (
             crate::kernels::HostPages,
@@ -166,7 +167,9 @@ impl FlintCheckpoint {
         ),
         EngError,
     > {
-        use crate::family::stored::{RoleRange, StackLayout, read_stack_into};
+        use crate::family::stored::{
+            RoleRange, StackLayout, read_stack_into, read_stack_runs_into,
+        };
         use crate::kernels::{HostPages, PackedPages, PageRange};
 
         let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
@@ -204,7 +207,12 @@ impl FlintCheckpoint {
             message: "fresh expert pages are not writable".into(),
         })?;
         for (weight, layout) in &stacks {
-            read_stack_into(&self.weights, weight, ids, dst, layout)?;
+            let read_stack = if coalesce_reads {
+                read_stack_runs_into
+            } else {
+                read_stack_into
+            };
+            read_stack(&self.weights, weight, ids, dst, layout)?;
         }
         dst[end..id_end].copy_from_slice(local_bytes);
         let range = |role: &RoleRange| PageRange {

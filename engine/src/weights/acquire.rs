@@ -182,6 +182,36 @@ impl StreamedWeights {
         self.read_range_into(key, start, dst)
     }
 
+    /// Reads consecutive leading slices into their contiguous destination.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn read_slice_run_into(
+        &self,
+        key: &str,
+        first: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), EngError> {
+        let Some((entry, start, slice_len)) = self.slice_span(key, first)? else {
+            return Err(EngError::Checkpoint(format!("missing tensor {key}")));
+        };
+        if count == 0 || count > entry.shape()[0] - first {
+            return Err(EngError::BadRequest(format!(
+                "tensor {key:?}: invalid run of {count} slices starting at {first}"
+            )));
+        }
+        let bytes = u64::from(count).checked_mul(slice_len);
+        if bytes != u64::try_from(dst.len()).ok() {
+            return Err(EngError::BadRequest(format!(
+                "tensor {key:?}: slice run does not fill the {}-byte destination",
+                dst.len()
+            )));
+        }
+        self.read_range_into(key, start, dst)
+    }
+
     /// The entry, data offset, and byte length of leading slice `index` of `key`.
     /// `None` when the key is absent.
     fn slice_span(
@@ -527,6 +557,28 @@ impl StreamedCheckpoint {
             .read_slice_into(key, index, dst)
     }
 
+    /// See [`StreamedWeights::read_slice_run_into`].
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn read_slice_run_into(
+        &self,
+        key: &str,
+        first: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), EngError> {
+        let &store = self
+            .route
+            .get(key)
+            .ok_or_else(|| EngError::Checkpoint(format!("missing tensor {key}")))?;
+        self.stores
+            .get(store)
+            .ok_or_else(invalid_route)?
+            .read_slice_run_into(key, first, count, dst)
+    }
+
     pub fn wait(&self, ticket: Ticket) -> Result<Completion, EngError> {
         ticket.outcome
     }
@@ -676,6 +728,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn read_slice_run_checks_extent_and_destination_before_writing() {
+        let (file, index) = shard(&[("a", "U32", vec![3, 2, 3], (0..72u8).collect())]);
+        let ckpt = open(file, &index);
+        let mut dst = [0xEE; 48];
+        for (first, count) in [(0, 0), (0, 1), (2, 2), (3, 2), (1, u32::MAX)] {
+            assert!(matches!(
+                ckpt.read_slice_run_into("a", first, count, &mut dst),
+                Err(EngError::BadRequest(_))
+            ));
+            assert_eq!(dst, [0xEE; 48]);
+        }
+        ckpt.read_slice_run_into("a", 1, 2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice(), (24..72u8).collect::<Vec<_>>());
     }
 
     #[test]

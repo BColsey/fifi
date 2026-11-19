@@ -18,6 +18,62 @@ pub(super) fn expert_pipeline_flagged() -> bool {
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ExpertReadRuns {
+    Off,
+    Prefill,
+    All,
+}
+
+impl ExpertReadRuns {
+    fn from_env(value: Option<&str>) -> Self {
+        match value {
+            Some("prefill") => Self::Prefill,
+            Some("1") => Self::All,
+            _ => Self::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Prefill => "prefill",
+            Self::All => "on",
+        }
+    }
+
+    pub(super) fn coalesce(self, rows: u32) -> bool {
+        matches!(self, Self::All) || (matches!(self, Self::Prefill) && rows > 1)
+    }
+}
+
+pub(super) fn expert_read_runs() -> ExpertReadRuns {
+    static MODE: OnceLock<ExpertReadRuns> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        ExpertReadRuns::from_env(
+            std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn expert_read_runs_preserve_legacy_and_allow_multi_row_only() {
+    for (value, one, many) in [
+        (None, false, false),
+        (Some("0"), false, false),
+        (Some("unexpected"), false, false),
+        (Some("prefill"), false, true),
+        (Some("1"), true, true),
+    ] {
+        let mode = ExpertReadRuns::from_env(value);
+        assert_eq!(mode.coalesce(1), one, "{value:?}");
+        assert_eq!(mode.coalesce(2), many, "{value:?}");
+    }
+}
+
 /// Mac MLX freed-buffer cache limit. Default 64 MiB: bounded reuse keeps
 /// per-step freed buffers on the device instead of paying a driver
 /// round-trip for every free/malloc pair. Rollback:
@@ -77,8 +133,10 @@ impl SwiGlu {
         stem: &str,
         experts: &[u32],
         remapped: &Tensor,
+        coalesce_reads: bool,
     ) -> Result<(Self, ExecutionTensor, crate::kernels::HostPages)> {
-        let (pages, packed, local) = source.expert_pages(stem, experts, remapped)?;
+        let (pages, packed, local) =
+            source.expert_pages(stem, experts, remapped, coalesce_reads)?;
         let (weights, ids) = k.import_packed_pages(&pages, &packed, &[local])?;
         let (weights, ids) = Self::take_experts(weights, ids)?;
         Ok((weights, ids, pages))
@@ -274,13 +332,15 @@ impl Model {
         };
         let disk = streamed_expert_bytes != 0;
         if disk {
+            let pipeline = expert_pipeline_flagged();
             eprintln!(
-                "flint: MLX expert pipeline {}",
-                if expert_pipeline_flagged() {
-                    "on"
+                "flint: MLX expert pipeline {}, contiguous reads {}",
+                if pipeline { "on" } else { "off" },
+                if pipeline {
+                    expert_read_runs().label()
                 } else {
                     "off"
-                }
+                },
             );
         }
         if let Some(bytes) = available {
