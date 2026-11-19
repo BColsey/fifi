@@ -1,5 +1,9 @@
 mod acquire;
 pub mod exl3;
+
+// No caller yet; kept compiling and tested standalone.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod expert_store;
 mod gguf;
 mod gguf_dequant;
 mod gguf_tables;

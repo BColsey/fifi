@@ -21,6 +21,10 @@ use std::cell::Cell;
 use std::fs::File;
 use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
+// Every read_at call site here is Linux-gated (the shared retry loop in
+// weights::expert_store carries the trait itself); the import must match
+// or non-Linux clippy fails it as unused.
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::FileExt;
 // O_DIRECT exists only on Linux; the trait import must match the cfg on
 // custom_flags below or non-Linux clippy fails it as unused.
@@ -474,22 +478,10 @@ impl ODirectRing {
 /// never touched), short at EOF: returns how many bytes were read before the
 /// file ended. The wanted-exactness check is the caller's, because only it
 /// knows which part of the aligned span is record and which is padding.
+/// The retry loop itself lives in `weights::expert_store` (shared with the
+/// expert record stores); this is a thin adapter over the shared handle.
 fn pread_at_most(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    let mut done = 0;
-    while done < buf.len() {
-        // read_at does not retry EINTR itself; a signal must not fail a
-        // span read that was making progress.
-        let n = match file.read_at(&mut buf[done..], offset + done as u64) {
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if n == 0 {
-            break;
-        }
-        done += n;
-    }
-    Ok(done)
+    crate::weights::expert_store::pread_at_most(file, buf, offset)
 }
 
 /// The host tier's LRU over the resident spare places: per layer, which
