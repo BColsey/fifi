@@ -239,13 +239,9 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             .engines
             .iter()
             .filter(|entry| {
-                matches!(
-                    entry.family.as_str(),
-                    flint::FAMILY
-                        | factory::FAMILY
-                        | q36_factory::FAMILY
-                        | q36_factory::DENSE_FAMILY
-                )
+                FAMILY_STARTERS
+                    .iter()
+                    .any(|&(family, _, metal)| metal && family == entry.family)
             })
             .count()
             > 1
@@ -573,14 +569,17 @@ fn start_gemma4(
 /// The closed registry of families this build starts. Staged backends
 /// refuse inside their starter before model or tokenizer reads; the
 /// config gate owns the unknown-family rejection text.
-const FAMILY_STARTERS: &[(&str, Starter)] = &[
-    (flint::FAMILY, start_flint),
-    (factory::FAMILY, start_flash),
-    (q36_factory::FAMILY, start_q36),
-    (q36_factory::DENSE_FAMILY, start_q36),
-    (nemotron_factory::FAMILY, start_nemotron),
-    (gemma4::FAMILY, start_gemma4),
-    (fake::FAMILY, start_fake),
+// The third column: the starter builds a Metal-resident executor on a
+// `native-mlx` build. The auto-budget one-model rule reads it, so the family
+// set it counts can never drift from this dispatch table.
+const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
+    (flint::FAMILY, start_flint, true),
+    (factory::FAMILY, start_flash, true),
+    (q36_factory::FAMILY, start_q36, true),
+    (q36_factory::DENSE_FAMILY, start_q36, true),
+    (nemotron_factory::FAMILY, start_nemotron, false),
+    (gemma4::FAMILY, start_gemma4, false),
+    (fake::FAMILY, start_fake, false),
 ];
 
 /// The per-entry prefix-reuse decision, pure in its inputs so the family
@@ -631,14 +630,14 @@ pub(crate) fn default_prefix_reuse_with(
 /// The registry's family names, for the uniqueness pin in tests.
 #[cfg(test)]
 pub(crate) fn family_names() -> Vec<&'static str> {
-    FAMILY_STARTERS.iter().map(|(name, _)| *name).collect()
+    FAMILY_STARTERS.iter().map(|(name, _, _)| *name).collect()
 }
 
 pub(crate) fn family_starter(family: &str) -> Option<Starter> {
     FAMILY_STARTERS
         .iter()
-        .find(|(name, _)| *name == family)
-        .map(|(_, starter)| *starter)
+        .find(|(name, _, _)| *name == family)
+        .map(|&(_, starter, _)| starter)
 }
 
 /// The startup line for the block prefix-match. The helper only formats:
@@ -1588,6 +1587,27 @@ mod tests {
             text.contains("engine e1 failed to start")
                 && text.contains("temperature must be between 0 and 2, found 2.5"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_metal_resident_flag_column_pins_the_mlx_starter_set() {
+        // The one-model rule reads this column, so the pinned set is the
+        // contract: exactly the MLX families carry the flag. A new family
+        // must choose its column deliberately - this test names the choice.
+        let metal: Vec<&str> = super::FAMILY_STARTERS
+            .iter()
+            .filter(|&&(_, _, metal)| metal)
+            .map(|&(name, _, _)| name)
+            .collect();
+        assert_eq!(
+            metal,
+            vec![
+                crate::family::flint::FAMILY,
+                crate::family::flash_next::factory::FAMILY,
+                crate::family::qwen36::factory::FAMILY,
+                crate::family::qwen36::factory::DENSE_FAMILY,
+            ]
         );
     }
 

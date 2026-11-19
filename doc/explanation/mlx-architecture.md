@@ -1,6 +1,6 @@
 # Shared execution on Apple Silicon
 
-Qwen3.6, Flash-Next and Flint use the same worker and generation session on MLX. Qwen3.6 and Flash-Next also use one host-side prefill planner and one native operation for a packed projection of a single row. A change at either of those seams is checked against both model families in one set of lib tests.
+Qwen3.6, Flash-Next and Flint use the same worker and generation session on MLX. Qwen3.6 and Flash-Next also use one host-side prefill planner and one native operation for a packed projection of a single row. A change at either of those seams is checked against both model families in one set of lib tests. All three use an opt-in Metal working-set budget and the same fitting-chunk rule with family-specific memory costs. [Device-aware startup and CUDA comparison](mlx-device-scaling.md)
 
 | Responsibility | Shared implementation | Family-owned inputs and behavior |
 | --- | --- | --- |
