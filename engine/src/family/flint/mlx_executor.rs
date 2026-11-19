@@ -188,14 +188,32 @@ impl FlintExecutor {
     }
 }
 
-/// The two batched widths supported by the serving options. Price the full-attention score,
-/// mask and softmax matrices for the composite fallback. The streaming kernel can use less.
+/// Ladder prefill widths for the device-budget path: the SHARED
+/// prefill::mlx::PREFILL_CANDIDATES ladder (2048 down to 1) capped by the
+/// switch ceiling, the same list Qwen3.6 and Flash-Next size their rows
+/// from, so the next rung change reaches all three with one edit. The
+/// [T, H] batch forward serves ANY width (its only bound is that a chunk
+/// plus its position fits the context), and the FlintPath fingerprint
+/// records the value the planner picks; the 512/1024 list the env switch
+/// recognizes is the QUALIFIED set for hand-rolled values, not a kernel
+/// constraint, and the switch's fail-safe (unrecognized -> 512) does not
+/// apply to planner results.
+///
+/// Pricing: the per-row charge is the composite attention fallback's
+/// score+mask+softmax materialization (3 x [rows*32, context] F32). The
+/// kernel that actually runs for a multi-row chunk is the sink-bearing
+/// float-flash prefill, whose per-row allocator cost is the Q projection
+/// plus the attention output (2 x 32 x 128 x 4 B ~= 32 KiB F32, two orders
+/// below the composite at 32K context), so the charge is a conservative
+/// upper bound that also covers the composite route the runtime flags can
+/// still select. Without the sub-512 rungs this charge cliffs to ONE row
+/// whenever under ~6.4 GiB remain at 32K context - the slowest path there
+/// is - which is why the ladder walks down to 4 instead.
 fn fitting_prefill_piece(max_rows: usize, context: u32, remaining: u64) -> Result<usize> {
     let score_bytes_per_row = 3 * 32 * u64::from(context) * 4;
-    let candidates = [1024_u32, 512]
-        .into_iter()
-        .filter(|&rows| rows as usize <= max_rows);
-    let rows = crate::family::prefill::mlx::largest_fitting_chunk(candidates, remaining, |rows| {
+    let max_rows = u32::try_from(max_rows)
+        .map_err(|_| EngError::BadRequest("Flint prefill ceiling exceeds u32".into()))?;
+    let rows = crate::family::prefill::mlx::admitted_chunk(max_rows, remaining, |rows| {
         Ok(u64::from(rows) * score_bytes_per_row)
     })?;
     Ok(rows.unwrap_or(1) as usize)
@@ -246,21 +264,56 @@ fn device_prefill_piece(
 
 #[cfg(test)]
 #[test]
-fn device_prefill_uses_only_supported_widths_and_respects_the_ceiling() {
+fn device_prefill_walks_the_ladder_and_respects_the_ceiling() {
     let context = 32768;
-    let floor = 3 * 32 * u64::from(context) * 4 * 512;
-    assert_eq!(fitting_prefill_piece(1024, context, floor - 1).unwrap(), 1);
-    assert_eq!(fitting_prefill_piece(1024, context, floor).unwrap(), 512);
+    let row = 3 * 32 * u64::from(context) * 4;
+    // Each rung is the largest whose whole-row charge fits; the rung below
+    // takes over where the old two-rung ladder cliffed to one row.
     assert_eq!(
-        fitting_prefill_piece(1024, context, floor * 2).unwrap(),
+        fitting_prefill_piece(1024, context, row * 512 - 1).unwrap(),
+        256
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 512).unwrap(),
+        512
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 1024).unwrap(),
         1024
     );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 256 - 1).unwrap(),
+        128
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, context, row * 4 - 1).unwrap(),
+        // Below four rows' worth of workspace no multi-row rung fits; the
+        // ladder has no 2 rung, so the planner falls to one row.
+        1
+    );
+    assert_eq!(fitting_prefill_piece(1024, context, row * 4).unwrap(), 4);
+    assert_eq!(fitting_prefill_piece(1024, context, row - 1).unwrap(), 1);
     assert_eq!(fitting_prefill_piece(512, context, u64::MAX).unwrap(), 512);
     assert_eq!(fitting_prefill_piece(1, context, u64::MAX).unwrap(), 1);
     assert_eq!(
-        fitting_prefill_piece(1024, context / 4, floor).unwrap(),
+        fitting_prefill_piece(1024, context / 4, row * 512).unwrap(),
         1024
     );
+}
+
+#[cfg(test)]
+#[test]
+fn device_prefill_does_not_cliff_on_the_studio_working_set() {
+    // The Mac Studio on-leg numbers from the S1 serve proof: a 28 GiB
+    // FIFI_MLX_WORKING_SET_MIB cap left exactly 5,638,506,944 bytes after
+    // resident weights, session state, reserves and the pressure margin.
+    // The old two-rung ladder selected ONE row there (512 rows cost
+    // 6,442,450,944); the walked ladder must not.
+    let context = 32768;
+    let remaining = 5_638_506_944_u64;
+    let selected = fitting_prefill_piece(1024, context, remaining).unwrap();
+    assert!(selected > 1, "cliffed to one row: {selected}");
+    assert_eq!(selected, 256);
 }
 
 impl ExecutorOps for FlintExecutor {
