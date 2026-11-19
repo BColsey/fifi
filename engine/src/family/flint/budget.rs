@@ -617,7 +617,7 @@ impl FlintEnv {
     /// the listed words arm a set value), exactly as the executor's
     /// default-on switch rule resolves the same text.
     pub(crate) fn alloc_cache_enabled(&self) -> bool {
-        crate::tokenizer::env_allows_value(self.alloc_cache.as_deref())
+        crate::env_switch::env_allows_value(self.alloc_cache.as_deref())
     }
 }
 

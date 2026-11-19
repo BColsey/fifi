@@ -264,12 +264,12 @@ fn cache_switch_defaults_on_and_supports_explicit_rollback() {
             "unset Flint selector must enable reuse"
         );
     }
-    assert!(crate::tokenizer::env_allows_value(None));
+    assert!(crate::env_switch::env_allows_value(None));
     for value in ["1", "true", "on", "  TrUe\n"] {
-        assert!(crate::tokenizer::env_allows_value(Some(value)));
+        assert!(crate::env_switch::env_allows_value(Some(value)));
     }
     for value in ["0", "off", "", "2"] {
-        assert!(!crate::tokenizer::env_allows_value(Some(value)));
+        assert!(!crate::env_switch::env_allows_value(Some(value)));
     }
 }
 

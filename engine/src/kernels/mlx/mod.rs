@@ -479,7 +479,7 @@ pub enum KvBlock<'a> {
 /// vendor fused SDPA with exactness-checked BF16 sinks. Read once per
 /// process (`OnceLock`, the family/session.rs:541-550 convention) so the
 /// decode hot path pays no env read per attention call. Polarity is the
-/// shared default-on reader `tokenizer::env_allows_default_on` (pinned by
+/// shared default-on reader `env_switch::env_allows_default_on` (pinned by
 /// the child-process rollback test): only an absent variable or an explicit
 /// enable word keeps it on; "0" (the rollback), any other value, or a value
 /// that is not UTF-8 restores the float-flash small-block path - a mis-set
@@ -487,7 +487,7 @@ pub enum KvBlock<'a> {
 pub fn decode_attn_flagged() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = crate::tokenizer::env_allows_default_on("FIFI_FLINT_MLX_DECODE_ATTN");
+        let on = crate::env_switch::env_allows_default_on("FIFI_FLINT_MLX_DECODE_ATTN");
         // The one load line an operator needs to confirm a rollback.
         eprintln!(
             "flint: decode attention vendor route {}",
@@ -510,7 +510,7 @@ pub fn compile_layer_flagged() -> bool {
     *ENABLED.get_or_init(|| {
         let on = match std::env::var("FIFI_FLINT_MLX_COMPILE_LAYER") {
             Err(_) => false,
-            Ok(value) => crate::tokenizer::env_allows_value(Some(&value)),
+            Ok(value) => crate::env_switch::env_allows_value(Some(&value)),
         };
         // The one load line an operator needs to confirm a rollback.
         eprintln!(
@@ -566,7 +566,7 @@ pub(crate) fn t1_flash_flagged() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FIFI_FLINT_MLX_T1_FLASH") {
         Err(_) => false,
-        Ok(value) => crate::tokenizer::env_allows_value(Some(&value)),
+        Ok(value) => crate::env_switch::env_allows_value(Some(&value)),
     })
 }
 

@@ -51,7 +51,7 @@ const JOBS_PIECE_ROWS: usize = 1024;
 const TALL_BLOCK_BYTES: usize = 64 << 20;
 
 fn alloc_cache_selected() -> bool {
-    crate::tokenizer::env_allows_default_on(ALLOC_CACHE_VAR)
+    crate::env_switch::env_allows_default_on(ALLOC_CACHE_VAR)
 }
 
 /// The frozen effective selectors the prefix fingerprint binds: one read per

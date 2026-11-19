@@ -91,7 +91,7 @@ fn t1_decode_routing_follows_the_decode_attn_flag() {
 fn t1_f32_routing_follows_the_t1_flash_flag() {
     let flagged = match std::env::var("FIFI_FLINT_MLX_T1_FLASH") {
         Err(_) => false,
-        Ok(value) => crate::tokenizer::env_allows_value(Some(&value)),
+        Ok(value) => crate::env_switch::env_allows_value(Some(&value)),
     };
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();

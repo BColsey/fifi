@@ -3,6 +3,7 @@ mod checkpoint_json;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod cache;
+mod env_switch;
 #[cfg(test)]
 mod exec_fake;
 pub mod expert_tier;

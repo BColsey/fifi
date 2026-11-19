@@ -89,15 +89,6 @@ impl ChatTemplate {
         source == include_str!("../../testdata/chat_template.jinja")
     }
 
-    /// The pure polarity of a default-on switch that FAILS SAFE, kept as a
-    /// test-only seam over the lifted `crate::tokenizer::env_allows_value`
-    /// (production reads go through `env_allows_default_on`). The policy
-    /// lives on the lifted function.
-    #[cfg(test)]
-    pub(super) fn env_allows_value(value: Option<&str>) -> bool {
-        super::env_allows_value(value)
-    }
-
     /// Pure resolution of the replay flags so the coupling is testable
     /// without touching process-global environment: replay needs an
     /// ELIGIBLE template (the caller passes demotion AND the pinned-template
@@ -132,7 +123,7 @@ impl ChatTemplate {
     }
 
     fn env_allows(name: &str) -> bool {
-        super::env_allows_default_on(name)
+        crate::env_switch::env_allows_default_on(name)
     }
 
     pub fn render(

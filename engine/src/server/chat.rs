@@ -400,7 +400,7 @@ pub(crate) fn warm_flag_on() -> bool {
         -1 => return false,
         _ => {}
     }
-    crate::tokenizer::env_allows_default_on(WARM_TURNS_VAR)
+    crate::env_switch::env_allows_default_on(WARM_TURNS_VAR)
 }
 
 /// When the prompt ends inside an open think block, the template asked for thinking and the
@@ -818,7 +818,7 @@ mod tests {
     /// value — disable words, case games, whitespace, empty — rolls back.
     #[test]
     fn only_the_enable_words_keep_warm_turns_on() {
-        use crate::tokenizer::env_allows_value;
+        use crate::env_switch::env_allows_value;
         assert!(env_allows_value(None), "unset: the default is ON");
         assert!(!env_allows_value(Some("0")), "the plain rollback");
         assert!(env_allows_value(Some("1")), "explicit enable");

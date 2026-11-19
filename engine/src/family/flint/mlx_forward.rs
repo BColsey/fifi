@@ -68,12 +68,12 @@ pub(crate) const GROUP_LAYERS: usize = 4;
 /// grouped into `GROUP_LAYERS`-layer evaluate chains. Default ON (an A/B run measured
 /// step 0.1038 -> 0.0774 s with bitwise-identical logits); the fail-safe rollback is
 /// `FIFI_FLINT_MLX_ASYNC_CHAIN=0` (or any non-enable value — see
-/// `tokenizer::env_allows_default_on`). Read once per process, and the effective state
+/// `env_switch::env_allows_default_on`). Read once per process, and the effective state
 /// is logged once at that read.
 pub(in crate::family::flint) fn async_chain_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        let on = crate::tokenizer::env_allows_default_on("FIFI_FLINT_MLX_ASYNC_CHAIN");
+        let on = crate::env_switch::env_allows_default_on("FIFI_FLINT_MLX_ASYNC_CHAIN");
         // The one load line an operator needs to confirm a rollback.
         eprintln!("flint: async chain {}", if on { "on" } else { "off" });
         on
@@ -87,7 +87,7 @@ pub(in crate::family::flint) fn async_chain_flagged() -> bool {
 pub(in crate::family::flint) fn coalesce_residual_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        let on = crate::tokenizer::env_allows_default_on("FIFI_FLINT_MLX_COALESCE_RESIDUAL");
+        let on = crate::env_switch::env_allows_default_on("FIFI_FLINT_MLX_COALESCE_RESIDUAL");
         eprintln!("flint: residual coalesce {}", if on { "on" } else { "off" });
         on
     })
@@ -108,7 +108,7 @@ pub(in crate::family::flint) fn coalesce_residual_flagged() -> bool {
 pub(in crate::family::flint) fn ring_view_env_flag(
     value: std::result::Result<String, std::env::VarError>,
 ) -> bool {
-    crate::tokenizer::env_result_allows_default_on(value)
+    crate::env_switch::env_result_allows_default_on(value)
 }
 
 /// Reads FIFI_FLINT_MLX_RING_VIEW once per process and logs the one load
@@ -122,7 +122,7 @@ pub(in crate::family::flint) fn ring_view_flagged() -> bool {
         // EFFECTIVE state: with ASYNC_CHAIN=0 the flag is armed but inert.
         // Reading the chain env directly (not via its OnceLock) keeps this
         // line side-effect-free and order-independent.
-        let chain = crate::tokenizer::env_allows_default_on("FIFI_FLINT_MLX_ASYNC_CHAIN");
+        let chain = crate::env_switch::env_allows_default_on("FIFI_FLINT_MLX_ASYNC_CHAIN");
         let state = if !on {
             "off"
         } else if chain {
@@ -176,7 +176,7 @@ pub(in crate::family::flint) fn prefill_chain_flagged() -> bool {
     *FLAG.get_or_init(|| {
         let on = match std::env::var("FIFI_FLINT_MLX_PREFILL_CHAIN") {
             Err(_) => false,
-            Ok(value) => crate::tokenizer::env_allows_value(Some(&value)),
+            Ok(value) => crate::env_switch::env_allows_value(Some(&value)),
         };
         // The one load line an operator needs to confirm a rollback.
         eprintln!("flint: prefill chain {}", if on { "on" } else { "off" });

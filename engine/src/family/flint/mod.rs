@@ -87,7 +87,7 @@ pub(crate) const FAMILY: &str = "flint";
 pub(crate) fn prefix_reuse_env(value: std::result::Result<String, std::env::VarError>) -> bool {
     match value {
         Err(_) => false,
-        Ok(value) => crate::tokenizer::env_allows_value(Some(&value)),
+        Ok(value) => crate::env_switch::env_allows_value(Some(&value)),
     }
 }
 

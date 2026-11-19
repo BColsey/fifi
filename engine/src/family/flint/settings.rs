@@ -13,7 +13,7 @@ fn default_on_selected(value: Option<&std::ffi::OsStr>) -> bool {
         None => true,
         Some(value) => value
             .to_str()
-            .is_some_and(|value| crate::tokenizer::env_allows_value(Some(value))),
+            .is_some_and(|value| crate::env_switch::env_allows_value(Some(value))),
     }
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn q8_tiled_selected(value: Option<&std::ffi::OsStr>) -> bool {
 fn default_off_selected(value: Option<&std::ffi::OsStr>) -> bool {
     value
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|value| crate::tokenizer::env_allows_value(Some(value)))
+        .is_some_and(|value| crate::env_switch::env_allows_value(Some(value)))
 }
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
