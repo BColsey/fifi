@@ -251,6 +251,38 @@ python3 scripts/mac_cache_study/flint_prefill_reuse.py \
   "$SCRATCH/prefill-routes.jsonl.gz" "$SCRATCH/prefill-reuse-replay.csv"
 ```
 
+### Bounded two-piece Flint layer fixture
+
+The fixture loads one routed layer at a time from the pinned Apple affine checkpoint. It uses the real weights for sliding-window layer 35 and full-attention layer 37. Deterministic BF16 inputs have the same 1,023- and 1,017-row shapes as the wider serving run. Attention advances one KV plane in piece order. The real router runs separately for each piece, then all staging schedules consume those same activations and route choices.
+
+The reference stages the selected experts independently per piece and uses the existing grouped projections. The shared stage reads the union once and runs the same grouped projections at the original widths. The wave arm stages up to 64 experts at a time and evaluates only pairs belonging to that wave. It restores token and expert rank order before the existing BF16 weighted reduction. Every arm checks that its pages retire before the next read. The fixture checks stage counts, exact record bytes, zero page-copy fallbacks and finite BF16 outputs with the original piece shapes. It compares each layer's outputs bit for bit.
+
+The test measures the MLX allocator peak during attention and routing, the allocator peak during expert work and output reconstruction, and the maximum staging mapping. It admits those components under an explicit device budget. The MLX cache limit is zero for the fixture. File-cache state stays in place across the three schedules.
+
+| Layer | Expert schedule | Expert records | Logical reads (MB) | Slice reads | Peak mapping (MiB) | Expert-phase MLX peak (MiB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 35, sliding window | Separate pieces | 511 | 904.20 | 27 | 432.03 | 601.57 |
+| 35, sliding window | Shared stage | 256 | 452.98 | 9 | 432.05 | 601.61 |
+| 35, sliding window | 64-expert waves | 256 | 452.98 | 36 | 108.02 | 198.40 |
+| 37, full attention | Separate pieces | 512 | 905.97 | 18 | 432.03 | 604.53 |
+| 37, full attention | Shared stage | 256 | 452.98 | 9 | 432.05 | 604.58 |
+| 37, full attention | 64-expert waves | 256 | 452.98 | 36 | 108.02 | 202.25 |
+
+Both layers produced bitwise-identical output with each schedule at full width and in the 32- and 28-row smoke run. The shared stage halved logical read bytes. Four waves delivered the same byte savings with one quarter of the peak staging mapping and more slice reads than the shared stage. The mapping and allocator columns measure separate interfaces to unified memory and can overlap. The fixture measures layer output, logical reads, and staging memory. The opt-in serving trial will measure physical reads and latency. [All 12 measurements](../../scripts/benchmarks/mac-m4-flint-prefill-reuse-layer-fixture.csv)
+
+From `engine/`, build the selection before reserving the GPU, then set the pinned checkpoint and device ceiling. Run with `FIFI_FLINT_PREFILL_REUSE_SMOKE=1` first to verify the 32- and 28-row case. The full fixture uses the same command with that switch set to zero.
+
+```sh
+cargo test --locked --offline --release --features native-mlx,native-fault-qualification --lib --no-run
+unset FIFI_FLINT_EXPERT_RECORDS FLINT_QUAL_STAGE_SYNC FLINT_QUAL_LAYER_CAPTURE
+FLINT_MODEL_DIR="$FLINT_ARTIFACT" FLINT_QUAL_GO=parent-owned-gpu-window \
+FIFI_FLINT_PREFILL_REUSE_SMOKE=1 FIFI_FLINT_EXPERT_TIMING=1 FIFI_FLINT_MLX_PREFILL_CHAIN=0 \
+FIFI_MLX_AUTO_BUDGET=0 FIFI_MLX_WORKING_SET_MIB=8192 FIFI_MLX_POSITIONED_READS=0 \
+cargo test --locked --offline --release --features native-mlx,native-fault-qualification --lib \
+  family::flint::mlx_forward::prefill_reuse_fixture::two_piece_prefill_reuse_preserves_layer_output \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)

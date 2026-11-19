@@ -220,7 +220,7 @@ pub(super) struct Layer {
 }
 
 impl Layer {
-    fn load(
+    pub(super) fn load(
         k: &mut MlxKernels,
         source: &Rc<FlintCheckpoint>,
         index: usize,
