@@ -363,6 +363,15 @@ impl Model {
         } else {
             ((0..super::config::LAYERS).map(|_| None).collect(), 0)
         };
+        #[cfg(feature = "native-fault-qualification")]
+        if source.has_records() {
+            if !disk || !expert_pipeline_flagged() || cached_expert_bytes != 0 {
+                return Err(EngError::BadRequest(
+                    "Flint expert records need disk-backed experts, the shared-page pipeline and expert caching off".into(),
+                ));
+            }
+            eprintln!("flint: MLX expert records layer 24 on");
+        }
         if disk {
             let pipeline = expert_pipeline_flagged();
             eprintln!(

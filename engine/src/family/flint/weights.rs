@@ -18,6 +18,13 @@ use crate::{
 #[path = "weights_profile.rs"]
 mod profile;
 use profile::Profile;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[path = "weights_records.rs"]
+pub(super) mod records;
 
 const HEADER_LIMIT: u64 = 16 * 1024 * 1024;
 const EMBEDDING: &str = "model.embed_tokens";
@@ -25,6 +32,12 @@ const EMBEDDING: &str = "model.embed_tokens";
 pub(super) struct FlintCheckpoint {
     weights: StreamedCheckpoint,
     profile: Profile,
+    #[cfg(all(
+        feature = "native-fault-qualification",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    records: Option<records::ExpertRecords>,
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -60,10 +73,31 @@ impl FlintCheckpoint {
         }
         let mut shards = Vec::new();
         let mut routes = BTreeMap::new();
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let records = std::env::var_os("FIFI_FLINT_EXPERT_RECORDS");
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let mut stamps = Vec::new();
         for path in paths {
             guard.check(&path, "model weights")?;
             let mut file = File::open(&path).map_err(checkpoint_io)?;
-            let len = file.metadata().map_err(checkpoint_io)?.len();
+            let meta = file.metadata().map_err(checkpoint_io)?;
+            let len = meta.len();
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            if records.is_some() {
+                stamps.push(records::ShardStamp::from(&meta));
+            }
             let header = ShardHeader::read(&mut file, len, HEADER_LIMIT)?;
             let name = path
                 .file_name()
@@ -95,7 +129,34 @@ impl FlintCheckpoint {
                 )));
             }
         }
-        Ok(Self { weights, profile })
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        let records = records
+            .as_deref()
+            .map(|path| records::ExpertRecords::open(Path::new(path), &stamps))
+            .transpose()?;
+        Ok(Self {
+            weights,
+            profile,
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            records,
+        })
+    }
+
+    #[cfg(all(
+        feature = "native-fault-qualification",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub(super) fn has_records(&self) -> bool {
+        self.records.is_some()
     }
 
     pub(super) fn tensor(&self, name: &str) -> Result<Tensor, EngError> {
@@ -265,8 +326,27 @@ impl FlintCheckpoint {
         } else {
             read_stack_into
         };
-        for (weight, layout) in &layout.stacks {
-            read_stack(&self.weights, weight, ids, dst, layout)?;
+        #[cfg(feature = "native-fault-qualification")]
+        let probe = stem == records::STEM && remapped.shape() == [6];
+        #[cfg(feature = "native-fault-qualification")]
+        let started = (probe && super::mlx_expert_timing::enabled()).then(std::time::Instant::now);
+        #[cfg(feature = "native-fault-qualification")]
+        let records_used = if let Some(records) = self.records.as_ref().filter(|_| probe) {
+            records.read(&layout, ids, dst)?;
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "native-fault-qualification"))]
+        let records_used = false;
+        if !records_used {
+            for (weight, layout) in &layout.stacks {
+                read_stack(&self.weights, weight, ids, dst, layout)?;
+            }
+        }
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(started) = started {
+            records::record_layer_read(started.elapsed(), records_used);
         }
         dst[end..id_end].copy_from_slice(local_bytes);
         let local = PageRange {

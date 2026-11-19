@@ -79,6 +79,22 @@ Both arms enabled prefix reuse and reserved 128 MiB under the same 8 GiB device 
 
 Run the serving driver with `--expert-timing --compact-flint-kv --working-set-mib 8192 --pairs 1` to repeat the comparison.
 
+### Compact Flint KV across two growth boundaries
+
+Two balanced pairs of fresh servers ran a 557-token prompt with 24 greedy completion tokens. Both arms used an 8 GiB ceiling, 256 admitted rows, prefill coalescing, and prefix reuse off. The three prompt pieces evaluated 255, 256, and 45 rows. The first logits call evaluated the pending prompt token. The compact full-attention planes consequently grew from 256 to 512, then 1,024 rows. The baseline stayed at 4,096 rows.
+
+| Serving measurement | Baseline | Compact |
+| --- | ---: | ---: |
+| Median time to first token | 33.39 s | 33.12 s |
+| Median decode throughput | 1.735 tok/s | 1.750 tok/s |
+| Median per-request decode forward p95 | 627 ms | 633 ms |
+| Median process peak footprint | 2.220 GB | 2.115 GB |
+| Median attributed SSD reads | 50.93 GB | 50.81 GB |
+
+All four completions, logical expert bytes, and read counts matched. Each request contributed 23 decode forwards. The p95 measures model forwards after the first token. This workload shows about 104 MB less peak footprint and similar latency and SSD traffic. [Four serving measurements](../../scripts/benchmarks/mac-m4-flint-kv-growth-557.csv)
+
+Run the Flint serving driver with `--compact-kv-growth --expert-timing --working-set-mib 8192 --pairs 2` to repeat the comparison.
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)
@@ -93,6 +109,30 @@ On 18 November 2026, the M4 mini copied only Flint layer 24 into a temporary 432
 The file counter reflects process-attributed storage reads. The uncached arm still had file-cache effects, including two pairs with zero source bytes attributed to the sliced layout. Among the 24 pairs where both arms attributed more than 90% of the logical bytes to storage, expert records reduced total attributed bytes by 2.3% and median paired time by 67.4%. A serving trial needs to compare cumulative traffic for warm, mixed and cold requests at the same memory ceiling. [All 128 measurements](../../scripts/benchmarks/mac-m4-flint-expert-records.csv)
 
 A two-pair cleanup check immediately afterward found the original slices cached and the newly built record file still reading from storage under `F_NOCACHE`. Median time rose from 1.09 to 4.30 ms in those pairs. The buffered, immediately warmed comparison still favored the record layout.
+
+### Bounded expert-record serving trial
+
+The qualification server can use a 432 MiB sidecar for layer 24. The builder captures the local source shard identities and writes the nine roles of each expert consecutively. The loader checks those identities and the declared size at startup. During a single-row stage, the reader scatters each selected expert into the same Metal staging pages using one positioned vector read. The remaining layers and multi-row stages read the original shards. The serving driver enables positioned shard reads and prefill coalescing in both arms.
+
+At the same 8 GiB ceiling, two pairs of fresh servers alternated order and each answered the same 16-token request twice with 12 completion tokens. The repeat ran immediately after the first request. The OS file cache stayed in place. All eight completions and logical bytes matched. Every layer-24 decode stage took six reads, down from 54. Total decode read calls per request fell from 27,918 to 27,390 and Metal page-copy fallbacks stayed at zero.
+
+| Request | Layer-24 read time per decode step | Paired layer change | Paired full decode rate | Median attributed SSD reads |
+| --- | ---: | ---: | ---: | ---: |
+| First after startup | 8.39 → 3.67 ms | −56.3% | +2.5% | 8.03 → 7.59 GB |
+| Immediate repeat | 8.00 → 3.65 ms | −54.4% | −0.8% | 7.08 → 7.18 GB |
+
+Total attributed SSD reads were 30.22 GB with shard slices and 29.55 GB with expert records. Full-request timings varied across the first and repeat visits. The single-layer result supports faster reads into staging pages and leaves the serving impact of wider use open. [Eight serving measurements](../../scripts/benchmarks/mac-m4-flint-layer24-records-serving.csv)
+
+Build the server with `native-mlx,native-fault-qualification` and use the established Flint serving driver. The sidecar stays in scratch beside the benchmark inputs.
+
+```sh
+python3 scripts/mac_cache_study/build_flint_layer24_records.py \
+  "$FLINT_ARTIFACT" "$SCRATCH/layer-24.records"
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/records-serving" \
+  --expert-records "$SCRATCH/layer-24.records" --expert-timing \
+  --working-set-mib 8192 --pairs 2
+```
 
 ### Reproduce the expert record probe
 
