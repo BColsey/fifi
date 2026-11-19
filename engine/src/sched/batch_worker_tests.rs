@@ -896,6 +896,73 @@ fn a_cold_prompt_and_a_stream_share_the_iteration_budget_in_either_arrival_order
 }
 
 #[test]
+fn a_prompt_that_finishes_prefill_joins_after_one_adoption_tick() {
+    // The either-order test above cannot tell WHEN the cold joins: its
+    // history appearing in some window passes it however late. The join the
+    // budget promises costs exactly one adoption tick after the finishing
+    // piece - readiness is computed at the tick top, before prefills run,
+    // and the seat needs one new_session - never a second idle tick. Every
+    // prefill call here belongs to the cold (the stream's prompt is empty),
+    // so the last prefill-bearing tick IS its finishing tick.
+    let log = Log::default();
+    let (hold, entered, unblock) = gate();
+    let mut fake = WindowFake::new(&log);
+    fake.hold = Some(hold);
+    let (engine, release) = start_with_budget(fake, 4);
+    let (stream, stream_events) = job(&[0], 16);
+    let (cold, cold_events) = job(&[1; 24], 1);
+    engine.handle().try_submit(stream).unwrap();
+    release.send(()).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    engine.handle().try_submit(cold).unwrap();
+    unblock.send(()).unwrap();
+    assert_eq!(usage(&collect(stream_events)).completion_tokens, 16);
+    assert_eq!(usage(&collect(cold_events)).completion_tokens, 1);
+    engine.shutdown();
+
+    let trace = lock(&log);
+    // Every prefill call belongs to the cold (the stream's prompt is empty),
+    // so the last prefill-bearing tick IS the cold's finishing tick.
+    let mut last_prefill_tick = None;
+    let mut join_window = None;
+    let mut tick = 0;
+    for call in &trace.calls {
+        if call.starts_with("prefill:") {
+            last_prefill_tick = Some(tick);
+        } else if call == "window" {
+            let window = &trace.windows[tick];
+            if join_window.is_none() && window.iter().any(|history| history[0] == 1) {
+                join_window = Some(tick);
+            }
+            tick += 1;
+        }
+    }
+    let last_prefill = last_prefill_tick.expect("the cold prefilled");
+    let join = join_window.expect("the cold joined a decode window");
+    // One adoption tick at most between the finishing piece and the window
+    // seat: readiness is computed at the tick top, before prefills run, and
+    // the seat needs one new_session. Gate timing can land the finishing
+    // piece before or after the tick's own window call, so the join sits one
+    // or two windows out - never more. A longer idle gap or a second
+    // session is the defect this pins.
+    assert!(
+        (1..=2).contains(&(join - last_prefill)),
+        "the cold idled {} windows after finishing",
+        join - last_prefill
+    );
+    assert_eq!(trace.windows[join].len(), 2);
+    assert_eq!(
+        trace
+            .calls
+            .iter()
+            .filter(|call| **call == "new_session")
+            .count(),
+        1,
+        "adoption must spend exactly one session"
+    );
+}
+
+#[test]
 fn cancelling_the_last_prefill_piece_keeps_the_row_out_of_decode() {
     let log = Log::default();
     let (hold, entered, unblock) = gate();

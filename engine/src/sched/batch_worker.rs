@@ -445,6 +445,9 @@ pub(super) fn work<E: ExecutorOps>(
             slot.ready |= slot.can_start_decode();
             prompt_slots += usize::from(!slot.ready);
         }
+        // One decode row per ready slot: the budget counts every non-prefilling
+        // slot as exactly one decode row this tick, so decode_rows is the number
+        // of ready slots, never a per-slot row count a family could raise.
         let decode_rows = slots.len() - prompt_slots;
         let mut prompt_rows = iteration_rows.max(slots.len()) - decode_rows;
         let mut index = 0;
