@@ -64,6 +64,7 @@ fn plan_with_slots(slots: usize) -> TierPlan {
             staging: 0,
             margin: 0,
         },
+        ring_backing_bytes: 0,
     })
     .unwrap()
 }
@@ -78,6 +79,7 @@ fn plan_at(positions: u64) -> TierPlan {
             positions,
             bytes_per_position: kv_position,
         },
+        0,
     ))
     .unwrap()
 }
@@ -311,6 +313,7 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
         },
         0,
         capped.host_memory(),
+        0,
     );
     assert_eq!(inputs.host.non_reclaimable, 64 * GIB - 50 * GIB);
 }

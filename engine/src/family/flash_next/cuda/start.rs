@@ -49,7 +49,8 @@ use super::{
     step_plan::StepPlan,
 };
 use crate::family::expert_bank::{
-    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_tier::TierChoice,
+    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru,
+    bank_tier::{RUNG_RING_SLOTS, TierChoice, rung_ring_placeholder_bytes},
 };
 use crate::family::flash_next::settings::{ple_batch, ple_device};
 use crate::{
@@ -621,6 +622,11 @@ pub(super) fn build_driver(
         },
         free_vram.saturating_sub(ring_budget),
         (mem_total, mem_available),
+        // The same infallible placeholder the two-phase choice below charges
+        // first: the pooled depth's records in flight, from the one shared
+        // constant. The real figure is read only when the tier already points
+        // at the disk rung, and re-validated there.
+        rung_ring_placeholder_bytes(record_bytes),
     )
     .with_prefill_arena(prefill_arena_bytes)?;
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
@@ -675,10 +681,10 @@ pub(super) fn build_driver(
         total: mem_total,
         available: mem_available,
     };
-    // The rung's pooled read depth: one worker per slot, one RECORD per
-    // job. The span bench's step cells issue two records per layer, so
-    // it cannot separate depth 4 from depth 8; 4 is provisional.
-    const RUNG_RING_SLOTS: usize = 4;
+    // The rung's pooled read depth (RUNG_RING_SLOTS, in the shared tier
+    // module): one worker per slot, one RECORD per job. The span bench's
+    // step cells issue two records per layer, so it cannot separate depth 4
+    // from depth 8; 4 is provisional.
     // The staging ring's own backing — the disk rung's read path and its budget floor.
     // Sizing is two-phase so every non-disk start stays byte-for-byte the pre-rung start:
     // the first pass charges the infallible placeholder (the full pooled depth's
@@ -688,7 +694,7 @@ pub(super) fn build_driver(
     // rung all charge one number (the allocated slots), and a non-disk answer is never
     // revised.
     let mode = std::env::var("FIFI_FLASH_NEXT_BANK_MODE").ok();
-    let ring_placeholder = RUNG_RING_SLOTS as u64 * record_bytes as u64;
+    let ring_placeholder = rung_ring_placeholder_bytes(record_bytes);
     let tier = HostPinPlan::bank_mode_tier(
         mode.as_deref(),
         &geometry,
@@ -706,7 +712,7 @@ pub(super) fn build_driver(
             if !matches!(tier, TierChoice::Disk) {
                 return Err(EngError::MemoryPlan(format!(
                     "the disk tier's real ring backing ({real} B) no longer fits where the \
-                     two-record placeholder did"
+                     {RUNG_RING_SLOTS}-record placeholder did"
                 )));
             }
             (tier, real)

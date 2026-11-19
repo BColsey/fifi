@@ -49,6 +49,7 @@ fn the_whole_trunk_uploads_and_the_device_holds_the_plans_trunk_bytes() {
             positions: 1,
             bytes_per_position: 1,
         },
+        0,
     );
     let plan = FlashLoadPlan::new(&report, &checkpoint.model_config, 0, card).expect("plan");
     assert_eq!(plan.trunk_bytes, 3_872_376_320);

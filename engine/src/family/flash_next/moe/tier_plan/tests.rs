@@ -31,6 +31,7 @@ pub(in crate::family::flash_next) fn inputs(positions: u64, elem: u64) -> TierIn
             positions,
             bytes_per_position: position(elem),
         },
+        0,
     )
 }
 
@@ -321,6 +322,7 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
             kv,
             free,
             (62 * GIB, available),
+            0,
         )
     };
     let base = measured(free, 54 * GIB);
@@ -365,6 +367,7 @@ fn tier_inputs_measured_golden_struct() {
         kv,
         22 * GIB,
         (64 * GIB, 6 * GIB),
+        0,
     );
     assert_eq!(inputs.vram.usable, 22 * GIB);
     assert_eq!(inputs.vram.non_expert, 7 * GIB + 512 * MIB);
@@ -379,6 +382,6 @@ fn tier_inputs_measured_golden_struct() {
     assert_eq!(inputs.host.staging, GIB);
     assert_eq!(inputs.host.margin, GIB);
     // The host floor: available memory cannot push non-reclaimable under 8 GiB.
-    let clamped = TierInputs::measured(shape(), (0, 0), kv, 0, (64 * GIB, 60 * GIB));
+    let clamped = TierInputs::measured(shape(), (0, 0), kv, 0, (64 * GIB, 60 * GIB), 0);
     assert_eq!(clamped.host.non_reclaimable, 8 * GIB);
 }

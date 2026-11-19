@@ -108,6 +108,7 @@ pub(super) fn plan_at(tier: TierShape, trunk: u64, positions: u64) -> TierPlan {
             positions,
             bytes_per_position: bytes,
         },
+        0,
     );
     TierPlan::new(&inputs).expect("the plan")
 }

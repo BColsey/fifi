@@ -47,7 +47,7 @@ fn budget() -> ContextBudget {
         bytes_per_position: 1,
     };
     ContextBudget::new(
-        TierInputs::cost_model_3090(shape, (TRUNK_BYTES, STATE_BYTES), placeholder),
+        TierInputs::cost_model_3090(shape, (TRUNK_BYTES, STATE_BYTES), placeholder, 0),
         FLASH_NEXT,
     )
 }
@@ -119,6 +119,7 @@ fn slots_text() -> String {
             positions: 1,
             bytes_per_position: 1,
         },
+        0,
     );
     let load =
         FlashLoadPlan::new(&pack_report(3_854_000_000), CONFIG, 32_640_183_408, card).unwrap();

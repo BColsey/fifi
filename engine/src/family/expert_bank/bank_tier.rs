@@ -31,6 +31,21 @@ pub(crate) enum TierChoice {
     Disk,
 }
 
+/// The pooled read depth of the staging ring: how many expert records are in
+/// flight at once. Every admission that charges the ring a placeholder reads
+/// this one number — the context budget's first pass and the start's
+/// two-phase choice — so the two can never charge different bytes for one
+/// pack (the two-frames defect this ladder exists to prevent, in small).
+pub(crate) const RUNG_RING_SLOTS: usize = 4;
+
+/// The ring bytes every admission charges before the real backing is read:
+/// the pooled depth's records in flight. The real figure (about four times
+/// the span plus a sector) is read only once the tier already points at the
+/// disk rung.
+pub(crate) fn rung_ring_placeholder_bytes(record_bytes: usize) -> u64 {
+    RUNG_RING_SLOTS as u64 * record_bytes as u64
+}
+
 impl TierChoice {
     /// The log line's name of the tier and its expected speed class.
     pub(crate) fn describe(&self) -> (&'static str, &'static str) {

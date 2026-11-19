@@ -35,6 +35,7 @@ fn card() -> TierInputs {
             positions: 1,
             bytes_per_position: 1,
         },
+        0,
     )
 }
 

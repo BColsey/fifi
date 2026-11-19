@@ -3,6 +3,7 @@
 //! floor, and a refusal names the longest context that would work.
 
 use super::*;
+use crate::family::expert_bank::bank_tier::{TierChoice, rung_ring_placeholder_bytes};
 use crate::family::flash_next::moe::tier_plan::TierShape;
 
 const MIB: u64 = 1 << 20;
@@ -25,7 +26,7 @@ fn budget() -> ContextBudget {
         bytes_per_position: 1,
     };
     ContextBudget::new(
-        TierInputs::cost_model_3090(shape, (TRUNK_BYTES, STATE_BYTES), placeholder),
+        TierInputs::cost_model_3090(shape, (TRUNK_BYTES, STATE_BYTES), placeholder, 0),
         FLASH_NEXT,
     )
 }
@@ -147,6 +148,130 @@ fn resolve_serves_what_fits_and_names_the_boundary_of_what_does_not() {
     assert!(text.contains("zero positions"), "{text}");
 }
 
+/// On cgroups of 2-20 GiB a served start used to refuse wanting
+/// 27,546,624,000 pinned host bytes. The rule under test: a
+/// requested context serves on the best tier that holds it — inclusive, else exclusive, else
+/// the disk tier — and only a host below the disk tier's own floor refuses, naming the floor.
+#[test]
+fn a_capped_host_serves_the_requested_context_through_the_disk_tier() {
+    const GIB: u64 = 1 << 30;
+    let shape = TierShape::from_pack(48, 512, 10, 24_576 * EXPERT_BYTES).unwrap();
+    let placeholder = KvPlan {
+        positions: 1,
+        bytes_per_position: 1,
+    };
+    for cap_gib in [20u64, 16, 12, 8, 6] {
+        // The admission snapshot under a fresh MemoryMax cgroup of `cap` on
+        // through the constructor the start uses: MemTotal
+        // still reads the whole machine while MemAvailable reads the cap, so
+        // the non-reclaimable floor nets the rest of the host out and the
+        // page cache holds `cap - 4 GiB` — always below the 27.5 GB pinned
+        // need, always above the disk tier's fixed terms once the ring reads
+        // the pack in place. The start's two-phase choice charges the same
+        // placeholder first: two records in flight, always inside the
+        // smallest cap's page cache.
+        let inputs = TierInputs::measured(
+            shape,
+            (TRUNK_BYTES, STATE_BYTES),
+            placeholder,
+            24 * GIB,
+            (62 * GIB, cap_gib * GIB - 40 * MIB),
+            rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
+        );
+        let budget = ContextBudget::new(inputs, FLASH_NEXT);
+        let served = budget
+            .resolve(4096, KvFormat::F16, 11)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a {cap_gib} GiB host serves the requested 4096 positions: {}",
+                    message(error)
+                )
+            });
+        assert_eq!(served.positions, 4096);
+        assert_eq!(served.plan.store_tier(), TierChoice::Disk);
+    }
+
+    // A host whose page cache cannot hold the fixed terms beside the floor
+    // refuses at the heap term, naming it: the non-reclaimable floor alone
+    // nets 60 of the 62 GiB out and the heap, staging and margin cannot fit
+    // beside them.
+    let inputs = TierInputs::measured(
+        shape,
+        (TRUNK_BYTES, STATE_BYTES),
+        placeholder,
+        24 * GIB,
+        (62 * GIB, 2 * GIB - 40 * MIB),
+        rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
+    );
+    let budget = ContextBudget::new(inputs, FLASH_NEXT);
+    let text = message(budget.resolve(4096, KvFormat::F16, 11).unwrap_err());
+    assert!(
+        text.contains("engine heap + staging + margin + host KV against host RAM"),
+        "{text}"
+    );
+}
+
+/// The boundary at the exclusive fit: one byte of page cache below the
+/// pinned need takes the disk tier; with the need covered the pinned store
+/// answers and serves the requested context.
+#[test]
+fn the_disk_tier_boundary_sits_at_the_exclusive_fit() {
+    const GIB: u64 = 1 << 30;
+    let shape = TierShape::from_pack(48, 512, 10, 24_576 * EXPERT_BYTES).unwrap();
+    let placeholder = KvPlan {
+        positions: 1,
+        bytes_per_position: 1,
+    };
+    // The fit byte, found where the plan itself crosses: the VRAM plan
+    // chooses the banked slots, so the pinned need is only known inside
+    // `TierPlan::new`. A 6 GiB `available` serves on the disk tier and a
+    // near-whole host pins the store, so the transition lies between them.
+    let resolve_tier = |available: u64| {
+        let inputs = TierInputs::measured(
+            shape,
+            (TRUNK_BYTES, STATE_BYTES),
+            placeholder,
+            24 * GIB,
+            (62 * GIB, available),
+            rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
+        );
+        ContextBudget::new(inputs, FLASH_NEXT)
+            .resolve(4096, KvFormat::F16, 11)
+            .map(|served| served.plan.store_tier())
+    };
+    let mut disk_side = 6 * GIB;
+    let mut exclusive_side = 61 * GIB;
+    while exclusive_side - disk_side > 1 {
+        let mid = disk_side + (exclusive_side - disk_side) / 2;
+        match resolve_tier(mid) {
+            Ok(TierChoice::Exclusive { .. }) => exclusive_side = mid,
+            _ => disk_side = mid,
+        }
+    }
+    // One byte below the fit takes the disk tier; at the fit the pinned
+    // store answers and the requested context serves on it.
+    assert_eq!(resolve_tier(disk_side).unwrap(), TierChoice::Disk);
+    assert!(matches!(
+        resolve_tier(exclusive_side).unwrap(),
+        TierChoice::Exclusive { .. }
+    ));
+    let inputs = TierInputs::measured(
+        shape,
+        (TRUNK_BYTES, STATE_BYTES),
+        placeholder,
+        24 * GIB,
+        (62 * GIB, exclusive_side),
+        rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
+    );
+    assert_eq!(
+        ContextBudget::new(inputs, FLASH_NEXT)
+            .resolve(4096, KvFormat::F16, 11)
+            .unwrap()
+            .positions,
+        4096
+    );
+}
+
 /// c0 goldens (P4): `largest_context` exact cells and `resolve` refusal text
 /// VERBATIM (the refusal strings are qualified output; P4 adapters must
 /// reproduce them byte for byte, so they are pinned whole, not by substring).
@@ -189,7 +314,7 @@ fn another_model_needs_only_a_shape_and_a_geometry() {
         bytes_per_position: 1,
     };
     let other = ContextBudget::new(
-        TierInputs::cost_model_3090(shape, (2_000_000_000, 64 * MIB), placeholder),
+        TierInputs::cost_model_3090(shape, (2_000_000_000, 64 * MIB), placeholder, 0),
         KvGeometry {
             cached_layers: 6,
             heads_kv: 4,
@@ -202,4 +327,15 @@ fn another_model_needs_only_a_shape_and_a_geometry() {
     let plan = other.resolve(131_072, KvFormat::F16, 128).unwrap();
     assert_eq!(plan.plan.slots_per_layer(), 128);
     assert_eq!(plan.plan.cold_bytes(), 0);
+}
+
+/// Checks the placeholder figure itself: rung_ring_placeholder_bytes
+/// must return RUNG_RING_SLOTS times the record bytes. A call site that
+/// goes back to a private literal is not caught by this test.
+#[test]
+fn the_ring_placeholder_is_the_pooled_depth() {
+    assert_eq!(
+        rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
+        crate::family::expert_bank::bank_tier::RUNG_RING_SLOTS as u64 * EXPERT_BYTES
+    );
 }

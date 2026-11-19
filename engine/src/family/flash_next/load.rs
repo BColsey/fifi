@@ -955,6 +955,8 @@ pub(crate) fn preflight_rows(
         },
         free_vram.saturating_sub(ring_budget),
         host,
+        // No ring source on this path: the pinned-store refusal stands.
+        0,
     );
     let plan = crate::family::flash_next::moe::load_plan::FlashLoadPlan::new(
         &report,
