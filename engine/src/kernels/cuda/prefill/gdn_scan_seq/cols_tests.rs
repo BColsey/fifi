@@ -601,7 +601,7 @@ mod mutants {
     // Equivalent mutants: removing the clamp `min(t0 + slot, m - 1)` (every use of the row pointer is already
     // under `slot < len`, so it only avoids forming a pointer past the object) and the `slot < len` guard on the
     // q/k staging while that clamp exists (the dead `qk_s` slots are never read). Mutant 20 (the tile barrier) is
-    // seen by racecheck, not by bytes; a racecheck leg under scripts/sanitizer_run.sh, built with the
+    // seen by racecheck, not by bytes; a compute-sanitizer racecheck leg, built with the
     // cuda-gdn-mutants feature and the mutant tests listed, kills it (not in the committed start list).
     use super::*;
     use crate::kernels::cuda::gdn_mutants::{self as gm, select};

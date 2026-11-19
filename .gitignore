@@ -37,7 +37,7 @@ target/
 __pycache__/
 *.py[cod]
 
-# Host instructions stay local; shared AGENTS.md and CLAUDE.md are tracked.
+# Host-local agent instructions stay local.
 /AGENTS.local.md
 
 # The ledger and process documents live in the internal ledger.

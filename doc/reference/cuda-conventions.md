@@ -8,8 +8,9 @@ a contract, not reshaping an accident. Every rule names its code site and
 what enforces it today.
 
 Debug tools that help while working against these rules:
-`FIFI_CUDA_POISON_ALLOC` and `FIFI_CUDA_LINEINFO` (`environment.md`), and the
-compute-sanitizer gate (`scripts/sanitizer_run.sh`).
+`FIFI_CUDA_POISON_ALLOC` and `FIFI_CUDA_LINEINFO` (`environment.md`), and
+NVIDIA compute-sanitizer (memcheck, racecheck, synccheck) over a build made
+with `FIFI_CUDA_LINEINFO`.
 
 ## Hidden synchronization sites
 

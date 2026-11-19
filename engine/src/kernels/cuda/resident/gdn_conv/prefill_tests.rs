@@ -670,7 +670,7 @@ mod mutants {
     // Accepted survivors, by construction (no test can see them): a dispatch-mapping swap such as
     // `case 16: launch_rows<32>` instead of `launch_rows<16>` writes the same bytes at a different launch shape.
     // Mutant 19 (a load one row past the tile) leaves the bytes unchanged and is seen by memcheck, not by bytes;
-    // a memcheck leg under scripts/sanitizer_run.sh, built with the cuda-gdn-mutants feature and the mutant
+    // a compute-sanitizer memcheck leg, built with the cuda-gdn-mutants feature and the mutant
     // tests listed, kills it (not in the committed start list).
     use super::*;
     use crate::kernels::cuda::gdn_mutants::{self as gm, select};
