@@ -43,6 +43,7 @@ use std::{
 
 use super::{
     ADAPTER_OPERATION, ALLOCATE_OPERATION, INITIALIZE_OPERATION, TERMINAL,
+    diagnostic_backend_error,
     guard::{DispatchGuard, Lease},
     memory_info_operation,
     native::{self, Activations, DeviceFailure, RawDevice, TILE_ROWS, TileVec, Tiled, TiledType},
@@ -422,6 +423,22 @@ impl CudaContext {
         let (free, total) = native::memory_info()
             .map_err(|status| native_error(&TERMINAL, memory_info_operation(status), status))?;
         Ok(MemoryInfo { free, total })
+    }
+
+    /// The device's static facts for the load-time tuner: multiprocessor
+    /// count, compute capability and PCI bus id. A diagnostic: failures
+    /// map through the non-latching `diagnostic_backend_error`, so a
+    /// driver that refuses the query cannot fail a start that used to
+    /// succeed.
+    // The production caller is the tuner line in the next commit.
+    #[allow(dead_code)]
+    pub(crate) fn device_attributes(
+        &self,
+    ) -> Result<native::device_info::DeviceAttributes, EngError> {
+        graph::ensure_closed("a device query")?;
+        let _dispatch = self.enter()?;
+        native::device_info::device_attributes()
+            .map_err(|status| diagnostic_backend_error("device attributes", status))
     }
 
     /// The driver's module loading mode: 1 is `CU_MODULE_EAGER_LOADING` and 2 is

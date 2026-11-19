@@ -364,6 +364,20 @@ fn latch_terminal(terminal: &AtomicBool, status_store: Option<&AtomicI32>, statu
     first
 }
 
+/// Maps a native failure of a pure diagnostic query (the tuner's device-attributes read) to
+/// an error WITHOUT latching the backend terminal: exotic-but-supported callers (a multi-GPU
+/// slice, a Jetson iGPU without a PCI bus, an old driver) must not turn a diagnostic into a
+/// refused start — a latched terminal fails every later `ensure_usable`.
+// The production caller is the tuner line in the next commit; the tests
+// here exercise only the native adapter below it.
+#[allow(dead_code)]
+fn diagnostic_backend_error(operation: &'static str, status: c_int) -> EngError {
+    EngError::Backend {
+        operation,
+        message: format!("{} (status {status})", native::status_message(status)),
+    }
+}
+
 /// The CUDA status of the first native failure that latched the global backend terminal,
 /// or `None` when the backend is usable or the latch carries no status (a panic-latch).
 /// A device probe reads it to classify an already-terminal backend like its first probe.
@@ -386,6 +400,19 @@ fn is_capture_status(status: c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_diagnostic_query_leaves_the_backend_usable() {
+        let error = diagnostic_backend_error("device attributes", 1);
+        match error {
+            EngError::Backend { operation, .. } => assert_eq!(operation, "device attributes"),
+            other => panic!("expected a Backend error, got {other:?}"),
+        }
+        // The diagnostic must not touch the global terminal latch: a
+        // start that logs hardware facts keeps serving after a refusal.
+        assert!(!TERMINAL.load(Ordering::Acquire));
+        assert_eq!(TERMINAL_STATUS.load(Ordering::Acquire), NO_LATCHED_STATUS);
+    }
 
     #[test]
     fn the_latch_records_only_the_first_status_of_the_global_backend() {
