@@ -49,7 +49,7 @@ The opt-in `FIFI_MLX_EXPERT_READ_RUNS=prefill` groups adjacent selected expert s
 
 The opt-in `FIFI_MLX_OVERLAP_EXPERT_READS=1` submits the independent shared expert to Metal before the CPU stages the same layer's exact routed experts. The layer output depends on both computations. Each family keeps its existing page release point and staging bound. Flint uses its shared-page pipeline when either common option is enabled. Explicit Flint legacy settings can override the common choices. Resident Qwen and Qwen3.8 dense use their resident projections and share the scheduler, KV formats and prefix lifecycle. [Apple Silicon controls](../reference/environment.md#apple-silicon-device-sizing)
 
-On the M4 mini, the published Flint checkpoint passed the shared-switch smoke test at an 8 GiB device ceiling with 256 admitted rows. The 16-token prefill used 26,244 reads with coalescing off and 20,979 with it on. Both arms read 5,159,780,352 logical prefill bytes, issued 7,614 decode reads, returned the same four-token completion and imported the staging pages without a copy fallback. The Qwen3.6 disk-backed fixture matched F32 and BF16 activations and issued 540 reads in the shared arm versus 594 in the control with 506,880 logical bytes each. Flash-Next's sparse-prefill and prefix fixtures passed with both common switches off and on. Full-checkpoint measurements on this mini cover Flint. [Flint serving comparison](mac-flint-ane-and-reads.md#balanced-serving-comparison-at-8-gib)
+On the M4 mini, the published Flint checkpoint passed the shared-switch smoke test at an 8 GiB device ceiling with 256 admitted rows. The 16-token prefill used 26,244 reads with coalescing off and 20,979 with it on. Both arms read 5,159,780,352 logical prefill bytes, issued 7,614 decode reads, returned the same four-token completion and imported the staging pages without a copy fallback. The Qwen3.6 disk-backed fixture matched F32 and BF16 activations and issued 540 reads in the shared arm versus 594 in the control with 506,880 logical bytes each. Flash-Next's sparse-prefill and prefix fixtures passed with both common switches off and on. [Flint serving comparison](mac-flint-ane-and-reads.md#balanced-serving-comparison-at-8-gib) · [Full Qwen3.6 checkpoint](#full-qwen36-checkpoint-on-the-m4-mini)
 
 ### Positioned local shard reads
 
@@ -167,6 +167,28 @@ Run the file-backed checkpoint test from `engine/` on Apple Silicon.
 cargo test --locked --release --features native-mlx,native-fault-qualification --lib \
   family::qwen36::resident::executor::tests::capped_qwen_streams_selected_experts_from_a_file_backed_checkpoint \
   -- --exact --nocapture --test-threads=1
+```
+
+### Full Qwen3.6 checkpoint on the M4 mini
+
+The mini ran the pinned 20.42 GB Qwen3.6 MLX 4-bit checkpoint from the external SSD. All four shards were verified against the publisher manifest, and the tokenizer bundle matched the engine pins. The smoke used an 8 GiB Metal ceiling, 4,096-token context, BF16 activations, Q8 KV, 128-row prefill, a 256 MiB allocator cache limit, and a 1 GiB session cap. [Pinned Qwen3.6 checkpoint](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit/tree/38740b847e4cb78f352aba30aa41c76e08e6eb46)
+
+The resident pre-import check required 18,543,034,368 bytes and refused the load. With `FIFI_Q36_MLX_DISK_EXPERTS=1`, the worker reported disk-backed experts, 1,167,156,748 bytes of resident weights, a 1,457,061,888-byte session reserve, and 452,984,832 bytes of expert staging. It admitted 128-row prefill.
+
+The A/B compared shared-expert overlap and prefill read coalescing together against streamed staging with both switches off. Device admission and prefill widths were identical. The two pairs alternated order with a fresh server per arm and retained the OS file cache. All eight timed requests matched all 12 sampled tokens and their output hashes.
+
+| Prompt | Median first token, control → shared | Attributed SSD reads | Decode throughput |
+| --- | ---: | ---: | ---: |
+| 27 tokens | 14.49 → 12.55 s | 8.65 → 8.26 GB | 1.39 → 1.36 tok/s |
+| 157 tokens | 34.67 → 27.02 s | 19.13 → 16.36 GB | 1.02 → 1.43 tok/s |
+
+The longer prompt reached its first token 22% sooner and attributed 15% fewer bytes to the external SSD. Decode throughput ranged from 0.87 to 1.70 tok/s across the runs. Median lifetime process peak was 3.020 GB for the control and 3.045 GB for shared staging. Those peaks include startup and the earlier request in each server process. [Serving and smoke measurements](../../scripts/benchmarks/mac-m4-qwen36-streamed-ab.csv)
+
+Build the Apple Silicon server with `native-mlx,native-fault-qualification`. Use a verified checkpoint directory and the process I/O counter from the [staging study](mac-flint-expert-pipeline.md#reproduce). Run the resident-refusal and streamed smoke first. Use a new output directory and `--pairs 2` for the serving A/B.
+
+```sh
+python3 scripts/mac_cache_study/qwen36_streamed_ab.py \
+  "$ENGINESRV" "$QWEN36_CHECKPOINT" "$SCRATCH/proc-io" "$SCRATCH/qwen36-stream-smoke" --smoke
 ```
 
 ## CUDA and MLX interfaces
