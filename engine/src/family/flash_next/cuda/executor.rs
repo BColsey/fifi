@@ -27,7 +27,7 @@ use crate::{
             StoreLimits, check_prompt,
         },
     },
-    tokenizer::DecodeBatch,
+    tokenizer::{DecodeBatch, DecodeFinish},
 };
 
 use super::driver::{ResumeSnapshot, ResumesState};
@@ -71,6 +71,10 @@ pub(in crate::family::flash_next) struct FlashCudaExecutor<S: ResumesState> {
     /// the trait's store-shape answers read this snapshot, not the live environment, so a
     /// test can pin the unarmed answers without touching the process-global switch.
     armed: bool,
+    /// The rung turn line the last finished turn printed, for the driver-level tests
+    /// that cannot intercept stderr. `None` until a turn ends.
+    #[cfg(test)]
+    last_turn_line: Option<String>,
 }
 
 /// The resume store's shape: no roots and two entries — the tip and one rolling block. A
@@ -144,6 +148,8 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
                 host_budget: resume::HOST_BUDGET_BYTES,
                 block_spacing: RESUME_BLOCK_SPACING,
                 armed: resume::on(),
+                #[cfg(test)]
+                last_turn_line: None,
             },
             DecodeSession::default(),
         ))
@@ -158,6 +164,35 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
     #[cfg(test)]
     pub(in crate::family::flash_next) fn stepper(&mut self) -> &mut S {
         &mut self.driver
+    }
+
+    /// Prints the rung's turn line once, marked when the turn aborted. An
+    /// aborted turn first drops its half-observed open step, so its line
+    /// counts only closed steps; a turn that never read through the rung
+    /// prints nothing.
+    fn emit_turn_line(&mut self, aborted: bool) {
+        if aborted {
+            self.driver.discard_decode_step();
+        }
+        let Some(line) = self.driver.rung_miss_line() else {
+            return;
+        };
+        let line = if aborted {
+            format!("{line} (turn aborted)")
+        } else {
+            line
+        };
+        #[cfg(test)]
+        {
+            self.last_turn_line = Some(line.clone());
+        }
+        eprintln!("{line}");
+    }
+
+    /// The line the last finished turn printed (see [`Self::emit_turn_line`]).
+    #[cfg(test)]
+    pub(in crate::family::flash_next) fn last_turn_line(&self) -> Option<&str> {
+        self.last_turn_line.as_deref()
     }
 
     /// Builds with a forced resume host budget, for the denial test (the default budget
@@ -246,7 +281,24 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
             sampler_vocab: self.rules.sampler_vocab,
             context_limit: self.driver.positions(),
         };
-        st.decode(&mut self.driver, generation, &limits)
+        let batch = st.decode(&mut self.driver, generation, &limits);
+        // The rung's decode miss line, ONCE per turn: this decode is one
+        // token per call, so the line waits for the turn to finish - the
+        // batch's finish reason, or the error exit. The line is a take
+        // (it closes the open step, formats and zeroes the bins), so the
+        // per-turn min, median and max are complete when it prints; the
+        // next turn starts clean and the driver reset between jobs finds
+        // nothing open to drop. A cancelled or failed turn reports its
+        // completed steps, marked; an aborted step is never counted.
+        match &batch {
+            Ok(b) => match b.finish {
+                Some(DecodeFinish::Cancelled) => self.emit_turn_line(true),
+                Some(_) => self.emit_turn_line(false),
+                None => {}
+            },
+            Err(_) => self.emit_turn_line(true),
+        }
+        batch
     }
 
     /// No transient routing or draft state exists between turns.

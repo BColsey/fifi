@@ -452,7 +452,7 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
                 let rig = Rig::new(&projector, &moe, &p.row).expect("rig");
                 let before = split.bank().state().stats().misses;
                 split
-                    .run(&launch, bank_layer, &rig.bufs().expect("bufs"), &moe)
+                    .run(&launch, bank_layer, 0, &rig.bufs().expect("bufs"), &moe)
                     .expect("the split block");
                 stream.synchronize().expect("sync");
                 let got = rig.out_bytes(&projector);
@@ -558,7 +558,7 @@ fn the_split_output_is_identical_at_two_slot_counts() {
                 let rig = Rig::new(&projector, &moe, &p.row).expect("rig");
                 let before = split.bank().state().stats().misses;
                 split
-                    .run(&launch, bank_layer, &rig.bufs().expect("bufs"), &moe)
+                    .run(&launch, bank_layer, 0, &rig.bufs().expect("bufs"), &moe)
                     .expect("the split block");
                 stream.synchronize().expect("sync");
                 let misses = (split.bank().state().stats().misses - before) as usize;

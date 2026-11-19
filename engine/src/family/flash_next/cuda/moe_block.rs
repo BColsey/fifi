@@ -735,6 +735,7 @@ mod device {
             &mut self,
             launch: &Launch<'_>,
             layer: usize,
+            pos: usize,
             bufs: &Exl3MoeBufs<'_>,
             dims: &MoeDims,
         ) -> Result<(), EngError> {
@@ -839,7 +840,11 @@ mod device {
             )?;
 
             // The copies for every pick, hits included; they run behind the resident pass.
-            self.bank.step(ctx, layer, &ids)?;
+            // This is the decode-only entry (prefill runs `run_prefill`),
+            // so this is where the rung's decode miss counter hears the
+            // layer: every layer of the token at `pos`, zero misses
+            // included.
+            self.bank.step_decode(ctx, layer, &ids, pos as u64)?;
             let slot_row_after = self.bank.slot_row(layer)?.to_vec();
             let second = plan_second_pass(&ids, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_ranks)) = second.miss {

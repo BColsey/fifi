@@ -415,6 +415,165 @@ pub(in crate::family::flash_next) struct RungSource {
     /// the pool has slots, so a longer miss list reads in chunks of this.
     slots: usize,
     mode: RungReadMode,
+    /// What decode actually missed on this rung, counted per (step, layer)
+    /// batch and per closed step (see [`DecodeMisses`]). Only the decode
+    /// path observes; the fill and the union-admit never do.
+    decode_misses: DecodeMisses,
+}
+
+/// The rung's decode miss mix: one observation per layer of a decode
+/// step (the layer's
+/// NO_PLACE count — exactly the records the layer reads through the
+/// pool; a layer with no miss is a real zero), one step closed when the
+/// next position arrives. A step's observations stay PENDING until it
+/// closes, so a step aborted by an error or a cancel is dropped whole.
+/// The decode thread is the only writer; the turn boundary and reset
+/// read, on the same engine thread.
+pub(in crate::family::flash_next) struct DecodeMisses {
+    layers: usize,
+    /// Index = misses of one (step, layer) batch; length experts + 1.
+    per_layer: Vec<std::sync::atomic::AtomicU64>,
+    /// Index = total misses of one closed step; length layers * experts + 1.
+    per_step: Vec<std::sync::atomic::AtomicU64>,
+    steps: std::sync::atomic::AtomicU64,
+    /// The open step's per-layer misses, by layer index.
+    pending: std::sync::Mutex<Option<PendingStep>>,
+}
+
+struct PendingStep {
+    pos: u64,
+    misses: Vec<u32>,
+    /// The last layer observed: the same position run again (a rollback
+    /// or a retry) restarts at a layer at or before this one, which
+    /// closes the first run as its own step.
+    last_layer: usize,
+}
+
+impl DecodeMisses {
+    pub(in crate::family::flash_next) fn new(layers: usize, experts: usize) -> Self {
+        Self {
+            layers,
+            per_layer: (0..=experts).map(|_| 0u64.into()).collect(),
+            per_step: (0..=layers.saturating_mul(experts))
+                .map(|_| 0u64.into())
+                .collect(),
+            steps: 0u64.into(),
+            pending: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// One layer of the decode step at `pos`: `misses` records read
+    /// through the pool. The next position closes the previous step, and
+    /// so does a layer at or before the last one seen - the same position
+    /// run again (a rollback, a retry) never merges into the first run.
+    pub(in crate::family::flash_next) fn observe(&self, pos: u64, layer: usize, misses: usize) {
+        let mut pending = self.pending.lock().expect("the decode miss pending");
+        let restart = match pending.as_ref() {
+            Some(step) => step.pos != pos || layer <= step.last_layer,
+            None => false,
+        };
+        if restart && let Some(closed) = pending.take() {
+            self.commit(&closed);
+        }
+        if pending.is_none() {
+            *pending = Some(PendingStep {
+                pos,
+                misses: vec![0; self.layers],
+                last_layer: 0,
+            });
+        }
+        let step = pending.as_mut().expect("a pending step just opened");
+        step.misses[layer] = misses as u32;
+        step.last_layer = layer;
+    }
+
+    /// Drops an aborted step whole: nothing it observed enters the bins.
+    pub(in crate::family::flash_next) fn discard_open(&self) {
+        *self.pending.lock().expect("the decode miss pending") = None;
+    }
+
+    /// The one-line report for the turn boundary, as a take: the open
+    /// step closes into the bins, the bins format, and then the counters
+    /// zero for the next turn - each turn's line reports only its own
+    /// steps. `None` when decode never read through the rung.
+    pub(in crate::family::flash_next) fn line(&self, pool_depth: usize) -> Option<String> {
+        let mut pending = self.pending.lock().expect("the decode miss pending");
+        if let Some(step) = pending.take() {
+            self.commit(&step);
+        }
+        drop(pending);
+        let per_layer: Vec<u64> = self
+            .per_layer
+            .iter()
+            .map(|b| b.swap(0, std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let per_step: Vec<u64> = self
+            .per_step
+            .iter()
+            .map(|b| b.swap(0, std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let steps = self.steps.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let layer_stats = MiniStats::of(&per_layer)?;
+        let step_stats = MiniStats::of(&per_step)?;
+        let step_word = if steps == 1 { "step" } else { "steps" };
+        Some(format!(
+            "disk rung decode: {steps} {step_word}, misses per layer min {} / median {} / max {}, \
+             per step min {} / median {} / max {}, pool depth {pool_depth}",
+            layer_stats.min,
+            layer_stats.median,
+            layer_stats.max,
+            step_stats.min,
+            step_stats.median,
+            step_stats.max,
+        ))
+    }
+
+    fn commit(&self, step: &PendingStep) {
+        let mut total = 0usize;
+        for &misses in &step.misses {
+            self.per_layer[misses as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            total += misses as usize;
+        }
+        self.per_step[total].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Min, exact lower median, max and count read off histogram bins.
+struct MiniStats {
+    min: u64,
+    median: u64,
+    max: u64,
+}
+
+impl MiniStats {
+    fn of(bins: &[u64]) -> Option<Self> {
+        let count: u64 = bins.iter().sum();
+        if count == 0 {
+            return None;
+        }
+        let min = bins.iter().enumerate().find(|&(_, &hits)| hits > 0)?.0 as u64;
+        let max = bins
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &hits)| hits > 0)?
+            .0 as u64;
+        // The lower median: the smallest value whose cumulative count
+        // reaches half the observations, exact from the bins.
+        let target = count.div_ceil(2);
+        let mut seen = 0u64;
+        let median = bins
+            .iter()
+            .enumerate()
+            .find(|&(_, &hits)| {
+                seen += hits;
+                seen >= target
+            })
+            .map(|(value, _)| value as u64)?;
+        Some(Self { min, median, max })
+    }
 }
 
 /// The pool's checkout bound: leases live only inside one step's miss
@@ -572,7 +731,31 @@ impl RungSource {
             experts,
             slots,
             mode,
+            decode_misses: DecodeMisses::new(layers, experts),
         })
+    }
+
+    /// One layer of a decode step at `pos`: `misses` is the layer's
+    /// NO_PLACE count, which is exactly the records the layer reads
+    /// through the pool (the miss list never repeats an expert).
+    pub(in crate::family::flash_next) fn observe_decode(
+        &self,
+        pos: u64,
+        layer: usize,
+        misses: usize,
+    ) {
+        self.decode_misses.observe(pos, layer, misses);
+    }
+
+    /// The decode miss line for the turn boundary (see
+    /// [`DecodeMisses::line`]); `None` when decode never read here.
+    pub(in crate::family::flash_next) fn decode_miss_line(&self) -> Option<String> {
+        self.decode_misses.line(self.slots)
+    }
+
+    /// Drops a decode step aborted by an error or a cancel, whole.
+    pub(in crate::family::flash_next) fn discard_decode_step(&self) {
+        self.decode_misses.discard_open();
     }
 
     /// The byte size `backing` must carry for [`Self::new`]: the exact

@@ -833,6 +833,7 @@ impl<'a> FlashStep<'a> {
     pub(super) fn moe_block(
         &self,
         layer: usize,
+        pos: usize,
         moe: &mut dyn MoeBlock,
         m: usize,
     ) -> Result<(), EngError> {
@@ -859,7 +860,7 @@ impl<'a> FlashStep<'a> {
         }
         let dims = self.moe_dims(1);
         for r in 0..m {
-            moe.run(&launch, layer, &self.moe_bufs_at(r)?, &dims)?;
+            moe.run(&launch, layer, pos, &self.moe_bufs_at(r)?, &dims)?;
         }
         Ok(())
     }
@@ -891,7 +892,7 @@ impl<'a> FlashStep<'a> {
             self.hyper_apply(Site::Attn, m)?;
             self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), m)?;
             tick(8);
-            self.moe_block(layer, moe, m)?;
+            self.moe_block(layer, pos, moe, m)?;
             tick(10);
             let r = self.hyper_apply(Site::Mlp, m);
             tick(8);
@@ -1098,10 +1099,13 @@ pub(super) fn bank_key(layer: usize, part: &str) -> String {
 /// stream. `bufs.route.resid_in` is a zero row for the combine. It may wait on the stream and copy
 /// (a partial expert bank does on a miss); the step does not rely on it being non-blocking.
 pub(super) trait MoeBlock {
+    /// `pos` is the token's position: one decode step is every layer's
+    /// run at the same position. The disk-rung miss counter keys on it.
     fn run(
         &mut self,
         launch: &Launch<'_>,
         layer: usize,
+        pos: usize,
         bufs: &Exl3MoeBufs<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError>;
@@ -1129,6 +1133,7 @@ impl MoeBlock for AllResidentMoe<'_> {
         &mut self,
         launch: &Launch<'_>,
         layer: usize,
+        _pos: usize,
         bufs: &Exl3MoeBufs<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError> {
@@ -1231,6 +1236,7 @@ impl MoeBlock for SplitMoeAt<'_> {
         &mut self,
         launch: &Launch<'_>,
         layer: usize,
+        pos: usize,
         bufs: &Exl3MoeBufs<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError> {
@@ -1244,7 +1250,7 @@ impl MoeBlock for SplitMoeAt<'_> {
                     self.first_layer + self.rows
                 ))
             })?;
-        self.inner.run(launch, row, bufs, dims)
+        self.inner.run(launch, row, pos, bufs, dims)
     }
 
     fn run_prefill(

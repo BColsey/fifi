@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use super::super::driver::StateSlot;
 use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds, chunk::ChunkDevice};
+use crate::family::flash_next::cuda::bank_source::DecodeMisses;
 use crate::family::flash_next::cuda::ple_feed::PleKeyValue;
 use crate::{
     EngError,
@@ -47,6 +48,10 @@ pub(in crate::family::flash_next::cuda) struct FakeDevice {
     /// The call that fails (its log name), once.
     pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
     pub(in crate::family::flash_next::cuda) resets: usize,
+    /// The rung's decode miss counter. When set, `layers` observes the
+    /// card device's pattern — one count per layer, misses equal to the
+    /// layer index — so driver-level tests see the turn line.
+    pub(in crate::family::flash_next::cuda) decode_misses: Option<DecodeMisses>,
 }
 
 impl FakeDevice {
@@ -89,6 +94,9 @@ impl TokenDevice for FakeDevice {
             for value in &mut self.stream {
                 *value += (layer + 1 + pos) as f32;
             }
+            if let Some(misses) = &self.decode_misses {
+                misses.observe(pos as u64, layer, layer);
+            }
         }
         self.step("layers", format!("{}..{} @{pos}", range.start, range.end))
     }
@@ -119,7 +127,21 @@ impl TokenDevice for FakeDevice {
     fn reset(&mut self) -> Result<(), EngError> {
         self.resets += 1;
         self.stream.clear();
+        // The card device ends an open decode step on reset; so does the fake.
+        if let Some(misses) = &self.decode_misses {
+            misses.discard_open();
+        }
         self.step("reset", String::new())
+    }
+
+    fn rung_miss_line(&self) -> Option<String> {
+        self.decode_misses.as_ref()?.line(4)
+    }
+
+    fn discard_decode_step(&self) {
+        if let Some(misses) = &self.decode_misses {
+            misses.discard_open();
+        }
     }
 }
 
@@ -158,6 +180,11 @@ pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
     /// The last state the resume seam wrote back, as read.
     pub(in crate::family::flash_next::cuda) state: Vec<(StateSlot, Vec<u8>)>,
     pub(in crate::family::flash_next::cuda) track_windows: bool,
+    /// The rung's decode miss counter, as on the token fake.
+    pub(in crate::family::flash_next::cuda) decode_misses: Option<DecodeMisses>,
+    /// True inside the prefill window: the production prefill path never
+    /// observes (SplitMoe::run_prefill), so the fake does not either.
+    pub(in crate::family::flash_next::cuda) in_prefill: bool,
 }
 
 impl FakeChunkDevice {
@@ -218,6 +245,7 @@ impl ChunkDevice for FakeChunkDevice {
     }
 
     fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.in_prefill = true;
         if self.track_windows {
             self.step("begin_prefill", String::new())?;
         }
@@ -225,6 +253,7 @@ impl ChunkDevice for FakeChunkDevice {
     }
 
     fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.in_prefill = false;
         if self.track_windows {
             self.step("end_prefill", String::new())?;
         }
@@ -239,6 +268,9 @@ impl ChunkDevice for FakeChunkDevice {
                 for cell in value.iter_mut() {
                     *cell += add;
                 }
+            }
+            if let (true, Some(misses)) = (!self.in_prefill, &self.decode_misses) {
+                misses.observe(pos as u64, layer, layer);
             }
         }
         self.step(
@@ -281,7 +313,21 @@ impl ChunkDevice for FakeChunkDevice {
     fn reset(&mut self) -> Result<(), EngError> {
         self.resets += 1;
         self.stream.clear();
+        // The card device ends an open decode step on reset; so does the fake.
+        if let Some(misses) = &self.decode_misses {
+            misses.discard_open();
+        }
         self.step("reset", String::new())
+    }
+
+    fn rung_miss_line(&self) -> Option<String> {
+        self.decode_misses.as_ref()?.line(4)
+    }
+
+    fn discard_decode_step(&self) {
+        if let Some(misses) = &self.decode_misses {
+            misses.discard_open();
+        }
     }
 }
 
@@ -292,10 +338,15 @@ pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     /// The first key of every device pair set (the device route hands them over in order).
     pub(in crate::family::flash_next::cuda) pairs: Vec<f32>,
     pub(in crate::family::flash_next::cuda) resets: usize,
+    /// PLE updates seen, for `fail_update_after`.
+    pub(in crate::family::flash_next::cuda) ple_calls: usize,
     /// The token whose `begin` fails.
     pub(in crate::family::flash_next::cuda) fail_begin: Option<u32>,
     /// Fails the PLE update.
     pub(in crate::family::flash_next::cuda) fail_update: bool,
+    /// Fails the PLE update after this many successful calls (a mid-turn
+    /// death that leaves earlier steps complete).
+    pub(in crate::family::flash_next::cuda) fail_update_after: Option<usize>,
     /// The width of the update (the stream's, unless a test breaks it).
     pub(in crate::family::flash_next::cuda) update_width: Option<usize>,
     pub(in crate::family::flash_next::cuda) start_width: Option<usize>,
@@ -313,7 +364,9 @@ impl TokenFeeds for FakeFeeds {
     }
 
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
-        if self.fail_update {
+        let calls = self.ple_calls;
+        self.ple_calls += 1;
+        if self.fail_update || self.fail_update_after.is_some_and(|n| calls >= n) {
             return Err(EngError::Checkpoint("the PLE step failed".into()));
         }
         self.updates.push((token, stream.to_vec()));

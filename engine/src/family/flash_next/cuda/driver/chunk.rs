@@ -343,6 +343,14 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         None
     }
+    /// The rung's decode miss line for the turn boundary (log-only), for a
+    /// device with a disk-rung bank.
+    fn rung_miss_line(&self) -> Option<String> {
+        None
+    }
+    /// Drops the rung's open decode step (an aborted turn's half-observed
+    /// one), for a device with a disk-rung bank.
+    fn discard_decode_step(&self) {}
 }
 
 mod shared;
@@ -678,6 +686,14 @@ impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for Chu
 
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         self.device().bank_snapshot()
+    }
+
+    fn rung_miss_line(&self) -> Option<String> {
+        self.device().rung_miss_line()
+    }
+
+    fn discard_decode_step(&self) {
+        self.device().discard_decode_step();
     }
 
     fn resume_host_bytes(&self) -> u64 {

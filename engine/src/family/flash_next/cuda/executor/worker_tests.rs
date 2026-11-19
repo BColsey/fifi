@@ -162,3 +162,146 @@ fn the_worker_drives_three_turns_a_suffix_and_a_switch() {
     let report = engine.shutdown();
     let _ = report;
 }
+
+/// The executor's turn line, driven the way the serve drives it: one
+/// `decode` call per token, over the chunk driver — the serve's own
+/// driver — whose fake observes outside the prefill window exactly as
+/// the production MoE seam does. The turn of three calls prints exactly
+/// ONE line — nothing mid-turn — with the steps and figures of the
+/// whole turn; a second turn prints its own; a turn that dies mid-step
+/// after its layers ran reports its completed steps, marked aborted.
+mod turn_line {
+    use super::super::{CudaRules, FlashCudaExecutor};
+    use crate::family::executor::{ExecutorOps, GenerationState};
+    use crate::family::flash_next::cuda::bank_source::DecodeMisses;
+    use crate::family::flash_next::cuda::driver::DriverShape;
+    use crate::family::flash_next::cuda::driver::chunk::ChunkDriver;
+    use crate::family::flash_next::cuda::driver::fakes::{
+        FakeChunkDevice, FakeFeeds, SAMPLER_VOCAB, shape,
+    };
+    use crate::tokenizer::{IncrementalDecoder, Tokenizer};
+
+    type Executor = FlashCudaExecutor<ChunkDriver<FakeChunkDevice, FakeFeeds>>;
+
+    fn executor(feeds: FakeFeeds) -> (Executor, crate::family::session::DecodeSession) {
+        let device = FakeChunkDevice {
+            decode_misses: Some(DecodeMisses::new(shape().layers, 8)),
+            ..Default::default()
+        };
+        let driver = ChunkDriver::new(
+            device,
+            feeds,
+            DriverShape {
+                positions: 32,
+                ..shape()
+            },
+        )
+        .expect("driver");
+        let (executor, session) = FlashCudaExecutor::with_host_budget_for_tests(
+            driver,
+            CudaRules {
+                eos: std::sync::Arc::from([]),
+                sampler_vocab: SAMPLER_VOCAB,
+            },
+            1 << 20,
+        )
+        .expect("executor");
+        (executor, session)
+    }
+
+    fn generation(max: usize) -> GenerationState {
+        let tokenizer = Tokenizer::from_bytes(super::TOKENIZER_JSON.as_bytes()).expect("parse");
+        GenerationState::new(IncrementalDecoder::new(&tokenizer))
+            .with_max_tokens(max.try_into().unwrap())
+    }
+
+    /// One turn: `decode` until the batch carries a finish reason.
+    fn run_turn(
+        executor: &mut Executor,
+        session: &mut crate::family::session::DecodeSession,
+        max: usize,
+    ) {
+        let mut gen_state = generation(max);
+        executor.reset(session).expect("reset");
+        executor.prefill(session, &[1, 2]).expect("prefill");
+        loop {
+            let batch = executor.decode(session, &mut gen_state).expect("decode");
+            if batch.finish.is_some() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_turn_of_decode_calls_prints_exactly_one_line() {
+        let (mut executor, mut session) = executor(FakeFeeds::default());
+        let mut gen_state = generation(3);
+        executor.reset(&mut session).expect("reset");
+        executor.prefill(&mut session, &[1, 2]).expect("prefill");
+        // Two mid-turn calls: no finish, no line yet.
+        for _ in 0..2 {
+            let batch = executor
+                .decode(&mut session, &mut gen_state)
+                .expect("decode");
+            assert!(batch.finish.is_none());
+            assert!(executor.last_turn_line().is_none(), "no line mid-turn");
+        }
+        let batch = executor
+            .decode(&mut session, &mut gen_state)
+            .expect("decode");
+        assert!(batch.finish.is_some());
+        let line = executor
+            .last_turn_line()
+            .expect("the turn's one line")
+            .to_string();
+        eprintln!("{line}");
+        // Three decode calls drove two rows: the Length finish arrives with the
+        // third sample, before that token's own row runs.
+        assert!(line.contains("2 steps"), "{line}");
+        assert!(line.contains("per step min 6 / median 6 / max 6"), "{line}");
+        assert!(!line.contains("aborted"), "{line}");
+    }
+
+    #[test]
+    fn a_second_turn_prints_its_own_line() {
+        let (mut executor, mut session) = executor(FakeFeeds::default());
+        run_turn(&mut executor, &mut session, 3);
+        assert!(executor.last_turn_line().unwrap().contains("2 steps"));
+        run_turn(&mut executor, &mut session, 2);
+        let second = executor.last_turn_line().expect("the second turn");
+        assert!(second.contains("1 step"), "{second}");
+    }
+
+    #[test]
+    fn an_aborted_turn_reports_its_completed_steps_marked() {
+        // The PLE update fails after the first token's layers ran, so the
+        // turn dies with one whole step observed.
+        // The PLE update dies after the prefill's two calls and one decode
+        // row, so the turn ends by error with one whole step observed.
+        let (mut executor, mut session) = executor(FakeFeeds {
+            fail_update_after: Some(3),
+            ..Default::default()
+        });
+        let mut gen_state = generation(3);
+        executor.reset(&mut session).expect("reset");
+        executor.prefill(&mut session, &[1, 2]).expect("prefill");
+        // Whole rows run first (no line while the turn lives), then the
+        // PLE update dies mid-turn.
+        let mut died = false;
+        for _ in 0..8 {
+            if executor.decode(&mut session, &mut gen_state).is_err() {
+                died = true;
+                break;
+            }
+            assert!(
+                executor.last_turn_line().is_none(),
+                "no line before the death"
+            );
+        }
+        assert!(died, "the turn never died");
+        let line = executor.last_turn_line().expect("the aborted turn's line");
+        eprintln!("{line}");
+        assert!(line.contains("1 step"), "{line}");
+        assert!(line.contains("(turn aborted)"), "{line}");
+    }
+}

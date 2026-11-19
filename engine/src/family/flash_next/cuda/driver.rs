@@ -199,6 +199,15 @@ pub(crate) trait ResumesState: StepperPositions {
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         None
     }
+    /// The rung's decode miss line for the turn boundary (log-only). The
+    /// default is `None`: a driver without a disk-rung bank reports nothing.
+    fn rung_miss_line(&self) -> Option<String> {
+        None
+    }
+    /// Drops the rung's open decode step — the one an aborted turn leaves
+    /// half-observed — so an aborted turn's line counts only closed steps.
+    /// The default does nothing: a driver without a rung has nothing open.
+    fn discard_decode_step(&self) {}
     /// The host bytes [`Self::save_resume`] would produce now, without reading any device
     /// state: the budget charge of one more entry.
     fn resume_host_bytes(&self) -> u64;
@@ -232,6 +241,14 @@ pub(super) trait TokenDevice: StartSink {
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         None
     }
+    /// The rung's decode miss line for the turn boundary (log-only), for a
+    /// device with a disk-rung bank.
+    fn rung_miss_line(&self) -> Option<String> {
+        None
+    }
+    /// Drops the rung's open decode step (an aborted turn's half-observed
+    /// one), for a device with a disk-rung bank.
+    fn discard_decode_step(&self) {}
 }
 
 /// The token driver: a [`TokenStepper`] over a device and its feeds.
@@ -453,6 +470,14 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
 }
 
 impl<D: TokenDevice + StateIo, F: TokenFeeds> ResumesState for TokenDriver<D, F> {
+    fn rung_miss_line(&self) -> Option<String> {
+        self.device.rung_miss_line()
+    }
+
+    fn discard_decode_step(&self) {
+        self.device.discard_decode_step();
+    }
+
     fn resume_generation(&self) -> u64 {
         self.generation
     }

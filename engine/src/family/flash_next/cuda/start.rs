@@ -1187,6 +1187,20 @@ impl ResumesState for StepDriver {
         StepDriver::bank_snapshot(self)
     }
 
+    fn rung_miss_line(&self) -> Option<String> {
+        match self {
+            Self::Token(driver) => driver.rung_miss_line(),
+            Self::Chunk(driver) => driver.rung_miss_line(),
+        }
+    }
+
+    fn discard_decode_step(&self) {
+        match self {
+            Self::Token(driver) => driver.discard_decode_step(),
+            Self::Chunk(driver) => driver.discard_decode_step(),
+        }
+    }
+
     fn resume_host_bytes(&self) -> u64 {
         match self {
             Self::Token(driver) => driver.resume_host_bytes(),

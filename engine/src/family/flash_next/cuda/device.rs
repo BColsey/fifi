@@ -158,6 +158,9 @@ impl TokenDevice for CardDevice {
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
+        // A reset ends whatever decode step was open — aborted by an
+        // error or a cancel — so its partial counts drop, not carry.
+        self.moe.bank().discard_decode_step();
         self.step.reset()
     }
 
@@ -167,6 +170,14 @@ impl TokenDevice for CardDevice {
 
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         Some(CardDevice::bank_report(self))
+    }
+
+    fn rung_miss_line(&self) -> Option<String> {
+        self.moe.bank().decode_miss_line()
+    }
+
+    fn discard_decode_step(&self) {
+        self.moe.bank().discard_decode_step()
     }
 }
 
@@ -366,11 +377,22 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         if let Err(error) = self.moe.end_prefill() {
             eprintln!("flash-next cuda: ending the prefill window on reset failed: {error:?}");
         }
+        // A reset ends whatever decode step was open — aborted by an
+        // error or a cancel — so its partial counts drop, not carry.
+        self.moe.bank().discard_decode_step();
         self.step.reset()
     }
 
     fn bank_misses(&self) -> Option<u64> {
         Some(self.moe.bank().stats().misses)
+    }
+
+    fn rung_miss_line(&self) -> Option<String> {
+        self.moe.bank().decode_miss_line()
+    }
+
+    fn discard_decode_step(&self) {
+        self.moe.bank().discard_decode_step()
     }
 
     fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {

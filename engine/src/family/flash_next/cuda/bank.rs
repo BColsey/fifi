@@ -926,6 +926,44 @@ pub(super) mod device {
             self.finish(ctx, copies)
         }
 
+        /// [`Self::step`] for the decode path, which knows the step's
+        /// position: every layer of the token at `pos` observes its
+        /// NO_PLACE count to the rung (a layer with no miss observes a
+        /// real zero). The count is exactly the records the layer reads
+        /// through the pool — the miss list never repeats an expert.
+        pub(in crate::family::flash_next) fn step_decode(
+            &mut self,
+            ctx: &CudaContext,
+            layer: usize,
+            picks: &[i32],
+            pos: u64,
+        ) -> Result<PassCopies, EngError> {
+            self.check_usable()?;
+            let copies = self.state.begin_pass(layer, picks)?;
+            if let Some(source) = self.source {
+                let misses = copies
+                    .ops
+                    .iter()
+                    .filter(|op| op.src_place == crate::family::expert_bank::NO_PLACE)
+                    .count();
+                source.observe_decode(pos, layer, misses);
+            }
+            self.finish(ctx, copies)
+        }
+
+        /// The rung's decode miss line for the turn boundary; `None`
+        /// when this bank never read through the rung (no disk tier).
+        pub(in crate::family::flash_next) fn decode_miss_line(&self) -> Option<String> {
+            self.source?.decode_miss_line()
+        }
+
+        /// Drops a decode step aborted by an error or a cancel, whole.
+        pub(in crate::family::flash_next) fn discard_decode_step(&self) {
+            if let Some(source) = self.source {
+                source.discard_decode_step();
+            }
+        }
+
         /// Admits the experts a prefill chunk used (oldest use first) and runs the copies.
         pub(in crate::family::flash_next) fn admit(
             &mut self,

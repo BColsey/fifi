@@ -894,7 +894,7 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
             let mixed_mlp = step
                 .read_f32(step.slot(Slot::Mixed(Site::Mlp)).unwrap(), hidden)
                 .expect("mixed");
-            step.moe_block(layer, block.as_block(), 1).expect("moe");
+            step.moe_block(layer, 0, block.as_block(), 1).expect("moe");
             let moe_out = step
                 .read_f32(step.slot(Slot::BlockOut(Site::Mlp)).unwrap(), hidden)
                 .expect("moe out");

@@ -449,6 +449,85 @@ fn a_read_that_fails_after_the_open_is_refused_by_name() {
     assert!(error.contains("the shard went away"), "{error}");
 }
 
+/// The decode miss counter driven exactly as production drives it: one
+/// `observe` per layer per position (zero misses included — layer 0 of
+/// the first step and the whole third layer of the second read nothing),
+/// the next position closing the previous step, `line` closing the last.
+/// Three layers, eight experts, pool depth four.
+#[test]
+fn the_decode_miss_counter_bins_the_production_call_pattern() {
+    use super::bank_source::DecodeMisses;
+    let misses = DecodeMisses::new(3, 8);
+    // Step at pos 7: layers miss 0, 3, 3.
+    misses.observe(7, 0, 0);
+    misses.observe(7, 1, 3);
+    misses.observe(7, 2, 3);
+    // Step at pos 8: layers miss 2, 1, 0 — layer 2 serves from the bank.
+    misses.observe(8, 0, 2);
+    misses.observe(8, 1, 1);
+    misses.observe(8, 2, 0);
+    let line = misses.line(4).expect("the line");
+    eprintln!("{line}");
+    // Six layer observations: two 0s, one 1, one 2, two 3s — the lower
+    // median of {0,0,1,2,3,3} is 1, and bin 0 carries the no-miss layers.
+    assert!(
+        line.contains("2 steps, misses per layer min 0 / median 1 / max 3"),
+        "{line}"
+    );
+    // Step totals: 6 then 3.
+    assert!(
+        line.contains("per step min 3 / median 3 / max 6, pool depth 4"),
+        "{line}"
+    );
+}
+
+/// The same position run twice (a rollback, a retry) makes two steps:
+/// the second run's layer 0 arrives at or before the first run's last
+/// layer and closes the first run, so nothing merges.
+#[test]
+fn a_rerun_of_one_position_counts_as_two_steps() {
+    use super::bank_source::DecodeMisses;
+    let misses = DecodeMisses::new(3, 8);
+    // First run of pos 4: layers 0, 1, 2 miss 1, 2, 3.
+    misses.observe(4, 0, 1);
+    misses.observe(4, 1, 2);
+    misses.observe(4, 2, 3);
+    // The rollback: pos 4 again, layers 0, 1, 2 miss 3, 0, 0.
+    misses.observe(4, 0, 3);
+    misses.observe(4, 1, 0);
+    misses.observe(4, 2, 0);
+    let line = misses.line(4).expect("the line");
+    assert!(line.contains("2 steps"), "{line}");
+    // Step totals 6 and 3, in their own bins.
+    assert!(line.contains("per step min 3 / median 3 / max 6"), "{line}");
+}
+
+/// A step aborted by an error or a cancel drops whole: nothing it
+/// observed enters the bins, and the next step starts clean.
+#[test]
+fn an_aborted_decode_step_drops_whole() {
+    use super::bank_source::DecodeMisses;
+    let misses = DecodeMisses::new(2, 8);
+    misses.observe(1, 0, 4);
+    // The step errors at layer 1; reset discards it.
+    misses.discard_open();
+    misses.observe(2, 0, 2);
+    misses.observe(2, 1, 2);
+    let line = misses.line(4).expect("the line");
+    assert!(
+        line.contains("1 step, misses per layer min 2 / median 2 / max 2"),
+        "{line}"
+    );
+    assert!(line.contains("per step min 4 / median 4 / max 4"), "{line}");
+}
+
+/// A fresh rung has no line: decode never read through it.
+#[test]
+fn a_rung_decode_never_used_prints_no_line() {
+    use super::bank_source::DecodeMisses;
+    assert!(DecodeMisses::new(2, 8).line(4).is_none());
+}
+
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::*;
