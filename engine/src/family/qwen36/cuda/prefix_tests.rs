@@ -151,3 +151,13 @@ fn process_memory_limit_2_gib_admits_one_large_pageable_shard_and_refuses_two() 
         !super::prefix::admit_pageable([(&layout, 32_767), (&layout, 32_767)].into_iter()).unwrap()
     );
 }
+
+#[test]
+fn the_save_decision_admits_at_the_boundary_and_skips_with_a_line() {
+    use super::prefix::admit_or_log;
+    // Ample room admits.
+    assert!(admit_or_log(10, usize::MAX));
+    // A shortfall skips; the boundary admits.
+    assert!(!admit_or_log(10, 9));
+    assert!(admit_or_log(10, 10));
+}

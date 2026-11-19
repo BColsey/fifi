@@ -138,17 +138,34 @@ pub(super) fn admit_pageable<'a>(
     states: impl Iterator<Item = (&'a StateLayout, usize)>,
 ) -> Result<bool, EngError> {
     let required = pageable_required(states)?;
-    let available = crate::family::host_admit::HostAdmission::probe(
+    // The cgroup-aware figure the other admissions size from, with the bare
+    // MemAvailable figure when the cgroup tree refuses. A probe that cannot
+    // verify anything falls back and logs: it proceeds with the save the
+    // engine performed before the check, it does not take a feature away.
+    let available = match crate::family::host_admit::HostAdmission::probe_or_bare(
         "q36 pageable prefix",
         "q36 pageable prefix",
-    )
-    .inspect_err(|error| {
+    ) {
+        Ok((_total, available)) => usize::try_from(available).unwrap_or(usize::MAX),
+        Err(error) => {
+            eprintln!(
+                "q36 cuda: pageable prefix host budget: probe unavailable ({}); proceeding without the check",
+                error.describe()
+            );
+            return Ok(true);
+        }
+    };
+    Ok(admit_or_log(required, available))
+}
+
+/// The save decision: one logged line states what a shortfall skip costs -
+/// nothing for the request - because the save is optional infrastructure.
+pub(super) fn admit_or_log(required: usize, available: usize) -> bool {
+    if required > available {
         eprintln!(
-            "q36 cuda: pageable prefix host budget: {}",
-            error.describe()
-        )
-    })
-    .ok()
-    .and_then(|budget| usize::try_from(budget.available_budget()).ok());
-    Ok(available.is_some_and(|bytes| required <= bytes))
+            "q36 cuda: pageable prefix host budget: skip save (need {required} bytes, have {available} bytes); the request is unaffected"
+        );
+        return false;
+    }
+    true
 }
