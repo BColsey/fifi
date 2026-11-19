@@ -463,4 +463,4 @@ impl RouteCounts {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::family::flash_next) mod tests;

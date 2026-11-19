@@ -23,7 +23,7 @@ fn position(elem: u64) -> u64 {
     position_bytes(12, 2, 256, elem, (128, 4)).unwrap()
 }
 
-fn inputs(positions: u64, elem: u64) -> TierInputs {
+pub(in crate::family::flash_next) fn inputs(positions: u64, elem: u64) -> TierInputs {
     TierInputs::cost_model_3090(
         shape(),
         (TRUNK_BYTES, STATE_BYTES),
@@ -40,7 +40,7 @@ fn slots(positions: u64, elem: u64) -> usize {
         .slots_per_layer()
 }
 
-fn message(error: EngError) -> String {
+pub(in crate::family::flash_next) fn message(error: EngError) -> String {
     error.describe()
 }
 

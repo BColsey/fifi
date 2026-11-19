@@ -64,8 +64,9 @@ const I32: usize = size_of::<i32>();
 /// wider chunks: every doubling halves the per-layer-chunk drain count of a deep prefill.
 /// The bound is the shared `MAX_EXL3_ROWS`: `shared_rows` refuses wider windows whatever the
 /// caller. The kernel's dense job bound is wider still (`jobs_row_cap`, 256, exl3.cu), so
-/// raising this is a planning decision, not a kernel port; see `begin_chunk`. A session may
-/// lift this to `exl3_rows_ceiling()` for measurement widths above the qualified default.
+/// raising this is a planning decision, not a kernel port; see `begin_chunk`. The supported
+/// window reaches `exl3_rows_ceiling()`; this const stays the default width and the
+/// per-assertion ladder point the oracle and parity suites pin.
 pub(super) const MAX_STEP_ROWS: usize = MAX_EXL3_ROWS;
 
 /// Shared by the arena charge, dense job writer and actual prefill Projector.

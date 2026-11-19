@@ -7,9 +7,10 @@ path and its `INFERENCE_FLASH_NEXT_SHARED_PREFILL` rollback switch were deleted
 after the flip was qualified). The variable is no longer read; setting it has
 no effect. The per-token `prefill_rows = 1` path is the token
 driver and remains.
-An unset `prefill_rows` resolves to 256; only width 256 is qualified (the measurements
-below). Explicit widths from 2 up to the shared bound run the shared path at that width,
-unqualified.
+An unset `prefill_rows` resolves to 256. Widths from 2 up to the shared bound
+run the shared path at that width; 1,024 and 2,048 have served 32K measurements
+(the configuration table's `prefill_rows` row carries the figures), and the
+oracle and parity suites pin 256.
 
 During an open prefill window, the shared steps use the common Projector and MoE pass.
 Decode and verify use the existing launches with the same arena owner.

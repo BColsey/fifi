@@ -49,7 +49,7 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
-    /// CUDA only: rows of one device step during prefill, 1 to 256. The unset default is
+    /// CUDA only: rows of one device step during prefill, 1 to 2,048. The unset default is
     /// 256, the qualified shared width; an explicit `1` selects the per-token prefill
     /// (the decode shape, served by the single-row path).
     pub(crate) prefill_rows: Option<u32>,
@@ -265,11 +265,11 @@ pub(in crate::family::flash_next) fn cuda_settings(
     {
         return Err(bad("expert_stats must not be empty".into()));
     }
-    // The step plan refuses widths above `MAX_STEP_ROWS` (`cuda/step_plan.rs`), which equals
-    // `MAX_EXL3_ROWS` of `project/exl3_jobs_plan.rs`; refusing here names `prefill_rows` at
-    // parse time instead of a plan refusal at boot. The ceiling may be raised above the
-    // qualified default by `INFERENCE_EXL3_ROWS_MAX` (a measurement width above the
-    // qualified default).
+    // The step plan refuses widths above the rows ceiling (`cuda/step_plan.rs`), which
+    // floors at `SUPPORTED_EXL3_ROWS` of `project/exl3_jobs_plan.rs`; refusing here names
+    // `prefill_rows` at parse time instead of a plan refusal at boot. The ceiling may be
+    // raised above the supported width by `INFERENCE_EXL3_ROWS_MAX` (a measurement width
+    // above the supported ceiling).
     let rows_ceiling = exl3_rows_ceiling().map_err(EngError::BadRequest)?;
     let prefill_rows = ranged(
         "prefill_rows",
@@ -724,10 +724,11 @@ mod tests {
         }
     }
 
-    /// `prefill_rows` takes the whole planned width (the shared `MAX_EXL3_ROWS`) and refuses
-    /// one row above it at parse time, naming the key.
+    /// `prefill_rows` takes the supported width (`SUPPORTED_EXL3_ROWS`, no measurement
+    /// variable) and refuses one row above it at parse time, naming the key. The
+    /// measurement variable still widens past it (pinned in `exl3_jobs_plan`).
     #[test]
-    fn prefill_rows_is_bounded_at_the_planned_chunk_width() {
+    fn prefill_rows_is_bounded_at_the_supported_width() {
         let env = FlashEnv::default();
         let at = |rows: u32| {
             let options = FlashOptions {
@@ -738,15 +739,20 @@ mod tests {
         };
         assert_eq!(at(256).unwrap().cuda.unwrap().prefill_rows, 256);
         assert_eq!(at(1).unwrap().cuda.unwrap().prefill_rows, 1);
-        assert!(message(at(257)).contains("prefill_rows"));
+        // The widened window is a supported setting now: 1,024 and 2,048 rows parse with
+        // no measurement variable; one row above the supported ceiling still refuses.
+        assert_eq!(at(1024).unwrap().cuda.unwrap().prefill_rows, 1024);
+        assert_eq!(at(2048).unwrap().cuda.unwrap().prefill_rows, 2048);
+        assert!(message(at(2049)).contains("prefill_rows"));
         assert!(message(at(0)).contains("prefill_rows"));
     }
 
-    /// `ring_rows` defaults to the stock 32, takes any value 1 to 256 (the ExL3 row cap),
-    /// refuses values outside it at parse time naming the key, and stays refused without
+    /// `ring_rows` defaults to the stock 32, takes any value up to the rows ceiling (the
+    /// shared supported width), refuses values outside it at parse time naming the key, and
+    /// stays refused without
     /// `cuda_decode`.
     #[test]
-    fn ring_rows_defaults_to_32_and_is_bounded_at_256() {
+    fn ring_rows_defaults_to_32_and_is_bounded_at_the_supported_width() {
         let env = FlashEnv::default();
         let at = |rows: Option<u32>| {
             let options = FlashOptions {
@@ -758,7 +764,10 @@ mod tests {
         assert_eq!(at(None).unwrap().cuda.unwrap().ring_rows, 32);
         assert_eq!(at(Some(256)).unwrap().cuda.unwrap().ring_rows, 256);
         assert_eq!(at(Some(1)).unwrap().cuda.unwrap().ring_rows, 1);
-        assert!(message(at(Some(257))).contains("ring_rows"));
+        // The bound shares the rows ceiling: a ring threshold at the supported width
+        // parses with no measurement variable; one above the ceiling still refuses.
+        assert_eq!(at(Some(2048)).unwrap().cuda.unwrap().ring_rows, 2048);
+        assert!(message(at(Some(2049))).contains("ring_rows"));
         assert!(message(at(Some(0))).contains("ring_rows"));
         let stray = FlashOptions {
             ring_rows: Some(32),

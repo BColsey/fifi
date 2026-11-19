@@ -704,7 +704,7 @@ pub(super) fn build_driver(
     stage("building the step");
     // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs
     // as device chunks of that many rows; one keeps the per-token prefill. The default
-    // width is 256 (the only qualified one).
+    // width is 256; the supported range reaches `exl3_rows_ceiling()`.
     let stream = Box::leak(Box::new(ctx.stream()?));
     let new_step = if rows > 1 {
         FlashStep::new_prefill

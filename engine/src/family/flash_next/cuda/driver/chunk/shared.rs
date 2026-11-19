@@ -145,7 +145,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
     pub(super) fn feed_shared_rows(&mut self, tokens: &[u32]) -> Result<()> {
         self.preflight_shared(tokens)?;
         let cap = self.chunk_cap.max(1);
-        // The qualified default unless a measurement session lifted the ceiling.
+        // The supported window ceiling; INFERENCE_EXL3_ROWS_MAX raises it further.
         let rows_ceiling = exl3_rows_ceiling().map_err(|d| refuse(&d))?;
         if cap > rows_ceiling {
             return Err(refuse(

@@ -98,7 +98,9 @@ fn shared_prefill_preflight_refusals_do_not_open_or_poison() {
     }
     let mut driver = shared_driver(FakeFeeds::default());
     assert!(driver.feed_rows(&[1; 7]).is_err());
-    driver.chunk_cap = crate::family::project::exl3_jobs_plan::MAX_EXL3_ROWS + 1;
+    // A chunk cap above the rows ceiling (the supported width, raisable by the measurement
+    // variable) refuses preflight without opening or poisoning the device.
+    driver.chunk_cap = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap() + 1;
     assert!(driver.feed_rows(&[1]).is_err());
     assert!(driver.device().log.is_empty());
     driver.feed_rows(&[]).unwrap();

@@ -1032,7 +1032,7 @@ mod tests {
         });
         assert_eq!(
             flash_load_plan_detail(&engine),
-            "the load would refuse this pack: engine config: prefill_rows must be between 1 and 256, found 9000"
+            "the load would refuse this pack: engine config: prefill_rows must be between 1 and 2048, found 9000"
         );
     }
 

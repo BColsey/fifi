@@ -89,13 +89,25 @@ pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
 /// windows. A kernel cap it is not — the dense job row cap is `jobs_row_cap` (256, exl3.cu)
 /// and the shared down groups split at 8 — this is the planning bound both families agreed
 /// on. Widened from 64 to 256 once the shared prefill oracle passed at 1, 3, 64, 65 and 256
-/// rows; the legacy path stays capped at 64.
+/// rows; the legacy path stays capped at 64. The const is the DEFAULT width; the refusal
+/// bound of the Flash-Next prefill paths is the runtime `exl3_rows_ceiling()` (2,048 by
+/// default, raisable by INFERENCE_EXL3_ROWS_MAX), which sits above it.
 pub(crate) const MAX_EXL3_ROWS: usize = 256;
 
+/// The rows window the shared prefill paths accept as a *supported* setting, with no
+/// measurement variable: the ceiling `prefill_rows`, the chunk plan and the MoE block
+/// plan check before an operator's configuration reaches a device. Raised from the 256
+/// planning bound above once the shared prefill oracle passed at 1,024 and 2,048 rows
+/// and two served 32K prompts ran both widths on the pack; the default stays 256.
+/// `INFERENCE_EXL3_ROWS_MAX` still raises the window above this for measurements
+/// (2,049 to 4,096).
+pub(crate) const SUPPORTED_EXL3_ROWS: usize = 2048;
+
 /// The widest rows window the shared EXL3 expert machinery may plan for this session:
-/// `MAX_EXL3_ROWS` unless `INFERENCE_EXL3_ROWS_MAX` raises it for a measurement. Values
-/// above the default are measurement widths, not qualified served defaults: the tiled
-/// dense-job writer covers them, but the oracle and parity suites only pin the default.
+/// `SUPPORTED_EXL3_ROWS` unless `INFERENCE_EXL3_ROWS_MAX` raises it further for a
+/// measurement. Values above the supported ceiling are measurement widths, not
+/// qualified served settings: the tiled dense-job writer covers them, but the oracle and
+/// parity suites only pin up to `SUPPORTED_EXL3_ROWS`.
 /// Only the Flash-Next prefill paths honour the raise (settings, the chunk plan, the
 /// shared driver and its MoE block); the K-row shared expert of `family::exl3::moe`
 /// still caps at `MAX_EXL3_ROWS`. Strict parse: digits only, 1 to 4096; anything else
@@ -104,9 +116,15 @@ pub(crate) fn exl3_rows_ceiling() -> Result<usize, String> {
     static CEILING: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
     CEILING
         .get_or_init(|| {
-            exl3_rows_ceiling_from(std::env::var("INFERENCE_EXL3_ROWS_MAX").ok().as_deref())
+            exl3_supported_ceiling_from(std::env::var("INFERENCE_EXL3_ROWS_MAX").ok().as_deref())
         })
         .clone()
+}
+
+/// [`exl3_rows_ceiling`] over an explicit raw value with the supported floor applied,
+/// for tests: the parsed measurement width, never below `SUPPORTED_EXL3_ROWS`.
+pub(crate) fn exl3_supported_ceiling_from(spec: Option<&str>) -> Result<usize, String> {
+    Ok(exl3_rows_ceiling_from(spec)?.max(SUPPORTED_EXL3_ROWS))
 }
 
 /// [`exl3_rows_ceiling`] over an explicit raw value, for tests.
@@ -178,6 +196,24 @@ mod tests {
             exl3_rows_ceiling_from(Some("x")).unwrap_err(),
             "INFERENCE_EXL3_ROWS_MAX must be digits only"
         );
+    }
+
+    #[test]
+    fn the_supported_ceiling_admits_2048_without_the_variable_and_only_higher_with_it() {
+        use super::{SUPPORTED_EXL3_ROWS, exl3_supported_ceiling_from};
+        // An operator reaches 2,048 rows with no measurement variable at all.
+        assert_eq!(
+            exl3_supported_ceiling_from(None).unwrap(),
+            SUPPORTED_EXL3_ROWS
+        );
+        assert_eq!(
+            exl3_supported_ceiling_from(Some("512")).unwrap(),
+            SUPPORTED_EXL3_ROWS
+        );
+        // Above the supported ceiling the variable still widens, for measurements.
+        assert_eq!(exl3_supported_ceiling_from(Some("4096")).unwrap(), 4096);
+        // The strict parse is unchanged.
+        assert!(exl3_supported_ceiling_from(Some("4097")).is_err());
     }
 
     #[test]

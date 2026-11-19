@@ -9,6 +9,8 @@ use super::{
         StepPlan, footprint,
     },
 };
+use crate::family::flash_next::moe::tier_plan::TierPlan;
+use crate::family::flash_next::moe::tier_plan::tests::{inputs, message};
 use crate::{EngError, family::flash_next::moe::context_budget::KvFormat};
 
 const KIB: usize = 1 << 10;
@@ -32,7 +34,11 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     let (_, g) = real();
     assert_eq!(StepPlan::prefill_bytes(false, &g, 0, 0).unwrap(), 0);
-    for rows in [1, 64, 65, MAX_STEP_ROWS] {
+    // The charge-equality ladder reaches the supported width: the arena a 2,048-row
+    // window would reserve is exactly what the device arena plan totals (an
+    // under-charge here is the memory defect of a wider window).
+    let ceiling = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap();
+    for rows in [1, 64, 65, MAX_STEP_ROWS, ceiling] {
         let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
         let actual = crate::kernels::cuda::plan_arena(&plan.arena_tensors())
             .unwrap()
@@ -42,7 +48,8 @@ fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
             u64::try_from(actual).unwrap()
         );
     }
-    assert!(StepPlan::prefill_bytes(true, &g, MAX_STEP_ROWS + 1, 32_768).is_err());
+    // The rows bound of the charge is the runtime ceiling, one above refuses.
+    assert!(StepPlan::prefill_bytes(true, &g, ceiling + 1, 32_768).is_err());
 }
 
 #[test]
@@ -105,7 +112,10 @@ fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
 fn shared_prefill_extension_keeps_the_existing_bounds() {
     let (_, g) = real();
     let options = StepOptions::default();
-    for rows in [0, MAX_STEP_ROWS + 1, usize::MAX] {
+    // The rows bound is the runtime ceiling (the supported width, raisable by the
+    // measurement variable), so the refusal probe sits one above it, not above 256.
+    let above = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap() + 1;
+    for rows in [0, above, usize::MAX] {
         assert!(StepPlan::new_prefill(&g, rows, 32_768, &options).is_err());
     }
     assert!(StepPlan::new_prefill(&g, 64, 0, &options).is_err());
@@ -325,7 +335,9 @@ fn the_decode_arena_is_a_few_megabytes() {
 #[test]
 fn rows_and_splits_outside_the_kernels_are_refused() {
     let (_, g) = real();
-    for rows in [0, MAX_STEP_ROWS + 1] {
+    // Above the runtime rows ceiling (the supported width), as the prefill bound test.
+    let above = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap() + 1;
+    for rows in [0, above] {
         let error = StepPlan::new(&g, rows, 4096, &StepOptions::default()).expect_err("rows");
         assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
     }
@@ -382,5 +394,45 @@ fn the_state_and_step_plans_agree_on_the_context() {
     assert_eq!(
         slot(&step, Slot::Scores).bytes,
         state.bytes().unwrap().cap_blocks * 4
+    );
+}
+
+#[test]
+fn a_prefill_arena_that_starves_the_card_refuses_at_plan_time_with_the_bytes() {
+    // A supported 2,048-row window on a card that cannot carry it next to the trunk
+    // refuses at load with the losing budget's own bytes - never at the first request.
+    // The arena term is the REAL charge of the window (StepPlan::prefill_bytes, the
+    // same helper start.rs feeds the plan), not a stand-in number.
+    let (_, g) = real();
+    let ceiling = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap();
+    let charge = StepPlan::prefill_bytes(true, &g, ceiling, 32_768).unwrap();
+    assert_eq!(
+        ceiling, 2_048,
+        "the supported window the refusal is computed from"
+    );
+    let base = inputs(131_072, 2);
+    // Fill the card to its last byte, then add the window's charge on top: the
+    // overcommit is exactly the 2,048-row charge, nothing else moves.
+    let headroom = base
+        .vram
+        .usable
+        .checked_sub(
+            base.vram.non_expert + base.vram.state + base.vram.arena + base.vram.desktop_reserve,
+        )
+        .expect("the fixture leaves headroom");
+    let starving = base
+        .with_prefill_arena(headroom + charge)
+        .expect("the charge itself only adds");
+    let error = TierPlan::new(&starving).expect_err("the card cannot carry it");
+    let text = message(error);
+    let needed = base.vram.usable + charge;
+    assert!(
+        text.contains("non-expert weights + state + arena + desktop reserve"),
+        "the refusal names the losing budget: {text}"
+    );
+    assert!(
+        text.contains(&needed.to_string()) && text.contains(&base.vram.usable.to_string()),
+        "the refusal carries the byte counts (needed {needed}, available {}): {text}",
+        base.vram.usable
     );
 }
