@@ -284,6 +284,8 @@ fn chunk_with_qsa(
     state.check_chunk(&decoder.weights, rows, batch)?;
     let growth = qsa_append_growth(&decoder.weights, state.pos(), rows)?;
     let permit = decoder.budget.acquire_growth(growth)?;
+    #[cfg(feature = "native-fault-qualification")]
+    let timing = super::super::stream_timing::begin(&decoder.kernels, state.pos());
     let old = state.begin();
     let result = match decoder.kernels.set_retire_cap(cap) {
         Ok(previous) => {
@@ -295,6 +297,10 @@ fn chunk_with_qsa(
     };
     if let Some(open) = decoder.prefill_pages.as_mut() {
         open.pool.release_lent();
+    }
+    #[cfg(feature = "native-fault-qualification")]
+    if let (Ok(_), Some(timing)) = (&result, timing) {
+        timing.finish(&decoder.kernels, rows, mode, "chunk");
     }
     result
 }

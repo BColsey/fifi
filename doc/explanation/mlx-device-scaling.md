@@ -151,6 +151,12 @@ python3 scripts/mac_cache_study/flash_next_oq4e_smoke.py \
   "$SCRATCH/flash-next-oq4e"
 ```
 
+### Flash-Next staging attribution
+
+The Flash-Next and Qwen3.6 profilers take their read, page-copy and MLX wait snapshots through the same helper. Flash-Next wraps each successful decode step or prefill chunk and records the page import calls in both paths. The qualification switch adds measurements at existing synchronization points. Read durations cover the shard calls, including cache hits. Native import, readback and evaluate walls can include queued Metal work.
+
+Use a release build with `native-mlx,native-fault-qualification` and add `--attribute` to the smoke command to capture the per-forward records. Use a new output directory and `--working-set-mib 12100` for the higher ceiling.
+
 ## Disk-backed Flint experts
 
 With automatic sizing enabled, Flint checks the checkpoint headers and serving reserves before importing weights. If the full resident model fits, Flint loads it as before. Otherwise it keeps attention, routers, shared experts, and the output head in memory and reads the routed experts by ID from the existing local safetensors files. Each layer imports only the experts selected for the current rows, restores the original routing order, and releases its staged weights after Metal completes the grouped projection. The model files stay on the local drive and the KV cache stays in unified memory.

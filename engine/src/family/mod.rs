@@ -62,6 +62,12 @@ pub(crate) mod mlx_budget;
 ))]
 pub(crate) mod mlx_kv;
 pub(crate) mod mlx_report;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod mlx_stream_stats;
 
 pub mod layer_weights;
 pub mod mapped_file;
