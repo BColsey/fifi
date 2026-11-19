@@ -1403,6 +1403,13 @@ fn gemm_dq_ty(quant: crate::kernels::cuda::resident::matvec_q::QuantType) -> boo
     matches!(quant, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
 }
 
+/// The per-launch FIFI_DELTA_TRACE probe, cached: every projection launch would
+/// otherwise take an env lock on the serve path.
+fn delta_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FIFI_DELTA_TRACE").is_ok())
+}
+
 /// The dequantizing-GEMM arm of a dense projection: the weight rides one of the
 /// in-house dequant types, so `gemm_dq` reads the f32 activation rows directly --
 /// no q8_1 quantize pass feeds the role -- and writes the f32 output rows in place
@@ -1428,7 +1435,7 @@ fn dense_gemm_dq(
     // Which-kernel-ran proof: with FIFI_DELTA_TRACE set, every projection the
     // dequantizing GEMM takes names the type and the fused segment offset.
     let (w_off, n) = w_seg.unwrap_or((0, weight.n_rows()));
-    if std::env::var("FIFI_DELTA_TRACE").is_ok() {
+    if delta_trace_on() {
         eprintln!("DELTA_TRACE GEMM_DQ quant {quant:?} w_off {w_off} n {n} col_off {col_off}");
     }
     let overflow = || EngError::MemoryPlan("the dense projection size overflows".to_owned());
@@ -1582,7 +1589,7 @@ fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
         };
         // Test-only trace of the projection launch (env-gated, the TTFT-trace pattern):
         // the launch shape AND the hash of the weight bytes this launch actually reads.
-        if std::env::var("FIFI_DELTA_TRACE").is_ok() {
+        if delta_trace_on() {
             let row_bytes = weight
                 .quant()
                 .weight_bytes(1, call_weight_k(weight))
@@ -1636,7 +1643,7 @@ fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
             run.dense(launch, call)?;
         }
         // Test-only ProjD hash after the launch, to bisect which launch first diverges.
-        if std::env::var("FIFI_DELTA_TRACE").is_ok() {
+        if delta_trace_on() {
             let dst = run.v(ChunkSlot::ProjD)?;
             let floats = (m - 1) * g.delta.ld + col_off + n;
             let mut bytes = vec![0u8; floats * 4];
