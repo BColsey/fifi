@@ -65,3 +65,21 @@ Prompt processing runs at about 1,000 tokens/s.
 
 Compared with the publisher's own runtime, fifi's next-token distributions have a mean KL divergence of 0.062 and 94.0% top-1 agreement.
 The publisher runtime's two modes differ from each other by 0.074 and 92.4%.
+
+## CPU sampling and expert probes on a Ryzen 9 3900X
+
+Release timings at engine revision `906e162f`, using Rust 1.98.1:
+
+| Workload | Measured result |
+| --- | --- |
+| Greedy selection over 248,077 logits, with block selection off | 0.19–0.20 ms per draw |
+| Greedy selection over the same logits, with block selection on | 0.03 ms per draw |
+| Q4_K expert forward pass, 2,048 hidden units and 512 intermediate units | 2.08 GB/s of weight bytes |
+| CPU decision head, 4,096 inputs, 512 hidden units and 260 outputs | 1.59 ms p50, 1.98 ms p99 |
+
+The greedy run used 30 timed draws per arm in off/on/on/off order on one
+logical CPU. Other host tasks built native CUDA code during the run. These
+results measure isolated CPU operations used by inference. The full record
+includes the sampler reference comparison and AVX2 EXL3 expert probes with
+one and twelve layers of synthetic weights.
+[Raw timings and test names](../../scripts/benchmarks/linux-3900x-cpu-20261119.json)
