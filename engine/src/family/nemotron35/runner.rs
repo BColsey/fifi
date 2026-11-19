@@ -207,7 +207,7 @@ pub fn generate(
         prompt_tokens,
         max_tokens,
         cache_entries,
-        probed_available_bytes()?,
+        admission::host_available_bytes()?,
     )
 }
 
@@ -253,7 +253,7 @@ pub fn generate_cuda(
         prompt_tokens,
         max_tokens,
         cache_entries,
-        probed_available_bytes()?,
+        admission::host_available_bytes()?,
         |directory, descriptor, spec, capacity, entries, policy, free| {
             admission::cuda::admit_cuda_serving(
                 directory,
@@ -331,14 +331,6 @@ fn generate_with_constructor<A>(
         elapsed: started.elapsed(),
         setup,
         hybrid: stack.hybrid_report(),
-    })
-}
-
-fn probed_available_bytes() -> Result<u64, EngError> {
-    admission::host_available_bytes().ok_or_else(|| {
-        EngError::MemoryPlan(
-            "Nemotron admission: host availability probe requires Linux; use generate_with_admission with an explicit available-byte budget".into(),
-        )
     })
 }
 
