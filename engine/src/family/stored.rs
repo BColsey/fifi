@@ -394,6 +394,42 @@ pub(crate) struct StackLayout {
 }
 
 impl StackLayout {
+    /// The publisher stores expert payloads as U8. A page import can view the
+    /// same byte ranges as U32 words without a repacking copy.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn for_byte_payload(
+        ckpt: &StreamedCheckpoint,
+        stem: &str,
+        spec: QuantizationSpec,
+        logical: &[u32],
+        count: u32,
+        base: usize,
+        page: usize,
+    ) -> Result<(SlicedWeight, Self), EngError> {
+        let &[slices, slice_rows, cols] = logical else {
+            return Err(EngError::Checkpoint(format!("{stem} has no expert stack")));
+        };
+        let stack = SlicedWeight {
+            stem: stem.into(),
+            spec,
+            slices,
+            slice_rows,
+            cols,
+        };
+        let mut layout = Self::new(ckpt, &stack, count, base, page)?;
+        let word_shape = match (layout.payload.dtype, layout.payload.shape.as_mut_slice()) {
+            (Dtype::U8, [_, _, width]) if *width > 0 && width.is_multiple_of(4) => width,
+            _ => {
+                return Err(EngError::Checkpoint(format!(
+                    "{stem} has invalid packed byte rows"
+                )));
+            }
+        };
+        *word_shape /= 4;
+        layout.payload.dtype = Dtype::U32;
+        Ok((stack, layout))
+    }
+
     /// Places the roles of a `count`-slice stack of `weight` from `base`, a multiple of `page`.
     pub(crate) fn new(
         ckpt: &StreamedCheckpoint,

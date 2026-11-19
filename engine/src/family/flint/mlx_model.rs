@@ -9,7 +9,14 @@ use crate::{
     kernels::{MlxKernels, ResidentPackedWeight},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
-use std::{path::Path, rc::Rc};
+use std::{path::Path, rc::Rc, sync::OnceLock};
+
+pub(super) fn expert_pipeline_flagged() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").is_some_and(|value| value == "1")
+    })
+}
 
 /// Mac MLX freed-buffer cache limit. Default 64 MiB: bounded reuse keeps
 /// per-step freed buffers on the device instead of paying a driver
@@ -61,6 +68,26 @@ impl SwiGlu {
         let up = source.packed_experts(&format!("{stem}.up_proj"), experts)?;
         let down = source.packed_experts(&format!("{stem}.down_proj"), experts)?;
         let (weights, ids) = k.import_packed_many_with(&[&gate, &up, &down], &[remapped])?;
+        Self::take_experts(weights, ids)
+    }
+
+    pub(super) fn load_expert_pages(
+        k: &mut MlxKernels,
+        source: &FlintCheckpoint,
+        stem: &str,
+        experts: &[u32],
+        remapped: &Tensor,
+    ) -> Result<(Self, ExecutionTensor, crate::kernels::HostPages)> {
+        let (pages, packed, local) = source.expert_pages(stem, experts, remapped)?;
+        let (weights, ids) = k.import_packed_pages(&pages, &packed, &[local])?;
+        let (weights, ids) = Self::take_experts(weights, ids)?;
+        Ok((weights, ids, pages))
+    }
+
+    fn take_experts(
+        weights: Vec<ResidentPackedWeight>,
+        ids: Vec<ExecutionTensor>,
+    ) -> Result<(Self, ExecutionTensor)> {
         let [gate, up, down] = weights
             .try_into()
             .map_err(|_| EngError::Checkpoint("short Flint expert import".into()))?;
@@ -246,6 +273,16 @@ impl Model {
             None => 0,
         };
         let disk = streamed_expert_bytes != 0;
+        if disk {
+            eprintln!(
+                "flint: MLX expert pipeline {}",
+                if expert_pipeline_flagged() {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
         if let Some(bytes) = available {
             eprintln!(
                 "flint: MLX weight placement={} weight_budget_bytes={bytes} resident_estimate_bytes={} streamed_bytes_per_expert={streamed_expert_bytes}",

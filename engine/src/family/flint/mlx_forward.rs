@@ -2,7 +2,7 @@
 
 use super::{
     factory::context_limit,
-    mlx_model::{Ffn, Layer, Model, Routed, SwiGlu},
+    mlx_model::{Ffn, Layer, Model, Routed, SwiGlu, expert_pipeline_flagged},
     mlx_route,
     mlx_state::{ChunkCachePlan, Plane, State, WINDOW},
     precision_native,
@@ -673,15 +673,20 @@ fn ffn(
             span.finish(Some((logits.dtype(), logits.shape())));
             #[cfg(test)]
             let span = Span::begin("ffn_experts", 0, None, Some((x.dtype(), x.shape())));
-            let rows = match routed {
-                Routed::Resident(weights) => grouped_experts(k, weights, x, &route.ids)?,
-                Routed::Disk { source, stem } => disk_experts(k, source, stem, x, &route.ids)?,
+            let (rows, shared_in_flight) = match routed {
+                Routed::Resident(weights) => (grouped_experts(k, weights, x, &route.ids)?, None),
+                Routed::Disk { source, stem } => {
+                    stage_disk_experts(k, source, stem, x, &route.ids, Some(shared))?
+                }
             };
             #[cfg(test)]
             span.finish(Some((rows.dtype(), rows.shape())));
             #[cfg(test)]
             let span = Span::begin("ffn_shared", 0, None, Some((x.dtype(), x.shape())));
-            let shared = shared.apply(k, x)?;
+            let shared = match shared_in_flight {
+                Some(output) => output,
+                None => shared.apply(k, x)?,
+            };
             #[cfg(test)]
             stage_fence(k, "ffn_shared", &shared)?;
             #[cfg(test)]
@@ -692,6 +697,7 @@ fn ffn(
     }
 }
 
+#[cfg(test)]
 pub(super) fn disk_experts(
     k: &mut MlxKernels,
     source: &super::weights::FlintCheckpoint,
@@ -699,7 +705,29 @@ pub(super) fn disk_experts(
     x: &ExecutionTensor,
     ids: &BoundedIndices,
 ) -> Result<ExecutionTensor> {
+    stage_disk_experts(k, source, stem, x, ids, None).map(|(rows, _)| rows)
+}
+
+fn stage_disk_experts(
+    k: &mut MlxKernels,
+    source: &super::weights::FlintCheckpoint,
+    stem: &str,
+    x: &ExecutionTensor,
+    ids: &BoundedIndices,
+    shared: Option<&SwiGlu>,
+) -> Result<(ExecutionTensor, Option<ExecutionTensor>)> {
+    let pipeline = expert_pipeline_flagged();
     let host = k.readback(ids.ids())?;
+    // The router results are available now. The shared expert only needs
+    // the same input and can run while the host stages the routed experts.
+    let shared = shared
+        .filter(|_| pipeline)
+        .map(|shared| {
+            let output = shared.apply(k, x)?;
+            k.evaluate_async(&[&output])?;
+            Ok::<_, EngError>(output)
+        })
+        .transpose()?;
     let bytes = host
         .host_bytes()
         .ok_or_else(|| EngError::Checkpoint("Flint expert IDs have no host bytes".into()))?;
@@ -721,12 +749,18 @@ pub(super) fn disk_experts(
         remapped.extend_from_slice(&(slot as u32).to_le_bytes());
     }
     let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
-    let (stack, local) = SwiGlu::load_experts(k, source, stem, &experts, &local)?;
+    let (stack, local, _pages) = if pipeline {
+        let (stack, local, pages) = SwiGlu::load_expert_pages(k, source, stem, &experts, &local)?;
+        (stack, local, Some(pages))
+    } else {
+        let (stack, local) = SwiGlu::load_experts(k, source, stem, &experts, &local)?;
+        (stack, local, None)
+    };
     let local = k.bound_indices(&local, experts.len() as u32)?;
     let rows = grouped_experts(k, &stack, x, &local)?;
     // Retire this layer's staged arrays before opening the next disk bank.
     k.evaluate(&[&rows])?;
-    Ok(rows)
+    Ok((rows, shared))
 }
 
 pub(super) fn grouped_experts(

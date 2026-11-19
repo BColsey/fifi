@@ -144,6 +144,92 @@ impl FlintCheckpoint {
         )
     }
 
+    /// Stage the requested experts' nine extents (three projections, each
+    /// with weight, scales and biases) into shared packed pages for
+    /// `MlxKernels::import_packed_pages`, with the compact ID list appended
+    /// as a local range. A Flint expert is nine extents, not one record: the
+    /// record store's `RecordSite` addresses whole experts (the Linux
+    /// O_DIRECT ring banks one record per site) and cannot name these
+    /// extents, so this reader stays separate from `weights::expert_store`
+    /// until the store's vocabulary grows per-extent addressing.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn expert_pages(
+        &self,
+        stem: &str,
+        ids: &[u32],
+        remapped: &Tensor,
+    ) -> Result<
+        (
+            crate::kernels::HostPages,
+            Vec<crate::kernels::PackedPages>,
+            crate::kernels::PageRange,
+        ),
+        EngError,
+    > {
+        use crate::family::stored::{RoleRange, StackLayout, read_stack_into};
+        use crate::kernels::{HostPages, PackedPages, PageRange};
+
+        let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
+        let page = HostPages::page_size();
+        let mut end = 0;
+        let mut stacks = Vec::with_capacity(3);
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            let name = format!("{stem}.{projection}");
+            let (shape, bits) = self
+                .profile
+                .packed
+                .get(&name)
+                .ok_or_else(|| invalid(&format!("unknown packed stem {name}")))?;
+            let (weight, layout) = StackLayout::for_byte_payload(
+                &self.weights,
+                &name,
+                affine(*bits),
+                shape,
+                count,
+                end,
+                page,
+            )?;
+            end = layout.end;
+            stacks.push((weight, layout));
+        }
+        let local_bytes = remapped
+            .host_bytes()
+            .ok_or_else(|| invalid("expert IDs need host bytes"))?;
+        let id_end = end
+            .checked_add(local_bytes.len())
+            .ok_or_else(|| EngError::MemoryPlan("Flint expert page lengths overflow".into()))?;
+        let mut pages = HostPages::try_new(id_end)?;
+        let dst = pages.try_write().ok_or_else(|| EngError::Backend {
+            operation: "Flint expert staging",
+            message: "fresh expert pages are not writable".into(),
+        })?;
+        for (weight, layout) in &stacks {
+            read_stack_into(&self.weights, weight, ids, dst, layout)?;
+        }
+        dst[end..id_end].copy_from_slice(local_bytes);
+        let range = |role: &RoleRange| PageRange {
+            offset: role.offset,
+            dtype: role.dtype,
+            shape: role.shape.clone(),
+        };
+        let packed = stacks
+            .into_iter()
+            .map(|(_, layout)| PackedPages {
+                payload: range(&layout.payload),
+                scales: range(&layout.scales),
+                biases: layout.biases.as_ref().map(range),
+                logical_shape: layout.logical_shape,
+                quantization: layout.spec,
+            })
+            .collect();
+        let local = PageRange {
+            offset: end,
+            dtype: remapped.dtype(),
+            shape: remapped.shape().to_vec(),
+        };
+        Ok((pages, packed, local))
+    }
+
     pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<PackedWeight, EngError> {
         let (shape, bits) = self
             .profile

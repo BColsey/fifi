@@ -138,6 +138,7 @@ On Apple Silicon:
 | `FIFI_FLINT_MLX_ASYNC_CHAIN` | on | switch | Evaluate decode work in chains of 4 layers instead of synchronizing after every layer. |
 | `FIFI_FLINT_MLX_COALESCE_RESIDUAL` | on | switch | Merge the residual updates of a decode step. |
 | `FIFI_FLINT_MLX_DECODE_ATTN` | on | switch | Use the fused MLX attention kernel for one-token decoding. Startup then refuses a checkpoint whose attention-sink values are not exact in BF16, and names the layer, head and value. |
+| `FIFI_FLINT_MLX_EXPERT_PIPELINE` | off | switch | Disk-backed Flint experts only: submit the shared expert to Metal before the host reads the routed expert slices, overlapping the read with the shared computation. [Overlapping expert reads](../explanation/mac-flint-expert-pipeline.md) |
 | `FIFI_FLINT_MLX_RING_VIEW` | on | switch | Read the full-attention KV cache as one ring view instead of concatenating it each step. Needs `FIFI_FLINT_MLX_ASYNC_CHAIN`. |
 | `FIFI_FLINT_PREFIX_REUSE` | off | switch | Experimental: keep prefix snapshots between turns. Also needs `"prefix_reuse": true`. |
 | `FIFI_FLINT_PREFIX_BUDGET_BYTES` | physical memory minus weights and a system reserve | positive byte count | Memory cap for prefix snapshots. `0` or an unreadable value refuses startup. |
