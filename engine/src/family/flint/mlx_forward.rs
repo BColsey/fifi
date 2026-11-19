@@ -239,7 +239,7 @@ impl Model {
             state.valid = true;
             #[cfg(feature = "native-fault-qualification")]
             if let Some(timing) = timing {
-                timing.finish(&self.kernels, rows);
+                timing.finish(&self.kernels, rows, state.full_capacity);
             }
         }
         result

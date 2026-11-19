@@ -95,6 +95,36 @@ All four completions, logical expert bytes, and read counts matched. Each reques
 
 Run the Flint serving driver with `--compact-kv-growth --expert-timing --working-set-mib 8192 --pairs 2` to repeat the comparison.
 
+### Flint KV growth during decode
+
+The prompt renders to 1,017 tokens with the pinned tokenizer and leaves seven decode forwards before position 1,024. Both arms use an 8 GiB Metal ceiling, 256 admitted prefill rows, and the original shards with prefill coalescing. Expert caching and prefix reuse are off. Each fresh process runs one request with 24 greedy completion tokens. Two pairs alternate the order of the arms.
+
+The qualification trace records the full-attention KV capacity after every successful forward. The compact arm is required to reach 1,024 rows during prefill and grow to 2,048 at position 1,024 in decode. The control keeps 4,096 rows. The driver compares that exact forward across both arms and records p95 separately for the seven preceding and 15 following decode forwards.
+
+All four requests produced the same completion and read 65.45 GB of logical expert weights in prefill and 11.48 GB in decode. Both arms made 80,226 prefill and 58,374 decode read calls per request with zero Metal staging-page copy fallbacks. The worker scheduled four prefill pieces and produced five model forwards of 255, 256, 256, 249, and one row, including the pending prompt token.
+
+| Serving measurement | Baseline | Compact |
+| --- | ---: | ---: |
+| Median time to first token | 53.74 s | 57.36 s |
+| Median decode throughput | 1.460 tok/s | 1.375 tok/s |
+| Median per-request decode forward p95, all 23 steps | 784 ms | 794 ms |
+| Median p95 across the seven forwards before growth | 748 ms | 811 ms |
+| Median forward at position 1,024 | 741 ms | 786 ms |
+| Median p95 across the 15 forwards after growth | 870 ms | 783 ms |
+| Median process peak footprint | 2.218 GB | 2.123 GB |
+| Total attributed SSD reads | 149.93 GB | 150.22 GB |
+| Total process page-ins | 109 | 561 |
+
+At position 1,024 the compact forward took 81 ms and 8 ms longer in the two pairs. The timed expert read portion of that forward was within 2 ms in the first pair and 58 ms lower in the second. Before-growth tails also rose in both pairs, and after-growth tails fell in both. These p95 figures use nearest rank, which selects the slowest sample in each seven- or 15-forward window. Compact KV consistently reduced peak footprint by 91–98 MB, and throughput went in opposite directions across the two pairs. The trial uses one prompt and leaves the OS file cache in place. [Four serving measurements](../../scripts/benchmarks/mac-m4-flint-kv-decode-growth-1017.csv)
+
+Build the server with `native-mlx,native-fault-qualification`. The driver validates the rendered token count through the local tokenizer before sending a completion.
+
+```sh
+python3 scripts/mac_cache_study/flint_pipeline_ab.py \
+  "$ENGINESRV" "$FLINT_ARTIFACT" "$SCRATCH/proc-io" "$SCRATCH/decode-growth" \
+  --compact-kv-decode-growth --expert-timing --working-set-mib 8192 --pairs 2
+```
+
 ## Expert-major storage probe
 
 A one-row Flint stage selects six experts. The published INT4 checkpoint stores gate, up and down payloads, scales and biases in separate tensors. That produces 54 slice reads for each routed layer. A contiguous record per expert can fill the nine destination ranges in one `preadv` call. Replaying six captured requests gives 324,864 slice reads for 6,016 one-row layer stages. Grouping existing consecutive slices reduces that count to 318,564. Reading one record per selected expert reduces it to 36,096. All three carry the same logical weight bytes. [Recorded routes](../../scripts/benchmarks/mac-m4-flint-expert-trace.jsonl.gz)

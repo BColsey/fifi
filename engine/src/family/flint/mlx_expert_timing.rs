@@ -36,7 +36,7 @@ impl ForwardTiming {
         })
     }
 
-    pub(super) fn finish(self, k: &MlxKernels, rows: u32) {
+    pub(super) fn finish(self, k: &MlxKernels, rows: u32, full_kv_rows: u32) {
         let forward_ns = self.started.elapsed().as_nanos() as u64;
         let end = qualification_expert_reads();
         let layer = layer_reads();
@@ -45,6 +45,7 @@ impl ForwardTiming {
             serde_json::json!({
                 "position": self.position,
                 "rows": rows,
+                "full_kv_rows": full_kv_rows,
                 "forward_ns": forward_ns,
                 "slice_reads": end.slice_reads - self.stats.slice_reads,
                 "read_bytes": end.read_bytes - self.stats.read_bytes,
