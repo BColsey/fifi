@@ -584,6 +584,7 @@ fn work<E, F>(
             return;
         }
     };
+    let iteration_rows = prefill_chunk;
     let prefill_chunk = executor.prefill_piece().unwrap_or(prefill_chunk);
     if prefill_chunk == 0 {
         let cause = "engine load failed: the executor planned a prefill piece of 0".to_string();
@@ -615,6 +616,7 @@ fn work<E, F>(
             jobs,
             shared,
             prefill_chunk,
+            iteration_rows,
             max_seqs,
         );
         return;
