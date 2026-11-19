@@ -3565,6 +3565,44 @@ mod tests {
     }
 
     #[test]
+    fn the_eviction_order_is_unchanged_on_a_mixed_multi_entry_store() {
+        // Same-path store mixing every shape the classifier ranks: a covered
+        // chain interior ([1,2] under [1,2,3,4]), leaves ([9], [1,3]) and a
+        // branch point ([1] with two incomparable chains). Classification is
+        // recomputed on the survivors at every eviction, exactly as the old
+        // two-pass code recomputed its extender vectors: after [1,3] is gone,
+        // [1] is no longer a branch point — it re-classifies as a chain
+        // interior under [1,2,3,4] and dies before the deepest leaf.
+        let keys: [&[u32]; 5] = [&[9], &[1], &[1, 2], &[1, 3], &[1, 2, 3, 4]];
+        let mut slot = store(0, keys.len());
+        for (id, &key) in keys.iter().enumerate() {
+            slot.lru.push(super::Stored {
+                id: id as u64,
+                kind: SaveKind::Periodic,
+                requests_since_use: 0,
+                saved: super::SavedPrefix {
+                    key: key.to_vec(),
+                    pending: 0,
+                    path: 1,
+                    state: Vec::new(),
+                },
+            });
+        }
+        let mut victims = Vec::new();
+        loop {
+            let before: Vec<u64> = slot.lru.iter().map(|entry| entry.id).collect();
+            if !slot.evict_lru_one(None) {
+                break;
+            }
+            let after: Vec<u64> = slot.lru.iter().map(|entry| entry.id).collect();
+            if let Some(&id) = before.iter().find(|id| !after.contains(id)) {
+                victims.push(id);
+            }
+        }
+        assert_eq!(victims, vec![2, 0, 3, 1, 4]);
+    }
+
+    #[test]
     fn an_eviction_protects_the_denied_lineage_not_the_last_restore() {
         // The interleave: lineage A saves its anchor, lineage B saves its own, and B restores - so
         // the store-global `restored` marker names B. A's denial must protect A's anchor, not the
