@@ -1343,52 +1343,37 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     /// restored it holds its own permit for the shared arrays; the cost is one cache miss for that
     /// conversation, never a correctness change. Returns whether an entry was removed.
     pub(crate) fn evict_lru_one(&mut self, protect: Option<u64>) -> bool {
-        // Radix-compression order: spend what the radix tree can regrow before what it cannot.
-        //   tier 0: dead TIP leaves - they never match the next turn of any conversation;
-        //   tier 1: single-chain interior anchors - entries with exactly ONE maximal
-        //           same-path extender (per32 under per49): per49 serves every prompt that
-        //           extends it; a prompt that diverges between per32 and per49 loses its per32
-        //           hit, which is only a longer prefill, never a wrong state;
-        //   tier 2: anchor leaves - each lineage's deepest entry, its best restore;
-        //   tier 3: branch points - extended by two or more incomparable branches (a
-        //           shared header): losing one costs EVERY branch under it;
-        //   tier 4: the protected entry, the denied lineage, last resort.
-        // Leaf status recomputed between evictions alone would strip a lineage entirely
-        // (per49 gone -> per32 becomes a leaf -> next) while another lineage still holds
-        // a covered interior, and the dead-tip tier frees only ~0.9 GB of ~3 GB the
-        // replay's t6 needs, so tiers 1-3 ARE reached there: a covered per@32,768 frees
-        // ~420 MB at zero t6 reuse cost in that replay (its prompts extend the deeper entry)
-        // while branch headers stay for last.
-        //
-        // Cost: one O(n^2) key-extension pass plus O(ext^2) maximal-extender counting
-        // per entry - trivial at the default 6 entries, and the override cap (4096)
-        // only makes a denial-path eviction measurably dear, never wrong.
-        let branches_of = |index: usize| -> usize {
-            let key = &self.lru[index].saved.key;
-            let path = &self.lru[index].saved.path;
-            let extenders: Vec<usize> = self
-                .lru
-                .iter()
-                .enumerate()
-                .filter(|(other, stored)| {
-                    *other != index
-                        && &stored.saved.path == path
-                        && stored.saved.key.len() > key.len()
-                        && stored.saved.key.starts_with(key)
-                })
-                .map(|(other, _)| other)
-                .collect();
-            extenders
-                .iter()
-                .filter(|&&extender| {
-                    let extender_key = &self.lru[extender].saved.key;
-                    !extenders.iter().any(|&deeper| {
-                        deeper != extender
-                            && self.lru[deeper].saved.key.len() > extender_key.len()
-                            && self.lru[deeper].saved.key.starts_with(extender_key)
-                    })
-                })
-                .count()
+        // Only zero, one, or multiple maximal extensions affect the rank. One maximal
+        // extension exists when all extensions form a chain with a unique deepest entry.
+        // Incomparable suffixes stay on separate branches regardless of later entries.
+        let branches_of = |index: usize| {
+            let anchor = &self.lru[index].saved;
+            let mut longest: &[u32] = &[];
+            let mut maxima = 0;
+            for entry in &self.lru {
+                let other = &entry.saved;
+                if other.key.len() <= anchor.key.len() || other.path != anchor.path {
+                    continue;
+                }
+                let Some(suffix) = other.key.strip_prefix(anchor.key.as_slice()) else {
+                    continue;
+                };
+                if suffix.len() > longest.len() {
+                    if !suffix.starts_with(longest) {
+                        return 2;
+                    }
+                    longest = suffix;
+                    maxima = 1;
+                } else {
+                    if !longest.starts_with(suffix) {
+                        return 2;
+                    }
+                    if suffix.len() == longest.len() {
+                        maxima = 2;
+                    }
+                }
+            }
+            maxima
         };
         let rank_of = |index: usize| {
             let stored = &self.lru[index];
@@ -3550,6 +3535,33 @@ mod tests {
         assert!(slot.evict_lru_one(None));
         assert_eq!(lens_of(&slot), Vec::<usize>::new());
         drop((b_step, b, per3_step, per3, per4_step, per4));
+    }
+
+    #[test]
+    fn duplicate_maximal_extensions_count_until_a_longer_entry_covers_both() {
+        fn victim(keys: &[&[u32]]) -> u64 {
+            let mut slot = store(0, keys.len());
+            for (id, &key) in keys.iter().enumerate() {
+                slot.lru.push(super::Stored {
+                    id: id as u64,
+                    kind: SaveKind::Periodic,
+                    requests_since_use: 0,
+                    saved: super::SavedPrefix {
+                        key: key.to_vec(),
+                        pending: 0,
+                        path: 1,
+                        state: Vec::new(),
+                    },
+                });
+            }
+            assert!(slot.evict_lru_one(None));
+            (0..keys.len() as u64)
+                .find(|&id| slot.lru.iter().all(|entry| entry.id != id))
+                .unwrap()
+        }
+        assert_eq!(victim(&[&[9], &[1], &[1, 2], &[1, 2]]), 0);
+        assert_eq!(victim(&[&[9], &[1], &[1, 2], &[1, 2], &[1, 2, 3]]), 1);
+        assert_eq!(victim(&[&[9], &[1], &[1, 2, 3], &[1, 2], &[1, 2]]), 1);
     }
 
     #[test]
