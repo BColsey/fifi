@@ -10,6 +10,13 @@
 
 pub(crate) mod bank_tier;
 pub(crate) mod host_tier;
+// disk_store is host-only and unwired on purpose until the config keys and
+// the restore path exist; drop this allow when they do.
+#[expect(
+    dead_code,
+    reason = "wired in a later change: config keys + restore path"
+)]
+pub(crate) mod disk_store;
 pub(crate) mod policy;
 pub(crate) use policy::ReplaceOnMissLru;
 
