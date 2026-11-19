@@ -229,9 +229,17 @@ impl Model {
         ChunkCachePlan::new(0, state.pos, rows, context_limit())?;
         // Partial layer writes never become a usable state. Reset discards all planes.
         state.valid = false;
+        #[cfg(feature = "native-fault-qualification")]
+        let timing = (self.streamed_expert_bytes != 0)
+            .then(|| super::mlx_expert_timing::ForwardTiming::begin(&self.kernels, state.pos))
+            .flatten();
         let result = self.forward(state, tokens, logits);
         if result.is_ok() {
             state.valid = true;
+            #[cfg(feature = "native-fault-qualification")]
+            if let Some(timing) = timing {
+                timing.finish(&self.kernels, rows);
+            }
         }
         result
     }

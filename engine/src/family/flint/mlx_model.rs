@@ -137,9 +137,24 @@ impl SwiGlu {
     ) -> Result<(Self, ExecutionTensor, crate::kernels::HostPages)> {
         let (pages, packed, local) =
             source.expert_pages(stem, experts, remapped, coalesce_reads)?;
-        let (weights, ids) = k.import_packed_pages(&pages, &packed, &[local])?;
-        let (weights, ids) = Self::take_experts(weights, ids)?;
+        let (weights, ids) = Self::import_expert_pages(k, &pages, &packed, local)?;
         Ok((weights, ids, pages))
+    }
+
+    pub(super) fn import_expert_pages(
+        k: &mut MlxKernels,
+        pages: &crate::kernels::HostPages,
+        packed: &[crate::kernels::PackedPages],
+        local: crate::kernels::PageRange,
+    ) -> Result<(Self, ExecutionTensor)> {
+        #[cfg(feature = "native-fault-qualification")]
+        let started = super::mlx_expert_timing::enabled().then(std::time::Instant::now);
+        let (weights, ids) = k.import_packed_pages(pages, packed, &[local])?;
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(started) = started {
+            crate::family::stored::record_page_import(started.elapsed());
+        }
+        Self::take_experts(weights, ids)
     }
 
     fn take_experts(

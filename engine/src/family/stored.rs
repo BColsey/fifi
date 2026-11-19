@@ -512,7 +512,7 @@ impl StackLayout {
 }
 
 /// Expert slice reads and page imports since the last reset (qualification builds only).
-/// Process-wide. The prefill pool records its page imports through `record_page_import`.
+/// Process-wide. Page-based expert banks and staging record imports through `record_page_import`.
 #[cfg(feature = "native-fault-qualification")]
 mod expert_counters {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -552,8 +552,7 @@ fn counted_read<T>(_bytes: usize, read: impl FnOnce() -> T) -> T {
     read()
 }
 
-/// Counts one expert page import of the prefill pool with its wall time (qualification builds
-/// only). The pool calls it around `MlxKernels::import_packed_pages`.
+/// Counts one expert page import and its wall time (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 pub(crate) fn record_page_import(elapsed: std::time::Duration) {
     use expert_counters::{IMPORT_NS, PAGE_IMPORTS, add, ns};
@@ -561,19 +560,25 @@ pub(crate) fn record_page_import(elapsed: std::time::Duration) {
     add(&IMPORT_NS, ns(elapsed));
 }
 
-/// The expert slice reads and page imports since the last reset (qualification test builds).
-#[cfg(all(test, feature = "native-fault-qualification"))]
+/// The expert slice reads and page imports since the last reset (qualification builds).
+#[cfg(all(
+    feature = "native-fault-qualification",
+    any(test, all(target_os = "macos", target_arch = "aarch64"))
+))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExpertReadStats {
     pub(crate) slice_reads: u64,
     pub(crate) read_bytes: u64,
     pub(crate) read_ns: u64,
-    /// `import_packed_pages` calls of the prefill pool (one per wave).
+    /// Calls to `import_packed_pages` for expert weights.
     pub(crate) page_imports: u64,
     pub(crate) import_ns: u64,
 }
 
-#[cfg(all(test, feature = "native-fault-qualification"))]
+#[cfg(all(
+    feature = "native-fault-qualification",
+    any(test, all(target_os = "macos", target_arch = "aarch64"))
+))]
 pub(crate) fn qualification_expert_reads() -> ExpertReadStats {
     use expert_counters::{IMPORT_NS, PAGE_IMPORTS, READ_BYTES, READ_NS, SLICE_READS};
     use std::sync::atomic::Ordering::Relaxed;
