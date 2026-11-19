@@ -529,3 +529,208 @@ fn narrow_sum_preserves_each_group_at_signed_byte_extremes() {
         }
     }
 }
+
+/// Bit-for-bit fast-vs-reference over the dense set. Every scale is a real
+/// float with a full mantissa (bit patterns drawn from the whole finite
+/// range), every half boundary k+0.5 is swept through each scale, and a
+/// million-value sweep draws full random mantissas across the whole finite
+/// range - the earlier version of this test multiplied a smallest-subnormal
+/// seed by sqrt(2), which collapsed to 2^-149 on every step, so its scales
+/// had no mantissa spread at all and compared the reference with itself.
+#[test]
+fn fast_quantization_is_bit_identical_dense() {
+    use super::{Q8gRow, fill_groups};
+    let assert_pair = |values: &[f32]| {
+        // The row contract wants a 256-value multiple; pad with zeros.
+        let mut input = values.to_vec();
+        input.resize(values.len().div_ceil(256) * 256, 0.0);
+        let input = &input[..];
+        let mut reference = Q8gRow::zeros(input.len()).unwrap();
+        let mut fast = Q8gRow::zeros(input.len()).unwrap();
+        fill_groups::<false>(input, &mut reference);
+        fill_groups::<true>(input, &mut fast);
+        assert_eq!(reference.q, fast.q, "q bytes differ at {input:?}");
+        assert_eq!(reference.s, fast.s);
+        assert!(
+            reference
+                .d
+                .iter()
+                .zip(&fast.d)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "scales differ"
+        );
+    };
+    let mut lcg = Lcg(0x9E37_79B9_7F4A_7C15);
+    // Scales: 145 random FINITE bit patterns (any exponent from subnormal to
+    // max, full random mantissa) plus the exact edges. Multiplying a half
+    // boundary by such a scale produces values whose quantized position
+    // depends on every mantissa bit, not just the exponent.
+    let mut scales = vec![f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX];
+    for _ in 0..145 {
+        let bits = (lcg.next() as u32) & 0x7F7F_FFFF; // finite, never NaN/inf
+        let bits = bits | 1; // never exactly zero
+        scales.push(f32::from_bits(bits));
+    }
+    for &s in &scales {
+        for n in -128i32..=128 {
+            let half = n as f32 + 0.5;
+            let input: Vec<f32> = [half.next_down(), half, half.next_up()]
+                .iter()
+                .map(|&v| v * s)
+                .collect();
+            assert_pair(&input);
+        }
+        // Saturation edges: the group max itself and values beyond it in magnitude.
+        assert_pair(&[
+            0.0,
+            -0.0,
+            s,
+            -s,
+            127.0 * s,
+            -127.0 * s,
+            128.0 * s,
+            -128.0 * s,
+        ]);
+    }
+    // Corners the boundary sweep cannot hit: negative zero, the smallest
+    // subnormal, and a reciprocal-overflowing group (amax subnormal makes
+    // 127/amax infinite).
+    assert_pair(&[-0.0; 256]);
+    assert_pair(&[f32::from_bits(1); 256]);
+    assert_pair(&[
+        f32::from_bits(1),
+        0.0,
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        1.0,
+        -1.0,
+        f32::from_bits(1) * 2.0,
+        0.0,
+    ]);
+    // Seeded sweep: one million values with FULL random mantissas over the
+    // whole finite range, both signs, subnormals included - drawn from raw
+    // bit patterns so no mantissa bit is pinned.
+    let mut input = Vec::with_capacity(1_000_000);
+    for _ in 0..1_000_000 / 2 {
+        let magnitude = f32::from_bits((lcg.next() as u32) & 0x7F7F_FFFF);
+        let signed = if lcg.next() & 1 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        input.push(signed);
+    }
+    for chunk in input.chunks(256) {
+        assert_pair(chunk);
+    }
+}
+
+/// The default with the variable unset, pinned in a child process: the
+/// `OnceLock` is process-global, so a parent that has already quantized
+/// once cannot observe the unset arm. The child (fresh process, the
+/// variable removed) quantizes the fixed row through the public entry and
+/// prints its digest; the parent asserts it equals the forced fast digest
+/// on an AVX2 host and the forced reference digest everywhere else, and
+/// that every rollback spelling disables while the enable words keep the
+/// default.
+#[test]
+fn fast_quantizer_default_matches_forced_path_in_a_child_process() {
+    use super::{Q8gRow, fill_groups, quantize_q8g};
+    const CHILD: &str = "kernels::expert_cpu_q8g::tests::fast_quantizer_default_matches_forced_path_in_a_child_process";
+
+    fn digest(row: &Q8gRow) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in row.q.iter() {
+            h ^= *byte as u8 as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        for word in row.s.iter() {
+            h ^= u64::from(*word as u32);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        for f in &row.d {
+            h ^= f.to_bits() as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    }
+
+    let mut lcg = Lcg(0x0123_4567_89ab_cdef);
+    let input: Vec<f32> = (0..768)
+        .map(|_| f32::from_bits(((lcg.next() as u32) & 0x7f7f_ffff) | 1))
+        .collect();
+
+    let forced = |fast: bool| {
+        let mut out = Q8gRow::zeros(input.len()).unwrap();
+        if fast {
+            fill_groups::<true>(&input, &mut out);
+        } else {
+            fill_groups::<false>(&input, &mut out);
+        }
+        digest(&out)
+    };
+    let reference = forced(false);
+    let fast = forced(true);
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = false;
+    let expected_default = if avx2 { fast } else { reference };
+
+    // The digest channel is a file: libtest swallows a passing test's stdout
+    // under capture, so a print cannot be read back by the parent.
+    let out_path = std::env::temp_dir().join("fifi-fast-quant-child-digest");
+    let run_child = |value: Option<&str>| -> u64 {
+        let _ = std::fs::remove_file(&out_path);
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args(["--exact", CHILD, "--test-threads", "1"])
+            .env("FQ_CHILD", "1")
+            .env("FQ_CHILD_OUT", &out_path)
+            .env_remove("FIFI_CPU_Q8G_FAST_QUANT");
+        if let Some(value) = value {
+            command.env("FIFI_CPU_Q8G_FAST_QUANT", value);
+        }
+        let output = command.output().expect("spawn the fast-quant child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "fast-quant child {value:?} exited with {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(&out_path)
+            .unwrap_or_else(|_| panic!("child {value:?} wrote no digest file:\n{stdout}"))
+            .trim()
+            .parse()
+            .expect("digest digits")
+    };
+
+    if let Some(path) = std::env::var_os("FQ_CHILD_OUT") {
+        let mut out = Q8gRow::zeros(input.len()).unwrap();
+        quantize_q8g(&input, &mut out).expect("row contract");
+        std::fs::write(path, digest(&out).to_string()).expect("write the digest file");
+        return;
+    }
+    assert_eq!(
+        run_child(None),
+        expected_default,
+        "unset default must take the {} path",
+        if avx2 { "fast" } else { "reference" }
+    );
+    for rollback in ["0", "off", "false", "maybe", ""] {
+        assert_eq!(
+            run_child(Some(rollback)),
+            reference,
+            "rollback {rollback:?}"
+        );
+    }
+    for enable in ["1", "true", "on"] {
+        assert_eq!(
+            run_child(Some(enable)),
+            expected_default,
+            "enable {enable:?} must keep the default path"
+        );
+    }
+}

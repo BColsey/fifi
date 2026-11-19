@@ -94,9 +94,7 @@ pub fn quantize_q8g(x: &[f32], out: &mut Q8gRow) -> Result<(), ExpertCpuError> {
         )));
     }
     static FAST_QUANT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FAST_QUANT
-        .get_or_init(|| std::env::var_os("FIFI_CPU_Q8G_FAST_QUANT").is_some_and(|v| v == "1"))
-    {
+    if *FAST_QUANT.get_or_init(fast_quant_default) {
         fill_groups::<true>(x, out);
     } else {
         fill_groups::<false>(x, out);
@@ -110,6 +108,21 @@ fn round_quantized(scaled: f32) -> i8 {
     let whole = scaled as i32;
     let fraction = scaled - whole as f32;
     (whole + i32::from(fraction >= 0.5) - i32::from(fraction <= -0.5)).clamp(-127, 127) as i8
+}
+
+/// `FIFI_CPU_Q8G_FAST_QUANT` rolls the default back through the shared fail-safe switch
+/// (`env_switch::env_allows_default_on`): absent keeps the fast path where the host reports
+/// AVX2; once set, only the enable words ("1", "true", "on") keep it on, and every other
+/// value — "0", "off", "false", garbage, non-UTF-8 — returns to the reference path. Other
+/// architectures stay on the reference path until measured.
+fn fast_quant_default() -> bool {
+    // The detect macro only exists on x86 targets; every other arch stays on the
+    // reference path.
+    #[cfg(target_arch = "x86_64")]
+    let allowed = std::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let allowed = false;
+    allowed && crate::env_switch::env_allows_default_on("FIFI_CPU_Q8G_FAST_QUANT")
 }
 
 fn fill_groups<const FAST: bool>(x: &[f32], out: &mut Q8gRow) {
