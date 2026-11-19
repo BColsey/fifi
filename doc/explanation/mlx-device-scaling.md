@@ -155,6 +155,15 @@ python3 scripts/mac_cache_study/flash_next_oq4e_smoke.py \
 
 The Flash-Next and Qwen3.6 profilers take their read, page-copy and MLX wait snapshots through the same helper. Flash-Next wraps each successful decode step or prefill chunk and records the page import calls in both paths. The qualification switch adds measurements at existing synchronization points. Read durations cover the shard calls, including cache hits. Native import, readback and evaluate walls can include queued Metal work.
 
+The 16 GB mini ran the same 36-token request at two working-set ceilings in two opposite orders, with a fresh server for each arm and the OS file cache retained. The worker piece stayed at 32 rows. The 11 GiB ceiling admitted 16-row executor chunks and the 12,100 MiB ceiling admitted 32. All four responses matched the original smoke's four sampled token IDs and output hash.
+
+| Ceiling | Executor rows | Prefill forwards | Logical prefill reads | Median first token | Median request SSD reads | Median decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 11,264 MiB | 16 | 4 | 22.65 GB | 49.13 s | 25.42 GB | 0.42 tok/s |
+| 12,100 MiB | 32 | 3 | 18.17 GB | 40.71 s | 21.58 GB | 0.37 tok/s |
+
+At the higher ceiling, logical prefill reads fell 20% and first-token time fell 17%. Prefill slice calls dropped from 64,899 to 49,410, and page imports dropped from 192 to 144. Every forward used zero page copies. The median time inside prefill shard reads fell from 43.61 to 35.65 s. It accounted for 88–89% of first-token time across the arms. Decode read the same 3.98 GB of logical data in every request and had lower measured throughput at the higher ceiling. The comparison covers one short prompt. [Requests](../../scripts/benchmarks/mac-m4-flash-next-attribution-requests.csv) · [26 forwards](../../scripts/benchmarks/mac-m4-flash-next-attribution-forwards.csv)
+
 Use a release build with `native-mlx,native-fault-qualification` and add `--attribute` to the smoke command to capture the per-forward records. Use a new output directory and `--working-set-mib 12100` for the higher ceiling.
 
 ## Disk-backed Flint experts
