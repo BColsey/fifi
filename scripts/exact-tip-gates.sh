@@ -2,10 +2,11 @@
 # Exact-tip gates for one commit, from clean trees and fresh target dirs.
 #
 # The host arms alone miss breakage that only the container (native-cuda) or the
-# Mac (native-mlx) build sees, so this battery runs every arm a handoff needs:
-# fmt, host clippy, host lib tests, published_text, the qualification inventory,
-# container clippy, container test build and a device-free lib test run (release,
-# native-cuda, no GPU), and a Mac
+# Mac (native-mlx) build sees, so this battery runs every arm a handoff needs: the
+# qualification inventory first (one second, no build - a stale count must fail
+# before minutes of host work), then fmt, host clippy, host lib tests,
+# published_text, container clippy, container test build and a device-free lib
+# test run (release, native-cuda, no GPU), and a Mac
 # native-mlx clippy. The commit is materialized as a detached worktree — a clean
 # checkout of the exact hash, never a working copy — and every Linux arm reads
 # that worktree; the Mac arm reads a `git archive` stream of the same commit
@@ -149,7 +150,7 @@ if [[ $mac == auto ]]; then
     fi
 fi
 
-arms=(fmt dead-test-scan host-clippy host-lib published-text qual qual-validate ctr-clippy ctr-tests ctr-lib-run)
+arms=(qual qual-validate fmt dead-test-scan host-clippy host-lib published-text ctr-clippy ctr-tests ctr-lib-run)
 [[ $mac == never ]] || arms+=(mac-clippy)
 
 if $list_only; then
@@ -380,14 +381,10 @@ if [[ $mac != never ]]; then
     mac_job=$!
 fi
 
-run_arm fmt cargo fmt --all --check || fail_now fmt fmt
-run_arm dead-test-scan python3 "$run/src/scripts/dead_test_scan.py" || fail_now dead-test-scan dead-test-scan
-run_arm host-clippy cargo clippy --locked --all-targets -- -D warnings || fail_now host-clippy host-clippy
-run_arm host-lib cargo test --locked --lib || fail_now host-lib host-lib
-run_arm published-text cargo test --locked --test published_text || fail_now published-text published-text
-
-# The qualification gate: the committed file must be exactly what the source
-# regenerates (drift FAILS the run), and validation reads the committed file.
+# The qualification gate runs FIRST: it takes one second and needs no build,
+# so a stale inventory count fails in the opening seconds instead of after the
+# host clippy and host lib arms. The committed file must be exactly what the
+# source regenerates (drift FAILS the run), and validation reads the committed file.
 facts="$run/src/scripts/qual_facts.json"
 facts_before=$(md5sum "$facts")
 run_arm qual bash "$run/tmp/qual-generate.sh" || fail_now qual qual
@@ -399,6 +396,12 @@ if [[ $(md5sum "$facts") != "$facts_before" ]]; then
 fi
 git -C "$run/src" checkout -- scripts/qual_facts.json
 run_arm qual-validate bash "$run/tmp/qual-validate.sh" || fail_now qual-validate qual-validate
+
+run_arm fmt cargo fmt --all --check || fail_now fmt fmt
+run_arm dead-test-scan python3 "$run/src/scripts/dead_test_scan.py" || fail_now dead-test-scan dead-test-scan
+run_arm host-clippy cargo clippy --locked --all-targets -- -D warnings || fail_now host-clippy host-clippy
+run_arm host-lib cargo test --locked --lib || fail_now host-lib host-lib
+run_arm published-text cargo test --locked --test published_text || fail_now published-text published-text
 
 ctr=(docker run --rm --pull=never --name "$CTR_NAME" --label fifi.owner=exact-tip-gates
     --user "$(id -u):$(id -g)" --network none --memory 24g --memory-swap 24g --cpus 4
