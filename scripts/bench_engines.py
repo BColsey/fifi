@@ -31,7 +31,7 @@ def nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def parse_stream(lines, start: float, clock=time.monotonic) -> dict:
+def parse_stream(lines, start: float, clock=time.monotonic, *, on_content=None) -> dict:
     """Read a complete enginesrv SSE reply; never infer token counts from chunks."""
     request_id = None
     first_delta = None
@@ -65,6 +65,12 @@ def parse_stream(lines, start: float, clock=time.monotonic) -> dict:
                 delta.get("content") or delta.get("reasoning_content")
             ):
                 first_delta = clock() - start
+            content = delta.get("content")
+            if on_content is not None and content is not None:
+                if not isinstance(content, str):
+                    raise ValueError("stream content is not text")
+                if content:
+                    on_content(content)
             if choice.get("finish_reason") is not None:
                 finish = choice["finish_reason"]
         if obj.get("usage") is not None:
