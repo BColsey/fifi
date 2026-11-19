@@ -107,9 +107,11 @@ pub struct WarmTurnCache {
     boundary_whole_head: bool,
     self_check: bool,
     pub(super) seed_resends: bool,
+    pub(super) resend_extra_bytes: usize,
+    previous_turn: Option<Box<DisplacedTurn>>,
     /// The last completed turn's ids and boundaries plus the SHA-256 of
     /// the exact request (messages, tools, thinking) that produced them —
-    /// one unit, dropped together whenever the slot reseeds or empties,
+    /// one unit, retained or dropped together whenever the slot reseeds,
     /// so a stale result can never outlive its fingerprint.
     /// A resend whose digest and key match reuses the stored ids
     /// outright (see `encode_prompt_warm`); any edit, reorder, tool,
@@ -127,6 +129,32 @@ struct LastTurn {
     tail_ids: Vec<u32>,
     bounds: PromptBoundaries,
     inputs: [u8; 32],
+}
+
+impl LastTurn {
+    fn result(&self, head: &[u32]) -> (Vec<u32>, PromptBoundaries) {
+        let mut ids = Vec::with_capacity(self.shared_head + self.tail_ids.len());
+        ids.extend_from_slice(&head[..self.shared_head]);
+        ids.extend_from_slice(&self.tail_ids);
+        (ids, self.bounds)
+    }
+}
+
+/// Only the immutable result survives displacement. The active conversation
+/// keeps exclusive ownership of its render and append state.
+struct DisplacedTurn {
+    key: WarmKey,
+    head: Vec<u32>,
+    turn: LastTurn,
+}
+
+impl DisplacedTurn {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.key.tools.capacity()
+            + self.key.system.as_ref().map_or(0, String::capacity)
+            + 4 * (self.head.capacity() + self.turn.tail_ids.capacity())
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -178,6 +206,11 @@ impl WarmTurnCache {
             first_head_end: None,
             boundary_whole_head: false,
             self_check: false,
+            previous_turn: None,
+            resend_extra_bytes: std::env::var("ENGINESRV_RESEND_EXTRA_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
             seed_resends: std::env::var_os("ENGINESRV_SEED_RESENDS").is_some_and(|v| v == "1"),
             last_turn: None,
             #[cfg(test)]
@@ -207,10 +240,25 @@ impl WarmTurnCache {
             .last_turn
             .as_ref()
             .expect("a completed turn always stores its result");
-        let mut ids = Vec::with_capacity(last.shared_head + last.tail_ids.len());
-        ids.extend_from_slice(&self.head_ids[..last.shared_head]);
-        ids.extend_from_slice(&last.tail_ids);
-        (ids, last.bounds)
+        last.result(&self.head_ids)
+    }
+
+    fn retain_displaced_turn(&mut self) {
+        self.previous_turn = None;
+        if !self.seed_resends || self.resend_extra_bytes == 0 {
+            return;
+        }
+        if let (Some(key), Some(turn)) = (self.key.take(), self.last_turn.take()) {
+            let head = if turn.shared_head > 0 {
+                std::mem::take(&mut self.head_ids)
+            } else {
+                Vec::new()
+            };
+            let previous = DisplacedTurn { key, head, turn };
+            if previous.bytes() <= self.resend_extra_bytes {
+                self.previous_turn = Some(Box::new(previous));
+            }
+        }
     }
 
     /// Same as [`Self::new`], but every warm turn cross-checks its ids
@@ -298,7 +346,8 @@ impl WarmTurnCache {
     /// The live cache footprint in bytes: the head render's and key
     /// strings' CAPACITY plus four bytes per id CAPACITY — capacity, not
     /// len, so a cleared-but-retained buffer cannot report zero while
-    /// holding its allocation.
+    /// holding its allocation. The optional displaced result is charged for
+    /// its box and for the capacity of every owned buffer.
     pub fn accounted_bytes(&self) -> usize {
         self.head_render.capacity()
             + 4 * self.head_ids.capacity()
@@ -309,6 +358,7 @@ impl WarmTurnCache {
                 .last_turn
                 .as_ref()
                 .map_or(0, |t| 4 * t.tail_ids.capacity() + 32)
+            + self.previous_turn.as_ref().map_or(0, |entry| entry.bytes())
     }
 }
 
@@ -607,7 +657,9 @@ impl TokenizerBundle {
         let key = warm_key(msgs, thinking, self.identity_fold(), &tools_json);
         // Only a matching, deterministic slot can serve its stored result. A
         // newly seeded slot optionally computes its digest after the head proof.
-        let digest = (cache.key.as_ref() == Some(&key) && self.tokenizer.boundary_eligible())
+        let active_key = cache.key.as_ref() == Some(&key);
+        let previous_key = cache.previous_turn.as_ref().is_some_and(|p| p.key == key);
+        let digest = ((active_key || previous_key) && self.tokenizer.boundary_eligible())
             .then(|| cache.request_digest(msgs, &tools_json, thinking));
         // Resend-HIT (an agent's repeat turn): byte-identical
         // render inputs to the request that filled `last_turn`. The key
@@ -620,15 +672,23 @@ impl TokenizerBundle {
         // a shifted tool-call field, a tool or thinking change, another
         // bundle or another effective flag set) misses the digest or the
         // key and takes the normal append/refuse path.
-        let resend_hit = digest.is_some_and(|d| {
+        let resend = digest.and_then(|inputs| {
+            if active_key
+                && cache
+                    .last_turn
+                    .as_ref()
+                    .is_some_and(|last| last.inputs == inputs)
+            {
+                return Some(cache.last_result());
+            }
             cache
-                .last_turn
+                .previous_turn
                 .as_ref()
-                .is_some_and(|last| last.inputs == d)
+                .filter(|p| previous_key && p.turn.inputs == inputs)
+                .map(|p| p.turn.result(&p.head))
         });
-        if resend_hit {
+        if let Some((ids, bounds)) = resend {
             cache.reuses += 1;
-            let (ids, bounds) = cache.last_result();
             // Production defaults do NOT re-verify: byte-exactness rests
             // on the deterministic tokenizer + fingerprint arguments. The
             // diagnostic cross-check (test builds always; production via
@@ -887,6 +947,7 @@ impl TokenizerBundle {
                     // whole cached head", whatever the head's roles — an
                     // all-system head is one case of it, not the definition.
                     cache.boundary_whole_head = whole_head;
+                    cache.retain_displaced_turn();
                     cache.head_render = head_render;
                     cache.head_ids = ids[..tip].to_vec();
                     // Drop the previous fingerprint and its ids together. A
@@ -908,6 +969,7 @@ impl TokenizerBundle {
                 // next turn takes the full path again. The buffers are
                 // DROPPED, not cleared — clear() keeps the allocation
                 // while accounted_bytes would keep reporting it.
+                cache.previous_turn = None;
                 cache.key = None;
                 cache.head_render = String::new();
                 cache.last_turn = None;
