@@ -5,7 +5,7 @@ If you have not built fifi before, do the [tutorial](../getting-started.md) firs
 
 ## On a Mac
 
-The resident profile below uses Apple Silicon with at least 36 GB of memory. The experimental disk-backed profile served the same checkpoint on a 16 GB M4 mini with a 4,096-token context. [Streamed profile and measurements](../explanation/mlx-device-scaling.md#full-qwen36-checkpoint-on-the-m4-mini)
+The resident profile below uses Apple Silicon with at least 36 GB of memory. The experimental disk-backed profile served the same checkpoint on a 16 GB M4 mini with a 4,096-token context.
 
 The Mac build also needs the following.
 

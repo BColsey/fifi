@@ -84,7 +84,7 @@ fn flint_mlx_expert_cache_tiers() {
                 k.evaluate(&[&output]).unwrap();
                 output
             }
-            "file_warm" => disk_experts(k, &checkpoint, stem, &input, &disk_ids).unwrap(),
+            "file_warm" => disk_experts(k, &checkpoint, stem, &input, &disk_ids, false).unwrap(),
             _ => unreachable!(),
         };
         let expected = run(&mut kernels, "resident");

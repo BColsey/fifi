@@ -38,9 +38,6 @@ Per-phase, at 526 / 4,022 / 32,028 prompt tokens:
 
 Caveats, stated: the MLX-LM figure is in-process (no HTTP, no server), while the fifi figure is the server's own counters; both are greedy on the same file. The comparison is honest about its layers but is not a pure like-for-like server pair.
 
-For single-layer Q8 decode and dense-prefill timings on a 16 GB M4 Mac mini,
-see the [M4 attention measurements](mac-m4-attention.md).
-
 ## Flint, MLX int4 21 GB fixture, on the same Apple Silicon host
 
 No reference pair exists: MLX-LM cannot load this model type ("Model type flint not supported"), so this table is single-engine, measured for admission and ceiling rather than comparison. Default arm (which equals the tuned arm — nothing qualified to switch on for Flint on MLX):

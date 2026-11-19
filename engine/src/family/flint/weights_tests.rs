@@ -639,7 +639,12 @@ fn expert_page_staging_matches_the_packed_experts_path() {
         HEADER_LIMIT,
     )
     .unwrap();
-    let checkpoint = FlintCheckpoint { profile, weights };
+    let checkpoint = FlintCheckpoint {
+        profile,
+        weights,
+        #[cfg(feature = "native-fault-qualification")]
+        records: None,
+    };
     let page = crate::kernels::HostPages::page_size();
     let refused = crate::family::stored::StackLayout::for_byte_payload(
         &checkpoint.weights,

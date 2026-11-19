@@ -93,7 +93,7 @@ The 16 GB M4 mini has four performance cores and six efficiency cores. The pool 
 
 The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts. [Sample times and I/O measurements](../../scripts/benchmarks/mac-m4-nemotron35-cpu-layer.csv)
 
-Build the ignored test on Apple Silicon, then run its separate processes with the driver below. Use the process I/O counter from the [Mac staging study](../explanation/mac-flint-expert-pipeline.md#reproduce). The test prints the runner path after compilation.
+Build the ignored test on Apple Silicon, then run its separate processes with the driver below. Build the [process I/O counter](../../scripts/mac_cache_study/proc-io.c). The test prints the runner path after compilation.
 
 ```sh
 cd engine

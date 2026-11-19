@@ -259,12 +259,6 @@ pub mod reference;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx_executor;
-#[cfg(all(
-    feature = "native-fault-qualification",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
-mod mlx_expert_timing;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx_expert_cache;
 #[cfg(all(
