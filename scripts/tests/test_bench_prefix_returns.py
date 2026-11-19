@@ -12,6 +12,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bench_prefix_returns as driver
+import record_prefix_checkpoint_bytes as checkpoints
 
 
 def tokens(source):
@@ -94,7 +95,12 @@ class Handler(BaseHTTPRequestHandler):
             time_to_first_token_ms=7,
             queue_wait_ms=1,
             decode_tokens_per_second=50 if server.report_decode else None,
+            endpoint="/v1/chat/completions",
+            prefix_entries=len(server.cache),
+            prefix_bytes=sum(len(entry) * 8 for entry in server.cache),
+            synthetic_sizes=[len(entry) * 8 for entry in server.cache],
         )
+        server.log_rows.append(server.row)
         chunks = [
             {"id": rid, "choices": [{"delta": {"content": answer}}]},
             {
@@ -129,6 +135,7 @@ class PrefixReturnsTests(unittest.TestCase):
         self.server.slots = slots
         self.server.cache = []
         self.server.requests = 0
+        self.server.log_rows = []
         return argparse.Namespace(
             url=f"http://127.0.0.1:{self.server.server_port}",
             model="fixture",
@@ -183,6 +190,36 @@ class PrefixReturnsTests(unittest.TestCase):
                 self.assertEqual(back["server_time_to_first_token_ms"], 7)
                 self.assertEqual(back["server_decode_tokens_per_second"], 50)
         self.assertEqual(*arms)
+
+    def test_checkpoint_record_matches_completed_chat_rows(self):
+        args = self.args(2, "retained", [2048, 262_144])
+        self.server.limit = 65_536
+        self.assertFalse(driver.run(args))
+        benchmark = json.loads(args.output.read_text())
+        rows = self.server.log_rows
+        log = ["server ready\n", *(json.dumps(row) for row in reversed(rows))]
+        result = checkpoints.record_checkpoint_bytes(benchmark, log)
+        self.assertEqual(result["capacity_refused_contexts"], [262_144])
+        samples = result["samples"]
+        self.assertEqual([row["prefix_entries"] for row in samples], [1, 1, 2, 2])
+        self.assertEqual([row["prefix_bytes"] for row in samples], [
+            sum(checkpoint_bytes for checkpoint_bytes in row["synthetic_sizes"])
+            for row in rows
+        ])
+        self.assertGreater(samples[-1]["reused_tokens"], 0)
+        self.assertNotIn("prompt", samples[-1])
+        self.assertNotIn("synthetic_sizes", samples[-1])
+
+        invalid_logs = [
+            log[:-1],
+            [*log, log[-1]],
+            [*log[:-1], json.dumps(dict(rows[0], reused_tokens=100))],
+            [*log[:-1], json.dumps(dict(rows[0], prefix_bytes=True))],
+        ]
+        for invalid in invalid_logs:
+            with self.subTest(invalid=invalid[-1]):
+                with self.assertRaises(ValueError):
+                    checkpoints.record_checkpoint_bytes(benchmark, invalid)
 
     def test_capacity_refusals_are_recorded_without_sending_inference(self):
         self.server.limit = 65_536
