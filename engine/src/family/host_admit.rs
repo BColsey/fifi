@@ -68,15 +68,19 @@ impl HostAdmission {
         self.admit_for(required, label)
     }
 
+    /// Bounds host availability by every verified enclosing memory limit, before caller headroom.
+    pub(crate) fn available_bytes(&self) -> u64 {
+        self.cgroup_remaining
+            .map_or(self.mem_available, |remaining| {
+                remaining.min(self.mem_available)
+            })
+    }
+
     /// The admission check with the caller's name in the refusal, so a prefix
     /// snapshot refusal does not masquerade as another caller's
     /// (the refusal names the caller).
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self
-            .cgroup_remaining
-            .map_or(self.mem_available, |remaining| {
-                remaining.min(self.mem_available)
-            });
+        let available = self.available_bytes();
         if required
             .checked_add(self.os_floor)
             .is_none_or(|needed| needed > available)
@@ -265,17 +269,32 @@ fn cgroup_from_proc(
             "{label} cannot map its process inside a complete unified cgroup tree."
         ))
     };
-    let mut lines = membership.lines();
-    let path = std::path::Path::new(
-        lines
-            .next()
-            .and_then(|line| line.strip_prefix("0::"))
-            .ok_or_else(invalid)?,
-    );
+    // Legacy hierarchies such as net_cls can coexist with v2 memory accounting.
+    let mut unified_path = None;
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let id = fields.next().ok_or_else(invalid)?;
+        let controllers = fields.next().ok_or_else(invalid)?;
+        let path = std::path::Path::new(fields.next().ok_or_else(invalid)?);
+        if !path.is_absolute() {
+            return Err(invalid());
+        }
+        if id == "0" {
+            if !controllers.is_empty() || unified_path.replace(path).is_some() {
+                return Err(invalid());
+            }
+        } else if !id.bytes().all(|b| b.is_ascii_digit())
+            || id.parse::<u32>().ok().is_none_or(|id| id == 0)
+            || controllers
+                .split(',')
+                .any(|c| c.is_empty() || c == "memory" || c.contains(char::is_whitespace))
+        {
+            return Err(invalid());
+        }
+    }
+    let path = unified_path.ok_or_else(invalid)?;
     if pid == 0
-        || lines.next().is_some()
         || !root.is_absolute()
-        || !path.is_absolute()
         || root
             .components()
             .chain(path.components())
@@ -678,7 +697,7 @@ mod tests {
         let (root, proc) = namespace_root("8589934592\n", "memory\n");
         let budget =
             HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
-        assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
+        assert_eq!(budget.available_bytes(), 6u64 << 30);
         assert_eq!(budget.os_floor, 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
@@ -686,6 +705,7 @@ mod tests {
         let budget =
             HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
+        assert_eq!(budget.available_bytes(), 24u64 << 30);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
         assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
         assert!(budget.admit(LABEL, (16u64 << 30) + 1).is_err());
@@ -724,12 +744,30 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_membership_uses_the_unified_memory_budget_in_either_order() {
+        let (root, proc) = namespace_root("8589934592\n", "memory\n");
+        for membership in ["1:net_cls:/\n0::/\n", "0::/\n2:cpu,cpuacct:/work:bench\n"] {
+            std::fs::write(proc.path().join("self/cgroup"), membership).unwrap();
+            let budget =
+                HostAdmission::probe_in(LABEL, ROOT_LABEL, proc.path(), root.path(), 42).unwrap();
+            // Machine-wide MemAvailable is 24 GiB, but only 6 GiB remain in this group.
+            assert_eq!(budget.available_bytes(), 6u64 << 30);
+        }
+    }
+
+    #[test]
     fn cgroup_discovery_rejects_bad_process_mapping() {
         for (membership, pid, owners, kind) in [
             ("0::/../work\n", 42, "41\n42\n", "domain"),
             ("0::work\n", 42, "41\n42\n", "domain"),
             ("0::/work\n0::/work\n", 42, "41\n42\n", "domain"),
             ("1:memory:/work\n", 42, "41\n42\n", "domain"),
+            ("0::/work\n1:cpu,memory:/\n", 42, "42\n", "domain"),
+            ("0::/work\n0:net_cls:/\n", 42, "42\n", "domain"),
+            ("0::/work\n1::/\n", 42, "42\n", "domain"),
+            ("0::/work\n1:cpu,:/\n", 42, "42\n", "domain"),
+            ("0::/work\nx:cpu:/\n", 42, "42\n", "domain"),
+            ("0::/work\n1:net_cls:relative\n", 42, "42\n", "domain"),
             ("0::/work\n", 0, "41\n42\n", "domain"),
             ("0::/work\n", 42, "41\n", "domain"),
             ("0::/work\n", 42, "41\n42\n", "threaded"),
