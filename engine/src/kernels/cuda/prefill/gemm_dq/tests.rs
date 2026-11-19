@@ -1139,7 +1139,9 @@ fn gemm_dq_inhouse_matches_the_reference_at_serve_offsets() {
         } else {
             build_weight_q40(seg_rows + lead_rows, k, 0x6eed_0002)
         };
-        let seg_bytes = if q5k { 22 * (k / 32) } else { 18 * (k / 32) };
+        let ty = if q5k { GgufType::Q5K } else { GgufType::Q40 };
+        // The type's own block numbers, not a hand-copied per-row byte count.
+        let seg_bytes = (ty.block_bytes() * (k as u64 / ty.block_elems())) as usize;
         let seg = &w_all[lead_rows * seg_bytes..];
         let mut rng = testkit::Rng::new(0x6eed_0003);
         // The serve x layout: token column c at c*x_stride with x_stride >= k
