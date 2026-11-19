@@ -76,7 +76,7 @@ impl QwenResidentStep<'_> {
             "q36 pinned prefix",
             "q36 pinned prefix",
         )
-        .inspect_err(|error| eprintln!("q36 cuda: pinned prefix host budget: {error}"))
+        .inspect_err(|error| eprintln!("q36 cuda: pinned prefix host budget: {}", error.describe()))
         .ok()
         .and_then(|budget| usize::try_from(budget.available_bytes()).ok());
         let entries = planned_entries(checkpoint, limit, available);
