@@ -413,15 +413,13 @@ impl DecodeSession {
         result
     }
 
-    /// `save_prefix` with a host-bytes charge: the store makes room, then hands the survivors'
-    /// bytes (measured by `size`) to `charge` before taking the snapshot; `false` refuses the
-    /// save. The charge sees what stays after the save, never the entries the room step is
-    /// about to retire.
+    /// Reserves the incoming snapshot against the host bytes that survive the room step.
+    /// A tip can spend its own superseded snapshot to fit the replacement.
     ///
     /// The Flash executor compiles only under `test` or `native-cuda` on Linux
     /// (`flash_next/cuda/mod.rs`), so a plain non-test build has no caller.
     #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
-    #[allow(clippy::too_many_arguments)] // the store's save seam: key/path/fed/kind plus the budget pair
+    #[allow(clippy::too_many_arguments)] // the store's save seam: key/path/fed/kind plus the snapshot budget
     pub(crate) fn save_prefix_budgeted<S, P: PartialEq>(
         &self,
         store: &mut PrefixStore<S, P>,
@@ -429,21 +427,12 @@ impl DecodeSession {
         path: P,
         fed: usize,
         kind: SaveKind,
-        size: &dyn Fn(&S) -> u64,
-        charge: &mut dyn FnMut(u64) -> bool,
+        budget: SnapshotBudget<'_, S>,
         mut snapshot: impl FnMut() -> Result<S>,
     ) -> Result<bool> {
         let pending = self.prefix_save_pending(key, fed)?;
         let observed = std::mem::replace(&mut store.restored, self.restored_prefix);
-        let result = store.save_charged(
-            key,
-            pending,
-            path,
-            kind,
-            Some(size),
-            Some(charge),
-            &mut snapshot,
-        );
+        let result = store.save_charged(key, pending, path, kind, Some(budget), &mut snapshot);
         store.restored = observed;
         result
     }
@@ -837,6 +826,24 @@ pub(crate) struct SaveSideTotals {
     pub(crate) restored_replaces: u64,
 }
 
+/// Host payload budget for a snapshot and the entries retained beside it.
+pub(crate) struct SnapshotBudget<'a, S> {
+    pub(crate) limit: u64,
+    pub(crate) incoming: u64,
+    pub(crate) size: &'a dyn Fn(&S) -> u64,
+}
+
+impl<S> SnapshotBudget<'_, S> {
+    fn remaining_after<'a>(&self, mut snapshots: impl Iterator<Item = &'a S>) -> Option<u64>
+    where
+        S: 'a,
+    {
+        snapshots.try_fold(self.limit.checked_sub(self.incoming)?, |left, snapshot| {
+            left.checked_sub((self.size)(snapshot))
+        })
+    }
+}
+
 impl<S, P> Default for PrefixStore<S, P> {
     fn default() -> Self {
         Self::with_limits(StoreLimits::default())
@@ -1026,23 +1033,17 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         kind: SaveKind,
         snapshot: &mut dyn FnMut() -> Result<S>,
     ) -> Result<bool> {
-        self.save_charged(key, pending, path, kind, None, None, snapshot)
+        self.save_charged(key, pending, path, kind, None, snapshot)
     }
 
-    /// `save` with a host-bytes charge: after the room step and before the snapshot, the
-    /// store sums the survivors' bytes with `size` and hands the total to `charge`; a `false`
-    /// return refuses the save. Charging after room is the point — the pre-room held bytes
-    /// count entries this save is about to evict, so a pre-room line denies every save of a
-    /// full store from turn 2 on, wedging reuse where the unbudgeted store rolls forward.
-    #[allow(clippy::too_many_arguments)] // mirrors the save seam: the budget pair rides the same call
+    /// Duplicate uses need no allocation. New entries must fit beside the surviving snapshots.
     fn save_charged(
         &mut self,
         key: &[u32],
         pending: u32,
         path: P,
         kind: SaveKind,
-        size: Option<&dyn Fn(&S) -> u64>,
-        charge: Option<&mut dyn FnMut(u64) -> bool>,
+        budget: Option<SnapshotBudget<'_, S>>,
         snapshot: &mut dyn FnMut() -> Result<S>,
     ) -> Result<bool> {
         // (a) A stored entry with the same key and the same path is a use, not a new snapshot.
@@ -1057,6 +1058,13 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                 self.save_refusals += 1; // a root promotion that found no victim
             }
             return Ok(done);
+        }
+        if let Some(budget) = &budget
+            && (budget.incoming > budget.limit
+                || (kind == SaveKind::Tip && !self.reserve_tip(key, budget)))
+        {
+            self.save_refusals += 1;
+            return Ok(false);
         }
         // (b) An entry with the same key and another path is replaced.
         let other_path =
@@ -1079,8 +1087,8 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
             self.block_rolls += (before - self.lru.len()) as u64;
         }
         // (c) Room. Only a Root save can evict a root here (rule e).
-        // While making room, recent-longer protection tries to retire a restored Tip ancestor
-        // before other LRU victims. Otherwise, that Tip ancestor is the last resort for an extending Tip.
+        // Budgeted tips have already made room. Recent-longer stores prefer a superseded tip;
+        // other stores use that ancestor as a last resort.
         match kind {
             SaveKind::Root => {
                 if self.limits.roots == 0 {
@@ -1133,21 +1141,12 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
                 }
             }
         }
-        // (c2) The budgeted charge, after room: the bytes the surviving entries hold must fit
-        // the line with the would-be entry. A refusal here never calls the snapshot (the
-        // read-back is the cost) and counts as a save-side refusal; the store may sit one
-        // entry lighter for it, which is the price of charging what really stays.
-        if let (Some(size), Some(charge)) = (size, charge) {
-            let held: u64 = self
-                .roots
-                .iter()
-                .chain(&self.lru)
-                .map(|stored| size(&stored.saved.state))
-                .sum();
-            if !charge(held) {
-                self.save_refusals += 1;
-                return Ok(false);
-            }
+        if let Some(budget) = budget
+            && kind != SaveKind::Tip
+            && budget.remaining_after(self.snapshots()).is_none()
+        {
+            self.save_refusals += 1;
+            return Ok(false);
         }
         // (d) The snapshot, with one eviction before each retry of a denied permit. The victim is
         // dropped before the next `snapshot` call: dropping releases its charge.
@@ -1372,21 +1371,59 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     /// a one-entry list is outside the rules: the restored periodic entry then stays and the tip
     /// save is skipped.
     fn drop_restored_ancestor(&mut self, key: &[u32]) -> bool {
-        let Some(id) = self.restored else {
+        let Some(pos) = self.restored_tip_ancestor(key) else {
             return false;
         };
-        let Some(pos) = self.lru.iter().position(|stored| stored.id == id) else {
+        self.lru.remove(pos);
+        true
+    }
+
+    fn restored_tip_ancestor(&self, key: &[u32]) -> Option<usize> {
+        let id = self.restored?;
+        self.lru.iter().position(|stored| {
+            stored.id == id
+                && stored.kind == SaveKind::Tip
+                && key.len() > stored.saved.key.len()
+                && key.starts_with(&stored.saved.key)
+        })
+    }
+
+    /// Choose space for a budgeted tip without evicting a warm conversation on a byte refusal.
+    fn reserve_tip(&mut self, key: &[u32], budget: &SnapshotBudget<'_, S>) -> bool {
+        let ancestor = self.restored_tip_ancestor(key);
+        // A same-key entry here has another path (duplicate uses already returned), so
+        // the normal path replacement will free its slot before the snapshot.
+        let needs_slot = self.lru.len() >= self.limits.entries
+            && !self.lru.iter().any(|stored| stored.saved.key == key);
+        let victim = if needs_slot {
+            let Some(pos) = ancestor.or_else(|| self.first_unprotected(key.len())) else {
+                return false;
+            };
+            Some(pos)
+        } else {
+            ancestor
+        };
+        let victim_id = victim.map(|pos| self.lru[pos].id);
+        let survivors = self
+            .roots
+            .iter()
+            .chain(&self.lru)
+            .filter(|stored| Some(stored.id) != victim_id && stored.saved.key != key)
+            .map(|stored| &stored.saved.state);
+        let Some(remaining) = budget.remaining_after(survivors) else {
             return false;
         };
-        let stored = &self.lru[pos];
-        if stored.kind == SaveKind::Tip
-            && key.len() > stored.saved.key.len()
-            && key.starts_with(&stored.saved.key)
+        if let Some(pos) = victim
+            && (needs_slot || (budget.size)(&self.lru[pos].saved.state) > remaining)
         {
             self.lru.remove(pos);
-            return true;
+            if Some(pos) == ancestor {
+                self.restored_replaces += 1;
+            } else {
+                self.room_removals += 1;
+            }
         }
-        false
+        true
     }
 
     /// The restore candidates for `prompt` under `path`: every stored entry whose path equals
@@ -1582,7 +1619,7 @@ fn after_token(
 mod tests {
     use super::{
         DecodePreparation, DecodeSession, Limits, PrefixStore, Result, SaveKind, ShadowReason,
-        StoreLimits, TokenStepper, after_token, before_step, check_prompt,
+        SnapshotBudget, StoreLimits, TokenStepper, after_token, before_step, check_prompt,
     };
     use crate::{
         EngError,
@@ -2829,7 +2866,83 @@ mod tests {
     }
 
     #[test]
-    fn a_refusing_charge_takes_no_snapshot_and_keeps_the_room_removals() {
+    fn a_budgeted_tip_preserves_the_other_conversation_and_frees_its_ancestor_before_copy() {
+        use std::rc::Rc;
+
+        let mut store = PrefixStore::with_limits(StoreLimits {
+            roots: 0,
+            entries: 2,
+        });
+        let a = [1, 2, 3, 4];
+        let b = [5, 6];
+        let old = Rc::new(());
+        let ancestor = Rc::downgrade(&old);
+        store
+            .save(&b, 6, 1, SaveKind::Tip, &mut || Ok((3_u64, Rc::new(()))))
+            .unwrap();
+        store
+            .save(&a[..3], 3, 1, SaveKind::Tip, &mut || {
+                Ok((2, Rc::clone(&old)))
+            })
+            .unwrap();
+        drop(old);
+
+        let size = |s: &(u64, Rc<()>)| s.0;
+        let mut row = DecodeSession::default();
+        assert_eq!(
+            row.restore_prefix(&mut store, &a, 1, |_| Ok(())).unwrap(),
+            3
+        );
+        row.prefill(&mut Fake::new(), &a[3..], LIMIT).unwrap();
+        let save_tip =
+            |store: &mut PrefixStore<_, _>, incoming, snapshot: &mut dyn FnMut() -> _| {
+                row.save_prefix_budgeted(
+                    store,
+                    &a,
+                    1,
+                    a.len() - 1,
+                    SaveKind::Tip,
+                    SnapshotBudget {
+                        limit: 5,
+                        incoming,
+                        size: &size,
+                    },
+                    snapshot,
+                )
+            };
+
+        // Even retiring A would leave only two bytes beside B.
+        assert!(!save_tip(&mut store, 3, &mut || panic!("over-budget read-back")).unwrap());
+        assert!(ancestor.upgrade().is_some());
+        assert_eq!(store.save_side_totals().room_removals, 0);
+        assert_eq!(store.save_side_totals().restored_replaces, 0);
+
+        assert!(
+            save_tip(&mut store, 2, &mut || {
+                assert!(
+                    ancestor.upgrade().is_none(),
+                    "retired bytes still overlap the allocation"
+                );
+                Ok((2, Rc::new(())))
+            })
+            .unwrap()
+        );
+        assert_eq!(store.save_side_totals().restored_replaces, 1);
+        assert_eq!(store.save_side_totals().room_removals, 0);
+        assert_eq!(
+            row.restore_prefix(&mut store, &[5, 6, 7], 1, |_| Ok(()))
+                .unwrap(),
+            b.len()
+        );
+        assert_eq!(
+            row.restore_prefix(&mut store, &[1, 2, 3, 4, 5], 1, |_| Ok(()))
+                .unwrap(),
+            a.len()
+        );
+    }
+
+    #[test]
+    fn a_denied_new_tip_keeps_both_restorable_checkpoints() {
         let tokens: Vec<u32> = (0..9_000).collect();
         let mut slot = store(0, 2);
         for len in [3_000, 5_000] {
@@ -2839,17 +2952,21 @@ mod tests {
                 Ok(true)
             );
         }
-        let (step, session) = held(&tokens[..7_000]);
+        let incoming = vec![2; 7_000];
+        let (step, session) = held(&incoming);
         let mut took_snapshot = false;
         let refused = session
             .save_prefix_budgeted(
                 &mut slot,
-                &tokens[..7_000],
+                &incoming,
                 1,
                 step.fed(),
                 SaveKind::Tip,
-                &|fed: &Vec<u32>| fed.len() as u64,
-                &mut |_| false,
+                SnapshotBudget {
+                    limit: 10_000,
+                    incoming: 6_999,
+                    size: &|fed: &Vec<u32>| fed.len() as u64,
+                },
                 || {
                     took_snapshot = true;
                     Ok(step.fed.clone())
@@ -2865,17 +2982,71 @@ mod tests {
         );
         assert_eq!(
             slot.save_side_totals().room_removals,
-            1,
-            "the room step's removal stays in place (the 3_000 cut was retired to admit \
-             the refused save)"
+            0,
+            "a refused new tip must not consume a checkpoint"
         );
-        // And the room victim is really gone: the longest restorable cut is now 5_000.
+        let (mut step, mut session) = held(&tokens[..4_000]);
+        session.reset(&mut step).unwrap();
+        assert_eq!(
+            restore(&mut session, &mut slot, &mut step, &tokens[..4_000], 1),
+            Ok(3_000)
+        );
         let (mut step, mut session) = held(&tokens[..8_000]);
         session.reset(&mut step).unwrap();
         assert_eq!(
             restore(&mut session, &mut slot, &mut step, &tokens[..8_000], 1),
             Ok(5_000)
         );
+        // Once the replacement fits beside the surviving 4,999-byte entry, spend just
+        // the ordinary LRU victim and publish the new tip.
+        let (step, session) = held(&incoming);
+        assert!(
+            session
+                .save_prefix_budgeted(
+                    &mut slot,
+                    &incoming,
+                    1,
+                    step.fed(),
+                    SaveKind::Tip,
+                    SnapshotBudget {
+                        limit: 11_998,
+                        incoming: 6_999,
+                        size: &|fed: &Vec<u32>| fed.len() as u64
+                    },
+                    || Ok(step.fed.clone()),
+                )
+                .unwrap()
+        );
+        assert_eq!(slot.keys(), [(5_000, false), (7_000, false)]);
+        assert_eq!(slot.save_side_totals().room_removals, 1);
+    }
+
+    #[test]
+    fn a_budgeted_tip_counts_a_different_path_replacement_once() {
+        let mut slot = PrefixStore::with_limits(StoreLimits {
+            roots: 1,
+            entries: 1,
+        });
+        slot.save(&[1], 1, 1, SaveKind::Root, &mut || Ok(6_u64))
+            .unwrap();
+        slot.save(&[2], 2, 1, SaveKind::Tip, &mut || Ok(4)).unwrap();
+        for (incoming, fits) in [(5, false), (4, true)] {
+            let budget = SnapshotBudget {
+                limit: 10,
+                incoming,
+                size: &|bytes| *bytes,
+            };
+            let saved = slot
+                .save_charged(&[2], 2, 2, SaveKind::Tip, Some(budget), &mut || {
+                    assert!(fits, "an over-budget replacement tried to allocate");
+                    Ok(incoming)
+                })
+                .unwrap();
+            assert_eq!(saved, fits);
+            assert_eq!(slot.roots[0].saved.state, 6);
+            assert_eq!(slot.lru[0].saved.path, if fits { 2 } else { 1 });
+            assert_eq!(slot.save_side_totals().room_removals, 0);
+        }
     }
 
     #[test]

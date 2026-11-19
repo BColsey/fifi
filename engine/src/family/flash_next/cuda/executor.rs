@@ -22,7 +22,9 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
-        session::{DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, check_prompt},
+        session::{
+            DecodeSession, Limits, PrefixStore, SaveKind, SnapshotBudget, StoreLimits, check_prompt,
+        },
     },
     tokenizer::DecodeBatch,
 };
@@ -259,12 +261,12 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
         // the line before the charge — one stale entry must not wedge the budget until
         // restart.
         self.prefix.retain_path(&generation);
-        // The charge runs after the store has made room, on the bytes the survivors hold
-        // plus the would-be entry: a pre-room charge counts the entry this save evicts, so
-        // a full two-entry store would deny every save from turn 2 on and reuse would stop
-        // advancing where the unbudgeted store rolls forward.
-        let budget = self.host_budget;
-        let entry_bytes = self.driver.resume_host_bytes();
+        // Reserve against the snapshots that will coexist with the new tip during read-back.
+        let budget = SnapshotBudget {
+            limit: self.host_budget,
+            incoming: self.driver.resume_host_bytes(),
+            size: &ResumeSnapshot::host_bytes,
+        };
         let driver = &mut self.driver;
         st.save_prefix_budgeted(
             &mut self.prefix,
@@ -272,8 +274,7 @@ impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
             generation,
             driver.fed(),
             kind,
-            &ResumeSnapshot::host_bytes,
-            &mut move |held| held.saturating_add(entry_bytes) <= budget,
+            budget,
             || driver.save_resume(),
         )
     }

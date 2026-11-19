@@ -463,3 +463,68 @@ fn a_denied_save_leaves_the_next_turn_a_correct_full_prefill() {
         "the denied turn equals a fresh full prefill"
     );
 }
+
+#[test]
+fn byte_limited_tip_advances_only_when_its_replacement_fits() {
+    crate::family::flash_next::cuda::resume::arm_for_tests();
+    let driver = TokenDriver::new(FakeDevice::default(), FakeFeeds::default(), shape()).unwrap();
+    let (mut executor, mut session) = FlashCudaExecutor::with_host_budget_for_tests(
+        driver,
+        CudaRules {
+            eos: Arc::from([]),
+            sampler_vocab: SAMPLER_VOCAB,
+        },
+        2,
+    )
+    .unwrap();
+
+    let prompt = [1, 2, 3, 4, 5];
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &prompt[..2]).unwrap();
+    executor.driver.device_mut().fixed = vec![7, 7];
+    assert!(
+        executor
+            .save_prefix(&session, &prompt[..2], SaveKind::Tip)
+            .unwrap()
+    );
+
+    executor.reset(&mut session).unwrap();
+    assert_eq!(
+        executor.restore_prefix(&mut session, &prompt[..3]).unwrap(),
+        2
+    );
+    executor.prefill(&mut session, &prompt[2..3]).unwrap();
+    executor.driver.device_mut().fixed = vec![8, 8, 8];
+    assert!(
+        !executor
+            .save_prefix(&session, &prompt[..3], SaveKind::Tip)
+            .unwrap()
+    );
+
+    executor.reset(&mut session).unwrap();
+    assert_eq!(
+        executor.restore_prefix(&mut session, &prompt[..4]).unwrap(),
+        2
+    );
+    assert_eq!(executor.driver.device().fixed, [7, 7]);
+    executor.prefill(&mut session, &prompt[2..4]).unwrap();
+    executor.driver.device_mut().fixed = vec![9, 9];
+    assert!(
+        executor
+            .save_prefix(&session, &prompt[..4], SaveKind::Tip)
+            .unwrap(),
+        "a two-byte tip must be able to replace its own two-byte checkpoint"
+    );
+
+    executor.reset(&mut session).unwrap();
+    assert_eq!(executor.restore_prefix(&mut session, &prompt).unwrap(), 4);
+    assert_eq!(executor.driver.device().fixed, [9, 9]);
+    executor.prefill(&mut session, &prompt[4..]).unwrap();
+    let (mut cold, mut cold_session) = build(&[]);
+    cold.reset(&mut cold_session).unwrap();
+    cold.prefill(&mut cold_session, &prompt).unwrap();
+    assert_eq!(
+        executor.decode(&mut session, &mut generation(1)).unwrap(),
+        cold.decode(&mut cold_session, &mut generation(1)).unwrap()
+    );
+}
