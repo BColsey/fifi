@@ -47,9 +47,9 @@ Startup measures free GPU memory after loading the weights and refuses the KV ca
 Other programs count: the desktop alone often takes several hundred MiB.
 On a 24 GB RTX 3090, the 180,224-token profile fits with up to 1,536 MiB in use by other programs, and the 262,144-token profile with up to 744 MiB.
 
-Saved prefixes live in pinned host memory. The pool holds up to three slots (two saved prefixes and one staging slot), each the size of the full KV cache plus the recurrent state, and is capped at 8 GiB.
-At 180,224 positions with the 8-bit cache, three slots take about 6.08 GB.
-The engine also wants 1 GiB of free host memory beyond the pool; when that is short it keeps one saved prefix, and then none.
+Saved prefixes live in pinned host memory. The pool holds up to nine slots (eight saved prefixes and one staging slot), each the size of the full KV cache plus the recurrent state. By default it takes at most half of the available host memory; `Q36_CUDA_PINNED_PREFIX_BYTES` sets its size.
+At 180,224 positions with the 8-bit cache, one slot takes about 2.03 GB, so nine slots take about 18.2 GB.
+The engine also wants 1 GiB of free host memory beyond the pool; when that is short it keeps fewer saved prefixes, down to none.
 
 ## Flint
 

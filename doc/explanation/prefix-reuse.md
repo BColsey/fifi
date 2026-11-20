@@ -21,7 +21,7 @@ Three settings help with that:
 On Apple Silicon, saved prefixes share `session_cap_bytes` with the live session. The store keeps the 6 most recently used prefixes (`prefix_store_entries`).
 
 On NVIDIA CUDA, the newest saved prefix stays on the GPU until a later request overwrites it, so restoring it needs no copy from host memory.
-Up to two saved prefixes are also kept in pinned host memory; see [How fifi plans memory](memory.md#on-nvidia-cuda).
+Up to eight saved prefixes are also kept in pinned host memory; see [How fifi plans memory](memory.md#on-nvidia-cuda).
 
 ## Which engines support it
 
