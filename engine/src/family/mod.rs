@@ -99,6 +99,11 @@ pub mod route;
 pub(crate) mod sampler;
 #[allow(
     dead_code,
+    reason = "the Bolt start plans its sequence count with it; the allow covers host builds, where only the tests call it"
+)]
+pub(crate) mod seq_plan;
+#[allow(
+    dead_code,
     reason = "the worker and the Qwen3.6, Flint and Flash-Next executors use the session; the allow covers the members only tests still call"
 )]
 pub(crate) mod session;
@@ -121,6 +126,11 @@ pub(crate) mod tiered_classify;
 #[cfg(test)]
 pub(crate) mod token_forcing;
 pub mod weight_plan;
+#[allow(
+    dead_code,
+    reason = "the Bolt executor runs its windows through the driver; the allow covers host builds, where only the tests call it"
+)]
+pub(crate) mod window;
 
 pub use keys::{KeyTier, TierAssignment};
 pub use layer_weights::{
