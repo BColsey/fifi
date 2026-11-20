@@ -390,11 +390,20 @@ impl FlashSettings {
     }
 }
 
-/// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool.
+/// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool:
+/// `INFERENCE_FLASH_NEXT_NGRAM_BULK=1` opts in. Strict: any other set value, a non-text value
+/// included, is refused.
 pub(in crate::family::flash_next) fn ngram_bulk() -> Result<bool, EngError> {
-    match std::env::var_os("INFERENCE_FLASH_NEXT_NGRAM_BULK") {
+    let raw = std::env::var_os("INFERENCE_FLASH_NEXT_NGRAM_BULK");
+    ngram_bulk_text(raw.as_ref().map(|value| value.to_string_lossy()).as_deref())
+}
+
+/// The text core of [`ngram_bulk`], split out so the strict rule is testable: this crate denies
+/// `unsafe_code`, so a test cannot carry the variable into the env reader itself.
+pub(in crate::family::flash_next) fn ngram_bulk_text(raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        Some("1") => Ok(true),
         None => Ok(false),
-        Some(value) if value == "1" => Ok(true),
         Some(_) => Err(EngError::BadRequest(
             "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset or \"1\"".into(),
         )),
@@ -1006,6 +1015,19 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<FlashOptions>(r#"{"kv_format": "fp8"}"#).is_err());
+    }
+
+    #[test]
+    fn the_ngram_bulk_text_refuses_anything_but_one() {
+        assert!(!super::ngram_bulk_text(None).unwrap());
+        assert!(super::ngram_bulk_text(Some("1")).unwrap());
+        for bad in ["", "0", "2", "yes", "true", " 1", "11", "\u{fffd}"] {
+            assert_eq!(
+                super::ngram_bulk_text(Some(bad)).unwrap_err().describe(),
+                "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset or \"1\"",
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
