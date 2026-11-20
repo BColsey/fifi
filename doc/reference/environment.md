@@ -112,7 +112,7 @@ With `tiered`, the pinned prefix pool is off unless `Q36_CUDA_PINNED_PREFIX=1` i
 
 ## Flash-Next on NVIDIA CUDA
 
-The Flash-Next family serves only with `flash_next.cuda_decode: true` in the config (opt-in; the family is not validated end to end):
+The Flash-Next family serves on the card in a `native-cuda` Linux build unless the entry sets `flash_next.cuda_decode: false` (the family is not validated end to end):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

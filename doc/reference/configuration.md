@@ -159,12 +159,12 @@ CPU experts trade decode speed for GPU memory and for PCIe traffic. On an RTX 30
 ## `flash_next`
 
 The `flash_next` object of one engine entry for `qwen3_8_flash_next`. Every key is optional. The
-keys below are the CUDA prefill keys; they need a `native-cuda` Linux build and `cuda_decode:
-true` (without it the entry serves through the MLX path and the CUDA keys are refused).
+keys below are the CUDA prefill keys; they need a `native-cuda` Linux build. That build serves on the
+card unless the entry sets `cuda_decode: false` (the MLX path, where the CUDA keys are refused).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `cuda_decode` | `false` | Serves the model on a CUDA card. The CUDA decoder is experimental. |
+| `cuda_decode` | `true` in a `native-cuda` Linux build, `false` elsewhere | Serves the model on a CUDA card. The CUDA decoder is experimental. |
 | `prefill_chunk` | 16 | Rows per chunked-prefill piece, 1 to 2,048. A piece wider than `prefill_rows` is streamed in `prefill_rows`-row device chunks (four per 1,024-row piece at the default `prefill_rows` of 256). Wide pieces need the prefill ring (`INFERENCE_FLASH_NEXT_RING_BUDGET`) to be useful. Single measured runs on the RTX 3090 EXL3 pack, a 28,916-token prompt, ring on, `prefill_rows` 256 (the default): prefill took 229 s at `prefill_chunk` 256, 221 s at 1,024 and 219 s at 2,048 - the chunk size barely moves it while the device step stays 256 rows. |
 | `prefill_rows` | 256 | Rows of one device prefill step, 1 to 2,048 (the shared supported width; the unset default is 256, and `1` selects the per-token prefill). Measured single runs, RTX 3090 EXL3 pack, the same 28,916-token prompt, ring on (budget 1.3e9), `prefill_chunk` 2,048, no measurement override set: 256 rows prefill 234.9 s / 3,390 GB streamed / 804 misses / 25.08 decode tok/s; 1,024 rows 184.1 s / 943 GB / 861 misses / 23.52 decode tok/s; 2,048 rows 180.1 s / 540 GB / 921 misses / 23.16 decode tok/s (all unwrapped). An earlier 1,024-row run under the nsys profiler measured 162 s prefill and 25.98 decode tok/s - profiler-wrapped walls are comparable only to other wrapped runs; the unwrapped figures above are the served numbers. The ring held 658 slots (1.15 GiB) at 256 rows and 690 (1.21 GiB) at the wider windows. The wider window's arena is card memory the expert bank gives up: resident experts per layer fell 183 (256 rows) to 165 (1,024) to 141 (2,048), and decode pays for it - 25.08 tokens per second at 256 rows against 23.52 at 1,024 and 23.16 at 2,048. A window the card cannot carry next to the trunk refuses at load with the losing budget's byte counts. |
 | `context` | 4,096 | K/V positions, a multiple of 4 from 4 to 262,144. The load refuses a context the card cannot hold next to the trunk. |

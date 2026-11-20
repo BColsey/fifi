@@ -37,9 +37,9 @@ pub(crate) struct FlashOptions {
     /// Records speculative next-layer expert hints in one-token steps. The default is false.
     /// Hints do not stage storage or change routing.
     pub(crate) expert_prefetch: Option<bool>,
-    /// Serves the model on a CUDA card (a `native-cuda` Linux build). The default is false: the
-    /// CUDA decoder is experimental and a CUDA build refuses to serve Flash-Next without it.
-    /// When true, `cache_limit_bytes` (an MLX allocator key) is not required and is refused if set.
+    /// Serves the model on a CUDA card (a `native-cuda` Linux build). The default is true in a
+    /// build that has the CUDA decoder and false elsewhere; `false` on a CUDA build refuses to
+    /// serve Flash-Next. When true, `cache_limit_bytes` (an MLX allocator key) is not required and is refused if set.
     pub(crate) cuda_decode: Option<bool>,
     /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Default
     /// 4096. The load refuses a context the card cannot hold next to the trunk.
@@ -376,8 +376,36 @@ impl FlashSettings {
         options: Option<&FlashOptions>,
         env: &FlashEnv,
     ) -> Result<Self, EngError> {
+        Self::with_cuda_default(
+            model_dir,
+            tokenizer_dir,
+            options,
+            env,
+            cfg!(all(feature = "native-cuda", target_os = "linux")),
+        )
+    }
+
+    /// `new` with the default of `cuda_decode` given: a build with the CUDA decoder serves on
+    /// the card unless the entry says `cuda_decode: false`.
+    fn with_cuda_default(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        options: Option<&FlashOptions>,
+        env: &FlashEnv,
+        cuda_default: bool,
+    ) -> Result<Self, EngError> {
         let default = FlashOptions::default();
         let options = options.unwrap_or(&default);
+        let resolved;
+        let options = if cuda_default && options.cuda_decode.is_none() {
+            resolved = FlashOptions {
+                cuda_decode: Some(true),
+                ..options.clone()
+            };
+            &resolved
+        } else {
+            options
+        };
         let cuda = cuda_settings(options)?;
         let (manifest, manifest_found_in_pack) =
             manifest_path(options, env, model_dir, tokenizer_dir)?;
@@ -610,6 +638,44 @@ mod tests {
                 cuda: None,
             }
         );
+    }
+
+    #[test]
+    fn a_cuda_build_serves_on_the_card_unless_the_entry_turns_it_off() {
+        let pack = tempfile::tempdir().expect("tempdir");
+        std::fs::write(pack.path().join("download-manifest.json"), b"{}").expect("write");
+        let build = |options: Option<&FlashOptions>, cuda_default: bool| {
+            FlashSettings::with_cuda_default(
+                pack.path(),
+                pack.path(),
+                options,
+                &FlashEnv::default(),
+                cuda_default,
+            )
+        };
+        // Nothing but the directories: the card, with every default of the decoder.
+        let on = build(None, true).unwrap();
+        assert_eq!(on.cache_limit, 0);
+        let cuda = on.cuda.expect("the CUDA decoder is on by default");
+        assert_eq!(cuda.context, super::DEFAULT_CUDA_CONTEXT);
+        // The same entry without the decoder in the build is the MLX arm, which needs its limit.
+        assert!(
+            message(build(None, false)).contains("cache_limit_bytes is missing"),
+            "an MLX-only build keeps the MLX settings"
+        );
+        // An explicit false keeps the MLX arm on a CUDA build.
+        let off = FlashOptions {
+            cuda_decode: Some(false),
+            cache_limit_bytes: Some(1 << 30),
+            ..FlashOptions::default()
+        };
+        assert_eq!(build(Some(&off), true).unwrap().cuda, None);
+        // An MLX allocator key beside the default names the conflict instead of switching arms.
+        let mlx_key = FlashOptions {
+            cache_limit_bytes: Some(1 << 30),
+            ..FlashOptions::default()
+        };
+        assert!(message(build(Some(&mlx_key), true)).contains("cannot be combined with cuda_decode"));
     }
 
     #[test]

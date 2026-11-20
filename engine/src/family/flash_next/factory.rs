@@ -93,8 +93,8 @@ fn launch(
     super::start::start(settings, prefix_reuse, ready_note)
 }
 
-/// A CUDA build serves Flash-Next only with `cuda_decode` set: the CUDA decoder is experimental
-/// and stays off until an operator asks for it.
+/// A CUDA build serves Flash-Next on the card unless the entry sets `cuda_decode` to false, which
+/// it refuses: the MLX backend is not in this build.
 #[cfg(all(
     feature = "native-cuda",
     target_os = "linux",
@@ -188,6 +188,7 @@ mod tests {
         let options = FlashOptions {
             manifest: Some(PathBuf::from("/does/not/exist/download-manifest.json")),
             cache_limit_bytes: Some(1024),
+            cuda_decode: Some(false),
             ..FlashOptions::default()
         };
         let text = message(start(Some(&options), &FlashEnv::default()));
