@@ -1,6 +1,8 @@
 // The hyper-connection read and apply of Qwen3.8 Flash-Next (see resident/hyper.h for the
-// formulas and the argument contract). Correctness first: one warp per output row of each dense
-// product and plain f32 accumulation; nothing is fused across the five steps yet.
+// formulas and the argument contract). Every dense product accumulates in plain f32, one warp per
+// output row; the five steps are not fused. The products of many tokens reuse each weight across
+// a tile of tokens (hyper_down_tiled_k, hyper_up_tiled_k) with the arithmetic order of the
+// one-token kernels, so both give the same bits.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -21,6 +23,13 @@ constexpr int kMaxHidden = 65536;
 constexpr int kMaxWidth = 1 << 18;
 constexpr int kMaxRank = 4096;
 constexpr int kWarps = 8;
+// Tiled products: output rows per warp, row groups per block of the up product, and the token
+// counts from which each product takes the tiled kernel (below them the one-token kernel is
+// faster: too few blocks to hide the staging of the activations).
+constexpr int kRowsPerWarp = 4;
+constexpr int kUpGroups = 4;
+constexpr int kDownTiledMinM = 32;
+constexpr int kUpTiledMinM = 4;
 constexpr int kNormThreads = 256;
 constexpr int kDtypeF16 = 0;
 constexpr int kDtypeBf16 = 1;
@@ -78,7 +87,8 @@ __global__ void hyper_norm_k(const float *__restrict__ x, const W *__restrict__ 
     }
 }
 
-// One warp per output row r of the down projection (r < rank) and of inject (r >= rank).
+// One block per token, one warp per output row r of the down projection (r < rank) and of inject
+// (r >= rank). The reference arithmetic of hyper_down_tiled_k.
 template <typename W>
 __global__ void hyper_down_k(const float *__restrict__ normed, const W *__restrict__ down,
                              const W *__restrict__ inject, float *__restrict__ low,
@@ -102,7 +112,8 @@ __global__ void hyper_down_k(const float *__restrict__ normed, const W *__restri
     }
 }
 
-// One warp per output row i of the up projection.
+// One block per token, one warp per output row i of the up projection. The reference arithmetic
+// of hyper_up_tiled_k.
 template <typename W>
 __global__ void hyper_up_k(const float *__restrict__ low, const W *__restrict__ up,
                            float *__restrict__ mix, int width, int rank) {
@@ -116,6 +127,167 @@ __global__ void hyper_up_k(const float *__restrict__ low, const W *__restrict__ 
     for (int j = lane; j < rank; j += 32) acc += load(w, j) * in[j];
     acc = warp_sum(acc);
     if (lane == 0) mix[(size_t)t * width + i] = acc;
+}
+
+// Weight reuse across tokens. A warp forms R output rows for a tile of T tokens at once: lane l
+// walks i = l, l + 32, ... in increasing order exactly as the one-token kernels above do, loads
+// each weight once and adds its product into the R * T accumulators, so every (row, token) sum
+// is built in the same order as hyper_down_k / hyper_up_k and is bit-identical to theirs.
+// The T activation rows of the block are staged in shared memory, one chunk of the input at a
+// time; chunks are multiples of 32 and taken in increasing order, so a lane's index order is
+// unchanged.
+
+constexpr int kStageFloats = 4096;
+
+// Floats of one token row staged at a time; a multiple of 32.
+template <int T>
+constexpr int kChunk = kStageFloats / T;
+
+// Reduces each of the N accumulators of the warp with the xor tree of warp_sum (offsets 16, 8,
+// 4, 2, 1 in that order, every add `own + partner`), but exchanges half of the live values at each
+// of the first log2(N) steps, so the lane that ends up holding accumulator a is lane >> (5 - log2 N)
+// and the shuffles number N - 1 + (5 - log2 N) instead of 5 N. Each accumulator sees the same adds
+// in the same order as under warp_sum, so the result is the same bits.
+template <int N, int OFF>
+__device__ __forceinline__ float fold(const float (&v)[N], int lane) {
+    if constexpr (N == 1) {
+        float x = v[0];
+#pragma unroll
+        for (int o = OFF; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+        return x;
+    } else {
+        const bool hi = (lane & OFF) != 0;
+        float w[N / 2];
+#pragma unroll
+        for (int k = 0; k < N / 2; ++k) {
+            const float send = hi ? v[k] : v[k + N / 2];
+            const float keep = hi ? v[k + N / 2] : v[k];
+            w[k] = keep + __shfl_xor_sync(0xffffffffu, send, OFF);
+        }
+        return fold<N / 2, OFF / 2>(w, lane);
+    }
+}
+
+template <int N>
+constexpr int kLog2 = N <= 1 ? 0 : 1 + kLog2<N / 2>;
+
+// Block-wide copy of `len` floats from each of T token rows (`in` + (tok0 + t) * stride + at)
+// into act[t * chunk ...]; tokens at or past m stage zeros.
+template <int T>
+__device__ __forceinline__ void stage_tile(float *act, const float *in, int tok0, int m,
+                                           size_t stride, int at, int len) {
+    constexpr int chunk = kChunk<T>;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        const bool live = tok0 + t < m;
+        const float *src = in + (size_t)(live ? tok0 + t : 0) * stride + at;
+        for (int j = threadIdx.x; j < len; j += blockDim.x) {
+            act[t * chunk + j] = live ? src[j] : 0.0f;
+        }
+    }
+}
+
+// acc[r * T + t] += w_r[at + j] * act[t][j] for this lane's j = lane, lane + 32, ... < len.
+template <typename W, int T, int R>
+__device__ __forceinline__ void tile_dot(const float *act, const W *const (&row)[R], int at,
+                                         int len, int lane, float (&acc)[R * T]) {
+    constexpr int chunk = kChunk<T>;
+#pragma unroll 4
+    for (int j = lane; j < len; j += 32) {
+        float wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) wv[r] = load(row[r], (size_t)at + j);
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float a = act[t * chunk + j];
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r * T + t] += wv[r] * a;
+        }
+    }
+}
+
+// One warp per R rows of the down projection (row < rank) and of inject (row >= rank), for the T
+// tokens of blockIdx.y. Rows past the last one run on a clamped row and store nothing.
+template <typename W, int T, int R>
+__global__ void __launch_bounds__(kWarps * 32)
+    hyper_down_tiled_k(const float *__restrict__ normed, const W *__restrict__ down,
+                       const W *__restrict__ inject, float *__restrict__ low,
+                       float *__restrict__ gate, int m, int branches, int width, int rank) {
+    constexpr int chunk = kChunk<T>;
+    constexpr int kAcc = R * T;
+    __shared__ float act[T * chunk];
+    const int lane = threadIdx.x & 31;
+    const int rows = rank + (inject != NULL ? branches : 0);
+    const int tok0 = blockIdx.y * T;
+    const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * R;
+    const W *rp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int at = min(row0 + r, rows - 1);
+        rp[r] = at < rank ? down + (size_t)at * width : inject + (size_t)(at - rank) * width;
+    }
+    float acc[kAcc];
+#pragma unroll
+    for (int a = 0; a < kAcc; ++a) acc[a] = 0.0f;
+    for (int at = 0; at < width; at += chunk) {
+        const int len = min(chunk, width - at);
+        __syncthreads();
+        stage_tile<T>(act, normed, tok0, m, (size_t)width, at, len);
+        __syncthreads();
+        tile_dot<W, T, R>(act, rp, at, len, lane, acc);
+    }
+    const float sum = fold<kAcc, 16>(acc, lane);
+    constexpr int kLow = 5 - kLog2<kAcc>;
+    const int a = lane >> kLow;
+    const int r = row0 + a / T;
+    const int t = tok0 + a % T;
+    if ((lane & ((1 << kLow) - 1)) != 0 || r >= rows || t >= m) return;
+    const float scaled = sum / (float)branches;
+    if (r < rank) {
+        low[(size_t)t * rank + r] = scaled * sigmoid_f(scaled);
+    } else {
+        gate[(size_t)t * branches + (r - rank)] = 2.0f * sigmoid_f(scaled);
+    }
+}
+
+// One warp per R rows of the up projection, `groups` times per block, for the T tokens of
+// blockIdx.y. A rank that fits one chunk is staged once per block.
+template <typename W, int T, int R>
+__global__ void __launch_bounds__(kWarps * 32)
+    hyper_up_tiled_k(const float *__restrict__ low, const W *__restrict__ up,
+                     float *__restrict__ mix, int m, int width, int rank, int groups) {
+    constexpr int chunk = kChunk<T>;
+    constexpr int kAcc = R * T;
+    __shared__ float act[T * chunk];
+    const int lane = threadIdx.x & 31;
+    const int tok0 = blockIdx.y * T;
+    const bool once = rank <= chunk;
+    for (int g = 0; g < groups; ++g) {
+        const int row0 = ((blockIdx.x * groups + g) * kWarps + (threadIdx.x >> 5)) * R;
+        const W *rp[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) rp[r] = up + (size_t)min(row0 + r, width - 1) * rank;
+        float acc[kAcc];
+#pragma unroll
+        for (int a = 0; a < kAcc; ++a) acc[a] = 0.0f;
+        for (int at = 0; at < rank; at += chunk) {
+            const int len = min(chunk, rank - at);
+            if (!once || g == 0) {
+                __syncthreads();
+                stage_tile<T>(act, low, tok0, m, (size_t)rank, at, len);
+                __syncthreads();
+            }
+            tile_dot<W, T, R>(act, rp, at, len, lane, acc);
+        }
+        const float sum = fold<kAcc, 16>(acc, lane);
+        constexpr int kLow = 5 - kLog2<kAcc>;
+        const int a = lane >> kLow;
+        const int r = row0 + a / T;
+        const int t = tok0 + a % T;
+        if ((lane & ((1 << kLow) - 1)) == 0 && r < width && t < m) {
+            mix[(size_t)t * width + r] = sum;
+        }
+    }
 }
 
 __global__ void hyper_combine_k(const float *__restrict__ normed, const float *__restrict__ mix,
@@ -200,24 +372,60 @@ bool valid_apply(const inference_cuda_hyper_apply_args &a, void *stream) {
            apart(x, {a.block, m * (size_t)a.hidden * 4});
 }
 
+template <typename W, int T>
+void launch_down_tiled(const inference_cuda_hyper_read_args &a, cudaStream_t s, int width) {
+    const int rows = a.rank + (a.inject != NULL ? a.branches : 0);
+    const int per_block = kWarps * kRowsPerWarp;
+    const dim3 grid((rows + per_block - 1) / per_block, (a.m + T - 1) / T);
+    hyper_down_tiled_k<W, T, kRowsPerWarp><<<grid, kWarps * 32, 0, s>>>(
+        (const float *)a.normed, (const W *)a.down, (const W *)a.inject, (float *)a.low,
+        (float *)a.gate, a.m, a.branches, width, a.rank);
+}
+
+template <typename W, int T>
+void launch_up_tiled(const inference_cuda_hyper_read_args &a, cudaStream_t s, int width) {
+    const int per_block = kWarps * kRowsPerWarp * kUpGroups;
+    const dim3 grid((width + per_block - 1) / per_block, (a.m + T - 1) / T);
+    hyper_up_tiled_k<W, T, kRowsPerWarp><<<grid, kWarps * 32, 0, s>>>(
+        (const float *)a.low, (const W *)a.up, (float *)a.mix, a.m, width, a.rank, kUpGroups);
+}
+
+// `tiled` false runs the one-token kernels for every m: the reference of the equality test.
 template <typename W>
-void launch_read(const inference_cuda_hyper_read_args &a, cudaStream_t s, Failure &failure) {
+void launch_read(const inference_cuda_hyper_read_args &a, cudaStream_t s, bool tiled,
+                 Failure &failure) {
     const int width = a.branches * a.hidden;
     const W *norm_w = (const W *)a.norm_w;
     hyper_norm_k<W><<<a.m * a.branches, kNormThreads, 0, s>>>(
         (const float *)a.x, norm_w, (float *)a.normed, a.branches, a.hidden, a.eps);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (!failure.ok()) return;
-    const int down_rows = a.rank + (a.inject != NULL ? a.branches : 0);
-    const dim3 down_grid(a.m, (down_rows + kWarps - 1) / kWarps);
-    hyper_down_k<W><<<down_grid, kWarps * 32, 0, s>>>(
-        (const float *)a.normed, (const W *)a.down, (const W *)a.inject, (float *)a.low,
-        (float *)a.gate, a.branches, width, a.rank);
+    if (tiled && a.m >= kDownTiledMinM) {
+        if (a.m >= 128) {
+            launch_down_tiled<W, 8>(a, s, width);
+        } else {
+            launch_down_tiled<W, 4>(a, s, width);
+        }
+    } else {
+        const int down_rows = a.rank + (a.inject != NULL ? a.branches : 0);
+        const dim3 down_grid(a.m, (down_rows + kWarps - 1) / kWarps);
+        hyper_down_k<W><<<down_grid, kWarps * 32, 0, s>>>(
+            (const float *)a.normed, (const W *)a.down, (const W *)a.inject, (float *)a.low,
+            (float *)a.gate, a.branches, width, a.rank);
+    }
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (!failure.ok()) return;
-    const dim3 up_grid(a.m, (width + kWarps - 1) / kWarps);
-    hyper_up_k<W><<<up_grid, kWarps * 32, 0, s>>>((const float *)a.low, (const W *)a.up,
-                                                   (float *)a.mix, width, a.rank);
+    if (tiled && a.m >= kUpTiledMinM) {
+        if (a.m >= 32) {
+            launch_up_tiled<W, 8>(a, s, width);
+        } else {
+            launch_up_tiled<W, 4>(a, s, width);
+        }
+    } else {
+        const dim3 up_grid(a.m, (width + kWarps - 1) / kWarps);
+        hyper_up_k<W><<<up_grid, kWarps * 32, 0, s>>>((const float *)a.low, (const W *)a.up,
+                                                       (float *)a.mix, width, a.rank);
+    }
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (!failure.ok()) return;
     const dim3 combine_grid(a.m, (a.hidden + 255) / 256);
@@ -226,10 +434,8 @@ void launch_read(const inference_cuda_hyper_read_args &a, cudaStream_t s, Failur
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
 }
 
-}  // namespace
-
-extern "C" int inference_cuda_hyper_read_launch(const inference_cuda_hyper_read_args *args,
-                                                void *stream, int *out_stage) {
+int read_entry(const inference_cuda_hyper_read_args *args, void *stream, int *out_stage,
+               bool tiled) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || !valid_read(*args, stream)) {
@@ -237,15 +443,27 @@ extern "C" int inference_cuda_hyper_read_launch(const inference_cuda_hyper_read_
         }
         Failure failure;
         if (args->weight_dtype == kDtypeF16) {
-            launch_read<__half>(*args, (cudaStream_t)stream, failure);
+            launch_read<__half>(*args, (cudaStream_t)stream, tiled, failure);
         } else {
-            launch_read<__nv_bfloat16>(*args, (cudaStream_t)stream, failure);
+            launch_read<__nv_bfloat16>(*args, (cudaStream_t)stream, tiled, failure);
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+}  // namespace
+
+extern "C" int inference_cuda_hyper_read_launch(const inference_cuda_hyper_read_args *args,
+                                                void *stream, int *out_stage) {
+    return read_entry(args, stream, out_stage, true);
+}
+
+extern "C" int inference_cuda_hyper_read_reference_launch(
+    const inference_cuda_hyper_read_args *args, void *stream, int *out_stage) {
+    return read_entry(args, stream, out_stage, false);
 }
 
 extern "C" int inference_cuda_hyper_apply_launch(const inference_cuda_hyper_apply_args *args,

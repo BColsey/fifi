@@ -1271,3 +1271,105 @@ fn a_large_eps_is_added_inside_the_root() {
     let got = run_read(&rig, &c, (0, 0));
     check_read("eps 1e-2", &c, &got);
 }
+
+fn submit_reference(rig: &Rig, call: HyperReadCall<'_>) -> Result<(), EngError> {
+    let result = rig.ctx.hyper_read_reference(&rig.stream, call);
+    rig.stream.synchronize().expect("drain");
+    result
+}
+
+/// One read on the tiled kernels and one on the one-token kernels, from the same inputs.
+fn run_pair(rig: &Rig, c: &Case) -> (Read, Read) {
+    let inputs = Inputs::new(&rig.ctx, c, (0, 0));
+    let tiled = Outputs::new(&rig.ctx, c);
+    let reference = Outputs::new(&rig.ctx, c);
+    submit_read(rig, read_call(c, &inputs, &tiled)).expect("a valid read");
+    submit_reference(rig, read_call(c, &inputs, &reference)).expect("a valid reference read");
+    (tiled.read(&rig.ctx), reference.read(&rig.ctx))
+}
+
+/// The first `m` tokens of `c` with its weights.
+fn first_tokens(c: &Case, m: usize) -> Case {
+    Case {
+        shape: HyperShape { m, ..c.shape },
+        x: c.x[..m * c.width()].to_vec(),
+        norm: c.norm.clone(),
+        down: c.down.clone(),
+        up: c.up.clone(),
+        inject: c.inject.clone(),
+        ..*c
+    }
+}
+
+fn assert_same_bits(label: &str, got: &Read, reference: &Read) {
+    assert_eq!(
+        bits(&got.normed),
+        bits(&reference.normed),
+        "{label}: normed"
+    );
+    assert_eq!(bits(&got.low), bits(&reference.low), "{label}: low");
+    assert_eq!(bits(&got.mix), bits(&reference.mix), "{label}: mix");
+    assert_eq!(bits(&got.mixed), bits(&reference.mixed), "{label}: mixed");
+    match (&got.gate, &reference.gate) {
+        (Some(g), Some(r)) => assert_eq!(bits(g), bits(r), "{label}: gate"),
+        (None, None) => {}
+        _ => panic!("{label}: a gate on one side only"),
+    }
+}
+
+const fn site(shape: (usize, usize, usize), dtype: HyperDtype, inject: bool) -> Spec {
+    Spec {
+        m: TILED_MAX_M,
+        branches: shape.0,
+        hidden: shape.1,
+        rank: shape.2,
+        dtype,
+        inject,
+    }
+}
+
+/// The largest token count below; each spec is drawn once at it and read at every count.
+const TILED_MAX_M: usize = 513;
+/// Counts that straddle the tile sizes (4 and 8), the token counts from which each product takes
+/// the tiled kernels (4 and 32) and the choice of the larger tile (128 and 32), with ragged
+/// last tiles.
+const TILED_MS: [usize; 15] = [1, 2, 3, 4, 5, 7, 8, 31, 32, 33, 127, 128, 129, 512, 513];
+
+const TILED_SPECS: [Spec; 12] = [
+    // The Flash-Next site, both dtypes, with and without inject.
+    site((4, 2560, 320), HyperDtype::F16, true),
+    site((4, 2560, 320), HyperDtype::F16, false),
+    site((4, 2560, 320), HyperDtype::Bf16, true),
+    site((4, 2560, 320), HyperDtype::Bf16, false),
+    // Rank and width off every multiple of 8, 32 and of the tile and row counts.
+    site((4, 2560, 333), HyperDtype::F16, true),
+    site((3, 1001, 100), HyperDtype::Bf16, true),
+    site((3, 37, 33), HyperDtype::F16, false),
+    site((1, 1, 1), HyperDtype::Bf16, true),
+    site((16, 300, 7), HyperDtype::F16, true),
+    // A rank past one staged chunk (512 floats at tile 8, 1024 at tile 4), and a width past
+    // several.
+    site((2, 64, 1100), HyperDtype::Bf16, true),
+    site((2, 2048, 4096), HyperDtype::F16, false),
+    site((5, 4099, 65), HyperDtype::Bf16, true),
+];
+
+#[test]
+fn tiled_read_is_bit_identical_to_the_one_token_kernels() {
+    if !testkit::device_present("tiled_read_is_bit_identical_to_the_one_token_kernels") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x4c07_0007);
+    let mut reads = 0;
+    for spec in TILED_SPECS {
+        let full = Case::new(&mut rng, spec);
+        for m in TILED_MS {
+            let c = first_tokens(&full, m);
+            let (got, reference) = run_pair(&rig, &c);
+            assert_same_bits(&format!("{spec:?} m {m}"), &got, &reference);
+            reads += 1;
+        }
+    }
+    assert_eq!(reads, TILED_SPECS.len() * TILED_MS.len());
+}

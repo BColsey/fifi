@@ -118,6 +118,14 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 
+    #[cfg(test)]
+    #[link_name = "inference_cuda_hyper_read_reference_launch"]
+    fn hyper_read_reference_raw(
+        args: *const HyperReadArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     #[link_name = "inference_cuda_hyper_apply_launch"]
     fn hyper_apply_raw(
         args: *const HyperApplyArgsRaw,
@@ -266,10 +274,30 @@ fn check_read(call: &HyperReadRaw<'_>) -> Result<HyperReadBytes, DeviceFailure> 
     Ok(need)
 }
 
+type ReadEntry = unsafe extern "C" fn(*const HyperReadArgsRaw, *mut c_void, *mut c_int) -> c_int;
+
 /// Queues the four read kernels on `stream` (norm, down and inject, up, combine).
 pub(in crate::kernels::cuda) fn hyper_read_launch(
     stream: &RawStream,
     call: HyperReadRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    queue_read(stream, call, hyper_read_raw)
+}
+
+/// The read on the one-token-per-block kernels for every `m`, which the tiled kernels of
+/// [`hyper_read_launch`] must match bit for bit.
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn hyper_read_reference_launch(
+    stream: &RawStream,
+    call: HyperReadRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    queue_read(stream, call, hyper_read_reference_raw)
+}
+
+fn queue_read(
+    stream: &RawStream,
+    call: HyperReadRaw<'_>,
+    entry: ReadEntry,
 ) -> Result<(), DeviceFailure> {
     check_read(&call)?;
     let (m, branches, hidden) = ints(call.dims).ok_or_else(invalid_argument)?;
@@ -298,13 +326,14 @@ pub(in crate::kernels::cuda) fn hyper_read_launch(
         eps: call.eps,
     };
     let mut stage = STAGE_NONE;
-    // SAFETY: `check_read` proved every range inside its live allocation (`RawRange::new`),
+    // SAFETY: `entry` is one of the two read entries of `hyper.cu`, which take the same arguments.
+    // `check_read` proved every range inside its live allocation (`RawRange::new`),
     // large enough for the call, aligned (f32 ranges to 4, weights to 2), every written range
     // apart from the other written ranges and from every read range, and `inject` and `gate` both
     // given or both null; the entry checks the addresses again. The allocations outlive the
     // queued work (`inference_cuda_free` synchronizes first). `args` is a live local that the
     // entry reads only during the call, `stream` is live, and `stage` is a writable c_int.
-    let status = unsafe { hyper_read_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe { entry(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

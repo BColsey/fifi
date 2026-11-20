@@ -28,6 +28,8 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::hyper::HyperDtype;
+#[cfg(test)]
+use crate::kernels::cuda::native::resident::hyper::hyper_read_reference_launch;
 use crate::kernels::cuda::native::resident::hyper::{
     HYPER_MAX_BRANCHES, HYPER_MAX_HIDDEN, HYPER_MAX_M, HYPER_MAX_RANK, HYPER_MAX_WIDTH,
     HyperApplyRaw, HyperDims, HyperReadBytes, HyperReadRaw, dims_width, hyper_apply_launch,
@@ -134,6 +136,21 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_hyper_read(&call)?;
         self.launch_on(stream, move |stream_raw| hyper_read_launch(stream_raw, raw))
+    }
+
+    /// [`Self::hyper_read`] on the one-token-per-block kernels for every `m`: the arithmetic
+    /// reference of the tiled kernels, which must give the same bits.
+    #[cfg(test)]
+    pub(crate) fn hyper_read_reference(
+        &self,
+        stream: &DeviceStream,
+        call: HyperReadCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_hyper_read(&call)?;
+        self.launch_on(stream, move |stream_raw| {
+            hyper_read_reference_launch(stream_raw, raw)
+        })
     }
 
     /// Queues `x += gate * block` per branch on `stream`.

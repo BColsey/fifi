@@ -15,6 +15,11 @@
  *   gate[t][b]      = 2 * sigmoid(dot(inject[b], normed[t]) / C)      (only with inject)
  * normed, low and mix are caller scratch; mixed [m][hidden] and gate [m][branches] are outputs.
  *
+ * Each dot product is one warp's sum: lane l adds the products of indices l, l + 32, ... in
+ * increasing order in f32 (fused multiply-add), and the 32 lane sums fold by xor offsets 16, 8,
+ * 4, 2, 1. The kernels take that order for any number of tokens, so the bits of one token do not
+ * depend on m or on its tile.
+ *
  * apply, per token: x[t][b][d] += gate[t][b] * block[t][d], in place.
  *
  * Limits: m in [1, 32768], branches in [1, 16], hidden in [1, 65536], width <= 262144,
@@ -59,6 +64,12 @@ typedef struct inference_cuda_hyper_apply_args {
 
 int inference_cuda_hyper_read_launch(const inference_cuda_hyper_read_args *args, void *stream,
                                      int *out_stage);
+
+/* The same read on the one-token-per-block kernels for every m. The tiled kernels that
+ * inference_cuda_hyper_read_launch takes for many tokens form every dot product in the same
+ * order, so both give the same bits; the equality tests compare the two. */
+int inference_cuda_hyper_read_reference_launch(const inference_cuda_hyper_read_args *args,
+                                               void *stream, int *out_stage);
 
 int inference_cuda_hyper_apply_launch(const inference_cuda_hyper_apply_args *args, void *stream,
                                       int *out_stage);
