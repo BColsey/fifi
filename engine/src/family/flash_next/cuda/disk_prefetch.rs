@@ -1,4 +1,4 @@
-//! One layer of speculative disk reads. Demand consumes only records already packed in RAM.
+//! Bounded speculative disk reads. Demand consumes records already packed in RAM.
 
 use crate::EngError;
 use std::{
@@ -17,6 +17,7 @@ pub(super) struct Target {
 
 struct Plan {
     target: Target,
+    generation: u64,
     pending: VecDeque<u16>,
     ready: Vec<(u16, Vec<u8>)>,
 }
@@ -33,7 +34,8 @@ struct Counters {
 #[derive(Default)]
 struct State {
     generation: u64,
-    plan: Option<Plan>,
+    plans: VecDeque<Plan>,
+    demand_active: bool,
     active: Option<(u64, u16)>,
     stop: bool,
     counters: Counters,
@@ -46,12 +48,14 @@ struct Shared {
 }
 
 pub(super) struct DiskPrefetch {
+    horizon: usize,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl DiskPrefetch {
     pub(super) fn spawn(
+        horizon: usize,
         mut read: impl FnMut(usize, u16) -> Result<Vec<u8>, EngError> + Send + 'static,
     ) -> Result<Self, EngError> {
         let shared = Arc::new(Shared::default());
@@ -64,13 +68,14 @@ impl DiskPrefetch {
                     let mut state = work.state.lock().expect("disk prefetch state");
                     state.active = None;
                     match record {
-                        Ok(bytes) if state.generation == generation => {
-                            if let Some(plan) = &mut state.plan {
+                        Ok(bytes) => {
+                            if let Some(plan) =
+                                state.plans.iter_mut().find(|p| p.generation == generation)
+                            {
                                 plan.ready.push((expert, bytes));
                             }
                         }
                         Err(_) => state.counters.failed += 1,
-                        _ => {}
                     }
                 }
             })
@@ -79,9 +84,14 @@ impl DiskPrefetch {
                 message: error.to_string(),
             })?;
         Ok(Self {
+            horizon,
             shared,
             worker: Some(worker),
         })
+    }
+
+    pub(super) fn horizon(&self) -> usize {
+        self.horizon
     }
 
     pub(super) fn submit(&self, target: Target, experts: impl Iterator<Item = u16>) {
@@ -91,22 +101,32 @@ impl DiskPrefetch {
         }
         let mut state = self.shared.state.lock().expect("disk prefetch state");
         state.generation += 1;
-        state.plan = Some(Plan {
+        let generation = state.generation;
+        state
+            .plans
+            .retain(|plan| plan.target.position == target.position && plan.target != target);
+        state.plans.push_back(Plan {
             target,
+            generation,
             pending,
             ready: Vec::new(),
         });
+        state
+            .plans
+            .make_contiguous()
+            .sort_unstable_by_key(|plan| plan.target.layer);
+        state.plans.truncate(self.horizon);
         self.shared.wake.notify_one();
     }
 
     pub(super) fn cancel(&self) {
         let mut state = self.shared.state.lock().expect("disk prefetch state");
-        state.generation += 1;
-        state.plan = None;
+        state.plans.clear();
     }
 
-    /// Closes the speculative queue before demand dispatch. A read already in the
-    /// kernel may finish, but it owns a separate slot and never delays demand on a lock.
+    /// Takes the current layer's completed records, dropping any other predictions
+    /// for that layer. Future layers stay queued, with launches paused during demand.
+    /// The single read already in flight uses its own slot and may finish in parallel.
     pub(super) fn read_demand(
         &self,
         target: Target,
@@ -115,15 +135,22 @@ impl DiskPrefetch {
     ) -> Result<Vec<Vec<u8>>, EngError> {
         let mut ready = {
             let mut state = self.shared.state.lock().expect("disk prefetch state");
-            let plan = state.plan.take().filter(|plan| plan.target == target);
-            if plan.is_some()
+            state.demand_active = true;
+            let plan = state
+                .plans
+                .iter()
+                .position(|plan| plan.target == target)
+                .and_then(|i| state.plans.remove(i));
+            state.plans.retain(|plan| {
+                plan.target.position == target.position && plan.target.layer > target.layer
+            });
+            if let Some(plan) = &plan
                 && let Some((generation, expert)) = state.active
-                && generation == state.generation
+                && generation == plan.generation
                 && experts.contains(&expert)
             {
                 state.counters.late += 1;
             }
-            state.generation += 1;
             plan.map_or_else(Vec::new, |plan| plan.ready)
         };
         let mut missing = Vec::new();
@@ -145,7 +172,14 @@ impl DiskPrefetch {
         }
 
         drop(ready);
-        let mut fetched = read(&missing)?.into_iter();
+        let fetched = read(&missing);
+        self.shared
+            .state
+            .lock()
+            .expect("disk prefetch state")
+            .demand_active = false;
+        self.shared.wake.notify_one();
+        let mut fetched = fetched?.into_iter();
         Ok(ordered
             .into_iter()
             .map(|record| record.unwrap_or_else(|| fetched.next().expect("one record per miss")))
@@ -174,11 +208,12 @@ impl Shared {
             if state.stop {
                 return None;
             }
-            if let Some(plan) = &mut state.plan
+            if !state.demand_active
+                && let Some(plan) = state.plans.iter_mut().find(|plan| !plan.pending.is_empty())
                 && let Some(expert) = plan.pending.pop_front()
             {
                 let layer = plan.target.layer;
-                let generation = state.generation;
+                let generation = plan.generation;
                 state.active = Some((generation, expert));
                 state.counters.issued += 1;
                 return Some((generation, layer, expert));
@@ -213,7 +248,7 @@ mod tests {
 
     #[test]
     fn ready_records_replace_reads_and_keep_exact_order() {
-        let prefetch = DiskPrefetch::spawn(|layer, id| {
+        let prefetch = DiskPrefetch::spawn(1, |layer, id| {
             assert_eq!(layer, 5);
             Ok(vec![id as u8])
         })
@@ -222,7 +257,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let state = prefetch.shared.state.lock().unwrap();
-            if state.plan.as_ref().unwrap().ready.len() == 2 {
+            if state.plans.front().unwrap().ready.len() == 2 {
                 break;
             }
             drop(state);
@@ -247,7 +282,7 @@ mod tests {
     fn demand_skips_an_inflight_guess_and_cancel_discards_its_result() {
         let (entered, started) = mpsc::channel();
         let (release, proceed) = mpsc::channel();
-        let prefetch = DiskPrefetch::spawn(move |_, id| {
+        let prefetch = DiskPrefetch::spawn(1, move |_, id| {
             entered.send(id).unwrap();
             proceed.recv_timeout(Duration::from_secs(3)).unwrap();
             Ok(vec![id as u8])
@@ -286,6 +321,70 @@ mod tests {
             prefetch
                 .report()
                 .contains("issued 1 failed 0 ready hits 0 late 1 demand 2")
+        );
+    }
+
+    #[test]
+    fn demand_pauses_queued_reads_without_discarding_future_layers() {
+        let (entered, started) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let prefetch = DiskPrefetch::spawn(2, move |layer, id| {
+            entered.send((layer, id)).unwrap();
+            proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok(vec![id as u8])
+        })
+        .unwrap();
+        let first = target();
+        let second = Target { layer: 6, ..first };
+        prefetch.submit(first, [3, 4].into_iter());
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(3)).unwrap(),
+            (5, 3)
+        );
+        prefetch.submit(second, [9].into_iter());
+
+        let intervening = Target { layer: 4, ..first };
+        let demand = prefetch
+            .read_demand(intervening, &[7], |ids| {
+                assert_eq!(ids, [7]);
+                release.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while prefetch.shared.state.lock().unwrap().active.is_some() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                assert!(started.try_recv().is_err());
+                Ok(vec![vec![70]])
+            })
+            .unwrap();
+        assert_eq!(demand, [vec![70]]);
+
+        for next in [(5, 4), (6, 9)] {
+            assert_eq!(started.recv_timeout(Duration::from_secs(3)).unwrap(), next);
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while prefetch.shared.state.lock().unwrap().active.is_some() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            prefetch
+                .read_demand(first, &[4, 3], |ids| {
+                    assert!(ids.is_empty());
+                    Ok(Vec::new())
+                })
+                .unwrap(),
+            [vec![4], vec![3]]
+        );
+        assert_eq!(
+            prefetch
+                .read_demand(second, &[9], |ids| {
+                    assert!(ids.is_empty());
+                    Ok(Vec::new())
+                })
+                .unwrap(),
+            [vec![9]]
         );
     }
 }

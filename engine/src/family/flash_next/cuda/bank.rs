@@ -637,7 +637,7 @@ pub(super) mod device {
 
     struct DecodeForecast<'a> {
         position: u64,
-        next: &'a [i32],
+        predicted: &'a [i32],
     }
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -948,7 +948,7 @@ pub(super) mod device {
             layer: usize,
             picks: &[i32],
             pos: u64,
-            next: &[i32],
+            predicted: &[i32],
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
             let copies = self.state.begin_pass(layer, picks)?;
@@ -965,7 +965,7 @@ pub(super) mod device {
                 copies,
                 Some(DecodeForecast {
                     position: pos,
-                    next,
+                    predicted,
                 }),
             )
         }
@@ -973,20 +973,21 @@ pub(super) mod device {
         pub(in crate::family::flash_next) fn enable_disk_prefetch(
             &mut self,
             backing: &'static mut [u8],
+            horizon: usize,
         ) -> Result<(), EngError> {
             let source = self.source.ok_or_else(|| {
                 EngError::BadRequest("disk prefetch needs the Flash-Next disk tier".into())
             })?;
             let reader = source.prefetch_reader(backing)?;
-            self.disk_prefetch = Some(DiskPrefetch::spawn(move |layer, expert| {
+            self.disk_prefetch = Some(DiskPrefetch::spawn(horizon, move |layer, expert| {
                 let mut records = source.read_packed_from(&reader, layer, &[expert])?;
                 Ok(records.pop().expect("one requested record"))
             })?);
             Ok(())
         }
 
-        pub(in crate::family::flash_next) fn disk_prefetch_enabled(&self) -> bool {
-            self.disk_prefetch.is_some()
+        pub(in crate::family::flash_next) fn disk_prefetch_horizon(&self) -> Option<usize> {
+            self.disk_prefetch.as_ref().map(DiskPrefetch::horizon)
         }
 
         /// The rung's decode miss line for the turn boundary; `None`
@@ -1108,18 +1109,22 @@ pub(super) mod device {
                 layer,
             };
             let records = prefetch.read_demand(current, &misses, read)?;
-            if !forecast.next.is_empty() {
+            if !forecast.predicted.is_empty() {
                 let target = Target {
-                    layer: layer + 1,
+                    layer: layer + prefetch.horizon(),
                     ..current
                 };
                 let slots = self.slot_row(target.layer)?;
-                let cold = forecast.next.iter().take(CANDIDATES).filter_map(|&id| {
-                    let id = u16::try_from(id).ok()?;
-                    slots.get(usize::from(id)).filter(|&&slot| slot < 0)?;
-                    Some(id)
-                });
-                // Exact SSD reads have finished. The next layer's reads can run
+                let cold = forecast
+                    .predicted
+                    .iter()
+                    .take(CANDIDATES)
+                    .filter_map(|&id| {
+                        let id = u16::try_from(id).ok()?;
+                        slots.get(usize::from(id)).filter(|&&slot| slot < 0)?;
+                        Some(id)
+                    });
+                // Exact SSD reads have finished. The predicted reads can run
                 // during the current uploads and expert projections.
                 prefetch.submit(target, cold);
             }

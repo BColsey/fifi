@@ -849,15 +849,15 @@ mod device {
             prof::blocked(35, profile, || scratch.read_at(stream, sc.log, &mut raw))?;
             let (ids, weights) = parse_log(&raw, k)?;
             let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
-            let next = if let Some(proxy) = &self.router_proxy {
-                let horizons = if self.log_router_proxy { HORIZONS } else { 1 };
-                let target_routers: Vec<_> = self.trunks[layer + 1..]
-                    .iter()
-                    .take(horizons)
-                    .map(|trunk| trunk.router)
-                    .collect();
-                let predictions = if self.log_router_proxy {
-                    proxy.record(
+            let horizon = self.bank.disk_prefetch_horizon();
+            let predicted = match &self.router_proxy {
+                Some(proxy) if self.log_router_proxy => {
+                    let target_routers: Vec<_> = self.trunks[layer + 1..]
+                        .iter()
+                        .take(HORIZONS)
+                        .map(|trunk| trunk.router)
+                        .collect();
+                    let predictions = proxy.record(
                         launch,
                         bufs.route.norm_row,
                         ActualRoute {
@@ -867,17 +867,21 @@ mod device {
                             slots: &slot_row_before,
                         },
                         &target_routers,
-                    )?
-                } else {
-                    proxy.sample(launch, bufs.route.norm_row, &target_routers)?
-                };
-                if self.bank.disk_prefetch_enabled() {
-                    predictions.into_iter().next().unwrap_or_default()
-                } else {
-                    Vec::new()
+                    )?;
+                    horizon
+                        .and_then(|h| predictions.into_iter().nth(h - 1))
+                        .unwrap_or_default()
                 }
-            } else {
-                Vec::new()
+                Some(proxy) => {
+                    if let Some(target) = horizon.and_then(|h| self.trunks.get(layer + h)) {
+                        let mut predictions =
+                            proxy.sample(launch, bufs.route.norm_row, &[target.router])?;
+                        predictions.pop().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => Vec::new(),
             };
 
             // The resident pass. Without a miss its combine IS the block's output; with one it
@@ -904,7 +908,8 @@ mod device {
             // so this is where the rung's decode miss counter hears the
             // layer: every layer of the token at `pos`, zero misses
             // included.
-            self.bank.step_decode(ctx, layer, &ids, pos as u64, &next)?;
+            self.bank
+                .step_decode(ctx, layer, &ids, pos as u64, &predicted)?;
             let slot_row_after = self.bank.slot_row(layer)?.to_vec();
             let second = plan_second_pass(&ids, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_ranks)) = second.miss {

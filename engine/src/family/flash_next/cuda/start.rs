@@ -672,12 +672,13 @@ fn build_driver_resolving(
             ));
         }
     };
-    let disk_prefetch_enabled = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH") {
-        None => false,
-        Some(value) if value == "1" => true,
+    let disk_prefetch_horizon = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH") {
+        None => None,
+        Some(value) if value == "1" => Some(1),
+        Some(value) if value == "2" => Some(2),
         Some(_) => {
             return Err(EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_DISK_PREFETCH must be unset or \"1\"".into(),
+                "INFERENCE_FLASH_NEXT_DISK_PREFETCH must be unset, \"1\", or \"2\"".into(),
             ));
         }
     };
@@ -814,18 +815,17 @@ fn build_driver_resolving(
     } else {
         0
     };
-    let prefetch_backing = if disk_prefetch_enabled {
+    let prefetch_backing = if disk_prefetch_horizon.is_some() {
         bank_source::RungSource::backing_bytes(&checkpoint, artifact, 1)?
     } else {
         0
     };
     // One raw slot, the worker's aligned read window, and the packed records in
-    // the current upload and next prediction. Include the transient pack workspace.
-    let prefetch_bytes = if disk_prefetch_enabled {
-        2 * prefetch_backing as u64 + 10 * record_bytes as u64
-    } else {
-        0
-    };
+    // the current upload and the pending layers. Include the transient pack workspace.
+    let prefetch_bytes = disk_prefetch_horizon.map_or(0, |horizon| {
+        let records = (horizon + 1) * super::disk_prefetch::CANDIDATES + 2;
+        2 * prefetch_backing as u64 + records as u64 * record_bytes as u64
+    });
     let terms = HostTerms {
         engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes,
         ..HostTerms::DEFAULT
@@ -868,7 +868,7 @@ fn build_driver_resolving(
         &terms,
         ring_placeholder,
     )?;
-    if disk_prefetch_enabled && !matches!(tier, TierChoice::Disk) {
+    if disk_prefetch_horizon.is_some() && !matches!(tier, TierChoice::Disk) {
         return Err(EngError::BadRequest(
             "INFERENCE_FLASH_NEXT_DISK_PREFETCH needs the Flash-Next disk tier".into(),
         ));
@@ -1086,11 +1086,11 @@ fn build_driver_resolving(
         began.elapsed().as_secs_f64()
     );
 
-    if disk_prefetch_enabled {
+    if let Some(horizon) = disk_prefetch_horizon {
         let backing = Box::leak(vec![0; prefetch_backing].into_boxed_slice());
-        bank.enable_disk_prefetch(backing)?;
+        bank.enable_disk_prefetch(backing, horizon)?;
         eprintln!(
-            "flash-next cuda: one-layer disk prefetch enabled, host reserve {prefetch_bytes} bytes"
+            "flash-next cuda: disk prefetch N+{horizon} enabled, host reserve {prefetch_bytes} bytes"
         );
     }
 
@@ -1127,7 +1127,7 @@ fn build_driver_resolving(
         &layout,
         &step.moe_dims(rows),
     )?;
-    if router_proxy_enabled || disk_prefetch_enabled {
+    if router_proxy_enabled || disk_prefetch_horizon.is_some() {
         block.enable_router_proxy(ctx, model.hyper.hidden(), router_proxy_enabled)?;
     }
     if router_proxy_enabled {
