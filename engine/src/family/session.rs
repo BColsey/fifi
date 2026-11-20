@@ -653,8 +653,10 @@ pub(crate) enum SaveKind {
     /// The state at the last message boundary of a prompt.
     Tip,
     /// The rolling block cut of a lineage: an LRU entry like a periodic one, except that a
-    /// no-shorter `Block` save on the same path replaces the previous `Block` entry, so one lineage
-    /// holds at most one cut at a time.
+    /// `Block` save replaces the previous `Block` entry of its lineage. A store without
+    /// `with_blocks_per_lineage` treats every `Block` of the path as one lineage; a store with it
+    /// replaces only the `Block` whose key is a strict prefix of the new key. Either way one
+    /// lineage holds at most one cut at a time.
     Block,
 }
 
@@ -703,10 +705,12 @@ pub(crate) fn shadow_block_lcp_enabled() -> bool {
 /// the tip, and a Periodic save takes precedence at a shared position - also
 /// at the true-position cut when a dropped periodic owns the target.
 ///
-/// The store keeps at most one Block per stored path. Q36's engine-wide path thus
-/// permits at most one Block for the engine, not one for every lineage.
-/// Recent-longer protection can retain a longer Block through one unrelated request
-/// instead of replacing it with a shorter cut. Other stores keep rolling replacement.
+/// A store keeps at most one Block per stored path, except that a store built with
+/// `with_blocks_per_lineage` (Q36 CUDA) keeps one per conversation: a new Block replaces only
+/// the Block whose key is a strict prefix of it, and the Blocks of other conversations fall
+/// under the entry limit and the LRU order. Recent-longer protection can retain a longer Block
+/// through one unrelated request instead of replacing it with a shorter cut. Other stores keep
+/// rolling replacement per path.
 ///
 /// `ENGINESRV_PREFIX_BLOCK_TOKENS` sets the spacing
 /// (default 4,096, the simulated hybrid sweet spot; a value below 1 falls back to
@@ -822,6 +826,10 @@ pub(crate) struct PrefixStore<S, P> {
     limits: StoreLimits,
     /// CUDA pinned stores opt in; other executors keep the legacy eviction rules.
     protect_recent_longer: bool,
+    /// A new `Block` save rolls away only a stored `Block` of its own conversation, the one
+    /// whose key is a strict prefix of the new key, instead of every `Block` of the path.
+    /// Off keeps one `Block` per path.
+    blocks_per_lineage: bool,
     /// The id of the next stored entry. Ids count up and are never reused.
     next_id: u64,
     /// The last restore observation, temporarily replaced by the saving session's lineage.
@@ -927,6 +935,7 @@ impl<S, P> PrefixStore<S, P> {
             lru: Vec::new(),
             limits,
             protect_recent_longer: false,
+            blocks_per_lineage: false,
             next_id: 0,
             restored: None,
             restored_kind: None,
@@ -946,6 +955,16 @@ impl<S, P> PrefixStore<S, P> {
     #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
     pub(crate) fn with_recent_longer_protection(mut self) -> Self {
         self.protect_recent_longer = true;
+        self
+    }
+
+    /// Keeps one `Block` per conversation instead of one per path. Two prompts belong to the
+    /// same conversation when the stored cut is a prefix of the new one, so a later cut of a
+    /// conversation replaces its earlier cut and leaves the cuts of other conversations to the
+    /// entry limit and the LRU order.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn with_blocks_per_lineage(mut self) -> Self {
+        self.blocks_per_lineage = true;
         self
     }
 
@@ -1114,8 +1133,13 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         kind: SaveKind,
         budget: Option<&SnapshotBudget<'_, S>>,
     ) -> bool {
+        let per_lineage = self.blocks_per_lineage;
         let rolls = |entry: &Stored<S, P>| {
-            kind == SaveKind::Block && entry.kind == SaveKind::Block && &entry.saved.path == path
+            kind == SaveKind::Block
+                && entry.kind == SaveKind::Block
+                && &entry.saved.path == path
+                && (!per_lineage
+                    || (entry.saved.key.len() < key.len() && key.starts_with(&entry.saved.key)))
         };
         let (list, limit) = if kind == SaveKind::Root {
             (&self.roots, self.limits.roots)
@@ -6381,6 +6405,111 @@ mod tests {
             Ok(true)
         );
         assert_eq!(slot.keys(), vec![(4, false), (4, false)]);
+    }
+
+    /// Saves `key` as a `Block` on path 1 and returns whether it was stored.
+    fn save_block(slot: &mut Slot, key: &[u32]) -> bool {
+        let (step, session) = held(key);
+        save_as(&session, slot, &step, key, 1, SaveKind::Block).unwrap()
+    }
+
+    /// Restores `prompt` on path 1 and returns the covered tokens.
+    fn restored_cover(slot: &mut Slot, prompt: &[u32]) -> usize {
+        let (mut step, mut session) = held(&[9]);
+        restore(&mut session, slot, &mut step, prompt, 1).unwrap()
+    }
+
+    /// With per-lineage cuts, two conversations on one path interleave their turns and each keeps
+    /// and restores its own cut; a later cut of a conversation rolls only that conversation's
+    /// earlier cut.
+    #[test]
+    fn interleaved_lineages_each_keep_and_restore_their_own_block() {
+        let mut slot = store(0, 4).with_blocks_per_lineage();
+        let a1 = [1, 2, 3, 4];
+        let b1 = [5, 6, 7, 8];
+        assert!(save_block(&mut slot, &a1));
+        assert!(save_block(&mut slot, &b1));
+        assert_eq!(slot.keys(), vec![(4, false), (4, false)]);
+        // A's second turn restores A's cut, then cuts further along its own conversation.
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 4, 9, 9, 9]), 4);
+        let a2 = [1, 2, 3, 4, 9, 9];
+        assert!(save_block(&mut slot, &a2));
+        assert_eq!(
+            slot.save_side_totals().block_rolls,
+            1,
+            "only A's earlier cut rolls"
+        );
+        assert_eq!(restored_cover(&mut slot, &[5, 6, 7, 8, 9, 9, 9]), 4);
+        let b2 = [5, 6, 7, 8, 7, 7];
+        assert!(save_block(&mut slot, &b2));
+        assert_eq!(slot.save_side_totals().block_rolls, 2);
+        assert_eq!(slot.keys().len(), 2);
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 4, 9, 9, 8]), 6);
+        assert_eq!(restored_cover(&mut slot, &[5, 6, 7, 8, 7, 7, 8]), 6);
+    }
+
+    /// A third conversation takes the entry limit's room by evicting the least recently used
+    /// cut, not by rolling a cut of another conversation.
+    #[test]
+    fn a_third_lineage_evicts_the_least_recently_used_block() {
+        let mut slot = store(0, 2).with_blocks_per_lineage();
+        let a = [1, 2, 3, 4];
+        let b = [5, 6, 7, 8];
+        let c = [9, 10, 11, 12];
+        assert!(save_block(&mut slot, &a));
+        assert!(save_block(&mut slot, &b));
+        // Using A makes B the least recently used.
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 4, 0]), 4);
+        assert!(save_block(&mut slot, &c));
+        assert_eq!(slot.keys().len(), 2);
+        assert_eq!(slot.save_side_totals().block_rolls, 0);
+        assert_eq!(slot.save_side_totals().room_removals, 1);
+        assert_eq!(
+            restored_cover(&mut slot, &[5, 6, 7, 8, 0]),
+            0,
+            "B was evicted"
+        );
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 4, 0]), 4);
+        assert_eq!(restored_cover(&mut slot, &[9, 10, 11, 12, 0]), 4);
+    }
+
+    /// A shorter cut inside a stored cut's own key is another entry, never a replacement of the
+    /// longer cut: the longer one is not a candidate for a prompt that diverges before its end.
+    #[test]
+    fn a_shorter_cut_of_a_shared_prefix_leaves_the_longer_block() {
+        let mut slot = store(0, 4)
+            .with_recent_longer_protection()
+            .with_blocks_per_lineage();
+        assert!(save_block(&mut slot, &[1, 2, 3, 4, 5, 6]));
+        assert!(save_block(&mut slot, &[1, 2, 3]));
+        assert_eq!(slot.keys(), vec![(6, false), (3, false)]);
+        assert_eq!(slot.save_side_totals().block_rolls, 0);
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 7, 7]), 3);
+        assert_eq!(restored_cover(&mut slot, &[1, 2, 3, 4, 5, 6, 7]), 6);
+    }
+
+    /// Per-lineage cuts keep the recent-longer rule for the limit: an unrelated cut cannot spend
+    /// a protected longer cut when the list is full.
+    #[test]
+    fn per_lineage_blocks_keep_the_recent_longer_protection_at_the_limit() {
+        let mut slot = store(0, 1)
+            .with_recent_longer_protection()
+            .with_blocks_per_lineage();
+        let long = [1, 2, 3, 4, 5, 6];
+        assert!(save_block(&mut slot, &long));
+        let (step, session) = held(&[9, 8, 7]);
+        assert_eq!(
+            session.save_prefix(
+                &mut slot,
+                &[9, 8, 7],
+                1,
+                step.fed(),
+                SaveKind::Block,
+                || { panic!("a declined short block must not take a snapshot") }
+            ),
+            Ok(false)
+        );
+        assert_eq!(slot.keys(), vec![(long.len(), false)]);
     }
 
     /// A Block cut is an LRU entry like a Periodic one: it fills `entries`, never a root

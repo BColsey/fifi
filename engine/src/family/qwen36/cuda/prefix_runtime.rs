@@ -152,7 +152,8 @@ impl QwenResidentStep<'_> {
                 roots: 0,
                 entries: 2,
             })
-            .with_recent_longer_protection();
+            .with_recent_longer_protection()
+            .with_blocks_per_lineage();
         }
         eprintln!(
             "q36 cuda: tiered prefix store, {} entries, extra budget {budget} B",
@@ -203,7 +204,8 @@ impl QwenResidentStep<'_> {
             roots: 0,
             entries: retained,
         })
-        .with_recent_longer_protection();
+        .with_recent_longer_protection()
+        .with_blocks_per_lineage();
         self.prefix.set_shadow_enabled(shadow_block_lcp_enabled());
         eprintln!(
             "q36 cuda: persistent pinned prefix, retained {retained}, staging 1, checkpoint {} B, total {} B; kill switches: Q36_CUDA_PINNED_PREFIX=0 (pageable), Q36_CUDA_STATE_ONLY_PREFIX=0 (pinned only)",
