@@ -235,6 +235,79 @@ pub(crate) struct Q36Options {
     /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
     /// `draft_rollback` `device` and the EXL3 pack.
     pub(crate) draft_verify: Option<String>,
+    /// The on-disk prefix cache of the CUDA arm: saved prefixes that survive a restart and an
+    /// eviction from pinned host memory. Absent means the default (see `KV_CACHE_DEFAULT_ON`).
+    pub(crate) kv_cache: Option<KvCacheOptions>,
+}
+
+/// The default of the on-disk prefix cache when the config and the environment say nothing.
+/// Off until the flip is announced: only a `kv_cache.dir`, `kv_cache.enabled: true`, or the
+/// environment turns it on.
+pub(crate) const KV_CACHE_DEFAULT_ON: bool = false;
+
+/// The `kv_cache` member of the `qwen36` object.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KvCacheOptions {
+    /// The cache directory, absolute. Naming it turns the cache on. Created 0700 when missing;
+    /// one process owns it at a time. Absent means the user cache directory
+    /// (`$XDG_CACHE_HOME/fifi/kv`, else `$HOME/.cache/fifi/kv`).
+    pub(crate) dir: Option<PathBuf>,
+    /// The byte quota of the directory, from 1 GiB. Absent means a quarter of the free space of
+    /// the filesystem at start, at most 64 GiB; under 4 GiB the cache stays off.
+    pub(crate) quota_bytes: Option<u64>,
+    /// `true` turns the cache on at the default directory, `false` keeps it off whatever else
+    /// is set. Absent follows the default of the build.
+    pub(crate) enabled: Option<bool>,
+}
+
+/// The checked `kv_cache` member: what the operator asked for, before the host is probed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KvCacheSettings {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) quota_bytes: Option<u64>,
+}
+
+fn kv_cache_settings(
+    options: &Q36Options,
+    backend: Backend,
+    devices: &[usize],
+) -> Result<Option<KvCacheSettings>, EngError> {
+    let Some(cache) = &options.kv_cache else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad(
+            "kv_cache is a CUDA member; the MLX arm refuses it".into()
+        ));
+    }
+    if devices.len() > 1 {
+        return Err(bad(
+            "kv_cache is refused with more than one CUDA device: the card path keeps no disk tier"
+                .into(),
+        ));
+    }
+    if let Some(dir) = &cache.dir
+        && !dir.is_absolute()
+    {
+        return Err(bad(format!(
+            "kv_cache.dir must be an absolute path, got {}",
+            dir.display()
+        )));
+    }
+    if let Some(quota) = cache.quota_bytes
+        && quota < (1 << 30)
+    {
+        return Err(bad(format!(
+            "kv_cache.quota_bytes must be at least 1073741824 (1 GiB), got {quota}"
+        )));
+    }
+    Ok(Some(KvCacheSettings {
+        enabled: cache.enabled,
+        dir: cache.dir.clone(),
+        quota_bytes: cache.quota_bytes,
+    }))
 }
 
 /// How a verify window runs its rows (`draft_verify`).
@@ -1019,6 +1092,8 @@ pub(crate) struct Q36Settings {
     /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
     /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
     pub(crate) cuda_devices: Vec<usize>,
+    /// The on-disk prefix cache, or `None` when the member is absent.
+    pub(crate) kv_cache: Option<KvCacheSettings>,
     /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
     /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
     /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
@@ -1568,6 +1643,7 @@ impl Q36Settings {
         };
         let tiered = tiered_settings(options, backend)?;
         let expert_bank = expert_bank_settings(options, backend, weights)?;
+        let kv_cache = kv_cache_settings(options, backend, &cuda_devices)?;
         let compile_program_limit = match options.compile_program_limit {
             Some(_) if backend != Backend::Mlx => {
                 return Err(bad("compile_program_limit requires the MLX backend".into()));
@@ -1741,6 +1817,7 @@ impl Q36Settings {
             draft_rollback,
             draft_verify,
             cuda_devices,
+            kv_cache,
             ignored_mlx_keys,
             derived,
             host_note,
@@ -1906,8 +1983,8 @@ mod tests {
         tokenizer_pin_for_spec,
     };
     use super::{
-        QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
-        rollback_mode_name, rollback_of, verify_mode_name, verify_of,
+        KvCacheSettings, QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat,
+        check_window_rows, rollback_mode_name, rollback_of, verify_mode_name, verify_of,
     };
     use crate::EngError;
     use crate::family::session::StoreLimits;
@@ -1981,6 +2058,46 @@ mod tests {
     fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         settings_for(Some(&options), &Q36Env::default(), Backend::Cuda)
+    }
+
+    #[test]
+    fn kv_cache_member_is_checked_and_cuda_single_device_only() {
+        assert_eq!(cuda_offload("{}").unwrap().kv_cache, None);
+        let named =
+            cuda_offload(r#"{"kv_cache":{"dir":"/c","quota_bytes":2147483648,"enabled":true}}"#)
+                .unwrap();
+        assert_eq!(
+            named.kv_cache,
+            Some(KvCacheSettings {
+                enabled: Some(true),
+                dir: Some(PathBuf::from("/c")),
+                quota_bytes: Some(2_147_483_648),
+            })
+        );
+        assert_eq!(
+            cuda_offload(r#"{"kv_cache":{}}"#).unwrap().kv_cache,
+            Some(KvCacheSettings::default())
+        );
+        for (body, needle) in [
+            (r#"{"kv_cache":{"dir":"relative/path"}}"#, "absolute"),
+            (r#"{"kv_cache":{"quota_bytes":1000}}"#, "1 GiB"),
+            (
+                r#"{"cuda_devices":[0,1],"capture":false,"kv_cache":{"dir":"/c"}}"#,
+                "more than one CUDA device",
+            ),
+        ] {
+            let text = error_text(cuda_offload(body));
+            assert!(text.contains(needle), "{body}: {text}");
+        }
+        let options: Q36Options =
+            serde_json::from_str(r#"{"cache_limit_bytes":1024,"kv_cache":{"dir":"/c"}}"#).unwrap();
+        let text = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Mlx,
+        ));
+        assert!(text.contains("CUDA member"), "{text}");
+        assert!(serde_json::from_str::<Q36Options>(r#"{"kv_cache":{"path":"/c"}}"#).is_err());
     }
 
     #[test]
@@ -3072,6 +3189,7 @@ mod tests {
                 tokenizer_dir: PathBuf::from("/t"),
                 cache_limit: 1024,
                 cuda_devices: vec![0],
+                kv_cache: None,
                 context_limit: 262_144,
                 session_cap: 4 << 30,
                 prefill_chunk: 256,

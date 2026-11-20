@@ -164,21 +164,42 @@ pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
 }
 
 fn crc32c_resume(state: u32, bytes: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
+    // Eight tables: table 0 is the byte-at-a-time table, table k advances a byte that sits k
+    // positions earlier in the stream, so eight input bytes fold in one step.
+    static TABLES: std::sync::OnceLock<[[u32; 256]; 8]> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let mut tables = [[0u32; 256]; 8];
+        for (i, slot) in tables[0].iter_mut().enumerate() {
             let mut crc = i as u32;
             for _ in 0..8 {
                 crc = (crc >> 1) ^ (0x82f6_3b78 & ((crc & 1).wrapping_neg()));
             }
             *slot = crc;
         }
-        table
+        for i in 0..256 {
+            for k in 1..8 {
+                let prev = tables[k - 1][i];
+                tables[k][i] = tables[0][(prev & 0xff) as usize] ^ (prev >> 8);
+            }
+        }
+        tables
     });
     let mut crc = state;
-    for &byte in bytes {
-        crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = tables[7][(low & 0xff) as usize]
+            ^ tables[6][((low >> 8) & 0xff) as usize]
+            ^ tables[5][((low >> 16) & 0xff) as usize]
+            ^ tables[4][(low >> 24) as usize]
+            ^ tables[3][(high & 0xff) as usize]
+            ^ tables[2][((high >> 8) & 0xff) as usize]
+            ^ tables[1][((high >> 16) & 0xff) as usize]
+            ^ tables[0][(high >> 24) as usize];
+    }
+    for &byte in remainder {
+        crc = tables[0][((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
     }
     crc
 }
@@ -1113,38 +1134,8 @@ pub(crate) fn write_entry_unaccounted(
         let _ = std::fs::remove_file(&staging);
     }
     fsync_dir(&root.path.join("objects"))?;
-    // The manifest in staging, fsynced, unpublished.
-    let bytes = manifest.canonical_bytes();
-    let entry_sha = H64::from_digest(sha256(&bytes));
-    let staged = root
-        .path
-        .join("staging")
-        .join(format!("{}.json", fresh_h32(b"man")));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staged)
-            .and_then(|mut f| {
-                f.write_all(&bytes)?;
-                f.sync_all()
-            })
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&staged);
-                DiskMiss::Refused(format!("manifest staging: {e}"))
-            })?;
-    }
-    // The commit is the rename; then both directories are synced.
-    std::fs::rename(&staged, root.entry_path(&entry_sha)).map_err(|e| {
-        let _ = std::fs::remove_file(&staged);
-        DiskMiss::Refused(format!("entry rename: {e}"))
-    })?;
-    fsync_dir(&root.path.join("entries"))?;
-    fsync_dir(&root.path.join("staging"))?;
-    Ok(entry_sha)
+    // The manifest in staging, fsynced, then renamed into place; both directories are synced.
+    root.stage_and_rename(manifest)
 }
 
 /// Completes or discards interrupted installs. A crash between an
@@ -1253,7 +1244,7 @@ fn regular_file(path: &Path, owner_uid: u32) -> Result<Option<()>, DiskMiss> {
 /// The effective uid, read from the kernel's own entry for this process;
 /// `u32::MAX` when unreadable, so any owner comparison refuses.
 #[cfg(target_os = "linux")]
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self")
         .map(|meta| meta.uid())
@@ -1360,6 +1351,13 @@ pub(crate) fn read_unverified_span(
         .map_err(|e| DiskMiss::Refused(format!("ring stage: {e}")))
 }
 
+/// Receives the chunks of an object as `(offset, bytes)` while it is read.
+pub(crate) type ChunkSink<'a> = dyn FnMut(u64, &[u8]) -> Result<(), DiskMiss> + 'a;
+
+/// The files of one directory the root recognises as `(id, modified time, bytes)`, and the number
+/// of items it does not.
+pub(crate) type Listing = (Vec<(H64, std::time::SystemTime, u64)>, usize);
+
 /// Verifies one dependency end-to-end through the O_DIRECT ring — the
 /// same read path a restore will use — by streaming its exact bytes in
 /// sector-sized chunks and checking SHA256 and CRC32C against the
@@ -1370,6 +1368,20 @@ pub(crate) fn verify_dependency(
     dep: &Dependency,
     ring: &mut ODirectRing,
     slot: Slot,
+) -> Result<(), DiskMiss> {
+    read_object_verified(root, dep, ring, slot, &mut |_, _| Ok(()))
+}
+
+/// [`verify_dependency`] that also hands every chunk to `sink` as `(offset, bytes)` in file
+/// order. The sink sees bytes before the whole-file hash and CRC32C have been checked, so what it
+/// receives is unverified until this function returns `Ok`: a caller that stages the bytes
+/// somewhere must discard them on any `Err` and may use them only after `Ok`.
+pub(crate) fn read_object_verified(
+    root: &DiskRoot,
+    dep: &Dependency,
+    ring: &mut ODirectRing,
+    slot: Slot,
+    sink: &mut ChunkSink<'_>,
 ) -> Result<(), DiskMiss> {
     use sha2::Digest;
     // Same re-assertion as read_unverified_span: the parser's cap does
@@ -1415,6 +1427,7 @@ pub(crate) fn verify_dependency(
             .map_err(|e| corrupt(format!("ring window: {e}")))?;
         hasher.update(window);
         crc_state = crc32c_resume(crc_state, window);
+        sink(done, window)?;
         done += want;
     }
     let crc_ok = (crc32c_resume(crc_state, &[]) ^ 0xffff_ffff) == u32::from_be_bytes(dep.crc32c.0);
@@ -1425,6 +1438,262 @@ pub(crate) fn verify_dependency(
         )));
     }
     Ok(())
+}
+
+/// One object being written from a stream of chunks: staged under `staging/`, hashed and
+/// checksummed as it goes, then installed under its content name by [`ObjectWriter::finish`].
+/// A dropped writer removes its staging file, so an abandoned or failed save leaves nothing.
+pub(crate) struct ObjectWriter {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    hasher: sha2::Sha256,
+    crc: u32,
+    len: u64,
+}
+
+impl Drop for ObjectWriter {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl ObjectWriter {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), DiskMiss> {
+        use sha2::Digest;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| DiskMiss::Refused("the object writer is finished".into()))?;
+        file.write_all(bytes)
+            .map_err(|e| DiskMiss::Refused(format!("staging write: {e}")))?;
+        self.hasher.update(bytes);
+        self.crc = crc32c_resume(self.crc, bytes);
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Syncs the staged bytes, names the object by their SHA256 and links it into `objects/`
+    /// without replacing anything. An object that already holds this name is verified against
+    /// the bytes' own length, hash and CRC32C and reused. `billing_engine` is the root's.
+    pub(crate) fn finish(mut self, root: &DiskRoot) -> Result<Dependency, DiskMiss> {
+        use sha2::Digest;
+        if self.len == 0 || self.len > OBJECT_BYTE_MAX {
+            return Err(corrupt(format!(
+                "an object of {} bytes is outside 1..={OBJECT_BYTE_MAX}",
+                self.len
+            )));
+        }
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| DiskMiss::Refused("the object writer is finished".into()))?;
+        let staged = self.path.clone();
+        let outcome = (|| {
+            file.sync_all()
+                .map_err(|e| DiskMiss::Refused(format!("staging sync: {e}")))?;
+            drop(file);
+            let digest: [u8; 32] = self.hasher.clone().finalize().into();
+            let dep = Dependency {
+                id: H64::from_digest(digest),
+                file_bytes: self.len,
+                crc32c: H8::from_digest((self.crc ^ 0xffff_ffff).to_be_bytes()),
+                billing_engine: root.marker.billing_engine,
+            };
+            let installed = root.object_path(&dep.id);
+            if regular_file(&installed, root.owner_uid)?.is_some() {
+                verify_object_bytes(
+                    &installed,
+                    &dep.id,
+                    dep.file_bytes,
+                    dep.crc32c,
+                    root.owner_uid,
+                )?;
+                return Ok(dep);
+            }
+            match std::fs::hard_link(&staged, &installed) {
+                Ok(()) => Ok(dep),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    verify_object_bytes(
+                        &installed,
+                        &dep.id,
+                        dep.file_bytes,
+                        dep.crc32c,
+                        root.owner_uid,
+                    )?;
+                    Ok(dep)
+                }
+                Err(e) => Err(DiskMiss::Refused(format!("object install: {e}"))),
+            }
+        })();
+        let _ = std::fs::remove_file(&staged);
+        outcome
+    }
+}
+
+/// A fresh entry id for a manifest: unique per attempt, carrying no user text.
+pub(crate) fn fresh_entry_id() -> H32 {
+    fresh_h32(b"entry")
+}
+
+impl DiskRoot {
+    /// The credential scope this root belongs to.
+    pub(crate) fn credential_scope(&self) -> H32 {
+        self.marker.credential_scope
+    }
+
+    /// The engine every object of this root is billed to.
+    pub(crate) fn billing_engine(&self) -> H64 {
+        self.marker.billing_engine
+    }
+
+    /// Starts one streamed object under `staging/` (0600, created exclusively).
+    pub(crate) fn begin_object(&self) -> Result<ObjectWriter, DiskMiss> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self
+            .path
+            .join("staging")
+            .join(format!("{}.part", fresh_h32(b"obj")));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| DiskMiss::Refused(format!("staging create: {e}")))?;
+        Ok(ObjectWriter {
+            file: Some(file),
+            path,
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            crc: 0xffff_ffff,
+            len: 0,
+        })
+    }
+
+    /// Syncs `objects/` after a save installed its objects.
+    pub(crate) fn sync_objects(&self) -> Result<(), DiskMiss> {
+        fsync_dir(&self.path.join("objects"))
+    }
+
+    /// Publishes a manifest whose objects are all installed: the manifest must pass the same
+    /// checks its reader applies, and is renamed into `entries/` under the SHA256 of its bytes.
+    pub(crate) fn publish_manifest(&self, manifest: &Manifest) -> Result<H64, DiskMiss> {
+        for dep in &manifest.dependencies {
+            if dep.billing_engine != self.marker.billing_engine {
+                return Err(DiskMiss::Refused(
+                    "a dependency is billed to a different engine than the root".into(),
+                ));
+            }
+        }
+        manifest.check()?;
+        if Manifest::parse(&manifest.canonical_bytes())? != *manifest {
+            return Err(corrupt(
+                "the manifest does not survive its canonical round trip",
+            ));
+        }
+        if manifest.credential_scope != self.marker.credential_scope {
+            return Err(DiskMiss::Refused(
+                "the entry belongs to a different credential scope than the root".into(),
+            ));
+        }
+        for dep in &manifest.dependencies {
+            if regular_file(&self.object_path(&dep.id), self.owner_uid)?.is_none() {
+                return Err(corrupt(format!(
+                    "dependency {} is not installed under the root",
+                    dep.id
+                )));
+            }
+        }
+        self.stage_and_rename(manifest)
+    }
+
+    fn stage_and_rename(&self, manifest: &Manifest) -> Result<H64, DiskMiss> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let bytes = manifest.canonical_bytes();
+        let entry_sha = H64::from_digest(sha256(&bytes));
+        let staged = self
+            .path
+            .join("staging")
+            .join(format!("{}.json", fresh_h32(b"man")));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .and_then(|mut f| {
+                f.write_all(&bytes)?;
+                f.sync_all()
+            })
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&staged);
+                DiskMiss::Refused(format!("manifest staging: {e}"))
+            })?;
+        std::fs::rename(&staged, self.entry_path(&entry_sha)).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            DiskMiss::Refused(format!("entry rename: {e}"))
+        })?;
+        fsync_dir(&self.path.join("entries"))?;
+        fsync_dir(&self.path.join("staging"))?;
+        Ok(entry_sha)
+    }
+
+    /// Every entry file under `entries/` as `(manifest digest, modified time, file bytes)`, and
+    /// the number of items that are not a `<64 hex>.json` regular file of this root's owner.
+    pub(crate) fn list_entries(&self) -> Result<Listing, DiskMiss> {
+        self.list_named("entries", ".json")
+    }
+
+    /// Every object under `objects/` as `(content digest, modified time, file bytes)`, and the
+    /// number of items that are not a `<64 hex>.bin` regular file of this root's owner.
+    pub(crate) fn list_objects(&self) -> Result<Listing, DiskMiss> {
+        self.list_named("objects", ".bin")
+    }
+
+    fn list_named(&self, dir: &str, suffix: &str) -> Result<Listing, DiskMiss> {
+        use std::os::unix::fs::MetadataExt;
+        let mut found = Vec::new();
+        let mut unknown = 0usize;
+        let listing = std::fs::read_dir(self.path.join(dir))
+            .map_err(|e| DiskMiss::Refused(format!("{dir} listing: {e}")))?;
+        for item in listing {
+            let item = item.map_err(|e| DiskMiss::Refused(format!("{dir} listing: {e}")))?;
+            let name = item.file_name();
+            let id = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(suffix))
+                .and_then(|stem| H64::parse(stem).ok());
+            let meta = std::fs::symlink_metadata(item.path())
+                .map_err(|e| DiskMiss::Refused(format!("{dir} stat: {e}")))?;
+            match id {
+                Some(id) if meta.is_file() && meta.uid() == self.owner_uid => {
+                    let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    found.push((id, modified, meta.len()));
+                }
+                _ => unknown += 1,
+            }
+        }
+        Ok((found, unknown))
+    }
+
+    /// Removes one entry file. Its objects stay until [`Self::remove_object`].
+    pub(crate) fn remove_entry(&self, id: &H64) {
+        let _ = std::fs::remove_file(self.entry_path(id));
+    }
+
+    /// Removes one object file.
+    pub(crate) fn remove_object(&self, id: &H64) {
+        let _ = std::fs::remove_file(self.object_path(id));
+    }
+
+    /// Marks an entry as used now, so a restart keeps the use order.
+    pub(crate) fn touch_entry(&self, id: &H64) {
+        if let Ok(file) = std::fs::File::options()
+            .write(true)
+            .open(self.entry_path(id))
+        {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    }
 }
 
 #[cfg(test)]
