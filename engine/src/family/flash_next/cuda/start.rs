@@ -179,7 +179,10 @@ pub(in crate::family::flash_next) fn start(
         EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())
     })?;
     let manifest = std::fs::read(&settings.manifest).map_err(|error| {
-        EngError::Checkpoint(format!("{}: {error}", settings.manifest.display()))
+        EngError::Checkpoint(format!(
+            "the manifest {} cannot be read: {error}",
+            settings.manifest.display()
+        ))
     })?;
     let pin = tokenizer_pin(&manifest, settings.tokenizer_vocab_size)?;
     let identity = pack_identity(&settings.artifact, &pin)?;

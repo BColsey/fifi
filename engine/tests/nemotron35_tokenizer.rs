@@ -240,7 +240,9 @@ fn nemotron35_missing_bundle_member_returns_checkpoint_error() {
         other => panic!("expected Checkpoint, got {other:?}"),
     }
 
-    for missing in BUNDLE_FILES {
+    // The members the load cannot do without: tokenizer.json, tokenizer_config.json, and the
+    // chat template when tokenizer_config.json carries none of its own.
+    for missing in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"] {
         let dir = tempfile::tempdir().expect("fixture directory");
         write_fixture(dir.path());
         fs::remove_file(dir.path().join(missing)).expect("remove bundle member");
@@ -257,4 +259,22 @@ fn nemotron35_missing_bundle_member_returns_checkpoint_error() {
             other => panic!("expected Checkpoint, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn nemotron35_missing_generation_config_loads_with_a_note_and_the_tokenizer_eos() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    write_fixture(dir.path());
+    fs::remove_file(dir.path().join("generation_config.json")).expect("remove bundle member");
+
+    let bundle = TokenizerBundle::load(dir.path(), &fixture_pin())
+        .expect("a missing generation_config.json loads");
+    assert_eq!(bundle.eos_token_id(), 11);
+    let notes = bundle.load_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("generation_config.json is missing"),
+        "{}",
+        notes[0]
+    );
 }

@@ -53,14 +53,23 @@ fn an_entry_without_a_manifest_stops_startup_and_names_the_engine_and_the_key() 
     let text = stderr(&output);
     assert!(text.contains("engine flash failed to start"), "{text}");
     assert!(
-        text.contains("manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set"),
+        text.contains(
+            "manifest is missing: set the manifest key or FLASH_NEXT_ARTIFACT_MANIFEST, or put \
+             download-manifest.json in the model directory \
+             (looked for /does/not/exist/download-manifest.json)"
+        ),
         "{text}"
     );
 }
 
 #[test]
 fn an_entry_without_a_cache_limit_stops_startup_and_names_the_key() {
-    let options = serde_json::json!({"manifest": "/does/not/exist/download-manifest.json"});
+    // The cache limit belongs to the MLX arm. A CUDA build takes the card arm unless the entry
+    // sets `cuda_decode` to false, so the entry states the arm it means.
+    let options = serde_json::json!({
+        "manifest": "/does/not/exist/download-manifest.json",
+        "cuda_decode": false
+    });
     let output = run(&config("127.0.0.1:0", Some(options)), &[]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
