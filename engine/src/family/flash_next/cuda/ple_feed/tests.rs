@@ -658,9 +658,6 @@ fn the_packed_chunk_embeddings_match_the_per_token_step_embeddings() {
 
 #[test]
 fn bulk_pack_feeds_match_ordered_steps_across_resume_and_eos() {
-    use super::super::{driver::TokenFeeds, pack_feeds::PackFeeds, testkit::checkpoint};
-    use crate::family::exl3_pack::EMBED_NAME;
-
     let dir = tempfile::tempdir().unwrap();
     let hidden = 2;
     let vocab = EOS + 1;
@@ -722,4 +719,78 @@ fn bulk_pack_feeds_match_ordered_steps_across_resume_and_eos() {
     batched.begin_chunk(&[token], true).unwrap();
     batched.reset();
     assert!(batched.take_feed_profile().is_none());
+}
+
+/// The values `ple_update` feeds the step for `token`: deterministic and token-specific.
+fn stream_of(hidden: usize, token: u32) -> Vec<f32> {
+    values(BRANCHES * hidden, token as usize, 1.0)
+}
+
+/// A feed whose history and ring come from stepping `fed` one token at a time.
+fn stepped_feed(dir: &Path, hidden: u32, fed: &[u32]) -> PleFeed {
+    let mut feed = feed_on(dir, hidden);
+    for &token in fed {
+        let plan = feed.plan(token).unwrap();
+        let gathered = feed.gather(&plan).unwrap();
+        feed.update(token, &gathered, &stream_of(hidden as usize, token))
+            .unwrap();
+    }
+    feed
+}
+
+fn local_rows(plan: &crate::family::flash_next::ple::RowPlan) -> Vec<u64> {
+    plan.rows.iter().map(|&(_, row)| u64::from(row)).collect()
+}
+
+#[test]
+fn a_chunk_row_plans_against_the_history_the_step_gives_it_wherever_eos_falls() {
+    // `plan_after` is what the serial chunk path plans each row with. It must pick the rows the
+    // per-token step picks: the end-of-sequence token empties the history, so the token after
+    // it hashes against no previous tokens whatever came before.
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = 8u32;
+    let chunks: [&[u32]; 7] = [
+        &[PROMPT[2], EOS, PROMPT[3], PROMPT[4]],
+        &[EOS, PROMPT[2], PROMPT[3]],
+        &[PROMPT[2], PROMPT[3], EOS],
+        &[PROMPT[2], EOS, EOS, PROMPT[3]],
+        &[
+            PROMPT[2], PROMPT[3], PROMPT[4], EOS, PROMPT[0], PROMPT[1], PROMPT[2],
+        ],
+        &[EOS],
+        &[PROMPT[3], PROMPT[4]],
+    ];
+    // Committed histories of zero, one and two tokens, and one ending on EOS.
+    let committed: [&[u32]; 4] = [
+        &[],
+        &[PROMPT[0]],
+        &[PROMPT[0], PROMPT[1]],
+        &[PROMPT[0], EOS],
+    ];
+    for fed in committed {
+        for chunk in chunks {
+            let planned = stepped_feed(dir.path(), hidden, fed);
+            let mut stepper = stepped_feed(dir.path(), hidden, fed);
+            for (index, &token) in chunk.iter().enumerate() {
+                let by_step = local_rows(&stepper.plan(token).unwrap());
+                let by_chunk = local_rows(&planned.plan_after(&chunk[..index], token).unwrap());
+                assert_eq!(
+                    by_chunk, by_step,
+                    "committed {fed:?}, chunk {chunk:?}, row {index}"
+                );
+                let gathered = stepper.gather(&stepper.plan(token).unwrap()).unwrap();
+                stepper
+                    .update(token, &gathered, &stream_of(hidden as usize, token))
+                    .unwrap();
+            }
+            let by_plan_chunk: Vec<Vec<u64>> = planned.plan_chunk(chunk).unwrap().per_token;
+            for (index, &token) in chunk.iter().enumerate() {
+                assert_eq!(
+                    by_plan_chunk[index],
+                    local_rows(&planned.plan_after(&chunk[..index], token).unwrap()),
+                    "committed {fed:?}, chunk {chunk:?}, row {index}: bulk planner"
+                );
+            }
+        }
+    }
 }

@@ -778,12 +778,21 @@ impl PleFeed {
         prefix: &[u32],
         token: u32,
     ) -> Result<RowPlan, EngError> {
-        let mut history = self.state.history().to_vec();
-        history.extend_from_slice(prefix);
-        //  reads the pair from a history of at most two; a longer slice would read
-        // the end-of-sequence marker for the second token and pick a different row set.
+        // The end-of-sequence token empties the history (`ple::plan_rows`), so the tokens before
+        // the last one in `prefix` never reach the plan, and neither does the committed history.
+        let eos = self.shape.dims().eos;
+        let mut history = match prefix.iter().rposition(|&seen| seen == eos) {
+            Some(last) => prefix[last + 1..].to_vec(),
+            None => {
+                let mut history = self.state.history().to_vec();
+                history.extend_from_slice(prefix);
+                history
+            }
+        };
+        // The hash reads the pair from a history of at most two.
         let keep_from = history.len().saturating_sub(2);
-        ple::plan_rows(&self.shape, &self.weights(), &history[keep_from..], token)
+        history.drain(..keep_from);
+        ple::plan_rows(&self.shape, &self.weights(), &history, token)
     }
 
     /// Plans the chunk from the committed history without changing the PLE state.
