@@ -47,6 +47,8 @@ mod router_proxy;
 #[cfg(test)]
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod rung_device_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod victim_cache;
 // S3: the state and decode arena plans size device memory with the kernel wrappers, so they build
 // with the native CUDA backend only. Staged: the decode step (S4) is the first caller.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

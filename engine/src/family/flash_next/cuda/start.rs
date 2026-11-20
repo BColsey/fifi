@@ -835,8 +835,34 @@ fn build_driver_resolving(
         let records = (horizon + 1) * super::disk_prefetch::CANDIDATES + 2;
         2 * prefetch_backing as u64 + records as u64 * record_bytes as u64
     });
+    let victim_budget = match std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES") {
+        Ok(text) => text.trim().parse::<usize>().map_err(|_| {
+            EngError::BadRequest(
+                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs a byte count".into(),
+            )
+        })?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => {
+            return Err(EngError::BadRequest(
+                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs a byte count".into(),
+            ));
+        }
+    };
+    let victim_layout = (victim_budget > 0)
+        .then(|| {
+            super::victim_cache::VictimLayout::new(victim_budget, model.moe.top_k(), record_bytes)
+        })
+        .transpose()?;
+    let victim_bytes = victim_layout
+        .as_ref()
+        .map_or(0, |layout| layout.bytes() as u64);
+    let engine_heap = (HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes)
+        .checked_add(victim_bytes)
+        .ok_or_else(|| {
+            EngError::MemoryPlan("Flash-Next victim cache host budget overflows".into())
+        })?;
     let terms = HostTerms {
-        engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes,
+        engine_heap,
         ..HostTerms::DEFAULT
     };
     let geometry = BankGeometry::new(
@@ -880,6 +906,11 @@ fn build_driver_resolving(
     if disk_prefetch_horizon.is_some() && !matches!(tier, TierChoice::Disk) {
         return Err(EngError::BadRequest(
             "INFERENCE_FLASH_NEXT_DISK_PREFETCH needs the Flash-Next disk tier".into(),
+        ));
+    }
+    if victim_layout.is_some() && !matches!(tier, TierChoice::Disk) {
+        return Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs the Flash-Next disk tier".into(),
         ));
     }
     let (tier, ring_bytes) = match tier {
@@ -1100,6 +1131,15 @@ fn build_driver_resolving(
         bank.enable_disk_prefetch(backing, horizon, join_active_prefetch)?;
         eprintln!(
             "flash-next cuda: disk prefetch N+{horizon} enabled, host reserve {prefetch_bytes} bytes, join={join_active_prefetch}"
+        );
+    }
+
+    if let Some(layout) = &victim_layout {
+        bank.enable_victim_cache(ctx, layout)?;
+        eprintln!(
+            "flash-next cuda: disk victim cache {} records, {} pinned bytes including upload reserve",
+            layout.resident_records(),
+            layout.bytes(),
         );
     }
 

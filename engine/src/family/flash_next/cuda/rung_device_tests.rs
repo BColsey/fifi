@@ -14,6 +14,16 @@ use crate::kernels::cuda::device_present;
 #[test]
 #[ignore = "needs a GPU (under 1 GiB)"]
 fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
+    compare_disk_and_exclusive(false);
+}
+
+#[test]
+#[ignore = "needs a GPU (under 1 GiB)"]
+fn a_disk_victim_returns_from_ram_after_eviction() {
+    compare_disk_and_exclusive(true);
+}
+
+fn compare_disk_and_exclusive(use_cache: bool) {
     assert!(device_present("Flash-Next disk rung"), "a GPU is required");
 
     // The synthetic pack mirrored onto a filesystem that serves O_DIRECT.
@@ -66,6 +76,11 @@ fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
     let ctx = projector.context();
     let mut disk = DeviceBank::build(ctx, disk_state, &buffered, &disk_plan, Some(retained))
         .expect("the rung bank builds");
+    if use_cache {
+        let layout = super::victim_cache::VictimLayout::new(record, 1, record).unwrap();
+        disk.enable_victim_cache(ctx, &layout)
+            .expect("cache allocation");
+    }
     let mut excl = DeviceBank::build(ctx, excl_state, &buffered, &excl_plan, None)
         .expect("the exclusive bank builds");
 
@@ -78,9 +93,13 @@ fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
             buffered
                 .record(layer, expert, &mut expected)
                 .expect("the pack record");
-            let _ = disk
-                .step(ctx, layer, &[i32::from(expert)])
-                .expect("the rung step");
+            if use_cache {
+                disk.step_decode(ctx, layer, &[i32::from(expert)], 0, &[])
+                    .expect("the cached rung step");
+            } else {
+                disk.step(ctx, layer, &[i32::from(expert)])
+                    .expect("the rung step");
+            }
             let _ = excl
                 .step(ctx, layer, &[i32::from(expert)])
                 .expect("the store step");
@@ -110,7 +129,8 @@ fn the_disk_rung_lands_the_packs_records_in_the_device_slots() {
         }
     }
     let stats = disk.stats();
-    assert_eq!(stats.misses, 4, "two ring reads per layer");
-    assert_eq!(stats.demotions, 0, "the rung never writes back");
+    assert_eq!(stats.misses, 4, "two exact misses per layer");
+    assert_eq!(disk.victim_cache_counts(), use_cache.then_some((2, 4)));
+    assert_eq!(stats.demotions, 0, "the disk policy has no host place");
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -620,6 +620,7 @@ pub(super) mod device {
     //! They are allocated once and held: dropping one synchronizes the device.
 
     use super::super::disk_prefetch::{CANDIDATES, DiskPrefetch, Target};
+    use super::super::victim_cache::{Key as VictimKey, VictimIndex, VictimLayout};
     use super::{
         HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
     };
@@ -640,6 +641,13 @@ pub(super) mod device {
         predicted: &'a [i32],
     }
 
+    struct VictimCache {
+        index: VictimIndex,
+        memory: PinnedBuf,
+        hits: u64,
+        writebacks: u64,
+    }
+
     pub(in crate::family::flash_next) struct DeviceBank {
         state: ExpertBankState<ReplaceOnMissLru>,
         slots: Vec<DeviceBuffer>,
@@ -651,6 +659,7 @@ pub(super) mod device {
         /// tiers never read a record after the fill.
         source: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
         disk_prefetch: Option<DiskPrefetch>,
+        victim_cache: Option<VictimCache>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -743,6 +752,7 @@ pub(super) mod device {
                 store,
                 source: retained,
                 disk_prefetch: None,
+                victim_cache: None,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -940,8 +950,8 @@ pub(super) mod device {
         /// [`Self::step`] for the decode path, which knows the step's
         /// position: every layer of the token at `pos` observes its
         /// NO_PLACE count to the rung (a layer with no miss observes a
-        /// real zero). The count is exactly the records the layer reads
-        /// through the pool — the miss list never repeats an expert.
+        /// real zero). The optional RAM cache and prefetch can satisfy
+        /// some of those misses before the demand reader runs.
         pub(in crate::family::flash_next) fn step_decode(
             &mut self,
             ctx: &CudaContext,
@@ -951,6 +961,19 @@ pub(super) mod device {
             predicted: &[i32],
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
+            let victims = self
+                .victim_cache
+                .as_ref()
+                .map(|_| {
+                    (0..self.state.geometry().slots)
+                        .map(|slot| {
+                            self.state.expert_in_slot(layer, slot).ok_or_else(|| {
+                                EngError::BadRequest("the Flash-Next bank slot is empty".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
             let copies = self.state.begin_pass(layer, picks)?;
             if let Some(source) = self.source {
                 let misses = copies
@@ -960,14 +983,47 @@ pub(super) mod device {
                     .count();
                 source.observe_decode(pos, layer, misses);
             }
-            self.finish(
-                ctx,
-                copies,
-                Some(DecodeForecast {
-                    position: pos,
-                    predicted,
-                }),
-            )
+            let forecast = DecodeForecast {
+                position: pos,
+                predicted,
+            };
+            if let Some(victims) = victims {
+                if let Err(error) = self.run_victim_copies(ctx, &copies, forecast, &victims) {
+                    self.state.poison();
+                    return Err(error);
+                }
+                Ok(copies)
+            } else {
+                self.finish(ctx, copies, Some(forecast))
+            }
+        }
+
+        pub(in crate::family::flash_next::cuda) fn enable_victim_cache(
+            &mut self,
+            ctx: &CudaContext,
+            layout: &VictimLayout,
+        ) -> Result<(), EngError> {
+            if self.source.is_none() {
+                return Err(EngError::BadRequest(
+                    "victim cache needs the Flash-Next disk tier".into(),
+                ));
+            }
+            self.victim_cache = Some(VictimCache {
+                index: VictimIndex::new(layout),
+                memory: ctx.pinned_buf(layout.bytes())?,
+                hits: 0,
+                writebacks: 0,
+            });
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(in crate::family::flash_next::cuda) fn victim_cache_counts(
+            &self,
+        ) -> Option<(u64, u64)> {
+            self.victim_cache
+                .as_ref()
+                .map(|cache| (cache.hits, cache.writebacks))
         }
 
         pub(in crate::family::flash_next) fn enable_disk_prefetch(
@@ -1001,6 +1057,15 @@ pub(super) mod device {
             let line = self.source?.decode_miss_line()?;
             if let Some(prefetch) = &self.disk_prefetch {
                 eprintln!("{}", prefetch.report());
+            }
+            if let Some(cache) = &self.victim_cache {
+                let bytes = self.state.geometry().record_bytes as u64;
+                eprintln!(
+                    "disk victim cache cumulative: hits {} writebacks {} writeback bytes {}",
+                    cache.hits,
+                    cache.writebacks,
+                    cache.writebacks * bytes,
+                );
             }
             Some(line)
         }
@@ -1082,18 +1147,12 @@ pub(super) mod device {
             }
         }
 
-        fn read_disk_misses(
+        fn read_disk_records(
             &self,
-            copies: &PassCopies,
+            layer: usize,
+            misses: &[u16],
             forecast: Option<DecodeForecast<'_>>,
         ) -> Result<Vec<Vec<u8>>, EngError> {
-            let layer = copies.layer;
-            let misses: Vec<_> = copies
-                .ops
-                .iter()
-                .filter(|op| op.src_place == NO_PLACE)
-                .map(|op| op.incoming)
-                .collect();
             let read = |experts: &[u16]| {
                 if experts.is_empty() {
                     return Ok(Vec::new());
@@ -1107,13 +1166,13 @@ pub(super) mod device {
                     .read_packed(layer, experts)
             };
             let Some((prefetch, forecast)) = self.disk_prefetch.as_ref().zip(forecast) else {
-                return read(&misses);
+                return read(misses);
             };
             let current = Target {
                 position: forecast.position,
                 layer,
             };
-            let records = prefetch.read_demand(current, &misses, read)?;
+            let records = prefetch.read_demand(current, misses, read)?;
             if !forecast.predicted.is_empty() {
                 let target = Target {
                     layer: layer + prefetch.horizon(),
@@ -1136,6 +1195,77 @@ pub(super) mod device {
             Ok(records)
         }
 
+        fn run_victim_copies(
+            &mut self,
+            ctx: &CudaContext,
+            copies: &PassCopies,
+            forecast: DecodeForecast<'_>,
+            victims: &[u16],
+        ) -> Result<(), EngError> {
+            let layer = copies.layer;
+            let bank = &self.slots[layer];
+            let record = self.state.geometry().record_bytes;
+            let cache = self.victim_cache.as_mut().expect("victim cache enabled");
+
+            // Reserve every RAM hit before choosing write-back slots. A cache
+            // eviction can never overwrite the source of a later upload.
+            let hits: Vec<_> = copies
+                .ops
+                .iter()
+                .map(|op| {
+                    cache.index.take(VictimKey {
+                        layer,
+                        expert: op.incoming,
+                    })
+                })
+                .collect();
+            for op in &copies.ops {
+                let slot = usize::from(op.slot);
+                let cached = cache.index.insert(VictimKey {
+                    layer,
+                    expert: victims[slot],
+                });
+                ctx.copy_to_pinned(
+                    &self.stream,
+                    bank.range(slot * record, record)?,
+                    &mut cache.memory,
+                    cached * record,
+                )?;
+            }
+            let mut misses = Vec::new();
+            for (op, hit) in copies.ops.iter().zip(&hits) {
+                if let Some(index) = *hit {
+                    ctx.copy_from_pinned(
+                        &self.stream,
+                        &mut cache.memory,
+                        index * record,
+                        bank.range(usize::from(op.slot) * record, record)?,
+                    )?;
+                } else {
+                    misses.push(op.incoming);
+                }
+            }
+            // The bank stream can save victims and upload hits while the
+            // exact SSD reads are running. Only actual misses reach the reader.
+            let packed = self.read_disk_records(layer, &misses, Some(forecast))?;
+            let cache = self.victim_cache.as_mut().expect("victim cache enabled");
+            let mut packed = packed.into_iter();
+            for (op, hit) in copies.ops.iter().zip(hits) {
+                if let Some(index) = hit {
+                    cache.index.release(index);
+                } else {
+                    let bytes = packed.next().expect("one packed record for each SSD miss");
+                    bank.write_at(&self.stream, usize::from(op.slot) * record, &bytes)?;
+                }
+            }
+            if !copies.ops.is_empty() {
+                cache.memory.synchronize(&self.stream)?;
+                cache.hits += (copies.ops.len() - misses.len()) as u64;
+                cache.writebacks += copies.ops.len() as u64;
+            }
+            Ok(())
+        }
+
         /// Runs the copies of `copies` on the bank's stream, in order, and returns when they have
         /// finished: per op the write-back (D2H) into the host place, then the H2D into the slot.
         /// A `NO_PLACE` src (the disk rung) reads the record from the source and uploads the
@@ -1146,8 +1276,21 @@ pub(super) mod device {
             copies: &PassCopies,
             forecast: Option<DecodeForecast<'_>>,
         ) -> Result<(), EngError> {
+            if !copies.ops.is_empty()
+                && let Some(cache) = &mut self.victim_cache
+            {
+                // Prefill and the non-decode step can change residency without
+                // recording victims. Restart the index at that boundary.
+                cache.index.clear();
+            }
             let mut packed_misses = if self.source.is_some() {
-                self.read_disk_misses(copies, forecast)?
+                let misses: Vec<_> = copies
+                    .ops
+                    .iter()
+                    .filter(|op| op.src_place == NO_PLACE)
+                    .map(|op| op.incoming)
+                    .collect();
+                self.read_disk_records(copies.layer, &misses, forecast)?
             } else {
                 Vec::new()
             }
