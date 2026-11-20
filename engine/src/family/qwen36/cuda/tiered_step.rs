@@ -973,11 +973,11 @@ impl<'w> TieredRuntime<'w> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::cuda::testkit;
+    use crate::kernels::cuda::device_present;
 
     #[test]
     fn pinned_warm_fill_round_trips_after_ring_reuse() {
-        if !testkit::device_present("pinned_warm_fill_round_trips_after_ring_reuse") {
+        if !device_present("pinned_warm_fill_round_trips_after_ring_reuse") {
             return;
         }
         let ctx = CudaContext::new().unwrap();
@@ -1027,7 +1027,8 @@ mod tests {
             .zip(lengths)
             .enumerate()
         {
-            let bytes = testkit::read_bytes(&ctx, stack.buffer(), (fills + 1) * width);
+            let mut bytes = vec![0; (fills + 1) * width];
+            stack.buffer().read_at(&stream, 0, &mut bytes).unwrap();
             for (slot, row) in bytes.chunks_exact(width).enumerate() {
                 let expected = if slot < fills {
                     (3 * slot + projection + 1) as u8
