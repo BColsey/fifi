@@ -14,10 +14,14 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use super::super::{
+    driver::TokenFeeds, feeds::RowReader, pack_feeds::PackFeeds, testkit::checkpoint,
+};
 use super::{
     FixedProjection, Gathered, HostMatrix, HostProjection, NgramRows, PleFeed, PleKeyValue,
     PleProjection, PleVectors,
 };
+use crate::family::exl3_pack::EMBED_NAME;
 use crate::{
     EngError,
     family::flash_next::ple::{PleDims, PleShape},
@@ -792,5 +796,153 @@ fn a_chunk_row_plans_against_the_history_the_step_gives_it_wherever_eos_falls() 
                 );
             }
         }
+    }
+}
+
+/// A `PackFeeds` over a fixture n-gram table and a zero BF16 embedding table, with the row pool
+/// when `reader` is set. The checkpoint is leaked: the feeds borrow it for the process.
+fn pack_feeds(dir: &Path, hidden: u32, reader: Option<RowReader>) -> PackFeeds {
+    let vocab = EOS + 1;
+    let source = Box::leak(Box::new(checkpoint(&[(
+        EMBED_NAME,
+        "BF16",
+        vec![vocab, hidden],
+        vec![0; (vocab * hidden * 2) as usize],
+    )])));
+    PackFeeds::new(
+        source,
+        feed_on(dir, hidden),
+        hidden as usize,
+        BRANCHES,
+        reader,
+    )
+}
+
+/// The feed's pooled reader, as `build_driver` makes it.
+fn pooled(dir: &Path, hidden: u32) -> RowReader {
+    let feed = feed_on(dir, hidden);
+    feed.rows().reader(2).unwrap()
+}
+
+fn assert_same_bits(left: &[f32], right: &[f32], what: &str) {
+    assert!(
+        left.iter()
+            .map(|value| value.to_bits())
+            .eq(right.iter().map(|value| value.to_bits())),
+        "{what}"
+    );
+}
+
+/// Runs `chunk` through all three feeds and requires every start vector, every PLE update and
+/// the final PLE state to agree bit for bit: `stepped` begins one token at a time, `serial`
+/// takes the whole chunk through the serial chunk path, `bulk` through the row pool.
+fn feed_chunk_three_ways(
+    stepped: &mut PackFeeds,
+    serial: &mut PackFeeds,
+    bulk: &mut PackFeeds,
+    chunk: &[u32],
+    hidden: usize,
+) {
+    let serial_starts = serial.begin_chunk(chunk, false).unwrap();
+    let bulk_starts = bulk.begin_chunk(chunk, false).unwrap();
+    assert_eq!(serial_starts.len(), chunk.len());
+    assert_eq!(bulk_starts.len(), chunk.len());
+    for (index, &token) in chunk.iter().enumerate() {
+        let truth = stepped.begin(token).unwrap();
+        for (name, start) in [
+            ("serial", &serial_starts[index]),
+            ("bulk", &bulk_starts[index]),
+        ] {
+            assert_eq!(start.stream, truth.stream, "{name} {chunk:?} row {index}");
+            assert_same_bits(
+                &start.ple_embedding,
+                &truth.ple_embedding,
+                &format!("{name} PLE embedding, chunk {chunk:?} row {index}"),
+            );
+        }
+        let stream = stream_of(hidden, token);
+        let want = stepped.ple_update(token, &stream).unwrap();
+        assert_eq!(
+            serial.ple_update(token, &stream).unwrap(),
+            want,
+            "serial update, chunk {chunk:?} row {index}"
+        );
+        assert_eq!(
+            bulk.ple_update(token, &stream).unwrap(),
+            want,
+            "bulk update, chunk {chunk:?} row {index}"
+        );
+    }
+    assert_eq!(serial.ple_state(), stepped.ple_state(), "serial {chunk:?}");
+    assert_eq!(bulk.ple_state(), stepped.ple_state(), "bulk {chunk:?}");
+}
+
+#[test]
+fn bulk_and_serial_chunks_and_per_token_steps_agree_bit_for_bit_with_eos_mid_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = 2u32;
+    let mut stepped = pack_feeds(dir.path(), hidden, None);
+    let mut serial = pack_feeds(dir.path(), hidden, None);
+    let mut bulk = pack_feeds(dir.path(), hidden, Some(pooled(dir.path(), hidden)));
+    // The first chunk opens with a history of zero tokens; the later chunks open on the
+    // histories the earlier ones left, one of them ending on EOS.
+    let chunks: [&[u32]; 6] = [
+        &[PROMPT[0], PROMPT[1]],
+        &[PROMPT[2], EOS, PROMPT[3], PROMPT[3], PROMPT[4]],
+        &[PROMPT[0], PROMPT[1], PROMPT[2], EOS],
+        &[PROMPT[3], PROMPT[4]],
+        &[EOS, PROMPT[0], PROMPT[1]],
+        &[PROMPT[2], EOS, EOS, PROMPT[4]],
+    ];
+    for chunk in chunks {
+        feed_chunk_three_ways(&mut stepped, &mut serial, &mut bulk, chunk, hidden as usize);
+    }
+}
+
+#[test]
+fn a_failed_bulk_read_fails_that_chunk_alone_and_the_retry_matches_the_serial_chunk() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = 2u32;
+    // A pool whose first read fails and whose later reads decode the real rows.
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let file = NgramFile::open(&path, &LocalGuard::new().unwrap(), KEY, LAYOUT).unwrap();
+    let table = Arc::new(NgramRows::new(file).unwrap());
+    let failed_once = Arc::new(AtomicBool::new(false));
+    let reader = RowReader::with_reader(
+        Arc::new({
+            let (table, failed_once) = (Arc::clone(&table), Arc::clone(&failed_once));
+            move |rows: &[u64]| {
+                if !failed_once.swap(true, Ordering::SeqCst) {
+                    return Err(EngError::Checkpoint("test: the n-gram read failed".into()));
+                }
+                let mut out = Vec::with_capacity(rows.len() * ROW_DIM);
+                for &row in rows {
+                    out.extend(table.row(row)?);
+                }
+                Ok(out)
+            }
+        }),
+        2,
+    )
+    .unwrap();
+    let mut bulk = pack_feeds(dir.path(), hidden, Some(reader));
+    let mut serial = pack_feeds(dir.path(), hidden, None);
+    let mut stepped = pack_feeds(dir.path(), hidden, None);
+    let first: &[u32] = &[PROMPT[0], PROMPT[1]];
+    let chunk: &[u32] = &[PROMPT[2], EOS, PROMPT[3], PROMPT[4]];
+
+    match bulk.begin_chunk(first, true) {
+        Err(EngError::Checkpoint(message)) => assert!(message.contains("read failed"), "{message}"),
+        other => panic!("{:?}", other.map(|starts| starts.len())),
+    }
+    // The failed chunk changed nothing the next one reads: not the PLE state, not the profile.
+    assert_eq!(bulk.ple_state(), serial.ple_state());
+    assert!(bulk.take_feed_profile().is_none());
+    // The same request goes on: the chunk and the ones after it match the other routes.
+    for chunk in [first, chunk, &[PROMPT[1], PROMPT[2], PROMPT[3]]] {
+        feed_chunk_three_ways(&mut stepped, &mut serial, &mut bulk, chunk, hidden as usize);
     }
 }
