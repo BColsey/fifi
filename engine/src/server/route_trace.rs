@@ -8,8 +8,8 @@
 //! GUI treats it as a live aggregate view, not a per-reply record. A step's picks are not
 //! correlated to a reply id; the reply correlation of the sampler trace is a different packet.
 //!
-//! The route is a server extension outside the client contract, exactly like
-//! `/v1/recent-requests` and `/v1/sampler-trace`, and carries the process API key. When the
+//! The route is a contract route, exactly like `/v1/recent-requests` and
+//! `/v1/sampler-trace`, and carries the process API key. When the
 //! flag is off the route answers 404 with the enabling hint, never an empty packet, so the GUI
 //! cannot mistake "off" for "no activity".
 
@@ -64,6 +64,7 @@ pub(crate) async fn get_route_trace() -> Result<Response, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::contract::assert_schema;
 
     fn picks(id: i32, weight: f32, gate: f32) -> LayerPicks {
         LayerPicks {
@@ -80,6 +81,7 @@ mod tests {
             (8_u32, vec![picks(500, 0.75, 1.0); 2]),
         ];
         let body = packet(&steps, Some((2, 2, 8)));
+        assert_schema("RouteTracePacket", &body);
         assert_eq!(body["packet"], 1);
         assert_eq!(body["ring_capacity"], route_stage::RING_STEPS);
         let steps = body["steps"].as_array().expect("steps array");

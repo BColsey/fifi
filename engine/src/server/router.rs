@@ -5,7 +5,7 @@
 //! extensions `POST /v1/token/encode`, `POST /v1/token/decode`, `POST /v1/apply-template`, and
 //! `GET /v1/recent-requests` (the GUI's live speed panel) and `GET /v1/sampler-trace` (one
 //! reply's armed sampler-trace packet; see `sampler_trace.rs`) and `GET /v1/route-trace` (the
-//! engine-wide routing stage ring; see `route_trace.rs`). The extensions are not in the
+//! engine-wide routing stage ring; see `route_trace.rs`). The extensions are part of the
 //! client contract.
 //! A route that the contract does not define, or that this server does not ship, gives a JSON 404.
 //! A method that a served path does not accept counts as an undefined route, because the contract
@@ -565,6 +565,36 @@ mod tests {
         let ready = &body["data"][1]["engines"][0];
         assert_eq!(ready["state"], "ready");
         assert!(ready.get("error").is_none(), "{ready}");
+    }
+
+    #[tokio::test]
+    async fn telemetry_route_matches_the_contract() {
+        let (state, _engine) = one_engine_state();
+        // A seeded store serves the route from the cache, so the test never
+        // spawns nvidia-smi: no GPU tool, no hung driver, no blocking wait.
+        // The unparseable power field stays null, exercising that shape too.
+        state.telemetry_store(serde_json::json!({
+            "gpus": super::parse_gpu_csv("0, NVIDIA X, 5, 100, 6144, 40, [N/A]\n"),
+            "source": "nvidia-smi",
+            "error": null,
+        }));
+        let request = testkit::get("/v1/telemetry", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        assert_schema("Telemetry", &body);
+        assert_eq!(body["gpus"].as_array().expect("gpu rows").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recent_requests_route_lists_an_empty_ring_at_startup() {
+        let (state, _engine) = one_engine_state();
+        let request = testkit::get("/v1/recent-requests", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        assert_schema("RecentRequests", &body);
+        assert!(body["requests"].as_array().expect("array").is_empty());
     }
 
     fn web_state() -> (

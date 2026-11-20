@@ -315,6 +315,7 @@ mod tests {
         let body = json!({"model": "model-a", "text": "hi!"});
         let (status, reply) = post(&app(&engine), "/v1/token/encode", &body).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_schema("EncodeResponse", &reply);
         assert_eq!(reply, json!({"tokens": [104, 105, 33], "length": 3}));
     }
 
@@ -343,6 +344,7 @@ mod tests {
         let body = json!({"model": "model-a", "tokens": [104, 105, 33]});
         let (status, reply) = post(&app, "/v1/token/decode", &body).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_schema("DecodeResponse", &reply);
         assert_eq!(reply, json!({"text": "hi!"}));
         let special = json!({"model": "model-a", "tokens": [257, 104, 256]});
         let (_, reply) = post(&app, "/v1/token/decode", &special).await;
@@ -374,6 +376,7 @@ mod tests {
         let body = json!({"model": "model-a", "messages": hi()});
         let (status, reply) = post(&app(&engine), "/v1/apply-template", &body).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_schema("ApplyTemplateResponse", &reply);
         assert_eq!(reply, json!({"prompt": PROMPT_OF_HI}));
     }
 

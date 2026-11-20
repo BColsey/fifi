@@ -781,6 +781,7 @@ mod tests {
     use crate::EngError;
     use crate::sched::job::{PrefillBankReport, PrefillPieces, PrefixHit, PrefixReport};
     use crate::sched::worker::{Engine, EngineState};
+    use crate::server::contract::assert_schema;
     use crate::server::router::router;
     use crate::server::state::AppState;
     use crate::server::testkit::{self, Ending};
@@ -1054,6 +1055,9 @@ mod tests {
         let (status, _headers, bytes) = testkit::send(&app, request).await;
         assert_eq!(status, StatusCode::OK);
         let reply = testkit::json_of(&bytes);
+        // The row carries values this request never set (session, error
+        // code): the schema must accept them, as null members.
+        assert_schema("RecentRequests", &reply);
         let rows = reply["requests"].as_array().expect("requests array");
         assert_eq!(rows.len(), 1, "this server's ring holds exactly its row");
         let row = &rows[0];
@@ -1074,6 +1078,18 @@ mod tests {
         assert_eq!(row["endpoint"], "/v1/messages");
         assert_eq!(row["outcome"], "ok");
         assert_eq!(&ring.rows_newest_first()[0], row);
+        // A second row with a fractional timing proves the schema's number
+        // type for the three timing fields on real ring data, not by luck
+        // of an integral millisecond.
+        ring.push("{\"model\": \"m\", \"endpoint\": \"/v1/messages\", \"queue_wait_ms\": 12.4}");
+        let request = testkit::get("/v1/recent-requests", Some(testkit::API_KEY));
+        let (status, _headers, bytes) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = testkit::json_of(&bytes);
+        assert_schema("RecentRequests", &reply);
+        let rows = reply["requests"].as_array().expect("requests array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["queue_wait_ms"].as_f64(), Some(12.4));
     }
 
     #[test]

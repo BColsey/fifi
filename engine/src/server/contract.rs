@@ -69,6 +69,103 @@ mod tests {
         );
     }
 
+    /// The (path, method) pairs router.rs registers, scanned from every
+    /// `.route("<path>", <method>(...))` call: whitespace and line breaks
+    /// inside the call are tolerated, and comment lines are dropped so a
+    /// documented route is never scanned.
+    fn served_routes(source: &str) -> Vec<(String, String)> {
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut served = Vec::new();
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let after_open = rest.trim_start();
+            let Some(after_path) = after_open.strip_prefix('"') else {
+                continue;
+            };
+            let Some(path_end) = after_path.find('"') else {
+                continue;
+            };
+            let path = after_path[..path_end].to_string();
+            let Some(comma) = after_path[path_end + 1..].find(',') else {
+                continue;
+            };
+            let after_comma = after_path[path_end + 1 + comma + 1..].trim_start();
+            let method_len = after_comma
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_comma.len());
+            served.push((path, after_comma[..method_len].to_string()));
+            rest = &after_comma[method_len..];
+        }
+        served
+    }
+
+    #[test]
+    fn every_router_route_is_in_the_contract() {
+        let source = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/router.rs"))
+            .expect("read src/server/router.rs");
+        let served = served_routes(&String::from_utf8_lossy(&source));
+        // A silent scan gap (an unmatched format, a moved file) cannot pass.
+        assert!(
+            served.len() >= 15,
+            "the router scan found {} routes; the scan is broken",
+            served.len()
+        );
+        // The web shell serves files, not the API contract.
+        let non_contract = ["/", "/assets/{*path}"];
+        let contract = super::fixture()["paths"]
+            .as_object()
+            .expect("contract paths");
+        let undocumented: Vec<&str> = served
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|route| !non_contract.contains(route) && !contract.contains_key(*route))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "routes the router serves but api/openapi.yaml does not describe: {undocumented:?}; \
+             add them to the contract and regenerate the fixture"
+        );
+        let unrouted: Vec<&String> = contract
+            .keys()
+            .filter(|path| {
+                !served
+                    .iter()
+                    .any(|(served, _)| served.as_str() == path.as_str())
+            })
+            .collect();
+        assert!(
+            unrouted.is_empty(),
+            "contract paths the router does not serve: {unrouted:?}"
+        );
+        // Methods too: every served (path, method) pair is declared in the
+        // contract, and every declared operation is served.
+        let mut served_ops: Vec<(String, String)> = served
+            .into_iter()
+            .filter(|(path, _)| !non_contract.contains(&path.as_str()))
+            .collect();
+        let mut declared: Vec<(String, String)> = contract
+            .iter()
+            .flat_map(|(path, item)| {
+                item.as_object()
+                    .expect("a path item")
+                    .keys()
+                    .map(|method| (path.clone(), method.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        served_ops.sort();
+        declared.sort();
+        assert_eq!(
+            served_ops, declared,
+            "served operations and contract operations differ"
+        );
+    }
+
     #[test]
     fn a_body_that_follows_the_contract_passes() {
         let body = json!({"error": {"message": "bad", "code": "bad_request"}});

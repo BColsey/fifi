@@ -297,6 +297,7 @@ pub(crate) async fn get_sampler_trace(
 mod tests {
     use super::*;
     use crate::family::sampler::{RecordedSample, SampleObservation, Sampler};
+    use crate::server::contract::assert_schema;
 
     /// Verified upper bound on one serialized position's bytes. Six candidates
     /// (five shown plus a rank-outside selected) with large ids,
@@ -427,6 +428,7 @@ mod tests {
         }
         let buffer = handle.lock().expect("buffer lock");
         let body = packet("r", &meta(), &buffer);
+        assert_schema("SamplerTracePacket", &body);
         assert_eq!(body["packet"], 2);
         assert_eq!(body["truncated"], true);
         assert_eq!(body["captured_positions"], 10);

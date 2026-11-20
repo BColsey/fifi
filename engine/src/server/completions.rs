@@ -215,6 +215,7 @@ mod tests {
         let engine = testkit::engine(testkit::script("Hello!"));
         let (status, body) = post(&app(&engine, 4_096), &request(json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_schema("Completion", &body);
         assert_eq!(body["object"], "text_completion");
         assert_eq!(body["model"], "model-a");
         assert_eq!(body["engine"], "e1");
@@ -320,6 +321,7 @@ mod tests {
             })
             .collect();
         for chunk in &chunks {
+            assert_schema("Completion", chunk);
             assert_eq!(chunk["object"], "text_completion");
             assert_eq!(chunk["model"], "model-a");
             assert_eq!(chunk["choices"][0]["index"], 0);
