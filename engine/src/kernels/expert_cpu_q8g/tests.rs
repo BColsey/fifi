@@ -922,6 +922,7 @@ fn identity_activation_rows(k: usize) -> Vec<Vec<f32>> {
 /// Already-quantized activation rows at the byte extremes, with the group sums the quantizer
 /// would store. The quantizer never emits -128, but the kernel accepts it, so the bound has to
 /// hold there too.
+#[cfg(target_arch = "x86_64")]
 fn identity_quantized_rows(k: usize) -> Vec<Q8gRow> {
     let mut rng = Lcg(0xFEED_0000 ^ k as u64);
     let mut rows = Vec::new();
