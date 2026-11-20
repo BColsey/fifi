@@ -38,8 +38,10 @@ use super::{
         DriverShape, ResumeSnapshot, ResumesState, StepperPositions, TokenDriver, TokenTimes,
     },
     executor::{CudaRules, FlashCudaExecutor},
-    feeds::StartShape,
-    feeds::device::{DevicePle, PleUpload},
+    feeds::{
+        DEFAULT_THREADS, StartShape,
+        device::{DevicePle, PleUpload},
+    },
     load::{TrunkList, upload::trunk_weights},
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
@@ -52,7 +54,7 @@ use crate::family::expert_bank::{
     BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru,
     bank_tier::{RUNG_RING_SLOTS, TierChoice, rung_ring_placeholder_bytes},
 };
-use crate::family::flash_next::settings::{ple_batch, ple_device};
+use crate::family::flash_next::settings::{ngram_bulk, ple_batch, ple_device};
 use crate::{
     EngError,
     family::{
@@ -585,6 +587,7 @@ pub(super) fn build_driver(
     let host_admission = HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?;
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
+    let bulk_reader = ngram_bulk()? && rows > 1;
     // The shared prefill arena serves chunked prefill only; `prefill_rows = 1` is the
     // per-token driver and keeps the pre-switch charge of zero.
     let prefill_arena_bytes = if rows > 1 {
@@ -1002,6 +1005,9 @@ pub(super) fn build_driver(
         ple_threads(),
     )?;
     let ngram_rows = NgramRows::new(ngram)?;
+    let reader = bulk_reader
+        .then(|| ngram_rows.reader(DEFAULT_THREADS))
+        .transpose()?;
     // The device route (chunked prefill only): the projections upload to the card and the feed
     // takes precomputed pairs; the host projection still backs the flag-off path.
     let device_ple = match ple_device()?.then_some(rows > 1) {
@@ -1078,7 +1084,7 @@ pub(super) fn build_driver(
     let hidden = model.hyper.hidden();
     let branches = model.hyper.branches();
     let ple_embed = model.ple.embed();
-    let feeds = PackFeeds::new(&checkpoint.source, ple, hidden, branches);
+    let feeds = PackFeeds::new(&checkpoint.source, ple, hidden, branches, reader);
     let shape = DriverShape {
         layers,
         ple_layer: model.ple_layer,

@@ -19,6 +19,9 @@
 //! Host cost: the key projection is `width x ple_embed` (10,240 x 2,560) F32 and the value
 //! projection `hidden x ple_embed`, about 33 M multiply-adds per token on `threads` host threads.
 
+use std::{rc::Rc, sync::Arc};
+
+use super::feeds::{self, ChunkRows, RowBlock, RowReader};
 use crate::{
     EngError,
     family::{
@@ -55,8 +58,8 @@ fn le_i64(bytes: &[u8], what: &str) -> Result<Vec<i64>, EngError> {
 /// The n-gram file with its decoder and hash tensors: global row to values. `Sync`, so the rows of
 /// the next token can be gathered on another thread while the card works (asserted below).
 pub(in crate::family) struct NgramRows {
-    file: NgramFile,
-    decoder: NgramDecoder,
+    file: Arc<NgramFile>,
+    decoder: Arc<NgramDecoder>,
     multipliers: Vec<i64>,
     vocab: Vec<i64>,
     offsets: Vec<i64>,
@@ -84,12 +87,16 @@ impl NgramRows {
             .collect();
         let decoder = NgramDecoder::new(file.table(), &offsets, &vocab, &bias)?;
         Ok(Self {
-            file,
-            decoder,
+            file: Arc::new(file),
+            decoder: Arc::new(decoder),
             multipliers,
             vocab,
             offsets,
         })
+    }
+
+    pub(in crate::family) fn reader(&self, threads: usize) -> Result<RowReader, EngError> {
+        RowReader::new(Arc::clone(&self.file), Arc::clone(&self.decoder), threads)
     }
 
     /// Rows in the table, the single virtual table the step addresses.
@@ -108,7 +115,7 @@ impl NgramRows {
                 Ok((row, self.row(row)?))
             })
             .collect::<Result<Vec<_>, EngError>>()?;
-        Ok(Gathered { rows })
+        Ok(Gathered::Serial(rows))
     }
 
     /// Reads and decodes global row `row`.
@@ -471,21 +478,30 @@ pub(in crate::family) enum FeedWeight {
 
 /// The decoded rows of one token, keyed by global row.
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::family) struct Gathered {
-    rows: Vec<(u64, Vec<f32>)>,
+pub(in crate::family) enum Gathered {
+    Serial(Vec<(u64, Vec<f32>)>),
+    Bulk { ids: Vec<u64>, block: Rc<RowBlock> },
 }
 
 impl Gathered {
+    #[cfg(test)]
     pub(in crate::family) fn len(&self) -> usize {
-        self.rows.len()
+        match self {
+            Self::Serial(rows) => rows.len(),
+            Self::Bulk { ids, .. } => ids.len(),
+        }
     }
 
-    /// The decoded values of global row `row`, if it was gathered.
+    /// The decoded values of global row `row`, if it was gathered for this token.
     pub(in crate::family) fn get(&self, row: u64) -> Option<&[f32]> {
-        self.rows
-            .iter()
-            .find(|(global, _)| *global == row)
-            .map(|(_, values)| values.as_slice())
+        match self {
+            Self::Serial(rows) => rows
+                .iter()
+                .find(|(global, _)| *global == row)
+                .map(|(_, values)| values.as_slice()),
+            Self::Bulk { ids, block } if ids.contains(&row) => block.get(row),
+            Self::Bulk { .. } => None,
+        }
     }
 }
 
@@ -780,6 +796,11 @@ impl PleFeed {
         // the end-of-sequence marker for the second token and pick a different row set.
         let keep_from = history.len().saturating_sub(2);
         ple::plan_rows(&self.shape, &self.weights(), &history[keep_from..], token)
+    }
+
+    /// Plans the chunk from the committed history without changing the PLE state.
+    pub(in crate::family) fn plan_chunk(&self, tokens: &[u32]) -> Result<ChunkRows, EngError> {
+        feeds::plan_chunk(&self.shape, &self.weights(), self.state.history(), tokens)
     }
 
     /// Reads and decodes the rows of `plan` (see [`NgramRows::gather`]).

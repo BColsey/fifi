@@ -30,7 +30,7 @@
 //! No user-space row cache: the page cache holds the rows, and a cache is justified only by a
 //! measured low hit rate.
 
-// Staged: the Flash-Next CUDA step is the first caller.
+// The reader serves chunked prefill. Some staging helpers are still only used by tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::{
@@ -134,18 +134,18 @@ pub(in crate::family) struct PendingRows {
 
 impl PendingRows {
     pub(in crate::family) fn wait(self) -> Result<RowBlock, EngError> {
-        let mut parts: Vec<Option<Vec<f32>>> = vec![None; self.parts];
+        let mut parts = vec![None; self.parts];
         for _ in 0..self.parts {
             let (part, result) = self.replies.recv().map_err(|_| {
                 EngError::Checkpoint("an n-gram reader thread ended before it replied".to_owned())
             })?;
-            parts[part] = Some(result?);
+            parts[part] = Some(result);
         }
         let mut values = Vec::with_capacity(self.ids.len() * ROW_DIM);
         for part in parts {
             values.extend(part.ok_or_else(|| {
                 EngError::Checkpoint("an n-gram reader part is missing".to_owned())
-            })?);
+            })??);
         }
         if values.len() != self.ids.len() * ROW_DIM {
             return Err(EngError::Checkpoint(format!(

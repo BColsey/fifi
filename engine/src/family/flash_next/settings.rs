@@ -390,6 +390,17 @@ impl FlashSettings {
     }
 }
 
+/// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool.
+pub(in crate::family::flash_next) fn ngram_bulk() -> Result<bool, EngError> {
+    match std::env::var_os("INFERENCE_FLASH_NEXT_NGRAM_BULK") {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset or \"1\"".into(),
+        )),
+    }
+}
+
 /// Whether the chunked prefill runs its two PLE projections on the card (the
 /// `dense_gemv` pair): `INFERENCE_FLASH_NEXT_PLE_DEVICE=1` opts in, the default keeps the host
 /// matvecs. The card reads the stored F16/BF16 weights once per chunk instead of the host's

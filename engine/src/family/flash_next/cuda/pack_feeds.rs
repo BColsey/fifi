@@ -1,17 +1,15 @@
 //! The host feeds of a token from the real pack: [`PackFeeds`] is the [`TokenFeeds`] of the driver.
 //!
-//! WHAT: [`TokenFeeds::begin`] reads the token's BF16 embedding row (`embedding::stream_row`, one
-//! positioned read of 5 KiB), plans and reads its 16 n-gram rows (`PleFeed::plan` and `gather`) and
-//! keeps the gathered rows for the update. [`TokenFeeds::ple_update`] hands the stream at the PLE
-//! layer's input to `PleFeed::update`, which is the host reference's PLE step over those rows.
-//!
-//! WHY the rows are read in `begin`: the driver reads them before it writes anything to the card, so
-//! a failed read leaves the state as it was. Overlapping the read with the layers before the PLE
-//! layer is a later change (the rows depend on the token history only).
+//! The driver gathers its BF16 token embeddings and n-gram rows before writing anything to the
+//! card. With the optional row pool, a multi-token chunk submits its n-gram reads before gathering
+//! the BF16 embeddings and shares the decoded row block in the ordered PLE updates.
+
+use std::{collections::VecDeque, rc::Rc};
 
 use super::{
     driver::{StartVectors, TokenFeeds},
     embedding::stream_row,
+    feeds::RowReader,
     ple_feed::{Gathered, PleFeed, PleKeyValue},
 };
 use crate::{EngError, weights::StreamedCheckpoint};
@@ -23,9 +21,9 @@ struct Pending<T> {
 }
 
 /// Takes the front pending rows, which must be `token`'s; a chunk consumes its rows in order.
-fn take_pending<T>(pending: &mut Vec<Pending<T>>, token: u32) -> Result<T, EngError> {
-    if pending.first().is_some_and(|front| front.token == token) {
-        return Ok(pending.remove(0).rows);
+fn take_pending<T>(pending: &mut VecDeque<Pending<T>>, token: u32) -> Result<T, EngError> {
+    if let Some(front) = pending.pop_front_if(|front| front.token == token) {
+        return Ok(front.rows);
     }
     Err(EngError::BadRequest(format!(
         "no n-gram rows were read for token {token}"
@@ -37,7 +35,8 @@ pub(super) struct PackFeeds {
     ple: PleFeed,
     hidden: usize,
     branches: usize,
-    pending: Vec<Pending<Gathered>>,
+    pending: VecDeque<Pending<Gathered>>,
+    reader: Option<RowReader>,
 }
 
 impl PackFeeds {
@@ -46,14 +45,50 @@ impl PackFeeds {
         ple: PleFeed,
         hidden: usize,
         branches: usize,
+        reader: Option<RowReader>,
     ) -> Self {
         Self {
             source,
             ple,
             hidden,
             branches,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
+            reader,
         }
+    }
+
+    fn begin_bulk_chunk(
+        &self,
+        tokens: &[u32],
+        reader: &RowReader,
+    ) -> Result<(Vec<StartVectors>, VecDeque<Pending<Gathered>>), EngError> {
+        let plan = self.ple.plan_chunk(tokens)?;
+        let read = reader.submit(&plan.all())?;
+        let streams: Result<Vec<_>, _> = tokens
+            .iter()
+            .map(|&token| stream_row(self.source, token, self.hidden, self.branches))
+            .collect();
+        let block = read.wait();
+        let streams = streams?;
+        let block = Rc::new(block?);
+
+        let mut starts = Vec::with_capacity(tokens.len());
+        let mut pending = VecDeque::with_capacity(tokens.len());
+        for ((&token, stream), ids) in tokens.iter().zip(streams).zip(plan.per_token) {
+            let ple_embedding = block.embedding(&ids, 1.0)?;
+            starts.push(StartVectors {
+                stream,
+                ple_embedding,
+            });
+            pending.push_back(Pending {
+                token,
+                rows: Gathered::Bulk {
+                    ids,
+                    block: Rc::clone(&block),
+                },
+            });
+        }
+        Ok((starts, pending))
     }
 }
 
@@ -67,8 +102,14 @@ impl TokenFeeds for PackFeeds {
     /// in the chunk), and every row set stays pending for the ordered update pass. All reads
     /// are host-only, so a failure leaves the feed where it was.
     fn begin_chunk(&mut self, tokens: &[u32]) -> Result<Vec<StartVectors>, EngError> {
+        if let Some(reader) = self.reader.as_ref().filter(|_| tokens.len() > 1) {
+            let (starts, pending) = self.begin_bulk_chunk(tokens, reader)?;
+            self.pending = pending;
+            return Ok(starts);
+        }
+
         let mut starts = Vec::with_capacity(tokens.len());
-        let mut pending = Vec::with_capacity(tokens.len());
+        let mut pending = VecDeque::with_capacity(tokens.len());
         for (i, &token) in tokens.iter().enumerate() {
             let stream = stream_row(self.source, token, self.hidden, self.branches)?;
             let (ple_embedding, rows) = self.ple.chunk_embedding(&tokens[..i], token)?;
@@ -76,7 +117,7 @@ impl TokenFeeds for PackFeeds {
                 stream,
                 ple_embedding,
             });
-            pending.push(Pending { token, rows });
+            pending.push_back(Pending { token, rows });
         }
         self.pending = pending;
         Ok(starts)
@@ -108,7 +149,7 @@ impl TokenFeeds for PackFeeds {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pending, take_pending};
+    use super::{Pending, VecDeque, take_pending};
     use crate::EngError;
 
     #[test]
@@ -116,7 +157,8 @@ mod tests {
         let mut pending = vec![Pending {
             token: 7,
             rows: "rows",
-        }];
+        }]
+        .into();
         assert_eq!(take_pending(&mut pending, 7).unwrap(), "rows");
         assert!(matches!(
             take_pending(&mut pending, 7),
@@ -129,7 +171,8 @@ mod tests {
         let mut pending = vec![Pending {
             token: 7,
             rows: "rows",
-        }];
+        }]
+        .into();
         assert!(matches!(
             take_pending(&mut pending, 8),
             Err(EngError::BadRequest(text)) if text.contains("token 8")
@@ -138,7 +181,7 @@ mod tests {
         // the row the real token still needs.
         assert_eq!(pending.len(), 1);
         assert_eq!(take_pending(&mut pending, 7).unwrap(), "rows");
-        let mut empty: Vec<Pending<()>> = Vec::new();
+        let mut empty: VecDeque<Pending<()>> = VecDeque::new();
         assert!(take_pending(&mut empty, 1).is_err());
     }
 }

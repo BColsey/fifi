@@ -270,7 +270,7 @@ fn a_failed_update_leaves_the_history_and_ring_alone() {
     let stream = values(BRANCHES * hidden, 40, 1.0);
     // A short stream, then rows that were not gathered for this token.
     assert!(feed.update(PROMPT[0], &gathered, &stream[1..]).is_err());
-    let empty = Gathered { rows: Vec::new() };
+    let empty = Gathered::Serial(Vec::new());
     assert!(matches!(
         feed.update(PROMPT[0], &empty, &stream),
         Err(EngError::BadRequest(_))
@@ -654,4 +654,55 @@ fn the_packed_chunk_embeddings_match_the_per_token_step_embeddings() {
             "row {index}: the packed embedding differs from the one the step projects"
         );
     }
+}
+
+#[test]
+fn bulk_pack_feeds_match_ordered_steps_across_resume_and_eos() {
+    use super::super::{driver::TokenFeeds, pack_feeds::PackFeeds, testkit::checkpoint};
+    use crate::family::exl3_pack::EMBED_NAME;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = 2;
+    let vocab = EOS + 1;
+    let source = Box::leak(Box::new(checkpoint(&[(
+        EMBED_NAME,
+        "BF16",
+        vec![vocab, hidden],
+        vec![0; (vocab * hidden * 2) as usize],
+    )])));
+    let baseline = feed_on(dir.path(), hidden);
+    let bulk = feed_on(dir.path(), hidden);
+    let reader = bulk.rows().reader(2).unwrap();
+    let mut serial = PackFeeds::new(source, baseline, hidden as usize, BRANCHES, None);
+    let mut batched = PackFeeds::new(source, bulk, hidden as usize, BRANCHES, Some(reader));
+
+    let start = serial.begin(PROMPT[0]).unwrap();
+    serial.ple_update(PROMPT[0], &start.stream).unwrap();
+    let (history, ring) = serial.ple_state().unwrap();
+    batched.ple_resume(history, ring).unwrap();
+
+    let tokens = [PROMPT[1], EOS, PROMPT[2], PROMPT[2], PROMPT[2], PROMPT[2]];
+    // An invalid last token must leave the committed state intact for the retry.
+    assert!(batched.begin_chunk(&[tokens[0], vocab]).is_err());
+    assert_eq!(batched.ple_state(), serial.ple_state());
+
+    let starts = batched.begin_chunk(&tokens).unwrap();
+    assert_eq!(starts.len(), tokens.len());
+    for (&token, bulk_start) in tokens.iter().zip(starts) {
+        let baseline = serial.begin(token).unwrap();
+        assert_eq!(bulk_start.stream, baseline.stream);
+        assert!(
+            bulk_start
+                .ple_embedding
+                .iter()
+                .map(|value| value.to_bits())
+                .eq(baseline.ple_embedding.iter().map(|value| value.to_bits()))
+        );
+        let stream = values(BRANCHES * hidden as usize, token as usize, 1.0);
+        assert_eq!(
+            batched.ple_update(token, &stream).unwrap(),
+            serial.ple_update(token, &stream).unwrap(),
+        );
+    }
+    assert_eq!(batched.ple_state(), serial.ple_state());
 }
