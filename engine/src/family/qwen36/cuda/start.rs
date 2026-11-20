@@ -1690,6 +1690,12 @@ fn make(
         );
         if let Some(short) = &card_short {
             eprintln!("{}", short.line(slots, options.context_tokens));
+            if settings.prefix_reuse {
+                eprintln!(
+                    "q36 cuda: prefix reuse follows the tiered engine's prefix store, which is off \
+                     unless Q36_TIERED_PREFIX=1"
+                );
+            }
         }
     }
     eprintln!(

@@ -151,6 +151,9 @@ struct Shared {
     /// Jobs being submitted or waiting to be dequeued. In-progress submissions
     /// are included conservatively, even if the channel later refuses them.
     queued: AtomicUsize,
+    /// Set once the built executor reports a prefix store of no roots and no entries: a prompt
+    /// boundary sent to such an engine can neither be saved nor restored.
+    no_prefix_store: AtomicBool,
 }
 
 struct ActiveJob {
@@ -168,6 +171,7 @@ impl Shared {
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
             queued: AtomicUsize::new(0),
+            no_prefix_store: AtomicBool::new(false),
         }
     }
 
@@ -260,6 +264,13 @@ pub(crate) struct EngineHandle {
 impl EngineHandle {
     pub(crate) fn state(&self) -> EngineState {
         self.shared.state()
+    }
+
+    /// Whether the engine keeps a prefix store a prompt boundary can use. True until a built
+    /// executor reports a store of no roots and no entries (a tiered Qwen3.6 start, for one):
+    /// the chat handler then marks no boundary, exactly as when the config turns the flag off.
+    pub(crate) fn keeps_prefix_store(&self) -> bool {
+        !self.shared.no_prefix_store.load(Ordering::SeqCst)
     }
 
     /// The phase the engine's start code last announced, present only
@@ -597,6 +608,10 @@ fn work<E, F>(
         drain(jobs, reject);
         return;
     }
+    let limits = executor.prefix_limits();
+    shared
+        .no_prefix_store
+        .store(limits.roots == 0 && limits.entries == 0, Ordering::SeqCst);
     shared.set_state(EngineState::Ready);
     shared.clear_load_stage();
     // The engine reports its own prefix capability to the one-shot note: the
@@ -604,7 +619,7 @@ fn work<E, F>(
     // family reports correctly without a factory flag.
     if let Some(note) = ready_note {
         note(EngineNote::Ready(PrefixCapability {
-            cuts_block: cuts_intermediate(executor.prefix_limits()),
+            cuts_block: cuts_intermediate(limits),
             spacing: executor.prefix_block_spacing(),
         }));
     }
@@ -1704,6 +1719,32 @@ mod tests {
             handle.state() == super::EngineState::Ready
         });
         assert_eq!(handle.load_stage(), None, "a ready engine reports no stage");
+    }
+
+    /// An executor that reports a prefix store of no roots and no entries leaves the handle
+    /// saying so by the time the engine is ready; every other store, the default one-entry
+    /// store included, keeps the answer true.
+    #[test]
+    fn the_handle_reports_whether_the_engine_keeps_a_prefix_store() {
+        for (roots, entries, kept) in [(0, 0, false), (0, 1, true), (2, 6, true), (1, 0, true)] {
+            let engine = spawn_engine::<FakeExecutor, _>(8, move |_| {
+                let mut executor = FakeExecutor::new(vec![], &[EOS], 100_000);
+                executor.with_prefix_limits(roots, entries);
+                Ok((executor, <FakeExecutor as ExecutorOps>::Session::default()))
+            })
+            .expect("spawn engine");
+            let handle = engine.handle();
+            wait_until("the engine to become ready", || {
+                handle.state() == super::EngineState::Ready
+            });
+            assert_eq!(
+                handle.keeps_prefix_store(),
+                kept,
+                "roots {roots}, entries {entries}"
+            );
+            drop(handle);
+            engine.shutdown();
+        }
     }
 
     /// A load that announced a stage and then failed leaves the stage
