@@ -657,6 +657,14 @@ impl PrefillArena {
             .transpose()
     }
 
+    /// Highest exclusive key position covered by a contiguous FP16 staging allocation.
+    pub(super) fn contiguous_staging_rows(&self) -> usize {
+        match &self.kv8_staging {
+            Some((plan, _, false)) => plan.capacity,
+            _ => 0,
+        }
+    }
+
     pub(super) fn segmented(&self) -> bool {
         self.kv8_staging.as_ref().is_some_and(|(_, _, mode)| *mode)
     }
@@ -704,12 +712,16 @@ pub(super) fn drive_chunks(
     drive_steps(start, tokens, steps, run)
 }
 
-/// Reuses the admitted arena for adjacent tiered chunks through 8K.
-/// The 4,096-row experiment also coalesces the initial pieces; normal arenas keep their cutoff.
-/// This bounded experiment leaves the normal planner and every later position unchanged.
-pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Vec<PrefillStep> {
+/// Merge adjacent steps within this feed. Beyond the original 8K range, a
+/// merged chunk must fit the contiguous K/V stage and the 2,048-row staged
+/// attention path. Larger chunks use query subtiles and may restage the keys.
+pub(super) fn coalesce_tiered_deep(
+    steps: Vec<PrefillStep>,
+    m_sess: usize,
+    staged_end: usize,
+) -> Vec<PrefillStep> {
     let first_deep = if m_sess == 4096 { 0 } else { 3_072 };
-    const LAST_END: usize = 8_192;
+    const ORIGINAL_END: usize = 8_192;
     const KV8_MAX_ROWS: usize = 4_096;
     let limit = m_sess.min(KV8_MAX_ROWS);
     let mut out = Vec::with_capacity(steps.len());
@@ -724,7 +736,8 @@ pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Ve
             && p0.checked_add(*rows) == Some(next)
             && let Some(total) = rows.checked_add(more)
             && total <= limit
-            && p0.checked_add(total).is_some_and(|end| end <= LAST_END)
+            && let Some(end) = p0.checked_add(total)
+            && (end <= ORIGINAL_END || (end <= staged_end && total <= 2_048))
         {
             *rows = total;
             merged = true;
@@ -736,17 +749,18 @@ pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Ve
     out
 }
 
-/// Experimental tiered driver: coalesce only the bounded deep pieces of the normal plan.
+/// Coalesce eligible tiered chunks within the stage and the current scheduler piece.
 pub(super) fn drive_tiered_wide_chunks(
     start: usize,
     tokens: &[u32],
     m_sess: usize,
     fixed_depth: bool,
+    staged_end: usize,
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
     let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
     let original = steps.len();
-    let widened = coalesce_tiered_deep(steps, m_sess);
+    let widened = coalesce_tiered_deep(steps, m_sess, staged_end);
     eprintln!(
         "tiered-wide-prefill: planned {original} steps as {}",
         widened.len()

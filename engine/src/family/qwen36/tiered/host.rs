@@ -1685,6 +1685,59 @@ mod tests {
         assert_eq!(bits(&got), bits(&want));
     }
 
+    /// Exercises the actual host dispatch with the gate both unset and enabled in separate
+    /// test processes. The reference is the whole-expert Q8_G path in routing order.
+    #[test]
+    fn q8g_split_dispatch_matches_the_whole_expert_sum() {
+        use crate::kernels::expert_cpu_q8g::{ExpertScratchQ8g, expert_forward_q8g};
+
+        let mut f = fixture();
+        f.host.pool =
+            CpuPool::with_kernel(2, SHAPE, ExpertKernel::Q8g(DotBackend::scalar())).unwrap();
+        install(&mut f.host, 1, 6, 1);
+        let ids = [3, 6, 1];
+        let weights = [0.25f32, 0.5, 0.125];
+        f.host
+            .begin_layer(1, &ids, &weights, &f.hidden, &f.hidden)
+            .unwrap();
+        let used_split = matches!(
+            f.host
+                .in_flight
+                .as_ref()
+                .and_then(|pending| pending.jobs.as_ref()),
+            Some(LayerJobs::Split { .. })
+        );
+        let requested = std::env::var_os("Q36_TIERED_SPLIT_JOBS").is_some_and(|value| value == "1");
+        assert_eq!(used_split, requested);
+        let got = f.host.finish_layer(1).unwrap().unwrap();
+
+        let bytes = f.region.bytes();
+        let mut scratch = ExpertScratchQ8g::new(SHAPE);
+        let mut out = vec![0.0f32; SHAPE.hidden];
+        let mut want = vec![0.0f32; SHAPE.hidden];
+        for (expert, weight) in [(3usize, 0.25f32), (1, 0.125)] {
+            let ranges = f.reference.ranges(1, expert).unwrap();
+            let slices = ExpertSlices {
+                gate: &bytes[ranges.gate],
+                up: &bytes[ranges.up],
+                down: &bytes[ranges.down],
+            };
+            expert_forward_q8g(
+                DotBackend::scalar(),
+                SHAPE,
+                &slices,
+                &f.hidden,
+                &mut scratch,
+                &mut out,
+            )
+            .unwrap();
+            for (sum, value) in want.iter_mut().zip(&out) {
+                *sum += weight * value;
+            }
+        }
+        assert_eq!(bits(&got), bits(&want));
+    }
+
     #[test]
     fn bad_routes_start_nothing() {
         let mut f = fixture();

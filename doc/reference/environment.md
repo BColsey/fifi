@@ -102,6 +102,7 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `Q36_TIERED_PREFILL_WARM` | `0` | only `1` is on | After the first committed tiered prefill chunk of at least 64 rows, promote up to four recently routed experts per layer. The startup warm-up respects a zero swap budget. |
 | `Q36_TIERED_PREFILL_PINNED` | `0` | only `1` is on | With prefill warm-up enabled and cold staging admitted, queue its expert uploads through the existing pinned ring. Residency is published after completion. |
 | `Q36_TIERED_WIDE_PREFILL` | `0` | only `1` is on | Coalesce adjacent tiered Q8 KV prefill pieces between positions 3072 and 8192, within the admitted arena. |
+| `Q36_TIERED_WIDE_STAGED` | `0` | only `1` is on | With wide tiered KV8 prefill active, merge pieces beyond position 8192 up to 2048 rows if their full key prefix fits the contiguous FP16 staging allocation. Segmented staging retains the depth policy. |
 | `Q36_TIERED_PREFILL_4096` | `0` | `0` or `1` | Admit up to 4096 prefill rows on native tiered Q8 KV with a 2048-row cap and non-fixed admission. Falls back to the normal ladder when the larger arena is too expensive. Pieces above 2048 rows are limited to the first 8192 positions. |
 | `FIFI_CUDA_ATTN_PREFILL_TURING` | `0` | only `1` is on | Enable the FP16 prefill tensor path for supported sm75 D256/GQA8 geometry when the kernel and shared memory are available. |
 | `Q36_TIERED_COLD_LIMIT` | unset | nonnegative expert count | Cap the number of experts staged per tiered prefill layer within the admitted cold bank. |

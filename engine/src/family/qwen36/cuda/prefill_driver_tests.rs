@@ -707,7 +707,7 @@ fn tiered_wide_deep_coalesces_only_contiguous_rows_through_8k() {
     use super::prefill_driver::coalesce_tiered_deep;
 
     let original = chunk_list(0, 8_288, 2_048).unwrap();
-    let widened = coalesce_tiered_deep(original, 2_048);
+    let widened = coalesce_tiered_deep(original, 2_048, 0);
     assert_eq!(
         widened,
         vec![
@@ -728,6 +728,66 @@ fn tiered_wide_deep_coalesces_only_contiguous_rows_through_8k() {
                 p0: 8_192,
                 rows: 96
             },
+        ]
+    );
+}
+
+#[test]
+fn tiered_wide_staged_stops_at_the_allocated_end_and_caps_deep_chunks() {
+    use super::prefill_driver::coalesce_tiered_deep;
+    use PrefillStep::Chunk;
+
+    let start = 30_719;
+    let end = start + 4_096;
+    for arena in [2_048, 4_096] {
+        let original = chunk_list(start, 6_144, arena).unwrap();
+        let mut expected = vec![
+            Chunk {
+                p0: start,
+                rows: 2_048,
+            },
+            Chunk {
+                p0: start + 2_048,
+                rows: 2_048,
+            },
+        ];
+        expected.extend(chunk_list(end, 2_048, arena).unwrap());
+        assert_eq!(coalesce_tiered_deep(original.clone(), arena, end), expected);
+        assert_eq!(coalesce_tiered_deep(original.clone(), arena, 0), original);
+    }
+}
+
+#[test]
+fn tiered_wide_staged_preserves_scheduler_pieces_and_imported_positions() {
+    use super::prefill_driver::drive_tiered_wide_chunks;
+
+    let start = 16_383;
+    let prompt = (0..4_097).collect::<Vec<u32>>();
+    let mut seen = Vec::new();
+    let mut steps = Vec::new();
+    for (offset, piece) in prompt.chunks(2_048).enumerate() {
+        let at = start + 2_048 * offset;
+        steps.extend(
+            drive_tiered_wide_chunks(at, piece, 2_048, false, 65_536, |_, rows| {
+                seen.extend_from_slice(rows);
+                Ok(())
+            })
+            .unwrap(),
+        );
+    }
+    assert_eq!(seen, prompt);
+    assert_eq!(
+        steps,
+        [
+            PrefillStep::Chunk {
+                p0: start,
+                rows: 2_048
+            },
+            PrefillStep::Chunk {
+                p0: start + 2_048,
+                rows: 2_048
+            },
+            PrefillStep::Feed { p0: start + 4_096 },
         ]
     );
 }
@@ -755,8 +815,8 @@ fn tiered_wide_deep_respects_arena_gaps_feeds_and_depth_limit() {
             rows: 1_024,
         },
     ];
-    assert_eq!(coalesce_tiered_deep(source.clone(), 1_024), source);
-    let got = coalesce_tiered_deep(source, 2_048);
+    assert_eq!(coalesce_tiered_deep(source.clone(), 1_024, 0), source);
+    let got = coalesce_tiered_deep(source, 2_048, 0);
     assert_eq!(
         got,
         vec![
@@ -2088,7 +2148,7 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
                 assert!(size <= 2048);
             }
             let chunk = &tokens[at - start..at - start + size];
-            drive_tiered_wide_chunks(at, chunk, 4096, false, |step, rows| {
+            drive_tiered_wide_chunks(at, chunk, 4096, false, 0, |step, rows| {
                 let (p0, count) = match step {
                     PrefillStep::Feed { p0 } => (p0, 1),
                     PrefillStep::Chunk { p0, rows } => (p0, rows),
@@ -2107,7 +2167,7 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
         assert_eq!(seen, tokens);
     }
     let steps =
-        super::prefill_driver::coalesce_tiered_deep(chunk_list(0, 7903, 4096).unwrap(), 4096);
+        super::prefill_driver::coalesce_tiered_deep(chunk_list(0, 7903, 4096).unwrap(), 4096, 0);
     assert_eq!(
         steps,
         vec![

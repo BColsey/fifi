@@ -199,6 +199,26 @@ fn a_40k_prefix_keeps_1024_rows_with_bounded_attention_partials() {
 }
 
 #[test]
+fn deep_tiered_staged_attention_fits_the_existing_partial_buffer() {
+    use crate::kernels::cuda::prefill::attn_prefill::cpf_attn_launch_plan;
+
+    let d = dims();
+    let attn = &d.shape.attn;
+    for rows in [1_025, 1_536, 2_047, 2_048] {
+        let geometry = CpfAttnGeometry {
+            m: rows,
+            n_head: attn.heads_q,
+            n_kv_head: attn.heads_kv,
+            head_dim: attn.head_dim,
+        };
+        for kv_len in [8_193, 16_384, 32_768, 65_536, 131_072, 262_144] {
+            let plan = cpf_attn_launch_plan(geometry, kv_len, 0, 68).unwrap();
+            assert!(cpf_attn_part_bytes(geometry, plan).unwrap() <= PART_CHARGE);
+        }
+    }
+}
+
+#[test]
 fn m_sess_bounds_every_chunk() {
     assert!(
         steps(0, 3000, 256)
