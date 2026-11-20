@@ -61,6 +61,16 @@ SOFTWARE.
   and the stream-k block and fixup-size rule of `launch_mul_mat_q` (vendored
   mmq.cuh:1395-1412) at the same pin, on top of the vendored config helpers. A test hash-pins both
   passages, and a sweep cross-checks the function against the Rust sizing.
+- Derived, outside the xavier-qwen tree: `scale_min` in `engine/src/kernels/expert_cpu.rs:68`
+  and in `engine/src/kernels/cuda/native/resident/embed.cu:77`, from ggml
+  `get_scale_min_k4` (ggml-quants.c at the pin): the same branch on `j < 4`, masks 63
+  and 0xF, and `>> 6 << 4` shifts, over the 12 scale bytes at Q4_K block offset 4; the
+  embed.cu comment names ggml. The test helper `scale_min_k4` in
+  `engine/src/kernels/cuda/resident/matvec_q/tests.rs:57` re-expresses it again. The Q8_1
+  quantization rule (`d = amax / 127`, `q = amax == 0 ? 0 : round(x / d)`) in
+  `engine/src/kernels/cuda/native/resident/add_rmsnorm_q8.cu:95` and
+  `engine/src/kernels/cuda/native/resident/swiglu_q8.cu:65` is from `quantize_q8_1` in the
+  vendored `engine/vendor/ggml-cuda-mmq/src/ggml-cuda/quantize.cu:92`.
 - Not derived: `dequant_256` in `engine/vendor/xavier-qwen/src/repack.cu:140` repeats no ggml Q4_K or Q6_K value logic. Its Q5_K branch calls `dequant_q5k`, listed above, and its other branches widen F32 and F16 values directly.
 
 ## ggml-cuda-mmq (llama.cpp CUDA MMQ and MMVQ kernels)
@@ -168,6 +178,7 @@ SOFTWARE.
 - Source: Python package `mlx-lm` 0.31.0 (https://github.com/ml-explore/mlx-lm), file `mlx_lm/models/gated_delta.py`, sha256 `3e445528acc01f7bcb0e44847cbdbb1ced69ce81218080f7dd701754e4dee856` (282 lines). The copy was taken from an installed mlx-lm 0.31.0 wheel. The wheel's RECORD file lists the same hash.
 - License: MIT, "Copyright © 2023 Apple Inc.", from `mlx_lm-0.31.0.dist-info/licenses/LICENSE`, sha256 `ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01`.
 - Taken: the Metal Shading Language source of the gated delta rule kernel (the scalar-gate, unmasked variant), which `mlx_lm/models/gated_delta.py` holds as a Python f-string. `engine/vendor/mlx-lm-gated-delta/extract_kernel.py` extracts it without change into `engine/vendor/mlx-lm-gated-delta/gated_delta_step.metal`. `engine/src/kernels/mlx/native/resident_ops.rs` embeds that file with `include_str!` as `GATED_DELTA_SOURCE`.
+- `engine/src/kernels/mlx/native/gated_delta_step.metal` is a byte-identical copy of `engine/vendor/mlx-lm-gated-delta/gated_delta_step.metal` (sha256 `b4ea3ae7ff2ca0ecb1d203109e8b333d310a0f18a5cf6f882f0e11332d6131fe`, git blob 3932bde8). No build input includes it; `resident_ops.rs` embeds the vendor path above. Its origin is the one this section records: the mlx-lm 0.31.0 kernel source.
 - Derived without copying text: the kernel name, the input and output names, the template arguments, the grid, and the threadgroup shape in `gated_delta_kernel_call` (`engine/src/kernels/mlx/native/guard.cpp`, called by `inference_mlx_gated_delta`) follow `_make_gated_delta_kernel` and `gated_delta_kernel` of the same file. The operand layouts in `engine/src/kernels/gated_delta.rs` follow the same file.
 - Not copied: no other part of mlx-lm.
 
