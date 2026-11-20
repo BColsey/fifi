@@ -1,4 +1,5 @@
-//! Opt-in bounded windows on the existing engine thread. No model or adapter is cloned.
+//! The batch worker: up to `max_seqs` sessions on the engine thread, one decode window per tick.
+//! No model or adapter is cloned.
 //! A failed window discards its sessions, including any consumed pending tokens.
 //! Output uses the job channel's reserved terminal slot and never waits for a receiver.
 //!
@@ -569,10 +570,10 @@ pub(super) fn work<E: ExecutorOps>(
     // The job that capacity refused while other slots were live, and the number of live slots at
     // the refusal.
     let mut waiting: Option<(Job, usize)> = None;
-    // A tick feeds at most one planned piece of prompt rows beside the decode rows: a piece is
-    // the size the prefill plan admitted and the size at which prefill runs fastest, so a
-    // smaller budget only slows every cold prompt (a 4,096-token prompt took 14.4 s at 16 rows
-    // against 3.5 s at 256 on the Mac Studio) while a stream waits at most one piece per tick.
+    // `iteration_rows` is the engine's per-tick row budget (the rows the engine was spawned
+    // with). A tick feeds at most one planned piece of prompt rows beside the decode rows, so
+    // the budget is never below the piece: a smaller one only slows every cold prompt, while a
+    // stream waits at most one piece per tick.
     let iteration_rows = iteration_rows.max(prefill_chunk);
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -704,6 +705,10 @@ pub(super) fn work<E: ExecutorOps>(
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
+                // A shutdown is seen between pieces; a cancelled slot is seen before its own.
+                if shared.stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 let grant = match decoding_share {
                     Some(_) => prompt_rows.div_ceil(prompt_slots),
                     None => prompt_rows.div_ceil(prompt_slots).min(prefill_chunk),

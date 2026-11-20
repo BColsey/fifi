@@ -156,7 +156,7 @@ struct Shared {
     /// Set once the built executor reports a prefix store of no roots and no entries: a prompt
     /// boundary sent to such an engine can neither be saved nor restored.
     no_prefix_store: AtomicBool,
-    /// What the batch worker's ticks did, for the metrics of a later slice and for the tests.
+    /// What the batch worker's ticks and session pool did, as counters a reader snapshots.
     ticks: batch_worker::TickCounters,
 }
 

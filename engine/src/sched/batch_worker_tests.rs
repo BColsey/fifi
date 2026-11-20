@@ -2558,3 +2558,55 @@ fn an_idle_engine_releases_its_pooled_sessions_but_one() {
     assert_eq!(snapshot(&engine).sessions_created, 2);
     engine.shutdown();
 }
+
+#[test]
+fn more_live_slots_than_the_budget_still_give_every_slot_a_row() {
+    // The planned piece is four rows and six prompts are live: the budget is raised to one row
+    // per live slot, so no prompt starves behind the others.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 6;
+    let (engine, release) = start_with_budget(fake, 2);
+    release.send(()).expect("load");
+    let mut all = Vec::new();
+    for index in 0..6u32 {
+        let (next, events) = job(&[index % 3; 12], 2);
+        engine.handle().try_submit(next).expect("submit");
+        all.push(events);
+    }
+    for events in all {
+        assert_eq!(usage(&collect(events)).completion_tokens, 2);
+    }
+    let counts = snapshot(&engine);
+    assert_eq!(counts.prefill_rows, 72);
+    engine.shutdown();
+}
+
+#[test]
+fn a_cancelled_cold_prompt_is_not_fed_after_its_cancel() {
+    // Two cold prompts take whole pieces in one idle tick. The first piece is held while the
+    // second job is cancelled: the second prompt is never fed.
+    let log = Log::default();
+    let (hold, entered, unblock) = gate();
+    let mut fake = WindowFake::new(&log);
+    fake.hold_prefill = Some(hold);
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0; 8], 1);
+    let (second, second_events) = job(&[1; 8], 1);
+    let cancel = Arc::clone(&second.generation.cancel);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
+    entered.recv_timeout(WAIT).expect("entered");
+    cancel.store(true, Ordering::SeqCst);
+    unblock.send(()).expect("release");
+    assert_eq!(usage(&collect(first_events)).completion_tokens, 1);
+    assert_eq!(finish(&collect(second_events)), DecodeFinish::Cancelled);
+    let fed = lock(&log)
+        .calls
+        .iter()
+        .filter(|call| call.starts_with("prefill:"))
+        .count();
+    assert_eq!(fed, 2, "only the first prompt's two pieces were fed");
+    engine.shutdown();
+}
