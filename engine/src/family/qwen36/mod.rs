@@ -3,6 +3,8 @@ pub mod activation;
 /// The paper version of the fixed CUDA admission ledger, shared by preflight
 /// estimates and the runtime admission so the two cannot drift apart.
 pub(crate) mod admission_sketch;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod card_short;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[expect(
     dead_code,

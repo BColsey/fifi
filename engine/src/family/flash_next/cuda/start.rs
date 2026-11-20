@@ -179,7 +179,10 @@ pub(in crate::family::flash_next) fn start(
         EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())
     })?;
     let manifest = std::fs::read(&settings.manifest).map_err(|error| {
-        EngError::Checkpoint(format!("{}: {error}", settings.manifest.display()))
+        EngError::Checkpoint(format!(
+            "the manifest {} cannot be read: {error}",
+            settings.manifest.display()
+        ))
     })?;
     let pin = tokenizer_pin(&manifest, settings.tokenizer_vocab_size)?;
     let identity = pack_identity(&settings.artifact, &pin)?;
@@ -864,6 +867,12 @@ fn build_driver_resolving(
             )));
         }
         TierChoice::Disk => HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes)?,
+        TierChoice::CardTiered { .. } => {
+            return Err(EngError::MemoryPlan(
+                "the host ladder answered a card tier to a start that passed no card figures"
+                    .into(),
+            ));
+        }
     };
     let (tier_name, speed_class) = tier.describe();
     // The rung reader is chosen and its read mode decided ONCE, here —

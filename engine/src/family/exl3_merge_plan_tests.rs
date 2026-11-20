@@ -835,8 +835,13 @@ fn the_start_resolves_the_switch_before_any_weight_work() {
     let start = include_str!("qwen36/cuda/start.rs");
     let body = &start[start.find("pub(crate) fn start(").expect("start")..];
     let switch = body.find("resolve_switch(").expect("the switch check");
+    // The tiered check runs inside the mode resolution that start calls.
+    assert!(
+        section(start, "fn runtime_modes(").contains("check_tiered_start("),
+        "runtime_modes runs the tiered check"
+    );
     for later in [
-        "check_tiered_start(",
+        "runtime_modes(settings)",
         "CudaProjector::new()",
         "open_gguf(",
         "load_exl3_dir_decided(",

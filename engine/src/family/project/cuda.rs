@@ -1049,6 +1049,17 @@ fn planned<'w>(
     Ok((tensor, bytes))
 }
 
+/// The device bytes a Native-layout load of `names` admits: the sum of the per-tensor figures
+/// `load` compares to the free bytes (before the KV, work and headroom terms), so a start can ask
+/// the same question without uploading anything.
+pub(crate) fn native_load_bytes(weights: &GgufWeights, names: &[&str]) -> Result<u64, EngError> {
+    names.iter().try_fold(0u64, |sum, name| {
+        let (_, bytes) = planned(weights, name, WeightLayout::Native)?;
+        sum.checked_add(bytes)
+            .ok_or_else(|| EngError::MemoryPlan("cuda admission: tensors overflow u64".into()))
+    })
+}
+
 /// Rejects a Q6_K, Q8_0 or Q5_0 tensor whose scales overflow fp16 before the first
 /// upload. This reads each such tensor once more than the upload does, one
 /// tensor and one chunk of whole blocks at a time, so host memory stays at
