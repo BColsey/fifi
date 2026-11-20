@@ -135,7 +135,7 @@ pub(super) fn step_with_checkpoint(
         None
     };
     let stage_started = timing.as_ref().map(|_| std::time::Instant::now());
-    let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices, 1)?;
+    let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices, 1, timing.as_mut())?;
     ForwardTiming::stage_ready(
         timing.as_mut(),
         stage_started,

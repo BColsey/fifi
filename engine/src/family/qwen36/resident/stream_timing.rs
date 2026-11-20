@@ -18,6 +18,8 @@ pub(super) struct ForwardTiming {
     position: u32,
     #[cfg(feature = "native-fault-qualification")]
     dense_reads: Option<ExpertReadStats>,
+    #[cfg(feature = "native-fault-qualification")]
+    expert_trace: Option<Vec<serde_json::Value>>,
     host_route_ns: u64,
     stages: u32,
     stage_fill_ns: u64,
@@ -38,11 +40,18 @@ impl ForwardTiming {
             let enabled = *ENABLED.get_or_init(|| {
                 std::env::var_os("FIFI_Q36_MLX_STREAM_TIMING").is_some_and(|value| value == "1")
             });
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trace_enabled = *TRACE.get_or_init(|| {
+                std::env::var_os("FIFI_Q36_MLX_EXPERT_TRACE").is_some_and(|value| value == "1")
+            });
             let dense = enabled && weights.stages_dense();
-            (dense || (enabled && weights.streams_experts())).then(|| Self {
+            let streamed = weights.streams_experts();
+            let trace = trace_enabled && streamed;
+            (dense || trace || (enabled && streamed)).then(|| Self {
                 counters: StreamSnapshot::begin(k),
                 position,
                 dense_reads: dense.then(qualification_expert_reads),
+                expert_trace: trace.then(Vec::new),
                 host_route_ns: 0,
                 stages: 0,
                 stage_fill_ns: 0,
@@ -66,6 +75,34 @@ impl ForwardTiming {
         let value = route();
         timing.host_route_ns += ns(started);
         value
+    }
+
+    /// Trace the exact checkpoint IDs passed to a successful stage, with its logical I/O.
+    /// Stages are appended in model layer order. Prompt forwards omit the final MoE.
+    pub(super) fn load_stage(
+        timing: Option<&mut Self>,
+        experts: &[u32],
+        coalesced: bool,
+        load: impl FnOnce() -> Result<ExpertPages, EngError>,
+    ) -> Result<ExpertPages, EngError> {
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(trace) = timing.and_then(|timing| timing.expert_trace.as_mut()) {
+            let before = qualification_expert_reads();
+            let pages = load()?;
+            let after = qualification_expert_reads();
+            trace.push(serde_json::json!({
+                "layer": trace.len(),
+                "experts": experts,
+                "coalesced": coalesced,
+                "slice_reads": after.slice_reads - before.slice_reads,
+                "read_bytes": after.read_bytes - before.read_bytes,
+                "mapped_bytes": pages.page_bytes()?,
+            }));
+            return Ok(pages);
+        }
+        #[cfg(not(feature = "native-fault-qualification"))]
+        let _ = (timing, experts, coalesced);
+        load()
     }
 
     pub(super) fn stage_ready(
@@ -108,6 +145,9 @@ impl ForwardTiming {
                     after.read_bytes.saturating_sub(before.read_bytes).into();
                 row["dense_ffn_slice_reads"] =
                     after.slice_reads.saturating_sub(before.slice_reads).into();
+            }
+            if let Some(trace) = self.expert_trace {
+                row["expert_trace"] = trace.into();
             }
             eprintln!("qwen36_stream_timing {row}");
         }
