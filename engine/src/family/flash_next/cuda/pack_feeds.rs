@@ -73,6 +73,15 @@ impl PackFeeds {
         }
     }
 
+    /// Keeps the feed profile across the request: a call that was not profiled leaves what the
+    /// profiled calls summed so far, and only [`TokenFeeds::take_feed_profile`] and
+    /// [`TokenFeeds::reset`] clear it.
+    fn keep_profile(&mut self, timing: Option<FeedProfile>) {
+        if timing.is_some() {
+            self.profile = timing;
+        }
+    }
+
     fn begin_bulk_chunk(
         &self,
         tokens: &[u32],
@@ -137,7 +146,7 @@ impl TokenFeeds for PackFeeds {
             if let Some(timing) = timing.as_mut() {
                 timing.bulk_rows += tokens.len();
             }
-            self.profile = timing;
+            self.keep_profile(timing);
             self.pending = pending;
             return Ok(starts);
         }
@@ -161,7 +170,7 @@ impl TokenFeeds for PackFeeds {
         if let Some(timing) = timing.as_mut() {
             timing.serial_rows += tokens.len();
         }
-        self.profile = timing;
+        self.keep_profile(timing);
         self.pending = pending;
         Ok(starts)
     }

@@ -946,3 +946,28 @@ fn a_failed_bulk_read_fails_that_chunk_alone_and_the_retry_matches_the_serial_ch
         feed_chunk_three_ways(&mut stepped, &mut serial, &mut bulk, chunk, hidden as usize);
     }
 }
+
+#[test]
+fn the_feed_profile_survives_unprofiled_calls_until_it_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = 2u32;
+    let mut feeds = pack_feeds(dir.path(), hidden, Some(pooled(dir.path(), hidden)));
+    let chunk = [PROMPT[0], PROMPT[1], PROMPT[2]];
+    feeds.begin_chunk(&chunk, true).unwrap();
+    for &token in &chunk {
+        feeds
+            .ple_update(token, &stream_of(hidden as usize, token))
+            .unwrap();
+    }
+    // Decode steps and an unprofiled chunk follow, as they do within one request.
+    let token = PROMPT[3];
+    feeds.begin(token).unwrap();
+    feeds
+        .ple_update(token, &stream_of(hidden as usize, token))
+        .unwrap();
+    feeds.begin_chunk(&[PROMPT[4], PROMPT[0]], false).unwrap();
+    let profile = feeds.take_feed_profile().expect("the profile was dropped");
+    assert_eq!((profile.serial_rows, profile.bulk_rows), (0, chunk.len()));
+    assert!(!profile.bulk_join.is_zero());
+    assert!(feeds.take_feed_profile().is_none());
+}
