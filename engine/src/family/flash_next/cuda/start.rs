@@ -174,7 +174,7 @@ impl Drop for BuildGuard {
 pub(in crate::family::flash_next) fn start(
     settings: &FlashSettings,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let cuda = settings.cuda.as_ref().ok_or_else(|| {
         EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())
     })?;
@@ -194,18 +194,55 @@ pub(in crate::family::flash_next) fn start(
     let artifact = settings.artifact.clone();
     let wanted = cuda.clone();
     let guard = BuildGuard::acquire()?;
+    // The engine thread plans the memory and sends the context it chose, once, when the config
+    // sets none; the server's request bound needs it before the weights finish loading.
+    let (announce, resolved) = if settings.context_auto {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
         make(
             stages,
             &artifact,
             &wanted,
+            announce,
             rules,
             identity,
             prefill_chunk as u32,
             guard,
         )
     })?;
-    Ok((engine, bundle))
+    let context = match resolved {
+        Some(receiver) => await_context(&receiver, || engine.handle().failure())?,
+        None => cuda.context,
+    };
+    Ok((engine, bundle, context))
+}
+
+/// What the engine thread tells `start` about the context: the one it chose, or the failure
+/// that ended the start before the memory plan.
+type ContextAnnouncement = Result<u32, String>;
+
+/// Waits for the engine thread's announcement. A closed channel means the thread ended without
+/// one; `failure` then supplies the cause the engine recorded.
+fn await_context(
+    receiver: &std::sync::mpsc::Receiver<ContextAnnouncement>,
+    failure: impl FnOnce() -> Option<String>,
+) -> Result<u32, EngError> {
+    let failed = |cause: String| {
+        EngError::Checkpoint(format!(
+            "Flash-Next start failed before the memory plan: {cause}"
+        ))
+    };
+    match receiver.recv() {
+        Ok(Ok(context)) => Ok(context),
+        Ok(Err(cause)) => Err(failed(cause)),
+        Err(_) => Err(failed(failure().unwrap_or_else(|| {
+            "the engine thread ended without a cause".to_string()
+        }))),
+    }
 }
 
 fn raw<'w>(weights: &'w CudaWeights, name: &str) -> Result<&'w DeviceBuffer, EngError> {
@@ -416,24 +453,32 @@ fn build_bank(
     Ok(bank)
 }
 
+#[allow(clippy::too_many_arguments)] // the values the start closure captured, passed once
 fn make(
     stages: &Stages<'_>,
     artifact: &Path,
     wanted: &CudaSettings,
+    announce: Option<std::sync::mpsc::SyncSender<ContextAnnouncement>>,
     rules: CudaRules,
     identity: PrefixIdentity,
     prefill_chunk: u32,
     guard: BuildGuard,
 ) -> Result<(FlashCudaExecutor<StepDriver>, DecodeSession), EngError> {
-    let driver = build_driver(
+    let driver = build_driver_resolving(
         &|name| stages.begin(name),
         artifact,
         wanted,
+        announce.as_ref(),
         rules.sampler_vocab,
         prefill_chunk,
         Some(guard),
-    )?;
-    FlashCudaExecutor::new(driver, rules, identity)
+    );
+    if let (Err(error), Some(announce)) = (&driver, &announce) {
+        // Nothing was announced when the build failed before the plan; after the plan the
+        // receiver has left, or its slot is taken, and the failure reaches the engine state.
+        let _ = announce.try_send(Err(error.describe()));
+    }
+    FlashCudaExecutor::new(driver?, rules, identity)
 }
 
 /// The figures one `tuning plan` line reports.
@@ -545,12 +590,35 @@ fn log_tuning_line(call: &TuningCall<'_>) {
     eprintln!("{}", log_line(&decide(&input), &input, false));
 }
 
-/// Loads the pack and builds the token driver. `guard` pins the one-engine flag at the first leak;
-/// a device test passes none.
+/// Loads the pack and builds the token driver with the context of `wanted`. `guard` pins the
+/// one-engine flag at the first leak; a device test passes none.
 pub(super) fn build_driver(
     stage: &dyn Fn(&'static str),
     artifact: &Path,
     wanted: &CudaSettings,
+    sampler_vocab: usize,
+    prefill_chunk: u32,
+    guard: Option<BuildGuard>,
+) -> Result<StepDriver, EngError> {
+    build_driver_resolving(
+        stage,
+        artifact,
+        wanted,
+        None,
+        sampler_vocab,
+        prefill_chunk,
+        guard,
+    )
+}
+
+/// [`build_driver`], and when `announce` is given the context of `wanted` is a placeholder: the
+/// memory plan picks it (see `default_context`), the start prints the choice and sends it
+/// through `announce` for `start` (`await_context`).
+fn build_driver_resolving(
+    stage: &dyn Fn(&'static str),
+    artifact: &Path,
+    wanted: &CudaSettings,
+    announce: Option<&std::sync::mpsc::SyncSender<ContextAnnouncement>>,
     sampler_vocab: usize,
     prefill_chunk: u32,
     mut guard: Option<BuildGuard>,
@@ -603,18 +671,6 @@ pub(super) fn build_driver(
         .as_ref()
         .map_or(Ok(0), PleDeviceShape::workspace_bytes)?;
     let batch_switch = ple_batch()?;
-    // The shared prefill arena serves chunked prefill only; `prefill_rows = 1` is the
-    // per-token driver and keeps the pre-switch charge of zero.
-    let prefill_arena_bytes = if rows > 1 {
-        StepPlan::prefill_bytes(
-            true,
-            &FlashGeometry::new(&model, &kinds)?,
-            rows,
-            wanted.context as usize,
-        )?
-    } else {
-        0
-    };
     // The prefill ring's budget, carved out before the load plan so the bank sizes itself
     // into what remains: at most 1.5 GiB and 30% of the free card, only for chunked prefill.
     // A ring below one streamed layer is not built (the multi-row path then keeps its
@@ -630,30 +686,86 @@ pub(super) fn build_driver(
     // horizon is the loader's own, not an independent guess.
 
     // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
-    // placeholder positions) with the numbers the pack and the context give.
-    let card = TierInputs::measured(
-        tier_shape,
-        (0, 0),
-        KvPlan {
-            positions: 1,
-            bytes_per_position: 1,
-        },
-        free_vram.saturating_sub(ring_budget),
-        (mem_total, mem_available),
-        // The same infallible placeholder the two-phase choice below charges
-        // first: the pooled depth's records in flight, from the one shared
-        // constant. The real figure is read only when the tier already points
-        // at the disk rung, and re-validated there.
-        rung_ring_placeholder_bytes(record_bytes),
-    )
-    .with_prefill_arena(prefill_arena_bytes)?
-    .with_prefill_arena(ple_workspace)?;
-    let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
-    let load = load_plan.at_context(
-        u64::from(wanted.context),
-        wanted.kv_format.format(),
-        model.moe.top_k() + 1,
-    )?;
+    // placeholder positions) with the numbers the pack and the context give. The shared prefill
+    // arena serves chunked prefill only; `prefill_rows = 1` is the per-token driver and keeps
+    // the pre-switch charge of zero. The arena grows with the context, so the plan is built per
+    // context.
+    let geometry_for_arena = FlashGeometry::new(&model, &kinds)?;
+    let plan_for = |context: u32| -> Result<FlashLoadPlan, EngError> {
+        let prefill_arena_bytes = if rows > 1 {
+            StepPlan::prefill_bytes(true, &geometry_for_arena, rows, context as usize)?
+        } else {
+            0
+        };
+        let card = TierInputs::measured(
+            tier_shape,
+            (0, 0),
+            KvPlan {
+                positions: 1,
+                bytes_per_position: 1,
+            },
+            free_vram.saturating_sub(ring_budget),
+            (mem_total, mem_available),
+            // The same infallible placeholder the two-phase choice below charges
+            // first: the pooled depth's records in flight, from the one shared
+            // constant. The real figure is read only when the tier already points
+            // at the disk rung, and re-validated there.
+            rung_ring_placeholder_bytes(record_bytes),
+        )
+        .with_prefill_arena(prefill_arena_bytes)?
+        .with_prefill_arena(ple_workspace)?;
+        FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)
+    };
+    let kv_format = wanted.kv_format.format();
+    let min_slots = model.moe.top_k() + 1;
+    let resolved;
+    let wanted = if let Some(announce) = announce {
+        let floor = min_slots.max(wanted.slots.map_or(0, |asked| asked as usize));
+        let slots_at = |context: u32| {
+            plan_for(context)
+                .and_then(|plan| plan.at_context(u64::from(context), kv_format, floor))
+                .ok()
+                .map(|load| load.context.plan.slots_per_layer())
+        };
+        let cap = crate::family::flash_next::settings::max_positions(&checkpoint.model_config)
+            .unwrap_or(crate::family::flash_next::settings::MAX_CUDA_CONTEXT)
+            .min(crate::family::flash_next::settings::MAX_CUDA_CONTEXT);
+        let chosen = crate::family::flash_next::settings::default_context(&slots_at, floor, cap);
+        let context = match &chosen {
+            Some(chosen) => {
+                eprintln!(
+                    "flash-next cuda: context {} chosen from the memory plan: {} expert slots per \
+                     layer at {}, {} at {} (model maximum {}); set flash_next.context to override",
+                    chosen.context,
+                    chosen.slots,
+                    chosen.context,
+                    chosen.baseline_slots,
+                    crate::family::flash_next::settings::DEFAULT_CUDA_CONTEXT,
+                    cap
+                );
+                chosen.context
+            }
+            None => {
+                eprintln!(
+                    "flash-next cuda: the memory plan admits no context from the default {}; \
+                     the load reports the shortfall",
+                    wanted.context
+                );
+                wanted.context
+            }
+        };
+        // A closed channel means `start` has given up; the build then fails on its own terms.
+        let _ = announce.send(Ok(context));
+        resolved = CudaSettings {
+            context,
+            ..wanted.clone()
+        };
+        &resolved
+    } else {
+        wanted
+    };
+    let load_plan = plan_for(wanted.context)?;
+    let load = load_plan.at_context(u64::from(wanted.context), kv_format, min_slots)?;
     let planned_slots = load.context.plan.slots_per_layer();
     let slots = match wanted.slots {
         None => planned_slots,
@@ -1300,9 +1412,54 @@ impl StepDriver {
 #[cfg(test)]
 mod tests {
     use super::{
-        BankGeometry, HostMemory, HostPinPlan, HostTerms, fill_from_profile, read_expert_stats,
+        BankGeometry, ContextAnnouncement, HostMemory, HostPinPlan, HostTerms, await_context,
+        fill_from_profile, read_expert_stats,
     };
     use std::io::Write as _;
+    use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn the_start_takes_the_context_the_engine_thread_announced() {
+        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
+        sender.send(Ok(75_776)).expect("send");
+        assert_eq!(
+            await_context(&receiver, || panic!("no failure is asked for")).expect("context"),
+            75_776
+        );
+    }
+
+    #[test]
+    fn a_failure_before_the_memory_plan_is_the_start_failure() {
+        // The build reports its own error.
+        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
+        sender
+            .send(Err("no CUDA device".to_string()))
+            .expect("send");
+        let error = await_context(&receiver, || None)
+            .expect_err("failure")
+            .describe();
+        assert_eq!(
+            error,
+            "Flash-Next start failed before the memory plan: no CUDA device"
+        );
+        // The thread ended and dropped the sender: the engine's recorded cause is used.
+        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
+        drop(sender);
+        let error = await_context(&receiver, || Some("the pack is unreadable".to_string()))
+            .expect_err("failure")
+            .describe();
+        assert!(
+            error.ends_with("before the memory plan: the pack is unreadable"),
+            "{error}"
+        );
+        // No cause recorded: the text still says what happened.
+        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
+        drop(sender);
+        let error = await_context(&receiver, || None)
+            .expect_err("failure")
+            .describe();
+        assert!(error.contains("ended without a cause"), "{error}");
+    }
 
     /// The Disk rung's refusals carry the plan's own byte counts, computed here from the same
     /// terms the plan uses: the floor refusal names every term, and the page-cache refusal names

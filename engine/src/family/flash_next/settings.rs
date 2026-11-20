@@ -41,8 +41,9 @@ pub(crate) struct FlashOptions {
     /// build that has the CUDA decoder and false elsewhere; `false` on a CUDA build refuses to
     /// serve Flash-Next. When true, `cache_limit_bytes` (an MLX allocator key) is not required and is refused if set.
     pub(crate) cuda_decode: Option<bool>,
-    /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Default
-    /// 4096. The load refuses a context the card cannot hold next to the trunk.
+    /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Unset, the
+    /// memory plan chooses it at start. The load refuses a context the card cannot hold next to
+    /// the trunk.
     pub(crate) context: Option<u32>,
     /// CUDA only: how the K/V is stored on the card. Default `f16`; `int8` has no attention
     /// kernel yet and the settings refuse it.
@@ -104,6 +105,79 @@ pub(crate) struct CudaSettings {
 pub(crate) const DEFAULT_CUDA_CONTEXT: u32 = 4096;
 /// Largest `context` value of the CUDA decoder.
 pub(crate) const MAX_CUDA_CONTEXT: u32 = 262_144;
+/// The share of the expert bank, in percent of the slots it has at [`DEFAULT_CUDA_CONTEXT`], that
+/// the default context may give up to the K/V cache. A longer context costs bank slots, and the
+/// slots decide decode speed, so the default stops where the bank would shrink past this.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const BANK_SHARE_GIVEN_PERCENT: usize = 10;
+
+/// The context the CUDA decoder serves when the config sets none, and what it was chosen from.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::family::flash_next) struct DefaultContext {
+    pub(in crate::family::flash_next) context: u32,
+    /// Expert slots per layer the plan leaves at `context`.
+    pub(in crate::family::flash_next) slots: usize,
+    /// Expert slots per layer at the smaller of [`DEFAULT_CUDA_CONTEXT`] and the cap.
+    pub(in crate::family::flash_next) baseline_slots: usize,
+}
+
+/// The longest context, a multiple of 1024 (or `cap` itself), at which the bank keeps at least
+/// `BANK_SHARE_GIVEN_PERCENT` percent fewer slots than at [`DEFAULT_CUDA_CONTEXT`] and not
+/// fewer than `min_slots`. `slots_at` is the memory plan: the slots per layer a context leaves,
+/// `None` when the plan refuses it; a longer context never leaves more. `cap` is the model's
+/// maximum. `None` when not even the baseline context fits, so the load then reports the plan's
+/// own refusal for it.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) fn default_context(
+    slots_at: &dyn Fn(u32) -> Option<usize>,
+    min_slots: usize,
+    cap: u32,
+) -> Option<DefaultContext> {
+    const GRANULE: u32 = 1024;
+    let cap = cap.min(MAX_CUDA_CONTEXT) / CUDA_CONTEXT_MULTIPLE * CUDA_CONTEXT_MULTIPLE;
+    let base_context = DEFAULT_CUDA_CONTEXT.min(cap);
+    if base_context == 0 {
+        return None;
+    }
+    let baseline_slots = slots_at(base_context)?;
+    let floor = min_slots.max(baseline_slots - baseline_slots * BANK_SHARE_GIVEN_PERCENT / 100);
+    let fits = |context: u32| slots_at(context).filter(|&slots| slots >= floor);
+    let choice = |context: u32, slots: usize| {
+        Some(DefaultContext {
+            context,
+            slots,
+            baseline_slots,
+        })
+    };
+    if let Some(slots) = fits(cap) {
+        return choice(cap, slots);
+    }
+    // The baseline is known to fit; bisect over multiples of the granule above it.
+    let mut low = base_context.div_ceil(GRANULE).min(cap / GRANULE);
+    let mut high = cap / GRANULE;
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid * GRANULE).is_some() {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let context = (low * GRANULE).max(base_context);
+    let slots = slots_at(context)?;
+    choice(context, slots)
+}
+
+/// The model's maximum positions from its `config.json` (`max_position_embeddings`, in the
+/// text configuration when there is one).
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) fn max_positions(config: &[u8]) -> Option<u32> {
+    let root = serde_json::from_slice::<serde_json::Value>(config).ok()?;
+    let text = root.get("text_config").unwrap_or(&root);
+    let value = text.get("max_position_embeddings")?.as_u64()?;
+    u32::try_from(value).ok().filter(|&value| value > 0)
+}
 /// Default row threshold of the prefill ring (`ring_rows`): on the shared prefill path,
 /// chunks at or above it take the ring's whole-chunk path, chunks below it the bank's
 /// union-admit path.
@@ -147,6 +221,9 @@ pub(crate) struct FlashSettings {
     /// True when neither the config nor the environment named the manifest and it was found
     /// as `download-manifest.json` in the model or tokenizer directory.
     pub(crate) manifest_found_in_pack: bool,
+    /// True when the CUDA decoder is on and the config sets no `context`: the memory plan
+    /// chooses it at start (`default_context`) and `cuda.context` holds the placeholder.
+    pub(crate) context_auto: bool,
     /// The MLX allocator cache limit in bytes (0 with the CUDA decoder, which ignores it).
     pub(crate) cache_limit: u64,
     pub(crate) prefill_budget: Option<u64>,
@@ -425,6 +502,7 @@ impl FlashSettings {
             tokenizer_dir: tokenizer_dir.to_path_buf(),
             manifest,
             manifest_found_in_pack,
+            context_auto: cuda.is_some() && options.context.is_none(),
             // An MLX allocator key: the CUDA decoder has no use for it.
             cache_limit: if cuda.is_some() {
                 0
@@ -606,6 +684,7 @@ mod tests {
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/art/download-manifest.json"),
                 manifest_found_in_pack: false,
+                context_auto: false,
                 cache_limit: 1_073_741_824,
                 prefill_budget: None,
                 tokenizer_vocab_size: 1000,
@@ -630,6 +709,7 @@ mod tests {
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/env-art/download-manifest.json"),
                 manifest_found_in_pack: false,
+                context_auto: false,
                 cache_limit: 2048,
                 prefill_budget: None,
                 tokenizer_vocab_size: 248_077,
@@ -676,6 +756,90 @@ mod tests {
             ..FlashOptions::default()
         };
         assert!(message(build(Some(&mlx_key), true)).contains("cannot be combined with cuda_decode"));
+    }
+
+    /// A plan whose slots fall by one per 2,048 positions from `top`.
+    fn falling(top: usize) -> impl Fn(u32) -> Option<usize> {
+        move |context| top.checked_sub(context as usize / 2048)
+    }
+
+    #[test]
+    fn the_default_context_stops_where_the_bank_would_lose_a_tenth() {
+        use super::default_context;
+        // 198 slots at 4,096: a tenth is 19 slots, so the longest context keeps 179 or more.
+        let chosen = default_context(&falling(200), 11, 262_144).expect("a plan");
+        assert_eq!(chosen.baseline_slots, 198);
+        assert_eq!(chosen.context, 44_032);
+        assert_eq!(chosen.slots, 179);
+        assert!(falling(200)(chosen.context + 1024).unwrap() < 179);
+        // The cap is the model maximum.
+        let capped = default_context(&falling(200), 11, 16_384).expect("a plan");
+        assert_eq!((capped.context, capped.slots), (16_384, 192));
+        // A model smaller than the baseline context serves its own maximum.
+        let tiny = default_context(&falling(200), 11, 2_048).expect("a plan");
+        assert_eq!(tiny.context, 2_048);
+        assert_eq!(tiny.baseline_slots, falling(200)(2_048).unwrap());
+        // The minimum slots of the step are a floor of their own.
+        let floor = default_context(&falling(200), 190, 262_144).expect("a plan");
+        assert_eq!(floor.context, 21_504);
+        assert!(floor.slots >= 190);
+        // A plan that refuses the baseline gives no default, so the load reports its refusal.
+        assert_eq!(default_context(&|_| None, 11, 262_144), None);
+        // A plan that refuses long contexts only: the longest admitted one wins.
+        let short = |context: u32| (context <= 24_576).then_some(100);
+        assert_eq!(
+            default_context(&short, 11, 262_144).map(|chosen| chosen.context),
+            Some(24_576)
+        );
+        // A flat plan serves the whole model.
+        assert_eq!(
+            default_context(&|_| Some(50), 11, 262_144).map(|chosen| chosen.context),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn the_model_maximum_is_read_from_the_text_configuration_or_the_top_level() {
+        use super::max_positions;
+        assert_eq!(
+            max_positions(br#"{"text_config":{"max_position_embeddings":262144}}"#),
+            Some(262_144)
+        );
+        assert_eq!(
+            max_positions(br#"{"max_position_embeddings":32768}"#),
+            Some(32_768)
+        );
+        assert_eq!(max_positions(br#"{"text_config":{}}"#), None);
+        assert_eq!(max_positions(b"not json"), None);
+        assert_eq!(
+            max_positions(include_bytes!("../../../tests/fixtures/qwen3_8_flash_next_config.json")),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn a_context_in_the_config_is_not_chosen_by_the_plan() {
+        let pack = tempfile::tempdir().expect("tempdir");
+        std::fs::write(pack.path().join("download-manifest.json"), b"{}").expect("write");
+        let build = |context: Option<u32>| {
+            let options = FlashOptions {
+                context,
+                ..FlashOptions::default()
+            };
+            FlashSettings::with_cuda_default(
+                pack.path(),
+                pack.path(),
+                Some(&options),
+                &FlashEnv::default(),
+                true,
+            )
+            .unwrap()
+        };
+        let auto = build(None);
+        assert!(auto.context_auto);
+        let set = build(Some(8192));
+        assert!(!set.context_auto);
+        assert_eq!(set.cuda.unwrap().context, 8192);
     }
 
     #[test]

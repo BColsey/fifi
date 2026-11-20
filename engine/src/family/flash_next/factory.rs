@@ -65,12 +65,9 @@ fn start_engine_with(
             settings.manifest.display()
         );
     }
-    let (engine, bundle) = launch(&settings, prefix_reuse, ready_note)?;
-    // The CUDA decoder serves the positions its caches hold; the MLX one a fixed limit.
-    let context_limit = settings
-        .cuda
-        .as_ref()
-        .map_or(CONTEXT_LIMIT, |cuda| cuda.context);
+    // The CUDA decoder serves the positions its caches hold (the memory plan's choice when the
+    // config sets none); the MLX one a fixed limit.
+    let (engine, bundle, context_limit) = launch(&settings, prefix_reuse, ready_note)?;
     Ok(StartedEngine {
         engine,
         bundle,
@@ -83,14 +80,15 @@ fn launch(
     settings: &FlashSettings,
     prefix_reuse: bool,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     if settings.cuda.is_some() {
         return Err(EngError::BadRequest(
             "engine config: cuda_decode needs a build with --features native-cuda on Linux; this build serves Flash-Next on MLX"
                 .to_string(),
         ));
     }
-    super::start::start(settings, prefix_reuse, ready_note)
+    let (engine, bundle) = super::start::start(settings, prefix_reuse, ready_note)?;
+    Ok((engine, bundle, CONTEXT_LIMIT))
 }
 
 /// A CUDA build serves Flash-Next on the card unless the entry sets `cuda_decode` to false, which
@@ -104,7 +102,7 @@ fn launch(
     settings: &FlashSettings,
     _prefix_reuse: bool,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     if settings.cuda.is_none() {
         return Err(EngError::BadRequest(
             "engine config: the Flash-Next CUDA decoder is off; set flash_next.cuda_decode to true to serve on a card (the MLX backend needs --features native-mlx on Apple Silicon)"
@@ -122,7 +120,7 @@ fn launch(
     _settings: &FlashSettings,
     _prefix_reuse: bool,
     _ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     Err(EngError::BadRequest(
         "engine config: this build has no Flash-Next backend; build with --features native-mlx on Apple Silicon"
             .to_string(),
