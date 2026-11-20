@@ -34,9 +34,10 @@ use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[path = "batch_worker.rs"]
@@ -652,7 +653,27 @@ fn work<E, F>(
         );
         return;
     }
-    while let Ok(Message::Job(job, ticket)) = jobs.recv() {
+    loop {
+        // An executor with background work (a disk write-behind) wakes between jobs to advance
+        // it; one without blocks on the queue as before.
+        let message = if executor.background_pending() {
+            match jobs.recv_timeout(BACKGROUND_POLL) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => {
+                    executor.background_step();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match jobs.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            }
+        };
+        let Message::Job(job, ticket) = message else {
+            break;
+        };
         drop(ticket);
         if shared.state() == EngineState::NativeFailed {
             reject(job);
@@ -692,11 +713,15 @@ fn work<E, F>(
         shared.set_state(next);
         *current = None;
     }
+    executor.background_drain();
     if shared.state() != EngineState::NativeFailed {
         shared.set_state(EngineState::Stopped);
     }
     drain(jobs, cancel_unstarted);
 }
+
+/// How long an idle engine waits for a job before it advances its background work.
+const BACKGROUND_POLL: Duration = Duration::from_millis(2);
 
 struct PromptPlan<'a> {
     tokens: &'a [u32],
@@ -1364,7 +1389,7 @@ mod tests {
         Job, JobEvent, JobHandle, JobUsage, PrefillPieces, PrefixHit, PrefixReport,
     };
     use crate::tokenizer::{DecodeBatch, DecodeFinish, IncrementalDecoder, Tokenizer};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
@@ -1420,6 +1445,10 @@ mod tests {
             crate::sched::job::PrefillBankReport,
             crate::sched::job::PrefillBankReport,
         )>,
+        /// Background work the spy reports as pending until `background_want` steps ran.
+        background_steps: Arc<AtomicUsize>,
+        background_want: usize,
+        background_drained: Arc<AtomicBool>,
     }
 
     impl Spy {
@@ -1451,6 +1480,9 @@ mod tests {
                 prefill_pair: false,
                 context_limit: None,
                 bank_reports: None,
+                background_steps: Arc::new(AtomicUsize::new(0)),
+                background_want: 0,
+                background_drained: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -1587,6 +1619,18 @@ mod tests {
                 return Err(error);
             }
             self.inner.decode(st, generation)
+        }
+
+        fn background_pending(&self) -> bool {
+            self.background_steps.load(Ordering::SeqCst) < self.background_want
+        }
+
+        fn background_step(&mut self) {
+            self.background_steps.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn background_drain(&mut self) {
+            self.background_drained.store(true, Ordering::SeqCst);
         }
 
         fn after_emit(&mut self) -> Result<(), EngError> {
@@ -4025,6 +4069,38 @@ mod tests {
         );
         drop(handle);
         engine.shutdown();
+    }
+
+    #[test]
+    fn an_idle_engine_advances_background_work_and_drains_it_at_shutdown() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]; 2], &log);
+        spy.background_want = 3;
+        let (steps, drained) = (
+            Arc::clone(&spy.background_steps),
+            Arc::clone(&spy.background_drained),
+        );
+        let engine = start_spy(100, spy);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while steps.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(steps.load(Ordering::SeqCst), 3, "the idle worker stepped");
+        assert!(!drained.load(Ordering::SeqCst), "no drain before shutdown");
+        // A job still runs between steps: the engine answers while background work is pending.
+        let handle = engine.handle();
+        let (job, events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
+        let events = run_one(&handle, job, events);
+        assert!(
+            matches!(events.last(), Some(JobEvent::Finished(_))),
+            "{events:?}"
+        );
+        drop(handle);
+        engine.shutdown();
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "shutdown drains background work"
+        );
     }
 
     #[test]

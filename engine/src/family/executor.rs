@@ -279,6 +279,17 @@ pub(crate) trait ExecutorOps {
     fn restore_candidate(&self, _prompt: &[u32]) -> Option<u64> {
         None
     }
+    /// Whether the executor has background work (a write-behind of saved prefixes) that the engine
+    /// thread should advance while it waits for the next job. Executors without any use this
+    /// default: nothing pending.
+    fn background_pending(&self) -> bool {
+        false
+    }
+    /// Advances the background work by one bounded step. The worker calls it between jobs, never
+    /// during one.
+    fn background_step(&mut self) {}
+    /// Finishes the background work before the engine thread ends, within a bound.
+    fn background_drain(&mut self) {}
     /// The largest prompt, in tokens, that the session budget could still admit for a fresh attempt
     /// of `st`: the pool-derived effective ceiling, not the configured context limit. The worker
     /// reports it as `PromptTooLong::limit_tokens` when an admission cannot be served even after

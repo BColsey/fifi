@@ -1208,3 +1208,56 @@ fn pinned_ready_one() {
 fn pinned_ready_two() {
     assert_pinned_ready(2);
 }
+
+/// The served engine reaches the step through `Q36CudaStep`: a deferred pinned save must publish
+/// at the first emit of its own job, which only holds when the wrapper forwards `after_emit`.
+#[test]
+#[ignore = "the 3090: loads the real model"]
+fn the_served_wrapper_publishes_a_deferred_save_after_the_first_emit() {
+    use super::card_session::Q36CudaStep;
+    let outcome = (|| -> Result<(usize, usize, usize), EngError> {
+        let gguf = gguf_path()?;
+        let bundle =
+            TokenizerBundle::load(gguf.parent().unwrap_or(Path::new(".")), &tokenizer_pin()?)?;
+        let ids = bundle.tokenizer().encode(
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+        )?;
+        let projector: &'static CudaProjector = Box::leak(Box::new(CudaProjector::new()?));
+        let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+        let device = Box::leak(Box::new(
+            projector.load_model(&model, load_options())?.device,
+        ));
+        let opts = options(KvMode::Fp16, CONTEXT, None);
+        let res: &'static StepResources = Box::leak(Box::new(StepResources::new(
+            projector.context(),
+            dims()?,
+            &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
+            &opts,
+        )?));
+        let mut step =
+            QwenResidentStep::new(projector.context(), res, device, &opts, rules_for(&bundle)?)?;
+        let layout = step.state_layout();
+        let checkpoint = layout.delta.total / layout.delta.slots + layout.kv.total;
+        step.enable_pinned_prefix_with(Some(3 * checkpoint))?;
+        let mut served = Q36CudaStep::Single(step);
+        let mut session = DecodeSession::default();
+        ExecutorOps::reset(&mut served, &mut session)?;
+        ExecutorOps::boundary(&mut served, &mut session);
+        ExecutorOps::prefill(&mut served, &mut session, head(&ids, 5)?)?;
+        let accepted =
+            ExecutorOps::save_prefix(&mut served, &session, head(&ids, 5)?, SaveKind::Tip)?;
+        assert!(accepted, "the pinned save is staged");
+        let before = ExecutorOps::prefix_report(&served).unwrap().entries as usize;
+        ExecutorOps::after_emit(&mut served)?;
+        let after = ExecutorOps::prefix_report(&served).unwrap().entries as usize;
+        // The idle hooks are reachable through the wrapper too, and with no disk tier they say
+        // there is nothing to do.
+        let pending = usize::from(ExecutorOps::background_pending(&served));
+        ExecutorOps::background_step(&mut served);
+        ExecutorOps::background_drain(&mut served);
+        Ok((before, after, pending))
+    })();
+    let (before, after, pending) = outcome.expect("the served wrapper runs on the card");
+    assert_eq!((before, after, pending), (0, 1, 0));
+    println!("SERVED_WRAPPER_AFTER_EMIT_PASS");
+}

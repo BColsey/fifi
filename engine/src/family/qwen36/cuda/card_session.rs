@@ -922,6 +922,34 @@ impl ExecutorOps for Q36CudaStep {
             Self::Cards(session) => session.boundary(st),
         }
     }
+
+    fn after_emit(&mut self) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => step.after_emit(),
+            Self::Cards(session) => session.after_emit(),
+        }
+    }
+
+    fn background_pending(&self) -> bool {
+        match self {
+            Self::Single(step) => step.background_pending(),
+            Self::Cards(session) => session.background_pending(),
+        }
+    }
+
+    fn background_step(&mut self) {
+        match self {
+            Self::Single(step) => step.background_step(),
+            Self::Cards(session) => session.background_step(),
+        }
+    }
+
+    fn background_drain(&mut self) {
+        match self {
+            Self::Single(step) => step.background_drain(),
+            Self::Cards(session) => session.background_drain(),
+        }
+    }
 }
 
 #[cfg(test)]
