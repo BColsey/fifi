@@ -4,7 +4,7 @@
 
 use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
-use crate::family::gemma4::FAMILY as GEMMA4_FAMILY;
+use crate::family::gemma4::{FAMILY as GEMMA4_FAMILY, Gemma4Options};
 use crate::family::{
     nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen36::{
@@ -90,6 +90,8 @@ pub(crate) struct EngineConfig {
     /// Options shared by `qwen3_6_35b_a3b` and `qwen3_8_27b_dense`.
     pub(crate) qwen36: Option<Q36Options>,
     pub(crate) nemotron: Option<NemotronOptions>,
+    /// Options of the `gemma4` family: the session count.
+    pub(crate) gemma4: Option<Gemma4Options>,
     /// Explicit CUDA pilot context and KV profile; absent on legacy MLX entries.
     pub(crate) flint: Option<FlintOptions>,
     /// Per-entry opt-out of resent-thinking replay (default: the template's
@@ -204,6 +206,11 @@ impl Config {
             {
                 return Err(StartupError(format!(
                     "engines[{index}] sets qwen36, which only the {Q36_FAMILY} family or {DENSE_FAMILY} family takes"
+                )));
+            }
+            if engine.family != GEMMA4_FAMILY && engine.gemma4.is_some() {
+                return Err(StartupError(format!(
+                    "engines[{index}] sets gemma4, which only the {GEMMA4_FAMILY} family takes"
                 )));
             }
             if engine.family != NEMOTRON_FAMILY && engine.nemotron.is_some() {
@@ -808,5 +815,53 @@ mod tests {
         let text = message(load(&text));
         assert!(text.contains("engines[0]"), "{text}");
         assert!(text.contains("only the nemotron35 family"), "{text}");
+    }
+
+    fn gemma4_entry(options: &str) -> String {
+        VALID.replace(
+            r#""family": "fake""#,
+            &format!(r#""family": "gemma4", "gemma4": {options}"#),
+        )
+    }
+
+    #[test]
+    fn a_gemma4_entry_reads_a_session_count_or_auto() {
+        use crate::family::gemma4::Gemma4Options;
+        let seqs = |options: &str| {
+            let config = load(&gemma4_entry(options)).expect("valid");
+            config.engines[0]
+                .gemma4
+                .as_ref()
+                .map(Gemma4Options::seqs)
+                .expect("options")
+        };
+        assert_eq!(format!("{:?}", seqs(r#"{"max_seqs": 4}"#)), "Count(4)");
+        assert_eq!(format!("{:?}", seqs(r#"{"max_seqs": "auto"}"#)), "Auto");
+        assert_eq!(format!("{:?}", seqs("{}")), "Count(1)");
+    }
+
+    #[test]
+    fn a_gemma4_session_count_outside_the_kernel_rows_is_rejected() {
+        for bad in [
+            r#"{"max_seqs": 0}"#,
+            r#"{"max_seqs": 9}"#,
+            r#"{"max_seqs": "many"}"#,
+        ] {
+            let text = message(load(&gemma4_entry(bad)));
+            assert!(text.contains("max_seqs"), "{bad}: {text}");
+        }
+        let text = message(load(&gemma4_entry(r#"{"max_seqs": 2, "extra": 1}"#)));
+        assert!(text.contains("extra"), "{text}");
+    }
+
+    #[test]
+    fn gemma4_options_on_another_family_are_rejected() {
+        let text = VALID.replace(
+            r#""family": "fake""#,
+            r#""family": "flash-next", "gemma4": {"max_seqs": 2}"#,
+        );
+        let text = message(load(&text));
+        assert!(text.contains("engines[0]"), "{text}");
+        assert!(text.contains("only the gemma4 family"), "{text}");
     }
 }

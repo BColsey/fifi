@@ -572,7 +572,7 @@ fn start_gemma4(
                     &config.model_dir,
                     &config.tokenizer_dir,
                     _ready_note,
-                    Default::default(),
+                    config.gemma4.clone().unwrap_or_default().seqs(),
                 )?;
                 Ok(StartedEngine {
                     engine: started.engine,
@@ -867,6 +867,7 @@ mod tests {
             flash_next: None,
             qwen36: None,
             nemotron: None,
+            gemma4: None,
             flint: None,
         }
     }
@@ -909,6 +910,7 @@ mod tests {
             flash_next: None,
             qwen36,
             nemotron: None,
+            gemma4: None,
             flint: None,
         }
     }

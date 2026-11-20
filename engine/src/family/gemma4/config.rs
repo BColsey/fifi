@@ -44,6 +44,21 @@ impl TryFrom<RawMaxSeqs> for MaxSeqs {
     }
 }
 
+/// The options of a `gemma4` engine entry.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Gemma4Options {
+    /// The sessions served at once; absent means one.
+    pub(crate) max_seqs: Option<MaxSeqs>,
+}
+
+impl Gemma4Options {
+    /// The count the engine starts with.
+    pub(crate) fn seqs(&self) -> MaxSeqs {
+        self.max_seqs.unwrap_or_default()
+    }
+}
+
 pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     let root = serde_json::from_slice::<UniqueValue>(json)
         .map_err(|error| EngError::Checkpoint(format!("configuration JSON: {error}")))?

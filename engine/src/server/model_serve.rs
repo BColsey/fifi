@@ -255,6 +255,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             flash_next: None,
             qwen36: Some(discovered.options.clone()),
             nemotron: None,
+            gemma4: None,
             flint: None,
         }],
     }

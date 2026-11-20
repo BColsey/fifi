@@ -197,6 +197,7 @@ mod tests {
             flash_next: None,
             qwen36: None,
             nemotron: None,
+            gemma4: None,
             flint: None,
         }
     }
