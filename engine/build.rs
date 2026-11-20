@@ -308,6 +308,7 @@ fn build_cuda() {
     for name in [
         "CUDA_PATH",
         "CXX",
+        "FIFI_CUDA_DEVICE_DEBUG",
         "FIFI_CUDA_LINEINFO",
         "INFERENCE_CUDA_ARCHS",
         "PATH",
@@ -346,6 +347,7 @@ fn build_cuda() {
         .include("src/kernels/cuda/native/prefill/ggml_shim")
         .files(CUDA_SOURCES)
         .warnings_into_errors(true);
+    device_code_profile(&mut build);
     // The fault entry points exist only in builds that qualify fault handling.
     if std::env::var_os("CARGO_FEATURE_CUDA_FAULT_QUALIFICATION").is_some() {
         build.define("INFERENCE_CUDA_FAULT_QUALIFICATION", None);
@@ -392,6 +394,19 @@ fn build_cuda() {
     build.compile("inference_cuda_native");
     build_mmq_vendor(&archs, &arch_header);
     toolkit.link_static_cudart();
+}
+
+/// Device code is compiled the same way in every cargo profile. `cc` adds nvcc's `-G` to a debug
+/// profile, which turns the device optimizer off: the kernels then run without the fused
+/// multiply-adds the optimizer forms, so two kernels that agree bit for bit in a release build
+/// differ in the last place in a test build. `FIFI_CUDA_DEVICE_DEBUG=1` keeps `-G` for a
+/// debugger session; the numerics of such a build are not those of a served build.
+fn device_code_profile(build: &mut cc::Build) {
+    let debugger = matches!(
+        std::env::var("FIFI_CUDA_DEVICE_DEBUG").as_deref(),
+        Ok("1" | "true" | "on")
+    );
+    build.debug(debugger);
 }
 
 /// One `-gencode` per listed arch, plus PTX for the newest one, which lets a newer GPU JIT the
@@ -453,6 +468,7 @@ fn build_mmq_glue(archs: &[String], arch_header: &std::path::Path) {
         .flag("-include")
         .flag(arch_header.to_str().expect("OUT_DIR is UTF-8"))
         .warnings_into_errors(true);
+    device_code_profile(&mut glue);
     gencode(&mut glue, archs);
     glue.compile("inference_cuda_mmq_glue");
 }
@@ -475,6 +491,7 @@ fn build_mmq_vendor(archs: &[String], arch_header: &std::path::Path) {
         .flag("--extended-lambda")
         .flag("-include")
         .flag(arch_header.to_str().expect("OUT_DIR is UTF-8"));
+    device_code_profile(&mut vendor);
     gencode(&mut vendor, archs);
     vendor.compile("ggml_cuda_mmq_vendor");
 }
