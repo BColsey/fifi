@@ -1,61 +1,59 @@
 # Benchmarks
 
 These numbers show what fifi does on the hardware it is tested on.
-Each table compares runs with the same weights on the same machine.
-They are single runs, and day-to-day noise is about 4%, so differences smaller than that are not meaningful.
-Tables were measured on different days and builds; compare within a table, not across tables.
+Each table compares runs with the same weights on the same machine, measured in the same window on the same day.
+Every fifi figure below comes from the same-day sweep of 20 Nov 2026 on frozen tip `47ad58e02`.
+Workload: greedy sampling, 256 generated tokens, fresh server boot per run, three runs per prompt size; ranges list all three runs.
+Reference engines appear only where a same-window pair exists — llama.cpp on the RTX 3090 and MLX-LM on Apple Silicon. Hosts that cannot run a reference engine carry single-engine figures and say so.
 
-Unless a table says otherwise, the workload is a recorded multi-turn chat session whose prompt grows with every turn, and fifi runs with prefix reuse on.
-"Time to first token" is how long a turn takes before the first reply token arrives.
+Day-to-day noise is about 4%, so differences smaller than that are not meaningful.
+"Prefill" is the server's own prefill interval; "decode" is its tokens-per-second counter. Where a reference engine reports differently (prompt-eval and eval intervals), the table names the column.
 
-## Qwen3.6 on Apple Silicon (M4 Max, 36 GB)
+## Qwen3.6-35B-A3B, GGUF Q4_K_M, on an RTX 3090 (24 GB)
 
-Against llama.cpp (Metal, 8-bit KV cache, `-ub 2048`), 12 turns:
+fifi: the default arm (nothing set; KV cache fp16, context 32,768). llama.cpp: `llama-server` 0.4.0-dev build 10934, commit `acecd5603`, CUDA build, `-c 32768 -ngl 99 --temp 0`, the same GGUF file and the same prompt files, four slots of 32,768 context. Same window, same card, same host. Figures are fifi `prefill_ms` vs llama.cpp `prompt_eval_ms` (both exclude generation), and each engine's own decode counter; each cell carries its three runs.
 
-| Metric | fifi | llama.cpp |
-| --- | --- | --- |
-| Sum of time to first token | 63.1 s | 64.35 s |
-| Decode speed | 63.3 tokens/s | 57.4 tokens/s |
+| Prompt tokens | fifi prefill ms | llama.cpp prefill ms | fifi decode tok/s | llama.cpp decode tok/s |
+| ---: | --- | --- | --- | --- |
+| 510 | 144.5 / 145.4 / 146.1 | 245.10 / 241.71 / 238.07 | 164.71–165.28 | ~146 |
+| 4,010 | 687.3–691.6 | 1,381.32 / 1,414.53 / 1,390.14 | 159.32–160.10 | ~141 |
+| 32,010 | 7,585.7–7,636.0 | 11,859.71 / 12,114.23 / 12,186.57 | 130.54–134.07 | ~127 |
 
-A later fifi build measured 57.1 s for the same sum.
+On this pair fifi is faster at every size: prefill by 1.6x to 2.0x, decode by 9 to 13 percent. A 128,010-token prompt is outside both servers' 32,768 default context (both would refuse it; fifi's tuned profile admits it, and that arm is not part of this pair).
 
-Against MLX-LM 0.32.2 (mlx 0.32.4, `--prompt-cache`), the same 12 turns:
+## Qwen3.6-35B-A3B, MLX 4-bit, on Apple Silicon (36 GB)
 
-| Metric | fifi (8-bit KV) | MLX-LM (16-bit KV) | MLX-LM (`--kv-bits 8`) |
-| --- | --- | --- | --- |
-| Sum of time to first token | 53.5 s | 44.9 s (11 turns) | 312.3 s |
-| First turn, nothing reused | 7.93 s | 7.98 s | |
-| Median later turn | 3.87 s | 3.55 s | 26.16 s |
-| Decode speed | 62.8 tokens/s | 100.1 tokens/s | 78.8 tokens/s |
-| Process memory | 13.0 GB | 17.6 GB | |
+fifi: the shipped 36 GB config (`engine/config/qwen36-mac-studio-36gb.json`) with paths swapped — see [Current status](status.md) for its figure table and switch list. The default arm refuses to start on this host (missing `cache_limit_bytes`), so the tuned arm is the only side that can pair.
 
-The MLX-LM run with its default cache failed on the twelfth turn, so its sum covers 11 turns.
-About half of fifi's decode gap to MLX-LM comes from the 8-bit KV cache; the rest is kernel time per step.
+MLX-LM 0.32.2 (Python 3.12 venv; the older 0.29.1 refuses this model type), the same model file, the same prompt strings, greedy sampling, 256 generated tokens, measured in-process (no HTTP layer): 2.5 / 2.5 / 4.3 s at 526 tokens (median 2.5), 4.6 / 4.6 / 5.7 s at 4,022 (median 4.6), 28.9 / 28.9 / 29.8 s at 32,028 (median 28.9).
 
-## Qwen3.6 on an RTX 3090 (24 GB)
+End-to-end, same prompts, same host, same day: fifi (prefill plus 256 tokens at its decode rate) takes 3.42 s at 526 tokens, 6.48 s at 4,022, 38.3 s at 32,028, against MLX-LM's 2.5 / 4.6 / 28.9 s. **MLX-LM is faster end-to-end at every size on this host: by 27% at 526, 29% at 4,022 and 25% at 32,028.** This is the headline gap for the MLX backend.
 
-Against llama.cpp (8-bit KV cache, `-ub 1024`), same GGUF file, 131,072-token context:
+Caveats, stated: the MLX-LM figure is in-process (no HTTP, no server), while the fifi figure sums two server-side counters; both are greedy on the same file. The comparison is honest about its layers but is not a pure like-for-like server pair.
 
-| Metric | fifi | llama.cpp |
-| --- | --- | --- |
-| Time to first token, 127,788-token prompt, nothing reused | 50.2 s | 52 s |
-| Time to first token, later turn at 128K tokens | 5.40 s | 5.7 s |
-| Decode speed | 24 to 68% faster at every measured depth | baseline |
+## Flint, MLX int4 21 GB fixture, on the same Apple Silicon host
 
-Long sessions:
+No reference pair exists: MLX-LM cannot load this model type ("Model type flint not supported"), so this table is single-engine, measured for admission and ceiling rather than comparison. Default arm (which equals the tuned arm — nothing qualified to switch on for Flint on MLX):
 
-- With the 180,224-token profile, a session ran 33 turns up to 178,229 tokens with no errors and passed 4 of 4 recall checks.
-- With the 262,144-token profile, a session reached 255,966 tokens with no errors and passed 7 of 7 recall checks. A turn at 192,014 tokens took 4.61 s to its first token; repeating the 255,966-token prompt unchanged took 0.474 s.
+| Prompt tokens | Prefill ms (median of 3) | Decode tok/s | Conditions |
+| ---: | ---: | --- | --- |
+| 526 | 424 | 52.34 / 52.73 / 52.75 | greedy, 256 tokens |
+| 4,022 | 2,944 | 48.41 / 48.52 / 48.54 | same |
+| 32,028 | 46,986 | 26.04 / 26.07 / 26.11 | fits under the env-fixed 32,768 ceiling; a 128K prompt refuses |
 
-## Flint on Apple Silicon
+Peak server RSS 14.1 GiB. For the model-on-model comparison against Qwen3.6-MLX on the same host (32K prefill 36% slower, decode 61% slower), see [Current status](status.md).
 
-| Prompt length | Decode time per token |
-| ---: | ---: |
-| 22 tokens | 23.1 ms |
-| 7,800 tokens | 25.6 ms |
-| 26,600 tokens | 40.2 ms |
+## Qwen3.6-35B-A3B, GGUF Q4_K_M, on an AGX Xavier board
 
-Prompt processing runs at about 1,000 tokens/s.
+No reference engine runs on this board (its software set does not include one and its configuration is frozen), so these are single-engine figures, useful for admission and thermal planning rather than comparison. Same weights file as the 3090 tables.
 
-Compared with the publisher's own runtime, fifi's next-token distributions have a mean KL divergence of 0.062 and 94.0% top-1 agreement.
-The publisher runtime's two modes differ from each other by 0.074 and 92.4%.
+| Arm | Prompt tokens | Prefill | Decode tok/s | Conditions |
+| --- | ---: | --- | --- | --- |
+| Default | 486 | 2,911.8–4,296.4 ms | 20.57–20.69 | two runs, peak 54.5 °C |
+| Default | 3,993 | 35,755–37,128 ms | 19.92–19.96 | three runs, peaks 60.5–67.0 °C |
+| Default | 31,650 | 28.0 and 29.5 min | 14.48 / 15.38 | two completed runs, temperature not recorded; three later runs hit the 88 °C thermal guard during prefill |
+| Tuned (KV q8, context 16,384, capture and prefix reuse) | 486 | 2,788.3–3,242.0 ms | 20.65–20.75 | three runs, temperature not recorded |
+| Tuned | 3,993 | 36,864.9–43,020.3 ms | 19.94–20.04 | three runs, temperature not recorded |
+| Tuned | 15,283 (max admitted) | 401,369.9 ms (~6.7 min) | 18.29 | one completed run, peak 87.0 °C; two later runs hit the guard |
+
+The board holds ~20 tok/s decode at every admitted size; its limits are prefill time and the 88 °C thermal guard. For the same weights on an RTX 3090, see the first table on this page.
