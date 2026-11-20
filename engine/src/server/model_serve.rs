@@ -152,7 +152,9 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let weight_format = select_weight_format(has_gguf, has_safetensors);
 
     let options = crate::family::qwen36::settings::Q36Options {
-        weight_format: Some(weight_format.to_string()),
+        // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
+        // they are.
+        weight_format: (weight_format != MLX_WEIGHTS).then(|| weight_format.to_string()),
         context_limit: args.context_limit,
         kv_dtype: args.kv_dtype.clone(),
         ..crate::family::qwen36::settings::Q36Options::default()
@@ -323,6 +325,17 @@ fn select_family(
     }
 }
 
+/// The weight kind a build with the MLX backend reports for a directory of safetensors shards
+/// and no GGUF file.
+const MLX_WEIGHTS: &str = "mlx";
+
+/// Whether this build serves from the MLX backend (Apple Silicon with `native-mlx`).
+const MLX_BUILD: bool = cfg!(all(
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+));
+
 fn select_weight_format(has_gguf: bool, has_safetensors: bool) -> &'static str {
     if has_gguf {
         if has_safetensors {
@@ -331,6 +344,8 @@ fn select_weight_format(has_gguf: bool, has_safetensors: bool) -> &'static str {
             );
         }
         "gguf"
+    } else if MLX_BUILD {
+        MLX_WEIGHTS
     } else {
         "exl3"
     }
@@ -503,6 +518,10 @@ mod tests {
         );
     }
 
+    fn safetensors_only_format() -> &'static str {
+        if super::MLX_BUILD { "mlx" } else { "exl3" }
+    }
+
     #[test]
     fn a_gguf_directory_is_detected_with_the_qualified_default_options() {
         let dir = model_dir(Some("qwen3_5_moe"), true, false);
@@ -525,14 +544,20 @@ mod tests {
         let dir = model_dir(Some("qwen3_5"), false, true);
         let discovered = discover(&args_for(dir.path())).expect("discovers");
         assert_eq!(discovered.family, "qwen3_8_27b_dense");
-        assert_eq!(discovered.weight_format, "exl3");
+        assert_eq!(discovered.weight_format, safetensors_only_format());
     }
 
     #[test]
     fn an_exl3_only_directory_is_detected_as_exl3() {
         let dir = model_dir(Some("qwen3_5_moe"), false, true);
         let discovered = discover(&args_for(dir.path())).expect("discovers");
-        assert_eq!(discovered.weight_format, "exl3");
+        assert_eq!(discovered.weight_format, safetensors_only_format());
+        // A directory of safetensors shards is an MLX pack on an MLX build, which sets no
+        // `weight_format` (the MLX arm refuses `exl3`), and an EXL3 pack elsewhere.
+        assert_eq!(
+            discovered.options.weight_format.as_deref(),
+            (!super::MLX_BUILD).then_some("exl3")
+        );
     }
 
     #[test]

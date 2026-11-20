@@ -2358,7 +2358,7 @@ mod tests {
     }
 
     /// The MLX arm reads a safetensors pack: the unset `weight_format` (`gguf`) must not demand a
-    /// `.gguf` file there, and a directory without any weight file still fails.
+    /// `.gguf` file there, and a directory without any weight file still fails the start.
     #[test]
     fn an_mlx_pack_passes_the_weight_format_check_without_a_gguf_file() {
         use crate::family::qwen36::settings::Backend;
@@ -2393,8 +2393,9 @@ mod tests {
             "{}",
             check.detail
         );
+        // No weight file: the host facts need the shard bytes, so the settings refuse first.
         let without = report_for(false);
-        let check = check_named(&without, "weight format");
+        let check = check_named(&without, "settings");
         assert_eq!(check.status, CheckStatus::Fail, "{}", check.detail);
     }
 
