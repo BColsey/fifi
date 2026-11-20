@@ -191,3 +191,15 @@ For the fixed short-answer corpus, run
 `python3 scripts/bench_corpus_accuracy.py BASE_URL API_KEY MODEL OUT.json`
 once per configuration and compare the two reports with
 `python3 scripts/bench_corpus_accuracy.py --compare A.json B.json`.
+
+An earlier standalone RTX 2080 Ti run with Q8 KV and one saved
+conversation took 834.27 seconds to first token for a 65,351-token prompt.
+An immediate repeat reused 65,344 tokens and took 0.87 seconds.
+After another conversation displaced that checkpoint, the original prompt
+took 836.37 seconds. Each figure is one observation. Separate 128-token
+continuations decoded at 80.19 tokens/s near 2K and 66.77 tokens/s near 64K.
+[Original workload and measurements](https://github.com/zbrdc/fifi/pull/89)
+
+The coding benchmark accepts `--reuse-mode disabled` to require zero reused
+tokens on the second turn. Its default `--reuse-mode required` checks the
+minimum reuse in addition to validating the requested edit.
