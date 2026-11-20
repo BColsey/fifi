@@ -73,6 +73,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
+| `kv_cache` | CUDA | off | An object that keeps saved prefixes on local disk, so a long conversation survives a restart and an eviction from pinned memory. Members: `dir` (an absolute path; naming it turns the cache on), `quota_bytes` (from 1 GiB) and `enabled`. See [below](#prefix-cache-on-disk-cuda). |
 | `tiered` | CUDA | off | Keep only some experts on the GPU. See [below](#tiered-experts-cuda). |
 | `draft_mode` | CUDA, `exl3` | `disabled` | Where speculative drafts come from: `disabled`, `ngram` (the tokens that followed the latest earlier occurrence of the context's tail) or `mtp` (the model's own MTP head, which needs `mtp_model_dir`; not usable yet). Any other value is refused. |
 | `num_draft_tokens` | CUDA, `exl3` | 2 | The most drafts one verify window carries, 1 to 16. |
@@ -92,6 +93,25 @@ The `draft_*`, `num_draft_tokens`, `hybrid_draft_tokens`, `ngram_match_min` and 
 `prefix_store_entries` is ignored with a log line when `prefix_reuse` is off.
 
 Before saving a new host-backed pageable prefix (the opt-in pageable path; the default pinned-prefix path is unchanged), the CUDA engine checks live host and process-cgroup memory. The check covers the committed KV and recurrent state on every participating card, the largest temporary copy buffer, and 1 GiB of headroom. If that space is unavailable, the engine skips the optional save with one logged line (what was needed, what was available, that the request is unaffected) and keeps the already-cached prefixes available for later requests; if no budget figure can be read at all, the save proceeds as before with one logged line. Reusing an existing checkpoint requires no new allocation and passes without a probe.
+
+### Prefix cache on disk (CUDA)
+
+`kv_cache` keeps the saved prefixes of a Qwen3.6 GGUF engine in a directory, so the next request of a long conversation reads its state from disk in seconds instead of processing the prompt again, also after a restart.
+It needs `prefix_reuse` and the pinned prefix pool; with either off, or with EXL3 weights, or with more than one CUDA device, the cache stays off and says why in its start line.
+
+```json
+"qwen36": { "kv_cache": { "dir": "/var/cache/fifi/kv", "quota_bytes": 21474836480 } }
+```
+
+- `dir`: absolute. Created with mode 0700 when missing; an existing directory must be owner-only. One process owns a directory at a time. Without `dir` the cache uses `$XDG_CACHE_HOME/fifi/kv`, else `$HOME/.cache/fifi/kv`.
+- `quota_bytes`: the most the directory may hold, at least 1 GiB. Without it the quota is a quarter of the free space of the directory's filesystem at start, at most 64 GiB; below 4 GiB the cache stays off. The least recently used entry goes first.
+- `enabled`: `false` keeps the cache off whatever else is set; `true` turns it on at the default directory.
+
+The environment overrides the config: `Q36_KV_CACHE_DIR`, `Q36_KV_CACHE_QUOTA_BYTES`, and `Q36_KV_CACHE=0` or `1`. A malformed value stops the start.
+`enginesrv --config <file> --purge-kv-cache` empties the directory (only a directory that holds a cache) and then starts.
+
+An entry holds the exact tokens, the DeltaNet state and the KV rows of one saved prefix. The disk is used only when pinned memory is not enough: once the pinned pool holds all but one of its entries (all of them for a pool of one or two), the least recently used entries are written in the background so their eviction never waits; a spill whose slot a save needs first is dropped and counted; and a graceful stop (SIGINT or SIGTERM) writes the tips that exist only in memory, newest first, within a bound derived from their bytes and the measured write rate. A session that fits in pinned memory writes nothing. An entry is read back, on a pinned-memory miss, with a CRC32C and SHA256 check of every byte. Entries carry the weights, tokenizer and chat-template digests of the load that wrote them; an entry of another load, a truncated or a corrupted one is a miss, logged, and the prompt is processed as without the cache. Entries below 1,024 positions are not written.
+The request log reports `prefix_source` (`device`, `pinned` or `disk`), for a disk restore `prefix_disk_bytes` and `prefix_disk_ms`, and the totals written since the start: `prefix_disk_written_entries`, `prefix_disk_written_bytes` and `prefix_disk_dropped`. The start line says where the watermark is, and each write says why (`watermark` or `stop`).
 
 ### GGUF content pinning (CUDA)
 

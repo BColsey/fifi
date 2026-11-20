@@ -1610,6 +1610,7 @@ fn make(
         let mut extras = Vec::new();
         if modes.prefix != PrefixMemory::Disabled {
             step.enable_pinned_prefix()?;
+            enable_kv_disk(&mut step, &settings)?;
         }
         let mut tip_bytes = 0;
         if modes.prefix == PrefixMemory::DeviceTip && step.pinned_prefix_enabled() {
@@ -1724,6 +1725,25 @@ fn make(
         projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
     );
     Ok((step, DecodeSession::default()))
+}
+
+/// Starts the on-disk prefix tier when the config, the environment or the build default asks for
+/// it, and says in one line whether it runs. A malformed override stops the start; a directory
+/// that cannot be used leaves the tier off.
+fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Result<(), EngError> {
+    use crate::family::qwen36::{kv_cache, settings::KV_CACHE_DEFAULT_ON};
+    let plan = kv_cache::plan(
+        settings.kv_cache.as_ref(),
+        &kv_cache::KvEnv::from_process(),
+        KV_CACHE_DEFAULT_ON,
+        kv_cache::free_bytes,
+    )
+    .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?;
+    match plan {
+        kv_cache::Plan::Off(reason) => eprintln!("q36 cuda: kv disk tier off: {reason}"),
+        kv_cache::Plan::On { resolved, origin } => step.enable_disk_tier(&resolved, origin),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

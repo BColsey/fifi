@@ -30,6 +30,46 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+/// Empties the prefix cache directory of every Qwen3.6 engine of `config`: the environment's,
+/// else the engine's `kv_cache.dir`, else the default location. A directory that holds
+/// anything besides a cache is refused and left alone.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn purge_kv_caches(config: &Config) -> Result<(), StartupError> {
+    use crate::family::qwen36::{factory::FAMILY, kv_cache};
+    let env = kv_cache::KvEnv::from_process();
+    for engine in &config.engines {
+        if engine.family != FAMILY {
+            continue;
+        }
+        let options = engine
+            .qwen36
+            .as_ref()
+            .and_then(|options| options.kv_cache.as_ref());
+        let Some(dir) = kv_cache::purge_dir(options, &env).map_err(StartupError)? else {
+            eprintln!(
+                "kv cache purge: engine {} has no cache directory (set kv_cache.dir)",
+                engine.id
+            );
+            continue;
+        };
+        let report = kv_cache::purge(&dir).map_err(StartupError)?;
+        eprintln!(
+            "kv cache purge: engine {}: {} entries, {} B removed from {}",
+            engine.id,
+            report.entries,
+            report.bytes,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+fn purge_kv_caches(_config: &Config) -> Result<(), StartupError> {
+    eprintln!("kv cache purge: the disk cache belongs to the CUDA build; nothing to purge");
+    Ok(())
+}
+
 /// `args` are the command-line arguments after the program name.
 /// The call returns after a shutdown signal and the end of the running requests.
 ///
@@ -45,9 +85,17 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
             .and_then(|action| crate::capability::cli::run(&action))
             .map_err(StartupError);
     }
-    let args: &[String] = match args.first().map(String::as_str) {
-        Some("serve") => &args[1..],
-        _ => args,
+    // `--purge-kv-cache` empties the on-disk prefix cache directory of each Qwen3.6 engine,
+    // then the server starts as usual.
+    let purge_kv_cache = args.iter().any(|arg| arg == "--purge-kv-cache");
+    let without_purge: Vec<String> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--purge-kv-cache")
+        .cloned()
+        .collect();
+    let args: &[String] = match without_purge.first().map(String::as_str) {
+        Some("serve") => &without_purge[1..],
+        _ => &without_purge,
     };
     // The simplified startup is a front end to the same path: it builds
     // a normal in-memory `Config` and everything downstream (key check,
@@ -65,6 +113,9 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     };
     let key = config.api_key(|name| std::env::var(name).ok())?;
     let address = config.listen_address()?;
+    if purge_kv_cache {
+        purge_kv_caches(&config)?;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
