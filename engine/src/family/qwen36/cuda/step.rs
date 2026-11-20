@@ -529,6 +529,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// prefix key. Empty until `set_prefix_identity`; an entry is persisted only when none is empty.
     prefix_identity: PrefixIdentity,
     prefix_pins: Option<super::state::pinned::PrefixPinPool>,
+    /// The disk tier behind the pinned entries, when the cache directory opened.
+    disk: Option<prefix_disk::DiskTier>,
+    /// The tier of the last restore from memory, taken when its report is built.
+    restore_source: Option<crate::sched::job::PrefixSource>,
     device_tip: Option<super::state::device_tip::DeviceTip>,
     /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
     /// A window on a step that wants it and holds no slots is refused before any state change.
@@ -1018,6 +1022,8 @@ impl<'a> QwenResidentStep<'a> {
             prefix: PrefixSlot::default(),
             prefix_identity: PrefixIdentity::default(),
             prefix_pins: None,
+            disk: None,
+            restore_source: None,
             device_tip: None,
             #[cfg(test)]
             trace_sync_capture: false,
@@ -2876,6 +2882,8 @@ impl<'a> QwenResidentStep<'a> {
 #[path = "shortlist_bench.rs"]
 mod shortlist_bench;
 
+#[path = "prefix_disk.rs"]
+mod prefix_disk;
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
 

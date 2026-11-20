@@ -1083,6 +1083,19 @@ impl<S, P> PrefixStore<S, P> {
         u32::try_from(longest - restored).unwrap_or(u32::MAX)
     }
 
+    /// Every stored entry as `(key, kind, state)`, roots first, each list from the least to the
+    /// most recently used.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn entries_lru(&self) -> impl Iterator<Item = (&[u32], SaveKind, &S)> {
+        self.roots.iter().chain(&self.lru).map(|stored| {
+            (
+                stored.saved.key.as_slice(),
+                stored.kind,
+                &stored.saved.state,
+            )
+        })
+    }
+
     /// The key length and `is_root` of every stored entry, roots first, each list from the least
     /// to the most recently used. For tests and logs.
     pub(crate) fn keys(&self) -> Vec<(usize, bool)> {
@@ -1619,6 +1632,41 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     /// the very anchor its next attempt restores.
     pub(crate) fn restore_candidate(&self, prompt: &[u32], path: &P) -> Option<u64> {
         self.candidates(prompt, path).first().map(|&(id, _, _)| id)
+    }
+
+    /// The key length of the entry a `restore_prefix` for `prompt` under `path` would try
+    /// first, or `None` when no entry qualifies.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn longest_candidate_len(&self, prompt: &[u32], path: &P) -> Option<usize> {
+        self.candidates(prompt, path)
+            .first()
+            .map(|&(_, _, len)| len)
+    }
+
+    /// Stores a state that came from another tier (a disk read) as an entry of `kind`, with
+    /// the same room, replacement and lineage rules as a save. The caller has already checked
+    /// that `key` ends in `pending`. Returns whether the entry is stored.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn save_loaded(
+        &mut self,
+        key: &[u32],
+        pending: u32,
+        path: P,
+        kind: SaveKind,
+        state: S,
+    ) -> Result<bool> {
+        let mut cell = Some(state);
+        let observed = self.restored.take();
+        // The state is loaded for the request that is about to restore it, so no resident entry
+        // is protected against it: the protection exists for a shorter save, not for this use.
+        let protection = std::mem::replace(&mut self.protect_recent_longer, false);
+        let result = self.save_charged(key, pending, path, kind, None, &mut || {
+            cell.take()
+                .ok_or_else(|| EngError::BadRequest("a loaded prefix state was used twice".into()))
+        });
+        self.protect_recent_longer = protection;
+        self.restored = observed;
+        result
     }
 
     /// One restore attempt on the entry `id`: run `restore` on its state. On success the entry
@@ -2867,6 +2915,36 @@ mod tests {
 
     fn store(roots: usize, entries: usize) -> Slot {
         PrefixStore::with_limits(StoreLimits { roots, entries })
+    }
+
+    /// A state that arrives from another tier is stored under the room rules of a save, except
+    /// that the recent-longer protection does not hold against it: with one slot, an unrelated
+    /// resident entry makes room for it, longer or shorter, in either kind.
+    #[test]
+    fn a_loaded_state_takes_the_place_of_an_unrelated_resident_entry() {
+        for protected in [false, true] {
+            let mut slot = store(0, 1).with_blocks_per_lineage();
+            if protected {
+                slot = slot.with_recent_longer_protection();
+            }
+            let resident: Vec<u32> = (0..80).collect();
+            let loaded: Vec<u32> = (100..150).collect();
+            assert_eq!(
+                slot.save_loaded(&resident, 79, 1u8, SaveKind::Tip, vec![1]),
+                Ok(true)
+            );
+            assert_eq!(
+                slot.save_loaded(&loaded, 149, 1u8, SaveKind::Tip, vec![2]),
+                Ok(true),
+                "protected {protected}"
+            );
+            assert_eq!(slot.keys(), vec![(50, false)]);
+            assert_eq!(
+                slot.save_loaded(&resident, 79, 1u8, SaveKind::Periodic, vec![3]),
+                Ok(true)
+            );
+            assert_eq!(slot.keys(), vec![(80, false)]);
+        }
     }
 
     /// Saves the tokens that `step` has fed as a tip.

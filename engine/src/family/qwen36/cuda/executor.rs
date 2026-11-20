@@ -194,6 +194,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
         let began = Instant::now();
         let out = st.prefill(self, toks, context_limit);
         self.record_prefill_piece(toks.len(), began);
+        self.pump_disk_prefill();
         out
     }
 
@@ -225,7 +226,29 @@ impl ExecutorOps for QwenResidentStep<'_> {
     }
 
     fn after_emit(&mut self) -> Result<()> {
-        self.complete_prefix_save()
+        self.complete_prefix_save()?;
+        self.pump_disk_emit();
+        Ok(())
+    }
+
+    fn background_pending(&self) -> bool {
+        self.disk_pending()
+    }
+
+    fn background_step(&mut self) {
+        // A save that publishes while the engine is idle (the last one of a job) is offered
+        // here, so the copy to disk starts without waiting for the next request.
+        if let Err(error) = self.complete_prefix_save() {
+            eprintln!("q36 cuda: deferred prefix save failed while idle: {error:?}");
+        }
+        self.pump_disk_idle();
+    }
+
+    fn background_drain(&mut self) {
+        if let Err(error) = self.complete_prefix_save() {
+            eprintln!("q36 cuda: deferred prefix save failed at shutdown: {error:?}");
+        }
+        self.drain_disk();
     }
 
     /// No transient routing or draft state exists: the step keeps nothing between turns. A
@@ -283,6 +306,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
         self.complete_prefix_save()?;
         let began = Instant::now();
         self.prefix.set_shadow_enabled(shadow_block_lcp_enabled());
+        self.promote_from_disk(prompt);
         let mut slot = std::mem::take(&mut self.prefix);
         let covered = st.restore_prefix(
             &mut slot,

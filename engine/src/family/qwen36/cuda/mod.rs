@@ -172,6 +172,7 @@ mod prefill_tests;
 mod prefix;
 #[cfg(test)]
 mod prefix_device_tests;
+mod prefix_shape;
 #[cfg(test)]
 mod prefix_tests;
 #[cfg(test)]

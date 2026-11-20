@@ -37,6 +37,12 @@ impl PinnedSnapshot {
         self.tokens
     }
 
+    /// A second owner of the backing slot. While it lives the pool keeps the slot out of its
+    /// rotation and out of Tip recycling, so a reader of the held bytes sees them unchanged.
+    pub(crate) fn hold(&self) -> Rc<RefCell<PinnedBuf>> {
+        Rc::clone(&self.data)
+    }
+
     pub(crate) fn copied_kv_bytes(&self) -> usize {
         self.copied_kv_bytes
     }
@@ -56,6 +62,22 @@ impl PendingPinned {
         }
         self.saved.device_tip = Some(key);
         Ok(())
+    }
+}
+
+/// A free slot being filled from outside the card (a read of the disk tier), before it becomes a
+/// snapshot. The slot is out of the rotation from `begin_landing` until the landing is dropped or
+/// finished.
+pub(crate) struct PinnedLanding {
+    saved: PinnedSnapshot,
+    epoch: u64,
+}
+
+impl PinnedLanding {
+    /// Copies `bytes` into the slot at `offset` (an offset of the whole slab: DeltaNet bytes
+    /// first, then the KV planes at their device offsets).
+    pub(crate) fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), EngError> {
+        self.saved.data.borrow_mut().write(offset, bytes)
     }
 }
 
@@ -117,6 +139,78 @@ impl PrefixPinPool {
 
     pub(crate) fn bytes(&self) -> usize {
         self.slab_bytes * self.slots.len()
+    }
+
+    /// Slots nothing holds: the ones a save or a landing may take.
+    pub(crate) fn free_slots(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| Rc::strong_count(slot) == 1)
+            .count()
+    }
+
+    /// The bytes of the DeltaNet state at the head of every slab.
+    pub(crate) fn delta_bytes(&self) -> usize {
+        self.delta_bytes
+    }
+
+    /// Takes a free slot for `tokens` positions that a caller fills with
+    /// [`PinnedLanding::write`]. Fails with `MemoryPlan` when every slot is held.
+    pub(crate) fn begin_landing(
+        &mut self,
+        stream: &DeviceStream,
+        state: &ResidentState,
+        tokens: usize,
+    ) -> Result<PinnedLanding, EngError> {
+        self.live_source = None;
+        if self.layout != state.layout {
+            return Err(invalid("state layout changed"));
+        }
+        if tokens == 0 || tokens > state.layout.kv.capacity {
+            return Err(invalid("landing positions are outside the KV capacity"));
+        }
+        let slot = (0..self.slots.len())
+            .map(|offset| (self.next + offset) % self.slots.len())
+            .find(|&i| Rc::strong_count(&self.slots[i]) == 1)
+            .ok_or_else(|| EngError::MemoryPlan("all pinned prefix slots are retained".into()))?;
+        self.generations[slot] = self.generations[slot]
+            .checked_add(1)
+            .ok_or_else(|| invalid("slot generation exhausted"))?;
+        self.next = (slot + 1) % self.slots.len();
+        Ok(PinnedLanding {
+            saved: PinnedSnapshot {
+                identity: state.identity.clone(),
+                layout: self.layout,
+                tokens,
+                owner: stream.id(),
+                slot,
+                generation: self.generations[slot],
+                copied_kv_bytes: 0,
+                data: Rc::clone(&self.slots[slot]),
+                device_tip: None,
+            },
+            epoch: self.epoch,
+        })
+    }
+
+    /// Turns a filled landing into a snapshot the store can hold. Refused when a reset or
+    /// import invalidated the pool while the landing was open.
+    pub(crate) fn finish_landing(
+        &mut self,
+        landing: PinnedLanding,
+    ) -> Result<PinnedSnapshot, EngError> {
+        let saved = &landing.saved;
+        if landing.epoch != self.epoch
+            || self.generations.get(saved.slot) != Some(&saved.generation)
+            || self
+                .slots
+                .get(saved.slot)
+                .is_none_or(|slot| !Rc::ptr_eq(&saved.data, slot))
+        {
+            return Err(invalid("a disk landing lost its slot"));
+        }
+        self.live_source = None;
+        Ok(landing.saved)
     }
 
     pub(crate) fn retained_entries(&self) -> usize {
@@ -1211,5 +1305,160 @@ mod tests {
             }
         }
         println!("PINNED_PREFIX_POOL_NATIVE_PASS");
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+    fn a_pinned_entry_survives_the_disk_cache_byte_exact_in_both_kv_formats() {
+        use crate::family::{
+            expert_bank::disk_store::DiskMiss,
+            qwen36::{
+                cuda::prefix_shape::EntryShape,
+                kv_cache::{Capture, KvDisk, LoadIdentity, Push, WriteSpec},
+            },
+        };
+        let ctx = CudaContext::new().expect("native CUDA context");
+        let stream = ctx.stream().expect("stream");
+        let dir = tempfile::tempdir().expect("scratch");
+        let pattern = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761).rotate_left(7) as u8 ^ seed)
+                .collect()
+        };
+        for mode in [KvMode::Fp16, KvMode::Int8G32] {
+            let positions = 1_500usize;
+            let options = StepOptions {
+                kv_mode: mode,
+                context_tokens: 2_048,
+                delta_slots: 1,
+                forked_experts: false,
+                tiered: None,
+                layout: WeightLayout::Native,
+            };
+            let mut state = ResidentState::allocate(&ctx, &stream, &common_tests::dims(), &options)
+                .expect("state");
+            let mut pool = PrefixPinPool::new(&ctx, state.layout, 2).expect("pool");
+            let kv_len = state.resident_kv().unwrap().bytes();
+            let delta_len = pool.delta_bytes;
+            state
+                .delta
+                .write_at(&stream, 0, &pattern(delta_len, 3))
+                .unwrap();
+            state
+                .resident_kv()
+                .unwrap()
+                .write_at(&stream, 0, &pattern(kv_len, 11))
+                .unwrap();
+            state.book.finish_overwrite(positions);
+            pool.invalidate().unwrap();
+            let pending = pool.begin(&ctx, &stream, &state, None).unwrap();
+            let saved = pool.finish(&ctx, &stream, &state, pending).unwrap();
+            let shape = EntryShape::of(&state.layout, positions).unwrap();
+            // The device's bytes of the entry, object by object: the Delta state, then each layer.
+            let objects_of = |state: &ResidentState| -> Vec<Vec<u8>> {
+                let mut delta = vec![0; delta_len];
+                state.delta.read_at(&stream, 0, &mut delta).unwrap();
+                let mut objects = vec![delta];
+                for layer in 0..state.layout.kv.layers {
+                    let mut object = Vec::new();
+                    for range in state.layout.kv.prefix_ranges(layer, positions).unwrap() {
+                        let mut bytes = vec![0; range.bytes];
+                        state
+                            .resident_kv()
+                            .unwrap()
+                            .read_at(&stream, range.device_offset, &mut bytes)
+                            .unwrap();
+                        object.extend_from_slice(&bytes);
+                    }
+                    objects.push(object);
+                }
+                objects
+            };
+            let before = objects_of(&state);
+            assert_eq!(
+                before.iter().map(|o| o.len() as u64).collect::<Vec<_>>(),
+                shape.object_bytes()
+            );
+            let load = LoadIdentity {
+                weights: "w".into(),
+                tokenizer: "t".into(),
+                template: "p".into(),
+                numeric_path: format!("{mode:?}"),
+                layout: "device-test".into(),
+            };
+            let (mut cache, _) =
+                KvDisk::open(&dir.path().join(format!("{mode:?}")), 1 << 30, &load).unwrap();
+            let key: Vec<u32> = (0..=positions as u32).collect();
+            let job = cache
+                .begin_write(WriteSpec {
+                    tokens: key.clone(),
+                    capture: Capture::Tip,
+                    object_bytes: shape.object_bytes(),
+                })
+                .unwrap();
+            let slot = saved.hold();
+            for run in shape.flat() {
+                let mut at = 0;
+                while at < run.bytes {
+                    let n = (run.bytes - at).min(1 << 20);
+                    let mut chunk = vec![0; n];
+                    slot.borrow().read(run.slab + at, &mut chunk).unwrap();
+                    loop {
+                        match cache.push(&job, chunk) {
+                            Push::Sent => break,
+                            Push::Full(back) => {
+                                chunk = back;
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Push::Dead => panic!("the writer stopped"),
+                        }
+                    }
+                    at += n;
+                }
+            }
+            assert!(cache.wait_idle(std::time::Duration::from_secs(60)));
+            drop(slot);
+            drop(saved);
+            let mut prompt = key.clone();
+            prompt.push(7);
+            let candidate = cache.lookup(&prompt).expect("the entry is stored");
+            let landing = pool.begin_landing(&stream, &state, positions).unwrap();
+            cache
+                .read(
+                    &candidate,
+                    &prompt,
+                    &shape.object_bytes(),
+                    &mut |object, offset, bytes| {
+                        shape
+                            .scatter(object, offset, bytes, &mut |slab, part| {
+                                landing.write(slab, part)
+                            })
+                            .map_err(|error| DiskMiss::Refused(format!("{error:?}")))
+                    },
+                )
+                .expect("a verified read");
+            let restored = pool.finish_landing(landing).unwrap();
+            state
+                .delta
+                .write_at(&stream, 0, &pattern(delta_len, 99))
+                .unwrap();
+            state
+                .resident_kv()
+                .unwrap()
+                .write_at(&stream, 0, &pattern(kv_len, 77))
+                .unwrap();
+            state.book.finish_overwrite(3);
+            pool.restore(&ctx, &stream, &mut state, &restored, None)
+                .expect("restore from the landed slot");
+            assert_eq!(state.tokens(), positions);
+            let after = objects_of(&state);
+            for (index, (a, b)) in before.iter().zip(&after).enumerate() {
+                assert!(
+                    a == b,
+                    "{mode:?}: object {index} differs after the disk round trip"
+                );
+            }
+        }
+        println!("PINNED_PREFIX_DISK_ROUND_TRIP_PASS");
     }
 }

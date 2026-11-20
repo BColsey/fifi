@@ -136,6 +136,7 @@ impl QwenResidentStep<'_> {
     pub(crate) fn record_prefix_lookup(&mut self, prompt: &[u32], covered: usize) {
         self.prefill_report
             .observe_prefix_lookup(&self.prefix, prompt, covered);
+        self.prefill_report.prefix_lookup.tier = self.restore_tier(covered);
     }
 
     /// Called once after tiered banks are attached and serving has enabled prefix reuse.
@@ -278,6 +279,7 @@ impl QwenResidentStep<'_> {
         if self.prefix.limits().entries == 0 {
             return Ok(false);
         }
+        self.free_slot_for_save();
         let pool = self
             .prefix_pins
             .as_mut()
@@ -356,6 +358,7 @@ impl QwenResidentStep<'_> {
                 "q36 cuda: prefix saved {positions} positions, {charge} B, {:.1} ms, KV copied {copied_kv_bytes} B",
                 began.elapsed().as_secs_f64() * 1000.0
             );
+            self.spill_over_watermark();
         }
         Ok(())
     }
@@ -376,6 +379,11 @@ impl QwenResidentStep<'_> {
                 saved,
                 self.device_tip.as_ref(),
             )?;
+        self.restore_source = Some(if device {
+            crate::sched::job::PrefixSource::Device
+        } else {
+            crate::sched::job::PrefixSource::Pinned
+        });
         if self.device_tip.is_some() {
             eprintln!(
                 "q36 cuda: prefix restore source {}",
