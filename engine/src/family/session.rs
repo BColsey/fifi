@@ -629,6 +629,10 @@ pub(crate) struct PrefixIdentity {
     pub(crate) weights: std::sync::Arc<str>,
     /// The pinned tokenizer digest, empty when the family loads unpinned.
     pub(crate) tokenizer: std::sync::Arc<str>,
+    /// The pinned chat-template digest, empty when the family records none. A render that
+    /// changes the prompt tokens for the same messages changes the tokens a key holds, but a
+    /// persisted entry also names the template its tokens came from.
+    pub(crate) template: std::sync::Arc<str>,
 }
 
 impl PrefixIdentity {
@@ -637,6 +641,12 @@ impl PrefixIdentity {
     /// is false rather than trust an empty identity's equality.
     pub(crate) fn is_pinned(&self) -> bool {
         !self.weights.is_empty() && !self.tokenizer.is_empty()
+    }
+
+    /// Every digest a persisted entry carries is present. An entry that reaches storage
+    /// outside this process must name the weights, tokenizer and template it was built under.
+    pub(crate) fn is_persistable(&self) -> bool {
+        self.is_pinned() && !self.template.is_empty()
     }
 }
 
@@ -4534,6 +4544,7 @@ mod tests {
         let foreign = PrefixIdentity {
             weights: "another-load".into(),
             tokenizer: "".into(),
+            ..PrefixIdentity::default()
         };
         let miss = session
             .restore_prefix(&mut slot, &[1, 2, 3, 4, 5], (1u8, foreign), |fed| {

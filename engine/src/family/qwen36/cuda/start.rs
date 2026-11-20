@@ -1215,35 +1215,8 @@ fn make_multi(
         &options,
         rules.eos,
         rules.sampler_vocab,
-        // The identity half of the prefix path: the GGUF header digest
-        // (hashed once while the header parsed) plus a bounded sample of the
-        // tensor-data region beyond the header (first and last 64 KiB), and
-        // the pinned tokenizer digest — layout plus sampled content, not a
-        // full digest. Constant for one loaded checkpoint, so folding it
-        // into a path leaves live save/restore behaviour unchanged.
-        {
-            use sha2::{Digest, Sha256};
-            let mut weights_hasher = Sha256::new();
-            let header = model.weights.header();
-            weights_hasher.update(header.header_sha256());
-            // The tensor-data region starts at the first tensor's absolute
-            // offset; the sample skips the already-hashed header.
-            let data_start = header
-                .tensors()
-                .iter()
-                .map(|tensor| tensor.abs_offset())
-                .min()
-                .unwrap_or(0);
-            let gguf_len = std::fs::metadata(&gguf)
-                .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?
-                .len();
-            crate::weights::hash_sampled_edges(&mut weights_hasher, &gguf, data_start, gguf_len)
-                .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?;
-            crate::family::session::PrefixIdentity {
-                weights: crate::weights::sha256_hex(&weights_hasher.finalize().into()).into(),
-                tokenizer: crate::weights::sha256_hex(&tokenizer_pin()?.tokenizer_json).into(),
-            }
-        },
+        // The identity half of the prefix path (see `gguf_prefix_identity`).
+        gguf_prefix_identity(&model.weights, &gguf)?,
         // Experimental and default off: the card path's prefix save/restore
         // is wired but NOT yet qualified (the restore passed filler-agnostic
         // bench answers and failed a deeper turn-chain check; see the branch
@@ -1343,6 +1316,39 @@ fn lower_rung(
             Ok(Some((variant, variant_plan, short)))
         }
     }
+}
+
+/// The load identity of a GGUF checkpoint for the prefix paths: the GGUF header digest (hashed
+/// once while the header parsed) plus a bounded sample of the tensor-data region beyond the
+/// header (first and last 64 KiB), the pinned tokenizer digest and the pinned chat-template
+/// digest - layout plus sampled content, not a full digest. Constant for one loaded
+/// checkpoint, so folding it into a path leaves live save/restore behaviour unchanged.
+fn gguf_prefix_identity(
+    weights: &crate::weights::GgufWeights,
+    gguf: &Path,
+) -> Result<crate::family::session::PrefixIdentity, EngError> {
+    let mut hasher = Sha256::new();
+    let header = weights.header();
+    hasher.update(header.header_sha256());
+    // The tensor-data region starts at the first tensor's absolute offset; the sample skips the
+    // already-hashed header.
+    let data_start = header
+        .tensors()
+        .iter()
+        .map(|tensor| tensor.abs_offset())
+        .min()
+        .unwrap_or(0);
+    let gguf_len = std::fs::metadata(gguf)
+        .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?
+        .len();
+    crate::weights::hash_sampled_edges(&mut hasher, gguf, data_start, gguf_len)
+        .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?;
+    let pin = tokenizer_pin()?;
+    Ok(crate::family::session::PrefixIdentity {
+        weights: crate::weights::sha256_hex(&hasher.finalize().into()).into(),
+        tokenizer: crate::weights::sha256_hex(&pin.tokenizer_json).into(),
+        template: crate::weights::sha256_hex(&pin.chat_template_jinja).into(),
+    })
 }
 
 fn make(
@@ -1550,6 +1556,9 @@ fn make(
         )?,
         None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
     };
+    if let Some((model, path)) = gguf.as_ref() {
+        step.set_prefix_identity(gguf_prefix_identity(&model.weights, path)?);
+    }
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
         // The section-timing marks stay off on the serve path: the timer is a measurement harness,

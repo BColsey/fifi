@@ -40,8 +40,8 @@ use crate::{
         executor::{ExecutorOps, GenerationState},
         sampler::Sampler,
         session::{
-            DecodeSession, Limits, SaveKind, StoreLimits, TokenStepper, check_prompt,
-            shadow_block_lcp_enabled,
+            DecodeSession, Limits, PrefixIdentity, SaveKind, StoreLimits, TokenStepper,
+            check_prompt, shadow_block_lcp_enabled,
         },
     },
     sched::job::PrefixReport,
@@ -321,8 +321,13 @@ impl QwenResidentStep<'_> {
         }
     }
 
-    fn prefill_path(&self) -> CudaPrefillPath {
-        CudaPrefillPath::Steps(self.state_layout().kv.mode)
+    /// The numeric path with the load identity: a state restores only under the path and the
+    /// load that saved it.
+    fn prefill_path(&self) -> (CudaPrefillPath, PrefixIdentity) {
+        (
+            CudaPrefillPath::Steps(self.state_layout().kv.mode),
+            self.prefix_identity(),
+        )
     }
 
     /// One stderr line per saved or restored entry; the turn gate's log parser reads the copy

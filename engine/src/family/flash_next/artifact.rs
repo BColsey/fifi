@@ -104,6 +104,7 @@ pub(crate) fn pack_identity(pack: &Path, pin: &TokenizerPin) -> Result<PrefixIde
     Ok(PrefixIdentity {
         weights: sha256_hex(&weights).into(),
         tokenizer: sha256_hex(&pin.tokenizer_json).into(),
+        template: sha256_hex(&pin.chat_template_jinja).into(),
     })
 }
 

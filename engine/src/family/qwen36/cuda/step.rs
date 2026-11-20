@@ -91,7 +91,7 @@ use crate::{
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
-    family::session::PrefixSlot,
+    family::session::{PrefixIdentity, PrefixSlot},
     family::speculate::{
         config::SpecConfig,
         driver::{RepeatDrafter, Speculator},
@@ -524,7 +524,10 @@ pub(crate) struct QwenResidentStep<'a> {
     prefill_report: PrefillReport,
     /// The engine's one host-backed prefix entry.
     /// The pinned pool keeps its backing alive across entry eviction.
-    pub(super) prefix: PrefixSlot<CudaSavedPrefix, CudaPrefillPath>,
+    pub(super) prefix: PrefixSlot<CudaSavedPrefix, (CudaPrefillPath, PrefixIdentity)>,
+    /// The weights, tokenizer and template digests of this load, the identity half of every
+    /// prefix key. Empty until `set_prefix_identity`; an entry is persisted only when none is empty.
+    prefix_identity: PrefixIdentity,
     prefix_pins: Option<super::state::pinned::PrefixPinPool>,
     device_tip: Option<super::state::device_tip::DeviceTip>,
     /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
@@ -1013,6 +1016,7 @@ impl<'a> QwenResidentStep<'a> {
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
             prefix: PrefixSlot::default(),
+            prefix_identity: PrefixIdentity::default(),
             prefix_pins: None,
             device_tip: None,
             #[cfg(test)]

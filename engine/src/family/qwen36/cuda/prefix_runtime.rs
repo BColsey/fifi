@@ -12,7 +12,9 @@ use crate::{
     EngError,
     family::host_admit::HostAdmission,
     family::qwen36::window_logic,
-    family::session::{DecodeSession, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled},
+    family::session::{
+        DecodeSession, PrefixIdentity, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled,
+    },
 };
 use std::time::Instant;
 
@@ -120,6 +122,16 @@ fn second_tiered_entry_refusal(
 }
 
 impl QwenResidentStep<'_> {
+    /// Names the weights, tokenizer and template this load serves. Without all three nothing is
+    /// written to disk and nothing is read from it.
+    pub(crate) fn set_prefix_identity(&mut self, identity: crate::family::session::PrefixIdentity) {
+        self.prefix_identity = identity;
+    }
+
+    pub(crate) fn prefix_identity(&self) -> crate::family::session::PrefixIdentity {
+        self.prefix_identity.clone()
+    }
+
     /// Import refills the report; freeze lookup facts afterward, before later saves replace it.
     pub(crate) fn record_prefix_lookup(&mut self, prompt: &[u32], covered: usize) {
         self.prefill_report
@@ -257,7 +269,7 @@ impl QwenResidentStep<'_> {
         session: &DecodeSession,
         key: &[u32],
         kind: SaveKind,
-        path: super::super::prefix::CudaPrefillPath,
+        path: (super::super::prefix::CudaPrefillPath, PrefixIdentity),
     ) -> Result<bool, EngError> {
         self.state_usable()?;
         let fed = self.tokens();

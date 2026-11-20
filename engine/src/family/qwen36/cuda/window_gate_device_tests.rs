@@ -97,7 +97,10 @@ fn a_failed_commit_leaves_a_step_that_only_a_reset_recovers() {
         "the pinned-prefix restore (17.5-1)",
         step.restore_pinned_prefix(&pinned),
     );
-    let path = CudaPrefillPath::Steps(step.state_layout().kv.mode);
+    let path = (
+        CudaPrefillPath::Steps(step.state_layout().kv.mode),
+        step.prefix_identity(),
+    );
     refused_by_the_gate(
         "the pinned-prefix save",
         step.stage_pinned_prefix(&session, &stream[..PREFIX], SaveKind::Tip, path),

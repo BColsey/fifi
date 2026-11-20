@@ -7,7 +7,7 @@ use super::state::{
 use super::{dims::KvMode, state_layout::StateLayout};
 use crate::{
     EngError,
-    family::session::{DecodeSession, PrefixSlot, SaveKind},
+    family::session::{DecodeSession, PrefixIdentity, PrefixSlot, SaveKind},
     sched::job::PrefixReport,
 };
 
@@ -58,7 +58,7 @@ pub(super) struct PendingPrefix {
     pub(super) session: DecodeSession,
     pub(super) fed: usize,
     pub(super) kind: SaveKind,
-    pub(super) path: CudaPrefillPath,
+    pub(super) path: (CudaPrefillPath, PrefixIdentity),
     pub(super) state: PendingPinned,
 }
 /// The numeric prefill path that built a saved entry: a state restores only under the path that
