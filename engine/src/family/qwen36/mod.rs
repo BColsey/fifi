@@ -27,7 +27,10 @@ pub(crate) mod factory;
 mod fixtures;
 mod host;
 pub(in crate::family) mod host_cpu;
+#[cfg(test)]
+mod host_defaults_tests;
 mod host_load;
+pub(crate) mod host_plan;
 #[cfg(test)]
 mod host_real;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

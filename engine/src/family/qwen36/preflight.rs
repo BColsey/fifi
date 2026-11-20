@@ -45,11 +45,7 @@ pub(crate) fn preflight_rows(
         kv_dtype: request.kv_dtype.map(|name| name.to_string()),
         ..Q36Options::default()
     };
-    let env = Q36Env {
-        cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
-        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
-        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
-    };
+    let env = Q36Env::from_process(request.model_dir);
     let settings = Q36Settings::new(
         request.model_dir,
         request.tokenizer_dir,

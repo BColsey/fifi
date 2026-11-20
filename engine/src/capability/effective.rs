@@ -90,17 +90,27 @@ pub(crate) fn q36_effective(
         }
     };
     let dense = settings.spec.feed_forward.is_some();
+    let derived = |key: &str| settings.derived.contains(&key);
+    let from_host = |key: &str, member: Origin| {
+        if derived(key) {
+            Origin::Derived
+        } else {
+            member
+        }
+    };
 
     let cache_origin = if options.cache_limit_bytes.is_some() {
         Origin::ConfigFile
     } else if backend == Backend::Mlx && env_cache_limit.is_some() {
         Origin::Environment
+    } else if derived("cache_limit_bytes") {
+        Origin::Derived
     } else {
         Origin::Default
     };
     let reserve_origin = if options.prefill_session_reserve_bytes.is_some() {
         Origin::ConfigFile
-    } else if backend == Backend::Mlx && options.prefill_budget_bytes.is_some() {
+    } else if backend == Backend::Mlx && settings.prefill_budget.is_some() {
         Origin::Derived
     } else {
         Origin::Default
@@ -157,7 +167,10 @@ pub(crate) fn q36_effective(
             settings
                 .prefill_budget
                 .map_or_else(|| "off".to_string(), |b| b.to_string()),
-            present(&options.prefill_budget_bytes),
+            from_host(
+                "prefill_budget_bytes",
+                present(&options.prefill_budget_bytes),
+            ),
         ),
         row(
             "prefill_session_reserve_bytes",
@@ -187,7 +200,7 @@ pub(crate) fn q36_effective(
         row(
             "compile",
             settings.compile.to_string(),
-            on_arm("compile", present(&options.compile)),
+            on_arm("compile", from_host("compile", present(&options.compile))),
         ),
         row(
             "compile_program_limit",

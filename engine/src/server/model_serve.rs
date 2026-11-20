@@ -670,7 +670,8 @@ mod tests {
         if cfg!(feature = "native-mlx") {
             // A native-mlx build reaches the settings validators before the backend
             // choice and refuses the default-args fixture (no cache limit) — also a
-            // verbatim preflight quote, so this arm pins that refusal instead.
+            // verbatim preflight quote, so this arm pins that refusal instead. The
+            // fixture holds no weight shard, so the host cannot derive a cache limit.
             assert!(
                 error.0.contains("cache_limit_bytes is missing"),
                 "{}",
@@ -701,11 +702,9 @@ mod tests {
             assert!(error.0.contains("tokenizer pin"), "{}", error.0);
         } else {
             if cfg!(feature = "native-mlx") {
-                assert!(
-                    error.0.contains("cache_limit_bytes is missing"),
-                    "{}",
-                    error.0
-                );
+                // This fixture holds a weight shard, so the host derives the cache limit.
+                assert!(!error.0.contains("cache_limit_bytes"), "{}", error.0);
+                assert!(error.0.contains("tokenizer pin"), "{}", error.0);
             } else {
                 assert!(error.0.contains("no GPU backend"), "{}", error.0);
             }

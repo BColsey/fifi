@@ -414,11 +414,7 @@ fn engine_input(
     let preflight =
         preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
             .map_err(|error| super::describe_error(&error));
-    let env = crate::family::qwen36::settings::Q36Env {
-        cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
-        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
-        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
-    };
+    let env = crate::family::qwen36::settings::Q36Env::from_process(&engine.model_dir);
     let effective = effective_rows(engine, &env);
     EngineInput {
         id: engine.id.clone(),

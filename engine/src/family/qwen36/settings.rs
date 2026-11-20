@@ -10,6 +10,7 @@
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
+use super::host_plan::{self, HostFacts, NoteValue};
 use crate::family::kv_format::KvRowShape;
 use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
 use crate::family::session::StoreLimits;
@@ -657,6 +658,24 @@ pub(crate) struct Q36Env {
     /// `Q36_SPEC_STEP_WINDOW`, `2` arming the checkpoint-window verify path (the raw
     /// value; `resident::executor`'s one-shot readers remain the parse authority).
     pub(crate) spec_step_window: Option<String>,
+    /// The host memory and the model's shard bytes, for the MLX values that no member and no
+    /// variable sets (`host_plan`). `None` keeps every such value required, as before.
+    pub(crate) host: Option<HostFacts>,
+}
+
+impl Q36Env {
+    /// The environment of this process and the host it runs on: the three allowlisted variables
+    /// and, for the model under `model_dir`, the facts the host-derived defaults read. The one
+    /// constructor every start, preflight and effective-configuration view calls, so they resolve
+    /// the same settings.
+    pub(crate) fn from_process(model_dir: &Path) -> Self {
+        Self {
+            cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+            kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
+            spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
+            host: HostFacts::probe(model_dir),
+        }
+    }
 }
 
 /// The checkpoint-window verify path (`Q36_SPEC_STEP_WINDOW=2`) commits at the NEXT
@@ -980,6 +999,12 @@ pub(crate) struct Q36Settings {
     /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
     /// it as the cap of `M_sess`.
     pub(crate) ignored_mlx_keys: Vec<&'static str>,
+    /// The keys whose value came from the host facts (`host_plan`): `cache_limit_bytes`,
+    /// `prefill_budget_bytes` and `compile`; not from a member, a variable or a fixed default. Empty when nothing was derived.
+    pub(crate) derived: Vec<&'static str>,
+    /// The one startup line that names the host facts and the source of each value; present only
+    /// when at least one value was derived.
+    pub(crate) host_note: Option<String>,
 }
 
 fn bad(message: String) -> EngError {
@@ -1003,23 +1028,38 @@ fn ranged<T: Copy + PartialOrd + std::fmt::Display>(
     }
 }
 
-fn cache_limit(options: &Q36Options, env: &Q36Env) -> Result<u64, EngError> {
-    let limit = match options.cache_limit_bytes {
-        Some(value) => value,
-        None => env
-            .cache_limit
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                bad("cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set".into())
-            })?
-            .parse::<u64>()
-            .map_err(|_| bad("Q36_CACHE_LIMIT is not a byte count".into()))?,
+/// The allocator cache limit and whether the host derived it: a member first, then
+/// `Q36_CACHE_LIMIT`, then the host rule. Without any of the three the start is refused.
+fn cache_limit(options: &Q36Options, env: &Q36Env) -> Result<(u64, CacheSource), EngError> {
+    let (limit, source) = match options.cache_limit_bytes {
+        Some(value) => (value, CacheSource::Member),
+        None => match env.cache_limit.as_deref().filter(|value| !value.is_empty()) {
+            Some(text) => (
+                text.parse::<u64>()
+                    .map_err(|_| bad("Q36_CACHE_LIMIT is not a byte count".into()))?,
+                CacheSource::Variable,
+            ),
+            None => match env.host {
+                Some(host) => (host.defaults().cache_limit_bytes, CacheSource::Host),
+                None => {
+                    return Err(bad(
+                        "cache_limit_bytes is missing and Q36_CACHE_LIMIT is not set".into(),
+                    ));
+                }
+            },
+        },
     };
     if limit == 0 {
         return Err(bad("the cache limit must be above 0".into()));
     }
-    Ok(limit)
+    Ok((limit, source))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheSource {
+    Member,
+    Variable,
+    Host,
 }
 
 fn at_least_one(key: &str, value: Option<u64>) -> Result<Option<u64>, EngError> {
@@ -1344,21 +1384,24 @@ impl Q36Settings {
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
         let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes, backend)?;
         let draft_verify = verify_of(options, draft_rollback, weights)?;
+        let mut budget_from_host = None;
+        let mut cache_source = None;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
             Backend::Mlx => {
-                let budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                let explicit_budget =
+                    at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                budget_from_host = match (explicit_budget, env.host) {
+                    (None, Some(host)) => Some(host.defaults().prefill_budget_bytes),
+                    _ => None,
+                };
+                let budget = explicit_budget.or(budget_from_host);
                 let reserve = reserve_plan(options, budget)?;
                 let activation = activation_of(options.activation_dtype.as_deref())?;
                 let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Mlx)?;
-                (
-                    budget,
-                    reserve,
-                    activation,
-                    kv,
-                    cache_limit(options, env)?,
-                    Vec::new(),
-                )
+                let (limit, source) = cache_limit(options, env)?;
+                cache_source = Some(source);
+                (budget, reserve, activation, kv, limit, Vec::new())
             }
             Backend::Cuda => {
                 refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
@@ -1431,6 +1474,12 @@ impl Q36Settings {
                 derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
             }
         };
+        if let (Some(budget), Some(host)) = (budget_from_host, env.host)
+            && let Some(text) =
+                host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
+        {
+            return Err(bad(text));
+        }
         let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
                 ranged(
@@ -1467,6 +1516,18 @@ impl Q36Settings {
             None => crate::kernels::ProgramLimit::default(),
         };
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
+        // The shipped Mac profile turns the compiled decode blocks on. A host-derived start does
+        // the same for the MoE family, except under speculation, whose windows the compiled
+        // blocks were not measured with.
+        let compile_from_host = backend == Backend::Mlx
+            && options.compile.is_none()
+            && env.host.is_some()
+            && spec.feed_forward.is_none()
+            && !speculation.enabled();
+        let compile = match backend {
+            Backend::Mlx => options.compile.unwrap_or(compile_from_host),
+            Backend::Cuda => false,
+        };
         // The override validates at boot through `ranged` (the same message shape as every
         // other member) so a typo cannot reach the store; the range keeps a fat finger from
         // asking for a million live slots.
@@ -1484,7 +1545,7 @@ impl Q36Settings {
                         .into(),
                 ));
             }
-            if !options.compile.unwrap_or(false) {
+            if !compile {
                 return Err(bad("max_seqs above 1 requires compile=true".into()));
             }
             if prefill_budget.is_none() || prefill_chunk < MIN_PREFILL_CHUNK_ROWS {
@@ -1499,6 +1560,84 @@ impl Q36Settings {
                 ));
             }
         }
+        let mut derived = Vec::new();
+        if cache_source == Some(CacheSource::Host) {
+            derived.push("cache_limit_bytes");
+        }
+        if budget_from_host.is_some() {
+            derived.push("prefill_budget_bytes");
+        }
+        if compile_from_host {
+            derived.push("compile");
+        }
+        let host_note = env.host.filter(|_| !derived.is_empty()).map(|host| {
+            let source = |key: &'static str, member: bool, rule: String| {
+                if derived.contains(&key) {
+                    rule
+                } else if member {
+                    "set".to_string()
+                } else {
+                    "default".to_string()
+                }
+            };
+            let cache_origin = match cache_source {
+                Some(CacheSource::Member) => "set",
+                Some(CacheSource::Variable) => "Q36_CACHE_LIMIT",
+                _ => "derived: memory / 9, 1 to 8 GiB",
+            };
+            let values = [
+                NoteValue {
+                    key: "cache_limit_bytes",
+                    value: cache_limit.to_string(),
+                    source: cache_origin.to_string(),
+                },
+                NoteValue {
+                    key: "prefill_budget_bytes",
+                    value: prefill_budget.map_or_else(|| "off".into(), |b| b.to_string()),
+                    source: source(
+                        "prefill_budget_bytes",
+                        options.prefill_budget_bytes.is_some(),
+                        "derived: memory minus the OS floor".into(),
+                    ),
+                },
+                NoteValue {
+                    key: "prefill_session_reserve_bytes",
+                    value: prefill_reserve.to_string(),
+                    source: if options.prefill_session_reserve_bytes.is_some() {
+                        "set".to_string()
+                    } else if prefill_budget.is_some() {
+                        "derived: cache at the context limit + DeltaNet state + cache limit + 1 GiB margin"
+                            .to_string()
+                    } else {
+                        "default".to_string()
+                    },
+                },
+                NoteValue {
+                    key: "context_limit",
+                    value: context_limit.to_string(),
+                    source: source("context_limit", options.context_limit.is_some(), String::new()),
+                },
+                NoteValue {
+                    key: "session_cap_bytes",
+                    value: session_cap.to_string(),
+                    source: source(
+                        "session_cap_bytes",
+                        options.session_cap_bytes.is_some(),
+                        String::new(),
+                    ),
+                },
+                NoteValue {
+                    key: "compile",
+                    value: compile.to_string(),
+                    source: source(
+                        "compile",
+                        options.compile.is_some(),
+                        "derived: on for the MoE family".into(),
+                    ),
+                },
+            ];
+            host_plan::startup_line(host, &values)
+        });
         Ok(Self {
             spec,
             artifact: model_dir.to_path_buf(),
@@ -1521,10 +1660,7 @@ impl Q36Settings {
             capture: options.capture.unwrap_or(backend == Backend::Cuda) && expert_bank.is_none(),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
-            compile: match backend {
-                Backend::Mlx => options.compile.unwrap_or(false),
-                Backend::Cuda => false,
-            },
+            compile,
             compile_program_limit,
             max_seqs,
             prefix_store_entries,
@@ -1539,6 +1675,8 @@ impl Q36Settings {
             draft_verify,
             cuda_devices,
             ignored_mlx_keys,
+            derived,
+            host_note,
         })
     }
 
@@ -2845,6 +2983,8 @@ mod tests {
                 draft_rollback: RollbackMode::Host,
                 draft_verify: VerifyMode::Eager,
                 ignored_mlx_keys: Vec::new(),
+                derived: Vec::new(),
+                host_note: None,
             }
         );
         assert_eq!(MLX_DEFAULT_CONTEXT_LIMIT, 262_144);

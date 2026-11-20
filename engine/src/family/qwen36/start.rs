@@ -92,6 +92,9 @@ pub(crate) fn start(
             "q36: prefix_store_entries is set but prefix_reuse is off; the member is ignored"
         );
     }
+    if let Some(line) = &settings.host_note {
+        eprintln!("{line}");
+    }
     let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
         let device = DeviceBudget::detect()?;
         stages.begin("opening the model");

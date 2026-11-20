@@ -59,11 +59,7 @@ pub(crate) fn start_engine_for_family(
 ) -> Result<(StartedEngine, Q36Settings), EngError> {
     let spec = descriptor(family)
         .ok_or_else(|| EngError::BadRequest(format!("unsupported Q36-style family {family}")))?;
-    let env = Q36Env {
-        cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
-        kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
-        spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
-    };
+    let env = Q36Env::from_process(model_dir);
     start_engine_with(
         model_dir,
         tokenizer_dir,
