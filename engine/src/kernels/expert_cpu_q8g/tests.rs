@@ -759,7 +759,7 @@ fn narrow_default_matches_forced_wide_over_random_sweep() {
             for g in 0..groups {
                 xq.d[g] = ((lcg.next() % 2001) as f32 - 1000.0) / 1_000_000.0;
                 for q in &mut xq.q[g * GROUP..(g + 1) * GROUP] {
-                    *q = (lcg.next() >> 56) as i8;
+                    *q = (lcg.next() >> 45) as i8;
                 }
                 xq.s[g] = xq.q[g * GROUP..(g + 1) * GROUP]
                     .iter()
@@ -842,7 +842,7 @@ fn narrow_and_wide_forced_paths_are_bit_identical_over_random_rows() {
         for g in 0..groups {
             xq.d[g] = ((lcg.next() % 2001) as f32 - 1000.0) / 1_000_000.0;
             for q in &mut xq.q[g * GROUP..(g + 1) * GROUP] {
-                *q = (lcg.next() >> 56) as i8;
+                *q = (lcg.next() >> 45) as i8;
             }
             xq.s[g] = xq.q[g * GROUP..(g + 1) * GROUP]
                 .iter()
