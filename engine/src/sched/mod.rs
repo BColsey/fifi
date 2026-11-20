@@ -5,7 +5,6 @@ use std::{
 
 use crate::EngError;
 
-pub mod batch;
 #[allow(
     dead_code,
     reason = "H4 wires the server to the engine handle; until then only tests call the job types"

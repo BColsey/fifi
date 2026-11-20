@@ -156,6 +156,8 @@ struct Shared {
     /// Set once the built executor reports a prefix store of no roots and no entries: a prompt
     /// boundary sent to such an engine can neither be saved nor restored.
     no_prefix_store: AtomicBool,
+    /// What the batch worker's ticks did, for the metrics of a later slice and for the tests.
+    ticks: batch_worker::TickCounters,
 }
 
 struct ActiveJob {
@@ -175,6 +177,7 @@ impl Shared {
             active: Mutex::new(Vec::new()),
             queued: AtomicUsize::new(0),
             no_prefix_store: AtomicBool::new(false),
+            ticks: batch_worker::TickCounters::default(),
         }
     }
 

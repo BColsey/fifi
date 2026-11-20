@@ -2142,3 +2142,158 @@ fn seeded_samplers_are_forwarded_independently_for_each_row() {
     drop(trace);
     engine.shutdown();
 }
+
+fn snapshot(engine: &Engine) -> super::TickSnapshot {
+    engine.handle().shared.ticks.snapshot()
+}
+
+#[test]
+fn ticks_count_the_rows_of_their_windows_and_prefill_pieces() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    let (first, first_events) = job(&[0, 0], 1);
+    let (second, second_events) = job(&[1, 1, 1], 2);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
+    collect(first_events);
+    collect(second_events);
+    let counts = snapshot(&engine);
+    assert_eq!(counts.windows, 2, "{counts:?}");
+    assert_eq!(counts.decode_rows, 3, "a window of two rows, then one");
+    assert_eq!(counts.max_window, 2);
+    assert_eq!(counts.prefill_rows, 5, "both prompts were fed");
+    assert!(counts.ticks >= counts.windows);
+    assert!(counts.executor_ns > 0, "{counts:?}");
+    engine.shutdown();
+}
+
+#[test]
+fn a_finished_session_serves_the_next_job_without_a_new_allocation() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    release.send(()).expect("load");
+    for round in 0..3u32 {
+        let (next, events) = job(&[round % 3], 2);
+        engine.handle().try_submit(next).expect("submit");
+        assert_eq!(usage(&collect(events)).completion_tokens, 2);
+    }
+    let counts = snapshot(&engine);
+    assert_eq!(counts.sessions_created, 0, "{counts:?}");
+    assert_eq!(counts.sessions_reused, 3, "{counts:?}");
+    assert!(
+        !lock(&log).calls.iter().any(|call| call == "new_session"),
+        "the seed session served every job"
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn two_live_jobs_allocate_one_session_and_return_both_to_the_pool() {
+    let log = Log::default();
+    let (engine, release) = start(WindowFake::new(&log));
+    release.send(()).expect("load");
+    for _ in 0..2 {
+        let (first, first_events) = job(&[0], 3);
+        let (second, second_events) = job(&[1], 3);
+        engine.handle().try_submit(first).expect("first");
+        engine.handle().try_submit(second).expect("second");
+        collect(first_events);
+        collect(second_events);
+    }
+    let counts = snapshot(&engine);
+    assert_eq!(counts.sessions_created, 1, "{counts:?}");
+    assert_eq!(counts.sessions_reused + counts.sessions_created, 4);
+    engine.shutdown();
+}
+
+/// A thousand cycles of admit, decode, finish and cancel at every stage must keep the engine
+/// at its session cap: a session that leaked from the pool would make a later job allocate
+/// beyond `max_seqs`.
+#[test]
+fn a_thousand_admit_and_cancel_cycles_never_allocate_past_the_cap() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 3;
+    fake.script_tokens = 9_000;
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    for cycle in 0..1_000usize {
+        let (first, first_events) = job(&[0, 1], 4);
+        let (second, mut second_events) = job(&[1], 4);
+        let (third, third_events) = job(&[2, 2, 2, 2, 2], 4);
+        engine.handle().try_submit(first).expect("first");
+        engine.handle().try_submit(second).expect("second");
+        engine.handle().try_submit(third).expect("third");
+        match cycle % 4 {
+            // Cancelled before the worker may have looked at it.
+            0 => second_events.cancel(),
+            // Cancelled after its first batch.
+            1 => loop {
+                match second_events.events.try_recv() {
+                    Ok(JobEvent::Batch(_)) => {
+                        second_events.cancel();
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::yield_now(),
+                }
+            },
+            // Cancelled while the queue still holds the third job.
+            2 => third_events.cancel(),
+            // Left to finish.
+            _ => {}
+        }
+        let first = collect(first_events);
+        collect(second_events);
+        let third = collect(third_events);
+        assert_eq!(usage(&first).completion_tokens, 4, "cycle {cycle}");
+        assert!(
+            matches!(
+                finish(&third),
+                DecodeFinish::Length | DecodeFinish::Cancelled
+            ),
+            "cycle {cycle}"
+        );
+    }
+    let counts = snapshot(&engine);
+    assert!(
+        counts.sessions_created <= 2,
+        "three slots hold the seed and at most two more: {counts:?}"
+    );
+    assert!(counts.sessions_reused >= 1_000, "{counts:?}");
+    assert_eq!(engine.shutdown().state, EngineState::Stopped);
+}
+
+#[test]
+fn the_sessions_of_a_failed_window_are_dropped_not_pooled() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.failure = Some(Failure::Local);
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    let (first, first_events) = job(&[0], 3);
+    let (second, second_events) = job(&[1], 3);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    for events in [first_events, second_events] {
+        let events = collect(events);
+        assert!(
+            matches!(
+                events.last(),
+                Some(JobEvent::Error(EngError::MemoryPlan(_)))
+            ),
+            "{events:?}"
+        );
+    }
+    let before = snapshot(&engine).sessions_created;
+    let (third, third_events) = job(&[0], 2);
+    let (fourth, fourth_events) = job(&[1], 2);
+    engine.handle().try_submit(third).expect("third");
+    engine.handle().try_submit(fourth).expect("fourth");
+    collect(third_events);
+    collect(fourth_events);
+    let after = snapshot(&engine).sessions_created;
+    assert_eq!(after - before, 2, "both jobs built fresh sessions");
+    engine.shutdown();
+}

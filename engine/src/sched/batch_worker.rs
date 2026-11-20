@@ -1,6 +1,12 @@
 //! Opt-in bounded windows on the existing engine thread. No model or adapter is cloned.
 //! A failed window discards its sessions, including any consumed pending tokens.
 //! Output uses the job channel's reserved terminal slot and never waits for a receiver.
+//!
+//! Sessions live in a pool. A session that leaves its slot normally (finished, cancelled, refused
+//! before its feed) goes back to the pool and is reset for the next job; `new_session` runs only
+//! when the pool is empty, and the slot count bounds the pool, so an engine holds at most
+//! `max_seqs` sessions. A session of a failed window is dropped, because its state cannot be
+//! trusted.
 
 use super::{
     ActiveJob, EngineState, Message, PromptPlan, Shared, cancel_unstarted, classified, drain,
@@ -16,8 +22,9 @@ use crate::sched::job::{
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 struct Slot<S> {
     session: S,
@@ -46,6 +53,128 @@ struct Slot<S> {
 impl<S> Slot<S> {
     fn can_start_decode(&self) -> bool {
         self.cursor == self.job.prompt.len() && !self.job.generation.cancel.load(Ordering::SeqCst)
+    }
+}
+
+/// What the ticks of the batch worker did. The counters only grow; a reader takes a snapshot
+/// and subtracts.
+#[derive(Default)]
+pub(super) struct TickCounters {
+    /// Ticks that reached the decode step, whether or not a window ran.
+    ticks: AtomicU64,
+    /// Windows handed to the executor.
+    windows: AtomicU64,
+    /// Rows of those windows: one per ready slot.
+    decode_rows: AtomicU64,
+    /// The widest window.
+    max_window: AtomicU64,
+    /// Prompt rows fed by prefill pieces.
+    prefill_rows: AtomicU64,
+    /// Nanoseconds inside executor calls (prefill pieces, windows, `after_emit`).
+    executor_ns: AtomicU64,
+    /// Nanoseconds of tick time outside executor calls: planning, sampling bookkeeping,
+    /// channel sends.
+    host_ns: AtomicU64,
+    /// Sessions the executor allocated for the pool.
+    sessions_created: AtomicU64,
+    /// Jobs that took a pooled session.
+    sessions_reused: AtomicU64,
+}
+
+/// A copy of the counters at one moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TickSnapshot {
+    pub(super) ticks: u64,
+    pub(super) windows: u64,
+    pub(super) decode_rows: u64,
+    pub(super) max_window: u64,
+    pub(super) prefill_rows: u64,
+    pub(super) executor_ns: u64,
+    pub(super) host_ns: u64,
+    pub(super) sessions_created: u64,
+    pub(super) sessions_reused: u64,
+}
+
+impl TickCounters {
+    pub(super) fn snapshot(&self) -> TickSnapshot {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        TickSnapshot {
+            ticks: read(&self.ticks),
+            windows: read(&self.windows),
+            decode_rows: read(&self.decode_rows),
+            max_window: read(&self.max_window),
+            prefill_rows: read(&self.prefill_rows),
+            executor_ns: read(&self.executor_ns),
+            host_ns: read(&self.host_ns),
+            sessions_created: read(&self.sessions_created),
+            sessions_reused: read(&self.sessions_reused),
+        }
+    }
+
+    fn add(counter: &AtomicU64, amount: u64) {
+        counter.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    fn nanos(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Times one tick from the end of admission to the end of the loop body, however the body
+/// exits, and splits the time into executor calls and the rest.
+struct TickTimer<'a> {
+    counters: &'a TickCounters,
+    started: Instant,
+    executor: Duration,
+}
+
+impl<'a> TickTimer<'a> {
+    fn new(counters: &'a TickCounters) -> Self {
+        Self {
+            counters,
+            started: Instant::now(),
+            executor: Duration::ZERO,
+        }
+    }
+
+    fn executor_call(&mut self, since: Instant) {
+        self.executor += since.elapsed();
+    }
+}
+
+impl Drop for TickTimer<'_> {
+    fn drop(&mut self) {
+        let host = self.started.elapsed().saturating_sub(self.executor);
+        TickCounters::add(
+            &self.counters.executor_ns,
+            TickCounters::nanos(self.executor),
+        );
+        TickCounters::add(&self.counters.host_ns, TickCounters::nanos(host));
+    }
+}
+
+/// The sessions that no slot holds. Each is reset by `setup_slot` when a job takes it.
+struct Pool<'a, S> {
+    free: Vec<S>,
+    counters: &'a TickCounters,
+}
+
+impl<'a, S> Pool<'a, S> {
+    fn new(first: S, counters: &'a TickCounters) -> Self {
+        Self {
+            free: vec![first],
+            counters,
+        }
+    }
+
+    fn take(&mut self) -> Option<S> {
+        let session = self.free.pop()?;
+        TickCounters::add(&self.counters.sessions_reused, 1);
+        Some(session)
+    }
+
+    fn give(&mut self, session: S) {
+        self.free.push(session);
     }
 }
 
@@ -120,13 +249,19 @@ fn cancelled<S>(slot: &mut Slot<S>) {
     }
 }
 
-fn remove_cancelled<S>(slots: &mut Vec<Slot<S>>, index: usize, shared: &Shared) -> bool {
+fn remove_cancelled<S>(
+    slots: &mut Vec<Slot<S>>,
+    index: usize,
+    shared: &Shared,
+    pool: &mut Pool<'_, S>,
+) -> bool {
     if !slots[index].job.generation.cancel.load(Ordering::SeqCst) {
         return false;
     }
     let mut slot = slots.remove(index);
     cancelled(&mut slot);
     unregister(shared, &slot.job);
+    pool.give(slot.session);
     true
 }
 
@@ -188,17 +323,20 @@ fn setup_slot<E: ExecutorOps>(
 /// report it.
 fn build_slot<E: ExecutorOps>(
     executor: &mut E,
-    seed: &mut Option<E::Session>,
+    pool: &mut Pool<'_, E::Session>,
     job: Job,
     prefill_chunk: usize,
 ) -> Result<Slot<E::Session>, (EngError, Box<Job>)> {
     if let Err(error) = executor.check_prompt(job.prompt.len()) {
         return Err((error, Box::new(job)));
     }
-    let session = match seed.take() {
+    let session = match pool.take() {
         Some(session) => session,
         None => match executor.new_session() {
-            Ok(session) => session,
+            Ok(session) => {
+                TickCounters::add(&pool.counters.sessions_created, 1);
+                session
+            }
             Err(error) => return Err((error, Box::new(job))),
         },
     };
@@ -225,17 +363,20 @@ fn build_slot<E: ExecutorOps>(
     };
     match setup_slot(executor, &mut slot, prefill_chunk) {
         Ok(()) => Ok(slot),
-        Err(error) => Err((error, Box::new(slot.job))),
+        Err(error) => {
+            pool.give(slot.session);
+            Err((error, Box::new(slot.job)))
+        }
     }
 }
 
 fn admit<E: ExecutorOps>(
     executor: &mut E,
-    seed: &mut Option<E::Session>,
+    pool: &mut Pool<'_, E::Session>,
     mut job: Job,
     prefill_chunk: usize,
 ) -> Result<Slot<E::Session>, EngError> {
-    match build_slot(executor, seed, job, prefill_chunk) {
+    match build_slot(executor, pool, job, prefill_chunk) {
         Ok(slot) => Ok(slot),
         Err((EngError::MemoryPlan(message), job_back)) => {
             // The eviction restart for admission itself, incrementally: `new_session`
@@ -264,7 +405,7 @@ fn admit<E: ExecutorOps>(
                 return Err(EngError::MemoryPlan(message));
             }
             job = *job_back;
-            let mut retried = build_slot(executor, seed, job, prefill_chunk);
+            let mut retried = build_slot(executor, pool, job, prefill_chunk);
             loop {
                 match retried {
                     Ok(slot) => {
@@ -282,7 +423,7 @@ fn admit<E: ExecutorOps>(
                         if !evict_for_retry(executor, None, &back.prompt, &back.generation.cancel) {
                             return Err(EngError::MemoryPlan(message));
                         }
-                        retried = build_slot(executor, seed, *back, prefill_chunk);
+                        retried = build_slot(executor, pool, *back, prefill_chunk);
                     }
                     Err((error, _)) => return Err(error),
                 }
@@ -377,7 +518,7 @@ pub(super) fn work<E: ExecutorOps>(
     iteration_rows: usize,
     max_seqs: usize,
 ) {
-    let mut seed = Some(session);
+    let mut pool = Pool::new(session, &shared.ticks);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -418,7 +559,7 @@ pub(super) fn work<E: ExecutorOps>(
             let events = job.events.clone();
             let cancel = Arc::clone(&job.generation.cancel);
             let prompt_len = prompt_tokens(&job.prompt);
-            match admit(executor, &mut seed, job, prefill_chunk) {
+            match admit(executor, &mut pool, job, prefill_chunk) {
                 Ok(slot) => slots.push(slot),
                 Err(error) => {
                     if matches!(error, EngError::Backend { .. }) {
@@ -437,6 +578,7 @@ pub(super) fn work<E: ExecutorOps>(
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
+        let mut tick = TickTimer::new(&shared.ticks);
         // A decode row advances one sequence. A prefill row feeds one prompt token.
         // Reserve the ready rows first, then share the remaining rows among cold slots.
         // One row per live slot is the minimum that guarantees progress in both phases.
@@ -455,11 +597,19 @@ pub(super) fn work<E: ExecutorOps>(
             if !slots[index].ready {
                 let grant = prompt_rows.div_ceil(prompt_slots).min(prefill_chunk);
                 prompt_slots -= 1;
-                if remove_cancelled(&mut slots, index, shared) {
+                if remove_cancelled(&mut slots, index, shared, &mut pool) {
                     continue;
                 }
                 let cursor = slots[index].cursor;
+                let called = Instant::now();
                 let result = prefill(executor, &mut slots[index], grant);
+                tick.executor_call(called);
+                if result.is_ok() {
+                    TickCounters::add(
+                        &shared.ticks.prefill_rows,
+                        (slots[index].cursor - cursor) as u64,
+                    );
+                }
                 // A denied call can already have fed rows. Charge its grant and retry
                 // on a later tick. Successful short pieces return unused rows immediately.
                 prompt_rows -= if result.is_ok() {
@@ -536,7 +686,7 @@ pub(super) fn work<E: ExecutorOps>(
                             }
                         }
                         if terminal {
-                            if remove_cancelled(&mut slots, index, shared) {
+                            if remove_cancelled(&mut slots, index, shared, &mut pool) {
                                 continue;
                             }
                             // Classify only when the ceiling PROVES the piece cannot fit
@@ -561,6 +711,7 @@ pub(super) fn work<E: ExecutorOps>(
                                 );
                                 send_terminal(&slot.job.events, JobEvent::Error(error));
                                 unregister(shared, &slot.job);
+                                pool.give(slot.session);
                                 continue;
                             }
                             // The ONE no-save recovery after exhaustion: record it, so the
@@ -588,7 +739,7 @@ pub(super) fn work<E: ExecutorOps>(
                                 return;
                             }
                             Err(EngError::MemoryPlan(message)) => {
-                                if remove_cancelled(&mut slots, index, shared) {
+                                if remove_cancelled(&mut slots, index, shared, &mut pool) {
                                     continue;
                                 }
                                 let slot = slots.remove(index);
@@ -600,12 +751,14 @@ pub(super) fn work<E: ExecutorOps>(
                                 );
                                 send_terminal(&slot.job.events, JobEvent::Error(error));
                                 unregister(shared, &slot.job);
+                                pool.give(slot.session);
                                 continue;
                             }
                             Err(other) => {
                                 let slot = slots.remove(index);
                                 send_terminal(&slot.job.events, JobEvent::Error(other));
                                 unregister(shared, &slot.job);
+                                pool.give(slot.session);
                                 continue;
                             }
                         }
@@ -615,6 +768,7 @@ pub(super) fn work<E: ExecutorOps>(
                         let slot = slots.remove(index);
                         send_terminal(&slot.job.events, JobEvent::Error(error));
                         unregister(shared, &slot.job);
+                        pool.give(slot.session);
                         continue;
                     }
                 }
@@ -635,9 +789,17 @@ pub(super) fn work<E: ExecutorOps>(
             }
         }
         let count = slots.iter().filter(|slot| slot.ready).count();
+        TickCounters::add(&shared.ticks.ticks, 1);
         if count == 0 {
             continue;
         }
+        TickCounters::add(&shared.ticks.windows, 1);
+        TickCounters::add(&shared.ticks.decode_rows, count as u64);
+        shared
+            .ticks
+            .max_window
+            .fetch_max(count as u64, Ordering::Relaxed);
+        let called = Instant::now();
         let batches = {
             let (mut sessions, mut generations): (Vec<_>, Vec<_>) = slots
                 .iter_mut()
@@ -646,6 +808,7 @@ pub(super) fn work<E: ExecutorOps>(
                 .unzip();
             executor.decode_window(&mut sessions, &mut generations)
         };
+        tick.executor_call(called);
         let batches = match batches {
             Ok(batches) if batches.len() == count => batches,
             Ok(_) => {
@@ -676,42 +839,52 @@ pub(super) fn work<E: ExecutorOps>(
         }
         let mut batches = batches.into_iter();
         let mut emitted = false;
-        slots.retain_mut(|slot| {
-            if !slot.ready {
-                return true;
-            }
-            let batch = match batches.next().expect("row count checked") {
-                Ok(batch) => batch,
-                Err(error) => {
-                    if !slot.slow {
-                        send_terminal(&slot.job.events, JobEvent::Error(error));
-                    }
-                    unregister(shared, &slot.job);
+        // A row the executor refused before its feed leaves with its error; its session is
+        // clean and returns to the pool.
+        let refused: Vec<Slot<E::Session>> = slots
+            .extract_if(.., |slot| {
+                if !slot.ready {
                     return false;
                 }
-            };
-            emitted = true;
-            slot.usage.completion_tokens = slot
-                .usage
-                .completion_tokens
-                .saturating_add(u32::try_from(batch.tokens.len()).unwrap_or(u32::MAX));
-            // The sampler's first-draw latch is the request's first decode position; the
-            // served margin rides the slot usage from the window that drew it.
-            slot.usage.first_token_margin = slot.job.generation.sampler.first_top2_margin();
-            slot.finished = batch.finish.is_some();
-            if !send_data(&slot.job.events, JobEvent::Batch(batch)) {
-                slot.job.generation.cancel.store(true, Ordering::SeqCst);
-                slot.slow = true;
-                // A slow client gets no terminal event, including during failure cleanup.
-                unregister(shared, &slot.job);
-            }
-            true
-        });
+                let batch = match batches.next().expect("row count checked") {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        if !slot.slow {
+                            send_terminal(&slot.job.events, JobEvent::Error(error));
+                        }
+                        unregister(shared, &slot.job);
+                        return true;
+                    }
+                };
+                emitted = true;
+                slot.usage.completion_tokens = slot
+                    .usage
+                    .completion_tokens
+                    .saturating_add(u32::try_from(batch.tokens.len()).unwrap_or(u32::MAX));
+                // The sampler's first-draw latch is the request's first decode position; the
+                // served margin rides the slot usage from the window that drew it.
+                slot.usage.first_token_margin = slot.job.generation.sampler.first_top2_margin();
+                slot.finished = batch.finish.is_some();
+                if !send_data(&slot.job.events, JobEvent::Batch(batch)) {
+                    slot.job.generation.cancel.store(true, Ordering::SeqCst);
+                    slot.slow = true;
+                    // A slow client gets no terminal event, including during failure cleanup.
+                    unregister(shared, &slot.job);
+                }
+                false
+            })
+            .collect();
+        for slot in refused {
+            pool.give(slot.session);
+        }
         if !emitted {
             continue;
         }
         // Complete deferred work once per emitted window, before dropping finished rows.
-        if let Err(error) = executor.after_emit() {
+        let called = Instant::now();
+        let emitted_result = executor.after_emit();
+        tick.executor_call(called);
+        if let Err(error) = emitted_result {
             if matches!(error, EngError::Backend { .. }) {
                 native_failed(shared, jobs, &error);
                 return;
@@ -719,17 +892,22 @@ pub(super) fn work<E: ExecutorOps>(
             window_failed(&mut slots, shared, &error);
             continue;
         }
-        slots.retain(|slot| {
-            if slot.slow || slot.finished {
-                if !slot.slow {
-                    send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
+        let done: Vec<Slot<E::Session>> = slots
+            .extract_if(.., |slot| {
+                if slot.slow || slot.finished {
+                    if !slot.slow {
+                        send_terminal(&slot.job.events, JobEvent::Finished(slot.usage.clone()));
+                    }
+                    unregister(shared, &slot.job);
+                    true
+                } else {
+                    false
                 }
-                unregister(shared, &slot.job);
-                false
-            } else {
-                true
-            }
-        });
+            })
+            .collect();
+        for slot in done {
+            pool.give(slot.session);
+        }
     }
     // Shutdown needs no further executor calls.
     for mut slot in slots {
