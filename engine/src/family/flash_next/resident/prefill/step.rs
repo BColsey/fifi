@@ -412,6 +412,10 @@ fn run(
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
     let mut stats = ChunkStats::default();
+    #[cfg(feature = "native-fault-qualification")]
+    let mut dense_unions = (batch == QsaBatch::Dense
+        && super::super::stream_timing::capture_dense_unions())
+    .then(|| Vec::with_capacity(weights.layers.len()));
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         if index == shape.ple_layer {
             let out = ple::block_rows(
@@ -461,6 +465,10 @@ fn run(
             .waves_extra
             .checked_add(u64::from(waves.saturating_sub(1)))
             .ok_or_else(|| bad("prefill wave count overflows u64"))?;
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(unions) = &mut dense_unions {
+            unions.push(route.distinct);
+        }
         h = hyper::apply_rows(&mut ctx, &shape.hyper, &h, &gate, &out)?;
         if mode == StepMode::Record {
             records.push(last_row(&mut ctx, &h, rows, branches, hidden)?);
@@ -530,6 +538,10 @@ fn run(
         None => None,
     };
     state.commit_rows(rows, layers, ple_ring, begun.history, permit)?;
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(unions) = dense_unions {
+        super::super::stream_timing::record_dense_unions(pos, rows, pool.set_experts(), &unions);
+    }
     Ok((
         StepResult {
             token: token_out,
