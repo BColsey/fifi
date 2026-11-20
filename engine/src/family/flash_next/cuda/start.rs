@@ -853,11 +853,32 @@ fn build_driver_resolving(
             super::victim_cache::VictimLayout::new(victim_budget, model.moe.top_k(), record_bytes)
         })
         .transpose()?;
+    let selective_victims =
+        match std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE").as_deref() {
+            Ok("1") => true,
+            Ok("0") | Err(std::env::VarError::NotPresent) => false,
+            _ => {
+                return Err(EngError::BadRequest(
+                    "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE needs 0 or 1".into(),
+                ));
+            }
+        };
+    if selective_victims && victim_layout.is_none() {
+        return Err(EngError::BadRequest(
+            "selective write-back needs a Flash-Next disk victim cache budget".into(),
+        ));
+    }
+    let recent_bytes = if selective_victims {
+        super::victim_cache::RecentPicks::bytes(layers, model.moe.experts())
+    } else {
+        0
+    };
     let victim_bytes = victim_layout
         .as_ref()
         .map_or(0, |layout| layout.bytes() as u64);
     let engine_heap = (HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes)
         .checked_add(victim_bytes)
+        .and_then(|bytes| bytes.checked_add(recent_bytes))
         .ok_or_else(|| {
             EngError::MemoryPlan("Flash-Next victim cache host budget overflows".into())
         })?;
@@ -1135,12 +1156,17 @@ fn build_driver_resolving(
     }
 
     if let Some(layout) = &victim_layout {
-        bank.enable_victim_cache(ctx, layout)?;
+        bank.enable_victim_cache(ctx, layout, selective_victims)?;
         eprintln!(
             "flash-next cuda: disk victim cache {} records, {} pinned bytes including upload reserve",
             layout.resident_records(),
             layout.bytes(),
         );
+        if selective_victims {
+            eprintln!(
+                "flash-next cuda: selective victim write-back enabled, {recent_bytes} history bytes"
+            );
+        }
     }
 
     stage("building the step");

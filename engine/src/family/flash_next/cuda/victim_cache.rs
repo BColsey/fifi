@@ -49,6 +49,49 @@ pub(super) struct Key {
     pub(super) expert: u16,
 }
 
+/// The two most recent distinct decode positions for each (layer, expert).
+pub(super) struct RecentPicks {
+    positions: Vec<[u64; 2]>,
+    experts: usize,
+}
+
+impl RecentPicks {
+    const NEVER: [u64; 2] = [u64::MAX; 2];
+    const WINDOW: u64 = 16;
+
+    pub(super) fn new(layers: usize, experts: usize) -> Self {
+        Self {
+            positions: vec![Self::NEVER; layers * experts],
+            experts,
+        }
+    }
+
+    pub(super) fn bytes(layers: usize, experts: usize) -> u64 {
+        (layers * experts * size_of::<[u64; 2]>()) as u64
+    }
+
+    pub(super) fn observe(&mut self, layer: usize, picks: &[i32], position: u64) {
+        for expert in picks.iter().filter_map(|&id| usize::try_from(id).ok()) {
+            let pair = &mut self.positions[layer * self.experts + expert];
+            if pair[0] != position {
+                *pair = [position, pair[0]];
+            }
+        }
+    }
+
+    pub(super) fn keep(&self, key: Key, position: u64) -> bool {
+        let [last, previous] = self.positions[key.layer * self.experts + usize::from(key.expert)];
+        last < position
+            && position
+                .checked_sub(previous)
+                .is_some_and(|age| age <= Self::WINDOW)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.positions.fill(Self::NEVER);
+    }
+}
+
 /// Least recent at the front. A taken slot remains reserved until all the
 /// uploads that use it have been queued. Spare slots cover those loans.
 pub(super) struct VictimIndex {
@@ -103,6 +146,22 @@ mod tests {
 
     fn key(layer: usize, expert: u16) -> Key {
         Key { layer, expert }
+    }
+
+    #[test]
+    fn admission_counts_distinct_recent_positions_in_the_same_layer() {
+        let mut recent = RecentPicks::new(2, 4);
+        assert_eq!(RecentPicks::bytes(2, 4), 128);
+        recent.observe(0, &[3, -1, 3], 8);
+        recent.observe(1, &[3], 9);
+        assert!(!recent.keep(key(0, 3), 10));
+        recent.observe(0, &[3], 12);
+        assert!(!recent.keep(key(0, 3), 12));
+        assert!(recent.keep(key(0, 3), 24));
+        assert!(!recent.keep(key(0, 3), 25));
+        assert!(!recent.keep(key(1, 3), 24));
+        recent.clear();
+        assert!(!recent.keep(key(0, 3), 24));
     }
 
     #[test]

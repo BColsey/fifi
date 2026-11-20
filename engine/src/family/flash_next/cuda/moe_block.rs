@@ -753,6 +753,10 @@ mod device {
             &self.bank
         }
 
+        pub(in crate::family::flash_next::cuda) fn bank_mut(&mut self) -> &mut DeviceBank {
+            &mut self.bank
+        }
+
         /// Queues layer `layer`'s MoE block on `launch.stream`. Reads `bufs.route.norm_row` (f32
         /// `[hidden]`, the hyper-mixed row) and `bufs.route.resid_in` (a zero row); writes the
         /// block output, the weighted picks plus the gated shared expert and no residual, to

@@ -620,7 +620,7 @@ pub(super) mod device {
     //! They are allocated once and held: dropping one synchronizes the device.
 
     use super::super::disk_prefetch::{CANDIDATES, DiskPrefetch, Target};
-    use super::super::victim_cache::{Key as VictimKey, VictimIndex, VictimLayout};
+    use super::super::victim_cache::{Key as VictimKey, RecentPicks, VictimIndex, VictimLayout};
     use super::{
         HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
     };
@@ -643,6 +643,7 @@ pub(super) mod device {
 
     struct VictimCache {
         index: VictimIndex,
+        recent: Option<RecentPicks>,
         memory: PinnedBuf,
         hits: u64,
         writebacks: u64,
@@ -988,6 +989,13 @@ pub(super) mod device {
                 predicted,
             };
             if let Some(victims) = victims {
+                if let Some(recent) = self
+                    .victim_cache
+                    .as_mut()
+                    .and_then(|cache| cache.recent.as_mut())
+                {
+                    recent.observe(layer, picks, pos);
+                }
                 if let Err(error) = self.run_victim_copies(ctx, &copies, forecast, &victims) {
                     self.state.poison();
                     return Err(error);
@@ -1002,14 +1010,17 @@ pub(super) mod device {
             &mut self,
             ctx: &CudaContext,
             layout: &VictimLayout,
+            selective: bool,
         ) -> Result<(), EngError> {
             if self.source.is_none() {
                 return Err(EngError::BadRequest(
                     "victim cache needs the Flash-Next disk tier".into(),
                 ));
             }
+            let geometry = self.state.geometry();
             self.victim_cache = Some(VictimCache {
                 index: VictimIndex::new(layout),
+                recent: selective.then(|| RecentPicks::new(geometry.layers, geometry.experts)),
                 memory: ctx.pinned_buf(layout.bytes())?,
                 hits: 0,
                 writebacks: 0,
@@ -1081,13 +1092,20 @@ pub(super) mod device {
             }
         }
 
-        /// Zeroes the rung's decode miss state for a device reset.
-        pub(in crate::family::flash_next) fn reset_decode_misses(&self) {
+        /// Starts a fresh decode turn's rung counters and route history.
+        pub(in crate::family::flash_next) fn reset_decode_misses(&mut self) {
             if let Some(prefetch) = &self.disk_prefetch {
                 prefetch.cancel();
             }
             if let Some(source) = self.source {
                 source.reset_decode_misses();
+            }
+            if let Some(recent) = self
+                .victim_cache
+                .as_mut()
+                .and_then(|cache| cache.recent.as_mut())
+            {
+                recent.clear();
             }
         }
 
@@ -1219,18 +1237,28 @@ pub(super) mod device {
                     })
                 })
                 .collect();
+            let mut writebacks = 0;
             for op in &copies.ops {
                 let slot = usize::from(op.slot);
-                let cached = cache.index.insert(VictimKey {
+                let key = VictimKey {
                     layer,
                     expert: victims[slot],
-                });
+                };
+                if cache
+                    .recent
+                    .as_ref()
+                    .is_some_and(|recent| !recent.keep(key, forecast.position))
+                {
+                    continue;
+                }
+                let cached = cache.index.insert(key);
                 ctx.copy_to_pinned(
                     &self.stream,
                     bank.range(slot * record, record)?,
                     &mut cache.memory,
                     cached * record,
                 )?;
+                writebacks += 1;
             }
             let mut misses = Vec::new();
             for (op, hit) in copies.ops.iter().zip(&hits) {
@@ -1258,10 +1286,11 @@ pub(super) mod device {
                     bank.write_at(&self.stream, usize::from(op.slot) * record, &bytes)?;
                 }
             }
-            if !copies.ops.is_empty() {
+            let hit_count = copies.ops.len() - misses.len();
+            if writebacks > 0 || hit_count > 0 {
                 cache.memory.synchronize(&self.stream)?;
-                cache.hits += (copies.ops.len() - misses.len()) as u64;
-                cache.writebacks += copies.ops.len() as u64;
+                cache.hits += hit_count as u64;
+                cache.writebacks += writebacks;
             }
             Ok(())
         }

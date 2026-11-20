@@ -161,7 +161,7 @@ impl TokenDevice for CardDevice {
         // A reset ends the turn's rung accounting whole — open step and
         // bins — so a turn that never printed its line leaves nothing
         // for the next one.
-        self.moe.bank().reset_decode_misses();
+        self.moe.inner.bank_mut().reset_decode_misses();
         self.step.reset()
     }
 
@@ -387,7 +387,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         // A reset ends the turn's rung accounting whole — open step and
         // bins — so a turn that never printed its line leaves nothing
         // for the next one.
-        self.moe.bank().reset_decode_misses();
+        self.moe.inner.bank_mut().reset_decode_misses();
         self.step.reset()
     }
 
