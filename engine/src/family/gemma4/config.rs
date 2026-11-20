@@ -27,6 +27,8 @@ impl Default for MaxSeqs {
 enum RawMaxSeqs {
     Count(u64),
     Word(String),
+    /// Anything else: a negative number, a fraction, a boolean, a list.
+    Other(Value),
 }
 
 impl TryFrom<RawMaxSeqs> for MaxSeqs {
@@ -35,10 +37,15 @@ impl TryFrom<RawMaxSeqs> for MaxSeqs {
     fn try_from(raw: RawMaxSeqs) -> Result<Self, String> {
         match raw {
             RawMaxSeqs::Count(count) if (1..=8).contains(&count) => Ok(Self::Count(count as usize)),
-            RawMaxSeqs::Count(count) => Err(format!("max_seqs {count} is outside 1 to 8")),
             RawMaxSeqs::Word(word) if word == "auto" => Ok(Self::Auto),
-            RawMaxSeqs::Word(word) => {
-                Err(format!("max_seqs accepts 1 to 8 or \"auto\", got {word:?}"))
+            RawMaxSeqs::Count(other) => {
+                Err(format!("max_seqs accepts 1 to 8 or \"auto\", got {other}"))
+            }
+            RawMaxSeqs::Word(other) => Err(format!(
+                "max_seqs accepts 1 to 8 or \"auto\", got {other:?}"
+            )),
+            RawMaxSeqs::Other(other) => {
+                Err(format!("max_seqs accepts 1 to 8 or \"auto\", got {other}"))
             }
         }
     }
@@ -63,19 +70,35 @@ pub(crate) struct Gemma4Options {
     pub(crate) prompt_rows: Option<PromptRows>,
 }
 
-/// A prompt share per tick from 1 to 4,096 rows.
+/// A prompt share per tick: from one planned piece (`BOLT_PIECE_ROWS`) to 4,096 rows. The worker
+/// feeds at least a whole piece per tick, so a smaller share is refused rather than raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "u64")]
+#[serde(try_from = "RawPromptRows")]
 pub(crate) struct PromptRows(pub(crate) usize);
 
-impl TryFrom<u64> for PromptRows {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPromptRows {
+    Rows(u64),
+    Other(Value),
+}
+
+impl TryFrom<RawPromptRows> for PromptRows {
     type Error = String;
 
-    fn try_from(rows: u64) -> Result<Self, String> {
-        if (1..=4096).contains(&rows) {
-            Ok(Self(rows as usize))
-        } else {
-            Err(format!("prompt_rows {rows} is outside 1 to 4096"))
+    fn try_from(raw: RawPromptRows) -> Result<Self, String> {
+        let piece = super::budget::BOLT_PIECE_ROWS as u64;
+        match raw {
+            RawPromptRows::Rows(rows) if rows < piece => Err(format!(
+                "prompt_rows {rows} is below one planned piece of {piece} rows: the engine feeds at least a whole piece per tick, so the share is {piece} to 4096"
+            )),
+            RawPromptRows::Rows(rows) if rows <= 4096 => Ok(Self(rows as usize)),
+            RawPromptRows::Rows(rows) => Err(format!(
+                "prompt_rows {rows} is above 4096: the share is {piece} to 4096"
+            )),
+            RawPromptRows::Other(other) => Err(format!(
+                "prompt_rows accepts a row count from {piece} to 4096, got {other}"
+            )),
         }
     }
 }

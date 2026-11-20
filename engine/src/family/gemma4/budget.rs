@@ -57,6 +57,10 @@ pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
 )]
 pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 * 4 + 8;
 
+/// The rows of one prefill piece of the Bolt step: the model takes this many prompt rows in one
+/// launch of its projections.
+pub(crate) const BOLT_PIECE_ROWS: usize = 8;
+
 /// The prompt rows per tick that the engine feeds while several sessions are live, when the entry
 /// does not set `prompt_rows`.
 #[cfg_attr(
@@ -170,5 +174,10 @@ mod tests {
             allocated += codes + scales;
         }
         assert_eq!(Some(allocated), bolt_kv_bytes_per_position());
+        assert_eq!(
+            BOLT_PIECE_ROWS,
+            crate::family::gemma4::resident::bolt::Bolt::PREFILL_BATCH
+        );
+        assert!(BOLT_AUTO_PROMPT_ROWS >= BOLT_PIECE_ROWS);
     }
 }

@@ -845,10 +845,13 @@ mod tests {
         for bad in [
             r#"{"max_seqs": 0}"#,
             r#"{"max_seqs": 9}"#,
+            r#"{"max_seqs": -1}"#,
+            r#"{"max_seqs": 2.5}"#,
             r#"{"max_seqs": "many"}"#,
+            r#"{"max_seqs": true}"#,
         ] {
             let text = message(load(&gemma4_entry(bad)));
-            assert!(text.contains("max_seqs"), "{bad}: {text}");
+            assert!(text.contains("accepts 1 to 8"), "{bad}: {text}");
         }
         let text = message(load(&gemma4_entry(r#"{"max_seqs": 2, "extra": 1}"#)));
         assert!(text.contains("extra"), "{text}");
@@ -863,10 +866,24 @@ mod tests {
         let config = load(&gemma4_entry("{}")).expect("valid");
         let options = config.engines[0].gemma4.as_ref().expect("options");
         assert_eq!(Gemma4Options::prompt_rows(options), None);
-        for bad in [r#"{"prompt_rows": 0}"#, r#"{"prompt_rows": 5000}"#] {
+        for bad in [r#"{"prompt_rows": 0}"#, r#"{"prompt_rows": 7}"#] {
+            let text = message(load(&gemma4_entry(bad)));
+            assert!(
+                text.contains("below one planned piece of 8 rows"),
+                "{bad}: {text}"
+            );
+        }
+        for bad in [
+            r#"{"prompt_rows": 5000}"#,
+            r#"{"prompt_rows": -3}"#,
+            r#"{"prompt_rows": 9.5}"#,
+        ] {
             let text = message(load(&gemma4_entry(bad)));
             assert!(text.contains("prompt_rows"), "{bad}: {text}");
         }
+        let config = load(&gemma4_entry(r#"{"prompt_rows": 8}"#)).expect("one piece is allowed");
+        let options = config.engines[0].gemma4.as_ref().expect("options");
+        assert_eq!(Gemma4Options::prompt_rows(options), Some(8));
     }
 
     #[test]
