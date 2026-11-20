@@ -974,15 +974,20 @@ pub(super) mod device {
             &mut self,
             backing: &'static mut [u8],
             horizon: usize,
+            join_active: bool,
         ) -> Result<(), EngError> {
             let source = self.source.ok_or_else(|| {
                 EngError::BadRequest("disk prefetch needs the Flash-Next disk tier".into())
             })?;
             let reader = source.prefetch_reader(backing)?;
-            self.disk_prefetch = Some(DiskPrefetch::spawn(horizon, move |layer, expert| {
-                let mut records = source.read_packed_from(&reader, layer, &[expert])?;
-                Ok(records.pop().expect("one requested record"))
-            })?);
+            self.disk_prefetch = Some(DiskPrefetch::spawn(
+                horizon,
+                join_active,
+                move |layer, expert| {
+                    let mut records = source.read_packed_from(&reader, layer, &[expert])?;
+                    Ok(records.pop().expect("one requested record"))
+                },
+            )?);
             Ok(())
         }
 

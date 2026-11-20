@@ -682,6 +682,15 @@ fn build_driver_resolving(
             ));
         }
     };
+    let join_active_prefetch = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN") {
+        None => false,
+        Some(value) if value == "1" && disk_prefetch_horizon.is_some() => true,
+        Some(_) => {
+            return Err(EngError::BadRequest(
+                "INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN needs value \"1\" and an enabled disk prefetch horizon".into(),
+            ));
+        }
+    };
     let projection_on_card = ple_device()?;
     let ple_shape = (projection_on_card && rows > 1).then(|| PleDeviceShape {
         width: model.hyper.hidden() * model.hyper.branches(),
@@ -1088,9 +1097,9 @@ fn build_driver_resolving(
 
     if let Some(horizon) = disk_prefetch_horizon {
         let backing = Box::leak(vec![0; prefetch_backing].into_boxed_slice());
-        bank.enable_disk_prefetch(backing, horizon)?;
+        bank.enable_disk_prefetch(backing, horizon, join_active_prefetch)?;
         eprintln!(
-            "flash-next cuda: disk prefetch N+{horizon} enabled, host reserve {prefetch_bytes} bytes"
+            "flash-next cuda: disk prefetch N+{horizon} enabled, host reserve {prefetch_bytes} bytes, join={join_active_prefetch}"
         );
     }
 
