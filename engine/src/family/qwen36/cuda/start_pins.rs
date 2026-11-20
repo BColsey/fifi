@@ -436,7 +436,7 @@ fn the_explicit_gguf_pin_reaches_both_loaders_and_precedes_model_open() {
 fn the_unpinned_admission_is_resolved_in_start_and_selects_in_open_only() {
     // A bad Q36_ALLOW_UNPINNED_GGUF spelling must fail FAST, at startup — start() resolves the
     // switch beside the SHA-256 toggle, before the bundle and the spawn — while the engine
-    // thread only selects the file: open_gguf selects through select_gguf and passes the
+    // thread only selects the file: open_gguf selects through select_gguf_noted and passes the
     // resolved bools to the identity check, and an unpinned checkpoint passes that check
     // through (no pinned size or digest; the strict model open is the gate).
     let start = pinned(fn_section("fn start("));
@@ -454,7 +454,7 @@ fn the_unpinned_admission_is_resolved_in_start_and_selects_in_open_only() {
     );
     let open = pinned(fn_section("fn open_gguf("));
     let select = open
-        .find("select_gguf(")
+        .find("select_gguf_noted(")
         .expect("open_gguf selects the file");
     let identity = open
         .find("check_gguf_identity(")
