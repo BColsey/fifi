@@ -104,7 +104,12 @@ struct Rows {
     stepped_rows: Vec<usize>,
     fail_after_step: Option<EngError>,
     short_result: bool,
-    wild_token: bool,
+    /// The index among the stepped rows whose logits come back too narrow to sample.
+    narrow_row: Option<usize>,
+    /// Makes `row_growth` fail for a session whose pending token is this one.
+    growth_error_on: Option<u32>,
+    /// Makes `reserve_growth` fail with a refusal that is not a memory denial.
+    reserve_error: bool,
 }
 
 impl Rows {
@@ -119,7 +124,9 @@ impl Rows {
             stepped_rows: Vec::new(),
             fail_after_step: None,
             short_result: false,
-            wild_token: false,
+            narrow_row: None,
+            growth_error_on: None,
+            reserve_error: false,
         }
     }
 }
@@ -193,11 +200,17 @@ impl WindowRows for Rows {
         Ok(())
     }
 
-    fn row_growth(&self, _session: &RowSession) -> Result<u64> {
+    fn row_growth(&self, session: &RowSession) -> Result<u64> {
+        if self.growth_error_on.is_some() && session.core.pending() == self.growth_error_on {
+            return Err(EngError::BadRequest("the row has no growth plan".into()));
+        }
         Ok(self.growth)
     }
 
     fn reserve_growth(&self, bytes: u64) -> Result<Permit> {
+        if self.reserve_error {
+            return Err(EngError::BadRequest("the growth ledger is closed".into()));
+        }
         if self.used.get() + bytes > self.cap {
             return Err(EngError::MemoryPlan("the rows are out of growth".into()));
         }
@@ -213,10 +226,10 @@ impl WindowRows for Rows {
         self.step_calls += 1;
         self.stepped_rows.push(sessions.len());
         let mut rows = Vec::new();
-        for (session, &token) in sessions.iter_mut().zip(tokens) {
+        for (index, (session, &token)) in sessions.iter_mut().zip(tokens).enumerate() {
             session.fed += 1;
             let mut row = logits_of(token);
-            if self.wild_token {
+            if self.narrow_row == Some(index) {
                 row.truncate(VOCAB - 1);
             }
             rows.push(row);
@@ -422,39 +435,108 @@ fn a_bad_shape_is_refused_before_any_change() {
 }
 
 #[test]
-fn a_refused_row_leaves_every_session_unmoved_and_every_row_uncancelled() {
+fn a_refused_row_does_not_lose_the_finish_of_another_row() {
     let mut family = Rows::new(4);
     let mut cancelled = session(&mut family, &[1, 2]);
     // A pending token past the embedding table: the family refuses this row.
-    let wild = session(&mut family, &[VOCAB as u32 + 5]);
-    let mut wild = wild;
+    let mut wild = session(&mut family, &[VOCAB as u32 + 5]);
     let mut ok = session(&mut family, &[5, 6]);
     let (mut g0, mut g1, mut g2) = (generation(4), generation(4), generation(4));
     g0.cancel.store(true, Ordering::SeqCst);
-    let fed: Vec<usize> = [&cancelled, &wild, &ok].iter().map(|s| s.fed).collect();
-    let error = decode_window(
+    let batches = decode_window(
         &mut family,
         &mut [&mut cancelled, &mut wild, &mut ok],
         &mut [&mut g0, &mut g1, &mut g2],
     )
-    .expect_err("the wild row refuses the window");
-    assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
-    assert_eq!(family.step_calls, 0);
+    .expect("the window itself stands");
     assert_eq!(
-        [&cancelled, &wild, &ok]
-            .iter()
-            .map(|s| s.fed)
-            .collect::<Vec<_>>(),
-        fed,
-        "no position moved"
+        batches[0].as_ref().expect("cancelled row").finish,
+        Some(DecodeFinish::Cancelled),
+        "the earlier row's cancel is kept"
     );
+    assert!(
+        matches!(batches[1], Err(EngError::BadRequest(_))),
+        "{:?}",
+        batches[1]
+    );
+    assert_eq!(batches[2].as_ref().expect("ok row").tokens, [next_of(6)]);
+    assert!(
+        cancelled.core.history().is_empty(),
+        "the cancelled row was reset"
+    );
+}
+
+#[test]
+fn an_earlier_finish_survives_a_later_row_that_fails_preparation() {
+    let mut family = Rows::new(4);
+    let mut done = session(&mut family, &[1]);
+    // No prompt: the token side has no pending token, so preparation fails.
+    let mut empty = RowSession::default();
+    let (mut limit_zero, mut g1) = (generation(0), generation(4));
+    let batches = decode_window(
+        &mut family,
+        &mut [&mut done, &mut empty],
+        &mut [&mut limit_zero, &mut g1],
+    )
+    .expect("window");
     assert_eq!(
-        cancelled.core.history(),
-        &[1, 2],
-        "the cancelled row kept its history"
+        batches[0].as_ref().expect("finished row").finish,
+        Some(DecodeFinish::Length)
     );
-    assert!(!cancelled.core.is_finished());
-    assert_eq!(ok.core.pending(), Some(6));
+    assert!(matches!(batches[1], Err(EngError::BadRequest(_))));
+}
+
+#[test]
+fn a_growth_plan_error_or_a_closed_ledger_refuses_that_row_only() {
+    let mut family = Rows::new(4);
+    family.growth_error_on = Some(2);
+    let mut a = session(&mut family, &[1]);
+    let mut b = session(&mut family, &[2]);
+    let mut c = session(&mut family, &[3]);
+    let (mut ga, mut gb, mut gc) = (generation(4), generation(0), generation(4));
+    let batches = decode_window(
+        &mut family,
+        &mut [&mut a, &mut b, &mut c],
+        &mut [&mut ga, &mut gb, &mut gc],
+    )
+    .expect("window");
+    assert_eq!(batches[0].as_ref().expect("a").tokens, [next_of(1)]);
+    assert_eq!(
+        batches[1].as_ref().expect("b").finish,
+        Some(DecodeFinish::Length),
+        "a limit-zero row finishes without a growth plan"
+    );
+    assert_eq!(batches[2].as_ref().expect("c").tokens, [next_of(3)]);
+    // The row whose pending token is 2 has a growth error once it needs a step.
+    let mut family = Rows::new(4);
+    family.growth_error_on = Some(2);
+    let mut a = session(&mut family, &[1]);
+    let mut b = session(&mut family, &[2]);
+    let (mut ga, mut gb) = (generation(4), generation(4));
+    let batches =
+        decode_window(&mut family, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]).expect("window");
+    assert_eq!(batches[0].as_ref().expect("a").tokens, [next_of(1)]);
+    assert!(matches!(batches[1], Err(EngError::BadRequest(_))));
+    assert_eq!(b.core.pending(), Some(2), "refused before its feed");
+    // A ledger that refuses every reservation refuses every stepping row, none of them lost.
+    let mut family = Rows::new(4);
+    family.reserve_error = true;
+    let mut a = session(&mut family, &[1]);
+    let mut b = session(&mut family, &[2]);
+    let mut done = session(&mut family, &[3]);
+    let (mut ga, mut gb, mut gd) = (generation(4), generation(4), generation(0));
+    let batches = decode_window(
+        &mut family,
+        &mut [&mut a, &mut b, &mut done],
+        &mut [&mut ga, &mut gb, &mut gd],
+    )
+    .expect("window");
+    assert!(matches!(batches[0], Err(EngError::BadRequest(_))));
+    assert!(matches!(batches[1], Err(EngError::BadRequest(_))));
+    assert_eq!(
+        batches[2].as_ref().expect("done").finish,
+        Some(DecodeFinish::Length)
+    );
 }
 
 #[test]
@@ -546,15 +628,34 @@ fn a_failure_after_the_step_is_outer_and_consumes_the_inputs() {
 }
 
 #[test]
-fn a_wrong_row_count_or_a_narrow_row_is_an_outer_error() {
+fn a_row_that_cannot_be_sampled_ends_alone_and_the_others_stand() {
     let mut family = Rows::new(8);
-    family.short_result = true;
+    family.narrow_row = Some(1);
     let mut a = session(&mut family, &[1]);
     let mut b = session(&mut family, &[2]);
-    let (mut ga, mut gb) = (generation(5), generation(5));
-    assert!(decode_window(&mut family, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]).is_err());
+    let mut c = session(&mut family, &[3]);
+    let (mut ga, mut gb, mut gc) = (generation(5), generation(5), generation(5));
+    let batches = decode_window(
+        &mut family,
+        &mut [&mut a, &mut b, &mut c],
+        &mut [&mut ga, &mut gb, &mut gc],
+    )
+    .expect("the window stands");
+    assert_eq!(batches[0].as_ref().expect("a").tokens, [next_of(1)]);
+    assert!(
+        matches!(batches[1], Err(EngError::Backend { .. })),
+        "{:?}",
+        batches[1]
+    );
+    assert_eq!(batches[2].as_ref().expect("c").tokens, [next_of(3)]);
+    assert_eq!(b.fed, 1, "its input was consumed");
+    assert_eq!(b.core.pending(), None, "so it is not retried");
+}
+
+#[test]
+fn a_wrong_row_count_is_an_outer_error() {
     let mut family = Rows::new(8);
-    family.wild_token = true;
+    family.short_result = true;
     let mut a = session(&mut family, &[1]);
     let mut b = session(&mut family, &[2]);
     let (mut ga, mut gb) = (generation(5), generation(5));

@@ -9,18 +9,18 @@
 //! Order of a window:
 //! 1. The shape is checked: equal nonempty slices within `max_seqs`.
 //! 2. A window of one row calls the solo `decode`, so a lone request runs the code it always ran.
-//! 3. Every row is validated before any state changes: the token side must hold a pending token
-//!    and the family must accept the row (`check_row`). A refusal here is an outer error and no
-//!    session has moved.
-//! 4. Each row takes its policy decision through `DecodeSession::prepare_decode`: cancellation,
-//!    the output limit and decoder tails finish a row without a model step.
-//! 5. The rows that still need a step reserve their growth. A memory denial refuses that row only,
-//!    before its feed; any other error is an outer error.
-//! 6. One row left runs the solo `decode`; two or more run `step_rows` once.
-//! 7. Every consumed input is recorded before any result is checked, then each row is sampled
-//!    with its own sampler and finished with the policy of a solo token. An error after the step
-//!    ran is an outer error: the worker discards the whole window and never publishes a partial
-//!    one.
+//! 3. Each row is validated (a pending token, the family's `check_row`) and takes its policy
+//!    decision through `DecodeSession::prepare_decode`: cancellation, the output limit and decoder
+//!    tails finish a row without a model step. A row that fails here, or whose growth cannot be
+//!    reserved (`row_growth`, `reserve_growth`), is refused alone, before its feed: its result is
+//!    its own error and every other row still finishes, cancels or steps.
+//! 4. One row left runs the solo `decode`; two or more run `step_rows` once. A failure of that
+//!    step is an outer error: every stepped row is in an unknown state and the worker discards
+//!    them.
+//! 5. Every consumed input is recorded before any result is checked, then each row is sampled
+//!    with its own sampler and finished with the policy of a solo token. A sampler or finish error
+//!    belongs to that row (its token was consumed, so its session needs a reset); the other rows'
+//!    results stand.
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
@@ -105,30 +105,21 @@ pub(crate) fn decode_window<F: WindowRows>(
             .decode(&mut *sessions[0], &mut *generations[0])
             .map(|batch| vec![Ok(batch)]);
     }
-    // Validate every input before cancellation or a decoder tail can change any row.
-    for slot in 0..rows {
-        let token = pending_of(family, &mut *sessions[slot])?;
-        let generation = &generations[slot];
-        if generation.cancel.load(Ordering::SeqCst) || generation.remaining_tokens() == Some(0) {
-            continue;
-        }
-        family.check_row(&*sessions[slot], token)?;
-    }
+    // Every refusal before the step belongs to its row: the other rows still finish, cancel or
+    // step, so one bad row never loses another row's finish. The checks that change nothing run
+    // first for each row; only a row that passes them reaches `prepare_decode`, which can finish
+    // or reset it.
     let mut results: Vec<Option<Result<DecodeBatch>>> = (0..rows).map(|_| None).collect();
     let mut stepping = Vec::with_capacity(rows);
     for slot in 0..rows {
-        let prepared = {
-            let (core, mut step, _) = family.split(&mut *sessions[slot]);
-            core.prepare_decode(&mut step, &mut *generations[slot])?
-        };
-        match prepared {
-            DecodePreparation::Finished(batch) => results[slot] = Some(Ok(batch)),
-            DecodePreparation::Token(_) => {
-                stepping.push((slot, family.row_growth(&*sessions[slot])?));
-            }
+        match prepare_row(family, &mut *sessions[slot], &mut *generations[slot]) {
+            Ok(Prepared::Done(batch)) => results[slot] = Some(Ok(batch)),
+            Ok(Prepared::Step(growth)) => stepping.push((slot, growth)),
+            Err(error) => results[slot] = Some(Err(error)),
         }
     }
-    // Rows are admitted against cumulative charges; the step recharges what it uses.
+    // Rows are admitted against cumulative charges; the step recharges what it uses. A denied
+    // charge refuses that row before its feed, whatever the error is.
     let mut permits = Vec::with_capacity(stepping.len());
     let mut admitted = Vec::with_capacity(stepping.len());
     for (slot, growth) in stepping {
@@ -137,8 +128,7 @@ pub(crate) fn decode_window<F: WindowRows>(
                 permits.push(permit);
                 admitted.push(slot);
             }
-            Err(error @ EngError::MemoryPlan(_)) => results[slot] = Some(Err(error)),
-            Err(error) => return Err(error),
+            Err(error) => results[slot] = Some(Err(error)),
         }
     }
     drop(permits);
@@ -146,8 +136,7 @@ pub(crate) fn decode_window<F: WindowRows>(
         0 => {}
         1 => {
             let slot = admitted[0];
-            let batch = family.decode(&mut *sessions[slot], &mut *generations[slot])?;
-            results[slot] = Some(Ok(batch));
+            results[slot] = Some(family.decode(&mut *sessions[slot], &mut *generations[slot]));
         }
         _ => step_window(family, sessions, generations, &admitted, &mut results)?,
     }
@@ -157,7 +146,38 @@ pub(crate) fn decode_window<F: WindowRows>(
         .collect()
 }
 
-/// Runs the batched step for the admitted rows and publishes one token for each.
+/// What one row does in a window.
+enum Prepared {
+    /// The row finished or was cancelled without a model step.
+    Done(DecodeBatch),
+    /// The row steps and needs this many bytes of growth.
+    Step(u64),
+}
+
+/// Validates one row and takes its policy decision. A row that cannot step returns its own error.
+fn prepare_row<F: WindowRows>(
+    family: &mut F,
+    session: &mut F::Session,
+    generation: &mut GenerationState,
+) -> Result<Prepared> {
+    let token = pending_of(family, session)?;
+    let ends = generation.cancel.load(Ordering::SeqCst) || generation.remaining_tokens() == Some(0);
+    if !ends {
+        family.check_row(&*session, token)?;
+    }
+    let prepared = {
+        let (core, mut step, _) = family.split(session);
+        core.prepare_decode(&mut step, generation)?
+    };
+    match prepared {
+        DecodePreparation::Finished(batch) => Ok(Prepared::Done(batch)),
+        DecodePreparation::Token(_) => Ok(Prepared::Step(family.row_growth(&*session)?)),
+    }
+}
+
+/// Runs the batched step for the admitted rows and publishes one token for each. A failure of the
+/// step itself is an outer error; a failure to sample or to finish one row belongs to that row
+/// alone, which the model has already fed.
 fn step_window<F: WindowRows>(
     family: &mut F,
     sessions: &mut [&mut F::Session],
@@ -192,22 +212,34 @@ fn step_window<F: WindowRows>(
         return Err(window_error("the step returned the wrong row count"));
     }
     let vocab = family.split(&mut *sessions[admitted[0]]).2.sampler_vocab;
-    let mut sampled = Vec::with_capacity(admitted.len());
     for (&slot, logits) in admitted.iter().zip(&stepped) {
-        let token = sample_logits(F::OPERATION, logits, &mut generations[slot].sampler, vocab)?;
-        if usize::try_from(token).map_or(true, |token| token >= vocab) {
-            return Err(window_error(
-                "a row returned a token outside the sampler vocabulary",
-            ));
-        }
-        sampled.push(token);
-    }
-    for (&slot, token) in admitted.iter().zip(sampled) {
-        let (core, mut step, limits) = family.split(&mut *sessions[slot]);
-        let batch = core.finish_decode_token(&mut step, &mut *generations[slot], &limits, token)?;
-        results[slot] = Some(Ok(batch));
+        results[slot] = Some(publish_row(
+            family,
+            &mut *sessions[slot],
+            &mut *generations[slot],
+            logits,
+            vocab,
+        ));
     }
     Ok(())
+}
+
+/// Samples one row from its logits and publishes the token with the policy of a solo token.
+fn publish_row<F: WindowRows>(
+    family: &mut F,
+    session: &mut F::Session,
+    generation: &mut GenerationState,
+    logits: &[f32],
+    vocab: usize,
+) -> Result<DecodeBatch> {
+    let token = sample_logits(F::OPERATION, logits, &mut generation.sampler, vocab)?;
+    if usize::try_from(token).map_or(true, |token| token >= vocab) {
+        return Err(window_error(
+            "a row returned a token outside the sampler vocabulary",
+        ));
+    }
+    let (core, mut step, limits) = family.split(session);
+    core.finish_decode_token(&mut step, generation, &limits, token)
 }
 
 #[cfg(test)]
