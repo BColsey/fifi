@@ -38,7 +38,8 @@ pub(crate) struct FlashOptions {
     /// Hints do not stage storage or change routing.
     pub(crate) expert_prefetch: Option<bool>,
     /// Serves the model on a CUDA card (a `native-cuda` Linux build). The default is true in a
-    /// build that has the CUDA decoder and false elsewhere; `false` on a CUDA build refuses to
+    /// build that has the CUDA decoder (when neither `cache_limit_bytes` nor `prefill_budget_bytes`
+    /// names the MLX arm) and false elsewhere; `false` on a CUDA build refuses to
     /// serve Flash-Next. When true, `cache_limit_bytes` (an MLX allocator key) is not required and is refused if set.
     pub(crate) cuda_decode: Option<bool>,
     /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Unset, the
@@ -463,7 +464,7 @@ impl FlashSettings {
     }
 
     /// `new` with the default of `cuda_decode` given: a build with the CUDA decoder serves on
-    /// the card unless the entry says `cuda_decode: false`.
+    /// the card unless the entry says `cuda_decode: false` or sets an MLX allocator key.
     fn with_cuda_default(
         model_dir: &Path,
         tokenizer_dir: &Path,
@@ -474,7 +475,10 @@ impl FlashSettings {
         let default = FlashOptions::default();
         let options = options.unwrap_or(&default);
         let resolved;
-        let options = if cuda_default && options.cuda_decode.is_none() {
+        // The MLX allocator keys name the MLX arm, so they keep an entry off the card.
+        let mlx_keys =
+            options.cache_limit_bytes.is_some() || options.prefill_budget_bytes.is_some();
+        let options = if cuda_default && options.cuda_decode.is_none() && !mlx_keys {
             resolved = FlashOptions {
                 cuda_decode: Some(true),
                 ..options.clone()
@@ -623,8 +627,10 @@ mod tests {
         }
     }
 
+    /// The settings of an entry with the build's default of `cuda_decode` pinned off, so the
+    /// expectations hold in a CUDA build too.
     fn settings(options: Option<&FlashOptions>, env: &FlashEnv) -> Result<FlashSettings, EngError> {
-        FlashSettings::new(Path::new("/art"), Path::new("/tok"), options, env)
+        FlashSettings::with_cuda_default(Path::new("/art"), Path::new("/tok"), options, env, false)
     }
 
     fn message(result: Result<FlashSettings, EngError>) -> String {
@@ -750,14 +756,18 @@ mod tests {
             ..FlashOptions::default()
         };
         assert_eq!(build(Some(&off), true).unwrap().cuda, None);
-        // An MLX allocator key beside the default names the conflict instead of switching arms.
+        // An MLX allocator key with no `cuda_decode` names the MLX arm, so it stays off the card.
         let mlx_key = FlashOptions {
             cache_limit_bytes: Some(1 << 30),
             ..FlashOptions::default()
         };
-        assert!(
-            message(build(Some(&mlx_key), true)).contains("cannot be combined with cuda_decode")
-        );
+        assert_eq!(build(Some(&mlx_key), true).unwrap().cuda, None);
+        // The same key beside an explicit `cuda_decode: true` is the conflict, named.
+        let both = FlashOptions {
+            cuda_decode: Some(true),
+            ..mlx_key
+        };
+        assert!(message(build(Some(&both), true)).contains("cannot be combined with cuda_decode"));
     }
 
     /// A plan whose slots fall by one per 2,048 positions from `top`.
