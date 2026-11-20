@@ -203,3 +203,22 @@ continuations decoded at 80.19 tokens/s near 2K and 66.77 tokens/s near 64K.
 The coding benchmark accepts `--reuse-mode disabled` to require zero reused
 tokens on the second turn. Its default `--reuse-mode required` checks the
 minimum reuse in addition to validating the requested edit.
+
+## Earlier peer CUDA measurements
+
+The older peer measurements used separate builds and workloads. Use each
+linked report for its exact device order, source revision, and settings.
+
+| Earlier measurement | Result | Source |
+| --- | --- | --- |
+| 512-row prefill and recall | Passed on 8,311 and 32,884 counted prompt tokens. Server prefill took 17.87 and 70.68 seconds. | [Upstream PR #42](https://github.com/zbrdc/fifi/pull/42), [fork PR #4](https://github.com/BColsey/fifi/pull/4) |
+| 1,024-row long recall | Passed on 131,195 counted prompt tokens. Server prefill took 157.78 seconds. | [Upstream PR #43](https://github.com/zbrdc/fifi/pull/43), [fork PR #10](https://github.com/BColsey/fifi/pull/10) |
+| 2,048-row build and host checks | Ten host checks were recorded and peer-device tests were enumerated. | [Upstream PR #44](https://github.com/zbrdc/fifi/pull/44), [fork PR #11](https://github.com/BColsey/fifi/pull/11) |
+| Peer prefix diagnostic | Separately checked aligned state and logits, and logged natural continuation comparisons. | [Upstream PR #46](https://github.com/zbrdc/fifi/pull/46), [fork PR #6](https://github.com/BColsey/fifi/pull/6) |
+| Cross-device event barriers | Long-prompt speed ratios were 1.0003 and 0.9989 across the two run orders. The separate resource records include CPU and GPU sampling. | [Upstream PR #47](https://github.com/zbrdc/fifi/pull/47), [fork PR #8](https://github.com/BColsey/fifi/pull/8), [resource observer PR](https://github.com/BColsey/fifi/pull/7) |
+| Incremental KV staging | Short- and long-prompt time-to-first-token ratios were 1.010 and 1.036. Median decode was 38.66 and 38.64 tokens/s without and with staging. | [Upstream PR #59](https://github.com/zbrdc/fifi/pull/59), [fork PR #1](https://github.com/BColsey/fifi/pull/1) |
+| Multi-block ring, two coding turns | Both edits passed at 261,696 and 261,740 prompt tokens, with zero reuse. First token arrived in 633.08 and 633.21 seconds. | [Fork PR #9](https://github.com/BColsey/fifi/pull/9) |
+| Peer expert placement | Records the older RTX 3080 placement experiment. The upstream placement code now charges each card's resident KV layout. | [Fork PR #3](https://github.com/BColsey/fifi/pull/3), [upstream PR #90](https://github.com/zbrdc/fifi/pull/90) |
+
+The paired host observer, bounded client, and scoped workload tests are
+documented in the [Peer-pair host observer](../explanation/p2p-pair-host-observer.md).
