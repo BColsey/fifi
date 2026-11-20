@@ -386,6 +386,7 @@ mod device {
                 restore_drops: self.prefix.restore_drop_count(),
                 evictions: self.prefix.eviction_count(),
                 save_side: self.prefix.save_side_totals(),
+                tier: Default::default(),
             })
         }
     }

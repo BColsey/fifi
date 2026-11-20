@@ -1984,6 +1984,7 @@ mod tests {
             restore_drops: 0,
             evictions: 0,
             save_side: crate::family::session::SaveSideTotals::default(),
+            tier: Default::default(),
         })
     }
 

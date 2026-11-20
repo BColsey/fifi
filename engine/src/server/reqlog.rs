@@ -200,6 +200,31 @@ fn render(entry: &Entry<'_>) -> String {
             json!(prefix.restore_drops),
         );
         object.insert("prefix_evictions".to_string(), json!(prefix.evictions));
+        // The tier that served the restore, and what a disk read cost: bytes and wall time of
+        // the verified read (zero for a restore from device or pinned memory).
+        object.insert(
+            "prefix_source".to_string(),
+            json!(prefix.tier.source.as_str()),
+        );
+        object.insert(
+            "prefix_disk_bytes".to_string(),
+            json!(prefix.tier.disk_bytes),
+        );
+        object.insert("prefix_disk_ms".to_string(), json!(prefix.tier.disk_ms));
+        // What the disk tier has taken since the engine started (lifetime totals): entries and
+        // bytes written because pinned memory ran short or at a stop, and spills dropped.
+        object.insert(
+            "prefix_disk_written_entries".to_string(),
+            json!(prefix.tier.disk_written_entries),
+        );
+        object.insert(
+            "prefix_disk_written_bytes".to_string(),
+            json!(prefix.tier.disk_written_bytes),
+        );
+        object.insert(
+            "prefix_disk_dropped".to_string(),
+            json!(prefix.tier.disk_dropped),
+        );
         object.insert(
             "prefix_uncached_shared".to_string(),
             json!(prefix.uncached_shared),
@@ -890,7 +915,7 @@ mod tests {
 
     /// The keys of a line whose request carried a prefix boundary: the keys above plus
     /// the `prefix_*` keys, sorted.
-    const PREFIX_KEYS: [&str; 39] = [
+    const PREFIX_KEYS: [&str; 45] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
@@ -907,6 +932,11 @@ mod tests {
         "prefill_ms",
         "prefill_pieces",
         "prefix_bytes",
+        "prefix_disk_bytes",
+        "prefix_disk_dropped",
+        "prefix_disk_ms",
+        "prefix_disk_written_bytes",
+        "prefix_disk_written_entries",
         "prefix_entries",
         "prefix_evictions",
         "prefix_hit",
@@ -916,6 +946,7 @@ mod tests {
         "prefix_save_refusals",
         "prefix_save_restored_replaces",
         "prefix_save_room_removals",
+        "prefix_source",
         "prefix_uncached_shared",
         "prompt_hash_1024",
         "prompt_hash_4096",
@@ -1546,6 +1577,7 @@ mod tests {
                 restore_drops: 0,
                 evictions: 0,
                 save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             ..empty_entry()
         };
@@ -1580,6 +1612,12 @@ mod tests {
                 "prefix_bytes": 422379520,
                 "prefix_restore_drops": 0,
                 "prefix_evictions": 0,
+                "prefix_source": "none",
+                "prefix_disk_bytes": 0,
+                "prefix_disk_ms": 0,
+                "prefix_disk_written_entries": 0,
+                "prefix_disk_written_bytes": 0,
+                "prefix_disk_dropped": 0,
                 "prefix_save_room_removals": 0,
                 "prefix_save_refusals": 0,
                 "prefix_save_duplicate_uses": 0,
@@ -1612,6 +1650,7 @@ mod tests {
                 restore_drops: 0,
                 evictions: 0,
                 save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             ..empty_entry()
         };
@@ -1849,6 +1888,12 @@ mod tests {
             "prefix_bytes": 2_000,
             "prefix_restore_drops": 0,
             "prefix_evictions": 0,
+            "prefix_source": "none",
+            "prefix_disk_bytes": 0,
+            "prefix_disk_ms": 0,
+            "prefix_disk_written_entries": 0,
+            "prefix_disk_written_bytes": 0,
+            "prefix_disk_dropped": 0,
             "prefix_save_room_removals": 0,
             "prefix_save_refusals": 0,
             "prefix_save_duplicate_uses": 0,

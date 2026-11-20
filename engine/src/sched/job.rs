@@ -219,6 +219,48 @@ pub(crate) struct PrefixReport {
     /// every mark of a lineage to other saves' room pressure while reporting
     /// `evictions` 0.
     pub(crate) save_side: crate::family::session::SaveSideTotals,
+    /// Where the restored state came from and what a disk read cost.
+    pub(crate) tier: PrefixTier,
+}
+
+/// The storage tier that served a prefix restore, for the request-log field `prefix_source`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrefixSource {
+    /// Nothing was restored, or the executor does not name a tier.
+    #[default]
+    None,
+    /// The state came back from the device's own copy of the tip.
+    Device,
+    /// The state came back from pinned host memory.
+    Pinned,
+    /// The state was read from the on-disk cache first, then restored.
+    Disk,
+}
+
+impl PrefixSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PrefixSource::None => "none",
+            PrefixSource::Device => "device",
+            PrefixSource::Pinned => "pinned",
+            PrefixSource::Disk => "disk",
+        }
+    }
+}
+
+/// The tier facts of one restore: the source, and for a disk restore the bytes read and the
+/// wall time of the read (verification included). The three `disk_written_*` and
+/// `disk_dropped` fields are lifetime totals of what went to the disk tier since the engine
+/// started: entries and bytes written (when pinned memory ran short or at a stop), and
+/// spills dropped because their slot was needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrefixTier {
+    pub(crate) source: PrefixSource,
+    pub(crate) disk_bytes: u64,
+    pub(crate) disk_ms: u32,
+    pub(crate) disk_written_entries: u32,
+    pub(crate) disk_written_bytes: u64,
+    pub(crate) disk_dropped: u32,
 }
 
 impl Default for PrefixReport {
@@ -232,6 +274,7 @@ impl Default for PrefixReport {
             restore_drops: 0,
             evictions: 0,
             save_side: crate::family::session::SaveSideTotals::default(),
+            tier: PrefixTier::default(),
         }
     }
 }
@@ -378,7 +421,7 @@ pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32
 mod tests {
     use super::{
         EVENT_CAPACITY, Job, JobEvent, JobUsage, PrefillBankReport, PrefillPieces, PrefixHit,
-        PrefixReport,
+        PrefixReport, PrefixTier,
     };
     use crate::EngError;
     use crate::family::executor::GenerationState;
@@ -459,7 +502,8 @@ mod tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: crate::family::session::SaveSideTotals::default()
+                save_side: crate::family::session::SaveSideTotals::default(),
+                tier: PrefixTier::default(),
             },
             "a literal, not the default under test"
         );

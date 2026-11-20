@@ -1547,6 +1547,7 @@ impl ExecutorOps for Q36Executor {
             restore_drops: self.prefix.restore_drop_count(),
             evictions: self.prefix.eviction_count(),
             save_side: self.prefix.save_side_totals(),
+            tier: Default::default(),
         })
     }
 
@@ -5575,7 +5576,8 @@ mod tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: SaveSideTotals::default()
+                save_side: SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "a fresh store reports all zero"
         );
@@ -5610,7 +5612,8 @@ mod tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: SaveSideTotals::default()
+                save_side: SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the root of 4 and the tip of 6 key tokens"
         );
@@ -5634,7 +5637,8 @@ mod tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: SaveSideTotals::default()
+                save_side: SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the root hit, and the tip's common prefix equals the restored root"
         );
@@ -5685,7 +5689,8 @@ mod tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: SaveSideTotals::default()
+                save_side: SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the stored key covers four prompt tokens that no checkpoint served"
         );
@@ -5727,6 +5732,7 @@ mod tests {
                 restore_drops: 0,
                 evictions: 0,
                 save_side,
+                tier: Default::default(),
             })
         };
         // Each round: the prompt, the boundary of the job, the expected tokens, the expected

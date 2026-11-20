@@ -1057,6 +1057,7 @@ impl ExecutorOps for FlintExecutor {
             // lifted for this store yet.
             shadow: None,
             save_side,
+            tier: Default::default(),
             restore_drops: self.prefix.restore_drop_count(),
             evictions: self.prefix.eviction_count(),
         })

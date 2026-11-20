@@ -927,6 +927,7 @@ impl ExecutorOps for FlintExecutor {
             restore_drops: self.prefix.restore_drop_count(),
             evictions: self.prefix.eviction_count(),
             save_side,
+            tier: Default::default(),
         })
     }
 }

@@ -480,6 +480,7 @@ impl ExecutorOps for FakeExecutor {
             restore_drops: store.restore_drop_count(),
             evictions: store.eviction_count(),
             save_side: store.save_side_totals(),
+            tier: Default::default(),
         })
     }
 
@@ -911,7 +912,8 @@ mod prefix_tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: crate::family::session::SaveSideTotals::default()
+                save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "a fresh store reports all zero"
         );
@@ -936,7 +938,8 @@ mod prefix_tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: crate::family::session::SaveSideTotals::default()
+                save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the root and the tip, 1,000 charged bytes each, no restore yet"
         );
@@ -958,7 +961,8 @@ mod prefix_tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: crate::family::session::SaveSideTotals::default()
+                save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the root hit; the tip shares exactly the restored four tokens"
         );
@@ -973,7 +977,8 @@ mod prefix_tests {
                 shadow: None,
                 restore_drops: 0,
                 evictions: 0,
-                save_side: crate::family::session::SaveSideTotals::default()
+                save_side: crate::family::session::SaveSideTotals::default(),
+                tier: Default::default(),
             }),
             "the reset cleared the hit of the restore"
         );
