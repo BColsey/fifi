@@ -9,7 +9,8 @@ use super::start::{
     BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, allow_unpinned_wanted, already_built,
     check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
     ignored_mlx_line, kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, open_gguf,
-    pinned_gguf, select_gguf, serve_kv_mode, sha256_wanted, step_options, tiered_plan_of,
+    pinned_gguf, select_gguf, select_gguf_noted, serve_kv_mode, sha256_wanted, step_options,
+    tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -160,12 +161,13 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
         "{missing}"
     );
     // A size off by one, then the pinned size: only the metadata is read (a sparse file, no
-    // 20 GB written).
+    // 20 GB written). The off-size file is served, not refused.
     let file = std::fs::File::create(&gguf).expect("create");
     file.set_len(GGUF_BYTES - 1).expect("truncate");
-    let wrong = text(check_gguf_identity(&gguf, false, true));
-    assert!(wrong.contains(&format!("{}", GGUF_BYTES - 1)), "{wrong}");
-    assert!(wrong.contains(&GGUF_BYTES.to_string()), "{wrong}");
+    assert!(
+        check_gguf_identity(&gguf, false, true).is_ok(),
+        "another size under the pinned name is served with a warning line"
+    );
     file.set_len(GGUF_BYTES).expect("sparse to the pinned size");
     assert!(
         check_gguf_identity(&gguf, false, true).is_ok(),
@@ -190,9 +192,9 @@ fn the_gguf_identity_is_checked_by_name_and_size() {
 
 #[test]
 fn the_unpinned_admission_selects_one_file_and_leaves_the_open_as_the_gate() {
-    // The switch: unset or `0` off, `1` on, every other spelling a typed refusal naming the
+    // The switch: unset or `1` on, `0` off, every other spelling a typed refusal naming the
     // variable — the same promise shape as the SHA-256 toggle.
-    for (raw, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+    for (raw, want) in [(None, true), (Some("0"), false), (Some("1"), true)] {
         assert_eq!(allow_unpinned_wanted(raw), Ok(want));
     }
     for raw in ["yes", "true", ""] {
@@ -218,7 +220,7 @@ fn the_unpinned_admission_selects_one_file_and_leaves_the_open_as_the_gate() {
     );
     // On, empty directory: nothing to serve.
     let empty = text(select_gguf(dir.path(), true));
-    assert!(empty.contains("no .gguf file"), "{empty}");
+    assert!(empty.contains("no .gguf weights file"), "{empty}");
     // On, one foreign file: admitted, and it is not the pinned identity.
     let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
     std::fs::write(&foreign, b"").expect("write");
@@ -233,13 +235,18 @@ fn the_unpinned_admission_selects_one_file_and_leaves_the_open_as_the_gate() {
         assert_eq!(path, pinned_path);
         assert!(pinned);
     }
-    // Two candidates: the admission refuses the ambiguity by naming both.
+    // Two candidates: the larger file, the higher precision, is served and the note names both.
     std::fs::remove_file(&pinned_path).expect("remove");
     let second = dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf");
-    std::fs::write(&second, b"").expect("write");
-    let many = text(select_gguf(dir.path(), true));
-    assert!(many.contains("exactly one .gguf"), "{many}");
-    assert!(many.contains("Q8_0") && many.contains("Q5_K_M"), "{many}");
+    std::fs::write(&second, b"larger").expect("write");
+    let (path, pinned, note) = select_gguf_noted(dir.path(), true).expect("ranked choice");
+    assert_eq!(path, second);
+    assert!(!pinned);
+    let note = note.expect("a choice is noted");
+    assert!(note.contains("Q8_0") && note.contains("Q5_K_M"), "{note}");
+    // A path to one file serves that file, in any directory.
+    let (path, pinned, note) = select_gguf_noted(&foreign, true).expect("a file path");
+    assert_eq!((path, pinned, note), (foreign.clone(), false, None));
     std::fs::remove_file(&second).expect("remove");
     // An unpinned file has no pinned size or digest: the identity check passes it through, and
     // the strict open is the gate — the admission ends at the GGUF parser (prefix `gguf:`),
@@ -281,10 +288,17 @@ fn an_explicit_content_pin_checks_unpinned_files_before_model_open() {
     let admission = checkpoint(open_gguf(dir.path(), false, false, Some(digest)));
     assert!(admission.contains("Q36_ALLOW_UNPINNED_GGUF"), "{admission}");
     std::fs::write(dir.path().join(GGUF_NAME), b"abc").unwrap();
+    // A pinned name with another size is served with a warning; the content pin still holds.
     let size = checkpoint(open_gguf(dir.path(), false, true, Some(digest)));
     assert!(
-        size.contains("has 3 bytes"),
-        "a content pin preserves the size gate: {size}"
+        size.starts_with("gguf"),
+        "the size alone does not refuse: {size}"
+    );
+    std::fs::write(dir.path().join(GGUF_NAME), b"abd").unwrap();
+    let other = checkpoint(open_gguf(dir.path(), false, true, Some(digest)));
+    assert!(
+        other.contains("does not match"),
+        "the digest still refuses: {other}"
     );
 }
 

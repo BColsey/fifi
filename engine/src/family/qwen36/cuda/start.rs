@@ -264,11 +264,12 @@ const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f8
 /// cannot silently skip the check. A value Rust cannot read as UTF-8 reads as unset (std's
 /// `env::var`), so it leaves the check off.
 const VERIFY_SHA256_VAR: &str = "Q36_VERIFY_GGUF_SHA256";
-/// The opt-in admission of a checkpoint other than the pinned file: `1` serves the directory's
-/// single `.gguf` when the pinned file is absent, and the strict model open — architecture
-/// metadata, full tensor set, types and dims — stays the gate, so only a Qwen3.6-35B-A3B
-/// conversion loads. Unset or `0` keeps the pinned-only behavior; every other spelling is a
-/// typed refusal raised at startup, exactly like `Q36_VERIFY_GGUF_SHA256`.
+/// The admission of a checkpoint other than the pinned file: unset or `1` serves the directory's
+/// `.gguf` (the highest-precision one when there are several) when the pinned file is absent,
+/// and the strict model open — architecture metadata, full tensor set, types and dims — stays
+/// the gate, so only a Qwen3.6-35B-A3B conversion loads. `0` keeps the pinned-only behavior;
+/// every other spelling is a typed refusal raised at startup, exactly like
+/// `Q36_VERIFY_GGUF_SHA256`.
 pub(crate) const ALLOW_UNPINNED_VAR: &str = "Q36_ALLOW_UNPINNED_GGUF";
 const CHUNK_PREFILL_VAR: &str = "Q36_CUDA_CHUNK_PREFILL";
 const CHUNK_ROWS_VAR: &str = "Q36_CUDA_CHUNK_ROWS";
@@ -507,15 +508,32 @@ pub(super) fn pinned_gguf(artifact: &Path) -> PathBuf {
 }
 
 /// The GGUF to serve and whether it is the pinned file. The pinned file wins whenever it is
-/// present; otherwise, with the unpinned admission on, the directory's single `.gguf` serves,
-/// and an empty or ambiguous directory is a typed refusal that names the candidates.
+/// present; otherwise, with the unpinned admission on, the directory's `.gguf` serves, and an
+/// empty directory is a typed refusal. A directory with several files serves the first the
+/// ranking gives (`gguf_select`: the largest, so the highest precision); a path to one `.gguf`
+/// file serves that file.
 pub(crate) fn select_gguf(
     artifact: &Path,
     allow_unpinned: bool,
 ) -> Result<(PathBuf, bool), EngError> {
+    select_gguf_noted(artifact, allow_unpinned).map(|(path, pinned, _)| (path, pinned))
+}
+
+/// [`select_gguf`] and the log line that names the other candidates when there was a choice.
+pub(crate) fn select_gguf_noted(
+    artifact: &Path,
+    allow_unpinned: bool,
+) -> Result<(PathBuf, bool, Option<String>), EngError> {
     let pinned = pinned_gguf(artifact);
     if pinned.is_file() {
-        return Ok((pinned, true));
+        return Ok((pinned, true, None));
+    }
+    if artifact.is_file()
+        && artifact
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(GGUF_NAME))
+    {
+        return Ok((artifact.to_path_buf(), true, None));
     }
     if !allow_unpinned {
         return Err(EngError::Checkpoint(format!(
@@ -524,39 +542,11 @@ pub(crate) fn select_gguf(
             pinned.display()
         )));
     }
-    let read = |error: std::io::Error| {
-        EngError::Checkpoint(format!(
-            "cuda checkpoint: cannot read {}: {error}",
-            artifact.display()
-        ))
-    };
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(artifact).map_err(read)? {
-        let path = entry.map_err(read)?.path();
-        if path.extension().is_some_and(|ext| ext == "gguf") && path.is_file() {
-            found.push(path);
-        }
-    }
-    found.sort();
-    match found.len() {
-        0 => Err(EngError::Checkpoint(format!(
-            "cuda checkpoint: no .gguf file in {} ({ALLOW_UNPINNED_VAR}=1 is set)",
-            artifact.display()
-        ))),
-        1 => Ok((found.pop().expect("len is 1"), false)),
-        _ => {
-            let names = found
-                .iter()
-                .map(|path| format!("{}", path.display()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(EngError::Checkpoint(format!(
-                "cuda checkpoint: {ALLOW_UNPINNED_VAR}=1 serves exactly one .gguf, found \
-                 {}: {names}",
-                found.len()
-            )))
-        }
-    }
+    let (_, files) = crate::family::gguf_select::candidates(artifact)
+        .map_err(|error| EngError::Checkpoint(format!("cuda checkpoint: {}", error.describe())))?;
+    // The weights stream through the tier ladder, so the first file in rank order serves.
+    let choice = crate::family::gguf_select::choose(&files, &|_| Ok(()))?;
+    Ok((choice.chosen.path, false, choice.line))
 }
 
 pub(super) fn sha256_wanted(raw: Option<&str>) -> Result<bool, EngError> {
@@ -569,13 +559,13 @@ pub(super) fn sha256_wanted(raw: Option<&str>) -> Result<bool, EngError> {
     }
 }
 
-/// The `Q36_ALLOW_UNPINNED_GGUF` resolution, the same promise shape as `sha256_wanted`: only `1`
-/// admits an unpinned checkpoint, `0` and unset keep the pinned-only behavior, and every other
+/// The `Q36_ALLOW_UNPINNED_GGUF` resolution, the same promise shape as `sha256_wanted`: unset and
+/// `1` admit an unpinned checkpoint, `0` keeps the pinned-only behavior, and every other
 /// spelling is a typed refusal.
 pub(crate) fn allow_unpinned_wanted(raw: Option<&str>) -> Result<bool, EngError> {
     match raw {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        None | Some("1") => Ok(true),
         Some(other) => Err(EngError::BadRequest(format!(
             "{ALLOW_UNPINNED_VAR} must be 0 or 1, found {other:?}"
         ))),
@@ -645,10 +635,11 @@ pub(crate) fn check_gguf_identity(path: &Path, verify: bool, pinned: bool) -> Re
     })?;
     let size = metadata.len();
     if size != GGUF_BYTES {
-        return Err(EngError::Checkpoint(format!(
-            "cuda checkpoint: {} has {size} bytes; the pinned {GGUF_NAME} has {GGUF_BYTES}",
+        // Another conversion under the same name: the strict model open decides whether it loads.
+        eprintln!(
+            "q36 cuda: {} has {size} bytes; the pinned {GGUF_NAME} has {GGUF_BYTES}; serving it",
             path.display()
-        )));
+        );
     }
     if verify {
         check_sha256(path, GGUF_SHA256)?;
@@ -787,11 +778,14 @@ pub(super) fn open_gguf(
     allow_unpinned: bool,
     expected_sha256: Option<&str>,
 ) -> Result<(GgufModel, PathBuf), EngError> {
-    let (gguf, pinned) = select_gguf(artifact, allow_unpinned)?;
+    let (gguf, pinned, note) = select_gguf_noted(artifact, allow_unpinned)?;
+    if let Some(line) = note {
+        eprintln!("q36 cuda: {line}");
+    }
     if !pinned {
         eprintln!(
-            "q36 cuda: serving unpinned checkpoint {} (admitted by {ALLOW_UNPINNED_VAR}=1; \
-             the model open validates it)",
+            "q36 cuda: serving checkpoint {}, which is not the pinned file (the model open \
+             validates it; {ALLOW_UNPINNED_VAR}=0 refuses it)",
             gguf.display()
         );
     }

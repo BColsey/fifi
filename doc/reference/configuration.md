@@ -68,7 +68,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `compile_program_limit` | MLX | 8 | Budget of distinct compiled program keys per adapter, from 1. Increasing it is opt-in and does not enable `compile`. CUDA refuses an explicit value. |
 | `max_seqs` | MLX | 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. |
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
-| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file; with `Q36_ALLOW_UNPINNED_GGUF=1`, the directory's single `.gguf` of the family, validated at open) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
+| `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file when present, otherwise the directory's largest `.gguf` of the family, validated at open; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
 | `gguf_sha256` | CUDA GGUF | off | Expected SHA-256 of the selected GGUF file, exactly 64 hex digits. Startup always verifies this pin before opening the model. MLX and EXL3 refuse the key. See [content pinning](#gguf-content-pinning-cuda). |
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
@@ -101,7 +101,7 @@ A mismatch refuses startup before model parsing or weight upload.
 This explicit pin takes precedence over `Q36_VERIFY_GGUF_SHA256`, so startup hashes the file once.
 Without the key, the existing filename, size and optional built-in hash checks remain unchanged.
 
-The key also works with `Q36_ALLOW_UNPINNED_GGUF=1` for an alternate checkpoint filename.
+The key also works for an alternate checkpoint filename.
 It does not enable unpinned admission or change which file startup selects.
 The pinned filename still wins when present, and its size check still applies.
 A matching digest establishes content identity, not model quality or source authenticity.

@@ -1543,7 +1543,8 @@ fn gguf_admission_check(model_dir: &Path, raw: Option<&str>) -> Check {
                 format!("the pinned CUDA checkpoint {GGUF_NAME} is present at its pinned size")
             } else {
                 format!(
-                    "{} is admitted by {ALLOW_UNPINNED_VAR}=1; the model open validates it",
+                    "{} is not the pinned file; it is served unless {ALLOW_UNPINNED_VAR}=0, and the \
+                     model open validates it",
                     gguf.display()
                 )
             },
@@ -2761,7 +2762,7 @@ mod tests {
         let foreign = dir.path().join("Qwen3.6-35B-A3B-Q5_K_M.gguf");
         std::fs::write(&foreign, b"").expect("write");
         // Switch off, pinned file absent: Fail naming the pinned identity and the switch.
-        let off = gguf_admission_check(dir.path(), None);
+        let off = gguf_admission_check(dir.path(), Some("0"));
         assert_eq!(off.name, "weight format");
         assert_eq!(off.status, super::CheckStatus::Fail);
         assert!(
@@ -2770,22 +2771,24 @@ mod tests {
             "{}",
             off.detail
         );
-        // Switch on, one foreign file: Pass with the admitted-checkpoint note.
-        let on = gguf_admission_check(dir.path(), Some("1"));
-        assert_eq!(on.status, super::CheckStatus::Pass);
-        assert!(
-            on.detail.contains("Q5_K_M") && on.detail.contains("Q36_ALLOW_UNPINNED_GGUF=1"),
-            "{}",
-            on.detail
-        );
+        // Switch unset or on, one foreign file: Pass with the admitted-checkpoint note.
+        for raw in [None, Some("1")] {
+            let on = gguf_admission_check(dir.path(), raw);
+            assert_eq!(on.status, super::CheckStatus::Pass);
+            assert!(
+                on.detail.contains("Q5_K_M") && on.detail.contains("Q36_ALLOW_UNPINNED_GGUF=0"),
+                "{}",
+                on.detail
+            );
+        }
         // A bad spelling: Fail before any selection, naming the refusal.
         let bad = gguf_admission_check(dir.path(), Some("yes"));
         assert_eq!(bad.status, super::CheckStatus::Fail);
         assert!(bad.detail.contains("must be 0 or 1"), "{}", bad.detail);
-        // Switch on, two candidates: Fail on the ambiguity.
-        std::fs::write(dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf"), b"").expect("write");
+        // Two candidates: the larger file is the one the loader serves.
+        std::fs::write(dir.path().join("Qwen3.6-35B-A3B-Q8_0.gguf"), b"larger").expect("write");
         let many = gguf_admission_check(dir.path(), Some("1"));
-        assert_eq!(many.status, super::CheckStatus::Fail);
-        assert!(many.detail.contains("exactly one .gguf"), "{}", many.detail);
+        assert_eq!(many.status, super::CheckStatus::Pass);
+        assert!(many.detail.contains("Q8_0"), "{}", many.detail);
     }
 }

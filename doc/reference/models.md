@@ -12,7 +12,7 @@
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
 
-On CUDA, any single `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves with `Q36_ALLOW_UNPINNED_GGUF=1`; the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
+On CUDA, any `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves (the largest when there are several; `Q36_ALLOW_UNPINNED_GGUF=0` serves only the pinned file); the strict open (architecture metadata and full tensor set) is the gate, and the pinned Q4_K_M file stays the qualified checkpoint and wins whenever it is present.
 
 For CUDA GGUF, `qwen36.gguf_sha256` binds startup to an expected full-file digest, including an alternate checkpoint admitted by that switch.
 See [content pinning](configuration.md#gguf-content-pinning-cuda).
