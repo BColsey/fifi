@@ -390,9 +390,9 @@ impl FlashSettings {
     }
 }
 
-/// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool:
-/// `INFERENCE_FLASH_NEXT_NGRAM_BULK=1` opts in. Strict: any other set value, a non-text value
-/// included, is refused.
+/// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool. On by
+/// default; `INFERENCE_FLASH_NEXT_NGRAM_BULK=0` reads them one token at a time and `1` names the
+/// default. Strict: any other set value, a non-text value included, is refused.
 pub(in crate::family::flash_next) fn ngram_bulk() -> Result<bool, EngError> {
     let raw = std::env::var_os("INFERENCE_FLASH_NEXT_NGRAM_BULK");
     ngram_bulk_text(raw.as_ref().map(|value| value.to_string_lossy()).as_deref())
@@ -402,10 +402,10 @@ pub(in crate::family::flash_next) fn ngram_bulk() -> Result<bool, EngError> {
 /// `unsafe_code`, so a test cannot carry the variable into the env reader itself.
 pub(in crate::family::flash_next) fn ngram_bulk_text(raw: Option<&str>) -> Result<bool, EngError> {
     match raw {
-        Some("1") => Ok(true),
-        None => Ok(false),
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
         Some(_) => Err(EngError::BadRequest(
-            "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset or \"1\"".into(),
+            "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset, \"0\" or \"1\"".into(),
         )),
     }
 }
@@ -1018,13 +1018,14 @@ mod tests {
     }
 
     #[test]
-    fn the_ngram_bulk_text_refuses_anything_but_one() {
-        assert!(!super::ngram_bulk_text(None).unwrap());
+    fn the_ngram_bulk_text_is_on_by_default_and_off_only_for_zero() {
+        assert!(super::ngram_bulk_text(None).unwrap());
         assert!(super::ngram_bulk_text(Some("1")).unwrap());
-        for bad in ["", "0", "2", "yes", "true", " 1", "11", "\u{fffd}"] {
+        assert!(!super::ngram_bulk_text(Some("0")).unwrap());
+        for bad in ["", "2", "yes", "true", "off", " 0", "00", "\u{fffd}"] {
             assert_eq!(
                 super::ngram_bulk_text(Some(bad)).unwrap_err().describe(),
-                "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset or \"1\"",
+                "INFERENCE_FLASH_NEXT_NGRAM_BULK must be unset, \"0\" or \"1\"",
                 "{bad:?}"
             );
         }
