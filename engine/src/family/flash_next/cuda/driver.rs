@@ -107,6 +107,35 @@ pub(super) struct StartVectors {
     pub(super) ple_embedding: Vec<f32>,
 }
 
+/// Wall times nested inside the chunk driver's `begin(host feeds)` phase.
+#[derive(Clone, Copy, Default)]
+pub(super) struct FeedProfile {
+    pub(super) serial_rows: usize,
+    pub(super) bulk_rows: usize,
+    pub(super) token_embedding: Duration,
+    pub(super) serial_ngram: Duration,
+    pub(super) bulk_plan_submit: Duration,
+    pub(super) bulk_join: Duration,
+    pub(super) bulk_assembly: Duration,
+}
+
+impl std::fmt::Display for FeedProfile {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "serial_rows={} bulk_rows={} token_embedding_ns={} serial_ngram_ns={} \
+             bulk_plan_submit_ns={} bulk_join_ns={} bulk_assembly_ns={}",
+            self.serial_rows,
+            self.bulk_rows,
+            self.token_embedding.as_nanos(),
+            self.serial_ngram.as_nanos(),
+            self.bulk_plan_submit.as_nanos(),
+            self.bulk_join.as_nanos(),
+            self.bulk_assembly.as_nanos(),
+        )
+    }
+}
+
 /// The host side of a token: the embedding table and the PLE feed.
 pub(super) trait TokenFeeds {
     /// The start vectors of `token`. Reads the pack and the n-gram table; changes no state.
@@ -114,8 +143,12 @@ pub(super) trait TokenFeeds {
     /// The start vectors of a whole chunk, in order. The default reads one token at a time,
     /// which serves a stateless feed; a feed whose `ple_update` consumes per-token rows must
     /// override it, because the plain `begin` holds one pending row set at a time.
-    fn begin_chunk(&mut self, tokens: &[u32]) -> Result<Vec<StartVectors>> {
+    fn begin_chunk(&mut self, tokens: &[u32], _profile: bool) -> Result<Vec<StartVectors>> {
         tokens.iter().map(|&token| self.begin(token)).collect()
+    }
+
+    fn take_feed_profile(&mut self) -> Option<FeedProfile> {
+        None
     }
     /// The PLE update for `token` given the stream at the PLE layer's input (`branches * hidden`).
     /// Advances the PLE history and ring: called once per fed token, after [`Self::begin`].

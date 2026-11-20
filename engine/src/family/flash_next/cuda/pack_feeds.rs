@@ -4,10 +4,14 @@
 //! card. With the optional row pool, a multi-token chunk submits its n-gram reads before gathering
 //! the BF16 embeddings and shares the decoded row block in the ordered PLE updates.
 
-use std::{collections::VecDeque, rc::Rc};
+use std::{
+    collections::VecDeque,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use super::{
-    driver::{StartVectors, TokenFeeds},
+    driver::{FeedProfile, StartVectors, TokenFeeds},
     embedding::stream_row,
     feeds::RowReader,
     ple_feed::{Gathered, PleFeed, PleKeyValue},
@@ -37,6 +41,17 @@ pub(super) struct PackFeeds {
     branches: usize,
     pending: VecDeque<Pending<Gathered>>,
     reader: Option<RowReader>,
+    profile: Option<FeedProfile>,
+}
+
+fn time_feed<T>(total: Option<&mut Duration>, f: impl FnOnce() -> T) -> T {
+    let Some(total) = total else {
+        return f();
+    };
+    let began = Instant::now();
+    let result = f();
+    *total += began.elapsed();
+    result
 }
 
 impl PackFeeds {
@@ -54,6 +69,7 @@ impl PackFeeds {
             branches,
             pending: VecDeque::new(),
             reader,
+            profile: None,
         }
     }
 
@@ -61,49 +77,67 @@ impl PackFeeds {
         &self,
         tokens: &[u32],
         reader: &RowReader,
+        mut profile: Option<&mut FeedProfile>,
     ) -> Result<(Vec<StartVectors>, VecDeque<Pending<Gathered>>), EngError> {
-        let plan = self.ple.plan_chunk(tokens)?;
-        let read = reader.submit(&plan.all())?;
-        let streams: Result<Vec<_>, _> = tokens
-            .iter()
-            .map(|&token| stream_row(self.source, token, self.hidden, self.branches))
-            .collect();
-        let block = read.wait();
+        let (plan, read) = time_feed(profile.as_mut().map(|p| &mut p.bulk_plan_submit), || {
+            let plan = self.ple.plan_chunk(tokens)?;
+            let read = reader.submit(&plan.all())?;
+            Ok::<_, EngError>((plan, read))
+        })?;
+        let streams: Result<Vec<_>, _> =
+            time_feed(profile.as_mut().map(|p| &mut p.token_embedding), || {
+                tokens
+                    .iter()
+                    .map(|&token| stream_row(self.source, token, self.hidden, self.branches))
+                    .collect()
+            });
+        let block = time_feed(profile.as_mut().map(|p| &mut p.bulk_join), || read.wait());
         let streams = streams?;
         let block = Rc::new(block?);
 
-        let mut starts = Vec::with_capacity(tokens.len());
-        let mut pending = VecDeque::with_capacity(tokens.len());
-        for ((&token, stream), ids) in tokens.iter().zip(streams).zip(plan.per_token) {
-            let ple_embedding = block.embedding(&ids, 1.0)?;
-            starts.push(StartVectors {
-                stream,
-                ple_embedding,
-            });
-            pending.push_back(Pending {
-                token,
-                rows: Gathered::Bulk {
-                    ids,
-                    block: Rc::clone(&block),
-                },
-            });
-        }
-        Ok((starts, pending))
+        time_feed(profile.map(|p| &mut p.bulk_assembly), || {
+            let mut starts = Vec::with_capacity(tokens.len());
+            let mut pending = VecDeque::with_capacity(tokens.len());
+            for ((&token, stream), ids) in tokens.iter().zip(streams).zip(plan.per_token) {
+                let ple_embedding = block.embedding(&ids, 1.0)?;
+                starts.push(StartVectors {
+                    stream,
+                    ple_embedding,
+                });
+                pending.push_back(Pending {
+                    token,
+                    rows: Gathered::Bulk {
+                        ids,
+                        block: Rc::clone(&block),
+                    },
+                });
+            }
+            Ok((starts, pending))
+        })
     }
 }
 
 impl TokenFeeds for PackFeeds {
     fn begin(&mut self, token: u32) -> Result<StartVectors, EngError> {
-        self.begin_chunk(&[token])
+        self.begin_chunk(&[token], false)
             .map(|mut starts| starts.pop().expect("one start"))
     }
 
     /// Row `i` plans against the history it will have when its turn comes (the tokens before it
     /// in the chunk), and every row set stays pending for the ordered update pass. All reads
     /// are host-only, so a failure leaves the feed where it was.
-    fn begin_chunk(&mut self, tokens: &[u32]) -> Result<Vec<StartVectors>, EngError> {
+    fn begin_chunk(
+        &mut self,
+        tokens: &[u32],
+        profile: bool,
+    ) -> Result<Vec<StartVectors>, EngError> {
+        let mut timing = profile.then(|| self.profile.unwrap_or_default());
         if let Some(reader) = self.reader.as_ref().filter(|_| tokens.len() > 1) {
-            let (starts, pending) = self.begin_bulk_chunk(tokens, reader)?;
+            let (starts, pending) = self.begin_bulk_chunk(tokens, reader, timing.as_mut())?;
+            if let Some(timing) = timing.as_mut() {
+                timing.bulk_rows += tokens.len();
+            }
+            self.profile = timing;
             self.pending = pending;
             return Ok(starts);
         }
@@ -111,16 +145,29 @@ impl TokenFeeds for PackFeeds {
         let mut starts = Vec::with_capacity(tokens.len());
         let mut pending = VecDeque::with_capacity(tokens.len());
         for (i, &token) in tokens.iter().enumerate() {
-            let stream = stream_row(self.source, token, self.hidden, self.branches)?;
-            let (ple_embedding, rows) = self.ple.chunk_embedding(&tokens[..i], token)?;
+            let stream = time_feed(timing.as_mut().map(|p| &mut p.token_embedding), || {
+                stream_row(self.source, token, self.hidden, self.branches)
+            })?;
+            let (ple_embedding, rows) =
+                time_feed(timing.as_mut().map(|p| &mut p.serial_ngram), || {
+                    self.ple.chunk_embedding(&tokens[..i], token)
+                })?;
             starts.push(StartVectors {
                 stream,
                 ple_embedding,
             });
             pending.push_back(Pending { token, rows });
         }
+        if let Some(timing) = timing.as_mut() {
+            timing.serial_rows += tokens.len();
+        }
+        self.profile = timing;
         self.pending = pending;
         Ok(starts)
+    }
+
+    fn take_feed_profile(&mut self) -> Option<FeedProfile> {
+        self.profile.take()
     }
 
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
@@ -133,6 +180,7 @@ impl TokenFeeds for PackFeeds {
     }
 
     fn reset(&mut self) {
+        self.profile = None;
         self.pending.clear();
         self.ple.reset();
     }
@@ -142,6 +190,7 @@ impl TokenFeeds for PackFeeds {
     }
 
     fn ple_resume(&mut self, history: &[u32], ring: &[f32]) -> Result<(), EngError> {
+        self.profile = None;
         self.pending.clear();
         self.ple.resume(history, ring)
     }

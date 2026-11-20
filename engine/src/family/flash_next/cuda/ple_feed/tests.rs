@@ -683,10 +683,11 @@ fn bulk_pack_feeds_match_ordered_steps_across_resume_and_eos() {
 
     let tokens = [PROMPT[1], EOS, PROMPT[2], PROMPT[2], PROMPT[2], PROMPT[2]];
     // An invalid last token must leave the committed state intact for the retry.
-    assert!(batched.begin_chunk(&[tokens[0], vocab]).is_err());
+    assert!(batched.begin_chunk(&[tokens[0], vocab], true).is_err());
     assert_eq!(batched.ple_state(), serial.ple_state());
 
-    let starts = batched.begin_chunk(&tokens).unwrap();
+    assert!(batched.take_feed_profile().is_none());
+    let starts = batched.begin_chunk(&tokens, true).unwrap();
     assert_eq!(starts.len(), tokens.len());
     for (&token, bulk_start) in tokens.iter().zip(starts) {
         let baseline = serial.begin(token).unwrap();
@@ -705,4 +706,20 @@ fn bulk_pack_feeds_match_ordered_steps_across_resume_and_eos() {
         );
     }
     assert_eq!(batched.ple_state(), serial.ple_state());
+
+    let token = PROMPT[0];
+    batched.begin_chunk(&[token], true).unwrap();
+    let profile = batched.take_feed_profile().unwrap();
+    assert_eq!((profile.serial_rows, profile.bulk_rows), (1, tokens.len()));
+    assert!(!profile.token_embedding.is_zero());
+    assert!(!profile.serial_ngram.is_zero());
+    assert!(!profile.bulk_plan_submit.is_zero());
+    assert!(!profile.bulk_join.is_zero());
+    assert!(!profile.bulk_assembly.is_zero());
+    assert!(batched.take_feed_profile().is_none());
+    assert!(serial.take_feed_profile().is_none());
+
+    batched.begin_chunk(&[token], true).unwrap();
+    batched.reset();
+    assert!(batched.take_feed_profile().is_none());
 }

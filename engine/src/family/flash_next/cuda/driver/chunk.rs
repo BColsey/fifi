@@ -465,7 +465,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         // Host reads only: a failure here leaves the state as it was.
         let t0 = Instant::now();
         let profile = prof::on();
-        let starts = self.feeds.begin_chunk(tokens)?;
+        let starts = self.feeds.begin_chunk(tokens, profile)?;
         if profile {
             prof::add(0, t0.elapsed());
             prof::ROWS.fetch_add(m as u64, AtomicOrdering::Relaxed);
@@ -661,6 +661,9 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         self.shared_window = false;
         if prof::on() {
             prof::dump_and_reset(prof::ROWS.load(AtomicOrdering::Relaxed));
+            if let Some(timing) = self.feeds.take_feed_profile() {
+                eprintln!("flash-next feed profile: {timing}");
+            }
         }
         Ok(logits)
     }

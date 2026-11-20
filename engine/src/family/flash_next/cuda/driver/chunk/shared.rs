@@ -185,7 +185,8 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             ));
         }
         let began = Instant::now();
-        let starts = self.feeds.begin_chunk(tokens)?;
+        let profile = prof::on();
+        let starts = self.feeds.begin_chunk(tokens, profile)?;
         let DriverShape { start, .. } = self.shape;
         if starts.len() != m
             || starts.iter().any(|row| {
@@ -196,7 +197,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 "the host start vectors do not match the chunk shape",
             ));
         }
-        if prof::on() {
+        if profile {
             prof::add(0, began.elapsed());
             prof::ROWS.fetch_add(m as u64, Ordering::Relaxed);
         }
