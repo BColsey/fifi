@@ -5,6 +5,13 @@ use inference_engine::{
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
+const BUNDLE_FILES: [&str; 4] = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "generation_config.json",
+];
+
 const FIXTURE_TOKENIZER_JSON_SHA256: &str =
     "ecc5ec5e4bc85b4554a526aec0671dded4b8592b73a37a38dac591cadaee2cc1";
 const FIXTURE_TOKENIZER_CONFIG_SHA256: &str =
@@ -128,6 +135,13 @@ fn nemotron35_model_bundle_loads_and_renders_the_trailing_user_turn() {
         eprintln!("skip: NEM35_MODEL_DIR is not set");
         return;
     };
+    for name in BUNDLE_FILES {
+        let path = model_dir.join(name);
+        assert!(path.is_file(), "{} must exist", path.display());
+        fs::read(&path)
+            .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
+    }
+
     let bundle = nemotron::load(&model_dir).expect("Nemotron bundle loads");
     assert_eq!(bundle.vocab_size(), 131_072);
     assert_eq!(bundle.eos_token_id(), 11);
@@ -226,7 +240,8 @@ fn nemotron35_missing_bundle_member_returns_checkpoint_error() {
         other => panic!("expected Checkpoint, got {other:?}"),
     }
 
-    // The fixture has no inline chat template in tokenizer_config.json.
+    // The members the load cannot do without: tokenizer.json, tokenizer_config.json, and the
+    // chat template when tokenizer_config.json carries none of its own.
     for missing in [
         "tokenizer.json",
         "tokenizer_config.json",
@@ -251,12 +266,19 @@ fn nemotron35_missing_bundle_member_returns_checkpoint_error() {
 }
 
 #[test]
-fn nemotron35_without_generation_config_uses_tokenizer_eos() {
+fn nemotron35_missing_generation_config_loads_with_a_note_and_the_tokenizer_eos() {
     let dir = tempfile::tempdir().expect("fixture directory");
     write_fixture(dir.path());
-    fs::remove_file(dir.path().join("generation_config.json")).expect("remove generation config");
+    fs::remove_file(dir.path().join("generation_config.json")).expect("remove bundle member");
 
     let bundle = TokenizerBundle::load(dir.path(), &fixture_pin())
-        .expect("fixture loads without generation config");
-    assert_eq!(bundle.eos_token_ids(), &[11]);
+        .expect("a missing generation_config.json loads");
+    assert_eq!(bundle.eos_token_id(), 11);
+    let notes = bundle.load_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("generation_config.json is missing"),
+        "{}",
+        notes[0]
+    );
 }

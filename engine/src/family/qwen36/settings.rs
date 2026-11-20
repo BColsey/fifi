@@ -647,6 +647,26 @@ pub(crate) struct TieredSettings {
     pub(crate) preload: bool,
 }
 
+/// The default CPU worker threads of the tiered member.
+const TIERED_DEFAULT_THREADS: u32 = 6;
+/// The default wait for one layer's CPU experts, in milliseconds.
+const TIERED_DEFAULT_TIMEOUT_MS: u32 = 10_000;
+
+impl TieredSettings {
+    /// The member a config that names `"tiered": {"slots": "auto"}` and nothing else
+    /// resolves to: the automatic lower rung of a start the card cannot carry.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        allow(dead_code, reason = "the CUDA start's card-short rung is the caller")
+    )]
+    pub(crate) const AUTO: Self = Self {
+        slots: SlotRequest::Fit,
+        threads: TIERED_DEFAULT_THREADS as usize,
+        timeout_ms: TIERED_DEFAULT_TIMEOUT_MS,
+        preload: false,
+    };
+}
+
 /// The environment fallbacks, read by the caller so that this file stays pure.
 #[derive(Debug, Default)]
 pub(crate) struct Q36Env {
@@ -1260,9 +1280,21 @@ fn tiered_settings(
     }
     let built = TieredSettings {
         slots,
-        threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 8)?)
-            .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
-        timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
+        threads: usize::try_from(ranged(
+            "tiered.threads",
+            tiered.threads,
+            TIERED_DEFAULT_THREADS,
+            1,
+            8,
+        )?)
+        .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
+        timeout_ms: ranged(
+            "tiered.timeout_ms",
+            tiered.timeout_ms,
+            TIERED_DEFAULT_TIMEOUT_MS,
+            1,
+            600_000,
+        )?,
         preload: tiered.preload.unwrap_or(false),
     };
     // The member shapes are validated above so their errors keep precedence; the exclusion
