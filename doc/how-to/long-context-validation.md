@@ -162,3 +162,32 @@ tokens.
 This synthetic check does not establish coding quality, multi-turn behavior,
 device isolation, or exact build identity. Record the running binary, model,
 hardware, and isolation separately when using the result as performance evidence.
+
+## RTX 2080 Ti tiered tuning measurements
+
+These same-binary comparisons used Qwen3.6-35B-A3B Q4_K_M, Q8 KV, a
+65,536-token context limit, eight CPU workers, and fresh prompts. Prompt
+rates include the short completed answer. Each row measures a distinct
+switch or setting against its own control.
+
+| Change | Earlier build | Measured result |
+| --- | --- | --- |
+| Coalesce tiered prefill through 8K | `52a85f4a` | At 7,904 prompt tokens, 318.21 to 369.81 tokens/s (+16.2%). The short and medium cases ranged from −0.3% to +1.4%. |
+| Tensor prefill attention on Turing, with wide prefill enabled in both arms | `70f81539` | At 7,904 prompt tokens, 364.19 to 684.39 tokens/s (+87.9%). The 4,277-token case gained 42.9%. In the 1,024-row attention microbenchmark, 18.50 to 0.61 ms. |
+| Stage an expert only after at least 16 routed rows in the piece | `9ae8611f` | The 1,977- and 4,277-token cases improved 9.3% and 19.2%. The 7,904-token result was within the control spread. |
+| Limit split CPU decode dispatch to four misses per layer | `a8b90af1` | Cold technical decode went from 45.05 to 46.21 tokens/s (+2.6%). Warm technical decode lost 1.3%. |
+| Admit 4,096 rows with a 64-expert staging cap | `08aa8242` | At 4,277 tokens, 809.05 to 917.28 tokens/s (+13.4%). At 7,904 tokens, 714.25 to 767.75 tokens/s (+7.5%). |
+| Raise the staging cap from 64 to 78 with 4,096 rows in both arms | `08aa8242` | At 7,904 tokens, 762.13 to 890.67 tokens/s (+16.9%). The 1,977-token case lost 4.6%. |
+| Queue expert warm-up uploads through pinned memory | `47f3c96a` | Median warm-up upload time fell from 124.6 to 87.4 ms. First token arrived 15 to 73 ms sooner across three matched prompts. |
+
+The [warm-up and upload record](../../scripts/benchmarks/qwen36-tiered-warmup-2080.json)
+includes the earlier builds, matched controls, route counts, and factual checks.
+The older 4,096-row trials also enabled their build's asynchronous decode
+fills. The short-piece staging cap has host coverage and awaits a GPU
+measurement. Repeat matched model-quality and concurrent long-context runs
+on the current tip before enabling these controls by default.
+
+For the fixed short-answer corpus, run
+`python3 scripts/bench_corpus_accuracy.py BASE_URL API_KEY MODEL OUT.json`
+once per configuration and compare the two reports with
+`python3 scripts/bench_corpus_accuracy.py --compare A.json B.json`.
