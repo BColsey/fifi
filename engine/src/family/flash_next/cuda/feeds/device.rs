@@ -1,11 +1,10 @@
 //! The device half of the feeds: the PLE key and value projections on the card, and the sink that
 //! writes a token start to the device.
 //!
-//! WHAT: [`DevicePle`] keeps the stored F16 or BF16 `key_proj` (`width x ple_embed`) and
-//! `value_proj` (`hidden x ple_embed`) on the device as they are in the pack (65 MiB, no F32
-//! copy) and runs them with `CudaContext::dense_gemv`. [`DevicePle::enqueue`] writes the embedding
+//! [`DevicePle`] borrows the trunk's stored F16 or BF16 `key_proj` (`width x ple_embed`) and
+//! `value_proj` (`hidden x ple_embed`) and runs them with `CudaContext::dense_gemv`. [`DevicePle::enqueue`] writes the embedding
 //! and queues the two launches on the step stream; [`DevicePle::collect`] reads the keys and the
-//! value back (44 KiB), behind the queued work. [`DeviceStart`] is the [`StartSink`] over the
+//! value back (50 KiB), behind the queued work. [`DeviceStart`] is the [`StartSink`] over the
 //! device words block and two F32 buffers: it builds the `StepParams` block (token and position)
 //! and writes the initial stream and the PLE embedding, all ordered on the step stream.
 //!
@@ -30,7 +29,7 @@
 use crate::{
     EngError,
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceStream,
+        CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         resident::{
             dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
             step_params::StepParams,
@@ -56,19 +55,37 @@ fn f32_values(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The shape of one uploaded projection set: `key` is `width x embed` values of the stored
-/// dtype, `value` is `hidden x embed`, and `rows_max` caps the per-chunk staging buffers.
-pub(in crate::family) struct PleUpload {
+/// Matrix dimensions and the maximum number of staged token rows.
+pub(in crate::family) struct PleDeviceShape {
     pub(in crate::family) width: usize,
     pub(in crate::family) hidden: usize,
     pub(in crate::family) embed: usize,
     pub(in crate::family) rows_max: usize,
 }
 
-/// The PLE projections resident on the device.
-pub(in crate::family) struct DevicePle {
-    key_weight: DeviceBuffer,
-    value_weight: DeviceBuffer,
+impl PleDeviceShape {
+    fn workspace(&self) -> Result<[usize; 3], EngError> {
+        let bytes = |features: usize| {
+            features
+                .checked_mul(self.rows_max)
+                .and_then(|n| n.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| EngError::MemoryPlan("PLE projection workspace overflows".into()))
+        };
+        Ok([bytes(self.embed)?, bytes(self.width)?, bytes(self.hidden)?])
+    }
+
+    pub(in crate::family) fn workspace_bytes(&self) -> Result<u64, EngError> {
+        self.workspace()?.into_iter().try_fold(0u64, |sum, bytes| {
+            sum.checked_add(bytes as u64)
+                .ok_or_else(|| EngError::MemoryPlan("PLE projection workspace overflows".into()))
+        })
+    }
+}
+
+/// The PLE projections borrow the trunk's stored matrices and own only the chunk workspace.
+pub(in crate::family) struct DevicePle<'w> {
+    key_weight: DeviceRange<'w>,
+    value_weight: DeviceRange<'w>,
     embedding: DeviceBuffer,
     keys: DeviceBuffer,
     value: DeviceBuffer,
@@ -79,19 +96,15 @@ pub(in crate::family) struct DevicePle {
     rows_max: usize,
 }
 
-impl DevicePle {
-    /// Uploads the projections as stored: `key` is `width x embed` values of `stored` and `value`
-    /// is `hidden x embed`, little-endian row-major (the pack layout `[out, in]`). `stored` is the
-    /// dtype of the tensors in the checkpoint; anything but F16 (the EXL3 pack) and BF16 (the
-    /// official checkpoint) is refused.
-    pub(in crate::family) fn upload(
+impl<'w> DevicePle<'w> {
+    pub(in crate::family) fn new(
         context: &CudaContext,
         stored: Dtype,
-        key: &[u8],
-        value: &[u8],
-        shape: PleUpload,
+        [key_weight, value_weight]: [DeviceRange<'w>; 2],
+        shape: PleDeviceShape,
     ) -> Result<Self, EngError> {
-        let PleUpload {
+        let [embedding, keys, value] = shape.workspace()?;
+        let PleDeviceShape {
             width,
             hidden,
             embed,
@@ -106,44 +119,31 @@ impl DevicePle {
                 )));
             }
         };
-        let overflow = || EngError::BadRequest("ple projection sizes overflow".to_owned());
-        let key_bytes = width
-            .checked_mul(embed)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(overflow)?;
-        let value_bytes = hidden
-            .checked_mul(embed)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(overflow)?;
-        if key.len() != key_bytes || value.len() != value_bytes {
+        let bytes = |rows: usize| {
+            rows.checked_mul(embed)
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| EngError::Checkpoint("PLE projection size overflows".into()))
+        };
+        let (key_bytes, value_bytes) = (bytes(width)?, bytes(hidden)?);
+        if key_weight.bytes() != key_bytes || value_weight.bytes() != value_bytes {
             return Err(EngError::Checkpoint(format!(
                 "ple projections hold {} and {} bytes, expected {key_bytes} and {value_bytes}",
-                key.len(),
-                value.len()
+                key_weight.bytes(),
+                value_weight.bytes()
             )));
         }
-        let place = |bytes: &[u8]| -> Result<DeviceBuffer, EngError> {
-            let buffer = context.allocate(bytes.len())?;
-            context.upload_at(&buffer, 0, bytes)?;
-            Ok(buffer)
-        };
         Ok(Self {
-            key_weight: place(key)?,
-            value_weight: place(value)?,
-            embedding: context.allocate(rows_max * embed * 4)?,
-            keys: context.allocate(rows_max * width * 4)?,
-            value: context.allocate(rows_max * hidden * 4)?,
+            key_weight,
+            value_weight,
+            embedding: context.allocate(embedding)?,
+            keys: context.allocate(keys)?,
+            value: context.allocate(value)?,
             dtype,
             width,
             hidden,
             embed,
             rows_max,
         })
-    }
-
-    /// Device bytes held by this object.
-    pub(in crate::family) fn device_bytes(&self) -> usize {
-        (self.width + self.hidden) * self.embed * 2 + (self.embed + self.width + self.hidden) * 4
     }
 
     /// The most rows one [`Self::enqueue_chunk`] takes.
@@ -169,15 +169,15 @@ impl DevicePle {
         }
         self.embedding.write_at(stream, 0, &f32_bytes(embedding))?;
         for (rows, weight, y, y_len) in [
-            (self.width, &self.key_weight, &self.keys, self.width),
-            (self.hidden, &self.value_weight, &self.value, self.hidden),
+            (self.width, self.key_weight, &self.keys, self.width),
+            (self.hidden, self.value_weight, &self.value, self.hidden),
         ] {
             context.dense_gemv(
                 stream,
                 DenseGemvCall {
                     shape: DenseGemvShape::packed(1, rows, self.embed),
                     dtype: self.dtype,
-                    w: weight.range(0, rows * self.embed * 2)?,
+                    w: weight,
                     x: self.embedding.range(0, self.embed * 4)?,
                     y: y.range(0, y_len * 4)?,
                 },
@@ -213,8 +213,8 @@ impl DevicePle {
     }
 
     /// Writes the `m` embeddings of one chunk (already scaled) and queues both projections as
-    /// one `m`-row launch each, so the weights stream once for the whole chunk instead of once
-    /// per row. The results stay on the device until [`Self::collect_chunk`].
+    /// one launch per matrix. Each GEMV block handles one token row. The results stay on the
+    /// device until [`Self::collect_chunk`].
     pub(in crate::family) fn enqueue_chunk(
         &mut self,
         context: &CudaContext,
@@ -237,20 +237,15 @@ impl DevicePle {
         }
         self.embedding.write_at(stream, 0, &f32_bytes(embeddings))?;
         for (rows, weight, y, y_len) in [
-            (self.width, &self.key_weight, &self.keys, m * self.width),
-            (
-                self.hidden,
-                &self.value_weight,
-                &self.value,
-                m * self.hidden,
-            ),
+            (self.width, self.key_weight, &self.keys, m * self.width),
+            (self.hidden, self.value_weight, &self.value, m * self.hidden),
         ] {
             context.dense_gemv(
                 stream,
                 DenseGemvCall {
                     shape: DenseGemvShape::packed(m, rows, self.embed),
                     dtype: self.dtype,
-                    w: weight.range(0, rows * self.embed * 2)?,
+                    w: weight,
                     x: self.embedding.range(0, m * self.embed * 4)?,
                     y: y.range(0, y_len * 4)?,
                 },
@@ -283,15 +278,15 @@ impl DevicePle {
 /// The device route of the PLE step: [`PleProjection`] over [`DevicePle`], for `PleFeed`. It owns
 /// shared handles to the step's context and stream, so the projection queues behind the layers
 /// already enqueued on that stream and `project` returns when its results are read back.
-pub(in crate::family) struct DevicePleRoute {
-    ple: DevicePle,
+pub(in crate::family) struct DevicePleRoute<'w> {
+    ple: DevicePle<'w>,
     context: Rc<CudaContext>,
     stream: Rc<DeviceStream>,
 }
 
-impl DevicePleRoute {
+impl<'w> DevicePleRoute<'w> {
     pub(in crate::family) fn new(
-        ple: DevicePle,
+        ple: DevicePle<'w>,
         context: Rc<CudaContext>,
         stream: Rc<DeviceStream>,
     ) -> Self {
@@ -303,7 +298,7 @@ impl DevicePleRoute {
     }
 }
 
-impl PleProjection for DevicePleRoute {
+impl PleProjection for DevicePleRoute<'_> {
     fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError> {
         self.ple.project(&self.context, &self.stream, embedding)
     }

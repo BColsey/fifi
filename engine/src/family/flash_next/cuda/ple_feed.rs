@@ -28,9 +28,8 @@ use crate::{
         exl3_pack::Root,
         flash_next::ple::{self, PleShape, PleState, PleWeights, RowPlan},
         project::Projector,
-        stored::{host_f32, stored_bytes},
+        stored::host_f32,
     },
-    tensor::Dtype,
     weights::{
         StreamedCheckpoint,
         exl3::ngram::{NgramAux, NgramDecoder, ROW_DIM},
@@ -584,7 +583,19 @@ impl PleVectors {
             matrix("value_proj.weight", hidden)?,
             threads,
         );
-        let vectors = Self {
+        Ok((Self::read_vectors(source, layer, shape)?, projection))
+    }
+
+    /// The device projection uses just the host norms and convolution.
+    pub(in crate::family) fn read_vectors(
+        source: &StreamedCheckpoint,
+        layer: usize,
+        shape: &PleShape,
+    ) -> Result<Self, EngError> {
+        let dims = shape.dims();
+        let width = dims.hidden as usize * dims.branches as usize;
+        let at = |suffix: &str| Root::Layers.name(layer, &format!("ple.{suffix}"));
+        Ok(Self {
             norm_key: host_f32(source, &at("norm_key.weight"), width)?,
             norm_query: host_f32(source, &at("norm_query.weight"), width)?,
             norm_conv: host_f32(source, &at("norm_conv.weight"), width)?,
@@ -593,30 +604,7 @@ impl PleVectors {
                 &at("conv1d.weight"),
                 width * dims.conv_kernel as usize,
             )?,
-        };
-        Ok((vectors, projection))
-    }
-
-    /// The two projections as stored (dtype and raw bytes, no conversion): the device route
-    /// uploads them to the card as the pack holds them, F16 or BF16.
-    pub(in crate::family) fn raw_projections(
-        source: &StreamedCheckpoint,
-        layer: usize,
-        shape: &PleShape,
-    ) -> Result<(Dtype, Vec<u8>, Vec<u8>), EngError> {
-        let dims = shape.dims();
-        let width = (dims.hidden * dims.branches) as usize;
-        let embed = shape.embed();
-        let at = |suffix: &str| Root::Layers.name(layer, &format!("ple.{suffix}"));
-        let raw = |suffix: &str, rows: usize| stored_bytes(source, &at(suffix), rows * embed);
-        let (key_dtype, key) = raw("key_proj.weight", width)?;
-        let (value_dtype, value) = raw("value_proj.weight", dims.hidden as usize)?;
-        if key_dtype != value_dtype {
-            return Err(EngError::Checkpoint(format!(
-                "the PLE projections are stored as {key_dtype:?} and {value_dtype:?}"
-            )));
-        }
-        Ok((key_dtype, key, value))
+        })
     }
 }
 

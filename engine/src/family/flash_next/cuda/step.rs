@@ -421,7 +421,7 @@ impl<'a> FlashStep<'a> {
     }
 
     /// A tensor kept as stored (F16 or BF16) with its dtype.
-    pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'_>, HyperDtype), EngError> {
+    pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'a>, HyperDtype), EngError> {
         match self.weights.get(name) {
             Some(CudaWeight::Raw { ty, buffer, .. }) => {
                 let dtype = match ty {

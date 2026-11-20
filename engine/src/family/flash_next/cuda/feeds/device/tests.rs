@@ -9,14 +9,14 @@
 //! - The start sink writes the `StepParams` block, the stream and the PLE embedding to their
 //!   offsets and nothing around them; a negative token or position is refused with nothing written.
 
-use super::{DevicePle, DevicePleRoute, DeviceStart, PleUpload, f32_bytes, f32_values};
+use super::{DevicePle, DevicePleRoute, DeviceStart, PleDeviceShape, f32_bytes, f32_values};
 use crate::{
     EngError,
     family::flash_next::cuda::{
         feeds::{StartShape, write_start},
         ple_feed::{HostMatrix, HostProjection, PleKeyValue, PleProjection},
     },
-    kernels::cuda::{CudaContext, device_present},
+    kernels::cuda::{CudaContext, DeviceBuffer, device_present},
     tensor::Dtype,
 };
 
@@ -42,6 +42,40 @@ fn narrow(dtype: Dtype, values: &[f32]) -> Vec<u16> {
             other => panic!("{other:?} is not a 16-bit float"),
         })
         .collect()
+}
+
+fn upload(context: &CudaContext, bytes: &[u8]) -> DeviceBuffer {
+    let buffer = context.allocate(bytes.len()).unwrap();
+    context.upload_at(&buffer, 0, bytes).unwrap();
+    buffer
+}
+
+fn entire(buffer: &DeviceBuffer) -> super::DeviceRange<'_> {
+    buffer.range(0, buffer.bytes()).unwrap()
+}
+
+#[test]
+fn ple_workspace_accounts_for_every_staged_row() {
+    let shape = PleDeviceShape {
+        width: WIDTH,
+        hidden: HIDDEN,
+        embed: EMBED,
+        rows_max: 256,
+    };
+    assert_eq!(shape.workspace_bytes().unwrap(), 15 * 1024 * 1024);
+    let wider = PleDeviceShape {
+        rows_max: 2048,
+        ..shape
+    };
+    assert_eq!(wider.workspace_bytes().unwrap(), 120 * 1024 * 1024);
+    let overflow = PleDeviceShape {
+        rows_max: usize::MAX,
+        ..wider
+    };
+    assert!(matches!(
+        overflow.workspace_bytes(),
+        Err(EngError::MemoryPlan(_))
+    ));
 }
 
 fn widen_one(dtype: Dtype, code: u16) -> f64 {
@@ -88,12 +122,13 @@ fn projections_match_f64(dtype: Dtype, gate: &str) {
     let stream = context.stream().expect("stream");
     let key = narrow(dtype, &values(WIDTH * EMBED, 1, 0.05));
     let value = narrow(dtype, &values(HIDDEN * EMBED, 2, 0.05));
-    let mut ple = DevicePle::upload(
+    let key_buffer = upload(&context, &half_bytes(&key));
+    let value_buffer = upload(&context, &half_bytes(&value));
+    let mut ple = DevicePle::new(
         &context,
         dtype,
-        &half_bytes(&key),
-        &half_bytes(&value),
-        PleUpload {
+        [entire(&key_buffer), entire(&value_buffer)],
+        PleDeviceShape {
             width: WIDTH,
             hidden: HIDDEN,
             embed: EMBED,
@@ -102,9 +137,11 @@ fn projections_match_f64(dtype: Dtype, gate: &str) {
     )
     .unwrap();
     assert_eq!(
-        ple.device_bytes(),
-        (WIDTH + HIDDEN) * EMBED * 2 + (EMBED + WIDTH + HIDDEN) * 4
+        ple.embedding.bytes() + ple.keys.bytes() + ple.value.bytes(),
+        2 * (EMBED + WIDTH + HIDDEN) * 4
     );
+    assert!(std::ptr::eq(ple.key_weight.buffer(), &key_buffer));
+    assert!(std::ptr::eq(ple.value_weight.buffer(), &value_buffer));
     let mut previous: Option<PleKeyValue> = None;
     for seed in [3usize, 4] {
         let x = values(EMBED, seed, 1.5);
@@ -147,34 +184,26 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
     }
     let context = CudaContext::new().expect("context");
     let stream = context.stream().expect("stream");
+    let short = upload(&context, &[0; 6]);
+    let matrix = upload(&context, &[0; 8]);
+    let shape = || PleDeviceShape {
+        width: 2,
+        hidden: 2,
+        embed: 2,
+        rows_max: 2,
+    };
+    let weights = [entire(&matrix); 2];
     assert!(
-        DevicePle::upload(
+        DevicePle::new(
             &context,
             Dtype::F16,
-            &[0; 6],
-            &[0; 8],
-            PleUpload {
-                width: 2,
-                hidden: 2,
-                embed: 2,
-                rows_max: 2,
-            },
+            [entire(&short), entire(&matrix)],
+            shape(),
         )
         .is_err()
     );
     for other in [Dtype::F32, Dtype::I32] {
-        match DevicePle::upload(
-            &context,
-            other,
-            &[0; 16],
-            &[0; 16],
-            PleUpload {
-                width: 2,
-                hidden: 2,
-                embed: 2,
-                rows_max: 2,
-            },
-        ) {
+        match DevicePle::new(&context, other, weights, shape()) {
             Err(EngError::Checkpoint(message)) => {
                 assert!(message.contains("F16 or BF16"), "{message}")
             }
@@ -182,19 +211,7 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
             Ok(_) => panic!("{other:?} was accepted"),
         }
     }
-    let mut ple = DevicePle::upload(
-        &context,
-        Dtype::F16,
-        &[0; 8],
-        &[0; 8],
-        PleUpload {
-            width: 2,
-            hidden: 2,
-            embed: 2,
-            rows_max: 2,
-        },
-    )
-    .unwrap();
+    let mut ple = DevicePle::new(&context, Dtype::F16, weights, shape()).unwrap();
     assert!(matches!(
         ple.enqueue(&context, &stream, &[0.0; 3]),
         Err(EngError::BadRequest(_))
@@ -296,13 +313,14 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
         HostMatrix::new(HIDDEN, EMBED, widen(&value)).unwrap(),
         4,
     );
+    let key_buffer = upload(&context, &half_bytes(&key));
+    let value_buffer = upload(&context, &half_bytes(&value));
     let mut route = DevicePleRoute::new(
-        DevicePle::upload(
+        DevicePle::new(
             &context,
             Dtype::F16,
-            &half_bytes(&key),
-            &half_bytes(&value),
-            PleUpload {
+            [entire(&key_buffer), entire(&value_buffer)],
+            PleDeviceShape {
                 width: WIDTH,
                 hidden: HIDDEN,
                 embed: EMBED,

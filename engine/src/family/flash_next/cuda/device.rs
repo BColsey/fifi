@@ -205,7 +205,7 @@ pub(super) struct CardChunkDevice {
     moe: SplitMoeAt<'static>,
     /// The PLE projections on the card, when the device route is on: `write_chunk_ple` stages the
     /// chunk's embeddings here and `ple_project_chunk` runs them.
-    ple: Option<DevicePle>,
+    ple: Option<DevicePle<'static>>,
     stream_width: usize,
     logits_width: usize,
     /// The rows of the chunk in flight, set by `write_chunk_params`.
@@ -220,7 +220,7 @@ impl CardChunkDevice {
     pub(super) fn with_ple(
         step: FlashStep<'static>,
         moe: SplitMoeAt<'static>,
-        ple: Option<DevicePle>,
+        ple: Option<DevicePle<'static>>,
     ) -> Self {
         let stream_width = step.geometry.branches * step.geometry.hidden;
         let logits_width = step.model.vocab;

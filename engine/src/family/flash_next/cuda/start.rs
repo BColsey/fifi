@@ -40,7 +40,7 @@ use super::{
     executor::{CudaRules, FlashCudaExecutor},
     feeds::{
         DEFAULT_THREADS, StartShape,
-        device::{DevicePle, PleUpload},
+        device::{DevicePle, PleDeviceShape},
     },
     load::{TrunkList, upload::trunk_weights},
     moe_block::{SplitMoe, SplitMoeTrunk},
@@ -80,9 +80,13 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceStream, host_register,
-        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW, ServedKernels},
+        resident::{
+            exl3::{IndexedOptions, SERVED_SINGLE_ROW, ServedKernels},
+            hyper::HyperDtype,
+        },
     },
     sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
+    tensor::Dtype,
     tokenizer::TokenizerBundle,
     weights::exl3::Checkpoint,
 };
@@ -588,6 +592,17 @@ pub(super) fn build_driver(
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
     let bulk_reader = ngram_bulk()? && rows > 1;
+    let projection_on_card = ple_device()?;
+    let ple_shape = (projection_on_card && rows > 1).then(|| PleDeviceShape {
+        width: model.hyper.hidden() * model.hyper.branches(),
+        hidden: model.hyper.hidden(),
+        embed: model.ple.embed(),
+        rows_max: rows,
+    });
+    let ple_workspace = ple_shape
+        .as_ref()
+        .map_or(Ok(0), PleDeviceShape::workspace_bytes)?;
+    let batch_switch = ple_batch()?;
     // The shared prefill arena serves chunked prefill only; `prefill_rows = 1` is the
     // per-token driver and keeps the pre-switch charge of zero.
     let prefill_arena_bytes = if rows > 1 {
@@ -631,7 +646,8 @@ pub(super) fn build_driver(
         // at the disk rung, and re-validated there.
         rung_ring_placeholder_bytes(record_bytes),
     )
-    .with_prefill_arena(prefill_arena_bytes)?;
+    .with_prefill_arena(prefill_arena_bytes)?
+    .with_prefill_arena(ple_workspace)?;
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
     let load = load_plan.at_context(
         u64::from(wanted.context),
@@ -658,11 +674,13 @@ pub(super) fn build_driver(
     }
 
     // The host side is admitted before anything is uploaded: the pinned store of the bank, the
-    // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
-    // `PleVectors::read` holds in F32 (their bytes ride inside the plan's `engine_heap` term
-    // below, so the plan and the guard count exactly the same bytes).
+    // engine heap and margin of `HostTerms`, including any host F32 PLE projections.
     let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
-    let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
+    let ple_bytes = if ple_shape.is_none() {
+        ple_width * model.ple.embed() as u64 * 4
+    } else {
+        0
+    };
     let terms = HostTerms {
         engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes,
         ..HostTerms::DEFAULT
@@ -994,48 +1012,33 @@ pub(super) fn build_driver(
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
 
-    // The batch flag is read before the 131 MB of projection weights, so a refused value
-    // fails fast instead of after the upload-scale read.
-    let batch_switch = ple_batch()?;
     stage("opening the n-gram table");
-    let (vectors, projection) = PleVectors::read(
-        &checkpoint.source,
-        model.ple_layer,
-        &model.ple,
-        ple_threads(),
-    )?;
     let ngram_rows = NgramRows::new(ngram)?;
     let reader = bulk_reader
         .then(|| ngram_rows.reader(DEFAULT_THREADS))
         .transpose()?;
-    // The device route (chunked prefill only): the projections upload to the card and the feed
-    // takes precomputed pairs; the host projection still backs the flag-off path.
-    let device_ple = match ple_device()?.then_some(rows > 1) {
-        Some(true) => {
-            stage("uploading the PLE projections");
-            let dims = model.ple.dims();
-            let (dtype, key, value) =
-                PleVectors::raw_projections(&checkpoint.source, model.ple_layer, &model.ple)?;
-            Some(DevicePle::upload(
-                ctx,
-                dtype,
-                &key,
-                &value,
-                PleUpload {
-                    width: (dims.hidden * dims.branches) as usize,
-                    hidden: dims.hidden as usize,
-                    embed: model.ple.embed(),
-                    rows_max: rows,
-                },
-            )?)
+    let device_ple = if let Some(shape) = ple_shape {
+        stage("allocating the PLE projection workspace");
+        let layer = model.ple_layer;
+        let (key, key_dtype) = step.half(&layer_name(layer, "ple.key_proj.weight"))?;
+        let (value, value_dtype) = step.half(&layer_name(layer, "ple.value_proj.weight"))?;
+        if key_dtype != value_dtype {
+            return Err(EngError::Checkpoint(
+                "the PLE projection matrices have different dtypes".into(),
+            ));
         }
-        Some(false) => {
+        let dtype = match key_dtype {
+            HyperDtype::F16 => Dtype::F16,
+            HyperDtype::Bf16 => Dtype::Bf16,
+        };
+        Some(DevicePle::new(ctx, dtype, [key, value], shape)?)
+    } else {
+        if projection_on_card {
             eprintln!(
                 "flash-next cuda: INFERENCE_FLASH_NEXT_PLE_DEVICE ignored (prefill rows = 1)"
             );
-            None
         }
-        None => None,
+        None
     };
     // The batch host route (chunked prefill only, no device route): the feed takes precomputed
     // pairs from one blocked product per chunk; the projection runs that product.
@@ -1056,6 +1059,7 @@ pub(super) fn build_driver(
         None => false,
     };
     let (ple, ple_host_batch) = if device_ple.is_some() {
+        let vectors = PleVectors::read_vectors(&checkpoint.source, model.ple_layer, &model.ple)?;
         (
             PleFeed::with_fixed(
                 model.ple,
@@ -1064,22 +1068,30 @@ pub(super) fn build_driver(
                 Rc::new(FixedProjection::new()),
             ),
             None,
-        )
-    } else if batch_ple {
-        (
-            PleFeed::with_fixed(
-                model.ple,
-                ngram_rows,
-                vectors,
-                Rc::new(FixedProjection::new()),
-            ),
-            Some(Box::new(projection)),
         )
     } else {
-        (
-            PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection)),
-            None,
-        )
+        let (vectors, projection) = PleVectors::read(
+            &checkpoint.source,
+            model.ple_layer,
+            &model.ple,
+            ple_threads(),
+        )?;
+        if batch_ple {
+            (
+                PleFeed::with_fixed(
+                    model.ple,
+                    ngram_rows,
+                    vectors,
+                    Rc::new(FixedProjection::new()),
+                ),
+                Some(Box::new(projection)),
+            )
+        } else {
+            (
+                PleFeed::new(model.ple, ngram_rows, vectors, Box::new(projection)),
+                None,
+            )
+        }
     };
     let hidden = model.hyper.hidden();
     let branches = model.hyper.branches();
