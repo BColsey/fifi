@@ -127,7 +127,10 @@ fn parse_spec(value: &Value, context: &str) -> Result<QuantizationSpec, EngError
         group_size: integer("group_size")?,
     };
     spec.validate().map_err(|error| match error {
-        EngError::Checkpoint(message) => EngError::Checkpoint(format!("{context}: {message}")),
+        EngError::Checkpoint(message) => EngError::Checkpoint(format!(
+            "{context}: {message} ({:?} {} bits in groups of {})",
+            spec.mode, spec.bits, spec.group_size
+        )),
         other => other,
     })?;
     Ok(spec)

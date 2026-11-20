@@ -1,6 +1,10 @@
 use serde_json::Value;
 
-use crate::{EngError, checkpoint_json::UniqueValue, kernels::QuantizationMode};
+use crate::{
+    EngError,
+    checkpoint_json::UniqueValue,
+    kernels::{QuantizationMode, QuantizationSpec},
+};
 
 use super::{
     quantization::QuantizationMap,
@@ -254,6 +258,9 @@ impl FamilySpec {
 
     fn check_quantization(&self, config: &[u8]) -> Result<(), EngError> {
         let defaults = QuantizationMap::from_json(config)?.defaults();
+        if self.reads_quantization_from_pack() {
+            return self.check_declared_quantization(defaults);
+        }
         if defaults.mode != QuantizationMode::Affine
             || defaults.bits != self.quant_bits
             || defaults.group_size != self.quant_group
@@ -269,6 +276,59 @@ impl FamilySpec {
             )));
         }
         Ok(())
+    }
+
+    /// A family that fixes no bit width takes affine bits and group size from the pack. The pack
+    /// is refused only for a combination the shared quantized matmul does not support, or one
+    /// whose projection widths do not split into whole groups and whole 32-bit words.
+    fn check_declared_quantization(&self, declared: QuantizationSpec) -> Result<(), EngError> {
+        let combination = format!(
+            "{:?} {} bits in groups of {}",
+            declared.mode, declared.bits, declared.group_size
+        );
+        if declared.mode != QuantizationMode::Affine {
+            return Err(EngError::Checkpoint(format!(
+                "configuration quantization is {combination}, family {} takes affine weights",
+                self.name
+            )));
+        }
+        declared.validate().map_err(|error| match error {
+            EngError::Checkpoint(message) => EngError::Checkpoint(format!(
+                "configuration quantization {combination} is not supported by the quantized matmul: {message}"
+            )),
+            other => other,
+        })?;
+        for (name, width) in self.projection_input_widths() {
+            let words = u64::from(width) * u64::from(declared.bits);
+            if width % declared.group_size != 0 || words % 32 != 0 {
+                return Err(EngError::Checkpoint(format!(
+                    "configuration quantization {combination} does not fit family {}: the {name} width {width} must be a multiple of {} and pack into whole 32-bit words",
+                    self.name, declared.group_size
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The input widths of the packed projections of a dense family.
+    fn projection_input_widths(&self) -> Vec<(&'static str, u32)> {
+        let mut widths = vec![
+            ("hidden", self.hidden),
+            (
+                "attention output",
+                self.heads_q.saturating_mul(self.head_dim),
+            ),
+        ];
+        if let Some(dense) = self.feed_forward {
+            widths.push(("feed-forward intermediate", dense.intermediate));
+        }
+        if let Some(linear) = self.linear {
+            widths.push((
+                "linear attention value",
+                linear.value_heads.saturating_mul(linear.value_head_dim),
+            ));
+        }
+        widths
     }
 }
 
@@ -463,6 +523,85 @@ mod tests {
         QWEN3_8_27B_DENSE
             .check_config(dense_config().to_string().as_bytes())
             .expect("dense checkpoint dimensions");
+    }
+
+    fn dense_config_quantized(mode: &str, bits: u32, group: u32) -> Vec<u8> {
+        let mut config = dense_config();
+        config["quantization"] = json!({"mode": mode, "bits": bits, "group_size": group});
+        config.to_string().into_bytes()
+    }
+
+    #[test]
+    fn dense_family_takes_every_supported_affine_width_and_group_from_the_pack() {
+        for bits in [2, 3, 4, 5, 6, 8] {
+            for group in [32, 64, 128] {
+                QWEN3_8_27B_DENSE
+                    .check_config(&dense_config_quantized("affine", bits, group))
+                    .unwrap_or_else(|error| panic!("affine {bits} bits group {group}: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn dense_family_refuses_an_unsupported_combination_and_names_it() {
+        for (mode, bits, group, expected) in [
+            ("affine", 7, 64, "7 bits in groups of 64"),
+            ("affine", 1, 64, "1 bits in groups of 64"),
+            ("affine", 4, 16, "4 bits in groups of 16"),
+            ("affine", 4, 256, "4 bits in groups of 256"),
+            ("mxfp4", 4, 32, "Mxfp4 4 bits in groups of 32"),
+        ] {
+            let Err(EngError::Checkpoint(message)) =
+                QWEN3_8_27B_DENSE.check_config(&dense_config_quantized(mode, bits, group))
+            else {
+                panic!("{mode} {bits} {group} must be refused");
+            };
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn dense_family_refuses_widths_that_do_not_split_into_groups() {
+        let mut spec = QWEN3_8_27B_DENSE;
+        spec.hidden = 5120 + 32;
+        let declared = QuantizationSpec {
+            mode: QuantizationMode::Affine,
+            bits: 4,
+            group_size: 64,
+        };
+        let Err(EngError::Checkpoint(message)) = spec.check_declared_quantization(declared) else {
+            panic!("a width that is not a multiple of the group must be refused");
+        };
+        assert!(
+            message.contains("hidden width 5152") && message.contains("4 bits in groups of 64"),
+            "{message}"
+        );
+        // 3-bit codes pack whole words only when the width is a multiple of 32.
+        spec.hidden = 5120 + 16;
+        let three = QuantizationSpec {
+            mode: QuantizationMode::Affine,
+            bits: 3,
+            group_size: 32,
+        };
+        assert!(spec.check_declared_quantization(three).is_err());
+    }
+
+    #[test]
+    fn the_moe_family_still_pins_its_declared_quantization() {
+        let mut config: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/qwen3_6_35b_a3b_config.json"
+        ))
+        .unwrap();
+        assert!(!QWEN3_6_35B_A3B.reads_quantization_from_pack());
+        for block in ["quantization", "quantization_config"] {
+            config[block]["bits"] = json!(6);
+        }
+        let Err(EngError::Checkpoint(message)) =
+            QWEN3_6_35B_A3B.check_config(config.to_string().as_bytes())
+        else {
+            panic!("the MoE family declares affine 4 bits");
+        };
+        assert!(message.contains("declares affine 4 bits"), "{message}");
     }
 
     #[test]

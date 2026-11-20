@@ -142,7 +142,11 @@ pub struct FamilySpec {
     pub top_k: u32,
     pub moe_inter: u32,
     pub shared_inter: u32,
+    /// Affine bit width the checkpoint must declare. Zero, with `quant_group` zero, means the
+    /// family fixes no width and takes it from the pack's `quantization` block.
     pub quant_bits: u32,
+    /// Affine group size the checkpoint must declare. Zero, with `quant_bits` zero, means the
+    /// pack declares it.
     pub quant_group: u32,
     pub act: Act,
     pub router: Router,
@@ -161,6 +165,12 @@ pub struct FamilySpec {
 }
 
 impl FamilySpec {
+    /// Whether the family leaves the affine bit width and group size to the pack
+    /// (`quant_bits` and `quant_group` both zero).
+    pub fn reads_quantization_from_pack(&self) -> bool {
+        self.quant_bits == 0 && self.quant_group == 0
+    }
+
     /// Index of the first layer that stores no K/V of its own. Layers at or above
     /// it attend into the cache slot a physical source layer wrote. Saturating so
     /// an unvalidated descriptor (more shared layers than layers) cannot underflow.
@@ -300,7 +310,8 @@ const fn dense_27b_attention() -> [AttentionKind; 64] {
 
 const QWEN3_8_27B_DENSE_LAYERS: [AttentionKind; 64] = dense_27b_attention();
 
-/// Portable descriptor for the affine-6 group-64 Qwen3.8-27B checkpoint.
+/// Portable descriptor for the Qwen3.8-27B checkpoint at any affine bit width and group size
+/// the shared quantized matmul supports; the pack's `quantization` block declares them.
 ///
 /// Attention uses output gating and untied embeddings, as checked by `check_config`.
 /// The checkpoint also declares RoPE partial factor 0.25, `mrope_interleaved: true`,
@@ -325,8 +336,8 @@ pub const QWEN3_8_27B_DENSE: FamilySpec = FamilySpec {
     top_k: 0,
     moe_inter: 0,
     shared_inter: 0,
-    quant_bits: 6,
-    quant_group: 64,
+    quant_bits: 0,
+    quant_group: 0,
     act: Act::Silu,
     // Dense layers do not use a router.
     router: Router::SoftmaxTopK { renorm: true },
@@ -525,7 +536,7 @@ mod tests {
                 context_limit: 262_144,
             })
         );
-        assert_eq!((spec.quant_bits, spec.quant_group), (6, 64));
+        assert!(spec.reads_quantization_from_pack());
         let full: Vec<_> = spec
             .layers_attention
             .iter()
