@@ -11,6 +11,11 @@ use crate::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+/// The most retained checkpoints one pool keeps, beside its single staging slot. The retained
+/// count follows the host budget; this cap bounds the pinned memory a long-lived server holds
+/// for saved prefixes, however much host memory is free.
+pub(crate) const MAX_RETAINED: usize = 8;
+
 fn invalid(message: &str) -> EngError {
     EngError::BadRequest(format!("pinned prefix: {message}"))
 }
@@ -54,7 +59,9 @@ impl PendingPinned {
     }
 }
 
-/// Bounded persistent backing: retained checkpoints plus one independently owned staging slot.
+/// Bounded persistent backing: `1..=MAX_RETAINED` retained checkpoints plus one independently
+/// owned staging slot. A slot is free when the pool holds its only reference; the store's
+/// entries and the pending save hold the others, so the rotation needs no count of its own.
 pub(crate) struct PrefixPinPool {
     slots: Vec<Rc<RefCell<PinnedBuf>>>,
     event: DeviceEvent,
@@ -83,8 +90,8 @@ impl PrefixPinPool {
         layout: StateLayout,
         retained: usize,
     ) -> Result<Self, EngError> {
-        if !(1..=2).contains(&retained) {
-            return Err(invalid("pool needs one or two retained entries"));
+        if !(1..=MAX_RETAINED).contains(&retained) {
+            return Err(invalid("pool needs between one and eight retained entries"));
         }
         let slab_bytes = Self::checkpoint_bytes(&layout)?;
         let delta_bytes = layout.delta.total / layout.delta.slots;
@@ -884,6 +891,219 @@ mod tests {
             Ok(())
         })();
         outcome.expect("exclusive live-source suffix copies and failure quarantine");
+    }
+
+    /// A pool, its store and one session over a small native state, saving and restoring
+    /// unrelated equal-length keys whose bytes name the key.
+    struct Rotation<'a> {
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        path: CudaPrefillPath,
+        state: ResidentState,
+        pool: PrefixPinPool,
+        store: PrefixSlot<PinnedSnapshot, CudaPrefillPath>,
+        session: DecodeSession,
+        counter: Counter,
+        used_slots: std::collections::BTreeSet<usize>,
+    }
+
+    impl Rotation<'_> {
+        fn key_of(i: u32) -> [u32; 5] {
+            [10 * i + 1, 10 * i + 2, 10 * i + 3, 10 * i + 4, 10 * i + 5]
+        }
+
+        fn byte_of(i: u32) -> u8 {
+            20 + 2 * i as u8
+        }
+
+        fn save(&mut self, i: u32) -> Result<bool, EngError> {
+            let key = Self::key_of(i);
+            self.session.reset(&mut self.counter)?;
+            self.session.prefill(&mut self.counter, &key, 16)?;
+            self.pool.invalidate()?;
+            let byte = Self::byte_of(i);
+            self.state
+                .delta
+                .write_at(self.stream, 0, &vec![byte; self.pool.delta_bytes])?;
+            let kv = self.state.resident_kv()?;
+            kv.write_at(self.stream, 0, &vec![byte + 1; kv.bytes()])?;
+            self.state.book.finish_overwrite(self.counter.fed());
+            let frozen = self.session.prepare_prefix_save(&key, self.counter.fed())?;
+            let mut pending = Some(self.pool.begin(self.ctx, self.stream, &self.state, None)?);
+            let (pool, state, used) = (&mut self.pool, &self.state, &mut self.used_slots);
+            frozen.save_prefix(
+                &mut self.store,
+                &key,
+                self.path,
+                self.counter.fed(),
+                SaveKind::Tip,
+                || {
+                    let pending = pending
+                        .take()
+                        .ok_or_else(|| EngError::Checkpoint("duplicate publication".into()))?;
+                    let saved = pool.finish(self.ctx, self.stream, state, pending)?;
+                    used.insert(saved.slot);
+                    Ok(saved)
+                },
+            )
+        }
+
+        /// The covered length of a restore for a prompt that extends key `i`.
+        fn restore(&mut self, i: u32) -> Result<usize, EngError> {
+            let mut prompt = Self::key_of(i).to_vec();
+            prompt.extend([7, 7, 7]);
+            self.session.reset(&mut self.counter)?;
+            let (pool, state, counter) = (&mut self.pool, &mut self.state, &mut self.counter);
+            self.session
+                .restore_prefix(&mut self.store, &prompt, self.path, |saved| {
+                    pool.restore(self.ctx, self.stream, state, saved, None)?;
+                    counter.0 = state.tokens();
+                    Ok(())
+                })
+        }
+
+        fn restored_bytes_are_key(&self, i: u32) -> Result<bool, EngError> {
+            let mut delta = vec![0; self.pool.delta_bytes];
+            self.state.delta.read_at(self.stream, 0, &mut delta)?;
+            let mut valid = delta.iter().all(|&byte| byte == Self::byte_of(i));
+            for layer in 0..self.state.layout.kv.layers {
+                for range in self.state.layout.kv.prefix_ranges(layer, 4)? {
+                    let mut bytes = vec![0; range.bytes];
+                    self.state.resident_kv()?.read_at(
+                        self.stream,
+                        range.device_offset,
+                        &mut bytes,
+                    )?;
+                    valid &= bytes.iter().all(|&byte| byte == Self::byte_of(i) + 1);
+                }
+            }
+            Ok(valid)
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+    fn many_retained_checkpoints_rotate_and_evict_the_oldest_first() {
+        const RETAINED: usize = 5;
+        const LAST: u32 = RETAINED as u32;
+        let outcome = (|| -> Result<(), EngError> {
+            let ctx = CudaContext::new()?;
+            let stream = ctx.stream()?;
+            for mode in [KvMode::Fp16, KvMode::Int8G32] {
+                let require = |valid: bool, detail: &str| {
+                    if valid {
+                        Ok(())
+                    } else {
+                        Err(EngError::Checkpoint(format!("{mode:?}: {detail}")))
+                    }
+                };
+                let options = StepOptions {
+                    kv_mode: mode,
+                    context_tokens: 16,
+                    delta_slots: 1,
+                    forked_experts: false,
+                    tiered: None,
+                    layout: WeightLayout::Native,
+                };
+                let state =
+                    ResidentState::allocate(&ctx, &stream, &common_tests::dims(), &options)?;
+                for retained in [0, MAX_RETAINED + 1] {
+                    require(
+                        matches!(
+                            PrefixPinPool::new(&ctx, state.layout, retained),
+                            Err(EngError::BadRequest(_))
+                        ),
+                        "the pool must refuse a count outside 1..=MAX_RETAINED",
+                    )?;
+                }
+                let widest = PrefixPinPool::new(&ctx, state.layout, MAX_RETAINED)?;
+                require(
+                    widest.retained_entries() == MAX_RETAINED
+                        && widest.bytes() == widest.slab_bytes * (MAX_RETAINED + 1),
+                    "the widest pool must hold MAX_RETAINED entries plus one staging slot",
+                )?;
+                drop(widest);
+
+                let mut rig = Rotation {
+                    ctx: &ctx,
+                    stream: &stream,
+                    path: CudaPrefillPath::Steps(mode),
+                    pool: PrefixPinPool::new(&ctx, state.layout, RETAINED)?,
+                    state,
+                    store: PrefixSlot::with_limits(StoreLimits {
+                        roots: 0,
+                        entries: RETAINED,
+                    })
+                    .with_recent_longer_protection(),
+                    session: DecodeSession::default(),
+                    counter: Counter(0),
+                    used_slots: Default::default(),
+                };
+                for i in 0..LAST {
+                    require(rig.save(i)?, "a save below the limit must publish")?;
+                }
+                require(
+                    rig.store.keys().len() == RETAINED,
+                    "all retained entries must be held",
+                )?;
+                // Every retained entry owns its own slot; exactly one stays free for staging.
+                let held: std::collections::BTreeSet<usize> =
+                    rig.store.snapshots().map(|saved| saved.slot).collect();
+                require(held.len() == RETAINED, "retained entries share a slot")?;
+                require(
+                    (0..=RETAINED).filter(|slot| !held.contains(slot)).count() == 1,
+                    "one slot must stay free for staging",
+                )?;
+                let staging = rig.pool.begin(&ctx, &stream, &rig.state, None)?;
+                require(
+                    matches!(
+                        rig.pool.begin(&ctx, &stream, &rig.state, None),
+                        Err(EngError::MemoryPlan(_))
+                    ),
+                    "a second staging save must be refused while every other slot is held",
+                )?;
+                drop(staging);
+
+                // Two more saves evict entries 0 and 1, oldest first, and reuse their slots.
+                for i in LAST..LAST + 2 {
+                    require(rig.save(i)?, "a save past the limit must publish")?;
+                }
+                require(
+                    rig.used_slots.len() == RETAINED + 1,
+                    "the rotation must visit every slot of the pool",
+                )?;
+                require(
+                    rig.store.keys().len() == RETAINED,
+                    "the store must stay at its limit",
+                )?;
+
+                // Restoring oldest to newest keeps the order; a miss changes nothing.
+                for i in 0..2 {
+                    require(
+                        rig.restore(i)? == 0,
+                        "the two oldest entries must be evicted",
+                    )?;
+                }
+                for i in 2..LAST + 2 {
+                    require(rig.restore(i)? == 5, "a retained entry must restore")?;
+                    require(rig.restored_bytes_are_key(i)?, "restored bytes differ")?;
+                }
+
+                // Entry 2 is the oldest again and entry 6 the newest: a new save evicts entry 2
+                // and keeps every later one.
+                require(rig.save(LAST + 2)?, "a save after restores must publish")?;
+                require(
+                    rig.restore(2)? == 0,
+                    "the least recently used entry must be the one evicted",
+                )?;
+                for i in 3..LAST + 3 {
+                    require(rig.restore(i)? == 5, "every more recent entry must survive")?;
+                    require(rig.restored_bytes_are_key(i)?, "restored bytes differ")?;
+                }
+            }
+            Ok(())
+        })();
+        outcome.expect("rotation and eviction hold for more than two retained entries");
     }
 
     #[test]

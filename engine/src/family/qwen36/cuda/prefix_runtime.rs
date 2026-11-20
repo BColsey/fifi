@@ -3,7 +3,7 @@ use super::super::{
     prefix::{CudaSavedPrefix, HOST_HEADROOM, PendingPrefix, entry_bytes},
     state::{
         device_tip::DeviceTip,
-        pinned::{PinnedSnapshot, PrefixPinPool},
+        pinned::{MAX_RETAINED, PinnedSnapshot, PrefixPinPool},
     },
 };
 use super::QwenResidentStep;
@@ -18,7 +18,6 @@ use std::time::Instant;
 
 const TIERED_EXTRA_BYTES_ENV: &str = "Q36_TIERED_PREFIX_EXTRA_BYTES";
 const PIN_BYTES_ENV: &str = "Q36_CUDA_PINNED_PREFIX_BYTES";
-const DEFAULT_PIN_BYTES_MAX: usize = 8usize << 30;
 
 fn byte_limit(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<usize>, EngError> {
     let Some(value) = value else { return Ok(None) };
@@ -44,15 +43,21 @@ fn mem_available(contents: &str) -> Option<usize> {
     kib.checked_mul(1024)
 }
 
-fn default_pin_bytes(checkpoint: usize) -> usize {
-    checkpoint.saturating_mul(3).min(DEFAULT_PIN_BYTES_MAX)
+/// The default pinned-pool byte cap: every retained entry up to `MAX_RETAINED` plus the staging
+/// slot, and never more than half of the admission budget, which stays for the weights' host
+/// tier and the pageable paths. No budget (a failed probe) plans no pool.
+fn default_pin_bytes(checkpoint: usize, available: Option<usize>) -> usize {
+    let full = checkpoint.saturating_mul(MAX_RETAINED + 1);
+    full.min(available.unwrap_or(0) / 2)
 }
 
+/// The retained entries (`1..=MAX_RETAINED`) that `limit` bytes and the host budget can hold
+/// beside one staging slot and `HOST_HEADROOM`, or 0 when not even one fits.
 fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) -> usize {
     if checkpoint == 0 {
         return 0;
     }
-    let retained = (limit / checkpoint).saturating_sub(1).min(2);
+    let retained = (limit / checkpoint).saturating_sub(1).min(MAX_RETAINED);
     if retained == 0 {
         return 0;
     }
@@ -168,14 +173,14 @@ impl QwenResidentStep<'_> {
         });
         self.prefix.set_shadow_enabled(shadow_block_lcp_enabled());
         let checkpoint = PrefixPinPool::checkpoint_bytes(self.state.layout())?;
-        let limit = byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
-            .unwrap_or_else(|| default_pin_bytes(checkpoint));
         // The admission budget (`MemAvailable` clamped by the cgroup limits), not the bare
         // meminfo figure: a cgroup-capped host must size its pins from the capped budget, and
         // there is no later guard here. A failed probe plans ZERO pinned entries (logged):
         // the probe refuses on exactly the cases the clamp exists for, so falling back to the
         // unclamped figure would repeat the bug this closes.
         let available = admission_budget("Qwen36 pinned prefix", "pins stay off");
+        let limit = byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
+            .unwrap_or_else(|| default_pin_bytes(checkpoint, available));
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(
@@ -428,11 +433,37 @@ mod tests {
     }
 
     #[test]
+    fn default_pin_bytes_cover_the_cap_or_half_of_the_budget() {
+        let size = 1024;
+        let full = (MAX_RETAINED + 1) * size;
+        let margin = 1usize << 20;
+        for (available, expected) in [
+            (None, 0),
+            (Some(0), 0),
+            (Some(1), 0),
+            (Some(2 * size), size),
+            (Some(2 * size + 1), size),
+            (Some(2 * full - 1), full - 1),
+            (Some(2 * full), full),
+            (Some(2 * full + margin), full),
+            (Some(usize::MAX), full),
+        ] {
+            assert_eq!(
+                default_pin_bytes(size, available),
+                expected,
+                "{available:?}"
+            );
+        }
+        assert_eq!(
+            default_pin_bytes(usize::MAX, Some(usize::MAX)),
+            usize::MAX / 2
+        );
+        assert_eq!(default_pin_bytes(0, Some(usize::MAX)), 0);
+    }
+
+    #[test]
     fn pin_admission_reserves_a_physical_staging_slot() {
         let size = 1024;
-        assert_eq!(default_pin_bytes(size), 3 * size);
-        assert_eq!(default_pin_bytes(4usize << 30), DEFAULT_PIN_BYTES_MAX);
-        assert_eq!(default_pin_bytes(usize::MAX), DEFAULT_PIN_BYTES_MAX);
         let margin = HOST_HEADROOM;
         for (limit, available, expected) in [
             (0, Some(margin + 3 * size), 0),
@@ -454,6 +485,69 @@ mod tests {
             planned_entries(usize::MAX / 3, usize::MAX, Some(usize::MAX)),
             1
         );
+    }
+
+    #[test]
+    fn retained_entries_grow_with_the_budget_and_stop_at_the_cap() {
+        const GIB: usize = 1 << 30;
+        // The default rule feeding the planner, as `enable_pinned_prefix` composes them, for
+        // a checkpoint of 1 GiB.
+        let plan =
+            |budget: Option<usize>| planned_entries(GIB, default_pin_bytes(GIB, budget), budget);
+        for (budget, expected) in [
+            (None, 0),
+            (Some(0), 0),
+            // Half of the budget must hold the staging slot and one retained entry.
+            (Some(3 * GIB), 0),
+            (Some(4 * GIB), 1),
+            (Some(6 * GIB), 2),
+            (Some(8 * GIB), 3),
+            (Some(14 * GIB), 6),
+            (Some(16 * GIB), 7),
+            (Some(18 * GIB), MAX_RETAINED),
+            (Some(20 * GIB), MAX_RETAINED),
+            (Some(512 * GIB), MAX_RETAINED),
+        ] {
+            assert_eq!(plan(budget), expected, "budget {budget:?}");
+        }
+        // The served 35B checkpoint on a 50 GiB host reaches the cap; a 5 GiB checkpoint (a
+        // 256K-token KV) is limited by the half-budget rule instead.
+        let served = 736_952_320;
+        let host = Some(50 * GIB);
+        assert_eq!(
+            planned_entries(served, default_pin_bytes(served, host), host),
+            MAX_RETAINED
+        );
+        let long = 5 * GIB;
+        assert_eq!(
+            planned_entries(long, default_pin_bytes(long, host), host),
+            4
+        );
+        // The headroom check still lowers an operator-sized plan when memory runs short.
+        assert_eq!(planned_entries(GIB, 9 * GIB, Some(4 * GIB)), 2);
+        assert_eq!(planned_entries(GIB, 9 * GIB, Some(GIB + GIB / 2)), 0);
+    }
+
+    #[test]
+    fn the_operator_byte_cap_overrides_the_default_rule() {
+        let size = 1usize << 20;
+        let budget = Some(HOST_HEADROOM + 64 * size);
+        // An exact cap picks the retained count whatever the default would have been.
+        for (cap, expected) in [
+            (0, 0),
+            (size, 0),
+            (2 * size, 1),
+            (4 * size, 3),
+            (9 * size, MAX_RETAINED),
+            (40 * size, MAX_RETAINED),
+        ] {
+            assert_eq!(planned_entries(size, cap, budget), expected, "cap {cap}");
+        }
+        // The default for the same budget is the capped rule, not the override.
+        assert_eq!(default_pin_bytes(size, budget), 9 * size);
+        // The override is still bounded by what the host can hold.
+        let scarce = Some(HOST_HEADROOM + 4 * size);
+        assert_eq!(planned_entries(size, 40 * size, scarce), 3);
     }
 
     #[test]
