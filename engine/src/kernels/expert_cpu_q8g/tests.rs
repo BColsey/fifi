@@ -867,3 +867,320 @@ fn narrow_and_wide_forced_paths_are_bit_identical_over_random_rows() {
         );
     }
 }
+
+/// Activation rows for the identity tests: real-sized random rows, and rows built to hit the
+/// corners of the quantizer (constants at the signed byte ends, zeros, negative zeros, one
+/// large outlier in every group, values on exact half boundaries under a unit scale).
+fn identity_activation_rows(k: usize) -> Vec<Vec<f32>> {
+    let mut rng = Lcg(0x1DE7_0000 ^ k as u64);
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..6 {
+        // Sum of four uniforms: a bell shape like real hidden activations.
+        rows.push(
+            (0..k)
+                .map(|_| (0..4).map(|_| rng.between(-1.0, 1.0)).sum::<f32>())
+                .collect(),
+        );
+    }
+    rows.push(vec![127.0; k]);
+    rows.push(vec![-128.0; k]);
+    rows.push(vec![0.0; k]);
+    rows.push(vec![-0.0; k]);
+    rows.push(
+        (0..k)
+            .map(|i| if i % 2 == 0 { 128.0 } else { -128.0 })
+            .collect(),
+    );
+    for outlier in [1.0e4f32, -1.0e4, 3.0e38, -3.0e38, 1.0e-30] {
+        rows.push(
+            (0..k)
+                .map(|i| {
+                    if i % GROUP == (i / GROUP * 7) % GROUP {
+                        outlier
+                    } else {
+                        rng.between(-1.0, 1.0) * outlier.abs().min(1.0)
+                    }
+                })
+                .collect(),
+        );
+    }
+    // Unit scale (the group maximum is exactly 127) with every other value on a half boundary.
+    rows.push(
+        (0..k)
+            .map(|i| {
+                if i % GROUP == 0 {
+                    127.0
+                } else {
+                    (rng.next() % 126) as f32 - 62.5
+                }
+            })
+            .collect(),
+    );
+    rows
+}
+
+/// Already-quantized activation rows at the byte extremes, with the group sums the quantizer
+/// would store. The quantizer never emits -128, but the kernel accepts it, so the bound has to
+/// hold there too.
+fn identity_quantized_rows(k: usize) -> Vec<Q8gRow> {
+    let mut rng = Lcg(0xFEED_0000 ^ k as u64);
+    let mut rows = Vec::new();
+    let mut push = |f: &mut dyn FnMut(usize) -> i8| {
+        let mut row = Q8gRow::zeros(k).unwrap();
+        for g in 0..k / GROUP {
+            row.d[g] = 0.0078125 * (1 + g % 5) as f32;
+            for t in 0..GROUP {
+                row.q[g * GROUP + t] = f(g * GROUP + t);
+            }
+            row.s[g] = row.q[g * GROUP..(g + 1) * GROUP]
+                .iter()
+                .map(|&q| i32::from(q))
+                .sum();
+        }
+        rows.push(row);
+    };
+    push(&mut |_| -128);
+    push(&mut |_| 127);
+    push(&mut |_| 0);
+    push(&mut |i| if i % 2 == 0 { 127 } else { -128 });
+    push(&mut |i| {
+        if i % GROUP == (i / GROUP * 5) % GROUP {
+            127
+        } else {
+            0
+        }
+    });
+    push(&mut |i| {
+        if i % GROUP == (i / GROUP * 5) % GROUP {
+            -128
+        } else {
+            0
+        }
+    });
+    push(&mut |_| (rng.next() >> 45) as i8);
+    rows
+}
+
+/// Weight rows for the identity tests: random bytes with sane block scales, nibbles all 15
+/// with the largest sub-block scales and mins, and nibbles all 0.
+fn identity_weight_rows(k: usize, rows: usize) -> Vec<Vec<u8>> {
+    let mut rng = Lcg(0xB10C_0000 ^ k as u64);
+    let blocks = rows * k / Q4K_BLOCK_VALUES;
+    let mut zero = vec![0u8; blocks * Q4K_BLOCK_BYTES];
+    for blk in zero.as_chunks_mut::<Q4K_BLOCK_BYTES>().0 {
+        blk[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        blk[4..16].fill(0xFF);
+    }
+    let mut high = vec![0xFFu8; blocks * Q4K_BLOCK_BYTES];
+    for blk in high.as_chunks_mut::<Q4K_BLOCK_BYTES>().0 {
+        blk[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        blk[2..4].copy_from_slice(&0x3c00u16.to_le_bytes());
+    }
+    vec![
+        random_rows(&mut rng, rows, k),
+        random_rows(&mut rng, rows, k),
+        high,
+        zero,
+    ]
+}
+
+fn fnv_bits(h: &mut u64, v: u64) {
+    *h ^= v;
+    *h = h.wrapping_mul(0x1000_0000_01b3);
+}
+
+/// The quantizer's two paths on every identity row, bit for bit (`q`, `s`, `d`).
+#[test]
+fn identity_quantizer_fast_equals_reference_on_real_sized_and_extreme_rows() {
+    for k in [512usize, 2048, 4096] {
+        for (n, x) in identity_activation_rows(k).iter().enumerate() {
+            let mut reference = Q8gRow::zeros(k).unwrap();
+            let mut fast = Q8gRow::zeros(k).unwrap();
+            fill_groups::<false>(x, &mut reference);
+            fill_groups::<true>(x, &mut fast);
+            assert_eq!(reference.q, fast.q, "q differs: k {k} row {n}");
+            assert_eq!(reference.s, fast.s, "s differs: k {k} row {n}");
+            let bits = |d: &[f32]| d.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&reference.d),
+                bits(&fast.d),
+                "d differs: k {k} row {n}"
+            );
+        }
+    }
+}
+
+/// The expert dot, three ways, on every identity weight row and activation row: the scalar
+/// reference, the AVX2 dot with wide sums, and the AVX2 dot with 16-bit sums, all bit-equal.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn identity_dot_scalar_wide_and_narrow_agree_on_real_sized_and_extreme_rows() {
+    use crate::kernels::expert_cpu_avx2::q4k_q8g_row_dot_forced;
+    if DotBackend::detect() == DotBackend::scalar() {
+        println!("AVX2 not detected, skipped");
+        return;
+    }
+    let mut compared = 0usize;
+    for k in [512usize, 2048] {
+        let mut activations: Vec<Q8gRow> = identity_quantized_rows(k);
+        for x in identity_activation_rows(k) {
+            activations.push(quantized(&x));
+        }
+        let row_bytes = k / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+        for weights in identity_weight_rows(k, 128) {
+            for xq in &activations {
+                for row in weights.chunks_exact(row_bytes) {
+                    let want = q4k_q8g_row_dot_scalar(row, xq);
+                    let wide = q4k_q8g_row_dot_forced::<false>(row, xq);
+                    let narrow = q4k_q8g_row_dot_forced::<true>(row, xq);
+                    assert_eq!(wide.to_bits(), want.to_bits(), "wide vs scalar, k {k}");
+                    assert_eq!(narrow.to_bits(), want.to_bits(), "narrow vs scalar, k {k}");
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert!(compared > 10_000, "only {compared} rows compared");
+}
+
+/// Digest of the full public path on the identity inputs: the quantizer entry (`quantize_q8g`,
+/// which reads the fast-path switch), the matvec on the detected backend (which reads the
+/// narrow-sum switch), and a real-sized expert forward.
+fn identity_pipeline_digest() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let backend = DotBackend::detect();
+    let shape = ExpertShape {
+        hidden: 2048,
+        inter: 512,
+    };
+    let rows = 64usize;
+    for k in [512usize, 2048] {
+        let row_bytes = k / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+        let weights = identity_weight_rows(k, rows);
+        for x in identity_activation_rows(k) {
+            let mut xq = Q8gRow::zeros(k).unwrap();
+            quantize_q8g(&x, &mut xq).unwrap();
+            for b in &xq.q {
+                fnv_bits(&mut h, *b as u8 as u64);
+            }
+            for v in &xq.d {
+                fnv_bits(&mut h, u64::from(v.to_bits()));
+            }
+            for s in &xq.s {
+                fnv_bits(&mut h, u64::from(*s as u32));
+            }
+            for w in &weights {
+                debug_assert_eq!(w.len(), rows * row_bytes);
+                let mut out = vec![0.0f32; rows];
+                q4k_q8g_matvec(backend, w, rows, k, &xq, &mut out).unwrap();
+                for v in out {
+                    fnv_bits(&mut h, u64::from(v.to_bits()));
+                }
+            }
+        }
+    }
+    {
+        let mut rng = Lcg(0xE4E4_0001);
+        let gate = random_rows(&mut rng, shape.inter, shape.hidden);
+        let up = random_rows(&mut rng, shape.inter, shape.hidden);
+        let down = random_rows(&mut rng, shape.hidden, shape.inter);
+        let slices = ExpertSlices {
+            gate: &gate,
+            up: &up,
+            down: &down,
+        };
+        let mut scratch = ExpertScratchQ8g::new(shape);
+        for x in identity_activation_rows(shape.hidden)
+            .into_iter()
+            .filter(|x| x.iter().all(|v| v.abs() < 1.0e6))
+        {
+            let mut out = vec![0.0f32; shape.hidden];
+            expert_forward_q8g(backend, shape, &slices, &x, &mut scratch, &mut out).unwrap();
+            for v in out {
+                fnv_bits(&mut h, u64::from(v.to_bits()));
+            }
+        }
+    }
+    h
+}
+
+/// The two kernel switches through the public path, in child processes (each switch is read
+/// once per process): every combination of unset, rollback words and enable words yields the
+/// same digest as the child with both switches rolled back.
+#[test]
+fn identity_public_path_is_bit_equal_under_every_switch_setting() {
+    const CHILD: &str = "kernels::expert_cpu_q8g::tests::identity_public_path_is_bit_equal_under_every_switch_setting";
+    if let Some(path) = std::env::var_os("IDENTITY_CHILD_OUT") {
+        std::fs::write(path, identity_pipeline_digest().to_string()).unwrap();
+        return;
+    }
+    let out_path = std::env::temp_dir().join(format!("fifi-identity-{}", std::process::id()));
+    let run = |fast: Option<&str>, narrow: Option<&str>| -> u64 {
+        let _ = std::fs::remove_file(&out_path);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", CHILD, "--test-threads", "1"])
+            .env("IDENTITY_CHILD_OUT", &out_path)
+            .env_remove("FIFI_CPU_Q8G_FAST_QUANT")
+            .env_remove("FIFI_CPU_Q8G_NARROW_SUM");
+        if let Some(v) = fast {
+            command.env("FIFI_CPU_Q8G_FAST_QUANT", v);
+        }
+        if let Some(v) = narrow {
+            command.env("FIFI_CPU_Q8G_NARROW_SUM", v);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child {fast:?}/{narrow:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(&out_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let rolled_back = run(Some("0"), Some("0"));
+    for (fast, narrow) in [
+        (None, None),
+        (Some("1"), Some("1")),
+        (Some("0"), None),
+        (None, Some("0")),
+        (Some("off"), Some("false")),
+        (Some("garbage"), Some("")),
+    ] {
+        assert_eq!(
+            run(fast, narrow),
+            rolled_back,
+            "fast {fast:?} narrow {narrow:?} differs from both switches off"
+        );
+    }
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// The public quantizer and the detected dot against the path the switches fall back to
+/// (reference quantizer, scalar dot), on the identity rows, in this process.
+#[test]
+fn identity_default_quantizer_and_matvec_equal_the_scalar_reference() {
+    let k = 2048usize;
+    let rows = 64usize;
+    let weights = identity_weight_rows(k, rows);
+    for x in identity_activation_rows(k) {
+        let mut want = Q8gRow::zeros(k).unwrap();
+        fill_groups::<false>(&x, &mut want);
+        let got = quantized(&x);
+        assert_eq!(got.q, want.q);
+        assert_eq!(got.s, want.s);
+        for w in &weights {
+            let (mut a, mut b) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+            q4k_q8g_matvec(DotBackend::scalar(), w, rows, k, &want, &mut a).unwrap();
+            q4k_q8g_matvec(DotBackend::detect(), w, rows, k, &got, &mut b).unwrap();
+            assert_eq!(
+                a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+}
