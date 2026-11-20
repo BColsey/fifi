@@ -75,10 +75,17 @@ fn parse_cases(text: &str) -> Vec<CaseRow> {
     rows
 }
 
-/// The opt-in shared-memory budget of `cc` in the tests: 96 KiB on sm_72, 99 KiB on the
-/// 3090 (the values of §B.0 (a); the skip never fires on either).
+/// Known Opt-in shared-memory budgets for the physical CUDA classes in this fixture.
 fn smpbo_of(cc: i32) -> usize {
-    if cc >= 800 { 101_376 } else { 98_304 }
+    match cc {
+        750 => 65_536,
+        700..=749 => 98_304,
+        _ => 101_376,
+    }
+}
+
+fn mma_build_architectures() -> impl Iterator<Item = i32> {
+    COMPILED_ARCHS.into_iter().filter(|&cc| cc >= CC_VOLTA)
 }
 
 /// The layout string the vendored CASE rows name per type (both headers agree).
@@ -160,12 +167,14 @@ fn config_tables_match_vendored_headers() {
     }
 }
 
-/// The `smpbo` skip never fires on either build arch for any of our types (§B.0 (a)): the
+/// The `smpbo` skip never fires on the compiled MMA architectures for any of our types (§B.0 (a)): the
 /// largest shared need is re-derived from the table data, not trusted. sm_72 offers 96 KiB
 /// and the 3090 99 KiB opt-in per block.
 #[test]
-fn shared_bytes_fit_both_build_architectures() {
-    for (cc, smpbo, largest) in [(720, 98_304, 60_672), (860, 101_376, 61_952)] {
+fn shared_bytes_fit_the_compiled_mma_architectures() {
+    for cc in mma_build_architectures() {
+        let smpbo = smpbo_of(cc);
+        let largest = if cc < CC_TURING { 60_672 } else { 61_952 };
         let mut max = 0;
         for mmq_type in [
             MmqType::Q80,
@@ -193,7 +202,7 @@ fn shared_bytes_fit_both_build_architectures() {
 /// and the table gaps of both fallback axes.
 #[test]
 fn j_best_pins_the_launch_selection() {
-    for cc in [720, 860] {
+    for cc in mma_build_architectures() {
         assert_eq!(j_best(MmqType::Q4K, false, cc, smpbo_of(cc), 130), Some(80));
         for (n, want) in [(56, 64), (72, 80), (88, 96), (104, 112), (120, 128)] {
             assert_eq!(
@@ -284,7 +293,7 @@ fn qwen_widths_and_ids_pins() {
 /// 1..=4096, both fallbacks, both build archs, with the minimum margin witnessed.
 #[test]
 fn exhaustive_dense_pad_rule() {
-    for cc in [720, 860] {
+    for cc in mma_build_architectures() {
         let nthreads = MmqConfig::select(cc).config().nthreads;
         for fallback in [false, true] {
             let mut worst = 0;
