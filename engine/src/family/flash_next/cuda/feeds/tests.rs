@@ -413,8 +413,8 @@ fn a_pending_read_completes_after_the_reader_is_dropped() {
 }
 
 #[test]
-fn a_panicking_reader_thread_fails_the_read_and_every_later_submit_on_that_worker() {
-    // One worker, so every submit lands on it. The first run panics; the worker ends.
+fn a_panicking_reader_thread_fails_that_read_and_the_pool_keeps_serving() {
+    // One worker, so every submit lands on it. The first run panics; the worker survives it.
     let tripped = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&tripped);
     let reader = RowReader::with_reader(
@@ -422,36 +422,55 @@ fn a_panicking_reader_thread_fails_the_read_and_every_later_submit_on_that_worke
             if rows.contains(&13) && !flag.swap(true, Ordering::SeqCst) {
                 panic!("test: the reader panics on row 13");
             }
-            Ok(vec![0.0; rows.len() * ROW_DIM])
+            Ok(rows
+                .iter()
+                .flat_map(|&row| std::iter::repeat_n(row as f32, ROW_DIM))
+                .collect())
         }),
         1,
     )
     .unwrap();
     match reader.read(&[12, 13]) {
-        Err(EngError::Checkpoint(message)) => assert!(message.contains("ended"), "{message}"),
+        Err(EngError::Checkpoint(message)) => {
+            assert!(message.contains("panicked"), "{message}");
+            assert!(message.contains("row 13"), "{message}");
+        }
         other => panic!("{other:?}"),
     }
-    // The worker leaves its loop when the panic unwinds; its queue closes a moment after the
-    // reply channel does, so poll for the failure instead of assuming the order.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match reader.submit(&[1]) {
-            Err(EngError::Checkpoint(message)) => {
-                assert!(message.contains("has ended"), "{message}");
-                break;
-            }
-            Ok(pending) => {
-                // Queued before the worker's receiver closed: the read cannot be served.
-                assert!(matches!(pending.wait(), Err(EngError::Checkpoint(_))));
-            }
-            Err(other) => panic!("{other:?}"),
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the dead worker was never reported"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+    // Later reads, on the same worker, are served and carry the right rows.
+    for _ in 0..3 {
+        let block = reader.read(&[12, 13]).unwrap();
+        assert_eq!(block.ids(), [12, 13]);
+        assert!(block.get(13).unwrap().iter().all(|v| *v == 13.0));
     }
+}
+
+#[test]
+fn a_failing_part_fails_the_whole_read_and_the_other_parts_do_not_leak_into_the_next() {
+    // Four workers, eight rows: two rows per part. The part that holds row 5 fails; the rest
+    // succeed. The read reports the failure, and the next read on the same pool is whole.
+    let reader = RowReader::with_reader(
+        Arc::new(|rows: &[u64]| {
+            if rows.contains(&5) {
+                return Err(EngError::Checkpoint("test: row 5 is unreadable".to_owned()));
+            }
+            Ok(rows
+                .iter()
+                .flat_map(|&row| std::iter::repeat_n(row as f32, ROW_DIM))
+                .collect())
+        }),
+        4,
+    )
+    .unwrap();
+    let rows: Vec<u64> = (0..8).collect();
+    match reader.read(&rows) {
+        Err(EngError::Checkpoint(message)) => assert!(message.contains("row 5"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    let others: Vec<u64> = vec![0, 1, 2, 3, 6, 7, 8, 9];
+    let block = reader.read(&others).unwrap();
+    assert_eq!(block.ids(), others);
+    assert!(block.get(9).unwrap().iter().all(|v| *v == 9.0));
 }
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {

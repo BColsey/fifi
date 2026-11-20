@@ -34,6 +34,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::{
+    any::Any,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -161,7 +163,7 @@ impl PendingRows {
     }
 }
 
-type ReadRun = dyn Fn(&[u64]) -> Result<Vec<f32>, EngError> + Send + Sync;
+pub(in crate::family) type ReadRun = dyn Fn(&[u64]) -> Result<Vec<f32>, EngError> + Send + Sync;
 
 /// Batched reads of the n-gram table through a pool of reader threads.
 ///
@@ -169,11 +171,11 @@ type ReadRun = dyn Fn(&[u64]) -> Result<Vec<f32>, EngError> + Send + Sync;
 /// together (a decode token behind a chunk, a double-buffered chunk worker) spread over the pool
 /// instead of queuing on the same first workers.
 ///
-/// A panic in a worker ends that worker. Reads that had a part on it fail with a `Checkpoint`
-/// error from [`PendingRows::wait`], and any later [`Self::submit`] that puts a part on it fails
-/// with a `Checkpoint` error: the pool does not respawn, so the reader is unusable and must be
-/// rebuilt. Dropping the reader closes the queues; the workers finish the jobs already queued and
-/// exit, so a [`PendingRows`] still waits to a complete block after the reader is dropped.
+/// A read that fails or panics in a worker fails the request that submitted it: the error comes
+/// back from [`PendingRows::wait`] (a panic as a `Checkpoint` error naming the panic) and the
+/// worker goes on to the next job, so later reads on the same reader are served. Dropping the
+/// reader closes the queues; the workers finish the jobs already queued and exit, so a
+/// [`PendingRows`] still waits to a complete block after the reader is dropped.
 pub(in crate::family) struct RowReader {
     workers: Vec<mpsc::Sender<Job>>,
     next: AtomicUsize,
@@ -193,7 +195,10 @@ impl RowReader {
         )
     }
 
-    fn with_reader(read: Arc<ReadRun>, threads: usize) -> Result<Self, EngError> {
+    pub(in crate::family) fn with_reader(
+        read: Arc<ReadRun>,
+        threads: usize,
+    ) -> Result<Self, EngError> {
         let threads = threads.clamp(1, MAX_THREADS);
         let mut workers = Vec::with_capacity(threads);
         for index in 0..threads {
@@ -203,7 +208,15 @@ impl RowReader {
                 .name(format!("flash-ngram-read-{index}"))
                 .spawn(move || {
                     for job in jobs {
-                        let result = read(&job.rows);
+                        // A panic in the read fails this job only: the worker keeps serving, so a
+                        // later read does not find a dead pool.
+                        let result = catch_unwind(AssertUnwindSafe(|| read(&job.rows)))
+                            .unwrap_or_else(|payload| {
+                                Err(EngError::Checkpoint(format!(
+                                    "an n-gram reader thread panicked reading rows: {}",
+                                    panic_text(payload.as_ref())
+                                )))
+                            });
                         // The caller dropped its PendingRows: nobody wants the rows.
                         let _ = job.reply.send((job.part, result));
                     }
@@ -255,6 +268,15 @@ impl RowReader {
     pub(in crate::family) fn read(&self, rows: &[u64]) -> Result<RowBlock, EngError> {
         self.submit(rows)?.wait()
     }
+}
+
+/// The message of a caught panic, when it carried text.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// Reads and decodes a run of ascending rows on the calling thread.
