@@ -49,11 +49,19 @@ impl TryFrom<RawMaxSeqs> for MaxSeqs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Gemma4Options {
     /// The sessions served at once; absent means one.
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        allow(dead_code, reason = "only the CUDA starter reads the count")
+    )]
     pub(crate) max_seqs: Option<MaxSeqs>,
 }
 
 impl Gemma4Options {
     /// The count the engine starts with.
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        allow(dead_code, reason = "only the CUDA starter reads the count")
+    )]
     pub(crate) fn seqs(&self) -> MaxSeqs {
         self.max_seqs.unwrap_or_default()
     }

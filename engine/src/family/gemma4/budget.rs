@@ -51,9 +51,17 @@ pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
 
 /// Bytes one extra session holds beside its cache planes: the raw and the capped logits row its
 /// slot adds to the window buffers, and its two position words.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter plans sessions")
+)]
 pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 * 4 + 8;
 
 /// What one more session costs the sequence planner.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter plans sessions")
+)]
 pub(crate) fn bolt_seq_cost() -> Option<SeqCost> {
     Some(SeqCost {
         fixed: BOLT_SEQ_FIXED_BYTES,
@@ -81,6 +89,14 @@ mod tests {
         // Twenty sliding layers at 1088 bytes plus four full layers at 2176.
         assert_eq!(20 * 1088 + 4 * 2176, 30_464);
         assert_eq!(bolt_kv_bytes_per_position(), Some(30_464));
+    }
+
+    #[test]
+    fn an_extra_session_costs_its_planes_and_its_window_rows() {
+        let cost = bolt_seq_cost().expect("cost");
+        assert_eq!(cost.per_position, 30_464);
+        // Raw and capped logits rows of 262,144 floats, and two position words.
+        assert_eq!(cost.fixed, 2 * 262_144 * 4 + 8);
     }
 
     #[test]
