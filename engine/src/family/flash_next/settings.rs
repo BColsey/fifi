@@ -22,8 +22,9 @@ pub(crate) const MAX_PREFILL_CHUNK: u32 = 2048;
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FlashOptions {
-    /// The artifact manifest (`download-manifest.json`) that pins the tokenizer files.
-    /// Fallback: `FLASH_NEXT_ARTIFACT_MANIFEST`.
+    /// The artifact manifest (`download-manifest.json`) that names the tokenizer files.
+    /// Fallbacks: `FLASH_NEXT_ARTIFACT_MANIFEST`, then `download-manifest.json` in the model
+    /// directory (or the tokenizer directory).
     pub(crate) manifest: Option<PathBuf>,
     /// The MLX allocator cache limit in bytes. Fallback: `FLASH_NEXT_CACHE_LIMIT`. There is no
     /// default.
@@ -143,6 +144,9 @@ pub(crate) struct FlashSettings {
     /// `generation_config.json`.
     pub(crate) tokenizer_dir: PathBuf,
     pub(crate) manifest: PathBuf,
+    /// True when neither the config nor the environment named the manifest and it was found
+    /// as `download-manifest.json` in the model or tokenizer directory.
+    pub(crate) manifest_found_in_pack: bool,
     /// The MLX allocator cache limit in bytes (0 with the CUDA decoder, which ignores it).
     pub(crate) cache_limit: u64,
     pub(crate) prefill_budget: Option<u64>,
@@ -178,20 +182,47 @@ fn bounded(key: &str, value: u32, low: u32, high: u32) -> Result<u32, EngError> 
     }
 }
 
-fn manifest_path(options: &FlashOptions, env: &FlashEnv) -> Result<PathBuf, EngError> {
+/// The file name a pack ships its manifest under.
+const PACK_MANIFEST: &str = "download-manifest.json";
+
+/// The manifest path: the config key, then `FLASH_NEXT_ARTIFACT_MANIFEST`, then
+/// `download-manifest.json` in the model directory or the tokenizer directory. The flag says the
+/// pack's own file was used.
+fn manifest_path(
+    options: &FlashOptions,
+    env: &FlashEnv,
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+) -> Result<(PathBuf, bool), EngError> {
     if let Some(path) = &options.manifest {
         if path.as_os_str().is_empty() {
             return Err(bad("manifest must not be empty".into()));
         }
-        return Ok(path.clone());
+        return Ok((path.clone(), false));
     }
-    env.manifest
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            bad("manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set".into())
-        })
+    if let Some(value) = env.manifest.as_deref().filter(|value| !value.is_empty()) {
+        return Ok((PathBuf::from(value), false));
+    }
+    let mut looked = Vec::new();
+    for dir in [model_dir, tokenizer_dir] {
+        let path = dir.join(PACK_MANIFEST);
+        if looked.contains(&path) {
+            continue;
+        }
+        if path.is_file() {
+            return Ok((path, true));
+        }
+        looked.push(path);
+    }
+    let names = looked
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" or ");
+    Err(bad(format!(
+        "manifest is missing: set the manifest key or FLASH_NEXT_ARTIFACT_MANIFEST, or put \
+         {PACK_MANIFEST} in the model directory (looked for {names})"
+    )))
 }
 
 /// The ring budget from its environment variable's value, shared by the
@@ -348,6 +379,8 @@ impl FlashSettings {
         let default = FlashOptions::default();
         let options = options.unwrap_or(&default);
         let cuda = cuda_settings(options)?;
+        let (manifest, manifest_found_in_pack) =
+            manifest_path(options, env, model_dir, tokenizer_dir)?;
         if let Some(budget) = options.prefill_budget_bytes {
             if cuda.is_some() {
                 return Err(bad(
@@ -362,7 +395,8 @@ impl FlashSettings {
         Ok(Self {
             artifact: model_dir.to_path_buf(),
             tokenizer_dir: tokenizer_dir.to_path_buf(),
-            manifest: manifest_path(options, env)?,
+            manifest,
+            manifest_found_in_pack,
             // An MLX allocator key: the CUDA decoder has no use for it.
             cache_limit: if cuda.is_some() {
                 0
@@ -543,6 +577,7 @@ mod tests {
                 artifact: PathBuf::from("/art"),
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/art/download-manifest.json"),
+                manifest_found_in_pack: false,
                 cache_limit: 1_073_741_824,
                 prefill_budget: None,
                 tokenizer_vocab_size: 1000,
@@ -566,6 +601,7 @@ mod tests {
                 artifact: PathBuf::from("/art"),
                 tokenizer_dir: PathBuf::from("/tok"),
                 manifest: PathBuf::from("/env-art/download-manifest.json"),
+                manifest_found_in_pack: false,
                 cache_limit: 2048,
                 prefill_budget: None,
                 tokenizer_vocab_size: 248_077,
@@ -574,6 +610,52 @@ mod tests {
                 cuda: None,
             }
         );
+    }
+
+    #[test]
+    fn a_manifest_in_the_pack_directory_is_used_when_nothing_names_one() {
+        let pack = tempfile::tempdir().expect("tempdir");
+        let tokens = tempfile::tempdir().expect("tempdir");
+        let options = FlashOptions {
+            manifest: None,
+            ..full()
+        };
+        let build = |env: &FlashEnv| {
+            FlashSettings::new(pack.path(), tokens.path(), Some(&options), env)
+        };
+        // Not shipped anywhere: the refusal names both files it looked for.
+        let text = message(build(&FlashEnv::default()));
+        assert!(text.starts_with("engine config: manifest is missing"), "{text}");
+        assert!(
+            text.contains(&pack.path().join("download-manifest.json").display().to_string())
+                && text.contains(&tokens.path().join("download-manifest.json").display().to_string()),
+            "{text}"
+        );
+        // Shipped with the tokenizer files only.
+        std::fs::write(tokens.path().join("download-manifest.json"), b"{}").expect("write");
+        let got = build(&FlashEnv::default()).unwrap();
+        assert_eq!(got.manifest, tokens.path().join("download-manifest.json"));
+        assert!(got.manifest_found_in_pack);
+        // Shipped with the model: the model directory wins.
+        std::fs::write(pack.path().join("download-manifest.json"), b"{}").expect("write");
+        let got = build(&FlashEnv::default()).unwrap();
+        assert_eq!(got.manifest, pack.path().join("download-manifest.json"));
+        assert!(got.manifest_found_in_pack);
+        // The environment variable and the config key both win over the pack's file.
+        let env = FlashEnv {
+            manifest: Some("/env/m.json".into()),
+            cache_limit: Some("1".into()),
+        };
+        let got = build(&env).unwrap();
+        assert_eq!(got.manifest, PathBuf::from("/env/m.json"));
+        assert!(!got.manifest_found_in_pack);
+        let named = FlashOptions {
+            manifest: Some(PathBuf::from("/cfg/m.json")),
+            ..options.clone()
+        };
+        let got = FlashSettings::new(pack.path(), tokens.path(), Some(&named), &env).unwrap();
+        assert_eq!(got.manifest, PathBuf::from("/cfg/m.json"));
+        assert!(!got.manifest_found_in_pack);
     }
 
     #[test]
@@ -623,7 +705,9 @@ mod tests {
         };
         assert_eq!(
             message(settings(Some(&no_manifest), &env)),
-            "engine config: manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set"
+            "engine config: manifest is missing: set the manifest key or \
+             FLASH_NEXT_ARTIFACT_MANIFEST, or put download-manifest.json in the model directory \
+             (looked for /art/download-manifest.json or /tok/download-manifest.json)"
         );
         let no_limit = FlashOptions {
             cache_limit_bytes: None,

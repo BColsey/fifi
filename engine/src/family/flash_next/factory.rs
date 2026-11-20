@@ -59,6 +59,12 @@ fn start_engine_with(
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
+    if settings.manifest_found_in_pack {
+        eprintln!(
+            "flash-next: using the pack's own manifest {}",
+            settings.manifest.display()
+        );
+    }
     let (engine, bundle) = launch(&settings, prefix_reuse, ready_note)?;
     // The CUDA decoder serves the positions its caches hold; the MLX one a fixed limit.
     let context_limit = settings
@@ -151,7 +157,9 @@ mod tests {
     fn an_entry_with_a_missing_setting_is_refused_before_the_backend() {
         assert_eq!(
             message(start(None, &FlashEnv::default())),
-            "engine config: manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set"
+            "engine config: manifest is missing: set the manifest key or \
+             FLASH_NEXT_ARTIFACT_MANIFEST, or put download-manifest.json in the model directory \
+             (looked for /a/download-manifest.json)"
         );
     }
 

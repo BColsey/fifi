@@ -48,7 +48,7 @@ Small card: with a holder leaving 5,836 MiB of device memory free, the default s
 
 ## Qwen3.8 Flash-Next, EXL3 3.05 bpw, on the same RTX 3090
 
-With nothing set the start refuses: "engine config: manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set". Every row below, both arms, sets `FLASH_NEXT_ARTIFACT_MANIFEST` to the pack's own `download-manifest.json`.
+Until the manifest default landed, a start with nothing set refused: "engine config: manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set". The start now uses the pack's own `download-manifest.json` when neither the config nor the variable names one. Every row below, both arms, was measured with `FLASH_NEXT_ARTIFACT_MANIFEST` set to that file.
 
 Default arm (context limit 4,096, the EXL3 default; server request log; greedy, 256 generated):
 
