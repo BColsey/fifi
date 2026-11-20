@@ -181,7 +181,7 @@ fn the_head_matvec_columns_equal_a_lone_column_up_to_the_head_width() {
         let mut weights: Vec<u8> = (0..rows.min(4096) * row_bytes)
             .map(|_| rng.byte())
             .collect();
-        for block in weights.chunks_exact_mut(34) {
+        for block in weights.as_chunks_mut::<34>().0 {
             block[0..2].copy_from_slice(&0x2c00u16.to_le_bytes());
         }
         while weights.len() < total {
@@ -288,6 +288,10 @@ fn random_planes(ctx: &CudaContext, head: usize, seed: u64) -> (Planes, Vec<Vec<
 /// match byte for byte.
 #[test]
 #[ignore = "requires a device; use --test-threads=1"]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the slot indexes several parallel per-slot collections"
+)]
 fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
     let (ctx, stream) = context();
     let positions = [0usize, 1, 37, 511, 512, 513, 4000, 30_000];

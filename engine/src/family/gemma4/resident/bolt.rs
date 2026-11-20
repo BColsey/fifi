@@ -256,6 +256,9 @@ impl Rows<'_> {
 /// head in launches of at most this many columns and every row sees the order a lone row sees.
 pub(crate) const HEAD_COLUMNS: usize = 4;
 
+/// The bytes of one zero write when a sequence clears its planes.
+const ZERO_CHUNK: usize = 8 << 20;
+
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// The per-step buffers, sized once at load.
@@ -649,15 +652,28 @@ impl Bolt {
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
         let ctx = &self.ctx;
+        // One zero chunk, written down every plane: a host vector the size of a plane would
+        // fault in its pages for every plane of every session.
+        let chunk = vec![0u8; ZERO_CHUNK];
+        let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
+            let buffer = ctx.allocate(bytes)?;
+            let mut at = 0;
+            while at < bytes {
+                let len = ZERO_CHUNK.min(bytes - at);
+                ctx.upload_at(&buffer, at, &chunk[..len])?;
+                at += len;
+            }
+            Ok(buffer)
+        };
         let mut kv = Vec::with_capacity(LAYERS);
         for layer in &self.layers {
             let head = layer.head;
             kv.push(if layer.physical() {
                 Some(Kv {
-                    k_codes: zero(ctx, KV_HEADS * CELLS * head)?,
-                    k_scales: zero(ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
-                    v_codes: zero(ctx, KV_HEADS * CELLS * head)?,
-                    v_scales: zero(ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
+                    k_codes: plane(KV_HEADS * CELLS * head)?,
+                    k_scales: plane(KV_HEADS * CELLS * (head / 32) * 2)?,
+                    v_codes: plane(KV_HEADS * CELLS * head)?,
+                    v_scales: plane(KV_HEADS * CELLS * (head / 32) * 2)?,
                     shape: Kv8Shape {
                         rows: 1,
                         n_kv_head: KV_HEADS,
@@ -747,7 +763,9 @@ impl Bolt {
         let mut bytes = vec![0u8; m * VOCAB * 4];
         window.capped.buf.read_at(&self.stream, 0, &mut bytes)?;
         Ok(bytes
-            .chunks_exact(VOCAB * 4)
+            .as_chunks::<{ VOCAB * 4 }>()
+            .0
+            .iter()
             .map(|row| {
                 row.as_chunks::<4>()
                     .0
