@@ -14,7 +14,7 @@ use crate::family::graph_state::book::Health;
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
-use super::super::state_layout::{DeltaPool, KvPool, Plane, StateLayout, Word};
+use super::super::state_layout::{DeltaPool, KvPool, Plane, StateLayout};
 use super::ResidentState;
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
