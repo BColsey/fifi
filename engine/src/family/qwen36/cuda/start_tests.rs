@@ -599,3 +599,50 @@ fn start_refuses_capture_with_tiered() {
         other => panic!("tiered with capture must be refused at the start: {other:?}"),
     }
 }
+
+/// HOST probe of the even-table 256k admission figures (no device, no context): the
+/// per-card manifest bytes of the two even tables the pair path builds and the sliced
+/// 262144-position state, so a refusal line can be attributed pre- or post-host-relief.
+/// Skips unless the machine-local pinned model dir exists.
+#[test]
+fn even_table_admission_probe() {
+    let artifact = Path::new("/home/ben/fifi-scratch/a81ebdf26a2a/qwen36-local/model");
+    if !artifact.is_dir() {
+        println!("SKIPPED even_table_admission_probe: no pinned model dir");
+        return;
+    }
+    let gguf = pinned_gguf(artifact);
+    let model = crate::family::gguf_model::open_qwen3_6_35b_a3b(&gguf, None).expect("open gguf");
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, super::pinned::ROTARY_DIM).expect("shape");
+    let dims = StepDims::new(&shape, &inventory).expect("dims");
+    let layers = super::layer_table::LayerTable::new(&dims, &inventory).expect("layers");
+    let gate = layers
+        .name(0, crate::family::gguf_model::Role::FfnGateExps)
+        .expect("gate");
+    let quant = model
+        .weights
+        .header()
+        .tensor(gate)
+        .expect("gate tensor")
+        .ggml_type();
+    for (name, k_align) in [("even256", 256usize), ("even32", 32usize)] {
+        let table = super::shard::ShardTable::new(&shape, 2, k_align).expect("table");
+        let loads = super::card_load::card_loads(&table, &inventory, quant).expect("loads");
+        for (card, set) in loads.iter().enumerate() {
+            println!("PROBE {name} card {card} manifest {}", set.upload_bytes());
+        }
+    }
+    let options = step_options(262144, WeightLayout::Native, KvMode::Int8G32).expect("options");
+    for heads in [dims.shape.attn.heads_kv, dims.shape.attn.heads_kv / 2] {
+        let layout = super::state_layout::StateLayout::new_with_kv_heads(&dims, &options, heads)
+            .expect("layout");
+        println!(
+            "PROBE state heads {heads} bytes {} (kv {}, delta {}, words {})",
+            layout.bytes().expect("bytes"),
+            layout.kv.total,
+            layout.delta.total,
+            layout.words.total
+        );
+    }
+}
