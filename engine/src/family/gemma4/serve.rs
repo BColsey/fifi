@@ -10,7 +10,7 @@
 //! the pending token's decode runs the head.
 
 #[cfg(any(feature = "native-cuda", test))]
-use std::{fs, path::Path, path::PathBuf};
+use std::{fs, path::Path};
 
 #[cfg(any(feature = "native-cuda", test))]
 use {super::config, crate::EngError};
@@ -25,40 +25,15 @@ pub(crate) fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
     config::check_bolt_config(&json)
 }
 
-/// The converted weights file: exactly one `.gguf` beside the config.
-#[cfg(any(feature = "native-cuda", test))]
-fn find_gguf(dir: &Path) -> Result<PathBuf, EngError> {
-    let mut found = Vec::new();
-    for entry in fs::read_dir(dir)
-        .map_err(|error| EngError::Checkpoint(format!("model directory: {error}")))?
-    {
-        let path = entry
-            .map_err(|error| EngError::Checkpoint(format!("model directory: {error}")))?
-            .path();
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-        {
-            found.push(path);
-        }
-    }
-    match found.len() {
-        1 => Ok(found.pop().expect("length checked")),
-        0 => Err(bad("no .gguf weights file in the model directory")),
-        n => Err(bad(&format!(
-            "{n} .gguf files in the model directory; exactly one expected"
-        ))),
-    }
-}
-
-#[cfg(any(feature = "native-cuda", test))]
+#[cfg(feature = "native-cuda")]
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(format!("gemma4 serve: {message}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bolt_configured, find_gguf};
+    use super::bolt_configured;
+    use crate::family::gguf_select::candidates;
 
     const BOLT_CONFIG: &[u8] = include_bytes!("../../../testdata/gemma4/bolt-config.json");
 
@@ -70,13 +45,28 @@ mod tests {
     }
 
     #[test]
-    fn find_gguf_requires_exactly_one_file() {
+    fn a_model_path_with_no_gguf_refuses_and_several_are_ranked() {
         let dir = scratch("none");
-        assert!(find_gguf(&dir).is_err());
+        assert!(candidates(&dir).is_err());
         std::fs::write(dir.join("bolt.gguf"), b"xx").expect("write");
-        assert!(find_gguf(&dir).is_ok());
-        std::fs::write(dir.join("other.gguf"), b"xx").expect("write");
-        assert!(find_gguf(&dir).is_err());
+        assert_eq!(candidates(&dir).expect("one").1.len(), 1);
+        std::fs::write(dir.join("other.gguf"), b"xxxx").expect("write");
+        let (_, files) = candidates(&dir).expect("two");
+        assert_eq!(files[0].path, dir.join("other.gguf"));
+        assert_eq!(files[1].path, dir.join("bolt.gguf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_config_gate_reads_the_directory_of_a_gguf_file_path() {
+        let dir = scratch("file-path");
+        std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
+        std::fs::write(dir.join("bolt-q4.gguf"), b"weights").expect("write weights");
+        std::fs::write(dir.join("bolt-q8.gguf"), b"weights-bigger").expect("write weights");
+        let (found, files) = candidates(&dir.join("bolt-q4.gguf")).expect("file path");
+        assert_eq!(found, dir);
+        assert_eq!(files.len(), 1);
+        bolt_configured(&found).expect("the Bolt config gate passes beside the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -92,14 +82,14 @@ mod tests {
     #[test]
     fn a_bolt_directory_passes_the_config_gate_and_finds_its_gguf() {
         // Checks the two helpers start_gemma4 dispatches on: bolt_configured
-        // accepts the pinned Bolt config, and find_gguf returns the single weights
+        // accepts the pinned Bolt config, and the candidates are the single weights
         // file. The server's engine start itself needs a device and is not run here.
         let dir = scratch("dispatch");
         std::fs::write(dir.join("config.json"), BOLT_CONFIG).expect("write config");
         std::fs::write(dir.join("bolt-e4b-q8_0.gguf"), b"weights").expect("write weights");
         bolt_configured(&dir).expect("the Bolt config gate passes");
-        let weights = find_gguf(&dir).expect("find_gguf returns the weights file");
-        assert_eq!(weights, dir.join("bolt-e4b-q8_0.gguf"));
+        let (_, files) = candidates(&dir).expect("the weights file is found");
+        assert_eq!(files[0].path, dir.join("bolt-e4b-q8_0.gguf"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -318,11 +308,14 @@ mod device {
         }
     }
 
+    /// `model_path` is the model directory or one `.gguf` file in it. A directory with several
+    /// `.gguf` files serves the highest-precision one that the device memory admits.
     pub(crate) fn start_bolt_engine(
-        model_dir: &Path,
+        model_path: &Path,
         tokenizer_dir: &Path,
         ready_note: ReadyNote,
     ) -> Result<StartedEngine, EngError> {
+        let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
         let eos = bundle.eos_token_ids().to_vec();
         if eos.is_empty() || eos.iter().any(|&id| id as usize >= VOCAB) {
@@ -335,11 +328,9 @@ mod device {
                 "the tokenizer vocabulary differs from the checkpoint vocabulary",
             ));
         }
-        let model = model_dir.to_path_buf();
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
-            let weights = super::find_gguf(&model)?;
             let serve = BoltServe {
-                model: bolt::load(&weights, None)?,
+                model: bolt::load_choosing(&files, None)?,
                 eos: eos.clone(),
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),

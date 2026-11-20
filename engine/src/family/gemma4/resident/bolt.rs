@@ -304,7 +304,24 @@ pub(crate) fn bolt_demand(
 }
 
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
-    let (weights, spelling) = super::super::open_bolt_weights(path, header_sha256)?;
+    let bytes = std::fs::metadata(path)
+        .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
+        .len();
+    load_choosing(
+        &[crate::family::gguf_select::GgufFile {
+            path: path.to_path_buf(),
+            bytes,
+        }],
+        header_sha256,
+    )
+}
+
+/// Loads the first of `files` (highest precision first) whose device demand the free memory
+/// admits, and prints which file it chose and why when there was a choice.
+pub(crate) fn load_choosing(
+    files: &[crate::family::gguf_select::GgufFile],
+    header_sha256: Option<&str>,
+) -> Result<Bolt, EngError> {
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
     let stream = ctx.stream()?;
     // Admit the device budget before allocating: weights + KV cache + scratch
@@ -312,10 +329,19 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     // the other resident executors use. An exact fit of the allocations alone
     // is refused; the shared error names the needed and free bytes.
     let free = ctx.memory_info()?.free as u64;
-    let weights_bytes = std::fs::metadata(path)
-        .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
-        .len();
-    let demand = bolt_demand(weights_bytes, attn_split_wanted()?)?;
+    let split = attn_split_wanted()?;
+    let choice = crate::family::gguf_select::choose(files, &|file| {
+        bolt_demand(file.bytes, split)
+            .and_then(|demand| crate::kernels::cuda::plan::admit(&demand, free))
+            .map(|_| ())
+            .map_err(|error| error.describe())
+    })?;
+    if let Some(line) = &choice.line {
+        eprintln!("{line}");
+    }
+    let path = choice.chosen.path.as_path();
+    let (weights, spelling) = super::super::open_bolt_weights(path, header_sha256)?;
+    let demand = bolt_demand(choice.chosen.bytes, split)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     let mut layers = Vec::with_capacity(LAYERS);
     // The canonical spelling's merged per_layer_token_embd is read once and

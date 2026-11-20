@@ -40,6 +40,7 @@ pub(crate) mod expert_bank;
 pub mod flint;
 pub mod gemma4;
 pub mod gguf_model;
+pub(crate) mod gguf_select;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.

@@ -293,7 +293,9 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
                 describe(&error)
             ))
         })?;
-        let loaded = SamplingDefaults::from_model_dir(&config.model_dir).map_err(|error| {
+        // A model path may name one `.gguf` file; its side files sit beside it.
+        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
+        let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
             StartupError(format!(
                 "engine {} failed to start: {}",
                 config.id,
@@ -347,7 +349,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
         // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
         // the template already wins over anything set here.
         apply_replay_overrides(&config.id, &mut bundle, config)?;
-        let generation = config.model_dir.join("generation_config.json");
+        let generation = model_directory.join("generation_config.json");
         // The label comes from the loader result, not from a second `exists` call, so the file
         // cannot change between the read and the log line.
         eprintln!(
@@ -552,7 +554,8 @@ fn start_gemma4(
 ) -> Result<StartedEngine, EngError> {
     #[cfg(feature = "native-cuda")]
     {
-        match gemma4::serve::bolt_configured(&config.model_dir) {
+        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
+        match gemma4::serve::bolt_configured(&model_directory) {
             Ok(()) => {
                 let started = gemma4::serve::start_bolt_engine(
                     &config.model_dir,
@@ -569,7 +572,7 @@ fn start_gemma4(
             Err(cause) => Err(EngError::BadRequest(format!(
                 "gemma4 serves only the Nemotron Bolt E4B on the native-cuda build; \
                      the model directory {} failed the Bolt configuration check: {}",
-                config.model_dir.display(),
+                model_directory.display(),
                 cause.describe()
             ))),
         }

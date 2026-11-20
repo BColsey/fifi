@@ -755,7 +755,9 @@ mod tests {
             cache_limit_bytes: Some(1 << 30),
             ..FlashOptions::default()
         };
-        assert!(message(build(Some(&mlx_key), true)).contains("cannot be combined with cuda_decode"));
+        assert!(
+            message(build(Some(&mlx_key), true)).contains("cannot be combined with cuda_decode")
+        );
     }
 
     /// A plan whose slots fall by one per 2,048 positions from `top`.
@@ -812,7 +814,9 @@ mod tests {
         assert_eq!(max_positions(br#"{"text_config":{}}"#), None);
         assert_eq!(max_positions(b"not json"), None);
         assert_eq!(
-            max_positions(include_bytes!("../../../tests/fixtures/qwen3_8_flash_next_config.json")),
+            max_positions(include_bytes!(
+                "../../../tests/fixtures/qwen3_8_flash_next_config.json"
+            )),
             Some(262_144)
         );
     }
@@ -850,15 +854,28 @@ mod tests {
             manifest: None,
             ..full()
         };
-        let build = |env: &FlashEnv| {
-            FlashSettings::new(pack.path(), tokens.path(), Some(&options), env)
-        };
+        let build =
+            |env: &FlashEnv| FlashSettings::new(pack.path(), tokens.path(), Some(&options), env);
         // Not shipped anywhere: the refusal names both files it looked for.
         let text = message(build(&FlashEnv::default()));
-        assert!(text.starts_with("engine config: manifest is missing"), "{text}");
         assert!(
-            text.contains(&pack.path().join("download-manifest.json").display().to_string())
-                && text.contains(&tokens.path().join("download-manifest.json").display().to_string()),
+            text.starts_with("engine config: manifest is missing"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                &pack
+                    .path()
+                    .join("download-manifest.json")
+                    .display()
+                    .to_string()
+            ) && text.contains(
+                &tokens
+                    .path()
+                    .join("download-manifest.json")
+                    .display()
+                    .to_string()
+            ),
             "{text}"
         );
         // Shipped with the tokenizer files only.

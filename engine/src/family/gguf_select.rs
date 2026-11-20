@@ -1,0 +1,258 @@
+//! Choosing the weights file of a model path that is a `.gguf` file or a directory holding
+//! several of them.
+//!
+//! A model path names either one `.gguf` file or a directory. A directory with several files
+//! (one model in several quantizations) is ranked by file size, largest first: for one model the
+//! size orders the quantizations by bits per weight. The first file that the caller's memory
+//! plan admits is served. The choice is deterministic: equal sizes order by path.
+
+#![cfg_attr(
+    all(not(test), not(feature = "native-cuda")),
+    expect(
+        dead_code,
+        reason = "the host build only reads the directory of a model path; the CUDA loaders choose"
+    )
+)]
+
+use crate::EngError;
+use std::path::{Path, PathBuf};
+
+/// One candidate weights file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GgufFile {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+}
+
+impl GgufFile {
+    fn name(&self) -> String {
+        self.path.file_name().map_or_else(
+            || self.path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn mib(&self) -> u64 {
+        self.bytes / (1 << 20)
+    }
+}
+
+fn is_gguf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
+/// The directory of a model path: the path itself, or the parent of a path to a `.gguf` file.
+pub(crate) fn directory_of(model: &Path) -> PathBuf {
+    if model.is_file() && is_gguf(model) {
+        match model.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => return parent.to_path_buf(),
+            _ => return PathBuf::from("."),
+        }
+    }
+    model.to_path_buf()
+}
+
+/// The directory that holds the model's side files (configuration, tokenizer) and the weights
+/// candidates ranked from the highest precision down. A path to one `.gguf` file gives that file
+/// alone and its parent directory; a directory gives every `.gguf` file in it.
+pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngError> {
+    let read = |error: std::io::Error, what: &Path| {
+        EngError::Checkpoint(format!("model path {}: {error}", what.display()))
+    };
+    if model.is_file() {
+        if !is_gguf(model) {
+            return Err(EngError::Checkpoint(format!(
+                "model path {} is a file without the .gguf extension; name a .gguf file or the \
+                 directory that holds it",
+                model.display()
+            )));
+        }
+        let bytes = std::fs::metadata(model)
+            .map_err(|error| read(error, model))?
+            .len();
+        let dir = match model.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        return Ok((
+            dir,
+            vec![GgufFile {
+                path: model.to_path_buf(),
+                bytes,
+            }],
+        ));
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(model).map_err(|error| read(error, model))? {
+        let path = entry.map_err(|error| read(error, model))?.path();
+        if is_gguf(&path) && path.is_file() {
+            let bytes = std::fs::metadata(&path)
+                .map_err(|error| read(error, &path))?
+                .len();
+            files.push(GgufFile { path, bytes });
+        }
+    }
+    if files.is_empty() {
+        return Err(EngError::Checkpoint(format!(
+            "no .gguf weights file in {}",
+            model.display()
+        )));
+    }
+    files.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    Ok((model.to_path_buf(), files))
+}
+
+/// The chosen file and the log line that names it and the other candidates.
+#[derive(Debug)]
+pub(crate) struct Choice {
+    pub(crate) chosen: GgufFile,
+    /// `None` when the path held one file, so there was nothing to choose.
+    pub(crate) line: Option<String>,
+}
+
+/// Picks the first of `files` (ranked, highest precision first) that `admit` accepts. `admit`
+/// returns the reason when the memory plan refuses a file. One file is returned without asking
+/// `admit`: its own load reports the refusal in full. When every file is refused the error
+/// carries each reason.
+pub(crate) fn choose(
+    files: &[GgufFile],
+    admit: &dyn Fn(&GgufFile) -> Result<(), String>,
+) -> Result<Choice, EngError> {
+    if let [only] = files {
+        return Ok(Choice {
+            chosen: only.clone(),
+            line: None,
+        });
+    }
+    let mut refused = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        match admit(file) {
+            Ok(()) => {
+                let mut others = refused.clone();
+                others.extend(
+                    files[index + 1..]
+                        .iter()
+                        .map(|other| format!("{} ({} MiB)", other.name(), other.mib())),
+                );
+                let line = format!(
+                    "gguf: serving {} ({} MiB), the highest-precision of {} files that the memory \
+                     plan admits; other files: {}",
+                    file.name(),
+                    file.mib(),
+                    files.len(),
+                    others.join(", ")
+                );
+                return Ok(Choice {
+                    chosen: file.clone(),
+                    line: Some(line),
+                });
+            }
+            Err(reason) => refused.push(format!(
+                "{} ({} MiB) refused: {reason}",
+                file.name(),
+                file.mib()
+            )),
+        }
+    }
+    Err(EngError::MemoryPlan(format!(
+        "no .gguf file of the model directory fits the memory plan: {}",
+        refused.join("; ")
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GgufFile, candidates, choose};
+    use std::path::Path;
+
+    fn write(dir: &Path, name: &str, bytes: usize) {
+        std::fs::write(dir.join(name), vec![0u8; bytes]).expect("write");
+    }
+
+    fn names(files: &[GgufFile]) -> Vec<String> {
+        files.iter().map(GgufFile::name).collect()
+    }
+
+    #[test]
+    fn a_directory_ranks_its_files_from_the_largest_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "m-q4_k_m.gguf", 50);
+        write(dir.path(), "m-q8_0.gguf", 80);
+        write(dir.path(), "m-q4_k.gguf", 50);
+        write(dir.path(), "m-q4_k_pure.gguf", 40);
+        write(dir.path(), "notes.txt", 500);
+        let (found, files) = candidates(dir.path()).expect("candidates");
+        assert_eq!(found, dir.path());
+        assert_eq!(
+            names(&files),
+            [
+                "m-q8_0.gguf",
+                "m-q4_k.gguf",
+                "m-q4_k_m.gguf",
+                "m-q4_k_pure.gguf"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_to_one_gguf_file_names_that_file_and_its_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "m-q8_0.gguf", 80);
+        write(dir.path(), "m-q4_k.gguf", 50);
+        let file = dir.path().join("m-q4_k.gguf");
+        let (found, files) = candidates(&file).expect("candidates");
+        assert_eq!(found, dir.path());
+        assert_eq!(names(&files), ["m-q4_k.gguf"]);
+        let choice = choose(&files, &|_| Err("never asked".into())).expect("one file");
+        assert_eq!(choice.chosen.path, file);
+        assert!(choice.line.is_none());
+    }
+
+    #[test]
+    fn a_directory_without_a_gguf_file_and_a_file_of_another_kind_refuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "config.json", 2);
+        let message = candidates(dir.path()).unwrap_err().describe();
+        assert!(message.contains("no .gguf weights file"), "{message}");
+        let message = candidates(&dir.path().join("config.json"))
+            .unwrap_err()
+            .describe();
+        assert!(message.contains(".gguf extension"), "{message}");
+    }
+
+    #[test]
+    fn the_highest_precision_file_that_the_plan_admits_wins_and_the_line_names_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "m-q8_0.gguf", 80);
+        write(dir.path(), "m-q4_k_m.gguf", 50);
+        write(dir.path(), "m-q4_k_pure.gguf", 40);
+        let (_, files) = candidates(dir.path()).expect("candidates");
+
+        let roomy = choose(&files, &|_| Ok(())).expect("choice");
+        assert_eq!(roomy.chosen.name(), "m-q8_0.gguf");
+        let line = roomy.line.expect("line");
+        assert!(line.contains("m-q4_k_m.gguf") && line.contains("m-q4_k_pure.gguf"));
+
+        let tight = choose(&files, &|file| {
+            if file.bytes > 60 {
+                Err("needs 80 bytes".into())
+            } else {
+                Ok(())
+            }
+        })
+        .expect("choice");
+        assert_eq!(tight.chosen.name(), "m-q4_k_m.gguf");
+        let line = tight.line.expect("line");
+        assert!(line.contains("m-q8_0.gguf") && line.contains("refused: needs 80 bytes"));
+        assert!(line.contains("m-q4_k_pure.gguf"));
+
+        let none = choose(&files, &|_| Err("full".into()))
+            .unwrap_err()
+            .describe();
+        assert!(
+            none.contains("m-q8_0.gguf") && none.contains("m-q4_k_pure.gguf"),
+            "{none}"
+        );
+    }
+}
