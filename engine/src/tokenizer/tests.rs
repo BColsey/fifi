@@ -87,15 +87,83 @@ fn missing_tokenizer_json_fails_checkpoint() {
 }
 
 #[test]
-fn template_hash_mismatch_fails_checkpoint() {
+fn a_file_that_differs_from_the_pin_warns_and_the_observed_bytes_are_served() {
+    for (name, flip) in [
+        ("tokenizer.json", 0usize),
+        ("tokenizer_config.json", 1),
+        ("chat_template.jinja", 2),
+        ("generation_config.json", 3),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pin = write_fixture(dir.path());
+        let observed = match flip {
+            0 => pin.tokenizer_json,
+            1 => pin.tokenizer_config_json,
+            2 => pin.chat_template_jinja,
+            _ => pin.generation_config_json,
+        };
+        match flip {
+            0 => pin.tokenizer_json[0] ^= 1,
+            1 => pin.tokenizer_config_json[0] ^= 1,
+            2 => pin.chat_template_jinja[0] ^= 1,
+            _ => pin.generation_config_json[0] ^= 1,
+        }
+        let bundle = TokenizerBundle::load(dir.path(), &pin).expect(name);
+        let notes = bundle.load_notes();
+        assert_eq!(notes.len(), 1, "{name}: {notes:?}");
+        let observed_hex: String = observed.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(notes[0].contains(name), "{}", notes[0]);
+        assert!(notes[0].contains(&observed_hex), "{}", notes[0]);
+        assert!(notes[0].contains("differs from the pinned"), "{}", notes[0]);
+        let served = match flip {
+            0 => bundle.identity().tokenizer_json,
+            1 => bundle.identity().tokenizer_config_json,
+            2 => bundle.identity().chat_template_jinja,
+            _ => bundle.identity().generation_config_json,
+        };
+        assert_eq!(
+            served, observed,
+            "{name}: the identity is the observed file"
+        );
+    }
+}
+
+#[test]
+fn files_that_match_the_pin_log_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pin = write_fixture(dir.path());
+    let bundle = TokenizerBundle::load(dir.path(), &pin).expect("load");
+    assert!(bundle.load_notes().is_empty(), "{:?}", bundle.load_notes());
+}
+
+#[test]
+fn a_missing_chat_template_file_uses_the_template_of_the_config() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut pin = write_fixture(dir.path());
-    pin.chat_template_jinja[0] ^= 1;
-    let message = checkpoint_message(TokenizerBundle::load(dir.path(), &pin));
-    assert!(
-        message.contains("chat_template.jinja"),
-        "message: {message}"
+    let config = serde_json::json!({
+        "tokenizer_class": "TestTokenizer",
+        "eos_token": "<|end|>",
+        "chat_template": CHAT_TEMPLATE,
+    })
+    .to_string();
+    rewrite_tokenizer_config(dir.path(), &mut pin, &config);
+    fs::remove_file(dir.path().join("chat_template.jinja")).expect("remove");
+    let bundle = TokenizerBundle::load(dir.path(), &pin).expect("load");
+    assert_eq!(bundle.load_notes().len(), 1, "{:?}", bundle.load_notes());
+    assert!(bundle.load_notes()[0].contains("chat_template.jinja is missing"));
+    assert_eq!(
+        bundle.identity().chat_template_jinja,
+        digest(CHAT_TEMPLATE.as_bytes())
     );
+}
+
+#[test]
+fn a_missing_chat_template_without_a_config_template_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pin = write_fixture(dir.path());
+    fs::remove_file(dir.path().join("chat_template.jinja")).expect("remove");
+    let message = checkpoint_message(TokenizerBundle::load(dir.path(), &pin));
+    assert!(message.contains("chat_template.jinja"), "{message}");
 }
 
 #[test]
@@ -121,12 +189,14 @@ fn load_reports_fixture_vocab_and_eos() {
 }
 
 #[test]
-fn vocab_mismatch_fails_checkpoint() {
+fn a_vocab_size_that_differs_from_the_pin_warns_and_the_observed_size_is_served() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut pin = write_fixture(dir.path());
     pin.vocab_size = VOCAB_SIZE - 1;
-    let message = checkpoint_message(TokenizerBundle::load(dir.path(), &pin));
-    assert!(message.contains("vocab"), "message: {message}");
+    let bundle = TokenizerBundle::load(dir.path(), &pin).expect("load");
+    assert_eq!(bundle.vocab_size(), VOCAB_SIZE);
+    assert_eq!(bundle.load_notes().len(), 1, "{:?}", bundle.load_notes());
+    assert!(bundle.load_notes()[0].contains("vocab size"));
 }
 
 #[test]
@@ -2500,17 +2570,20 @@ fn eos_ids_outside_the_vocab_or_of_the_wrong_type_fail_checkpoint() {
 }
 
 #[test]
-fn generation_config_is_pinned_like_the_other_files() {
+fn generation_config_differing_from_the_pin_warns_and_a_missing_one_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut pin = write_fixture(dir.path());
     pin.generation_config_json[0] ^= 1;
-    let message = checkpoint_message(TokenizerBundle::load(dir.path(), &pin));
-    assert!(message.contains("generation_config.json"), "{message}");
+    let bundle = TokenizerBundle::load(dir.path(), &pin).expect("load");
+    assert!(bundle.load_notes()[0].contains("generation_config.json"));
+    assert_eq!(bundle.eos_token_ids(), &[EOS_ID, SECOND_EOS_ID]);
     let dir = tempfile::tempdir().expect("tempdir");
     let pin = write_fixture(dir.path());
     fs::remove_file(dir.path().join("generation_config.json")).expect("remove");
-    let message = checkpoint_message(TokenizerBundle::load(dir.path(), &pin));
-    assert!(message.contains("generation_config.json"), "{message}");
+    let bundle = TokenizerBundle::load(dir.path(), &pin).expect("load");
+    assert!(bundle.load_notes()[0].contains("generation_config.json is missing"));
+    assert_eq!(bundle.eos_token_ids(), &[EOS_ID]);
+    assert_eq!(bundle.identity().generation_config_json, digest(b""));
 }
 
 #[test]

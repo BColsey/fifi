@@ -1773,8 +1773,9 @@ fn digest(text: &str) -> Result<[u8; 32], EngError> {
     Ok(out)
 }
 
-/// The pin of the tokenizer files of the pinned checkpoint. `TokenizerBundle::load` rejects any
-/// other `tokenizer.json`, `tokenizer_config.json`, template, or `generation_config.json`.
+/// The pin of the tokenizer files of the pinned checkpoint. `TokenizerBundle::load` logs a warning
+/// for any other `tokenizer.json`, `tokenizer_config.json`, template, or `generation_config.json`
+/// and serves the files it finds.
 pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
     Ok(TokenizerPin {
         tokenizer_json: digest(TOKENIZER_JSON_SHA256)?,

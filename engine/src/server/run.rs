@@ -1211,6 +1211,7 @@ mod tests {
     fn the_dense_family_dispatches_to_the_selected_factory_before_any_load() {
         let mut config = engine_config("dense", None);
         config.family = "qwen3_8_27b_dense".into();
+        config.tokenizer_dir = std::env::temp_dir().join("fake-tokenizer-dir");
         config.context_limit = None;
         config.qwen36 = Some(Q36Options {
             cache_limit_bytes: Some(1024),
@@ -1225,10 +1226,10 @@ mod tests {
             assert!(text.contains("qwen3_8_27b_dense requires the native-mlx backend"));
         } else if cfg!(feature = "native-mlx") {
             // A native-mlx build carries the dense factory, so the dispatch witness is
-            // the factory's own first refusal: the tokenizer pin check fires before any
+            // the factory's own first refusal: the tokenizer load fires before any
             // model file access, which is the point here.
             assert!(
-                text.contains("tokenizer.json hash does not match the pinned revision"),
+                text.contains("tokenizer.json is missing from the checkpoint directory"),
                 "{text}"
             );
         } else {

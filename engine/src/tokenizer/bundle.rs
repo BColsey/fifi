@@ -42,6 +42,7 @@ pub struct TokenizerBundle {
     eos_token_ids: Vec<u32>,
     vocab_size: u32,
     template: ChatTemplate,
+    notes: Vec<String>,
     /// Bundle-local render/encode counter for the work comparison between
     /// the derived and three-pass boundary paths (the work tests pin
     /// derived <= reference on the deriving, ineligible-fallback,
@@ -368,32 +369,107 @@ fn empty_render() -> EngError {
 }
 
 impl TokenizerBundle {
+    /// Loads the tokenizer files of `dir`. The pin names the revision the engine was qualified on.
+    /// A file whose bytes differ from the pin, a vocabulary size that differs from the pinned
+    /// one, and a missing `chat_template.jinja` or `generation_config.json` each log one warning
+    /// line and load continues with the observed bytes, which become the bundle's identity. The
+    /// executors compare the vocabulary with the model's own head size and refuse a larger one.
+    /// `tokenizer.json` and `tokenizer_config.json` are required.
     pub fn load(dir: &Path, pin: &TokenizerPin) -> Result<Self, EngError> {
-        let tokenizer_bytes = read_pinned(dir, "tokenizer.json", pin.tokenizer_json)?;
-        let config_bytes = read_pinned(dir, "tokenizer_config.json", pin.tokenizer_config_json)?;
-        let template_bytes = read_pinned(dir, "chat_template.jinja", pin.chat_template_jinja)?;
-        let generation_bytes =
-            read_pinned(dir, "generation_config.json", pin.generation_config_json)?;
-        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)?;
-        let vocab_size = checked_vocab_size(&tokenizer, pin.vocab_size)?;
+        let mut notes = Vec::new();
+        let tokenizer_bytes = require(
+            "tokenizer.json",
+            read_observed(dir, "tokenizer.json", pin.tokenizer_json, &mut notes)?,
+        )?;
+        let config_bytes = require(
+            "tokenizer_config.json",
+            read_observed(
+                dir,
+                "tokenizer_config.json",
+                pin.tokenizer_config_json,
+                &mut notes,
+            )?,
+        )?;
         let config = parse_json(&config_bytes, "tokenizer_config.json")?;
-        let generation = parse_json(&generation_bytes, "generation_config.json")?;
+        let template_bytes = match read_observed(
+            dir,
+            "chat_template.jinja",
+            pin.chat_template_jinja,
+            &mut notes,
+        )? {
+            Some(bytes) => bytes,
+            None => {
+                let text = config
+                    .get("chat_template")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        EngError::Checkpoint(
+                            "chat_template.jinja is missing from the checkpoint directory and \
+                             tokenizer_config.json has no chat_template string"
+                                .to_string(),
+                        )
+                    })?;
+                notes.push(
+                    "tokenizer: chat_template.jinja is missing; using the chat_template string of \
+                     tokenizer_config.json"
+                        .to_string(),
+                );
+                text.as_bytes().to_vec()
+            }
+        };
+        let generation_bytes = read_observed(
+            dir,
+            "generation_config.json",
+            pin.generation_config_json,
+            &mut notes,
+        )?;
+        let generation = match &generation_bytes {
+            Some(bytes) => parse_json(bytes, "generation_config.json")?,
+            None => {
+                notes.push(
+                    "tokenizer: generation_config.json is missing; the end-of-sequence ids come \
+                     from tokenizer_config.json alone"
+                        .to_string(),
+                );
+                serde_json::Value::Object(serde_json::Map::new())
+            }
+        };
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)?;
+        let vocab_size = tokenizer.vocab_size();
+        if vocab_size != pin.vocab_size {
+            notes.push(format!(
+                "tokenizer: vocab size {vocab_size} differs from the pinned {}; serving the \
+                 observed vocabulary, which the engine checks against the model's own head size",
+                pin.vocab_size
+            ));
+        }
         let eos_token_ids = eos_lookup(&config, &generation, &tokenizer)?;
         let template = parse_template(&template_bytes)?;
+        for note in &notes {
+            eprintln!("{note}");
+        }
         Ok(Self {
             identity: TokenizerIdentity {
-                tokenizer_json: pin.tokenizer_json,
-                tokenizer_config_json: pin.tokenizer_config_json,
-                chat_template_jinja: pin.chat_template_jinja,
-                generation_config_json: pin.generation_config_json,
+                tokenizer_json: digest(&tokenizer_bytes),
+                tokenizer_config_json: digest(&config_bytes),
+                chat_template_jinja: digest(&template_bytes),
+                generation_config_json: digest(generation_bytes.as_deref().unwrap_or(&[])),
             },
             tokenizer,
             eos_token_ids,
             vocab_size,
             template,
+            notes,
             #[cfg(test)]
             counts: std::sync::Mutex::new((0, 0)),
         })
+    }
+
+    /// The warning lines `load` logged: one per file whose bytes differ from the pin or that is
+    /// missing, and one for a vocabulary size that differs from the pin. Empty when every file
+    /// matches the pin.
+    pub fn load_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Output grammar bound to the exact pinned chat template. Unknown templates retain
@@ -1200,20 +1276,42 @@ fn resend_digest(msgs: &[PromptMessage], tools_json: &str, thinking: Thinking) -
     hasher.finalize().into()
 }
 
-fn read_pinned(dir: &Path, name: &str, expected: [u8; 32]) -> Result<Vec<u8>, EngError> {
-    let bytes = fs::read(dir.join(name)).map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            EngError::Checkpoint(format!("{name} is missing from the checkpoint directory"))
-        } else {
-            EngError::Checkpoint(format!("{name} could not be read: {error}"))
+/// Reads one tokenizer file. `None` when it does not exist. A digest that differs from the pin
+/// adds a warning line to `notes` and the file is still returned.
+fn read_observed(
+    dir: &Path,
+    name: &str,
+    expected: [u8; 32],
+    notes: &mut Vec<String>,
+) -> Result<Option<Vec<u8>>, EngError> {
+    let bytes = match fs::read(dir.join(name)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(EngError::Checkpoint(format!(
+                "{name} could not be read: {error}"
+            )));
         }
-    })?;
-    if digest(&bytes) != expected {
-        return Err(EngError::Checkpoint(format!(
-            "{name} hash does not match the pinned revision"
-        )));
+    };
+    let observed = digest(&bytes);
+    if observed != expected {
+        notes.push(format!(
+            "tokenizer: {name} sha256 {} differs from the pinned {}; serving the observed file",
+            hex32(&observed),
+            hex32(&expected)
+        ));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
+}
+
+fn require(name: &str, bytes: Option<Vec<u8>>) -> Result<Vec<u8>, EngError> {
+    bytes.ok_or_else(|| {
+        EngError::Checkpoint(format!("{name} is missing from the checkpoint directory"))
+    })
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -1226,16 +1324,6 @@ fn parse_json(bytes: &[u8], name: &str) -> Result<serde_json::Value, EngError> {
     serde_json::from_slice::<UniqueValue>(bytes)
         .map(|value| value.0)
         .map_err(|error| EngError::Checkpoint(format!("{name} parse failed: {error}")))
-}
-
-fn checked_vocab_size(tokenizer: &Tokenizer, expected: u32) -> Result<u32, EngError> {
-    let vocab_size = tokenizer.vocab_size();
-    if vocab_size != expected {
-        return Err(EngError::Checkpoint(format!(
-            "tokenizer vocab size {vocab_size} does not match the pinned vocab size {expected}"
-        )));
-    }
-    Ok(vocab_size)
 }
 
 fn eos_lookup(

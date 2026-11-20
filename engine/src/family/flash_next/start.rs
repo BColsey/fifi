@@ -2,8 +2,8 @@
 //!
 //! The tokenizer bundle loads on the calling thread. It carries only portable data. The engine
 //! thread builds everything native inside the `make` closure (`FlashExecutor::open`), so no native
-//! value crosses a thread boundary. The tokenizer files come from `tokenizer_dir` and are checked
-//! against the artifact manifest, so a stepping-stone template or tokenizer fails at load.
+//! value crosses a thread boundary. The tokenizer files come from `tokenizer_dir` and are compared
+//! with the artifact manifest; a file that differs logs a warning and is served as found.
 
 use super::artifact::tokenizer_pin;
 use super::factory::CONTEXT_LIMIT;

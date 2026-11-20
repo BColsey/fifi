@@ -221,7 +221,7 @@ pub(super) fn pinned_template_sha() -> [u8; 32] {
 /// The tested tokenizer release for this family, SHA-256 pinned file by
 /// file: RecursiveSI/flint-int4 revision 3b93f905, publisher manifest
 /// flint-int4.json. Shared by the loader and the diagnostic surfaces so
-/// both refuse the same files.
+/// both warn about the same files.
 pub(crate) fn tokenizer_pin() -> crate::tokenizer::TokenizerPin {
     crate::tokenizer::TokenizerPin {
         tokenizer_json: digest(b"a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68"),

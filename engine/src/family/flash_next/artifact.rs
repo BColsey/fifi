@@ -1,8 +1,8 @@
 //! Files of the Flash-Next artifact directory that the server loads.
 //!
 //! The artifact manifest (`download-manifest.json`) maps each file name to `{"sha256", "size"}`.
-//! The manifest is the authority for the tokenizer files. `TokenizerBundle::load` checks each file
-//! against the pin that `tokenizer_pin` builds, so a stepping-stone template cannot load by mistake.
+//! The manifest names the expected tokenizer files. `TokenizerBundle::load` compares each file
+//! with the pin that `tokenizer_pin` builds and logs a warning for each one that differs.
 
 use std::path::Path;
 
