@@ -407,6 +407,41 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+    fn pinned_read_returns_the_device_bytes_and_reports_its_rate() {
+        assert!(testkit::device_present(
+            "pinned_read_returns_the_device_bytes_and_reports_its_rate"
+        ));
+        let ctx = CudaContext::new().expect("context");
+        let stream = ctx.stream().expect("stream");
+        let event = ctx.event().expect("event");
+        let len = 128usize << 20;
+        let data = pattern(len, 41);
+        let device = testkit::upload_bytes(&ctx, &data);
+        let mut host = ctx.pinned_buf(len).expect("pinned");
+        ctx.copy_to_pinned(&stream, device.range(0, len).expect("source"), &mut host, 0)
+            .expect("D2H");
+        stream.record(&event).expect("record");
+        host.wait(&event).expect("wait");
+        let mut out = vec![0u8; len];
+        let began = std::time::Instant::now();
+        host.read(0, &mut out).expect("read");
+        let seconds = began.elapsed().as_secs_f64();
+        assert!(out == data, "the read returns the bytes the device wrote");
+        // An unaligned inner range and the edges of the allocation.
+        let mut part = vec![0u8; 4099];
+        host.read(len - 4099, &mut part).expect("tail");
+        assert_eq!(part[..], data[len - 4099..]);
+        host.read(3, &mut part).expect("unaligned head");
+        assert_eq!(part[..], data[3..3 + 4099]);
+        println!(
+            "PINNED_READ_RATE {:.0} MB/s over {} MiB",
+            len as f64 / 1e6 / seconds,
+            len >> 20
+        );
+    }
+
     fn pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))

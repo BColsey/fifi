@@ -737,13 +737,19 @@ pub(in crate::kernels::cuda) fn pinned_read_into(
     if end > pinned.bytes {
         return Err(invalid_argument());
     }
-    let base = pinned.ptr.as_ptr().cast::<u8>().cast_const();
-    for (index, slot) in out.iter_mut().enumerate() {
-        // SAFETY: `offset + index < end <= pinned.bytes`, and the allocation stays live and
-        // unfreed while `pinned` is borrowed. The volatile read keeps the compiler from caching
-        // bytes a device copy wrote; that no copy is writing them right now is the caller's
-        // proven precondition above.
-        *slot = unsafe { base.add(offset + index).read_volatile() };
+    // The acquire fence orders the copy after the caller's event wait, so the bytes read are the
+    // ones the device copy wrote.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: `offset + out.len() <= pinned.bytes`, the allocation stays live and unfreed while
+    // `pinned` is borrowed, and `out` is a distinct host slice, so the ranges do not overlap.
+    // That no device copy is writing the source range right now is the caller's proven
+    // precondition above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            pinned.ptr.as_ptr().cast::<u8>().cast_const().add(offset),
+            out.as_mut_ptr(),
+            out.len(),
+        );
     }
     Ok(())
 }
