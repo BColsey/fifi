@@ -680,56 +680,67 @@ mod tests {
         assert!(printed.contains("ENGINESRV_API_KEY"), "{printed}");
     }
 
-    /// The refusal a user of this binary sees, quoted verbatim, with
-    /// preflight's own next-step line. Each build picks its own arm below:
-    /// the CPU build's backend check, the device builds' settings and
-    /// tokenizer-pin refusals. The green zero-config path is the CUDA
-    /// build's, exercised by the hardware lane; the settings the CPU
-    /// build WOULD resolve are covered by the discovery tests above
+    /// What each build does with the two fixture directories. A tokenizer that differs from the
+    /// pin only warns, so it decides nothing here: the GGUF directory builds a configuration in a
+    /// CUDA build, and the EXL3-only directory is refused by the weight-format check, quoted
+    /// verbatim with preflight's own next-step line. Each build picks its own arm below: the CPU
+    /// build's backend check, the CUDA build's weight-format check, the MLX build's settings
+    /// validators. The green zero-config path is the CUDA build's, exercised by the hardware
+    /// lane; the settings the CPU build WOULD resolve are covered by the discovery tests above
     /// and the parity test of `run`.
     #[test]
     fn build_config_refusals_quote_preflight_verbatim() {
         let dir = model_dir(Some("qwen3_5_moe"), true, false);
-        let error = super::build_config(&args_for(dir.path())).unwrap_err();
-        assert!(error.0.contains("cannot serve"), "{}", error.0);
+        let built = super::build_config(&args_for(dir.path()));
         if cfg!(feature = "native-mlx") {
             // A native-mlx build reaches the settings validators before the backend
             // choice and refuses the default-args fixture (no cache limit) — also a
             // verbatim preflight quote, so this arm pins that refusal instead. The
             // fixture holds no weight shard, so the host cannot derive a cache limit.
+            let error = built.unwrap_err();
+            assert!(error.0.contains("cannot serve"), "{}", error.0);
             assert!(
                 error.0.contains("cache_limit_bytes is missing"),
                 "{}",
                 error.0
             );
+            assert!(error.0.contains("next:"), "{}", error.0);
         } else if cfg!(all(feature = "native-cuda", target_os = "linux")) {
-            // A Linux native-cuda build picks the CUDA backend and reaches the
-            // preflight validators: the fixture's tokenizer is not the pinned one,
-            // so this arm pins that verbatim refusal instead of the CPU build's
-            // "no GPU backend". (native-cuda is a no-op off Linux, engine/build.rs.)
-            assert!(error.0.contains("tokenizer pin"), "{}", error.0);
+            // A Linux native-cuda build picks the CUDA backend. The fixture's tokenizer is not
+            // the pinned one, which only warns, so the GGUF directory builds a configuration
+            // for the qwen3_6_35b_a3b family with its GGUF weights.
+            // (native-cuda is a no-op off Linux, engine/build.rs.)
+            let config = built.expect("a GGUF directory builds a configuration");
+            let engine = &config.engines[0];
+            assert_eq!(engine.family, "qwen3_6_35b_a3b");
+            assert_eq!(engine.model_dir, dir.path());
+            let options = engine.qwen36.as_ref().expect("qwen36 options");
+            assert_eq!(options.weight_format.as_deref(), Some("gguf"));
         } else {
+            let error = built.unwrap_err();
+            assert!(error.0.contains("cannot serve"), "{}", error.0);
             assert!(error.0.contains("no GPU backend"), "{}", error.0);
+            assert!(error.0.contains("next:"), "{}", error.0);
         }
-        assert!(error.0.contains("next:"), "{}", error.0);
 
-        // The same refusal carries EXL3-only directories on every build
-        // (detection itself is covered above): even a CUDA build refuses
-        // them here, because the fixture's tokenizer fails the preflight
-        // pin before the experimental verdict can speak.
+        // The EXL3-only directory: a CUDA build serves GGUF weights only and refuses it with
+        // the weight-format check; an MLX build reads the shard as an MLX pack and builds a
+        // configuration with no weight format member; the CPU build has no GPU backend.
         let exl3 = model_dir(Some("qwen3_5_moe"), false, true);
-        let error = super::build_config(&args_for(exl3.path())).unwrap_err();
-        if cfg!(all(feature = "native-cuda", target_os = "linux")) {
-            // The EXL3-only directory's experimental qualification never
-            // gets to speak here: its fixture tokenizer fails the same
-            // preflight check first, and a failed check outranks the
-            // experimental verdict, so this build refuses it too.
-            assert!(error.0.contains("tokenizer pin"), "{}", error.0);
+        let built = super::build_config(&args_for(exl3.path()));
+        if cfg!(feature = "native-mlx") {
+            let config = built.expect("an MLX build reads the shard as an MLX pack");
+            let engine = &config.engines[0];
+            assert_eq!(engine.family, "qwen3_6_35b_a3b");
+            assert_eq!(engine.model_dir, exl3.path());
+            let options = engine.qwen36.as_ref().expect("qwen36 options");
+            assert_eq!(options.weight_format, None);
         } else {
-            if cfg!(feature = "native-mlx") {
-                // This fixture holds a weight shard, so the host derives the cache limit.
-                assert!(!error.0.contains("cache_limit_bytes"), "{}", error.0);
-                assert!(error.0.contains("tokenizer pin"), "{}", error.0);
+            let error = built.unwrap_err();
+            assert!(error.0.contains("cannot serve"), "{}", error.0);
+            assert!(error.0.contains("next:"), "{}", error.0);
+            if cfg!(all(feature = "native-cuda", target_os = "linux")) {
+                assert!(error.0.contains("no .gguf weights file in"), "{}", error.0);
             } else {
                 assert!(error.0.contains("no GPU backend"), "{}", error.0);
             }
