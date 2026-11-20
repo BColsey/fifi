@@ -651,10 +651,20 @@ impl Bolt {
     /// layers at `CELLS` positions and its two position words. The planes are read only below
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
-        let ctx = &self.ctx;
         // One zero chunk on the device, copied down every plane: the planes are cleared at
         // device speed and no host memory the size of a plane is touched.
-        let zeros = zero(ctx, ZERO_CHUNK)?;
+        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
+        let built = self.build_seq(&zeros);
+        // The queued copies read `zeros`: the stream drains before it drops, whether or not the
+        // build succeeded.
+        let drained = self.stream.synchronize();
+        let seq = built?;
+        drained?;
+        Ok(seq)
+    }
+
+    fn build_seq(&self, zeros: &DeviceBuffer) -> Result<BoltSeq, EngError> {
+        let ctx = &self.ctx;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
             let mut at = 0;
@@ -686,15 +696,12 @@ impl Bolt {
                 None
             });
         }
-        let seq = BoltSeq {
+        Ok(BoltSeq {
             id: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
             kv,
             pos: zero(ctx, 4)?,
             kv_len: zero(ctx, 4)?,
-        };
-        // The copies read `zeros`, which drops here.
-        self.stream.synchronize()?;
-        Ok(seq)
+        })
     }
 
     /// Allocates the logits rows that a window of up to `rows` sequences needs, once. A request

@@ -75,7 +75,7 @@ impl SeqPlan {
     /// The numbers for the start line.
     pub(crate) fn describe(&self) -> String {
         format!(
-            "sequences {} of at most {} (bound by {}): {} bytes per extra sequence ({} fixed + {} positions x {} bytes), {} extra, {} free after the first sequence, {} headroom, {} free after",
+            "sequences {} of at most {} (bound by {}): {} bytes per extra sequence ({} fixed + {} positions x {} bytes), {} extra sequences for {} bytes, {} free after the first sequence, {} headroom, {} free after",
             self.seqs,
             self.inputs.row_cap.min(self.inputs.ceiling),
             self.bound.name(),
@@ -84,6 +84,7 @@ impl SeqPlan {
             self.inputs.context,
             self.inputs.cost.per_position,
             self.seqs.saturating_sub(1),
+            self.extra_bytes,
             self.inputs.free,
             self.inputs.headroom,
             self.free_after,
@@ -278,5 +279,9 @@ mod tests {
         assert!(line.contains("30464"), "{line}");
         assert!(line.contains("32768"), "{line}");
         assert!(line.contains(&plan.free_after.to_string()), "{line}");
+        assert!(
+            line.contains(&format!("for {} bytes", plan.extra_bytes)),
+            "{line}"
+        );
     }
 }
