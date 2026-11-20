@@ -106,6 +106,11 @@ pub(crate) trait ExecutorOps {
     }
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
+    /// Consumes the final piece for a request that will decode next. The worker has finished
+    /// saving prefixes and will call only decode or reset on this session.
+    fn prefill_for_decode(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()> {
+        self.prefill(st, toks)
+    }
     /// Tries to consume a fresh prompt as two pieces in one call. A declined
     /// pair leaves the session untouched. A cancelled pair requires a reset.
     fn try_prefill_pair(

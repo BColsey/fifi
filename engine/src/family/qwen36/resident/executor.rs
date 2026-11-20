@@ -40,7 +40,9 @@
 //! decoder tests only. A run of one row is a one-token step, as in the Flash-Next executor, and a
 //! chunk equals the steps within the chunk-parity tolerance, not bit for bit. A chunk routes as its
 //! decoder holds (`Routing::Device`, the default, routes on the device; `Routing::Host` keeps the
-//! host-routed reference), and every decode step keeps device routing. A Q36 chunk has no page set,
+//! host-routed reference), and every decode step keeps device routing. The disk-staged dense path
+//! can append the pending token to an admitted final chunk after the worker's last prefix save.
+//! The first decode still owns sampling and publication. A Q36 chunk has no page set,
 //! so the Flash-Next rule that opens page sets once has no counterpart here.
 //!
 //! A failed prefill: a denied growth permit or a bad token in chunk k leaves chunks 1 to k - 1
@@ -99,7 +101,7 @@ use crate::{
     tokenizer::DecodeBatch,
     weights::StreamedCheckpoint,
 };
-use std::path::Path;
+use std::{ops::ControlFlow, path::Path};
 
 // The largest planned chunk is the most rows that the decoder accepts. The build fails if they differ.
 const _: () = assert!(PREFILL_CANDIDATES[0] == MAX_CHUNK_ROWS);
@@ -173,6 +175,7 @@ pub(crate) struct Q36Executor {
     fixed_state_bytes: u64,
     /// The chunk size of the batched prefill, set only by `apply_chunk`. `None` means one-token steps.
     chunk: Option<u32>,
+    fuse_final_prefill: bool,
     mlx_plan: Option<MlxExecutionPlan>,
     /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
     /// `Miss` until a restore takes an entry, and a reset clears it again, so the report of a job
@@ -198,6 +201,8 @@ pub(crate) struct Q36Session {
     state: ResidentState,
     /// The committed tokens, the pending token, and the finish flag.
     core: DecodeSession,
+    /// Logits prepared by the final worker piece. Only the first decode consumes them.
+    first_logits: Option<Vec<f32>>,
     /// Opt-in live Delta state shares the aggregate budget with KV growth and snapshots.
     _fixed_state: Option<GrowthPermit>,
 }
@@ -207,6 +212,7 @@ pub(crate) struct Q36Session {
 struct Q36Step<'a> {
     decoder: &'a mut ResidentDecoder<'static>,
     state: &'a mut ResidentState,
+    first_logits: Option<Vec<f32>>,
     /// The chunk size that `plan_prefill` stored, or `None` for one-token steps.
     chunk: Option<u32>,
     /// Tests only: the chunk log of the executor.
@@ -247,6 +253,9 @@ impl TokenStepper for Q36Step<'_> {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+        if let Some(logits) = self.first_logits.take() {
+            return Ok(logits);
+        }
         self.decoder
             .step(self.state, token, StepMode::Logits)?
             .logits
@@ -257,10 +266,13 @@ impl TokenStepper for Q36Step<'_> {
     }
 
     fn fed(&self) -> usize {
-        fed_positions(self.state)
+        // The token-side session consumes the prepared row through logits(), just like a solo
+        // step. Until then it sees the pending position, including during cancellation.
+        fed_positions(self.state) - usize::from(self.first_logits.is_some())
     }
 
     fn reset(&mut self) -> Result<()> {
+        self.first_logits = None;
         self.decoder.reset(self.state)
     }
 }
@@ -1068,6 +1080,7 @@ impl Q36Executor {
         let session = Q36Session {
             state,
             core: DecodeSession::default(),
+            first_logits: None,
             _fixed_state: fixed_state,
         };
         let mut executor = Self {
@@ -1079,6 +1092,8 @@ impl Q36Executor {
             max_seqs: rules.max_seqs,
             fixed_state_bytes,
             chunk: None,
+            fuse_final_prefill: std::env::var_os("FIFI_Q36_MLX_FUSE_FINAL_PREFILL")
+                .is_some_and(|value| value == "1"),
             mlx_plan: None,
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
@@ -1128,6 +1143,7 @@ impl Q36Executor {
         let step = Q36Step {
             decoder: &mut self.decoder,
             state,
+            first_logits: None,
             chunk: self.chunk,
             #[cfg(test)]
             log: &self.log,
@@ -1373,6 +1389,7 @@ impl ExecutorOps for Q36Executor {
         Ok(Q36Session {
             state: self.decoder.zero_state()?,
             core: DecodeSession::default(),
+            first_logits: None,
             _fixed_state: fixed_state,
         })
     }
@@ -1562,6 +1579,7 @@ impl ExecutorOps for Q36Executor {
     }
 
     fn reset(&mut self, st: &mut Q36Session) -> Result<()> {
+        st.first_logits = None;
         let Q36Session { state, core, .. } = st;
         let (mut step, _) = self.split(state);
         core.reset(&mut step)?;
@@ -1584,17 +1602,70 @@ impl ExecutorOps for Q36Executor {
         core.prefill(&mut step, toks, limits.context_limit)
     }
 
+    fn prefill_for_decode(&mut self, st: &mut Q36Session, toks: &[u32]) -> Result<()> {
+        if !self.fuse_final_prefill || self.max_seqs != 1 || self.speculator.is_some() {
+            return self.prefill(st, toks);
+        }
+        let PrefillPath::Chunked(width) = PrefillPath::of(self.chunk) else {
+            return self.prefill(st, toks);
+        };
+        // The first worker piece has no pending token from an earlier piece. In every other
+        // piece that previous token leads the batch, including when we restored a prefix.
+        let rows = toks
+            .len()
+            .saturating_add(usize::from(st.core.pending().is_some()));
+        let rows = match u32::try_from(rows) {
+            Ok(rows @ 2..) if rows <= width => rows,
+            _ => return self.prefill(st, toks),
+        };
+        if !self.decoder.weights.stages_dense()
+            || super::prefill::step::chunk_ranges(&self.decoder, st.state.pos(), rows)?.len() != 1
+        {
+            return self.prefill(st, toks);
+        }
+        let pending = *toks
+            .last()
+            .ok_or_else(|| EngError::BadRequest("empty prefill chunk".to_string()))?;
+        let Q36Session {
+            state,
+            core,
+            first_logits,
+            ..
+        } = st;
+        core.prefill_with(toks, self.context_limit, |head| {
+            let mut batch = Vec::with_capacity(rows as usize);
+            batch.extend_from_slice(head);
+            batch.push(pending);
+            let result = self.decoder.prefill(state, &batch, StepMode::Logits)?;
+            *first_logits = Some(
+                result
+                    .logits
+                    .ok_or_else(|| window_output_error("the final prefill returned no logits"))?,
+            );
+            #[cfg(test)]
+            self.log.lock().unwrap().push(batch.len());
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    }
+
     fn decode(
         &mut self,
         st: &mut Q36Session,
         generation: &mut GenerationState,
     ) -> Result<DecodeBatch> {
-        let Q36Session { state, core, .. } = st;
+        let Q36Session {
+            state,
+            core,
+            first_logits,
+            ..
+        } = st;
         // The take/put-back moves the drafter out of `&mut self` for the window call: a
         // panic inside `speculator.decode` unwinds before the put-back and the speculator is
         // dropped with the executor, so the feature turns off only with the engine.
         let Some(mut speculator) = self.speculator.take() else {
             let (mut step, limits) = self.split(state);
+            step.first_logits = first_logits.take();
             return core.decode(&mut step, generation, &limits);
         };
         let (step, limits) = self.split(state);
@@ -3056,6 +3127,154 @@ mod tests {
         }
     }
 
+    fn check_dense_final_prefill(
+        executor: &mut Q36Executor,
+        session: &mut Q36Session,
+        activation: Activation,
+    ) {
+        #[cfg(feature = "native-fault-qualification")]
+        use crate::family::stored::qualification_expert_reads;
+
+        executor.fuse_final_prefill = false;
+        let prompt = cycle(6);
+        let (prefix, tail) = prompt.split_at(4);
+        executor.reset(session).unwrap();
+        executor.prefill(session, prefix).unwrap();
+        assert!(
+            executor
+                .save_prefix(session, prefix, SaveKind::Tip)
+                .unwrap()
+        );
+
+        let restore = |executor: &mut Q36Executor, session: &mut Q36Session| {
+            executor.reset(session).unwrap();
+            assert_eq!(
+                executor.restore_prefix(session, &prompt).unwrap(),
+                prefix.len()
+            );
+            assert_eq!(session.state.pos() as usize, prefix.len() - 1);
+            assert!(session.first_logits.is_none());
+        };
+        restore(executor, session);
+        #[cfg(feature = "native-fault-qualification")]
+        let before = qualification_expert_reads();
+        executor.prefill_for_decode(session, tail).unwrap();
+        assert!(session.first_logits.is_none(), "default path");
+        #[cfg(feature = "native-fault-qualification")]
+        let after_prompt = qualification_expert_reads();
+        let baseline = executor
+            .decoder
+            .step(&mut session.state, prompt[5], StepMode::Logits)
+            .unwrap()
+            .logits
+            .unwrap();
+        #[cfg(feature = "native-fault-qualification")]
+        let after_decode = qualification_expert_reads();
+        let mut greedy = Sampler::greedy();
+        let expected_token = sample_logits("qwen36", &baseline, &mut greedy, VOCAB).unwrap();
+        let baseline_second = executor
+            .decoder
+            .step(&mut session.state, expected_token, StepMode::Logits)
+            .unwrap()
+            .logits
+            .unwrap();
+
+        executor.fuse_final_prefill = true;
+        restore(executor, session);
+        #[cfg(feature = "native-fault-qualification")]
+        let before_fused = qualification_expert_reads();
+        executor.prefill_for_decode(session, tail).unwrap();
+        assert_eq!(session.core.history(), prompt);
+        assert_eq!(session.core.pending(), Some(prompt[5]));
+        assert_eq!(session.state.pos(), 6);
+        let logits = session.first_logits.as_ref().unwrap();
+        if activation == Activation::F32 {
+            assert_parity(logits, &baseline, "first dense logits");
+        }
+        assert_eq!(
+            sample_logits("qwen36", logits, &mut greedy, VOCAB).unwrap(),
+            expected_token
+        );
+        #[cfg(feature = "native-fault-qualification")]
+        let after_fused = qualification_expert_reads();
+        #[cfg(feature = "native-fault-qualification")]
+        {
+            assert_eq!(
+                after_fused.read_bytes - before_fused.read_bytes,
+                after_decode.read_bytes - after_prompt.read_bytes,
+            );
+            assert_eq!(
+                after_fused.slice_reads - before_fused.slice_reads,
+                after_decode.slice_reads - after_prompt.slice_reads,
+            );
+            assert!(after_prompt.read_bytes > before.read_bytes);
+            println!(
+                "{activation:?} final FFN reads eliminated={} logical bytes eliminated={}",
+                after_prompt.slice_reads - before.slice_reads,
+                after_prompt.read_bytes - before.read_bytes,
+            );
+        }
+        let mut generation = GenerationState::new(IncrementalDecoder::new(&tokenizer()));
+        let batch = executor.decode(session, &mut generation).unwrap();
+        assert_eq!(batch.tokens, [expected_token]);
+        assert!(batch.finish.is_none());
+        assert!(session.first_logits.is_none());
+        assert_eq!(session.state.pos(), 6);
+        assert_eq!(session.core.pending(), Some(expected_token));
+        #[cfg(feature = "native-fault-qualification")]
+        assert_eq!(qualification_expert_reads(), after_fused);
+        let actual_second = executor
+            .decoder
+            .step(&mut session.state, expected_token, StepMode::Logits)
+            .unwrap()
+            .logits
+            .unwrap();
+        if activation == Activation::F32 {
+            assert_parity(&actual_second, &baseline_second, "second dense logits");
+        }
+        assert_eq!(
+            sample_logits("qwen36", &actual_second, &mut greedy, VOCAB).unwrap(),
+            sample_logits("qwen36", &baseline_second, &mut greedy, VOCAB).unwrap(),
+        );
+
+        restore(executor, session);
+        executor.prefill_for_decode(session, tail).unwrap();
+        let mut cancelled = seeded_generation(2);
+        cancelled
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let batch = executor.decode(session, &mut cancelled).unwrap();
+        assert!(batch.tokens.is_empty());
+        assert_eq!(batch.finish, Some(DecodeFinish::Cancelled));
+        assert!(session.first_logits.is_none());
+        assert!(session.core.history().is_empty());
+        assert_eq!(session.state.pos(), 0);
+
+        restore(executor, session);
+        executor.prefill_for_decode(session, tail).unwrap();
+        executor.eos.push(expected_token);
+        let batch = executor
+            .decode(
+                session,
+                &mut GenerationState::new(IncrementalDecoder::new(&tokenizer())),
+            )
+            .unwrap();
+        assert_eq!(batch.finish, Some(DecodeFinish::Stop));
+        assert_eq!(batch.tokens, [expected_token]);
+        assert_eq!(session.core.pending(), None);
+        executor.eos.pop();
+
+        executor.reset(session).unwrap();
+        executor.prefill_for_decode(session, &prompt[..1]).unwrap();
+        assert!(session.first_logits.is_none(), "one pending row");
+        assert_eq!(session.state.pos(), 0);
+        executor.reset(session).unwrap();
+        executor.prefill(session, &prompt[..2]).unwrap();
+        executor.prefill_for_decode(session, &prompt[2..]).unwrap();
+        assert!(session.first_logits.is_none(), "the chunk is full");
+        assert_eq!(session.state.pos(), 5);
+    }
+
     #[test]
     fn capped_dense_qwen_stages_one_file_backed_ffn_at_a_time() {
         use crate::family::qwen36::fixtures::checkpoint_files;
@@ -3190,6 +3409,7 @@ mod tests {
                     "{activation:?}/{kv_dtype:?} resident_bytes={resident_bytes} stage_bytes={stage_bytes} logical_ffn_bytes={bytes} ffn_slice_reads={reads}"
                 );
             }
+            check_dense_final_prefill(&mut streamed, &mut streamed_session, activation);
         }
     }
 
@@ -3263,6 +3483,13 @@ mod tests {
             assert!(!resident.decoder.weights.streams_experts());
             let (mut disk, mut disk_session) = build_for(base + decode_stage).unwrap();
             assert!(disk.decoder.weights.streams_experts());
+            disk.force_chunk(Some(4));
+            disk.fuse_final_prefill = true;
+            disk.prefill_for_decode(&mut disk_session, &prompt[..3])
+                .unwrap();
+            assert!(disk_session.first_logits.is_none());
+            assert_eq!(disk_session.state.pos(), 2);
+            disk.reset(&mut disk_session).unwrap();
             assert_eq!(disk.decoder.weights.expert_page_bytes().unwrap(), 0);
             assert_eq!(
                 disk.decoder.weights.expert_stage_bytes(ckpt, 1).unwrap(),
@@ -4850,6 +5077,7 @@ mod tests {
         let mut target = Q36Session {
             state: executor.decoder.zero_state().unwrap(),
             core: DecodeSession::default(),
+            first_logits: None,
             _fixed_state: None,
         };
         executor.prefill(&mut target, &[5, 6]).unwrap();
