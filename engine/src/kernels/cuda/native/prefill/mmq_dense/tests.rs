@@ -441,7 +441,7 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     // (fallback off) and the partial-tile ones (fallback on), all three weight types, and
     // device facts of the sm_86, sm_89 and sm_72 classes plus a one-SM device and a device
     // whose shared memory fits no tile width.
-    let sets: [(&str, i32, i32, usize); 7] = [
+    let sets: [(&str, i32, i32, usize); 8] = [
         ("sm_86, 82 SMs", 860, 82, 101_376),
         ("sm_89 class, 20 SMs", 890, 20, 102_400),
         ("sm_72, 8 SMs", 720, 8, 98_304),
@@ -455,7 +455,12 @@ fn the_c_fixup_need_agrees_with_the_rust_sizing_everywhere() {
     // build, so their cc follows the first compiled fleet arch instead of a literal. A
     // single-arch build still sweeps its own class at 20 and 1 SMs and under a tight
     // shared-memory cap.
-    let fleet_smpbo = [(860, 101_376usize), (890, 102_400), (720, 98_304)];
+    let fleet_smpbo = [
+        (860, 101_376usize),
+        (890, 102_400),
+        (720, 98_304),
+        (750, 65_536),
+    ];
     let built = compiled_archs();
     let Some((base_cc, base_smpbo)) = fleet_smpbo
         .iter()
