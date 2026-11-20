@@ -30,6 +30,8 @@ mod bolt_graph;
 mod step;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
 
 use crate::EngError;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};

@@ -1,6 +1,7 @@
 //! The serving wrap of the resident Bolt executor.
 //!
-//! One session per engine. The token side is the shared `DecodeSession`
+//! One session per engine by default; `max_seqs` above one serves several sessions in one decode
+//! window. The token side is the shared `DecodeSession`
 //! (`family::session`): it owns the committed tokens, the pending token and
 //! the finish rules (cancel, length, end of sequence, context limit). The
 //! model side is a `TokenStepper` that feeds prompt rows cache-only and reads
@@ -98,27 +99,32 @@ mod tests {
 mod device {
     use std::path::Path;
 
-    use super::super::resident::bolt::{self, Bolt, CELLS, VOCAB};
+    use super::super::budget;
+    use super::super::config::MaxSeqs;
+    use super::super::resident::bolt::{self, Bolt, BoltSeq, CELLS, VOCAB};
     use crate::{
         EngError,
         family::{
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
+            seq_plan::{SeqInputs, plan_seqs},
             session::{
                 DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, StoreLimits,
                 TokenStepper,
             },
+            window::{self, WindowRows},
         },
         sched::worker::{ReadyNote, spawn_engine_noted},
         tokenizer::DecodeBatch,
     };
 
     /// The token side is the shared `DecodeSession`; `pos` is the model cache
-    /// position (the number of tokens fed). The finish rules live in
-    /// `family::session`, not here.
+    /// position (the number of tokens fed); `seq` holds the KV planes and position
+    /// words of this session. The finish rules live in `family::session`, not here.
     pub(crate) struct BoltSession {
         core: DecodeSession,
         pos: usize,
+        seq: BoltSeq,
     }
 
     pub(crate) struct BoltServe {
@@ -141,6 +147,12 @@ mod device {
         /// but does not retain it, and threading it means widening `bolt::load`'s return; this
         /// seam takes it when that return widens.
         identity: PrefixIdentity,
+        /// The sessions the engine serves at once; the worker reads it after start.
+        max_seqs: usize,
+        /// False once several sessions share the model: the position-only snapshot would
+        /// rewind to cells that another session's decode no longer guarantees, so the store
+        /// saves and restores nothing.
+        prefix_enabled: bool,
     }
 
     /// The store's explicit one-tip shape (no roots, no periodic points),
@@ -152,8 +164,9 @@ mod device {
 
     /// The model side of one session: feeds prompt rows cache-only and reads
     /// the capped logits of a decode step. The session never holds it.
-    struct Step<'a> {
+    pub(crate) struct Step<'a> {
         model: &'a mut Bolt,
+        seq: &'a BoltSeq,
         pos: &'a mut usize,
         generation: &'a mut u64,
     }
@@ -174,7 +187,8 @@ mod device {
 
         fn feed(&mut self, token: u32) -> Result<(), EngError> {
             self.note_fresh();
-            self.model.prefill_batch(&[token], *self.pos, false)?;
+            self.model
+                .prefill_batch(self.seq, &[token], *self.pos, false)?;
             *self.pos += 1;
             Ok(())
         }
@@ -182,7 +196,8 @@ mod device {
         fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
             for chunk in tokens.chunks(Bolt::PREFILL_BATCH) {
                 self.note_fresh();
-                self.model.prefill_batch(chunk, *self.pos, false)?;
+                self.model
+                    .prefill_batch(self.seq, chunk, *self.pos, false)?;
                 *self.pos += chunk.len();
             }
             Ok(())
@@ -190,7 +205,7 @@ mod device {
 
         fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
             self.note_fresh();
-            self.model.decode(token, *self.pos)?;
+            self.model.decode(self.seq, token, *self.pos)?;
             *self.pos += 1;
             self.model.capped_logits()
         }
@@ -209,6 +224,26 @@ mod device {
     impl ExecutorOps for BoltServe {
         type Session = BoltSession;
 
+        fn max_seqs(&self) -> usize {
+            self.max_seqs
+        }
+
+        fn new_session(&mut self) -> Result<Self::Session, EngError> {
+            Ok(BoltSession {
+                core: DecodeSession::default(),
+                pos: 0,
+                seq: self.model.new_seq()?,
+            })
+        }
+
+        fn decode_window(
+            &mut self,
+            sessions: &mut [&mut Self::Session],
+            generations: &mut [&mut GenerationState],
+        ) -> Result<Vec<Result<crate::tokenizer::DecodeBatch, EngError>>, EngError> {
+            window::decode_window(self, sessions, generations)
+        }
+
         fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32] {
             st.core.history()
         }
@@ -216,6 +251,7 @@ mod device {
         fn reset(&mut self, st: &mut Self::Session) -> Result<(), EngError> {
             st.core.reset(&mut Step {
                 model: &mut self.model,
+                seq: &st.seq,
                 pos: &mut st.pos,
                 generation: &mut self.generation,
             })
@@ -235,6 +271,7 @@ mod device {
             st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
+                    seq: &st.seq,
                     pos: &mut st.pos,
                     generation: &mut self.generation,
                 },
@@ -256,6 +293,7 @@ mod device {
             st.core.decode(
                 &mut Step {
                     model: &mut self.model,
+                    seq: &st.seq,
                     pos: &mut st.pos,
                     generation: &mut self.generation,
                 },
@@ -276,6 +314,9 @@ mod device {
             key: &[u32],
             kind: SaveKind,
         ) -> Result<bool, EngError> {
+            if !self.prefix_enabled {
+                return Ok(false);
+            }
             let path = (self.generation, self.identity.clone());
             let fed = st.pos;
             st.core
@@ -295,8 +336,11 @@ mod device {
             st: &mut Self::Session,
             prompt: &[u32],
         ) -> Result<usize, EngError> {
+            if !self.prefix_enabled {
+                return Ok(0);
+            }
             let path = (self.generation, self.identity.clone());
-            let BoltSession { core, pos } = st;
+            let BoltSession { core, pos, .. } = st;
             let restored = core.restore_prefix(&mut self.prefix, prompt, path, |saved| {
                 *pos = *saved;
                 Ok(())
@@ -308,12 +352,110 @@ mod device {
         }
     }
 
+    impl WindowRows for BoltServe {
+        type Stepper<'a> = Step<'a>;
+        /// The planes are preallocated, so a position costs no growth.
+        type Permit = ();
+        const OPERATION: &'static str = "gemma4_bolt";
+
+        fn split<'a>(
+            &'a mut self,
+            session: &'a mut BoltSession,
+        ) -> (&'a mut DecodeSession, Step<'a>, Limits<'a>) {
+            let BoltSession { core, pos, seq } = session;
+            (
+                core,
+                Step {
+                    model: &mut self.model,
+                    seq,
+                    pos,
+                    generation: &mut self.generation,
+                },
+                Limits {
+                    eos: &self.eos,
+                    sampler_vocab: VOCAB,
+                    context_limit: CELLS,
+                },
+            )
+        }
+
+        fn check_row(&self, session: &BoltSession, token: u32) -> Result<(), EngError> {
+            if session.pos >= CELLS {
+                return Err(EngError::ContextLimit(format!(
+                    "position {} reaches the {CELLS} cell context",
+                    session.pos
+                )));
+            }
+            if token as usize >= VOCAB {
+                return Err(EngError::BadRequest(
+                    "token is outside the embedding table".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn row_growth(&self, _session: &BoltSession) -> Result<u64, EngError> {
+            Ok(0)
+        }
+
+        fn reserve_growth(&self, _bytes: u64) -> Result<(), EngError> {
+            Ok(())
+        }
+
+        /// One token of every session through one step. A session that feeds from position 0
+        /// advances the cell generation at the attempt, as a solo feed does.
+        fn step_rows(
+            &mut self,
+            sessions: &mut [&mut BoltSession],
+            tokens: &[u32],
+        ) -> Result<Vec<Vec<f32>>, EngError> {
+            if sessions.iter().any(|session| session.pos == 0) {
+                self.generation += 1;
+            }
+            let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
+            let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
+            let rows = self.model.decode_rows(&seqs, tokens, &positions)?;
+            for session in sessions.iter_mut() {
+                session.pos += 1;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// The free device bytes the planner may spend on extra sessions: what remains once the
+    /// first session is allocated.
+    fn plan_sessions(
+        model: &Bolt,
+        seqs: MaxSeqs,
+    ) -> Result<crate::family::seq_plan::SeqPlan, EngError> {
+        let free = u64::try_from(model.ctx.memory_info()?.free).unwrap_or(u64::MAX);
+        let inputs = SeqInputs {
+            free,
+            headroom: budget::BOLT_HEADROOM_BYTES,
+            cost: budget::bolt_seq_cost()
+                .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
+            context: CELLS as u64,
+            row_cap: Bolt::PREFILL_BATCH,
+            ceiling: Bolt::PREFILL_BATCH,
+        };
+        plan_seqs(
+            inputs,
+            match seqs {
+                MaxSeqs::Count(count) => Some(count),
+                MaxSeqs::Auto => None,
+            },
+        )
+    }
+
     /// `model_path` is the model directory or one `.gguf` file in it. A directory with several
-    /// `.gguf` files serves the highest-precision one that the device memory admits.
+    /// `.gguf` files serves the highest-precision one that the device memory admits; `seqs`
+    /// is the explicit session count or the count the free memory funds. Several sessions turn
+    /// the position-only prefix snapshot off and the decode graph off, and the start line says so.
     pub(crate) fn start_bolt_engine(
         model_path: &Path,
         tokenizer_dir: &Path,
         ready_note: ReadyNote,
+        seqs: MaxSeqs,
     ) -> Result<StartedEngine, EngError> {
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
@@ -329,18 +471,33 @@ mod device {
             ));
         }
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
+            let mut model = bolt::load_choosing(&files, None)?;
+            let first = model.new_seq()?;
+            let plan = plan_sessions(&model, seqs)?;
+            eprintln!("gemma4 bolt: {}", plan.describe());
+            if plan.seqs > 1 {
+                model.reserve_window(plan.seqs)?;
+                model.use_decode_graph(false);
+                eprintln!(
+                    "gemma4 bolt: {} sessions share the model, so the position-only prefix snapshot and the decode graph are off",
+                    plan.seqs
+                );
+            }
             let serve = BoltServe {
-                model: bolt::load_choosing(&files, None)?,
+                model,
                 eos: eos.clone(),
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
+                max_seqs: plan.seqs,
+                prefix_enabled: plan.seqs == 1,
             };
             Ok((
                 serve,
                 BoltSession {
                     core: DecodeSession::default(),
                     pos: 0,
+                    seq: first,
                 },
             ))
         })?;
@@ -364,8 +521,8 @@ mod device {
         }
 
         /// Greedy argmax of the capped logits after one decode step.
-        fn greedy_step(model: &mut Bolt, token: u32, pos: usize) -> u32 {
-            model.decode(token, pos).expect("decode");
+        fn greedy_step(model: &mut Bolt, seq: &BoltSeq, token: u32, pos: usize) -> u32 {
+            model.decode(seq, token, pos).expect("decode");
             let logits = model.capped_logits().expect("capped logits");
             logits
                 .iter()
@@ -382,10 +539,10 @@ mod device {
 
         /// Feeds a prompt cache-only, holding nothing pending: the model-level
         /// control for cold runs.
-        fn feed(model: &mut Bolt, prompt: &[u32]) {
+        fn feed(model: &mut Bolt, seq: &BoltSeq, prompt: &[u32]) {
             for (index, &token) in prompt.iter().enumerate() {
                 model
-                    .prefill_batch(&[token], index, false)
+                    .prefill_batch(seq, &[token], index, false)
                     .expect("prefill");
             }
         }
@@ -403,15 +560,16 @@ mod device {
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_restore_past_a_decode_matches_the_cold_replay() {
             let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..3_000u32).map(|index| 100 + (index % 977)).collect();
-            feed(&mut model, &prompt);
+            feed(&mut model, &seq, &prompt);
             // The save point mirrors the session's: `prompt.len() - 1` tokens
             // fed, the last token held pending.
             let saved = prompt.len() - 1;
             // Turn 1: 48 greedy tokens past the save point.
             let mut token = prompt[saved];
             for pos in (saved..).take(48) {
-                token = greedy_step(&mut model, token, pos);
+                token = greedy_step(&mut model, &seq, token, pos);
             }
             // The restored branch: rewind to the save point, feed the held
             // token plus an extension whose tokens differ from turn 1's drawn
@@ -421,12 +579,12 @@ mod device {
             tail.extend_from_slice(&extension);
             let draw = |model: &mut Bolt| -> Vec<u32> {
                 model
-                    .prefill_batch(&tail, saved, false)
+                    .prefill_batch(&seq, &tail, saved, false)
                     .expect("tail prefill");
                 let mut token = *tail.last().expect("tail");
                 let mut drawn = Vec::new();
                 for pos in (saved + tail.len()..).take(24) {
-                    token = greedy_step(model, token, pos);
+                    token = greedy_step(model, &seq, token, pos);
                     drawn.push(token);
                 }
                 drawn
@@ -434,7 +592,7 @@ mod device {
             let restored = draw(&mut model);
             // The cold control: reset (position 0), re-feed the prompt, then
             // the same tail and greedy continuation.
-            feed(&mut model, &prompt);
+            feed(&mut model, &seq, &prompt);
             let cold = draw(&mut model);
             assert_eq!(restored, cold, "the restore must match the cold replay");
             assert!(
@@ -454,6 +612,7 @@ mod device {
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_graphed_greedy_run_matches_the_eager_run() {
             let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let seq = model.new_seq().expect("sequence");
             assert!(
                 !model.graph_mode.active(),
                 "the graph stays off without FIFI_BOLT_DECODE_GRAPH"
@@ -465,20 +624,20 @@ mod device {
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             let extension: Vec<u32> = (0..8u32).map(|index| 90_000 + index).collect();
             let run = |model: &mut Bolt, prompt: &[u32]| -> Vec<u32> {
-                feed(model, prompt);
+                feed(model, &seq, prompt);
                 let saved = prompt.len() - 1;
                 let mut token = prompt[saved];
                 let mut drawn = Vec::new();
                 for pos in (saved..).take(10) {
-                    token = greedy_step(model, token, pos);
+                    token = greedy_step(model, &seq, token, pos);
                     drawn.push(token);
                 }
                 model
-                    .prefill_batch(&extension, saved + 10, false)
+                    .prefill_batch(&seq, &extension, saved + 10, false)
                     .expect("mid-run prefill");
                 let mut token = *extension.last().expect("extension");
                 for pos in (saved + 10 + extension.len()..).take(86) {
-                    token = greedy_step(model, token, pos);
+                    token = greedy_step(model, &seq, token, pos);
                     drawn.push(token);
                 }
                 drawn
@@ -525,18 +684,19 @@ mod device {
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_graphed_split_run_matches_the_eager_split_run() {
             let mut model: Bolt = bolt::load(&pinned_bolt(), None).expect("load");
+            let seq = model.new_seq().expect("sequence");
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             // The chain AND the logits bits per step: matching the greedy
             // chain alone is weaker than the pin this test owes, and the
             // bits make every replayed buffer write checkable.
             let run = |model: &mut Bolt, prompt: &[u32]| -> (Vec<u32>, Vec<Vec<u32>>) {
-                feed(model, prompt);
+                feed(model, &seq, prompt);
                 let saved = prompt.len() - 1;
                 let mut token = prompt[saved];
                 let mut drawn = Vec::new();
                 let mut bits = Vec::new();
                 for pos in (saved..).take(24) {
-                    model.decode(token, pos).expect("decode");
+                    model.decode(&seq, token, pos).expect("decode");
                     let logits = model.capped_logits().expect("capped logits");
                     bits.push(logits.iter().map(|value| value.to_bits()).collect());
                     token = logits
@@ -612,11 +772,10 @@ mod device {
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
+                max_seqs: 1,
+                prefix_enabled: true,
             };
-            let mut st = BoltSession {
-                core: DecodeSession::default(),
-                pos: 0,
-            };
+            let mut st = serve.new_session().expect("session");
             let first: Vec<u32> = (0..64).map(|index| 100 + (index % 977)).collect();
             let first_ext: Vec<u32> = first.iter().copied().chain(500..512).collect();
 
@@ -632,6 +791,7 @@ mod device {
             assert_eq!(st.pos, 0, "the pending token is not fed yet");
             let mut step = Step {
                 model: &mut serve.model,
+                seq: &st.seq,
                 pos: &mut st.pos,
                 generation: &mut serve.generation,
             };
@@ -662,11 +822,10 @@ mod device {
                 generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
+                max_seqs: 1,
+                prefix_enabled: true,
             };
-            let mut st = BoltSession {
-                core: DecodeSession::default(),
-                pos: 0,
-            };
+            let mut st = serve.new_session().expect("session");
             let n = 64;
             let first: Vec<u32> = (0..n as u32).map(|index| 100 + (index % 977)).collect();
             let other: Vec<u32> = (0..n as u32).map(|index| 200 + (index % 811)).collect();

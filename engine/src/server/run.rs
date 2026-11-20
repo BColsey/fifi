@@ -572,6 +572,7 @@ fn start_gemma4(
                     &config.model_dir,
                     &config.tokenizer_dir,
                     _ready_note,
+                    Default::default(),
                 )?;
                 Ok(StartedEngine {
                     engine: started.engine,

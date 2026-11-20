@@ -15,6 +15,7 @@
 )]
 
 use crate::family::device_budget::KvPlan;
+use crate::family::seq_plan::SeqCost;
 use crate::family::spec::AttentionKind;
 use crate::family::spec::NEMOTRON_BOLT_E4B;
 
@@ -47,6 +48,18 @@ pub(crate) fn bolt_kv_bytes_per_position() -> Option<u64> {
 /// `plan::admit`, the same headroom rule the other resident executors use, so
 /// an exact fit of the allocations alone is refused.
 pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
+
+/// Bytes one extra session holds beside its cache planes: the raw and the capped logits row its
+/// slot adds to the window buffers, and its two position words.
+pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 * 4 + 8;
+
+/// What one more session costs the sequence planner.
+pub(crate) fn bolt_seq_cost() -> Option<SeqCost> {
+    Some(SeqCost {
+        fixed: BOLT_SEQ_FIXED_BYTES,
+        per_position: bolt_kv_bytes_per_position()?,
+    })
+}
 
 /// The cache the resident executor holds: one plane set per configured position.
 /// The starter admits this plan against free device memory before loading; the

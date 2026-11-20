@@ -62,6 +62,7 @@ use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
 use crate::weights::GgufType;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Geometry is read from the family descriptor, the single source of truth;
 // the executor pins only the cache cell count and the checkpoint properties
@@ -200,9 +201,62 @@ pub(crate) struct BoltLayer {
     scale: f32,
     global: bool,
     head: usize,
-    kv: Option<Kv>,
+    /// For a layer without its own cache planes, the physical layer whose planes it attends into.
     kv_source: Option<usize>,
 }
+
+impl BoltLayer {
+    /// Whether the layer writes cache planes of its own.
+    fn physical(&self) -> bool {
+        self.kv_source.is_none()
+    }
+}
+
+/// The device state of one sequence: its KV8 planes for the physical layers and the two words
+/// the position and attention kernels read. A session owns one; the model owns none, so any
+/// number of sequences can step through the same weights.
+pub(crate) struct BoltSeq {
+    id: u64,
+    /// One entry per layer; `Some` for the physical layers.
+    kv: Vec<Option<Kv>>,
+    /// The position of the first row of the step (`StepParams.pos`).
+    pos: DeviceBuffer,
+    /// The key count the first row attends over (`pos + 1`).
+    kv_len: DeviceBuffer,
+}
+
+/// The logits rows of a window: the raw head output and its softcap, one vocabulary row per
+/// sequence. Allocated only for an engine that serves more than one sequence.
+pub(crate) struct WindowBuffers {
+    rows: usize,
+    logits: Vector,
+    capped: Vector,
+}
+
+/// What the rows of one step are.
+enum Rows<'a> {
+    /// `m` consecutive positions of one sequence from `pos`: a prompt chunk or one decode token.
+    Chunk { seq: &'a BoltSeq, pos: usize },
+    /// One token of each of several sequences, in window order.
+    Window { seqs: &'a [&'a BoltSeq] },
+}
+
+impl Rows<'_> {
+    /// The position label of the trace files.
+    fn trace_pos(&self) -> usize {
+        match self {
+            Self::Chunk { pos, .. } => *pos,
+            Self::Window { .. } => 0,
+        }
+    }
+}
+
+/// The columns of one head launch in a window. The vendored matvec keeps one summation order
+/// for up to four columns and switches to another above that, so a window of more rows runs the
+/// head in launches of at most this many columns and every row sees the order a lone row sees.
+pub(crate) const HEAD_COLUMNS: usize = 4;
+
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// The per-step buffers, sized once at load.
 pub(crate) struct Scratch {
@@ -239,8 +293,6 @@ pub(crate) struct Scratch {
     /// full prefill batch of every q head at the wider head width.
     pub(crate) q8_qk: DeviceBuffer,
     pub(crate) ids: DeviceBuffer,
-    pub(crate) pos: DeviceBuffer,
-    pub(crate) kv_len: DeviceBuffer,
     /// The KV8 decode-append status word. The launch contract requires it;
     /// the caller's host range checks make the kernel's refuse path
     /// unreachable, so nothing reads it back.
@@ -257,6 +309,8 @@ pub(crate) struct Bolt {
     /// are written in place, the scratch sits at its load-time capacity) and a
     /// scratch grow drops the graph before any replacement.
     graph: Option<GraphExec<'static>>,
+    /// The sequence whose planes and words the captured body baked.
+    graph_seq: u64,
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
     pub(crate) layers: Vec<BoltLayer>,
@@ -273,6 +327,8 @@ pub(crate) struct Bolt {
     /// the first reason, always counted. Every capture refusal pins the mode
     /// to eager; the eager body stays the reference.
     pub(crate) graph_mode: DecodeGraphMode,
+    /// The logits rows of a window, present once `reserve_window` ran.
+    window: Option<WindowBuffers>,
 }
 
 fn embed_scale() -> f32 {
@@ -376,23 +432,6 @@ pub(crate) fn load_choosing(
             Some(NEMOTRON_BOLT_E4B.shared_kv_source(layer as u32)? as usize)
         };
         let base = format!("blk.{layer}.");
-        let kv = if physical {
-            Some(Kv {
-                k_codes: zero(&ctx, KV_HEADS * CELLS * head)?,
-                k_scales: zero(&ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
-                v_codes: zero(&ctx, KV_HEADS * CELLS * head)?,
-                v_scales: zero(&ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
-                shape: Kv8Shape {
-                    rows: 1,
-                    n_kv_head: KV_HEADS,
-                    head_dim: head,
-                    cells: CELLS,
-                    code_scale: Kv8CodeScale::UnroundedF32,
-                },
-            })
-        } else {
-            None
-        };
         layers.push(BoltLayer {
             attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,
             q_norm: vector(&weights, &ctx, &format!("{base}attn_q_norm.weight"), head)?,
@@ -515,7 +554,6 @@ pub(crate) fn load_choosing(
             scale: scalar(&weights, &format!("{base}layer_output_scale.weight"))?,
             global,
             head,
-            kv,
             kv_source,
         });
     }
@@ -574,8 +612,6 @@ pub(crate) fn load_choosing(
             q8_1_bytes(GLOBAL_HEAD, Bolt::PREFILL_BATCH * HEADS).expect("qk dump size"),
         )?,
         ids: zero(&ctx, Bolt::PREFILL_BATCH * 4)?,
-        pos: zero(&ctx, 4)?,
-        kv_len: zero(&ctx, 4)?,
         status: zero(&ctx, 4)?,
         attn_part: if attn_split {
             Some(zero(&ctx, attn_part_bytes())?)
@@ -600,11 +636,127 @@ pub(crate) fn load_choosing(
         eps,
         graph_mode: DecodeGraphMode::new(decode_graph_wanted()?),
         graph: None,
+        graph_seq: 0,
+        window: None,
     })
 }
 
 impl Bolt {
     pub(crate) const PREFILL_BATCH: usize = 8;
+
+    /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical
+    /// layers at `CELLS` positions and its two position words. The planes are read only below
+    /// the position word, so a sequence that is reset needs no clearing.
+    pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
+        let ctx = &self.ctx;
+        let mut kv = Vec::with_capacity(LAYERS);
+        for layer in &self.layers {
+            let head = layer.head;
+            kv.push(if layer.physical() {
+                Some(Kv {
+                    k_codes: zero(ctx, KV_HEADS * CELLS * head)?,
+                    k_scales: zero(ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
+                    v_codes: zero(ctx, KV_HEADS * CELLS * head)?,
+                    v_scales: zero(ctx, KV_HEADS * CELLS * (head / 32) * 2)?,
+                    shape: Kv8Shape {
+                        rows: 1,
+                        n_kv_head: KV_HEADS,
+                        head_dim: head,
+                        cells: CELLS,
+                        code_scale: Kv8CodeScale::UnroundedF32,
+                    },
+                })
+            } else {
+                None
+            });
+        }
+        Ok(BoltSeq {
+            id: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+            kv,
+            pos: zero(ctx, 4)?,
+            kv_len: zero(ctx, 4)?,
+        })
+    }
+
+    /// Allocates the logits rows that a window of up to `rows` sequences needs, once. A request
+    /// for fewer rows than are held keeps the buffers.
+    pub(crate) fn reserve_window(&mut self, rows: usize) -> Result<(), EngError> {
+        if !(2..=Self::PREFILL_BATCH).contains(&rows) {
+            return Err(EngError::BadRequest(format!(
+                "a Bolt window holds 2 to {} rows, got {rows}",
+                Self::PREFILL_BATCH
+            )));
+        }
+        if self.window.as_ref().is_some_and(|held| held.rows >= rows) {
+            return Ok(());
+        }
+        self.window = Some(WindowBuffers {
+            rows,
+            logits: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
+            capped: vector_filled(&self.ctx, rows * VOCAB, 0.0)?,
+        });
+        Ok(())
+    }
+
+    /// Steps one token of each sequence together and returns the capped logits row of each, in
+    /// order. The projections, norms, feed-forward and per-layer-input blocks run once over all
+    /// rows; rotation, cache append and attention run once per sequence against its own planes
+    /// and words, which is the launch a lone sequence makes. The head runs in launches of at
+    /// most [`HEAD_COLUMNS`] columns. `positions[i]` is the cell the token of `seqs[i]` is
+    /// written to.
+    pub(crate) fn decode_rows(
+        &mut self,
+        seqs: &[&BoltSeq],
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<Vec<f32>>, EngError> {
+        let m = seqs.len();
+        if m != tokens.len() || m != positions.len() {
+            return Err(EngError::BadRequest(
+                "a Bolt window needs one token and one position per sequence".to_owned(),
+            ));
+        }
+        if !(2..=Self::PREFILL_BATCH).contains(&m) {
+            return Err(EngError::BadRequest(format!(
+                "a Bolt window holds 2 to {} rows, got {m}",
+                Self::PREFILL_BATCH
+            )));
+        }
+        if self.window.as_ref().is_none_or(|held| held.rows < m) {
+            return Err(EngError::BadRequest(
+                "the Bolt window buffers are not reserved for this many rows".to_owned(),
+            ));
+        }
+        if positions.iter().any(|&pos| pos >= CELLS) {
+            return Err(EngError::ContextLimit(
+                "the Bolt decode window exceeds the context".to_owned(),
+            ));
+        }
+        self.grow_scratch(m)?;
+        let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.scratch.ids.write_at_enqueue(&self.stream, 0, &ids)?;
+        for (seq, &pos) in seqs.iter().zip(positions) {
+            seq.pos
+                .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
+            seq.kv_len
+                .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+        }
+        self.decode_body(&Rows::Window { seqs }, true, m)?;
+        self.graph_mode.note_eager();
+        let window = self.window.as_ref().expect("checked above");
+        let mut bytes = vec![0u8; m * VOCAB * 4];
+        window.capped.buf.read_at(&self.stream, 0, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(VOCAB * 4)
+            .map(|row| {
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            })
+            .collect())
+    }
 
     /// Arms or disarms the decode graph for this model (the environment
     /// sets the load-time default; the tests flip it between runs).
@@ -681,6 +833,7 @@ impl Bolt {
     /// logits are drawn.
     pub(crate) fn prefill_batch(
         &mut self,
+        seq: &BoltSeq,
         tokens: &[u32],
         pos: usize,
         logits: bool,
@@ -696,7 +849,7 @@ impl Bolt {
             ));
         }
         self.grow_scratch(tokens.len())?;
-        self.decode_with_logits(tokens, pos, logits)?;
+        self.decode_with_logits(seq, tokens, pos, logits)?;
         if !logits {
             self.stream.synchronize()?;
         }
@@ -792,8 +945,8 @@ impl Bolt {
 
     /// Runs one decode step for the token at the position and leaves the capped
     /// logits in the device buffer. Synchronizes once at the end.
-    pub(crate) fn decode(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, true)
+    pub(crate) fn decode(&mut self, seq: &BoltSeq, token: u32, pos: usize) -> Result<(), EngError> {
+        self.decode_with_logits(seq, &[token], pos, true)
     }
 
     /// Runs one step without the output norm and the logits projection, for prompt tokens
@@ -801,12 +954,18 @@ impl Bolt {
     /// The shared-KV layers are skipped: they write no cache cells, and their
     /// hidden state only feeds the final norm, so a token whose logits are
     /// never read does not need them.
-    pub(crate) fn decode_hidden(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, false)
+    pub(crate) fn decode_hidden(
+        &mut self,
+        seq: &BoltSeq,
+        token: u32,
+        pos: usize,
+    ) -> Result<(), EngError> {
+        self.decode_with_logits(seq, &[token], pos, false)
     }
 
     fn decode_with_logits(
         &mut self,
+        seq: &BoltSeq,
         tokens: &[u32],
         pos: usize,
         logits: bool,
@@ -822,12 +981,11 @@ impl Bolt {
         // decode graph bakes their addresses, and the eager path saves the
         // three per-step allocations the uploads made.
         self.scratch.ids.write_at_enqueue(&self.stream, 0, &ids)?;
-        self.scratch
-            .pos
+        seq.pos
             .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
-        self.scratch
-            .kv_len
+        seq.kv_len
             .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
+        let rows = Rows::Chunk { seq, pos };
         let facts = DecodeGraphFacts {
             trace_armed: trace_dir().is_some(),
             multi_token: m > 1,
@@ -836,13 +994,17 @@ impl Bolt {
         if check_decode_graph(facts).is_ok() {
             // The mode gates the replay too: a disarmed (or refused) mode must
             // not keep replaying a graph it captured earlier.
-            if let Some(exec) = self.graph.as_ref().filter(|_| self.graph_mode.active()) {
+            if let Some(exec) = self
+                .graph
+                .as_ref()
+                .filter(|_| self.graph_mode.active() && self.graph_seq == seq.id)
+            {
                 exec.launch(&self.stream)?;
                 self.graph_mode.note_replay();
                 return self.stream.synchronize();
             }
             if self.graph_mode.active() && self.graph_mode.warm() {
-                match self.capture_decode_graph(pos) {
+                match self.capture_decode_graph(seq, pos) {
                     Ok(()) => {
                         self.graph_mode.note_replay();
                         return self.stream.synchronize();
@@ -856,7 +1018,7 @@ impl Bolt {
                 }
             }
         }
-        self.decode_body(pos, logits, m)?;
+        self.decode_body(&rows, logits, m)?;
         self.graph_mode.note_eager();
         if check_decode_graph(facts).is_ok() {
             // One clean eager step warms every kernel the capture records
@@ -871,7 +1033,8 @@ impl Bolt {
     /// No per-step scalar but the trace label's position reaches the kernels
     /// through arguments; the kernels that depend on the position or the KV
     /// length read the step words.
-    fn decode_body(&self, pos: usize, logits: bool, m: usize) -> Result<(), EngError> {
+    fn decode_body(&self, rows: &Rows<'_>, logits: bool, m: usize) -> Result<(), EngError> {
+        let pos = rows.trace_pos();
         let ctx = &self.ctx;
         let stream = &self.stream;
         let sc = &self.scratch;
@@ -908,7 +1071,7 @@ impl Bolt {
         } else {
             self.layers
                 .iter()
-                .position(|layer| layer.kv.is_none())
+                .position(|layer| !layer.physical())
                 .unwrap_or(LAYERS)
         };
         self.per_layer_inputs(h1, m, kv_prefix * PLE)?;
@@ -923,7 +1086,7 @@ impl Bolt {
                 h[r1],
                 h[r2],
                 h[out],
-                pos,
+                rows,
                 kv_prefix * PLE,
                 m,
             )?;
@@ -935,6 +1098,9 @@ impl Bolt {
             return Ok(());
         }
         let input = h[current];
+        if let Rows::Window { .. } = rows {
+            return self.window_head(input, m);
+        }
         ctx.add_rmsnorm_q8(
             stream,
             AddNormQ8Call {
@@ -980,17 +1146,72 @@ impl Bolt {
     /// records the work without running it, so this step's token is produced
     /// by the first replay. A refusal propagates to the caller, which notes it
     /// sticky and runs the body eagerly.
-    fn capture_decode_graph(&mut self, pos: usize) -> Result<(), EngError> {
+    fn capture_decode_graph(&mut self, seq: &BoltSeq, pos: usize) -> Result<(), EngError> {
         let plan = CapturePlan {
             pins: &[],
             holds: Vec::new(),
         };
+        let rows = Rows::Chunk { seq, pos };
         let (exec, ()) = self
             .ctx
-            .capture(&self.stream, plan, || self.decode_body(pos, true, 1))?;
+            .capture(&self.stream, plan, || self.decode_body(&rows, true, 1))?;
         exec.launch(&self.stream)?;
         self.graph = Some(exec);
+        self.graph_seq = seq.id;
         Ok(())
+    }
+
+    /// The head of a window: the output norm over every row, the tied-embedding projection in
+    /// launches of at most [`HEAD_COLUMNS`] columns, and the softcap over all rows.
+    fn window_head(&self, input: &Vector, m: usize) -> Result<(), EngError> {
+        let ctx = &self.ctx;
+        let stream = &self.stream;
+        let sc = &self.scratch;
+        let window = self
+            .window
+            .as_ref()
+            .ok_or_else(|| EngError::BadRequest("the Bolt window buffers are absent".to_owned()))?;
+        ctx.add_rmsnorm_q8(
+            stream,
+            AddNormQ8Call {
+                n: HIDDEN,
+                eps: self.eps,
+                h: input.buf.range(0, m * HIDDEN * 4)?,
+                delta: None,
+                weight: self.out_norm.buf.range(0, self.out_norm.bytes())?,
+                norm_out: sc.nrm.buf.range(0, m * HIDDEN * 4)?,
+                q8: sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
+                rows: m,
+            },
+        )?;
+        let row_bytes = q8_1_bytes(HIDDEN, 1).expect("hidden q8 row size");
+        for first in (0..m).step_by(HEAD_COLUMNS) {
+            let columns = HEAD_COLUMNS.min(m - first);
+            ctx.matvec_q(
+                stream,
+                MatvecCall {
+                    ty: QuantType::Q80,
+                    w: self.embed.buf.range(0, self.embed.bytes())?,
+                    x_q8: sc.q8_hidden.range(first * row_bytes, columns * row_bytes)?,
+                    y: window
+                        .logits
+                        .buf
+                        .range(first * VOCAB * 4, columns * VOCAB * 4)?,
+                    k: HIDDEN,
+                    rows: self.embed.rows,
+                    ncols: columns,
+                },
+            )?;
+        }
+        ctx.softcap(
+            stream,
+            SoftcapCall {
+                out: window.capped.buf.range(0, m * VOCAB * 4)?,
+                x: window.logits.buf.range(0, m * VOCAB * 4)?,
+                cap: SOFT_CAP,
+                n: m * VOCAB,
+            },
+        )
     }
 
     /// Projects the scaled embedding into the per-layer planes and scales by
@@ -1036,6 +1257,151 @@ impl Bolt {
         )
     }
 
+    /// Rotation, cache append and attention of one layer. A chunk runs them once over its
+    /// consecutive rows against its sequence; a window runs them once per row against that
+    /// row's sequence, with the launch a lone row makes.
+    fn rope_append_attend(&self, index: usize, rows: &Rows<'_>, m: usize) -> Result<(), EngError> {
+        let layer = &self.layers[index];
+        let ctx = &self.ctx;
+        let stream = &self.stream;
+        let sc = &self.scratch;
+        let head = layer.head;
+        let q_rows = HEADS * head;
+        let kv_rows = KV_HEADS * head;
+        let physical = layer.physical();
+        let source = layer.kv_source.unwrap_or(index);
+        let pos = rows.trace_pos();
+        let attn_split = sc.attn_part.as_ref().map(|part| {
+            let bytes = attn_part_bytes();
+            AttnDecodeGemmaSplit {
+                // Sized at load for the full prefill batch; the range cannot fail.
+                part: part.range(0, bytes).expect("partial buffer"),
+                max_splits: ATTN_SPLIT_MAX,
+                min_keys: ATTN_SPLIT_MIN_KEYS,
+            }
+        });
+        // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
+        // row sits at cell `first`.
+        let group =
+            |seq: &BoltSeq, row: usize, count: usize, first: usize| -> Result<(), EngError> {
+                let own = seq.kv[source]
+                    .as_ref()
+                    .expect("the shared-KV source layer is physical");
+                // A shared layer rotates its query only; the rope kernel requires at least one k
+                // row, so it rotates one scratch row that no later launch reads.
+                ctx.rope_gemma(
+                    stream,
+                    RopeGemmaCall {
+                        q: sc
+                            .q_normed
+                            .buf
+                            .range(row * q_rows * 4, count * q_rows * 4)?,
+                        k: if physical {
+                            sc.k_normed
+                                .buf
+                                .range(row * kv_rows * 4, count * kv_rows * 4)?
+                        } else {
+                            sc.k_normed.buf.range(0, kv_rows * 4)?
+                        },
+                        pos: seq.pos.range(0, 4)?,
+                        factors: match (&self.rope_freqs, layer.global) {
+                            (Some(freqs), true) => Some(freqs.buf.range(0, freqs.bytes())?),
+                            _ => None,
+                        },
+                        rows_q: count,
+                        rows_k: if physical { count } else { 1 },
+                        n_q_head: HEADS,
+                        n_kv_head: KV_HEADS,
+                        head_dim: head,
+                        global_mode: layer.global,
+                    },
+                )?;
+                if physical {
+                    let data = Kv8Data {
+                        k: sc
+                            .k_normed
+                            .buf
+                            .range(row * kv_rows * 4, count * kv_rows * 4)?,
+                        v: sc
+                            .v_normed
+                            .buf
+                            .range(row * kv_rows * 4, count * kv_rows * 4)?,
+                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                    };
+                    if count == 1 {
+                        // The decode entry: the device pos word is authoritative, so a captured
+                        // replay writes the cell of the step it replays instead of the
+                        // capture-time cell. The status word satisfies the launch contract; the
+                        // caller's host check that `pos + m` leaves the context makes the
+                        // kernel's refuse path unreachable, so the word is never read back.
+                        ctx.kv8_append(
+                            stream,
+                            Kv8Shape {
+                                rows: 1,
+                                ..own.shape
+                            },
+                            data,
+                            seq.pos.range(0, 4)?,
+                            sc.status.range(0, 4)?,
+                        )?;
+                    } else {
+                        // The prefill chunk entry takes its position as a host scalar; it is never
+                        // captured (a multi-token step refuses arming), so the baked-scalar hazard
+                        // does not arise.
+                        ctx.kv8_chunk(
+                            stream,
+                            Kv8Shape {
+                                rows: count,
+                                ..own.shape
+                            },
+                            data,
+                            first,
+                        )?;
+                    }
+                }
+                self.trace(
+                    pos,
+                    &format!("L{index}_v"),
+                    &sc.v_normed,
+                    (row + count) * kv_rows * 4,
+                );
+                ctx.attn_decode_gemma(
+                    stream,
+                    AttnDecodeGemmaCall {
+                        out: sc.ctx_out.buf.range(row * q_rows * 4, count * q_rows * 4)?,
+                        status: None,
+                        q: sc
+                            .q_normed
+                            .buf
+                            .range(row * q_rows * 4, count * q_rows * 4)?,
+                        k_codes: own.k_codes.range(0, own.k_codes.bytes())?,
+                        k_scales: own.k_scales.range(0, own.k_scales.bytes())?,
+                        v_codes: own.v_codes.range(0, own.v_codes.bytes())?,
+                        v_scales: own.v_scales.range(0, own.v_scales.bytes())?,
+                        kv_len: seq.kv_len.range(0, 4)?,
+                        m: count,
+                        n_q_head: HEADS,
+                        n_kv_head: KV_HEADS,
+                        head_dim: head,
+                        cells: CELLS,
+                        window: if layer.global { 0 } else { LOCAL_WINDOW },
+                        scale: 1.0,
+                        split: attn_split,
+                    },
+                )
+            };
+        match rows {
+            Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
+            Rows::Window { seqs } => seqs
+                .iter()
+                .enumerate()
+                .try_for_each(|(row, seq)| group(seq, row, 1, 0)),
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the residual rotation keeps four separate buffers"
@@ -1047,10 +1413,11 @@ impl Bolt {
         r1: &Vector,
         r2: &Vector,
         out: &Vector,
-        pos: usize,
+        rows: &Rows<'_>,
         ple_stride: usize,
         m: usize,
     ) -> Result<(), EngError> {
+        let pos = rows.trace_pos();
         let layer = &self.layers[index];
         let ctx = &self.ctx;
         let stream = &self.stream;
@@ -1058,18 +1425,7 @@ impl Bolt {
         let head = layer.head;
         let q_rows = HEADS * head;
         let kv_rows = KV_HEADS * head;
-        let (own_kv, shared) = match &layer.kv {
-            Some(own) => (own, false),
-            None => (
-                self.layers[layer
-                    .kv_source
-                    .expect("a cacheless layer names its shared-KV source")]
-                .kv
-                .as_ref()
-                .expect("the shared-KV source layer is physical"),
-                true,
-            ),
-        };
+        let shared = !layer.physical();
         self.norm_rows(
             stream,
             input.buf.range(0, input.bytes())?,
@@ -1158,113 +1514,7 @@ impl Bolt {
                 },
             )?;
         }
-        // A shared layer rotates its query only; the rope kernel requires at least
-        // one k row, so it rotates one scratch row that no later launch reads.
-        let physical = !shared;
-        ctx.rope_gemma(
-            stream,
-            RopeGemmaCall {
-                q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
-                k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
-                pos: sc.pos.range(0, 4)?,
-                factors: match (&self.rope_freqs, layer.global) {
-                    (Some(freqs), true) => Some(freqs.buf.range(0, freqs.bytes())?),
-                    _ => None,
-                },
-                rows_q: m,
-                rows_k: if physical { m } else { 1 },
-                n_q_head: HEADS,
-                n_kv_head: KV_HEADS,
-                head_dim: head,
-                global_mode: layer.global,
-            },
-        )?;
-        if physical {
-            if m == 1 {
-                // The decode entry: the device pos word is authoritative, so a
-                // captured replay writes the cell of the step it replays
-                // instead of the capture-time cell. The status word satisfies
-                // the launch contract; the caller's host check that
-                // `pos + m` leaves the context makes the kernel's refuse
-                // path unreachable, so the word is never read back.
-                ctx.kv8_append(
-                    stream,
-                    Kv8Shape {
-                        rows: 1,
-                        ..layer
-                            .kv
-                            .as_ref()
-                            .expect("physical layers own a cache")
-                            .shape
-                    },
-                    Kv8Data {
-                        k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
-                        v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
-                        k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
-                        k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
-                        v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
-                        v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
-                    },
-                    sc.pos.range(0, 4)?,
-                    sc.status.range(0, 4)?,
-                )?;
-            } else {
-                // The prefill chunk entry takes its position as a host
-                // scalar; it is never captured (a multi-token step refuses
-                // arming), so the baked-scalar hazard does not arise.
-                ctx.kv8_chunk(
-                    stream,
-                    Kv8Shape {
-                        rows: m,
-                        ..layer
-                            .kv
-                            .as_ref()
-                            .expect("physical layers own a cache")
-                            .shape
-                    },
-                    Kv8Data {
-                        k: sc.k_normed.buf.range(0, m * kv_rows * 4)?,
-                        v: sc.v_normed.buf.range(0, m * kv_rows * 4)?,
-                        k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
-                        k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
-                        v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
-                        v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
-                    },
-                    pos,
-                )?;
-            }
-        }
-        self.trace(pos, &format!("L{index}_v"), &sc.v_normed, m * kv_rows * 4);
-        let attn_split = sc.attn_part.as_ref().map(|part| {
-            let bytes = attn_part_bytes();
-            AttnDecodeGemmaSplit {
-                // Sized at load for the full prefill batch; the range cannot fail.
-                part: part.range(0, bytes).expect("partial buffer"),
-                max_splits: ATTN_SPLIT_MAX,
-                min_keys: ATTN_SPLIT_MIN_KEYS,
-            }
-        });
-        ctx.attn_decode_gemma(
-            stream,
-            AttnDecodeGemmaCall {
-                out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
-                status: None,
-                q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
-                k_codes: own_kv.k_codes.range(0, own_kv.k_codes.bytes())?,
-                k_scales: own_kv.k_scales.range(0, own_kv.k_scales.bytes())?,
-                v_codes: own_kv.v_codes.range(0, own_kv.v_codes.bytes())?,
-                v_scales: own_kv.v_scales.range(0, own_kv.v_scales.bytes())?,
-                kv_len: sc.kv_len.range(0, 4)?,
-                m,
-                n_q_head: HEADS,
-                n_kv_head: KV_HEADS,
-                head_dim: head,
-                cells: CELLS,
-                window: if layer.global { 0 } else { LOCAL_WINDOW },
-                scale: 1.0,
-                split: attn_split,
-            },
-        )?;
+        self.rope_append_attend(index, rows, m)?;
         self.trace(pos, &format!("L{index}_ctx"), &sc.ctx_out, m * q_rows * 4);
         ctx.quantize_q8_1(
             stream,
@@ -1915,12 +2165,15 @@ mod tests {
     fn trace_two_single_steps() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
         let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let seq = model.new_seq().expect("sequence");
         for (pos, token) in [2u32, 19].into_iter().enumerate() {
             if pos == 0 {
-                model.decode(token, pos).expect("first token with logits");
+                model
+                    .decode(&seq, token, pos)
+                    .expect("first token with logits");
             } else {
                 model
-                    .decode_hidden(token, pos)
+                    .decode_hidden(&seq, token, pos)
                     .expect("second token hidden");
             }
         }
@@ -1932,9 +2185,10 @@ mod tests {
     fn trace_full_prompt_logits() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
         let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        let seq = model.new_seq().expect("sequence");
         for pos in 0..32u32 {
             let token = 2 + pos * 17;
-            model.decode(token, pos as usize).expect("step");
+            model.decode(&seq, token, pos as usize).expect("step");
         }
     }
 
@@ -1945,43 +2199,44 @@ mod tests {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
         let header = std::env::var("BOLT_Q8_HEADER_SHA256").ok();
         let mut model = super::load(std::path::Path::new(&path), header.as_deref()).expect("load");
+        let seq = model.new_seq().expect("sequence");
         assert!(matches!(
-            model.prefill_batch(&[], 0, false),
+            model.prefill_batch(&seq, &[], 0, false),
             Err(EngError::BadRequest(_))
         ));
         assert!(matches!(
-            model.prefill_batch(&[2; 9], 0, false),
+            model.prefill_batch(&seq, &[2; 9], 0, false),
             Err(EngError::BadRequest(_))
         ));
         assert!(matches!(
-            model.prefill_batch(&[2], CELLS, false),
+            model.prefill_batch(&seq, &[2], CELLS, false),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(
-            model.prefill_batch(&[2], usize::MAX, false),
+            model.prefill_batch(&seq, &[2], usize::MAX, false),
             Err(EngError::ContextLimit(_))
         ));
         // Decode bounds its position like prefill: the last valid cell is one below the cap.
         assert!(matches!(
-            model.decode(2, CELLS),
+            model.decode(&seq, 2, CELLS),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(
-            model.decode_hidden(2, CELLS),
+            model.decode_hidden(&seq, 2, CELLS),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(
-            model.decode(2, usize::MAX),
+            model.decode(&seq, 2, usize::MAX),
             Err(EngError::ContextLimit(_))
         ));
         let prompt: Vec<u32> = (0..32).map(|i| 2 + i * 17).collect();
         let single_started = std::time::Instant::now();
         for (pos, &token) in prompt.iter().enumerate() {
             if pos + 1 == prompt.len() {
-                model.decode(token, pos).expect("single last token");
+                model.decode(&seq, token, pos).expect("single last token");
             } else {
                 model
-                    .decode_hidden(token, pos)
+                    .decode_hidden(&seq, token, pos)
                     .expect("single hidden token");
             }
         }
@@ -1994,7 +2249,9 @@ mod tests {
             std::fs::write(&path, bytes).expect("dump logits");
             eprintln!("logits dumped to {path}");
         }
-        model.decode(2, prompt.len()).expect("single continuation");
+        model
+            .decode(&seq, 2, prompt.len())
+            .expect("single continuation");
         let continued = logits(&model);
         eprintln!("timing 32 single steps {single_elapsed:?}");
         // Eight rows is the shipped cap; three also exercises a partial final batch.
@@ -2003,13 +2260,15 @@ mod tests {
             let mut pos = 0;
             for batch in prompt.chunks(width) {
                 model
-                    .prefill_batch(batch, pos, pos + batch.len() == prompt.len())
+                    .prefill_batch(&seq, batch, pos, pos + batch.len() == prompt.len())
                     .expect("batch");
                 pos += batch.len();
             }
             let elapsed = started.elapsed();
             assert_logits(&logits(&model), &expected);
-            model.decode(2, prompt.len()).expect("batch continuation");
+            model
+                .decode(&seq, 2, prompt.len())
+                .expect("batch continuation");
             assert_logits(&logits(&model), &continued);
             eprintln!(
                 "timing 32 batched tokens m={width} {elapsed:?}; speedup {:.3}",
@@ -2037,27 +2296,30 @@ mod tests {
             // Fresh load per width: the cache starts zeroed, so a missing
             // skip-path write here is not masked by the last width's cells.
             let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+            let seq = model.new_seq().expect("sequence");
             // Skip-prefill: non-final batches hide logits and run only the
             // physical prefix; the final batch reads logits over the cache.
             let mut pos = 0;
             for batch in prompt.chunks(width) {
                 model
-                    .prefill_batch(batch, pos, pos + batch.len() == n)
+                    .prefill_batch(&seq, batch, pos, pos + batch.len() == n)
                     .expect("skip batch");
                 pos += batch.len();
             }
             let skip = logits(&model);
-            model.decode(2, n).expect("skip continuation");
+            model.decode(&seq, 2, n).expect("skip continuation");
             let skip_continued = logits(&model);
             // Full-layer prefill overwrites the same cells from position 0:
             // every batch reads logits, so every layer runs.
             let mut pos = 0;
             for batch in prompt.chunks(Bolt::PREFILL_BATCH) {
-                model.prefill_batch(batch, pos, true).expect("full batch");
+                model
+                    .prefill_batch(&seq, batch, pos, true)
+                    .expect("full batch");
                 pos += batch.len();
             }
             assert_logits(&logits(&model), &skip);
-            model.decode(2, n).expect("full continuation");
+            model.decode(&seq, 2, n).expect("full continuation");
             assert_logits(&logits(&model), &skip_continued);
         }
     }

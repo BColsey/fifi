@@ -1,9 +1,48 @@
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{EngError, checkpoint_json::UniqueValue};
 
 const ARCHITECTURE: &str = "Gemma4UnifiedForConditionalGeneration";
 const BOLT_ARCHITECTURE: &str = "Gemma4ForConditionalGeneration";
+
+/// How many sessions the Bolt engine serves at once: an explicit count from 1 to 8, or `auto`,
+/// which asks the sequence planner for the count the free device memory funds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawMaxSeqs")]
+pub(crate) enum MaxSeqs {
+    Count(usize),
+    Auto,
+}
+
+impl Default for MaxSeqs {
+    /// One session: the engine serves one request at a time.
+    fn default() -> Self {
+        Self::Count(1)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawMaxSeqs {
+    Count(u64),
+    Word(String),
+}
+
+impl TryFrom<RawMaxSeqs> for MaxSeqs {
+    type Error = String;
+
+    fn try_from(raw: RawMaxSeqs) -> Result<Self, String> {
+        match raw {
+            RawMaxSeqs::Count(count) if (1..=8).contains(&count) => Ok(Self::Count(count as usize)),
+            RawMaxSeqs::Count(count) => Err(format!("max_seqs {count} is outside 1 to 8")),
+            RawMaxSeqs::Word(word) if word == "auto" => Ok(Self::Auto),
+            RawMaxSeqs::Word(word) => {
+                Err(format!("max_seqs accepts 1 to 8 or \"auto\", got {word:?}"))
+            }
+        }
+    }
+}
 
 pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     let root = serde_json::from_slice::<UniqueValue>(json)
