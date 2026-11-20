@@ -2361,7 +2361,7 @@ fn matvec_q80_matches_the_integer_reference() {
             }
         }
         // The fused mirror is the arithmetic contract: at the serve shape the
-        // kernel must agree with it BIT-FIR-BIT (both use the exact dp4a
+        // kernel must agree with it bit for bit (both use the exact dp4a
         // integers, one fmaf per block and the xor tree, so any drift here is a
         // real accumulation change, not quantization noise).
         if k == 2560 {
@@ -2515,7 +2515,7 @@ fn matvec_q40_refuses_bad_shapes_before_the_adapter() {
 }
 
 /// The two entries the resident can serve a Q8_0 projection through must
-/// agree BIT-FOR-BIT on every shape and width the dense resident launches:
+/// agree bit for bit on every shape and width the dense resident launches:
 /// the column-invariant entry over native blocks against the split-plane
 /// entry over its repacked planes, column by column, at the decode width
 /// (one column) and every batched width through eight. The shapes are the
