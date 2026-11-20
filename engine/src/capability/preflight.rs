@@ -757,6 +757,22 @@ fn q36_preflight(
         WeightFormat::Gguf if backend == Backend::Cuda => {
             checks.push(pinned_gguf_check(model_dir, inspection));
         }
+        // The MLX arm reads an MLX safetensors pack; `gguf` is only the unset default of
+        // `weight_format`, which the MLX arm does not use.
+        WeightFormat::Gguf
+            if backend == Backend::Mlx
+                && inspection.gguf_files.is_empty()
+                && inspection.safetensors_files > 0 =>
+        {
+            checks.push(Check::new(
+                "weight format",
+                CheckStatus::Pass,
+                format!(
+                    "{} MLX safetensors shards are present; exact file identity is verified by the loader",
+                    inspection.safetensors_files
+                ),
+            ));
+        }
         WeightFormat::Gguf if inspection.gguf_files.is_empty() => checks.push(Check::new(
             "weight format",
             CheckStatus::Fail,
@@ -2339,6 +2355,47 @@ mod tests {
         );
         assert_eq!(report.verdict, Verdict::Unsupported);
         assert_eq!(report.dimensions.compatibility, Compatibility::Unsupported);
+    }
+
+    /// The MLX arm reads a safetensors pack: the unset `weight_format` (`gguf`) must not demand a
+    /// `.gguf` file there, and a directory without any weight file still fails.
+    #[test]
+    fn an_mlx_pack_passes_the_weight_format_check_without_a_gguf_file() {
+        use crate::family::qwen36::settings::Backend;
+        let candidate = super::Candidate {
+            context_limit: Some(4096),
+            ..super::Candidate::default()
+        };
+        let report_for = |with_shard: bool| {
+            let dir = tempfile::tempdir().unwrap().keep();
+            if with_shard {
+                std::fs::write(dir.join("model-00001-of-00001.safetensors"), vec![0u8; 8]).unwrap();
+            }
+            for name in crate::capability::inspect::TOKENIZER_FILES {
+                std::fs::write(dir.join(name), "{}").unwrap();
+            }
+            let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
+            super::q36_preflight(
+                &dir,
+                &dir,
+                &inspection,
+                &candidate,
+                &cuda_facts(24u64 << 30),
+                Some(Backend::Mlx),
+                Vec::new(),
+            )
+        };
+        let with = report_for(true);
+        let check = check_named(&with, "weight format");
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+        assert!(
+            check.detail.contains("1 MLX safetensors shards"),
+            "{}",
+            check.detail
+        );
+        let without = report_for(false);
+        let check = check_named(&without, "weight format");
+        assert_eq!(check.status, CheckStatus::Fail, "{}", check.detail);
     }
 
     #[test]
