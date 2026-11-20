@@ -54,6 +54,19 @@ struct RingSlot {
     pending: bool,
 }
 
+impl RingSlot {
+    fn wait_ready(&mut self, stream: &DeviceStream) -> Result<(), EngError> {
+        if self.pending {
+            self.buf.wait(&self.event)?;
+            self.pending = false;
+        } else if self.buf.pending_stream().is_some() {
+            // An enqueue can succeed before a later enqueue or its event record fails.
+            self.buf.synchronize(stream)?;
+        }
+        Ok(())
+    }
+}
+
 /// Ring depth: eight batch-sized slots (~18.9 MiB at the Qwen slice of 589,824 B and
 /// batches of four) — enough ahead-runs to keep the DMA fed while one slot waits its
 /// event.
@@ -148,10 +161,7 @@ impl ColdStaging {
                 let at_slot = at % ring.len();
                 at += 1;
                 let slot = &mut ring[at_slot];
-                if slot.pending {
-                    slot.buf.wait(&slot.event)?;
-                    slot.pending = false;
-                }
+                slot.wait_ready(stream)?;
                 for (step, entry) in batch.iter().enumerate() {
                     let range = range_of(entry);
                     let slice = bytes.get(range.clone()).ok_or_else(|| {
@@ -239,6 +249,30 @@ pub(super) struct BankFill<'d> {
     pub(super) stream: &'d DeviceStream,
 }
 
+impl<'d> BankFill<'d> {
+    fn expert<'r>(
+        &self,
+        layer: usize,
+        ranges: &ExpertRanges,
+        region: &'r dyn MappedRegion,
+    ) -> Result<(&'d ExpertBank, [&'r [u8]; 3]), HostError> {
+        let bank = self
+            .banks
+            .get(layer)
+            .ok_or_else(|| HostError::Device(format!("no bank for layer {layer}")))?;
+        let bytes = region.bytes();
+        let cut = |range: &Range<usize>| {
+            bytes.get(range.clone()).ok_or_else(|| {
+                HostError::Device(format!("expert range {range:?} is outside the region"))
+            })
+        };
+        Ok((
+            bank,
+            [cut(&ranges.gate)?, cut(&ranges.up)?, cut(&ranges.down)?],
+        ))
+    }
+}
+
 impl BankDevice for BankFill<'_> {
     fn fill_slot(
         &mut self,
@@ -247,25 +281,63 @@ impl BankDevice for BankFill<'_> {
         ranges: &ExpertRanges,
         region: &Arc<dyn MappedRegion>,
     ) -> Result<(), HostError> {
-        let device = |what: String| HostError::Device(what);
-        let bank = self
-            .banks
-            .get(layer)
-            .ok_or_else(|| device(format!("no bank for layer {layer}")))?;
-        let bytes = region.bytes();
-        let cut = |range: &Range<usize>| {
-            bytes
-                .get(range.clone())
-                .ok_or_else(|| device(format!("expert range {range:?} is outside the region")))
-        };
-        bank.fill(
-            self.stream,
-            slot,
-            cut(&ranges.gate)?,
-            cut(&ranges.up)?,
-            cut(&ranges.down)?,
-        )
-        .map_err(|error| device(format!("{error:?}")))
+        let (bank, [gate, up, down]) = self.expert(layer, ranges, region.as_ref())?;
+        bank.fill(self.stream, slot, gate, up, down)
+            .map_err(fill_error)
+    }
+}
+
+fn fill_error(error: EngError) -> HostError {
+    HostError::Device(format!("{error:?}"))
+}
+
+/// A warm-up fill uses a slot of the cold staging ring for all three projections.
+/// The ledger's wait still precedes publication of any destination slot.
+struct PinnedWarmFill<'d, 'r> {
+    targets: BankFill<'d>,
+    context: &'d CudaContext,
+    ring: &'r mut [RingSlot],
+    next: usize,
+}
+
+impl BankDevice for PinnedWarmFill<'_, '_> {
+    fn fill_slot(
+        &mut self,
+        layer: usize,
+        slot: usize,
+        ranges: &ExpertRanges,
+        region: &Arc<dyn MappedRegion>,
+    ) -> Result<(), HostError> {
+        let (bank, slices) = self.targets.expert(layer, ranges, region.as_ref())?;
+        let lengths = slices.map(|slice| slice.len());
+        let [gate, up, down] = bank.fill_ranges(slot, lengths).map_err(fill_error)?;
+        let offsets = [0, lengths[0], lengths[0] + lengths[1]];
+        let index = self.next;
+        self.next = (index + 1) % self.ring.len();
+        let staging = &mut self.ring[index];
+        let stream = self.targets.stream;
+        staging.wait_ready(stream).map_err(fill_error)?;
+        // Fill the whole host slot before enqueuing any copy from it.
+        for (offset, slice) in offsets.into_iter().zip(slices) {
+            staging.buf.write(offset, slice).map_err(fill_error)?;
+        }
+        for (offset, dst) in offsets.into_iter().zip([gate, up, down]) {
+            self.context
+                .copy_from_pinned(stream, &mut staging.buf, offset, dst)
+                .map_err(fill_error)?;
+        }
+        stream.record(&staging.event).map_err(fill_error)?;
+        staging.pending = true;
+        Ok(())
+    }
+
+    fn wait_fills(&mut self) -> Result<(), HostError> {
+        for staging in &mut *self.ring {
+            staging
+                .wait_ready(self.targets.stream)
+                .map_err(fill_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -848,6 +920,7 @@ impl<'w> TieredRuntime<'w> {
 
     pub(super) fn warm_after_prefill(
         &mut self,
+        context: &CudaContext,
         stream: &DeviceStream,
         rows: usize,
     ) -> Result<(), EngError> {
@@ -857,13 +930,27 @@ impl<'w> TieredRuntime<'w> {
         }
         self.warm_prefill = false;
         let start = std::time::Instant::now();
-        let mut fills = BankFill {
+        let targets = BankFill {
             banks: &self.banks,
             stream,
         };
-        let swaps = self.host.warm_prefill(&mut fills).map_err(host_error)?;
+        let use_pinned =
+            std::env::var_os("Q36_TIERED_PREFILL_PINNED").is_some_and(|value| value == "1");
+        let (swaps, transfer) = if let Some(staging) = self.cold.as_mut().filter(|_| use_pinned) {
+            let mut fills = PinnedWarmFill {
+                targets,
+                context,
+                ring: &mut staging.ring,
+                next: 0,
+            };
+            (self.host.warm_prefill(&mut fills), "pinned")
+        } else {
+            let mut fills = targets;
+            (self.host.warm_prefill(&mut fills), "blocking")
+        };
+        let swaps = swaps.map_err(host_error)?;
         eprintln!(
-            "tiered prefill warm-up: {swaps} swaps in {:.1} ms",
+            "tiered prefill warm-up: {swaps} swaps in {:.1} ms ({transfer})",
             start.elapsed().as_secs_f64() * 1e3
         );
         Ok(())
@@ -880,5 +967,78 @@ impl<'w> TieredRuntime<'w> {
             self.probe_report.merge(&report);
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::cuda::testkit;
+
+    #[test]
+    fn pinned_warm_fill_round_trips_after_ring_reuse() {
+        if !testkit::device_present("pinned_warm_fill_round_trips_after_ring_reuse") {
+            return;
+        }
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let geometry = ExpertBankGeometry {
+            hidden: 512,
+            inter: 256,
+            top_k: 2,
+        };
+        let mut staging = ColdStaging::new(&ctx, geometry, 2).unwrap();
+        let fills = COLD_RING_DEPTH + 3;
+        let bank = ExpertBank::new(&ctx, geometry, fills + 1).unwrap();
+        let (gate, down) = bank.slice_bytes().unwrap();
+        let lengths = [gate, gate, down];
+        let stride = lengths.iter().sum::<usize>();
+        let mut bytes = Vec::new();
+        for slot in 0..fills {
+            for (projection, length) in lengths.into_iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(
+                    (slot * 3 + projection + 1) as u8,
+                    length,
+                ));
+            }
+        }
+        let region: Arc<dyn MappedRegion> = Arc::new(bytes);
+        let mut transfer = PinnedWarmFill {
+            targets: BankFill {
+                banks: std::slice::from_ref(&bank),
+                stream: &stream,
+            },
+            context: &ctx,
+            ring: &mut staging.ring,
+            next: 0,
+        };
+        for slot in 0..fills {
+            let offset = slot * stride;
+            let ranges = ExpertRanges {
+                gate: offset..offset + gate,
+                up: offset + gate..offset + 2 * gate,
+                down: offset + 2 * gate..offset + stride,
+            };
+            transfer.fill_slot(0, slot, &ranges, &region).unwrap();
+        }
+        transfer.wait_fills().unwrap();
+        for (projection, (stack, width)) in [bank.gate(), bank.up(), bank.down()]
+            .into_iter()
+            .zip(lengths)
+            .enumerate()
+        {
+            let bytes = testkit::read_bytes(&ctx, stack.buffer(), (fills + 1) * width);
+            for (slot, row) in bytes.chunks_exact(width).enumerate() {
+                let expected = if slot < fills {
+                    (3 * slot + projection + 1) as u8
+                } else {
+                    0
+                };
+                assert!(
+                    row.iter().all(|&byte| byte == expected),
+                    "projection {projection} slot {slot}"
+                );
+            }
+        }
     }
 }

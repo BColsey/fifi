@@ -1663,7 +1663,7 @@ impl<'a> QwenResidentStep<'a> {
         if let Some(runtime) = tiered_chunk {
             runtime
                 .borrow_mut()
-                .warm_after_prefill(stream, m)
+                .warm_after_prefill(context, stream, m)
                 .inspect_err(|_| ctx.state.poison())?;
         }
         if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
