@@ -579,6 +579,15 @@ fn fast_quantization_is_bit_identical_dense() {
                 .map(|&v| v * s)
                 .collect();
             assert_pair(&input);
+            // With the group maximum at 127 * s the reciprocal scale maps s to 1, so
+            // the same values land on (or one ulp either side of) the k + 0.5
+            // quantization boundaries; alone in the group they quantize to +-127.
+            let top = 127.0 * s;
+            if top.is_finite() {
+                let mut with_max = vec![top];
+                with_max.extend_from_slice(&input);
+                assert_pair(&with_max);
+            }
         }
         // Saturation edges: the group max itself and values beyond it in magnitude.
         assert_pair(&[
