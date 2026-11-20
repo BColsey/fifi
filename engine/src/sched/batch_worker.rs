@@ -378,7 +378,7 @@ fn admit<E: ExecutorOps>(
     pool: &mut Pool<'_, E::Session>,
     mut job: Job,
     prefill_chunk: usize,
-) -> Result<Slot<E::Session>, EngError> {
+) -> Result<Slot<E::Session>, (EngError, Box<Job>)> {
     match build_slot(executor, pool, job, prefill_chunk) {
         Ok(slot) => Ok(slot),
         Err((EngError::MemoryPlan(message), job_back)) => {
@@ -405,7 +405,7 @@ fn admit<E: ExecutorOps>(
                 &job_back.prompt,
                 &job_back.generation.cancel,
             ) {
-                return Err(EngError::MemoryPlan(message));
+                return Err((EngError::MemoryPlan(message), job_back));
             }
             job = *job_back;
             let mut retried = build_slot(executor, pool, job, prefill_chunk);
@@ -424,15 +424,15 @@ fn admit<E: ExecutorOps>(
                     }
                     Err((EngError::MemoryPlan(message), back)) => {
                         if !evict_for_retry(executor, None, &back.prompt, &back.generation.cancel) {
-                            return Err(EngError::MemoryPlan(message));
+                            return Err((EngError::MemoryPlan(message), back));
                         }
                         retried = build_slot(executor, pool, *back, prefill_chunk);
                     }
-                    Err((error, _)) => return Err(error),
+                    Err(failed) => return Err(failed),
                 }
             }
         }
-        Err((error, _)) => Err(error),
+        Err(failed) => Err(failed),
     }
 }
 
@@ -547,6 +547,9 @@ pub(super) fn work<E: ExecutorOps>(
     let share = executor.prompt_rows_per_tick();
     let mut pool = Pool::new(session, &shared.ticks);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
+    // The job that capacity refused while other slots were live, and the number of live slots at
+    // the refusal.
+    let mut waiting: Option<(Job, usize)> = None;
     // A tick feeds at most one planned piece of prompt rows beside the decode rows: a piece is
     // the size the prefill plan admitted and the size at which prefill runs fastest, so a
     // smaller budget only slows every cold prompt (a 4,096-token prompt took 14.4 s at 16 rows
@@ -562,41 +565,68 @@ pub(super) fn work<E: ExecutorOps>(
             if slots.len() == max_seqs {
                 break;
             }
-            let message = if slots.is_empty() {
-                shared.set_state(EngineState::Ready);
-                jobs.recv().ok()
-            } else {
-                jobs.try_recv().ok()
-            };
-            let Some(message) = message else {
-                if slots.is_empty() {
-                    shared.set_state(EngineState::Stopped);
-                    return;
+            // A job that capacity refused waits at the head of the line, ahead of the queue,
+            // and is retried when a slot has freed since its refusal.
+            let (job, fresh) = match waiting.take() {
+                Some((job, at)) if slots.len() < at => (job, false),
+                Some(held) => {
+                    waiting = Some(held);
+                    break;
                 }
-                break;
+                None => {
+                    let message = if slots.is_empty() {
+                        shared.set_state(EngineState::Ready);
+                        jobs.recv().ok()
+                    } else {
+                        jobs.try_recv().ok()
+                    };
+                    let Some(message) = message else {
+                        if slots.is_empty() {
+                            shared.set_state(EngineState::Stopped);
+                            return;
+                        }
+                        break;
+                    };
+                    let Message::Job(job, ticket) = message else {
+                        shared.stop.store(true, Ordering::SeqCst);
+                        break;
+                    };
+                    drop(ticket);
+                    (job, true)
+                }
             };
-            let Message::Job(job, ticket) = message else {
-                shared.stop.store(true, Ordering::SeqCst);
-                break;
-            };
-            drop(ticket);
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
+                if !fresh {
+                    unregister(shared, &job);
+                }
                 cancel_unstarted(job);
                 continue;
             }
-            shared.set_state(EngineState::Busy);
-            send_data(&job.events, JobEvent::Started);
-            register(shared, &job);
+            if fresh {
+                shared.set_state(EngineState::Busy);
+                send_data(&job.events, JobEvent::Started);
+                register(shared, &job);
+            }
             // Keep portable handles registered even if session allocation or restore panics.
             let events = job.events.clone();
             let cancel = Arc::clone(&job.generation.cancel);
             let prompt_len = prompt_tokens(&job.prompt);
             match admit(executor, &mut pool, job, prefill_chunk) {
                 Ok(slot) => slots.push(slot),
-                Err(error) => {
+                Err((error, job_back)) => {
                     if matches!(error, EngError::Backend { .. }) {
                         native_failed(shared, jobs, &error);
                         return;
+                    }
+                    if matches!(error, EngError::MemoryPlan(_))
+                        && !slots.is_empty()
+                        && !cancel.load(Ordering::SeqCst)
+                    {
+                        // The sessions the live slots hold are what the memory is spent on:
+                        // the job waits for one to finish instead of failing. Only a lone job
+                        // that cannot be admitted at all is refused.
+                        waiting = Some((*job_back, slots.len()));
+                        break;
                     }
                     if matches!(error, EngError::MemoryPlan(_)) && cancel.load(Ordering::SeqCst) {
                         send_cancelled(&events, prompt_len);
@@ -894,6 +924,10 @@ pub(super) fn work<E: ExecutorOps>(
             native_failed(shared, jobs, error);
             return;
         }
+        // A row whose growth was denied while another row of the window advanced waits: the
+        // memory may come back when a stream finishes. A row denied with no row advancing is
+        // refused, because nothing live can free memory for it.
+        let any_advanced = batches.iter().any(|row| row.is_ok());
         let mut batches = batches.into_iter();
         let mut emitted = false;
         // A row the executor refused before its feed leaves with its error; its session is
@@ -905,6 +939,7 @@ pub(super) fn work<E: ExecutorOps>(
                 }
                 let batch = match batches.next().expect("row count checked") {
                     Ok(batch) => batch,
+                    Err(EngError::MemoryPlan(_)) if any_advanced && !slot.slow => return false,
                     Err(error) => {
                         if !slot.slow {
                             send_terminal(&slot.job.events, JobEvent::Error(error));
@@ -967,6 +1002,10 @@ pub(super) fn work<E: ExecutorOps>(
         }
     }
     // Shutdown needs no further executor calls.
+    if let Some((job, _)) = waiting {
+        unregister(shared, &job);
+        cancel_unstarted(job);
+    }
     for mut slot in slots {
         cancelled(&mut slot);
         unregister(shared, &slot.job);

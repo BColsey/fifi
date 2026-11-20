@@ -109,6 +109,13 @@ struct WindowFake {
     spacing: Option<usize>,
     /// The prompt rows per tick the fake asks the worker for; `None` keeps the worker's rule.
     prompt_share: Option<usize>,
+    /// The sessions the fake can hold, the seed included: `new_session` beyond it is a memory
+    /// denial, as when the device has no room for another session.
+    session_cap: Option<usize>,
+    /// The sessions built so far, the seed included.
+    created: usize,
+    /// The window row that is denied its growth every time.
+    deny_slot: Option<usize>,
 }
 
 impl WindowFake {
@@ -139,6 +146,9 @@ impl WindowFake {
             reset_calls: 0,
             spacing: None,
             prompt_share: None,
+            session_cap: None,
+            created: 1,
+            deny_slot: None,
         }
     }
 
@@ -192,6 +202,12 @@ impl ExecutorOps for WindowFake {
 
     fn new_session(&mut self) -> Result<Row, EngError> {
         self.note("new_session");
+        if self.session_cap.is_some_and(|cap| self.created >= cap) {
+            return Err(EngError::MemoryPlan(
+                "the device holds no more sessions".into(),
+            ));
+        }
+        self.created += 1;
         if std::mem::take(&mut self.deny_session) {
             if let Some(cancel) = &self.cancel_denied_session {
                 cancel.store(true, Ordering::SeqCst);
@@ -310,6 +326,10 @@ impl ExecutorOps for WindowFake {
         let failure = self.failure.take();
         let mut batches = Vec::new();
         for (slot, (row, generation)) in rows.iter_mut().zip(generations).enumerate() {
+            if self.deny_slot == Some(slot) {
+                batches.push(Err(EngError::MemoryPlan("row growth denied".into())));
+                continue;
+            }
             if slot == 1 && matches!(failure, Some(Failure::RowLocal | Failure::RowNative)) {
                 batches.push(Err(if matches!(failure, Some(Failure::RowNative)) {
                     native_error()
@@ -1882,17 +1902,15 @@ fn row_growth_denial_keeps_admitted_and_queued_jobs_running() {
     let first = collect(first_events);
     assert_eq!(output(&first), "aaa");
     assert_eq!(usage(&first).completion_tokens, 3);
-    assert_eq!(
-        collect(denied_events),
-        vec![JobEvent::Error(EngError::MemoryPlan(
-            "row growth denied".into()
-        ))]
-    );
+    // The denied row waits one window and then advances: its client sees no error.
+    let denied = collect(denied_events);
+    assert_eq!(output(&denied), "aaa");
+    assert_eq!(usage(&denied).completion_tokens, 3);
     let next = collect(next_events);
     assert_eq!(output(&next), "aa");
     assert_eq!(usage(&next).completion_tokens, 2);
     assert_eq!(lock(&log).windows[0], vec![vec![0], vec![1]]);
-    assert_eq!(lock(&log).windows[1], vec![vec![0, 0], vec![2]]);
+    assert_eq!(lock(&log).windows[1], vec![vec![0, 0], vec![1]]);
     assert_eq!(engine.shutdown().state, EngineState::Stopped);
 }
 
@@ -1916,12 +1934,9 @@ fn row_growth_denial_preserves_a_cancelled_peers_finish() {
     let first = collect(first_events);
     assert_eq!(finish(&first), DecodeFinish::Cancelled);
     assert_eq!(usage(&first).completion_tokens, 0);
-    assert_eq!(
-        collect(denied_events),
-        vec![JobEvent::Error(EngError::MemoryPlan(
-            "row growth denied".into()
-        ))]
-    );
+    // The cancelled peer's finish stands and the denied row, now alone, advances.
+    let denied = collect(denied_events);
+    assert_eq!(output(&denied), "aaa");
     assert_eq!(engine.shutdown().state, EngineState::Stopped);
 }
 
@@ -2401,5 +2416,104 @@ fn a_share_smaller_than_the_cold_slots_still_gives_each_one_row() {
     engine.handle().try_submit(second).expect("second");
     assert_eq!(usage(&collect(first_events)).completion_tokens, 1);
     assert_eq!(usage(&collect(second_events)).completion_tokens, 1);
+    engine.shutdown();
+}
+
+#[test]
+fn a_job_waits_for_a_session_while_others_hold_the_capacity() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 3;
+    fake.session_cap = Some(2);
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0], 4);
+    let (second, second_events) = job(&[1], 4);
+    let (third, third_events) = job(&[2], 3);
+    for request in [first, second, third] {
+        engine.handle().try_submit(request).expect("submit");
+    }
+    release.send(()).expect("load");
+    // The third job finds no session while two are live: it queues, then takes the session a
+    // finished job returns, and its client never sees a refusal.
+    for (events, tokens) in [(first_events, 4), (second_events, 4), (third_events, 3)] {
+        let events = collect(events);
+        assert_eq!(usage(&events).completion_tokens, tokens, "{events:?}");
+    }
+    let new_sessions = lock(&log)
+        .calls
+        .iter()
+        .filter(|call| *call == "new_session")
+        .count();
+    assert!(
+        new_sessions >= 2,
+        "the third job asked and was refused, then waited"
+    );
+    assert_eq!(snapshot(&engine).sessions_created, 1);
+    engine.shutdown();
+}
+
+#[test]
+fn a_lone_job_that_cannot_get_a_session_is_refused() {
+    // A failed window drops its sessions, so the pool is empty and the device holds no more: the
+    // next job is alone, nothing live can free memory for it, and the denial is final.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 2;
+    fake.session_cap = Some(2);
+    fake.evictions = 0;
+    fake.failure = Some(Failure::Local);
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0], 3);
+    let (second, second_events) = job(&[1], 3);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
+    for events in [first_events, second_events] {
+        assert!(matches!(
+            collect(events).last(),
+            Some(JobEvent::Error(EngError::MemoryPlan(_)))
+        ));
+    }
+    let (alone, alone_events) = job(&[2], 3);
+    engine.handle().try_submit(alone).expect("alone");
+    assert_eq!(
+        collect(alone_events),
+        vec![JobEvent::Error(EngError::MemoryPlan(
+            "the device holds no more sessions".into()
+        ))]
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn a_denied_row_waits_for_its_peer_and_a_lone_denied_row_is_refused() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.deny_slot = Some(1);
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0], 3);
+    let (denied, denied_events) = job(&[1], 3);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(denied).expect("denied");
+    release.send(()).expect("load");
+    // The peer advances while the second row is denied every window; once the peer has
+    // finished the denied row is alone in slot 0, which the fake does not deny, and finishes.
+    assert_eq!(usage(&collect(first_events)).completion_tokens, 3);
+    assert_eq!(usage(&collect(denied_events)).completion_tokens, 3);
+    engine.shutdown();
+    // Every row denied: no row advances, so the denial is final for all of them.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.deny_slot = Some(0);
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    let (only, only_events) = job(&[0], 3);
+    engine.handle().try_submit(only).expect("only");
+    assert_eq!(
+        collect(only_events),
+        vec![JobEvent::Error(EngError::MemoryPlan(
+            "row growth denied".into()
+        ))]
+    );
     engine.shutdown();
 }
