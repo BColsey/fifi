@@ -97,7 +97,18 @@ pub(in super::super) fn open(
 /// last chunk of a prompt.
 pub(in super::super) fn close(decoder: &mut ResidentDecoder<'_>) {
     if let Some(open) = decoder.prefill_pages.take() {
+        #[cfg(feature = "native-fault-qualification")]
+        let memory = super::super::stream_timing::prefill_memory(&decoder.kernels)
+            .map(|before| (open.pool.byte_len(), before));
         open.pool.finish();
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some((mapped_bytes, before)) = memory {
+            super::super::stream_timing::record_prefill_release(
+                &decoder.kernels,
+                mapped_bytes,
+                before,
+            );
+        }
     }
 }
 

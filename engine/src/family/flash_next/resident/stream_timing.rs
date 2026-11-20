@@ -1,5 +1,8 @@
 use super::StepMode;
-use crate::{family::mlx_stream_stats::StreamSnapshot, kernels::MlxKernels};
+use crate::{
+    family::mlx_stream_stats::StreamSnapshot,
+    kernels::{MlxKernels, mlx::native::qualification_process_usage},
+};
 
 pub(super) struct ForwardTiming {
     counters: StreamSnapshot,
@@ -36,6 +39,32 @@ pub(super) fn record_prefix_budget_refusal(position: u32, charged_bytes: u64, li
     }
 }
 
+pub(super) fn prefill_memory(kernels: &MlxKernels) -> Option<serde_json::Value> {
+    if !enabled() {
+        return None;
+    }
+    let footprint = qualification_process_usage().map(|(_, bytes)| bytes);
+    let allocator = kernels.memory_stats().ok();
+    Some(serde_json::json!({
+        "process_footprint_bytes": footprint,
+        "mlx_active_bytes": allocator.map(|stats| stats.active),
+        "mlx_cache_bytes": allocator.map(|stats| stats.cache),
+    }))
+}
+
+pub(super) fn record_prefill_release(
+    kernels: &MlxKernels,
+    mapped_bytes: u64,
+    before: serde_json::Value,
+) {
+    let event = serde_json::json!({
+        "mapped_pool_bytes": mapped_bytes,
+        "before": before,
+        "after": prefill_memory(kernels),
+    });
+    eprintln!("flash_next_prefill_release {event}");
+}
+
 impl ForwardTiming {
     pub(super) fn finish(self, kernels: &MlxKernels, rows: u32, mode: StepMode, route: &str) {
         let mut row = self.counters.finish(kernels);
@@ -43,6 +72,11 @@ impl ForwardTiming {
         row["rows"] = rows.into();
         row["mode"] = format!("{mode:?}").into();
         row["forward_path"] = route.into();
+        if mode == StepMode::Logits {
+            let usage = qualification_process_usage();
+            row["process_read_bytes"] = usage.map(|(bytes, _)| bytes).into();
+            row["process_footprint_bytes"] = usage.map(|(_, bytes)| bytes).into();
+        }
         eprintln!("flash_next_stream_timing {row}");
     }
 }
