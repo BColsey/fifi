@@ -14,6 +14,9 @@
 //! - Allocator cache limit: one ninth of the memory, rounded down to whole GiB and held between
 //!   1 and 8 GiB: 4 GiB of 36 GiB. Nothing measured the upper bound; it only stops a large host
 //!   from retaining allocator buffers without limit.
+//! - Context: the default context stays when the model and the session reserve at that context fit
+//!   the budget. Otherwise a start that sets no `context_limit` takes the largest multiple of 1024
+//!   positions that fits, down to 4,096, and below that it is refused with the shortfall.
 //! - Compile: on for the MoE family when no speculation runs, as the shipped profile sets it.
 
 use std::path::Path;
@@ -26,6 +29,12 @@ const MIN_OS_FLOOR_BYTES: u64 = 4 * GIB;
 /// The allocator cache limit bounds.
 const MIN_CACHE_LIMIT_BYTES: u64 = GIB;
 const MAX_CACHE_LIMIT_BYTES: u64 = 8 * GIB;
+
+/// The least context a derived choice may land on: below it the start is refused.
+pub(crate) const MIN_DERIVED_CONTEXT: u32 = 4096;
+/// The step of a derived context. A multiple of the cache growth quantum (256 positions) and of
+/// the 8-bit cache group (64), and the step the context search of the capability report uses.
+const CONTEXT_STEP: u32 = 1024;
 
 /// What the host and the model directory say, read once at start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +105,26 @@ pub(crate) fn startup_line(facts: HostFacts, values: &[NoteValue]) -> String {
         gib(facts.model_bytes),
         gib(defaults.os_floor_bytes),
     )
+}
+
+/// The largest context whose session reserve still fits next to the model in `budget`, when the
+/// reserve is `per_position * context + fixed_bytes` (the shape of the derived reserve): a
+/// multiple of 1024 positions, at least 4,096. `None` when the model and the fixed part leave no
+/// room for that floor, or `per_position` is 0.
+pub(crate) fn largest_context(
+    facts: HostFacts,
+    budget: u64,
+    per_position: u64,
+    fixed_bytes: u64,
+) -> Option<u32> {
+    let room = budget
+        .checked_sub(facts.model_bytes)?
+        .checked_sub(fixed_bytes)?;
+    let positions = room.checked_div(per_position)?;
+    let step = u64::from(CONTEXT_STEP);
+    let rounded =
+        u32::try_from(positions / step * step).unwrap_or(u32::MAX / CONTEXT_STEP * CONTEXT_STEP);
+    (rounded >= MIN_DERIVED_CONTEXT).then_some(rounded)
 }
 
 /// The refusal of a host whose derived budget cannot hold the model and the session reserve.
@@ -229,6 +258,32 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn the_largest_context_is_a_whole_step_that_fits() {
+        let host = facts(36);
+        let budget = host.defaults().prefill_budget_bytes;
+        let fixed = 5 * GIB;
+        let per_position = 10_880;
+        let context = largest_context(host, budget, per_position, fixed).expect("fits");
+        assert_eq!(context % 1024, 0);
+        let reserve = |positions: u32| per_position * u64::from(positions) + fixed;
+        assert!(host.model_bytes + reserve(context) <= budget);
+        assert!(host.model_bytes + reserve(context + 1024) > budget);
+        // No room for the fixed part, a floor that does not fit, a zero charge per position.
+        assert_eq!(largest_context(host, budget, per_position, budget), None);
+        let tight = budget - host.model_bytes - fixed;
+        assert_eq!(
+            largest_context(host, budget, tight / 4095, fixed),
+            None,
+            "4,095 positions are below the floor"
+        );
+        assert_eq!(
+            largest_context(host, budget, tight / 4096, fixed),
+            Some(4096)
+        );
+        assert_eq!(largest_context(host, budget, 0, fixed), None);
     }
 
     #[test]

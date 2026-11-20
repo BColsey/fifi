@@ -140,7 +140,7 @@ pub(crate) fn q36_effective(
         row(
             "context_limit",
             settings.context_limit.to_string(),
-            present(&options.context_limit),
+            from_host("context_limit", present(&options.context_limit)),
         ),
         row(
             "kv_dtype",

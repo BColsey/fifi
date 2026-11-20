@@ -205,3 +205,121 @@ fn the_dense_family_derives_the_budget_but_keeps_compile_off() {
     assert!(got.prefill_budget.is_some());
     assert!(!got.compile);
 }
+
+/// The shard bytes of a 6-bit dense 27B pack: 21.7 GiB.
+const DENSE_6BIT_BYTES: u64 = 23_300_000_000;
+
+fn dense_env(memory_gib: u64, model_bytes: u64) -> Q36Env {
+    Q36Env {
+        host: Some(HostFacts {
+            memory_bytes: memory_gib * GIB,
+            model_bytes,
+        }),
+        ..Q36Env::default()
+    }
+}
+
+fn dense(options: Option<&Q36Options>, env: &Q36Env) -> Result<Q36Settings, EngError> {
+    Q36Settings::new_for_family(
+        Path::new("/a"),
+        Path::new("/a"),
+        options,
+        env,
+        Backend::Mlx,
+        crate::family::spec::QWEN3_8_27B_DENSE,
+    )
+}
+
+#[test]
+fn a_context_that_does_not_fit_the_default_shrinks_to_the_largest_that_fits() {
+    let host = dense_env(36, DENSE_6BIT_BYTES);
+    let got = dense(None, &host).expect("a smaller context fits");
+    let budget = got.prefill_budget.expect("derived budget");
+    assert!(got.context_limit < 262_144);
+    assert_eq!(got.context_limit % 1024, 0);
+    assert!(
+        DENSE_6BIT_BYTES + got.prefill_reserve <= budget,
+        "the chosen context fits"
+    );
+    // One step more does not fit.
+    let per_position =
+        super::settings::cache_growth_per_position(&got.spec, got.kv, got.activation).unwrap();
+    assert!(
+        DENSE_6BIT_BYTES + got.prefill_reserve + 1024 * per_position > budget,
+        "the next step does not fit"
+    );
+    assert!(got.derived.contains(&"context_limit"));
+    let line = got.host_note.expect("one startup line");
+    assert!(
+        line.contains(&format!(
+            "context_limit={} (derived: largest that fits the budget)",
+            got.context_limit
+        )),
+        "{line}"
+    );
+    assert!(!line.contains('\n'));
+    // The session cap follows the chosen context, not the default one.
+    assert_eq!(
+        got.session_cap,
+        per_position * u64::from(got.context_limit)
+            + super::settings::delta_state_bytes(&got.spec).unwrap()
+    );
+}
+
+#[test]
+fn a_default_that_fits_is_not_changed() {
+    let got = dense(None, &dense_env(128, DENSE_6BIT_BYTES)).expect("serves");
+    assert_eq!(got.context_limit, 262_144);
+    let line = got.host_note.expect("line");
+    assert!(line.contains("context_limit=262144 (default)"), "{line}");
+}
+
+#[test]
+fn no_context_above_the_floor_is_refused_with_the_shortfall() {
+    // 30 GiB budget against 29.5 GiB of weights: the fixed part of the reserve alone is over.
+    let text = refusal(dense(None, &dense_env(36, 31_700_000_000)));
+    assert!(text.contains("the model needs 29.5 GiB"), "{text}");
+    assert!(text.contains("context 262144"), "{text}");
+    assert!(text.contains("short by"), "{text}");
+}
+
+#[test]
+fn a_context_below_the_floor_is_refused() {
+    // Room for fewer than 4,096 positions: the model leaves only the fixed part and 2,000 positions.
+    let spec = crate::family::spec::QWEN3_8_27B_DENSE;
+    let per_position = super::settings::cache_growth_per_position(
+        &spec,
+        super::settings::KvDtype::Q8,
+        super::settings::Activation::Bf16,
+    )
+    .unwrap();
+    let fixed = super::settings::delta_state_bytes(&spec).unwrap() + 4 * GIB + GIB;
+    let budget = 30 * GIB;
+    let model = budget - fixed - 2_000 * per_position;
+    let text = refusal(dense(None, &dense_env(36, model)));
+    assert!(text.contains("short by"), "{text}");
+    assert!(text.contains("context 262144"), "{text}");
+}
+
+#[test]
+fn an_explicit_context_that_does_not_fit_keeps_the_refusal() {
+    let options = Q36Options {
+        context_limit: Some(262_144),
+        ..Q36Options::default()
+    };
+    let text = refusal(dense(Some(&options), &dense_env(36, DENSE_6BIT_BYTES)));
+    assert!(text.contains("context 262144"), "{text}");
+    assert!(text.contains("short by"), "{text}");
+}
+
+#[test]
+fn the_moe_family_shares_the_rule() {
+    let got = resolve(None, &{
+        let mut tight = env(36);
+        tight.host.as_mut().unwrap().model_bytes = 23 * GIB;
+        tight
+    })
+    .expect("a smaller context fits");
+    assert!(got.context_limit > 150_000 && got.context_limit < 262_144);
+    assert!(got.derived.contains(&"context_limit"));
+}

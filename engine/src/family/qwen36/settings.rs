@@ -1000,7 +1000,9 @@ pub(crate) struct Q36Settings {
     /// it as the cap of `M_sess`.
     pub(crate) ignored_mlx_keys: Vec<&'static str>,
     /// The keys whose value came from the host facts (`host_plan`): `cache_limit_bytes`,
-    /// `prefill_budget_bytes` and `compile`; not from a member, a variable or a fixed default. Empty when nothing was derived.
+    /// `prefill_budget_bytes`, `compile` and `context_limit` (the largest context that fits the
+    /// derived budget); not from a member, a variable or a fixed default. Empty when nothing was
+    /// derived.
     pub(crate) derived: Vec<&'static str>,
     /// The one startup line that names the host facts and the source of each value; present only
     /// when at least one value was derived.
@@ -1429,7 +1431,7 @@ impl Q36Settings {
         // match above, BEFORE `context_limit` and the second match, so a config with both faults
         // names the cache-limit fault first; the CUDA arm refuses its keys in the first match,
         // reads no cache limit, and takes only `context_limit` below.
-        let context_limit = ranged(
+        let mut context_limit = ranged(
             "context_limit",
             options.context_limit,
             spec.feed_forward.map_or(
@@ -1443,6 +1445,26 @@ impl Q36Settings {
             spec.feed_forward
                 .map_or(u32::MAX, |dense| dense.context_limit),
         )?;
+        // A start that names no context and cannot hold the model plus the reserve at the default
+        // takes the largest context that fits the derived budget. The reserve is linear in the
+        // context (`derived_reserve`), so the fixed part is its value at zero positions.
+        let mut context_from_host = false;
+        if options.context_limit.is_none()
+            && matches!(reserve, ReservePlan::Derive)
+            && let (Some(budget), Some(host)) = (budget_from_host, env.host)
+        {
+            let default_reserve =
+                derived_reserve(&spec, kv, activation, context_limit, cache_limit)?;
+            if host_plan::shortfall_text(host, budget, default_reserve, context_limit).is_some() {
+                let per_position = cache_growth_per_position(&spec, kv, activation)?;
+                let fixed = derived_reserve(&spec, kv, activation, 0, cache_limit)?;
+                if let Some(chosen) = host_plan::largest_context(host, budget, per_position, fixed)
+                {
+                    context_limit = chosen.min(context_limit);
+                    context_from_host = true;
+                }
+            }
+        }
         // The dense spec's session floor: one full session of cache
         // growth plus the fixed state. An absent cap derives exactly
         // this (the MoE default would not admit the dense session);
@@ -1570,6 +1592,9 @@ impl Q36Settings {
         if compile_from_host {
             derived.push("compile");
         }
+        if context_from_host {
+            derived.push("context_limit");
+        }
         let host_note = env.host.filter(|_| !derived.is_empty()).map(|host| {
             let source = |key: &'static str, member: bool, rule: String| {
                 if derived.contains(&key) {
@@ -1615,7 +1640,11 @@ impl Q36Settings {
                 NoteValue {
                     key: "context_limit",
                     value: context_limit.to_string(),
-                    source: source("context_limit", options.context_limit.is_some(), String::new()),
+                    source: source(
+                        "context_limit",
+                        options.context_limit.is_some(),
+                        "derived: largest that fits the budget".into(),
+                    ),
                 },
                 NoteValue {
                     key: "session_cap_bytes",
