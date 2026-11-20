@@ -1658,6 +1658,14 @@ impl<'a> QwenResidentStep<'a> {
         (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
             .commit_chunk(&mut ctx, p0, m, status)
             .inspect_err(|_| ctx.state.poison())?;
+        // The status read fenced the chunk's bank readers before any fill can
+        // overwrite a slot. Only the committed chunk can supply warm-up routes.
+        if let Some(runtime) = tiered_chunk {
+            runtime
+                .borrow_mut()
+                .warm_after_prefill(stream, m)
+                .inspect_err(|_| ctx.state.poison())?;
+        }
         if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
             eprintln!(
                 "chunk-close p0={p0} m={m}: body {:.0} ms, status-read {:.0} ms, revalidate {:.0} ms",

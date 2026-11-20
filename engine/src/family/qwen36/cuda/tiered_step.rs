@@ -279,6 +279,7 @@ pub(super) struct TieredRuntime<'w> {
     cold: Option<ColdStaging>,
     /// The bank depth (slots per layer) every bank was built with.
     slot_count: usize,
+    warm_prefill: bool,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
     syncs: HostSyncs,
     /// The TCAP sync-vs-drain probe's state (Q36_TIERED_PROBE=1 only): the previous
@@ -352,6 +353,8 @@ impl<'w> TieredRuntime<'w> {
             host,
             cold,
             slot_count,
+            warm_prefill: std::env::var_os("Q36_TIERED_PREFILL_WARM")
+                .is_some_and(|value| value == "1"),
             syncs: HostSyncs::default(),
             probe_start: None,
             probe_end: None,
@@ -841,6 +844,29 @@ impl<'w> TieredRuntime<'w> {
     /// The host waits of the token that just ended (layers and fills), and zero for the next one.
     pub(super) fn take_syncs(&mut self) -> HostSyncs {
         std::mem::take(&mut self.syncs)
+    }
+
+    pub(super) fn warm_after_prefill(
+        &mut self,
+        stream: &DeviceStream,
+        rows: usize,
+    ) -> Result<(), EngError> {
+        // Small chunks seldom contain enough routing history to guide a warm-up.
+        if !self.warm_prefill || rows < 64 {
+            return Ok(());
+        }
+        self.warm_prefill = false;
+        let start = std::time::Instant::now();
+        let mut fills = BankFill {
+            banks: &self.banks,
+            stream,
+        };
+        let swaps = self.host.warm_prefill(&mut fills).map_err(host_error)?;
+        eprintln!(
+            "tiered prefill warm-up: {swaps} swaps in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
     }
 
     pub(super) fn end_token(&mut self, stream: &DeviceStream) -> Result<TokenReport, EngError> {

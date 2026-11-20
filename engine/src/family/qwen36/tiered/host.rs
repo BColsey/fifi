@@ -855,12 +855,51 @@ impl TieredHost {
         let routes = std::mem::replace(&mut self.routes, vec![Vec::new(); self.cfg.layers]);
         self.policy.observe(&routes);
         let swaps = self.policy.boundary();
+        self.apply_swaps(device, &swaps)?;
+        let mut report = std::mem::take(&mut self.report);
+        report.swaps = u32::try_from(swaps.len()).unwrap_or(u32::MAX);
+        let (hits, total) = self.meter.counts();
+        report.guess_hits = hits.saturating_sub(self.meter_seen.0);
+        report.guess_samples = total.saturating_sub(self.meter_seen.1);
+        self.meter_seen = (hits, total);
+        Ok(report)
+    }
+
+    /// Warm the banks from the most recently committed chunk's routes.
+    #[cfg(any(feature = "native-cuda", test))]
+    pub(in crate::family::qwen36) fn warm_prefill(
+        &mut self,
+        device: &mut dyn BankDevice,
+    ) -> Result<usize, HostError> {
+        if self.poisoned {
+            return Err(HostError::Poisoned);
+        }
+        if self.in_flight.is_some() {
+            return Err(HostError::Order(
+                "warm prefill while a layer is in flight".into(),
+            ));
+        }
+        if self.cfg.swaps_per_token == 0.0 {
+            return Ok(0);
+        }
+        let swaps = self.policy.prefill_warm_swaps(&self.routes);
+        if !swaps.is_empty() {
+            self.apply_swaps(device, &swaps)?;
+        }
+        Ok(swaps.len())
+    }
+
+    fn apply_swaps(
+        &mut self,
+        device: &mut dyn BankDevice,
+        swaps: &[Swap],
+    ) -> Result<(), HostError> {
         // Publish everything a mid-token prefetch queued BEFORE the boundary picks
         // victims: the policy already counts those promotees as residents, so an
         // unpublish of one that is still Filling would refuse (the invariant the
         // original inline-complete fills never had to state).
         self.drain_fills(device)?;
-        for swap in &swaps {
+        for swap in swaps {
             // The policy can select a promotee from an earlier swap in this same
             // boundary as the next victim. Publish any queued fills before trying
             // to unpublish that victim; skipping individual swaps would leave the
@@ -877,13 +916,7 @@ impl TieredHost {
             }
         }
         self.drain_fills(device)?;
-        let mut report = std::mem::take(&mut self.report);
-        report.swaps = u32::try_from(swaps.len()).unwrap_or(u32::MAX);
-        let (hits, total) = self.meter.counts();
-        report.guess_hits = hits.saturating_sub(self.meter_seen.0);
-        report.guess_samples = total.saturating_sub(self.meter_seen.1);
-        self.meter_seen = (hits, total);
-        Ok(report)
+        Ok(())
     }
 
     /// Fills the banks before the first token: for `e` in `0..min(slots, experts)` expert `e` goes
@@ -2119,6 +2152,37 @@ mod tests {
             few.host.preload_all(&mut MockDevice::default()),
             Err(HostError::Config(_))
         ));
+    }
+
+    #[test]
+    fn prefill_warmup_uses_only_recent_picks_and_keeps_the_ledger_in_sync() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let mut rows = vec![
+            ChunkRouteRow {
+                ids: vec![3, 0, 1, 2],
+                weights: vec![0.25; 4]
+            };
+            40
+        ];
+        rows.extend(vec![
+            ChunkRouteRow {
+                ids: vec![7, 6, 5, 4],
+                weights: vec![0.25; 4]
+            };
+            32
+        ]);
+        f.host.begin_chunk_layer(0, &rows, 0).unwrap();
+
+        assert_eq!(f.host.warm_prefill(&mut device).unwrap(), 3);
+        f.host.check_consistency().unwrap();
+        let experts: Vec<_> = filled(&device, &f.reference)[LAYERS * SLOTS..]
+            .iter()
+            .map(|&(layer, _, expert)| (layer, expert))
+            .collect();
+        assert_eq!(experts, [(0, 4), (0, 5), (0, 6)]);
+        assert!(!f.host.is_resident(0, 3));
     }
 
     #[test]
