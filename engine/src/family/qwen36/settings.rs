@@ -580,9 +580,8 @@ pub(crate) struct TieredOptions {
     /// default is false: the banks start empty and policy P fills them.
     pub(crate) preload: Option<bool>,
     /// Bank swaps per token, in thousandths, from 0 to 8000. The default 250 buys one
-    /// promotion per four tokens model-wide — sized for the blocking fill path. With
-    /// the async fill channel (Q36_TIERED_ASYNC_FILLS) the budget can rise: the
-    /// boundary's candidates are this token's actual misses, best score-ratio first.
+    /// promotion per four tokens model-wide. The boundary considers this token's misses
+    /// in descending score-ratio order.
     pub(crate) swaps_milli: Option<u32>,
 }
 
