@@ -149,6 +149,8 @@ mod device {
         identity: PrefixIdentity,
         /// The sessions the engine serves at once; the worker reads it after start.
         max_seqs: usize,
+        /// The prompt rows the worker feeds per tick while sessions share the model.
+        prompt_rows: usize,
         /// False once several sessions share the model: the position-only snapshot would
         /// rewind to cells that another session's decode no longer guarantees, so the store
         /// saves and restores nothing.
@@ -226,6 +228,10 @@ mod device {
 
         fn max_seqs(&self) -> usize {
             self.max_seqs
+        }
+
+        fn prompt_rows_per_tick(&self) -> Option<usize> {
+            (self.max_seqs > 1).then_some(self.prompt_rows)
         }
 
         fn new_session(&mut self) -> Result<Self::Session, EngError> {
@@ -456,6 +462,7 @@ mod device {
         tokenizer_dir: &Path,
         ready_note: ReadyNote,
         seqs: MaxSeqs,
+        prompt_rows: Option<usize>,
     ) -> Result<StartedEngine, EngError> {
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
@@ -490,8 +497,20 @@ mod device {
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
                 max_seqs: plan.seqs,
+                prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
                 prefix_enabled: plan.seqs == 1,
             };
+            if plan.seqs > 1 {
+                eprintln!(
+                    "gemma4 bolt: {} prompt rows per tick while sessions share the model ({})",
+                    serve.prompt_rows,
+                    if prompt_rows.is_some() {
+                        "set"
+                    } else {
+                        "automatic"
+                    }
+                );
+            }
             Ok((
                 serve,
                 BoltSession {
@@ -773,6 +792,7 @@ mod device {
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
                 max_seqs: 1,
+                prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
                 prefix_enabled: true,
             };
             let mut st = serve.new_session().expect("session");
@@ -823,6 +843,7 @@ mod device {
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
                 max_seqs: 1,
+                prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
                 prefix_enabled: true,
             };
             let mut st = serve.new_session().expect("session");

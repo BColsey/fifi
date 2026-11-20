@@ -497,6 +497,29 @@ fn prefill<E: ExecutorOps>(
     Ok(())
 }
 
+/// Feeds up to `grant` rows of one slot's prompt in as many pieces as they need. It stops when the
+/// grant is spent, the prompt is whole, the slot is cancelled, or a piece feeds nothing.
+fn prefill_share<E: ExecutorOps>(
+    executor: &mut E,
+    slot: &mut Slot<E::Session>,
+    grant: usize,
+) -> Result<(), EngError> {
+    let mut left = grant;
+    loop {
+        let before = slot.cursor;
+        prefill(executor, slot, left)?;
+        let fed = slot.cursor - before;
+        left = left.saturating_sub(fed);
+        if left == 0
+            || fed == 0
+            || slot.cursor == slot.job.prompt.len()
+            || slot.job.generation.cancel.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+    }
+}
+
 /// Removes only failed window rows. Their mutated generations and sessions cannot be replayed.
 fn window_failed<S>(slots: &mut Vec<Slot<S>>, shared: &Shared, error: &EngError) {
     slots.retain(|slot| {
@@ -521,6 +544,7 @@ pub(super) fn work<E: ExecutorOps>(
     iteration_rows: usize,
     max_seqs: usize,
 ) {
+    let share = executor.prompt_rows_per_tick();
     let mut pool = Pool::new(session, &shared.ticks);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
     // A tick feeds at most one planned piece of prompt rows beside the decode rows: a piece is
@@ -608,18 +632,34 @@ pub(super) fn work<E: ExecutorOps>(
         } else {
             iteration_rows
         };
-        let mut prompt_rows = tick_rows.max(slots.len()) - decode_rows;
+        // While streams decode, an executor that sets a prompt share feeds that many rows per
+        // tick beside the decode rows, never fewer than one planned piece, in as many pieces as
+        // the rows need. Without a share the cold prompt takes the piece less the decode rows.
+        let decoding_share = share
+            .filter(|_| decode_rows > 0)
+            .map(|rows| rows.max(prefill_chunk));
+        let mut prompt_rows = match decoding_share {
+            Some(rows) => rows.max(prompt_slots),
+            None => tick_rows.max(slots.len()) - decode_rows,
+        };
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
-                let grant = prompt_rows.div_ceil(prompt_slots).min(prefill_chunk);
+                let grant = match decoding_share {
+                    Some(_) => prompt_rows.div_ceil(prompt_slots),
+                    None => prompt_rows.div_ceil(prompt_slots).min(prefill_chunk),
+                };
                 prompt_slots -= 1;
                 if remove_cancelled(&mut slots, index, shared, &mut pool) {
                     continue;
                 }
                 let cursor = slots[index].cursor;
                 let called = Instant::now();
-                let result = prefill(executor, &mut slots[index], grant);
+                let result = if decoding_share.is_some() {
+                    prefill_share(executor, &mut slots[index], grant)
+                } else {
+                    prefill(executor, &mut slots[index], grant)
+                };
                 tick.executor_call(called);
                 if result.is_ok() {
                     TickCounters::add(

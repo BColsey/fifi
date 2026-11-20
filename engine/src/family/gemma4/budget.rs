@@ -57,6 +57,14 @@ pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
 )]
 pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 * 4 + 8;
 
+/// The prompt rows per tick that the engine feeds while several sessions are live, when the entry
+/// does not set `prompt_rows`.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter reads the share")
+)]
+pub(crate) const BOLT_AUTO_PROMPT_ROWS: usize = 8;
+
 /// What one more session costs the sequence planner.
 #[cfg_attr(
     not(feature = "native-cuda"),

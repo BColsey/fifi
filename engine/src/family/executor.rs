@@ -79,6 +79,16 @@ pub(crate) trait ExecutorOps {
             "this executor does not support decode windows".into(),
         ))
     }
+    /// The prompt rows the batch worker feeds per tick, over all cold slots together, while a
+    /// stream decodes, beside the decode rows. `None` keeps the worker's rule: the planned piece
+    /// less one row per ready slot, shared among the cold slots, one piece each. `Some(n)` makes
+    /// the share independent of the piece size: the worker feeds at least one planned piece and
+    /// at most `n` rows when `n` is larger, and a cold slot may run several pieces in a tick
+    /// until its part is spent. With no stream decoding every cold prompt takes whole pieces
+    /// whatever the share. Only the batch worker reads it.
+    fn prompt_rows_per_tick(&self) -> Option<usize> {
+        None
+    }
     /// An executor with a context limit returns the typed over-length refusal for a prompt
     /// that cannot fit; it changes no state. Executors without a limit accept every prompt.
     fn check_prompt(&self, _prompt_tokens: usize) -> Result<()> {

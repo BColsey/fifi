@@ -573,6 +573,10 @@ fn start_gemma4(
                     &config.tokenizer_dir,
                     _ready_note,
                     config.gemma4.clone().unwrap_or_default().seqs(),
+                    config
+                        .gemma4
+                        .as_ref()
+                        .and_then(gemma4::Gemma4Options::prompt_rows),
                 )?;
                 Ok(StartedEngine {
                     engine: started.engine,

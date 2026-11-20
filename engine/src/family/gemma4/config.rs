@@ -54,9 +54,42 @@ pub(crate) struct Gemma4Options {
         allow(dead_code, reason = "only the CUDA starter reads the count")
     )]
     pub(crate) max_seqs: Option<MaxSeqs>,
+    /// The prompt rows fed per tick while several sessions are live, over all cold sessions
+    /// together; absent means the automatic share.
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        allow(dead_code, reason = "only the CUDA starter reads the share")
+    )]
+    pub(crate) prompt_rows: Option<PromptRows>,
+}
+
+/// A prompt share per tick from 1 to 4,096 rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u64")]
+pub(crate) struct PromptRows(pub(crate) usize);
+
+impl TryFrom<u64> for PromptRows {
+    type Error = String;
+
+    fn try_from(rows: u64) -> Result<Self, String> {
+        if (1..=4096).contains(&rows) {
+            Ok(Self(rows as usize))
+        } else {
+            Err(format!("prompt_rows {rows} is outside 1 to 4096"))
+        }
+    }
 }
 
 impl Gemma4Options {
+    /// The explicit prompt share, if the entry sets one.
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        allow(dead_code, reason = "only the CUDA starter reads the share")
+    )]
+    pub(crate) fn prompt_rows(&self) -> Option<usize> {
+        self.prompt_rows.map(|rows| rows.0)
+    }
+
     /// The count the engine starts with.
     #[cfg_attr(
         not(feature = "native-cuda"),

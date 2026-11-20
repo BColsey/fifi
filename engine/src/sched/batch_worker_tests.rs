@@ -107,6 +107,8 @@ struct WindowFake {
     /// The pinned block prefix-match spacing (S4): `None` keeps every save-point
     /// walk on the no-block path regardless of the flipped environment default.
     spacing: Option<usize>,
+    /// The prompt rows per tick the fake asks the worker for; `None` keeps the worker's rule.
+    prompt_share: Option<usize>,
 }
 
 impl WindowFake {
@@ -136,6 +138,7 @@ impl WindowFake {
             fail_reset_call: None,
             reset_calls: 0,
             spacing: None,
+            prompt_share: None,
         }
     }
 
@@ -181,6 +184,10 @@ impl ExecutorOps for WindowFake {
 
     fn max_seqs(&self) -> usize {
         self.max
+    }
+
+    fn prompt_rows_per_tick(&self) -> Option<usize> {
+        self.prompt_share
     }
 
     fn new_session(&mut self) -> Result<Row, EngError> {
@@ -2319,5 +2326,80 @@ fn the_sessions_of_a_failed_window_are_dropped_not_pooled() {
     collect(fourth_events);
     let after = snapshot(&engine).sessions_created;
     assert_eq!(after - before, 2, "both jobs built fresh sessions");
+    engine.shutdown();
+}
+
+/// The longest run of prefill calls with no other executor call between them: the pieces one
+/// tick fed for a cold prompt while a stream decoded.
+fn longest_prefill_run(share: Option<usize>) -> usize {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.prompt_share = share;
+    let (engine, release) = start(fake);
+    let (stream, stream_events) = job(&[0], 40);
+    let (cold, cold_events) = job(&[1; 24], 1);
+    engine.handle().try_submit(stream).expect("stream");
+    engine.handle().try_submit(cold).expect("cold");
+    release.send(()).expect("load");
+    collect(stream_events);
+    collect(cold_events);
+    engine.shutdown();
+    let trace = lock(&log);
+    let (mut longest, mut run) = (0, 0);
+    for call in &trace.calls {
+        if call.starts_with("prefill:") {
+            run += 1;
+            longest = longest.max(run);
+        } else if call != "reset" && call != "boundary" {
+            run = 0;
+        }
+    }
+    longest
+}
+
+#[test]
+fn a_prompt_share_feeds_several_pieces_in_one_tick_while_a_stream_decodes() {
+    // The fake plans pieces of four rows. A cold prompt beside a decoding stream feeds one piece
+    // per tick by the worker's rule; with a share of 24 rows it feeds the rest of its prompt in
+    // one tick. The first tick has no stream decoding, so it feeds whole pieces either way.
+    let default_run = longest_prefill_run(None);
+    let share_run = longest_prefill_run(Some(24));
+    assert!(default_run <= 2, "{default_run}");
+    assert!(share_run >= 5, "{share_run}");
+}
+
+#[test]
+fn a_share_below_the_planned_piece_still_feeds_one_whole_piece() {
+    // A share of one row cannot slow a cold prompt below the piece the executor plans.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.prompt_share = Some(1);
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    let (stream, stream_events) = job(&[0], 30);
+    let (cold, cold_events) = job(&[1; 16], 1);
+    engine.handle().try_submit(stream).expect("stream");
+    engine.handle().try_submit(cold).expect("cold");
+    collect(stream_events);
+    collect(cold_events);
+    let counts = snapshot(&engine);
+    engine.shutdown();
+    assert_eq!(counts.prefill_rows, 17, "{counts:?}");
+}
+
+#[test]
+fn a_share_smaller_than_the_cold_slots_still_gives_each_one_row() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.prompt_share = Some(1);
+    fake.max = 3;
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    let (first, first_events) = job(&[0, 1, 2], 1);
+    let (second, second_events) = job(&[1, 1, 1], 1);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    assert_eq!(usage(&collect(first_events)).completion_tokens, 1);
+    assert_eq!(usage(&collect(second_events)).completion_tokens, 1);
     engine.shutdown();
 }

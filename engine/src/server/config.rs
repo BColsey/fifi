@@ -855,6 +855,21 @@ mod tests {
     }
 
     #[test]
+    fn a_gemma4_prompt_share_reads_a_row_count_and_refuses_the_rest() {
+        use crate::family::gemma4::Gemma4Options;
+        let config = load(&gemma4_entry(r#"{"max_seqs": 4, "prompt_rows": 32}"#)).expect("valid");
+        let options = config.engines[0].gemma4.as_ref().expect("options");
+        assert_eq!(Gemma4Options::prompt_rows(options), Some(32));
+        let config = load(&gemma4_entry("{}")).expect("valid");
+        let options = config.engines[0].gemma4.as_ref().expect("options");
+        assert_eq!(Gemma4Options::prompt_rows(options), None);
+        for bad in [r#"{"prompt_rows": 0}"#, r#"{"prompt_rows": 5000}"#] {
+            let text = message(load(&gemma4_entry(bad)));
+            assert!(text.contains("prompt_rows"), "{bad}: {text}");
+        }
+    }
+
+    #[test]
     fn gemma4_options_on_another_family_are_rejected() {
         let text = VALID.replace(
             r#""family": "fake""#,
