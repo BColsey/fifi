@@ -54,6 +54,8 @@ The startup line gives the selected path and the bytes charged. The planner rese
 
 With prefix reuse enabled, set `FIFI_FLASH_NEXT_MLX_PREFIX_BUDGET_BYTES` to a positive byte count to bound the retained snapshot store. For example, `268435456` sets a 256 MiB cap. Startup charges the smaller of this cap and the default snapshot reservation. A snapshot that exceeds the cap is skipped and previously retained snapshots remain available. The planner continues to charge live state, restore overlap and the allocator cache separately.
 
+`FIFI_FLASH_NEXT_MLX_DECODE_CACHE_SLOTS` sets the number of retained expert records per layer during sampled decode. It defaults to zero and accepts up to four slots, bounded by the model's experts selected per token. A positive setting requires automatic MLX sizing or an explicit `FIFI_MLX_WORKING_SET_MIB` ceiling. Startup checks the page-rounded cache mapping and its metadata against the device budget. The mapping is released at the decode boundary before the next prefill. Only demand reads populate it, after an expert is selected twice in a row. Cached slices are copied into the existing rank-ordered staging set.
+
 ## `qwen36`
 
 Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
