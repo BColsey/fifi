@@ -65,29 +65,31 @@ pub(crate) struct SeqPlan {
     pub(crate) per_seq: u64,
     /// Bytes the extra sequences charge together.
     pub(crate) extra_bytes: u64,
-    /// Free bytes that remain after them.
+    /// Free bytes that would remain if every extra sequence were allocated: a figure of the plan.
     pub(crate) free_after: u64,
     pub(crate) bound: Bound,
     inputs: SeqInputs,
 }
 
 impl SeqPlan {
-    /// The numbers for the start line.
+    /// The numbers for the start line, in MiB. Sessions after the first are allocated when
+    /// requests need them: a lone client holds one.
     pub(crate) fn describe(&self) -> String {
+        let mib = |bytes: u64| bytes >> 20;
         format!(
-            "sequences {} of at most {} (bound by {}): {} bytes per extra sequence ({} fixed + {} positions x {} bytes), {} extra sequences for {} bytes, {} free after the first sequence, {} headroom, {} free after",
+            "sessions {} of at most {} (bound by {}); each extra session is {} MiB ({} bytes fixed + {} positions x {} bytes) and is allocated when a request needs it; {} extra for {} MiB; {} MiB free after the first session, {} MiB kept as headroom, {} MiB would be left if every extra session were allocated (a figure of the plan, not a reservation)",
             self.seqs,
             self.inputs.row_cap.min(self.inputs.ceiling),
             self.bound.name(),
-            self.per_seq,
+            mib(self.per_seq),
             self.inputs.cost.fixed,
             self.inputs.context,
             self.inputs.cost.per_position,
             self.seqs.saturating_sub(1),
-            self.extra_bytes,
-            self.inputs.free,
-            self.inputs.headroom,
-            self.free_after,
+            mib(self.extra_bytes),
+            mib(self.inputs.free),
+            mib(self.inputs.headroom),
+            mib(self.free_after),
         )
     }
 }
@@ -272,16 +274,27 @@ mod tests {
     }
 
     #[test]
-    fn the_start_line_carries_the_numbers() {
+    fn the_start_line_carries_the_numbers_in_mib() {
         let plan = plan_seqs(inputs(5 * GIB), None).expect("plan");
         let line = plan.describe();
-        assert!(line.contains(&format!("sequences {}", plan.seqs)), "{line}");
+        assert!(line.contains(&format!("sessions {}", plan.seqs)), "{line}");
         assert!(line.contains("30464"), "{line}");
         assert!(line.contains("32768"), "{line}");
-        assert!(line.contains(&plan.free_after.to_string()), "{line}");
         assert!(
-            line.contains(&format!("for {} bytes", plan.extra_bytes)),
+            line.contains(&format!(
+                "{} MiB would be left if every extra session were allocated",
+                plan.free_after >> 20
+            )),
             "{line}"
+        );
+        assert!(
+            line.contains(&format!("for {} MiB", plan.extra_bytes >> 20)),
+            "{line}"
+        );
+        assert!(line.contains("allocated when a request needs it"), "{line}");
+        assert!(
+            !line.contains(&plan.extra_bytes.to_string()),
+            "no raw byte counts: {line}"
         );
     }
 }

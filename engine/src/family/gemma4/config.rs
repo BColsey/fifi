@@ -6,8 +6,10 @@ use crate::{EngError, checkpoint_json::UniqueValue};
 const ARCHITECTURE: &str = "Gemma4UnifiedForConditionalGeneration";
 const BOLT_ARCHITECTURE: &str = "Gemma4ForConditionalGeneration";
 
-/// How many sessions the Bolt engine serves at once: an explicit count from 1 to 8, or `auto`,
-/// which asks the sequence planner for the count the free device memory funds.
+/// How many sessions the Bolt engine serves at once: an explicit count from 1 to 8, or `auto`
+/// (the default), which asks the sequence planner for the count the free device memory funds
+/// after the first session. Sessions are allocated when requests need them, so a lone client
+/// holds one session and the window rows of the plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawMaxSeqs")]
 pub(crate) enum MaxSeqs {
@@ -16,9 +18,9 @@ pub(crate) enum MaxSeqs {
 }
 
 impl Default for MaxSeqs {
-    /// One session: the engine serves one request at a time.
+    /// The count the free device memory funds.
     fn default() -> Self {
-        Self::Count(1)
+        Self::Auto
     }
 }
 
@@ -55,7 +57,7 @@ impl TryFrom<RawMaxSeqs> for MaxSeqs {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Gemma4Options {
-    /// The sessions served at once; absent means one.
+    /// The sessions served at once; absent means the count the free memory funds.
     #[cfg_attr(
         not(feature = "native-cuda"),
         allow(dead_code, reason = "only the CUDA starter reads the count")

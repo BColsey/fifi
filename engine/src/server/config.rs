@@ -837,7 +837,8 @@ mod tests {
         };
         assert_eq!(format!("{:?}", seqs(r#"{"max_seqs": 4}"#)), "Count(4)");
         assert_eq!(format!("{:?}", seqs(r#"{"max_seqs": "auto"}"#)), "Auto");
-        assert_eq!(format!("{:?}", seqs("{}")), "Count(1)");
+        assert_eq!(format!("{:?}", seqs("{}")), "Auto");
+        assert_eq!(format!("{:?}", seqs(r#"{"max_seqs": 1}"#)), "Count(1)");
     }
 
     #[test]
