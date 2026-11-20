@@ -80,6 +80,19 @@ git clone https://github.com/zbrdc/fifi.git
 The server executable is named `enginesrv`. The Rust crate is named
 `inference-engine`.
 
+## Thanks to
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [MLX](https://github.com/ml-explore/mlx)
+- [mlx-lm](https://github.com/ml-explore/mlx-lm)
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3)
+- [TabbyAPI](https://github.com/theroyallab/tabbyAPI)
+- [Strata](https://github.com/Niko1221/Strata)
+- [Basalt](https://github.com/jesdga95/basalt)
+- [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
+- [vLLM](https://github.com/vllm-project/vllm)
+- [SGLang](https://github.com/sgl-project/sglang)
+
 ## License
 
 fifi is distributed under the [Apache License 2.0](LICENSE). See
