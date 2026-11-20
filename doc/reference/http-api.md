@@ -1,7 +1,7 @@
 # HTTP API
 
 `enginesrv` serves the routes below on the `listen` address of its [configuration file](configuration.md).
-The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). The completion, token and template routes are extensions that the contract file does not describe.
+The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). It describes every route below, including this server's extensions to the OpenAI and Anthropic APIs.
 
 ## Routes
 
@@ -10,6 +10,7 @@ The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). The completion,
 | `GET /health` | no | Answers `{"status":"ok"}` while the process runs. |
 | `GET /ready` | no | `200 {"status":"ready"}` when at least one engine is ready or busy; otherwise `503` with code `not_ready` and the state of each engine. |
 | `GET /v1/models` | yes | Model names, each with the engines that serve it and their states. |
+| `GET /v1/system` | yes | What this build and process are: version, compiled backends, host memory and CPU threads, the engines with their states and resolved context limits. No device probe. See [Monitor routes](#monitor-routes). |
 | `POST /v1/chat/completions` | yes | OpenAI-style chat completion, with or without streaming. |
 | `POST /v1/completions` | yes | Raw text completion of one prompt string, with or without streaming. The chat template is not applied. |
 | `POST /v1/messages` | yes | Anthropic-style Messages request, with or without streaming. |
@@ -18,6 +19,9 @@ The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). The completion,
 | `POST /v1/token/decode` | yes | Text of a list of token ids. No generation runs. |
 | `POST /v1/apply-template` | yes | The prompt text that the chat template makes of chat messages. No generation runs. |
 | `GET /v1/sampler-trace` | yes | One reply's armed sampler-trace packet, as `?id=<reply id>`. See [Sampler trace](#sampler-trace). |
+| `GET /v1/telemetry` | yes | GPU rows from `nvidia-smi` for the monitor panel. See [Monitor routes](#monitor-routes). |
+| `GET /v1/recent-requests` | yes | The last 64 request-log rows, newest first. See [Monitor routes](#monitor-routes). |
+| `GET /v1/route-trace` | yes | The router staging ring of the last 16 decode steps. `404` with the enabling hint unless the engine runs with `Q36_ROUTE_STAGE=1`. See [Monitor routes](#monitor-routes). |
 
 ## Authentication
 
@@ -41,6 +45,13 @@ refused with `400`. The ring keeps the last four replies' traces under a
 global position budget (drop-oldest); an unknown or evicted id reports
 `404`, so a dropped trace is explicit. Nothing is captured retroactively:
 arming happens before generation begins.
+
+The packet carries the reply's generated text: the sampled pieces
+include reasoning and tool-call text, unredacted, and the candidates
+carry token ids with their probabilities. One process key
+guards every API route, so any key holder can read any retained trace,
+and reply ids are sequential and guessable. Treat the route accordingly
+when prompts carry sensitive content.
 
 ## Chat completions
 
@@ -144,6 +155,31 @@ Sampling bounds and defaults are the same as for chat completions.
 
 Content blocks in the reply are `text`, `thinking` (with an empty `signature`) and `tool_use`.
 `usage.cache_read_input_tokens` counts prompt tokens served from a saved prefix, and `input_tokens` counts the rest. `cache_creation_input_tokens` is always 0.
+
+## Monitor routes
+
+The four GET routes below serve the monitor panel and diagnostics.
+They answer with the process API key, like every other `/v1` route.
+
+`GET /v1/system` reports what this build and process are: the crate version, the native backends compiled in, host memory and CPU threads, and the engines with their states, resolved context limits, and retained effective settings.
+The serving process does not probe devices; a failed device query could latch the backend.
+For device facts, run the short-lived `enginesrv doctor` command instead.
+
+`GET /v1/telemetry` reports GPU rows read from `nvidia-smi`, run as a subprocess: index, name, GPU utilization, memory used and total in bytes, temperature, and power draw.
+A snapshot is held for 2 seconds.
+With no GPU tool, or after a failed run, the route still answers `200` with empty `gpus` and an `error` that says why: the absence is data for the panel, not a request failure.
+A field that `nvidia-smi` prints but the server cannot parse stays `null`, never zero.
+
+`GET /v1/recent-requests` answers the last 64 request-log rows, newest first, as `{"requests": [...]}`.
+A row keeps the allowlisted keys of the request log (request id, endpoint, engine, token counts, timings) — every key, every row, with `null` for a value the row does not have.
+`count_tokens` lines never land in the ring.
+There is no filtering and no aggregation: the panel computes its own figures.
+
+`GET /v1/route-trace` answers the routing stage's ring of the last 16 decode steps, process wide.
+The stage is opt-in at process level only: start the engine with `Q36_ROUTE_STAGE=1`.
+With the flag off the route answers `404` with the enabling hint, never an empty packet, so a reader cannot mistake off for no activity.
+Steps are oldest first; each layer entry carries the expert `ids` (u16; a router fault serializes as 65535), the `weights`, and the shared `gate`.
+The reply carries `Cache-Control: no-store`.
 
 ## Errors
 

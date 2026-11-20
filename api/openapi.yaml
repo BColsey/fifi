@@ -1137,6 +1137,580 @@ components:
         input_tokens:
           type: integer
           description: The number of tokens in the rendered prompt.
+    CompletionRequest:
+      type: object
+      required: [prompt]
+      properties:
+        model:
+          type: string
+          description: A model name from GET /v1/models, as on the chat path.
+        prompt:
+          type: string
+          minLength: 1
+          description: >-
+            One non-empty string. A list of strings or of token ids gets
+            400. The server tokenizes the prompt as written: no chat
+            template, no start-of-sequence token. Text that spells a
+            special token, such as <|im_end|>, is tokenized as that token;
+            the server does not escape it.
+        stream:
+          type: boolean
+          default: false
+        max_tokens:
+          type: integer
+          default: 2048
+          minimum: 1
+          description: >-
+            The server lowers it when the prompt plus max_tokens would
+            pass the context limit of the engine. This route does not read
+            max_completion_tokens; the OpenAI reference defines that field
+            only for chat completions.
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: >-
+            0 selects greedy decoding. The default is the value in
+            generation_config.json of the serving model, else 0.7.
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: >-
+            The default is the value in generation_config.json of the serving
+            model, else 1.0.
+        top_k:
+          type: integer
+          minimum: 0
+          description: >-
+            0 turns top-k off. The default is the value in
+            generation_config.json of the serving model, else 0.
+        stop:
+          description: >-
+            One string or an array of strings, matched on the decoded
+            text. The stop text is not part of the reply.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        x-engine:
+          type: string
+          description: >-
+            Server extension. The id of the engine to use. It overrides model,
+            and an unknown id gets 404.
+        x-session:
+          type: string
+          description: >-
+            Server extension. A named session binds to the engine that serves
+            its first request and returns to it afterwards.
+      description: >-
+        n must be 1 or absent; any other value gets 400. echo true, and a
+        suffix, logprobs, or best_of that is not null, get 400. seed,
+        presence_penalty, frequency_penalty, logit_bias, stream_options
+        and user are accepted and ignored. A stream always ends with the
+        usage chunk, whatever stream_options says.
+    Completion:
+      type: object
+      required: [id, object, created, model, engine, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: text_completion
+        created:
+          type: integer
+        model:
+          type: string
+        engine:
+          type: string
+          description: >-
+            Server extension. The id of the engine that served the request.
+        choices:
+          type: array
+          minItems: 1
+          maxItems: 1
+          description: One choice is generated for each request.
+          items:
+            type: object
+            required: [index, text, logprobs, finish_reason]
+            properties:
+              index:
+                type: integer
+              text:
+                type: string
+                description: >-
+                  The generated text as it is: no think block, tool call,
+                  or whitespace is cut out.
+              logprobs:
+                type: "null"
+                description: Always null.
+              finish_reason:
+                type:
+                  - string
+                  - "null"
+                enum: [stop, length, null]
+        usage:
+          allOf:
+            - $ref: "#/components/schemas/Usage"
+          description: Present on the final reply and on the final stream chunk.
+    EncodeRequest:
+      type: object
+      description: >-
+        Server extension. Either text or messages, not both: a request
+        that sets both, or neither, gets 400. With messages, the tools,
+        tool_choice, x-thinking, chat_template_kwargs and response_format
+        fields have the meaning and the checks of the chat path.
+      properties:
+        model:
+          type: string
+          description: A model name from GET /v1/models, as on the chat path.
+        x-engine:
+          type: string
+          description: >-
+            Server extension. The id of the engine to use. It overrides model,
+            and an unknown id gets 404.
+        x-session:
+          type: string
+          description: >-
+            Server extension. A named session binds to the engine that serves
+            its first request and returns to it afterwards.
+        text:
+          type: string
+          description: >-
+            A string, tokenized as written. No start-of-sequence token is
+            added, and the text of a special token such as <|im_start|>
+            becomes that token.
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+          description: >-
+            Chat messages, rendered with the chat template and the
+            generation prompt, then tokenized. The ids are the ids that a
+            chat completion with the same fields sends to the engine.
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tool"
+        tool_choice:
+          $ref: "#/components/schemas/ToolChoice"
+        response_format:
+          $ref: "#/components/schemas/ResponseFormat"
+        x-thinking:
+          type: string
+          enum: [default, "on", "off"]
+          default: default
+          description: >-
+            With messages only. Sets the enable_thinking flag of the chat
+            template of the model, as on the chat path.
+        chat_template_kwargs:
+          type: object
+          additionalProperties: false
+          properties:
+            enable_thinking:
+              type: boolean
+          description: With messages only. The checks of the chat path apply.
+    EncodeResponse:
+      type: object
+      required: [tokens, length]
+      properties:
+        tokens:
+          type: array
+          items:
+            type: integer
+          description: The token ids.
+        length:
+          type: integer
+          description: The count of the ids.
+    DecodeRequest:
+      type: object
+      required: [tokens]
+      properties:
+        model:
+          type: string
+          description: A model name from GET /v1/models, as on the chat path.
+        x-engine:
+          type: string
+          description: >-
+            Server extension. The id of the engine to use. It overrides model,
+            and an unknown id gets 404.
+        x-session:
+          type: string
+          description: >-
+            Server extension. A named session binds to the engine that serves
+            its first request and returns to it afterwards.
+        tokens:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+          description: >-
+            Token ids. An id outside the vocabulary of the engine gets
+            400, and so does an array longer than the context limit of
+            the engine, in tokens.
+    DecodeResponse:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          description: >-
+            The text of the ids. Special tokens are always left out; no field of
+            this route keeps them.
+    ApplyTemplateRequest:
+      type: object
+      required: [messages]
+      properties:
+        model:
+          type: string
+          description: A model name from GET /v1/models, as on the chat path.
+        x-engine:
+          type: string
+          description: >-
+            Server extension. The id of the engine to use. It overrides model,
+            and an unknown id gets 404.
+        x-session:
+          type: string
+          description: >-
+            Server extension. A named session binds to the engine that serves
+            its first request and returns to it afterwards.
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tool"
+        tool_choice:
+          $ref: "#/components/schemas/ToolChoice"
+        x-thinking:
+          type: string
+          enum: [default, "on", "off"]
+          default: default
+          description: >-
+            Sets the enable_thinking flag of the chat template of the model, as
+            on the chat path.
+        chat_template_kwargs:
+          type: object
+          additionalProperties: false
+          properties:
+            enable_thinking:
+              type: boolean
+          description: The checks of the chat path apply.
+    ApplyTemplateResponse:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: >-
+            The text that a chat completion would tokenize, ending with the
+            generation prompt.
+    SamplerTracePacket:
+      type: object
+      required:
+        - packet
+        - reply_id
+        - model
+        - sampling
+        - capture_scope
+        - truncated
+        - captured_positions
+        - raw_byte_len
+        - aligned_positions
+        - alignment_error
+        - trailer
+        - positions
+      properties:
+        packet:
+          type: integer
+          const: 2
+        reply_id:
+          type: string
+        model:
+          type: string
+        sampling:
+          type: object
+          required: [temperature, top_p, top_k]
+          properties:
+            temperature:
+              type: number
+            top_p:
+              type: number
+            top_k:
+              type: integer
+        capture_scope:
+          type: string
+          const: decode
+        truncated:
+          type: boolean
+          description: >-
+            True when the position limit of the buffer cut the capture.
+        captured_positions:
+          type: integer
+        raw_byte_len:
+          type: integer
+          description: >-
+            The bytes of raw generated text that the aligned pieces cover.
+        aligned_positions:
+          type: integer
+          description: The positions whose offset is set.
+        alignment_error:
+          type: boolean
+          description: >-
+            True once the replay of the reply disagreed with the recorded
+            positions. Alignment stops there; the offsets before the break
+            stay trustworthy.
+        trailer:
+          type: string
+          description: >-
+            Decoder text flushed at the end that belongs to no single position.
+        positions:
+          type: array
+          items:
+            type: object
+            required:
+              - token_id
+              - rank
+              - kept
+              - greedy
+              - selected_prob
+              - candidates
+              - offset
+              - piece
+            properties:
+              token_id:
+                type: integer
+              rank:
+                type: integer
+              kept:
+                type: integer
+              greedy:
+                type: boolean
+              selected_prob:
+                type:
+                  - number
+                  - "null"
+                description: >-
+                  The selected token's probability. Null when the sampler
+                  did not record one, such as a greedy pick.
+              candidates:
+                type: array
+                items:
+                  type: object
+                  required: [token_id, prob]
+                  properties:
+                    token_id:
+                      type: integer
+                    prob:
+                      type: number
+              offset:
+                type:
+                  - integer
+                  - "null"
+                description: >-
+                  The byte offset into the raw generated text. Null until
+                  the replay reaches this position, or forever when
+                  alignment stopped early.
+              piece:
+                type:
+                  - string
+                  - "null"
+                description: >-
+                  The text piece that the replay matched at this position.
+    Telemetry:
+      type: object
+      required: [gpus, source, error]
+      properties:
+        gpus:
+          type: array
+          description: >-
+            One row per GPU line of the nvidia-smi output. Empty when the tool
+            did not run or failed.
+          items:
+            type: object
+            properties:
+              index:
+                type:
+                  - integer
+                  - "null"
+              name:
+                type:
+                  - string
+                  - "null"
+              util_percent:
+                type:
+                  - number
+                  - "null"
+              mem_used_bytes:
+                type:
+                  - integer
+                  - "null"
+                description: Bytes.
+              mem_total_bytes:
+                type:
+                  - integer
+                  - "null"
+                description: Bytes.
+              temp_c:
+                type:
+                  - number
+                  - "null"
+              power_w:
+                type:
+                  - number
+                  - "null"
+        source:
+          type: string
+          const: nvidia-smi
+        error:
+          type:
+            - string
+            - "null"
+          description: >-
+            Null on success. With no GPU tool, or after a failed run, it says
+            why, and the status stays 200.
+    RecentRequests:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          description: >-
+            The last 64 rows of the request log, newest first. A row holds
+            the allowlisted keys of the request log, every one of them,
+            with null for a value the row does not have.
+            /v1/messages/count_tokens lines never land in the ring.
+          items:
+            type: object
+            properties:
+              request_id:
+                type:
+                  - string
+                  - "null"
+              method:
+                type:
+                  - string
+                  - "null"
+              endpoint:
+                type:
+                  - string
+                  - "null"
+              model:
+                type: string
+              engine:
+                type:
+                  - string
+                  - "null"
+              session:
+                type:
+                  - string
+                  - "null"
+              started_at_ms:
+                type: integer
+                description: Epoch milliseconds.
+              stream:
+                type: boolean
+              status:
+                type:
+                  - integer
+                  - "null"
+              outcome:
+                type: string
+              error_code:
+                type:
+                  - string
+                  - "null"
+              finish_reason:
+                type:
+                  - string
+                  - "null"
+              prompt_tokens:
+                type: integer
+              completion_tokens:
+                type: integer
+              reused_tokens:
+                type: integer
+              queue_wait_ms:
+                type:
+                  - number
+                  - "null"
+              prefill_ms:
+                type:
+                  - number
+                  - "null"
+              time_to_first_token_ms:
+                type:
+                  - number
+                  - "null"
+              decode_tokens_per_second:
+                type:
+                  - number
+                  - "null"
+    RouteTracePacket:
+      type: object
+      required: [packet, ring_capacity, steps]
+      properties:
+        packet:
+          type: integer
+          const: 1
+        ring_capacity:
+          type: integer
+          description: The step capacity of the ring, 16 in this build.
+        layers:
+          type:
+            - integer
+            - "null"
+          description: >-
+            The MoE layer count of the staged model, when an engine supplies
+            facts; else null.
+        top_k:
+          type:
+            - integer
+            - "null"
+          description: The experts each step picks; else null.
+        experts:
+          type:
+            - integer
+            - "null"
+          description: The expert count of the staged model; else null.
+        steps:
+          type: array
+          description: The retained steps, oldest first.
+          items:
+            type: object
+            required: [step, layers]
+            properties:
+              step:
+                type: integer
+              layers:
+                type: array
+                description: One entry per MoE layer in launch order.
+                items:
+                  type: object
+                  required: [ids, weights, gate]
+                  properties:
+                    ids:
+                      type: array
+                      items:
+                        type: integer
+                        minimum: 0
+                        maximum: 65535
+                      description: >-
+                        Expert indices as u16; a router fault serializes as
+                        65535.
+                    weights:
+                      type: array
+                      items:
+                        type: number
+                    gate:
+                      type: number
+                      description: The layer's shared router gate value.
 paths:
   /health:
     get:
@@ -1455,3 +2029,280 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AnthropicError"
+  /v1/completions:
+    post:
+      operationId: createCompletion
+      summary: Text completion
+      description: |-
+        OpenAI-style text completion: continues one prompt string. The
+        server tokenizes the prompt as written: no chat template, no
+        start-of-sequence token. Text that spells a special token, such
+        as <|im_end|>, is tokenized as that token. The reply text is the
+        generated text as it is.
+
+        A raw completion marks no prefix boundary, so the server saves
+        and restores no prefix for it. x-sample-trace arms nothing here;
+        only the chat route arms capture.
+
+        Admission, the stream rules, and the error accounting are those
+        of /v1/chat/completions: the headers and the first chunk leave
+        when the engine queue accepts the job, a later error is one
+        event: error in the stream without [DONE], a disconnect or a
+        too-slow reader cancels the job, and no request timeout applies.
+      requestBody:
+        description: >-
+          The body may be at most 16 MiB. A larger body gets
+          400 bad_request.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionRequest"
+      responses:
+        "200":
+          description: One completion, or a stream of chunks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Completion"
+            text/event-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Completion"
+                description: |-
+                  Each event is one data line with a Completion as JSON,
+                  then a blank line. A text chunk carries the piece in
+                  choices[0].text; the final chunk has an empty text, the
+                  finish_reason, and the usage. The last event is
+                  data: [DONE]. Chunks carry no role. Comment lines keep
+                  the connection open between chunks. An error after the
+                  first chunk is one event: error whose body carries the
+                  Error fields beside a usage object with the work the
+                  job had done, and the stream ends without [DONE].
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/CapacityConflict"
+        "422":
+          $ref: "#/components/responses/CheckpointFailure"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+        "503":
+          $ref: "#/components/responses/Overloaded"
+  /v1/token/encode:
+    post:
+      operationId: encodeTokens
+      summary: Tokenize text or chat messages (server extension)
+      description: |-
+        Server extension. The token ids of a text, or of chat messages
+        after the chat template. The route queues no engine job: it
+        answers while an engine loads and after one failed. It reads no
+        sampling field: temperature, top_p, top_k, max_tokens, stop and
+        stream are ignored. Each served request writes one line to the
+        request log with no finish reason or timings; prompt_tokens is
+        the number of ids returned.
+      requestBody:
+        description: >-
+          The body may be at most 16 MiB. A larger body gets
+          400 bad_request.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EncodeRequest"
+      responses:
+        "200":
+          description: The ids and their count.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EncodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/CheckpointFailure"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+  /v1/token/decode:
+    post:
+      operationId: decodeTokens
+      summary: Detokenize ids (server extension)
+      description: |-
+        Server extension. The text of a list of token ids. Special tokens
+        are always left out of the text; no field of this route keeps
+        them. More ids than the context limit of the engine get 400,
+        because no prompt or completion of that engine is longer. The
+        route queues no engine job, and it reads no sampling field. Each
+        served request writes one line to the request log with no finish
+        reason or timings; prompt_tokens is the number of ids received.
+      requestBody:
+        description: >-
+          The body may be at most 16 MiB. A larger body gets
+          400 bad_request.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecodeRequest"
+      responses:
+        "200":
+          description: The text of the ids.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecodeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/CheckpointFailure"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+  /v1/apply-template:
+    post:
+      operationId: applyTemplate
+      summary: Render the chat template (server extension)
+      description: |-
+        Server extension. The prompt text that the chat template makes of
+        the messages, ending with the generation prompt. Nothing is
+        generated. A chat template that renders no text gets 400 with
+        the message rendered prompt is empty. The route queues no engine
+        job, and it reads no sampling field. Each served request writes
+        one line to the request log with no finish reason or timings;
+        prompt_tokens is zero.
+      requestBody:
+        description: >-
+          The body may be at most 16 MiB. A larger body gets
+          400 bad_request.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyTemplateRequest"
+      responses:
+        "200":
+          description: The rendered prompt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyTemplateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/CheckpointFailure"
+        "500":
+          $ref: "#/components/responses/BackendFailure"
+  /v1/sampler-trace:
+    get:
+      operationId: getSamplerTrace
+      summary: Sampler trace of one reply (server extension)
+      description: |-
+        The capture packet of one reply that armed x-sample-trace on
+        /v1/chat/completions. Capture is opt-in twice: the server's
+        sample_trace setting must permit it and the request must arm it.
+        The ring keeps the last four replies' traces under a global
+        position budget and drops the oldest first; an unknown or evicted
+        id gets 404, so a dropped trace is explicit. The packet carries
+        the reply's generated text: the sampled pieces include reasoning
+        and tool-call text, unredacted, and the candidates carry token
+        ids with their probabilities. One process key guards every API
+        route, so any key holder can read any retained trace, and reply
+        ids are sequential and guessable. The reply
+        carries Cache-Control: no-store.
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: The reply id. A missing or empty id also gets 404.
+      responses:
+        "200":
+          description: The trace packet of the reply.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SamplerTracePacket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/telemetry:
+    get:
+      operationId: getTelemetry
+      summary: GPU telemetry (server extension)
+      description: |-
+        GPU rows for the monitor panel, read from nvidia-smi run as a
+        subprocess: a failed driver tool cannot latch the serving backend
+        the way an in-process CUDA query could, the rule that /v1/system
+        states. A snapshot is held for 2 seconds. With no GPU tool, or
+        after a failed run, the route still answers 200 with empty gpus
+        and an error that says why: the absence is data for the panel,
+        not a request failure. Memory fields are bytes. A field that
+        nvidia-smi prints but the server cannot parse stays null, never
+        zero.
+      responses:
+        "200":
+          description: The GPU rows, or the reason there are none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Telemetry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/recent-requests:
+    get:
+      operationId: listRecentRequests
+      summary: Recent request rows (server extension)
+      description: |-
+        The last 64 rows of the request log, newest first, for the
+        monitor panel. No filtering and no aggregation: the panel
+        computes its own figures.
+      responses:
+        "200":
+          description: The retained rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecentRequests"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/route-trace:
+    get:
+      operationId: getRouteTrace
+      summary: Router staging trace (server extension)
+      description: |-
+        The routing stage's ring of the last 16 decode steps, process
+        wide. The stage is opt-in at process level only: start the engine
+        with Q36_ROUTE_STAGE=1. There is no per-request arming, unlike
+        the sampler trace. With the stage off the route answers 404 with
+        the enabling hint, never an empty packet, so a reader cannot
+        mistake off for no activity. Steps are oldest first, and ids are
+        u16 expert indices; a router fault serializes as 65535. The reply
+        carries Cache-Control: no-store.
+      responses:
+        "200":
+          description: The ring of the routing stage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteTracePacket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
