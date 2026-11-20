@@ -1023,7 +1023,7 @@ struct PinnedReadyObs {
 }
 
 /// Observe the real adapter, not a separately constructed pool or a planned-entry count.
-fn pinned_ready_phase() -> Result<(Vec<u32>, Vec<PinnedReadyObs>), EngError> {
+fn pinned_ready_phase(expected: usize) -> Result<(Vec<u32>, Vec<PinnedReadyObs>), EngError> {
     let gguf = gguf_path()?;
     let bundle = TokenizerBundle::load(gguf.parent().unwrap_or(Path::new(".")), &tokenizer_pin()?)?;
     // The old P5 oracle asset is not required for this capacity probe.
@@ -1049,7 +1049,9 @@ fn pinned_ready_phase() -> Result<(Vec<u32>, Vec<PinnedReadyObs>), EngError> {
             .and_then(|bytes| bytes.checked_add(layout.kv.total))
             .ok_or_else(|| EngError::Checkpoint("pinned-ready layout size".into()))?;
         let pinned_before = ctx.live_owners().pinned;
-        step.enable_pinned_prefix()?;
+        // The cap holds `expected` retained entries and the staging slot, whatever the process
+        // environment says.
+        step.enable_pinned_prefix_with(Some((expected + 1) * checkpoint))?;
         let pinned_enabled = ctx.live_owners().pinned;
         let capacity = step.prefix.limits().entries;
         let initial_ready = step.prefix.entries_len() + step.prefix.roots_len();
@@ -1123,8 +1125,8 @@ fn assert_empty_probe(probe: &Probe) {
 }
 
 fn assert_pinned_ready(expected: usize) {
-    let (ids, observations) =
-        pinned_ready_phase().unwrap_or_else(|error| panic!("pinned-ready device phase: {error:?}"));
+    let (ids, observations) = pinned_ready_phase(expected)
+        .unwrap_or_else(|error| panic!("pinned-ready device phase: {error:?}"));
     assert_eq!(observations.len(), 2);
     for (obs, mode) in observations.iter().zip([KvMode::Fp16, KvMode::Int8G32]) {
         eprintln!("PINNED_READY_NATIVE expected={expected} {obs:?}");

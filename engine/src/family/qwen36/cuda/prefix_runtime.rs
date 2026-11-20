@@ -163,6 +163,12 @@ impl QwenResidentStep<'_> {
     }
 
     pub(crate) fn enable_pinned_prefix(&mut self) -> Result<(), EngError> {
+        self.enable_pinned_prefix_with(None)
+    }
+
+    /// [`Self::enable_pinned_prefix`] with the byte cap of the pool given by the caller. `None`
+    /// reads `Q36_CUDA_PINNED_PREFIX_BYTES` and falls back to the default cap.
+    pub(crate) fn enable_pinned_prefix_with(&mut self, cap: Option<usize>) -> Result<(), EngError> {
         if self.started || self.is_tiered() || self.prefix.key_len().is_some() {
             return Err(EngError::BadRequest(
                 "pinned prefix needs a fresh non-tiered step".into(),
@@ -180,8 +186,11 @@ impl QwenResidentStep<'_> {
         // the probe refuses on exactly the cases the clamp exists for, so falling back to the
         // unclamped figure would repeat the bug this closes.
         let available = admission_budget("Qwen36 pinned prefix", "pins stay off");
-        let limit = byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
-            .unwrap_or_else(|| default_pin_bytes(checkpoint, available));
+        let limit = match cap {
+            Some(bytes) => bytes,
+            None => byte_limit(PIN_BYTES_ENV, std::env::var_os(PIN_BYTES_ENV).as_deref())?
+                .unwrap_or_else(|| default_pin_bytes(checkpoint, available)),
+        };
         let entries = planned_entries(checkpoint, limit, available);
         if entries == 0 {
             eprintln!(

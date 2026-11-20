@@ -127,7 +127,7 @@ fn the_cuda_step_reports_the_admitted_pinned_store_limits() {
     let admission = pinned(section_of(
         include_str!("prefix_runtime.rs"),
         "prefix_runtime.rs",
-        "fn enable_pinned_prefix(",
+        "fn enable_pinned_prefix_with(",
     ));
     assert!(
         admission.contains(concat!(
