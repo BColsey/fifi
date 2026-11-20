@@ -983,7 +983,7 @@ fn cancelling_the_last_prefill_piece_keeps_the_row_out_of_decode() {
 }
 
 #[test]
-fn a_one_row_budget_gives_each_live_sequence_progress() {
+fn an_idle_batch_feeds_each_cold_prompt_a_whole_piece() {
     let log = Log::default();
     let (engine, release) = start_with_budget(WindowFake::new(&log), 1);
     let (first, first_events) = job(&[0; 3], 2);
@@ -993,12 +993,36 @@ fn a_one_row_budget_gives_each_live_sequence_progress() {
     release.send(()).unwrap();
     for events in [first_events, second_events] {
         let result = usage(&collect(events));
-        assert_eq!(result.prefill_pieces.count, 3);
-        assert_eq!(result.prefill_pieces.max_rows, 1);
+        // The piece is 4: with no stream decoding each cold prompt takes a whole piece.
+        assert_eq!(result.prefill_pieces.count, 1);
+        assert_eq!(result.prefill_pieces.max_rows, 3);
         assert_eq!(result.completion_tokens, 2);
     }
     engine.shutdown();
     assert_eq!(lock(&log).windows[0], [vec![0; 3], vec![1; 3]]);
+}
+
+#[test]
+fn a_cold_prompt_takes_the_piece_minus_the_decode_rows_while_a_stream_decodes() {
+    let log = Log::default();
+    let (hold, entered, unblock) = gate();
+    let mut fake = WindowFake::new(&log);
+    fake.hold = Some(hold);
+    let (engine, release) = start_with_budget(fake, 1);
+    let (stream, stream_events) = job(&[0], 16);
+    let (cold, cold_events) = job(&[1; 6], 1);
+    engine.handle().try_submit(stream).unwrap();
+    release.send(()).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    engine.handle().try_submit(cold).unwrap();
+    unblock.send(()).unwrap();
+    assert_eq!(usage(&collect(stream_events)).completion_tokens, 16);
+    let result = usage(&collect(cold_events));
+    // The piece is 4 and one row of it decodes the stream, so the prompt feeds 3 rows per tick.
+    assert_eq!(result.prefill_pieces.count, 2);
+    assert_eq!(result.prefill_pieces.max_rows, 3);
+    assert_eq!(result.completion_tokens, 1);
+    engine.shutdown();
 }
 
 #[test]

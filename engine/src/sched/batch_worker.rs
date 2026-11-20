@@ -178,6 +178,9 @@ impl<'a, S> Pool<'a, S> {
     }
 }
 
+/// The most whole prefill pieces one tick feeds while no stream decodes.
+const MAX_IDLE_PIECES: usize = 8;
+
 fn register(shared: &Shared, job: &Job) {
     lock(&shared.active).push(ActiveJob {
         cancel: Arc::clone(&job.generation.cancel),
@@ -520,6 +523,11 @@ pub(super) fn work<E: ExecutorOps>(
 ) {
     let mut pool = Pool::new(session, &shared.ticks);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
+    // A tick feeds at most one planned piece of prompt rows beside the decode rows: a piece is
+    // the size the prefill plan admitted and the size at which prefill runs fastest, so a
+    // smaller budget only slows every cold prompt (a 4,096-token prompt took 14.4 s at 16 rows
+    // against 3.5 s at 256 on the Mac Studio) while a stream waits at most one piece per tick.
+    let iteration_rows = iteration_rows.max(prefill_chunk);
     loop {
         if shared.stop.load(Ordering::SeqCst) {
             break;
@@ -591,7 +599,16 @@ pub(super) fn work<E: ExecutorOps>(
         // slot as exactly one decode row this tick, so decode_rows is the number
         // of ready slots, never a per-slot row count a family could raise.
         let decode_rows = slots.len() - prompt_slots;
-        let mut prompt_rows = iteration_rows.max(slots.len()) - decode_rows;
+        // With no stream decoding nothing waits on the tick, so each cold prompt takes a whole
+        // piece (one per sequence the batch holds at most, which bounds the wait of a
+        // cancellation): a prompt that arrives alone prefills as fast as the single-sequence
+        // worker, and several cold prompts take turns at the full piece size.
+        let tick_rows = if decode_rows == 0 {
+            iteration_rows * prompt_slots.clamp(1, MAX_IDLE_PIECES)
+        } else {
+            iteration_rows
+        };
+        let mut prompt_rows = tick_rows.max(slots.len()) - decode_rows;
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
