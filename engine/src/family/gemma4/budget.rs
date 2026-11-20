@@ -14,6 +14,7 @@
     )
 )]
 
+use super::config::MaxSeqs;
 use crate::family::device_budget::KvPlan;
 use crate::family::seq_plan::SeqCost;
 use crate::family::spec::AttentionKind;
@@ -81,6 +82,45 @@ pub(crate) fn bolt_seq_cost() -> Option<SeqCost> {
     })
 }
 
+/// The session request the start plans with, and what it says about the decode graph.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter plans sessions")
+)]
+pub(crate) struct SessionAsk {
+    /// The count to plan with.
+    pub(crate) seqs: MaxSeqs,
+    /// A line for the start output when the decode graph changed the request.
+    pub(crate) note: Option<String>,
+}
+
+/// An explicit decode graph (`FIFI_BOLT_DECODE_GRAPH=1`) is a request the start honours. The graph
+/// replays one session's one-token step, so with an automatic count the start plans one session
+/// and says why; with an explicit count above one the windows win and the graph is off. Without the
+/// graph the request is unchanged.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter plans sessions")
+)]
+pub(crate) fn session_ask(seqs: MaxSeqs, graph_wanted: bool) -> SessionAsk {
+    match (seqs, graph_wanted) {
+        (MaxSeqs::Auto, true) => SessionAsk {
+            seqs: MaxSeqs::Count(1),
+            note: Some(
+                "FIFI_BOLT_DECODE_GRAPH=1 asks for the decode graph, which serves one session: planning 1 session; set max_seqs to plan more, which turns the graph off"
+                    .to_owned(),
+            ),
+        },
+        (MaxSeqs::Count(count), true) if count > 1 => SessionAsk {
+            seqs,
+            note: Some(format!(
+                "max_seqs {count} runs windows, which the decode graph does not capture: FIFI_BOLT_DECODE_GRAPH=1 is ignored"
+            )),
+        },
+        _ => SessionAsk { seqs, note: None },
+    }
+}
+
 /// The cache the resident executor holds: one plane set per configured position.
 /// The starter admits this plan against free device memory before loading; the
 /// positions come from the caller (the executor pins its cell count). `None`
@@ -109,6 +149,25 @@ mod tests {
         assert_eq!(cost.per_position, 30_464);
         // Raw and capped logits rows of 262,144 floats, and two position words.
         assert_eq!(cost.fixed, 2 * 262_144 * 4 + 8);
+    }
+
+    #[test]
+    fn an_explicit_decode_graph_with_an_automatic_count_plans_one_session() {
+        let ask = session_ask(MaxSeqs::Auto, true);
+        assert_eq!(ask.seqs, MaxSeqs::Count(1));
+        assert!(
+            ask.note
+                .expect("a reason")
+                .contains("FIFI_BOLT_DECODE_GRAPH=1")
+        );
+        // An explicit count above one wins over the graph, and says so.
+        let ask = session_ask(MaxSeqs::Count(4), true);
+        assert_eq!(ask.seqs, MaxSeqs::Count(4));
+        assert!(ask.note.expect("a reason").contains("is ignored"));
+        // One session keeps the graph silently; without the graph nothing changes.
+        assert_eq!(session_ask(MaxSeqs::Count(1), true).note, None);
+        let ask = session_ask(MaxSeqs::Auto, false);
+        assert_eq!((ask.seqs, ask.note), (MaxSeqs::Auto, None));
     }
 
     #[test]

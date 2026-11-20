@@ -480,7 +480,11 @@ mod device {
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
             let mut model = bolt::load_choosing(&files, None)?;
             let first = model.new_seq()?;
-            let plan = plan_sessions(&model, seqs)?;
+            let ask = budget::session_ask(seqs, model.graph_mode.active());
+            if let Some(note) = &ask.note {
+                eprintln!("gemma4 bolt: {note}");
+            }
+            let plan = plan_sessions(&model, ask.seqs)?;
             eprintln!("gemma4 bolt: {}", plan.describe());
             if plan.seqs > 1 {
                 model.reserve_window(plan.seqs)?;
