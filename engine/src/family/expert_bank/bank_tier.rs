@@ -12,6 +12,13 @@
 //! Below the disk tier's minimum (the ring staging plus the fixed
 //! overhead) the choice refuses, named — the caller surfaces the two
 //! numbers that disagreed.
+//!
+//! A caller that also knows the card passes a [`CardBudget`]: when the
+//! whole load fits the free device bytes the ladder answers exactly as it
+//! does without one; when it does not, the ladder answers
+//! [`TierChoice::CardTiered`] (the routed experts stay on the host, the
+//! banks take what the card has left) or refuses, naming the side that
+//! cannot carry its share.
 
 // Ungated host code, but until a second family's start calls the ladder only tests do; the
 // flash-next start reaches it through `HostPinPlan::choose_store_tier` on the CUDA path.
@@ -29,6 +36,10 @@ pub(crate) enum TierChoice {
     Exclusive { spare_places: usize },
     /// No pinned store: every miss reads through the staging ring.
     Disk,
+    /// The card cannot carry the whole load: the routed experts stay on the
+    /// host (`host_bytes` of them) and each layer keeps at most `slots`
+    /// experts on the card.
+    CardTiered { slots: usize, host_bytes: u64 },
 }
 
 /// The pooled read depth of the staging ring: how many expert records are in
@@ -59,7 +70,37 @@ impl TierChoice {
                  of the real pack); the rung's read mode — O_DIRECT or buffered — is decided \
                  once at start and stated on the tier line; prefill rides the union-admit path",
             ),
+            Self::CardTiered { .. } => (
+                "card-tiered experts",
+                "experts on the host, the hottest in per-layer slots on the card",
+            ),
         }
+    }
+}
+
+/// The card's side of one load: what the whole load needs on the device and
+/// how much of it the routed experts are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CardBudget {
+    /// Device bytes free now.
+    pub(crate) free: u64,
+    /// Bytes the whole resident load needs on the card (tensors, KV cache,
+    /// work and headroom): the figure the device admission compares to
+    /// `free`.
+    pub(crate) demand: u64,
+    /// The part of `demand` that is routed-expert tensors: the host serves
+    /// these when the card cannot carry the whole load.
+    pub(crate) expert_bytes: u64,
+    /// Device bytes of one expert slot in one layer.
+    pub(crate) slot_bytes: u64,
+    /// The fewest slots per layer a token's picks need.
+    pub(crate) min_slots: usize,
+}
+
+impl CardBudget {
+    /// Bytes the load is short of the card, or zero when it fits.
+    pub(crate) fn short_by(&self) -> u64 {
+        self.demand.saturating_sub(self.free)
     }
 }
 
@@ -93,6 +134,9 @@ pub(crate) struct TierBudget {
     pub(crate) ring_bytes: u64,
     /// The one host budget, bytes.
     pub(crate) available: u64,
+    /// The card's side, for a caller that can serve its experts from the
+    /// host. `None` keeps the host-only ladder.
+    pub(crate) card: Option<CardBudget>,
 }
 
 impl TierBudget {
@@ -115,11 +159,77 @@ impl TierBudget {
     }
 }
 
+impl TierBudget {
+    /// The card-short answer: the experts stay on the host (which must hold
+    /// them beside its fixed overhead and page-cache floor) and the banks
+    /// take the card's bytes left after everything else in the load. The
+    /// slot count is the most the card carries before the step's own state
+    /// is allocated, so it is an upper bound the caller's bank sizing may
+    /// lower. Refuses, naming both figures, when the card cannot hold the
+    /// non-expert load plus the minimum banks or the host cannot hold the
+    /// experts.
+    fn card_tiered(&self, card: &CardBudget) -> Result<TierChoice, EngError> {
+        let overflow = || tier_error("the card byte counts overflow".into());
+        let resident = card.demand.checked_sub(card.expert_bytes).ok_or_else(|| {
+            tier_error(format!(
+                "the {} expert bytes exceed the {}-byte load demand",
+                card.expert_bytes, card.demand
+            ))
+        })?;
+        let per_slot_of_layers = card
+            .slot_bytes
+            .checked_mul(self.layers as u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(overflow)?;
+        let room = card.free.saturating_sub(resident);
+        let carried = usize::try_from(room / per_slot_of_layers)
+            .unwrap_or(usize::MAX)
+            .min(self.experts);
+        if carried < card.min_slots {
+            let minimum = per_slot_of_layers
+                .checked_mul(card.min_slots as u64)
+                .and_then(|banks| banks.checked_add(resident))
+                .ok_or_else(overflow)?;
+            return Err(tier_error(format!(
+                "the card has {} bytes free; without its experts the load still needs {resident} \
+                 bytes and the {} minimum slots per layer need {minimum} in all",
+                card.free, card.min_slots
+            )));
+        }
+        let host_need = card
+            .expert_bytes
+            .checked_add(self.overhead_bytes)
+            .and_then(|need| need.checked_add(self.cache_floor))
+            .ok_or_else(overflow)?;
+        if host_need > self.available {
+            return Err(tier_error(format!(
+                "the card is short by {} bytes and the host budget of {} bytes cannot hold the {} \
+                 expert bytes it would serve beside {} of fixed overhead and a {} byte page-cache \
+                 floor",
+                card.short_by(),
+                self.available,
+                card.expert_bytes,
+                self.overhead_bytes,
+                self.cache_floor
+            )));
+        }
+        Ok(TierChoice::CardTiered {
+            slots: carried,
+            host_bytes: card.expert_bytes,
+        })
+    }
+}
+
 /// Chooses the tier: inclusive while it fits, then the exclusive tier at
 /// the largest fitting spare-place count, then the disk tier, and a named
 /// refusal below the minimum.
 pub(crate) fn choose_tier(budget: &TierBudget) -> Result<TierChoice, EngError> {
     let overflow = || tier_error("the tier byte counts overflow".into());
+    if let Some(card) = &budget.card
+        && card.short_by() > 0
+    {
+        return budget.card_tiered(card);
+    }
     let inclusive_store = (budget.layers as u64)
         .checked_mul(budget.experts as u64)
         .and_then(|places| places.checked_mul(budget.record_bytes))
@@ -178,6 +288,7 @@ mod tests {
             cache_floor: 10,
             ring_bytes: 250,
             available,
+            card: None,
         }
     }
 
@@ -248,5 +359,122 @@ mod tests {
         huge.record_bytes = u64::MAX;
         let error = choose_tier(&huge).unwrap_err();
         assert!(error.describe().contains("overflow"), "{error:?}");
+    }
+
+    /// Two layers of 10 experts and 5-byte slots: the load needs 1,000 bytes
+    /// on the card, 700 of them routed experts, so the card carries the
+    /// 300-byte rest plus `5 * 2` bytes per slot-of-every-layer.
+    fn card_budget(free: u64) -> TierBudget {
+        TierBudget {
+            record_bytes: 35,
+            layers: 2,
+            experts: 10,
+            slots: 0,
+            max_spare_places: 0,
+            min_spare_places: 0,
+            overhead_bytes: 50,
+            cache_floor: 10,
+            ring_bytes: 0,
+            available: 1_000,
+            card: Some(CardBudget {
+                free,
+                demand: 1_000,
+                expert_bytes: 700,
+                slot_bytes: 5,
+                min_slots: 2,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_load_that_fits_the_card_answers_as_the_host_only_ladder_does() {
+        for free in [1_000, 1_001, 50_000] {
+            let with_card = card_budget(free);
+            let mut without = card_budget(free);
+            without.card = None;
+            assert_eq!(
+                choose_tier(&with_card),
+                choose_tier(&without),
+                "free {free}: the card arm must not change a fitting start"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_short_load_moves_its_experts_to_the_host_and_banks_the_rest() {
+        // 999 free: short by 1; 300 resident leaves 699, ten bytes per slot of
+        // every layer: 69 slots, capped at the 10 experts of a layer.
+        assert_eq!(
+            choose_tier(&card_budget(999)),
+            Ok(TierChoice::CardTiered {
+                slots: 10,
+                host_bytes: 700
+            })
+        );
+        // 340 free leaves 40: four slots per layer.
+        assert_eq!(
+            choose_tier(&card_budget(340)),
+            Ok(TierChoice::CardTiered {
+                slots: 4,
+                host_bytes: 700
+            })
+        );
+        // 320 leaves 20: exactly the two-slot minimum.
+        assert_eq!(
+            choose_tier(&card_budget(320)),
+            Ok(TierChoice::CardTiered {
+                slots: 2,
+                host_bytes: 700
+            })
+        );
+    }
+
+    #[test]
+    fn a_card_that_cannot_carry_the_minimum_banks_refuses_by_name() {
+        let error = choose_tier(&card_budget(319)).unwrap_err();
+        let text = error.describe();
+        assert!(text.contains("319 bytes free"), "{text}");
+        assert!(text.contains("300"), "{text}");
+        assert!(text.contains("320"), "{text}");
+        assert!(text.contains("2 minimum slots"), "{text}");
+    }
+
+    #[test]
+    fn a_host_that_cannot_hold_the_experts_refuses_by_name() {
+        // 700 + 50 + 10 = 760 is the host's need; 759 refuses, 760 serves.
+        let mut short = card_budget(500);
+        short.available = 759;
+        let error = choose_tier(&short).unwrap_err();
+        let text = error.describe();
+        assert!(text.contains("short by 500 bytes"), "{text}");
+        assert!(text.contains("759"), "{text}");
+        assert!(text.contains("700 expert bytes"), "{text}");
+        assert!(text.contains("50 of fixed overhead"), "{text}");
+        let mut exact = card_budget(500);
+        exact.available = 760;
+        assert!(matches!(
+            choose_tier(&exact),
+            Ok(TierChoice::CardTiered { .. })
+        ));
+    }
+
+    #[test]
+    fn the_card_arm_refuses_instead_of_wrapping() {
+        let mut huge = card_budget(500);
+        huge.card.as_mut().unwrap().slot_bytes = u64::MAX;
+        assert!(
+            choose_tier(&huge)
+                .unwrap_err()
+                .describe()
+                .contains("overflow")
+        );
+        let mut inverted = card_budget(500);
+        inverted.card.as_mut().unwrap().expert_bytes = 2_000;
+        assert!(
+            choose_tier(&inverted)
+                .unwrap_err()
+                .describe()
+                .contains("exceed")
+        );
     }
 }

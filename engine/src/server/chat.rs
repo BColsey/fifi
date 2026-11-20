@@ -102,7 +102,9 @@ pub(crate) async fn submit(
     let bundle = Arc::clone(&entry.bundle);
     let (messages, thinking) = (input.messages, input.thinking);
     let template_tools = input.tools.clone();
-    let prefix_reuse = entry.prefix_reuse;
+    // The flag follows the engine: one that keeps no prefix store gets no boundary, no warm
+    // tokenization and no save or restore call, as when the config turns the flag off.
+    let prefix_reuse = entry.prefix_reuse && entry.handle.keeps_prefix_store();
     let warm = std::sync::Arc::clone(&entry.warm);
     let (prompt, boundaries, start) = tokio::task::spawn_blocking(move || {
         // Without the flag the handler marks no boundary, so the engine neither saves nor restores.
@@ -955,6 +957,34 @@ mod tests {
         assert!(
             warm.lock().expect("warm lock").is_none(),
             "no prefix_reuse means no warm cache, flag or not"
+        );
+    }
+
+    /// The entry's flag follows the engine: with `prefix_reuse` on in the entry, an engine that
+    /// keeps no prefix store still gets the plain path, so no warm cache is seeded.
+    #[tokio::test]
+    async fn an_engine_without_a_prefix_store_gets_no_warm_tokenization() {
+        assert!(
+            std::env::var_os("ENGINESRV_WARM_TURNS").is_none(),
+            "no other test may set the env flag"
+        );
+        let probes = testkit::probe_engine_without_prefix_store();
+        let bundle = testkit::bundle_with_pinned_template();
+        testkit::wait_for_state(&probes.engine.handle(), EngineState::Ready);
+        let mut entry = testkit::entry("e1", "model-a", &probes.engine, 4_096);
+        entry.prefix_reuse = true;
+        entry.bundle = Arc::clone(&bundle);
+        let warm = Arc::clone(&entry.warm);
+        let app = router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])));
+        let body = conversation(&[("user", "hello")]);
+        let (status, reply) = post(&app, &body).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        testkit::wait_until("the prompt is prefilled", || {
+            !probes.prompt.lock().expect("prompt lock").is_empty()
+        });
+        assert!(
+            warm.lock().expect("warm lock").is_none(),
+            "no prefix store means no warm cache, flag on or not"
         );
     }
 

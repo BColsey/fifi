@@ -332,6 +332,7 @@ impl HostPinPlan {
             cache_floor: terms.ngram_cache_min,
             ring_bytes,
             available: memory.available,
+            card: None,
         })
         .map_err(|ladder| {
             // Below the minimum the ladder's own text used to replace the plan's counts; carry

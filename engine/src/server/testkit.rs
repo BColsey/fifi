@@ -364,10 +364,23 @@ struct Probe {
     sampling: Arc<Mutex<Option<SamplingParams>>>,
     delay: Duration,
     decodes: Arc<AtomicUsize>,
+    /// Reports a prefix store of no roots and no entries.
+    no_store: bool,
 }
 
 impl ExecutorOps for Probe {
     type Session = Vec<u32>;
+
+    fn prefix_limits(&self) -> crate::family::session::StoreLimits {
+        if self.no_store {
+            crate::family::session::StoreLimits {
+                roots: 0,
+                entries: 0,
+            }
+        } else {
+            crate::family::session::StoreLimits::default()
+        }
+    }
 
     fn history<'s>(&self, st: &'s Vec<u32>) -> &'s [u32] {
         st
@@ -449,6 +462,14 @@ pub(super) fn gated_probes() -> (Probes, std::sync::mpsc::Sender<()>) {
 }
 
 fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -> Probes {
+    probes_with(delay, gate, false)
+}
+
+fn probes_with(
+    delay: Duration,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+    no_store: bool,
+) -> Probes {
     let prompt = Arc::new(Mutex::new(Vec::new()));
     let sampling = Arc::new(Mutex::new(None));
     let decodes = Arc::new(AtomicUsize::new(0));
@@ -457,6 +478,7 @@ fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -
         sampling: Arc::clone(&sampling),
         delay,
         decodes: Arc::clone(&decodes),
+        no_store,
     };
     let engine = spawn_engine(512, move |_| {
         if let Some(wait) = gate {
@@ -491,6 +513,11 @@ pub(super) fn probe_engine() -> (Engine, Arc<Mutex<Vec<u32>>>) {
 
 pub(super) fn probe_engine_with_sampling() -> Probes {
     probes(Duration::ZERO)
+}
+
+/// A probe engine whose executor reports a prefix store of no roots and no entries.
+pub(super) fn probe_engine_without_prefix_store() -> Probes {
+    probes_with(Duration::ZERO, None, true)
 }
 
 pub(super) fn wait_until(what: &str, condition: impl Fn() -> bool) {

@@ -10,6 +10,7 @@
 //! process is refused.
 use crate::family::exl3::layer_table::LayerTable;
 
+use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
 use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
@@ -34,7 +35,7 @@ use super::{
     state_layout::{KvPool, StateLayout},
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
-    tiered_load::{attach_tiered_parts, names_without_experts},
+    tiered_load::{attach_tiered_parts, bank_slot_bytes, geometry_of, names_without_experts},
 };
 use crate::family::exl3_merge_plan::{
     SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
@@ -45,9 +46,10 @@ use crate::{
         QWEN3_6_35B_A3B,
         exl3::bank::{Exl3SlotResolver, ExpertStore},
         gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
+        host_admit::HostAdmission,
         project::cuda::{
             BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
-            served_admission,
+            native_load_bytes, served_admission,
         },
         qwen36::host::HostShape,
         session::DecodeSession,
@@ -798,35 +800,10 @@ pub(super) fn open_gguf(
     Ok((model, gguf))
 }
 
-/// Loads and pins the tokenizer, builds the rules from the SAME loaded bundle BEFORE any device
-/// work (a missing tokenizer file fails in seconds, not after a 20 GB upload), takes the
-/// one-engine guard, and starts the engine thread. The state is `Loading` until `make` returns;
-/// a load failure leaves `Error` with the message and releases the guard.
-pub(crate) fn start(
-    settings: &Q36Settings,
-    ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
-    // The toggle is resolved HERE, before any work: a bad `Q36_VERIFY_GGUF_SHA256` spelling is
-    // refused at startup, not on the engine thread after the projector exists; unset stays OFF
-    // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
-    let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
-    // Likewise the unpinned admission: a bad `Q36_ALLOW_UNPINNED_GGUF` spelling stops the start
-    // before any weight is read; unset stays off.
-    let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
-    // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
-    // start before any weight is read. Unset on a GGUF checkpoint is off and is not refused.
-    resolve_switch(
-        shared_in_routed_explicit(),
-        matches!(settings.weights, WeightFormat::Exl3),
-    )?;
-    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read.
-    // The step's own checks of its fields run later, once the slots are armed.
-    if settings.draft_verify == VerifyMode::Krow {
-        check_krow_env(
-            std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
-            std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
-        )?;
-    }
+/// The runtime modes one settings record selects, from the environment: the prefill path, the
+/// admission style and the prefix memory. The start asks it once, and asks again for the tiered
+/// variant when the card cannot carry the load.
+fn runtime_modes(settings: &Q36Settings) -> Result<RuntimeModes, EngError> {
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
     let chunk_off = chunk_rollback_requested(std::env::var_os(CHUNK_PREFILL_VAR).as_deref());
@@ -879,6 +856,39 @@ pub(crate) fn start(
             settings.tiered.is_none(),
         ),
     };
+    Ok(modes)
+}
+
+/// Loads and pins the tokenizer, builds the rules from the SAME loaded bundle BEFORE any device
+/// work (a missing tokenizer file fails in seconds, not after a 20 GB upload), takes the
+/// one-engine guard, and starts the engine thread. The state is `Loading` until `make` returns;
+/// a load failure leaves `Error` with the message and releases the guard.
+pub(crate) fn start(
+    settings: &Q36Settings,
+    ready_note: ReadyNote,
+) -> Result<(Engine, TokenizerBundle), EngError> {
+    // The toggle is resolved HERE, before any work: a bad `Q36_VERIFY_GGUF_SHA256` spelling is
+    // refused at startup, not on the engine thread after the projector exists; unset stays OFF
+    // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
+    let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
+    // Likewise the unpinned admission: a bad `Q36_ALLOW_UNPINNED_GGUF` spelling stops the start
+    // before any weight is read; unset stays off.
+    let allow_unpinned = allow_unpinned_wanted(std::env::var(ALLOW_UNPINNED_VAR).ok().as_deref())?;
+    // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
+    // start before any weight is read. Unset on a GGUF checkpoint is off and is not refused.
+    resolve_switch(
+        shared_in_routed_explicit(),
+        matches!(settings.weights, WeightFormat::Exl3),
+    )?;
+    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read.
+    // The step's own checks of its fields run later, once the slots are armed.
+    if settings.draft_verify == VerifyMode::Krow {
+        check_krow_env(
+            std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
+            std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
+        )?;
+    }
+    let modes = runtime_modes(settings)?;
     let device_first = device_first_wanted(std::env::var_os(DEVICE_FIRST_VAR).as_deref())?;
     let plan = if device_first {
         StartupPlan::new_device_first(settings, verify, allow_unpinned, modes)?
@@ -1277,6 +1287,62 @@ fn check_fused_inproj(cards: usize, fused: bool) -> Result<(), EngError> {
     Ok(())
 }
 
+/// The card-short decision of one GGUF start, asked before any weight is uploaded. The card's
+/// figures are the ones the load's admission compares (the native tensor bytes, the KV reserve,
+/// the headroom, the free bytes), so a start that fits answers `None` and goes on unchanged. A
+/// card-short start that the ladder says card plus host can carry answers the tiered variant of
+/// the settings with its startup plan and the decision; one it cannot carry prints why and goes
+/// on to the load's own refusal. A config that names tiered experts, host-paged KV or a device
+/// list is never asked.
+fn lower_rung(
+    projector: &CudaProjector,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    model: &GgufModel,
+) -> Result<Option<(Q36Settings, StartupPlan, CardShort)>, EngError> {
+    if plan.paged.is_some() || !card_short::automatic(settings, plan.device_first_native.is_some())
+    {
+        return Ok(None);
+    }
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
+    let dims = StepDims::new(&shape, &inventory)?;
+    let names = model.plan().device_names();
+    let resident_names = names_without_experts(&names);
+    let tensors = native_load_bytes(&model.weights, &names)?;
+    let resident = native_load_bytes(&model.weights, &resident_names)?;
+    let geometry = geometry_of(&dims);
+    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    let figures = CardFigures {
+        free,
+        tensors,
+        expert_bytes: tensors.saturating_sub(resident),
+        kv_cache: plan.reserve,
+        work: load_options(plan.reserve, plan.modes.fixed_admission)
+            .reserve
+            .work,
+        headroom: prefill_headroom(plan.modes.fixed_admission) as u64,
+        slot_bytes: bank_slot_bytes(geometry)?,
+        layers: dims.shape.kinds.len(),
+        experts: dims.shape.moe.experts,
+        top_k: dims.shape.moe.top_k,
+    };
+    let (_, host_available) = HostAdmission::probe_or_bare("q36 cuda tiered", "Qwen36")?;
+    match card_short::decide(&figures, host_available) {
+        CardVerdict::Fits => Ok(None),
+        CardVerdict::Refused { line } => {
+            eprintln!("{line}");
+            Ok(None)
+        }
+        CardVerdict::Short(short) => {
+            let variant = card_short::tiered_variant(settings);
+            let modes = runtime_modes(&variant)?;
+            let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+            Ok(Some((variant, variant_plan, short)))
+        }
+    }
+}
+
 fn make(
     stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
@@ -1284,10 +1350,8 @@ fn make(
     plan: StartupPlan,
     mut guard: BuildGuard,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
-    let kv_cache = plan.reserve;
     let verify = plan.verify;
     let allow_unpinned = plan.allow_unpinned;
-    let fixed_admission = plan.modes.fixed_admission;
     stages.begin("initializing CUDA");
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
@@ -1301,6 +1365,17 @@ fn make(
         )?),
         WeightFormat::Exl3 => None,
     };
+    // The lower rung: a GGUF start the card cannot carry whole serves the tiered path when card
+    // plus host can, instead of refusing at the load's admission.
+    let (settings, plan, card_short) = match gguf.as_ref() {
+        Some((model, _)) => match lower_rung(&projector, &settings, &plan, model)? {
+            Some((variant, variant_plan, short)) => (variant, variant_plan, Some(short)),
+            None => (settings, plan, None),
+        },
+        None => (settings, plan, None),
+    };
+    let kv_cache = plan.reserve;
+    let fixed_admission = plan.modes.fixed_admission;
     let tiered = tiered_plan_of(&settings);
     // The banked EXL3 load's leftovers (None on every resident path): the host store and the
     // figures the resolver build below needs. Declared here because the load match's arms are
@@ -1613,6 +1688,15 @@ fn make(
             "q36 cuda: tiered, {} slots per layer, {} cpu threads, timeout {} ms",
             slots, plan.threads, plan.timeout_ms
         );
+        if let Some(short) = &card_short {
+            eprintln!("{}", short.line(slots, options.context_tokens));
+            if settings.prefix_reuse {
+                eprintln!(
+                    "q36 cuda: prefix reuse follows the tiered engine's prefix store, which is off \
+                     unless Q36_TIERED_PREFIX=1"
+                );
+            }
+        }
     }
     eprintln!(
         "q36 cuda: {} weights resident ({} B), free after load {} B, context_limit {}, kv {}, \

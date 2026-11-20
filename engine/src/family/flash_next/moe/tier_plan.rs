@@ -331,6 +331,7 @@ impl TierPlan {
                 cache_floor: 0,
                 ring_bytes: inputs.ring_backing_bytes,
                 available: host.page_cache,
+                card: None,
             }) {
                 Ok(TierChoice::Disk) => TierChoice::Disk,
                 // The pinned store missed, so no pinning rung can fit below
