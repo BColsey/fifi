@@ -6,16 +6,25 @@ pub(super) struct ForwardTiming {
     position: u32,
 }
 
-pub(super) fn begin(kernels: &MlxKernels, position: u32) -> Option<ForwardTiming> {
+fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    ENABLED
-        .get_or_init(|| {
-            std::env::var_os("FIFI_FLASH_NEXT_MLX_STREAM_TIMING").is_some_and(|value| value == "1")
-        })
-        .then(|| ForwardTiming {
-            counters: StreamSnapshot::begin(kernels),
-            position,
-        })
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLASH_NEXT_MLX_STREAM_TIMING").is_some_and(|value| value == "1")
+    })
+}
+
+pub(super) fn begin(kernels: &MlxKernels, position: u32) -> Option<ForwardTiming> {
+    enabled().then(|| ForwardTiming {
+        counters: StreamSnapshot::begin(kernels),
+        position,
+    })
+}
+
+pub(super) fn record_prefix_restore(position: u32, charged_bytes: u64) {
+    if enabled() {
+        let event = serde_json::json!({"position": position, "charged_bytes": charged_bytes});
+        eprintln!("flash_next_prefix_restore {event}");
+    }
 }
 
 impl ForwardTiming {
@@ -45,4 +54,18 @@ pub(super) fn record_dense_unions(position: u32, rows: u32, set_experts: u32, la
         "layers": layers,
     });
     eprintln!("flash_next_dense_expert_trace {event}");
+}
+
+/// Capture the experts selected by successful one-row sampling forwards.
+pub(super) fn capture_decode_routes() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_FLASH_NEXT_MLX_DECODE_EXPERT_TRACE")
+            .is_some_and(|value| value == "1")
+    })
+}
+
+pub(super) fn record_decode_routes(position: u32, layers: &[Vec<u32>]) {
+    let event = serde_json::json!({"position": position, "layers": layers});
+    eprintln!("flash_next_decode_expert_trace {event}");
 }
