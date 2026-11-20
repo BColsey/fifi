@@ -27,6 +27,15 @@ pub(super) fn record_prefix_restore(position: u32, charged_bytes: u64) {
     }
 }
 
+pub(super) fn record_prefix_budget_refusal(position: u32, charged_bytes: u64, limit_bytes: u64) {
+    if enabled() {
+        let event = serde_json::json!({
+            "position": position, "charged_bytes": charged_bytes, "limit_bytes": limit_bytes,
+        });
+        eprintln!("flash_next_prefix_budget_refusal {event}");
+    }
+}
+
 impl ForwardTiming {
     pub(super) fn finish(self, kernels: &MlxKernels, rows: u32, mode: StepMode, route: &str) {
         let mut row = self.counters.finish(kernels);

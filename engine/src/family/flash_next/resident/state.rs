@@ -400,22 +400,25 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Shares the committed state as a snapshot. It makes no native call and copies no array. One
-    /// permit charges the QSA bytes and the fixed bytes to `budget`. A poisoned state returns
-    /// `BadRequest`. A denied permit returns `MemoryPlan`. On error the state and the budget are unchanged.
-    pub(super) fn snapshot(
-        &self,
-        budget: &mut SessionBudget,
-    ) -> Result<ResidentSnapshot, EngError> {
+    /// Computes the same charge as a snapshot without changing the state or budget.
+    pub(super) fn snapshot_bytes(&self) -> Result<u64, EngError> {
         if self.is_poisoned() {
             return Err(EngError::BadRequest(
                 "a poisoned resident state cannot be saved".into(),
             ));
         }
-        let bytes = qsa_bytes(&self.layers)?
+        qsa_bytes(&self.layers)?
             .checked_add(fixed_bytes(&self.layers, &self.ple_ring)?)
-            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))?;
-        let charge = budget.acquire_growth(bytes)?;
+            .ok_or_else(|| EngError::MemoryPlan("snapshot bytes overflow u64".into()))
+    }
+
+    /// Shares the committed state as a snapshot. It makes no native call and copies no array.
+    /// One permit charges its allocated bytes to the session budget.
+    pub(super) fn snapshot(
+        &self,
+        budget: &mut SessionBudget,
+    ) -> Result<ResidentSnapshot, EngError> {
+        let charge = budget.acquire_growth(self.snapshot_bytes()?)?;
         Ok(ResidentSnapshot {
             layers: self.layers.iter().map(LayerState::share).collect(),
             ple_ring: self.ple_ring.share(),
