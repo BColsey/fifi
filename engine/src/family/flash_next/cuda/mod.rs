@@ -39,6 +39,8 @@ mod prefill_ring;
 mod prefill_ring_device_tests;
 #[cfg(test)]
 mod prefill_ring_tests;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod router_proxy;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg(test)]
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]

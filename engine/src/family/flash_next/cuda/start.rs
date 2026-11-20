@@ -663,6 +663,15 @@ fn build_driver_resolving(
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
     let bulk_reader = ngram_bulk()? && rows > 1;
+    let router_proxy_enabled = match std::env::var_os("INFERENCE_FLASH_NEXT_ROUTER_PROXY") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err(EngError::BadRequest(
+                "INFERENCE_FLASH_NEXT_ROUTER_PROXY must be unset or \"1\"".into(),
+            ));
+        }
+    };
     let projection_on_card = ple_device()?;
     let ple_shape = (projection_on_card && rows > 1).then(|| PleDeviceShape {
         width: model.hyper.hidden() * model.hyper.branches(),
@@ -1084,6 +1093,10 @@ fn build_driver_resolving(
         &layout,
         &step.moe_dims(rows),
     )?;
+    if router_proxy_enabled {
+        block.enable_router_proxy(ctx, model.hyper.hidden())?;
+        eprintln!("flash-next cuda: future-router probe enabled");
+    }
     // The prefill streaming ring refills its slots from the bank's store (demotion); the
     // disk rung has no store to stream from, so funding the ring under it would strand the
     // slots — every whole-chunk expert serves as a no-ring-entry through the rung's reads.

@@ -347,6 +347,7 @@ mod device {
                 cuda::{
                     bank::device::DeviceBank,
                     prefill_adapter::device::{LayerStore, PrefillAdapter, RingStore},
+                    router_proxy::{ActualRoute, HORIZONS, RouterProxy},
                 },
                 moe::slot_bank::SlotBankLayout,
                 settings::RingUploads,
@@ -492,6 +493,7 @@ mod device {
         /// copy a reopened window left outstanding; a window whose chunks are all below
         /// `ring_min_rows` never engages the ring and admits against that quiet store.
         ring_engaged: bool,
+        router_proxy: Option<RouterProxy>,
     }
 
     /// One pass over the bank.
@@ -639,7 +641,21 @@ mod device {
                 ring: None,
                 ring_min_rows: 1,
                 ring_engaged: false,
+                router_proxy: None,
             })
+        }
+
+        pub(in crate::family::flash_next) fn enable_router_proxy(
+            &mut self,
+            ctx: &CudaContext,
+            hidden: usize,
+        ) -> Result<(), EngError> {
+            self.router_proxy = Some(RouterProxy::build(
+                ctx,
+                hidden,
+                self.bank.geometry().experts,
+            )?);
+            Ok(())
         }
 
         /// Tries to fund the prefill ring: `budget` record slots of device memory, clamped to
@@ -827,6 +843,24 @@ mod device {
             prof::blocked(35, profile, || scratch.read_at(stream, sc.log, &mut raw))?;
             let (ids, weights) = parse_log(&raw, k)?;
             let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
+            if let Some(proxy) = &self.router_proxy {
+                let target_routers: Vec<_> = self.trunks[layer + 1..]
+                    .iter()
+                    .take(HORIZONS)
+                    .map(|trunk| trunk.router)
+                    .collect();
+                proxy.record(
+                    launch,
+                    bufs.route.norm_row,
+                    ActualRoute {
+                        layer,
+                        position: pos,
+                        picks: &ids,
+                        slots: &slot_row_before,
+                    },
+                    &target_routers,
+                )?;
+            }
 
             // The resident pass. Without a miss its combine IS the block's output; with one it
             // skips the combine entirely (the miss pass's combine is the block's only sum, and
