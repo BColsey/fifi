@@ -103,7 +103,9 @@ pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = path;
+        // A missing file still reports NotFound, so callers that tell a missing pack file from a
+        // refusing filesystem see the same kinds on every platform.
+        std::fs::metadata(path)?;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the O_DIRECT ring is Linux-only",
