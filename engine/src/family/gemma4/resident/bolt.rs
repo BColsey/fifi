@@ -652,15 +652,15 @@ impl Bolt {
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
         let ctx = &self.ctx;
-        // One zero chunk, written down every plane: a host vector the size of a plane would
-        // fault in its pages for every plane of every session.
-        let chunk = vec![0u8; ZERO_CHUNK];
+        // One zero chunk on the device, copied down every plane: the planes are cleared at
+        // device speed and no host memory the size of a plane is touched.
+        let zeros = zero(ctx, ZERO_CHUNK)?;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
             let mut at = 0;
             while at < bytes {
                 let len = ZERO_CHUNK.min(bytes - at);
-                ctx.upload_at(&buffer, at, &chunk[..len])?;
+                ctx.copy_device(&self.stream, zeros.range(0, len)?, buffer.range(at, len)?)?;
                 at += len;
             }
             Ok(buffer)
@@ -686,12 +686,15 @@ impl Bolt {
                 None
             });
         }
-        Ok(BoltSeq {
+        let seq = BoltSeq {
             id: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
             kv,
             pos: zero(ctx, 4)?,
             kv_len: zero(ctx, 4)?,
-        })
+        };
+        // The copies read `zeros`, which drops here.
+        self.stream.synchronize()?;
+        Ok(seq)
     }
 
     /// Allocates the logits rows that a window of up to `rows` sequences needs, once. A request
