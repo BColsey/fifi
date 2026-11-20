@@ -985,6 +985,57 @@ struct PartArm {
     cudaError_t err;       // the first failure of the query or the opt-in
 };
 
+/* Turing pilot, opt-in and limited to the measured Qwen geometry. The single
+ * stage fits 64 KiB: 32 KiB K/V plus 32 KiB exchange. Other devices and models
+ * retain their existing selection. Read once per process; unset is rollback. */
+bool turing_attention_enabled() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_CUDA_ATTN_PREFILL_TURING"));
+    return enabled;
+}
+
+template <int kHeadDim, int kGroup>
+PartArm arm_part_turing(int device) {
+    constexpr int bytes = 2 * kTile * kHeadDim * 2 + (kThreadsD / 32) * 2048;
+    PartArm arm = {0, attn_prefill_part_dsplit_k<kHeadDim, kGroup, true>, true,
+                   kThreadsD, bytes, cudaSuccess};
+    int limit = 0, threads = 0;
+    arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (arm.err == cudaSuccess) arm.err = cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerBlock, device);
+    cudaFuncAttributes attr = {};
+    if (arm.err == cudaSuccess) arm.err = cudaFuncGetAttributes(&attr, arm.kernel);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ptx = attr.ptxVersion;
+    if (arm.ptx != 75 || !attn_prefill_plan::fits(limit, attr.sharedSizeBytes, bytes) ||
+        !attn_prefill_plan::fits_threads(threads, attr.maxThreadsPerBlock, kThreadsD)) {
+        arm.err = cudaErrorInvalidConfiguration;
+        return arm;
+    }
+    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    return arm;
+}
+
+template <int kHeadDim, int kGroup>
+bool try_arm_turing(int device, PartArm &arm) {
+    if constexpr (kHeadDim != 256 || kGroup != 8) {
+        return false;
+    } else {
+        if (!turing_attention_enabled()) return false;
+        if (device < 0) {
+            arm.err = cudaGetDevice(&device);
+            if (arm.err != cudaSuccess) return true;
+        }
+        int major = 0, minor = 0;
+        arm.err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        if (arm.err != cudaSuccess) return true;
+        arm.err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+        if (arm.err != cudaSuccess) return true;
+        if (major != 7 || minor != 5) return false;
+        arm = arm_part_turing<kHeadDim, kGroup>(device);
+        return true;
+    }
+}
+
 /* Unset and all values other than exactly "1" retain the original path. Read
  * once per process, so changing the switch requires restarting the engine. */
 bool adaptive_attention_enabled() {
@@ -1000,6 +1051,7 @@ PartArm arm_part_legacy() {
     constexpr int simt_bytes = (kRows + 2 * kTile) * kHeadDim * 2;
     PartArm arm = {0, attn_prefill_part_simt_legacy_k<kHeadDim, kGroup>, false, 128,
                    simt_bytes, cudaSuccess};
+    if (try_arm_turing<kHeadDim, kGroup>(-1, arm)) return arm;
     cudaFuncAttributes attr = {};
     arm.err = cudaFuncGetAttributes(&attr, attn_prefill_part_dsplit_k<kHeadDim, kGroup>);
     if (arm.err != cudaSuccess) return arm;
@@ -1025,6 +1077,7 @@ PartArm arm_part(int device) {
     constexpr int dsplit_bytes = attn_prefill_plan::dsplit_bytes(kTile, kHeadDim, kThreadsD);
     PartArm arm = {0, attn_prefill_part_simt_k<kHeadDim, kGroup>, false, 128, simt_bytes,
                    cudaSuccess};
+    if (try_arm_turing<kHeadDim, kGroup>(device, arm)) return arm;
     int limit = 0;
     arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (arm.err != cudaSuccess) return arm;
@@ -1055,37 +1108,6 @@ PartArm arm_part(int device) {
     return arm;
 }
 
-/* Turing pilot, opt-in and limited to the measured Qwen geometry. The single
- * stage fits 64 KiB: 32 KiB K/V plus 32 KiB exchange. Other devices and models
- * retain their existing selection. Read once per process; unset is rollback. */
-bool turing_attention_enabled() {
-    static const bool enabled = attn_prefill_plan::adaptive_enabled(
-        std::getenv("FIFI_CUDA_ATTN_PREFILL_TURING"));
-    return enabled;
-}
-
-template <int kHeadDim, int kGroup>
-PartArm arm_part_turing() {
-    constexpr int bytes = 2 * kTile * kHeadDim * 2 + (kThreadsD / 32) * 2048;
-    PartArm arm = {0, attn_prefill_part_dsplit_k<kHeadDim, kGroup, true>, true,
-                   kThreadsD, bytes, cudaSuccess};
-    int device = 0, limit = 0, threads = 0;
-    arm.err = cudaGetDevice(&device);
-    if (arm.err == cudaSuccess) arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (arm.err == cudaSuccess) arm.err = cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerBlock, device);
-    cudaFuncAttributes attr = {};
-    if (arm.err == cudaSuccess) arm.err = cudaFuncGetAttributes(&attr, arm.kernel);
-    if (arm.err != cudaSuccess) return arm;
-    arm.ptx = attr.ptxVersion;
-    if (arm.ptx != 75 || !attn_prefill_plan::fits(limit, attr.sharedSizeBytes, bytes) ||
-        !attn_prefill_plan::fits_threads(threads, attr.maxThreadsPerBlock, kThreadsD)) {
-        arm.err = cudaErrorInvalidConfiguration;
-        return arm;
-    }
-    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-    return arm;
-}
-
 /* The legacy path retains its process-wide arm; adaptive successes are cached
  * by CUDA device and instantiated model geometry. Adaptive failures propagate
  * and are not cached. */
@@ -1094,17 +1116,7 @@ Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
         PartArm arm;
-        int major = 0, minor = 0;
-        if (turing_attention_enabled()) {
-            int current = 0;
-            failure.record(cudaGetDevice(&current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (failure.ok()) failure.record(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, current), INFERENCE_CUDA_STAGE_LAUNCH);
-            if (!failure.ok()) return failure;
-        }
-        if (turing_attention_enabled() && major == 7 && minor == 5 && kHeadDim == 256 && kGroup == 8) {
-            arm = arm_part_turing<kHeadDim, kGroup>();
-        } else if (adaptive_attention_enabled()) {
+        if (adaptive_attention_enabled()) {
             int device = -1;
             failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
             if (!failure.ok()) return failure;
