@@ -66,6 +66,12 @@ pub(super) fn geometry_of(dims: &StepDims) -> ExpertBankGeometry {
     }
 }
 
+/// The device bytes of one expert slot in one layer's bank.
+pub(super) fn bank_slot_bytes(geometry: ExpertBankGeometry) -> Result<u64, EngError> {
+    let minimum_bank = ExpertBank::bytes_for(geometry, geometry.top_k)?;
+    Ok(minimum_bank / geometry.top_k as u64)
+}
+
 /// Refuses a plan whose banks do not fit `free` device bytes (after the weights, the KV cache
 /// and the step state are resident), through `plan_vram`: the minimum bank is the plan's own
 /// slots per layer, the desktop reserve is the loader's headroom. The message names the numbers.
@@ -87,8 +93,7 @@ pub(super) fn admit_banks(
             geometry.top_k
         )));
     }
-    let minimum_bank = ExpertBank::bytes_for(geometry, geometry.top_k)?;
-    let bytes_per_slot = minimum_bank / geometry.top_k as u64;
+    let bytes_per_slot = bank_slot_bytes(geometry)?;
     let budget = VramBudget {
         usable: free,
         non_expert: 0,

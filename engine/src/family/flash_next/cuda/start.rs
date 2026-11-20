@@ -867,6 +867,12 @@ fn build_driver_resolving(
             )));
         }
         TierChoice::Disk => HostPinPlan::new_disk(&geometry, &memory, &terms, ring_bytes)?,
+        TierChoice::CardTiered { .. } => {
+            return Err(EngError::MemoryPlan(
+                "the host ladder answered a card tier to a start that passed no card figures"
+                    .into(),
+            ));
+        }
     };
     let (tier_name, speed_class) = tier.describe();
     // The rung reader is chosen and its read mode decided ONCE, here —
