@@ -146,3 +146,66 @@ fn freeing_out_of_order_is_refused() {
     ring.replan(&bank);
     assert!(ring.free_layer(&compute, 1).is_err());
 }
+
+#[test]
+#[ignore = "needs a GPU (under 1 GiB)"]
+fn selected_ring_copies_unique_misses_and_preserves_reads_across_wrap() {
+    assert!(device_present("Flash-Next selected prefill ring"));
+    let record = 9216;
+    let geometry = BankGeometry::new(3, 12, 2, 4, record).unwrap();
+    let row = [0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1];
+    let rows: Vec<&[i32]> = vec![row.as_slice(); geometry.layers];
+    let counts = vec![vec![0; geometry.experts]; geometry.layers];
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
+    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
+
+    let projector = crate::family::project::cuda::CudaProjector::new().unwrap();
+    let ctx = projector.context();
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &HostMemory {
+            total: 62 << 30,
+            available: 55 << 30,
+        },
+        &HostTerms::DEFAULT,
+    )
+    .unwrap();
+    let mut bank = DeviceBank::build(ctx, state, &Pattern, &plan, None).unwrap();
+    let compute = ctx.stream().unwrap();
+    let captured = ctx.allocate(3 * record).unwrap();
+    let mut ring = PrefillRing::build(ctx, geometry, 8).unwrap();
+    ring.replan(&bank);
+    ring.enable_selected();
+    let before = bank.prefill_report().upload_bytes;
+
+    let batches = [
+        (0, &[4, 7, 4, 0][..], &[(4, 0), (7, 1)][..]),
+        (1, &[0, 1][..], &[][..]),
+        (2, &[4, 4][..], &[(4, 2)][..]),
+    ];
+    for (layer, picks, snapshots) in batches {
+        ring.issue_selected(ctx, &mut bank, layer, picks).unwrap();
+        ring.wait_layer(&compute, layer).unwrap();
+        for &(expert, index) in snapshots {
+            let slot = usize::from(ring.slot_of(layer, expert).unwrap());
+            ctx.copy_device(
+                &compute,
+                ring.slots().range(slot * record, record).unwrap(),
+                captured.range(index * record, record).unwrap(),
+            )
+            .unwrap();
+        }
+        ring.free_layer(&compute, layer).unwrap();
+    }
+
+    let mut got = vec![0; 3 * record];
+    captured.read_at(&compute, 0, &mut got).unwrap();
+    assert_eq!(
+        bank.prefill_report().upload_bytes - before,
+        (3 * record) as u64
+    );
+    for (bytes, (layer, expert)) in got.chunks_exact(record).zip([(0, 4), (0, 7), (2, 4)]) {
+        assert_eq!(bytes, expected(layer, expert, record));
+    }
+}

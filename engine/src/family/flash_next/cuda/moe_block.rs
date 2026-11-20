@@ -651,6 +651,7 @@ mod device {
             ctx: &CudaContext,
             budget: usize,
             min_rows: usize,
+            selected: bool,
         ) -> Result<usize, EngError> {
             let geometry = *self.bank.geometry();
             let streamed = geometry
@@ -667,6 +668,9 @@ mod device {
                 return Ok(0);
             }
             let slots = ring.ring_slots();
+            if selected {
+                ring.enable_selected();
+            }
             self.ring = Some(ring);
             self.ring_min_rows = min_rows;
             Ok(slots)
@@ -1014,11 +1018,10 @@ mod device {
             let launch = projector.launch;
             if whole_chunk {
                 self.ring_engaged = true;
-                self.ring.as_mut().expect("active ring").issue_through(
-                    launch.ctx,
-                    &mut self.bank,
-                    layer + 1,
-                )?;
+                let ring = self.ring.as_mut().expect("active ring");
+                if !ring.is_selected() {
+                    ring.issue_through(launch.ctx, &mut self.bank, layer + 1)?;
+                }
             }
             self.route(launch, layer, bufs, dims)?;
             let bytes = dims.rows * dims.hidden * F32;
@@ -1050,23 +1053,21 @@ mod device {
                 down: trunk.shared_down,
             };
             if whole_chunk {
-                let ring = self.ring.as_ref().expect("active ring");
+                let ring = self.ring.as_mut().expect("active ring");
+                let ring_spans = SlotSpans::new(&self.bank_layout, ring.ring_slots())?;
                 let mut store = RingStore {
-                    adapter: PrefillAdapter::new(&mut self.bank),
+                    bank: &mut self.bank,
+                    ctx: launch.ctx,
                     ring,
                     layer,
                     spans: &self.spans,
-                    ring_spans: SlotSpans::new(&self.bank_layout, ring.ring_slots())?,
+                    ring_spans,
                     book: self.book,
                 };
                 prefill_moe::run_store(projector, &weights, &common, dims, &sub, &mut store)?;
                 // Record used events only after both sources' reads are queued. A reused
                 // ring slot's next copy waits these on the copy stream.
-                return self
-                    .ring
-                    .as_mut()
-                    .expect("active ring")
-                    .free_layer(launch.stream, layer);
+                return ring.free_layer(launch.stream, layer);
             }
             // No ring drain is needed here: ring copies are issued only by the whole-chunk
             // branch, which latches `ring_engaged`, so a union admit never follows a ring copy

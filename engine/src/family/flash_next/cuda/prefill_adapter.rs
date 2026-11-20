@@ -133,11 +133,12 @@ pub(in crate::family::flash_next) mod device {
         weights::exl3::Codebook,
     };
 
-    /// Frozen-bank/ring views of one layer. The caller issues copies before the shared pass,
-    /// and frees the layer only after all of its projections have been queued.
+    /// Frozen-bank/ring views of one layer. The caller frees the layer after both sources'
+    /// projections have been queued.
     pub(in crate::family::flash_next::cuda) struct RingStore<'a> {
-        pub(in crate::family::flash_next::cuda) adapter: PrefillAdapter<'a>,
-        pub(in crate::family::flash_next::cuda) ring: &'a PrefillRing,
+        pub(in crate::family::flash_next::cuda) bank: &'a mut DeviceBank,
+        pub(in crate::family::flash_next::cuda) ctx: &'a CudaContext,
+        pub(in crate::family::flash_next::cuda) ring: &'a mut PrefillRing,
         pub(in crate::family::flash_next::cuda) layer: usize,
         pub(in crate::family::flash_next::cuda) spans: &'a SlotSpans,
         pub(in crate::family::flash_next::cuda) ring_spans: SlotSpans,
@@ -150,21 +151,37 @@ pub(in crate::family::flash_next) mod device {
             stream: &DeviceStream,
             picks: &[usize],
         ) -> Result<Vec<usize>, EngError> {
-            self.adapter.record_route(picks);
+            self.bank.record_route(picks);
             let slots = ring_slots(
-                self.adapter.slot_row(self.layer)?,
-                self.adapter.geometry().slots,
+                self.bank.slot_row(self.layer)?,
+                self.bank.geometry().slots,
                 picks,
                 |expert| self.ring.slot_of(self.layer, expert),
             )?;
-            self.ring.wait_layer(stream, self.layer)?;
+            if self.ring.is_selected() {
+                self.ring
+                    .issue_selected(self.ctx, self.bank, self.layer, picks)?;
+            } else {
+                self.ring.wait_layer(stream, self.layer)?;
+            }
             Ok(slots)
         }
     }
 
     impl PrefillStore for RingStore<'_> {
+        fn reads_routes_before_shared(&self) -> bool {
+            self.ring.is_selected()
+        }
+
+        fn wait_ring(&self, stream: &DeviceStream) -> Result<(), EngError> {
+            if self.ring.is_selected() {
+                self.ring.wait_layer(stream, self.layer)?;
+            }
+            Ok(())
+        }
+
         fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
-            let slots = self.adapter.slots(self.layer)?;
+            let slots = self.bank.slots(self.layer)?;
             Ok([
                 self.spans.members_of(slots, 0, self.book)?,
                 self.spans.members_of(slots, 1, self.book)?,

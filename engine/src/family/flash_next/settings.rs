@@ -534,6 +534,18 @@ impl FlashSettings {
     }
 }
 
+/// Whether the CUDA expert ring copies only the current layer's selected misses.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::flash_next) fn ring_selected() -> Result<bool, EngError> {
+    match std::env::var_os("INFERENCE_FLASH_NEXT_RING_SELECTED") {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_RING_SELECTED must be unset or \"1\"".into(),
+        )),
+    }
+}
+
 /// Whether CUDA prefill reads each chunk's distinct n-gram rows through the row pool. On by
 /// default; `INFERENCE_FLASH_NEXT_NGRAM_BULK=0` reads them one token at a time and `1` names the
 /// default. Strict: any other set value, a non-text value included, is refused.

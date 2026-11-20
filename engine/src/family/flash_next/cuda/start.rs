@@ -1088,6 +1088,7 @@ fn build_driver_resolving(
     // disk rung has no store to stream from, so funding the ring under it would strand the
     // slots — every whole-chunk expert serves as a no-ring-entry through the rung's reads.
     if rows > 1 && ring_budget > 0 && !matches!(host_plan.mode, HostMode::Disk) {
+        let selected = crate::family::flash_next::settings::ring_selected()?;
         let slots = block.plan_ring(
             ctx,
             crate::family::flash_next::settings::ring_record_count(
@@ -1096,6 +1097,7 @@ fn build_driver_resolving(
                 2 * streamed,
             ) as usize,
             wanted.ring_rows as usize,
+            selected,
         )?;
         if slots == 0 {
             eprintln!(
@@ -1106,9 +1108,10 @@ fn build_driver_resolving(
         } else {
             eprintln!(
                 "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank; \
-                 shared prefill whole-chunk at {} rows and above",
+                 shared prefill whole-chunk at {} rows and above, {} uploads",
                 slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                wanted.ring_rows
+                wanted.ring_rows,
+                if selected { "selected" } else { "eager" }
             );
         }
     }

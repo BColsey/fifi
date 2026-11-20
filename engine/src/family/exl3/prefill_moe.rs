@@ -45,7 +45,7 @@ use crate::{
         project::cuda::exl3::{Exl3Bank, Exl3Members},
     },
     kernels::cuda::{
-        DeviceRange,
+        DeviceRange, DeviceStream,
         prefill::swiglu_rows::SwigluRowsCall,
         resident::moe_combine::{CombineCall, CombineOut, SharedTerm},
     },
@@ -79,6 +79,16 @@ impl SlotResolver for LayerResolver<'_, '_> {
 /// The next resolve may replace the bytes that those views address.
 pub(in crate::family) trait PrefillStore: SlotResolver {
     fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError>;
+
+    /// A store can issue routed copies before the shared expert to overlap them.
+    fn reads_routes_before_shared(&self) -> bool {
+        false
+    }
+
+    /// Fences the optional ring source after resident projections have been queued.
+    fn wait_ring(&self, _stream: &DeviceStream) -> Result<(), EngError> {
+        Ok(())
+    }
 
     /// An optional disjoint source. Its logical slots follow `members()`'s slots; it borrows
     /// the ring's own records, never copies them into the bank. Single-source stores retain
@@ -488,8 +498,11 @@ pub(in crate::family) fn run_store(
     sub: &[(usize, MoeDims)],
     bank: &mut impl PrefillStore,
 ) -> Result<(), EngError> {
-    shared(projector, weights, bufs, dims)?;
-    split::mark(projector.launch.stream, "shared expert");
+    let reads_routes_first = bank.reads_routes_before_shared();
+    if !reads_routes_first {
+        shared(projector, weights, bufs, dims)?;
+        split::mark(projector.launch.stream, "shared expert");
+    }
     // One readback for the whole chunk: each sub-block's mapping then runs host-side from
     // the picks already in hand, and only its mapped slot ids return to the device — the
     // per-sub-block readback, a blocking drain of the stream, is gone. The mapping stays
@@ -537,16 +550,20 @@ pub(in crate::family) fn run_store(
             };
             plan_pairs(&slots, n_member, k)?
         };
+        if reads_routes_first && r0 == 0 {
+            shared(projector, weights, bufs, dims)?;
+            split::mark(projector.launch.stream, "shared expert");
+        }
         let members = bank.members()?;
         if let Some(ring) = bank.ring_members()? {
-            let plans = plan.split_members(members[0].members)?;
-            // Reuse the packed intermediates and permutation region on the same stream;
-            // down scatters each source to disjoint original pair positions. No phantom
-            // jobs for unused physical slots, and no combine until both sources finish.
-            for (members, plan) in [members, ring].into_iter().zip(plans) {
-                if !plan.order.is_empty() {
-                    routed_plan(projector, members, &sub_bufs, sub_dims, plan, pair)?;
-                }
+            let [resident, streamed] = plan.split_members(members[0].members)?;
+            // Both sources reuse the same scratch and scatter to disjoint pair positions.
+            if !resident.order.is_empty() {
+                routed_plan(projector, members, &sub_bufs, sub_dims, resident, pair)?;
+            }
+            if !streamed.order.is_empty() {
+                bank.wait_ring(projector.launch.stream)?;
+                routed_plan(projector, ring, &sub_bufs, sub_dims, streamed, pair)?;
             }
         } else {
             routed_plan(projector, members, &sub_bufs, sub_dims, plan, pair)?;

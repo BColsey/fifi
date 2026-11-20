@@ -1,7 +1,7 @@
-//! The prefill expert ring: streams every expert a big chunk needs from the pinned store onto
-//! the device behind the compute stream, one copy-stream entry per expert in layer-major
-//! order, so later layers' experts arrive while earlier layers compute. This is the overlap
-//! Strata measured at ~1.2k tok/s prefill on a 12 GB card: PCIe becomes background traffic.
+//! The prefill expert ring streams records from a frozen pinned store to a separate copy
+//! stream. The eager path queues nonresident experts ahead in layer-major order. The
+//! routed path queues only selected nonresident experts and overlaps their copies with
+//! the shared and resident experts of the same layer.
 //!
 //! Ordering discipline (the same shape as the bank's twice-reviewed copy tail): a ring slot's
 //! next H2D copy on the copy stream waits the `used` event the compute stream recorded after
@@ -78,10 +78,12 @@ pub(super) mod device {
         /// The first layer whose `free_layer` has not run yet (the consumed point).
         freed: usize,
         issued: usize,
+        /// When enabled, the current layer's issued entries. Only these slots have copy
+        /// obligations for the layer. The eager path tracks its horizon with `issued`.
+        selected: Option<Vec<StreamEntry>>,
         record: usize,
         ring: usize,
-        /// Whether a chunked prefill window is open: the single-row step rides the ring only
-        /// then (decode keeps the bank's miss path).
+        /// Whether a chunked prefill window is open.
         active: bool,
     }
 
@@ -115,6 +117,7 @@ pub(super) mod device {
                 per_layer: 0,
                 freed: 0,
                 issued: 0,
+                selected: None,
                 record: geometry.record_bytes,
                 ring,
                 active: false,
@@ -156,8 +159,7 @@ pub(super) mod device {
                 .unwrap_or(0);
             self.entries = entries;
             self.layer_start = layer_start;
-            self.freed = 0;
-            self.issued = 0;
+            self.begin_chunk();
         }
 
         /// The most streamed experts any one layer needs: the ring must hold at least this
@@ -192,20 +194,68 @@ pub(super) mod device {
             }
             while self.issued < target {
                 let entry = self.entries[self.issued];
-                let slot = usize::from(entry.slot);
-                if self.live[slot] {
-                    self.copy.wait(&self.used[slot])?;
-                }
-                bank.stream_place(
-                    ctx,
-                    &self.copy,
-                    usize::from(entry.layer),
-                    entry.place,
-                    self.range(slot)?,
-                )?;
-                self.copy.record(&self.copied[slot])?;
-                self.live[slot] = true;
+                self.issue(ctx, bank, entry)?;
                 self.issued += 1;
+            }
+            Ok(())
+        }
+
+        fn issue(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            entry: StreamEntry,
+        ) -> Result<(), EngError> {
+            let slot = usize::from(entry.slot);
+            if self.live[slot] {
+                self.copy.wait(&self.used[slot])?;
+            }
+            bank.stream_place(
+                ctx,
+                &self.copy,
+                usize::from(entry.layer),
+                entry.place,
+                self.range(slot)?,
+            )?;
+            self.copy.record(&self.copied[slot])?;
+            self.live[slot] = true;
+            Ok(())
+        }
+
+        pub(in crate::family::flash_next) fn enable_selected(&mut self) {
+            self.selected = Some(Vec::with_capacity(self.per_layer));
+        }
+
+        pub(in crate::family::flash_next) fn is_selected(&self) -> bool {
+            self.selected.is_some()
+        }
+
+        /// Queues the selected entries of the current layer after route resolution. The
+        /// existing plan keeps slot assignments stable when the selected set is sparse.
+        pub(in crate::family::flash_next) fn issue_selected(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+            picks: &[usize],
+        ) -> Result<(), EngError> {
+            if layer != self.freed || layer >= bank.geometry().layers || !self.is_selected() {
+                return Err(EngError::BadRequest(
+                    "the prefill ring can issue selected experts only for its current layer".into(),
+                ));
+            }
+            let mut wanted = vec![false; bank.geometry().experts];
+            for &expert in picks {
+                *wanted.get_mut(expert).ok_or_else(|| {
+                    EngError::BadRequest("prefill ring: a selected expert is out of range".into())
+                })? = true;
+            }
+            for i in self.layer_start[layer]..self.layer_start[layer + 1] {
+                let entry = self.entries[i];
+                if wanted[usize::from(entry.expert)] {
+                    self.issue(ctx, bank, entry)?;
+                    self.selected.as_mut().expect("selected ring").push(entry);
+                }
             }
             Ok(())
         }
@@ -216,6 +266,9 @@ pub(super) mod device {
         pub(in crate::family::flash_next) fn begin_chunk(&mut self) {
             self.freed = 0;
             self.issued = 0;
+            if let Some(selected) = &mut self.selected {
+                selected.clear();
+            }
         }
 
         /// Whether a prefill window is open (armed by the owning block's `begin_prefill`).
@@ -257,8 +310,15 @@ pub(super) mod device {
             stream: &DeviceStream,
             layer: usize,
         ) -> Result<(), EngError> {
-            for entry in self.layer_entries(layer) {
-                stream.wait(&self.copied[usize::from(entry.slot)])?;
+            if let Some(selected) = &self.selected {
+                if let Some(entry) = selected.last() {
+                    // The final copy event covers all earlier copies on this stream.
+                    stream.wait(&self.copied[usize::from(entry.slot)])?;
+                }
+            } else {
+                for entry in self.layer_entries(layer) {
+                    stream.wait(&self.copied[usize::from(entry.slot)])?;
+                }
             }
             Ok(())
         }
@@ -278,8 +338,15 @@ pub(super) mod device {
                     self.freed
                 )));
             }
-            for entry in self.layer_entries(layer) {
+            let entries = self
+                .selected
+                .as_deref()
+                .unwrap_or_else(|| self.layer_entries(layer));
+            for entry in entries {
                 stream.record(&self.used[usize::from(entry.slot)])?;
+            }
+            if let Some(selected) = &mut self.selected {
+                selected.clear();
             }
             self.freed += 1;
             Ok(())

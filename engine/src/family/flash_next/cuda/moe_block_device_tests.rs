@@ -1015,7 +1015,9 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
     let trunks = arm_trunks(&arms);
     let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
     let streamed = shape.experts() - SLOTS;
-    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
+    let slots = split
+        .plan_ring(ctx, streamed, 1, false)
+        .expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
     split.begin_prefill().unwrap();
 
@@ -1164,7 +1166,7 @@ fn ring_chunk_pass(m: usize, held: Option<usize>) {
             let mut control = SplitMoe::new(ctx, arm_trunks(&arms), bank, &layout, &one_row_chunk)
                 .expect("the control split");
             control
-                .plan_ring(ctx, shape.experts() - SLOTS, 1)
+                .plan_ring(ctx, shape.experts() - SLOTS, 1, false)
                 .expect("fund the control's ring");
             control.begin_prefill().unwrap();
             control.begin_chunk();
@@ -1415,7 +1417,9 @@ fn each_projection_through_the_jobs_family_and_the_indexed_family_on_one_row() {
     };
     let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &two_rows).expect("split");
     let streamed = shape.experts() - SLOTS;
-    let slots = split.plan_ring(ctx, streamed, 1).expect("fund the ring");
+    let slots = split
+        .plan_ring(ctx, streamed, 1, false)
+        .expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
     split.begin_prefill().unwrap();
     split.begin_chunk();
@@ -1824,7 +1828,7 @@ fn the_prefill_ring_and_union_paths_cross_both_ways_without_a_copy_conflict() {
     let mut split = SplitMoe::new(ctx, vec![trunk], bank, &layout, &big).expect("split");
     let streamed = shape.experts() - SLOTS;
     let slots = split
-        .plan_ring(ctx, streamed, THRESHOLD)
+        .plan_ring(ctx, streamed, THRESHOLD, false)
         .expect("fund the ring");
     assert!(slots >= streamed, "the ring holds one full streamed layer");
     // Each window reopens (begin_prefill) and runs one chunk; no end_prefill between them,
