@@ -215,6 +215,9 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             if open_window {
                 family.begin_window(&mut ctx)?;
             }
+            if want_logits {
+                family.driver.device.begin_prefill_logits()?;
+            }
             family.write_chunk_inputs(&mut ctx, p0, m)?;
             family.clear_chunk_status(&mut ctx)?;
             family.run_layers(&mut ctx, p0, m)?;

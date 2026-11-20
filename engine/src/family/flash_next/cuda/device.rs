@@ -326,6 +326,12 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         Ok(())
     }
 
+    fn begin_prefill_logits(&mut self) -> Result<(), EngError> {
+        // Keep the shared kernels for the logits row. Once the pinned stores are drained,
+        // its routed experts can use the bank's union admit on the bank stream.
+        self.moe.end_prefill()
+    }
+
     fn end_prefill(&mut self) -> Result<(), EngError> {
         self.step.prefill_window.set(false);
         self.moe.end_prefill()

@@ -47,9 +47,14 @@ fn shared_prefill_opens_once_for_two_chunks_and_closes_after_sampling() {
             "health",
         ]
     );
+    let prefed_calls = driver.device().log.len();
     assert_eq!(driver.logits(4).unwrap().len(), LOGITS);
     assert_eq!(driver.fed(), 4);
     let log = &driver.device().log;
+    assert_eq!(
+        &log[prefed_calls..prefed_calls + 2],
+        ["begin_prefill_logits", "chunk_params 4 3 1"].map(String::from)
+    );
     assert_eq!(
         &log[log.len() - 4..],
         ["head", "read_logits", "health", "end_prefill"].map(String::from)
@@ -137,7 +142,13 @@ fn shared_prefill_device_failures_poison_before_commit_and_reset_recovers() {
 
 #[test]
 fn shared_prefill_sampling_failures_preserve_commit_and_close_rules() {
-    for failure in ["head", "read_logits", "health", "end_prefill"] {
+    for failure in [
+        "begin_prefill_logits",
+        "head",
+        "read_logits",
+        "health",
+        "end_prefill",
+    ] {
         let mut driver = shared_driver(FakeFeeds::default());
         driver.feed_rows(&[1, 2]).unwrap();
         driver.device_mut().fail = Some(failure);

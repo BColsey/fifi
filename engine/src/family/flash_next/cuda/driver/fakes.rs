@@ -252,6 +252,13 @@ impl ChunkDevice for FakeChunkDevice {
         Ok(())
     }
 
+    fn begin_prefill_logits(&mut self) -> Result<(), EngError> {
+        if self.track_windows {
+            self.step("begin_prefill_logits", String::new())?;
+        }
+        Ok(())
+    }
+
     fn end_prefill(&mut self) -> Result<(), EngError> {
         self.in_prefill = false;
         if self.track_windows {

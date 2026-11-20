@@ -307,6 +307,10 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn begin_prefill(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Hands the expert store back to the bank before the final shared logits row.
+    fn begin_prefill_logits(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Closes the prefill window after the sampling row ran. The single-token step of later
     /// decode uses the bank's miss path again; a no-op when no window is open.
     fn end_prefill(&mut self) -> Result<()> {

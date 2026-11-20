@@ -978,12 +978,10 @@ mod device {
             // path: a small chunk's picks usually fit the bank without admission, and the ring
             // re-issues its copies every chunk, which costs more than grouping saves there.
             // Once a window streams a whole chunk it latches onto the ring (`ring_engaged`) for
-            // the rest of the window, so the trailing single-row logits step does not switch to
-            // the bank stream while the ring's copies are outstanding on the copy stream.
-            // Invariant: pieces within a window never grow (the chunk driver feeds equal-sized
-            // pieces, a smaller remainder, then the 1-row logits step), so a union admit never
-            // follows a whole chunk in the same window and the begin_prefill ring plan stays
-            // valid; each scheduler piece reopens its own window.
+            // the rest of the feed window, keeping smaller remainder chunks on the same store.
+            // The standalone logits row closes the ring before calling this pass.
+            // Pieces within a feed window never grow. A union admit can only follow a
+            // whole chunk after the ring is drained, and each scheduler piece replans the ring.
             let whole_chunk = crate::family::flash_next::settings::ring_whole_chunk(
                 ring_active,
                 dims.rows,
@@ -1072,8 +1070,8 @@ mod device {
             }
             // No ring drain is needed here: ring copies are issued only by the whole-chunk
             // branch, which latches `ring_engaged`, so a union admit never follows a ring copy
-            // in the same window; `begin_prefill` drains a reopened window's outstanding ring
-            // copies before the latch resets.
+            // in a feed window. Reopening prefill or preparing the final logits row drains
+            // the prior window's ring copies before bank admits can run.
             let ring_funded = self.ring.is_some();
             let mut store = LayerStore {
                 adapter: PrefillAdapter::new(&mut self.bank),
