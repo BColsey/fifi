@@ -459,7 +459,11 @@ pub(super) fn needs_arena(
 ) -> bool {
     let supported_kv =
         kv_mode == KvMode::Fp16 || (kv_mode == KvMode::Int8G32 && kv8_chunked_prefill);
-    layout != WeightLayout::Tiled && supported_kv && !tiered && !mmq_q6k
+    let chunk_ok = !tiered
+        || super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        );
+    layout != WeightLayout::Tiled && supported_kv && chunk_ok && !mmq_q6k
 }
 
 /// The two session-build guards of `admit_prefill` as a pure seam (condition 8a): the
@@ -678,6 +682,7 @@ pub(super) fn chunk_ids(rows: &[u32], sampler_width: usize) -> Result<Vec<i32>, 
 
 use super::prefill::{ChunkBufs, ChunkModel, ChunkRows, ChunkSparse};
 use super::state::ResidentState;
+use super::tiered_step::TieredRuntime;
 use crate::family::prefill::chunk_family::ChunkFamily;
 
 /// What the chunk body captures today, handed to the trait opaquely: the state, the launch, the
@@ -702,6 +707,7 @@ pub(super) struct Q36ChunkCtx<'a, 'w> {
 /// the trait).
 pub(super) struct Q36ChunkFamily<'a, 'w> {
     bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+    tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
     #[cfg(test)]
     kernel_class: super::prefill::ChunkKernelClass,
     pub(super) segmented_parts: usize,
@@ -710,10 +716,12 @@ pub(super) struct Q36ChunkFamily<'a, 'w> {
 impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
     pub(super) fn new(
         bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
+        tiered: Option<&'a std::cell::RefCell<TieredRuntime<'w>>>,
         #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
     ) -> Self {
         Self {
             bank,
+            tiered,
             #[cfg(test)]
             kernel_class,
             segmented_parts: 0,
@@ -746,7 +754,10 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
 
     fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<(), EngError> {
         let run = super::prefill::ChunkRun::new(&*ctx.state, ctx.model, ctx.bufs, ctx.chunk_rows)?;
-        let run = run.with_bank(self.bank).with_sparse(ctx.sparse.take());
+        let run = run
+            .with_bank(self.bank)
+            .with_tiered(self.tiered)
+            .with_sparse(ctx.sparse.take());
         #[cfg(test)]
         let run = run.with_kernel_class(self.kernel_class);
         super::prefill::run_chunk_body(&ctx.launch, &run)?;

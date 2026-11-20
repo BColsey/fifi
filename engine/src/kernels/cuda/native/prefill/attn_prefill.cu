@@ -204,8 +204,8 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_legacy_k(Args a) {
         return;  // no partial
     }
     extern __shared__ __half smem[];
-    __half *sq = smem;  // [64][256], then stage 0 of K at 32 KB and of V at 64 KB
-    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + 2 * kTile * kHeadDim;
+    __half *sq = smem;  // [64][256], then the one K stage at 32 KB and V at 48 KB (D256)
+    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + kTile * kHeadDim;
     const int s = blockIdx.x, kvh = blockIdx.y, tile = blockIdx.z;
     Block b;
     if (!block_of<kHeadDim, kGroup>(a, s, kvh, tile, b)) return;
@@ -957,7 +957,7 @@ bool adaptive_attention_enabled() {
  * the experimental adaptive path is off. */
 template <int kHeadDim, int kGroup>
 PartArm arm_part_legacy() {
-    constexpr int simt_bytes = kRows * kHeadDim * 2 + 4 * kTile * kHeadDim * 2;
+    constexpr int simt_bytes = (kRows + 2 * kTile) * kHeadDim * 2;
     PartArm arm = {0, attn_prefill_part_simt_legacy_k<kHeadDim, kGroup>, false, 128,
                    simt_bytes, cudaSuccess};
     cudaFuncAttributes attr = {};
@@ -1098,9 +1098,18 @@ __device__ inline Q8GroupScalars q8_group_scalars(
  * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
  * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
  * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
- * attn_prefill_part_q8_k; no atomics. */
+ * attn_prefill_part_q8_k; no atomics.
+ *
+ * Launch bounds carry the occupancy this kernel can reach, not an aspiration: the
+ * 64 KiB dynamic shared request of enqueue_q8_tiled is a whole Turing/Ampere SM's
+ * block budget, so at most ONE block is ever resident per SM. minBlocks 2 (ptxas's
+ * reading of a plain 256 bound) is unreachable, and on sm_75 ptxas pays for it —
+ * 128 registers plus a 36-byte spill, and the arm's zero-spill invariant
+ * (localSizeBytes == 0) then refuses the kernel with cudaErrorInvalidValue for the
+ * rest of the process. minBlocks 1 compiles spill-free (145 registers) with the
+ * same one-block residency the shared budget already forces. */
 template <int kHeadDim>
-__global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
+__global__ void __launch_bounds__(256, 1) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
     constexpr int kLanes = 32, kWarps = 8;
     constexpr int kDims = kHeadDim / kLanes;       // dims one lane owns
@@ -1302,11 +1311,15 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
         cudaFuncAttributes attr = {};
         const cudaError_t got =
             cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>);
-        if (got != cudaSuccess) return got;  // propagate the real CUDA error
-        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0)
+        if (got != cudaSuccess) {
+            return got;  // propagate the real CUDA error
+        }
+        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0) {
             return cudaErrorInvalidValue;  // attribute-invariant refusal, not a CUDA error
-        return cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
+        }
+        const cudaError_t set = cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kTileBytes);
+        return set;
     }();
     if (arm_error != cudaSuccess) {
         failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);
