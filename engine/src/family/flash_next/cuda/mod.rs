@@ -24,6 +24,8 @@ mod bank_source;
 mod bank_source_tests;
 #[cfg(test)]
 mod bank_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod disk_prefetch;
 #[cfg(test)]
 mod driver_glue_tests;
 mod moe_block;

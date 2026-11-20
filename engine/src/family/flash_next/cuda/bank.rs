@@ -619,9 +619,12 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
+    use super::super::disk_prefetch::{CANDIDATES, DiskPrefetch, Target};
     use super::{
         HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
     };
+    use crate::family::expert_bank::NO_PLACE;
+
     use crate::family::expert_bank::{BankGeometry, BankStats, ExpertBankState, PassCopies};
     use crate::{
         EngError,
@@ -631,6 +634,11 @@ pub(super) mod device {
         sync::atomic::{AtomicU64, Ordering},
         time::Instant,
     };
+
+    struct DecodeForecast<'a> {
+        position: u64,
+        next: &'a [i32],
+    }
 
     pub(in crate::family::flash_next) struct DeviceBank {
         state: ExpertBankState<ReplaceOnMissLru>,
@@ -642,6 +650,7 @@ pub(super) mod device {
         /// through the trait. Every other mode leaves it absent, as before the rung: those
         /// tiers never read a record after the fill.
         source: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
+        disk_prefetch: Option<DiskPrefetch>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -733,6 +742,7 @@ pub(super) mod device {
                 slots,
                 store,
                 source: retained,
+                disk_prefetch: None,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -924,7 +934,7 @@ pub(super) mod device {
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
             let copies = self.state.begin_pass(layer, picks)?;
-            self.finish(ctx, copies)
+            self.finish(ctx, copies, None)
         }
 
         /// [`Self::step`] for the decode path, which knows the step's
@@ -938,6 +948,7 @@ pub(super) mod device {
             layer: usize,
             picks: &[i32],
             pos: u64,
+            next: &[i32],
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
             let copies = self.state.begin_pass(layer, picks)?;
@@ -949,18 +960,51 @@ pub(super) mod device {
                     .count();
                 source.observe_decode(pos, layer, misses);
             }
-            self.finish(ctx, copies)
+            self.finish(
+                ctx,
+                copies,
+                Some(DecodeForecast {
+                    position: pos,
+                    next,
+                }),
+            )
+        }
+
+        pub(in crate::family::flash_next) fn enable_disk_prefetch(
+            &mut self,
+            backing: &'static mut [u8],
+        ) -> Result<(), EngError> {
+            let source = self.source.ok_or_else(|| {
+                EngError::BadRequest("disk prefetch needs the Flash-Next disk tier".into())
+            })?;
+            let reader = source.prefetch_reader(backing)?;
+            self.disk_prefetch = Some(DiskPrefetch::spawn(move |layer, expert| {
+                let mut records = source.read_packed_from(&reader, layer, &[expert])?;
+                Ok(records.pop().expect("one requested record"))
+            })?);
+            Ok(())
+        }
+
+        pub(in crate::family::flash_next) fn disk_prefetch_enabled(&self) -> bool {
+            self.disk_prefetch.is_some()
         }
 
         /// The rung's decode miss line for the turn boundary; `None`
         /// when this bank never read through the rung (no disk tier).
         pub(in crate::family::flash_next) fn decode_miss_line(&self) -> Option<String> {
-            self.source?.decode_miss_line()
+            let line = self.source?.decode_miss_line()?;
+            if let Some(prefetch) = &self.disk_prefetch {
+                eprintln!("{}", prefetch.report());
+            }
+            Some(line)
         }
 
         /// Ends a decode step aborted by an error or a cancel: a fully
         /// observed step still counts, a half-observed one drops.
         pub(in crate::family::flash_next) fn discard_decode_step(&self) {
+            if let Some(prefetch) = &self.disk_prefetch {
+                prefetch.cancel();
+            }
             if let Some(source) = self.source {
                 source.discard_decode_step();
             }
@@ -968,6 +1012,9 @@ pub(super) mod device {
 
         /// Zeroes the rung's decode miss state for a device reset.
         pub(in crate::family::flash_next) fn reset_decode_misses(&self) {
+            if let Some(prefetch) = &self.disk_prefetch {
+                prefetch.cancel();
+            }
             if let Some(source) = self.source {
                 source.reset_decode_misses();
             }
@@ -1008,7 +1055,7 @@ pub(super) mod device {
             }
             self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
             let started = Instant::now();
-            self.finish(ctx, copies).inspect(|_| {
+            self.finish(ctx, copies, None).inspect(|_| {
                 self.upload_ns
                     .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             })
@@ -1018,8 +1065,9 @@ pub(super) mod device {
             &mut self,
             ctx: &CudaContext,
             copies: PassCopies,
+            forecast: Option<DecodeForecast<'_>>,
         ) -> Result<PassCopies, EngError> {
-            match self.run_copies(ctx, &copies) {
+            match self.run_copies(ctx, &copies, forecast) {
                 Ok(()) => Ok(copies),
                 Err(error) => {
                     self.state.poison();
@@ -1028,19 +1076,76 @@ pub(super) mod device {
             }
         }
 
+        fn read_disk_misses(
+            &self,
+            copies: &PassCopies,
+            forecast: Option<DecodeForecast<'_>>,
+        ) -> Result<Vec<Vec<u8>>, EngError> {
+            let layer = copies.layer;
+            let misses: Vec<_> = copies
+                .ops
+                .iter()
+                .filter(|op| op.src_place == NO_PLACE)
+                .map(|op| op.incoming)
+                .collect();
+            let read = |experts: &[u16]| {
+                if experts.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.source
+                    .ok_or_else(|| {
+                        EngError::BadRequest(
+                            "a no-place copy needs the disk rung's retained record source".into(),
+                        )
+                    })?
+                    .read_packed(layer, experts)
+            };
+            let Some((prefetch, forecast)) = self.disk_prefetch.as_ref().zip(forecast) else {
+                return read(&misses);
+            };
+            let current = Target {
+                position: forecast.position,
+                layer,
+            };
+            let records = prefetch.read_demand(current, &misses, read)?;
+            if !forecast.next.is_empty() {
+                let target = Target {
+                    layer: layer + 1,
+                    ..current
+                };
+                let slots = self.slot_row(target.layer)?;
+                let cold = forecast.next.iter().take(CANDIDATES).filter_map(|&id| {
+                    let id = u16::try_from(id).ok()?;
+                    slots.get(usize::from(id)).filter(|&&slot| slot < 0)?;
+                    Some(id)
+                });
+                // Exact SSD reads have finished. The next layer's reads can run
+                // during the current uploads and expert projections.
+                prefetch.submit(target, cold);
+            }
+            Ok(records)
+        }
+
         /// Runs the copies of `copies` on the bank's stream, in order, and returns when they have
         /// finished: per op the write-back (D2H) into the host place, then the H2D into the slot.
         /// A `NO_PLACE` src (the disk rung) reads the record from the source and uploads the
         /// staged bytes instead — the rung's every-miss staging-ring read.
-        fn run_copies(&mut self, ctx: &CudaContext, copies: &PassCopies) -> Result<(), EngError> {
+        fn run_copies(
+            &mut self,
+            ctx: &CudaContext,
+            copies: &PassCopies,
+            forecast: Option<DecodeForecast<'_>>,
+        ) -> Result<(), EngError> {
+            let mut packed_misses = if self.source.is_some() {
+                self.read_disk_misses(copies, forecast)?
+            } else {
+                Vec::new()
+            }
+            .into_iter();
             if copies.ops.is_empty() {
                 return Ok(());
             }
             let geometry: BankGeometry = *self.state.geometry();
-            // Scope-local: the no-place arm below is compiled only in the native-cuda
-            // view, and a module-level import reads as unused where it is not.
-            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-            use crate::family::expert_bank::NO_PLACE;
             let layer = copies.layer;
             let Some(bank) = self.slots.get(layer) else {
                 return Err(EngError::BadRequest(format!(
@@ -1048,24 +1153,6 @@ pub(super) mod device {
                 )));
             };
             let record = geometry.record_bytes;
-            // The disk rung's misses read as ONE store batch at the pool's
-            // depth; the packed records upload in op order below.
-            let misses_exist = copies.ops.iter().any(|op| op.src_place == NO_PLACE);
-            let mut packed_misses: std::vec::IntoIter<Vec<u8>> = Vec::new().into_iter();
-            if misses_exist {
-                let Some(source) = self.source else {
-                    return Err(EngError::BadRequest(
-                        "a no-place copy needs the disk rung's retained record source".into(),
-                    ));
-                };
-                let misses: Vec<u16> = copies
-                    .ops
-                    .iter()
-                    .filter(|op| op.src_place == NO_PLACE)
-                    .map(|op| op.incoming)
-                    .collect();
-                packed_misses = source.read_packed(layer, &misses)?.into_iter();
-            }
             let mut store = self.store.get_mut(layer);
             for op in &copies.ops {
                 let slot = bank.range(geometry.offset(usize::from(op.slot)), record)?;
@@ -1085,9 +1172,11 @@ pub(super) mod device {
                     )?;
                 }
                 if op.src_place == NO_PLACE {
-                    let record = packed_misses
-                        .next()
-                        .expect("one packed record a no-place op");
+                    let record = packed_misses.next().ok_or_else(|| {
+                        EngError::BadRequest(
+                            "a no-place copy needs the disk rung's retained record source".into(),
+                        )
+                    })?;
                     bank.write_at(&self.stream, geometry.offset(usize::from(op.slot)), &record)?;
                 } else {
                     let Some(store) = store.as_deref_mut() else {

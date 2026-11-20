@@ -15,7 +15,7 @@ use std::time::Instant;
 
 const WORD: usize = size_of::<i32>();
 pub(super) const HORIZONS: usize = 2;
-const MAX_PICKS: usize = 32;
+pub(super) const MAX_PICKS: usize = 32;
 
 pub(super) struct ActualRoute<'a> {
     pub(super) layer: usize,
@@ -34,12 +34,13 @@ impl RouterProxy {
         ctx: &CudaContext,
         hidden: usize,
         experts: usize,
+        picks: usize,
     ) -> Result<Self, EngError> {
         let shape = RouterShape {
             m: 1,
             hidden,
             n_expert: experts,
-            top_k: experts.min(MAX_PICKS),
+            top_k: experts.min(picks),
         };
         let outputs = (HORIZONS + 1) * shape.top_k * WORD + WORD;
         Ok(Self {
@@ -50,7 +51,7 @@ impl RouterProxy {
 
     /// Router matrices and the input are read-only. The true route and health flag
     /// keep their own buffers. Both predictions share one blocking readback.
-    fn sample(
+    pub(super) fn sample(
         &self,
         launch: &Launch<'_>,
         x: DeviceRange<'_>,
@@ -105,7 +106,7 @@ impl RouterProxy {
         input: DeviceRange<'_>,
         actual: ActualRoute<'_>,
         future_routers: &[&DeviceBuffer],
-    ) -> Result<(), EngError> {
+    ) -> Result<Vec<Vec<i32>>, EngError> {
         let started = Instant::now();
         let predictions = self.sample(launch, input, future_routers)?;
         let probe_ns = started.elapsed().as_nanos();
@@ -130,7 +131,7 @@ impl RouterProxy {
                 "probe_ns": probe_ns,
             })
         );
-        Ok(())
+        Ok(predictions)
     }
 }
 
@@ -161,7 +162,7 @@ mod tests {
             buffer.write_at(&stream, 0, &bytes).unwrap();
             (buffer, bytes)
         };
-        let probe = RouterProxy::build(ctx, 4, 4).unwrap();
+        let probe = RouterProxy::build(ctx, 4, 4, MAX_PICKS).unwrap();
         let (row, expected_input) = write(&[1.0, 0.0, 0.0, 0.0]);
         let (first, _) = write(&[
             3.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,

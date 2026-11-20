@@ -391,7 +391,7 @@ enum Addressing {
 /// pinned slot per record, staged and placed by the ring. The flat grid is
 /// the same as the buffered backend's.
 pub(crate) struct RingRecords {
-    addressing: Addressing,
+    addressing: Arc<Addressing>,
     ring: Arc<Mutex<ODirectRing>>,
     layers: usize,
     experts_per_layer: usize,
@@ -457,7 +457,7 @@ impl RingRecords {
             .ok_or_else(|| index_arithmetic_overflow("slot span"))?;
         let ring = ODirectRing::new(slots, slot_span, mem).map_err(EngError::Checkpoint)?;
         Ok(Self {
-            addressing: Addressing::Flat { file },
+            addressing: Arc::new(Addressing::Flat { file }),
             ring: Arc::new(Mutex::new(ring)),
             layers,
             experts_per_layer,
@@ -539,7 +539,7 @@ impl RingRecords {
             .ok_or_else(|| index_arithmetic_overflow("slot span"))?;
         let ring = ODirectRing::new(slots, slot_span, mem).map_err(EngError::Checkpoint)?;
         Ok(Self {
-            addressing: Addressing::Spans { sites, max_window },
+            addressing: Arc::new(Addressing::Spans { sites, max_window }),
             ring: Arc::new(Mutex::new(ring)),
             layers,
             experts_per_layer,
@@ -667,6 +667,28 @@ impl ExpertRecordStore for RingRecords {
 }
 
 impl RingRecords {
+    /// A single-slot lane over the same index with its own checkout pool and fill lock.
+    /// Demand reads can proceed even while this lane has a read in flight.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn one_slot_reader(&self, mem: &'static mut [u8]) -> Result<Self, EngError> {
+        let span = NonZeroU64::new(align_up_sector(self.record_bytes) + SECTOR)
+            .ok_or_else(|| index_arithmetic_overflow("slot span"))?;
+        let slots = NonZeroUsize::MIN;
+        let ring = ODirectRing::new(slots, span, mem).map_err(EngError::Checkpoint)?;
+        Ok(Self {
+            addressing: Arc::clone(&self.addressing),
+            ring: Arc::new(Mutex::new(ring)),
+            layers: self.layers,
+            experts_per_layer: self.experts_per_layer,
+            record_bytes: self.record_bytes,
+            slots: 1,
+            shard_open: self.shard_open,
+            max_wait: self.max_wait,
+            pool: ReadPool::spawn(1),
+            fill_lock: Mutex::new(()),
+        })
+    }
+
     /// Fills a batch through the read pool — dispatch, reap, lease — the
     /// shape both addressings share; the per-mode work lives in
     /// [`Self::fill_flat`] and [`Self::fill_spans`]. On error the batch's
@@ -681,7 +703,7 @@ impl RingRecords {
     ) -> Result<(), EngError> {
         debug_assert_eq!(slots.len(), offsets.len());
         let _fill = self.fill_lock.lock().expect("fill lock");
-        match &self.addressing {
+        match self.addressing.as_ref() {
             Addressing::Flat { file } => self.fill_flat(file, slots, offsets, leases),
             Addressing::Spans { sites, max_window } => {
                 self.fill_spans(sites, *max_window, slots, offsets, leases)

@@ -542,10 +542,15 @@ impl DecodeMisses {
         let steps = self.steps.swap(0, std::sync::atomic::Ordering::Relaxed);
         let layer_stats = MiniStats::of(&per_layer)?;
         let step_stats = MiniStats::of(&per_step)?;
+        let total_records: u64 = per_step
+            .iter()
+            .enumerate()
+            .map(|(n, count)| n as u64 * count)
+            .sum();
         let step_word = if steps == 1 { "step" } else { "steps" };
         Some(format!(
             "disk rung decode: {steps} {step_word}, misses per layer min {} / median {} / max {}, \
-             per step min {} / median {} / max {}, pool depth {pool_depth}",
+             per step min {} / median {} / max {}, pool depth {pool_depth}, exact records {total_records}",
             layer_stats.min,
             layer_stats.median,
             layer_stats.max,
@@ -837,13 +842,31 @@ impl RungSource {
         layer: usize,
         experts: &[u16],
     ) -> Result<Vec<Vec<u8>>, EngError> {
+        self.read_packed_from(&self.store, layer, experts)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn prefetch_reader(
+        &self,
+        backing: &'static mut [u8],
+    ) -> Result<RingRecords, EngError> {
+        let bytes = align_up_sector(self.store.record_bytes()) + SECTOR;
+        self.store.one_slot_reader(carve(backing, bytes as usize)?)
+    }
+
+    pub(super) fn read_packed_from(
+        &self,
+        reader: &RingRecords,
+        layer: usize,
+        experts: &[u16],
+    ) -> Result<Vec<Vec<u8>>, EngError> {
         let mut packed = Vec::with_capacity(experts.len());
-        for chunk in experts.chunks(self.slots.max(1)) {
+        for chunk in experts.chunks(reader.max_batch()) {
             let sites: Vec<RecordSite> = chunk
                 .iter()
                 .map(|&expert| RecordSite { layer, expert })
                 .collect();
-            let leases = self.store.read_records(&sites)?;
+            let leases = reader.read_records(&sites)?;
             packed.extend(
                 chunk
                     .iter()

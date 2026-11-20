@@ -672,6 +672,15 @@ fn build_driver_resolving(
             ));
         }
     };
+    let disk_prefetch_enabled = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err(EngError::BadRequest(
+                "INFERENCE_FLASH_NEXT_DISK_PREFETCH must be unset or \"1\"".into(),
+            ));
+        }
+    };
     let projection_on_card = ple_device()?;
     let ple_shape = (projection_on_card && rows > 1).then(|| PleDeviceShape {
         width: model.hyper.hidden() * model.hyper.branches(),
@@ -805,8 +814,20 @@ fn build_driver_resolving(
     } else {
         0
     };
+    let prefetch_backing = if disk_prefetch_enabled {
+        bank_source::RungSource::backing_bytes(&checkpoint, artifact, 1)?
+    } else {
+        0
+    };
+    // One raw slot, the worker's aligned read window, and the packed records in
+    // the current upload and next prediction. Include the transient pack workspace.
+    let prefetch_bytes = if disk_prefetch_enabled {
+        2 * prefetch_backing as u64 + 10 * record_bytes as u64
+    } else {
+        0
+    };
     let terms = HostTerms {
-        engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes,
+        engine_heap: HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes,
         ..HostTerms::DEFAULT
     };
     let geometry = BankGeometry::new(
@@ -847,6 +868,11 @@ fn build_driver_resolving(
         &terms,
         ring_placeholder,
     )?;
+    if disk_prefetch_enabled && !matches!(tier, TierChoice::Disk) {
+        return Err(EngError::BadRequest(
+            "INFERENCE_FLASH_NEXT_DISK_PREFETCH needs the Flash-Next disk tier".into(),
+        ));
+    }
     let (tier, ring_bytes) = match tier {
         TierChoice::Disk => {
             let real =
@@ -1046,7 +1072,7 @@ fn build_driver_resolving(
             stats_path.map_or(String::new(), |p| p.display().to_string())
         );
     }
-    let bank = build_bank(
+    let mut bank = build_bank(
         projector,
         geometry,
         &host_plan,
@@ -1059,6 +1085,14 @@ fn build_driver_resolving(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()
     );
+
+    if disk_prefetch_enabled {
+        let backing = Box::leak(vec![0; prefetch_backing].into_boxed_slice());
+        bank.enable_disk_prefetch(backing)?;
+        eprintln!(
+            "flash-next cuda: one-layer disk prefetch enabled, host reserve {prefetch_bytes} bytes"
+        );
+    }
 
     stage("building the step");
     // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs
@@ -1093,8 +1127,10 @@ fn build_driver_resolving(
         &layout,
         &step.moe_dims(rows),
     )?;
+    if router_proxy_enabled || disk_prefetch_enabled {
+        block.enable_router_proxy(ctx, model.hyper.hidden(), router_proxy_enabled)?;
+    }
     if router_proxy_enabled {
-        block.enable_router_proxy(ctx, model.hyper.hidden())?;
         eprintln!("flash-next cuda: future-router probe enabled");
     }
     // The prefill streaming ring refills its slots from the bank's store (demotion); the

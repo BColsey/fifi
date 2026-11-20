@@ -346,8 +346,9 @@ mod device {
             flash_next::{
                 cuda::{
                     bank::device::DeviceBank,
+                    disk_prefetch::CANDIDATES,
                     prefill_adapter::device::{LayerStore, PrefillAdapter, RingStore},
-                    router_proxy::{ActualRoute, HORIZONS, RouterProxy},
+                    router_proxy::{ActualRoute, HORIZONS, MAX_PICKS, RouterProxy},
                 },
                 moe::slot_bank::SlotBankLayout,
                 settings::RingUploads,
@@ -494,6 +495,7 @@ mod device {
         /// `ring_min_rows` never engages the ring and admits against that quiet store.
         ring_engaged: bool,
         router_proxy: Option<RouterProxy>,
+        log_router_proxy: bool,
     }
 
     /// One pass over the bank.
@@ -642,6 +644,7 @@ mod device {
                 ring_min_rows: 1,
                 ring_engaged: false,
                 router_proxy: None,
+                log_router_proxy: false,
             })
         }
 
@@ -649,12 +652,15 @@ mod device {
             &mut self,
             ctx: &CudaContext,
             hidden: usize,
+            log: bool,
         ) -> Result<(), EngError> {
             self.router_proxy = Some(RouterProxy::build(
                 ctx,
                 hidden,
                 self.bank.geometry().experts,
+                if log { MAX_PICKS } else { CANDIDATES },
             )?);
+            self.log_router_proxy = log;
             Ok(())
         }
 
@@ -843,24 +849,36 @@ mod device {
             prof::blocked(35, profile, || scratch.read_at(stream, sc.log, &mut raw))?;
             let (ids, weights) = parse_log(&raw, k)?;
             let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
-            if let Some(proxy) = &self.router_proxy {
+            let next = if let Some(proxy) = &self.router_proxy {
+                let horizons = if self.log_router_proxy { HORIZONS } else { 1 };
                 let target_routers: Vec<_> = self.trunks[layer + 1..]
                     .iter()
-                    .take(HORIZONS)
+                    .take(horizons)
                     .map(|trunk| trunk.router)
                     .collect();
-                proxy.record(
-                    launch,
-                    bufs.route.norm_row,
-                    ActualRoute {
-                        layer,
-                        position: pos,
-                        picks: &ids,
-                        slots: &slot_row_before,
-                    },
-                    &target_routers,
-                )?;
-            }
+                let predictions = if self.log_router_proxy {
+                    proxy.record(
+                        launch,
+                        bufs.route.norm_row,
+                        ActualRoute {
+                            layer,
+                            position: pos,
+                            picks: &ids,
+                            slots: &slot_row_before,
+                        },
+                        &target_routers,
+                    )?
+                } else {
+                    proxy.sample(launch, bufs.route.norm_row, &target_routers)?
+                };
+                if self.bank.disk_prefetch_enabled() {
+                    predictions.into_iter().next().unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
 
             // The resident pass. Without a miss its combine IS the block's output; with one it
             // skips the combine entirely (the miss pass's combine is the block's only sum, and
@@ -886,7 +904,7 @@ mod device {
             // so this is where the rung's decode miss counter hears the
             // layer: every layer of the token at `pos`, zero misses
             // included.
-            self.bank.step_decode(ctx, layer, &ids, pos as u64)?;
+            self.bank.step_decode(ctx, layer, &ids, pos as u64, &next)?;
             let slot_row_after = self.bank.slot_row(layer)?.to_vec();
             let second = plan_second_pass(&ids, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_ranks)) = second.miss {
