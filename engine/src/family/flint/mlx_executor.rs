@@ -44,6 +44,7 @@ pub(super) struct FlintExecutor {
     mlx_plan: MlxExecutionPlan,
     request_sized_kv: bool,
     request_prefill: bool,
+    flash_prefill: bool,
     prefill_pair: PrefillPairPolicy,
     cancel_prefill_pair: bool,
     eos: Vec<u32>,
@@ -186,11 +187,12 @@ impl FlintExecutor {
         let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
             std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
         ));
-        let (prefill_piece, memory) = if let Some((device, charges, _)) = reserve {
-            let (piece, memory) = device_prefill_piece(device, &model, max_rows, &charges)?;
-            (piece, Some(memory))
+        let (prefill_piece, memory, flash_prefill) = if let Some((device, charges, _)) = reserve {
+            let (piece, memory, flash_prefill) =
+                device_prefill_piece(device, &model, max_rows, &charges)?;
+            (piece, Some(memory), flash_prefill)
         } else {
-            (max_rows, None)
+            (max_rows, None, false)
         };
         let (placement, placement_reason) = if model.streamed_expert_bytes != 0 {
             ("disk_experts", "full expert banks exceed the device budget")
@@ -237,6 +239,7 @@ impl FlintExecutor {
                 mlx_plan,
                 request_sized_kv,
                 request_prefill,
+                flash_prefill,
                 prefill_pair,
                 cancel_prefill_pair: std::env::var_os("FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR")
                     .is_some_and(|value| value == "1"),
@@ -462,7 +465,7 @@ fn device_prefill_piece(
     model: &Model,
     max_rows: usize,
     session: &[(&'static str, u64)],
-) -> Result<(usize, MlxPrefillMemory)> {
+) -> Result<(usize, MlxPrefillMemory, bool)> {
     // Model::open_for_budget has imported its resident arrays. The allocator
     // count includes those arrays; the prefill reserve separately prices the
     // whole session including the fixed-size rings.
@@ -513,6 +516,7 @@ fn device_prefill_piece(
             base_charges: charges.into_iter().collect(),
             workspace: [("expert_staging_bytes", staging)].into(),
         },
+        flash_prefill,
     ))
 }
 
@@ -645,21 +649,26 @@ fn request_span_admits_a_wider_piece_at_the_same_budget() {
     let expert = 1_769_472;
     let remaining = 5_453_957_568;
     assert_eq!(
-        fitting_prefill_piece(1024, 32768, remaining, expert).unwrap(),
+        fitting_prefill_piece(1024, 32768, remaining, expert, false).unwrap(),
         256
     );
     assert_eq!(
-        fitting_prefill_piece(1024, 2041, remaining, expert).unwrap(),
+        fitting_prefill_piece(1024, 2041, remaining, expert, false).unwrap(),
         1024
     );
     let just_fits = 3 * 32 * 4 * 2041 * 1024 + expert_staging_bytes(expert, 1024);
     assert_eq!(
-        fitting_prefill_piece(1024, 2041, just_fits, expert).unwrap(),
+        fitting_prefill_piece(1024, 2041, just_fits, expert, false).unwrap(),
         1024
     );
     assert_eq!(
-        fitting_prefill_piece(1024, 2041, just_fits - 1, expert).unwrap(),
+        fitting_prefill_piece(1024, 2041, just_fits - 1, expert, false).unwrap(),
         512
+    );
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, remaining, expert, true).unwrap(),
+        fitting_prefill_piece(1024, 32768, remaining, expert, true).unwrap(),
+        "flash workspace is independent of prompt span"
     );
 }
 
@@ -704,6 +713,7 @@ impl ExecutorOps for FlintExecutor {
                     prompt_rows as u32,
                     memory.remaining_bytes,
                     self.model.streamed_expert_bytes,
+                    self.flash_prefill,
                 )?);
             }
             st.request_prefill_piece = NonZeroUsize::new(rows);
