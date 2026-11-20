@@ -53,7 +53,11 @@ fn an_entry_without_a_manifest_stops_startup_and_names_the_engine_and_the_key() 
     let text = stderr(&output);
     assert!(text.contains("engine flash failed to start"), "{text}");
     assert!(
-        text.contains("manifest is missing and FLASH_NEXT_ARTIFACT_MANIFEST is not set"),
+        text.contains("manifest is missing: set the manifest key or FLASH_NEXT_ARTIFACT_MANIFEST"),
+        "{text}"
+    );
+    assert!(
+        text.contains("download-manifest.json in the model directory"),
         "{text}"
     );
 }
