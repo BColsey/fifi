@@ -91,23 +91,24 @@ The 16 GB M4 mini has four performance cores and six efficiency cores. The pool 
 | 8 | 27.46 ms | 37.26 ms |
 | 10 | 25.93 ms | 38.79 ms |
 
-The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts. [Sample times and I/O measurements](../../scripts/benchmarks/mac-m4-nemotron35-cpu-layer.csv)
+The fresh six-thread trial took 169.78 ms for its first call and 127.59 ms at p50 over 11 subsequent calls. The trial attributed 710.5 MB of SSD reads and 45,090 page-ins to its process. Four threads gave the lowest warm median in this single-layer scalar study. These measurements cover one routed layer and the tested mix of selected experts.
 
-Build the ignored test on Apple Silicon, then run its separate processes with the driver below. Build the [process I/O counter](../../scripts/mac_cache_study/proc-io.c). The test prints the runner path after compilation.
+Run the ignored profiler on Apple Silicon with a pinned layer directory and a process I/O counter. The counter takes a process ID and prints a JSON object with cumulative `bytes_read` and `pageins` fields. Start a fresh process for each thread count.
 
 ```sh
 cd engine
-cargo test --locked --release --test nemotron35_cpu_expert_profile --no-run
-cd ..
-python3 scripts/mac_cache_study/nemotron35_cpu_profile.py \
-  "$NEM35_PROFILE_RUNNER" "$NEM35_LAYER1_DIR" "$SCRATCH/proc-io" "$SCRATCH/nemotron35-profile"
+NEM35_CPU_PROFILE_CHECKPOINT="$NEM35_LAYER1_DIR" \
+NEM35_CPU_PROFILE_THREADS=4 NEM35_CPU_PROFILE_ITERATIONS=31 \
+NEM35_CPU_PROFILE_LAYER=1 NEM35_CPU_PROFILE_PROC_IO="$PROC_IO_COUNTER" \
+  cargo test --locked --release --test nemotron35_cpu_expert_profile \
+  profile_pinned_nemotron_mapped_experts -- --ignored --nocapture
 ```
 
 ### Compare the NEON NVFP4 kernel
 
 `FIFI_NEM35_CPU_NEON=1` selects a vector dot product for the mapped CPU expert pool on Apple Silicon. It decodes the E2M1 nibbles with a NEON table lookup and accumulates F32 products in four lanes. The existing scalar path remains the default. The numerical suite checks short and production-width matrices, multi-row batches, refusal cases, and reproducibility across thread counts.
 
-The paired run on the same layer 1 shard alternated scalar and NEON with each thread count, using 31 timed calls in each of 12 arms. The Flash-Next transfer was paused for this measurement. The table compares paired medians within this run.
+The paired run on the same layer 1 shard alternated scalar and NEON with each thread count, using 31 timed calls in each of 12 arms. The table compares paired medians within this run.
 
 | Threads | Scalar p50 | NEON p50 | Scalar p90 | NEON p90 |
 | ---: | ---: | ---: | ---: | ---: |
@@ -115,9 +116,9 @@ The paired run on the same layer 1 shard alternated scalar and NEON with each th
 | 4 | 10.47 ms | 3.56 ms | 11.10 ms | 3.89 ms |
 | 6 | 8.60 ms | 3.10 ms | 8.89 ms | 3.45 ms |
 
-At four threads the paired median was 2.94 times faster. All four- and six-thread arms recorded zero SSD reads and zero page-ins. The first one-thread scalar process attributed 28.2 MB of reads across setup and its calls, and the remaining one-thread processes recorded zero. This step measures the CPU expert layer. Full-model quality and a default selection remain open. [Per-arm measurements](../../scripts/benchmarks/mac-m4-nemotron35-neon-ab.csv)
+At four threads the paired median was 2.94 times faster. All four- and six-thread arms recorded zero SSD reads and zero page-ins. The first one-thread scalar process attributed 28.2 MB of reads across setup and its calls, and the remaining one-thread processes recorded zero. This step measures the CPU expert layer. Full-model quality and a default selection remain open.
 
-Repeat the same profiler command with `--compare-neon` and a fresh output directory.
+Run the profiler in a fresh process with `FIFI_NEM35_CPU_NEON=1` to measure the NEON kernel.
 
 ## See also
 
