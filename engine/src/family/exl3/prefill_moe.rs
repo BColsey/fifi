@@ -561,8 +561,8 @@ pub(in crate::family) fn run_store(
             if !resident.order.is_empty() {
                 routed_plan(projector, members, &sub_bufs, sub_dims, resident, pair)?;
             }
+            bank.wait_ring(projector.launch.stream)?;
             if !streamed.order.is_empty() {
-                bank.wait_ring(projector.launch.stream)?;
                 routed_plan(projector, ring, &sub_bufs, sub_dims, streamed, pair)?;
             }
         } else {

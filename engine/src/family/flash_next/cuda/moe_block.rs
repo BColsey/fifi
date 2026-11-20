@@ -349,6 +349,7 @@ mod device {
                     prefill_adapter::device::{LayerStore, PrefillAdapter, RingStore},
                 },
                 moe::slot_bank::SlotBankLayout,
+                settings::RingUploads,
             },
             project::{
                 cuda::{
@@ -651,7 +652,7 @@ mod device {
             ctx: &CudaContext,
             budget: usize,
             min_rows: usize,
-            selected: bool,
+            uploads: RingUploads,
         ) -> Result<usize, EngError> {
             let geometry = *self.bank.geometry();
             let streamed = geometry
@@ -668,8 +669,10 @@ mod device {
                 return Ok(0);
             }
             let slots = ring.ring_slots();
-            if selected {
-                ring.enable_selected();
+            match uploads {
+                RingUploads::Eager => {}
+                RingUploads::Selected => ring.enable_selected(),
+                RingUploads::Lookahead => ring.enable_lookahead(geometry),
             }
             self.ring = Some(ring);
             self.ring_min_rows = min_rows;
@@ -713,6 +716,7 @@ mod device {
                 self.bank.synchronize_store(layer, ring.copy_stream())?;
             }
             ring.set_active(false);
+            ring.clear_history();
             Ok(())
         }
 
@@ -1021,6 +1025,8 @@ mod device {
                 let ring = self.ring.as_mut().expect("active ring");
                 if !ring.is_selected() {
                     ring.issue_through(launch.ctx, &mut self.bank, layer + 1)?;
+                } else if layer == 0 {
+                    ring.issue_first(launch.ctx, &mut self.bank)?;
                 }
             }
             self.route(launch, layer, bufs, dims)?;

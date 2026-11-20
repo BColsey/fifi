@@ -209,3 +209,82 @@ fn selected_ring_copies_unique_misses_and_preserves_reads_across_wrap() {
         assert_eq!(bytes, expected(layer, expert, record));
     }
 }
+
+#[test]
+#[ignore = "needs a GPU (under 1 GiB)"]
+fn lookahead_reuses_predictions_and_fills_misses_after_slot_conflicts() {
+    assert!(device_present("Flash-Next prefill ring lookahead"));
+    let record = 9216;
+    let geometry = BankGeometry::new(2, 12, 2, 4, record).unwrap();
+    let row = [0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1];
+    let rows: Vec<&[i32]> = vec![row.as_slice(); geometry.layers];
+    let counts = vec![vec![0; geometry.experts]; geometry.layers];
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
+    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
+
+    let projector = crate::family::project::cuda::CudaProjector::new().unwrap();
+    let ctx = projector.context();
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &HostMemory {
+            total: 62 << 30,
+            available: 55 << 30,
+        },
+        &HostTerms::DEFAULT,
+    )
+    .unwrap();
+    let mut bank = DeviceBank::build(ctx, state, &Pattern, &plan, None).unwrap();
+    let compute = ctx.stream().unwrap();
+    let captured = ctx.allocate(4 * record).unwrap();
+    let mut ring = PrefillRing::build(ctx, geometry, 12).unwrap();
+    ring.replan(&bank);
+    ring.enable_lookahead(geometry);
+    let before = bank.prefill_report().upload_bytes;
+    ring.issue_first(ctx, &mut bank).unwrap();
+    for layer in 0..2 {
+        ring.issue_selected(ctx, &mut bank, layer, &[4, 8]).unwrap();
+        ring.wait_layer(&compute, layer).unwrap();
+        ring.free_layer(&compute, layer).unwrap();
+    }
+    let uploads = |bank: &DeviceBank| (bank.prefill_report().upload_bytes - before) / record as u64;
+    assert_eq!(uploads(&bank), 4);
+
+    // A scheduler piece reopens the plan. Layer 0 preloads the two preceding picks,
+    // including expert 4, whose slot conflicts with layer 1's predicted expert 8.
+    ring.replan(&bank);
+    assert_eq!(ring.slot_of(0, 4), ring.slot_of(1, 8));
+    ring.issue_first(ctx, &mut bank).unwrap();
+    assert_eq!(uploads(&bank), 6);
+    let batches = [(0, &[8][..]), (1, &[4, 8, 10][..])];
+    let mut index = 0;
+    for (layer, picks) in batches {
+        ring.issue_selected(ctx, &mut bank, layer, picks).unwrap();
+        assert_eq!(uploads(&bank), if layer == 0 { 7 } else { 9 });
+        ring.wait_layer(&compute, layer).unwrap();
+        for &expert in picks {
+            let slot = usize::from(ring.slot_of(layer, expert as u16).unwrap());
+            ctx.copy_device(
+                &compute,
+                ring.slots().range(slot * record, record).unwrap(),
+                captured.range(index * record, record).unwrap(),
+            )
+            .unwrap();
+            index += 1;
+        }
+        ring.free_layer(&compute, layer).unwrap();
+    }
+    let mut got = vec![0; 4 * record];
+    captured.read_at(&compute, 0, &mut got).unwrap();
+    for (bytes, (layer, expert)) in got
+        .chunks_exact(record)
+        .zip([(0, 8), (1, 4), (1, 8), (1, 10)])
+    {
+        assert_eq!(bytes, expected(layer, expert, record));
+    }
+
+    ring.clear_history();
+    ring.replan(&bank);
+    ring.issue_first(ctx, &mut bank).unwrap();
+    assert_eq!(uploads(&bank), 9);
+}

@@ -1,7 +1,7 @@
 //! The prefill expert ring streams records from a frozen pinned store to a separate copy
 //! stream. The eager path queues nonresident experts ahead in layer-major order. The
-//! routed path queues only selected nonresident experts and overlaps their copies with
-//! the shared and resident experts of the same layer.
+//! routed path queues selected nonresident experts. The lookahead variant also uses
+//! the preceding chunk's picks to start the next layer's copies before its router runs.
 //!
 //! Ordering discipline (the same shape as the bank's twice-reviewed copy tail): a ring slot's
 //! next H2D copy on the copy stream waits the `used` event the compute stream recorded after
@@ -62,6 +62,13 @@ pub(super) mod device {
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream},
     };
 
+    struct Lookahead {
+        /// Exact routed picks, replaced layer by layer as each chunk runs.
+        routes: Vec<Vec<bool>>,
+        /// Copies issued for the next layer in slots the current layer does not hold.
+        next: Vec<StreamEntry>,
+    }
+
     /// The ring's device side: `ring` record slots laid out like one bank layer, plus one copy
     /// stream whose H2D copies run behind the compute stream via per-slot events.
     pub(in crate::family::flash_next) struct PrefillRing {
@@ -81,6 +88,7 @@ pub(super) mod device {
         /// When enabled, the current layer's issued entries. Only these slots have copy
         /// obligations for the layer. The eager path tracks its horizon with `issued`.
         selected: Option<Vec<StreamEntry>>,
+        lookahead: Option<Lookahead>,
         record: usize,
         ring: usize,
         /// Whether a chunked prefill window is open.
@@ -118,6 +126,7 @@ pub(super) mod device {
                 freed: 0,
                 issued: 0,
                 selected: None,
+                lookahead: None,
                 record: geometry.record_bytes,
                 ring,
                 active: false,
@@ -226,6 +235,76 @@ pub(super) mod device {
             self.selected = Some(Vec::with_capacity(self.per_layer));
         }
 
+        pub(in crate::family::flash_next) fn enable_lookahead(&mut self, geometry: BankGeometry) {
+            self.enable_selected();
+            self.lookahead = Some(Lookahead {
+                routes: vec![vec![false; geometry.experts]; geometry.layers],
+                next: Vec::with_capacity(self.per_layer),
+            });
+        }
+
+        /// Start a new request without routing history from an earlier context.
+        pub(in crate::family::flash_next) fn clear_history(&mut self) {
+            if let Some(lookahead) = &mut self.lookahead {
+                for layer in &mut lookahead.routes {
+                    layer.fill(false);
+                }
+            }
+        }
+
+        pub(in crate::family::flash_next) fn issue_first(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+        ) -> Result<(), EngError> {
+            self.issue_prediction(ctx, bank, 0)
+        }
+
+        /// Issues one layer's predictions from the previous chunk. Current DMA and
+        /// projection obligations keep their slots until `free_layer`.
+        fn issue_prediction(
+            &mut self,
+            ctx: &CudaContext,
+            bank: &mut DeviceBank,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            let Some(predicted) = self.lookahead.as_ref().and_then(|v| v.routes.get(layer)) else {
+                return Ok(());
+            };
+            let selected = self
+                .selected
+                .as_ref()
+                .expect("lookahead uses selected uploads");
+            let mut held = vec![false; self.ring];
+            for entry in selected {
+                held[usize::from(entry.slot)] = true;
+            }
+            let copies: Vec<_> = self
+                .layer_entries(layer)
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    predicted[usize::from(entry.expert)] && !held[usize::from(entry.slot)]
+                })
+                .collect();
+            for entry in copies {
+                self.issue(ctx, bank, entry)?;
+                if layer == self.freed {
+                    self.selected
+                        .as_mut()
+                        .expect("lookahead uses selected uploads")
+                        .push(entry);
+                } else {
+                    self.lookahead
+                        .as_mut()
+                        .expect("lookahead enabled")
+                        .next
+                        .push(entry);
+                }
+            }
+            Ok(())
+        }
+
         pub(in crate::family::flash_next) fn is_selected(&self) -> bool {
             self.selected.is_some()
         }
@@ -250,12 +329,24 @@ pub(super) mod device {
                     EngError::BadRequest("prefill ring: a selected expert is out of range".into())
                 })? = true;
             }
+            // The current layer already holds any prefetched entries that survived
+            // the preceding layer's slot check. A requested resident stays in the bank.
+            let selected = self.selected.as_ref().expect("selected ring");
+            let mut issued = vec![false; wanted.len()];
+            for entry in selected {
+                issued[usize::from(entry.expert)] = true;
+            }
             for i in self.layer_start[layer]..self.layer_start[layer + 1] {
                 let entry = self.entries[i];
-                if wanted[usize::from(entry.expert)] {
+                let expert = usize::from(entry.expert);
+                if wanted[expert] && !issued[expert] {
                     self.issue(ctx, bank, entry)?;
                     self.selected.as_mut().expect("selected ring").push(entry);
                 }
+            }
+            if let Some(lookahead) = &mut self.lookahead {
+                lookahead.routes[layer] = wanted;
+                self.issue_prediction(ctx, bank, layer + 1)?;
             }
             Ok(())
         }
@@ -268,6 +359,9 @@ pub(super) mod device {
             self.issued = 0;
             if let Some(selected) = &mut self.selected {
                 selected.clear();
+            }
+            if let Some(lookahead) = &mut self.lookahead {
+                lookahead.next.clear();
             }
         }
 
@@ -347,6 +441,9 @@ pub(super) mod device {
             }
             if let Some(selected) = &mut self.selected {
                 selected.clear();
+                if let Some(lookahead) = &mut self.lookahead {
+                    std::mem::swap(selected, &mut lookahead.next);
+                }
             }
             self.freed += 1;
             Ok(())

@@ -534,15 +534,39 @@ impl FlashSettings {
     }
 }
 
-/// Whether the CUDA expert ring copies only the current layer's selected misses.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(in crate::family::flash_next) fn ring_selected() -> Result<bool, EngError> {
-    match std::env::var_os("INFERENCE_FLASH_NEXT_RING_SELECTED") {
-        None => Ok(false),
-        Some(value) if value == "1" => Ok(true),
-        Some(_) => Err(EngError::BadRequest(
-            "INFERENCE_FLASH_NEXT_RING_SELECTED must be unset or \"1\"".into(),
-        )),
+#[derive(Clone, Copy)]
+pub(in crate::family::flash_next) enum RingUploads {
+    Eager,
+    Selected,
+    Lookahead,
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl RingUploads {
+    pub(in crate::family::flash_next) fn from_env() -> Result<Self, EngError> {
+        let enabled = |name: &str| match std::env::var_os(name) {
+            None => Ok(false),
+            Some(value) if value == "1" => Ok(true),
+            Some(_) => Err(EngError::BadRequest(format!(
+                "{name} must be unset or \"1\""
+            ))),
+        };
+        let selected = enabled("INFERENCE_FLASH_NEXT_RING_SELECTED")?;
+        let lookahead = enabled("INFERENCE_FLASH_NEXT_RING_LOOKAHEAD")?;
+        Ok(match (selected, lookahead) {
+            (_, true) => Self::Lookahead,
+            (true, false) => Self::Selected,
+            (false, false) => Self::Eager,
+        })
+    }
+
+    pub(in crate::family::flash_next) fn label(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Selected => "selected",
+            Self::Lookahead => "lookahead",
+        }
     }
 }
 
