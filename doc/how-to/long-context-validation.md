@@ -138,3 +138,27 @@ sampled by the engine for each verified turn. It also lists depths refused by
 the advertised context limit. Allocator reserves, temporary copy buffers and
 GPU memory high-water marks need separate measurements. Keep one log per server
 process because request IDs can repeat after restart.
+
+## Read the result
+
+The JSON result records the counted prompt and completion tokens, prefix reuse,
+finish reason, expected codes, answer, and `recall_passed`. A passing recall
+requires all three codes in order and a normal `stop` finish. A truncated or
+incorrect answer is saved as a completed failure and the command exits with
+status 2. A missing token count, unconfirmed cold prompt, or incomplete stream
+leaves a `.partial` failure record and exits with status 1. Existing output and
+partial files are not overwritten.
+
+`estimated_prompt_tokens_per_second` divides the server-counted prompt by the
+time until the first visible streamed content. It includes tokenization,
+queueing, and response overhead. When a matching completed server record is
+available, `server_prefill_ms` measures engine start to the first generated
+batch, and `server_prompt_tokens_per_second` divides the cold prompt count by
+that interval. It includes the first-batch work, so it is also an estimate.
+`server_queue_wait_ms` and `server_decode_tokens_per_second` come from the same
+record when those fields are available. Stream chunks are never counted as
+tokens.
+
+This synthetic check does not establish coding quality, multi-turn behavior,
+device isolation, or exact build identity. Record the running binary, model,
+hardware, and isolation separately when using the result as performance evidence.
