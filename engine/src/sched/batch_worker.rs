@@ -23,7 +23,7 @@ use crate::tokenizer::{DecodeBatch, DecodeFinish};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 struct Slot<S> {
@@ -77,8 +77,10 @@ pub(super) struct TickCounters {
     host_ns: AtomicU64,
     /// Sessions the executor allocated for the pool.
     sessions_created: AtomicU64,
-    /// Jobs that took a pooled session.
+    /// Jobs that took a pooled session that had served a job before.
     sessions_reused: AtomicU64,
+    /// Sessions released because the engine sat idle.
+    sessions_trimmed: AtomicU64,
 }
 
 /// A copy of the counters at one moment.
@@ -93,6 +95,7 @@ pub(super) struct TickSnapshot {
     pub(super) host_ns: u64,
     pub(super) sessions_created: u64,
     pub(super) sessions_reused: u64,
+    pub(super) sessions_trimmed: u64,
 }
 
 impl TickCounters {
@@ -108,6 +111,7 @@ impl TickCounters {
             host_ns: read(&self.host_ns),
             sessions_created: read(&self.sessions_created),
             sessions_reused: read(&self.sessions_reused),
+            sessions_trimmed: read(&self.sessions_trimmed),
         }
     }
 
@@ -153,28 +157,43 @@ impl Drop for TickTimer<'_> {
     }
 }
 
-/// The sessions that no slot holds. Each is reset by `setup_slot` when a job takes it.
+/// The sessions that no slot holds. Each is reset by `setup_slot` when a job takes it. A session
+/// that has served a job is `used`: the seed the executor built at start is not, so taking it is
+/// not counted as a reuse.
 struct Pool<'a, S> {
-    free: Vec<S>,
+    free: Vec<(S, bool)>,
     counters: &'a TickCounters,
+    /// How long the engine may sit with no request before the pool keeps one session.
+    idle_trim: Option<Duration>,
 }
 
 impl<'a, S> Pool<'a, S> {
-    fn new(first: S, counters: &'a TickCounters) -> Self {
+    fn new(first: S, counters: &'a TickCounters, idle_trim: Option<Duration>) -> Self {
         Self {
-            free: vec![first],
+            free: vec![(first, false)],
             counters,
+            idle_trim,
         }
     }
 
     fn take(&mut self) -> Option<S> {
-        let session = self.free.pop()?;
-        TickCounters::add(&self.counters.sessions_reused, 1);
+        let (session, used) = self.free.pop()?;
+        if used {
+            TickCounters::add(&self.counters.sessions_reused, 1);
+        }
         Some(session)
     }
 
     fn give(&mut self, session: S) {
-        self.free.push(session);
+        self.free.push((session, true));
+    }
+
+    /// Releases every pooled session but one, which keeps a lone client's next request from
+    /// paying an allocation.
+    fn trim_to_one(&mut self) {
+        let extra = self.free.len().saturating_sub(1);
+        self.free.truncate(1);
+        TickCounters::add(&self.counters.sessions_trimmed, extra as u64);
     }
 }
 
@@ -545,7 +564,7 @@ pub(super) fn work<E: ExecutorOps>(
     max_seqs: usize,
 ) {
     let share = executor.prompt_rows_per_tick();
-    let mut pool = Pool::new(session, &shared.ticks);
+    let mut pool = Pool::new(session, &shared.ticks, executor.session_idle_trim());
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
     // The job that capacity refused while other slots were live, and the number of live slots at
     // the refusal.
@@ -576,7 +595,17 @@ pub(super) fn work<E: ExecutorOps>(
                 None => {
                     let message = if slots.is_empty() {
                         shared.set_state(EngineState::Ready);
-                        jobs.recv().ok()
+                        match pool.idle_trim {
+                            Some(trim) => match jobs.recv_timeout(trim) {
+                                Ok(message) => Some(message),
+                                Err(RecvTimeoutError::Timeout) => {
+                                    pool.trim_to_one();
+                                    continue;
+                                }
+                                Err(RecvTimeoutError::Disconnected) => None,
+                            },
+                            None => jobs.recv().ok(),
+                        }
                     } else {
                         jobs.try_recv().ok()
                     };

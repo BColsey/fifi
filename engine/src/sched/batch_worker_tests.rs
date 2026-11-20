@@ -116,6 +116,8 @@ struct WindowFake {
     created: usize,
     /// The window row that is denied its growth every time.
     deny_slot: Option<usize>,
+    /// How long the fake lets the engine idle before the pool trims; `None` never trims.
+    idle_trim: Option<Duration>,
 }
 
 impl WindowFake {
@@ -149,6 +151,7 @@ impl WindowFake {
             session_cap: None,
             created: 1,
             deny_slot: None,
+            idle_trim: None,
         }
     }
 
@@ -198,6 +201,10 @@ impl ExecutorOps for WindowFake {
 
     fn prompt_rows_per_tick(&self) -> Option<usize> {
         self.prompt_share
+    }
+
+    fn session_idle_trim(&self) -> Option<Duration> {
+        self.idle_trim
     }
 
     fn new_session(&mut self) -> Result<Row, EngError> {
@@ -2226,7 +2233,10 @@ fn a_finished_session_serves_the_next_job_without_a_new_allocation() {
     }
     let counts = snapshot(&engine);
     assert_eq!(counts.sessions_created, 0, "{counts:?}");
-    assert_eq!(counts.sessions_reused, 3, "{counts:?}");
+    assert_eq!(
+        counts.sessions_reused, 2,
+        "the seed's first job is not a reuse: {counts:?}"
+    );
     assert!(
         !lock(&log).calls.iter().any(|call| call == "new_session"),
         "the seed session served every job"
@@ -2249,7 +2259,7 @@ fn two_live_jobs_allocate_one_session_and_return_both_to_the_pool() {
     }
     let counts = snapshot(&engine);
     assert_eq!(counts.sessions_created, 1, "{counts:?}");
-    assert_eq!(counts.sessions_reused + counts.sessions_created, 4);
+    assert_eq!(counts.sessions_reused + counts.sessions_created, 3);
     engine.shutdown();
 }
 
@@ -2515,5 +2525,36 @@ fn a_denied_row_waits_for_its_peer_and_a_lone_denied_row_is_refused() {
             "row growth denied".into()
         ))]
     );
+    engine.shutdown();
+}
+
+#[test]
+fn an_idle_engine_releases_its_pooled_sessions_but_one() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 3;
+    fake.idle_trim = Some(Duration::from_millis(60));
+    let (engine, release) = start(fake);
+    let mut events = Vec::new();
+    for round in 0..3u32 {
+        let (next, next_events) = job(&[round], 6);
+        engine.handle().try_submit(next).expect("submit");
+        events.push(next_events);
+    }
+    release.send(()).expect("load");
+    for next_events in events {
+        collect(next_events);
+    }
+    assert_eq!(
+        snapshot(&engine).sessions_created,
+        2,
+        "three slots, the seed and two more"
+    );
+    wait(|| snapshot(&engine).sessions_trimmed == 2);
+    // The engine still serves: the kept session takes the next job without an allocation.
+    let (again, again_events) = job(&[0], 2);
+    engine.handle().try_submit(again).expect("again");
+    assert_eq!(usage(&collect(again_events)).completion_tokens, 2);
+    assert_eq!(snapshot(&engine).sessions_created, 2);
     engine.shutdown();
 }

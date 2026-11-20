@@ -10,6 +10,13 @@ use std::sync::atomic::AtomicBool;
 
 type Result<T> = std::result::Result<T, EngError>;
 
+/// How long a batch engine sits with no request before it keeps one session. A chat user pauses
+/// for seconds between turns, so a pool that outlives that spares the next burst its allocations;
+/// a pool that outlives minutes holds the memory of a burst (seven sessions on a Bolt engine is
+/// 6.5 GiB) for the life of the process.
+pub(crate) const DEFAULT_SESSION_IDLE_TRIM: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// Per-job generation state. The executor feeds the decoder inside `decode`.
 pub(crate) struct GenerationState {
     pub(crate) decoder: IncrementalDecoder,
@@ -78,6 +85,11 @@ pub(crate) trait ExecutorOps {
         Err(EngError::BadRequest(
             "this executor does not support decode windows".into(),
         ))
+    }
+    /// How long the batch worker may sit with no request before it releases every pooled session
+    /// but one. `None` keeps every session for the life of the engine.
+    fn session_idle_trim(&self) -> Option<std::time::Duration> {
+        Some(DEFAULT_SESSION_IDLE_TRIM)
     }
     /// The prompt rows the batch worker feeds per tick, over all cold slots together, while a
     /// stream decodes, beside the decode rows. `None` keeps the worker's rule: the planned piece
