@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use super::error::ServerError;
-use super::state::{AppState, RemoveRefused, engine_error_info};
+use super::state::{AddRefused, AppState, MAX_RUNTIME_ENGINES, RemoveRefused, engine_error_info};
 use super::wire::state_name;
 use crate::EngError;
 
@@ -37,6 +37,7 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json:
                 "state": state_name(entry.handle.state()),
                 "context_limit": entry.context_limit,
                 "runtime_added": state.owns_engine(&entry.id),
+                "memory_held_until_restart": entry.memory_held_until_restart(),
             });
             let cells = row.as_object_mut().expect("row is an object");
             // The stage and the failure are present only when there is
@@ -68,6 +69,28 @@ pub(crate) struct AddEngineRequest {
     tokenizer_dir: Option<String>,
 }
 
+/// An engine id is one plain token, never a dotted name: it becomes a header value, a log
+/// field and a URL segment.
+pub(crate) fn valid_engine_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// The message of a refused derivation without the caller's paths: the
+/// cause stays, the directory names become `<model_dir>` and
+/// `<tokenizer_dir>`, so the answer does not map the host's filesystem.
+fn scrub_paths(message: &str, model_dir: &Path, tokenizer_dir: Option<&Path>) -> String {
+    let mut text = message.to_string();
+    if let Some(dir) = tokenizer_dir {
+        text = text.replace(&dir.display().to_string(), "<tokenizer_dir>");
+    }
+    text.replace(&model_dir.display().to_string(), "<model_dir>")
+}
+
 /// POST /v1/engines — start one engine at runtime.
 ///
 /// The derivation runs on a blocking thread: `build_config` is the
@@ -78,9 +101,23 @@ pub(crate) async fn add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddEngineRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ServerError> {
-    let model_dir = PathBuf::from(body.model_dir.trim());
-    if model_dir.as_os_str().is_empty() {
+    let requested = body.model_dir.trim().to_string();
+    if requested.is_empty() {
         return Err(EngError::BadRequest("model_dir is required".into()).into());
+    }
+    if let Some(id) = &body.id
+        && !valid_engine_id(id)
+    {
+        return Err(EngError::BadRequest(
+            "id must be 1 to 64 characters of letters, digits, '.', '_' or '-'".into(),
+        )
+        .into());
+    }
+    if state.runtime_engine_count() >= MAX_RUNTIME_ENGINES {
+        return Err(EngError::BadRequest(format!(
+            "{MAX_RUNTIME_ENGINES} engines added at runtime are already running; stop one first"
+        ))
+        .into());
     }
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     if crate::family::mlx_budget::enabled() {
@@ -94,9 +131,17 @@ pub(crate) async fn add(
         )
         .into());
     }
+    // An `org/repo` id names the cached snapshot of its `main` ref, read
+    // from this server's own hub cache.
+    let mut model_dir = PathBuf::from(&requested);
+    if !model_dir.exists()
+        && let Some(snapshot) = state.hf().main_snapshot(&requested)
+    {
+        model_dir = snapshot;
+    }
     let id = match &body.id {
         Some(id) => id.clone(),
-        None => default_id(&model_dir, &state),
+        None => default_id(&model_dir, &requested, &state),
     };
     if state.engine_exists(&id) {
         return Err(EngError::BadRequest(format!(
@@ -104,17 +149,21 @@ pub(crate) async fn add(
         ))
         .into());
     }
+    let tokenizer_dir = body.tokenizer_dir.clone().map(PathBuf::from);
+    let derive = state.derive();
+    let scrub_model = model_dir.clone();
+    let scrub_tokenizer = tokenizer_dir.clone();
     let derivation = tokio::task::spawn_blocking(move || {
         let args = crate::server::model_serve::ModelServeArgs {
             model_dir,
-            tokenizer_dir: body.tokenizer_dir.map(PathBuf::from),
+            tokenizer_dir,
             family: body.family.clone(),
             context_limit: body.context_limit,
             kv_dtype: body.kv_dtype.clone(),
             listen: None,
             print_config: false,
         };
-        let mut config = crate::server::model_serve::build_config(&args)?;
+        let mut config = derive(&args)?;
         let mut engines = std::mem::take(&mut config.engines);
         if engines.is_empty() {
             return Err(crate::server::StartupError(
@@ -127,22 +176,44 @@ pub(crate) async fn add(
         Ok::<_, crate::server::StartupError>((config.prefix_reuse, engine_config))
     })
     .await
-    .map_err(|error| EngError::BadRequest(format!("engine derivation failed: {error}")))?
-    .map_err(|error| EngError::BadRequest(error.to_string()))?;
+    .map_err(|_| EngError::BadRequest("engine derivation failed".into()))?
+    .map_err(|error| {
+        EngError::BadRequest(scrub_paths(
+            &error.to_string(),
+            &scrub_model,
+            scrub_tokenizer.as_deref(),
+        ))
+    })?;
     let (file_prefix_reuse, mut engine_config) = derivation;
     engine_config.id = id.clone();
+    refuse_pinned_family(&state, &engine_config.family)?;
     let started = tokio::task::spawn_blocking(move || {
         crate::server::run::start_one(&engine_config, file_prefix_reuse)
     })
     .await
-    .map_err(|error| EngError::BadRequest(format!("engine start failed: {error}")))?
-    .map_err(|error| EngError::BadRequest(error.to_string()))?;
-    let (engine, entry) = started;
-    let Some(shared) = state.add_engine(entry, engine) else {
-        return Err(EngError::BadRequest(format!(
-            "engine {id} already exists; pass a different id"
+    .map_err(|_| EngError::BadRequest("engine start failed".into()))?
+    .map_err(|error| {
+        EngError::BadRequest(scrub_paths(
+            &error.to_string(),
+            &scrub_model,
+            scrub_tokenizer.as_deref(),
         ))
-        .into());
+    })?;
+    let (engine, entry) = started;
+    let shared = match state.try_add_engine(entry, engine) {
+        Ok(shared) => shared,
+        Err(AddRefused::IdTaken) => {
+            return Err(EngError::BadRequest(format!(
+                "engine {id} already exists; pass a different id"
+            ))
+            .into());
+        }
+        Err(AddRefused::TooMany) => {
+            return Err(EngError::BadRequest(format!(
+                "{MAX_RUNTIME_ENGINES} engines added at runtime are already running; stop one first"
+            ))
+            .into());
+        }
     };
     if !cfg!(test) {
         crate::server::run::spawn_stage_reporter(std::slice::from_ref(&shared));
@@ -158,17 +229,66 @@ pub(crate) async fn add(
     ))
 }
 
-/// The engine id when the request carries none: the directory's own
-/// name, and when that is taken, the first free `-2`, `-3`, …
-/// suffix. Derived from the snapshot directory of a hub download,
-/// this is the repo name — readable in the picker without any
-/// configuration.
-fn default_id(model_dir: &Path, state: &AppState) -> String {
-    let base = model_dir
-        .file_name()
+/// Refuses a start whose family keeps its memory for the life of the
+/// process once an engine of it ran: the answer names the engine and
+/// the way out, instead of contending for memory the family still holds.
+fn refuse_pinned_family(state: &AppState, family: &str) -> Result<(), EngError> {
+    if !super::run::holds_memory_until_restart(family) {
+        return Ok(());
+    }
+    let Some((holder, running)) = state.pinned_holder(family) else {
+        return Ok(());
+    };
+    Err(EngError::BadRequest(if running {
+        format!(
+            "the {family} family keeps its memory for the life of the process and engine \
+             {holder} already serves it; this server runs one engine of the family"
+        )
+    } else {
+        format!(
+            "engine {holder} of the {family} family was stopped, but the family keeps its \
+             memory until the server process exits: restart the server to free card memory, \
+             then start the engine again"
+        )
+    }))
+}
+
+/// The engine id when the request carries none: the repo name of a hub
+/// cache snapshot (its path is `models--org--name/snapshots/<commit>`,
+/// so the commit directory is not a name), or the directory's own name,
+/// or the repo part of an `org/name` request. When that is taken, the
+/// first free `-2`, `-3`, … suffix; characters outside the id rule
+/// become `-`.
+fn default_id(model_dir: &Path, requested: &str, state: &AppState) -> String {
+    let hub_repo = model_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .unwrap_or("engine")
-        .to_string();
+        .and_then(|name| name.strip_prefix("models--"))
+        .and_then(|name| name.rsplit("--").next());
+    let raw = hub_repo
+        .or_else(|| {
+            (!model_dir.exists() && requested.contains('/'))
+                .then(|| requested.rsplit('/').next())
+                .flatten()
+        })
+        .or_else(|| model_dir.file_name().and_then(|name| name.to_str()))
+        .unwrap_or("engine");
+    let mut base: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(56)
+        .collect();
+    if base.is_empty() {
+        base = "engine".to_string();
+    }
     if !state.engine_exists(&base) {
         return base;
     }
@@ -179,31 +299,50 @@ fn default_id(model_dir: &Path, state: &AppState) -> String {
     format!("{base}-{counter}")
 }
 
+/// What a stop of a process-lifetime family answers: the jobs end and
+/// the engine leaves the lists, but its memory stays allocated.
+pub(crate) const HELD_MEMORY_NOTE: &str =
+    "stopped; card memory returns when the server process restarts";
+
 /// DELETE /v1/engines/{id} — stop and remove one runtime-added
 /// engine. In-flight and queued jobs on it are cancelled; sessions
-/// bound to it rebind on their next request.
+/// bound to it rebind on their next request. The answer says whether
+/// the stop returned the engine's memory.
 pub(crate) async fn remove(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
+    if !valid_engine_id(&id) {
+        return Err(ServerError::NotFound("no such engine".into()));
+    }
     let id_for_stop = id.clone();
     let stopped = tokio::task::spawn_blocking(move || state.remove_engine(&id_for_stop))
         .await
-        .map_err(|error| EngError::BadRequest(format!("engine stop join failed: {error}")))?;
+        .map_err(|_| EngError::BadRequest("engine stop did not finish".into()))?;
     match stopped {
-        Ok((entry, report)) => Ok(Json(serde_json::json!({
-            "id": id,
-            "model": entry.model,
-            "state": "stopped",
-            "shutdown_failure": report.failure,
-        }))),
+        Ok((entry, report)) => {
+            let held = entry.memory_held_until_restart();
+            let mut body = serde_json::json!({
+                "id": id,
+                "model": entry.model,
+                "state": "stopped",
+                "shutdown_failure": report.failure,
+                "memory_released": !held,
+            });
+            if held {
+                body["memory_held_until_restart"] = true.into();
+                body["note"] = HELD_MEMORY_NOTE.into();
+            }
+            Ok(Json(body))
+        }
         Err(RemoveRefused::BootEngine) => Err(EngError::BadRequest(format!(
             "engine {id} was started by the configuration; only engines added at runtime can \
              be removed"
         ))
         .into()),
-        Err(RemoveRefused::Unknown) => {
-            Err(ServerError::NotFound(format!("engine {id} does not exist")))
+        Err(RemoveRefused::Unknown) => Err(ServerError::NotFound("no such engine".into())),
+        Err(RemoveRefused::ShuttingDown) => {
+            Err(EngError::BadRequest(format!("engine {id} is shutting down")).into())
         }
     }
 }

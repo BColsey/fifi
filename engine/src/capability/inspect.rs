@@ -95,9 +95,18 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
         // `entry.metadata()` does not traverse symlinks, and every file
         // of a hub-cache snapshot is a symlink into `blobs/` — follow the
         // entry's path so hub layouts count as the files they point at.
-        let metadata = std::fs::metadata(entry.path()).map_err(|error| {
-            checkpoint(format!("cannot stat {}: {error}", entry.path().display()))
-        })?;
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            // A link whose blob is gone (a half-finished download) names
+            // no file: skip it, the way a missing file is skipped.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(checkpoint(format!(
+                    "cannot stat {}: {error}",
+                    entry.path().display()
+                )));
+            }
+        };
         if metadata.is_file() {
             files.push(FileFact {
                 name: entry.file_name().to_string_lossy().into_owned(),
@@ -277,6 +286,22 @@ mod tests {
         let report = inspect(&dir, &dir).unwrap();
         assert_eq!(report.safetensors_files, 1);
         assert_eq!(report.weight_bytes(), 80);
+    }
+
+    #[test]
+    fn a_dangling_link_in_a_snapshot_is_skipped_not_fatal() {
+        let dir = scratch("danglinglink");
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("blobs/gone", dir.join("model-00002.safetensors")).unwrap();
+        let report = inspect(&dir, &dir).expect("a dangling link must not fail the inventory");
+        assert_eq!(report.safetensors_files, 0);
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| file.name != "model-00002.safetensors")
+        );
     }
 
     #[test]

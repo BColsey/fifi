@@ -17,7 +17,7 @@
 //! experimental feature is armed by this path: every other option is
 //! the resolver's own documented default.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::capability::probe::{CompiledBackends, HardwareFacts};
 use crate::capability::{Probe, describe_error, inspect, preflight};
@@ -167,10 +167,6 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     })
 }
 
-/// Discover the model, run the non-probing preflight, and build the
-/// in-memory `Config` for the existing serve path. Prints the chosen
-/// configuration and any qualification acknowledgement before the
-/// engines start.
 /// A `--model` argument that names an existing path is that path;
 /// anything else shaped like `org/repo` resolves to the hub cache
 /// snapshot of its `main` ref, and anything else is left for
@@ -191,6 +187,10 @@ fn resolve_model_dir(args: &ModelServeArgs) -> ModelServeArgs {
     args.clone()
 }
 
+/// Discover the model, run the non-probing preflight, and build the
+/// in-memory `Config` for the existing serve path. Prints the chosen
+/// configuration and any qualification acknowledgement before the
+/// engines start.
 pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
     // An `org/repo` id names a hub-cache download (the GUI's model
     // page, or `hf download`); a literal existing path always wins.
@@ -315,6 +315,61 @@ pub(crate) fn config_json(config: &Config) -> String {
         }],
     });
     serde_json::to_string_pretty(&document).expect("the built config is valid JSON")
+}
+
+/// The family `serve --model` would start for this directory, from
+/// the same inspection and the same selection: `Err` carries the words
+/// the CLI would refuse with. The hub cache listing uses it so its
+/// "servable" badge cannot disagree with the loader.
+pub(crate) fn servable_family(model_dir: &Path) -> Result<String, String> {
+    let inspection =
+        inspect::inspect(model_dir, model_dir).map_err(|error| describe_error(&error))?;
+    if inspection.gguf_files.is_empty() && inspection.safetensors_files == 0 {
+        return Err("no .gguf or .safetensors weight files".to_string());
+    }
+    select_family(&ModelServeArgs::default(), &inspection).map_err(|error| error.0)
+}
+
+/// The memory one engine of a downloaded snapshot needs, from the
+/// capability preflight's own estimate (the planner's closed-form cache
+/// and admission terms) with the weight term narrowed to the one
+/// quantization a serve loads.
+pub(crate) struct TierEstimate {
+    pub(crate) vram_bytes: u64,
+    pub(crate) ram_bytes: u64,
+    pub(crate) disk_bytes: u64,
+    pub(crate) basis: String,
+}
+
+pub(crate) fn estimate_tiers(model_dir: &Path, family: &str) -> Option<TierEstimate> {
+    let facts = HardwareFacts {
+        backends: CompiledBackends::of_this_build(),
+        cuda: no_cuda_facts(),
+        host: crate::capability::probe::probe_host(),
+    };
+    let candidate = preflight::Candidate {
+        family: Some(family.to_string()),
+        ..preflight::Candidate::default()
+    };
+    let report = preflight::preflight(model_dir, model_dir, &candidate, &facts).ok()?;
+    let estimate = report.estimate?;
+    let (weights, picked) = match crate::family::gguf_select::candidates(model_dir) {
+        Ok((_, candidates)) if !candidates.is_empty() => {
+            (candidates[0].bytes, "the largest GGUF quantization on disk")
+        }
+        _ => (estimate.weight_bytes, "the checkpoint files on disk"),
+    };
+    let other = estimate.total_bytes.saturating_sub(estimate.weight_bytes);
+    Some(TierEstimate {
+        vram_bytes: weights + other + estimate.admission_charges_bytes,
+        ram_bytes: weights,
+        disk_bytes: weights,
+        basis: format!(
+            "{picked} ({weights} bytes) plus the planner's cache, state and admission terms ({} bytes) at context {}",
+            other + estimate.admission_charges_bytes,
+            estimate.context_limit
+        ),
+    })
 }
 
 fn select_family(

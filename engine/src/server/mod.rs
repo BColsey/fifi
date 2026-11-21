@@ -18,6 +18,8 @@ mod family_registry_tests;
 #[cfg(test)]
 mod flint_tests;
 mod hf;
+#[cfg(test)]
+mod hf_tests;
 mod messages;
 mod model_serve;
 mod pieces;

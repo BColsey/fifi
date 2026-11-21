@@ -197,6 +197,7 @@ fn entry_with(
         defaults,
         effective,
         model_dir: std::path::PathBuf::new(),
+        family: "fake".to_string(),
     }
 }
 

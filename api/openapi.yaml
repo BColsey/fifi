@@ -1801,7 +1801,8 @@ components:
     EngineSummary:
       type: object
       required:
-        [id, model, model_dir, state, context_limit, runtime_added]
+        [id, model, model_dir, state, context_limit, runtime_added,
+         memory_held_until_restart]
       description: >-
         One engine of the runtime API: the fields the GUI's model
         page needs, including the directory the weights came from.
@@ -1827,6 +1828,12 @@ components:
           description: >-
             True when the runtime API (not the boot configuration)
             owns this engine, so DELETE /v1/engines/{id} can stop it.
+        memory_held_until_restart:
+          type: boolean
+          description: >-
+            True when the engine's family keeps its weights allocated for
+            the life of the process, so stopping the engine does not
+            return its card or host memory until the server restarts.
     HfDownloadJob:
       type: object
       required: [id, repo, revision, state]
@@ -1840,7 +1847,7 @@ components:
           type: string
         state:
           type: string
-          enum: [resolving, downloading, done, failed, cancelled]
+          enum: [downloading, done, failed, cancelled]
         commit:
           type: string
         files_total:
@@ -1853,21 +1860,33 @@ components:
           type: integer
         current_file:
           type: string
-        error:
+        detail:
           type: string
+          description: >-
+            The failure cause of a failed job; the snapshot path of a
+            finished one.
         estimate:
           $ref: "#/components/schemas/ResourceEstimate"
     ResourceEstimate:
       type: object
-      required: [vram_bytes, ram_bytes, disk_bytes, mode]
+      required: [vram_bytes, ram_bytes, disk_bytes, planned, basis, mode]
       description: >-
-        The resource tiers a pack needs, estimated from its weight
-        bytes. The engine picks the smallest tier that fits at serve
-        time, automatically: GPU-resident when the card carries the
-        weights, host-streamed when host memory does, disk-streamed
-        when neither does. Figures are the pack only; the runtime
-        working set is admitted per serve.
+        The resource tiers one engine of a model needs. The engine picks
+        the smallest tier that fits at serve time, automatically:
+        GPU-resident when the card carries the weights, host-streamed
+        when host memory does, disk-streamed when neither does. For a
+        snapshot on disk (planned true) the figures come from the
+        capability preflight's planner and count the one quantization a
+        serve loads plus the cache, state and admission terms. For a
+        file listing not yet downloaded (planned false) they are the
+        weight bytes of the largest quantization only. The runtime
+        working set is admitted at each serve.
       properties:
+        planned:
+          type: boolean
+        basis:
+          type: string
+          description: What the figures count.
         vram_bytes:
           type: integer
           description: The GPU-resident tier's weight bytes.
@@ -2508,7 +2527,10 @@ paths:
         resolved to the hub cache the way serve --model does. The
         load is asynchronous; the state surfaces report progress.
         Only engines this route added can be removed by
-        DELETE /v1/engines/{id}.
+        DELETE /v1/engines/{id}. An id is 1 to 64 characters of
+        letters, digits, dot, underscore or dash; at most eight
+        runtime engines run at once. Error text names directories as
+        model_dir and tokenizer_dir, not by their host paths.
       requestBody:
         required: true
         content:
@@ -2557,7 +2579,14 @@ paths:
       description: >-
         Stops one engine the runtime API added. In-flight and queued
         jobs on it are cancelled; sessions bound to it rebind on
-        their next request. Boot-configured engines are refused.
+        their next request. Boot-configured engines are refused. The
+        answer says whether the stop returned the engine's memory: the
+        Qwen3.6 and Flash-Next families allocate their weights for the
+        life of the process, so for them memory_released is false, the
+        card memory returns only when the server process restarts, and
+        POST /v1/engines refuses another engine of the family until
+        then ("restart the server to free card memory"). A second
+        stop of an engine that is still shutting down answers so.
       parameters:
         - name: id
           in: path
@@ -2571,7 +2600,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [id, model, state]
+                required: [id, model, state, memory_released]
                 properties:
                   id:
                     type: string
@@ -2580,6 +2609,22 @@ paths:
                   state:
                     type: string
                     enum: [stopped]
+                  memory_released:
+                    type: boolean
+                    description: >-
+                      False when the family keeps its weights allocated for
+                      the life of the process (Qwen3.6 and Flash-Next): the
+                      engine stopped, but its card memory returns only when
+                      the server process restarts, and a new engine of that
+                      family is refused until then.
+                  memory_held_until_restart:
+                    type: boolean
+                    description: Present and true when memory_released is false.
+                  note:
+                    type: string
+                    description: >-
+                      Present when memory_released is false: the plain
+                      statement of it.
                   shutdown_failure:
                     type: string
                     description: >-
@@ -2676,15 +2721,13 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [repo, bytes, estimate, refs, snapshots]
+                      required: [repo, bytes, refs, snapshots]
                       properties:
                         repo:
                           type: string
                         bytes:
                           type: integer
                           description: Total size of the repo's blobs.
-                        estimate:
-                          $ref: "#/components/schemas/ResourceEstimate"
                         refs:
                           type: array
                           items:
@@ -2699,7 +2742,9 @@ paths:
                           type: array
                           items:
                             type: object
-                            required: [commit, path, gguf, families]
+                            required:
+                              [commit, path, gguf, complete, servable,
+                               families]
                             properties:
                               commit:
                                 type: string
@@ -2709,10 +2754,22 @@ paths:
                                 type: array
                                 items:
                                   type: string
+                              complete:
+                                type: boolean
+                                description: >-
+                                  No download is still filling the
+                                  snapshot and every file resolves.
+                              servable:
+                                type: boolean
+                                description: >-
+                                  Complete, and serve --model would start
+                                  it as a family of this build.
                               families:
                                 type: array
                                 items:
                                   type: string
+                              estimate:
+                                $ref: "#/components/schemas/ResourceEstimate"
         "401":
           $ref: "#/components/responses/Unauthorized"
   /v1/hf/tree:
@@ -2740,7 +2797,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [repo, revision, commit, total_bytes, files]
+                required: [repo, revision, commit, total_bytes, estimate, files]
                 properties:
                   repo:
                     type: string
@@ -2750,6 +2807,8 @@ paths:
                     type: string
                   total_bytes:
                     type: integer
+                  estimate:
+                    $ref: "#/components/schemas/ResourceEstimate"
                   files:
                     type: array
                     items:
@@ -2834,7 +2893,9 @@ paths:
             type: integer
       responses:
         "200":
-          description: The job was asked to stop.
+          description: >-
+            The job was asked to stop (cancelling true), or had already
+            ended (cancelling false, state names how).
           content:
             application/json:
               schema:
@@ -2845,6 +2906,9 @@ paths:
                     type: integer
                   cancelling:
                     type: boolean
+                  state:
+                    type: string
+                    enum: [done, failed, cancelled]
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

@@ -927,6 +927,207 @@ mod tests {
         assert_eq!(find("late")["runtime_added"], true);
     }
 
+    /// A derivation that names a family and starts nothing: the answers
+    /// under test come from the checks before the start.
+    fn derive_family(
+        args: &crate::server::model_serve::ModelServeArgs,
+        family: &str,
+    ) -> Result<crate::server::config::Config, crate::server::StartupError> {
+        let text = serde_json::json!({
+            "listen": "127.0.0.1:1",
+            "api_key_env": "K",
+            "engines": [{
+                "id": "derived",
+                "model_dir": args.model_dir,
+                "tokenizer_dir": args.model_dir,
+                "family": family,
+            }],
+        });
+        Ok(serde_json::from_value(text).expect("config"))
+    }
+
+    fn derive_q36(
+        args: &crate::server::model_serve::ModelServeArgs,
+    ) -> Result<crate::server::config::Config, crate::server::StartupError> {
+        derive_family(args, crate::family::qwen36::factory::FAMILY)
+    }
+
+    #[tokio::test]
+    async fn stopping_an_engine_says_when_its_memory_stays_held() {
+        let (state, _engine) = one_engine_state();
+        let held = testkit::engine(Vec::new());
+        let mut entry = testkit::entry("held", "model-b", &held, 1_024);
+        entry.family = crate::family::qwen36::factory::FAMILY.to_string();
+        state.add_engine(entry, held);
+        let freed = testkit::engine(Vec::new());
+        state.add_engine(testkit::entry("freed", "model-c", &freed, 1_024), freed);
+        let app = router(state);
+
+        let (_status, _headers, body) =
+            testkit::send(&app, testkit::get("/v1/engines", Some(testkit::API_KEY))).await;
+        let listed = testkit::json_of(&body);
+        let flag = |id: &str| {
+            listed["engines"]
+                .as_array()
+                .expect("engines")
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .map(|entry| entry["memory_held_until_restart"].clone())
+        };
+        assert_eq!(flag("held"), Some(serde_json::json!(true)));
+        assert_eq!(flag("freed"), Some(serde_json::json!(false)));
+
+        let request = testkit::request("DELETE", "/v1/engines/held", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        assert_eq!(body["state"], "stopped");
+        assert_eq!(body["memory_released"], false);
+        assert_eq!(body["memory_held_until_restart"], true);
+        assert_eq!(
+            body["note"],
+            "stopped; card memory returns when the server process restarts"
+        );
+
+        let request = testkit::request("DELETE", "/v1/engines/freed", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        assert_eq!(body["memory_released"], true);
+        assert!(body.get("note").is_none(), "{body}");
+        assert!(body.get("memory_held_until_restart").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_serve_after_a_stop_of_a_held_family_is_refused_up_front() {
+        let (state, _engine) = one_engine_state();
+        let state = Arc::new(
+            Arc::try_unwrap(state)
+                .ok()
+                .expect("sole owner")
+                .with_derive(derive_q36),
+        );
+        let held = testkit::engine(Vec::new());
+        let mut entry = testkit::entry("first", "model-b", &held, 1_024);
+        entry.family = crate::family::qwen36::factory::FAMILY.to_string();
+        state.add_engine(entry, held);
+        let app = router(Arc::clone(&state));
+
+        // Running: one engine of the family per process.
+        let (status, _headers, body) = testkit::send(
+            &app,
+            post_engines(r#"{"model_dir":"/nowhere/model","id":"second"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = testkit::json_of(&body)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(
+            message.contains("engine first already serves it"),
+            "{message}"
+        );
+
+        let request = testkit::request("DELETE", "/v1/engines/first", Some(testkit::API_KEY));
+        let (status, _headers, _body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Stopped: the memory is still held, so a serve is refused with the way out.
+        let (status, _headers, body) = testkit::send(
+            &app,
+            post_engines(r#"{"model_dir":"/nowhere/model","id":"third"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = testkit::json_of(&body)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(
+            message.contains("restart the server to free card memory"),
+            "{message}"
+        );
+        assert!(!state.engine_exists("third"));
+    }
+
+    #[tokio::test]
+    async fn an_engine_id_must_be_one_plain_token_and_the_runtime_set_is_capped() {
+        let (state, _engine) = one_engine_state();
+        let app = router(Arc::clone(&state));
+        for id in ["", "a b", "x/y", "..", ".hidden", &"x".repeat(65), "a\nb"] {
+            let body = serde_json::json!({"model_dir": "/m", "id": id}).to_string();
+            let (status, _headers, answer) = testkit::send(&app, post_engines(&body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id:?}");
+            let message = testkit::json_of(&answer)["error"]["message"]
+                .as_str()
+                .expect("message")
+                .to_string();
+            assert!(message.contains("id must be"), "{id:?}: {message}");
+        }
+        for index in 0..crate::server::state::MAX_RUNTIME_ENGINES {
+            let late = testkit::engine(Vec::new());
+            let id = format!("late{index}");
+            assert!(
+                state
+                    .add_engine(testkit::entry(&id, "model-x", &late, 1_024), late)
+                    .is_some()
+            );
+        }
+        let (status, _headers, answer) = testkit::send(
+            &app,
+            post_engines(r#"{"model_dir":"/m","id":"one-too-many"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = testkit::json_of(&answer)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(
+            message.contains("already running; stop one first"),
+            "{message}"
+        );
+        let extra = testkit::engine(Vec::new());
+        assert!(
+            state
+                .add_engine(testkit::entry("over", "model-x", &extra, 1_024), extra)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_stop_during_shutdown_says_so_and_unknown_ids_are_generic() {
+        let (state, _engine) = one_engine_state();
+        let late = testkit::engine(Vec::new());
+        state.add_engine(testkit::entry("busy", "model-b", &late, 1_024), late);
+        state.mark_stopping_for_test("busy");
+        let app = router(state);
+        let request = testkit::request("DELETE", "/v1/engines/busy", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            testkit::json_of(&body)["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("is shutting down")
+        );
+        for id in ["nope", "has%20space"] {
+            let request = testkit::request(
+                "DELETE",
+                &format!("/v1/engines/{id}"),
+                Some(testkit::API_KEY),
+            );
+            let (status, _headers, body) = testkit::send(&app, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(
+                testkit::json_of(&body)["error"]["message"],
+                "no such engine",
+                "{id}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn deleting_a_boot_engine_is_refused_but_known() {
         let (state, _engine) = one_engine_state();
@@ -976,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adding_an_engine_from_a_missing_directory_carries_the_cli_error() {
+    async fn adding_an_engine_from_a_missing_directory_carries_the_cli_error_without_the_path() {
         let (state, _engine) = one_engine_state();
         let (status, _headers, body) = testkit::send(
             &router(state),
@@ -987,7 +1188,8 @@ mod tests {
         let body = testkit::json_of(&body);
         assert_eq!(body["error"]["code"], "bad_request");
         let message = body["error"]["message"].as_str().expect("message");
-        assert!(message.contains("no-such-dir-anywhere"), "{message}");
+        assert!(!message.contains("no-such-dir-anywhere"), "{message}");
+        assert!(message.contains("<model_dir>"), "{message}");
     }
 }
 

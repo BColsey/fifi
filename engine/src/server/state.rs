@@ -56,6 +56,17 @@ pub(crate) struct EngineEntry {
     /// The directory the weights loaded from. `GET /v1/engines` shows
     /// it so the GUI can match a served engine to a cache snapshot.
     pub(crate) model_dir: std::path::PathBuf,
+    /// The family name the engine was started as.
+    pub(crate) family: String,
+}
+
+impl EngineEntry {
+    /// True when stopping this engine does not return its device or host
+    /// memory: the family allocates its weights for the life of the
+    /// process, so the memory returns when the server restarts.
+    pub(crate) fn memory_held_until_restart(&self) -> bool {
+        super::run::holds_memory_until_restart(&self.family)
+    }
 }
 
 pub(crate) struct AppState {
@@ -68,6 +79,18 @@ pub(crate) struct AppState {
     /// remove only what it added; boot engines live and die with the
     /// process, because their `Engine` owners sit on `run`'s stack.
     owned: Mutex<HashMap<String, crate::sched::worker::Engine>>,
+    /// Runtime engines whose shutdown is still running, by id: a second
+    /// stop of the same id answers "shutting down", not "unknown".
+    stopping: Mutex<HashSet<String>>,
+    /// Families whose weights live for the process (see
+    /// `EngineEntry::memory_held_until_restart`), each mapped to the
+    /// engine id that started it. A family stays here after its engine
+    /// stops: its memory is still held, so a new start is refused up
+    /// front.
+    pinned: Mutex<HashMap<String, String>>,
+    /// Derives one engine configuration from a model directory:
+    /// `serve --model`'s own `build_config`; tests substitute one.
+    derive: DeriveFn,
     /// The hub bridge: search, cache listing, download jobs. Shared
     /// state is all locks and atomics, so handlers clone the Arc.
     hf: Arc<super::hf::HfHub>,
@@ -127,15 +150,39 @@ pub(crate) fn unix_seconds() -> u64 {
 pub(crate) enum RemoveRefused {
     BootEngine,
     Unknown,
+    /// Another stop of the same id is still shutting the worker down.
+    ShuttingDown,
 }
+
+/// The signature of `model_serve::build_config`.
+pub(crate) type DeriveFn =
+    fn(&super::model_serve::ModelServeArgs) -> Result<super::config::Config, super::StartupError>;
+
+/// Why `try_add_engine` refused.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AddRefused {
+    IdTaken,
+    TooMany,
+}
+
+/// The most engines the runtime API owns at once (running or stopping).
+pub(crate) const MAX_RUNTIME_ENGINES: usize = 8;
 
 impl AppState {
     /// The caller has checked that the key is not empty.
     pub(crate) fn new(api_key: &str, engines: Vec<EngineEntry>) -> Self {
+        let pinned = engines
+            .iter()
+            .filter(|entry| entry.memory_held_until_restart())
+            .map(|entry| (entry.family.clone(), entry.id.clone()))
+            .collect();
         Self {
             api_key: api_key.as_bytes().to_vec(),
             engines: RwLock::new(engines.into_iter().map(Arc::new).collect()),
             owned: Mutex::new(HashMap::new()),
+            derive: super::model_serve::build_config,
+            stopping: Mutex::new(HashSet::new()),
+            pinned: Mutex::new(pinned),
             hf: Arc::new(super::hf::HfHub::from_env()),
             started: unix_seconds(),
             requests: AtomicU64::new(0),
@@ -414,6 +461,62 @@ impl AppState {
         Arc::clone(&self.engines.read().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// Builder: replaces the hub bridge (tests point it at a mock hub).
+    #[cfg(test)]
+    pub(crate) fn with_hf(mut self, hf: super::hf::HfHub) -> Self {
+        self.hf = Arc::new(hf);
+        self
+    }
+
+    /// Builder: replaces the derivation (tests start a fake engine).
+    #[cfg(test)]
+    pub(crate) fn with_derive(mut self, derive: DeriveFn) -> Self {
+        self.derive = derive;
+        self
+    }
+
+    pub(crate) fn derive(&self) -> DeriveFn {
+        self.derive
+    }
+
+    /// The engine that holds `family`'s process-lifetime memory, when
+    /// one was ever started in this process, and whether it still runs.
+    pub(crate) fn pinned_holder(&self, family: &str) -> Option<(String, bool)> {
+        let id = self
+            .pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(family)
+            .cloned()?;
+        let running = self.engine_exists(&id);
+        Some((id, running))
+    }
+
+    /// How many engines the runtime API owns (running or stopping).
+    pub(crate) fn runtime_engine_count(&self) -> usize {
+        let owned = self
+            .owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let stopping = self
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        owned + stopping
+    }
+
+    /// Test hook: marks an id as shutting down, the window a second
+    /// stop of the same engine must answer for.
+    #[cfg(test)]
+    pub(crate) fn mark_stopping_for_test(&self, id: &str) {
+        self.stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string());
+    }
+
     /// The hub bridge.
     pub(crate) fn hf(&self) -> &Arc<super::hf::HfHub> {
         &self.hf
@@ -441,19 +544,37 @@ impl AppState {
     /// reads in reverse, so the two cannot interleave into a listed
     /// but unremovable engine. On refusal the caller owns the
     /// `Engine` and must shut it down itself.
+    #[cfg(test)]
     pub(crate) fn add_engine(
         &self,
         entry: EngineEntry,
         engine: crate::sched::worker::Engine,
     ) -> Option<Arc<EngineEntry>> {
+        self.try_add_engine(entry, engine).ok()
+    }
+
+    /// `add_engine` with the reason of a refusal: the id is taken, or
+    /// the runtime API already owns `MAX_RUNTIME_ENGINES` engines.
+    pub(crate) fn try_add_engine(
+        &self,
+        entry: EngineEntry,
+        engine: crate::sched::worker::Engine,
+    ) -> Result<Arc<EngineEntry>, AddRefused> {
         let shared = Arc::new(entry);
         let mut engines = self.engines.write().unwrap_or_else(PoisonError::into_inner);
-        if engines.iter().any(|existing| existing.id == shared.id) {
+        let refusal = if engines.iter().any(|existing| existing.id == shared.id) {
+            Some(AddRefused::IdTaken)
+        } else if self.runtime_engine_count() >= MAX_RUNTIME_ENGINES {
+            Some(AddRefused::TooMany)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
             // Refused: shut the engine down here — dropping it
             // without a join would strand the worker thread.
             drop(engines);
             engine.shutdown();
-            return None;
+            return Err(refusal);
         }
         let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
         list.push(Arc::clone(&shared));
@@ -463,7 +584,13 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(shared.id.clone(), engine);
-        Some(shared)
+        if shared.memory_held_until_restart() {
+            self.pinned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(shared.family.clone(), shared.id.clone());
+        }
+        Ok(shared)
     }
 
     /// Removes one runtime-added engine: the id leaves the list
@@ -477,7 +604,15 @@ impl AppState {
     ) -> Result<(Arc<EngineEntry>, crate::sched::worker::ShutdownReport), RemoveRefused> {
         let engine = {
             let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
-            owned.remove(id)
+            let mut stopping = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
+            if stopping.contains(id) {
+                return Err(RemoveRefused::ShuttingDown);
+            }
+            let engine = owned.remove(id);
+            if engine.is_some() {
+                stopping.insert(id.to_string());
+            }
+            engine
         };
         let Some(engine) = engine else {
             return Err(if self.engine_exists(id) {
@@ -504,6 +639,10 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (engine_id, _)| engine_id != id);
         let report = engine.shutdown();
+        self.stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
         match removed {
             Some(entry) => Ok((entry, report)),
             // The engine was owned but never listed; the honest answer

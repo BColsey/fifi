@@ -138,6 +138,9 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         spawn_stage_reporter(&entries);
     }
     let mut state = AppState::new(&key, entries);
+    if !cfg!(test) {
+        state.hf().sweep_partials();
+    }
     state = state.with_sample_trace(config.sample_trace);
     if let Some(web_dir) = &config.web_dir {
         // Refuse at startup, with the path named, rather than serving a
@@ -442,6 +445,7 @@ pub(crate) fn start_one(
         defaults: loaded.values,
         effective,
         model_dir: config.model_dir.clone(),
+        family: config.family.clone(),
     };
     Ok((engine, entry))
 }
@@ -693,6 +697,20 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (gemma4::FAMILY, start_gemma4, false),
     (fake::FAMILY, start_fake, false),
 ];
+
+/// The families whose weights live for the whole process: the Qwen3.6 and
+/// Flash-Next starters allocate them once and never free them (their
+/// one-engine-per-process guard refuses a second start for the same
+/// reason). Stopping such an engine ends its jobs but returns no memory
+/// until the server process restarts.
+pub(crate) fn holds_memory_until_restart(family: &str) -> bool {
+    [
+        q36_factory::FAMILY,
+        q36_factory::DENSE_FAMILY,
+        factory::FAMILY,
+    ]
+    .contains(&family)
+}
 
 /// The per-entry prefix-reuse decision, pure in its inputs so the family
 /// exclusion is testable without an engine: an unset flag resolves to the
@@ -2321,5 +2339,28 @@ mod tests {
             checked >= 3,
             "expected the shipped Q36-family configs, exercised {checked}"
         );
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::holds_memory_until_restart;
+
+    #[test]
+    fn only_the_process_lifetime_families_hold_memory_after_a_stop() {
+        for family in [
+            crate::family::qwen36::factory::FAMILY,
+            crate::family::qwen36::factory::DENSE_FAMILY,
+            crate::family::flash_next::factory::FAMILY,
+        ] {
+            assert!(holds_memory_until_restart(family), "{family}");
+        }
+        for family in [
+            super::fake::FAMILY,
+            crate::family::flint::FAMILY,
+            crate::family::gemma4::FAMILY,
+        ] {
+            assert!(!holds_memory_until_restart(family), "{family}");
+        }
     }
 }
