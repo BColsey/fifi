@@ -674,6 +674,7 @@ pub(super) mod device {
         victim_cache: Option<VictimCache>,
         refill_timing: Option<Cell<[RefillTiming; 2]>>,
         trace_prefill_routes: bool,
+        exact_prefill_groups: bool,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -769,6 +770,7 @@ pub(super) mod device {
                 victim_cache: None,
                 refill_timing: None,
                 trace_prefill_routes: false,
+                exact_prefill_groups: false,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1085,6 +1087,14 @@ pub(super) mod device {
 
         pub(in crate::family::flash_next::cuda) fn enable_prefill_route_trace(&mut self) {
             self.trace_prefill_routes = self.source.is_some();
+        }
+
+        pub(in crate::family::flash_next::cuda) fn enable_exact_prefill_groups(&mut self) {
+            self.exact_prefill_groups = self.source.is_some();
+        }
+
+        pub(in crate::family::flash_next::cuda) fn uses_exact_prefill_groups(&self) -> bool {
+            self.exact_prefill_groups
         }
 
         pub(in crate::family::flash_next::cuda) fn trace_prefill_chunk(

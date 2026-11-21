@@ -25,6 +25,52 @@
 use super::moe_block::pick_union;
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) fn exact_route_groups(
+    picks: &[i32],
+    top_k: usize,
+    experts: usize,
+    slots: usize,
+) -> Result<Vec<std::ops::Range<usize>>, crate::EngError> {
+    use crate::EngError;
+    if top_k == 0 || top_k > slots || !picks.len().is_multiple_of(top_k) {
+        return Err(EngError::BadRequest(
+            "Flash-Next exact prefill groups need complete rows that fit the bank".into(),
+        ));
+    }
+    let mut groups = Vec::new();
+    let mut seen = vec![false; experts];
+    let mut start = 0;
+    let mut distinct = 0;
+    let add = |seen: &mut [bool], row: &[i32]| -> Result<usize, EngError> {
+        row.iter().try_fold(0, |count, &id| {
+            let entry = usize::try_from(id)
+                .ok()
+                .and_then(|index| seen.get_mut(index))
+                .ok_or_else(|| {
+                    EngError::BadRequest(format!(
+                        "Flash-Next exact prefill groups need picks inside 0..{experts}, got {id}"
+                    ))
+                })?;
+            Ok(count + usize::from(!std::mem::replace(entry, true)))
+        })
+    };
+    for (index, row) in picks.chunks_exact(top_k).enumerate() {
+        distinct += add(&mut seen, row)?;
+        if distinct > slots {
+            groups.push(start..index);
+            start = index;
+            seen.fill(false);
+            distinct = add(&mut seen, row)?;
+        }
+    }
+    let rows = picks.len() / top_k;
+    if start < rows {
+        groups.push(start..rows);
+    }
+    Ok(groups)
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) fn drain_before_admit<T>(
     drain: impl FnOnce() -> Result<(), crate::EngError>,
     admit: impl FnOnce() -> Result<T, crate::EngError>,
@@ -123,6 +169,7 @@ pub(in crate::family::flash_next) mod device {
         EngError,
         family::{
             exl3::{
+                launch::MoeDims,
                 prefill::window,
                 prefill_moe::{PrefillStore, SlotResolver},
             },
@@ -269,6 +316,32 @@ pub(in crate::family::flash_next) mod device {
     }
 
     impl PrefillStore for LayerStore<'_> {
+        fn route_groups(
+            &self,
+            picks: &[i32],
+            dims: &MoeDims,
+        ) -> Result<Option<Vec<(usize, MoeDims)>>, EngError> {
+            if !self.adapter.bank.uses_exact_prefill_groups() {
+                return Ok(None);
+            }
+            let slots = self.adapter.bank.geometry().slots;
+            let groups = super::exact_route_groups(picks, dims.top_k, dims.n_expert, slots)?;
+            Ok(Some(
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        (
+                            group.start,
+                            MoeDims {
+                                rows: group.len(),
+                                ..*dims
+                            },
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+
         fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
             let buffer = self.adapter.slots(self.layer)?;
             Ok([

@@ -3,10 +3,26 @@
 //! repeats, which is the mapping the golden's admit arm pins. Cardless: everything here runs on
 //! the policy and the slot row, the parts of the contract that live on the host.
 
-use super::prefill_adapter::{AdmitPlan, drain_before_admit, ring_slots};
+use super::prefill_adapter::{AdmitPlan, drain_before_admit, exact_route_groups, ring_slots};
 use crate::EngError;
 use crate::family::expert_bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use std::cell::RefCell;
+
+#[test]
+fn exact_groups_keep_whole_rows_and_count_shared_experts_once() {
+    let picks = [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 4, 4];
+    assert_eq!(exact_route_groups(&picks, 2, 6, 4).unwrap(), [0..3, 3..6]);
+    let groups = exact_route_groups(&[0, 1, 0, 1], 2, 2, 2).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], 0..2);
+}
+
+#[test]
+fn exact_groups_refuse_an_invalid_pick_or_partial_row() {
+    assert!(exact_route_groups(&[0, -1], 2, 3, 2).is_err());
+    assert!(exact_route_groups(&[0, 3], 2, 3, 2).is_err());
+    assert!(exact_route_groups(&[0], 2, 3, 2).is_err());
+}
 
 #[test]
 fn ring_mapping_keeps_bank_and_ring_slots_disjoint_without_admission() {

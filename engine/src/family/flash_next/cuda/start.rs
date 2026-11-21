@@ -631,6 +631,8 @@ fn build_driver_resolving(
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_DISK_PROFILE")?;
     let prefill_route_trace =
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_PREFILL_ROUTE_TRACE")?;
+    let exact_prefill_groups =
+        super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_PREFILL_EXACT_GROUPS")?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -1101,6 +1103,12 @@ fn build_driver_resolving(
     }
     if prefill_route_trace {
         bank.enable_prefill_route_trace();
+    }
+    if exact_prefill_groups {
+        bank.enable_exact_prefill_groups();
+        if bank.uses_exact_prefill_groups() {
+            eprintln!("flash-next cuda: exact disk prefill groups enabled");
+        }
     }
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",

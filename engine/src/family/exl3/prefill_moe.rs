@@ -80,6 +80,15 @@ impl SlotResolver for LayerResolver<'_, '_> {
 pub(in crate::family) trait PrefillStore: SlotResolver {
     fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError>;
 
+    /// Refines the caller's row partition after the existing router readback.
+    fn route_groups(
+        &self,
+        _picks: &[i32],
+        _dims: &MoeDims,
+    ) -> Result<Option<Vec<(usize, MoeDims)>>, EngError> {
+        Ok(None)
+    }
+
     /// A store can issue routed copies before the shared expert to overlap them.
     fn reads_routes_before_shared(&self) -> bool {
         false
@@ -508,6 +517,8 @@ pub(in crate::family) fn run_store(
     // per-sub-block readback, a blocking drain of the stream, is gone. The mapping stays
     // per sub-block: one sub-block's picks fit the slots together, a whole chunk's need not.
     let picks = read_ids(projector.launch, bufs.ids, dims)?;
+    let route_groups = bank.route_groups(&picks, dims)?;
+    let sub = route_groups.as_deref().unwrap_or(sub);
     let pair = projector.launch.ctx.exl3_jobs_pair_enabled()?;
     let k = dims.top_k;
     for &(r0, ref sub_dims) in sub {
