@@ -53,6 +53,19 @@ impl DeviceBudget {
         }
     }
 
+    /// Constrain an admission check by a separate budget, leaving the original device
+    /// budget available for reporting.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(super) fn capped_for_admission(self, cap: u64) -> Self {
+        Self {
+            ceiling: Some(self.ceiling.map_or(cap, |ceiling| ceiling.min(cap))),
+            ..self
+        }
+    }
+
     /// A configured upper bound can make the working set smaller.
     pub(crate) fn prefill(self, configured: Option<u64>) -> u64 {
         self.bytes().min(configured.unwrap_or(u64::MAX))
@@ -191,6 +204,9 @@ mod tests {
         assert_eq!(constrained.bytes(), 4 << 30);
         assert_eq!(constrained.prefill(Some(2 << 30)), 2 << 30);
         assert_eq!(constrained.prefill(Some(8 << 30)), 4 << 30);
+        assert_eq!(constrained.capped_for_admission(8 << 30).bytes(), 4 << 30);
+        assert_eq!(constrained.capped_for_admission(3 << 30).bytes(), 3 << 30);
+        assert_eq!(device.capped_for_admission(16 << 30).bytes(), 12 << 30);
         assert!(
             constrained
                 .remaining("fixture", &[("weights", 5 << 30)])

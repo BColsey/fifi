@@ -667,6 +667,15 @@ impl TieredSettings {
     };
 }
 
+/// The opted-in MLX placement policy. The expert fallback can still choose residency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MlxPlacement {
+    #[default]
+    Resident,
+    ExpertFallback,
+    DenseFfnStaging,
+}
+
 /// The environment fallbacks, read by the caller so that this file stays pure.
 #[derive(Debug, Default)]
 pub(crate) struct Q36Env {
@@ -681,19 +690,28 @@ pub(crate) struct Q36Env {
     /// The host memory and the model's shard bytes, for the MLX values that no member and no
     /// variable sets (`host_plan`). `None` keeps every such value required, as before.
     pub(crate) host: Option<HostFacts>,
+    /// Disk weights are available only when MLX working-set planning is active.
+    pub(crate) mlx_disk_experts: bool,
+    pub(crate) mlx_disk_dense_ffn: bool,
 }
 
 impl Q36Env {
-    /// The environment of this process and the host it runs on: the three allowlisted variables
-    /// and, for the model under `model_dir`, the facts the host-derived defaults read. The one
-    /// constructor every start, preflight and effective-configuration view calls, so they resolve
-    /// the same settings.
+    /// Read the process inputs shared by startup, preflight and effective configuration.
     pub(crate) fn from_process(model_dir: &Path) -> Self {
+        #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+        let device_budget = crate::family::mlx_budget::enabled();
+        #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+        let device_budget = false;
         Self {
             cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
             kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
             spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
             host: HostFacts::probe(model_dir),
+            mlx_disk_experts: device_budget
+                && std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").is_some_and(|value| value == "1"),
+            mlx_disk_dense_ffn: device_budget
+                && std::env::var_os("FIFI_Q36_MLX_DISK_DENSE_FFN")
+                    .is_some_and(|value| value == "1"),
         }
     }
 }
@@ -970,6 +988,10 @@ pub(crate) struct Q36Settings {
     pub(crate) prefill_budget: Option<u64>,
     /// The bytes that the planner keeps free. It is used only when `prefill_budget` is set.
     pub(crate) prefill_reserve: u64,
+    pub(crate) mlx_placement: MlxPlacement,
+    /// When resident host admission defers to disk staging, startup must still enforce the host
+    /// budget alongside the Metal ceiling.
+    pub(crate) mlx_host_placement_cap: Option<u64>,
     /// The dtype of the decode activations, which also picks the scale storage. The default is
     /// `bf16`.
     pub(crate) activation: Activation,
@@ -1528,11 +1550,22 @@ impl Q36Settings {
                 derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
             }
         };
+        let mlx_placement = match (backend, spec.feed_forward.is_some()) {
+            (Backend::Mlx, false) if env.mlx_disk_experts => MlxPlacement::ExpertFallback,
+            (Backend::Mlx, true) if env.mlx_disk_dense_ffn => MlxPlacement::DenseFfnStaging,
+            _ => MlxPlacement::Resident,
+        };
+        let mut mlx_host_placement_cap = None;
         if let (Some(budget), Some(host)) = (budget_from_host, env.host)
             && let Some(text) =
                 host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
         {
-            return Err(bad(text));
+            // Context sizing still depends on the resident checkpoint total. An explicit context
+            // can go straight to the loader's staged weight and session charges.
+            if options.context_limit.is_none() || mlx_placement == MlxPlacement::Resident {
+                return Err(bad(text));
+            }
+            mlx_host_placement_cap = Some(budget);
         }
         let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
@@ -1709,6 +1742,8 @@ impl Q36Settings {
             prefill_chunk,
             prefill_budget,
             prefill_reserve,
+            mlx_placement,
+            mlx_host_placement_cap,
             activation,
             kv,
             kv_offload_host_bytes,
@@ -3027,6 +3062,8 @@ mod tests {
                 prefill_chunk: 256,
                 prefill_budget: None,
                 prefill_reserve: 0,
+                mlx_placement: super::MlxPlacement::Resident,
+                mlx_host_placement_cap: None,
                 activation: super::Activation::Bf16,
                 kv: super::KvDtype::Q8,
                 kv_offload_host_bytes: None,

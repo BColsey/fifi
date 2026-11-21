@@ -920,17 +920,21 @@ impl Q36Executor {
         settings: &Q36Settings,
         rules: Q36Rules,
         device: DeviceBudget,
-        disk_experts: bool,
     ) -> Result<(Self, Q36Session)> {
+        use crate::family::qwen36::settings::MlxPlacement;
+
+        let budget = settings
+            .mlx_host_placement_cap
+            .map_or(device, |cap| device.capped_for_admission(cap));
+        let disk_experts = settings.mlx_placement == MlxPlacement::ExpertFallback;
+        let stage_dense_ffn = settings.mlx_placement == MlxPlacement::DenseFfnStaging;
         Self::open_with_placement(
             &settings.artifact,
             settings.cache_limit,
             rules,
             &settings.spec,
-            Some((device, settings, disk_experts)),
-            settings.spec.feed_forward.is_some()
-                && std::env::var_os("FIFI_Q36_MLX_DISK_DENSE_FFN")
-                    .is_some_and(|value| value == "1"),
+            Some((budget, settings, disk_experts)),
+            stage_dense_ffn,
         )
     }
 
@@ -2647,12 +2651,16 @@ mod tests {
 
     #[test]
     fn mlx_preimport_rejects_qwen_weight_floor_without_payload_reads() {
-        use crate::{family::qwen36::fixtures::checkpoint_files, weights::acquire_read};
+        use crate::{
+            family::qwen36::{fixtures::checkpoint_files, settings::MlxPlacement},
+            weights::acquire_read,
+        };
         let _serial = crate::native_test_lock();
-        for (spec, disk_experts) in [
-            (&TINY_GQA, false),
-            (&TINY_GQA, true),
-            (&tiny::TINY_DENSE, false),
+        for (spec, placement) in [
+            (&TINY_GQA, MlxPlacement::Resident),
+            (&TINY_GQA, MlxPlacement::ExpertFallback),
+            (&tiny::TINY_DENSE, MlxPlacement::Resident),
+            (&tiny::TINY_DENSE, MlxPlacement::DenseFfnStaging),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let entries = tiny::entries(spec);
@@ -2662,7 +2670,9 @@ mod tests {
                     *dtype == "U32"
                         && key.ends_with(".weight")
                         && !key.contains(".embed_tokens.")
-                        && !(disk_experts && key.contains(".switch_mlp."))
+                        && !(placement == MlxPlacement::ExpertFallback
+                            && key.contains(".switch_mlp."))
+                        && !(placement == MlxPlacement::DenseFfnStaging && key.contains(".mlp."))
                 })
                 .map(|(_, _, _, bytes)| bytes.len() as u64)
                 .sum();
@@ -2676,6 +2686,7 @@ mod tests {
             settings.artifact = dir.path().to_path_buf();
             settings.spec = *spec;
             settings.prefill_reserve = 0;
+            settings.mlx_placement = placement;
             let rules = || Q36Rules {
                 session_cap: 16 << 20,
                 ..chunk_rules()
@@ -2693,22 +2704,28 @@ mod tests {
 
             acquire_read::reset();
             acquire_read::set(true);
+            let too_small = reserve + floor - 1;
+            let device_limit = if placement == MlxPlacement::Resident {
+                too_small
+            } else {
+                settings.mlx_host_placement_cap = Some(too_small);
+                4 << 30
+            };
             let refused = Q36Executor::open_for_device(
                 &settings,
                 rules(),
-                DeviceBudget::new(reserve + floor - 1).unwrap(),
-                disk_experts,
+                DeviceBudget::new(device_limit).unwrap(),
             );
             acquire_read::set(false);
             assert_eq!(acquire_read::snapshot(), (0, 0, 0));
             assert!(matches!(refused, Err(EngError::MemoryPlan(m))
                 if m.contains("Qwen MLX pre-import")
                 && m.contains(&format!("packed_weight_payload_floor_bytes={floor}"))));
+            settings.mlx_host_placement_cap = None;
             let (_executor, _session) = Q36Executor::open_for_device(
                 &settings,
                 rules(),
                 DeviceBudget::new(4 << 30).unwrap(),
-                disk_experts,
             )
             .unwrap();
         }

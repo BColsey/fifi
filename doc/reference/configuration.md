@@ -60,6 +60,8 @@ With prefix reuse enabled, set `FIFI_FLASH_NEXT_MLX_PREFIX_BUDGET_BYTES` to a po
 
 Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 
+For Qwen3.6 MoE or Qwen3.8 dense on Apple Silicon, the matching [disk-staging switch](environment.md#apple-silicon-device-sizing) and an active Metal working-set limit allow an explicit `context_limit` with a host-derived `prefill_budget_bytes`. If the entire checkpoint exceeds the host budget, startup checks resident weights, staging and session memory against that budget and the Metal limit. With no explicit context, host-derived context sizing still uses the complete checkpoint.
+
 | Key | Backend | Default | Meaning |
 | --- | --- | --- | --- |
 | `context_limit` | both | MLX 262,144; CUDA 32,768 | Context limit in tokens, from 2. |
