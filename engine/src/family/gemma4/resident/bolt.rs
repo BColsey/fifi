@@ -3112,6 +3112,92 @@ mod tests {
         }
     }
 
+    /// True-token scores of the wide prefill attention against the row attention on real text:
+    /// every fourth batch of eight tokens ends with logits, and each such position records the
+    /// negative log-likelihood of the next true token and the arg-max under both paths. The text
+    /// comes from `BOLT_SCORE_TOKENS`, one document per line as space-separated token ids; the
+    /// records are written to `BOLT_SCORE_OUT` as tab-separated rows (document, position, true
+    /// token, nll under the row attention, nll under the wide attention, arg-max of each, KL of
+    /// the wide distribution from the row one).
+    #[test]
+    #[ignore = "requires the converted Bolt file, token documents and a device; use --release"]
+    fn wide_prefill_scores_real_text_like_the_row_attention() {
+        use std::fmt::Write as _;
+        let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
+        let docs = std::fs::read_to_string(std::env::var("BOLT_SCORE_TOKENS").expect("token file"))
+            .expect("token documents");
+        let out_path = std::env::var("BOLT_SCORE_OUT").expect("output file");
+        let mut model = super::load(std::path::Path::new(&path), None).expect("load");
+        assert!(
+            model.use_wide_prefill(true),
+            "this device has the wide path"
+        );
+        let seq = model.new_seq().expect("sequence");
+        let log_softmax = |v: &[f32]| -> Vec<f64> {
+            let top = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f64 = v.iter().map(|&x| f64::from(x - top).exp()).sum();
+            let log_sum = sum.ln() + f64::from(top);
+            v.iter().map(|&x| f64::from(x) - log_sum).collect()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i)
+        };
+        let mut report = String::new();
+        for (doc, line) in docs.lines().enumerate() {
+            let tokens: Vec<u32> = line
+                .split_whitespace()
+                .map(|t| t.parse().expect("a token id"))
+                .collect();
+            // Scored positions: the last token of every fourth batch, whose next token is known.
+            let mut rows: Vec<(usize, [Vec<f32>; 2])> = Vec::new();
+            for (pass, wide) in [false, true].into_iter().enumerate() {
+                model.use_wide_prefill(wide);
+                let mut pos = 0;
+                for (index, batch) in tokens.chunks(Bolt::PREFILL_BATCH).enumerate() {
+                    let scored = index % 4 == 3 && pos + batch.len() < tokens.len();
+                    model
+                        .prefill_batch(&seq, batch, pos, scored)
+                        .expect("batch");
+                    pos += batch.len();
+                    if scored {
+                        let row = logits(&model);
+                        if pass == 0 {
+                            rows.push((pos, [row, Vec::new()]));
+                        } else {
+                            let at = rows
+                                .iter_mut()
+                                .find(|(p, _)| *p == pos)
+                                .expect("the same positions");
+                            at.1[1] = row;
+                        }
+                    }
+                }
+            }
+            for (pos, [row, wide]) in rows {
+                let truth = tokens[pos] as usize;
+                let (lp_row, lp_wide) = (log_softmax(&row), log_softmax(&wide));
+                let kl: f64 = lp_row
+                    .iter()
+                    .zip(&lp_wide)
+                    .map(|(a, b)| a.exp() * (a - b))
+                    .sum();
+                writeln!(
+                    report,
+                    "{doc}\t{pos}\t{truth}\t{:.6}\t{:.6}\t{}\t{}\t{kl:.6e}",
+                    -lp_row[truth],
+                    -lp_wide[truth],
+                    argmax(&row),
+                    argmax(&wide)
+                )
+                .expect("string write");
+            }
+        }
+        std::fs::write(out_path, report).expect("scores written");
+    }
+
     /// The skipped-shared prefill must leave the same final logits as a
     /// full-layer prefill: a hidden batch runs only the cache-writing physical
     /// prefix, while a logits batch runs every layer. The shared layers write
