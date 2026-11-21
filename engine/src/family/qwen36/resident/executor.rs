@@ -4700,8 +4700,8 @@ mod tests {
     /// prompt end (a cold turn that saves its tip) and two splits (a turn restored from the tip
     /// of the turn before, then saving its own). Environment: `Q36_CKPT_DIR`, `Q36_QUAL_DOCS`
     /// (a directory of text files), `Q36_QUAL_OUT` (the JSON lines file), `Q36_QUAL_LENS`
-    /// (comma separated prompt lengths), `Q36_QUAL_GEN` (scored tokens), `Q36_CACHE_LIMIT`,
-    /// `Q36_ACTIVATION`, `Q36_KV_DTYPE`.
+    /// (comma separated prompt lengths), `Q36_QUAL_GEN` (scored tokens), `Q36_QUAL_CONTEXT`
+    /// (the context limit, default 8192), `Q36_CACHE_LIMIT`, `Q36_ACTIVATION`, `Q36_KV_DTYPE`.
     #[test]
     #[ignore = "needs the Q36 checkpoint and a text directory on the Mac"]
     fn prompt_piece_plans_score_the_same_text_for_the_quality_gate() {
@@ -4724,7 +4724,7 @@ mod tests {
             prefix_store: StoreLimits::default(),
             eos: vec![],
             sampler_vocab: 248_320,
-            context_limit: 8192,
+            context_limit: env_u64("Q36_QUAL_CONTEXT", Some(8192)) as u32,
             session_cap: 1 << 30,
             max_seqs: 1,
             activation: activation_from_env(),
@@ -4760,14 +4760,139 @@ mod tests {
                     let records = score_sequence(&mut model, prompt, scored, 248_320).unwrap();
                     for record in records {
                         lines.push_str(&format!(
-                            "{{\"doc\":\"{name}\",\"len\":{len},\"plan\":\"{plan}\",\"pos\":{},\"nll\":{},\"hit\":{}}}\n",
+                            "{{\"doc\":\"{name}\",\"len\":{len},\"plan\":\"{plan}\",\"pos\":{},\"nll\":{},\"hit\":{},\"argmax\":{}}}\n",
                             record.position,
                             -record.logprob,
-                            record.argmax == record.generated
+                            record.argmax == record.generated,
+                            record.argmax
                         ));
                     }
                 }
                 eprintln!("scored {name} at {len}");
+            }
+        }
+        std::fs::write(&out, lines).unwrap();
+    }
+
+    /// How far the logits of a cold turn and of a restored turn sit from those of the unsplit
+    /// prompt, for the quality arm of the prefix-reuse default. For each text and prompt length it
+    /// reads the greedy continuation of the unsplit prompt, then feeds those tokens through the
+    /// cold and warm plans and writes one JSON line per step: the KL divergence of the unsplit
+    /// distribution from the plan's, the largest absolute logit difference, both argmax ids and
+    /// the unsplit top-two logit gap. The first step whose plan argmax differs from the unsplit
+    /// token is where the free-running text of that plan first diverges. Environment: as for
+    /// the scoring test, with `Q36_QUAL_STEPS` for the number of greedy steps.
+    #[test]
+    #[ignore = "needs the Q36 checkpoint and a text directory on the Mac"]
+    fn split_prompt_logits_stay_within_float_reordering_of_the_unsplit_prompt() {
+        let _serial = crate::native_test_lock();
+        let ckpt_dir = env_path("Q36_CKPT_DIR");
+        let docs = env_path("Q36_QUAL_DOCS");
+        let out = env_path("Q36_QUAL_OUT");
+        let lens: Vec<usize> = std::env::var("Q36_QUAL_LENS")
+            .unwrap()
+            .split(',')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let steps = env_u64("Q36_QUAL_STEPS", Some(128)) as usize;
+        let cache_limit = env_u64("Q36_CACHE_LIMIT", None);
+        let tokenizer =
+            Tokenizer::from_bytes(&std::fs::read(ckpt_dir.join("tokenizer.json")).unwrap())
+                .unwrap();
+        let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
+            eos: vec![],
+            sampler_vocab: 248_320,
+            context_limit: env_u64("Q36_QUAL_CONTEXT", Some(8192)) as u32,
+            session_cap: 1 << 30,
+            max_seqs: 1,
+            activation: activation_from_env(),
+            kv_dtype: kv_dtype_from_env(),
+            compile: false,
+            compile_program_limit: Default::default(),
+        };
+        let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
+        executor.chunk = Some(256);
+        let mut files: Vec<_> = std::fs::read_dir(&docs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        let vocab = 248_320;
+        let argmax = |row: &[f32]| {
+            row[..vocab]
+                .iter()
+                .enumerate()
+                .fold(
+                    (0, f32::MIN),
+                    |best, (id, &v)| if v > best.1 { (id, v) } else { best },
+                )
+        };
+        let log_softmax = |row: &[f32]| -> Vec<f64> {
+            let top = row[..vocab].iter().fold(f32::MIN, |a, &b| a.max(b)) as f64;
+            let sum: f64 = row[..vocab].iter().map(|&v| (v as f64 - top).exp()).sum();
+            row[..vocab]
+                .iter()
+                .map(|&v| v as f64 - top - sum.ln())
+                .collect()
+        };
+        let mut lines = String::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let ids = tokenizer.encode(text.as_str()).unwrap();
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            for &len in &lens {
+                if ids.len() < len + steps {
+                    continue;
+                }
+                let prompt = &ids[..len];
+                let mut rows_of = |splits: Vec<usize>, forced: &[u32]| -> Vec<Vec<f32>> {
+                    let Q36Session { state, .. } = &mut session;
+                    let (step, _) = executor.split(state);
+                    let mut model = SplitModel { step, splits };
+                    use crate::family::token_forcing::score::ForcedModel;
+                    model.reset().unwrap();
+                    let mut rows = vec![model.prefill_logits(prompt).unwrap()];
+                    for step in 0..steps - 1 {
+                        let token = match forced.get(step) {
+                            Some(&token) => token,
+                            None => argmax(&rows[step]).0 as u32,
+                        };
+                        rows.push(model.step_logits(token).unwrap());
+                    }
+                    rows
+                };
+                let base = rows_of(vec![], &[]);
+                let greedy: Vec<u32> = base.iter().map(|row| argmax(row).0 as u32).collect();
+                let base_logs: Vec<Vec<f64>> = base.iter().map(|row| log_softmax(row)).collect();
+                for (plan, splits) in [("cold", vec![len - 7]), ("warm", vec![len - 107, len - 7])]
+                {
+                    let rows = rows_of(splits, &greedy);
+                    for (step, (row, base_row)) in rows.iter().zip(&base).enumerate() {
+                        let logs = log_softmax(row);
+                        let kl: f64 = base_logs[step]
+                            .iter()
+                            .zip(&logs)
+                            .map(|(&lb, &lp)| lb.exp() * (lb - lp))
+                            .sum();
+                        let max_diff = row[..vocab]
+                            .iter()
+                            .zip(&base_row[..vocab])
+                            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                        let (best, top) = argmax(base_row);
+                        let second = base_row[..vocab]
+                            .iter()
+                            .enumerate()
+                            .filter(|&(id, _)| id != best)
+                            .fold(f32::MIN, |m, (_, &v)| m.max(v));
+                        lines.push_str(&format!(
+                            "{{\"doc\":\"{name}\",\"len\":{len},\"plan\":\"{plan}\",\"step\":{step},\"kl\":{kl},\"max_logit_diff\":{max_diff},\"base_argmax\":{best},\"plan_argmax\":{},\"base_top2_gap\":{}}}\n",
+                            argmax(row).0,
+                            top - second
+                        ));
+                    }
+                }
+                eprintln!("diagnosed {name} at {len}");
             }
         }
         std::fs::write(&out, lines).unwrap();
