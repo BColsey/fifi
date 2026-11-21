@@ -1714,7 +1714,7 @@ impl ExecutorOps for Q36Executor {
             first_logits,
             ..
         } = st;
-        core.prefill_with(toks, self.context_limit, |head| {
+        let _ = core.prefill_with(toks, self.context_limit, |head| {
             let mut batch = Vec::with_capacity(rows as usize);
             batch.extend_from_slice(head);
             batch.push(pending);
