@@ -986,6 +986,11 @@ impl InklingExpertSource {
         page_size: usize,
         stage_bytes: usize,
     ) -> Result<usize, EngError> {
+        if !ids.len().is_multiple_of(TOP_K) {
+            return Err(EngError::BadRequest(
+                "Inkling routed groups require complete top-k rows".into(),
+            ));
+        }
         let mut selected = 0_u128;
         let mut fits = 0;
         for (index, row) in ids.chunks_exact(TOP_K).enumerate() {
@@ -1367,7 +1372,13 @@ mod tests {
                 assert_eq!(exact.extra_bytes, exact_extra);
                 assert!(!exact.split_visits);
 
-                let shared = adjacent.repeat(2);
+                let row = &adjacent[..TOP_K];
+                assert!(
+                    source
+                        .routed_group_len(0, &adjacent, page, solo.stage_bytes)
+                        .is_err()
+                );
+                let shared = row.repeat(2);
                 let disjoint: Vec<_> = (0..2 * TOP_K).collect();
                 assert_eq!(
                     source
@@ -1387,14 +1398,7 @@ mod tests {
                         .is_err()
                 );
                 let other = &disjoint[TOP_K..];
-                let ordered = [
-                    adjacent.as_slice(),
-                    adjacent.as_slice(),
-                    other,
-                    other,
-                    other,
-                ]
-                .concat();
+                let ordered = [row, row, other, other, other].concat();
                 let mut remaining = ordered.as_slice();
                 for expected in [2, 3] {
                     let rows = source
