@@ -1424,7 +1424,9 @@ mod tests {
             .unwrap();
         assert_eq!(output.shape(), [2, 1, 2]);
         let expected: Vec<_> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .map(|(i, row)| {
                 let g = bf16(row[0]);
@@ -1446,7 +1448,9 @@ mod tests {
         let expected: Vec<_> = (0..2)
             .map(|col| {
                 let sum = rows
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .fold(0.0, |acc, row| acc + bf16(row[col]));
                 bf16(sum)
             })

@@ -1952,98 +1952,6 @@ pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-
-    macro_rules! le_hex {
-        ($table:expr) => {{
-            let mut hasher = Sha256::new();
-            for value in $table.iter() {
-                hasher.update(value.to_le_bytes());
-            }
-            hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        }};
-    }
-
-    #[test]
-    fn kmask_iq2xs_matches_pinned_sha256() {
-        assert_eq!(KMASK_IQ2XS.len(), 8);
-        assert_eq!(
-            le_hex!(KMASK_IQ2XS),
-            "5ac9831b2e30eb285ef34f8501620f878432d5c04331ad1ae47f977a83ba41a5"
-        );
-    }
-
-    #[test]
-    fn ksigns_iq2xs_matches_pinned_sha256() {
-        assert_eq!(KSIGNS_IQ2XS.len(), 128);
-        assert_eq!(
-            le_hex!(KSIGNS_IQ2XS),
-            "a76742a603f8beca5212ecce0f1f02f11a4887fd2f7c8b15aca0ea3eb3380c31"
-        );
-    }
-
-    #[test]
-    fn iq2xxs_grid_matches_pinned_sha256() {
-        assert_eq!(IQ2XXS_GRID.len(), 256);
-        assert_eq!(
-            le_hex!(IQ2XXS_GRID),
-            "05826b5d3e472a3a78f196be62ac78acf81df0f909626e12ab9fa2a5d490dd54"
-        );
-    }
-
-    #[test]
-    fn iq2xs_grid_matches_pinned_sha256() {
-        assert_eq!(IQ2XS_GRID.len(), 512);
-        assert_eq!(
-            le_hex!(IQ2XS_GRID),
-            "06e47aaca60b4dc1d9b5a3f34540437058a6b142b4d7a59d5ded769b4d1bf1de"
-        );
-    }
-
-    #[test]
-    fn iq2s_grid_matches_pinned_sha256() {
-        assert_eq!(IQ2S_GRID.len(), 1024);
-        assert_eq!(
-            le_hex!(IQ2S_GRID),
-            "e1aa1473412b0552c2174c30ef22ab4073f6a181b85a17056e8249bd2932fd88"
-        );
-    }
-
-    #[test]
-    fn iq3xxs_grid_matches_pinned_sha256() {
-        assert_eq!(IQ3XXS_GRID.len(), 256);
-        assert_eq!(
-            le_hex!(IQ3XXS_GRID),
-            "46e35f5a997efdee6c99ce57854c8a0d4f0ff8ca57e5e8a60c0793ea580acf5d"
-        );
-    }
-
-    #[test]
-    fn iq3s_grid_matches_pinned_sha256() {
-        assert_eq!(IQ3S_GRID.len(), 512);
-        assert_eq!(
-            le_hex!(IQ3S_GRID),
-            "bd1af4945a1717c65610b0284e4628b9a1ba3b306fae3a06f6e5f597356e349f"
-        );
-    }
-
-    #[test]
-    fn kvalues_iq4nl_matches_pinned_sha256() {
-        assert_eq!(KVALUES_IQ4NL.len(), 16);
-        assert_eq!(
-            le_hex!(KVALUES_IQ4NL),
-            "61aa47540aa024b5d6ddaa839b84ffe59f3d5a349af5c6c7ffcb5e0474b46163"
-        );
-    }
-}
-
 pub(crate) const IQ1S_GRID: [u16; 2048] = [
     0x0000, 0x0002, 0x0005, 0x0008, 0x000a, 0x0011, 0x0015, 0x0020, 0x0022, 0x0028, 0x002a, 0x0045,
     0x0051, 0x0054, 0x0056, 0x0065, 0x0080, 0x0082, 0x0088, 0x008a, 0x0095, 0x00a0, 0x00a2, 0x00a8,
@@ -2229,4 +2137,96 @@ pub(crate) fn inkling_codebook_words(dtype: super::gguf::GgufType) -> Option<u32
         _ => return None,
     };
     Some(words as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    macro_rules! le_hex {
+        ($table:expr) => {{
+            let mut hasher = Sha256::new();
+            for value in $table.iter() {
+                hasher.update(value.to_le_bytes());
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }};
+    }
+
+    #[test]
+    fn kmask_iq2xs_matches_pinned_sha256() {
+        assert_eq!(KMASK_IQ2XS.len(), 8);
+        assert_eq!(
+            le_hex!(KMASK_IQ2XS),
+            "5ac9831b2e30eb285ef34f8501620f878432d5c04331ad1ae47f977a83ba41a5"
+        );
+    }
+
+    #[test]
+    fn ksigns_iq2xs_matches_pinned_sha256() {
+        assert_eq!(KSIGNS_IQ2XS.len(), 128);
+        assert_eq!(
+            le_hex!(KSIGNS_IQ2XS),
+            "a76742a603f8beca5212ecce0f1f02f11a4887fd2f7c8b15aca0ea3eb3380c31"
+        );
+    }
+
+    #[test]
+    fn iq2xxs_grid_matches_pinned_sha256() {
+        assert_eq!(IQ2XXS_GRID.len(), 256);
+        assert_eq!(
+            le_hex!(IQ2XXS_GRID),
+            "05826b5d3e472a3a78f196be62ac78acf81df0f909626e12ab9fa2a5d490dd54"
+        );
+    }
+
+    #[test]
+    fn iq2xs_grid_matches_pinned_sha256() {
+        assert_eq!(IQ2XS_GRID.len(), 512);
+        assert_eq!(
+            le_hex!(IQ2XS_GRID),
+            "06e47aaca60b4dc1d9b5a3f34540437058a6b142b4d7a59d5ded769b4d1bf1de"
+        );
+    }
+
+    #[test]
+    fn iq2s_grid_matches_pinned_sha256() {
+        assert_eq!(IQ2S_GRID.len(), 1024);
+        assert_eq!(
+            le_hex!(IQ2S_GRID),
+            "e1aa1473412b0552c2174c30ef22ab4073f6a181b85a17056e8249bd2932fd88"
+        );
+    }
+
+    #[test]
+    fn iq3xxs_grid_matches_pinned_sha256() {
+        assert_eq!(IQ3XXS_GRID.len(), 256);
+        assert_eq!(
+            le_hex!(IQ3XXS_GRID),
+            "46e35f5a997efdee6c99ce57854c8a0d4f0ff8ca57e5e8a60c0793ea580acf5d"
+        );
+    }
+
+    #[test]
+    fn iq3s_grid_matches_pinned_sha256() {
+        assert_eq!(IQ3S_GRID.len(), 512);
+        assert_eq!(
+            le_hex!(IQ3S_GRID),
+            "bd1af4945a1717c65610b0284e4628b9a1ba3b306fae3a06f6e5f597356e349f"
+        );
+    }
+
+    #[test]
+    fn kvalues_iq4nl_matches_pinned_sha256() {
+        assert_eq!(KVALUES_IQ4NL.len(), 16);
+        assert_eq!(
+            le_hex!(KVALUES_IQ4NL),
+            "61aa47540aa024b5d6ddaa839b84ffe59f3d5a349af5c6c7ffcb5e0474b46163"
+        );
+    }
 }

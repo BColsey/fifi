@@ -200,7 +200,7 @@ fn publisher_qkv_placement_real_weights() {
             let host = source
                 .with_bytes(name, entry, full_range(entry), false, |packed| {
                     let mut transposed = vec![0; h * WIDTH * 4];
-                    for (row, packed) in packed.chunks_exact(WIDTH * 2).enumerate() {
+                    for (row, packed) in packed.as_chunks::<{ WIDTH * 2 }>().0.iter().enumerate() {
                         for (col, &bytes) in packed.as_chunks::<2>().0.iter().enumerate() {
                             let at = (col * h + row) * 4;
                             transposed[at..at + 4]
