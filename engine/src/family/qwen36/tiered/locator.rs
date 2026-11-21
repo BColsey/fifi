@@ -2,55 +2,25 @@
 //!
 //! WHAT: [`ExpertLocator`] turns one parsed [`GgufHeader`] into the absolute
 //! byte ranges of single experts inside the three stacked per-layer expert
-//! tensors of a GGUF conversion (llama.cpp naming, Q4_K), into pool jobs over
-//! any shared region holding the whole file, and into the per-expert byte count
-//! the budget planners need. WHY: the CPU tier reads each routed expert
-//! straight from the memory-mapped file, so it needs one validated, I/O-free
-//! mapping from `(layer, expert)` to bytes — validated once at load, never per
-//! token. This module does no file I/O and creates no mapping (a file-backed
-//! mmap needs `unsafe`, a separate decision): the caller supplies any
-//! `Arc<dyn MappedRegion>`. Nothing about Qwen3.6 is hard-coded; every number
-//! arrives as an argument. Used by `TieredHost` and the tiered load.
+//! tensors of a Q4_K GGUF conversion, into pool jobs over any shared region
+//! holding the whole file, and into the per-expert byte count the budget
+//! planners need. The placement and its validation are the shared
+//! [`GgufExpertIndex`] (`weights::gguf_experts`); this module adds the Q4_K
+//! shape rule and the mapped-region jobs. WHY: the CPU tier reads each routed
+//! expert straight from the memory-mapped file, so it needs one validated,
+//! I/O-free mapping from `(layer, expert)` to bytes, built once at load. This
+//! module does no file I/O and creates no mapping (a file-backed mmap needs
+//! `unsafe`, a separate decision): the caller supplies any `Arc<dyn
+//! MappedRegion>`. Nothing about Qwen3.6 is hard-coded; every number arrives as
+//! an argument. Used by `TieredHost` and the tiered load.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use super::cpu_pool::{ExpertJob, MappedRegion};
-use crate::kernels::expert_cpu::{ExpertShape, Q4K_BLOCK_BYTES, Q4K_BLOCK_VALUES};
-use crate::weights::{GgufHeader, GgufTensor, GgufType};
-
-/// Names of the three stacked expert tensors of a layer; the literal `{layer}`
-/// is a placeholder the locator replaces with the layer number (llama.cpp
-/// writes the layer index there).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpertTensorNames {
-    pub gate: String,
-    pub up: String,
-    pub down: String,
-}
-
-impl ExpertTensorNames {
-    /// The llama.cpp GGUF convention: `blk.{layer}.ffn_gate_exps.weight`,
-    /// `blk.{layer}.ffn_up_exps.weight` and `blk.{layer}.ffn_down_exps.weight`.
-    /// WHY: matching the on-disk names byte for byte is what lets the locator
-    /// index unmodified llama.cpp conversions.
-    pub fn llama_cpp() -> Self {
-        Self {
-            gate: String::from("blk.{layer}.ffn_gate_exps.weight"),
-            up: String::from("blk.{layer}.ffn_up_exps.weight"),
-            down: String::from("blk.{layer}.ffn_down_exps.weight"),
-        }
-    }
-
-    pub fn for_layer(&self, layer: usize) -> Self {
-        let fill = |name: &str| name.replace("{layer}", &layer.to_string());
-        Self {
-            gate: fill(&self.gate),
-            up: fill(&self.up),
-            down: fill(&self.down),
-        }
-    }
-}
+use crate::kernels::expert_cpu::{ExpertShape, Q4K_BLOCK_VALUES};
+pub use crate::weights::{ExpertTensorNames, LocatorError};
+use crate::weights::{GgufExpertIndex, GgufHeader, GgufType};
 
 /// The byte ranges of one expert inside the file: absolute, half-open `usize`
 /// offsets, ready to index any region that holds the whole file at its offsets.
@@ -64,52 +34,12 @@ pub struct ExpertRanges {
     pub down: Range<usize>,
 }
 
-/// Typed failure of building or querying an [`ExpertLocator`]; every refusal
-/// names the tensor or the arguments that lost, and nothing is half-indexed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LocatorError {
-    MissingTensor {
-        /// The looked-up name, `{layer}` already replaced.
-        name: String,
-    },
-    /// The tensor exists but is structurally unusable (wrong ggml type, wrong
-    /// rank, a byte length that disagrees with its dims, a range beyond the
-    /// file, or an overlap with a sibling of the same layer); `why` says which.
-    BadTensor { name: String, why: String },
-    /// The geometry disagrees: a tensor's dims differ from the expected
-    /// `[ne0, ne1, ne2]` (transposed, wrong extents, or `ne2 != experts`), or
-    /// the locator arguments themselves are impossible. The string names the
-    /// tensor and both geometries.
-    ShapeMismatch(String),
-    /// `ranges`/`job` asked for a layer outside `0..layers` or an expert
-    /// outside `0..experts`; the numbers echo the arguments.
-    OutOfRange { layer: usize, expert: usize },
-    /// A checked offset or size computation overflowed; nothing was indexed.
-    Overflow,
-}
-
-/// Placement of one stacked tensor: its absolute file offset and the byte
-/// stride between consecutive experts (`ne0 * ne1 / 256 * 144`, Q4_K).
-#[derive(Debug)]
-struct TensorSpan {
-    offset: u64,
-    per_expert: u64,
-}
-
-#[derive(Debug)]
-struct LayerSpans {
-    gate: TensorSpan,
-    up: TensorSpan,
-    down: TensorSpan,
-}
-
 /// The validated placement of every expert of every requested layer inside one
 /// GGUF file. Built once at load from a parsed header; every later
 /// `ranges`/`job` call is pure arithmetic over the stored spans.
 #[derive(Debug)]
 pub struct ExpertLocator {
-    spans: Vec<LayerSpans>,
-    experts: usize,
+    index: GgufExpertIndex,
     expert_bytes: u64,
     shape: ExpertShape,
 }
@@ -138,11 +68,6 @@ pub fn require_q4k_shexp(header: &GgufHeader, layers: usize) -> Result<(), Locat
         }
     }
     Ok(())
-}
-
-/// Widens a `usize` to `u64` (GGUF arithmetic is `u64`), checked.
-fn widen(n: usize) -> Result<u64, LocatorError> {
-    u64::try_from(n).map_err(|_| LocatorError::Overflow)
 }
 
 impl ExpertLocator {
@@ -176,154 +101,57 @@ impl ExpertLocator {
                 shape.hidden, shape.inter
             )));
         }
-        let (hidden, inter, experts) = (widen(shape.hidden)?, widen(shape.inter)?, widen(experts)?);
-        let side = [hidden, inter, experts]; // gate/up: [hidden, inter, experts]
-        let down = [inter, hidden, experts]; // down: [inter, hidden, experts]
-        let mut spans = Vec::with_capacity(layers);
-        let span = |name: &str, want: [u64; 3]| -> Result<TensorSpan, LocatorError> {
-            Self::tensor_span(Self::require(header, name)?, name, want, experts, header)
-        };
-        for layer in 0..layers {
-            let names_l = names.for_layer(layer);
-            let entry = LayerSpans {
-                gate: span(&names_l.gate, side)?,
-                up: span(&names_l.up, side)?,
-                down: span(&names_l.down, down)?,
-            };
-            Self::check_disjoint(&entry, experts, &names_l)?;
-            spans.push(entry);
+        if names.gate.is_none() {
+            return Err(LocatorError::ShapeMismatch(
+                "locator: the expert kernels need a gate stack, and the names give none".into(),
+            ));
         }
-        let first = &spans[0];
-        let expert_bytes = first
-            .gate
-            .per_expert
-            .checked_add(first.up.per_expert)
-            .and_then(|sum| sum.checked_add(first.down.per_expert))
-            .ok_or(LocatorError::Overflow)?;
+        // One file: the mapped region holds the whole file at its offsets, so a tensor in a
+        // later shard of a split set cannot be addressed by absolute offset.
+        for layer in 0..layers {
+            let at = names.for_layer(layer);
+            for name in at.gate.iter().chain([&at.up, &at.down]) {
+                if let Some(shard) = header
+                    .tensor(name)
+                    .map(|tensor| tensor.shard())
+                    .filter(|&shard| shard > 0)
+                {
+                    return Err(LocatorError::BadTensor {
+                        name: name.clone(),
+                        why: format!(
+                            "the locator maps one file; tensor {name} is in shard {}",
+                            shard + 1
+                        ),
+                    });
+                }
+            }
+        }
+        let index = GgufExpertIndex::new(
+            header,
+            &[header.file_len()],
+            names,
+            layers,
+            experts,
+            (shape.hidden, shape.inter),
+            Some(&[GgufType::Q4K]),
+        )?;
+        let expert_bytes = index.record_bytes(0)?;
         Ok(ExpertLocator {
-            spans,
-            experts: usize::try_from(experts).map_err(|_| LocatorError::Overflow)?,
+            index,
             expert_bytes,
             shape,
         })
     }
 
-    fn require<'a>(header: &'a GgufHeader, name: &str) -> Result<&'a GgufTensor, LocatorError> {
-        header
-            .tensor(name)
-            .ok_or_else(|| LocatorError::MissingTensor {
-                name: name.to_owned(),
-            })
-    }
-
-    /// Validates one stacked tensor against its expected dims `[ne0, ne1, ne2]`
-    /// (check order: type, rank, dims, byte length, range) and spans it.
-    fn tensor_span(
-        tensor: &GgufTensor,
-        name: &str,
-        want: [u64; 3],
-        experts: u64,
-        header: &GgufHeader,
-    ) -> Result<TensorSpan, LocatorError> {
-        if tensor.ggml_type() != GgufType::Q4K {
-            return Err(LocatorError::BadTensor {
-                name: name.to_owned(),
-                why: format!("expected type Q4_K, found {}", tensor.ggml_type().name()),
-            });
-        }
-        let dims = tensor.dims();
-        if dims.len() != 3 {
-            return Err(LocatorError::BadTensor {
-                name: name.to_owned(),
-                why: format!("expected 3 dimensions, found {}", dims.len()),
-            });
-        }
-        let got = [dims[0], dims[1], dims[2]];
-        if got != want {
-            return Err(LocatorError::ShapeMismatch(format!(
-                "tensor {name} has dims {got:?}, expected {want:?} \
-                 (ne0 is the contiguous row length)"
-            )));
-        }
-        let (values, block) = (widen(Q4K_BLOCK_VALUES)?, widen(Q4K_BLOCK_BYTES)?);
-        let per_expert = want[0]
-            .checked_mul(want[1])
-            .and_then(|v| v.checked_div(values))
-            .and_then(|v| v.checked_mul(block))
-            .ok_or(LocatorError::Overflow)?;
-        let expected_len = per_expert
-            .checked_mul(experts)
-            .ok_or(LocatorError::Overflow)?;
-        if tensor.byte_len() != expected_len {
-            return Err(LocatorError::BadTensor {
-                name: name.to_owned(),
-                why: format!(
-                    "byte length {} disagrees with per-expert {per_expert} x {experts} \
-                     experts",
-                    tensor.byte_len()
-                ),
-            });
-        }
-        let end = tensor
-            .abs_offset()
-            .checked_add(tensor.byte_len())
-            .ok_or(LocatorError::Overflow)?;
-        if end > header.file_len() {
-            return Err(LocatorError::BadTensor {
-                name: name.to_owned(),
-                why: format!(
-                    "range {}..{end} ends beyond the file length {}",
-                    tensor.abs_offset(),
-                    header.file_len()
-                ),
-            });
-        }
-        Ok(TensorSpan {
-            offset: tensor.abs_offset(),
-            per_expert,
-        })
-    }
-
-    /// The three tensors of a layer must not overlap each other (the parser
-    /// already refuses overlap globally; this keeps the promise local).
-    fn check_disjoint(
-        entry: &LayerSpans,
-        experts: u64,
-        names: &ExpertTensorNames,
-    ) -> Result<(), LocatorError> {
-        let placed = [
-            (&names.gate, &entry.gate),
-            (&names.up, &entry.up),
-            (&names.down, &entry.down),
-        ];
-        for pair in placed.windows(2) {
-            let ((name_a, span_a), (name_b, span_b)) = (pair[0], pair[1]);
-            let end = |span: &TensorSpan| {
-                span.per_expert
-                    .checked_mul(experts)
-                    .and_then(|len| span.offset.checked_add(len))
-                    .ok_or(LocatorError::Overflow)
-            };
-            let (end_a, end_b) = (end(span_a)?, end(span_b)?);
-            if span_a.offset < end_b && span_b.offset < end_a {
-                return Err(LocatorError::BadTensor {
-                    name: (*name_b).clone(),
-                    why: format!("overlaps tensor {name_a} of the same layer"),
-                });
-            }
-        }
-        Ok(())
-    }
-
     /// The layer count this locator was built for; valid layer indices are
     /// `0..layers()`.
     pub fn layers(&self) -> usize {
-        self.spans.len()
+        self.index.layers()
     }
 
     /// The expert count per layer; valid expert indices are `0..experts()`.
     pub fn experts(&self) -> usize {
-        self.experts
+        self.index.experts()
     }
 
     /// The expert shape every indexed tensor was validated against.
@@ -338,37 +166,21 @@ impl ExpertLocator {
         self.expert_bytes
     }
 
-    fn entry(&self, layer: usize, expert: usize) -> Result<&LayerSpans, LocatorError> {
-        if layer >= self.spans.len() || expert >= self.experts {
-            return Err(LocatorError::OutOfRange { layer, expert });
-        }
-        Ok(&self.spans[layer])
-    }
-
     /// The absolute byte ranges of expert `expert` of layer `layer`:
     /// `abs_offset + expert * per_expert .. + per_expert` per stacked tensor,
     /// checked at every step; the ranges index a region holding the file.
     pub fn ranges(&self, layer: usize, expert: usize) -> Result<ExpertRanges, LocatorError> {
-        let entry = self.entry(layer, expert)?;
-        let slice = |span: &TensorSpan| -> Result<Range<usize>, LocatorError> {
-            let at = span
-                .offset
-                .checked_add(
-                    widen(expert)?
-                        .checked_mul(span.per_expert)
-                        .ok_or(LocatorError::Overflow)?,
-                )
-                .ok_or(LocatorError::Overflow)?;
-            let end = at
-                .checked_add(span.per_expert)
-                .ok_or(LocatorError::Overflow)?;
-            let start = usize::try_from(at).map_err(|_| LocatorError::Overflow)?;
-            Ok(start..usize::try_from(end).map_err(|_| LocatorError::Overflow)?)
+        let slices = self.index.slices(layer, expert)?;
+        let range = |r: &Range<u64>| -> Result<Range<usize>, LocatorError> {
+            Ok(
+                usize::try_from(r.start).map_err(|_| LocatorError::Overflow)?
+                    ..usize::try_from(r.end).map_err(|_| LocatorError::Overflow)?,
+            )
         };
         Ok(ExpertRanges {
-            gate: slice(&entry.gate)?,
-            up: slice(&entry.up)?,
-            down: slice(&entry.down)?,
+            gate: range(&slices.require_gate()?.file_range)?,
+            up: range(&slices.up.file_range)?,
+            down: range(&slices.down.file_range)?,
         })
     }
 
@@ -498,14 +310,14 @@ pub(crate) mod tests {
         experts: usize,
         shape: ExpertShape,
     ) -> Vec<Entry> {
-        let names = ExpertTensorNames::llama_cpp();
+        let names = ExpertTensorNames::standard();
         let blocks = shape.hidden * shape.inter / Q4K_BLOCK_VALUES * experts;
         let (h, i, e) = (shape.hidden as u64, shape.inter as u64, experts as u64);
         let mut entries = Vec::new();
         for layer in 0..layers {
             let nl = names.for_layer(layer);
             for (name, dims) in [
-                (nl.gate, [h, i, e]),
+                (nl.gate.expect("gate"), [h, i, e]),
                 (nl.up, [h, i, e]),
                 (nl.down, [i, h, e]),
             ] {
@@ -543,12 +355,16 @@ pub(crate) mod tests {
         let mut table = expert_entries(rng, layers, experts, shape);
         table.reverse();
         place_sequential(&mut table);
-        let names = ExpertTensorNames::llama_cpp();
+        let names = ExpertTensorNames::standard();
         let offsets = (0..layers)
             .map(|layer| {
                 let nl = names.for_layer(layer);
                 let at = |n: &str| table.iter().find(|e| e.name == n).unwrap().data_offset;
-                [at(&nl.gate), at(&nl.up), at(&nl.down)]
+                [
+                    at(nl.gate.as_deref().expect("gate")),
+                    at(&nl.up),
+                    at(&nl.down),
+                ]
             })
             .collect();
         (write_gguf(&table), offsets)
@@ -627,29 +443,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn llama_cpp_names_are_the_gguf_convention() {
+    fn standard_names_are_the_gguf_convention() {
         // The literal spellings of the stacked expert tensors; `{layer}` stays
         // a placeholder until for_layer replaces it.
-        let n = ExpertTensorNames::llama_cpp();
-        assert_eq!(n.gate, "blk.{layer}.ffn_gate_exps.weight");
+        let n = ExpertTensorNames::standard();
+        assert_eq!(n.gate.as_deref(), Some("blk.{layer}.ffn_gate_exps.weight"));
         assert_eq!(n.up, "blk.{layer}.ffn_up_exps.weight");
         assert_eq!(n.down, "blk.{layer}.ffn_down_exps.weight");
     }
 
     #[test]
     fn locator_names_replace_the_layer_placeholder() {
-        let l7 = ExpertTensorNames::llama_cpp().for_layer(7);
-        assert_eq!(l7.gate, "blk.7.ffn_gate_exps.weight");
+        let l7 = ExpertTensorNames::standard().for_layer(7);
+        assert_eq!(l7.gate.as_deref(), Some("blk.7.ffn_gate_exps.weight"));
         assert_eq!(l7.up, "blk.7.ffn_up_exps.weight");
         assert_eq!(l7.down, "blk.7.ffn_down_exps.weight");
         let custom = ExpertTensorNames {
-            gate: String::from("{layer}/g/{layer}"),
+            gate: Some(String::from("{layer}/g/{layer}")),
             up: String::from("{layer}/u"),
             down: String::from("{layer}/d"),
         };
-        assert_eq!(custom.for_layer(3).gate, "3/g/3");
+        assert_eq!(custom.for_layer(3).gate.as_deref(), Some("3/g/3"));
         assert_eq!(custom.for_layer(3).up, "3/u");
-        assert_eq!(custom.gate, "{layer}/g/{layer}");
+        assert_eq!(custom.gate.as_deref(), Some("{layer}/g/{layer}"));
     }
 
     #[test]
@@ -686,7 +502,7 @@ pub(crate) mod tests {
         let (file, _) = expert_file(&mut Lcg(0x10C_A7E2_0000_0001), 2, 5, shape);
         let header = parse(&file.0);
         let locator =
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 2, 5, shape).unwrap();
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 2, 5, shape).unwrap();
         assert_eq!(
             locator.ranges(2, 0),
             Err(LocatorError::OutOfRange {
@@ -726,7 +542,7 @@ pub(crate) mod tests {
             expert_file(&mut Lcg(0xFA7E_5EED_0000_0002), 3, 5, shape);
         let header = parse(&bytes);
         let locator =
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 3, 5, shape).unwrap();
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 3, 5, shape).unwrap();
         assert_eq!((locator.layers(), locator.experts()), (3, 5));
         let per = slice_bytes(shape.hidden, shape.inter);
         for (layer, layer_offsets) in offsets.iter().enumerate() {
@@ -761,7 +577,7 @@ pub(crate) mod tests {
         let ((bytes, data_start), offsets) = expert_file(&mut rng, 2, 3, shape);
         let header = parse(&bytes);
         let locator =
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 2, 3, shape).unwrap();
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 2, 3, shape).unwrap();
         let per = slice_bytes(shape.hidden, shape.inter);
         let region: Arc<dyn MappedRegion> = Arc::new(bytes.clone());
         let hidden: Vec<f32> = (0..shape.hidden)
@@ -816,7 +632,7 @@ pub(crate) mod tests {
         let ((bytes, _), _) = expert_file(&mut rng, 2, 4, shape);
         let header = parse(&bytes);
         let locator =
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 2, 4, shape).unwrap();
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 2, 4, shape).unwrap();
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&bytes).unwrap();
         file.flush().unwrap();
@@ -855,7 +671,7 @@ pub(crate) mod tests {
         let (file, _) = expert_file(&mut Lcg(0x0EED_0CC0_0000_0004), 3, 5, shape);
         let header = parse(&file.0);
         let locator =
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 3, 5, shape).unwrap();
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 3, 5, shape).unwrap();
         let per = slice_bytes(shape.hidden, shape.inter) as u64;
         assert_eq!(locator.expert_bytes(), 3 * per);
         let cfg = TieredConfig {
@@ -896,7 +712,7 @@ pub(crate) mod tests {
         };
         let locate = |file: &(Vec<u8>, usize)| {
             let header = parse(&file.0);
-            ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 2, 4, shape)
+            ExpertLocator::new(&header, &ExpertTensorNames::standard(), 2, 4, shape)
         };
         let fresh = |seed: u64| expert_entries(&mut Lcg(seed), 2, 4, shape);
 
@@ -946,7 +762,7 @@ pub(crate) mod tests {
         let gate = header.tensor("blk.0.ffn_gate_exps.weight").unwrap();
         let per = (512 * 256 / 256 * 144) as u64;
         assert_ne!(gate.byte_len(), per * 4, "the byte lengths must disagree");
-        match ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 2, 4, shape) {
+        match ExpertLocator::new(&header, &ExpertTensorNames::standard(), 2, 4, shape) {
             Err(LocatorError::ShapeMismatch(why)) => {
                 assert!(why.contains("[512, 256, 6]"), "{why}");
             }
@@ -967,5 +783,56 @@ pub(crate) mod tests {
         let (bytes, _) = write_gguf(&table);
         let len = bytes.len() as u64;
         assert!(GgufHeader::from_bytes(&bytes, len, len).is_err());
+    }
+
+    /// A split set whose expert stacks are in the second file: the locator maps one file and
+    /// refuses by tensor and shard.
+    #[test]
+    fn a_tensor_in_a_later_shard_is_refused_by_name_and_shard() {
+        use crate::weights::GgufWeights;
+        use crate::weights::gguf_experts::test_support::{LIMITS, T, kv_u16, write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = |n: u16| dir.path().join(format!("q-{n:05}-of-00002.gguf"));
+        let kvs = |no: u16| {
+            vec![
+                kv_u16("split.no", no),
+                kv_u16("split.count", 2),
+                kv_u16("split.tensors.count", 3),
+            ]
+        };
+        let per = 256 * 256 / 256 * 144;
+        let stack = |part: &str| T {
+            name: format!("blk.0.ffn_{part}_exps.weight"),
+            dims: vec![256, 256, 2],
+            ty: GgufType::Q4K,
+            payload: vec![0; 2 * per],
+        };
+        write(&name(1), &kvs(0), &[]);
+        write(
+            &name(2),
+            &kvs(1),
+            &[stack("gate"), stack("up"), stack("down")],
+        );
+        let weights = GgufWeights::open_any_type(&name(1), LIMITS, None).expect("open the set");
+        let shape = ExpertShape {
+            hidden: 256,
+            inter: 256,
+        };
+        let error = ExpertLocator::new(
+            weights.header(),
+            &ExpertTensorNames::standard(),
+            1,
+            2,
+            shape,
+        )
+        .expect_err("a later shard");
+        assert_eq!(
+            error,
+            LocatorError::BadTensor {
+                name: "blk.0.ffn_gate_exps.weight".into(),
+                why: "the locator maps one file; tensor blk.0.ffn_gate_exps.weight is in shard 2"
+                    .into()
+            }
+        );
     }
 }

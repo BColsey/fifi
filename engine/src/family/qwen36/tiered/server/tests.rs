@@ -176,7 +176,7 @@ fn locate(bytes: &[u8]) -> ExpertLocator {
     let header = parse(bytes);
     ExpertLocator::new(
         &header,
-        &ExpertTensorNames::llama_cpp(),
+        &ExpertTensorNames::standard(),
         LAYERS,
         EXPERTS,
         SHAPE,
@@ -605,8 +605,7 @@ fn server_shutdown_joins_within_the_timeout_while_busy() {
     let mut rng = Lcg(0x5EED_C0C5_0000_0005);
     let ((bytes, _), _) = expert_file(&mut rng, 1, 8, SHAPE);
     let header = parse(&bytes);
-    let locator =
-        ExpertLocator::new(&header, &ExpertTensorNames::llama_cpp(), 1, 8, SHAPE).unwrap();
+    let locator = ExpertLocator::new(&header, &ExpertTensorNames::standard(), 1, 8, SHAPE).unwrap();
     let row: Vec<f32> = (0..SHAPE.hidden)
         .map(|_| rng.f32_between(-1.0, 1.0))
         .collect();

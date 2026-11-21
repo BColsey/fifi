@@ -76,6 +76,11 @@ pub(super) fn reset_lease_slots_for_test() {
 /// count instead. A buffer skipped after a terminal failure stays counted.
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Device bytes held by live buffers of this process: zero once every engine has stopped.
+pub(crate) fn live_device_bytes() -> usize {
+    LIVE_BYTES.load(Ordering::Acquire)
+}
+
 /// Live streams of this process. Like [`LIVE_BYTES`], an owner skipped after a
 /// terminal failure stays counted.
 static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);

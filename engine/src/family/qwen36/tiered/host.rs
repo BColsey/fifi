@@ -1228,7 +1228,7 @@ mod tests {
         let mut rng = Lcg(0xD4D4_0000_5EED_0001);
         let ((bytes, _), _) = expert_file(&mut rng, LAYERS, EXPERTS, SHAPE);
         let header = parse(&bytes);
-        let names = ExpertTensorNames::llama_cpp();
+        let names = ExpertTensorNames::standard();
         let make = || ExpertLocator::new(&header, &names, LAYERS, EXPERTS, SHAPE).unwrap();
         let region: Arc<dyn MappedRegion> = Arc::new(bytes);
         let kernel = ExpertKernel::Q8k(DotBackend::scalar());
@@ -1717,7 +1717,7 @@ mod tests {
         let mut rng = Lcg(0xD4D4_0000_5EED_0002);
         let ((bytes, _), _) = expert_file(&mut rng, LAYERS, EXPERTS, SHAPE);
         let header = parse(&bytes);
-        let names = ExpertTensorNames::llama_cpp();
+        let names = ExpertTensorNames::standard();
         let region: Arc<dyn MappedRegion> = Arc::new(bytes);
         let locator = || ExpertLocator::new(&header, &names, LAYERS, EXPERTS, SHAPE).unwrap();
         let pool = |shape| CpuPool::new(1, shape).unwrap();

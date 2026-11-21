@@ -51,8 +51,22 @@ use crate::kernels::cuda::{
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
-/// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`).
+/// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`) of the fp16
+/// packs of the Tiled block.
 const PACK_WIDTH: usize = 256;
+/// The width quantum of the q8_1 packs of the Native block: one q8_1 block.
+const Q8_WIDTH: usize = 32;
+/// Pick slots one expert matvec or batched SwiGLU launch takes. A block with more picks runs
+/// its expert launches in consecutive chunks of this many (Flash-Next picks ten).
+const LAUNCH_SLOTS: usize = 8;
+
+/// The pick slots of a block as `(first, count)` chunks of at most [`LAUNCH_SLOTS`]. A block of
+/// eight picks or fewer is one chunk over every slot, the launch it always made.
+fn slot_chunks(top_k: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..top_k)
+        .step_by(LAUNCH_SLOTS)
+        .map(move |first| (first, LAUNCH_SLOTS.min(top_k - first)))
+}
 
 impl MoeDims {
     pub(super) fn new(dims: &StepDims, rows: usize) -> Self {
@@ -427,7 +441,7 @@ pub(super) struct ExpertFacts {
 /// packs of the Native block. The wrong-kind accessor is a typed refusal, so a Native list cannot
 /// launch against Tiled packs or the other way round.
 #[derive(Clone, Copy)]
-pub(super) enum Packs<'b> {
+pub(in crate::family) enum Packs<'b> {
     Xf {
         moe: DeviceRange<'b>,
         down: DeviceRange<'b>,
@@ -578,14 +592,14 @@ pub(super) fn check_block(
     weights: &WeightFacts,
     bufs: &BufferFacts,
 ) -> Result<(), EngError> {
-    check_dims(dims)?;
+    check_dims(dims, bufs.expert.packs.kind)?;
     check_weights(dims, weights)?;
     let need = NeedBytes::of(dims, bufs.expert.packs.kind)?;
     check_sizes(&need, bufs)?;
     check_apart(bufs)
 }
 
-fn check_dims(dims: &MoeDims) -> Result<(), EngError> {
+fn check_dims(dims: &MoeDims, kind: PackKind) -> Result<(), EngError> {
     if dims.rows != 1 {
         return Err(refuse(format!(
             "the block takes one row, got {}",
@@ -598,9 +612,13 @@ fn check_dims(dims: &MoeDims) -> Result<(), EngError> {
             dims.top_k, dims.n_expert
         )));
     }
-    if !dims.inter.is_multiple_of(PACK_WIDTH) || !dims.shared_inter.is_multiple_of(PACK_WIDTH) {
+    let width = match kind {
+        PackKind::Xf => PACK_WIDTH,
+        PackKind::Q8 => Q8_WIDTH,
+    };
+    if !dims.inter.is_multiple_of(width) || !dims.shared_inter.is_multiple_of(width) {
         return Err(refuse(format!(
-            "inter {} and shared_inter {} must be multiples of {PACK_WIDTH}",
+            "inter {} and shared_inter {} must be multiples of {width}",
             dims.inter, dims.shared_inter
         )));
     }
@@ -756,7 +774,7 @@ fn check_apart(bufs: &BufferFacts) -> Result<(), EngError> {
 /// launches) or the file's own blocks of the Native load (the ONE merged `matvec_expert` launch;
 /// the depth rides `NativeWeight::experts`).
 #[derive(Clone, Copy)]
-pub(super) enum StackWeights<'w> {
+pub(in crate::family) enum StackWeights<'w> {
     Tiled(ExpertStack<'w>),
     Native(&'w NativeWeight),
 }
@@ -765,42 +783,42 @@ pub(super) enum StackWeights<'w> {
 /// lookup of `LayerTable`): the raw F32 router matrices and the expert stacks and shared-expert
 /// projections of the session's layout (tiles or native blocks).
 #[derive(Clone, Copy)]
-pub(super) struct MoeLayerWeights<'w> {
+pub(in crate::family) struct MoeLayerWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix (`ffn_gate_inp`).
-    pub(super) router: &'w DeviceBuffer,
+    pub(in crate::family) router: &'w DeviceBuffer,
     /// The raw F32 `[hidden]` shared-gate vector (`ffn_gate_inp_shexp`).
-    pub(super) router_shared: &'w DeviceBuffer,
+    pub(in crate::family) router_shared: &'w DeviceBuffer,
     /// The gate stack of all routed experts.
-    pub(super) gate: StackWeights<'w>,
+    pub(in crate::family) gate: StackWeights<'w>,
     /// The up stack of all routed experts.
-    pub(super) up: StackWeights<'w>,
+    pub(in crate::family) up: StackWeights<'w>,
     /// The down stack of all routed experts.
-    pub(super) down: StackWeights<'w>,
-    pub(super) shared_gate: DenseWeight<'w>,
-    pub(super) shared_up: DenseWeight<'w>,
-    pub(super) shared_down: DenseWeight<'w>,
+    pub(in crate::family) down: StackWeights<'w>,
+    pub(in crate::family) shared_gate: DenseWeight<'w>,
+    pub(in crate::family) shared_up: DenseWeight<'w>,
+    pub(in crate::family) shared_down: DenseWeight<'w>,
 }
 
 /// The expert and shared-expert ranges of the block: views of the step arena, the input packs
 /// grouped in [`Packs`].
-pub(super) struct ExpertBufs<'b> {
-    pub(super) packs: Packs<'b>,
+pub(in crate::family) struct ExpertBufs<'b> {
+    pub(in crate::family) packs: Packs<'b>,
     /// f32 `[top_k][gate | up]`, slot `s`'s halves contiguous for its pack.
-    pub(super) expert_gu: DeviceRange<'b>,
+    pub(in crate::family) expert_gu: DeviceRange<'b>,
     /// f32 `[top_k][hidden]` in pick order, the combine's expert term.
-    pub(super) expert_down: DeviceRange<'b>,
+    pub(in crate::family) expert_down: DeviceRange<'b>,
     /// f32 `[gate | up]` of the shared expert.
-    pub(super) shared_gu: DeviceRange<'b>,
+    pub(in crate::family) shared_gu: DeviceRange<'b>,
     /// f32 `[hidden]`, the shared expert's down output.
-    pub(super) shared_out: DeviceRange<'b>,
+    pub(in crate::family) shared_out: DeviceRange<'b>,
 }
 
 /// The fifteen device ranges of the block, grouped so no function takes more than four arguments.
-pub(super) struct MoeBuffers<'b> {
+pub(in crate::family) struct MoeBuffers<'b> {
     /// Routing and residual ranges.
-    pub(super) route: RouteBufs<'b>,
+    pub(in crate::family) route: RouteBufs<'b>,
     /// Expert and shared-expert ranges.
-    pub(super) expert: ExpertBufs<'b>,
+    pub(in crate::family) expert: ExpertBufs<'b>,
 }
 
 fn pack_facts(packs: &Packs<'_>) -> PackFacts {
@@ -1225,26 +1243,36 @@ fn op_expert_gu(
         None
     };
     let (moe, _, _) = bufs.expert.packs.q8()?;
-    launch.ctx.matvec_expert(
-        launch.stream,
-        ExpertMatvecCall {
-            ty: native.quant(),
-            w_stack: native_stack(native)?,
-            glu_gate: match gate_native {
-                Some(g) => Some(native_stack(g)?),
-                None => None,
+    let w_stack = native_stack(native)?;
+    let glu_gate = match gate_native {
+        Some(g) => Some(native_stack(g)?),
+        None => None,
+    };
+    for (first, used) in slot_chunks(dims.top_k) {
+        let ids = if used == dims.top_k {
+            bufs.route.ids
+        } else {
+            slice(&bufs.route.ids, first * I32, used * I32)?
+        };
+        launch.ctx.matvec_expert(
+            launch.stream,
+            ExpertMatvecCall {
+                ty: native.quant(),
+                w_stack,
+                glu_gate,
+                ids,
+                x_q8: moe,
+                x_per_slot: false,
+                y: tail(&bufs.expert.expert_gu, offset + first * 2 * dims.inter)?,
+                y_slot_stride: 2 * dims.inter,
+                k: dims.hidden,
+                rows: dims.inter,
+                n_expert: dims.n_expert,
+                n_used: used,
             },
-            ids: bufs.route.ids,
-            x_q8: moe,
-            x_per_slot: false,
-            y: tail(&bufs.expert.expert_gu, offset)?,
-            y_slot_stride: 2 * dims.inter,
-            k: dims.hidden,
-            rows: dims.inter,
-            n_expert: dims.n_expert,
-            n_used: dims.top_k,
-        },
-    )
+        )?;
+    }
+    Ok(())
 }
 
 /// The ONE merged down matvec of the native block ([`MoeOp::ExpertDownQ`]): `matvec_expert` with
@@ -1258,23 +1286,46 @@ fn op_expert_down(
     let dims = dims_of(weights, bufs);
     let native = weights.down.native()?;
     let (_, down, _) = bufs.expert.packs.q8()?;
-    launch.ctx.matvec_expert(
-        launch.stream,
-        ExpertMatvecCall {
-            ty: native.quant(),
-            w_stack: native_stack(native)?,
-            glu_gate: None,
-            ids: bufs.route.ids,
-            x_q8: down,
-            x_per_slot: true,
-            y: whole_of(&bufs.expert.expert_down)?,
-            y_slot_stride: dims.hidden,
-            k: dims.inter,
-            rows: dims.hidden,
-            n_expert: dims.n_expert,
-            n_used: dims.top_k,
-        },
-    )
+    let w_stack = native_stack(native)?;
+    let row = q8_1_bytes(dims.inter, 1)
+        .ok_or_else(|| refuse("the down pack row size overflows".to_owned()))?;
+    for (first, used) in slot_chunks(dims.top_k) {
+        let whole = used == dims.top_k;
+        launch.ctx.matvec_expert(
+            launch.stream,
+            ExpertMatvecCall {
+                ty: native.quant(),
+                w_stack,
+                glu_gate: None,
+                ids: if whole {
+                    bufs.route.ids
+                } else {
+                    slice(&bufs.route.ids, first * I32, used * I32)?
+                },
+                x_q8: if whole {
+                    down
+                } else {
+                    slice(&down, first * row, used * row)?
+                },
+                x_per_slot: true,
+                y: if whole {
+                    whole_of(&bufs.expert.expert_down)?
+                } else {
+                    slice(
+                        &bufs.expert.expert_down,
+                        first * dims.hidden * F32,
+                        used * dims.hidden * F32,
+                    )?
+                },
+                y_slot_stride: dims.hidden,
+                k: dims.inter,
+                rows: dims.hidden,
+                n_expert: dims.n_expert,
+                n_used: used,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// The shared gate/up/down matvec of the native block ([`MoeOp::SharedGateQ`],
@@ -1363,17 +1414,31 @@ fn op_swiglu_q(
         ),
         _ => return Err(refuse("the native swiglu takes a Q op".to_owned())),
     };
-    launch.ctx.swiglu_q8(
-        launch.stream,
-        SwigluQ8Call {
-            gu,
-            q8,
-            n_ff,
-            y_slot_stride,
-            slots,
-            glu_done,
-        },
-    )
+    let row = q8_1_bytes(n_ff, 1)
+        .ok_or_else(|| refuse("the SwiGLU pack row size overflows".to_owned()))?;
+    for (first, used) in slot_chunks(slots) {
+        let whole = used == slots;
+        launch.ctx.swiglu_q8(
+            launch.stream,
+            SwigluQ8Call {
+                gu: if whole {
+                    gu
+                } else {
+                    slice(&gu, first * y_slot_stride * F32, used * y_slot_stride * F32)?
+                },
+                q8: if whole {
+                    q8
+                } else {
+                    slice(&q8, first * row, used * row)?
+                },
+                n_ff,
+                y_slot_stride,
+                slots: used,
+                glu_done,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// The combine: `resid_out = resid_in + (picks in pick order + gate * shared)` out of place
@@ -1434,7 +1499,7 @@ pub(super) fn launch_op(
     }
 }
 
-pub(super) fn run_moe_block(
+pub(in crate::family) fn run_moe_block(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
     bufs: &MoeBuffers<'_>,

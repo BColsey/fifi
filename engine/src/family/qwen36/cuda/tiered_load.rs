@@ -167,7 +167,7 @@ pub(super) fn build_tiered(
     let checkpoint = |what: String| EngError::Checkpoint(format!("tiered: {what}"));
     let locator = ExpertLocator::new(
         header,
-        &ExpertTensorNames::llama_cpp(),
+        &ExpertTensorNames::standard(),
         layers,
         moe.experts,
         shape,

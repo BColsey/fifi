@@ -5,7 +5,10 @@ use std::ops::Range;
 
 use crate::{
     EngError,
-    weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
+    weights::{
+        ExpertSlice, ExpertTensorNames, GgufExpertIndex, GgufHeader, GgufTensor, GgufType,
+        MetaValue,
+    },
 };
 
 pub(super) struct MatrixSource {
@@ -63,10 +66,29 @@ pub(super) fn expert_sources(
     }
     check_architecture(header)?;
     let stem = format!("blk.{layer}.ffn");
+    // The placement of the three stacked tensors is the shared expert index's; only the
+    // per-expert scales of the `.scale` tensors are sliced here.
+    let index = GgufExpertIndex::single_file(
+        header,
+        &ExpertTensorNames::with_stem(&stem),
+        256,
+        (2048, 512),
+        &[GgufType::Nvfp4],
+    )?;
+    let [gate, up, down] = index.three_slices(0, expert as usize)?;
+    let source = |slice: &ExpertSlice<'_>, part: &str, shape: [usize; 2]| {
+        let name = format!("{stem}_{part}.scale");
+        let scales = required(header, &name, GgufType::F32, &[256])?;
+        Ok::<_, EngError>(MatrixSource {
+            data: slice.file_range.clone(),
+            scale: selected_range(scales, expert, 4)?,
+            shape,
+        })
+    };
     Ok(ExpertSources {
-        gate: part(header, &format!("{stem}_gate_exps"), [512, 2048], expert)?,
-        up: part(header, &format!("{stem}_up_exps"), [512, 2048], expert)?,
-        down: part(header, &format!("{stem}_down_exps"), [2048, 512], expert)?,
+        gate: source(&gate, "gate_exps", [512, 2048])?,
+        up: source(&up, "up_exps", [512, 2048])?,
+        down: source(&down, "down_exps", [2048, 512])?,
     })
 }
 
@@ -108,27 +130,6 @@ fn check_architecture(header: &GgufHeader) -> Result<(), EngError> {
         return Err(invalid("general.architecture must be flint"));
     }
     Ok(())
-}
-
-fn part(
-    header: &GgufHeader,
-    stem: &str,
-    shape: [usize; 2],
-    expert: u32,
-) -> Result<MatrixSource, EngError> {
-    let weight = required(
-        header,
-        &format!("{stem}.weight"),
-        GgufType::Nvfp4,
-        &[shape[1] as u64, shape[0] as u64, 256],
-    )?;
-    let scales = required(header, &format!("{stem}.scale"), GgufType::F32, &[256])?;
-    let part_bytes = weight.byte_len() / 256;
-    Ok(MatrixSource {
-        data: selected_range(weight, expert, part_bytes)?,
-        scale: selected_range(scales, expert, 4)?,
-        shape,
-    })
 }
 
 pub(super) fn required<'a>(

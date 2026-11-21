@@ -334,6 +334,15 @@ mod tests {
         RecordSite { layer, expert }
     }
 
+    #[test]
+    fn every_layer_has_the_uniform_record_size() {
+        let grid = counting_grid(4, 8, 16);
+        let store = store(&grid).expect("the store builds");
+        for layer in 0..4 {
+            assert_eq!(store.record_bytes_at(layer).unwrap(), store.record_bytes());
+        }
+    }
+
     fn expected(grid: &CountingGrid, s: RecordSite) -> &[u8] {
         let index = (s.layer * 8 + usize::from(s.expert)) * 16;
         &grid.bytes[index..index + 16]

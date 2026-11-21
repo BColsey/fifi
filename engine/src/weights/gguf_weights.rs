@@ -301,6 +301,43 @@ impl GgufWeights {
         self.check_len(tensor.shard())
     }
 
+    /// Fills each buffer from its shard file at the given absolute offset, as `reads` lists
+    /// `(shard, file offset, buffer)`. Every range must lie inside its shard's length when
+    /// opened (`EngError::BadRequest` before any read otherwise). Each distinct shard's length
+    /// is checked once, after the reads, so a file changed since open fails the whole call.
+    #[cfg_attr(not(test), expect(dead_code, reason = "no caller outside the tests"))]
+    pub(crate) fn read_file_ranges(
+        &self,
+        reads: &mut [(usize, u64, &mut [u8])],
+    ) -> Result<(), EngError> {
+        for (shard, offset, buf) in reads.iter() {
+            let len =
+                self.file_lens.get(*shard).copied().ok_or_else(|| {
+                    EngError::BadRequest(format!("gguf: shard {shard} is not open"))
+                })?;
+            let end = offset.checked_add(buf.len() as u64);
+            if end.is_none_or(|end| end > len) {
+                return Err(EngError::BadRequest(format!(
+                    "gguf: {} bytes at offset {offset} lie outside shard {shard} of {len} bytes",
+                    buf.len()
+                )));
+            }
+        }
+        for (shard, offset, buf) in reads.iter_mut() {
+            self.files[*shard]
+                .read_exact_at(buf, *offset)
+                .map_err(|e| read_error(&format!("shard {shard}"), &e))?;
+        }
+        let mut checked: Vec<usize> = Vec::new();
+        for (shard, _, _) in reads.iter() {
+            if !checked.contains(shard) {
+                self.check_len(*shard)?;
+                checked.push(*shard);
+            }
+        }
+        Ok(())
+    }
+
     /// Fills buf with header bytes at file offset offset of shard 1 (the file itself
     /// outside a split set), where the metadata lives.
     ///

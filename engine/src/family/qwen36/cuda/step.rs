@@ -105,7 +105,7 @@ use crate::{
             add_rmsnorm_q8::AddNormQ8Call,
             embed::{EmbedCall, EmbedNativeCall},
             embed_bf16::EmbedBf16Call,
-            matvec_q::{MatvecCall, QuantType},
+            matvec_q::QuantType,
             shortlist::{self, ShortlistCall, ShortlistMassCall},
             step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
         },
@@ -2766,21 +2766,13 @@ impl<'a> QwenResidentStep<'a> {
                     m: STEP_ROWS,
                 },
             ),
-            HeadWeight::Native(head) => {
-                let ty = head.quant();
-                self.context.matvec_q(
-                    &self.stream,
-                    MatvecCall {
-                        ty,
-                        w: head.buffer().range(0, head.buffer().bytes())?,
-                        x_q8: self.view(Slot::Q8Final)?,
-                        y,
-                        k: head.k(),
-                        rows: head.n_rows(),
-                        ncols: STEP_ROWS,
-                    },
-                )
-            }
+            HeadWeight::Native(head) => self.context.matvec_native(
+                &self.stream,
+                head,
+                self.view(Slot::Q8Final)?,
+                y,
+                STEP_ROWS,
+            ),
             HeadWeight::Bf16(_) | HeadWeight::Exl3(_) => Err(EngError::Checkpoint(
                 "step weights: the head of this load is not a quantized matrix".to_owned(),
             )),

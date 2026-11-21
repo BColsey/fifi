@@ -30,6 +30,11 @@ pub(crate) mod exl3_pack;
 pub(crate) mod flash_next;
 
 pub(crate) mod device_budget;
+#[allow(
+    dead_code,
+    reason = "ungated so plain host gates run its order test; the card families that build their step on it are native-cuda"
+)]
+pub(crate) mod engine_owner;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(in crate::family) mod exl3_tensors;
 /// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
@@ -48,6 +53,11 @@ pub(crate) mod gguf_select;
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
+#[allow(
+    dead_code,
+    reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"
+)]
+pub(crate) mod recipe;
 // Pure host bookkeeping, compiled wherever it has a caller: every Linux
 // build (the admission fits need the cgroup-aware probe) and the test build.
 #[cfg(any(test, target_os = "linux"))]

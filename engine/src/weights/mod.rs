@@ -12,6 +12,7 @@ pub mod exl3;
 pub(crate) mod expert_store;
 mod gguf;
 mod gguf_dequant;
+pub(crate) mod gguf_experts;
 mod gguf_split;
 mod gguf_tables;
 /// The IQ4_NL value table, re-exported for the native table pin test
@@ -50,6 +51,9 @@ pub use gguf::{
 };
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
+};
+pub use gguf_experts::{
+    ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
 pub use gguf_identity::{TENSOR_SAMPLE, gguf_identity_digest};
 pub(crate) use gguf_split::shard_name_of;

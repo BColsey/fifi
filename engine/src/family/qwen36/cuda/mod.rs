@@ -102,7 +102,7 @@ mod mixer_ops;
 mod mixer_shapes;
 #[cfg(test)]
 mod mixer_tests;
-mod mixer_weights;
+pub(in crate::family) mod mixer_weights;
 pub(in crate::family) mod moe;
 mod mtp_load;
 #[cfg(test)]

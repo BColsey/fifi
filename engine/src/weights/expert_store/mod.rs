@@ -61,9 +61,18 @@ pub(crate) trait ExpertRecordStore: Send + Sync {
     /// Reads one lease per site, in order.
     fn read_records(&self, sites: &[RecordSite]) -> Result<Vec<Self::Lease>, EngError>;
 
-    /// Bytes of one expert record. Every record has the same size; this
-    /// drives tier arithmetic and batching bounds.
+    /// Bytes of one expert record: the same for every record unless the store overrides
+    /// [`Self::record_bytes_at`], in which case the largest. Drives tier arithmetic and
+    /// batching bounds.
     fn record_bytes(&self) -> u64;
+
+    /// Bytes of one record of `layer`; a layer outside the store is `BadRequest`. A store whose records differ by layer (a GGUF quantizes
+    /// each layer's experts on their own) overrides this; [`Self::record_bytes`] is then the
+    /// largest, which a slot or staging buffer serving every layer must hold. The default is
+    /// the uniform size.
+    fn record_bytes_at(&self, _layer: usize) -> Result<u64, EngError> {
+        Ok(self.record_bytes())
+    }
 
     /// The largest batch this store accepts in one call; a bigger batch is
     /// a `BadRequest` refusal before any I/O. Stores without a bound

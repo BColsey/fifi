@@ -44,7 +44,6 @@ use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::NativeWeight;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::embed::EmbedNativeCall;
-use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::step_params::ArgmaxCall;
 
 const F32: usize = size_of::<f32>();
@@ -270,17 +269,12 @@ pub(crate) fn run_card_token(
             )?;
             let head = heads[card];
             let rows = head.n_rows();
-            ctx.matvec_q(
+            ctx.matvec_native(
                 stream,
-                MatvecCall {
-                    ty: head.quant(),
-                    w: head.buffer().range(0, head.buffer().bytes())?,
-                    x_q8: view(card, Slot::Q8Final)?,
-                    y: view(card, Slot::Logits)?,
-                    k: head.k(),
-                    rows,
-                    ncols: 1,
-                },
+                head,
+                view(card, Slot::Q8Final)?,
+                view(card, Slot::Logits)?,
+                1,
             )?;
             ctx.argmax(
                 stream,

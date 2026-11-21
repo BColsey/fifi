@@ -1024,6 +1024,16 @@ mod tests {
         RecordSite { layer, expert }
     }
 
+    #[test]
+    fn every_layer_has_the_uniform_record_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, file) = grid_file(&dir, 0);
+        let store = store(file, 2);
+        for layer in 0..LAYERS {
+            assert_eq!(store.record_bytes_at(layer).unwrap(), store.record_bytes());
+        }
+    }
+
     /// The span grid: extents across two shards at non-sector-aligned
     /// file offsets, assembled to their record offsets by the pool's
     /// workers; a shard that ends inside a record; and a site whose

@@ -681,3 +681,69 @@ fn cuda_qsa_indexer_matches_the_host_at_the_kernel_limits() -> Result<(), EngErr
         &schedules,
     )
 }
+
+/// Equal block scores: the device keeps the lowest-numbered blocks among those that tie for the
+/// last place, as the host's ranking does (descending score, the lower block first on a tie).
+/// The scores take three values, so most blocks tie, at every number of visible blocks.
+#[test]
+fn cuda_qsa_selection_breaks_ties_by_the_lower_block_like_the_host() -> Result<(), EngError> {
+    if !device_present("cuda_qsa_selection_breaks_ties_by_the_lower_block_like_the_host") {
+        return Ok(());
+    }
+    let geom = FLASH_NEXT;
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let (cap, budget) = (geom.cap_blocks, geom.budget_blocks);
+    let mut rng = Rng(0x71e5);
+    let values = [0.5f32, 1.0, 2.0];
+    let scores: Vec<f32> = (0..cap)
+        .map(|_| values[(rng.unit() * 3.0) as usize % 3])
+        .collect();
+    let scores_dev = ctx.upload(&f32_bytes(&scores))?;
+    let chosen_dev = ctx.upload(&vec![0xFF_u8; budget * 4])?;
+    let dims = geom.host_dims();
+    for blocks in [budget + 1, budget + 7, 40, cap - 1] {
+        // The token whose cache holds `blocks` complete blocks and an open tail of one.
+        let position = blocks * geom.ratio;
+        stream.synchronize()?;
+        ctx.qsa_select(
+            &stream,
+            QsaSelectCall {
+                indexer: geom.indexer(),
+                m: 1,
+                budget_blocks: budget,
+                position: QsaPosition::Host(position),
+                scores: scores_dev.range(0, cap * 4)?,
+                blocks: chosen_dev.range(0, budget * 4)?,
+                status: None,
+            },
+        )?;
+        stream.synchronize()?;
+        let device: Vec<i32> = download(&ctx, &chosen_dev, budget)
+            .into_iter()
+            .map(|v| v.to_bits() as i32)
+            .collect();
+        let host = select_positions(
+            dims,
+            &scores[..blocks]
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect::<Vec<_>>(),
+            position as u32,
+        )?;
+        let mut host_blocks: Vec<usize> = host
+            .iter()
+            .filter(|&&p| p < blocks * geom.ratio)
+            .map(|&p| p / geom.ratio)
+            .collect();
+        host_blocks.dedup();
+        host_blocks.sort_unstable();
+        let device_blocks: Vec<usize> = device
+            .iter()
+            .filter(|&&b| b >= 0)
+            .map(|&b| b as usize)
+            .collect();
+        assert_eq!(device_blocks, host_blocks, "{blocks} blocks visible");
+    }
+    Ok(())
+}

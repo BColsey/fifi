@@ -2191,7 +2191,7 @@ fn chunk_moe_tiered_arm_fails_clean_on_empty_banks() {
         let mut rng = Lcg(0xD4D4_0000_5EED_0001);
         let ((bytes, _), _) = expert_file(&mut rng, 3, 8, shape);
         let header = parse(&bytes);
-        let names = ExpertTensorNames::llama_cpp();
+        let names = ExpertTensorNames::standard();
         let locator = ExpertLocator::new(&header, &names, 3, 8, shape)
             .map_err(|error| EngError::BadRequest(format!("the tiered fixture: {error:?}")))?;
         let region: Arc<dyn MappedRegion> = Arc::new(bytes);

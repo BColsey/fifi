@@ -29,7 +29,7 @@ const F32: usize = size_of::<f32>();
 /// One dense projection weight of a layer: the tiles of the Tiled load that `matmul` reads, or the
 /// file's own blocks of the Native load that `matvec_q` reads.
 #[derive(Clone, Copy)]
-pub(super) enum DenseWeight<'w> {
+pub(in crate::family) enum DenseWeight<'w> {
     Tiled(&'w TiledWeight),
     Native(&'w NativeWeight),
     Exl3(&'w Exl3Weight),

@@ -99,6 +99,7 @@ pub(crate) mod kv_f16_append;
 pub(crate) mod kv_f16_rows;
 pub(crate) mod matmul_expert;
 pub(crate) mod matvec_expert;
+pub(crate) mod matvec_native;
 pub(crate) mod matvec_q;
 pub(crate) mod moe_combine;
 pub(crate) mod pack_rows;
