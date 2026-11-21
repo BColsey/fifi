@@ -14,6 +14,8 @@
 //!    tails finish a row without a model step. A row that fails here, or whose growth cannot be
 //!    reserved (`row_growth`, `reserve_growth`), is refused alone, before its feed: its result is
 //!    its own error and every other row still finishes, cancels or steps.
+//!    Only a `MemoryPlan` refusal before the feed can succeed on a later window (the worker waits
+//!    and asks again); any other refusal is final for that row.
 //! 4. One row left runs the solo `decode`; two or more run `step_rows` once. A failure of that
 //!    step is an outer error: every stepped row is in an unknown state and the worker discards
 //!    them.

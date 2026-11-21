@@ -440,7 +440,9 @@ fn build_slot<E: ExecutorOps>(
     match setup_slot(executor, &mut slot, prefill_chunk) {
         Ok(()) => Ok(slot),
         Err(error) => {
-            pool.give(slot.session);
+            // A session whose reset or restore failed is not trusted again: it is dropped, and
+            // the pool allocates a fresh one when it is next empty.
+            drop(slot.session);
             Err((error, Box::new(slot.job)))
         }
     }

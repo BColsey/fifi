@@ -2839,3 +2839,24 @@ fn a_stop_during_a_piece_ends_the_tick_before_the_next_prompt() {
     engine.shutdown();
     drop((first_events, second_events));
 }
+
+#[test]
+fn a_session_whose_setup_failed_is_not_pooled_again() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.fail_reset_call = Some((0, EngError::BadRequest("the reset was refused".into())));
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    let (first, first_events) = job(&[0], 2);
+    engine.handle().try_submit(first).expect("first");
+    assert!(matches!(
+        collect(first_events).last(),
+        Some(JobEvent::Error(EngError::BadRequest(_)))
+    ));
+    let (second, second_events) = job(&[1], 2);
+    engine.handle().try_submit(second).expect("second");
+    assert_eq!(usage(&collect(second_events)).completion_tokens, 2);
+    // The seed that failed its reset is gone: the second job got a session of its own.
+    assert_eq!(snapshot(&engine).sessions_created, 1);
+    engine.shutdown();
+}
