@@ -868,7 +868,9 @@ fn flint_records_fill_exact_expert_slots_and_check_source_identity() {
 
     let root = sparse_checkpoint(|_| {});
     let source = FlintCheckpoint::open(root.path()).unwrap();
-    let layout = source.expert_page_layout(records::STEM, 6).unwrap();
+    let layout = source
+        .expert_page_layout("model.layers.24.mlp.switch_mlp", 6)
+        .unwrap();
     let roles: Vec<_> = layout
         .stacks
         .iter()
@@ -920,6 +922,55 @@ fn flint_records_fill_exact_expert_slots_and_check_source_identity() {
     assert!(records::ExpertRecords::open(&path, &[unrelated]).is_err());
     file.set_len(file_len - 1).unwrap();
     assert!(records::ExpertRecords::open(&path, &[]).is_err());
+}
+
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[test]
+fn flint_record_set_selects_only_declared_layers_and_limits_files() {
+    let root = tempfile::tempdir().unwrap();
+    let write_sidecar = |name: &str, layer| {
+        let header = serde_json::to_vec(&json!({
+            "format": "fifi-flint-expert-records-v1", "layer": layer, "shards": [],
+            "role_bytes": vec![196608; 9]
+        }))
+        .unwrap();
+        let mut file = File::create(root.path().join(name)).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len(8 + header.len() as u64 + 256 * 1_769_472)
+            .unwrap();
+    };
+    assert!(records::RecordSet::open(root.path(), &[], true).is_err());
+    write_sidecar("a.records", 47);
+    write_sidecar("b.records", 2);
+    std::fs::write(root.path().join("ignore.tmp"), []).unwrap();
+    let control = records::RecordSet::open(root.path(), &[], false).unwrap();
+    assert_eq!(control.describe(), "layers=2,47 mode=shards");
+    assert!(matches!(
+        control.for_stem("model.layers.2.mlp.switch_mlp"),
+        Some((_, false))
+    ));
+    assert!(control.for_stem("model.layers.24.mlp.switch_mlp").is_none());
+    assert!(matches!(
+        records::RecordSet::open(root.path(), &[], true)
+            .unwrap()
+            .for_stem("model.layers.47.mlp.switch_mlp"),
+        Some((_, true))
+    ));
+    write_sidecar("c.records", 47);
+    assert!(records::RecordSet::open(root.path(), &[], true).is_err());
+    write_sidecar("c.records", 1);
+    assert!(records::RecordSet::open(root.path(), &[], true).is_err());
+    write_sidecar("c.records", 24);
+    write_sidecar("d.records", 30);
+    assert!(records::RecordSet::open(root.path(), &[], true).is_ok());
+    write_sidecar("e.records", 31);
+    assert!(records::RecordSet::open(root.path(), &[], true).is_err());
 }
 
 #[test]
