@@ -227,13 +227,20 @@ pub(crate) fn q36_effective(
     rows
 }
 
+/// A Mac switch is on only for the exact value `1`. Any other value is
+/// reported as off, with the value named, so the row says what the start
+/// will do with it.
 fn mlx_switch(key: &'static str, name: &str) -> EffectiveSetting {
     let value = std::env::var_os(name);
-    row(
-        key,
-        value.as_deref().is_some_and(|flag| flag == "1").to_string(),
-        env_origin(&value),
-    )
+    row(key, mlx_switch_text(value.as_deref()), env_origin(&value))
+}
+
+fn mlx_switch_text(value: Option<&std::ffi::OsStr>) -> String {
+    match value {
+        None => "false".into(),
+        Some(flag) if flag == "1" => "true".into(),
+        Some(flag) => format!("false (ignored: {:?} is not 1)", flag.to_string_lossy()),
+    }
 }
 
 fn env_origin<T>(value: &Option<T>) -> Origin {
@@ -813,5 +820,19 @@ mod tests {
             Origin::IgnoredOnThisBackend
         );
         assert_eq!(origin(&rows, "compile"), Origin::IgnoredOnThisBackend);
+    }
+
+    #[test]
+    fn a_mac_switch_names_a_value_other_than_one_as_ignored() {
+        use std::ffi::OsStr;
+        assert_eq!(super::mlx_switch_text(None), "false");
+        assert_eq!(super::mlx_switch_text(Some(OsStr::new("1"))), "true");
+        for other in ["true", "0", "", "yes"] {
+            let text = super::mlx_switch_text(Some(OsStr::new(other)));
+            assert!(
+                text.starts_with("false (ignored: ") && text.contains(&format!("{other:?}")),
+                "{other:?}: {text}"
+            );
+        }
     }
 }

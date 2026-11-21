@@ -98,8 +98,11 @@ pub(crate) fn start(
     let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
         let device = DeviceBudget::detect()?;
         stages.begin("opening the model");
-        let disk_experts =
-            std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").is_some_and(|value| value == "1");
+        let disk_setting = std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS");
+        let disk_experts = disk_setting.as_deref().is_some_and(|value| value == "1");
+        if let Some(reason) = disk_experts_ignored(disk_setting.as_deref(), device.is_some()) {
+            eprintln!("q36: FIFI_Q36_MLX_DISK_EXPERTS ignored: {reason}");
+        }
         let (mut executor, session) = if let Some(device) = device.filter(|_| disk_experts) {
             Q36Executor::open_for_device(&owned, rules, device)?
         } else {
@@ -438,5 +441,37 @@ mod tests {
             },
             "the override reaches dense as well"
         );
+    }
+}
+
+/// Why a set FIFI_Q36_MLX_DISK_EXPERTS does not stage experts from disk, or
+/// `None` when it is unset or takes effect.
+fn disk_experts_ignored(value: Option<&std::ffi::OsStr>, device_sizing: bool) -> Option<String> {
+    let value = value?;
+    if value != "1" {
+        return Some(format!(
+            "{:?} is not 1, so the experts stay resident",
+            value.to_string_lossy()
+        ));
+    }
+    (!device_sizing).then(|| {
+        "device sizing is off; set FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB, so the experts stay resident"
+            .to_string()
+    })
+}
+
+#[cfg(test)]
+mod disk_experts_note_tests {
+    use super::disk_experts_ignored;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_set_switch_that_does_not_take_effect_says_why() {
+        assert_eq!(disk_experts_ignored(None, false), None);
+        assert_eq!(disk_experts_ignored(Some(OsStr::new("1")), true), None);
+        let off = disk_experts_ignored(Some(OsStr::new("1")), false).unwrap();
+        assert!(off.contains("device sizing is off") && off.contains("FIFI_MLX_WORKING_SET_MIB"));
+        let bad = disk_experts_ignored(Some(OsStr::new("true")), true).unwrap();
+        assert!(bad.contains("\"true\" is not 1"));
     }
 }
