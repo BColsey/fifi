@@ -92,8 +92,35 @@ impl DenseStep {
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         let output = self.range(Slot::Output, 0, shape[0])?;
-        self.run(context, x, output, |input| {
+        self.run(context, &self.stream, x, output, |input| {
             self.launch(context, codes, shape, input, output)
+        })
+    }
+
+    pub(super) fn project_streamed(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        dtype: DenseDtype,
+        weight: DeviceRange<'_>,
+        [rows, cols]: [usize; 2],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        if cols != x.len() {
+            return Err(bad("streamed expert projection input width differs"));
+        }
+        let output = self.range(Slot::Output, 0, rows)?;
+        self.run(context, stream, x, output, |input| {
+            context.dense_gemv(
+                stream,
+                DenseGemvCall {
+                    shape: DenseGemvShape::packed(1, rows, cols),
+                    dtype,
+                    w: weight,
+                    x: input,
+                    y: output,
+                },
+            )
         })
     }
 
@@ -109,7 +136,7 @@ impl DenseStep {
         let all = self.range(Slot::Output, 0, width + forget.shape[0])?;
         let first = self.range(Slot::Output, 0, width)?;
         let second = self.range(Slot::Output, width, forget.shape[0])?;
-        let mut values = self.run(context, x, all, |input| {
+        let mut values = self.run(context, &self.stream, x, all, |input| {
             self.launch(context, &down.codes, down.shape, input, reduced)?;
             self.launch(context, &gain.codes, gain.shape, reduced, first)?;
             self.launch(context, &forget.codes, forget.shape, reduced, second)
@@ -143,22 +170,23 @@ impl DenseStep {
     fn run(
         &self,
         context: &CudaContext,
+        stream: &DeviceStream,
         x: &[f32],
         output: DeviceRange<'_>,
         enqueue: impl FnOnce(DeviceRange<'_>) -> Result<(), EngError>,
     ) -> Result<Vec<f32>, EngError> {
         if !x.iter().all(|value| value.is_finite()) {
-            return Err(bad("CUDA BF16 projection requires finite input"));
+            return Err(bad("CUDA projection requires finite input"));
         }
         let input = self.range(Slot::Input, 0, x.len())?;
         let bytes: Vec<_> = x.iter().map(|&value| value.to_ne_bytes()).collect();
         let mut transfer = self.transfer.borrow_mut();
         transfer.write(0, bytes.as_flattened())?;
-        context.copy_from_pinned(&self.stream, &mut transfer, 0, input)?;
-        let result = enqueue(input)
-            .and_then(|()| context.copy_to_pinned(&self.stream, output, &mut transfer, 0));
+        context.copy_from_pinned(stream, &mut transfer, 0, input)?;
+        let result =
+            enqueue(input).and_then(|()| context.copy_to_pinned(stream, output, &mut transfer, 0));
         // Even a refused launch may follow an accepted input copy.
-        let waited = transfer.synchronize(&self.stream);
+        let waited = transfer.synchronize(stream);
         result?;
         waited?;
 
@@ -166,7 +194,7 @@ impl DenseStep {
         transfer.read(0, bytes.as_flattened_mut())?;
         let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
         if !values.iter().all(|value| value.is_finite()) {
-            return Err(bad("CUDA BF16 projection produced a nonfinite output"));
+            return Err(bad("CUDA projection produced a nonfinite output"));
         }
         Ok(values)
     }

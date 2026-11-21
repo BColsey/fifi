@@ -21,6 +21,7 @@ constexpr int kMaxLd = 1 << 20;
 constexpr int kWarps = 8;
 constexpr int kDtypeF16 = 0;
 constexpr int kDtypeBf16 = 1;
+constexpr int kDtypeGgufNvfp4 = 2;
 
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
 
@@ -73,9 +74,47 @@ __global__ void dense_gemv_k(const W *__restrict__ w, const float *__restrict__ 
     if (lane == 0) y[(size_t)t * ld_y + r] = acc;
 }
 
+// Each lane reads one packed byte and consumes both nibbles of its GGUF block.
+__device__ float gguf_scale(unsigned code) {
+    if (code == 0x7f) return 0.0f;
+    const unsigned exp = (code >> 3) & 15u, frac = code & 7u;
+    return exp == 0 ? float(frac) / 512.0f
+                    : __int_as_float(((exp + 120u) << 23) | (frac << 20));
+}
+
+__device__ float gguf_fp4(unsigned code) {
+    const unsigned m = code & 7u;
+    const float v = m < 2 ? float(m) * 0.5f :
+        __int_as_float(((126u + (m >> 1)) << 23) | ((m & 1u) << 22));
+    return code > 8 ? -v : v;
+}
+
+__global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row >= a.rows) return;
+    const float *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
+    const int blocks = a.cols / 64;
+    const auto *w = static_cast<const unsigned char *>(a.w) + size_t(row) * blocks * 36;
+    const int group = lane / 8;
+    float sum = 0;
+    for (int block = 0; block < blocks; ++block) {
+        const auto *b = w + block * 36;
+        const float scale = gguf_scale(b[group]);
+        const unsigned pair = b[4 + lane];
+        const int col = block * 64 + group * 16 + lane % 8;
+        sum = fmaf(gguf_fp4(pair & 15u) * scale, x[col], sum);
+        sum = fmaf(gguf_fp4(pair >> 4) * scale, x[col + 8], sum);
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
+}
+
 bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
     if (stream == NULL || a.w == NULL || a.x == NULL || a.y == NULL) return false;
-    if (a.weight_dtype != kDtypeF16 && a.weight_dtype != kDtypeBf16) return false;
+    const bool gguf = a.weight_dtype == kDtypeGgufNvfp4;
+    if (!gguf && a.weight_dtype != kDtypeF16 && a.weight_dtype != kDtypeBf16) return false;
+    if (gguf && a.cols % 64 != 0) return false;
     if (a.m < 1 || a.m > kMaxM || a.rows < 1 || a.rows > kMaxRows || a.cols < 1 ||
         a.cols > kMaxCols) {
         return false;
@@ -83,7 +122,8 @@ bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
     if (a.ld_x < a.cols || a.ld_x > kMaxLd || a.ld_y < a.rows || a.ld_y > kMaxLd) return false;
     if (!aligned(a.w, 2) || !aligned(a.x, 4) || !aligned(a.y, 4)) return false;
     const size_t m = (size_t)a.m;
-    const Span weights = {a.w, (size_t)a.rows * a.cols * 2};
+    const size_t row_bytes = gguf ? size_t(a.cols / 64) * 36 : size_t(a.cols) * 2;
+    const Span weights = {a.w, size_t(a.rows) * row_bytes};
     const Span in = {a.x, ((m - 1) * a.ld_x + a.cols) * 4};
     const Span out = {a.y, ((m - 1) * a.ld_y + a.rows) * 4};
     return apart(out, in) && apart(out, weights);
@@ -112,7 +152,11 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        if (args->weight_dtype == kDtypeF16) {
+        if (args->weight_dtype == kDtypeGgufNvfp4) {
+            const dim3 grid((args->rows + kWarps - 1) / kWarps, args->m);
+            gguf_nvfp4_gemv<<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(*args);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        } else if (args->weight_dtype == kDtypeF16) {
             launch<__half>(*args, (cudaStream_t)stream, failure);
         } else {
             launch<__nv_bfloat16>(*args, (cudaStream_t)stream, failure);

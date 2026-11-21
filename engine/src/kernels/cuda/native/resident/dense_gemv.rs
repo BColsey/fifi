@@ -33,6 +33,7 @@ const HALF: usize = 2;
 pub(crate) enum DenseDtype {
     F16,
     Bf16,
+    GgufNvfp4,
 }
 
 impl DenseDtype {
@@ -40,6 +41,7 @@ impl DenseDtype {
         match self {
             Self::F16 => 0,
             Self::Bf16 => 1,
+            Self::GgufNvfp4 => 2,
         }
     }
 }
@@ -111,6 +113,13 @@ pub(crate) struct DenseGemvBytes {
 /// `None` outside the limits of `dense_gemv.h` or when a size overflows. The last activation row
 /// and the last result row hold only `cols` and `rows` values: the strides pad between rows.
 pub(in crate::kernels::cuda) fn gemv_need(dims: GemvDims) -> Option<DenseGemvBytes> {
+    typed_gemv_need(dims, DenseDtype::F16)
+}
+
+pub(in crate::kernels::cuda) fn typed_gemv_need(
+    dims: GemvDims,
+    dtype: DenseDtype,
+) -> Option<DenseGemvBytes> {
     let inside = (1..=GEMV_MAX_M).contains(&dims.m)
         && (1..=GEMV_MAX_ROWS).contains(&dims.rows)
         && (1..=GEMV_MAX_COLS).contains(&dims.cols)
@@ -126,7 +135,13 @@ pub(in crate::kernels::cuda) fn gemv_need(dims: GemvDims) -> Option<DenseGemvByt
             .checked_mul(FLOAT)
     };
     Some(DenseGemvBytes {
-        w: dims.rows.checked_mul(dims.cols)?.checked_mul(HALF)?,
+        w: match dtype {
+            DenseDtype::GgufNvfp4 if dims.cols.is_multiple_of(64) => {
+                dims.rows.checked_mul(dims.cols / 64)?.checked_mul(36)?
+            }
+            DenseDtype::GgufNvfp4 => return None,
+            _ => dims.rows.checked_mul(dims.cols)?.checked_mul(HALF)?,
+        },
         x: strided(dims.m, dims.ld_x, dims.cols)?,
         y: strided(dims.m, dims.ld_y, dims.rows)?,
     })
@@ -138,7 +153,7 @@ fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
 
 /// The result is apart from both inputs; the inputs may share bytes.
 fn check(call: &DenseGemvRaw<'_>) -> Result<DenseGemvBytes, DeviceFailure> {
-    let need = gemv_need(call.dims).ok_or_else(invalid_argument)?;
+    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
     let sized =
         fits(&call.w, need.w, HALF) && fits(&call.x, need.x, FLOAT) && fits(&call.y, need.y, FLOAT);
     let out = Span::of(&call.y, need.y);

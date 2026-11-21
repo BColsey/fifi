@@ -92,6 +92,7 @@ fn narrow(dtype: DenseDtype, values: &[f32]) -> Vec<u16> {
         .map(|&v| match dtype {
             DenseDtype::F16 => half::f16::from_f32(v).to_bits(),
             DenseDtype::Bf16 => half::bf16::from_f32(v).to_bits(),
+            DenseDtype::GgufNvfp4 => unreachable!("half-precision fixture"),
         })
         .collect()
 }
@@ -102,6 +103,7 @@ fn widen(dtype: DenseDtype, codes: &[u16]) -> Vec<f64> {
         .map(|&c| match dtype {
             DenseDtype::F16 => half::f16::from_bits(c).to_f64(),
             DenseDtype::Bf16 => half::bf16::from_bits(c).to_f64(),
+            DenseDtype::GgufNvfp4 => unreachable!("half-precision fixture"),
         })
         .collect()
 }
@@ -421,4 +423,73 @@ fn bad_arguments_are_refused_before_any_launch() {
         .dense_gemv(&rig.stream, ok(shape))
         .expect("valid call");
     rig.stream.synchronize().expect("drain");
+}
+
+#[test]
+fn gguf_nvfp4_projects_original_blocks_and_checks_their_extents() {
+    if !testkit::device_present("gguf_nvfp4_projects_original_blocks_and_checks_their_extents") {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = DenseGemvShape::packed(2, 256, 128);
+    let mut blocks = Vec::new();
+    for scale in 0..=255u8 {
+        for block in 0..2 {
+            blocks.extend([scale; 4]);
+            blocks.extend((0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(block)));
+        }
+    }
+    let mut weights = vec![0.0; shape.rows * shape.cols];
+    crate::weights::dequantize_into(crate::weights::GgufType::Nvfp4, &blocks, &mut weights)
+        .unwrap();
+    let inputs: Vec<_> = (0..shape.m * shape.cols)
+        .map(|i| ((i % 11) as i32 - 5) as f32)
+        .collect();
+    let w = Padded::new(&rig.ctx, &blocks, 0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&inputs), 0);
+    let y = Padded::new(&rig.ctx, &sentinel(shape.rows * shape.m * 4), 0);
+    let call = || DenseGemvCall {
+        shape,
+        dtype: DenseDtype::GgufNvfp4,
+        w: w.all(),
+        x: x.all(),
+        y: y.all(),
+    };
+    refused(
+        &rig,
+        DenseGemvCall {
+            w: w.range(0, blocks.len() - 1),
+            ..call()
+        },
+        &y,
+        "the call needs",
+    );
+    refused(
+        &rig,
+        DenseGemvCall {
+            shape: DenseGemvShape::packed(2, 256, 127),
+            ..call()
+        },
+        &y,
+        "the CUDA dense matvec takes",
+    );
+    rig.ctx.dense_gemv(&rig.stream, call()).unwrap();
+    rig.stream.synchronize().unwrap();
+    let out = y.read(&rig.ctx, "GGUF output");
+    let got: Vec<_> = out
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_ne_bytes(*b))
+        .collect();
+    // Integer activations and one binary scale per row keep these small sums exact.
+    let expected: Vec<f32> = inputs
+        .chunks_exact(shape.cols)
+        .flat_map(|x| {
+            weights
+                .chunks_exact(shape.cols)
+                .map(move |w| x.iter().zip(w).map(|(x, w)| x * w).sum::<f32>())
+        })
+        .collect();
+    assert_eq!(got, expected);
 }

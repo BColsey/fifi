@@ -49,7 +49,7 @@ pub use report::{TierReport, TokenSplit};
 pub use residency::{Coverage, Placement, Residency};
 pub use stream::StreamBankPlan;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) use stream_cuda::CudaStreamBanks;
+pub(crate) use stream_cuda::{CudaBankLease, CudaStreamBanks};
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) use stream_nvfp4::launch_device_input as project_nvfp4_batch_device;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

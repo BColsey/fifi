@@ -22,6 +22,9 @@ use super::cuda_projection::{
     gguf::{ExpertView, GgufCuda, Nvfp4Layer, Nvfp4Stack, can_repack},
 };
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod streaming;
+
 const HEADER_LIMIT: u64 = 32 * 1024 * 1024;
 
 pub(crate) fn gguf_path(path: &Path) -> Result<Option<PathBuf>, EngError> {
@@ -570,12 +573,7 @@ impl GgufTextWeights {
                 continue;
             }
             let stack = |t: &Tensor, bytes, suffix| -> Result<Nvfp4Stack<'_>, EngError> {
-                let scale = format!("{prefix}.{suffix}_scale");
-                let tensor_scales = if self.tensors.contains_key(&scale) {
-                    Some(self.tensor(&scale)?.1)
-                } else {
-                    None
-                };
+                let tensor_scales = self.scale_bytes(&format!("{prefix}.{suffix}"))?;
                 Ok(Nvfp4Stack {
                     bytes,
                     file_range: t.bytes.clone(),
@@ -665,7 +663,7 @@ impl GgufTextWeights {
         }
         let plane = bytes.len() / tensor.planes;
         let payload = &bytes[index * plane..][..plane];
-        let factor = self.expert_factor(name, index, tensor.planes)?;
+        let factor = expert_scale(self.scale_bytes(name)?, index)?;
         let gate_up = name.ends_with(".w13_weight");
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         let cuda_output = self.cuda.as_ref().and_then(|cuda| {
@@ -696,16 +694,12 @@ impl GgufTextWeights {
         }
         Ok(output)
     }
-    fn expert_factor(&self, name: &str, id: usize, experts: usize) -> Result<f32, EngError> {
-        let scale = format!("{name}_scale");
-        if !self.tensors.contains_key(&scale) {
-            return Ok(1.0);
-        }
-        let factor = self.row(&scale, 0, experts)?[id];
-        if !factor.is_finite() || factor < 0.0 {
-            return Err(bad(format!("invalid GGUF expert {id} scale for {name}")));
-        }
-        Ok(factor)
+    fn scale_bytes(&self, name: &str) -> Result<Option<&[u8]>, EngError> {
+        let key = format!("{name}_scale");
+        self.tensors
+            .get(&key)
+            .map(|_| self.tensor(&key).map(|(_, raw)| raw))
+            .transpose()
     }
 
     fn expert_project(
@@ -723,6 +717,22 @@ impl GgufTextWeights {
         }
         Ok(output)
     }
+}
+
+pub(super) fn expert_scale(scales: Option<&[u8]>, id: usize) -> Result<f32, EngError> {
+    let Some(raw) = scales else { return Ok(1.0) };
+    let bytes = raw
+        .as_chunks::<4>()
+        .0
+        .get(id)
+        .ok_or_else(|| bad("GGUF expert scale index is outside its tensor"))?;
+    let factor = f32::from_le_bytes(*bytes);
+    if !factor.is_finite() || factor < 0.0 {
+        return Err(bad(
+            "GGUF expert tensor scale must be finite and nonnegative",
+        ));
+    }
+    Ok(factor)
 }
 
 fn project_rows(

@@ -40,6 +40,12 @@ pub(super) struct TextMath {
     use_gate_bias: bool,
 }
 
+impl TextMath {
+    fn expert_activation(&self, gate: f32, up: f32) -> f32 {
+        softcap(gate, self.mlp_gate_softcap) * sigmoid(gate) * softcap(up, self.mlp_up_softcap)
+    }
+}
+
 pub(super) struct CpuForward {
     pub(super) spec: TextSpec,
     pub(super) math: TextMath,
@@ -399,6 +405,25 @@ impl CpuForward {
         let down = format!("{prefix}.experts.w2_weight");
         let activation = self.weights.activate(input)?;
         let mut output = vec![0.0; self.hidden()];
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Weights::Gguf(weights) = &self.weights
+            && weights.stream_experts(
+                [&gate_up, &down],
+                layer as u32,
+                &selected,
+                input,
+                |gate, up| self.math.expert_activation(gate, up),
+                |id, row| {
+                    add(
+                        &mut output,
+                        row,
+                        self.math.route_scale * (scores[id] / total),
+                    )
+                },
+            )?
+        {
+            return Ok(output);
+        }
         for id in selected {
             let key = ExpertId {
                 layer: layer as u32,
@@ -411,11 +436,7 @@ impl CpuForward {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|&[gate, up]| {
-                    softcap(gate, self.math.mlp_gate_softcap)
-                        * sigmoid(gate)
-                        * softcap(up, self.math.mlp_up_softcap)
-                })
+                .map(|&[gate, up]| self.math.expert_activation(gate, up))
                 .collect();
             let activation = self.weights.activate(&middle)?;
             let contribution = self

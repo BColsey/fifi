@@ -4,7 +4,8 @@
  *
  * For each of m activation rows t and each weight row r:
  *   y[t * ld_y + r] = sum_c w[r][c] * x[t * ld_x + c]
- * with w a dense row-major [rows][cols] matrix in its stored dtype (0: binary16, 1: bfloat16),
+ * with w a dense row-major [rows][cols] matrix in its stored dtype (0: binary16, 1: bfloat16,
+ * 2: original GGUF NVFP4 blocks of 36 bytes per 64 columns, tensor multiplier applied by caller),
  * widened exactly to f32 in registers, x and y f32. Products and sums are f32: a lane adds its
  * columns in ascending order with fused multiply-adds, and the 32 lanes of a warp combine by a
  * fixed xor butterfly, so a result depends on cols and the alignment of w, never on m, rows or

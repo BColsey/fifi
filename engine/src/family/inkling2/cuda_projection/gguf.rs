@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod residency;
+pub(in crate::family::inkling2) mod streaming;
 
 use residency::ResidentExperts;
 pub(in crate::family::inkling2) use residency::{Nvfp4Layer, Nvfp4Stack};
@@ -24,6 +25,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
     dense: BTreeMap<String, Resident>,
     resident: ResidentExperts,
+    stream_banks: Option<RefCell<crate::expert_tier::CudaStreamBanks>>,
     expert_codes: DeviceBuffer,
     expert_scales: DeviceBuffer,
     packed: RefCell<Packed>,
@@ -63,9 +65,11 @@ impl GgufCuda {
         let plan = DensePlan::new(shape, hidden, spec.core.gate_rank as usize)?;
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
         let context = CudaContext::with_admission(&admission)?;
+        let stream_plan = streaming::plan(hidden, ff)?;
+        let stream_bytes = stream_plan.map_or(0, |p| p.device_bytes());
         let demand = Demand {
             tensors,
-            work: (stage[0] + stage[1] + plan.device_bytes) as u64,
+            work: (stage[0] + stage[1] + plan.device_bytes) as u64 + stream_bytes,
             kv_cache: 0,
             headroom: DEVICE_HEADROOM,
         };
@@ -86,11 +90,14 @@ impl GgufCuda {
                 ))
             })
             .collect::<Result<_, EngError>>()?;
+        let stream_banks = stream_plan
+            .map(|plan| crate::expert_tier::CudaStreamBanks::new(&context, plan).map(RefCell::new))
+            .transpose()?;
         let resident = ResidentExperts::load(&context, spec.n_routed_experts as u32, layers, file)?;
         eprintln!(
             "Inkling GGUF CUDA projections {}",
             serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": tensors,
-                "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
+                "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
                 "resident_expert_bytes": resident.bytes(),
                 "resident_expert_layers": resident.placement().full_layers(),
                 "resident_expert_count": resident.placement().resident_experts()})
@@ -99,6 +106,7 @@ impl GgufCuda {
             step,
             dense,
             resident,
+            stream_banks,
             expert_codes,
             expert_scales,
             packed: RefCell::new(Packed {

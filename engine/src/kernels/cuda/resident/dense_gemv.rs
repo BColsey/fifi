@@ -1,4 +1,4 @@
-//! The shared dense F16/BF16 projection for the Flash-Next PLE and Inkling CUDA stages.
+//! Shared matrix-vector projection for F16, BF16 and original GGUF NVFP4 weights.
 //! Activations and results stay in device buffers between launches.
 //!
 //! [`CudaContext::dense_gemv`] queues one kernel on a [`DeviceStream`] and returns. It allocates
@@ -14,7 +14,7 @@ use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, DenseGemvBytes};
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
-    dense_gemv_launch, gemv_need,
+    dense_gemv_launch, gemv_need, typed_gemv_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -62,15 +62,17 @@ pub(crate) struct DenseGemvCall<'b> {
     pub(crate) y: DeviceRange<'b>,
 }
 
-/// The bytes each range of a launch of `shape` must hold.
+/// Buffer sizes for a dense F16 or BF16 matrix of this shape.
 pub(crate) fn dense_gemv_bytes(shape: DenseGemvShape) -> Result<DenseGemvBytes, EngError> {
-    gemv_need(shape.dims()).ok_or_else(|| {
-        EngError::BadRequest(format!(
-            "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
+    gemv_need(shape.dims()).ok_or_else(|| invalid_shape(shape))
+}
+
+fn invalid_shape(shape: DenseGemvShape) -> EngError {
+    EngError::BadRequest(format!(
+        "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
              {GEMV_MAX_ROWS} weight rows, 1 to {GEMV_MAX_COLS} columns and strides from the row \
              width to {GEMV_MAX_LD}, got {shape:?}"
-        ))
-    })
+    ))
 }
 
 impl CudaContext {
@@ -90,7 +92,8 @@ impl CudaContext {
     }
 
     fn plan_dense_gemv<'b>(&self, call: &DenseGemvCall<'b>) -> Result<DenseGemvRaw<'b>, EngError> {
-        let need = dense_gemv_bytes(call.shape)?;
+        let need = typed_gemv_need(call.shape.dims(), call.dtype)
+            .ok_or_else(|| invalid_shape(call.shape))?;
         require_fit("w", &call.w, need.w, 2)?;
         require_fit("x", &call.x, need.x, 4)?;
         require_fit("y", &call.y, need.y, 4)?;

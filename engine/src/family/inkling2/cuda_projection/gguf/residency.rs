@@ -144,12 +144,10 @@ impl ExpertPayloadSource for Source<'_> {
         let mut data = vec![0; n / 2];
         let mut scales = vec![0; n / 16];
         repack_nvfp4_into(&part.bytes[offset..][..size], &mut data, &mut scales)?;
-        let tensor_scale = part.tensor_scales.map_or(1.0, |raw| {
-            f32::from_le_bytes(raw.as_chunks::<4>().0[id.expert as usize])
-        });
-        if !tensor_scale.is_finite() || tensor_scale < 0.0 {
-            return Err(bad("GGUF tier found an invalid expert scale"));
-        }
+        let tensor_scale = crate::family::inkling2::gguf_weights::expert_scale(
+            part.tensor_scales,
+            id.expert as usize,
+        )?;
         Ok(ExpertPayload {
             data,
             scales,
