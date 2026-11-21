@@ -1,18 +1,18 @@
 import { test } from "node:test";
 import { strictEqual } from "node:assert";
-import { statusOf, estimateLine } from "./models.js";
+import { statusOf, estimateLine, stopQuestion, stoppedLine, snapshotStatus } from "./models.js";
 import { searchHubModels, startHubDownload, type HubDownloadJob } from "./api.js";
 
 function job(overrides: Partial<HubDownloadJob>): HubDownloadJob {
-  return { id: 1, repo: "org/name", revision: "main", state: "resolving", ...overrides };
+  return { id: 1, repo: "org/name", revision: "main", state: "downloading", ...overrides };
 }
 
 test("download status lines carry the counters the GUI polls", () => {
-  strictEqual(statusOf(job({})), "resolving");
+  strictEqual(statusOf(job({ files_done: 0, files_total: 2, bytes: 0, bytes_total: 10 })), "0/2 files, 0 B of 10 B");
   strictEqual(statusOf(job({ state: "done" })), "done");
   strictEqual(statusOf(job({ state: "cancelled" })), "cancelled");
   strictEqual(
-    statusOf(job({ state: "failed", error: "hub returned 429" })),
+    statusOf(job({ state: "failed", detail: "hub returned 429" })),
     "hub returned 429",
   );
   strictEqual(
@@ -83,5 +83,33 @@ test("estimateLine states the tier ladder from the pack size", () => {
   strictEqual(
     line,
     "4.7 GiB resident on GPU, or streamed from RAM/disk — picked automatically",
+  );
+});
+
+test("a stop says when the card memory stays held until the server restarts", () => {
+  strictEqual(stoppedLine("e1", { memory_released: true }), "Engine e1 stopped.");
+  strictEqual(
+    stoppedLine("q36", {
+      memory_released: false,
+      note: "stopped; card memory returns when the server process restarts",
+    }),
+    "Engine q36 stopped; card memory returns when the server process restarts",
+  );
+  strictEqual(stopQuestion("e1", false), "Stop engine e1? Running jobs on it are cancelled.");
+  strictEqual(stopQuestion("q36", true).includes("not returned until the server process restarts"), true);
+});
+
+test("the page offers Serve only for a complete snapshot of a known family", () => {
+  strictEqual(
+    snapshotStatus({ complete: true, servable: true, families: ["qwen3_6_35b_a3b"] }),
+    "serves as qwen3_6_35b_a3b",
+  );
+  strictEqual(
+    snapshotStatus({ complete: false, servable: false, families: [] }).startsWith("incomplete"),
+    true,
+  );
+  strictEqual(
+    snapshotStatus({ complete: true, servable: false, families: [] }),
+    "no family of this build recognises it",
   );
 });

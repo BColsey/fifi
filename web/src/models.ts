@@ -35,24 +35,53 @@ export function statusOf(job: HubDownloadJob): string {
         `${formatBytes(job.bytes ?? 0)} of ${formatBytes(job.bytes_total ?? 0)}` +
         (job.current_file === undefined ? "" : ` — ${job.current_file}`);
     case "failed":
-      return job.error ?? "failed";
+      return job.detail ?? "failed";
     default:
       return job.state;
   }
 }
 
+/** The question before a stop, honest about memory the family keeps. */
+export function stopQuestion(id: string, memoryHeld: boolean): string {
+  return memoryHeld
+    ? `Stop engine ${id}? Running jobs on it are cancelled. Its card memory is not ` +
+      "returned until the server process restarts, and this server cannot load another " +
+      "engine of this family before then."
+    : `Stop engine ${id}? Running jobs on it are cancelled.`;
+}
+
+/** The line shown after a stop: the server's own note when memory stays held. */
+export function stoppedLine(
+  id: string,
+  result: { memory_released: boolean; note?: string },
+): string {
+  return result.memory_released
+    ? `Engine ${id} stopped.`
+    : `Engine ${id} ${result.note ?? "stopped; card memory returns when the server process restarts"}`;
+}
+
+/** What the page says about one cached snapshot, and whether it can be served. */
+export function snapshotStatus(snapshot: {
+  complete: boolean;
+  servable: boolean;
+  families: string[];
+}): string {
+  if (!snapshot.complete) return "incomplete: a download is unfinished or a file is missing";
+  if (!snapshot.servable) return "no family of this build recognises it";
+  return `serves as ${snapshot.families.join(", ")}`;
+}
+
 /** The one-line resource ladder for a model the user is looking
- * at: the pack's size, then the tier note. The three tier figures
- * carry the same bytes here (the pack is the requirement in every
- * tier); what changes per tier is where those bytes sit, which the
- * mode line states. */
+ * at: the weights one engine loads, then the tier note. */
 export function estimateLine(est: {
   vram_bytes: number;
   ram_bytes: number;
   disk_bytes: number;
   mode: string;
+  planned?: boolean;
 }): string {
-  return `${formatBytes(est.vram_bytes)} resident on GPU, or streamed from RAM/disk — picked automatically`;
+  const weightsOnly = est.planned === false ? " (weights only; cache and working set not added)" : "";
+  return `${formatBytes(est.vram_bytes)} resident on GPU, or streamed from RAM/disk — picked automatically${weightsOnly}`;
 }
 
 export class ModelsView {
@@ -158,7 +187,7 @@ export class ModelsView {
    * timer dies when the view is idle so the page costs nothing. */
   private schedulePoll(): void {
     const active = this.downloads.some(
-      (job) => job.state === "resolving" || job.state === "downloading",
+      (job) => job.state === "downloading",
     );
     if (active && this.pollTimer === null) {
       this.pollTimer = setInterval(() => void this.refresh(), 2_000);
@@ -188,7 +217,7 @@ export class ModelsView {
     const running = this.downloads.some(
       (job) =>
         job.repo === repo &&
-        (job.state === "resolving" || job.state === "downloading"),
+        (job.state === "downloading"),
     );
     if (running) {
       this.say(`${repo} is already downloading.`);
@@ -214,10 +243,11 @@ export class ModelsView {
   }
 
   private async stop(id: string): Promise<void> {
-    if (!window.confirm(`Stop engine ${id}? Running jobs on it are cancelled.`)) return;
+    const held = this.engines.find((engine) => engine.id === id)?.memory_held_until_restart === true;
+    if (!window.confirm(stopQuestion(id, held))) return;
     try {
-      await removeEngine(id);
-      this.say(`Engine ${id} stopped.`);
+      const result = await removeEngine(id);
+      this.say(stoppedLine(id, result));
       await this.refresh();
     } catch (err) {
       this.say(err instanceof Error ? err.message : String(err));
@@ -281,7 +311,7 @@ export class ModelsView {
           needs.title = job.estimate.mode;
         }
         const action = document.createElement("td");
-        if (job.state === "resolving" || job.state === "downloading") {
+        if (job.state === "downloading") {
           const cancel = document.createElement("button");
           cancel.type = "button";
           cancel.textContent = "Cancel";
@@ -309,26 +339,32 @@ export class ModelsView {
         this.cacheBody.append(line("No models cached yet."));
       }
       for (const model of this.cache.models) {
-        const p = document.createElement("p");
-        if (model.estimate !== undefined) {
-          const est = document.createElement("small");
-          est.textContent = estimateLine(model.estimate);
-          est.title = model.estimate.mode;
-          p.append(est, document.createElement("br"));
+        const heading = document.createElement("p");
+        heading.textContent = `${model.repo} — ${formatBytes(model.bytes)}`;
+        this.cacheBody.append(heading);
+        for (const snapshot of model.snapshots) {
+          const row = document.createElement("p");
+          if (snapshot.estimate !== undefined) {
+            const est = document.createElement("small");
+            est.textContent = estimateLine(snapshot.estimate);
+            est.title = `${snapshot.estimate.basis} — ${snapshot.estimate.mode}`;
+            row.append(est, document.createElement("br"));
+          }
+          row.append(
+            document.createTextNode(
+              `${snapshot.commit.slice(0, 8)} — ${snapshotStatus(snapshot)} `,
+            ),
+          );
+          if (snapshot.servable) {
+            const serve = document.createElement("button");
+            serve.type = "button";
+            serve.textContent = "Serve";
+            serve.title = `Start an engine on exactly this snapshot (${snapshot.commit}).`;
+            serve.addEventListener("click", () => void this.serve(snapshot.path));
+            row.append(serve);
+          }
+          this.cacheBody.append(row);
         }
-        const serve = document.createElement("button");
-        serve.type = "button";
-        serve.textContent = "Serve";
-        serve.title = `Start an engine on ${model.repo} (main ref) without a restart.`;
-        serve.addEventListener("click", () => void this.serve(model.repo));
-        p.append(
-          document.createTextNode(
-            `${model.repo} — ${formatBytes(model.bytes)}, ` +
-            `${model.snapshots.length} snapshot(s) `,
-          ),
-          serve,
-        );
-        this.cacheBody.append(p);
       }
     } else if (this.cache !== null) {
       // A scan failure answers 200 with {"error"} and no models

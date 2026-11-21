@@ -568,6 +568,8 @@ export interface EngineSummary {
   error?: EngineErrorInfo;
   context_limit: number;
   runtime_added: boolean;
+  /** Stopping this engine returns no memory until the server restarts. */
+  memory_held_until_restart: boolean;
 }
 
 export interface EngineList {
@@ -597,24 +599,32 @@ export interface HubCacheRef {
   commit: string;
 }
 
-export interface HubCacheSnapshot {
-  commit: string;
-  path: string;
-  gguf: string[];
-  families: string[];
-}
-
 export interface ResourceEstimate {
   vram_bytes: number;
   ram_bytes: number;
   disk_bytes: number;
+  /** True when the planner produced it from a snapshot on disk. */
+  planned: boolean;
+  /** What the figures count, in the server's words. */
+  basis: string;
   mode: string;
+}
+
+export interface HubCacheSnapshot {
+  commit: string;
+  path: string;
+  gguf: string[];
+  /** No download is still filling it and every file resolves. */
+  complete: boolean;
+  /** Complete, and `serve --model` would start it as a known family. */
+  servable: boolean;
+  families: string[];
+  estimate?: ResourceEstimate;
 }
 
 export interface HubCacheModel {
   repo: string;
   bytes: number;
-  estimate: ResourceEstimate;
   refs: HubCacheRef[];
   snapshots: HubCacheSnapshot[];
 }
@@ -624,8 +634,7 @@ export interface HubCache {
   models: HubCacheModel[];
 }
 
-export type HubDownloadState =
-  "resolving" | "downloading" | "done" | "failed" | "cancelled";
+export type HubDownloadState = "downloading" | "done" | "failed" | "cancelled";
 
 export interface HubDownloadJob {
   id: number;
@@ -638,7 +647,8 @@ export interface HubDownloadJob {
   bytes?: number;
   bytes_total?: number;
   current_file?: string;
-  error?: string;
+  /** The failure cause of a failed job; the path of a finished one. */
+  detail?: string;
   estimate?: ResourceEstimate;
 }
 
@@ -689,6 +699,15 @@ export function addEngine(
 
 export function removeEngine(
   id: string
-): Promise<{ id: string; model: string; state: string; shutdown_failure?: string }> {
+): Promise<{
+  id: string;
+  model: string;
+  state: string;
+  shutdown_failure?: string;
+  /** False when the family keeps the engine's memory until the server restarts. */
+  memory_released: boolean;
+  memory_held_until_restart?: boolean;
+  note?: string;
+}> {
   return sendJson("DELETE", `/v1/engines/${encodeURIComponent(id)}`);
 }
