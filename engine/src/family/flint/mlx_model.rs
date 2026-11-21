@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     EngError,
-    kernels::{MlxKernels, ResidentPackedWeight},
+    kernels::{HostPages, MlxKernels, PackedPages, PageRange, ResidentPackedWeight},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
 use std::{cell::RefCell, path::Path, rc::Rc, sync::OnceLock};
@@ -144,9 +144,9 @@ impl SwiGlu {
 
     pub(super) fn import_expert_pages(
         k: &mut MlxKernels,
-        pages: &crate::kernels::HostPages,
-        packed: &[crate::kernels::PackedPages],
-        local: crate::kernels::PageRange,
+        pages: &HostPages,
+        packed: &[PackedPages],
+        local: PageRange,
     ) -> Result<(Self, ExecutionTensor)> {
         #[cfg(feature = "native-fault-qualification")]
         let started = super::mlx_expert_timing::enabled().then(std::time::Instant::now);
@@ -158,7 +158,7 @@ impl SwiGlu {
         Self::take_experts(weights, ids)
     }
 
-    pub(super) fn take_experts(
+    fn take_experts(
         weights: Vec<ResidentPackedWeight>,
         ids: Vec<ExecutionTensor>,
     ) -> Result<(Self, ExecutionTensor)> {

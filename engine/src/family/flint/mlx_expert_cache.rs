@@ -167,8 +167,7 @@ impl LayerExpertCache {
         };
         let result = (|| {
             let (weights, ids) =
-                k.import_packed_pages(&self.pages, &self.layout.packed, &[indices])?;
-            let (weights, ids) = SwiGlu::take_experts(weights, ids)?;
+                SwiGlu::import_expert_pages(k, &self.pages, &self.layout.packed, indices)?;
             let local = k.bound_indices(&ids, self.slots.len() as u32)?;
             let rows = grouped_experts(k, &weights, x, &local)?;
             k.evaluate(&[&rows])?;
