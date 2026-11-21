@@ -31,17 +31,172 @@ pub(crate) fn host_budget(memory_bytes: u64) -> u64 {
     memory_bytes.saturating_sub(floor)
 }
 
-/// The budget an MLX start with no device budget of its own sizes itself from: the host budget
-/// of `memory_bytes` when a resident model of `model_bytes` does not fit it, and `None` when it
-/// fits, so a start that fits is not sized and behaves as it always did. Every MLX family's
-/// start reads this one rule.
+/// What an MLX start reads about the machine, once: the unified memory, what Metal recommends as
+/// a working set (`None` where there is no Metal), and the owner's ceiling
+/// (`FIFI_MLX_WORKING_SET_MIB`). Every Apple Silicon family plans and loads from this one value,
+/// so a plan that accepts a start is the budget the load enforces. The type holds numbers only;
+/// reading them is `mac_memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MacMemory {
+    pub(crate) physical_bytes: u64,
+    pub(crate) metal_bytes: Option<u64>,
+    pub(crate) ceiling_bytes: Option<u64>,
+}
+
+impl MacMemory {
+    /// The bytes a model and its sessions may take: the host budget (the memory less the OS
+    /// floor), bounded by Metal's recommended working set and by the ceiling. A ceiling above the
+    /// others never raises it.
+    pub(crate) fn budget(self) -> u64 {
+        host_budget(self.physical_bytes)
+            .min(self.metal_bytes.unwrap_or(u64::MAX))
+            .min(self.ceiling_bytes.unwrap_or(u64::MAX))
+    }
+
+    /// The budget a start that sets no device budget of its own sizes itself from: `budget()`
+    /// when a resident model of `model_bytes` does not fit it, and `None` when it fits, so a start
+    /// that fits is not sized and behaves as it always did.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn implied_budget(self, model_bytes: u64) -> Option<u64> {
+        let budget = self.budget();
+        (model_bytes > budget).then_some(budget)
+    }
+}
+
+/// Why a Qwen start with no device budget of its own takes the memory budget anyway, or `None`
+/// when it runs unsized as it always did. The decision reads facts only: the host plan already
+/// chose to stream (`staged_cap`), the owner forces streaming, or the resident model of
+/// `model_bytes` does not fit the budget.
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
-pub(crate) fn implied_cap(model_bytes: u64, memory_bytes: u64) -> Option<u64> {
-    let budget = host_budget(memory_bytes);
-    (model_bytes > budget).then_some(budget)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SizedBecause {
+    HostPlanStreams,
+    Forced,
+    ModelDoesNotFit,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl SizedBecause {
+    /// The start line that says why the start is sized from `budget`.
+    pub(crate) fn note(self, budget: u64) -> String {
+        match self {
+            Self::HostPlanStreams => format!(
+                "q36: the resident model does not fit the budget of {budget} bytes; routed experts stream from disk (set FIFI_Q36_MLX_DISK_EXPERTS=0 to refuse instead)"
+            ),
+            Self::Forced => format!(
+                "q36: FIFI_Q36_MLX_DISK_EXPERTS=1 streams the routed experts from disk under the budget of {budget} bytes"
+            ),
+            Self::ModelDoesNotFit => format!(
+                "mlx: the resident model does not fit the budget of {budget} bytes; sizing from the budget"
+            ),
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn sized_because(
+    memory: MacMemory,
+    staged_cap: Option<u64>,
+    force_stream: bool,
+    model_bytes: Option<u64>,
+) -> Option<SizedBecause> {
+    if staged_cap.is_some() {
+        Some(SizedBecause::HostPlanStreams)
+    } else if force_stream {
+        Some(SizedBecause::Forced)
+    } else {
+        model_bytes
+            .and_then(|model| memory.implied_budget(model))
+            .map(|_| SizedBecause::ModelDoesNotFit)
+    }
+}
+
+/// What a model, a session reserve and one saved prefix need against a budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryFit {
+    pub(crate) needed: u64,
+    pub(crate) budget: u64,
+}
+
+impl EntryFit {
+    pub(crate) fn of(model_bytes: u64, reserve: u64, entry: u64, budget: u64) -> Self {
+        Self {
+            needed: model_bytes.saturating_add(reserve).saturating_add(entry),
+            budget,
+        }
+    }
+
+    pub(crate) fn fits(self) -> bool {
+        self.needed <= self.budget
+    }
+}
+
+/// Reads the machine and the checkpoint under `artifact` and says whether a start with no budget
+/// of its own is sized from the memory budget, and why (`sized_because`).
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn sizing_for(
+    artifact: &Path,
+    staged_cap: Option<u64>,
+    force_stream: bool,
+) -> Option<(SizedBecause, MacMemory)> {
+    let memory = mac_memory()?;
+    sized_because(memory, staged_cap, force_stream, shard_bytes(artifact))
+        .map(|because| (because, memory))
+}
+
+/// The ceiling variable, in whole MiB.
+pub(crate) const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
+
+/// The ceiling variable as bytes: unset gives `None`, a malformed or zero value is an error that
+/// names the variable.
+pub(crate) fn ceiling_from_env() -> Result<Option<u64>, crate::EngError> {
+    std::env::var_os(CEILING_MIB)
+        .as_deref()
+        .map(parse_ceiling)
+        .transpose()
+}
+
+pub(crate) fn parse_ceiling(value: &std::ffi::OsStr) -> Result<u64, crate::EngError> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .filter(|&bytes| bytes != 0)
+        .ok_or_else(|| {
+            crate::EngError::BadRequest(format!(
+                "{CEILING_MIB} must be a positive whole number of MiB that fits in u64 bytes"
+            ))
+        })
+}
+
+/// Reads the machine: the physical memory, Metal's recommendation where this build has Metal, and
+/// the ceiling. `None` when the memory is unknown. A malformed ceiling is left out here and
+/// refused by the start that loads (`DeviceBudget::detect`).
+pub(crate) fn mac_memory() -> Option<MacMemory> {
+    Some(MacMemory {
+        physical_bytes: physical_memory_bytes()?,
+        metal_bytes: metal_working_set_bytes(),
+        ceiling_bytes: ceiling_from_env().ok().flatten(),
+    })
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn metal_working_set_bytes() -> Option<u64> {
+    Some(crate::kernels::MlxKernels::recommended_working_set_bytes()).filter(|&bytes| bytes > 0)
+}
+
+#[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+fn metal_working_set_bytes() -> Option<u64> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -141,12 +296,149 @@ pub(crate) fn shard_bytes(model_dir: &std::path::Path) -> Option<u64> {
     (shards > 0).then_some(total)
 }
 
-/// Whether the model, a session reserve and `extra` bytes (a saved prefix entry) fit `budget`.
-pub(crate) fn fits_budget(model_bytes: u64, reserve: u64, extra: u64, budget: u64) -> bool {
-    model_bytes
-        .checked_add(reserve)
-        .and_then(|bytes| bytes.checked_add(extra))
-        .is_some_and(|needed| needed <= budget)
+// The derived defaults of an MLX start, read by every family's settings.
+
+use std::path::Path;
+
+const GIB: u64 = 1 << 30;
+
+/// A byte count in GiB, to one decimal.
+pub(crate) fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// The allocator cache limit bounds.
+const MIN_CACHE_LIMIT_BYTES: u64 = GIB;
+const MAX_CACHE_LIMIT_BYTES: u64 = 8 * GIB;
+
+/// The least context a derived choice may land on: below it the start is refused.
+pub(crate) const MIN_DERIVED_CONTEXT: u32 = 4096;
+/// The step of a derived context. A multiple of the cache growth quantum (256 positions) and of
+/// the 8-bit cache group (64), and the step the context search of the capability report uses.
+const CONTEXT_STEP: u32 = 1024;
+
+/// What the host and the model directory say, read once at start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostFacts {
+    /// Physical (unified) memory in bytes.
+    pub(crate) memory_bytes: u64,
+    /// What Metal recommends as a working set, where this build has Metal.
+    pub(crate) metal_bytes: Option<u64>,
+    /// The `FIFI_MLX_WORKING_SET_MIB` ceiling, in bytes.
+    pub(crate) ceiling_bytes: Option<u64>,
+    /// The bytes of the model's `*.safetensors` shards: the resident weights charge.
+    pub(crate) model_bytes: u64,
+}
+
+/// The values derived from the host facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostDefaults {
+    pub(crate) os_floor_bytes: u64,
+    pub(crate) prefill_budget_bytes: u64,
+    pub(crate) cache_limit_bytes: u64,
+}
+
+impl HostFacts {
+    /// Reads the physical memory of this host and the shard bytes under `model_dir`. `None` when
+    /// either is unknown (no memory probe, no shard): the caller then keeps the settings as they
+    /// were before derivation existed, with their original refusals.
+    pub(crate) fn probe(model_dir: &Path) -> Option<Self> {
+        let memory = mac_memory()?;
+        let model_bytes = shard_bytes(model_dir)?;
+        Some(Self {
+            memory_bytes: memory.physical_bytes,
+            metal_bytes: memory.metal_bytes,
+            ceiling_bytes: memory.ceiling_bytes,
+            model_bytes,
+        })
+    }
+
+    /// The machine facts of the start, the one input of its memory budget.
+    pub(crate) fn memory(self) -> MacMemory {
+        MacMemory {
+            physical_bytes: self.memory_bytes,
+            metal_bytes: self.metal_bytes,
+            ceiling_bytes: self.ceiling_bytes,
+        }
+    }
+
+    pub(crate) fn defaults(self) -> HostDefaults {
+        let prefill_budget_bytes = self.memory().budget();
+        HostDefaults {
+            os_floor_bytes: self
+                .memory_bytes
+                .saturating_sub(host_budget(self.memory_bytes)),
+            prefill_budget_bytes,
+            cache_limit_bytes: (self.memory_bytes / 9 / GIB * GIB)
+                .clamp(MIN_CACHE_LIMIT_BYTES, MAX_CACHE_LIMIT_BYTES),
+        }
+    }
+}
+
+/// The largest context whose session reserve still fits next to the model in `budget`, when the
+/// reserve is `per_position * context + fixed_bytes` (the shape of the derived reserve): a
+/// multiple of 1024 positions, at least 4,096. `None` when the model and the fixed part leave no
+/// room for that floor, or `per_position` is 0.
+pub(crate) fn largest_context(
+    facts: HostFacts,
+    budget: u64,
+    per_position: u64,
+    fixed_bytes: u64,
+) -> Option<u32> {
+    let room = budget
+        .checked_sub(facts.model_bytes)?
+        .checked_sub(fixed_bytes)?;
+    let positions = room.checked_div(per_position)?;
+    let step = u64::from(CONTEXT_STEP);
+    let rounded =
+        u32::try_from(positions / step * step).unwrap_or(u32::MAX / CONTEXT_STEP * CONTEXT_STEP);
+    (rounded >= MIN_DERIVED_CONTEXT).then_some(rounded)
+}
+
+/// The refusal of a host whose derived budget cannot hold the model and the session reserve.
+pub(crate) fn shortfall_text(
+    facts: HostFacts,
+    budget: u64,
+    reserve: u64,
+    context_limit: u32,
+) -> Option<String> {
+    let needed = facts.model_bytes.checked_add(reserve)?;
+    if needed <= budget {
+        return None;
+    }
+    let defaults = facts.defaults();
+    Some(format!(
+        "this host has {} of unified memory, {} after the {} OS floor; the model needs {} and the \
+         session reserve at context {context_limit} needs {} more, {} in all: short by {} ({} \
+         bytes). Use a smaller model, set a smaller context_limit and cache_limit_bytes, or set \
+         prefill_budget_bytes yourself",
+        gib(facts.memory_bytes),
+        gib(budget),
+        gib(defaults.os_floor_bytes),
+        gib(facts.model_bytes),
+        gib(reserve),
+        gib(needed),
+        gib(needed - budget),
+        needed - budget,
+    ))
+}
+
+pub(crate) use self::ExpertBytes as ExpertFacts;
+
+impl HostFacts {
+    /// The facts of a start that streams its routed experts: the model keeps everything except
+    /// the expert tensors resident, plus one stage of experts.
+    pub(crate) fn staged(self, experts: ExpertFacts) -> Self {
+        Self {
+            model_bytes: staged_model_bytes(self.model_bytes, experts),
+            ..self
+        }
+    }
+}
+
+/// Reads the routed expert bytes of the checkpoint under `model_dir`.
+pub(crate) fn expert_facts(model_dir: &Path) -> Option<ExpertFacts> {
+    expert_bytes_in(model_dir)
 }
 
 #[cfg(test)]
@@ -181,7 +473,63 @@ mod tests {
         assert_eq!(host_budget(36 * GIB), 30 * GIB);
         assert_eq!(host_budget(16 * GIB), 12 * GIB);
         assert_eq!(host_budget(24 * GIB), 20 * GIB);
-        assert!(fits_budget(10, 20, 30, 60) && !fits_budget(10, 20, 30, 59));
+    }
+
+    fn mac(memory_gib: u64, metal_gib: Option<u64>, ceiling_mib: Option<u64>) -> MacMemory {
+        const GIB: u64 = 1 << 30;
+        MacMemory {
+            physical_bytes: memory_gib * GIB,
+            metal_bytes: metal_gib.map(|gib| gib * GIB),
+            ceiling_bytes: ceiling_mib.map(|mib| mib << 20),
+        }
+    }
+
+    #[test]
+    fn the_budget_is_the_lowest_of_the_host_budget_metal_and_the_ceiling() {
+        const GIB: u64 = 1 << 30;
+        // No Metal and no ceiling: the host budget of a 16, 24, 36 and 64 GiB host.
+        for (memory, want) in [(16, 12 * GIB), (24, 20 * GIB), (36, 30 * GIB)] {
+            assert_eq!(mac(memory, None, None).budget(), want, "{memory} GiB");
+        }
+        // Metal below the host budget lowers it, so a plan never admits what the load refuses.
+        assert_eq!(mac(16, Some(11), None).budget(), 11 * GIB);
+        assert_eq!(mac(24, Some(18), None).budget(), 18 * GIB);
+        // Metal above the host budget does not raise it.
+        assert_eq!(mac(36, Some(48), None).budget(), 30 * GIB);
+        // The ceiling lowers and never raises.
+        assert_eq!(mac(36, Some(28), Some(12288)).budget(), 12 * GIB);
+        assert_eq!(mac(36, Some(28), Some(65536)).budget(), 28 * GIB);
+    }
+
+    #[test]
+    fn a_start_with_no_budget_of_its_own_is_sized_only_for_a_reason() {
+        const GIB: u64 = 1 << 30;
+        let model = Some(20_401_094_656u64);
+        // A 36 GiB host holds the model: no reason, the start runs as it always did.
+        assert_eq!(sized_because(mac(36, None, None), None, false, model), None);
+        // 16 GiB does not hold it, and a 24 GiB host whose Metal working set is 17 GiB does not.
+        assert_eq!(
+            sized_because(mac(16, None, None), None, false, model),
+            Some(SizedBecause::ModelDoesNotFit)
+        );
+        assert_eq!(
+            sized_because(mac(24, Some(17), None), None, false, model),
+            Some(SizedBecause::ModelDoesNotFit)
+        );
+        // A set working-set ceiling below the model sizes a 36 GiB host as well.
+        assert_eq!(
+            sized_because(mac(36, None, Some(12 * 1024)), None, false, model),
+            Some(SizedBecause::ModelDoesNotFit)
+        );
+        // The host plan's streaming and the owner's `1` size it whatever the shards say.
+        assert_eq!(
+            sized_because(mac(36, None, None), Some(30 * GIB), false, None),
+            Some(SizedBecause::HostPlanStreams)
+        );
+        assert_eq!(
+            sized_because(mac(36, None, None), None, true, None),
+            Some(SizedBecause::Forced)
+        );
     }
 
     #[test]
@@ -190,7 +538,7 @@ mod tests {
         // The shard bytes of the Qwen3.6 MLX 4-bit checkpoint (19.0 GiB) and of the Flint INT4
         // checkpoint (21.05 GiB) against the host budgets of 16, 24, 36 and 64 GiB hosts
         // (12, 20, 30 and 53.3 GiB). Qwen3.6 on a 24 GiB host fits by its shards alone; its host
-        // plan adds the session reserve and streams the experts from `mlx_staged_cap` instead.
+        // plan adds the session reserve and streams the experts instead.
         for (name, model, sized) in [
             ("qwen36", 20_401_094_656u64, [true, false, false, false]),
             ("flint", 22_600_000_000, [true, true, false, false]),
@@ -198,12 +546,12 @@ mod tests {
         ] {
             for (memory, want) in [16, 24, 36, 64].into_iter().zip(sized) {
                 assert_eq!(
-                    implied_cap(model, memory * GIB).is_some(),
+                    mac(memory, None, None).implied_budget(model).is_some(),
                     want,
                     "{name} on {memory} GiB"
                 );
             }
         }
-        assert_eq!(implied_cap(22 * GIB, 24 * GIB), Some(20 * GIB));
+        assert_eq!(mac(24, None, None).implied_budget(22 * GIB), Some(20 * GIB));
     }
 }

@@ -19,72 +19,19 @@
 //!   positions that fits, down to 4,096, and below that it is refused with the shortfall.
 //! - Compile: on for the MoE family when no speculation runs, as the shipped profile sets it.
 
-use std::path::Path;
-
 const GIB: u64 = 1 << 30;
 #[cfg(test)]
 const MIB: u64 = 1 << 20;
 
-/// The allocator cache limit bounds.
-const MIN_CACHE_LIMIT_BYTES: u64 = GIB;
-const MAX_CACHE_LIMIT_BYTES: u64 = 8 * GIB;
-
-/// The least context a derived choice may land on: below it the start is refused.
-pub(crate) const MIN_DERIVED_CONTEXT: u32 = 4096;
-/// The step of a derived context. A multiple of the cache growth quantum (256 positions) and of
-/// the 8-bit cache group (64), and the step the context search of the capability report uses.
-const CONTEXT_STEP: u32 = 1024;
-
-/// What the host and the model directory say, read once at start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HostFacts {
-    /// Physical (unified) memory in bytes.
-    pub(crate) memory_bytes: u64,
-    /// The bytes of the model's `*.safetensors` shards: the resident weights charge.
-    pub(crate) model_bytes: u64,
-}
-
-/// The values derived from the host facts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HostDefaults {
-    pub(crate) os_floor_bytes: u64,
-    pub(crate) prefill_budget_bytes: u64,
-    pub(crate) cache_limit_bytes: u64,
-}
-
-impl HostFacts {
-    /// Reads the physical memory of this host and the shard bytes under `model_dir`. `None` when
-    /// either is unknown (no memory probe, no shard): the caller then keeps the settings as they
-    /// were before derivation existed, with their original refusals.
-    pub(crate) fn probe(model_dir: &Path) -> Option<Self> {
-        let memory_bytes = physical_memory_bytes()?;
-        let model_bytes = weights_bytes(model_dir)?;
-        Some(Self {
-            memory_bytes,
-            model_bytes,
-        })
-    }
-
-    pub(crate) fn defaults(self) -> HostDefaults {
-        let prefill_budget_bytes = crate::family::host_memory::host_budget(self.memory_bytes);
-        HostDefaults {
-            os_floor_bytes: self.memory_bytes.saturating_sub(prefill_budget_bytes),
-            prefill_budget_bytes,
-            cache_limit_bytes: (self.memory_bytes / 9 / GIB * GIB)
-                .clamp(MIN_CACHE_LIMIT_BYTES, MAX_CACHE_LIMIT_BYTES),
-        }
-    }
-}
+pub(crate) use crate::family::host_memory::{
+    ExpertFacts, HostFacts, expert_facts, gib, largest_context, shortfall_text,
+};
 
 /// One value of the startup line: its name, its number, and where the number came from.
 pub(crate) struct NoteValue {
     pub(crate) key: &'static str,
     pub(crate) value: String,
     pub(crate) source: String,
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
 /// The one startup line: the host facts, then each value with its source.
@@ -103,82 +50,6 @@ pub(crate) fn startup_line(facts: HostFacts, values: &[NoteValue]) -> String {
     )
 }
 
-/// The largest context whose session reserve still fits next to the model in `budget`, when the
-/// reserve is `per_position * context + fixed_bytes` (the shape of the derived reserve): a
-/// multiple of 1024 positions, at least 4,096. `None` when the model and the fixed part leave no
-/// room for that floor, or `per_position` is 0.
-pub(crate) fn largest_context(
-    facts: HostFacts,
-    budget: u64,
-    per_position: u64,
-    fixed_bytes: u64,
-) -> Option<u32> {
-    let room = budget
-        .checked_sub(facts.model_bytes)?
-        .checked_sub(fixed_bytes)?;
-    let positions = room.checked_div(per_position)?;
-    let step = u64::from(CONTEXT_STEP);
-    let rounded =
-        u32::try_from(positions / step * step).unwrap_or(u32::MAX / CONTEXT_STEP * CONTEXT_STEP);
-    (rounded >= MIN_DERIVED_CONTEXT).then_some(rounded)
-}
-
-/// The refusal of a host whose derived budget cannot hold the model and the session reserve.
-pub(crate) fn shortfall_text(
-    facts: HostFacts,
-    budget: u64,
-    reserve: u64,
-    context_limit: u32,
-) -> Option<String> {
-    let needed = facts.model_bytes.checked_add(reserve)?;
-    if needed <= budget {
-        return None;
-    }
-    let defaults = facts.defaults();
-    Some(format!(
-        "this host has {} of unified memory, {} after the {} OS floor; the model needs {} and the \
-         session reserve at context {context_limit} needs {} more, {} in all: short by {} ({} \
-         bytes). Use a smaller model, set a smaller context_limit and cache_limit_bytes, or set \
-         prefill_budget_bytes yourself",
-        gib(facts.memory_bytes),
-        gib(budget),
-        gib(defaults.os_floor_bytes),
-        gib(facts.model_bytes),
-        gib(reserve),
-        gib(needed),
-        gib(needed - budget),
-        needed - budget,
-    ))
-}
-
-pub(crate) use crate::family::host_memory::ExpertBytes as ExpertFacts;
-
-impl HostFacts {
-    /// The facts of a start that streams its routed experts: the model keeps everything except
-    /// the expert tensors resident, plus one stage of experts.
-    pub(crate) fn staged(self, experts: ExpertFacts) -> Self {
-        Self {
-            model_bytes: crate::family::host_memory::staged_model_bytes(self.model_bytes, experts),
-            ..self
-        }
-    }
-}
-
-/// Reads the routed expert bytes of the checkpoint under `model_dir`.
-pub(crate) fn expert_facts(model_dir: &Path) -> Option<ExpertFacts> {
-    crate::family::host_memory::expert_bytes_in(model_dir)
-}
-
-fn physical_memory_bytes() -> Option<u64> {
-    crate::family::host_memory::physical_memory_bytes()
-}
-
-/// The summed length of the top-level `*.safetensors` files (symlinks followed), the way the
-/// loader opens them. `None` when the directory cannot be read or holds no shard.
-fn weights_bytes(model_dir: &Path) -> Option<u64> {
-    crate::family::host_memory::shard_bytes(model_dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +57,8 @@ mod tests {
     fn facts(memory_gib: u64) -> HostFacts {
         HostFacts {
             memory_bytes: memory_gib * GIB,
+            metal_bytes: None,
+            ceiling_bytes: None,
             model_bytes: 20_402_000_000,
         }
     }
@@ -298,11 +171,11 @@ mod tests {
     fn a_directory_without_shards_gives_no_facts() {
         let dir = std::env::temp_dir().join(format!("host-plan-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(weights_bytes(&dir), None);
+        assert_eq!(crate::family::host_memory::shard_bytes(&dir), None);
         std::fs::write(dir.join("a.safetensors"), [0u8; 10]).unwrap();
         std::fs::write(dir.join("b.safetensors"), [0u8; 5]).unwrap();
         std::fs::write(dir.join("c.json"), [0u8; 100]).unwrap();
-        assert_eq!(weights_bytes(&dir), Some(15));
+        assert_eq!(crate::family::host_memory::shard_bytes(&dir), Some(15));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

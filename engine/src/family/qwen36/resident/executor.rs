@@ -916,13 +916,14 @@ impl Q36Executor {
         rules: Q36Rules,
         device: DeviceBudget,
         disk_experts: bool,
+        force_stream: bool,
     ) -> Result<(Self, Q36Session)> {
         Self::open_with_placement(
             &settings.artifact,
             settings.cache_limit,
             rules,
             &settings.spec,
-            Some((device, settings, disk_experts)),
+            Some((device, settings, disk_experts, force_stream)),
         )
     }
 
@@ -931,7 +932,7 @@ impl Q36Executor {
         cache_limit: u64,
         rules: Q36Rules,
         spec: &FamilySpec,
-        placement: Option<(DeviceBudget, &Q36Settings, bool)>,
+        placement: Option<(DeviceBudget, &Q36Settings, bool, bool)>,
     ) -> Result<(Self, Q36Session)> {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
@@ -940,7 +941,7 @@ impl Q36Executor {
         let shape = shape_of(&config, spec)?;
         admit(&shape, &rules)?;
         let plan = placement
-            .map(|(device, settings, _)| {
+            .map(|(device, settings, _, force_stream)| {
                 let retained = (rules.max_seqs > 1).then_some(rules.session_cap);
                 let context = usize::try_from(rules.context_limit)
                     .map_err(|_| EngError::MemoryPlan("context exceeds platform size".into()))?;
@@ -962,6 +963,7 @@ impl Q36Executor {
                     device,
                     reserve,
                     max_seqs: rules.max_seqs,
+                    force_stream,
                 })
             })
             .transpose()?;
@@ -969,7 +971,7 @@ impl Q36Executor {
             crate::family::prefill::mlx::StagingReads::of_placement(false, plan.is_some())
                 .positioned;
         let ckpt = open_checkpoint(artifact, positioned)?;
-        let disk_experts = placement.is_some_and(|(_, _, disk_experts)| disk_experts);
+        let disk_experts = placement.is_some_and(|(_, _, disk_experts, _)| disk_experts);
         if let Some(plan) = plan {
             plan.device
                 .check_packed_payload_floor(
@@ -2667,6 +2669,7 @@ mod tests {
                 rules(),
                 DeviceBudget::new(reserve + floor - 1).unwrap(),
                 disk_experts,
+                false,
             );
             acquire_read::set(false);
             assert_eq!(acquire_read::snapshot(), (0, 0, 0));
@@ -2678,6 +2681,7 @@ mod tests {
                 rules(),
                 DeviceBudget::new(4 << 30).unwrap(),
                 disk_experts,
+                false,
             )
             .unwrap();
         }
@@ -3155,6 +3159,7 @@ mod tests {
                         device: DeviceBudget::new(bytes).unwrap(),
                         reserve: 0,
                         max_seqs: 1,
+                        force_stream: false,
                     }),
                 )
             };
@@ -3323,6 +3328,7 @@ mod tests {
                 device: DeviceBudget::new(device_bytes).unwrap(),
                 reserve: 0,
                 max_seqs: 1,
+                force_stream: false,
             }),
         )
     }
@@ -3479,6 +3485,7 @@ mod tests {
                     rules(),
                     DeviceBudget::new(bytes).unwrap(),
                     disk_experts,
+                    false,
                 )
             };
             let message = |result: Result<(Q36Executor, Q36Session)>| match result {
@@ -3676,6 +3683,7 @@ mod tests {
                 device: DeviceBudget::new(base + stage).unwrap(),
                 reserve: 0,
                 max_seqs: 2,
+                force_stream: false,
             }),
         );
         assert!(matches!(

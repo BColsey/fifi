@@ -176,7 +176,7 @@ impl FlintExecutor {
         let retention_cap = super::retention_cap_for(
             super::prefix_reuse_opt_in(),
             std::env::var_os("FIFI_FLINT_PREFIX_BUDGET_BYTES").as_deref(),
-            physical_memory_bytes,
+            crate::family::host_memory::mac_memory,
             || weights_charge(root),
         )
         .map_err(EngError::Checkpoint)?;
@@ -932,25 +932,6 @@ impl ExecutorOps for FlintExecutor {
             tier: Default::default(),
         })
     }
-}
-
-/// Physical memory in bytes via `/usr/sbin/sysctl` -n hw.memsize` - the
-/// ABSOLUTE path (a PATH lookup breaks under a restricted PATH or sandbox,
-/// which would refuse engine loads; the absolute binary needs no PATH at
-/// all). `None` when the probe fails, which the cap seam treats as
-/// underivable (fail closed, opt-in only).
-fn physical_memory_bytes() -> Option<u64> {
-    std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
 }
 
 /// The loaded-weights charge: the safetensors bytes under the model root,

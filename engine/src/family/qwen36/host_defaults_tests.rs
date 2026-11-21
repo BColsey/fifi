@@ -13,6 +13,8 @@ fn env(memory_gib: u64) -> Q36Env {
     Q36Env {
         host: Some(HostFacts {
             memory_bytes: memory_gib * GIB,
+            metal_bytes: None,
+            ceiling_bytes: None,
             model_bytes: MODEL_BYTES,
         }),
         ..Q36Env::default()
@@ -213,6 +215,8 @@ fn dense_env(memory_gib: u64, model_bytes: u64) -> Q36Env {
     Q36Env {
         host: Some(HostFacts {
             memory_bytes: memory_gib * GIB,
+            metal_bytes: None,
+            ceiling_bytes: None,
             model_bytes,
         }),
         ..Q36Env::default()
@@ -385,4 +389,61 @@ fn the_override_zero_and_unreadable_experts_keep_the_refusal() {
 fn a_host_too_small_for_the_staged_model_is_refused() {
     let tiny = resolve(None, &env_with_experts(4, DiskExperts::Auto));
     assert!(refusal(tiny).contains("short by"));
+}
+
+fn env_on(memory_gib: u64, metal_gib: Option<u64>, ceiling_mib: Option<u64>) -> Q36Env {
+    let mut env = env_with_experts(memory_gib, DiskExperts::Auto);
+    let host = env.host.as_mut().unwrap();
+    host.metal_bytes = metal_gib.map(|gib| gib * GIB);
+    host.ceiling_bytes = ceiling_mib.map(|mib| mib << 20);
+    env
+}
+
+/// The plan and the load read one budget: the number the settings plan the prefill against is the
+/// number `DeviceBudget` enforces when the start loads, on a 16, 24, 36 and 64 GiB host whose
+/// Metal recommendation is below the host budget, and the start the plan accepts fits that
+/// number at the context it serves.
+#[test]
+fn the_plan_and_the_load_budget_agree_on_every_host_class() {
+    use crate::family::mlx_budget::DeviceBudget;
+    for (memory, metal) in [(16, 11), (24, 18), (36, 27), (64, 48)] {
+        let env = env_on(memory, Some(metal), None);
+        let host = env.host.unwrap();
+        let got = resolve(None, &env).unwrap_or_else(|error| panic!("{memory} GiB: {error:?}"));
+        let load = DeviceBudget::from_memory(host.memory()).unwrap().bytes();
+        assert_eq!(got.prefill_budget, Some(load), "{memory} GiB host");
+        assert!(
+            load <= metal * GIB,
+            "{memory} GiB: the load never passes Metal"
+        );
+        let resident = if got.mlx_staged_cap.is_some() {
+            host.staged(EXPERTS).model_bytes
+        } else {
+            host.model_bytes
+        };
+        assert!(
+            resident + got.prefill_reserve <= load,
+            "{memory} GiB: {resident} + {} > {load}",
+            got.prefill_reserve
+        );
+        println!(
+            "{memory} GiB host, Metal {metal} GiB: budget {load} streams={} context={}",
+            got.mlx_staged_cap.is_some(),
+            got.context_limit
+        );
+    }
+}
+
+/// `FIFI_MLX_WORKING_SET_MIB` lowers the budget the settings plan from, so a start that the load
+/// would refuse is not planned as if it had the host budget, and it never raises it.
+#[test]
+fn the_working_set_setting_bounds_the_plan_as_it_bounds_the_load() {
+    let got = resolve(None, &env_on(36, Some(27), Some(12288))).unwrap();
+    assert_eq!(got.prefill_budget, Some(12 * GIB));
+    assert!(
+        got.mlx_staged_cap.is_some(),
+        "19 GiB of weights stream under 12 GiB"
+    );
+    let higher = resolve(None, &env_on(36, Some(27), Some(65536))).unwrap();
+    assert_eq!(higher.prefill_budget, Some(27 * GIB));
 }

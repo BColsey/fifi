@@ -753,7 +753,7 @@ impl ResidentWeights {
                     .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))?,
             )?;
         }
-        let resident = all_experts.total() <= available;
+        let resident = !plan.force_stream && all_experts.total() <= available;
         let decode_stage = if resident {
             0
         } else {
@@ -936,6 +936,8 @@ pub(super) struct ExpertDevicePlan {
     pub(super) device: DeviceBudget,
     pub(super) reserve: u64,
     pub(super) max_seqs: usize,
+    /// Stream the routed experts even when they fit (`FIFI_Q36_MLX_DISK_EXPERTS=1`).
+    pub(super) force_stream: bool,
 }
 
 /// The packed weights of a model and the dtypes of their scale and bias tensors.

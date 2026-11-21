@@ -9,6 +9,7 @@
 //! a clear error naming both features and never touches a file.
 
 use super::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+use crate::family::host_memory::EntryFit;
 use crate::{
     EngError,
     family::{FamilySpec, QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE, flash_next::factory::StartedEngine},
@@ -106,13 +107,34 @@ pub(crate) fn settings_with_prefix_reuse(
     settings.prefix_reuse = prefix_reuse;
     // An MLX start that sets no session cap takes the cap the prefix store needs, instead of
     // refusing the default cap.
+    // The raise stays inside the memory budget: a cap that would take the model, the reserve and
+    // one entry past it is left alone, and the cap rule then refuses with what it needs.
     if prefix_reuse
         && backend == Backend::Mlx
         && options.is_none_or(|options| options.session_cap_bytes.is_none())
+        && entry_fit(&settings, env).is_none_or(|fit| fit.fits())
     {
         settings.raise_session_cap_for_prefix_reuse()?;
     }
     Ok(settings)
+}
+
+/// The fit of one saved prefix in the budget the settings resolved: `None` when the host memory,
+/// the budget or the entry size is not known. A start that streams its experts counts one stage
+/// of them, not the whole stacks.
+fn entry_fit(settings: &Q36Settings, env: &Q36Env) -> Option<EntryFit> {
+    let (host, budget) = (env.host?, settings.prefill_budget?);
+    let entry = settings.prefix_entry_bytes().ok()?;
+    let resident = match (settings.mlx_staged_cap, env.experts) {
+        (Some(_), Some(experts)) => host.staged(experts).model_bytes,
+        _ => host.model_bytes,
+    };
+    Some(EntryFit::of(
+        resident,
+        settings.prefill_reserve,
+        entry,
+        budget,
+    ))
 }
 
 /// Whether an entry that sets no `prefix_reuse` keeps conversation prefixes on a Mac, and why
@@ -161,29 +183,20 @@ fn mlx_auto_prefix_reuse_with(
     if settings.check_prefix_reuse_cap(true).is_err() {
         return off("the configured session_cap_bytes is below what a saved prefix needs".into());
     }
-    let (Some(host), Some(budget)) = (env.host, settings.prefill_budget) else {
-        return off("the host memory or the prefill budget is not known".into());
+    let Some(fit) = entry_fit(&settings, env) else {
+        return off("the host memory, the prefill budget or the prefix entry is not known".into());
     };
-    let entry = match settings.prefix_entry_bytes() {
-        Ok(entry) => entry,
-        Err(error) => return off(format!("the prefix entry is not priced ({error:?})")),
-    };
-    let resident = match (settings.mlx_staged_cap, env.experts) {
-        (Some(_), Some(experts)) => host.staged(experts).model_bytes,
-        _ => host.model_bytes,
-    };
-    let needed = resident
-        .saturating_add(settings.prefill_reserve)
-        .saturating_add(entry);
-    if !crate::family::host_memory::fits_budget(resident, settings.prefill_reserve, entry, budget) {
+    if !fit.fits() {
         return off(format!(
-            "the model, the session reserve and one saved prefix need {needed} bytes and the budget is {budget}"
+            "the model, the session reserve and one saved prefix need {} bytes and the budget is {}",
+            fit.needed, fit.budget
         ));
     }
     (
         true,
         format!(
-            "the model, the session reserve and one saved prefix need {needed} of {budget} bytes"
+            "the model, the session reserve and one saved prefix need {} of {} bytes",
+            fit.needed, fit.budget
         ),
     )
 }
@@ -555,6 +568,8 @@ mod tests {
         let env = |memory_gib: u64| Q36Env {
             host: Some(HostFacts {
                 memory_bytes: memory_gib * GIB,
+                metal_bytes: None,
+                ceiling_bytes: None,
                 model_bytes: 20_401_094_656,
             }),
             experts: Some(ExpertFacts {
@@ -602,5 +617,54 @@ mod tests {
             },
         );
         assert!(!on, "{reason}");
+    }
+
+    /// The automatic reuse decision reads the budget the load enforces, so a working-set ceiling
+    /// below the host budget is the number it checks against.
+    #[test]
+    fn automatic_reuse_checks_the_working_set_ceiling_not_the_host_budget() {
+        use super::super::host_plan::{ExpertFacts, HostFacts};
+        use super::{QWEN3_6_35B_A3B, mlx_auto_prefix_reuse_with};
+        use std::path::Path;
+        const GIB: u64 = 1 << 30;
+        let env = |ceiling_mib: Option<u64>| Q36Env {
+            host: Some(HostFacts {
+                memory_bytes: 36 * GIB,
+                metal_bytes: Some(27 * GIB),
+                ceiling_bytes: ceiling_mib.map(|mib| mib << 20),
+                model_bytes: 20_401_094_656,
+            }),
+            experts: Some(ExpertFacts {
+                total_bytes: 18_119_393_280,
+                stage_bytes: 452_984_832,
+            }),
+            ..Q36Env::default()
+        };
+        // A start that names its context, as the served 12 GiB arm does: the default context of
+        // 262,144 positions needs more than 12 GiB for the reserve and one entry.
+        let options = Q36Options {
+            context_limit: Some(32_768),
+            ..Q36Options::default()
+        };
+        let decide = |ceiling| {
+            mlx_auto_prefix_reuse_with(
+                QWEN3_6_35B_A3B,
+                Path::new("/a"),
+                Path::new("/a"),
+                Some(&options),
+                &env(ceiling),
+            )
+        };
+        let (on, reason) = decide(None);
+        assert!(on && reason.contains(&(27 * GIB).to_string()), "{reason}");
+        let (on, reason) = decide(Some(12288));
+        assert!(
+            reason.contains(&(12 * GIB).to_string()),
+            "the 12 GiB ceiling is the budget: {reason}"
+        );
+        assert!(
+            on,
+            "the staged model, the reserve and one entry fit 12 GiB: {reason}"
+        );
     }
 }

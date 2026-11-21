@@ -289,18 +289,25 @@ fn flint_prefix_reuse_opt_in_is_constant_false_off_the_store_targets() {
 
 /// The retention-cap arithmetic is pure so the host suite pins it,
 /// including the too-small-headroom refusal.
+fn mac(memory_gib: u64) -> crate::family::host_memory::MacMemory {
+    crate::family::host_memory::MacMemory {
+        physical_bytes: memory_gib << 30,
+        metal_bytes: None,
+        ceiling_bytes: None,
+    }
+}
+
 #[test]
 fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
-    use super::{
-        PREFIX_OS_FLOOR_BYTES, derived_retention_cap, retention_admitted, retention_cap_from_env,
-    };
-    // Derivation: physical - weights - floor, saturating; unknown
-    // physical is None and must NEVER read as "no cap".
+    use super::{derived_retention_cap, retention_admitted, retention_cap_from_env};
+    // Derivation: the memory budget - weights, saturating; unknown
+    // memory is None and must NEVER read as "no cap".
+    let budget_64 = mac(64).budget();
     assert_eq!(
-        derived_retention_cap(Some(64 << 30), 4 << 30),
-        Some((64 << 30) - (4 << 30) - PREFIX_OS_FLOOR_BYTES)
+        derived_retention_cap(Some(mac(64)), 4 << 30),
+        Some(budget_64 - (4 << 30))
     );
-    assert_eq!(derived_retention_cap(Some(8 << 30), 4 << 30), Some(0));
+    assert_eq!(derived_retention_cap(Some(mac(8)), 8 << 30), Some(0));
     assert_eq!(
         derived_retention_cap(None, 0),
         None,
@@ -308,7 +315,7 @@ fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
     );
 
     // Admission: 2x new charge (entry + COW) + the retained overlap fits.
-    let cap = (64 << 30) - (4 << 30) - PREFIX_OS_FLOOR_BYTES;
+    let cap = budget_64 - (4 << 30);
     assert!(retention_admitted(1 << 30, 0, cap));
     assert!(
         !retention_admitted(cap, 0, cap),
@@ -393,11 +400,11 @@ fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
     };
     assert!(text.contains("FIFI_FLINT_PREFIX_BUDGET_BYTES"), "{text}");
     assert_eq!(
-        retention_cap_for(true, None, || Some(64 << 30), || Ok(4 << 30)),
-        Ok((64 << 30) - (4 << 30) - super::PREFIX_OS_FLOOR_BYTES)
+        retention_cap_for(true, None, || Some(mac(64)), || Ok(4 << 30)),
+        Ok(mac(64).budget() - (4 << 30))
     );
     assert!(retention_cap_for(true, None, || None, || Ok(0)).is_err());
-    assert!(retention_cap_for(true, None, || Some(8 << 30), || Ok(4 << 30)).is_err());
+    assert!(retention_cap_for(true, None, || Some(mac(8)), || Ok(8 << 30)).is_err());
 }
 
 /// The native-CUDA arm of the same coverage: the env

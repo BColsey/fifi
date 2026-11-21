@@ -1,10 +1,11 @@
 //! Startup working-set budget for an opted-in Apple Silicon model.
 
-use std::{ffi::OsStr, fmt};
+use std::fmt;
 
-use crate::{EngError, family::device_budget::DeviceReserve};
-
-const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
+use crate::{
+    EngError,
+    family::{device_budget::DeviceReserve, host_memory::MacMemory},
+};
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -29,26 +30,31 @@ impl DeviceBudget {
         })
     }
 
-    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn detect() -> Result<Option<Self>, EngError> {
-        if enabled() {
-            let ceiling = configured_ceiling()?;
-            let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
-            Ok(Some(Self { ceiling, ..device }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// The budget of a start that sets none: what Metal recommends, capped at the host budget
-    /// when the host plan derived one.
-    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn implied(cap: u64) -> Result<Self, EngError> {
-        let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    /// The budget of `memory`, the one value the plan and the load both read: Metal reports the
+    /// working set and the ceiling field holds the rest of the rule (`MacMemory::budget`).
+    pub(crate) fn from_memory(memory: MacMemory) -> Result<Self, EngError> {
+        let device = Self::new(memory.metal_bytes.unwrap_or(0))?;
         Ok(Self {
-            ceiling: Some(cap.min(device.recommended)),
+            ceiling: Some(memory.budget()),
             ..device
         })
+    }
+
+    /// The budget of a start that opted in (`FIFI_MLX_AUTO_BUDGET=1` or a ceiling variable).
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn detect() -> Result<Option<Self>, EngError> {
+        if !enabled() {
+            return Ok(None);
+        }
+        crate::family::host_memory::ceiling_from_env()?;
+        let memory = crate::family::host_memory::mac_memory().ok_or_else(|| {
+            EngError::MemoryPlan("the unified memory of this host is unknown".into())
+        })?;
+        Self::from_memory(memory).map(Some)
     }
 
     /// The budget of a start that sets none and whose resident model does not fit the host
@@ -61,18 +67,18 @@ impl DeviceBudget {
             return Ok(Some(device));
         }
         let (Some(memory), Some(model)) = (
-            crate::family::host_memory::physical_memory_bytes(),
+            crate::family::host_memory::mac_memory(),
             crate::family::host_memory::shard_bytes(model_dir),
         ) else {
             return Ok(None);
         };
-        let Some(budget) = crate::family::host_memory::implied_cap(model, memory) else {
+        let Some(budget) = memory.implied_budget(model) else {
             return Ok(None);
         };
         eprintln!(
-            "mlx: the resident model needs {model} bytes and the host budget is {budget}; sizing from the host budget"
+            "mlx: the resident model needs {model} bytes and the budget is {budget}; sizing from the budget"
         );
-        Self::implied(budget).map(Some)
+        Self::from_memory(memory).map(Some)
     }
 
     pub(crate) fn bytes(self) -> u64 {
@@ -158,31 +164,15 @@ impl fmt::Display for DeviceBudget {
     }
 }
 
-fn parse_ceiling(value: &OsStr) -> Result<u64, EngError> {
-    value
-        .to_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|mib| mib.checked_mul(1 << 20))
-        .filter(|&bytes| bytes != 0)
-        .ok_or_else(|| {
-            EngError::BadRequest(format!(
-                "{CEILING_MIB} must be a positive whole number of MiB that fits in u64 bytes"
-            ))
-        })
-}
-
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled() -> bool {
     std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
-        || std::env::var_os(CEILING_MIB).is_some()
+        || std::env::var_os(crate::family::host_memory::CEILING_MIB).is_some()
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn configured_ceiling() -> Result<Option<u64>, EngError> {
-    std::env::var_os(CEILING_MIB)
-        .as_deref()
-        .map(parse_ceiling)
-        .transpose()
+    crate::family::host_memory::ceiling_from_env()
 }
 
 /// The packed `.weight` payload bytes that `is_resident` keeps in memory, read from the
@@ -202,6 +192,8 @@ pub(super) fn packed_payload_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::host_memory::parse_ceiling;
+    use std::ffi::OsStr;
 
     #[test]
     fn metal_working_set_caps_explicit_budget_and_checks_base_charges() {

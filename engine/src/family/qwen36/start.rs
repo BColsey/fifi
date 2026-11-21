@@ -105,25 +105,29 @@ pub(crate) fn start(
                 "q36: FIFI_Q36_MLX_DISK_EXPERTS ignored: {reason}; the placement is automatic"
             );
         }
-        // Without a device budget of its own, a start whose resident model does not fit the
-        // host memory runs under the host budget and streams its routed experts.
-        let device = match (device, owned.mlx_staged_cap) {
-            (None, Some(cap)) => {
-                eprintln!(
-                    "q36: the resident model does not fit the host budget of {cap} bytes; routed experts stream from disk (set FIFI_Q36_MLX_DISK_EXPERTS=0 to refuse instead)"
-                );
-                Some(DeviceBudget::implied(cap)?)
-            }
-            // No host plan figure either (a dense model, or the plan could not read the host):
-            // the shared rule decides from the shard bytes and the memory.
-            (None, None) => DeviceBudget::detect_or_implied(&owned.artifact)?,
-            (device, _) => device,
+        // Without a device budget of its own, a start is sized from the memory budget (the one
+        // rule every MLX family reads) when its host plan streams the routed experts, when
+        // `FIFI_Q36_MLX_DISK_EXPERTS=1` forces streaming, or when its resident model does not fit.
+        let force_stream = disk_setting == DiskExperts::On;
+        let device = match device {
+            Some(device) => Some(device),
+            None => match crate::family::host_memory::sizing_for(
+                &owned.artifact,
+                owned.mlx_staged_cap,
+                force_stream,
+            ) {
+                Some((because, memory)) => {
+                    eprintln!("{}", because.note(memory.budget()));
+                    Some(DeviceBudget::from_memory(memory)?)
+                }
+                None => None,
+            },
         };
         // Automatic and `1` let the placement choose by fit; `0` keeps the experts resident, so a
         // start that does not fit is refused before any import.
         let disk_experts = disk_setting != DiskExperts::Off;
         let (mut executor, session) = if let Some(device) = device {
-            Q36Executor::open_for_device(&owned, rules, device, disk_experts)?
+            Q36Executor::open_for_device(&owned, rules, device, disk_experts, force_stream)?
         } else {
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
         };

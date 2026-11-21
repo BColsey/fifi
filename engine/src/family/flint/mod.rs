@@ -92,29 +92,18 @@ pub(crate) fn prefix_reuse_env(value: std::result::Result<String, std::env::VarE
 }
 
 /// The fixed OS floor subtracted from physical memory when deriving the
-/// Flint prefix retention cap: the same spirit as the pinned-RAM
-/// rule - the engine never plans against memory the OS needs. 8 GiB: macOS
-/// anonymous compression + windowserver + the harness measured well under
-/// this on the 64 GiB Mac.
-#[cfg(any(
-    test,
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
-))]
-pub(in crate::family::flint) const PREFIX_OS_FLOOR_BYTES: u64 = 8 << 30;
-
-/// The derived retention cap: physical memory minus the loaded-weights
-/// charge minus the OS floor. `None` when physical memory is
-/// unknown - callers must treat that as NO cap derivable (fail closed),
-/// never as "no limit".
+/// The derived retention cap: the memory budget of the start (`MacMemory::budget`, the one rule
+/// every MLX family plans from) minus the loaded-weights charge. `None` when the memory is
+/// unknown - callers must treat that as NO cap derivable (fail closed), never as "no limit".
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 pub(in crate::family::flint) fn derived_retention_cap(
-    physical: Option<u64>,
+    memory: Option<crate::family::host_memory::MacMemory>,
     weights: u64,
 ) -> Option<u64> {
-    physical.map(|p| p.saturating_sub(weights.saturating_add(PREFIX_OS_FLOOR_BYTES)))
+    memory.map(|memory| memory.budget().saturating_sub(weights))
 }
 
 /// Retention admission: the worst case a save commits is the new entry's
@@ -173,7 +162,7 @@ pub(in crate::family::flint) fn retention_cap_from_env(
 pub(in crate::family::flint) fn retention_cap_for(
     opt_in: bool,
     env_raw: Option<&std::ffi::OsStr>,
-    physical: impl FnOnce() -> Option<u64>,
+    memory: impl FnOnce() -> Option<crate::family::host_memory::MacMemory>,
     weights: impl FnOnce() -> Result<u64, String>,
 ) -> Result<u64, String> {
     if !opt_in {
@@ -189,13 +178,13 @@ pub(in crate::family::flint) fn retention_cap_for(
         ),
         Some(cap) => Ok(cap),
         None => {
-            let physical = physical()
+            let memory = memory()
                 .ok_or_else(|| "physical memory unknown (sysctl hw.memsize failed)".to_string())?;
             let weights = weights()?;
-            derived_retention_cap(Some(physical), weights)
+            derived_retention_cap(Some(memory), weights)
                 .filter(|cap| *cap > 0)
                 .ok_or_else(|| {
-                    "derived retention cap is zero (physical <= weights + OS floor)".to_string()
+                    "derived retention cap is zero (the memory budget <= the weights)".to_string()
                 })
         }
     }
