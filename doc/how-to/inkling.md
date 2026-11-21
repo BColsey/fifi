@@ -233,7 +233,7 @@ Both chats used 56 completion tokens including EOS. CPU attention projections to
 
 The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefill tok/s and 13.74 decode tok/s on the fork with 12 output tokens and full Metal offload. Its effective context was 256 tokens and it did not use fifi's 6 GiB budget. Those are reference-runtime observations.
 
-### Cache experiments awaiting device qualification
+### Cache and placement experiments
 
 `FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1` uses the full already-admitted expert budget for packed Metal buffers when every stored expert projection has a direct packed kernel. Set it alongside `FIFI_INKLING_GGUF_PACKED_MLX=1`. The application retains one copy of each cached packed projection. The phase trace reports the two tier capacities and retained payload bytes. Use the same ceiling with and without the flag when comparing it.
 
@@ -242,6 +242,25 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 `FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. At `e9f74c2b`, the real fork test matched projected expert vectors and merged visit outputs bitwise across seven layers, including zero-retention and eviction cases. With warm retention, total grouped MLX import and readback synchronizations fell from 32 to four per visit. Combined packed, single-copy, grouped and four-worker probes on both real layouts each recorded 480 expert readbacks across 240 visits. Both selected token 152717. The fork matched the ordered top ten from the external reference with cosine similarity 0.999973.
 
 `FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. At `e9f74c2b`, all 200,058 first-generation logits after a five-token prompt matched bitwise with one and four workers on each real file. Preflight verified the independent grouped-expert and worker charges on both files. With both optimizations enabled, each GGUF preflight required 1,263,707,392 bytes and rejected a 1 GiB ceiling. Matched request latency, CPU time and SSD byte measurements remain in progress.
+
+### Matched Unsloth GGUF fork requests at 6 GiB
+
+The exact `e9f74c2b` binary processed five prompt tokens and twelve greedy output tokens twice in each fresh process. It used a 192-token context, mapped dense weights and direct packed Metal kernels. The three trials each changed one setting. Controls ran before and after them. No competing build was detected. All ten outputs matched and reached the requested limit. The OS page cache was uncontrolled.
+
+| Setting | Request | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (MB) | Peak process footprint (GB) | Swap-out pages |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control before | First | 7.78 | 0.64 | 0.53 | 28.39 | 3.10 | 1,365.01 | 4.51 | 0 |
+| Single-copy cache | First | 7.65 | 0.65 | 0.57 | 26.93 | 3.10 | 0.12 | 3.37 | 0 |
+| Grouped readback | First | 6.63 | 0.75 | 0.65 | 23.60 | 3.10 | 117.51 | 4.53 | 0 |
+| Four CPU workers | First | 5.40 | 0.93 | 0.78 | 19.43 | 3.10 | 217.09 | 4.53 | 0 |
+| Control after | First | 7.88 | 0.63 | 0.57 | 27.33 | 3.10 | 134.86 | 4.60 | 0 |
+| Control before | Repeat | 6.93 | 0.72 | 0.58 | 25.77 | 0 | 0 | 4.51 | 0 |
+| Single-copy cache | Repeat | 6.93 | 0.72 | 0.58 | 25.74 | 0 | 0 | 3.37 | 0 |
+| Grouped readback | Repeat | 5.91 | 0.85 | 0.67 | 22.23 | 0 | 0.30 | 4.53 | 0 |
+| Four CPU workers | Repeat | 4.45 | 1.12 | 0.83 | 17.77 | 0 | 1.32 | 4.59 | 0 |
+| Control after | Repeat | 6.95 | 0.72 | 0.58 | 25.88 | 0 | 27.21 | 4.60 | 0 |
+
+Four workers halved CPU attention projection time from about 14.3 s to 7.1 s on the repeat. Grouped execution reduced expert readbacks from 12,288 to 1,536 across the full request and reduced time in readback from about 5.58 s to 2.25 s. Single-copy retention lowered peak footprint by 1.14–1.24 GB while matching both controls’ repeat decode rate. The first requests read the same logical expert bytes. Physical traffic varied by more than 1.2 GB between the two first-request controls, so this run does not establish a physical I/O reduction from the three flags.
 
 ### Speculative read replay
 
