@@ -2065,8 +2065,10 @@ mod tests {
                 assert!(
                     host.host_bytes()
                         .unwrap()
-                        .chunks_exact(4)
-                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| u32::from_le_bytes(*bytes))
                         .eq(expected.map(|value| value.to_bits())),
                     "embedding differs from CPU for {rows} rows at sample {sample}"
                 );
