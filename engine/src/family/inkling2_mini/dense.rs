@@ -1,6 +1,6 @@
 //! Text weight access for the official Inkling 2 Mini safetensor layout.
 
-use std::{cell::OnceCell, collections::BTreeMap, fs::File, ops::Range, path::Path};
+use std::{cell::OnceCell, collections::BTreeMap, fs::File, ops::Range, path::Path, sync::Arc};
 
 use half::bf16;
 
@@ -9,12 +9,95 @@ const MAX_BF16_WORKERS: usize = 4;
 use safetensors::{Dtype, tensor::TensorInfo};
 
 use super::{
-    HEADER_LIMIT, SHARD, checkpoint_error, parse_json, read_exact_at, read_stored_header,
-    validate_config, weight_plan,
+    CORE_START, HEADER_LIMIT, SHARD, checkpoint_error, gguf, gguf_dense, parse_json, read_exact_at,
+    read_stored_header, validate_config, weight_plan,
 };
 use crate::{EngError, storage_guard::LocalGuard};
 
-pub struct DenseWeights {
+pub struct DenseWeights(Backend);
+
+enum Backend {
+    Safetensors(SafetensorDense),
+    Gguf(gguf_dense::Dense),
+}
+
+impl DenseWeights {
+    pub fn open(dir: &Path) -> Result<Self, EngError> {
+        Ok(Self(Backend::Safetensors(SafetensorDense::open(dir)?)))
+    }
+
+    pub fn from_gguf(source: Arc<gguf::Weights>) -> Result<Self, EngError> {
+        Ok(Self(Backend::Gguf(gguf_dense::Dense::new(source)?)))
+    }
+
+    pub fn shape(&self, name: &str) -> Result<&[usize], EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.shape(name),
+            Backend::Gguf(w) => w.shape(name),
+        }
+    }
+
+    pub fn vector(&self, name: &str) -> Result<Vec<f32>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.vector(name),
+            Backend::Gguf(w) => w.vector(name),
+        }
+    }
+
+    pub fn bf16(&self, name: &str) -> Result<Vec<bf16>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.bf16(name),
+            Backend::Gguf(w) => Ok(w.vector(name)?.into_iter().map(bf16::from_f32).collect()),
+        }
+    }
+
+    pub fn row(&self, name: &str, row: usize) -> Result<Vec<f32>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.row(name, row),
+            Backend::Gguf(w) => w.row(name, row),
+        }
+    }
+
+    pub fn matvec(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.matvec(name, input),
+            Backend::Gguf(w) => w.matvec_rows(name, input, 0..w.shape(name)?[0]),
+        }
+    }
+
+    pub fn matvec_rows(
+        &self,
+        name: &str,
+        input: &[f32],
+        rows: Range<usize>,
+    ) -> Result<Vec<f32>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => w.matvec_rows(name, input, rows),
+            Backend::Gguf(w) => w.matvec_rows(name, input, rows),
+        }
+    }
+
+    pub fn loop_query(&self, layer: usize, stream: usize) -> Result<Vec<f32>, EngError> {
+        match &self.0 {
+            Backend::Safetensors(w) => {
+                let (suffix, offset) = match stream {
+                    0 => ("", 0),
+                    1 => ("_kv", 0),
+                    2 => ("_kv", 1),
+                    3 => ("", 1),
+                    _ => return Err(checkpoint_error("invalid Inkling loop query stream")),
+                };
+                w.row(
+                    &format!("model.llm.middle_cycle_cross_pass{suffix}_queries"),
+                    2 * (layer - CORE_START) + offset,
+                )
+            }
+            Backend::Gguf(w) => w.loop_query(layer, stream),
+        }
+    }
+}
+
+struct SafetensorDense {
     shard: File,
     len: u64,
     data_start: u64,
@@ -26,7 +109,7 @@ struct DenseEntry {
     bytes: OnceCell<Box<[u8]>>,
 }
 
-impl DenseWeights {
+impl SafetensorDense {
     /// Validates the official checkpoint metadata. Text matrices are loaded on first
     /// projection and retain their stored precision. Embedding lookup reads one row.
     pub fn open(dir: &Path) -> Result<Self, EngError> {
@@ -337,7 +420,7 @@ mod tests {
             .collect();
         shard.write_all(&[0; 11]).unwrap();
         shard.write_all(&bytes).unwrap();
-        let dense = DenseWeights {
+        let dense = SafetensorDense {
             shard,
             len: 11 + bytes.len() as u64,
             data_start: 11,

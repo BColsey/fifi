@@ -44,6 +44,8 @@ pub struct GgufFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inkling2_loop:
         Option<Result<crate::family::inkling2_mini::gguf_metadata::Geometry, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_tensors: Option<Result<(), String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -169,25 +171,33 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
         Some(MetaValue::String(value)) => Some(value.clone()),
         _ => None,
     };
-    let inkling2_loop = (architecture.as_deref() == Some("inkling2_loop")).then(|| {
-        crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
-            .map_err(|error| super::describe_error(&error))
-    });
+    let inkling2_loop =
+        matches!(architecture.as_deref(), Some("inkling2_loop" | "inkling2")).then(|| {
+            crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
+                .map_err(|error| super::describe_error(&error))
+        });
     if path
         .extension()
         .is_some_and(|extension| extension == "gguf_file")
-        && inkling2_loop.is_none()
+        && architecture.as_deref() != Some("inkling2_loop")
     {
         return Err(checkpoint(
             ".gguf_file requires the inkling2_loop architecture".into(),
         ));
     }
+    let inkling2_tensors = inkling2_loop.as_ref().and_then(|geometry| {
+        geometry.as_ref().ok().map(|_| {
+            crate::family::inkling2_mini::gguf::validate_tensors(&header)
+                .map_err(|error| super::describe_error(&error))
+        })
+    });
     Ok(GgufFact {
         file: String::new(),
         file_bytes,
         architecture,
         tensor_count: header.tensors().len(),
         inkling2_loop,
+        inkling2_tensors,
     })
 }
 

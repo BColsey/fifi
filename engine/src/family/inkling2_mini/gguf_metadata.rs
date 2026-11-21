@@ -1,4 +1,4 @@
-//! Header-only geometry for the mainline fixed-loop Inkling 2 Mini GGUF.
+//! Header geometry for both fixed-loop Inkling 2 Mini GGUF layouts.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -12,6 +12,31 @@ use crate::{
     EngError,
     weights::{GgufHeader, MetaValue},
 };
+
+/// The fork advertises logical visits as its block count. Both formats store
+/// only the physical layers, but their loop message queries use different names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Layout {
+    Mainline,
+    Fork,
+}
+
+impl Layout {
+    pub(super) fn from_header(header: &GgufHeader) -> Option<Self> {
+        match header.meta("general.architecture") {
+            Some(MetaValue::String(arch)) if arch == MODEL_TYPE => Some(Self::Mainline),
+            Some(MetaValue::String(arch)) if arch == "inkling2" => Some(Self::Fork),
+            _ => None,
+        }
+    }
+
+    fn architecture(self) -> &'static str {
+        match self {
+            Self::Mainline => MODEL_TYPE,
+            Self::Fork => "inkling2",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Geometry {
@@ -38,11 +63,24 @@ pub(crate) fn inspect(
             "split GGUF checkpoint inspection is unsupported",
         ));
     }
+    let layout = Layout::from_header(header)
+        .ok_or_else(|| checkpoint_error("unsupported Inkling GGUF architecture"))?;
+    let logical_layers = LAYERS + (CORE_END - CORE_START) * (PASSES - 1);
+    let (block_count, core_start, core_end, loop_count) = match layout {
+        Layout::Mainline => (LAYERS, "loop.start", "loop.end", "loop.count"),
+        Layout::Fork => (
+            logical_layers,
+            "loop.core_start",
+            "loop.core_end",
+            "num_loops",
+        ),
+    };
+    let arch = layout.architecture();
     for (name, expected) in [
-        ("block_count", LAYERS as u32),
-        ("loop.start", CORE_START as u32),
-        ("loop.end", CORE_END as u32),
-        ("loop.count", PASSES as u32),
+        ("block_count", block_count as u32),
+        (core_start, CORE_START as u32),
+        (core_end, CORE_END as u32),
+        (loop_count, PASSES as u32),
         ("loop.gate_rank", 64),
         ("embedding_length", HIDDEN as u32),
         ("context_length", MAX_CONTEXT),
@@ -55,40 +93,33 @@ pub(crate) fn inspect(
         ("attention.value_length_swa", HEAD_DIM as u32),
         ("attention.sliding_window", WINDOW),
     ] {
-        let key = format!("{MODEL_TYPE}.{name}");
+        let key = format!("{arch}.{name}");
         if header.meta(&key) != Some(&MetaValue::U32(expected)) {
             return Err(checkpoint_error(format!("{key} must be {expected}")));
         }
     }
     if !matches!(
-        header.meta("inkling2_loop.loop.varying"),
+        header.meta(&format!("{arch}.loop.varying")),
         None | Some(MetaValue::Bool(false))
     ) {
-        return Err(checkpoint_error("inkling2_loop.loop.varying must be false"));
+        return Err(checkpoint_error(format!(
+            "{arch}.loop.varying must be false"
+        )));
     }
     for (key, element_type, width, expected) in [
-        (
-            "inkling2_loop.attention.head_count",
-            4,
-            4,
-            QUERY_HEADS as u32,
-        ),
-        (
-            "inkling2_loop.attention.head_count_kv",
-            4,
-            4,
-            KV_HEADS as u32,
-        ),
-        ("inkling2_loop.attention.sliding_window_pattern", 7, 1, 0),
+        ("attention.head_count", 4, 4, QUERY_HEADS as u32),
+        ("attention.head_count_kv", 4, 4, KV_HEADS as u32),
+        ("attention.sliding_window_pattern", 7, 1, 0),
     ] {
-        let Some(MetaValue::Array(array)) = header.meta(key) else {
+        let key = format!("{arch}.{key}");
+        let Some(MetaValue::Array(array)) = header.meta(&key) else {
             return Err(checkpoint_error(format!("{key} must be an array")));
         };
         // The published conversion stores head counts as I32. Positive counts
         // have identical bytes in either integer encoding.
         let type_matches =
             array.elem_type == element_type || (element_type == 4 && array.elem_type == 5);
-        if !type_matches || array.len != LAYERS as u64 {
+        if !type_matches || array.len != block_count as u64 {
             return Err(checkpoint_error(format!(
                 "{key} has invalid element type or length"
             )));
@@ -96,11 +127,11 @@ pub(crate) fn inspect(
         source
             .seek(SeekFrom::Start(array.byte_range.start))
             .map_err(checkpoint_error)?;
-        let mut bytes = [0; LAYERS * 4];
+        let mut bytes = [0; super::VISITS * 4];
         source
-            .read_exact(&mut bytes[..LAYERS * width])
+            .read_exact(&mut bytes[..block_count * width])
             .map_err(checkpoint_error)?;
-        for (layer, bytes) in bytes[..LAYERS * width].chunks_exact(width).enumerate() {
+        for (layer, bytes) in bytes[..block_count * width].chunks_exact(width).enumerate() {
             let valid = match *bytes {
                 [value] => value == u8::from(layer % 6 != 5),
                 [a, b, c, d] => u32::from_le_bytes([a, b, c, d]) == expected,
@@ -113,7 +144,6 @@ pub(crate) fn inspect(
             }
         }
     }
-    let logical_layers = LAYERS + (CORE_END - CORE_START) * (PASSES - 1);
     let global_layers = logical_layers / 6;
     Ok(Geometry {
         physical_layers: LAYERS,
