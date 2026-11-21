@@ -137,16 +137,32 @@ pub(crate) fn q36_effective(
                 .unwrap_or_else(|| "off".to_string()),
             present(&options.gguf_sha256),
         ),
-        row(
-            "context_limit",
-            settings.context_limit.to_string(),
-            from_host("context_limit", present(&options.context_limit)),
-        ),
-        row(
-            "kv_dtype",
-            kv_dtype_name(settings.kv).to_string(),
-            present(&options.kv_dtype),
-        ),
+        if settings.context_auto {
+            row(
+                "context_limit",
+                "the largest the free card carries, chosen at load".to_string(),
+                Origin::Derived,
+            )
+        } else {
+            row(
+                "context_limit",
+                settings.context_limit.to_string(),
+                from_host("context_limit", present(&options.context_limit)),
+            )
+        },
+        if settings.kv_auto {
+            row(
+                "kv_dtype",
+                "f32 (fp16) or q8, chosen from the free card at load".to_string(),
+                Origin::Derived,
+            )
+        } else {
+            row(
+                "kv_dtype",
+                kv_dtype_name(settings.kv).to_string(),
+                present(&options.kv_dtype),
+            )
+        },
         row(
             "activation_dtype",
             activation_name(settings.activation).to_string(),

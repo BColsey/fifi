@@ -107,7 +107,7 @@ fn run_serving_ttft() -> Result<(), EngError> {
     let options = serving_fixture_options(65_536)?;
     let dir = Path::new(&model_dir);
     let settings = Q36Settings::new(dir, dir, Some(&options), &Q36Env::default(), Backend::Cuda)?;
-    let (engine, tokenizer) = super::start(&settings, None)?;
+    let (engine, tokenizer, _served) = super::start(&settings, None)?;
     let handle = engine.handle();
     let measured = (|| {
         wait_ttft_ready(&handle)?;
@@ -178,7 +178,7 @@ fn run_serving_long_sanity() -> Result<(), EngError> {
     let options = serving_fixture_options(131_072)?;
     let dir = Path::new(&model_dir);
     let settings = Q36Settings::new(dir, dir, Some(&options), &Q36Env::default(), Backend::Cuda)?;
-    let (engine, tokenizer) = super::start(&settings, None)?;
+    let (engine, tokenizer, _served) = super::start(&settings, None)?;
     let handle = engine.handle();
     let measured = (|| {
         wait_ttft_ready(&handle)?;

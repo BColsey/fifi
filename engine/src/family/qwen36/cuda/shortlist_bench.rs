@@ -184,7 +184,7 @@ fn device_shortlist_served_decode() -> Result<(), EngError> {
     settings.prefix_reuse = profile["prefix_reuse"]
         .as_bool()
         .ok_or_else(|| bad("prefix_reuse"))?;
-    let (engine, tokenizer) = start(&settings, None)?;
+    let (engine, tokenizer, _served) = start(&settings, None)?;
     let measured = run_jobs(&engine.handle(), &tokenizer, &mut output);
     let shutdown = engine.shutdown();
     measured?;

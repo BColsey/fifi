@@ -1005,6 +1005,14 @@ pub(crate) struct Q36Settings {
     pub(crate) activation: Activation,
     /// The form of the attention KV cache. The default is `f32`, the control.
     pub(crate) kv: KvDtype,
+    /// A CUDA GGUF start whose config names no `kv_dtype`: the start picks the form from the free
+    /// card after the weights (see `admission_sketch::choose_cuda_fit`); `kv` is the fallback
+    /// when the card cannot be read.
+    pub(crate) kv_auto: bool,
+    /// A CUDA GGUF start whose config names no `context_limit`: the start picks the largest
+    /// context the free card carries; `context_limit` is the fallback when the card cannot be
+    /// read.
+    pub(crate) context_auto: bool,
     /// Host-backed CUDA Q8 KV is disabled when this budget is absent.
     pub(crate) kv_offload_host_bytes: Option<u64>,
     /// Graph capture of the CUDA arm; the MLX arm ignores it with one start line.
@@ -1596,6 +1604,15 @@ impl Q36Settings {
         let tiered = tiered_settings(options, backend)?;
         let expert_bank = expert_bank_settings(options, backend, weights)?;
         let kv_cache = kv_cache_settings(options, backend, &cuda_devices)?;
+        // The card-driven choices apply to the single-device GGUF start that names neither
+        // tiered experts nor host-paged KV; every member the config names is taken as given.
+        let card_chosen = backend == Backend::Cuda
+            && weights == WeightFormat::Gguf
+            && cuda_devices == [0]
+            && tiered.is_none()
+            && kv_offload_host_bytes.is_none();
+        let kv_auto = card_chosen && options.kv_dtype.is_none();
+        let context_auto = card_chosen && options.context_limit.is_none();
         let compile_program_limit = match options.compile_program_limit {
             Some(_) if backend != Backend::Mlx => {
                 return Err(bad("compile_program_limit requires the MLX backend".into()));
@@ -1745,6 +1762,8 @@ impl Q36Settings {
             prefill_reserve,
             activation,
             kv,
+            kv_auto,
+            context_auto,
             kv_offload_host_bytes,
             // The CUDA arm captures by default (EXL3 reads the picks on the device; a GGUF step
             // saves its launch overhead — measured 5.3 percent of wall in the W3 bench, at a
@@ -3149,6 +3168,8 @@ mod tests {
                 prefill_reserve: 0,
                 activation: super::Activation::Bf16,
                 kv: super::KvDtype::Q8,
+                kv_auto: false,
+                context_auto: false,
                 kv_offload_host_bytes: None,
                 capture: false,
                 compile: false,
@@ -4129,13 +4150,51 @@ mod tests {
         );
     }
 
-    /// The default flip of the MLX arm does not reach the CUDA arm: it keeps the F32 cache and
-    /// 32,768 positions, which its F32 cache is sized by.
+    /// The default flip of the MLX arm does not reach the CUDA arm: its fallback is the F32
+    /// cache and 32,768 positions, which the start replaces with the card's choice when the
+    /// config names neither.
     #[test]
-    fn the_cuda_arm_keeps_the_f32_form_and_32768_positions_by_default() {
+    fn the_cuda_arm_falls_back_to_the_f32_form_and_32768_positions() {
         let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(got.kv, super::KvDtype::F32);
         assert_eq!(got.context_limit, 32_768);
+    }
+
+    /// The card chooses what the config leaves open, for the single-device GGUF start that
+    /// fixes neither tiered experts nor host-paged KV; a member the config names is taken as
+    /// given, and the MLX arm never reads the card.
+    #[test]
+    fn the_card_chooses_only_what_a_cuda_gguf_config_leaves_open() {
+        let flags = |text: &str, backend| {
+            let options: Q36Options = serde_json::from_str(text).unwrap();
+            let got = settings_for(Some(&options), &Q36Env::default(), backend).unwrap();
+            (got.kv_auto, got.context_auto)
+        };
+        assert_eq!(flags("{}", Backend::Cuda), (true, true));
+        assert_eq!(
+            flags(r#"{"context_limit":65536}"#, Backend::Cuda),
+            (true, false)
+        );
+        assert_eq!(flags(r#"{"kv_dtype":"q8"}"#, Backend::Cuda), (false, true));
+        assert_eq!(
+            flags(r#"{"kv_dtype":"q8","context_limit":65536}"#, Backend::Cuda),
+            (false, false)
+        );
+        assert_eq!(
+            flags(
+                r#"{"tiered":{"slots":"auto"},"capture":false}"#,
+                Backend::Cuda
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            flags(r#"{"cuda_devices":[0,1],"capture":false}"#, Backend::Cuda),
+            (false, false)
+        );
+        assert_eq!(
+            flags(r#"{"cache_limit_bytes":1024}"#, Backend::Mlx),
+            (false, false)
+        );
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -10,6 +10,7 @@
 //! process is refused.
 use crate::family::exl3::layer_table::LayerTable;
 
+use super::super::admission_sketch::choose_cuda_fit;
 use super::super::card_short::{self, CardFigures, CardShort, CardVerdict};
 use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
@@ -868,7 +869,7 @@ fn runtime_modes(settings: &Q36Settings) -> Result<RuntimeModes, EngError> {
 pub(crate) fn start(
     settings: &Q36Settings,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, Q36Settings), EngError> {
     // The toggle is resolved HERE, before any work: a bad `Q36_VERIFY_GGUF_SHA256` spelling is
     // refused at startup, not on the engine thread after the projector exists; unset stays OFF
     // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
@@ -912,16 +913,53 @@ pub(crate) fn start(
     })?;
     let guard = BuildGuard::acquire()?;
     let owned = settings.clone();
+    // A start that leaves the context or the cache form to the card gets them from the engine
+    // thread once it has read the free memory; the server's request bound needs them before the
+    // weights finish loading.
+    let (announce, resolved) = if settings.context_auto || settings.kv_auto {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     let engine = if owned.cuda_devices == [0] {
         spawn_engine_noted(piece, ready_note, move |stages| {
-            make(stages, owned, rules, plan, guard)
+            make(stages, owned, rules, plan, guard, announce)
         })?
     } else {
         spawn_engine_noted(piece, ready_note, move |stages| {
             make_multi(stages, owned, rules, plan, guard)
         })?
     };
-    Ok((engine, bundle))
+    let served = match resolved {
+        Some(receiver) => await_served(&receiver, || engine.handle().failure())?,
+        None => settings.clone(),
+    };
+    Ok((engine, bundle, served))
+}
+
+/// What the engine thread tells `start` about a card-chosen start: the settings it serves, or
+/// the failure that ended the start before the card was read.
+pub(super) type Announcement = Result<Q36Settings, String>;
+
+/// Waits for the engine thread's announcement. A closed channel means the thread ended without
+/// one; `failure` then supplies the cause the engine recorded.
+pub(super) fn await_served(
+    receiver: &std::sync::mpsc::Receiver<Announcement>,
+    failure: impl FnOnce() -> Option<String>,
+) -> Result<Q36Settings, EngError> {
+    let failed = |cause: String| {
+        EngError::Checkpoint(format!(
+            "q36 cuda start failed before the card plan: {cause}"
+        ))
+    };
+    match receiver.recv() {
+        Ok(Ok(served)) => Ok(served),
+        Ok(Err(cause)) => Err(failed(cause)),
+        Err(_) => Err(failed(failure().unwrap_or_else(|| {
+            "the engine thread ended without a cause".to_string()
+        }))),
+    }
 }
 
 fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<u64, EngError> {
@@ -1338,12 +1376,81 @@ fn gguf_prefix_identity(
     })
 }
 
+/// The cache form and context of a start that left them to the card, asked before any weight is
+/// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
+/// its native tensors, so the choice charges what the load will. A start whose config fixes both
+/// (or fits no form at all, which the lower rung or the load's own refusal then handles) answers
+/// `None` and goes on unchanged. The variant carries the chosen figures with its own runtime
+/// modes and startup plan, since the cache form picks the prefill path.
+fn card_fit(
+    projector: &CudaProjector,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    model: &GgufModel,
+) -> Result<Option<(Q36Settings, StartupPlan)>, EngError> {
+    if !(settings.kv_auto || settings.context_auto)
+        || plan.paged.is_some()
+        || plan.device_first_native.is_some()
+        || !card_short::automatic(settings, false)
+    {
+        return Ok(None);
+    }
+    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
+    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    let Some(fit) = choose_cuda_fit(
+        &settings.spec,
+        free,
+        weights,
+        (!settings.kv_auto).then_some(settings.kv),
+        (!settings.context_auto).then_some(settings.context_limit),
+    )?
+    else {
+        return Ok(None);
+    };
+    let variant = Q36Settings {
+        kv: fit.form,
+        context_limit: fit.context,
+        ..settings.clone()
+    };
+    let modes = runtime_modes(&variant)?;
+    let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+    eprintln!(
+        "q36 cuda: context {} with the {} KV cache, chosen from the card ({free} bytes free,          {weights} bytes of weights); set context_limit and kv_dtype to override",
+        fit.context,
+        match fit.form {
+            KvDtype::Q8 => "int8",
+            KvDtype::F32 | KvDtype::Bf16 => "fp16",
+        }
+    );
+    Ok(Some((variant, variant_plan)))
+}
+
 fn make(
     stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
     rules: QwenRules,
     plan: StartupPlan,
+    guard: BuildGuard,
+    announce: Option<std::sync::mpsc::SyncSender<Announcement>>,
+) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
+    let built = make_resolving(stages, settings, rules, plan, guard, announce.as_ref());
+    if let (Err(error), Some(announce)) = (&built, &announce) {
+        // Nothing was announced when the build failed before the card plan; after it the
+        // slot is taken and the failure reaches the engine state.
+        let _ = announce.try_send(Err(error.describe()));
+    }
+    built
+}
+
+/// [`make`] after the announcement is wired: reads the card, settles the cache form and context
+/// the start left open, tells `start` what it serves, then loads.
+fn make_resolving(
+    stages: &crate::sched::worker::Stages<'_>,
+    settings: Q36Settings,
+    rules: QwenRules,
+    plan: StartupPlan,
     mut guard: BuildGuard,
+    announce: Option<&std::sync::mpsc::SyncSender<Announcement>>,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let verify = plan.verify;
     let allow_unpinned = plan.allow_unpinned;
@@ -1360,6 +1467,14 @@ fn make(
         )?),
         WeightFormat::Exl3 => None,
     };
+    // The cache form and context the config left open come from the free card.
+    let (settings, plan) = match gguf.as_ref() {
+        Some((model, _)) => match card_fit(&projector, &settings, &plan, model)? {
+            Some((variant, variant_plan)) => (variant, variant_plan),
+            None => (settings, plan),
+        },
+        None => (settings, plan),
+    };
     // The lower rung: a GGUF start the card cannot carry whole serves the tiered path when card
     // plus host can, instead of refusing at the load's admission.
     let (settings, plan, card_short) = match gguf.as_ref() {
@@ -1369,6 +1484,10 @@ fn make(
         },
         None => (settings, plan, None),
     };
+    if let Some(announce) = announce {
+        // A full slot means `start` already has an answer; a closed channel means it gave up.
+        let _ = announce.try_send(Ok(settings.clone()));
+    }
     let kv_cache = plan.reserve;
     let fixed_admission = plan.modes.fixed_admission;
     let tiered = tiered_plan_of(&settings);

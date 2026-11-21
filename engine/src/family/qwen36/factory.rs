@@ -128,7 +128,9 @@ fn start_engine_with(
         spec,
     )?;
     settings.check_prefix_reuse_cap(prefix_reuse)?;
-    let (engine, bundle) = launch(&settings, ready_note)?;
+    // A card-chosen context and cache form are known only once the engine thread has read the
+    // card, so the settings the caller gets are the ones the engine serves.
+    let (engine, bundle, settings) = launch(&settings, ready_note)?;
     Ok((
         StartedEngine {
             engine,
@@ -143,15 +145,16 @@ fn start_engine_with(
 fn launch(
     settings: &Q36Settings,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
-    super::start::start(settings, ready_note)
+) -> Result<(Engine, TokenizerBundle, Q36Settings), EngError> {
+    let (engine, bundle) = super::start::start(settings, ready_note)?;
+    Ok((engine, bundle, settings.clone()))
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn launch(
     settings: &Q36Settings,
     ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, Q36Settings), EngError> {
     super::cuda::start::start(settings, ready_note)
 }
 
@@ -162,7 +165,7 @@ fn launch(
 fn launch(
     settings: &Q36Settings,
     _ready_note: ReadyNote,
-) -> Result<(Engine, TokenizerBundle), EngError> {
+) -> Result<(Engine, TokenizerBundle, Q36Settings), EngError> {
     if settings.spec.feed_forward.is_some() {
         return Err(EngError::BadRequest(format!(
             "engine config: this build has no {} backend; build with --features native-mlx on Apple Silicon",

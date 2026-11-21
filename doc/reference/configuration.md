@@ -56,8 +56,8 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 
 | Key | Backend | Default | Meaning |
 | --- | --- | --- | --- |
-| `context_limit` | both | MLX 262,144; CUDA 32,768 | Context limit in tokens, from 2. |
-| `kv_dtype` | both | MLX `q8`; CUDA `f32` | KV cache format: `q8` (8-bit), `f32`, or `bf16` (MLX only). On CUDA, `f32` stores the cache in FP16. |
+| `context_limit` | both | MLX 262,144; CUDA GGUF: the largest the free card carries, up to 262,144 | Context limit in tokens, from 2. A CUDA GGUF start on one device with no `tiered` and no `kv_offload_host_bytes` reads the free card before the weights are uploaded and takes the largest context (a multiple of 1,024) whose cache, DeltaNet state, staged int8 rows and admission margins fit beside the weights; the start line names the choice. A value you set is served as given. When the card cannot carry even the smallest context the start keeps 32,768 and takes the tiered rung or the load's own refusal. |
+| `kv_dtype` | both | MLX `q8`; CUDA GGUF: chosen from the free card | KV cache format: `q8` (8-bit), `f32`, or `bf16` (MLX only). On CUDA, `f32` stores the cache in FP16. On the CUDA GGUF start described under `context_limit`, an absent `kv_dtype` is chosen with the context: FP16 when it reaches 131,072 positions (or the context you set), otherwise `q8`, which holds almost twice the positions in the same bytes. `q8` changes generated text against FP16; name `kv_dtype` to fix the form. |
 | `activation_dtype` | MLX | `bf16` | Decode activations: `bf16` or `f32`. CUDA accepts the key and ignores it. |
 | `cache_limit_bytes` | MLX | none | MLX allocator cache limit. Falls back to `Q36_CACHE_LIMIT`; on MLX one of the two is required. |
 | `session_cap_bytes` | MLX | 4 GiB | Memory for the live session and saved prefixes. |
