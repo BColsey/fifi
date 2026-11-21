@@ -1403,6 +1403,20 @@ pub(crate) fn drain_bound(remaining: u64, rate: Option<f64>) -> Duration {
     Duration::from_secs_f64(seconds.clamp(15.0, 300.0))
 }
 
+/// Set by the second stop signal of the process: a graceful stop that is still writing prefixes to
+/// disk gives up at once instead of waiting out its bound.
+static HURRY: AtomicBool = AtomicBool::new(false);
+
+/// Asks every stop that is flushing prefixes to give up now.
+pub(crate) fn request_hurry() {
+    HURRY.store(true, Ordering::SeqCst);
+}
+
+/// The flag a flush polls.
+pub(crate) fn hurry_flag() -> &'static AtomicBool {
+    &HURRY
+}
+
 /// The environment names that override the `kv_cache` member.
 pub(crate) const DIR_ENV: &str = "Q36_KV_CACHE_DIR";
 pub(crate) const QUOTA_ENV: &str = "Q36_KV_CACHE_QUOTA_BYTES";

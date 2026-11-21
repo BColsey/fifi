@@ -1718,11 +1718,26 @@ fn make(
     Ok((step, DecodeSession::default()))
 }
 
+/// Why this start cannot run the on-disk prefix tier whatever the config says, when it cannot. A
+/// start that keeps only some experts on the card (the explicit `tiered` option, or the lower rung
+/// a card too small for the checkpoint takes) saves no prefixes by default, so a cache directory
+/// would only hold entries nothing reads.
+fn kv_disk_blocker(settings: &Q36Settings) -> Option<&'static str> {
+    settings
+        .tiered
+        .is_some()
+        .then_some("a tiered-experts start keeps no prefix entries to spill")
+}
+
 /// Starts the on-disk prefix tier when the config, the environment or the build default asks for
 /// it, and says in one line whether it runs. A malformed override stops the start; a directory
 /// that cannot be used leaves the tier off.
 fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Result<(), EngError> {
     use crate::family::qwen36::{kv_cache, settings::KV_CACHE_DEFAULT_ON};
+    if let Some(reason) = kv_disk_blocker(settings) {
+        eprintln!("q36 cuda: kv disk tier off: {reason}");
+        return Ok(());
+    }
     let plan = kv_cache::plan(
         settings.kv_cache.as_ref(),
         &kv_cache::KvEnv::from_process(),
@@ -2080,6 +2095,16 @@ mod paged_start_tests {
             wide_stage: false,
             prefix: PrefixMemory::Disabled,
         }
+    }
+
+    #[test]
+    fn a_tiered_start_leaves_the_disk_tier_off() {
+        let tiered = settings(r#"{"capture":false,"tiered":{"slots":40}}"#);
+        assert!(kv_disk_blocker(&tiered).is_some());
+        assert!(kv_disk_blocker(&settings("{}")).is_none());
+        let tiered_with_cache =
+            settings(r#"{"capture":false,"tiered":{"slots":"auto"},"kv_cache":{"enabled":true}}"#);
+        assert!(kv_disk_blocker(&tiered_with_cache).is_some());
     }
 
     #[test]

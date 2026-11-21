@@ -737,8 +737,9 @@ pub(in crate::kernels::cuda) fn pinned_read_into(
     if end > pinned.bytes {
         return Err(invalid_argument());
     }
-    // The acquire fence orders the copy after the caller's event wait, so the bytes read are the
-    // ones the device copy wrote.
+    // The caller has already waited on the event recorded behind the device copy; that wait is
+    // what makes the bytes visible. The fence only keeps the compiler and the CPU from moving
+    // the reads below before this point; it does not synchronise with the device by itself.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     // SAFETY: `offset + out.len() <= pinned.bytes`, the allocation stays live and unfreed while
     // `pinned` is borrowed, and `out` is a distinct host slice, so the ranges do not overlap.

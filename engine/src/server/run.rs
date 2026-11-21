@@ -849,7 +849,7 @@ pub(crate) async fn serve(
 }
 
 /// The call needs a running Tokio runtime. A signal that arrives before the first poll is not
-/// lost. When the process cannot install the handlers, the future waits for the interrupt
+/// lost. A second signal after the first asks a waiting disk-cache flush to give up. When the process cannot install the handlers, the future waits for the interrupt
 /// signal alone.
 fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
     #[cfg(unix)]
@@ -865,6 +865,17 @@ fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
                 _ = terminate.recv() => {}
                 _ = interrupt.recv() => {}
             }
+            // The first signal starts the graceful stop. A second one, of either kind, tells a
+            // stop that is still writing prefixes to disk to give up at once.
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+                eprintln!("enginesrv: second stop signal: not waiting for unsaved prefixes");
+                #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+                crate::family::qwen36::kv_cache::request_hurry();
+            });
             return;
         }
         let _ = tokio::signal::ctrl_c().await;

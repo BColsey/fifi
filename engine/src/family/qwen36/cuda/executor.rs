@@ -239,14 +239,14 @@ impl ExecutorOps for QwenResidentStep<'_> {
         // A save that publishes while the engine is idle (the last one of a job) is offered
         // here, so the copy to disk starts without waiting for the next request.
         if let Err(error) = self.complete_prefix_save() {
-            eprintln!("q36 cuda: deferred prefix save failed while idle: {error:?}");
+            self.note_background_error("while idle", &error);
         }
         self.pump_disk_idle();
     }
 
     fn background_drain(&mut self) {
         if let Err(error) = self.complete_prefix_save() {
-            eprintln!("q36 cuda: deferred prefix save failed at shutdown: {error:?}");
+            self.note_background_error("at shutdown", &error);
         }
         self.drain_disk();
     }
