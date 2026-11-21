@@ -14,11 +14,23 @@ pub(crate) struct Run {
     pub(crate) bytes: usize,
 }
 
+/// What one object of an entry holds, which is what the manifest names it by. The envelope fixes
+/// the page size (256 rows), so a family names only the kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectRole {
+    /// State of constant size whatever the length (recurrent state): `kind` names it.
+    FixedState { kind: &'static str },
+    /// The rows `0..positions` of one attention layer's cache.
+    Pages,
+}
+
 /// The objects of one entry, in file order, each the runs of the slab that make it up back to
-/// back. An object does not depend on the capacity of the process that wrote it.
+/// back, and what each holds. An object does not depend on the capacity of the process that
+/// wrote it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SlabLayout {
     pub(crate) objects: Vec<Vec<Run>>,
+    pub(crate) roles: Vec<ObjectRole>,
 }
 
 impl SlabLayout {
@@ -75,6 +87,11 @@ mod tests {
 
     fn layout() -> SlabLayout {
         SlabLayout {
+            roles: vec![
+                ObjectRole::FixedState { kind: "state" },
+                ObjectRole::Pages,
+                ObjectRole::Pages,
+            ],
             objects: vec![
                 vec![Run { slab: 0, bytes: 10 }],
                 vec![

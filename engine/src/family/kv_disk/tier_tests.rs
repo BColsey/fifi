@@ -1,7 +1,7 @@
 //! The disk tier's logic, without any family: a slot is memory, the cache is a real one in a
 //! scratch directory, and an entry is three small objects.
 use super::super::FamilyContract;
-use super::super::{LoadIdentity, spill_candidates};
+use super::super::{LoadIdentity, ObjectRole, spill_candidates};
 use super::*;
 
 const OBJECT: usize = 8192;
@@ -21,6 +21,11 @@ impl SlotBytes for Memory {
 
 fn shape_of(_positions: usize) -> Result<SlabLayout, EngError> {
     Ok(SlabLayout {
+        roles: vec![
+            ObjectRole::FixedState { kind: "deltanet" },
+            ObjectRole::Pages,
+            ObjectRole::Pages,
+        ],
         objects: (0..3)
             .map(|at| {
                 vec![Run {
@@ -45,6 +50,7 @@ fn load() -> LoadIdentity {
             snapshot_schema: "test.state.v1",
             payload_abi: "test.payload.v1",
             position_policy: "absolute",
+            render_mode: "chat",
         },
     }
 }
@@ -298,4 +304,133 @@ fn the_start_line_names_the_directory_the_privacy_and_the_wait() {
     ] {
         assert!(line.contains(needle), "{needle}: {line}");
     }
+}
+
+#[test]
+fn spill_picks_offer_the_oldest_entries_and_skip_a_tip_that_a_longer_tip_extends() {
+    let base = key(1_100, 1);
+    let mut longer = base.clone();
+    longer.extend(key(300, 9));
+    let other = key(1_100, 5);
+    // Oldest first: a tip, an unrelated block entry, the same conversation's longer tip.
+    let entries = [
+        Stored {
+            key: &base,
+            tip: true,
+        },
+        Stored {
+            key: &other,
+            tip: false,
+        },
+        Stored {
+            key: &longer,
+            tip: true,
+        },
+    ];
+    // Two to offer: the first is dead (its conversation continued), so only the block entry.
+    assert_eq!(spill_picks(&entries, 2), vec![1]);
+    assert_eq!(spill_picks(&entries, 3), vec![1, 2]);
+    assert_eq!(spill_picks(&entries, 0), Vec::<usize>::new());
+    // A block entry is never dead, whatever extends it.
+    let block_then_tip = [
+        Stored {
+            key: &base,
+            tip: false,
+        },
+        Stored {
+            key: &longer,
+            tip: true,
+        },
+    ];
+    assert_eq!(spill_picks(&block_then_tip, 2), vec![0, 1]);
+}
+
+#[test]
+fn stop_picks_are_the_live_tips_newest_first() {
+    let base = key(1_100, 1);
+    let mut longer = base.clone();
+    longer.extend(key(300, 9));
+    let other = key(1_200, 5);
+    let block = key(1_100, 7);
+    let entries = [
+        Stored {
+            key: &base,
+            tip: true,
+        },
+        Stored {
+            key: &block,
+            tip: false,
+        },
+        Stored {
+            key: &other,
+            tip: true,
+        },
+        Stored {
+            key: &longer,
+            tip: true,
+        },
+    ];
+    // The dead tip and the block entry stay in memory; the newest tip goes first.
+    assert_eq!(stop_picks(&entries), vec![3, 2]);
+    assert_eq!(stop_picks(&[]), Vec::<usize>::new());
+}
+
+#[test]
+fn memory_is_short_only_when_the_host_cannot_fund_another_entry_above_the_reserve() {
+    let gib = 1u64 << 30;
+    assert!(!host_memory_is_short(Some(40 * gib), gib, 2 * gib));
+    assert!(!host_memory_is_short(Some(3 * gib), gib, 2 * gib));
+    assert!(host_memory_is_short(Some(3 * gib - 1), gib, 2 * gib));
+    // A host that cannot be read counts as short: no entry is lost for lack of a look.
+    assert!(host_memory_is_short(None, gib, 2 * gib));
+}
+
+#[test]
+fn a_restore_retries_only_while_the_entry_it_tried_was_damaged() {
+    let mut tries = 0;
+    assert_eq!(
+        retry_while_removed(3, || {
+            tries += 1;
+            tries < 3
+        }),
+        3
+    );
+    // The first lookup that finds nothing or restores ends it.
+    assert_eq!(retry_while_removed(3, || false), 1);
+    // Three damaged entries in a row end at the limit, not after it.
+    let mut damaged = 0;
+    assert_eq!(
+        retry_while_removed(3, || {
+            damaged += 1;
+            true
+        }),
+        3
+    );
+    assert_eq!(damaged, 3);
+}
+
+#[test]
+fn a_stop_longer_than_a_service_managers_timeout_says_so() {
+    assert_eq!(stop_timeout_note(Duration::from_secs(9)), "");
+    let docker = stop_timeout_note(Duration::from_secs(30));
+    assert!(
+        docker.contains("Docker") && !docker.contains("systemd"),
+        "{docker}"
+    );
+    let both = stop_timeout_note(Duration::from_secs(200));
+    assert!(
+        both.contains("Docker") && both.contains("systemd"),
+        "{both}"
+    );
+}
+
+#[test]
+fn the_drain_names_its_rate_and_where_it_came_from() {
+    // Captured stderr is not available to a unit test; the rate the line is built from is: a
+    // fresh cache has only the probe's.
+    let dir = tempfile::tempdir().unwrap();
+    let tier = tier(dir.path());
+    let (rate, source) = tier.cache.write_rate();
+    assert_eq!(source, crate::family::kv_disk::RateSource::Probe);
+    assert!(rate > 0.0 && source.describe().contains("probe"));
 }

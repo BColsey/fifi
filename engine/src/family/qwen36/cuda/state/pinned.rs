@@ -1389,6 +1389,7 @@ mod tests {
                     snapshot_schema: "qwen36.compact-state.v1",
                     payload_abi: "delta-f32.kv-compact.v1",
                     position_policy: "absolute-rope-from-zero",
+                    render_mode: "chat",
                 },
             };
             let (mut cache, _) =
@@ -1399,6 +1400,7 @@ mod tests {
                     tokens: key.clone(),
                     capture: Capture::Tip,
                     object_bytes: shape.object_bytes(),
+                    object_roles: shape.roles.clone(),
                 })
                 .unwrap();
             let slot = saved.hold();

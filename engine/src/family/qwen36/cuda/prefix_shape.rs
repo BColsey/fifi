@@ -4,7 +4,7 @@
 use super::state_layout::StateLayout;
 use crate::{
     EngError,
-    family::kv_disk::{Run, SlabLayout},
+    family::kv_disk::{ObjectRole, Run, SlabLayout},
 };
 
 /// The layout of an entry of `positions` committed positions: object 0 is the DeltaNet state;
@@ -36,7 +36,9 @@ pub(super) fn entry_slab(layout: &StateLayout, positions: usize) -> Result<SlabL
         }
         objects.push(runs);
     }
-    Ok(SlabLayout { objects })
+    let mut roles = vec![ObjectRole::FixedState { kind: "deltanet" }];
+    roles.resize(objects.len(), ObjectRole::Pages);
+    Ok(SlabLayout { objects, roles })
 }
 
 #[cfg(test)]

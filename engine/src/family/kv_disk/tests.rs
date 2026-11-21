@@ -14,6 +14,7 @@ fn load(weights: &str) -> LoadIdentity {
             snapshot_schema: "test.state.v1",
             payload_abi: "test.payload.v1",
             position_policy: "absolute",
+            render_mode: "chat",
         },
     }
 }
@@ -38,7 +39,7 @@ fn the_numeric_recipe_version_and_every_digest_enter_the_namespace() {
 fn a_directory_that_serves_direct_io_opens_and_a_missing_one_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     match probe_direct_io(dir.path()) {
-        Ok(()) => {}
+        Ok(rate) => assert!(rate >= WRITE_RATE_FLOOR && rate.is_finite(), "{rate}"),
         Err(reason) => {
             eprintln!("direct I/O refused on the test directory ({reason}); the probe test skips");
             return;
@@ -60,6 +61,7 @@ fn a_cancel_survives_a_full_command_queue() {
         tokens: tokens(2_049, 1),
         capture: Capture::Tip,
         object_bytes: vec![1 << 20, 1 << 20],
+        object_roles: roles_of(2),
     };
     let job = cache.begin_write(spec).unwrap();
     // The queue is not what carries the cancel: the shared state records it.
@@ -67,6 +69,13 @@ fn a_cancel_survives_a_full_command_queue() {
     assert!(cache.wait_idle(Duration::from_secs(120)));
     assert!(cache.shared.lock().aborted.is_empty());
     assert_eq!(cache.entry_count(), 0);
+}
+
+/// The roles of `count` objects: a fixed state, then attention pages.
+fn roles_of(count: usize) -> Vec<ObjectRole> {
+    let mut roles = vec![ObjectRole::FixedState { kind: "deltanet" }];
+    roles.resize(count, ObjectRole::Pages);
+    roles
 }
 
 fn tokens(len: usize, seed: u32) -> Vec<u32> {
@@ -97,6 +106,7 @@ fn store(
         tokens: key.to_vec(),
         capture,
         object_bytes: parts.iter().map(|part| part.len() as u64).collect(),
+        object_roles: roles_of(parts.len()),
     };
     let job = cache.begin_write(spec)?;
     let flat: Vec<u8> = parts.concat();
@@ -491,22 +501,93 @@ fn the_default_directory_and_quota_follow_the_host() {
     assert_eq!(default_quota(16 * gib - 4), None);
     assert_eq!(default_quota(10_000 * gib), Some(64 * gib));
     let wanted = Wanted::default();
-    let resolved = resolve(&wanted, None, Some("/home/u"), |_| Some(40 * gib)).unwrap();
+    let resolved = resolve(&wanted, None, Some("/home/u"), |_| Some(40 * gib), |_| 0).unwrap();
     assert_eq!(resolved.dir, PathBuf::from("/home/u/.cache/fifi/kv"));
     assert_eq!(resolved.quota_bytes, 10 * gib);
-    assert!(resolve(&wanted, None, Some("/home/u"), |_| Some(8 * gib)).is_err());
-    assert!(resolve(&wanted, None, None, |_| Some(40 * gib)).is_err());
+    assert!(resolve(&wanted, None, Some("/home/u"), |_| Some(8 * gib), |_| 0).is_err());
+    assert!(resolve(&wanted, None, None, |_| Some(40 * gib), |_| 0).is_err());
     let exact = Wanted {
         dir: Some("/d".into()),
         quota_bytes: Some(3 * gib),
     };
     assert_eq!(
-        resolve(&exact, None, None, |_| None).unwrap(),
+        resolve(&exact, None, None, |_| None, |_| 0).unwrap(),
         Resolved {
             dir: "/d".into(),
             quota_bytes: 3 * gib
         }
     );
+}
+
+#[test]
+fn a_disk_that_filled_up_does_not_strand_the_bytes_the_cache_holds() {
+    let gib = 1u64 << 30;
+    let wanted = Wanted::default();
+    // A 20 GiB cache on a disk that now has 12 GiB free: a quarter of the free space alone is
+    // 3 GiB, under the floor, and would leave the 20 GiB stranded. Counted with the held bytes
+    // the quota is a quarter of 32 GiB.
+    let resolved = resolve(
+        &wanted,
+        None,
+        Some("/home/u"),
+        |_| Some(12 * gib),
+        |_| 20 * gib,
+    )
+    .unwrap();
+    assert_eq!(resolved.quota_bytes, 8 * gib);
+    // With nothing held the same disk keeps the tier off, and says so without a purge hint.
+    let off = resolve(&wanted, None, Some("/home/u"), |_| Some(12 * gib), |_| 0).unwrap_err();
+    assert!(!off.contains("--purge-kv-cache"), "{off}");
+    // Held bytes that still do not make the floor name the bytes and the way to empty them.
+    let off = resolve(&wanted, None, Some("/home/u"), |_| Some(gib), |_| 2 * gib).unwrap_err();
+    assert!(
+        off.contains(&(2 * gib).to_string()) && off.contains("--purge-kv-cache"),
+        "{off}"
+    );
+}
+
+#[test]
+fn held_bytes_counts_a_cache_directory_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(held_bytes(dir.path()), 0);
+    std::fs::create_dir_all(dir.path().join("objects")).unwrap();
+    std::fs::write(dir.path().join("objects").join("a"), vec![0u8; 1000]).unwrap();
+    assert_eq!(
+        held_bytes(dir.path()),
+        0,
+        "no marker: not a cache directory"
+    );
+    std::fs::write(dir.path().join(MARKER_FILE), b"{}").unwrap();
+    std::fs::create_dir_all(dir.path().join("entries")).unwrap();
+    std::fs::write(dir.path().join("entries").join("b"), vec![0u8; 24]).unwrap();
+    assert_eq!(held_bytes(dir.path()), 1024);
+}
+
+#[test]
+fn opening_under_a_lower_quota_evicts_down_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("c");
+    let load = load("w");
+    {
+        let (mut cache, _) = KvDisk::open(&cache_dir, 1 << 30, &load).unwrap();
+        for seed in 0..3u32 {
+            store(
+                &mut cache,
+                &tokens(1_500, seed),
+                Capture::Tip,
+                &[vec![1u8; 4096], vec![seed as u8; 3 << 20]],
+            )
+            .unwrap();
+            cache.poll();
+        }
+        assert_eq!(cache.entry_count(), 3);
+    }
+    // Room for about one entry: the two least recently used go at open, not at the next write.
+    let (cache, report) = KvDisk::open(&cache_dir, 4 << 20, &load).unwrap();
+    assert_eq!(report.evicted, 2, "{report:?}");
+    assert_eq!(cache.entry_count(), 1);
+    assert!(report.used_bytes <= 4 << 20, "{report:?}");
+    assert!(held_bytes(&cache_dir) <= 4 << 20);
 }
 
 fn env(dir: Option<&str>, quota: Option<&str>, switch: Option<&str>) -> KvEnv {
@@ -516,7 +597,45 @@ fn env(dir: Option<&str>, quota: Option<&str>, switch: Option<&str>) -> KvEnv {
         switch: switch.map(str::to_owned),
         xdg_cache_home: None,
         home: Some("/home/u".to_owned()),
+        family_dir: "",
     }
+}
+
+#[test]
+fn each_family_keeps_its_default_cache_in_its_own_directory() {
+    let gib = 1u64 << 30;
+    let free = |_: &Path| Some(100 * gib);
+    for (family, expected) in [
+        ("", "/home/u/.cache/fifi/kv"),
+        ("qwen36", "/home/u/.cache/fifi/kv/qwen36"),
+        ("gemma4", "/home/u/.cache/fifi/kv/gemma4"),
+    ] {
+        let Plan::On { resolved, .. } =
+            plan(None, &env(None, None, None).for_family(family), true, free).unwrap()
+        else {
+            panic!("on")
+        };
+        assert_eq!(resolved.dir, PathBuf::from(expected), "{family}");
+        assert_eq!(
+            purge_dir(None, &env(None, None, None).for_family(family)).unwrap(),
+            Some(PathBuf::from(expected))
+        );
+    }
+    // A named directory is taken as given, whatever the family.
+    let named = KvCacheSettings {
+        dir: Some("/c".into()),
+        ..KvCacheSettings::default()
+    };
+    let Plan::On { resolved, .. } = plan(
+        Some(&named),
+        &env(None, None, None).for_family("gemma4"),
+        true,
+        free,
+    )
+    .unwrap() else {
+        panic!("on")
+    };
+    assert_eq!(resolved.dir, PathBuf::from("/c"));
 }
 
 #[test]
@@ -737,9 +856,9 @@ fn the_drain_bound_follows_the_remaining_bytes_and_the_write_rate() {
 #[test]
 fn the_write_rate_follows_the_recent_saves_and_the_slower_of_two_readings() {
     const MIB: u64 = 1 << 20;
-    // Nothing to read from before 16 MiB have completed: the assumed rate applies.
+    // Nothing to read without a timed save.
     assert_eq!(rate_of_recent_saves(&[]), None);
-    assert_eq!(rate_of_recent_saves(&[(8 * MIB, 100)]), None);
+    assert_eq!(rate_of_recent_saves(&[(0, 100)]), None);
     // 100 MiB in one second.
     let fast = (100 * MIB, 1_000);
     let rate = rate_of_recent_saves(&[fast]).unwrap();
@@ -760,22 +879,65 @@ fn the_write_rate_follows_the_recent_saves_and_the_slower_of_two_readings() {
 }
 
 #[test]
-fn the_writer_reports_a_measured_rate_after_a_save() {
+fn the_rate_is_the_probes_until_16_mib_were_written_in_total_and_the_saves_after() {
     let dir = tempfile::tempdir().unwrap();
     let (mut cache, _) = KvDisk::open(&dir.path().join("c"), 1 << 30, &load("w")).unwrap();
-    assert_eq!(cache.write_rate(), None);
-    let part = vec![7u8; 17 << 20];
+    let (probe, source) = cache.write_rate();
+    assert_eq!(source, RateSource::Probe);
+    assert!(probe >= WRITE_RATE_FLOOR && probe.is_finite(), "{probe}");
+    // Three saves of 5 MiB: 15 MiB in total, one short of the 16 MiB the saves need.
+    for seed in 0..3u32 {
+        store(
+            &mut cache,
+            &tokens(1_500, seed),
+            Capture::Tip,
+            &[vec![1u8; 4096], vec![seed as u8; 5 << 20]],
+        )
+        .unwrap();
+        assert!(cache.wait_idle(Duration::from_secs(60)));
+        cache.poll();
+    }
+    assert_eq!(cache.write_rate(), (probe, RateSource::Probe));
+    // A fourth save passes 16 MiB in total: the rate now comes from the saves, though the last
+    // four saves together are not the first to reach 16 MiB.
+    store(
+        &mut cache,
+        &tokens(1_500, 9),
+        Capture::Tip,
+        &[vec![1u8; 4096], vec![9u8; 5 << 20]],
+    )
+    .unwrap();
+    assert!(cache.wait_idle(Duration::from_secs(60)));
+    cache.poll();
+    let (rate, source) = cache.write_rate();
+    assert_eq!(source, RateSource::Saves);
+    assert!(rate >= WRITE_RATE_FLOOR && rate.is_finite(), "{rate}");
+}
+
+#[test]
+fn a_write_leaves_the_filesystem_its_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut cache, _) = KvDisk::open(&dir.path().join("c"), 1 << 30, &load("w")).unwrap();
+    cache.set_min_free(u64::MAX / 2);
+    let error = store(
+        &mut cache,
+        &tokens(1_500, 1),
+        Capture::Tip,
+        &[vec![1u8; 4096], vec![2u8; 1 << 20]],
+    )
+    .unwrap_err();
+    assert!(matches!(error, WriteSkip::DiskLow { .. }), "{error:?}");
+    assert!(error.to_string().contains("reserve"), "{error}");
+    assert_eq!(cache.entry_count(), 0);
+    // With the reserve back at its default a small entry is written.
+    cache.set_min_free(MIN_FREE_RESERVE);
     store(
         &mut cache,
         &tokens(1_500, 1),
         Capture::Tip,
-        &[vec![1u8; 4096], part],
+        &[vec![1u8; 4096], vec![2u8; 1 << 20]],
     )
     .unwrap();
-    assert_eq!(cache.write_rate(), None, "a rate is read from the reports");
-    assert_eq!(cache.poll().len(), 1);
-    let rate = cache.write_rate().expect("a rate after 17 MiB");
-    assert!(rate > 1e4 && rate.is_finite(), "{rate}");
 }
 
 #[test]
@@ -803,4 +965,167 @@ fn an_exact_key_is_found_in_the_index_only_for_this_load() {
     store(&mut cache, &key, Capture::Tip, &objects(2)).unwrap();
     assert!(cache.has_exact(&key));
     assert!(!cache.has_exact(&key[..1_499]));
+}
+
+#[test]
+fn an_object_a_save_in_flight_installed_survives_the_eviction_of_the_entry_that_shared_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut cache, _) = KvDisk::open(&dir.path().join("c"), 1 << 30, &load("w")).unwrap();
+    store(
+        &mut cache,
+        &tokens(1_500, 1),
+        Capture::Tip,
+        &[vec![1u8; 4096], vec![2u8; 1 << 20]],
+    )
+    .unwrap();
+    assert!(cache.wait_idle(Duration::from_secs(60)));
+    let (first, second) = {
+        let state = cache.shared.lock();
+        let objects = &state.records[0].objects;
+        (objects[0].0, objects[1].0)
+    };
+    // A save in flight has installed the first object too (identical bytes are stored once).
+    cache.shared.lock().pinned.insert(first.0, 1);
+    {
+        let mut state = cache.shared.lock();
+        let quota = state.quota;
+        assert!(cache.shared.evict_for(&mut state, quota));
+    }
+    assert_eq!(cache.entry_count(), 0, "the entry is evicted");
+    let (objects, _) = cache.shared.root.list_objects().unwrap();
+    let held: Vec<[u8; 32]> = objects.iter().map(|(id, _, _)| id.0).collect();
+    assert!(held.contains(&first.0), "the pinned object stays");
+    assert!(!held.contains(&second.0), "an unpinned object goes");
+}
+
+#[test]
+fn a_process_that_dies_midway_through_a_save_leaves_nothing_a_start_can_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("c");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "family::kv_disk::tests::die_midway_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("KV_DIE_DIR", &cache_dir)
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child aborts mid-save");
+    assert!(cache_dir.join("staging").exists(), "the child began a save");
+    let (cache, report) = KvDisk::open(&cache_dir, 1 << 30, &load("w")).unwrap();
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!((report.entries, report.foreign), (0, 0));
+    let count = |sub: &str| std::fs::read_dir(cache_dir.join(sub)).unwrap().count();
+    assert_eq!(count("staging"), 0, "the torn staging file is swept");
+    assert_eq!(count("entries"), 0);
+    // And the directory takes a save again.
+    let mut cache = cache;
+    store(
+        &mut cache,
+        &tokens(1_500, 1),
+        Capture::Tip,
+        &[vec![1u8; 4096], vec![2u8; 1 << 20]],
+    )
+    .unwrap();
+    assert!(cache.wait_idle(Duration::from_secs(60)));
+    assert_eq!(cache.entry_count(), 1);
+}
+
+/// The child of the test above: begins a save of 8 MiB, feeds half of it, waits until the writer
+/// has staged bytes, and aborts the process.
+#[test]
+#[ignore = "run by the test that kills it"]
+fn die_midway_child() {
+    let Some(dir) = std::env::var_os("KV_DIE_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (mut cache, _) = KvDisk::open(&dir, 1 << 30, &load("w")).unwrap();
+    let spec = WriteSpec {
+        tokens: tokens(1_500, 1),
+        capture: Capture::Tip,
+        object_bytes: vec![4096, 8 << 20],
+        object_roles: roles_of(2),
+    };
+    let job = cache.begin_write(spec).unwrap();
+    let mut first = vec![1u8; 4096];
+    first.extend(vec![2u8; 4 << 20]);
+    let mut chunk = first;
+    loop {
+        match cache.push(&job, chunk) {
+            Push::Sent => break,
+            Push::Full(back) => {
+                chunk = back;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Push::Dead => panic!("the writer is down"),
+        }
+    }
+    let began = Instant::now();
+    while std::fs::read_dir(dir.join("staging")).unwrap().count() == 0 {
+        assert!(began.elapsed() < Duration::from_secs(60), "nothing staged");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    std::process::abort();
+}
+
+#[test]
+fn a_write_that_fails_midway_is_a_failed_save_that_leaves_no_entry_and_no_object() {
+    // The file-size limit stands in for a full disk: the write fails partway through an object,
+    // as ENOSPC does, and the cache must report the failure and keep nothing of the save. (A
+    // real ENOSPC needs a small filesystem, which an unprivileged test cannot mount.)
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("c");
+    let me = std::env::current_exe().unwrap();
+    let status = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(r#"trap '' XFSZ; ulimit -f 12288; exec "$0" --exact family::kv_disk::tests::limited_write_child --ignored --test-threads=1"#)
+        .arg(&me)
+        .env("KV_LIMIT_DIR", &cache_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child's own assertions held");
+    let (cache, report) = KvDisk::open(&cache_dir, 1 << 30, &load("w")).unwrap();
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!(report.orphans, 0, "no object was left behind");
+}
+
+/// The child of the test above, under a 12 MiB file-size limit (the start-up probe writes 8).
+#[test]
+#[ignore = "run by the test that limits it"]
+fn limited_write_child() {
+    let Some(dir) = std::env::var_os("KV_LIMIT_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (mut cache, _) = KvDisk::open(&dir, 1 << 30, &load("w")).unwrap();
+    let outcome = store(
+        &mut cache,
+        &tokens(1_500, 1),
+        Capture::Tip,
+        &[vec![1u8; 4096], vec![2u8; 16 << 20]],
+    );
+    assert!(outcome.is_ok(), "the save starts: {outcome:?}");
+    let began = Instant::now();
+    let mut failed = false;
+    while !failed {
+        for event in cache.poll() {
+            match event {
+                WriteEvent::Failed { reason, .. } => {
+                    eprintln!("failed as expected: {reason}");
+                    failed = true;
+                }
+                WriteEvent::Done { .. } => panic!("a 16 MiB object cannot be written under 12 MiB"),
+            }
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "no failure came");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(cache.wait_idle(Duration::from_secs(60)));
+    assert_eq!(cache.entry_count(), 0);
+    let staged = std::fs::read_dir(dir.join("staging")).unwrap().count();
+    assert_eq!(staged, 0, "the failed save left a staged file");
 }

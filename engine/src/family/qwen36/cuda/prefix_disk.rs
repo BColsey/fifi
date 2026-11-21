@@ -7,7 +7,7 @@
 //! verified in full, stored as an ordinary entry, and restored through the existing pinned path,
 //! so the disk tier adds no second restore code. Every failure here is a logged miss.
 use super::super::{
-    prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes},
+    prefix::{CudaPrefillPath, CudaSavedPrefix, HOST_HEADROOM, entry_bytes},
     prefix_shape::entry_slab,
     state::{LAYOUT_TAG, pinned::PinnedSnapshot},
 };
@@ -15,10 +15,12 @@ use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
+        host_admit::HostAdmission,
         kv_disk::{
             Capture, DiskTier, FamilyContract, Held, Hit, KvDisk, LoadIdentity, MIN_POSITIONS,
             PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, Resolved, SlotBytes,
-            drain_bound, hurry_flag, spill_candidates, start_line,
+            Stored, drain_bound, host_memory_is_short, hurry_flag, restore_report,
+            retry_while_removed, spill_candidates, spill_picks, start_line, stop_picks,
         },
         session::SaveKind,
     },
@@ -40,6 +42,7 @@ const CONTRACT: FamilyContract = FamilyContract {
     snapshot_schema: "qwen36.compact-state.v1",
     payload_abi: "delta-f32.kv-compact.v1",
     position_policy: "absolute-rope-from-zero",
+    render_mode: "chat",
 };
 
 /// Lookups one restore may spend on entries that turn out damaged.
@@ -155,41 +158,53 @@ impl QwenResidentStep<'_> {
         self.disk.is_some()
     }
 
-    /// After a save publishes: when the store holds as many entries as the watermark, queue the
-    /// least recently used ones that the next saves would push out, so their eviction never
-    /// waits for a write. Below the watermark the disk is not touched.
+    /// Whether the host's memory is short: what the start plan read to size the pinned pool (the
+    /// cgroup-clamped available budget) is under the headroom the plan keeps plus one more entry.
+    fn host_memory_short(&self) -> bool {
+        let entry = self
+            .prefix_pins
+            .as_ref()
+            .map_or(0, |pool| pool.bytes() / (pool.retained_entries() + 1));
+        let available = HostAdmission::probe("Qwen36 kv disk", "Qwen36")
+            .ok()
+            .map(|admission| admission.available_budget());
+        host_memory_is_short(available, HOST_HEADROOM as u64, entry as u64)
+    }
+
+    /// After a save publishes: when the store holds as many entries as the watermark and the
+    /// host's memory is short, queue the least recently used ones that the next saves would push
+    /// out, so their eviction never waits for a write. With memory to spare, or below the
+    /// watermark, the disk is not touched.
     pub(super) fn spill_over_watermark(&mut self) {
         if !self.prefix_identity.is_persistable() {
+            return;
+        }
+        let stored = self.prefix.entries_len() + self.prefix.roots_len();
+        let want = match self.disk.as_ref() {
+            Some(tier) => spill_candidates(stored, tier.retained),
+            None => return,
+        };
+        if want == 0 || !self.host_memory_short() {
             return;
         }
         let Some(tier) = self.disk.as_mut() else {
             return;
         };
-        let stored = self.prefix.entries_len() + self.prefix.roots_len();
-        let want = spill_candidates(stored, tier.retained);
-        if want == 0 {
-            return;
-        }
         let layout = *self.state.layout();
-        // A tip that a longer tip of the same conversation extends is dead: the longer one covers
-        // every prompt the shorter one would.
-        let tips: Vec<&[u32]> = self
-            .prefix
-            .entries_lru()
-            .filter(|(_, kind, _)| *kind == SaveKind::Tip)
-            .map(|(key, _, _)| key)
-            .collect();
-        let offers: Vec<Held> = self
-            .prefix
-            .entries_lru()
-            .take(want)
-            .filter(|(key, kind, _)| {
-                *kind != SaveKind::Tip
-                    || !tips
-                        .iter()
-                        .any(|newer| newer.len() > key.len() && newer.starts_with(key))
+        let entries: Vec<_> = self.prefix.entries_lru().collect();
+        let view: Vec<Stored<'_>> = entries
+            .iter()
+            .map(|&(key, kind, _)| Stored {
+                key,
+                tip: kind == SaveKind::Tip,
             })
-            .filter_map(|(key, kind, saved)| held_of(&layout, key, kind, saved, Reason::Watermark))
+            .collect();
+        let offers: Vec<Held> = spill_picks(&view, want)
+            .into_iter()
+            .filter_map(|at| {
+                let (key, kind, saved) = entries[at];
+                held_of(&layout, key, kind, saved, Reason::Watermark)
+            })
             .collect();
         for offer in offers {
             tier.enqueue(offer);
@@ -257,25 +272,25 @@ impl QwenResidentStep<'_> {
         if self.disk.is_none() {
             return;
         }
-        // The tips in memory that the disk does not hold, newest first; a tip that a longer tip
-        // of the same conversation extends is dead.
+        // The live tips in memory, newest first.
         let layout = *self.state.layout();
         let mut tips: Vec<Held> = Vec::new();
         if self.prefix_identity.is_persistable() {
-            let mut stored: Vec<Held> = self
-                .prefix
-                .entries_lru()
-                .filter(|(_, kind, _)| *kind == SaveKind::Tip)
-                .filter_map(|(key, kind, saved)| held_of(&layout, key, kind, saved, Reason::Stop))
+            let entries: Vec<_> = self.prefix.entries_lru().collect();
+            let view: Vec<Stored<'_>> = entries
+                .iter()
+                .map(|&(key, kind, _)| Stored {
+                    key,
+                    tip: kind == SaveKind::Tip,
+                })
                 .collect();
-            stored.reverse();
-            for held in stored {
-                if !tips.iter().any(|newer| {
-                    newer.key.len() > held.key.len() && newer.key.starts_with(&held.key)
-                }) {
-                    tips.push(held);
-                }
-            }
+            tips = stop_picks(&view)
+                .into_iter()
+                .filter_map(|at| {
+                    let (key, kind, saved) = entries[at];
+                    held_of(&layout, key, kind, saved, Reason::Stop)
+                })
+                .collect();
         }
         let left_in_memory = self.prefix.entries_len().saturating_sub(tips.len());
         let Some(tier) = self.disk.as_mut() else {
@@ -301,11 +316,7 @@ impl QwenResidentStep<'_> {
         // An entry that fails its integrity check is removed, so the next lookup names the
         // next longest stored prefix: a damaged tip falls back to its block cut, not to a
         // cold prefill.
-        for _ in 0..PROMOTE_ATTEMPTS {
-            if !self.promote_once(prompt) {
-                break;
-            }
-        }
+        retry_while_removed(PROMOTE_ATTEMPTS, || self.promote_once(prompt));
     }
 
     /// One lookup and read. Returns true when the entry failed its integrity check and was
@@ -420,29 +431,6 @@ impl QwenResidentStep<'_> {
     /// the read cost.
     pub(super) fn restore_tier(&mut self, covered: usize) -> PrefixTier {
         let source = self.restore_source.take();
-        let mut tier = PrefixTier::default();
-        if let Some(disk) = self.disk.as_ref() {
-            let c = &disk.counters;
-            tier.disk_written_entries =
-                u32::try_from(c.watermark.entries + c.stop.entries).unwrap_or(u32::MAX);
-            tier.disk_written_bytes = c.watermark.bytes + c.stop.bytes;
-            tier.disk_dropped = u32::try_from(c.dropped).unwrap_or(u32::MAX);
-        }
-        if covered == 0 {
-            return tier;
-        }
-        if let Some(hit) = self
-            .disk
-            .as_mut()
-            .and_then(|tier| tier.hit.take())
-            .filter(|hit| hit.key_len == covered)
-        {
-            tier.source = PrefixSource::Disk;
-            tier.disk_bytes = hit.bytes;
-            tier.disk_ms = hit.ms.round().min(f64::from(u32::MAX)) as u32;
-            return tier;
-        }
-        tier.source = source.unwrap_or(PrefixSource::Pinned);
-        tier
+        restore_report(self.disk.as_mut(), covered, source, PrefixSource::Pinned)
     }
 }

@@ -6,10 +6,14 @@
 //! the queue, the counters and the policy, so every family that wires it behaves the same.
 
 use super::{
-    ASSUMED_WRITE_RATE, CHUNK_BYTES, Candidate, Capture, KvDisk, OpenReport, Push, Put, ReadStats,
-    Resolved, Run, SlabLayout, WriteEvent, WriteJob, WriteSpec, drain_bound, watermark,
+    CHUNK_BYTES, Candidate, Capture, KvDisk, OpenReport, Push, Put, ReadStats, Resolved, Run,
+    SlabLayout, WriteEvent, WriteJob, WriteSpec, drain_bound, watermark,
 };
-use crate::{EngError, family::expert_bank::disk_store::DiskMiss};
+use crate::{
+    EngError,
+    family::expert_bank::disk_store::DiskMiss,
+    sched::job::{PrefixSource, PrefixTier},
+};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
@@ -51,6 +55,18 @@ impl Reason {
 /// source; a test supplies memory.
 pub(crate) trait SlotBytes {
     fn read(&self, at: usize, out: &mut [u8]) -> Result<(), EngError>;
+}
+
+/// Host memory held by a family's store is a slot as it is.
+impl SlotBytes for Vec<u8> {
+    fn read(&self, at: usize, out: &mut [u8]) -> Result<(), EngError> {
+        let end = at
+            .checked_add(out.len())
+            .filter(|end| *end <= self.len())
+            .ok_or_else(|| EngError::BadRequest("kv disk: read past the slot".into()))?;
+        out.copy_from_slice(&self[at..end]);
+        Ok(())
+    }
 }
 
 /// A pinned entry waiting to be copied to disk, holding its slot.
@@ -271,6 +287,7 @@ impl DiskTier {
                     tokens: held.key.clone(),
                     capture: held.capture,
                     object_bytes: shape.object_bytes(),
+                    object_roles: shape.roles.clone(),
                 };
                 let evicted_before = self.cache.evicted();
                 match self.cache.begin_write(spec) {
@@ -390,16 +407,15 @@ impl DiskTier {
         }
         let remaining: u64 = self.queued.iter().map(|held| held.bytes).sum::<u64>()
             + self.copying.as_ref().map_or(0, Copying::remaining);
-        let rate = self.cache.write_rate();
-        let bound = bound_of(remaining, rate);
+        let (rate, source) = self.cache.write_rate();
+        let bound = bound_of(remaining, Some(rate));
         let count = self.queued.len() + usize::from(self.copying.is_some());
         eprintln!(
-            "{label}: kv disk stop: {count} tips only in memory ({remaining} B to move), {dropped} waiting spills dropped, {left_in_memory} other entries stay in memory only; waiting at most {:.0} s at {}; a second stop signal ends the wait",
+            "{label}: kv disk stop: {count} tips only in memory ({remaining} B to move), {dropped} waiting spills dropped, {left_in_memory} other entries stay in memory only; waiting at most {:.0} s at {:.1} MB/s, {}{}; a second stop signal ends the wait",
             bound.as_secs_f64(),
-            rate.map_or_else(
-                || format!("an assumed {:.0} MB/s", ASSUMED_WRITE_RATE / 1e6),
-                |rate| format!("{:.1} MB/s, the rate of its last saves", rate / 1e6)
-            )
+            rate / 1e6,
+            source.describe(),
+            stop_timeout_note(bound)
         );
         let began = Instant::now();
         let mut hurried = false;
@@ -521,6 +537,67 @@ impl DiskTier {
     }
 }
 
+/// One entry of a family's host prefix store, as the tier's picking rules see it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stored<'a> {
+    pub(crate) key: &'a [u32],
+    pub(crate) tip: bool,
+}
+
+/// Whether a tip of `entries` is dead: a longer tip of the same conversation covers every prompt
+/// it would.
+fn extended_by_a_tip(entries: &[Stored<'_>], of: &Stored<'_>) -> bool {
+    of.tip
+        && entries.iter().any(|newer| {
+            newer.tip && newer.key.len() > of.key.len() && newer.key.starts_with(of.key)
+        })
+}
+
+/// Which stored entries to offer the disk now, as indexes into `entries` (least recently used
+/// first): the `want` oldest, less the dead tips. `entries` are in use order, oldest first.
+pub(crate) fn spill_picks(entries: &[Stored<'_>], want: usize) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .take(want)
+        .filter(|(_, entry)| !extended_by_a_tip(entries, entry))
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Which stored entries a graceful stop writes: the live tips, newest first. What is not a tip is
+/// left out; a tip that a longer tip extends is dead.
+pub(crate) fn stop_picks(entries: &[Stored<'_>]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, entry)| entry.tip && !extended_by_a_tip(entries, entry))
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Whether the host's memory is short: its available budget (the cgroup-clamped figure the
+/// start plan reads) is under `reserve` (the headroom the start plan keeps) plus one more entry.
+/// A host whose memory cannot be read counts as short, so no entry is lost for lack of a look.
+pub(crate) fn host_memory_is_short(available: Option<u64>, reserve: u64, entry_bytes: u64) -> bool {
+    available.is_none_or(|available| available < reserve.saturating_add(entry_bytes))
+}
+
+/// Runs `once` up to `attempts` times, again only while it reports that the entry it tried was
+/// damaged and removed, so a damaged tip falls back to the next stored prefix and not to a cold
+/// prefill. Returns how many lookups ran.
+pub(crate) fn retry_while_removed(attempts: usize, mut once: impl FnMut() -> bool) -> usize {
+    let mut ran = 0;
+    while ran < attempts {
+        ran += 1;
+        if !once() {
+            break;
+        }
+    }
+    ran
+}
+
 /// The first line of a started tier: where it lives, how much it may hold, what it found, what it
 /// keeps (the conversations' exact tokens), how to turn it off, and how long a stop may wait.
 pub(crate) fn start_line(
@@ -531,17 +608,64 @@ pub(crate) fn start_line(
     retained: usize,
 ) -> String {
     format!(
-        "{label}: kv disk tier on ({origin}), dir {dir}, quota {quota} B, {} entries of this load found ({} of other loads, {} removed, {} stray objects removed), {} B used; written only when pinned memory is short (from {} of {retained} entries) and at a graceful stop, which may wait up to {} s for unsaved prefixes (a second stop signal ends the wait); conversations (their exact token lists and model state) persist on disk at {dir} up to {quota} B; turn it off with kv_cache.enabled false or FIFI_KV_CACHE=0; purge with --purge-kv-cache",
+        "{label}: kv disk tier on ({origin}), dir {dir}, quota {quota} B, {} entries of this load found ({} of other loads, {} removed, {} stray objects removed, {} evicted to fit the quota), {} B used; written only when the host's memory is short (a store of {retained} entries, from {} of them) and at a graceful stop, which may wait up to {} s for unsaved prefixes (a second stop signal ends the wait); conversations (their exact token lists and model state) persist on disk at {dir} up to {quota} B; turn it off with kv_cache.enabled false or FIFI_KV_CACHE=0; purge with --purge-kv-cache",
         report.entries,
         report.foreign,
         report.dropped,
         report.orphans,
+        report.evicted,
         report.used_bytes,
         watermark(retained),
         drain_bound(u64::MAX, None).as_secs(),
         dir = resolved.dir.display(),
         quota = resolved.quota_bytes,
     )
+}
+
+/// The tier facts of a restore that covered `covered` tokens, for the request log: the written
+/// totals of the disk tier, and the source of the restore. `source` is the memory tier that
+/// served it (`None` when the family does not say, which reads as `fallback`); a restore that
+/// promoted a disk entry names the disk and what the read cost.
+pub(crate) fn restore_report(
+    disk: Option<&mut DiskTier>,
+    covered: usize,
+    source: Option<PrefixSource>,
+    fallback: PrefixSource,
+) -> PrefixTier {
+    let mut tier = PrefixTier::default();
+    let mut hit = None;
+    if let Some(disk) = disk {
+        let counters = &disk.counters;
+        tier.disk_written_entries =
+            u32::try_from(counters.watermark.entries + counters.stop.entries).unwrap_or(u32::MAX);
+        tier.disk_written_bytes = counters.watermark.bytes + counters.stop.bytes;
+        tier.disk_dropped = u32::try_from(counters.dropped).unwrap_or(u32::MAX);
+        hit = disk.hit.take();
+    }
+    if covered == 0 {
+        return tier;
+    }
+    if let Some(hit) = hit.filter(|hit| hit.key_len == covered) {
+        tier.source = PrefixSource::Disk;
+        tier.disk_bytes = hit.bytes;
+        tier.disk_ms = hit.ms.round().min(f64::from(u32::MAX)) as u32;
+        return tier;
+    }
+    tier.source = source.unwrap_or(fallback);
+    tier
+}
+
+/// What a stop that waits `bound` runs into: the shortest stop timeouts of the usual service
+/// managers, whose kill would come first and leave the newest tip unwritten.
+pub(crate) fn stop_timeout_note(bound: Duration) -> String {
+    if bound > Duration::from_secs(90) {
+        "; longer than systemd's default 90 s and Docker's default 10 s stop timeouts, which would end the process first".to_owned()
+    } else if bound > Duration::from_secs(10) {
+        "; longer than Docker's default 10 s stop timeout, which would end the process first"
+            .to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// The reason a finished job was started for (a stopped one reads as the watermark).

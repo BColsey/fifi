@@ -1740,7 +1740,7 @@ fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Re
     }
     let plan = kv_cache::plan(
         settings.kv_cache.as_ref(),
-        &kv_cache::KvEnv::from_process(),
+        &kv_cache::KvEnv::from_process().for_family("qwen36"),
         KV_CACHE_DEFAULT_ON,
         kv_cache::free_bytes,
     )

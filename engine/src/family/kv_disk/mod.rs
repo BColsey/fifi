@@ -24,10 +24,11 @@ mod slab;
 mod tier;
 
 pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
-pub(crate) use slab::{Put, Run, SlabLayout};
+pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};
 pub(crate) use tier::{
     DiskTier, Held, Hit, PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, SlotBytes,
-    start_line,
+    Stored, host_memory_is_short, restore_report, retry_while_removed, spill_picks, start_line,
+    stop_picks,
 };
 
 use crate::family::expert_bank::{
@@ -64,6 +65,13 @@ pub(crate) const QUOTA_FLOOR_BYTES: u64 = 4 << 30;
 pub(crate) const QUOTA_EXPLICIT_MIN_BYTES: u64 = 1 << 30;
 /// One read or write chunk, in bytes. A multiple of the sector.
 pub(crate) const CHUNK_BYTES: usize = 8 << 20;
+/// Free space the cache filesystem must keep beyond an entry's bytes: a write that would leave
+/// less is skipped, so the cache never takes the last bytes of a shared disk.
+pub(crate) const MIN_FREE_RESERVE: u64 = 512 << 20;
+/// The rows the envelope hashes in one block: a property of the envelope, not of a family.
+const BLOCK_ROWS: u64 = 256;
+/// Bytes the start-up probe writes to time the disk.
+const PROBE_BYTES: usize = 8 << 20;
 /// Chunks queued between the engine thread and the writer.
 const WRITER_QUEUE: usize = 4;
 
@@ -138,6 +146,8 @@ pub(crate) struct FamilyContract {
     pub(crate) snapshot_schema: &'static str,
     pub(crate) payload_abi: &'static str,
     pub(crate) position_policy: &'static str,
+    /// How the family renders a prompt (`chat`): part of what an entry's tokens mean.
+    pub(crate) render_mode: &'static str,
 }
 
 impl LoadIdentity {
@@ -167,7 +177,7 @@ impl LoadIdentity {
                 &format!("recipe-v{NUMERIC_RECIPE_VERSION}; {}", self.numeric_path),
             ),
             position_policy_digest: digest("position", self.family.position_policy),
-            render_mode: "chat".to_owned(),
+            render_mode: self.family.render_mode.to_owned(),
             kv_layout_digest: digest("kv-layout", &self.layout),
         }
     }
@@ -180,6 +190,8 @@ pub(crate) struct WriteSpec {
     pub(crate) capture: Capture,
     /// Byte length of every object, in the order the chunks arrive.
     pub(crate) object_bytes: Vec<u64>,
+    /// What each object holds, in the same order: the manifest names fixed state and pages by it.
+    pub(crate) object_roles: Vec<ObjectRole>,
 }
 
 impl WriteSpec {
@@ -199,6 +211,8 @@ pub(crate) enum WriteSkip {
     Present,
     /// The entry would not fit the quota even with every other entry gone.
     OverQuota { need: u64, quota: u64 },
+    /// The filesystem has too little free space left for the entry and the reserve.
+    DiskLow { free: u64, need: u64 },
     /// The entry is too short to repay a disk read.
     Short,
     /// The spec has no tokens or no objects.
@@ -214,6 +228,10 @@ impl std::fmt::Display for WriteSkip {
             WriteSkip::OverQuota { need, quota } => {
                 write!(f, "the entry needs {need} B, the quota is {quota} B")
             }
+            WriteSkip::DiskLow { free, need } => write!(
+                f,
+                "{free} B free on the cache filesystem is under the {need} B the entry needs and the {MIN_FREE_RESERVE} B reserve"
+            ),
             WriteSkip::Short => f.write_str("fewer positions than the minimum"),
             WriteSkip::Invalid => f.write_str("the entry has no tokens or objects"),
             WriteSkip::WriterDown => f.write_str("the writer thread stopped"),
@@ -280,6 +298,10 @@ struct State {
     quota: u64,
     /// Entries removed to stay inside the quota since open.
     evicted: u64,
+    /// Objects the save in flight has installed, with how many saves hold each. An installed
+    /// object may be one an older entry already names (identical bytes are stored once); eviction
+    /// must not remove it from under the manifest that is about to name it.
+    pinned: std::collections::HashMap<[u8; 32], usize>,
 }
 
 impl State {
@@ -326,7 +348,8 @@ impl Shared {
             let shared = state
                 .records
                 .iter()
-                .any(|other| other.objects.iter().any(|(other_id, _)| other_id == id));
+                .any(|other| other.objects.iter().any(|(other_id, _)| other_id == id))
+                || state.pinned.contains_key(&id.0);
             if !shared {
                 self.root.remove_object(id);
             }
@@ -369,6 +392,8 @@ pub(crate) struct OpenReport {
     pub(crate) orphans: usize,
     pub(crate) used_bytes: u64,
     pub(crate) quota_bytes: u64,
+    /// Entries removed at open to bring the directory under its quota.
+    pub(crate) evicted: u64,
 }
 
 /// A stored entry that can restore a prompt.
@@ -398,6 +423,14 @@ pub(crate) struct KvDisk {
     next_id: u64,
     /// Bytes and milliseconds of the most recent saves that completed, for the write rate.
     recent_saves: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
+    /// Bytes of every save that completed since open.
+    saved_total: std::sync::atomic::AtomicU64,
+    /// The write rate the start-up probe measured, in bytes per second.
+    probe_rate: f64,
+    /// The directory, for the free-space check before a write.
+    dir: PathBuf,
+    /// Free space a write must leave behind (`MIN_FREE_RESERVE`; a test sets another).
+    min_free: u64,
     // Held for the lifetime of the cache: the advisory lock names this process the owner.
     _lock: std::fs::File,
 }
@@ -466,16 +499,18 @@ fn lock_dir(dir: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Writes one sector to a scratch file in `dir` with `O_DIRECT` and reads it back the same way. A
-/// directory whose filesystem refuses direct I/O (some tmpfs, overlay and encrypted home
-/// directories) could take writes and then fail every verified read, filling the quota with
-/// entries that never restore, so the cache stays off there.
-fn probe_direct_io(dir: &Path) -> Result<(), String> {
+/// Writes `PROBE_BYTES` to a scratch file in `dir` with `O_DIRECT`, syncs it, reads a sector back
+/// the same way, and returns the measured write rate in bytes per second. A directory whose
+/// filesystem refuses direct I/O (some tmpfs, overlay and encrypted home directories) could take
+/// writes and then fail every verified read, filling the quota with entries that never restore,
+/// so the cache stays off there. The rate is what a graceful stop plans its first wait from,
+/// before any entry has been written.
+fn probe_direct_io(dir: &Path) -> Result<f64, String> {
     use rustix::fs::OFlags;
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let sector = SECTOR as usize;
     let path = dir.join(format!(".direct-probe-{}", std::process::id()));
-    let outcome = (|| -> Result<(), String> {
+    let outcome = (|| -> Result<f64, String> {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
@@ -488,23 +523,26 @@ fn probe_direct_io(dir: &Path) -> Result<(), String> {
             .open(&path)
             .map_err(|e| io_err("opening a direct-I/O file", e))?;
         // An O_DIRECT buffer must be sector-aligned.
-        let mut backing = vec![0u8; 2 * sector];
+        let mut backing = vec![0u8; PROBE_BYTES + sector];
         let skip = (sector - backing.as_ptr() as usize % sector) % sector;
-        let (first, rest) = backing[skip..].split_at_mut(sector);
-        let _ = rest;
-        for (at, byte) in first.iter_mut().enumerate() {
+        let buffer = &mut backing[skip..skip + PROBE_BYTES];
+        for (at, byte) in buffer.iter_mut().enumerate() {
             *byte = (at % 251) as u8;
         }
-        file.write_all_at(first, 0)
+        let began = Instant::now();
+        file.write_all_at(buffer, 0)
             .map_err(|e| io_err("a direct-I/O write", e))?;
-        let expected = first.to_vec();
-        first.fill(0);
-        file.read_exact_at(first, 0)
+        file.sync_all()
+            .map_err(|e| io_err("syncing the probe file", e))?;
+        let seconds = began.elapsed().as_secs_f64().max(1e-6);
+        let expected = buffer[..sector].to_vec();
+        buffer[..sector].fill(0);
+        file.read_exact_at(&mut buffer[..sector], 0)
             .map_err(|e| io_err("a direct-I/O read", e))?;
-        if first != expected.as_slice() {
+        if buffer[..sector] != expected[..] {
             return Err("a direct-I/O read returned other bytes than were written".into());
         }
-        Ok(())
+        Ok((PROBE_BYTES as f64 / seconds).max(WRITE_RATE_FLOOR))
     })();
     let _ = std::fs::remove_file(&path);
     outcome.map_err(|reason| {
@@ -531,7 +569,7 @@ impl KvDisk {
         let lock = lock_dir(dir)?;
         let dir =
             std::fs::canonicalize(dir).map_err(|e| io_err("resolving the cache directory", e))?;
-        probe_direct_io(&dir)?;
+        let probe_rate = probe_direct_io(&dir)?;
         let root = DiskRoot::open_or_create(&dir, credential_scope(), billing_engine())
             .map_err(|e| format!("opening the cache root: {e}"))?;
         let identity = load.record();
@@ -617,14 +655,23 @@ impl KvDisk {
             reading: None,
             quota: quota_bytes,
             evicted: 0,
+            pinned: std::collections::HashMap::new(),
         };
-        report.used_bytes = state.used();
         let shared = Arc::new(Shared {
             root,
             namespace,
             identity,
             state: Mutex::new(state),
         });
+        // A quota below what the directory already holds (the disk filled up since, or the
+        // operator lowered it) removes the least recently used entries now, so the bytes never
+        // sit stranded above the quota with nothing able to write.
+        {
+            let mut state = shared.lock();
+            shared.evict_for(&mut state, 0);
+            report.evicted = state.evicted;
+            report.used_bytes = state.used();
+        }
         let (commands, command_rx) = mpsc::sync_channel(WRITER_QUEUE + 2);
         let (event_tx, events) = mpsc::channel();
         let writer = {
@@ -654,6 +701,10 @@ impl KvDisk {
                 rings,
                 next_id: 0,
                 recent_saves: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                saved_total: std::sync::atomic::AtomicU64::new(0),
+                probe_rate,
+                min_free: MIN_FREE_RESERVE,
+                dir,
                 _lock: lock,
             },
             report,
@@ -836,7 +887,11 @@ impl KvDisk {
     /// Starts a save, or says why it is not worth one. The entry's bytes are reserved against the
     /// quota first, evicting the least recently used entries to make room.
     pub(crate) fn begin_write(&mut self, spec: WriteSpec) -> Result<WriteJob, WriteSkip> {
-        if spec.tokens.len() < 2 || spec.object_bytes.is_empty() || spec.object_bytes.contains(&0) {
+        if spec.tokens.len() < 2
+            || spec.object_bytes.is_empty()
+            || spec.object_bytes.contains(&0)
+            || spec.object_roles.len() != spec.object_bytes.len()
+        {
             return Err(WriteSkip::Invalid);
         }
         if (spec.positions() as usize) < MIN_POSITIONS {
@@ -867,6 +922,17 @@ impl KvDisk {
                     need,
                     quota: state.quota,
                 });
+            }
+            // The filesystem must keep its reserve after this entry and what other saves have
+            // promised: a shared disk that is nearly full is left alone, not filled.
+            if let Some(free) = free_bytes(&self.dir)
+                && free
+                    < state
+                        .reserved
+                        .saturating_add(need)
+                        .saturating_add(self.min_free)
+            {
+                return Err(WriteSkip::DiskLow { free, need });
             }
             state.reserved += need;
         }
@@ -915,6 +981,8 @@ impl KvDisk {
 
     /// Notes a completed save of `bytes` that took `ms` from its start to its report.
     fn record_save(&self, bytes: u64, ms: u64) {
+        self.saved_total
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         let mut recent = self
             .recent_saves
             .lock()
@@ -925,18 +993,30 @@ impl KvDisk {
         }
     }
 
-    /// The write rate in bytes per second that a stop plans with, from the most recent saves that
-    /// completed (bytes over the time from their start to their report, syncs and publication
-    /// included; aborted saves do not count). The lower of the rate over the last
-    /// `RECENT_SAVES` saves and the rate of the newest save, so a disk that has just slowed down
-    /// is believed at once and one that has just sped up is not; never below `WRITE_RATE_FLOOR`.
-    /// `None` until 16 MiB have completed, which is when the assumed rate applies.
-    pub(crate) fn write_rate(&self) -> Option<f64> {
-        let recent = self
-            .recent_saves
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        rate_of_recent_saves(recent.iter())
+    /// The write rate in bytes per second that a stop plans with, and where it comes from. Once
+    /// 16 MiB have been written in total it is the rate of the most recent saves (bytes over the
+    /// time from their start to their report, syncs and publication included; aborted saves do
+    /// not count): the lower of the rate over the last `RECENT_SAVES` saves and the newest save's
+    /// rate, so a disk that has just slowed down is believed at once and one that has just sped
+    /// up is not. Before that it is the rate the start-up probe measured. Never below
+    /// `WRITE_RATE_FLOOR`.
+    pub(crate) fn write_rate(&self) -> (f64, RateSource) {
+        if self.saved_total.load(std::sync::atomic::Ordering::Relaxed) >= MIN_RATE_BYTES {
+            let recent = self
+                .recent_saves
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(rate) = rate_of_recent_saves(recent.iter()) {
+                return (rate, RateSource::Saves);
+            }
+        }
+        (self.probe_rate, RateSource::Probe)
+    }
+
+    /// Overrides the free space a write must leave behind.
+    #[cfg(test)]
+    pub(crate) fn set_min_free(&mut self, bytes: u64) {
+        self.min_free = bytes;
     }
 
     /// Whether no save is in flight.
@@ -1116,10 +1196,17 @@ fn release(shared: &Shared, job: Current) {
     state.aborted.remove(&job.id);
     state.reserved = state.reserved.saturating_sub(job.need);
     for dep in &job.installed {
+        if let Some(holds) = state.pinned.get_mut(&dep.id.0) {
+            *holds -= 1;
+            if *holds == 0 {
+                state.pinned.remove(&dep.id.0);
+            }
+        }
         let named = state
             .records
             .iter()
-            .any(|record| record.objects.iter().any(|(id, _)| *id == dep.id));
+            .any(|record| record.objects.iter().any(|(id, _)| *id == dep.id))
+            || state.pinned.contains_key(&dep.id.0);
         if !named {
             shared.root.remove_object(&dep.id);
         }
@@ -1151,8 +1238,9 @@ fn feed(
         bytes = &bytes[take..];
         if job.written_in_object == size {
             let writer = job.writer.take().expect("the object writer exists");
-            job.installed
-                .push(writer.finish(&shared.root).map_err(|e| e.to_string())?);
+            let installed = writer.finish(&shared.root).map_err(|e| e.to_string())?;
+            *shared.lock().pinned.entry(installed.id.0).or_insert(0) += 1;
+            job.installed.push(installed);
         }
     }
     if job.installed.len() < job.spec.object_bytes.len() {
@@ -1242,7 +1330,7 @@ fn build_manifest(shared: &Shared, job: &Current) -> Result<Manifest, String> {
         q,
         pending_token,
         tokens: spec.tokens.clone(),
-        block_size: 256,
+        block_size: BLOCK_ROWS,
         block_hashes: Vec::new(),
         provenance: Provenance {
             capture_kind: spec.capture.name().to_owned(),
@@ -1250,7 +1338,7 @@ fn build_manifest(shared: &Shared, job: &Current) -> Result<Manifest, String> {
             actual_fed_cuts: vec![p],
             save_lattice: SaveLattice {
                 origin_q: q,
-                stride_q: 256,
+                stride_q: BLOCK_ROWS,
                 selected_q: vec![q],
                 skipped_q: Vec::new(),
             },
@@ -1259,33 +1347,43 @@ fn build_manifest(shared: &Shared, job: &Current) -> Result<Manifest, String> {
         page_versions: Vec::new(),
         fixed_state: Vec::new(),
     };
-    for block in 0..q.div_ceil(256) as usize {
+    for block in 0..q.div_ceil(BLOCK_ROWS) as usize {
         let hash = manifest.block_hash(block);
         manifest.block_hashes.push(H64::from_digest(hash));
     }
-    let delta = job.installed.first().ok_or("an entry without objects")?;
-    manifest.fixed_state.push(FixedState {
-        layer: 0,
-        kind: "deltanet".to_owned(),
-        dep: delta.id,
-        byte_offset: 0,
-        byte_length: delta.file_bytes,
-        at_p: p,
-        schema: shared.identity.snapshot_schema.clone(),
-    });
-    for (layer, dep) in job.installed.iter().skip(1).enumerate() {
-        manifest.page_versions.push(PageVersion {
-            layer: u32::try_from(layer).map_err(|_| "too many layers".to_owned())?,
-            dep: dep.id,
-            byte_offset: 0,
-            byte_length: dep.file_bytes,
-            first_pos: 0,
-            valid_rows: p,
-            page_rows: 256,
-            tail_rows: u32::try_from(1 + (p - 1) % 256).map_err(|_| "tail rows".to_owned())?,
-            version: disk_store::fresh_entry_id(),
-            ring_origin: RingOrigin::Null(()),
-        });
+    let mut fixed = 0u32;
+    let mut pages = 0u32;
+    for (dep, role) in job.installed.iter().zip(&spec.object_roles) {
+        match *role {
+            ObjectRole::FixedState { kind } => {
+                manifest.fixed_state.push(FixedState {
+                    layer: fixed,
+                    kind: kind.to_owned(),
+                    dep: dep.id,
+                    byte_offset: 0,
+                    byte_length: dep.file_bytes,
+                    at_p: p,
+                    schema: shared.identity.snapshot_schema.clone(),
+                });
+                fixed += 1;
+            }
+            ObjectRole::Pages => {
+                manifest.page_versions.push(PageVersion {
+                    layer: pages,
+                    dep: dep.id,
+                    byte_offset: 0,
+                    byte_length: dep.file_bytes,
+                    first_pos: 0,
+                    valid_rows: p,
+                    page_rows: BLOCK_ROWS,
+                    tail_rows: u32::try_from(1 + (p - 1) % BLOCK_ROWS)
+                        .map_err(|_| "tail rows".to_owned())?,
+                    version: disk_store::fresh_entry_id(),
+                    ring_origin: RingOrigin::Null(()),
+                });
+                pages += 1;
+            }
+        }
     }
     Ok(manifest)
 }
@@ -1370,6 +1468,15 @@ pub(crate) fn default_dir(xdg_cache_home: Option<&str>, home: Option<&str>) -> O
     Some(base.join("fifi").join("kv"))
 }
 
+/// `dir` for one family: a subdirectory when the family names one.
+pub(crate) fn in_family(dir: PathBuf, family_dir: &str) -> PathBuf {
+    if family_dir.is_empty() {
+        dir
+    } else {
+        dir.join(family_dir)
+    }
+}
+
 /// The default quota for `free_bytes` of free space: a quarter of it, at most 64 GiB, and `None`
 /// (the tier stays off) when that is under 4 GiB.
 pub(crate) fn default_quota(free_bytes: u64) -> Option<u64> {
@@ -1388,12 +1495,32 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
     stat.f_bavail.checked_mul(stat.f_frsize)
 }
 
+/// The bytes a cache directory already holds: the entries, objects and staged files of a
+/// directory that carries the cache marker, whichever load wrote them. Zero for anything else.
+pub(crate) fn held_bytes(dir: &Path) -> u64 {
+    if !dir.join(MARKER_FILE).exists() {
+        return 0;
+    }
+    ["entries", "objects", "staging"]
+        .iter()
+        .filter_map(|name| std::fs::read_dir(dir.join(name)).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|item| item.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// Resolves the wanted directory and quota against the host. `Err` names why the tier stays off.
+/// The default quota counts the bytes the directory already holds as available: they belong to
+/// the cache, so a disk that has since filled up does not strand them.
 pub(crate) fn resolve(
     wanted: &Wanted,
     xdg_cache_home: Option<&str>,
     home: Option<&str>,
     free: impl Fn(&Path) -> Option<u64>,
+    held: impl Fn(&Path) -> u64,
 ) -> Result<Resolved, String> {
     let dir = match &wanted.dir {
         Some(dir) => dir.clone(),
@@ -1404,9 +1531,17 @@ pub(crate) fn resolve(
         Some(quota) => quota,
         None => {
             let free = free(&dir).ok_or("the free space of the cache directory is unknown")?;
-            default_quota(free).ok_or_else(|| {
+            let held = held(&dir);
+            default_quota(free.saturating_add(held)).ok_or_else(|| {
+                let stranded = if held > 0 {
+                    format!(
+                        "; the directory still holds {held} B of saved prefixes that no start can use or evict while the tier is off: empty it with --purge-kv-cache"
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{free} B free is under the floor: a quarter of it is below {QUOTA_FLOOR_BYTES} B"
+                    "{free} B free and {held} B already held there: a quarter of the sum is below {QUOTA_FLOOR_BYTES} B{stranded}"
                 )
             })?
         }
@@ -1436,17 +1571,39 @@ pub(crate) fn spill_candidates(entries: usize, retained: usize) -> usize {
 /// How many of the newest completed saves the write rate is read from.
 const RECENT_SAVES: usize = 4;
 
+/// Bytes that must have been written in total before the saves' rate replaces the probe's.
+const MIN_RATE_BYTES: u64 = 16 << 20;
+
 /// The lowest write rate a stop plans with, in bytes per second.
 pub(crate) const WRITE_RATE_FLOOR: f64 = 1e6;
 
-/// The write rate from `saves` (bytes, milliseconds; oldest first): see `KvDisk::write_rate`.
+/// Where a write rate comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateSource {
+    /// The timed write of the start-up probe.
+    Probe,
+    /// The saves that completed.
+    Saves,
+}
+
+impl RateSource {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            RateSource::Probe => "the start-up probe's rate",
+            RateSource::Saves => "the rate of its last saves",
+        }
+    }
+}
+
+/// The write rate from `saves` (bytes, milliseconds; oldest first): the lower of their average
+/// and the newest save's rate, never below `WRITE_RATE_FLOOR`. `None` without a timed save.
 pub(crate) fn rate_of_recent_saves<'a>(
     saves: impl IntoIterator<Item = &'a (u64, u64)>,
 ) -> Option<f64> {
     let saves: Vec<&(u64, u64)> = saves.into_iter().collect();
     let bytes: u64 = saves.iter().map(|save| save.0).sum();
     let ms: u64 = saves.iter().map(|save| save.1).sum();
-    if bytes < 16 << 20 || ms == 0 {
+    if bytes == 0 || ms == 0 {
         return None;
     }
     let over_all = bytes as f64 / (ms as f64 / 1e3);
@@ -1500,9 +1657,19 @@ pub(crate) struct KvEnv {
     pub(crate) switch: Option<String>,
     pub(crate) xdg_cache_home: Option<String>,
     pub(crate) home: Option<String>,
+    /// The subdirectory of the default location this family keeps its cache in, so two families
+    /// of one process never share a directory by default. Empty for the location itself.
+    pub(crate) family_dir: &'static str,
 }
 
 impl KvEnv {
+    /// The same environment for one family's engines: its default directory is `family_dir`
+    /// under the default location.
+    pub(crate) fn for_family(mut self, family_dir: &'static str) -> Self {
+        self.family_dir = family_dir;
+        self
+    }
+
     pub(crate) fn from_process() -> Self {
         let get = |name: &str| std::env::var(name).ok();
         // The names of the first family to wire the cache keep working.
@@ -1513,6 +1680,7 @@ impl KvEnv {
             switch: named(SWITCH_ENV, "Q36_KV_CACHE"),
             xdg_cache_home: get("XDG_CACHE_HOME"),
             home: get("HOME"),
+            family_dir: "",
         }
     }
 }
@@ -1530,9 +1698,10 @@ pub(crate) fn purge_dir(
             Err(format!("{DIR_ENV} must be an absolute path, got {dir:?}"))
         };
     }
-    Ok(options
-        .and_then(|options| options.dir.clone())
-        .or_else(|| default_dir(env.xdg_cache_home.as_deref(), env.home.as_deref())))
+    Ok(options.and_then(|options| options.dir.clone()).or_else(|| {
+        default_dir(env.xdg_cache_home.as_deref(), env.home.as_deref())
+            .map(|dir| in_family(dir, env.family_dir))
+    }))
 }
 
 /// What the tier will do at start.
@@ -1609,7 +1778,10 @@ pub(crate) fn plan(
         ));
     }
     let wanted = Wanted {
-        dir: env_dir.or(config_dir),
+        dir: env_dir.or(config_dir).or_else(|| {
+            default_dir(env.xdg_cache_home.as_deref(), env.home.as_deref())
+                .map(|dir| in_family(dir, env.family_dir))
+        }),
         quota_bytes: env_quota.or(config.and_then(|c| c.quota_bytes)),
     };
     match resolve(
@@ -1617,6 +1789,7 @@ pub(crate) fn plan(
         env.xdg_cache_home.as_deref(),
         env.home.as_deref(),
         free,
+        held_bytes,
     ) {
         Ok(resolved) => Ok(Plan::On { resolved, origin }),
         Err(reason) => Ok(Plan::Off(reason)),
