@@ -3,6 +3,7 @@
 use super::{CELLS, FFN, Gemma, HEADS, HIDDEN, LOCAL_WINDOW, SOFT_CAP, VOCAB};
 use crate::EngError;
 use crate::kernels::cuda::DeviceRange;
+use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideCall};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
 use crate::kernels::cuda::resident::embed_q8::EmbedQ8Call;
@@ -55,7 +56,7 @@ impl Gemma {
             ));
         }
         self.grow_scratch(tokens.len())?;
-        self.decode_with_logits(tokens, pos, logits)?;
+        self.decode_with_logits(tokens, pos, logits, true)?;
         if !logits {
             self.stream.synchronize()?;
         }
@@ -126,13 +127,13 @@ impl Gemma {
     /// Runs one decode step for the token at the position and leaves the capped
     /// logits in the device buffer. Synchronizes once at the end.
     pub(crate) fn decode(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, true)
+        self.decode_with_logits(&[token], pos, true, false)
     }
 
     /// Runs one step without the output norm and the logits projection, for prompt tokens
     /// whose logits are never read. It queues the step and does not synchronize.
     pub(crate) fn decode_hidden(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, false)
+        self.decode_with_logits(&[token], pos, false, true)
     }
 
     fn decode_with_logits(
@@ -140,6 +141,7 @@ impl Gemma {
         tokens: &[u32],
         pos: usize,
         logits: bool,
+        prefill: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -178,7 +180,7 @@ impl Gemma {
         let mut current = 1usize;
         for layer in &self.layers {
             let (input, r1, r2, out) = layer_buffers(current);
-            self.decode_layer(layer, h[input], h[r1], h[r2], h[out], pos, m)?;
+            self.decode_layer(layer, h[input], h[r1], h[r2], h[out], pos, m, prefill)?;
             current = out;
         }
         if !logits {
@@ -240,6 +242,7 @@ impl Gemma {
         out: &super::Vector,
         pos: usize,
         m: usize,
+        prefill: bool,
     ) -> Result<(), EngError> {
         let ctx = &self.ctx;
         let stream = &self.stream;
@@ -398,27 +401,52 @@ impl Gemma {
             },
             pos,
         )?;
-        ctx.attn_decode_gemma(
-            stream,
-            AttnDecodeGemmaCall {
-                out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
-                status: None,
-                q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
-                k_codes: layer.kv.k_codes.range(0, layer.kv.k_codes.bytes())?,
-                k_scales: layer.kv.k_scales.range(0, layer.kv.k_scales.bytes())?,
-                v_codes: layer.kv.v_codes.range(0, layer.kv.v_codes.bytes())?,
-                v_scales: layer.kv.v_scales.range(0, layer.kv.v_scales.bytes())?,
-                kv_len: sc.kv_len.range(0, 4)?,
-                m,
-                n_q_head: HEADS,
-                n_kv_head: n_kv,
-                head_dim: head,
-                cells: CELLS,
-                window: if layer.global { 0 } else { LOCAL_WINDOW },
-                scale: 1.0,
-                split: None,
-            },
-        )?;
+        // A prompt chunk of a global layer, of any length, runs the wide prefill attention when
+        // the device has it; decode steps keep the decode attention.
+        let wide: Option<&WideAttention> = self
+            .wide_prefill
+            .as_ref()
+            .filter(|wide| prefill && layer.global && wide.is_on());
+        if let Some(wide) = wide {
+            wide.attend(
+                ctx,
+                stream,
+                WideCall {
+                    planes: [
+                        &layer.kv.k_codes,
+                        &layer.kv.k_scales,
+                        &layer.kv.v_codes,
+                        &layer.kv.v_scales,
+                    ],
+                    q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
+                    out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
+                    rows: m,
+                    p0: pos,
+                },
+            )?;
+        } else {
+            ctx.attn_decode_gemma(
+                stream,
+                AttnDecodeGemmaCall {
+                    out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
+                    status: None,
+                    q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
+                    k_codes: layer.kv.k_codes.range(0, layer.kv.k_codes.bytes())?,
+                    k_scales: layer.kv.k_scales.range(0, layer.kv.k_scales.bytes())?,
+                    v_codes: layer.kv.v_codes.range(0, layer.kv.v_codes.bytes())?,
+                    v_scales: layer.kv.v_scales.range(0, layer.kv.v_scales.bytes())?,
+                    kv_len: sc.kv_len.range(0, 4)?,
+                    m,
+                    n_q_head: HEADS,
+                    n_kv_head: n_kv,
+                    head_dim: head,
+                    cells: CELLS,
+                    window: if layer.global { 0 } else { LOCAL_WINDOW },
+                    scale: 1.0,
+                    split: None,
+                },
+            )?;
+        }
         ctx.quantize_q8_1(
             stream,
             QuantizeCall {

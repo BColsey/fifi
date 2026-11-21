@@ -46,8 +46,7 @@ use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{
-    AttnKvView, AttnPrefillCall, AttnPrefillShape, CPF_ATTN_Q_TILE, CpfAttnGeometry, CpfAttnPlan,
-    CpfAttnSpan, cpf_attn_part_bytes, cpf_attn_wide_split, kv8_plane_view,
+    WideAttention, WideCall, WideGeometry, WideLoad,
 };
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
@@ -66,7 +65,7 @@ use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
 use crate::weights::GgufType;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Geometry is read from the family descriptor, the single source of truth;
 // the executor pins only the cache cell count and the checkpoint properties
@@ -106,8 +105,9 @@ const PLE_COMBINED_SCALE: f32 = std::f32::consts::SQRT_2.recip();
 /// loading. `None` on overflow. Mirrors `grow_scratch` so the charge cannot
 /// undercount the prefill working set. The attention split's partial buffer
 /// is charged only when `attn_split_armed` (the split is the default since it
-/// landed; the admission must refuse an armed load before allocating).
-pub(crate) fn scratch_bytes(attn_split_armed: bool) -> Option<u64> {
+/// landed; the admission must refuse an armed load before allocating), and the wide
+/// prefill attention's only when `wide_prefill` (the device gate passed).
+pub(crate) fn scratch_bytes(attn_split_armed: bool, wide_prefill: bool) -> Option<u64> {
     let rows = Bolt::PREFILL_BATCH as u64;
     let growable_f32 = [
         8 * HIDDEN,                 // h[4], nrm, nrm2, proj, down
@@ -136,9 +136,12 @@ pub(crate) fn scratch_bytes(attn_split_armed: bool) -> Option<u64> {
     if attn_split_armed {
         total = total.checked_add(attn_part_bytes() as u64)?;
     }
-    // The wide prefill attention's partial buffer: charged on every device, because the
-    // admission runs before the device is asked whether it takes that path.
-    total = total.checked_add(wide_part_bytes()? as u64)?;
+    // The wide prefill attention's partial buffer, present only when the device gate passed.
+    if wide_prefill {
+        // The partial buffer holds at most 128 splits, so the model maximum bounds it for every
+        // planned cell count.
+        total = total.checked_add(wide_geometry(MAX_CELLS).part_bytes().ok()? as u64)?;
+    }
     Some(total)
 }
 
@@ -192,54 +195,10 @@ pub(crate) fn attn_split_wanted() -> Result<bool, EngError> {
     split_armed_from(std::env::var(ATTN_SPLIT_VAR).ok().as_deref())
 }
 
-/// The environment variable that overrides the wide prefill attention of the global layers:
-/// `0` or `off` runs them through the decode attention row group by row group, as before. Unset
-/// is the default: the wide kernel runs on every device that passes its gate.
-pub(crate) const WIDE_PREFILL_VAR: &str = "FIFI_BOLT_WIDE_PREFILL";
-
-/// The wide prefill attention is chosen by the device alone (see
-/// `CudaContext::attn_prefill_wide_supported`); the environment text can only turn it off.
-pub(crate) fn wide_prefill_allowed_from(raw: Option<&str>) -> Result<bool, EngError> {
-    match raw {
-        None => Ok(true),
-        Some(v) => parse_switch(
-            Some(v),
-            &format!("bolt wide prefill attention: {WIDE_PREFILL_VAR}"),
-        ),
-    }
-}
-
-/// The geometry of one global-layer prefill chunk of `rows` consecutive tokens.
-fn wide_geometry(rows: usize) -> CpfAttnGeometry {
-    CpfAttnGeometry {
-        m: rows,
-        n_head: HEADS,
-        n_kv_head: KV_HEADS,
-        head_dim: GLOBAL_HEAD,
-    }
-}
-
-/// The partial buffer of the wide prefill attention: the full prefill batch over the splits of
-/// the fixed stride plan, which covers the whole cache.
-pub(crate) fn wide_part_bytes() -> Option<usize> {
-    let split = cpf_attn_wide_split(CELLS).ok()?;
-    cpf_attn_part_bytes(
-        wide_geometry(Bolt::PREFILL_BATCH),
-        CpfAttnPlan {
-            q_tile: CPF_ATTN_Q_TILE,
-            max_splits: split.max_splits,
-            min_keys: split.min_keys,
-        },
-    )
-    .ok()
-}
-
-/// What the wide prefill attention needs beyond the planes: its partial buffer. Present only on
-/// a device that passed the kernel's gate and an environment that did not turn the path off.
-pub(crate) struct WidePrefill {
-    part: DeviceBuffer,
-    on: AtomicBool,
-    launches: AtomicU64,
+/// What the wide prefill attention sees of the global layers: the prefill batch at most, over
+/// the whole cache.
+fn wide_geometry(cells: usize) -> WideGeometry {
+    WideGeometry::unscaled(HEADS, KV_HEADS, cells, Bolt::PREFILL_BATCH)
 }
 
 pub(crate) struct BoltLayer {
@@ -357,7 +316,13 @@ pub(crate) struct WindowBuffers {
 /// What the rows of one step are.
 enum Rows<'a> {
     /// `m` consecutive positions of one sequence from `pos`: a prompt chunk or one decode token.
-    Chunk { seq: &'a BoltSeq, pos: usize },
+    Chunk {
+        seq: &'a BoltSeq,
+        pos: usize,
+        /// A prompt chunk: its global layers may take the prefill attention. A decode token is
+        /// not, so a captured decode step never holds a launch that bakes its position.
+        prefill: bool,
+    },
     /// One token of each of several sequences, in window order.
     Window { seqs: &'a [&'a BoltSeq] },
 }
@@ -459,7 +424,7 @@ pub(crate) struct Bolt {
     /// sample of every tensor and its length and modification time.
     pub(crate) weights_identity: String,
     /// The wide prefill attention of the global layers, when the device runs it.
-    wide_prefill: Option<WidePrefill>,
+    wide_prefill: Option<WideAttention>,
 }
 
 fn embed_scale() -> f32 {
@@ -474,6 +439,7 @@ pub(crate) fn bolt_demand(
     weights_bytes: u64,
     attn_split_armed: bool,
     cells: usize,
+    wide_prefill: bool,
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
     let kv = super::super::budget::bolt_kv_plan(cells as u64)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
@@ -481,7 +447,7 @@ pub(crate) fn bolt_demand(
         .positions
         .checked_mul(kv.bytes_per_position)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
-    let scratch = scratch_bytes(attn_split_armed)
+    let scratch = scratch_bytes(attn_split_armed, wide_prefill)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     Ok(crate::kernels::cuda::plan::Demand {
         tensors: weights_bytes,
@@ -503,13 +469,14 @@ pub(crate) fn plan_cells(
     free: u64,
     weights_bytes: u64,
     attn_split_armed: bool,
+    wide_prefill: bool,
     sessions: usize,
 ) -> Result<Option<usize>, EngError> {
     use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
 
     let per_position = super::super::budget::bolt_kv_bytes_per_position()
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
-    let scratch = scratch_bytes(attn_split_armed)
+    let scratch = scratch_bytes(attn_split_armed, wide_prefill)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
     // Allocations of the first session that the admission demand does not list (measured on the
@@ -571,12 +538,13 @@ fn cells_for(
     free: u64,
     weights_bytes: u64,
     split: bool,
+    wide: bool,
     sessions: usize,
 ) -> Result<usize, EngError> {
-    let Some(one) = plan_cells(free, weights_bytes, split, 1)? else {
+    let Some(one) = plan_cells(free, weights_bytes, split, wide, 1)? else {
         return Ok(FALLBACK_CELLS);
     };
-    let all = plan_cells(free, weights_bytes, split, sessions)?.unwrap_or(0);
+    let all = plan_cells(free, weights_bytes, split, wide, sessions)?.unwrap_or(0);
     Ok(all.max(one.min(FALLBACK_CELLS)))
 }
 
@@ -613,9 +581,13 @@ pub(crate) fn load_choosing(
     // is refused; the shared error names the needed and free bytes.
     let free = ctx.memory_info()?.free as u64;
     let split = attn_split_wanted()?;
+    // The wide prefill attention is built wherever the device gate passes and starts as the
+    // override or the default says; the admission charges its buffer when it is built.
+    let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
+    let wide = wide_load.passed();
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        cells_for(free, file.bytes, split, sessions)
-            .and_then(|cells| bolt_demand(file.bytes, split, cells))
+        cells_for(free, file.bytes, split, wide, sessions)
+            .and_then(|cells| bolt_demand(file.bytes, split, cells, wide))
             .and_then(|demand| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
@@ -630,8 +602,8 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let cells = cells_for(free, choice.chosen.bytes, split, sessions)?;
-    let demand = bolt_demand(choice.chosen.bytes, split, cells)?;
+    let cells = cells_for(free, choice.chosen.bytes, split, wide, sessions)?;
+    let demand = bolt_demand(choice.chosen.bytes, split, cells, wide)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
     eprintln!(
@@ -861,30 +833,7 @@ pub(crate) fn load_choosing(
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
-    // The wide prefill attention is the default wherever the device gate passes; the
-    // environment can only turn it off.
-    let wide_allowed = wide_prefill_allowed_from(std::env::var(WIDE_PREFILL_VAR).ok().as_deref())?;
-    let wide_supported = ctx.attn_prefill_wide_supported()?;
-    let wide_prefill = if wide_allowed && wide_supported {
-        let bytes = wide_part_bytes().ok_or_else(|| {
-            EngError::MemoryPlan("the wide prefill partial size overflows".into())
-        })?;
-        Some(WidePrefill {
-            part: zero(&ctx, bytes)?,
-            on: AtomicBool::new(true),
-            launches: AtomicU64::new(0),
-        })
-    } else {
-        None
-    };
-    eprintln!(
-        "gemma4 bolt: wide prefill attention for the global layers {}",
-        match (wide_allowed, wide_supported) {
-            (true, true) => "on (the device runs the head_dim 512 kernel)",
-            (false, _) => "off (the environment turned it off)",
-            (true, false) => "off (this device cannot run the head_dim 512 kernel)",
-        }
-    );
+    let wide_prefill = wide_load.build(&ctx, wide_geometry(cells))?;
     Ok(Bolt {
         cells,
         ctx,
@@ -1263,7 +1212,7 @@ impl Bolt {
             ));
         }
         self.grow_scratch(tokens.len())?;
-        self.decode_with_logits(seq, tokens, pos, logits)?;
+        self.decode_with_logits(seq, tokens, pos, logits, true)?;
         if !logits {
             self.stream.synchronize()?;
         }
@@ -1360,7 +1309,7 @@ impl Bolt {
     /// Runs one decode step for the token at the position and leaves the capped
     /// logits in the device buffer. Synchronizes once at the end.
     pub(crate) fn decode(&mut self, seq: &BoltSeq, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(seq, &[token], pos, true)
+        self.decode_with_logits(seq, &[token], pos, true, false)
     }
 
     /// Runs one step without the output norm and the logits projection, for prompt tokens
@@ -1374,7 +1323,7 @@ impl Bolt {
         token: u32,
         pos: usize,
     ) -> Result<(), EngError> {
-        self.decode_with_logits(seq, &[token], pos, false)
+        self.decode_with_logits(seq, &[token], pos, false, true)
     }
 
     fn decode_with_logits(
@@ -1383,6 +1332,7 @@ impl Bolt {
         tokens: &[u32],
         pos: usize,
         logits: bool,
+        prefill: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
         if pos.checked_add(m).is_none_or(|end| end > self.cells) {
@@ -1399,10 +1349,12 @@ impl Bolt {
             .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
         seq.kv_len
             .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
-        let rows = Rows::Chunk { seq, pos };
+        let rows = Rows::Chunk { seq, pos, prefill };
         let facts = DecodeGraphFacts {
             trace_armed: trace_dir().is_some(),
-            multi_token: m > 1,
+            // A prompt chunk of any length is not a decode step: its prefill attention takes the
+            // position as a launch argument, which a captured graph would bake.
+            multi_token: m > 1 || prefill,
             hidden: !logits,
         };
         if check_decode_graph(facts).is_ok() {
@@ -1565,7 +1517,11 @@ impl Bolt {
             pins: &[],
             holds: Vec::new(),
         };
-        let rows = Rows::Chunk { seq, pos };
+        let rows = Rows::Chunk {
+            seq,
+            pos,
+            prefill: false,
+        };
         let (exec, ()) = self
             .ctx
             .capture(&self.stream, plan, || self.decode_body(&rows, true, 1))?;
@@ -1694,6 +1650,15 @@ impl Bolt {
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
+        // A prompt chunk of a global layer runs the wide prefill attention when the device has it,
+        // whatever its length (a lone row included), so a row's cache cell and logits do not
+        // depend on how the prompt was cut; decode steps and windows keep the decode attention.
+        let wide = match rows {
+            Rows::Chunk { prefill: true, .. } => {
+                self.wide_prefill.as_ref().filter(|wide| wide.is_on())
+            }
+            _ => None,
+        };
         // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
         // row sits at cell `first`.
         let group =
@@ -1782,16 +1747,23 @@ impl Bolt {
                     &sc.v_normed,
                     (row + count) * kv_rows * 4,
                 );
-                // A prompt chunk of a global layer runs the wide prefill attention when the
-                // device has it: the same cache, one launch for all the chunk's rows.
                 if layer.global
-                    && count > 1
-                    && let Some(wide) = self
-                        .wide_prefill
-                        .as_ref()
-                        .filter(|w| w.on.load(Ordering::Relaxed))
+                    && let Some(wide) = wide
                 {
-                    return self.wide_attend(wide, own, row, count, first);
+                    return wide.attend(
+                        ctx,
+                        stream,
+                        WideCall {
+                            planes: [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
+                            q: sc
+                                .q_normed
+                                .buf
+                                .range(row * q_rows * 4, count * q_rows * 4)?,
+                            out: sc.ctx_out.buf.range(row * q_rows * 4, count * q_rows * 4)?,
+                            rows: count,
+                            p0: first,
+                        },
+                    );
                 }
                 ctx.attn_decode_gemma(
                     stream,
@@ -1819,7 +1791,7 @@ impl Bolt {
                 )
             };
         match rows {
-            Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
+            Rows::Chunk { seq, pos, .. } => group(seq, 0, m, *pos),
             Rows::Window { seqs } => seqs
                 .iter()
                 .enumerate()
@@ -1827,97 +1799,22 @@ impl Bolt {
         }
     }
 
-    /// The attention of `count` consecutive prompt rows of a global layer, starting at scratch
-    /// row `row` and cache cell `first`, through the head_dim 512 prefill kernel over the
-    /// layer's KV8 planes. The key splits are a fixed stride over the cache, so a row's output does
-    /// not depend on how the rows are grouped into chunks of two or more; a chunk of one row (the
-    /// tail of a prompt, and every decode step) takes the decode attention instead. The rows of the
-    /// chunk are one query tile. The rows' own cells were appended on this stream just before.
-    fn wide_attend(
-        &self,
-        wide: &WidePrefill,
-        own: &Kv,
-        row: usize,
-        count: usize,
-        first: usize,
-    ) -> Result<(), EngError> {
-        let sc = &self.scratch;
-        let q_rows = HEADS * GLOBAL_HEAD;
-        fn view<'b>(
-            codes: &'b DeviceBuffer,
-            scales: &'b DeviceBuffer,
-        ) -> Result<AttnKvView<'b>, EngError> {
-            Ok(kv8_plane_view(
-                codes.range(0, codes.bytes())?,
-                scales.range(0, scales.bytes())?,
-                CELLS,
-                GLOBAL_HEAD,
-            ))
-        }
-        let views = [
-            view(&own.k_codes, &own.k_scales)?,
-            view(&own.v_codes, &own.v_scales)?,
-        ];
-        let geometry = wide_geometry(count);
-        // A fixed stride over the whole cache: a row's partials do not depend on the chunk it
-        // arrives in.
-        let split = cpf_attn_wide_split(CELLS)?;
-        let part_bytes = cpf_attn_part_bytes(
-            geometry,
-            CpfAttnPlan {
-                q_tile: CPF_ATTN_Q_TILE,
-                max_splits: split.max_splits,
-                min_keys: split.min_keys,
-            },
-        )?;
-        wide.launches.fetch_add(1, Ordering::Relaxed);
-        self.ctx.attn_prefill(
-            &self.stream,
-            AttnPrefillCall {
-                storage: views[0].layout.storage,
-                shape: AttnPrefillShape {
-                    m: count,
-                    n_head: HEADS,
-                    n_kv_head: KV_HEADS,
-                    head_dim: GLOBAL_HEAD,
-                    cache_rows: CELLS,
-                    ld: 0,
-                    p0: first as i64,
-                },
-                span: CpfAttnSpan::FULL,
-                split,
-                q_tile: CPF_ATTN_Q_TILE,
-                scale: 1.0,
-                q: sc
-                    .q_normed
-                    .buf
-                    .range(row * q_rows * 4, count * q_rows * 4)?,
-                proj: None,
-                k_cache: views[0].payload,
-                v_cache: views[1].payload,
-                kv_views: Some(views),
-                part: wide.part.range(0, part_bytes)?,
-                out: sc.ctx_out.buf.range(row * q_rows * 4, count * q_rows * 4)?,
-                status: Some(sc.status.range(0, 4)?),
-                sinks: None,
-            },
-        )
-    }
-
     /// Turns the wide prefill attention on or off for this model, for a comparison on one
     /// load; returns whether the device has it at all.
+    #[cfg(test)]
     pub(crate) fn use_wide_prefill(&self, on: bool) -> bool {
         self.wide_prefill.as_ref().is_some_and(|wide| {
-            wide.on.store(on, Ordering::Relaxed);
+            wide.set_on(on);
             true
         })
     }
 
     /// How many wide prefill attention launches this model has queued.
+    #[cfg(test)]
     pub(crate) fn wide_prefill_launches(&self) -> u64 {
         self.wide_prefill
             .as_ref()
-            .map_or(0, |wide| wide.launches.load(Ordering::Relaxed))
+            .map_or(0, WideAttention::launches)
     }
 
     #[expect(
@@ -2331,15 +2228,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_wide_prefill_default_is_on_and_the_environment_only_turns_it_off() {
-        assert!(wide_prefill_allowed_from(None).expect("unset allows"));
-        assert!(wide_prefill_allowed_from(Some("1")).expect("1 allows"));
-        assert!(!wide_prefill_allowed_from(Some("0")).expect("zero turns it off"));
-        assert!(!wide_prefill_allowed_from(Some("off")).expect("off turns it off"));
-        assert!(wide_prefill_allowed_from(Some("yes")).is_err());
-    }
-
-    #[test]
     fn the_split_default_is_armed_and_zero_disarms() {
         // Unset arms the qualified split; `0`/`off` is the rollback to the
         // single-pass summation order; any other spelling refuses the load.
@@ -2356,14 +2244,18 @@ mod tests {
         // fixed f32 ones + two logits rows (524,800 x 4), growable q8 at eight
         // columns plus the fixed head/qk buffers, plus the 12 input-cell bytes;
         // the armed split adds its partial buffer on top.
-        let disarmed = scratch_bytes(false).expect("the disarmed scratch computes");
-        let armed = scratch_bytes(true).expect("the armed scratch computes");
-        // The wide prefill attention's partial buffer is charged on top, on every device.
-        let wide = wide_part_bytes().expect("the wide partial size computes") as u64;
-        assert_eq!(wide, 16_842_752);
-        assert_eq!(disarmed, 5_168_716 + wide);
-        assert_eq!(armed, 9_379_404 + wide);
+        let disarmed = scratch_bytes(false, false).expect("the disarmed scratch computes");
+        let armed = scratch_bytes(true, false).expect("the armed scratch computes");
+        assert_eq!(disarmed, 5_168_716);
+        assert_eq!(armed, 9_379_404);
         assert_eq!(armed - disarmed, attn_part_bytes() as u64);
+        // The wide prefill attention's partial buffer is charged only where the gate passed.
+        let wide = wide_geometry(MAX_CELLS)
+            .part_bytes()
+            .expect("the wide partial size computes") as u64;
+        assert_eq!(wide, 16_842_752);
+        assert_eq!(scratch_bytes(false, true), Some(disarmed + wide));
+        assert_eq!(scratch_bytes(true, true), Some(armed + wide));
     }
 
     #[test]
@@ -2372,7 +2264,8 @@ mod tests {
         // no room for the headroom reserve must be refused by the shared admit;
         // the same demand fits once the reserve is included.
         let weights_bytes = 3_000_000_000u64;
-        let demand = bolt_demand(weights_bytes, true, 32_768).expect("the Bolt demand computes");
+        let demand =
+            bolt_demand(weights_bytes, true, 32_768, true).expect("the Bolt demand computes");
         assert_eq!(demand.tensors, weights_bytes);
         assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
         let allocations = demand.tensors + demand.kv_cache + demand.work;
@@ -2439,33 +2332,46 @@ mod tests {
     fn the_planned_cells_are_the_largest_count_the_card_carries() {
         let weights = 7_578_800_000u64;
         let free_for = |cells: usize| {
-            let demand = bolt_demand(weights, true, cells).expect("demand");
+            let demand = bolt_demand(weights, true, cells, false).expect("demand");
             demand.tensors + demand.kv_cache + demand.work + demand.headroom
         };
         // A 3090-sized card holds the model maximum.
         assert_eq!(
-            plan_cells(22_000_000_000, weights, true, 1).expect("plan"),
+            plan_cells(22_000_000_000, weights, true, false, 1).expect("plan"),
             Some(MAX_CELLS)
         );
         // A card that carries 40,960 cells and not one step more gets exactly those.
         let free = free_for(40_960);
         assert_eq!(
-            plan_cells(free, weights, true, 1).expect("plan"),
+            plan_cells(free, weights, true, false, 1).expect("plan"),
             Some(40_960)
         );
         assert_eq!(
-            plan_cells(free - 1, weights, true, 1).expect("plan"),
+            plan_cells(free - 1, weights, true, false, 1).expect("plan"),
             Some(39_936)
         );
         // The count the plan returns passes the shared admission, and a card short of the
         // smallest count plans none.
-        let demand = bolt_demand(weights, true, 40_960).expect("demand");
+        let demand = bolt_demand(weights, true, 40_960, false).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
         assert_eq!(
-            plan_cells(free_for(1024) - 1, weights, true, 1).expect("plan"),
+            plan_cells(free_for(1024) - 1, weights, true, false, 1).expect("plan"),
             None
         );
         assert_eq!(MAX_CELLS, 65_536);
+    }
+
+    #[test]
+    fn the_planned_cells_fund_the_wide_prefill_buffer_when_the_gate_passes() {
+        let weights = 7_600_000_000u64;
+        for free in [11_000_000_000u64, 14_000_000_000, 21_000_000_000] {
+            let plain = cells_for(free, weights, true, false, 1).expect("cells");
+            let wide = cells_for(free, weights, true, true, 1).expect("cells");
+            assert!(wide <= plain, "{free}: {wide} against {plain}");
+            let demand = bolt_demand(weights, true, wide, true).expect("demand");
+            crate::kernels::cuda::plan::admit(&demand, free)
+                .unwrap_or_else(|error| panic!("{free}: {wide} cells: {error:?}"));
+        }
     }
 
     /// The sessions the planner funds once `cells` are resident beside the weights.
@@ -2473,7 +2379,7 @@ mod tests {
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
         // What the first session holds beyond its admission demand, as measured on the 3090.
         const UNLISTED_BYTES: u64 = 196 << 20;
-        let demand = bolt_demand(weights, true, cells).expect("demand");
+        let demand = bolt_demand(weights, true, cells, false).expect("demand");
         let after_first =
             free.saturating_sub(demand.tensors + demand.kv_cache + demand.work + UNLISTED_BYTES);
         let plan = plan_seqs(
@@ -2499,12 +2405,16 @@ mod tests {
             .map(|gib| gib << 30)
             .chain([23_448_322_048, 23_566_221_312])
         {
-            let cells = cells_for(free, weights, true, target).expect("cells");
+            let cells = cells_for(free, weights, true, false, target).expect("cells");
             let old = funded_sessions(free, weights, FALLBACK_CELLS);
             let now = funded_sessions(free, weights, cells);
             assert!(
                 cells
-                    >= FALLBACK_CELLS.min(plan_cells(free, weights, true, 1).unwrap().unwrap_or(0)),
+                    >= FALLBACK_CELLS.min(
+                        plan_cells(free, weights, true, false, 1)
+                            .unwrap()
+                            .unwrap_or(0)
+                    ),
                 "{free}: {cells} cells"
             );
             assert!(
@@ -2518,13 +2428,16 @@ mod tests {
     fn the_cache_is_widened_only_as_far_as_every_planned_session_fits() {
         let weights = 7_946_927_552u64;
         let free = 23_448_322_048u64;
-        let cells = cells_for(free, weights, true, Bolt::PREFILL_BATCH).expect("cells");
+        let cells = cells_for(free, weights, true, false, Bolt::PREFILL_BATCH).expect("cells");
         assert!(cells > FALLBACK_CELLS && cells < MAX_CELLS, "{cells}");
         assert_eq!(funded_sessions(free, weights, cells), Bolt::PREFILL_BATCH);
         // The model maximum alone would have cost a session on this card.
         assert!(funded_sessions(free, weights, MAX_CELLS) < Bolt::PREFILL_BATCH);
         // One planned session (the decode graph) takes the whole model maximum.
-        assert_eq!(cells_for(free, weights, true, 1).expect("cells"), MAX_CELLS);
+        assert_eq!(
+            cells_for(free, weights, true, false, 1).expect("cells"),
+            MAX_CELLS
+        );
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
@@ -3039,9 +2952,9 @@ mod tests {
             .map(|n| n.parse().expect("a prompt length"))
             .collect();
         // `BOLT_WIDE_WIDTHS` lists the other batch widths to compare, comma separated (default
-        // 5,3; empty for none).
+        // 5,3,1; empty for none).
         let widths: Vec<usize> = std::env::var("BOLT_WIDE_WIDTHS")
-            .unwrap_or_else(|_| "5,3".to_owned())
+            .unwrap_or_else(|_| "5,3,1".to_owned())
             .split(',')
             .filter(|n| !n.is_empty())
             .map(|n| n.parse().expect("a batch width"))
@@ -3080,19 +2993,16 @@ mod tests {
             let run = |model: &mut Bolt, wide: bool| run_width(model, wide, Bolt::PREFILL_BATCH);
             let (old, old_launches, old_time) = run(&mut model, false);
             let (new, new_launches, new_time) = run(&mut model, true);
-            // The row attention is bit-stable across batch widths. The wide attention is too for
-            // chunks of two or more rows (a kernel test pins that); a width that leaves a single
-            // row at the end of the prompt sends that row to the decode attention, which moves
-            // the logits by about the amount the two paths differ. The spread over pieces of 5
-            // and of 3 is reported for both paths.
+            // Pieces of any width, a lone row included, leave the logits of pieces of 8 bit for
+            // bit: the rows' cache cells and the attention of every row do not depend on the cut.
             for &width in &widths {
-                let (wide_other, _, _) = run_width(&mut model, true, width);
-                let (row_other, _, _) = run_width(&mut model, false, width);
-                let (kl_wide, max_wide, _) = compare_logits(&new, &wide_other);
-                let (kl_row, max_row, _) = compare_logits(&old, &row_other);
-                eprintln!(
-                    "WIDTH len {len} pieces of {width} against pieces of 8: wide kl {kl_wide:.3e} \
-                     max|dlogit| {max_wide:.3e}; row kl {kl_row:.3e} max|dlogit| {max_row:.3e}"
+                let (other, _, _) = run_width(&mut model, true, width);
+                assert!(
+                    other
+                        .iter()
+                        .zip(&new)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "len {len}: pieces of {width} differ from pieces of 8"
                 );
             }
             assert_eq!(old_launches, 0, "the row attention ran");
@@ -3112,13 +3022,32 @@ mod tests {
         }
     }
 
-    /// True-token scores of the wide prefill attention against the row attention on real text:
-    /// every fourth batch of eight tokens ends with logits, and each such position records the
-    /// negative log-likelihood of the next true token and the arg-max under both paths. The text
-    /// comes from `BOLT_SCORE_TOKENS`, one document per line as space-separated token ids; the
-    /// records are written to `BOLT_SCORE_OUT` as tab-separated rows (document, position, true
-    /// token, nll under the row attention, nll under the wide attention, arg-max of each, KL of
-    /// the wide distribution from the row one).
+    /// The widths, 1 to 8, in which a prompt of `len` tokens is cut for the scoring test: a fixed
+    /// pseudo-random sequence, so lone rows and every alignment of a chunk end occur and both
+    /// paths of one document see the same cut.
+    fn score_widths(len: usize, seed: u64) -> Vec<usize> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut widths = Vec::new();
+        let mut left = len;
+        while left > 0 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let width = (1 + (state >> 33) as usize % Bolt::PREFILL_BATCH).min(left);
+            widths.push(width);
+            left -= width;
+        }
+        widths
+    }
+
+    /// True-token scores of the wide prefill attention against the row attention on real text.
+    /// Each document is cut into pieces of 1 to 8 tokens (`score_widths`); every third piece ends
+    /// with logits, and its last position records the negative log-likelihood of the next true
+    /// token and the arg-max under both paths. The text comes from `BOLT_SCORE_TOKENS`, one
+    /// document per line as space-separated token ids; the records are written to
+    /// `BOLT_SCORE_OUT` as tab-separated rows (document, position, true token, nll under the row
+    /// attention, nll under the wide attention, arg-max of each, KL of the wide distribution from
+    /// the row one, width of the piece).
     #[test]
     #[ignore = "requires the converted Bolt file, token documents and a device; use --release"]
     fn wide_prefill_scores_real_text_like_the_row_attention() {
@@ -3151,32 +3080,34 @@ mod tests {
                 .split_whitespace()
                 .map(|t| t.parse().expect("a token id"))
                 .collect();
-            // Scored positions: the last token of every fourth batch, whose next token is known.
-            let mut rows: Vec<(usize, [Vec<f32>; 2])> = Vec::new();
+            let widths = score_widths(tokens.len(), doc as u64 + 1);
+            // Scored positions: the last token of every third piece, whose next token is known.
+            let mut rows: Vec<(usize, usize, [Vec<f32>; 2])> = Vec::new();
             for (pass, wide) in [false, true].into_iter().enumerate() {
                 model.use_wide_prefill(wide);
                 let mut pos = 0;
-                for (index, batch) in tokens.chunks(Bolt::PREFILL_BATCH).enumerate() {
-                    let scored = index % 4 == 3 && pos + batch.len() < tokens.len();
+                for (index, &width) in widths.iter().enumerate() {
+                    let batch = &tokens[pos..pos + width];
+                    let scored = index % 3 == 2 && pos + width < tokens.len();
                     model
                         .prefill_batch(&seq, batch, pos, scored)
                         .expect("batch");
-                    pos += batch.len();
+                    pos += width;
                     if scored {
                         let row = logits(&model);
                         if pass == 0 {
-                            rows.push((pos, [row, Vec::new()]));
+                            rows.push((pos, width, [row, Vec::new()]));
                         } else {
                             let at = rows
                                 .iter_mut()
-                                .find(|(p, _)| *p == pos)
+                                .find(|(p, ..)| *p == pos)
                                 .expect("the same positions");
-                            at.1[1] = row;
+                            at.2[1] = row;
                         }
                     }
                 }
             }
-            for (pos, [row, wide]) in rows {
+            for (pos, width, [row, wide]) in rows {
                 let truth = tokens[pos] as usize;
                 let (lp_row, lp_wide) = (log_softmax(&row), log_softmax(&wide));
                 let kl: f64 = lp_row
@@ -3186,7 +3117,7 @@ mod tests {
                     .sum();
                 writeln!(
                     report,
-                    "{doc}\t{pos}\t{truth}\t{:.6}\t{:.6}\t{}\t{}\t{kl:.6e}",
+                    "{doc}\t{pos}\t{truth}\t{:.6}\t{:.6}\t{}\t{}\t{kl:.6e}\t{width}",
                     -lp_row[truth],
                     -lp_wide[truth],
                     argmax(&row),

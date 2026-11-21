@@ -34,6 +34,7 @@ mod tests;
 mod window_tests;
 
 use crate::EngError;
+use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry, WideLoad};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
@@ -161,6 +162,14 @@ pub(crate) struct Gemma {
     pub(crate) logits: Vector,
     pub(crate) logits_capped: Vector,
     pub(crate) eps: f32,
+    /// The wide prefill attention of the global layers, when the device runs it.
+    pub(crate) wide_prefill: Option<WideAttention>,
+}
+
+/// What the wide prefill attention sees of the global layers: one kv head of 512-wide planes
+/// read by every query head, at most one prefill batch of rows.
+fn wide_geometry() -> WideGeometry {
+    WideGeometry::unscaled(HEADS, 1, CELLS, Gemma::PREFILL_BATCH)
 }
 
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Gemma, EngError> {
@@ -294,6 +303,10 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     };
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
+    // The wide prefill attention is built wherever the device gate passes and starts as the
+    // override or the default says.
+    let wide_prefill =
+        WideLoad::read(&ctx, "gemma4 humanizer", wide_geometry())?.build(&ctx, wide_geometry())?;
     Ok(Gemma {
         ctx,
         stream,
@@ -305,6 +318,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
         logits,
         logits_capped,
         eps,
+        wide_prefill,
     })
 }
 
