@@ -13,10 +13,6 @@
 //! Every refusal is a `BadRequest` and happens before any native call, because a status from the
 //! native layer other than an allocation failure latches the backend terminal. A refused call
 //! changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

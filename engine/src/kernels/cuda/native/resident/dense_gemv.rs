@@ -13,10 +13,6 @@
 //! - The argument struct is a live local that the entry reads only during the call. Its `repr(C)`
 //!   mirror is private here and pinned by `const` asserts to the field order of `dense_gemv.h`.
 //!   No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
