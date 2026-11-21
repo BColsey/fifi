@@ -55,7 +55,7 @@ impl Q8Cursor {
 
     /// Records that the buffer was quantized for a `quant` weight.
     pub(crate) fn note(&self, quant: QuantType) {
-        if let Ok(ty) = mmq_type_of(quant) {
+        if let Ok(ty) = super::mmq_type_of(quant) {
             self.0.set(Some(ty.q8_1_layout()));
         }
     }

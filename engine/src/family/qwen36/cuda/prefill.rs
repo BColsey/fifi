@@ -54,8 +54,7 @@ use crate::{
             mmq_dense::{MmqDenseCall, MmqDenseInputCall},
             mmq_facts::MmqFacts,
             mmq_mmid::{
-                IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedQuant, RoutedX, mmq_type_of,
-                routed_gemm,
+                IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedQuant, RoutedX, routed_gemm,
             },
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
             swiglu_rows::SwigluRowsCall,
