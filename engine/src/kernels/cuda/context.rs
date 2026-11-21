@@ -156,6 +156,8 @@ pub(crate) struct CudaContext {
     lease: Rc<Lease>,
     workspace: RefCell<Workspace>,
     pinned_stage: RefCell<Option<pinned_stage::Stage>>,
+    /// The page-locked double buffer of the native weight upload, kept for the next tensor.
+    upload_ring: RefCell<Option<native_weight::UploadRing>>,
     /// Whether a call larger than the workspace may grow it.
     growth: Growth,
     /// The MMQ device facts of this context's device, read at most once.
@@ -399,6 +401,7 @@ impl CudaContext {
             argmax_scratch: RefCell::new(None),
             exl3_table_regions: RefCell::new(Vec::new()),
             pinned_stage: RefCell::new(None),
+            upload_ring: RefCell::new(None),
             #[cfg(test)]
             workspace_allocations: std::cell::Cell::new(1),
             #[cfg(all(test, feature = "native-cuda"))]

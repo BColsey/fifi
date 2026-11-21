@@ -19,7 +19,58 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::weights::GgufType;
 use std::{marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 
-use super::{BlockReader, CudaContext, DeviceBuffer, QuantTensor, host_source};
+use super::{
+    BlockReader, CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, PinnedBuf, QuantTensor,
+    host_source,
+};
+
+/// Two page-locked staging buffers, a stream and one event per buffer: the file read of the
+/// next chunk runs while the DMA copy of the previous one is in flight, and the copy reads
+/// page-locked memory (about twice the rate of a copy from pageable memory).
+pub(super) struct UploadRing {
+    stream: DeviceStream,
+    slots: [RingSlot; 2],
+    next: usize,
+    capacity: usize,
+}
+
+struct RingSlot {
+    buffer: PinnedBuf,
+    copied: DeviceEvent,
+    in_flight: bool,
+}
+
+impl UploadRing {
+    fn new(context: &CudaContext, capacity: usize) -> Result<Self, EngError> {
+        let slot = || -> Result<RingSlot, EngError> {
+            Ok(RingSlot {
+                buffer: context.pinned_buf(capacity)?,
+                copied: context.event()?,
+                in_flight: false,
+            })
+        };
+        Ok(Self {
+            stream: context.stream()?,
+            slots: [slot()?, slot()?],
+            next: 0,
+            capacity,
+        })
+    }
+
+    /// Waits for every copy still in flight; the buffers are free for the host afterwards.
+    fn drain(&mut self) -> Result<(), EngError> {
+        let mut result = Ok(());
+        for slot in &mut self.slots {
+            if slot.in_flight {
+                slot.in_flight = false;
+                if let Err(error) = slot.buffer.wait(&slot.copied) {
+                    result = result.and(Err(error));
+                }
+            }
+        }
+        result
+    }
+}
 
 /// A quantized weight in the GGUF file's own block layout, resident on the device: one
 /// allocation of `n_rows` rows of `k / block_size` blocks each, `experts` the stack depth of a
@@ -107,6 +158,77 @@ impl CudaContext {
         })
     }
 
+    /// Uploads the chunks of `plan` into `buffer` through the page-locked ring, reading chunk
+    /// n + 1 from the file while chunk n is copied. `Ok(false)` when the ring cannot be had
+    /// (page-locked memory is not available), with nothing written.
+    fn upload_through_ring(
+        &self,
+        buffer: &DeviceBuffer,
+        plan: &RowChunkPlan,
+        row_bytes: usize,
+        chunk_bytes: usize,
+        read: BlockReader<'_>,
+    ) -> Result<bool, EngError> {
+        let mut held = self.upload_ring.borrow_mut();
+        if held
+            .as_ref()
+            .is_some_and(|ring| ring.capacity < chunk_bytes)
+        {
+            // A wider chunk than the ring was made for: the old ring goes first.
+            if let Some(mut old) = held.take() {
+                old.drain()?;
+            }
+        }
+        if held.is_none() {
+            match UploadRing::new(self, chunk_bytes) {
+                Ok(ring) => *held = Some(ring),
+                Err(EngError::MemoryPlan(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(ring) = held.as_mut() else {
+            return Ok(false);
+        };
+        let result = self.run_ring(ring, buffer, plan, row_bytes, read);
+        // Whatever happened, no copy may still read a buffer or write the device allocation
+        // when this returns.
+        let drained = ring.drain();
+        result.and(drained).map(|()| true)
+    }
+
+    fn run_ring(
+        &self,
+        ring: &mut UploadRing,
+        buffer: &DeviceBuffer,
+        plan: &RowChunkPlan,
+        row_bytes: usize,
+        read: BlockReader<'_>,
+    ) -> Result<(), EngError> {
+        for first in (0..plan.rows).step_by(plan.per_chunk) {
+            let bytes = plan.count_of(first) * row_bytes;
+            let offset = first * row_bytes;
+            let slot = &mut ring.slots[ring.next];
+            ring.next ^= 1;
+            if slot.in_flight {
+                slot.in_flight = false;
+                slot.buffer.wait(&slot.copied)?;
+            }
+            slot.buffer.fill(bytes, |part| read(offset, part))?;
+            if let Some(cache) = &buffer.alloc_cache {
+                cache.settle()?;
+            }
+            self.copy_from_pinned(
+                &ring.stream,
+                &mut slot.buffer,
+                0,
+                buffer.range(offset, bytes)?,
+            )?;
+            ring.stream.record(&slot.copied)?;
+            slot.in_flight = true;
+        }
+        Ok(())
+    }
+
     /// Reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through `read` in chunks of whole rows and
     /// uploads the file's own blocks into one device allocation made up front.
     ///
@@ -137,12 +259,16 @@ impl CudaContext {
         let plan = RowChunkPlan::new(tensor.n_rows, row_bytes, chunk_limit);
         let buffer = self.alloc(tensor.source_len)?;
         let raw = self.owned(&buffer)?;
-        let mut source = host_source(name, plan.per_chunk * row_bytes)?;
-        for first in (0..plan.rows).step_by(plan.per_chunk) {
-            let part = &mut source[..plan.count_of(first) * row_bytes];
-            read(first * row_bytes, part)?;
-            let _dispatch = self.enter()?;
-            super::host_write(&buffer, raw, first * row_bytes, part)?;
+        let chunk_bytes = plan.per_chunk * row_bytes;
+        if !self.upload_through_ring(&buffer, &plan, row_bytes, chunk_bytes, read)? {
+            // No page-locked memory to be had: the chunks go through one pageable buffer.
+            let mut source = host_source(name, chunk_bytes)?;
+            for first in (0..plan.rows).step_by(plan.per_chunk) {
+                let part = &mut source[..plan.count_of(first) * row_bytes];
+                read(first * row_bytes, part)?;
+                let _dispatch = self.enter()?;
+                super::host_write(&buffer, raw, first * row_bytes, part)?;
+            }
         }
         Ok(NativeWeight {
             buffer,

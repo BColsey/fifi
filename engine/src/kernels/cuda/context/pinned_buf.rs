@@ -173,6 +173,34 @@ impl PinnedBuf {
         })
     }
 
+    /// Lets `fill` write the first `len` bytes in place, for a read straight from a file into
+    /// page-locked memory. Refuses while a copy is outstanding or a device copy ever wrote the
+    /// buffer, as `write` does.
+    pub(crate) fn fill(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), EngError>,
+    ) -> Result<(), EngError> {
+        ensure_usable(&TERMINAL)?;
+        ensure_closed("a pinned fill")?;
+        if self.pending.is_some() {
+            return Err(refuse(
+                "the CUDA pinned buffer has a copy outstanding: wait for an event recorded behind it first",
+            ));
+        }
+        if len == 0 || len > self.bytes {
+            return Err(refuse(format!(
+                "the CUDA pinned fill of {len} bytes lies outside a pinned buffer of {} bytes",
+                self.bytes
+            )));
+        }
+        let raw = self
+            .raw
+            .as_mut()
+            .ok_or_else(|| refuse("the CUDA pinned buffer was already freed"))?;
+        fill(&mut resident::pinned_view_mut(raw)[..len])
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.bytes
     }

@@ -207,6 +207,48 @@ fn upload_native_round_trips_the_file_bytes_of_every_type_and_a_stack() {
 }
 
 #[test]
+fn the_upload_ring_grows_for_a_wider_chunk_and_the_bytes_still_land_in_file_order() {
+    const NAME: &str =
+        "the_upload_ring_grows_for_a_wider_chunk_and_the_bytes_still_land_in_file_order";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let mut rng = testkit::Rng::new(0x5249_4e47);
+    let (k, n_rows) = (512, 24);
+    let row_bytes = k / 256 * 144;
+    let source: Vec<u8> = (0..n_rows * row_bytes)
+        .map(|_| (rng.next_u64() >> 24) as u8)
+        .collect();
+    let tensor = QuantTensor {
+        name: "w",
+        ty: GgufType::Q4K,
+        n_rows,
+        k,
+        source_len: source.len(),
+    };
+    // Narrow chunks first (the ring is made for 2 rows), then 5 rows, then 2 again: the ring
+    // grows once and is reused, and every upload reads back as the file holds it.
+    for rows_per_chunk in [2, 5, 2, 24] {
+        let weight = ctx
+            .upload_native(tensor, rows_per_chunk * row_bytes, &mut |at, buf| {
+                buf.copy_from_slice(&source[at..at + buf.len()]);
+                Ok(())
+            })
+            .expect("upload");
+        let mut back = vec![0u8; source.len()];
+        ctx.download(weight.buffer(), &mut back).expect("download");
+        assert_eq!(back, source, "{rows_per_chunk} rows per chunk");
+    }
+    let ring = ctx.upload_ring.borrow();
+    assert_eq!(
+        ring.as_ref().map(|ring| ring.capacity),
+        Some(24 * row_bytes),
+        "the ring holds the widest chunk seen"
+    );
+}
+
+#[test]
 fn a_failed_read_of_a_native_upload_frees_the_allocation() {
     const NAME: &str = "a_failed_read_of_a_native_upload_frees_the_allocation";
     if !testkit::device_present(NAME) {

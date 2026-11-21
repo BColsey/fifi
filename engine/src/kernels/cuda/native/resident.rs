@@ -795,6 +795,15 @@ pub(in crate::kernels::cuda) fn pinned_view(pinned: &RawPinned) -> &[u8] {
     }
 }
 
+/// The whole pinned allocation as a writable host slice. The owner proves no transfer can
+/// access it while the slice lives: no copy is outstanding and no device copy ever wrote it.
+pub(in crate::kernels::cuda) fn pinned_view_mut(pinned: &mut RawPinned) -> &mut [u8] {
+    // SAFETY: the allocation is `pinned.bytes` bytes long, live and unfreed while `pinned` is
+    // mutably borrowed, and zero-initialized before use. The mutable borrow of the owner makes
+    // this the only host reference; the caller proves no transfer is in flight.
+    unsafe { std::slice::from_raw_parts_mut(pinned.ptr.as_ptr().cast::<u8>(), pinned.bytes) }
+}
+
 /// Writes a checked pinned range. The owner proves no transfer can access it.
 pub(in crate::kernels::cuda) fn pinned_write_from(
     pinned: &RawPinned,
