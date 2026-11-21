@@ -1,6 +1,12 @@
 //! The fixed-loop Inkling 2 Mini text checkpoint and its independent per-visit state.
 
 mod checkpoint;
+#[cfg(all(test, target_pointer_width = "64"))]
+mod cpu_attention;
+#[cfg(all(test, target_pointer_width = "64"))]
+mod cpu_forward;
+#[cfg(all(test, target_pointer_width = "64"))]
+mod cpu_weights;
 
 pub(crate) use checkpoint::inspect_checkpoint;
 use serde::Deserialize;

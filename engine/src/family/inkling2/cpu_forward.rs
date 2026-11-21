@@ -1,0 +1,557 @@
+//! Short-context, text-only native CPU reference for Inkling 2 Mini.
+
+use std::{fs, path::Path};
+
+use serde::Deserialize;
+
+use super::{
+    Attention, LayerVisit, TextSpec, bad, cpu_attention::VisitState, cpu_weights::Weights,
+};
+use crate::EngError;
+
+const MAX_CPU_CONTEXT: usize = 128;
+const MIX_EPS: f32 = 1e-6;
+
+#[derive(Deserialize)]
+struct CpuConfig {
+    text_config: TextMath,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TextMath {
+    pub(super) d_rel: usize,
+    pub(super) rel_extent: usize,
+    pub(super) sconv_kernel_size: usize,
+    pub(super) rms_norm_eps: f32,
+    pub(super) qk_l2_clip_threshold: f32,
+    pub(super) rel_l2_clip_threshold: f32,
+    log_scaling_n_floor: usize,
+    final_logit_softcapping: f32,
+    mlp_gate_softcap: f32,
+    mlp_up_softcap: f32,
+    route_scale: f32,
+    q_bias: bool,
+    o_bias: bool,
+    attn_res_normalize_values: bool,
+    use_value_norm_no_gamma: bool,
+    use_gate_bias: bool,
+}
+
+pub(super) struct CpuForward {
+    pub(super) spec: TextSpec,
+    pub(super) math: TextMath,
+    pub(super) weights: Weights,
+    pub(super) context: usize,
+    visits: Vec<LayerVisit>,
+    state: Vec<VisitState>,
+    position: usize,
+    failed: bool,
+}
+
+#[derive(Clone)]
+struct Stream {
+    blocks: Vec<Vec<f32>>,
+    current: Vec<f32>,
+}
+
+struct MessageBank {
+    first_block: usize,
+    stream: Stream,
+}
+
+#[derive(Clone, Copy)]
+enum Role {
+    Query,
+    Key,
+    Value,
+    Mlp,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Query => "attn",
+            Self::Key => "k",
+            Self::Value => "v",
+            Self::Mlp => "mlp",
+        }
+    }
+}
+
+impl CpuForward {
+    fn open(directory: &Path, context: usize) -> Result<Self, EngError> {
+        let config = fs::read(directory.join("config.json"))
+            .map_err(|error| bad(format!("read text configuration: {error}")))?;
+        let spec = TextSpec::from_config(&config)?;
+        let math = serde_json::from_slice::<CpuConfig>(&config)
+            .map_err(|error| bad(format!("read text forward parameters: {error}")))?
+            .text_config;
+        math.validate(context, &spec)?;
+        let visits = spec.visits();
+        let state = (0..visits.len()).map(|_| VisitState::default()).collect();
+        let weights = Weights::open(directory, &spec)?;
+        Ok(Self {
+            spec,
+            math,
+            weights,
+            context,
+            visits,
+            state,
+            position: 0,
+            failed: false,
+        })
+    }
+
+    pub(super) fn hidden(&self) -> usize {
+        self.spec.hidden_size as usize
+    }
+
+    fn token(&mut self, id: u32, collect_logits: bool) -> Result<Option<Vec<f32>>, EngError> {
+        if self.failed {
+            return Err(bad(
+                "a previous CPU forward failed and invalidated the sequence state",
+            ));
+        }
+        if self.position >= self.context || u64::from(id) >= self.spec.unpadded_vocab_size {
+            return Err(bad(
+                "token or sequence is outside the short-context CPU limits",
+            ));
+        }
+
+        self.failed = true;
+        let mut state = std::mem::take(&mut self.state);
+        let stream = self.forward(&mut state, id)?;
+        let logits = collect_logits.then(|| self.logits(&stream)).transpose()?;
+        self.position += 1;
+        self.state = state;
+        self.failed = false;
+        Ok(logits)
+    }
+
+    fn forward(&self, state: &mut [VisitState], id: u32) -> Result<Stream, EngError> {
+        let mut input = self
+            .weights
+            .row("model.llm.embed.weight", id as usize, self.hidden())?;
+        self.norm(&mut input, "model.llm.embed_norm.weight")?;
+        let mut stream = Stream {
+            blocks: Vec::new(),
+            current: input,
+        };
+        let core = &self.spec.core;
+        let width = core.core_end - core.core_start;
+
+        self.run_visits(&self.visits[..core.core_start], state, &mut stream, None)?;
+        let prelude = stream.clone();
+        let mut bank = None;
+        for pass in 0..core.num_passes {
+            let start = core.core_start + pass * width;
+            if pass > 0 {
+                bank = Some(MessageBank {
+                    first_block: prelude.blocks.len() + 1,
+                    stream: std::mem::replace(&mut stream, prelude.clone()),
+                });
+            }
+            self.run_visits(
+                &self.visits[start..start + width],
+                state,
+                &mut stream,
+                bank.as_ref(),
+            )?;
+        }
+        let suffix = core.core_start + core.num_passes * width;
+        self.run_visits(&self.visits[suffix..], state, &mut stream, None)?;
+        Ok(stream)
+    }
+
+    fn logits(&self, stream: &Stream) -> Result<Vec<f32>, EngError> {
+        let query = self
+            .weights
+            .vec("model.llm.attn_res.output_query", self.hidden())?;
+        let mut last = stream.mix(0, &query);
+        self.norm(&mut last, "model.llm.norm.weight")?;
+        let mut logits = self.weights.project(
+            "model.llm.unembed.weight",
+            &last,
+            self.spec.unpadded_vocab_size as usize,
+        )?;
+        for value in &mut logits {
+            *value = softcap(*value, self.math.final_logit_softcapping);
+        }
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err(bad("non-finite native CPU logits"));
+        }
+        Ok(logits)
+    }
+
+    fn run_visits(
+        &self,
+        visits: &[LayerVisit],
+        state: &mut [VisitState],
+        stream: &mut Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<(), EngError> {
+        for &visit in visits {
+            self.layer(visit, &mut state[visit.state_slot], stream, bank)?;
+        }
+        Ok(())
+    }
+
+    fn layer(
+        &self,
+        visit: LayerVisit,
+        state: &mut VisitState,
+        stream: &mut Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<(), EngError> {
+        let physical = visit.weight_layer;
+        let layer = format!("model.llm.layers.{physical}");
+        let inputs = self.attention_inputs(visit, &layer, stream, bank)?;
+        let attn = self.attention(&layer, visit.attention, &inputs, state)?;
+        if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
+            stream
+                .blocks
+                .push(std::mem::replace(&mut stream.current, attn));
+        } else {
+            add(&mut stream.current, &attn, 1.0);
+        }
+
+        let query = self.weights.vec(
+            &format!("model.llm.attn_res.mlp_queries.{physical}"),
+            self.hidden(),
+        )?;
+        let mut mlp_input = stream.mix(0, &query);
+        self.control(&mut mlp_input, bank, physical, &layer, Role::Mlp)?;
+        self.norm(&mut mlp_input, &format!("{layer}.mlp_norm.weight"))?;
+        let mlp = self.moe(&format!("{layer}.mlp"), &mlp_input)?;
+        add(
+            &mut stream.current,
+            &self.mlp_conv(mlp, &layer, state)?,
+            1.0,
+        );
+        Ok(())
+    }
+
+    fn attention_inputs(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        stream: &Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<[Vec<f32>; 3], EngError> {
+        let physical = visit.weight_layer;
+        let local = visit.attention == Attention::Local;
+        let mut inputs = [Vec::new(), Vec::new(), Vec::new()];
+        for (i, (role, norm)) in [
+            (Role::Query, "q_input_norm"),
+            (Role::Key, "k_input_norm"),
+            (Role::Value, "v_input_norm"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if local && i > 0 && bank.is_none() {
+                inputs[i] = inputs[0].clone();
+                continue;
+            }
+            let mut input = if let Some(query_index) = physical.checked_sub(1) {
+                let row = if local { 0 } else { i };
+                let query = self.weights.row(
+                    &format!("model.llm.attn_res.attn_queries.{query_index}"),
+                    row,
+                    self.hidden(),
+                )?;
+                stream.mix(0, &query)
+            } else {
+                stream.current.clone()
+            };
+            self.control(&mut input, bank, physical, layer, role)?;
+            let norm = if local { "attn_norm" } else { norm };
+            self.norm(&mut input, &format!("{layer}.{norm}.weight"))?;
+            inputs[i] = input;
+        }
+        Ok(inputs)
+    }
+
+    fn norm(&self, values: &mut [f32], weight: &str) -> Result<(), EngError> {
+        let weights = self.weights.vec(weight, values.len())?;
+        rms_norm(values, self.math.rms_norm_eps);
+        for (value, weight) in values.iter_mut().zip(weights) {
+            *value *= weight;
+        }
+        Ok(())
+    }
+
+    fn control(
+        &self,
+        input: &mut [f32],
+        bank: Option<&MessageBank>,
+        physical: usize,
+        layer: &str,
+        role: Role,
+    ) -> Result<(), EngError> {
+        let Some(bank) = bank else {
+            return Ok(());
+        };
+        let (kind, offset) = match role {
+            Role::Query => ("cross_pass_queries", 0),
+            Role::Key => ("cross_pass_kv_queries", 0),
+            Role::Value => ("cross_pass_kv_queries", 1),
+            Role::Mlp => ("cross_pass_queries", 1),
+        };
+        let row = 2 * (physical - self.spec.core.core_start) + offset;
+        let query = self.weights.row(
+            &format!("model.llm.middle_cycle_{kind}"),
+            row,
+            self.hidden(),
+        )?;
+        let message = bank.stream.mix(bank.first_block, &query);
+        let ctrl = format!("{layer}.controllers.{}", role.name());
+
+        let mut gate = input.to_vec();
+        gate.extend_from_slice(&message);
+        for half in gate.chunks_exact_mut(self.hidden()) {
+            rms_norm(half, MIX_EPS);
+        }
+        let reduced = self.weights.project(
+            &format!("{ctrl}.down_weight"),
+            &gate,
+            self.spec.core.gate_rank as usize,
+        )?;
+        let gain = self
+            .weights
+            .project(&format!("{ctrl}.gain_weight"), &reduced, self.hidden())?;
+        let forget =
+            self.weights
+                .project(&format!("{ctrl}.forget_weight"), &reduced, self.hidden())?;
+        for (((value, message), gain), forget) in
+            input.iter_mut().zip(message).zip(gain).zip(forget)
+        {
+            *value = (*value - forget.tanh() * *value) + gain.tanh() * message;
+        }
+        Ok(())
+    }
+
+    fn moe(&self, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+        let experts = self.spec.n_routed_experts as usize;
+        let scores = self
+            .weights
+            .project(&format!("{prefix}.gate.weight"), input, experts)?
+            .into_iter()
+            .map(sigmoid)
+            .collect::<Vec<_>>();
+        let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
+        let selected = route(&scores, &bias, self.spec.num_experts_per_tok as usize)?;
+        let total = selected
+            .iter()
+            .map(|&id| scores[id])
+            .sum::<f32>()
+            .max(1.0 / 16384.0);
+        let gate_up = format!("{prefix}.experts.w13_weight");
+        let down = format!("{prefix}.experts.w2_weight");
+        let activation = self.weights.activate(input)?;
+        let mut output = vec![0.0; self.hidden()];
+        for id in selected {
+            let pairs = self.weights.expert(&gate_up, id, &activation, input)?;
+            let middle: Vec<f32> = pairs
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[gate, up]| {
+                    softcap(gate, self.math.mlp_gate_softcap)
+                        * sigmoid(gate)
+                        * softcap(up, self.math.mlp_up_softcap)
+                })
+                .collect();
+            let activation = self.weights.activate(&middle)?;
+            let contribution = self.weights.expert(&down, id, &activation, &middle)?;
+            add(
+                &mut output,
+                &contribution,
+                self.math.route_scale * (scores[id] / total),
+            );
+        }
+        Ok(output)
+    }
+}
+
+impl TextMath {
+    fn validate(&self, context: usize, spec: &TextSpec) -> Result<(), EngError> {
+        if context == 0
+            || context > MAX_CPU_CONTEXT
+            || context > self.log_scaling_n_floor
+            || context > spec.model_max_length as usize
+        {
+            return Err(bad(format!(
+                "invalid CPU reference context, expected 1..={MAX_CPU_CONTEXT} and at most the log-scale floor"
+            )));
+        }
+        if self.d_rel == 0
+            || self.rel_extent == 0
+            || self.sconv_kernel_size == 0
+            || self.q_bias
+            || self.o_bias
+            || !self.use_gate_bias
+            || !self.attn_res_normalize_values
+            || !self.use_value_norm_no_gamma
+            || ![
+                self.rms_norm_eps,
+                self.qk_l2_clip_threshold,
+                self.rel_l2_clip_threshold,
+                self.final_logit_softcapping,
+                self.mlp_gate_softcap,
+                self.mlp_up_softcap,
+                self.route_scale,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && value > 0.0)
+        {
+            return Err(bad("unsupported native CPU forward parameters"));
+        }
+        Ok(())
+    }
+}
+
+impl Stream {
+    fn mix(&self, first_block: usize, query: &[f32]) -> Vec<f32> {
+        let states = self.blocks[first_block..]
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.current));
+        let scale = (query.len() as f32).sqrt().recip();
+        let rows = states
+            .map(|state| {
+                let mut norm = state.clone();
+                rms_norm(&mut norm, MIX_EPS);
+                (dot(&norm, query) * scale, norm)
+            })
+            .collect::<Vec<_>>();
+        let peak = rows
+            .iter()
+            .map(|(score, _)| *score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut mass = 0.0;
+        let mut result = vec![0.0; query.len()];
+        for (score, state) in rows {
+            let weight = (score - peak).exp();
+            mass += weight;
+            add(&mut result, &state, weight);
+        }
+        for value in &mut result {
+            *value /= mass;
+        }
+        result
+    }
+}
+
+fn route(scores: &[f32], bias: &[f32], count: usize) -> Result<Vec<usize>, EngError> {
+    let mut order: Vec<(usize, f32)> = scores
+        .iter()
+        .zip(bias)
+        .enumerate()
+        .map(|(id, (score, bias))| (id, score + bias))
+        .collect();
+    if order.iter().any(|&(_, score)| !score.is_finite()) {
+        return Err(bad("non-finite expert routing score"));
+    }
+    order.sort_unstable_by(|(left_id, left), (right_id, right)| {
+        right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+    });
+    Ok(order.into_iter().take(count).map(|(id, _)| id).collect())
+}
+
+pub(super) fn dot(x: &[f32], y: &[f32]) -> f32 {
+    x.iter().zip(y).map(|(x, y)| x * y).sum()
+}
+
+pub(super) fn rms_norm(x: &mut [f32], eps: f32) {
+    let scale = (dot(x, x) / x.len() as f32 + eps).sqrt().recip();
+    for value in x {
+        *value *= scale;
+    }
+}
+
+pub(super) fn sigmoid(x: f32) -> f32 {
+    (1.0 + (-x).exp()).recip()
+}
+
+fn softcap(x: f32, cap: f32) -> f32 {
+    cap * (x / cap).tanh()
+}
+
+fn add(dst: &mut [f32], src: &[f32], scale: f32) {
+    for (dst, src) in dst.iter_mut().zip(src) {
+        *dst += scale * src;
+    }
+}
+
+#[test]
+fn routing_uses_bias_to_rank_and_orders_ties_by_expert() {
+    assert_eq!(
+        route(&[0.9, 0.2, 0.5, 0.5], &[0.0, 1.0, 0.0, 0.0], 3).unwrap(),
+        [1, 0, 2]
+    );
+}
+
+#[test]
+fn depth_mix_can_exclude_the_first_core_boundary() {
+    let stream = Stream {
+        blocks: vec![vec![0.0, 2.0]],
+        current: vec![2.0, 0.0],
+    };
+    let both = stream.mix(0, &[0.0; 2]);
+    let current = stream.mix(1, &[0.0; 2]);
+    assert!((both[0] - both[1]).abs() < 1e-6);
+    assert!((current[0] - std::f32::consts::SQRT_2).abs() < 1e-6);
+    assert_eq!(current[1], 0.0);
+}
+
+#[test]
+#[ignore = "requires the native Inkling 2 Mini safetensors checkpoint"]
+fn native_cpu_logits() {
+    use std::{
+        env,
+        io::{BufWriter, Write},
+        time::Instant,
+    };
+
+    let directory = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set FIFI_INKLING_MODEL_DIR");
+    let output = env::var_os("FIFI_INKLING_LOGITS").expect("set FIFI_INKLING_LOGITS");
+    let tokens =
+        env::var("FIFI_INKLING_TOKEN_IDS").expect("set comma-separated FIFI_INKLING_TOKEN_IDS");
+    let tokens = tokens
+        .split(',')
+        .map(|token| token.parse::<u32>().expect("invalid token ID"))
+        .collect::<Vec<_>>();
+    let last_only = env::var_os("FIFI_INKLING_LAST_LOGITS_ONLY").is_some();
+    let mut model = CpuForward::open(Path::new(&directory), tokens.len()).unwrap();
+    let mut output = BufWriter::new(fs::File::create(output).unwrap());
+    let last_index = tokens.len() - 1;
+    for (index, token) in tokens.into_iter().enumerate() {
+        let start = Instant::now();
+        let Some(logits) = model
+            .token(token, !last_only || index == last_index)
+            .unwrap()
+        else {
+            eprintln!(
+                "token={token} prefill seconds={:.3}",
+                start.elapsed().as_secs_f64()
+            );
+            continue;
+        };
+        let top = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        eprintln!(
+            "token={token} top_id={} top_logit={} seconds={:.3}",
+            top.0,
+            top.1,
+            start.elapsed().as_secs_f64()
+        );
+        for value in logits {
+            output.write_all(&value.to_le_bytes()).unwrap();
+        }
+    }
+    output.flush().unwrap();
+}

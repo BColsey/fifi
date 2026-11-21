@@ -1,6 +1,9 @@
 //! Validate the published text tensor geometry from the safetensors header.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use super::{TextSpec, bad, checked_product};
 use crate::{
@@ -19,6 +22,21 @@ pub(crate) fn inspect_checkpoint(
     directory: &Path,
     spec: &TextSpec,
 ) -> Result<CheckpointFacts, EngError> {
+    let (_, file) = open_shard(directory)?;
+    validate_text(&file, spec, file.tensor_count() as u64)
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+pub(super) fn open_checkpoint(
+    directory: &Path,
+    spec: &TextSpec,
+) -> Result<(PathBuf, ShardReader), EngError> {
+    let (path, file) = open_shard(directory)?;
+    validate_text(&file, spec, file.tensor_count() as u64)?;
+    Ok((path, file))
+}
+
+fn open_shard(directory: &Path) -> Result<(PathBuf, ShardReader), EngError> {
     let bytes = fs::read(directory.join("model.safetensors.index.json"))
         .map_err(|error| bad(format!("read safetensors index: {error}")))?;
     let index = serde_json::from_slice::<UniqueValue>(&bytes)
@@ -38,7 +56,8 @@ pub(crate) fn inspect_checkpoint(
             "expected the single safetensors shard of the Mini release",
         ));
     }
-    let file = ShardReader::open(directory.join(name))?;
+    let path = directory.join(name);
+    let file = ShardReader::open(&path)?;
     if file.tensor_count() != map.len()
         || index["metadata"]["total_size"].as_u64() != Some(file.payload_len())
         || map.keys().any(|key| file.tensor(key).is_none())
@@ -48,7 +67,7 @@ pub(crate) fn inspect_checkpoint(
         ));
     }
 
-    validate_text(&file, spec, map.len() as u64)
+    Ok((path, file))
 }
 
 fn validate_text(
