@@ -748,8 +748,7 @@ fn stage_disk_experts(
         .filter(|_| pipeline || cache.is_some())
         .map(|shared| {
             let output = shared.apply(k, x)?;
-            k.evaluate_async(&[&output])?;
-            Ok::<_, EngError>(output)
+            crate::family::prefill::mlx::submit_shared_expert(k, output)
         })
         .transpose()?;
     let bytes = host

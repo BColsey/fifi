@@ -17,14 +17,14 @@ use crate::{
     EngError,
     family::{
         mlx_budget::DeviceBudget,
-        prefill::mlx::{local_expert_ids, sorted_expert_ids},
+        prefill::mlx::{local_expert_ids, prefill_expert_read_runs, sorted_expert_ids},
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
         },
         stored::{
             RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
-            read_stacked_into, stacked_layout,
+            read_stack_runs_into, read_stacked_into, read_stacked_runs_into, stacked_layout,
         },
     },
     kernels::{HostPages, MlxKernels, PackedPages, PackedWeight, PageRange, ResidentPackedWeight},
@@ -402,6 +402,7 @@ impl ExpertSlices {
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
         ids: &[u32],
+        coalesce: bool,
     ) -> Result<ExpertPages, EngError> {
         let ExpertLayout {
             gate: gate_narrow,
@@ -417,7 +418,12 @@ impl ExpertSlices {
                 operation: "expert_pages",
                 message: "new expert pages are not writable".into(),
             })?;
-            read_stacked_into(
+            let read_stacked = if coalesce {
+                read_stacked_runs_into
+            } else {
+                read_stacked_into
+            };
+            read_stacked(
                 ckpt,
                 gate,
                 up,
@@ -431,7 +437,12 @@ impl ExpertSlices {
                 self.f32_scales,
             )?;
             let down_target = down_read.as_ref().unwrap_or(&down_layout);
-            read_stack_into(ckpt, down, ids, bytes, down_target)?;
+            let read_stack = if coalesce {
+                read_stack_runs_into
+            } else {
+                read_stack_into
+            };
+            read_stack(ckpt, down, ids, bytes, down_target)?;
             if self.f32_scales {
                 widen_stack_scales(bytes, &down_layout)?;
             }
@@ -479,11 +490,16 @@ impl RMoe {
         }
     }
 
+    pub(super) fn streams_experts(&self) -> bool {
+        self.disk().is_some()
+    }
+
     pub(super) fn stage_selection(
         &self,
         kernels: &mut MlxKernels,
         ckpt: Option<&StreamedCheckpoint>,
         selected: &[u32],
+        rows: u32,
     ) -> Result<Option<(ExpertPages, Vec<u32>)>, EngError> {
         let Some(slices) = self.disk() else {
             return Ok(None);
@@ -492,7 +508,11 @@ impl RMoe {
             ckpt.ok_or_else(|| EngError::Checkpoint("missing Qwen expert checkpoint".into()))?;
         let experts = sorted_expert_ids(selected);
         let local = local_expert_ids(selected, &experts)?;
-        Ok(Some((slices.stage(kernels, ckpt, &experts)?, local)))
+        let coalesce = rows > 1 && prefill_expert_read_runs();
+        Ok(Some((
+            slices.stage(kernels, ckpt, &experts, coalesce)?,
+            local,
+        )))
     }
 
     pub(super) fn expert_pages(&self) -> Result<&ExpertPages, EngError> {
@@ -663,7 +683,8 @@ impl ResidentWeights {
                 if let RFeedForward::Moe(moe) = &mut layer.feed_forward
                     && let Some(slices) = moe.disk()
                 {
-                    moe.experts = Experts::Resident(Box::new(slices.stage(kernels, ckpt, &ids)?));
+                    moe.experts =
+                        Experts::Resident(Box::new(slices.stage(kernels, ckpt, &ids, false)?));
                 }
             }
         }

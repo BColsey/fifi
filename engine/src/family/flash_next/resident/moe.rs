@@ -10,7 +10,10 @@ use super::super::moe::{MoeShape, select};
 use super::ops::{Ctx, dim, linear, short_import, values};
 use super::slots::{ExpertSlots, SetLayout};
 use super::weights::RMoe;
-use crate::family::stored::read_stack_into;
+use crate::family::{
+    prefill::mlx::{overlap_expert_reads, submit_shared_expert},
+    stored::read_stack_into,
+};
 use crate::{
     EngError,
     kernels::{BinaryOp, HostPages, ReduceOp, ResidentPackedWeight, UnaryOp},
@@ -155,8 +158,17 @@ pub(super) fn step_paged(
 ) -> Result<(ExecutionTensor, Selection), EngError> {
     let (routes, probs) = route(ctx, shape, w, x)?;
     slots.release_lent();
+    let queued_shared = if overlap_expert_reads() {
+        let output = shared(ctx, w, x)?;
+        Some(submit_shared_expert(ctx.kernels, output)?)
+    } else {
+        None
+    };
     let experts = routed(ctx, ckpt, w, slots, &routes, x)?;
-    let shared_out = shared(ctx, w, x)?;
+    let shared_out = match queued_shared {
+        Some(output) => output,
+        None => shared(ctx, w, x)?,
+    };
     let out = ctx.kernels.binary(BinaryOp::Add, &experts, &shared_out)?;
     Ok((out, (routes, probs)))
 }

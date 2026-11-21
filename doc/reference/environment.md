@@ -41,6 +41,8 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `FIFI_MLX_REUSE_IDENTITY_RESHAPE` | off | Set to `1` to share a validated native resident tensor when the requested reshape matches its current dimensions. |
 | `FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL` | off | Set to `1` to batch sparse Flash-Next MLX prompt rows when chunked prefill has workspace left over. Each batch has up to eight rows. It shrinks as the prefix grows and takes one-token steps when fewer than two rows fit. |
 | `FIFI_Q36_MLX_DISK_EXPERTS` | off | Set to `1` with MLX device sizing enabled to let Qwen3.6 stage routed experts from local shards when the full expert banks exceed the working set. The streamed path uses one session and charges one layer of expert pages to the prefill plan. |
+| `FIFI_MLX_EXPERT_READ_RUNS` | off | Set to `prefill` to group adjacent expert slice reads on the multi-row disk-backed paths in Flint, Flash-Next and Qwen3.6 MoE. Each run covers exactly the selected experts. Flint's legacy read policy and pipeline switches take precedence when set. |
+| `FIFI_MLX_OVERLAP_EXPERT_READS` | off | Set to `1` to submit the independent shared expert to Metal before the same layer's exact routed weights are read on the CPU. This applies to disk-backed Flint, Flash-Next and Qwen3.6 MoE. Flint's legacy pipeline switch takes precedence when set. |
 
 ## Qwen3.6 on Apple Silicon
 

@@ -702,10 +702,7 @@ fn read_stack_to_pages<const COALESCE: bool>(
         while rank < indices.len() {
             let index = indices[rank];
             let count = if COALESCE {
-                1 + indices[rank..]
-                    .windows(2)
-                    .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
-                    .count()
+                consecutive_count(&indices[rank..])
             } else {
                 1
             };
@@ -737,6 +734,13 @@ fn read_stack_to_pages<const COALESCE: bool>(
         }
     }
     Ok(())
+}
+
+fn consecutive_count(indices: &[u32]) -> usize {
+    1 + indices
+        .windows(2)
+        .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
+        .count()
 }
 
 /// Expands BF16 values to F32 inside one buffer, with no second buffer.
@@ -883,6 +887,34 @@ pub(crate) fn read_stacked_into(
     layouts: &StackedLayouts<'_>,
     f32_scales: bool,
 ) -> Result<(), EngError> {
+    read_stacked::<false>(ckpt, gate, up, indices, dst, layouts, f32_scales)
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn read_stacked_runs_into(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
+    read_stacked::<true>(ckpt, gate, up, indices, dst, layouts, f32_scales)
+}
+
+fn read_stacked<const COALESCE: bool>(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
     let (gate_narrow, up_narrow, wide) = (layouts.gate, layouts.up, layouts.stacked);
     if indices.is_empty() || u32::try_from(indices.len()).ok() != Some(wide.count) {
         return Err(EngError::BadRequest(format!(
@@ -918,6 +950,22 @@ pub(crate) fn read_stacked_into(
             .slice_len
             .checked_add(u.slice_len)
             .ok_or_else(|| EngError::BadRequest(format!("stacked {role} pair overflows")))?;
+        #[cfg(any(
+            test,
+            all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+        ))]
+        if COALESCE {
+            return read_stacked_role_runs(
+                ckpt,
+                role,
+                [(gate, g.slice_len), (up, u.slice_len)],
+                indices,
+                dst,
+                wide_role,
+                pair,
+                widen,
+            );
+        }
         for (rank, &index) in indices.iter().enumerate() {
             let offset_error = || EngError::BadRequest(format!("stacked {role} offset overflows"));
             let slot = wide_role
@@ -984,6 +1032,73 @@ pub(crate) fn read_stacked_into(
         wide.biases.as_ref(),
     ) {
         read_role("biases", g, u, w, f32_scales)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "two source roles and one shared destination stride"
+)]
+fn read_stacked_role_runs(
+    ckpt: &StreamedCheckpoint,
+    role: &str,
+    weights: [(&SlicedWeight, usize); 2],
+    indices: &[u32],
+    dst: &mut [u8],
+    layout: &RoleRange,
+    pair: usize,
+    widen: bool,
+) -> Result<(), EngError> {
+    use std::io::IoSliceMut;
+    const MAX_VECTORS: usize = 64;
+    let invalid = || EngError::BadRequest(format!("invalid stacked {role} staging range"));
+    let at = if widen { pair } else { 0 };
+    let used = at
+        .checked_add(pair)
+        .filter(|&end| end <= layout.slice_len)
+        .ok_or_else(invalid)?;
+    let end = indices
+        .len()
+        .checked_mul(layout.slice_len)
+        .and_then(|size| layout.offset.checked_add(size))
+        .ok_or_else(invalid)?;
+    let slots = dst.get_mut(layout.offset..end).ok_or_else(invalid)?;
+    let keys = weights.map(|(weight, _)| format!("{}.{role}", weight.stem));
+    let mut rank = 0;
+    while rank < indices.len() {
+        let count = consecutive_count(&indices[rank..][..(indices.len() - rank).min(MAX_VECTORS)]);
+        let group = &mut slots[rank * layout.slice_len..(rank + count) * layout.slice_len];
+        let mut offset = at;
+        for ((_, size), key) in weights.iter().zip(&keys) {
+            let end = offset + size;
+            if count == 1 {
+                counted_read(*size, || {
+                    ckpt.read_slice_into(key, indices[rank], &mut group[offset..end])
+                })?;
+            } else {
+                // The source role is contiguous. The destination has one
+                // disjoint range per expert in the fused gate/up stack.
+                let mut iov: Vec<_> = group
+                    .chunks_exact_mut(layout.slice_len)
+                    .map(|slot| IoSliceMut::new(&mut slot[offset..end]))
+                    .collect();
+                counted_read(count * size, || {
+                    ckpt.read_slice_run_scattered(key, indices[rank], &mut iov)
+                })?;
+            }
+            offset = end;
+        }
+        if widen {
+            for slot in group.chunks_exact_mut(layout.slice_len) {
+                widen_bf16_in_place(&mut slot[..used])?;
+            }
+        }
+        rank += count;
     }
     Ok(())
 }
@@ -1299,6 +1414,25 @@ mod tests {
             true,
         )
         .unwrap();
+        let mut grouped = vec![0xAB_u8; wide.end + page];
+        read_stacked_runs_into(
+            &ckpt,
+            &gate,
+            &up,
+            &indices,
+            &mut grouped,
+            &StackedLayouts {
+                gate: &gate_narrow,
+                up: &up_narrow,
+                stacked: &wide,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            grouped, dst,
+            "vectored reads preserve wide scales and slot padding"
+        );
         let f32_of = |bytes: &[u8]| -> Vec<u8> {
             let mut wide = Vec::with_capacity(bytes.len() * 2);
             for i in (0..bytes.len()).step_by(2) {
