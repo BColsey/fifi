@@ -12,6 +12,7 @@ pub(super) struct Dense {
     source: Arc<Weights>,
     entries: BTreeMap<String, Entry>,
     mapping: Option<MappedFile>,
+    attention_workers: usize,
 }
 
 struct Entry {
@@ -30,7 +31,11 @@ enum Transform {
 }
 
 impl Dense {
-    pub(super) fn new(source: Arc<Weights>, mapping_budget: u64) -> Result<(Self, u64), EngError> {
+    pub(super) fn new(
+        source: Arc<Weights>,
+        mapping_budget: u64,
+        attention_workers: usize,
+    ) -> Result<(Self, u64), EngError> {
         let mut entries = BTreeMap::new();
         let mut add = |canonical: String, name: String, shape: Option<Vec<usize>>, transform| {
             let tensor = source
@@ -189,6 +194,7 @@ impl Dense {
                 source,
                 entries,
                 mapping,
+                attention_workers,
             },
             mapped_bytes,
         ))
@@ -253,12 +259,19 @@ impl Dense {
         rows: Range<usize>,
     ) -> Result<Vec<f32>, EngError> {
         let entry = self.entry(name)?;
+        let workers = attention_workers_for(&entry.name, self.attention_workers);
         if let Some(mapping) = self.mapping.as_ref().filter(|_| entry.mapped_len > 0) {
-            return self
-                .source
-                .project_mapped(&entry.name, rows, input, mapping, entry.mapped_len);
+            return self.source.project_mapped(
+                &entry.name,
+                rows,
+                input,
+                mapping,
+                entry.mapped_len,
+                workers,
+            );
         }
-        self.source.project(&entry.name, 0, rows, input, true)
+        self.source
+            .project_with_workers(&entry.name, 0, rows, input, true, workers)
     }
 
     pub(super) fn loop_query(&self, layer: usize, stream: usize) -> Result<Vec<f32>, EngError> {
@@ -332,6 +345,24 @@ fn page_span(offset: u64, bytes: u64, page: u64) -> Result<u64, EngError> {
         .ok_or_else(super::staging_overflow)
 }
 
+fn attention_workers_for(name: &str, configured: usize) -> usize {
+    if configured > 1
+        && name
+            .strip_prefix("blk.")
+            .and_then(|name| name.split_once('.'))
+            .is_some_and(|(_, projection)| {
+                matches!(
+                    projection,
+                    "attn_q.weight" | "attn_k.weight" | "attn_v.weight" | "attn_output.weight"
+                )
+            })
+    {
+        configured
+    } else {
+        1
+    }
+}
+
 fn projection_uses(name: &str) -> Option<usize> {
     if name == "output.weight" {
         return Some(1);
@@ -361,6 +392,28 @@ fn projection_uses(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_gguf_attention_matrices_use_the_requested_workers() {
+        for name in [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+        ] {
+            let name = format!("blk.6.{name}");
+            assert_eq!(attention_workers_for(&name, 4), 4);
+            assert_eq!(attention_workers_for(&name, 1), 1);
+        }
+        for name in [
+            "output.weight",
+            "blk.6.attn_gate.weight",
+            "blk.6.ffn_gate_inp.weight",
+            "blk.6.loop_attn_down.weight",
+        ] {
+            assert_eq!(attention_workers_for(name, 4), 1);
+        }
+    }
 
     #[test]
     fn dense_mapping_selects_only_recurring_projections_and_charges_page_spans() {

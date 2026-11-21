@@ -211,7 +211,13 @@ impl Decoder {
 
     fn open_gguf(path: &Path, context: u32, native: bool) -> Result<Self, EngError> {
         let map_dense = std::env::var_os(gguf::DENSE_MAPPING_ENV).is_some_and(|value| value == "1");
-        Self::open_gguf_with_dense_mapping(path, context, native, map_dense)
+        Self::open_gguf_with_dense_mapping(
+            path,
+            context,
+            native,
+            map_dense,
+            super::dense::attention_cpu_workers(),
+        )
     }
 
     fn open_gguf_with_dense_mapping(
@@ -219,25 +225,34 @@ impl Decoder {
         context: u32,
         native: bool,
         map_dense: bool,
+        attention_workers: usize,
     ) -> Result<Self, EngError> {
         if !(1..=MAX_CONTEXT).contains(&context) {
             return Err(EngError::BadRequest("Invalid Inkling context limit".into()));
         }
         let state = super::state_plan(context)?;
         let scratch = if native {
-            gguf::native_scratch_bytes()
+            gguf::native_scratch_bytes(attention_workers)
         } else {
-            gguf::projection_scratch_bytes()
+            gguf::projection_scratch_bytes(attention_workers)
         };
         let charges = super::base_charges(0, scratch, &state);
         let headroom = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)?
             .map_or(Ok(0), |device| {
                 super::working_set_remaining(device, &charges)
             })?;
+        if attention_workers > 1 {
+            eprintln!(
+                "Inkling 2 Mini GGUF: attention_cpu_workers={attention_workers} planned_scratch_bytes={scratch}"
+            );
+        }
         let source = Arc::new(gguf::Weights::open(path)?);
         let mapping_budget = if map_dense { headroom } else { 0 };
-        let (dense, mapped_bytes) =
-            DenseWeights::from_gguf_with_mapping(Arc::clone(&source), mapping_budget)?;
+        let (dense, mapped_bytes) = DenseWeights::from_gguf_with_mapping(
+            Arc::clone(&source),
+            mapping_budget,
+            attention_workers,
+        )?;
         let headroom = headroom - mapped_bytes;
         if map_dense {
             eprintln!(
@@ -666,13 +681,37 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a complete Inkling GGUF at INKLING_GGUF_REFERENCE and Apple Metal"]
+    fn gguf_attention_workers_preserve_logits() {
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let _lock = crate::native_test_lock();
+        let run = |workers| {
+            let mut decoder =
+                Decoder::open_gguf_with_dense_mapping(Path::new(&file), 128, true, false, workers)
+                    .unwrap();
+            decoder
+                .advance_rows(&[371, 151451, 149879, 151194])
+                .unwrap();
+            decoder.step(149884).unwrap()
+        };
+        let serial = run(1);
+        let parallel = run(4);
+        assert_eq!(serial.len(), parallel.len());
+        let mismatch = serial
+            .iter()
+            .zip(&parallel)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(mismatch, None, "parallel GGUF attention changed a logit");
+    }
+
+    #[test]
     #[ignore = "requires complete Unsloth GGUF weights at INKLING_GGUF_REFERENCE and a Metal budget"]
     fn fork_gguf_mapped_dense_matches_reference_logits() {
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let _lock = crate::native_test_lock();
         let run = |mapped| {
             let mut decoder =
-                Decoder::open_gguf_with_dense_mapping(Path::new(&file), 128, false, mapped)
+                Decoder::open_gguf_with_dense_mapping(Path::new(&file), 128, false, mapped, 1)
                     .unwrap();
             assert_eq!(decoder.dense.has_mapped_gguf_projection(), mapped);
             decoder
