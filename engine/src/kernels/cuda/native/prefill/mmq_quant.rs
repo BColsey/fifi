@@ -5,7 +5,6 @@
 //! are trusted device indices (the guarded ids builder writes them), so only their capacity
 //! is checked here.
 
-
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 
