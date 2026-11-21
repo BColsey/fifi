@@ -1119,9 +1119,9 @@ fn context_rows(
     }
 }
 
-/// The largest multiple-of-1024 context at or below `requested` the plan
-/// still admits at `min_slots`, found by binary search over the same
-/// refusal the loader raises (the plan's fit is monotone in the context).
+/// The largest multiple-of-1024 context below `requested` the plan still admits at `min_slots`:
+/// the shared context search over the same refusal the loader raises (the plan's fit is monotone
+/// in the context). The caller already knows `requested` does not fit.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 fn largest_fitting_context(
     plan: &crate::family::flash_next::moe::load_plan::FlashLoadPlan,
@@ -1129,19 +1129,11 @@ fn largest_fitting_context(
     kv: crate::family::flash_next::moe::context_budget::KvFormat,
     min_slots: usize,
 ) -> Option<u64> {
-    // Search over multiples of 1024, like the qwen36 proposal. The caller
-    // already knows `requested` does not fit, so `hi` starts refused.
-    let mut lo = 0u64;
-    let mut hi = requested / 1024;
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if plan.at_context(mid * 1024, kv, min_slots).is_ok() {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    (lo > 0).then(|| lo * 1024)
+    let requested = u32::try_from(requested).ok()?;
+    crate::family::admission_sketch::largest_fitting_context(requested, &|context| {
+        plan.at_context(u64::from(context), kv, min_slots).is_ok()
+    })
+    .map(u64::from)
 }
 
 #[cfg(test)]

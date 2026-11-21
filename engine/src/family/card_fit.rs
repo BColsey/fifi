@@ -14,6 +14,12 @@
 //! form the config names is the only one weighed. `None` means no form fits even the smallest
 //! context, and the load then reports its own refusal or takes a lower rung.
 
+// The planner's callers are the CUDA starts; a build without them uses only the context search.
+#![cfg_attr(
+    not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+    allow(dead_code, reason = "only the CUDA starts plan a form")
+)]
+
 use crate::family::admission_sketch::largest_fitting_context;
 
 /// One cache form a family can build.
@@ -60,6 +66,18 @@ fn fits(card: CardBytes, charge: &dyn Fn(u32) -> Option<u64>, context: u32) -> b
     })
 }
 
+/// The longest context at most `ceiling`, a multiple of the search step (or `ceiling` itself), for
+/// which `fits` holds; `None` when not even one step fits. `fits` must be monotone (a longer
+/// context never fits where a shorter one does not). This is the one context search: a plan whose
+/// limit is not a byte count (the expert slots a context leaves, a refusal of the load's own
+/// admission) passes its own predicate; a plan of byte charges goes through [`longest_context`].
+pub(crate) fn longest_where(ceiling: u32, fits: &dyn Fn(u32) -> bool) -> Option<u32> {
+    if fits(ceiling) {
+        return Some(ceiling);
+    }
+    largest_fitting_context(ceiling, fits)
+}
+
 /// The longest context at most `ceiling`, a multiple of the search step (or `ceiling` itself),
 /// that `charge` fits on the card.
 pub(crate) fn longest_context(
@@ -67,10 +85,7 @@ pub(crate) fn longest_context(
     charge: &dyn Fn(u32) -> Option<u64>,
     ceiling: u32,
 ) -> Option<u32> {
-    if fits(card, charge, ceiling) {
-        return Some(ceiling);
-    }
-    largest_fitting_context(ceiling, &|context| fits(card, charge, context))
+    longest_where(ceiling, &|context| fits(card, charge, context))
 }
 
 /// Plans the form and context; see the module rule.
@@ -111,6 +126,10 @@ mod tests {
 
     fn thin(context: u32) -> Option<u64> {
         Some(u64::from(context) / 1024 * MIB + 64 * MIB)
+    }
+
+    fn fits_card(card: CardBytes, charge: &dyn Fn(u32) -> Option<u64>, context: u32) -> bool {
+        fits(card, charge, context)
     }
 
     fn card(free_steps: u64) -> CardBytes {
@@ -192,6 +211,24 @@ mod tests {
         ];
         let fit = plan_card_fit(card(64 + 100), &same, LIMITS).expect("fits");
         assert_eq!(fit.form, 'a');
+    }
+
+    #[test]
+    fn a_plan_with_its_own_limit_uses_the_same_search() {
+        // A limit that is not a byte count: the plan fits up to 90,000 positions.
+        let fits = |context: u32| context <= 90_000;
+        assert_eq!(longest_where(262_144, &fits), Some(89_088));
+        // The ceiling itself is tried first, so a ceiling that fits is returned as given.
+        assert_eq!(longest_where(50_001, &fits), Some(50_001));
+        // Nothing fits, or not even one step does.
+        assert_eq!(longest_where(262_144, &|_| false), None);
+        assert_eq!(longest_where(262_144, &|context| context < 1024), None);
+        // A byte charge goes through the same search.
+        let card = card(64 + 2 * 100);
+        assert_eq!(
+            longest_context(card, &thin, 262_144),
+            longest_where(262_144, &|context| fits_card(card, &thin, context))
+        );
     }
 
     #[test]

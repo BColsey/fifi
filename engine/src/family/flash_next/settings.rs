@@ -135,7 +135,6 @@ pub(in crate::family::flash_next) fn default_context(
     min_slots: usize,
     cap: u32,
 ) -> Option<DefaultContext> {
-    const GRANULE: u32 = 1024;
     let cap = cap.min(MAX_CUDA_CONTEXT) / CUDA_CONTEXT_MULTIPLE * CUDA_CONTEXT_MULTIPLE;
     let base_context = DEFAULT_CUDA_CONTEXT.min(cap);
     if base_context == 0 {
@@ -143,31 +142,17 @@ pub(in crate::family::flash_next) fn default_context(
     }
     let baseline_slots = slots_at(base_context)?;
     let floor = min_slots.max(baseline_slots - baseline_slots * BANK_SHARE_GIVEN_PERCENT / 100);
-    let fits = |context: u32| slots_at(context).filter(|&slots| slots >= floor);
-    let choice = |context: u32, slots: usize| {
-        Some(DefaultContext {
-            context,
-            slots,
-            baseline_slots,
-        })
-    };
-    if let Some(slots) = fits(cap) {
-        return choice(cap, slots);
-    }
-    // The baseline is known to fit; bisect over multiples of the granule above it.
-    let mut low = base_context.div_ceil(GRANULE).min(cap / GRANULE);
-    let mut high = cap / GRANULE;
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if fits(mid * GRANULE).is_some() {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    let context = (low * GRANULE).max(base_context);
-    let slots = slots_at(context)?;
-    choice(context, slots)
+    // The baseline is known to fit; the shared search finds the longest context above it.
+    let context = crate::family::card_fit::longest_where(cap, &|context| {
+        slots_at(context).is_some_and(|slots| slots >= floor)
+    })
+    .unwrap_or(base_context)
+    .max(base_context);
+    Some(DefaultContext {
+        context,
+        slots: slots_at(context)?,
+        baseline_slots,
+    })
 }
 
 /// The model's maximum positions from its `config.json` (`max_position_embeddings`, in the

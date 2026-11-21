@@ -28,10 +28,7 @@
 use super::tier_plan::{TierInputs, TierPlan, indexer_key_bytes};
 use crate::{
     EngError,
-    family::{
-        admission_sketch::{CONTEXT_SEARCH_STEP, largest_fitting_context},
-        device_budget::KvPlan,
-    },
+    family::{admission_sketch::CONTEXT_SEARCH_STEP, device_budget::KvPlan},
 };
 
 /// Context positions are searched and reported in multiples of this, the step of the context
@@ -188,11 +185,10 @@ impl ContextBudget {
         if top < CONTEXT_SEARCH_STEP {
             return None;
         }
-        let fits = |positions: u32| self.meets(u64::from(positions), format, min_slots);
-        if fits(top) {
-            return Some(u64::from(top));
-        }
-        largest_fitting_context(top, &fits).map(u64::from)
+        crate::family::card_fit::longest_where(top, &|positions: u32| {
+            self.meets(u64::from(positions), format, min_slots)
+        })
+        .map(u64::from)
     }
 
     /// What the step calls at load: the plan for `requested` positions, or a refusal that states
