@@ -491,6 +491,8 @@ pub struct MlxExpertCache {
     denominators: [Option<[Option<[u8; 4]>; 2]>; LAYERS],
     staging: Option<HostPages>,
     staging_rows: usize,
+    staging_capacity: Option<usize>,
+    split_prefill_visits: bool,
     trace_routes: bool,
     timing: Option<ExpertTimings>,
     stats: MlxExpertCacheStats,
@@ -512,6 +514,8 @@ impl MlxExpertCache {
             denominators: [None; LAYERS],
             staging: None,
             staging_rows: 1,
+            staging_capacity: None,
+            split_prefill_visits: false,
             trace_routes: std::env::var_os("FIFI_INKLING_ROUTE_TRACE").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
             timing: timing::enabled().then(ExpertTimings::default),
@@ -522,8 +526,11 @@ impl MlxExpertCache {
     /// Use the working-set headroom already available to the expert cache.
     /// The single-token arena was charged by the base plan.
     pub(super) fn configure_prefill(&mut self, requested: usize) -> Result<usize, EngError> {
+        if requested <= 1 || self.max_bytes == 0 {
+            return Ok(1);
+        }
         let mut staging = None;
-        let (rows, extra) = self.source.reserve_prefill_window(
+        let reservation = self.source.reserve_prefill_window(
             requested.min(MAX_ROUTED_ROWS),
             HostPages::page_size(),
             self.max_bytes,
@@ -537,12 +544,40 @@ impl MlxExpertCache {
             },
         )?;
         if let Some(pages) = staging {
+            self.staging_capacity = Some(pages.len());
             self.staging = Some(pages);
-            self.staging_rows = rows;
-            self.max_bytes -= extra;
+            self.staging_rows = reservation.rows;
+            self.split_prefill_visits = reservation.split_visits;
+            self.max_bytes -= reservation.extra_bytes;
             self.stats.staging_allocations += 1;
         }
-        Ok(rows)
+        Ok(reservation.rows)
+    }
+
+    pub(super) fn routed_group_len(
+        &self,
+        layer: usize,
+        routes: &InklingRoutes,
+        start: usize,
+    ) -> Result<usize, EngError> {
+        let rows = routes.rows() - start;
+        if rows <= 1 || !self.split_prefill_visits {
+            return Ok(rows);
+        }
+        let capacity = self
+            .staging
+            .as_ref()
+            .map(HostPages::len)
+            .or(self.staging_capacity)
+            .ok_or_else(|| {
+                EngError::MemoryPlan("Inkling staging reservation is unavailable".into())
+            })?;
+        self.source.routed_group_len(
+            layer,
+            &routes.expert_ids()[start * TOP_K..],
+            HostPages::page_size(),
+            capacity,
+        )
     }
 
     pub(super) fn capacity_bytes(&self) -> usize {
@@ -615,9 +650,12 @@ impl MlxExpertCache {
                         .as_mut()
                         .map(|t| &mut t.staging_arena_allocation_ns),
                     || {
-                        let bytes = self
-                            .source
-                            .prefill_staging_bytes(self.staging_rows, HostPages::page_size())?;
+                        let bytes = match self.staging_capacity {
+                            Some(bytes) => bytes,
+                            None => self
+                                .source
+                                .prefill_staging_bytes(1, HostPages::page_size())?,
+                        };
                         HostPages::try_new(bytes)
                     },
                 )?;
@@ -1115,11 +1153,22 @@ mod tests {
         let single = source.prefill_staging_bytes(1, page).unwrap();
         let double = source.prefill_staging_bytes(2, page).unwrap();
         let charge = double - single + 2 * super::super::PREFILL_WORKSPACE_PER_ROW;
-        let mut fallback = MlxExpertCache::new(&kernels, Arc::clone(&source), charge - 1);
+        let workspace = 2 * super::super::PREFILL_WORKSPACE_PER_ROW;
+        let mut fallback = MlxExpertCache::new(&kernels, Arc::clone(&source), workspace - 1);
         assert_eq!(fallback.configure_prefill(2).unwrap(), 1);
         assert!(fallback.staging.is_none());
+        let mut constrained = MlxExpertCache::new(&kernels, Arc::clone(&source), workspace);
+        assert_eq!(constrained.configure_prefill(2).unwrap(), 2);
+        assert_eq!(constrained.staging.as_ref().unwrap().len(), single);
+        let overlapping = InklingRoutes::from_logits(&[logits[0], logits[0]], &bias).unwrap();
+        assert_eq!(constrained.routed_group_len(0, &routes, 0).unwrap(), 1);
+        assert_eq!(constrained.routed_group_len(0, &overlapping, 0).unwrap(), 2);
+        let output = constrained
+            .forward_quantized_readback(&mut kernels, 0, &overlapping, &input)
+            .unwrap();
+        assert_eq!(output.shape(), [2, HIDDEN as u32]);
         let mut batch = MlxExpertCache::new(&kernels, Arc::clone(&source), charge);
-        assert_eq!(batch.configure_prefill(3).unwrap(), 2);
+        assert_eq!(batch.configure_prefill(2).unwrap(), 2);
         assert_eq!(batch.max_bytes, 0);
         let output = batch
             .forward_quantized_readback(&mut kernels, 0, &routes, &input)
@@ -1127,15 +1176,20 @@ mod tests {
         let actual = output.host_bytes().unwrap();
         let mut solo = MlxExpertCache::new(&kernels, source, 0);
         for (index, value) in [1.0, -0.5].into_iter().enumerate() {
-            let routes = InklingRoutes::from_logits(&logits[index..=index], &bias).unwrap();
+            let solo_routes = InklingRoutes::from_logits(&logits[index..=index], &bias).unwrap();
             let output = solo
-                .forward_quantized_readback(&mut kernels, 0, &routes, &make_input(&[value]))
+                .forward_quantized_readback(&mut kernels, 0, &solo_routes, &make_input(&[value]))
                 .unwrap();
+            let routes = routes.select_rows(index..index + 1);
             let width = HIDDEN * size_of::<f32>();
             assert_eq!(
                 &actual[index * width..(index + 1) * width],
                 output.host_bytes().unwrap()
             );
+            let split = constrained
+                .forward_quantized_readback(&mut kernels, 0, &routes, &make_input(&[value]))
+                .unwrap();
+            assert_eq!(split.host_bytes().unwrap(), output.host_bytes().unwrap());
         }
         assert_eq!(batch.stats().misses, TOP_K as u64 + 1);
         assert_eq!(solo.stats().misses, 2 * TOP_K as u64);

@@ -73,6 +73,18 @@ impl InklingRoutes {
         })
     }
 
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(super) fn select_rows(&self, rows: std::ops::Range<usize>) -> Self {
+        let picks = rows.start * TOP_K..rows.end * TOP_K;
+        Self {
+            expert_ids: self.expert_ids[picks.clone()].to_vec(),
+            weights: self.weights[picks].to_vec(),
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.expert_ids.len() / TOP_K
     }
@@ -89,6 +101,22 @@ impl InklingRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_row_selection_preserves_pick_order_and_weight_bits() {
+        let logits = std::array::from_fn::<_, 3, _>(|row| {
+            std::array::from_fn(|expert| ((expert + row * 11) % EXPERTS) as f32 / 11.0)
+        });
+        let all = InklingRoutes::from_logits(&logits, &[0.0; EXPERTS]).unwrap();
+        let tail = all.select_rows(1..3);
+        assert_eq!(tail.expert_ids(), &all.expert_ids()[TOP_K..]);
+        assert!(
+            tail.weights()
+                .iter()
+                .zip(&all.weights()[TOP_K..])
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
 
     #[test]
     fn routes_rank_by_corrected_sigmoid_with_lower_id_ties() {

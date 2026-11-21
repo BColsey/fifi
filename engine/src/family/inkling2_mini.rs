@@ -945,16 +945,60 @@ impl InklingExpertSource {
     }
 
     fn prefill_staging_bytes(&self, rows: usize, page_size: usize) -> Result<usize, EngError> {
-        let routes = rows * TOP_K;
-        let experts: [usize; EXPERTS] = std::array::from_fn(|id| id);
         (0..self.layers.len()).try_fold(0, |peak, layer| {
-            let plan = self.plan(layer, &experts[..routes.min(EXPERTS)], page_size)?;
-            let [_, _, end] = route_page_offsets(plan.staging_bytes(), routes, page_size)?;
-            let allocation = end
-                .checked_next_multiple_of(page_size)
-                .ok_or_else(staging_overflow)?;
-            Ok(peak.max(allocation))
+            let bytes =
+                self.group_staging_bytes(layer, rows, (rows * TOP_K).min(EXPERTS), page_size)?;
+            Ok(peak.max(bytes))
         })
+    }
+
+    fn group_staging_bytes(
+        &self,
+        layer: usize,
+        rows: usize,
+        unique: usize,
+        page_size: usize,
+    ) -> Result<usize, EngError> {
+        // Every expert has the same stride within a layer. Identity changes the
+        // read runs, while the packed layout depends only on the unique count.
+        let experts: [usize; EXPERTS] = std::array::from_fn(|id| id);
+        let plan = self.plan(layer, &experts[..unique], page_size)?;
+        let [_, _, end] = route_page_offsets(plan.staging_bytes(), rows * TOP_K, page_size)?;
+        end.checked_next_multiple_of(page_size)
+            .ok_or_else(staging_overflow)
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn routed_group_len(
+        &self,
+        layer: usize,
+        ids: &[usize],
+        page_size: usize,
+        stage_bytes: usize,
+    ) -> Result<usize, EngError> {
+        let mut selected = 0_u128;
+        let mut fits = 0;
+        for (index, row) in ids.chunks_exact(TOP_K).enumerate() {
+            for &expert in row {
+                selected |= 1_u128 << expert;
+            }
+            let rows = index + 1;
+            let bytes =
+                self.group_staging_bytes(layer, rows, selected.count_ones() as usize, page_size)?;
+            if bytes > stage_bytes {
+                break;
+            }
+            fits = rows;
+        }
+        if fits == 0 {
+            return Err(EngError::MemoryPlan(
+                "Inkling staging cannot hold one routed token".into(),
+            ));
+        }
+        Ok(fits)
     }
 
     #[cfg(any(
@@ -967,21 +1011,48 @@ impl InklingExpertSource {
         page_size: usize,
         headroom: usize,
         mut reserve: impl FnMut(usize) -> Result<bool, EngError>,
-    ) -> Result<(usize, usize), EngError> {
-        if requested <= 1 || headroom == 0 {
-            return Ok((1, 0));
-        }
+    ) -> Result<PrefillReservation, EngError> {
         let solo_bytes = self.prefill_staging_bytes(1, page_size)?;
-        for rows in (2..=requested).rev() {
-            let stage_bytes = self.prefill_staging_bytes(rows, page_size)?;
-            // Charge the enlarged stage and all row-private workspace.
-            let extra = (stage_bytes - solo_bytes) + rows * PREFILL_WORKSPACE_PER_ROW;
-            if extra <= headroom && reserve(stage_bytes)? {
-                return Ok((rows, extra));
+        let max_rows = requested.min(headroom / PREFILL_WORKSPACE_PER_ROW);
+        let mut failed_stage = None;
+        for rows in (2..=max_rows).rev() {
+            let workspace = rows * PREFILL_WORKSPACE_PER_ROW;
+            let worst_case = self.prefill_staging_bytes(rows, page_size)?;
+            let budgeted_pages = (headroom - workspace) / page_size;
+            let extra_stage = (worst_case - solo_bytes).min(budgeted_pages * page_size);
+            let stage_bytes = solo_bytes + extra_stage;
+            if failed_stage.is_some_and(|failed| stage_bytes >= failed) {
+                continue;
             }
+            if reserve(stage_bytes)? {
+                return Ok(PrefillReservation {
+                    rows,
+                    stage_bytes,
+                    extra_bytes: extra_stage + workspace,
+                    split_visits: stage_bytes < worst_case,
+                });
+            }
+            failed_stage = Some(stage_bytes);
         }
-        Ok((1, 0))
+        Ok(PrefillReservation {
+            rows: 1,
+            stage_bytes: solo_bytes,
+            extra_bytes: 0,
+            split_visits: false,
+        })
     }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+#[derive(Debug, PartialEq, Eq)]
+struct PrefillReservation {
+    rows: usize,
+    stage_bytes: usize,
+    extra_bytes: usize,
+    split_visits: bool,
 }
 
 fn mac_stage_page_size() -> usize {
@@ -1063,12 +1134,16 @@ fn mlx_budget_row(
         match working_set_remaining(device, &charges) {
             Ok(remaining) => {
                 let remaining = usize::try_from(remaining).map_err(|_| staging_overflow())?;
-                let (rows, extra) =
-                    source.reserve_prefill_window(requested, page_size, remaining, |_| Ok(true))?;
-                let cache = remaining - extra;
+                let PrefillReservation {
+                    rows,
+                    stage_bytes,
+                    extra_bytes,
+                    split_visits,
+                } = source.reserve_prefill_window(requested, page_size, remaining, |_| Ok(true))?;
+                let cache = remaining - extra_bytes;
                 (
                     format!(
-                        "{plan}; {device}; up to {rows} prefill rows by budget, with {extra} B extra stage/workspace and {cache} B optional expert cache at that width; arena allocation may lower the width"
+                        "{plan}; {device}; up to {rows} prefill rows by budget, with {extra_bytes} B extra stage/workspace, a {stage_bytes} B staging arena and {cache} B optional expert cache; route-dependent split={split_visits}; arena allocation may lower the width"
                     ),
                     Some(true),
                 )
@@ -1268,14 +1343,76 @@ mod tests {
                         .reserve_prefill_window(2, page, headroom, |_| Ok(true))
                         .unwrap()
                 };
-                assert_eq!(reserve(0), (1, 0));
-                assert_eq!(reserve(exact_extra - 1), (1, 0));
-                assert_eq!(reserve(exact_extra), (2, exact_extra));
+                let solo = reserve(0);
+                assert_eq!(solo.rows, 1);
+                assert_eq!(solo.extra_bytes, 0);
+                let constrained = reserve(2 * PREFILL_WORKSPACE_PER_ROW);
+                assert_eq!(constrained.rows, 2);
+                assert_eq!(constrained.stage_bytes, solo.stage_bytes);
+                assert!(constrained.split_visits);
+                assert_eq!(constrained.extra_bytes, 2 * PREFILL_WORKSPACE_PER_ROW);
+                let exact = reserve(exact_extra);
+                assert_eq!(exact.rows, 2);
+                assert_eq!(exact.extra_bytes, exact_extra);
+                assert!(!exact.split_visits);
+
+                let shared = adjacent.repeat(2);
+                let disjoint: Vec<_> = (0..2 * TOP_K).collect();
+                assert_eq!(
+                    source
+                        .routed_group_len(0, &shared, page, constrained.stage_bytes)
+                        .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    source
+                        .routed_group_len(0, &disjoint, page, constrained.stage_bytes)
+                        .unwrap(),
+                    1
+                );
+                assert!(
+                    source
+                        .routed_group_len(0, &shared, page, solo.stage_bytes - page)
+                        .is_err()
+                );
+                let other = &disjoint[TOP_K..];
+                let ordered = [
+                    adjacent.as_slice(),
+                    adjacent.as_slice(),
+                    other,
+                    other,
+                    other,
+                ]
+                .concat();
+                let mut remaining = ordered.as_slice();
+                for expected in [2, 3] {
+                    let rows = source
+                        .routed_group_len(0, remaining, page, solo.stage_bytes)
+                        .unwrap();
+                    assert_eq!(rows, expected);
+                    let (chosen, rest) = remaining.split_at(rows * TOP_K);
+                    let plan = source.plan(0, chosen, page).unwrap();
+                    let [_, _, end] =
+                        route_page_offsets(plan.staging_bytes(), chosen.len(), page).unwrap();
+                    assert!(end <= solo.stage_bytes);
+                    remaining = rest;
+                }
+                assert!(remaining.is_empty());
+
+                // The payload alone fits, while the route metadata for two rows does not.
+                let small_page = 32;
+                let one_row = source.prefill_staging_bytes(1, small_page).unwrap();
+                assert_eq!(
+                    source
+                        .routed_group_len(0, &shared, small_page, one_row)
+                        .unwrap(),
+                    1
+                );
                 assert_eq!(
                     source
                         .reserve_prefill_window(2, page, exact_extra, |_| Ok(false))
                         .unwrap(),
-                    (1, 0)
+                    solo,
                 );
             }
             assert!(source.plan(0, &[128], 1).is_err());
