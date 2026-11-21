@@ -101,7 +101,7 @@ mod device {
 
     use super::super::budget;
     use super::super::config::MaxSeqs;
-    use super::super::kv_tier::{self, BoltDisk};
+    use super::super::kv_tier::{self, BoltFamily, TIER_LABEL};
     use super::super::resident::bolt::{self, Bolt, BoltSeq, BoltSnapshot, VOCAB};
     use crate::{
         EngError,
@@ -109,7 +109,7 @@ mod device {
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
-            kv_disk::{self as kv_cache, KV_CACHE_DEFAULT_ON, KvCacheSettings},
+            kv_disk::{self as kv_cache, HostStoreDisk, KV_CACHE_DEFAULT_ON, KvCacheSettings},
             seq_plan::{SeqInputs, plan_seqs},
             session::{
                 DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, ShadowLcp,
@@ -161,7 +161,7 @@ mod device {
         prefix_uncached: u32,
         prefix_shadow: Option<ShadowLcp>,
         /// The on-disk tier behind the host store, when it runs.
-        disk: Option<BoltDisk>,
+        disk: Option<HostStoreDisk>,
         /// The tier facts of the last restore, for `prefix_report`.
         prefix_tier: PrefixTier,
     }
@@ -354,8 +354,8 @@ mod device {
                     .save_prefix(&mut self.prefix, key, identity, st.pos, kind, || {
                         model.snapshot_seq(&st.seq, st.pos)
                     })?;
-            if saved && let Some(disk) = self.disk.as_mut() {
-                disk.spill_over_watermark(&self.prefix);
+            if saved {
+                self.with_disk(|disk, family, prefix| disk.spill_after_save(family, prefix));
             }
             Ok(saved)
         }
@@ -372,13 +372,12 @@ mod device {
             let model = &self.model;
             // The host store missed or holds a shorter prefix: the disk may hold a longer one.
             if let Some(disk) = self.disk.as_mut() {
-                disk.promote(
-                    &mut self.prefix,
-                    &identity,
-                    prompt,
-                    model.cells(),
-                    &|cells| model.snapshot_layer_bytes(cells),
-                );
+                let layer_bytes = |cells| model.snapshot_layer_bytes(cells);
+                let family = BoltFamily {
+                    layer_bytes: &layer_bytes,
+                    context_cells: model.cells(),
+                };
+                disk.promote(&family, &mut self.prefix, &identity, prompt);
             }
             let BoltSession { core, pos, seq } = st;
             let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
@@ -390,7 +389,7 @@ mod device {
             self.prefix_hit = self.prefix.restored_kind().into();
             self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
             self.prefix_shadow = self.prefix.shadow_report();
-            self.prefix_tier = kv_tier::restore_tier(self.disk.as_mut(), covered);
+            self.prefix_tier = kv_cache::restore_tier(self.disk.as_mut(), covered);
             Ok(covered)
         }
 
@@ -417,37 +416,40 @@ mod device {
 
         /// Whether the disk tier has saves the engine thread should advance while it waits.
         fn background_pending(&self) -> bool {
-            self.disk.as_ref().is_some_and(BoltDisk::pending)
+            self.disk.as_ref().is_some_and(HostStoreDisk::pending)
         }
 
         /// Copies a bounded part of the pending saves to the writer: a few MiB per call, which a
         /// batching worker makes between ticks and an idle one every 2 ms.
         fn background_step(&mut self) {
-            self.with_disk(|disk, _, layer_bytes| disk.pump_emit(layer_bytes));
+            self.with_disk(|disk, family, _| disk.pump(family));
         }
 
         /// A graceful stop: writes the tips that exist only in host memory, within the tier's
         /// bound.
         fn background_drain(&mut self) {
-            self.with_disk(|disk, prefix, layer_bytes| disk.drain(prefix, layer_bytes));
+            self.with_disk(|disk, family, prefix| disk.drain(family, prefix));
         }
     }
 
     impl BoltServe {
-        /// Runs `work` on the disk tier with the layer sizes of a snapshot of any length.
+        /// Runs `work` on the disk tier with the family view of the model and the host store.
         fn with_disk(
             &mut self,
             work: impl FnOnce(
-                &mut BoltDisk,
+                &mut HostStoreDisk,
+                &BoltFamily<'_>,
                 &mut PrefixStore<BoltSnapshot, PrefixIdentity>,
-                kv_tier::LayerBytes<'_>,
             ),
         ) {
             let model = &self.model;
             if let Some(disk) = self.disk.as_mut() {
-                work(disk, &mut self.prefix, &|cells| {
-                    model.snapshot_layer_bytes(cells)
-                });
+                let layer_bytes = |cells| model.snapshot_layer_bytes(cells);
+                let family = BoltFamily {
+                    layer_bytes: &layer_bytes,
+                    context_cells: model.cells(),
+                };
+                work(disk, &family, &mut self.prefix);
             }
         }
     }
@@ -623,7 +625,9 @@ mod device {
                     eprintln!("gemma4 bolt: kv disk tier off: {reason}");
                     None
                 }
-                kv_cache::Plan::On { resolved, origin } => BoltDisk::open(resolved, origin, &load),
+                kv_cache::Plan::On { resolved, origin } => {
+                    HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
+                }
             };
             let serve = BoltServe {
                 model,
