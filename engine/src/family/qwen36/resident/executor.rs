@@ -4695,6 +4695,53 @@ mod tests {
         }
     }
 
+    /// The model side as a forced reference whose prompt path is a turn restored from a saved
+    /// prefix, through the executor's own save and restore: the prompt up to `saved` is
+    /// prefilled and saved as a tip, the session is reset and restored from that tip (the
+    /// snapshot of the resident state), and the rest of the prompt is prefilled in two calls
+    /// split at `cut`, as the worker does for a turn that saves its own tip.
+    struct RestoredModel<'a> {
+        executor: &'a mut Q36Executor,
+        session: &'a mut Q36Session,
+        saved: usize,
+        cut: usize,
+        covered: usize,
+    }
+
+    impl crate::family::token_forcing::score::ForcedModel for RestoredModel<'_> {
+        fn reset(&mut self) -> Result<()> {
+            self.executor.reset(self.session)
+        }
+
+        fn prefill_logits(&mut self, context: &[u32]) -> Result<Vec<f32>> {
+            self.executor.reset(self.session)?;
+            self.executor
+                .prefill(self.session, &context[..self.saved])?;
+            assert!(
+                self.executor
+                    .save_prefix(self.session, &context[..self.saved], SaveKind::Tip)?,
+                "the tip was not saved"
+            );
+            self.executor.reset(self.session)?;
+            self.covered = self.executor.restore_prefix(self.session, context)?;
+            assert_eq!(
+                self.covered, self.saved,
+                "the restore covered the saved tip"
+            );
+            self.executor
+                .prefill(self.session, &context[self.covered..self.cut])?;
+            self.executor.prefill(self.session, &context[self.cut..])?;
+            let pending = self.session.core.pending().expect("a pending token");
+            self.step_logits(pending)
+        }
+
+        fn step_logits(&mut self, token: u32) -> Result<Vec<f32>> {
+            let Q36Session { state, .. } = &mut *self.session;
+            let (mut step, _) = self.executor.split(state);
+            step.logits(token)
+        }
+    }
+
     /// Teacher-forced scores of text under three prompt piece plans, for the quality arm of the
     /// prefix-reuse default: no split (no boundary marked), one split seven tokens before the
     /// prompt end (a cold turn that saves its tip) and two splits (a turn restored from the tip
@@ -4753,11 +4800,23 @@ mod tests {
                     ("none", vec![]),
                     ("cold", vec![len - 7]),
                     ("warm", vec![len - 107, len - 7]),
+                    ("restore", vec![]),
                 ] {
-                    let Q36Session { state, .. } = &mut session;
-                    let (step, _) = executor.split(state);
-                    let mut model = SplitModel { step, splits };
-                    let records = score_sequence(&mut model, prompt, scored, 248_320).unwrap();
+                    let records = if plan == "restore" {
+                        let mut model = RestoredModel {
+                            executor: &mut executor,
+                            session: &mut session,
+                            saved: len - 107,
+                            cut: len - 7,
+                            covered: 0,
+                        };
+                        score_sequence(&mut model, prompt, scored, 248_320).unwrap()
+                    } else {
+                        let Q36Session { state, .. } = &mut session;
+                        let (step, _) = executor.split(state);
+                        let mut model = SplitModel { step, splits };
+                        score_sequence(&mut model, prompt, scored, 248_320).unwrap()
+                    };
                     for record in records {
                         lines.push_str(&format!(
                             "{{\"doc\":\"{name}\",\"len\":{len},\"plan\":\"{plan}\",\"pos\":{},\"nll\":{},\"hit\":{},\"argmax\":{}}}\n",
@@ -4846,28 +4905,44 @@ mod tests {
                     continue;
                 }
                 let prompt = &ids[..len];
-                let mut rows_of = |splits: Vec<usize>, forced: &[u32]| -> Vec<Vec<f32>> {
-                    let Q36Session { state, .. } = &mut session;
-                    let (step, _) = executor.split(state);
-                    let mut model = SplitModel { step, splits };
-                    use crate::family::token_forcing::score::ForcedModel;
-                    model.reset().unwrap();
-                    let mut rows = vec![model.prefill_logits(prompt).unwrap()];
-                    for step in 0..steps - 1 {
-                        let token = match forced.get(step) {
-                            Some(&token) => token,
-                            None => argmax(&rows[step]).0 as u32,
+                let mut rows_of =
+                    |plan: &str, splits: Vec<usize>, forced: &[u32]| -> Vec<Vec<f32>> {
+                        use crate::family::token_forcing::score::ForcedModel;
+                        let mut rows_from = |model: &mut dyn ForcedModel| {
+                            model.reset().unwrap();
+                            let mut rows = vec![model.prefill_logits(prompt).unwrap()];
+                            for step in 0..steps - 1 {
+                                let token = match forced.get(step) {
+                                    Some(&token) => token,
+                                    None => argmax(&rows[step]).0 as u32,
+                                };
+                                rows.push(model.step_logits(token).unwrap());
+                            }
+                            rows
                         };
-                        rows.push(model.step_logits(token).unwrap());
-                    }
-                    rows
-                };
-                let base = rows_of(vec![], &[]);
+                        if plan == "restore" {
+                            rows_from(&mut RestoredModel {
+                                executor: &mut executor,
+                                session: &mut session,
+                                saved: len - 107,
+                                cut: len - 7,
+                                covered: 0,
+                            })
+                        } else {
+                            let Q36Session { state, .. } = &mut session;
+                            let (step, _) = executor.split(state);
+                            rows_from(&mut SplitModel { step, splits })
+                        }
+                    };
+                let base = rows_of("none", vec![], &[]);
                 let greedy: Vec<u32> = base.iter().map(|row| argmax(row).0 as u32).collect();
                 let base_logs: Vec<Vec<f64>> = base.iter().map(|row| log_softmax(row)).collect();
-                for (plan, splits) in [("cold", vec![len - 7]), ("warm", vec![len - 107, len - 7])]
-                {
-                    let rows = rows_of(splits, &greedy);
+                for (plan, splits) in [
+                    ("cold", vec![len - 7]),
+                    ("warm", vec![len - 107, len - 7]),
+                    ("restore", vec![]),
+                ] {
+                    let rows = rows_of(plan, splits, &greedy);
                     for (step, (row, base_row)) in rows.iter().zip(&base).enumerate() {
                         let logs = log_softmax(row);
                         let kl: f64 = base_logs[step]
