@@ -68,6 +68,21 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
     n_active = (n_keys + chunk - 1) / chunk;
 }
 
+/* The split plan of a call at head_dim kHeadDim over `count` visible keys. The head_dim 512 path
+ * splits at a fixed absolute stride: split s holds keys [s * min_keys, (s + 1) * min_keys) of
+ * the visible range, whatever the query tile, so the partials a row receives, and the order the
+ * combine sums them in, do not depend on how a prompt is cut into chunks (a split the row cannot
+ * see is a neutral partial). The other head dimensions keep the per-tile plan. */
+template <int kHeadDim>
+__device__ inline void plan_splits(const Args &a, int count, int &chunk, int &n_active) {
+    if (kHeadDim == 512) {
+        chunk = a.min_keys;
+        n_active = min((count + chunk - 1) / chunk, a.max_splits);
+    } else {
+        split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
+    }
+}
+
 /* Visible keys of the query tile whose rows sit at positions p_first .. n_keys - 1: the union
  * of the rows' windows (attn_decode.cu:81-84 per row), from the first row's oldest visible
  * position to the last row's own; first is the position of visible key 0. sees() then cuts
@@ -143,7 +158,7 @@ __device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &
     int count;
     visible(a, a.p0 + b.t0, b.n_keys, b.first, count);
     int chunk, n_active;
-    split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
+    plan_splits<kHeadDim>(a, count, chunk, n_active);
     if (s >= n_active) return false;
     b.k_begin = s * chunk;
     b.k_end = min(count, b.k_begin + chunk);
@@ -729,7 +744,7 @@ __global__ void __launch_bounds__(kHeadDim < 128 ? 128 : kHeadDim) attn_prefill_
     visible(a, a.p0 + tile * kQTile, n_keys, first, count);
     int chunk, n_active;
     if (a.mode == 2) n_active = a.max_splits;
-    else split_plan(count, a.max_splits, a.min_keys, chunk, n_active);
+    else plan_splits<kHeadDim>(a, count, chunk, n_active);
     const size_t n_cells = (size_t)((a.m + kQTile - 1) / kQTile) * a.n_kv_head * a.max_splits;
     const size_t cell0 = ((size_t)tile * a.n_kv_head + kvh) * a.max_splits;
     const int rr = (t & (kQTile - 1)) * group + g;
@@ -889,6 +904,11 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
           a->k_cache == views.k.payload && a->v_cache == views.v.payload))
         return false;
     if (a->head_dim == kD512 && !d512_views(views, *a)) return false;
+    /* The fixed-stride split plan of head_dim 512 must reach the last key a tile can see. */
+    if (a->head_dim == kD512 && !segmented &&
+        (long long)a->max_splits * a->min_keys <
+            (a->window > 0 ? (long long)a->window + kQTile : (long long)a->cache_rows))
+        return false;
     /* Uniform q8: both planes q8 with matching group geometry. Mixed ("q8k"):
      * K q8, V f16. */
     if (q8_view(views.v, *a))

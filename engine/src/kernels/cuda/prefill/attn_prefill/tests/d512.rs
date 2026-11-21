@@ -10,7 +10,7 @@
 //! The kernel rounds q, K, V and P to fp16 and accumulates in f32, so the bound is relative
 //! to the largest value of V, not to f32 rounding: `TOLERANCE` below.
 
-use super::super::{AttnKvLayout, AttnKvView, AttnScalarLayout, AttnStrides};
+use super::super::{AttnKvLayout, AttnKvView, AttnScalarLayout, AttnStrides, cpf_attn_wide_split};
 use super::*;
 use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
 use crate::tensor::Dtype;
@@ -153,20 +153,10 @@ fn shape(m: usize, cells: usize, p0: usize) -> AttnPrefillShape {
 }
 
 fn plan(shape: &AttnPrefillShape, window: usize) -> Result<CpfAttnSplit, EngError> {
-    let plan = cpf_attn_launch_plan(
-        CpfAttnGeometry {
-            m: shape.m,
-            n_head: shape.n_head,
-            n_kv_head: shape.n_kv_head,
-            head_dim: shape.head_dim,
-        },
-        shape.p0 as usize + shape.m,
-        window,
-        CPF_ATTN_SM_COUNT,
-    )?;
-    Ok(CpfAttnSplit {
-        max_splits: plan.max_splits,
-        min_keys: plan.min_keys,
+    cpf_attn_wide_split(if window > 0 {
+        window + CPF_ATTN_TILE_ROWS
+    } else {
+        shape.cache_rows
     })
 }
 
@@ -299,24 +289,60 @@ fn observe(
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let planes = upload(&ctx, cache);
-    let shape = shape(m, cache.cells, p0);
-    let split = plan(&shape, window)?;
     let span = CpfAttnSpan {
         window: window as i64,
         ring: 0,
     };
-    let io = io(&ctx, &shape, split, q)?;
-    ctx.attn_prefill(&stream, call(shape, split, span, &planes, &io)?)?;
-    stream.synchronize()?;
-    let prefill = testkit::floats(&testkit::read_bytes(&ctx, &io.out, io.out_bytes));
-    let status = i32::from_le_bytes(
-        testkit::read_bytes(&ctx, &io.status, 4)[..4]
-            .try_into()
-            .expect("the status word"),
-    );
-    let guards = testkit::read_bytes(&ctx, &io.part, io.part_bytes)
-        .iter()
-        .any(|&b| b != PART_FILL);
+    // The fixed-stride plan keeps one partial per split for every row of a tile, so a long
+    // cache bounds the rows one call can take; a row does not depend on its chunk, so the
+    // chunk runs as consecutive calls of the most rows the partial budget allows.
+    let part_of = |rows: usize| -> Result<usize, EngError> {
+        let probe = shape(rows, cache.cells, p0);
+        let split = plan(&probe, window)?;
+        cpf_attn_part_bytes(
+            CpfAttnGeometry {
+                m: rows,
+                n_head: probe.n_head,
+                n_kv_head: probe.n_kv_head,
+                head_dim: probe.head_dim,
+            },
+            CpfAttnPlan {
+                q_tile: CPF_ATTN_Q_TILE,
+                max_splits: split.max_splits,
+                min_keys: split.min_keys,
+            },
+        )
+    };
+    let per_tile = part_of(CPF_ATTN_Q_TILE)?;
+    let step = (CPF_ATTN_PART_CAP / per_tile).max(1) * CPF_ATTN_Q_TILE;
+    let row = HEADS * WIDE;
+    let mut prefill = Vec::with_capacity(m * row);
+    let mut status = 0;
+    let mut guards = false;
+    let mut start = 0;
+    while start < m {
+        let rows = step.min(m - start);
+        let shape = shape(rows, cache.cells, p0 + start);
+        let split = plan(&shape, window)?;
+        let io = io(&ctx, &shape, split, &q[start * row..(start + rows) * row])?;
+        ctx.attn_prefill(&stream, call(shape, split, span, &planes, &io)?)?;
+        stream.synchronize()?;
+        prefill.extend(testkit::floats(&testkit::read_bytes(
+            &ctx,
+            &io.out,
+            io.out_bytes,
+        )));
+        let word = i32::from_le_bytes(
+            testkit::read_bytes(&ctx, &io.status, 4)[..4]
+                .try_into()
+                .expect("the status word"),
+        );
+        status = if status == 0 { word } else { status };
+        guards |= testkit::read_bytes(&ctx, &io.part, io.part_bytes)
+            .iter()
+            .any(|&b| b != PART_FILL);
+        start += rows;
+    }
     let mut rows = vec![0f32; if decode { m * HEADS * WIDE } else { 0 }];
     if decode {
         let launches = m.div_ceil(16);
@@ -324,7 +350,8 @@ fn observe(
             .flat_map(|i| ((p0 + 16 * i + 1) as i32).to_le_bytes())
             .collect();
         let lens = testkit::upload_bytes(&ctx, &words);
-        let dec_out = testkit::upload_filled(&ctx, OUT_FILL, io.out_bytes);
+        let dec_out = testkit::upload_filled(&ctx, OUT_FILL, m * row * 4);
+        let q_all = testkit::upload_bytes(&ctx, &le(q));
         let codes_bytes = KV_HEADS * cache.cells * WIDE;
         let scale_bytes = KV_HEADS * cache.cells * GROUPS * 2;
         for i in 0..launches {
@@ -335,7 +362,7 @@ fn observe(
                 AttnDecodeGemmaCall {
                     out: dec_out.range(t0 * row_bytes, n * row_bytes)?,
                     status: None,
-                    q: io.q.range(t0 * row_bytes, n * row_bytes)?,
+                    q: q_all.range(t0 * row_bytes, n * row_bytes)?,
                     k_codes: planes.codes[0].range(0, codes_bytes)?,
                     k_scales: planes.scales[0].range(0, scale_bytes)?,
                     v_codes: planes.codes[1].range(0, codes_bytes)?,
@@ -353,7 +380,7 @@ fn observe(
             )?;
         }
         stream.synchronize()?;
-        rows = testkit::floats(&testkit::read_bytes(&ctx, &dec_out, io.out_bytes));
+        rows = testkit::floats(&testkit::read_bytes(&ctx, &dec_out, m * row * 4));
     }
     Ok(Observation {
         prefill,
@@ -1167,4 +1194,179 @@ fn d512_device_gate_admits_the_test_card() {
     let ctx = CudaContext::new().expect("context");
     ctx.check_wide_device()
         .expect("sm_80 PTX and an 80 KB opt-in on the test card");
+}
+
+/// Sixteen query heads over one kv head (the shape of a Gemma global layer) run as four virtual
+/// kv heads of four query heads whose views have head stride 0, so every virtual head reads the
+/// one real head. With q = 0 each row is the exact mean of that head's V rows.
+#[test]
+fn d512_serves_sixteen_heads_over_one_kv_head_through_a_zero_stride_view() {
+    if !testkit::device_present("d512_serves_sixteen_heads_over_one_kv_head") {
+        return;
+    }
+    let (m, p0, heads, virtual_kv) = (13usize, 300usize, 16usize, 4usize);
+    let phase = || -> Result<Vec<f32>, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        let cells = p0 + m;
+        let planes = struct_planes(&ctx, cells, &|row| Some(row), true, Dtype::F16, 0);
+        let mut layout = planes.layout;
+        layout.payload_strides.head_stride_bytes = 0;
+        if let Some(scales) = layout.scales.as_mut() {
+            scales.strides.head_stride_bytes = 0;
+        }
+        let extents = layout.extents(cells, virtual_kv, WIDE)?;
+        let view = |p: usize| -> Result<AttnKvView<'_>, EngError> {
+            Ok(AttnKvView {
+                layout,
+                payload: planes.codes[p].range(0, extents.payload_bytes)?,
+                scales: Some(planes.scales[p].range(0, extents.scale_bytes.unwrap_or(0))?),
+                bias: None,
+            })
+        };
+        let views = [view(0)?, view(1)?];
+        let shape = AttnPrefillShape {
+            m,
+            n_head: heads,
+            n_kv_head: virtual_kv,
+            head_dim: WIDE,
+            cache_rows: cells,
+            ld: 0,
+            p0: p0 as i64,
+        };
+        let geometry = CpfAttnGeometry {
+            m,
+            n_head: heads,
+            n_kv_head: virtual_kv,
+            head_dim: WIDE,
+        };
+        let plan = cpf_attn_wide_split(cells)?;
+        let part_bytes = cpf_attn_part_bytes(
+            geometry,
+            CpfAttnPlan {
+                q_tile: CPF_ATTN_Q_TILE,
+                max_splits: plan.max_splits,
+                min_keys: plan.min_keys,
+            },
+        )?;
+        let out_bytes = m * heads * WIDE * 4;
+        let q = testkit::upload_bytes(&ctx, &vec![0u8; out_bytes]);
+        let part = testkit::upload_filled(&ctx, PART_FILL, part_bytes);
+        let out = testkit::upload_filled(&ctx, OUT_FILL, out_bytes);
+        ctx.attn_prefill(
+            &stream,
+            AttnPrefillCall {
+                storage: layout.storage,
+                shape,
+                span: CpfAttnSpan::FULL,
+                split: CpfAttnSplit {
+                    max_splits: plan.max_splits,
+                    min_keys: plan.min_keys,
+                },
+                q_tile: CPF_ATTN_Q_TILE,
+                scale: 1.0,
+                q: q.range(0, out_bytes)?,
+                proj: None,
+                k_cache: views[0].payload,
+                v_cache: views[1].payload,
+                kv_views: Some(views),
+                part: part.range(0, part_bytes)?,
+                out: out.range(0, out_bytes)?,
+                status: None,
+                sinks: None,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(testkit::floats(&testkit::read_bytes(&ctx, &out, out_bytes)))
+    };
+    let out = phase().expect("the device phase");
+    let mut worst = 0f64;
+    for t in 0..m {
+        let pos = p0 + t;
+        let want: Vec<f64> = (0..WIDE)
+            .map(|d| (0..=pos).map(|j| v_value(j, 0, d, true)).sum::<f64>() / (pos + 1) as f64)
+            .collect();
+        let magnitude = want.iter().fold(1e-3f64, |a, v| a.max(v.abs()));
+        for h in 0..heads {
+            let base = (t * heads + h) * WIDE;
+            let error = (0..WIDE)
+                .map(|d| (f64::from(out[base + d]) - want[d]).abs())
+                .fold(0.0, f64::max);
+            worst = worst.max(error / magnitude);
+        }
+    }
+    println!("D512 16 heads over 1 kv head: worst row error {worst:.3e}");
+    assert!(worst <= STRUCTURED_BOUND, "{worst:e}");
+}
+
+/// Runs `parts` (start position, rows) of one prompt in order over one cache and returns the
+/// output rows of the whole prompt.
+fn run_parts(cache: &Cache, q: &[f32], parts: &[(usize, usize)]) -> Result<Vec<f32>, EngError> {
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let planes = upload(&ctx, cache);
+    let row = HEADS * WIDE;
+    let mut out = Vec::new();
+    for &(p0, m) in parts {
+        let shape = shape(m, cache.cells, p0);
+        let split = plan(&shape, 0)?;
+        let io = io(&ctx, &shape, split, &q[p0 * row..(p0 + m) * row])?;
+        ctx.attn_prefill(
+            &stream,
+            call(shape, split, CpfAttnSpan::FULL, &planes, &io)?,
+        )?;
+        stream.synchronize()?;
+        out.extend(testkit::floats(&testkit::read_bytes(
+            &ctx,
+            &io.out,
+            io.out_bytes,
+        )));
+    }
+    Ok(out)
+}
+
+/// A row's output is a function of its position and the cache alone: the same bytes whether the
+/// prompt runs as one chunk, as chunks of 8 or 5, or resumed at an odd position, so a prompt
+/// served from a restored prefix, in pieces of any size, or alone gives the same cache and logits.
+#[test]
+fn d512_rows_do_not_depend_on_how_the_prompt_is_chunked() {
+    if !testkit::device_present("d512_rows_do_not_depend_on_how_the_prompt_is_chunked") {
+        return;
+    }
+    let (rows, cells) = (643usize, 700usize);
+    let cache = cache(cells, 0xd516, 0.12, 1.0);
+    let q = q_values(rows, 0x5eed, 1.5);
+    let cut = |size: usize| -> Vec<(usize, usize)> {
+        (0..rows)
+            .step_by(size)
+            .map(|p0| (p0, size.min(rows - p0)))
+            .collect()
+    };
+    let whole = run_parts(&cache, &q, &[(0, rows)]).expect("one chunk");
+    let layouts = [
+        ("chunks of 8", cut(8)),
+        ("chunks of 5", cut(5)),
+        ("chunks of 64", cut(64)),
+        (
+            "resumed at 13 and 301",
+            vec![(0, 13), (13, 288), (301, 342)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, parts) in layouts {
+        let got = run_parts(&cache, &q, &parts).expect(label);
+        if le(&got) != le(&whole) {
+            let first = got
+                .iter()
+                .zip(&whole)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .unwrap_or(0);
+            failures.push(format!(
+                "{label}: first differing value at row {} head {}",
+                first / (HEADS * WIDE),
+                first % (HEADS * WIDE) / WIDE
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

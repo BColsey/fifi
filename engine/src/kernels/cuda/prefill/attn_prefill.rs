@@ -78,6 +78,28 @@ pub(crate) const CPF_ATTN_PART_CAP: usize = 64 * 1024 * 1024;
 pub(crate) const CPF_ATTN_WIDE_HEAD_DIM: usize = 512;
 /// Query heads per kv head the wide kernel packs into one 32-row tile.
 const WIDE_GROUP: usize = 4;
+/// The fewest keys per split of the wide kernel's fixed-stride plan.
+const WIDE_MIN_SPLIT_KEYS: usize = 128;
+
+/// The split plan of the wide kernel for a cache that holds at most `keys` visible keys (the
+/// cache rows of a linear call, the window plus a tile for a windowed one). The wide kernel cuts
+/// the visible range at a fixed absolute stride, `min_keys` keys per split, so a row's result
+/// does not depend on how its prompt is chunked; the stride is the capacity over the most
+/// splits a plan may take, at least [`WIDE_MIN_SPLIT_KEYS`], rounded up to a key tile of 32, and
+/// `max_splits` is the number of strides the capacity needs.
+pub(crate) fn cpf_attn_wide_split(keys: usize) -> Result<CpfAttnSplit, EngError> {
+    if keys == 0 {
+        return Err(rule("wide split", "a wide plan needs at least one key"));
+    }
+    let stride = keys
+        .div_ceil(CPF_ATTN_MAX_SPLITS)
+        .max(WIDE_MIN_SPLIT_KEYS)
+        .next_multiple_of(CPF_ATTN_TILE_KEYS);
+    Ok(CpfAttnSplit {
+        max_splits: keys.div_ceil(stride),
+        min_keys: stride,
+    })
+}
 
 /// The geometry of one prefill attention call: a chunk of `m` rows, `n_head` query heads over
 /// `n_kv_head` kv heads, and the head dimension. Every value is a run-time argument; the
@@ -601,6 +623,43 @@ impl AttnKvView<'_> {
     }
 }
 
+/// The Q8 affine view of one layer's `Int8G32` KV planes, the layout `kv8_chunk` and the decode
+/// attention share: signed codes `[kv head][cell][head_dim]` and f16 scales
+/// `[kv head][cell][head_dim / 32]`, 32-value groups, no bias plane. `cells` is the capacity of a
+/// kv head's plane, so the head stride is a whole plane; the view spans both planes as they are.
+pub(crate) fn kv8_plane_view<'b>(
+    codes: DeviceRange<'b>,
+    scales: DeviceRange<'b>,
+    cells: usize,
+    head_dim: usize,
+) -> AttnKvView<'b> {
+    let groups = head_dim / 32;
+    AttnKvView {
+        layout: AttnKvLayout {
+            storage: AttnKvStorage::Q8Affine {
+                group_size: 32,
+                signed: true,
+            },
+            payload_strides: AttnStrides {
+                time_stride_bytes: head_dim,
+                head_stride_bytes: cells * head_dim,
+            },
+            scales: Some(AttnScalarLayout {
+                dtype: Dtype::F16,
+                strides: AttnStrides {
+                    time_stride_bytes: groups * 2,
+                    head_stride_bytes: cells * groups * 2,
+                },
+                group_stride_bytes: 2,
+            }),
+            bias: None,
+        },
+        payload: codes,
+        scales: Some(scales),
+        bias: None,
+    }
+}
+
 fn check_storage(storage: AttnKvStorage, dim: usize) -> Result<(), EngError> {
     if storage == AttnKvStorage::F16 {
         return Ok(());
@@ -1086,6 +1145,27 @@ fn check_wide(call: &AttnPrefillCall<'_>, views: &[AttnKvView<'_>; 2]) -> Result
     Ok(())
 }
 
+/// The fixed-stride plan of a full wide launch must reach the last key a tile can see: the cache
+/// rows, or the window and one tile of rows.
+fn check_wide_split(call: &AttnPrefillCall<'_>) -> Result<(), EngError> {
+    let reach = if call.span.window > 0 {
+        usize::try_from(call.span.window).unwrap_or(usize::MAX) + CPF_ATTN_TILE_ROWS
+    } else {
+        call.shape.cache_rows
+    };
+    if call.split.max_splits.saturating_mul(call.split.min_keys) < reach {
+        return Err(rule(
+            "wide split",
+            &format!(
+                "head_dim {CPF_ATTN_WIDE_HEAD_DIM} needs max_splits * min_keys >= {reach}, \
+                 got {} * {} (see cpf_attn_wide_split)",
+                call.split.max_splits, call.split.min_keys
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn raw_kv<'b>(ctx: &CudaContext, view: &AttnKvView<'b>) -> Result<AttnKvRaw<'b>, EngError> {
     Ok(AttnKvRaw {
         layout: view.layout,
@@ -1238,21 +1318,31 @@ impl CudaContext {
     /// device write: the kernel would otherwise trap and latch the context. A failed query
     /// is not latched either.
     fn check_wide_device(&self) -> Result<(), EngError> {
-        let _dispatch = self.enter()?;
-        match attn_prefill_d512_supported() {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(rule(
+        if self.attn_prefill_wide_supported()? {
+            Ok(())
+        } else {
+            Err(rule(
                 "device",
                 &format!(
                     "head_dim {CPF_ATTN_WIDE_HEAD_DIM} needs sm_80 PTX and an 80 KB shared \
                      memory opt-in per block, which this device or build does not provide"
                 ),
-            )),
-            Err(status) => Err(crate::kernels::cuda::diagnostic_backend_error(
+            ))
+        }
+    }
+
+    /// Whether the device of this context can run the head_dim 512 kernel (PTX of at least
+    /// sm_80 and a shared-memory opt-in of 80 KB per block): the fact a caller reads once at
+    /// load to choose that path or its fallback. A failed query is an error that latches
+    /// nothing.
+    pub(crate) fn attn_prefill_wide_supported(&self) -> Result<bool, EngError> {
+        let _dispatch = self.enter()?;
+        attn_prefill_d512_supported().map_err(|status| {
+            crate::kernels::cuda::diagnostic_backend_error(
                 "attn_prefill head_dim 512 device query",
                 status,
-            )),
-        }
+            )
+        })
     }
 
     fn attn_prefill_enqueue(
@@ -1295,6 +1385,9 @@ impl CudaContext {
         };
         ints.ld = if call.proj.is_some() { ints.ld } else { 0 };
         check_span_split(&call)?;
+        if full && call.shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM {
+            check_wide_split(&call)?;
+        }
         let bytes = cpf_attn_part_bytes(geometry(&call.shape), plan_of(&call.split))?;
         if bytes > CPF_ATTN_PART_CAP {
             return Err(EngError::MemoryPlan(format!(

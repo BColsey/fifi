@@ -14,8 +14,8 @@ use crate::kernels::cuda::{
     prefill::{
         attn_prefill::{
             AttnKvLayout, AttnKvStorage, AttnKvView, AttnPrefillCall, AttnPrefillShape,
-            AttnScalarLayout, AttnStrides, CPF_ATTN_SM_COUNT, CpfAttnSpan, CpfAttnSplit,
-            cpf_attn_launch_plan, cpf_attn_part_bytes,
+            AttnStrides, CPF_ATTN_SM_COUNT, CpfAttnSpan, CpfAttnSplit, cpf_attn_launch_plan,
+            cpf_attn_part_bytes, kv8_plane_view,
         },
         flint_qk::QkProducerCall,
     },
@@ -24,7 +24,6 @@ use crate::kernels::cuda::{
         kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape},
     },
 };
-use crate::tensor::Dtype;
 
 mod health;
 mod layer_major;
@@ -1316,30 +1315,12 @@ fn f16_row(input: &[f32]) -> Result<Vec<u8>> {
 }
 
 fn q8_view(planes: [&DeviceBuffer; 2], cells: usize) -> Result<AttnKvView<'_>> {
-    Ok(AttnKvView {
-        layout: AttnKvLayout {
-            storage: AttnKvStorage::Q8Affine {
-                group_size: 32,
-                signed: true,
-            },
-            payload_strides: AttnStrides {
-                time_stride_bytes: 128,
-                head_stride_bytes: cells * 128,
-            },
-            scales: Some(AttnScalarLayout {
-                dtype: Dtype::F16,
-                strides: AttnStrides {
-                    time_stride_bytes: 8,
-                    head_stride_bytes: cells * 8,
-                },
-                group_stride_bytes: 2,
-            }),
-            bias: None,
-        },
-        payload: planes[0].range(0, planes[0].bytes())?,
-        scales: Some(planes[1].range(0, planes[1].bytes())?),
-        bias: None,
-    })
+    Ok(kv8_plane_view(
+        planes[0].range(0, planes[0].bytes())?,
+        planes[1].range(0, planes[1].bytes())?,
+        cells,
+        128,
+    ))
 }
 
 /// The per-token sticky word the device KV guard ORs into (arm ON only).
