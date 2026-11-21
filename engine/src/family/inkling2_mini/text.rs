@@ -209,6 +209,16 @@ impl Decoder {
     }
 
     fn open_gguf(path: &Path, context: u32, native: bool) -> Result<Self, EngError> {
+        let map_dense = std::env::var_os(gguf::DENSE_MAPPING_ENV).is_some_and(|value| value == "1");
+        Self::open_gguf_with_dense_mapping(path, context, native, map_dense)
+    }
+
+    fn open_gguf_with_dense_mapping(
+        path: &Path,
+        context: u32,
+        native: bool,
+        map_dense: bool,
+    ) -> Result<Self, EngError> {
         if !(1..=MAX_CONTEXT).contains(&context) {
             return Err(EngError::BadRequest("Invalid Inkling context limit".into()));
         }
@@ -224,7 +234,15 @@ impl Decoder {
                 super::working_set_remaining(device, &charges)
             })?;
         let source = Arc::new(gguf::Weights::open(path)?);
-        let dense = DenseWeights::from_gguf(Arc::clone(&source))?;
+        let mapping_budget = if map_dense { headroom } else { 0 };
+        let (dense, mapped_bytes) =
+            DenseWeights::from_gguf_with_mapping(Arc::clone(&source), mapping_budget)?;
+        let headroom = headroom - mapped_bytes;
+        if map_dense {
+            eprintln!(
+                "Inkling 2 Mini GGUF: mapped_dense_budget_bytes={mapped_bytes} remaining_expert_budget_bytes={headroom}"
+            );
+        }
         let experts = if native {
             let headroom = usize::try_from(headroom).map_err(|_| super::staging_overflow())?;
             Experts::GgufMlx(Box::new(gguf_mlx::Experts::open(source, headroom)?))
@@ -634,6 +652,34 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires complete Unsloth GGUF weights at INKLING_GGUF_REFERENCE and a Metal budget"]
+    fn fork_gguf_mapped_dense_matches_reference_logits() {
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let _lock = crate::native_test_lock();
+        let run = |mapped| {
+            let mut decoder =
+                Decoder::open_gguf_with_dense_mapping(Path::new(&file), 128, false, mapped)
+                    .unwrap();
+            assert_eq!(decoder.dense.has_mapped_gguf_projection(), mapped);
+            decoder
+                .advance_rows(&[371, 151451, 149879, 151194])
+                .unwrap();
+            decoder.step(149884).unwrap()
+        };
+        let reference = run(false);
+        let candidate = run(true);
+        assert_eq!(candidate.len(), reference.len());
+        let mismatch = candidate
+            .iter()
+            .zip(reference)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(
+            mismatch, None,
+            "mapped GGUF dense projection changed a logit"
+        );
+    }
 
     #[test]
     #[ignore = "requires a complete Unsloth UD-IQ2_XXS GGUF at INKLING_GGUF_REFERENCE"]

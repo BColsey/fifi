@@ -29,7 +29,28 @@ impl DenseWeights {
     }
 
     pub fn from_gguf(source: Arc<gguf::Weights>) -> Result<Self, EngError> {
-        Ok(Self(Backend::Gguf(gguf_dense::Dense::new(source)?)))
+        Self::from_gguf_with_mapping(source, 0).map(|(dense, _)| dense)
+    }
+
+    pub(super) fn from_gguf_with_mapping(
+        source: Arc<gguf::Weights>,
+        mapping_budget: u64,
+    ) -> Result<(Self, u64), EngError> {
+        let (dense, mapped_bytes) = gguf_dense::Dense::new(source, mapping_budget)?;
+        Ok((Self(Backend::Gguf(dense)), mapped_bytes))
+    }
+
+    #[cfg(all(
+        test,
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub(super) fn has_mapped_gguf_projection(&self) -> bool {
+        match &self.0 {
+            Backend::Gguf(dense) => dense.has_mapping(),
+            Backend::Safetensors(_) => false,
+        }
     }
 
     pub fn shape(&self, name: &str) -> Result<&[usize], EngError> {
@@ -256,14 +277,7 @@ impl SafetensorDense {
                 }
                 Dtype::F32 => resident
                     .chunks_exact(row_size)
-                    .map(|row| {
-                        row.as_chunks::<4>()
-                            .0
-                            .iter()
-                            .zip(input)
-                            .map(|(&word, &value)| f32::from_le_bytes(word) * value)
-                            .sum()
-                    })
+                    .map(|row| dot_f32_le(row, input))
                     .collect(),
                 _ => unreachable!("only BF16 and F32 dense tensors are loaded"),
             }
@@ -433,12 +447,18 @@ fn widen(dtype: Dtype, bytes: &[u8]) -> Vec<f32> {
     }
 }
 
-fn widen_bf16(word: [u8; 2]) -> f32 {
-    f32::from_bits(u32::from(u16::from_le_bytes(word)) << 16)
+pub(super) fn dot_f32_le(weights: &[u8], input: &[f32]) -> f32 {
+    weights
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(input)
+        .map(|(&word, &value)| f32::from_le_bytes(word) * value)
+        .sum()
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-fn dot_bf16(weights: &[u8], input: &[f32]) -> f32 {
+// GGUF's reference reduces in scalar order, including BF16 rows.
+pub(super) fn dot_bf16_le_scalar(weights: &[u8], input: &[f32]) -> f32 {
     weights
         .as_chunks::<2>()
         .0
@@ -446,6 +466,15 @@ fn dot_bf16(weights: &[u8], input: &[f32]) -> f32 {
         .zip(input)
         .map(|(&word, &value)| widen_bf16(word) * value)
         .sum()
+}
+
+fn widen_bf16(word: [u8; 2]) -> f32 {
+    f32::from_bits(u32::from(u16::from_le_bytes(word)) << 16)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+fn dot_bf16(weights: &[u8], input: &[f32]) -> f32 {
+    dot_bf16_le_scalar(weights, input)
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]

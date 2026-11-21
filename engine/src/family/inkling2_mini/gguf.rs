@@ -1,6 +1,6 @@
 //! Tensor validation and bounded reads for the two fixed-loop GGUF formats.
 
-use std::{fs::File, io::BufReader, path::Path};
+use std::{fs::File, io::BufReader, ops::Range, path::Path, time::SystemTime};
 
 use super::{
     CONV_TAPS, CORE_END, CORE_START, EXPERTS, HEAD_DIM, HEADER_LIMIT, HIDDEN, INTERMEDIATE,
@@ -10,9 +10,11 @@ use super::{
 };
 use crate::{
     EngError,
+    family::mapped_file::MappedFile,
     weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
 };
 
+pub(super) const DENSE_MAPPING_ENV: &str = "FIFI_INKLING_GGUF_MMAP_DENSE";
 const ROWS_PER_READ: usize = 256;
 pub(super) const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
 const PADDED_VOCAB: u64 = 201_024;
@@ -243,6 +245,7 @@ pub(crate) fn validate_tensors(header: &GgufHeader) -> Result<(), EngError> {
 pub struct Weights {
     file: File,
     header: GgufHeader,
+    modified: Option<SystemTime>,
 }
 
 impl Weights {
@@ -250,11 +253,23 @@ impl Weights {
         crate::storage_guard::require_local(path, "model weights")?;
         let file = File::open(path).map_err(checkpoint_error)?;
         let mut reader = BufReader::new(&file);
-        let len = file.metadata().map_err(checkpoint_error)?.len();
-        let header = GgufHeader::parse(&mut reader, len, HEADER_LIMIT)?;
+        let metadata = file.metadata().map_err(checkpoint_error)?;
+        let header = GgufHeader::parse(&mut reader, metadata.len(), HEADER_LIMIT)?;
         gguf_metadata::inspect(&header, &mut reader)?;
         validate_tensors(&header)?;
-        Ok(Self { file, header })
+        Ok(Self {
+            file,
+            header,
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    pub(super) fn map_projection_source(&self) -> Result<MappedFile, EngError> {
+        let modified = self
+            .modified
+            .ok_or_else(|| checkpoint_error("GGUF modification time unavailable"))?;
+        let file = self.file.try_clone().map_err(checkpoint_error)?;
+        MappedFile::from_file(file, self.header.file_len(), modified).map_err(checkpoint_error)
     }
 
     pub fn header(&self) -> &GgufHeader {
@@ -348,6 +363,43 @@ impl Weights {
         Ok(result)
     }
 
+    pub(super) fn project_mapped(
+        &self,
+        name: &str,
+        rows: Range<usize>,
+        input: &[f32],
+        mapping: &MappedFile,
+        admitted_bytes: u64,
+    ) -> Result<Vec<f32>, EngError> {
+        let tensor = self.tensor(name)?;
+        let (width, height, dtype, row_bytes) = matrix(tensor)?;
+        if tensor.dims().len() != 2
+            || rows.start > rows.end
+            || rows.end > height
+            || input.len() != width
+        {
+            return Err(EngError::BadRequest(format!(
+                "projection exceeds Inkling GGUF tensor {name}"
+            )));
+        }
+        let offset = (rows.start * row_bytes) as u64;
+        let end = (rows.end * row_bytes) as u64;
+        if end > admitted_bytes || end > tensor.byte_len() {
+            return Err(EngError::BadRequest(format!(
+                "projection exceeds mapped Inkling GGUF tensor {name}"
+            )));
+        }
+        mapping.check_unchanged().map_err(checkpoint_error)?;
+        let start = (tensor.abs_offset() + offset) as usize;
+        let stop = (tensor.abs_offset() + end) as usize;
+        let bytes = mapping.as_ref().get(start..stop).ok_or_else(|| {
+            checkpoint_error(format!("mapped GGUF tensor {name} is out of bounds"))
+        })?;
+        let result = project_packed_rows(dtype, row_bytes, bytes, input)?;
+        mapping.check_unchanged().map_err(checkpoint_error)?;
+        Ok(result)
+    }
+
     fn buffer(&self, name: &str, len: usize) -> Result<Vec<u8>, EngError> {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(len).map_err(|_| {
@@ -433,6 +485,32 @@ impl Weights {
     }
 }
 
+fn project_packed_rows(
+    dtype: GgufType,
+    row_bytes: usize,
+    bytes: &[u8],
+    input: &[f32],
+) -> Result<Vec<f32>, EngError> {
+    let rows = bytes.chunks_exact(row_bytes);
+    let result = match dtype {
+        GgufType::F32 => rows
+            .map(|row| super::dense::dot_f32_le(row, input))
+            .collect(),
+        GgufType::Bf16 => rows
+            .map(|row| super::dense::dot_bf16_le_scalar(row, input))
+            .collect(),
+        _ => {
+            let mut values = vec![0.; input.len()];
+            rows.map(|row| {
+                crate::weights::dequantize_into(dtype, row, &mut values)?;
+                Ok(values.iter().zip(input).map(|(w, x)| w * x).sum())
+            })
+            .collect::<Result<Vec<_>, EngError>>()?
+        }
+    };
+    Ok(result)
+}
+
 pub(super) fn projection_scratch_bytes() -> u64 {
     // Largest possible FP32 row (the controller input) times the chunk, plus
     // one output logits row and conservatively sized attention and MoE temporaries.
@@ -462,14 +540,20 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
         )? {
         match super::working_set_remaining(device, &charges) {
             Ok(headroom) => {
-                let ram = headroom / 4;
-                (
+                let chosen = if std::env::var_os(DENSE_MAPPING_ENV)
+                    .is_some_and(|value| value == "1")
+                {
+                    format!(
+                        "{plan}, up to {headroom} B shared by mapped packed dense projections and expert cache under {device}; exact dense reservation is selected at load; MLX allocator pool is process-wide and outside these logical cache capacities"
+                    )
+                } else {
+                    let ram = headroom / 4;
                     format!(
                         "{plan}, {ram} B for packed RAM and {} B for expanded Metal expert planes under {device}; MLX allocator pool is process-wide and outside these logical cache capacities",
                         headroom - ram
-                    ),
-                    Some(true),
-                )
+                    )
+                };
+                (chosen, Some(true))
             }
             Err(error) => (format!("{plan}, {}", error.describe()), Some(false)),
         }
@@ -539,5 +623,84 @@ impl Weights {
             dtype,
             bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod mapped_projection_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_projection_matches_buffered_gates_and_bounds_the_selected_rows() {
+        use std::io::Write;
+
+        let mut artifact = tempfile::NamedTempFile::new().unwrap();
+        let name = "output.weight";
+        let mut header = b"GGUF".to_vec();
+        header.extend(3_u32.to_le_bytes());
+        header.extend(1_u64.to_le_bytes());
+        header.extend(0_u64.to_le_bytes());
+        header.extend((name.len() as u64).to_le_bytes());
+        header.extend(name.as_bytes());
+        header.extend(2_u32.to_le_bytes());
+        header.extend(3_u64.to_le_bytes());
+        header.extend(2_u64.to_le_bytes());
+        header.extend(0_u32.to_le_bytes());
+        header.extend(0_u64.to_le_bytes());
+        header.resize(header.len().next_multiple_of(32), 0);
+        artifact.write_all(&header).unwrap();
+        for weight in [1.0_f32, -2.0, 3.0, 4.0, 5.0, 1.0] {
+            artifact.write_all(&weight.to_le_bytes()).unwrap();
+        }
+        let file = File::open(artifact.path()).unwrap();
+        let meta = file.metadata().unwrap();
+        let header =
+            GgufHeader::parse(&mut BufReader::new(&file), meta.len(), HEADER_LIMIT).unwrap();
+        let weights = Weights {
+            file,
+            header,
+            modified: meta.modified().ok(),
+        };
+        let mapping = weights.map_projection_source().unwrap();
+        let input = [0.5, 0.25, -0.75];
+        let before = weights.project(name, 0, 0..1, &input).unwrap();
+        let after = weights
+            .project_mapped(name, 0..1, &input, &mapping, 12)
+            .unwrap();
+        assert_eq!(before[0].to_bits(), after[0].to_bits());
+        assert!(
+            weights
+                .project_mapped(name, 1..2, &input, &mapping, 12)
+                .is_err()
+        );
+        artifact.as_file().set_len(0).unwrap();
+        assert!(
+            weights
+                .project_mapped(name, 0..1, &input, &mapping, 12)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mapped_packed_dots_preserve_reference_accumulation() {
+        let input: Vec<_> = (0..256).map(|i| ((i % 11) as f32 - 5.) / 8.).collect();
+        let weights = input.iter().rev().copied();
+        let f32_bytes: Vec<_> = weights.clone().flat_map(f32::to_le_bytes).collect();
+        let bf16_bytes: Vec<_> = weights
+            .flat_map(|v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let mut iq4_block = vec![0x33; 136];
+        iq4_block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_bits().to_le_bytes());
+        for (dtype, row) in [
+            (GgufType::F32, f32_bytes),
+            (GgufType::Bf16, bf16_bytes),
+            (GgufType::Iq4Xs, iq4_block),
+        ] {
+            let mut values = vec![0.; input.len()];
+            crate::weights::dequantize_into(dtype, &row, &mut values).unwrap();
+            let reference: f32 = values.iter().zip(&input).map(|(w, x)| w * x).sum();
+            let mapped = project_packed_rows(dtype, row.len(), &row, &input).unwrap();
+            assert_eq!(mapped[0].to_bits(), reference.to_bits(), "{dtype:?}");
+        }
     }
 }
