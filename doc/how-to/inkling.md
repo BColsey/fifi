@@ -405,6 +405,12 @@ With GGUF, `FIFI_INKLING_ROUTE_TRACE=1` writes ordered expert selections,
 plane sizes and cache counters for each visit. Use a separate trace run
 when comparing throughput.
 
+`FIFI_INKLING_GGUF_SEGMENTED_LRU=1` selects the experimental cache policy
+for GGUF checkpoints using single-copy packed Metal experts. Hits can
+promote planes into a protected queue within 90% of the same Metal
+budget. New admissions compete for the rest of the cache. Compare against
+the same checkpoint and working-set budget with the variable unset.
+
 For GGUF, the same timing output reports `gguf_file_read_bytes`,
 `gguf_unique_file_read_bytes`, and `gguf_metal_staged_bytes`. The first two
 show total file demand and one copy per distinct expert tensor plane in each
