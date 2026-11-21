@@ -172,6 +172,37 @@ mod tests {
         assert_eq!((ask.seqs, ask.note), (MaxSeqs::Auto, None));
     }
 
+    /// What the automatic count plans on small cards, from the numbers of a start: the card, the
+    /// file the memory plan picks (the 4,033.5 MiB Q4_K file when Q8_0 does not fit), the first
+    /// session and the scratch, about 300 MiB the desktop holds, and the headroom.
+    #[test]
+    fn the_default_plans_one_session_on_a_6_gb_card_and_three_on_an_8_gb_card() {
+        use crate::family::seq_plan::{SeqInputs, plan_seqs};
+        let mib = |value: f64| (value * f64::from(1u32 << 20)) as u64;
+        let cost = bolt_seq_cost().expect("cost");
+        let first_session = 30_464 * 32_768;
+        let plan = |card_mib: f64| {
+            let free = mib(card_mib - 300.0 - 4_033.5 - 9.0) - first_session;
+            plan_seqs(
+                SeqInputs {
+                    free,
+                    headroom: BOLT_HEADROOM_BYTES,
+                    cost,
+                    context: 32_768,
+                    row_cap: BOLT_PIECE_ROWS,
+                    ceiling: BOLT_PIECE_ROWS,
+                },
+                None,
+            )
+            .expect("plan")
+        };
+        // 6,144 MiB: 849 MiB remain after the first session, 337 MiB above the headroom, which
+        // is less than the 954 MiB of one more session.
+        assert_eq!(plan(6_144.0).seqs, 1);
+        // 8,192 MiB: 2,897 MiB remain, 2,385 above the headroom: two more sessions.
+        assert_eq!(plan(8_192.0).seqs, 3);
+    }
+
     #[test]
     fn the_headroom_keeps_half_a_gib_free() {
         // The resident admission folds this into the demand, so an exact fit of
