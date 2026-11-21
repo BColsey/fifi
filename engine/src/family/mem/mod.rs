@@ -43,9 +43,8 @@ pub(crate) const HOST_MARGIN_BYTES: u64 = 2 * GIB;
 pub(crate) const HOST_HEADROOM_BYTES: u64 = GIB;
 
 /// The bytes the OS keeps out of every host plan: a tenth of physical memory, never under 8 GiB,
-/// and never more than a fifth of it, so a small host keeps room for a store (an 8 GiB host keeps
-/// 1.6 GiB, a 16 GiB host 3.2 GiB, a 32 GiB host 6.4 GiB, a 62 GiB host 8 GiB). The fifth is the
-/// largest share the banked EXL3 store ever kept back, so no host plans stricter than before.
+/// and never more than a quarter of it, so a small host keeps room for a store (an 8 GiB host
+/// keeps 2 GiB, a 16 GiB host 4 GiB, a 32 GiB host 8 GiB, a 62 GiB host 8 GiB).
 /// The one floor: the host guard, every family's host plan and the facts' `spare` read it here.
 pub(crate) fn os_floor_of(total: u64) -> u64 {
     total
@@ -54,8 +53,8 @@ pub(crate) fn os_floor_of(total: u64) -> u64 {
         .min(total / MAX_OS_FLOOR_SHARE)
 }
 
-/// The floor is at most this fraction (one over) of physical memory.
-const MAX_OS_FLOOR_SHARE: u64 = 5;
+/// The floor is at most this fraction (one over) of physical memory: a quarter.
+const MAX_OS_FLOOR_SHARE: u64 = 4;
 
 /// The machine as a host plan reads it: `MemTotal`, the budget (`available`: `MemAvailable`
 /// clamped by every cgroup ancestor's remaining bytes) and the bytes of the budget kept back.
@@ -194,13 +193,13 @@ mod tests {
     const SPELLING_OF_THE_FLOOR_RULE: &str = concat!(".div_ceil(", "10).max(");
 
     #[test]
-    fn the_floor_is_a_tenth_never_under_eight_gib_and_never_over_a_fifth() {
-        // (total GiB, floor bytes): a fifth below 40 GiB, 8 GiB from 40 to 80 GiB, a tenth above.
+    fn the_floor_is_a_tenth_never_under_eight_gib_and_never_over_a_quarter() {
+        // (total GiB, floor bytes): a quarter below 32 GiB, 8 GiB from 32 to 80 GiB, a tenth above.
         for (total_gib, floor) in [
-            (8u64, 8 * GIB / 5),
-            (16, 16 * GIB / 5),
-            (32, 32 * GIB / 5),
-            (40, 8 * GIB),
+            (8u64, 2 * GIB),
+            (16, 4 * GIB),
+            (24, 6 * GIB),
+            (32, 8 * GIB),
             (62, 8 * GIB),
             (80, 8 * GIB),
             (128, (128 * GIB).div_ceil(10)),
@@ -209,15 +208,6 @@ mod tests {
         }
         assert_eq!(os_floor_of(0), 0);
         assert_eq!(os_floor_of(u64::MAX), u64::MAX.div_ceil(10));
-    }
-
-    /// The banked EXL3 store used to keep back `max(2 GiB, total / 5)`; the one floor never
-    /// keeps back more, on any host, so no host plans stricter than before.
-    #[test]
-    fn the_floor_is_never_stricter_than_the_margin_the_exl3_store_kept() {
-        for total in (1..=256u64).map(|gib| gib * GIB / 2) {
-            assert!(os_floor_of(total) <= (2 * GIB).max(total / 5), "{total}");
-        }
     }
 
     #[test]
