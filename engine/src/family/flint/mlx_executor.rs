@@ -284,26 +284,6 @@ pub(crate) const FLASH_PREFILL_ROW_BYTES: u64 = 512 * 1024;
 /// charge cliffs to ONE row whenever under ~6.4 GiB remain at 32K context
 /// (the slowest path there is), which is why the ladder walks down to 4
 /// instead.
-/// The bytes of the prefill piece the ladder picks inside `remaining`, priced
-/// by the flash route, so that memory reserved for other uses leaves it intact.
-pub(super) fn planned_prefill_reserve(
-    max_rows: usize,
-    remaining: u64,
-    streamed_expert_bytes: u64,
-) -> u64 {
-    let rows = fitting_prefill_piece(
-        max_rows,
-        context_limit(),
-        remaining,
-        streamed_expert_bytes,
-        true,
-    )
-    .unwrap_or(1) as u32;
-    FLASH_PREFILL_BASE_BYTES
-        + FLASH_PREFILL_ROW_BYTES * u64::from(rows)
-        + expert_staging_bytes(streamed_expert_bytes, rows)
-}
-
 fn fitting_prefill_piece(
     max_rows: usize,
     context: u32,
@@ -324,6 +304,26 @@ fn fitting_prefill_piece(
         .map_err(|_| EngError::BadRequest("Flint prefill ceiling exceeds u32".into()))?;
     let rows = crate::family::prefill::mlx::admitted_chunk(max_rows, remaining, charge)?;
     Ok(rows.unwrap_or(1) as usize)
+}
+
+/// The bytes of the prefill piece the ladder picks inside `remaining`, priced
+/// by the flash route, so that memory reserved for other uses leaves it intact.
+pub(super) fn planned_prefill_reserve(
+    max_rows: usize,
+    remaining: u64,
+    streamed_expert_bytes: u64,
+) -> u64 {
+    let rows = fitting_prefill_piece(
+        max_rows,
+        context_limit(),
+        remaining,
+        streamed_expert_bytes,
+        true,
+    )
+    .unwrap_or(1) as u32;
+    FLASH_PREFILL_BASE_BYTES
+        + FLASH_PREFILL_ROW_BYTES * u64::from(rows)
+        + expert_staging_bytes(streamed_expert_bytes, rows)
 }
 
 fn device_session_charges(retention_cap: u64) -> Result<[(&'static str, u64); 5]> {
