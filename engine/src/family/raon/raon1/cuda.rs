@@ -34,6 +34,7 @@ use crate::kernels::cuda::resident::block_ops::{
 };
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
+use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
@@ -812,15 +813,22 @@ impl Raon1Device {
         out: &DeviceBuffer,
     ) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.run(BlockOp::hc_apply(
-            n,
-            HIDDEN,
-            resid.range(0, n * STREAMS * HIDDEN * 4)?,
-            sc.proj.range(0, n * HIDDEN * 4)?,
-            sc.post.range(0, n * STREAMS * 4)?,
-            sc.comb.range(0, n * 16 * 4)?,
-            out.range(0, n * STREAMS * HIDDEN * 4)?,
-        )?)
+        self.ctx.hyper_mix_apply(
+            &self.stream,
+            HyperMixApplyCall {
+                shape: HyperShape {
+                    m: n,
+                    branches: STREAMS,
+                    hidden: HIDDEN,
+                    rank: 1,
+                },
+                x: resid.range(0, n * STREAMS * HIDDEN * 4)?,
+                out: out.range(0, n * STREAMS * HIDDEN * 4)?,
+                mix: sc.comb.range(0, n * STREAMS * STREAMS * 4)?,
+                gate: sc.post.range(0, n * STREAMS * 4)?,
+                block: sc.proj.range(0, n * HIDDEN * 4)?,
+            },
+        )
     }
 
     fn attn_half(&self, layer: usize, n: usize, pos0: usize) -> Result<(), EngError> {

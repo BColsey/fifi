@@ -1,6 +1,6 @@
 /*
  * Launch entry of block_ops: the row operations of a hybrid decoder block that are not
- * shared with another resident kernel yet (the convolution is `gdn_conv`, the norm is `add_rmsnorm_q8`): the four-stream mixed residual with its stream-mixing matrix, a
+ * shared with another resident kernel yet (the convolution is `gdn_conv`, the norm is `add_rmsnorm_q8`, the stream-mixing apply is `hyper_mix_apply`): the four-stream mixed residual with its stream-mixing matrix, a
  * delta-rule scan with a decay per key channel, absorbed latent attention over one shared
  * key/value head, the SiTU activation with its q8_1 quantize, and a biased sigmoid router.
  * Launch-only: nothing here allocates, copies or synchronizes. Every operation works on
@@ -31,8 +31,6 @@ extern "C" {
  * 1 HC_READ   mixed-residual read of one site. p0 resid f32 [n][4*h]; p1 fn f16 [17][4*h];
  *             p2 base f32 [17]; p3 scale f32 [4]; p4 branch f32 [n][h] (W); p5 post f32
  *             [n][4] (W); p6 comb f32 [n][16] (W). i0 n; i1 h. f0 epsilon; f1 magnitude.
- * 2 HC_APPLY  p0 resid f32 [n][4*h]; p1 branch f32 [n][h]; p2 post f32 [n][4]; p3 comb f32
- *             [n][16]; p4 out f32 [n][4*h] (W). i0 n; i1 h.
  * 4 HC_MEAN   p0 resid f32 [rows][4*h]; p1 out f32 [h] (W). i0 row; i1 h.
  * 6 RDA_SCAN  p0 q; p1 k; p2 v; p3 g1; each f32 [n][heads*hd]; p4 dt_bias f32 [heads*hd];
  *             p5 a f32 [heads]; p6 beta f32 [n][heads]; p7 delta f32 [n][heads]; p8
@@ -66,7 +64,6 @@ extern "C" {
  */
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
-    INFERENCE_CUDA_BLOCK_OP_HC_APPLY = 2,
     INFERENCE_CUDA_BLOCK_OP_HC_MEAN = 4,
     INFERENCE_CUDA_BLOCK_OP_RDA_SCAN = 6,
     INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB = 7,

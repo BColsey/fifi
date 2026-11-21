@@ -3,6 +3,7 @@
 //! Device runs go through the card lease only, one test thread.
 use super::*;
 use crate::kernels::cuda::resident::block_ops::{MlaShape, RdaInputs, RowOutputs};
+use crate::kernels::cuda::resident::hyper::{HyperApplyCall, HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 
 struct Rig {
@@ -323,18 +324,25 @@ fn the_mixed_residual_read_apply_and_mean_match_the_host() {
         assert_close("comb", &r.read(&comb, n * 16), &want_comb, 1e-4);
         // apply: out[dst] = sum_src comb[dst + 4 src] inp[src] + post[dst] branch
         let out = r.zeros(n * hc * h);
-        r.run(
-            BlockOp::hc_apply(
-                n,
-                h,
-                whole(&ib),
-                whole(&branch),
-                whole(&post),
-                whole(&comb),
-                whole(&out),
+        r.ctx
+            .hyper_mix_apply(
+                &r.stream,
+                HyperMixApplyCall {
+                    shape: HyperShape {
+                        m: n,
+                        branches: hc,
+                        hidden: h,
+                        rank: 1,
+                    },
+                    x: whole(&ib),
+                    out: whole(&out),
+                    mix: whole(&comb),
+                    gate: whole(&post),
+                    block: whole(&branch),
+                },
             )
-            .expect("op"),
-        );
+            .expect("mix apply");
+        r.stream.synchronize().expect("drain");
         let mut want = vec![0f32; n * hc * h];
         for t in 0..n {
             for dst in 0..hc {
@@ -692,4 +700,58 @@ fn refusals_name_the_slot() {
         )
         .expect_err("short range refused");
     assert!(matches!(err, crate::EngError::BadRequest(_)), "{err:?}");
+}
+
+/// With an identity matrix the mixing apply writes the bits of the in-place apply that the
+/// Flash-Next step uses.
+#[test]
+fn the_mixing_apply_with_an_identity_matrix_is_the_in_place_apply() {
+    let Some(r) = rig("hyper mix apply identity") else {
+        return;
+    };
+    let (m, b, h) = (7usize, 4usize, 96usize);
+    let x = data(71, m * b * h, 1.0);
+    let gate = data(72, m * b, 1.0);
+    let block = data(73, m * h, 1.0);
+    let identity: Vec<f32> = (0..m * b * b)
+        .map(|i| if (i % (b * b)) % (b + 1) == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let (xb, gb, bb, mb) = (r.up(&x), r.up(&gate), r.up(&block), r.up(&identity));
+    let shape = HyperShape {
+        m,
+        branches: b,
+        hidden: h,
+        rank: 1,
+    };
+    let out = r.zeros(m * b * h);
+    r.ctx
+        .hyper_mix_apply(
+            &r.stream,
+            HyperMixApplyCall {
+                shape,
+                x: whole(&xb),
+                out: whole(&out),
+                mix: whole(&mb),
+                gate: whole(&gb),
+                block: whole(&bb),
+            },
+        )
+        .expect("mix apply");
+    r.ctx
+        .hyper_apply(
+            &r.stream,
+            HyperApplyCall {
+                shape,
+                x: whole(&xb),
+                gate: whole(&gb),
+                block: whole(&bb),
+            },
+        )
+        .expect("apply");
+    r.stream.synchronize().expect("drain");
+    let (mixed, in_place) = (r.read(&out, m * b * h), r.read(&xb, m * b * h));
+    assert!(
+        mixed.iter().zip(&in_place).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the two applies differ"
+    );
 }

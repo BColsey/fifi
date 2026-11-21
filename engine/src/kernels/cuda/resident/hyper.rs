@@ -32,7 +32,8 @@ pub(crate) use crate::kernels::cuda::native::resident::hyper::HyperDtype;
 use crate::kernels::cuda::native::resident::hyper::hyper_read_reference_launch;
 use crate::kernels::cuda::native::resident::hyper::{
     HYPER_MAX_BRANCHES, HYPER_MAX_HIDDEN, HYPER_MAX_M, HYPER_MAX_RANK, HYPER_MAX_WIDTH,
-    HyperApplyRaw, HyperDims, HyperReadBytes, HyperReadRaw, dims_width, hyper_apply_launch,
+    HyperApplyRaw, HyperDims, HyperMixApplyRaw, HyperReadBytes, HyperReadRaw, dims_width,
+    hyper_apply_launch, hyper_mix_apply_launch,
     hyper_read_launch, read_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
@@ -91,6 +92,17 @@ pub(crate) struct HyperReadCall<'b> {
 pub(crate) struct HyperApplyCall<'b> {
     pub(crate) shape: HyperShape,
     pub(crate) x: DeviceRange<'b>,
+    pub(crate) gate: DeviceRange<'b>,
+    pub(crate) block: DeviceRange<'b>,
+}
+
+/// One mixing apply: `out` f32 `[m][width]` is written from `x` (the same shape) through `mix`
+/// f32 `[m][branches * branches]`, `gate` f32 `[m][branches]` and `block` f32 `[m][hidden]`.
+pub(crate) struct HyperMixApplyCall<'b> {
+    pub(crate) shape: HyperShape,
+    pub(crate) x: DeviceRange<'b>,
+    pub(crate) out: DeviceRange<'b>,
+    pub(crate) mix: DeviceRange<'b>,
     pub(crate) gate: DeviceRange<'b>,
     pub(crate) block: DeviceRange<'b>,
 }
@@ -163,6 +175,54 @@ impl CudaContext {
         let raw = self.plan_hyper_apply(&call)?;
         self.launch_on(stream, move |stream_raw| {
             hyper_apply_launch(stream_raw, raw)
+        })
+    }
+
+    /// Queues `out[dst] = sum_src mix[dst][src] * x[src] + gate[dst] * block` on `stream`: the
+    /// apply of a stream-mixing residual. The in-place apply above is the same kernel without
+    /// the matrix.
+    pub(crate) fn hyper_mix_apply(
+        &self,
+        stream: &DeviceStream,
+        call: HyperMixApplyCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let shape = call.shape;
+        let width = check_dims(shape)?;
+        let floats = |count: usize, per_row: usize| {
+            count
+                .checked_mul(per_row)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| {
+                    EngError::BadRequest(format!(
+                        "the CUDA hyper-connection shape {shape:?} overflows"
+                    ))
+                })
+        };
+        let x_bytes = floats(shape.m, width)?;
+        let mix_bytes = floats(shape.m, shape.branches * shape.branches)?;
+        let gate_bytes = floats(shape.m, shape.branches)?;
+        let block_bytes = floats(shape.m, shape.hidden)?;
+        require_fit("x", &call.x, x_bytes, 4)?;
+        require_fit("out", &call.out, x_bytes, 4)?;
+        require_fit("mix", &call.mix, mix_bytes, 4)?;
+        require_fit("gate", &call.gate, gate_bytes, 4)?;
+        require_fit("block", &call.block, block_bytes, 4)?;
+        let out = Claim::of("out", &call.out, x_bytes);
+        require_apart(&out, &Claim::of("x", &call.x, x_bytes))?;
+        require_apart(&out, &Claim::of("mix", &call.mix, mix_bytes))?;
+        require_apart(&out, &Claim::of("gate", &call.gate, gate_bytes))?;
+        require_apart(&out, &Claim::of("block", &call.block, block_bytes))?;
+        let raw = HyperMixApplyRaw {
+            dims: shape.dims(),
+            x: self.raw_range(&call.x)?,
+            out: self.raw_range(&call.out)?,
+            mix: self.raw_range(&call.mix)?,
+            gate: self.raw_range(&call.gate)?,
+            block: self.raw_range(&call.block)?,
+        };
+        self.launch_on(stream, move |stream_raw| {
+            hyper_mix_apply_launch(stream_raw, raw)
         })
     }
 

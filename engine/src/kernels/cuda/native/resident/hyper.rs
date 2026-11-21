@@ -110,7 +110,39 @@ const _: () = assert!(
         && offset_of!(HyperApplyArgsRaw, hidden) == 32
 );
 
+/// Mirror of `inference_cuda_hyper_mix_apply_args`.
+#[repr(C)]
+struct HyperMixApplyArgsRaw {
+    x: *const c_void,
+    out: *mut c_void,
+    mix: *const c_void,
+    gate: *const c_void,
+    block: *const c_void,
+    m: c_int,
+    branches: c_int,
+    hidden: c_int,
+}
+
+const _: () = assert!(
+    size_of::<HyperMixApplyArgsRaw>() == 56
+        && offset_of!(HyperMixApplyArgsRaw, x) == 0
+        && offset_of!(HyperMixApplyArgsRaw, out) == 8
+        && offset_of!(HyperMixApplyArgsRaw, mix) == 16
+        && offset_of!(HyperMixApplyArgsRaw, gate) == 24
+        && offset_of!(HyperMixApplyArgsRaw, block) == 32
+        && offset_of!(HyperMixApplyArgsRaw, m) == 40
+        && offset_of!(HyperMixApplyArgsRaw, branches) == 44
+        && offset_of!(HyperMixApplyArgsRaw, hidden) == 48
+);
+
 unsafe extern "C" {
+    #[link_name = "inference_cuda_hyper_mix_apply_launch"]
+    fn hyper_mix_apply_raw(
+        args: *const HyperMixApplyArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
     #[link_name = "inference_cuda_hyper_read_launch"]
     fn hyper_read_raw(
         args: *const HyperReadArgsRaw,
@@ -164,6 +196,16 @@ pub(in crate::kernels::cuda) struct HyperReadRaw<'a> {
 pub(in crate::kernels::cuda) struct HyperApplyRaw<'a> {
     pub(in crate::kernels::cuda) dims: HyperDims,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) gate: RawRange<'a>,
+    pub(in crate::kernels::cuda) block: RawRange<'a>,
+}
+
+/// What one mixing apply launch touches: `out` is written, apart from every input.
+pub(in crate::kernels::cuda) struct HyperMixApplyRaw<'a> {
+    pub(in crate::kernels::cuda) dims: HyperDims,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) out: RawRange<'a>,
+    pub(in crate::kernels::cuda) mix: RawRange<'a>,
     pub(in crate::kernels::cuda) gate: RawRange<'a>,
     pub(in crate::kernels::cuda) block: RawRange<'a>,
 }
@@ -380,5 +422,58 @@ pub(in crate::kernels::cuda) fn hyper_apply_launch(
     // the entry checks the addresses again. The allocations outlive the queued work, `args` is a
     // live local read only during the call, `stream` is live and `stage` is writable.
     let status = unsafe { hyper_apply_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Queues the mixing apply on `stream`:
+/// `out[t][dst][d] = sum_src mix[t][dst + src * branches] * x[t][src][d] + gate[t][dst] * block[t][d]`.
+pub(in crate::kernels::cuda) fn hyper_mix_apply_launch(
+    stream: &RawStream,
+    call: HyperMixApplyRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let dims = call.dims;
+    let width = dims_width(dims).ok_or_else(invalid_argument)?;
+    let bytes = |per_row: usize| {
+        dims.m
+            .checked_mul(per_row)
+            .and_then(|v| v.checked_mul(FLOAT))
+            .ok_or_else(invalid_argument)
+    };
+    let (x_bytes, mix_bytes, gate_bytes, block_bytes) = (
+        bytes(width)?,
+        bytes(dims.branches * dims.branches)?,
+        bytes(dims.branches)?,
+        bytes(dims.hidden)?,
+    );
+    let out = Span::of(&call.out, x_bytes);
+    let ok = fits(&call.x, x_bytes, FLOAT)
+        && fits(&call.out, x_bytes, FLOAT)
+        && fits(&call.mix, mix_bytes, FLOAT)
+        && fits(&call.gate, gate_bytes, FLOAT)
+        && fits(&call.block, block_bytes, FLOAT)
+        && out.apart(&Span::of(&call.x, x_bytes))
+        && out.apart(&Span::of(&call.mix, mix_bytes))
+        && out.apart(&Span::of(&call.gate, gate_bytes))
+        && out.apart(&Span::of(&call.block, block_bytes));
+    if !ok {
+        return Err(invalid_argument());
+    }
+    let (m, branches, hidden) = ints(dims).ok_or_else(invalid_argument)?;
+    let args = HyperMixApplyArgsRaw {
+        x: call.x.address().cast_const(),
+        out: call.out.address(),
+        mix: call.mix.address().cast_const(),
+        gate: call.gate.address().cast_const(),
+        block: call.block.address().cast_const(),
+        m,
+        branches,
+        hidden,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: the checks above proved the five ranges inside their live allocations, large
+    // enough, 4-byte aligned, and `out`, which the kernel writes, apart from the others; the entry
+    // checks the addresses again. The allocations outlive the queued work, `args` is a live local
+    // read only during the call, `stream` is live and `stage` is writable.
+    let status = unsafe { hyper_mix_apply_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }

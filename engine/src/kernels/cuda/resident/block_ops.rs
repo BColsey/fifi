@@ -106,25 +106,6 @@ impl<'b> BlockOp<'b> {
             .write(6, comb, bytes(&[n, 16, 4])?))
     }
 
-    /// `out[dst] = sum_src comb[dst][src] * resid[src] + post[dst] * branch`.
-    pub(crate) fn hc_apply(
-        n: usize,
-        h: usize,
-        resid: DeviceRange<'b>,
-        branch: DeviceRange<'b>,
-        post: DeviceRange<'b>,
-        comb: DeviceRange<'b>,
-        out: DeviceRange<'b>,
-    ) -> Result<Self, EngError> {
-        let width = bytes(&[HC_HEAD, h])?;
-        Ok(Self::new(2, &[n, h], &[])?
-            .read(0, resid, bytes(&[n, width, 4])?)
-            .read(1, branch, bytes(&[n, h, 4])?)
-            .read(2, post, bytes(&[n, HC_HEAD, 4])?)
-            .read(3, comb, bytes(&[n, 16, 4])?)
-            .write(4, out, bytes(&[n, width, 4])?))
-    }
-
     /// The mean of the four streams of token row `row`.
     pub(crate) fn hc_mean(
         row: usize,

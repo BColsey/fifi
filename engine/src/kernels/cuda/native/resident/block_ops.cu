@@ -172,22 +172,6 @@ __global__ void __launch_bounds__(256) hc_read_kernel(
     }
 }
 
-__global__ void hc_apply_kernel(const float *resid, const float *branch, const float *post,
-                                const float *comb, float *out, int h) {
-    const int t = blockIdx.x;
-    const int k = blockIdx.y * blockDim.x + threadIdx.x;
-    if (k >= h) return;
-    const float *inp = resid + (size_t)t * kHcStreams * h;
-    const float b = branch[(size_t)t * h + k];
-    for (int dst = 0; dst < kHcStreams; ++dst) {
-        float acc = 0.0f;
-        for (int src = 0; src < kHcStreams; ++src)
-            acc += inp[src * h + k] * comb[(size_t)t * 16 + dst + src * kHcStreams];
-        acc += b * post[(size_t)t * kHcStreams + dst];
-        out[((size_t)t * kHcStreams + dst) * h + k] = acc;
-    }
-}
-
 __global__ void hc_mean_kernel(const float *resid, float *out, int row, int h) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= h) return;
@@ -627,20 +611,6 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                                                        (const float *)p[2], (const float *)p[3],
                                                        (float *)p[4], (float *)p[5], (float *)p[6],
                                                        (int)h, f[0], f[1]);
-            return launch_status(out_stage);
-        }
-        case INFERENCE_CUDA_BLOCK_OP_HC_APPLY: {
-            const long long n = i[0], h = i[1], w = 4LL * h;
-            if (n < 1 || n > 65536 || h < 32 || h > 8192) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            slots.use(0, n * w * 4, false);
-            slots.use(1, n * h * 4, false);
-            slots.use(2, n * 4 * 4, false);
-            slots.use(3, n * 16 * 4, false);
-            slots.use(4, n * w * 4, true);
-            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            hc_apply_kernel<<<dim3((unsigned)n, (unsigned)((h + 255) / 256)), 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (const float *)p[2], (const float *)p[3],
-                (float *)p[4], (int)h);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_HC_MEAN: {

@@ -304,7 +304,13 @@ __global__ void hyper_combine_k(const float *__restrict__ normed, const float *_
     mixed[(size_t)t * hidden + d] = sum / (float)branches;
 }
 
-__global__ void hyper_apply_k(float *__restrict__ x, const float *__restrict__ gate,
+/* One apply kernel for both uses. With Mix = false it is the in-place gated write
+ * x[t][b][d] += gate[t][b] * block[t][d] (`x_in` is not read; the instruction stream is that of
+ * the original kernel). With Mix = true it writes out[t][dst][d] = sum_src mix[t][dst + src *
+ * branches] * x_in[t][src][d] + gate[t][dst] * block[t][d], out and x_in apart. */
+template <bool Mix>
+__global__ void hyper_apply_k(float *__restrict__ x, const float *__restrict__ x_in,
+                              const float *__restrict__ mix, const float *__restrict__ gate,
                               const float *__restrict__ block, int branches, int hidden) {
     const int i = blockIdx.y * blockDim.x + threadIdx.x;
     const int width = branches * hidden;
@@ -312,7 +318,18 @@ __global__ void hyper_apply_k(float *__restrict__ x, const float *__restrict__ g
     const int t = blockIdx.x;
     const int b = i / hidden;
     const int d = i - b * hidden;
-    x[(size_t)t * width + i] += gate[(size_t)t * branches + b] * block[(size_t)t * hidden + d];
+    if constexpr (Mix) {
+        float acc = 0.0f;
+        for (int src = 0; src < branches; ++src)
+            acc += x_in[(size_t)t * width + src * hidden + d] *
+                   mix[(size_t)t * branches * branches + b + src * branches];
+        acc += block[(size_t)t * hidden + d] * gate[(size_t)t * branches + b];
+        x[(size_t)t * width + i] = acc;
+    } else {
+        (void)x_in;
+        (void)mix;
+        x[(size_t)t * width + i] += gate[(size_t)t * branches + b] * block[(size_t)t * hidden + d];
+    }
 }
 
 bool shape_ok(int m, int branches, int hidden) {
@@ -360,6 +377,24 @@ bool valid_read(const inference_cuda_hyper_read_args &a, void *stream) {
         }
     }
     return true;
+}
+
+bool valid_mix_apply(const inference_cuda_hyper_mix_apply_args &a, void *stream) {
+    if (stream == NULL || a.x == NULL || a.out == NULL || a.mix == NULL || a.gate == NULL ||
+        a.block == NULL) {
+        return false;
+    }
+    if (!shape_ok(a.m, a.branches, a.hidden)) return false;
+    if (!aligned(a.x, 4) || !aligned(a.out, 4) || !aligned(a.mix, 4) || !aligned(a.gate, 4) ||
+        !aligned(a.block, 4)) {
+        return false;
+    }
+    const size_t m = (size_t)a.m, width = (size_t)a.branches * a.hidden;
+    const Span out = {a.out, m * width * 4};
+    return apart(out, {a.x, m * width * 4}) &&
+           apart(out, {a.mix, m * (size_t)a.branches * a.branches * 4}) &&
+           apart(out, {a.gate, m * (size_t)a.branches * 4}) &&
+           apart(out, {a.block, m * (size_t)a.hidden * 4});
 }
 
 bool valid_apply(const inference_cuda_hyper_apply_args &a, void *stream) {
@@ -476,9 +511,30 @@ extern "C" int inference_cuda_hyper_apply_launch(const inference_cuda_hyper_appl
         const int width = args->branches * args->hidden;
         const dim3 grid(args->m, (width + 255) / 256);
         Failure failure;
-        hyper_apply_k<<<grid, 256, 0, (cudaStream_t)stream>>>(
-            (float *)args->x, (const float *)args->gate, (const float *)args->block,
-            args->branches, args->hidden);
+        hyper_apply_k<false><<<grid, 256, 0, (cudaStream_t)stream>>>(
+            (float *)args->x, NULL, NULL, (const float *)args->gate,
+            (const float *)args->block, args->branches, args->hidden);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_hyper_mix_apply_launch(
+    const inference_cuda_hyper_mix_apply_args *args, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid_mix_apply(*args, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const int width = args->branches * args->hidden;
+        const dim3 grid(args->m, (width + 255) / 256);
+        Failure failure;
+        hyper_apply_k<true><<<grid, 256, 0, (cudaStream_t)stream>>>(
+            (float *)args->out, (const float *)args->x, (const float *)args->mix,
+            (const float *)args->gate, (const float *)args->block, args->branches, args->hidden);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

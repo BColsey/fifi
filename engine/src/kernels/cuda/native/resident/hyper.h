@@ -62,6 +62,25 @@ typedef struct inference_cuda_hyper_apply_args {
     int hidden;
 } inference_cuda_hyper_apply_args;
 
+/* The same apply with a stream-mixing matrix, out of place:
+ * out[t][dst][d] = sum_src mix[t][dst + src * branches] * x[t][src][d] + gate[t][dst] * block[t][d].
+ * x is f32 [m][branches * hidden], out the same shape and apart from every input, mix f32
+ * [m][branches * branches], gate f32 [m][branches], block f32 [m][hidden]. The in-place apply
+ * above is the same kernel without the matrix. */
+typedef struct inference_cuda_hyper_mix_apply_args {
+    const void *x;
+    void *out;
+    const void *mix;
+    const void *gate;
+    const void *block;
+    int m;
+    int branches;
+    int hidden;
+} inference_cuda_hyper_mix_apply_args;
+
+int inference_cuda_hyper_mix_apply_launch(const inference_cuda_hyper_mix_apply_args *args,
+                                          void *stream, int *out_stage);
+
 int inference_cuda_hyper_read_launch(const inference_cuda_hyper_read_args *args, void *stream,
                                      int *out_stage);
 
