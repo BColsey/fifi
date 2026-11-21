@@ -180,6 +180,12 @@ pub(in crate::family::flash_next) const DECODE_BLOCK_TYPES: [GgufType; 8] = [
     GgufType::Iq4Xs,
 ];
 
+/// Tensor types the routed-expert kernel reads: the vendored matvec arms only. The in-house
+/// dense kernels (Q5_K, Q4_0, Q3_K, IQ4_XS) have no id-indexed expert form yet, so an expert
+/// matrix of those types is a gap although a dense matrix of the same type is not.
+pub(in crate::family::flash_next) const EXPERT_BLOCK_TYPES: [GgufType; 4] =
+    [GgufType::Q4K, GgufType::Q50, GgufType::Q6K, GgufType::Q80];
+
 /// What a role requires of its tensor's type.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -765,11 +771,11 @@ impl TensorMap {
     /// each with its tensor count, bytes and first tensor, in order of first appearance.
     pub(in crate::family::flash_next) fn kernel_gaps(
         &self,
-        supported: impl Fn(GgufType) -> bool,
+        supported: impl Fn(Place, GgufType) -> bool,
     ) -> Vec<KernelGap> {
         let mut gaps: Vec<KernelGap> = Vec::new();
         for entry in self.entries.iter().filter(|e| e.needs_kernel()) {
-            if is_float(entry.ty) || supported(entry.ty) {
+            if is_float(entry.ty) || supported(entry.place, entry.ty) {
                 continue;
             }
             match gaps.iter_mut().find(|gap| gap.ty == entry.ty) {
@@ -789,9 +795,14 @@ impl TensorMap {
     }
 }
 
-/// Whether the in-tree CUDA decode kernels read `ty` as stored blocks.
-pub(in crate::family::flash_next) fn has_decode_kernel(ty: GgufType) -> bool {
-    DECODE_BLOCK_TYPES.contains(&ty)
+/// Whether the in-tree CUDA decode kernels read a matrix of `ty` served from `place` as stored
+/// blocks: the dense matvec kernels for the trunk, the expert kernel for the routed experts.
+pub(in crate::family::flash_next) fn has_decode_kernel(place: Place, ty: GgufType) -> bool {
+    if place == Place::Experts {
+        EXPERT_BLOCK_TYPES.contains(&ty)
+    } else {
+        DECODE_BLOCK_TYPES.contains(&ty)
+    }
 }
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -812,6 +823,32 @@ mod cuda_tests {
             QuantType::Q40 => GgufType::Q40,
             QuantType::Q3K => GgufType::Q3K,
             QuantType::Iq4Xs => GgufType::Iq4Xs,
+        }
+    }
+
+    #[test]
+    fn the_expert_block_types_are_the_vendored_matvec_arms() {
+        // The vendored arms are the formats that carry a `ggml_type`; the in-house formats
+        // have none (`QuantType::ggml` is unreachable for them). Same exhaustive match.
+        let vendored = |quant: QuantType| match quant {
+            QuantType::Q4K | QuantType::Q50 | QuantType::Q6K | QuantType::Q80 => true,
+            QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs => false,
+        };
+        for quant in [
+            QuantType::Q4K,
+            QuantType::Q50,
+            QuantType::Q6K,
+            QuantType::Q80,
+            QuantType::Q5K,
+            QuantType::Q40,
+            QuantType::Q3K,
+            QuantType::Iq4Xs,
+        ] {
+            assert_eq!(
+                EXPERT_BLOCK_TYPES.contains(&gguf_type(quant)),
+                vendored(quant),
+                "{quant:?}"
+            );
         }
     }
 

@@ -136,16 +136,20 @@ impl GgufModel {
                 )
             })
             .collect();
-        let readable: Vec<&str> = tensors::DECODE_BLOCK_TYPES
-            .iter()
-            .map(|ty| ty.name())
-            .collect();
+        let names = |types: &[crate::weights::GgufType]| {
+            types
+                .iter()
+                .map(|ty| ty.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         EngError::Checkpoint(format!(
             "Flash-Next GGUF {} cannot be served on CUDA yet: no decode kernel reads {}. The \
-             CUDA kernels read {}.",
+             dense kernels read {}; the routed-expert kernel reads {}.",
             self.first_path().display(),
             listed.join(", "),
-            readable.join(", ")
+            names(&tensors::DECODE_BLOCK_TYPES),
+            names(&tensors::EXPERT_BLOCK_TYPES)
         ))
     }
 
