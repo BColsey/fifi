@@ -42,6 +42,7 @@ struct Cache<T> {
     protected: VecDeque<Entry<T>>,
     protected_bytes: usize,
     protected_limit: usize,
+    miss_bytes_since_protected_hit: usize,
     bytes: usize,
     limit: usize,
 }
@@ -53,6 +54,7 @@ impl<T> Cache<T> {
             protected: VecDeque::new(),
             protected_bytes: 0,
             protected_limit: 0,
+            miss_bytes_since_protected_hit: 0,
             bytes: 0,
             limit,
         }
@@ -64,6 +66,7 @@ impl<T> Cache<T> {
             let entry = self.protected.remove(position)?;
             let value = Rc::clone(&entry.value);
             self.protected.push_back(entry);
+            self.miss_bytes_since_protected_hit = 0;
             return Some(value);
         }
         let position = self.entries.iter().position(matches)?;
@@ -87,13 +90,25 @@ impl<T> Cache<T> {
         if bytes > self.limit {
             return 0;
         }
+        // After a probationary budget's worth of new demand without a protected
+        // hit, let that demand reclaim the oldest protected planes.
+        let reclaim_protected = if self.protected_limit == 0 {
+            false
+        } else {
+            self.miss_bytes_since_protected_hit =
+                self.miss_bytes_since_protected_hit.saturating_add(bytes);
+            self.miss_bytes_since_protected_hit > self.limit - self.protected_limit
+        };
         let mut evicted = 0;
         while self.bytes > self.limit - bytes {
             evicted += 1;
-            let Some(victim) = self.entries.pop_front() else {
-                // The incoming plane would itself be the oldest probationary
-                // entry. Keep the protected planes and dispatch without caching it.
-                return evicted;
+            let victim = if reclaim_protected && let Some(victim) = self.protected.pop_front() {
+                self.protected_bytes -= victim.bytes;
+                victim
+            } else {
+                self.entries
+                    .pop_front()
+                    .expect("tracked probationary bytes")
             };
             self.bytes -= victim.bytes;
         }
@@ -667,12 +682,13 @@ mod tests {
     #[test]
     fn segmented_lru_retains_a_reused_plane_during_new_admissions() {
         let mut cache = Cache::new(10);
-        cache.protected_limit = 9;
+        cache.protected_limit = 6;
         for id in 0..3 {
             assert_eq!(cache.put(("gate".into(), id), 3, Rc::new(id)), 0);
         }
         assert_eq!(*cache.get("gate", 0).unwrap(), 0);
         for id in 3..6 {
+            assert_eq!(*cache.get("gate", 0).unwrap(), 0);
             assert_eq!(cache.put(("gate".into(), id), 3, Rc::new(id)), 1);
         }
         assert_eq!(*cache.get("gate", 0).unwrap(), 0);
@@ -682,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_lru_demotes_by_bytes_and_can_skip_an_incoming_plane() {
+    fn segmented_lru_demotes_by_bytes() {
         let mut cache = Cache::new(16);
         cache.protected_limit = 9;
         for (id, bytes) in [(0, 6), (1, 4), (2, 6)] {
@@ -691,10 +707,26 @@ mod tests {
         assert!(cache.get("gate", 0).is_some());
         assert!(cache.get("gate", 1).is_some());
         assert_eq!(cache.protected_bytes, 4);
-        assert_eq!(cache.put(("down".into(), 3), 13, Rc::new(3)), 3);
-        assert_eq!(cache.bytes, 4);
-        assert!(cache.get("down", 3).is_none());
-        assert!(cache.get("gate", 1).is_some());
+        assert_eq!(cache.bytes, 16);
+    }
+
+    #[test]
+    fn segmented_lru_reclaims_space_for_a_new_working_set() {
+        let mut cache = Cache::new(100);
+        cache.protected_limit = 90;
+        for id in 0..80 {
+            cache.put(("gate".into(), id), 1, Rc::new(id));
+        }
+        for id in 0..80 {
+            assert_eq!(*cache.get("gate", id).unwrap(), id);
+        }
+        for id in 80..120 {
+            cache.put(("gate".into(), id), 1, Rc::new(id));
+            assert!(cache.bytes <= cache.limit);
+        }
+        for id in 80..120 {
+            assert_eq!(*cache.get("gate", id).unwrap(), id);
+        }
     }
 
     #[test]
