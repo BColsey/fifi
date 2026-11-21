@@ -25,6 +25,39 @@
 use super::moe_block::pick_union;
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrefillWaveScope {
+    Layer(usize),
+    All,
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl PrefillWaveScope {
+    pub(super) fn parse(value: &std::ffi::OsStr) -> Result<Self, crate::EngError> {
+        if value == "all" {
+            return Ok(Self::All);
+        }
+        value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .map(Self::Layer)
+            .ok_or_else(|| {
+                crate::EngError::BadRequest(
+                    "INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER needs a zero-based layer number or all"
+                        .into(),
+                )
+            })
+    }
+
+    pub(super) fn includes(self, layer: usize) -> bool {
+        match self {
+            Self::Layer(selected) => layer == selected,
+            Self::All => true,
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) fn plan_expert_waves(
     picks: &[i32],
     slot_row: &[i32],
@@ -366,6 +399,7 @@ pub(in crate::family::flash_next) mod device {
             if dims.rows <= 1 || !bank.uses_prefill_waves(self.layer) {
                 return Ok(None);
             }
+            bank.trace_wave_routes(self.layer, picks);
             super::plan_expert_waves(picks, bank.slot_row(self.layer)?, bank.geometry().slots)
                 .map(Some)
         }

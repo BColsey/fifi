@@ -621,6 +621,7 @@ pub(super) mod device {
 
     use super::super::bank_source::DiskReadTiming;
     use super::super::disk_prefetch::{CANDIDATES, DiskPrefetch, Target};
+    use super::super::prefill_adapter::PrefillWaveScope;
     use super::super::victim_cache::{Key as VictimKey, RecentPicks, VictimIndex, VictimLayout};
     use super::{
         HostPinPlan, ROUTE_BUCKETS, RecordSource, ReplaceOnMissLru, route_bucket, route_counts,
@@ -675,7 +676,7 @@ pub(super) mod device {
         refill_timing: Option<Cell<[RefillTiming; 2]>>,
         trace_prefill_routes: bool,
         exact_prefill_groups: bool,
-        prefill_wave_layer: Option<usize>,
+        prefill_waves: Option<PrefillWaveScope>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -772,7 +773,7 @@ pub(super) mod device {
                 refill_timing: None,
                 trace_prefill_routes: false,
                 exact_prefill_groups: false,
-                prefill_wave_layer: None,
+                prefill_waves: None,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1101,19 +1102,22 @@ pub(super) mod device {
 
         pub(in crate::family::flash_next::cuda) fn enable_prefill_waves(
             &mut self,
-            layer: usize,
+            scope: PrefillWaveScope,
         ) -> Result<(), EngError> {
-            if self.source.is_none() || layer >= self.state.geometry().layers {
+            if self.source.is_none()
+                || matches!(scope, PrefillWaveScope::Layer(layer) if layer >= self.state.geometry().layers)
+            {
                 return Err(EngError::BadRequest(
-                    "INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER needs a valid layer of a Flash-Next disk bank".into(),
+                    "INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER needs a Flash-Next disk bank and a valid layer selection".into(),
                 ));
             }
-            self.prefill_wave_layer = Some(layer);
+            self.prefill_waves = Some(scope);
             Ok(())
         }
 
         pub(in crate::family::flash_next::cuda) fn uses_prefill_waves(&self, layer: usize) -> bool {
-            self.prefill_wave_layer == Some(layer)
+            self.prefill_waves
+                .is_some_and(|scope| scope.includes(layer))
         }
 
         pub(in crate::family::flash_next::cuda) fn trace_prefill_chunk(
@@ -1143,6 +1147,17 @@ pub(super) mod device {
             if self.trace_prefill_routes {
                 let record = serde_json::json!({"layer": layer, "picks": picks, "misses": misses});
                 eprintln!("flash-next disk prefill group: {record}");
+            }
+        }
+
+        pub(in crate::family::flash_next::cuda) fn trace_wave_routes(
+            &self,
+            layer: usize,
+            picks: &[i32],
+        ) {
+            if self.trace_prefill_routes {
+                let record = serde_json::json!({"layer": layer, "picks": picks});
+                eprintln!("flash-next disk prefill wave routes: {record}");
             }
         }
 

@@ -4,11 +4,22 @@
 //! the policy and the slot row, the parts of the contract that live on the host.
 
 use super::prefill_adapter::{
-    AdmitPlan, drain_before_admit, exact_route_groups, plan_expert_waves, ring_slots,
+    AdmitPlan, PrefillWaveScope, drain_before_admit, exact_route_groups, plan_expert_waves,
+    ring_slots,
 };
 use crate::EngError;
 use crate::family::expert_bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use std::cell::RefCell;
+
+#[test]
+fn prefill_wave_selection_supports_one_layer_and_all_layers() {
+    let one = PrefillWaveScope::parse("13".as_ref()).unwrap();
+    let all = PrefillWaveScope::parse("all".as_ref()).unwrap();
+    assert!(one.includes(13));
+    assert!(!one.includes(0));
+    assert!((0..48).all(|layer| all.includes(layer)));
+    assert!(PrefillWaveScope::parse("on".as_ref()).is_err());
+}
 
 #[test]
 fn expert_waves_dispatch_gpu_hits_first_and_group_every_cold_pair_once() {
