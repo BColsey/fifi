@@ -1889,6 +1889,21 @@ impl Q36Settings {
             .ok_or_else(|| bad("the prefix_reuse cap requirement overflows u64".into()))?;
         Ok((growth, fixed, required))
     }
+
+    /// The bytes one saved prefix entry holds at the context limit: its attention caches plus
+    /// the fixed DeltaNet state. The live session's own cache is already in the prefill reserve.
+    pub(crate) fn prefix_entry_bytes(&self) -> Result<u64, EngError> {
+        let (_, fixed, required) = self.prefix_reuse_requirement()?;
+        Ok((required - fixed) / 2 + fixed)
+    }
+
+    /// The session cap that makes the `prefix_reuse` rule hold, for an MLX start whose cap the
+    /// configuration does not set.
+    pub(crate) fn raise_session_cap_for_prefix_reuse(&mut self) -> Result<(), EngError> {
+        let (_, _, required) = self.prefix_reuse_requirement()?;
+        self.session_cap = self.session_cap.max(required);
+        Ok(())
+    }
 }
 
 /// The executor's checked shape, before any shard opens or any weight is imported.

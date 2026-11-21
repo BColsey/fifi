@@ -487,10 +487,10 @@ fn the_shipped_rtx3090_fp16_config_passes_every_check_before_the_backend() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let text = stderr(&output);
     assert!(text.contains("engine q36 failed to start"), "{text}");
-    // The profile is CUDA-only: a build that reads the settings as the MLX arm applies that
-    // arm's prefix_reuse session cap, which the 98,304-position fp16 cache exceeds.
+    // The profile is CUDA-only: a build that reads the settings as the MLX arm raises the unset
+    // session cap for prefix reuse and stops at the missing backend.
     #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
-    let expected = "prefix_reuse needs session_cap_bytes";
+    let expected = "this build has no Q36 backend";
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     let expected = "tokenizer.json is missing from the checkpoint directory";
     assert!(text.contains(expected), "{text}");

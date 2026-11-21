@@ -386,6 +386,21 @@ pub(crate) fn start_one(
                 .map(|options| options.kv_profile.as_str()),
         );
     let prefix_reuse = entry_prefix_reuse(config, file_prefix_reuse, flint_opt_in);
+    if file_prefix_reuse.is_none()
+        && config.family == q36_factory::FAMILY
+        && cfg!(all(
+            feature = "native-mlx",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))
+    {
+        let (_, reason) = auto_mlx_prefix_reuse(config);
+        eprintln!(
+            "engine {}: prefix reuse {} automatically: {reason}",
+            config.id,
+            if prefix_reuse { "on" } else { "off" }
+        );
+    }
     // The block prefix-match state is process-wide (the env parse) but only
     // matters for engines whose store can cut a rolling Block entry. The
     // engine thread fires this note with the BUILT executor's own
@@ -744,6 +759,13 @@ pub(crate) fn default_prefix_reuse_with(
     engine: &EngineConfig,
     p2p_env: Option<&std::ffi::OsStr>,
 ) -> bool {
+    if cfg!(all(
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    )) {
+        return engine.family == q36_factory::FAMILY && auto_mlx_prefix_reuse(engine).0;
+    }
     if !cfg!(all(feature = "native-cuda", target_os = "linux")) {
         return false;
     }
@@ -755,6 +777,16 @@ pub(crate) fn default_prefix_reuse_with(
         }
         _ => false,
     }
+}
+
+/// The Mac decision for a Qwen3.6 entry that sets no `prefix_reuse`, with its reason.
+pub(crate) fn auto_mlx_prefix_reuse(engine: &EngineConfig) -> (bool, String) {
+    q36_factory::mlx_auto_prefix_reuse(
+        &engine.family,
+        &engine.model_dir,
+        &engine.tokenizer_dir,
+        engine.qwen36.as_ref(),
+    )
 }
 
 /// The registry's family names, for the uniqueness pin in tests.
@@ -1571,10 +1603,12 @@ mod tests {
     fn the_prefix_reuse_flag_of_the_file_reaches_the_q36_session_cap_rule() {
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(4 << 30),
             ..Q36Options::default()
         };
-        // With the flag on, the Q36 engine start applies the session-cap rule and refuses the
-        // default cap of 4 GiB before it reaches the backend.
+        // With the flag on, the Q36 engine start applies the session-cap rule and refuses a
+        // configured cap of 4 GiB before it reaches the backend (an unset cap is raised to
+        // what the saved prefix needs).
         let error = start_engines(&file_with(vec![q36_config(Some(options))], Some(true)))
             .err()
             .expect("error");

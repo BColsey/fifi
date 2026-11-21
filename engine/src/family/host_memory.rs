@@ -141,6 +141,14 @@ pub(crate) fn shard_bytes(model_dir: &std::path::Path) -> Option<u64> {
     (shards > 0).then_some(total)
 }
 
+/// Whether the model, a session reserve and `extra` bytes (a saved prefix entry) fit `budget`.
+pub(crate) fn fits_budget(model_bytes: u64, reserve: u64, extra: u64, budget: u64) -> bool {
+    model_bytes
+        .checked_add(reserve)
+        .and_then(|bytes| bytes.checked_add(extra))
+        .is_some_and(|needed| needed <= budget)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +181,7 @@ mod tests {
         assert_eq!(host_budget(36 * GIB), 30 * GIB);
         assert_eq!(host_budget(16 * GIB), 12 * GIB);
         assert_eq!(host_budget(24 * GIB), 20 * GIB);
+        assert!(fits_budget(10, 20, 30, 60) && !fits_budget(10, 20, 30, 59));
     }
 
     #[test]

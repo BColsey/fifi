@@ -104,7 +104,88 @@ pub(crate) fn settings_with_prefix_reuse(
     let mut settings =
         Q36Settings::new_for_family(model_dir, tokenizer_dir, options, env, backend, spec)?;
     settings.prefix_reuse = prefix_reuse;
+    // An MLX start that sets no session cap takes the cap the prefix store needs, instead of
+    // refusing the default cap.
+    if prefix_reuse
+        && backend == Backend::Mlx
+        && options.is_none_or(|options| options.session_cap_bytes.is_none())
+    {
+        settings.raise_session_cap_for_prefix_reuse()?;
+    }
     Ok(settings)
+}
+
+/// Whether an entry that sets no `prefix_reuse` keeps conversation prefixes on a Mac, and why
+/// not when it does not. Reuse is on when the host memory holds the model, the session reserve
+/// and one saved prefix entry at the context the start will use, and the configuration does not
+/// pin a smaller session cap; otherwise the start keeps the plain full prefill.
+pub(crate) fn mlx_auto_prefix_reuse(
+    family: &str,
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    options: Option<&Q36Options>,
+) -> (bool, String) {
+    let Some(spec) = descriptor(family) else {
+        return (false, "unsupported family".into());
+    };
+    if backend_of_build() != Backend::Mlx {
+        return (false, "not an Apple Silicon start".into());
+    }
+    let env = Q36Env::from_process(model_dir);
+    mlx_auto_prefix_reuse_with(spec, model_dir, tokenizer_dir, options, &env)
+}
+
+fn mlx_auto_prefix_reuse_with(
+    spec: FamilySpec,
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    options: Option<&Q36Options>,
+    env: &Q36Env,
+) -> (bool, String) {
+    let off = |why: String| (false, why);
+    if spec.feed_forward.is_some() {
+        return off("the dense family keeps one session".into());
+    }
+    let settings = match settings_with_prefix_reuse(
+        model_dir,
+        tokenizer_dir,
+        options,
+        env,
+        Backend::Mlx,
+        true,
+        spec,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => return off(format!("the settings do not resolve ({error:?})")),
+    };
+    if settings.check_prefix_reuse_cap(true).is_err() {
+        return off("the configured session_cap_bytes is below what a saved prefix needs".into());
+    }
+    let (Some(host), Some(budget)) = (env.host, settings.prefill_budget) else {
+        return off("the host memory or the prefill budget is not known".into());
+    };
+    let entry = match settings.prefix_entry_bytes() {
+        Ok(entry) => entry,
+        Err(error) => return off(format!("the prefix entry is not priced ({error:?})")),
+    };
+    let resident = match (settings.mlx_staged_cap, env.experts) {
+        (Some(_), Some(experts)) => host.staged(experts).model_bytes,
+        _ => host.model_bytes,
+    };
+    let needed = resident
+        .saturating_add(settings.prefill_reserve)
+        .saturating_add(entry);
+    if !crate::family::host_memory::fits_budget(resident, settings.prefill_reserve, entry, budget) {
+        return off(format!(
+            "the model, the session reserve and one saved prefix need {needed} bytes and the budget is {budget}"
+        ));
+    }
+    (
+        true,
+        format!(
+            "the model, the session reserve and one saved prefix need {needed} of {budget} bytes"
+        ),
+    )
 }
 
 /// The Linux tests reach `settings_with_prefix_reuse` and the rules; the call from this
@@ -247,11 +328,13 @@ mod tests {
      {
         let options = Q36Options {
             cache_limit_bytes: Some(1024),
+            session_cap_bytes: Some(4 << 30),
             ..Q36Options::default()
         };
-        // The default cap of 4 GiB covers one live session of the default 8-bit cache at the
+        // A configured cap of 4 GiB covers one live session of the default 8-bit cache at the
         // default limit of 262,144 positions (2,917,990,400 bytes with the DeltaNet state), but
-        // not the entry beside it (5,770,117,120 bytes together).
+        // not the entry beside it (5,770,117,120 bytes together). A cap that the configuration
+        // sets stays exact; only an unset cap is raised to what the prefix store needs.
         let text = error_text(start_with_reuse(Some(&options), &Q36Env::default(), true));
         assert!(
             text.contains("at least 5770117120 bytes")
@@ -260,6 +343,18 @@ mod tests {
                 && text.contains("raise session_cap_bytes"),
             "{text}"
         );
+    }
+
+    // An unset session cap is raised to what the prefix store needs instead of refusing.
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+    #[test]
+    fn an_unset_session_cap_is_raised_for_prefix_reuse() {
+        let options = Q36Options {
+            cache_limit_bytes: Some(1024),
+            ..Q36Options::default()
+        };
+        let text = error_text(start_with_reuse(Some(&options), &Q36Env::default(), true));
+        assert!(!text.contains("raise session_cap_bytes"), "{text}");
     }
 
     // The CUDA arm ignores `session_cap_bytes` (an MLX-only key), so the cap rule has no CUDA
@@ -449,5 +544,63 @@ mod tests {
         // The fallback arm is not compiled in this build: its full text is pinned by equality
         // in `a_complete_entry_in_a_build_without_the_backend_names_both_features`, which runs
         // on the no-backend build where the text IS the error.
+    }
+
+    #[test]
+    fn a_mac_start_keeps_prefixes_when_the_host_holds_one_saved_entry() {
+        use super::super::host_plan::{ExpertFacts, HostFacts};
+        use super::{QWEN3_6_35B_A3B, mlx_auto_prefix_reuse_with};
+        use std::path::Path;
+        const GIB: u64 = 1 << 30;
+        let env = |memory_gib: u64| Q36Env {
+            host: Some(HostFacts {
+                memory_bytes: memory_gib * GIB,
+                model_bytes: 20_401_094_656,
+            }),
+            experts: Some(ExpertFacts {
+                total_bytes: 18_119_393_280,
+                stage_bytes: 452_984_832,
+            }),
+            ..Q36Env::default()
+        };
+        let decide = |memory_gib: u64, options: Option<&Q36Options>| {
+            mlx_auto_prefix_reuse_with(
+                QWEN3_6_35B_A3B,
+                Path::new("/a"),
+                Path::new("/a"),
+                options,
+                &env(memory_gib),
+            )
+        };
+        for memory_gib in [16, 24, 36, 64] {
+            let (on, reason) = decide(memory_gib, None);
+            println!("{memory_gib} GiB host: prefix reuse {on}: {reason}");
+            assert!(on, "{memory_gib} GiB: {reason}");
+        }
+        // A configured cap below what a saved prefix needs keeps reuse off instead of refusing.
+        let small_cap = Q36Options {
+            session_cap_bytes: Some(1 << 30),
+            ..Q36Options::default()
+        };
+        let (on, reason) = decide(36, Some(&small_cap));
+        assert!(!on && reason.contains("session_cap_bytes"), "{reason}");
+        // A host with no room for the saved entry keeps reuse off.
+        let tight = Q36Options {
+            context_limit: Some(262_144),
+            ..Q36Options::default()
+        };
+        let mut crowded = env(36);
+        crowded.host.as_mut().unwrap().model_bytes = 28 * GIB;
+        let (on, reason) = mlx_auto_prefix_reuse_with(
+            QWEN3_6_35B_A3B,
+            Path::new("/a"),
+            Path::new("/a"),
+            Some(&tight),
+            &Q36Env {
+                experts: None,
+                ..crowded
+            },
+        );
+        assert!(!on, "{reason}");
     }
 }
