@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strictEqual } from "node:assert";
-import { statusOf } from "./models.js";
+import { statusOf, estimateLine } from "./models.js";
 import { searchHubModels, startHubDownload, type HubDownloadJob } from "./api.js";
 
 function job(overrides: Partial<HubDownloadJob>): HubDownloadJob {
@@ -71,4 +71,17 @@ test("a download starts as a POST with the repo only", async () => {
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("estimateLine states the tier ladder from the pack size", () => {
+  const line = estimateLine({
+    vram_bytes: 5_000_000_000,
+    ram_bytes: 5_000_000_000,
+    disk_bytes: 5_000_000_000,
+    mode: "auto: Fifi picks GPU-resident, host-streamed, or disk-streamed",
+  });
+  strictEqual(
+    line,
+    "4.7 GiB resident on GPU, or streamed from RAM/disk — picked automatically",
+  );
 });

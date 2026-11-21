@@ -41,6 +41,20 @@ export function statusOf(job: HubDownloadJob): string {
   }
 }
 
+/** The one-line resource ladder for a model the user is looking
+ * at: the pack's size, then the tier note. The three tier figures
+ * carry the same bytes here (the pack is the requirement in every
+ * tier); what changes per tier is where those bytes sit, which the
+ * mode line states. */
+export function estimateLine(est: {
+  vram_bytes: number;
+  ram_bytes: number;
+  disk_bytes: number;
+  mode: string;
+}): string {
+  return `${formatBytes(est.vram_bytes)} resident on GPU, or streamed from RAM/disk — picked automatically`;
+}
+
 export class ModelsView {
   private readonly searchBody: HTMLDivElement;
   private readonly downloadsBody: HTMLDivElement;
@@ -261,6 +275,11 @@ export class ModelsView {
         repo.textContent = job.repo;
         const status = document.createElement("td");
         status.textContent = statusOf(job);
+        const needs = document.createElement("td");
+        if (job.estimate !== undefined) {
+          needs.textContent = estimateLine(job.estimate);
+          needs.title = job.estimate.mode;
+        }
         const action = document.createElement("td");
         if (job.state === "resolving" || job.state === "downloading") {
           const cancel = document.createElement("button");
@@ -272,7 +291,7 @@ export class ModelsView {
               this.say(err instanceof Error ? err.message : String(err))));
           action.append(cancel);
         }
-        tr.append(repo, status, action);
+        tr.append(repo, status, needs, action);
         table.append(tr);
       }
       this.downloadsBody.append(table);
@@ -291,6 +310,12 @@ export class ModelsView {
       }
       for (const model of this.cache.models) {
         const p = document.createElement("p");
+        if (model.estimate !== undefined) {
+          const est = document.createElement("small");
+          est.textContent = estimateLine(model.estimate);
+          est.title = model.estimate.mode;
+          p.append(est, document.createElement("br"));
+        }
         const serve = document.createElement("button");
         serve.type = "button";
         serve.textContent = "Serve";

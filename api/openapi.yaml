@@ -1853,6 +1853,31 @@ components:
           type: string
         error:
           type: string
+        estimate:
+          $ref: "#/components/schemas/ResourceEstimate"
+    ResourceEstimate:
+      type: object
+      required: [vram_bytes, ram_bytes, disk_bytes, mode]
+      description: >-
+        The resource tiers a pack needs, estimated from its weight
+        bytes. The engine picks the smallest tier that fits at serve
+        time, automatically: GPU-resident when the card carries the
+        weights, host-streamed when host memory does, disk-streamed
+        when neither does. Figures are the pack only; the runtime
+        working set is admitted per serve.
+      properties:
+        vram_bytes:
+          type: integer
+          description: The GPU-resident tier's weight bytes.
+        ram_bytes:
+          type: integer
+          description: The host-streamed tier's weight bytes.
+        disk_bytes:
+          type: integer
+          description: The pack's bytes, always on disk.
+        mode:
+          type: string
+          description: The automatic tier-selection note.
 paths:
   /health:
     get:
@@ -2649,13 +2674,15 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [repo, bytes, refs, snapshots]
+                      required: [repo, bytes, estimate, refs, snapshots]
                       properties:
                         repo:
                           type: string
                         bytes:
                           type: integer
                           description: Total size of the repo's blobs.
+                        estimate:
+                          $ref: "#/components/schemas/ResourceEstimate"
                         refs:
                           type: array
                           items:

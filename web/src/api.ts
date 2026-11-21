@@ -602,9 +602,17 @@ export interface HubCacheSnapshot {
   families: string[];
 }
 
+export interface ResourceEstimate {
+  vram_bytes: number;
+  ram_bytes: number;
+  disk_bytes: number;
+  mode: string;
+}
+
 export interface HubCacheModel {
   repo: string;
   bytes: number;
+  estimate: ResourceEstimate;
   refs: HubCacheRef[];
   snapshots: HubCacheSnapshot[];
 }
@@ -629,6 +637,7 @@ export interface HubDownloadJob {
   bytes_total?: number;
   current_file?: string;
   error?: string;
+  estimate?: ResourceEstimate;
 }
 
 export function listEngines(signal?: AbortSignal): Promise<EngineList> {

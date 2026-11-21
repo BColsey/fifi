@@ -234,6 +234,7 @@ impl Job {
                 cells.insert("bytes".into(), bytes.into());
                 cells.insert("bytes_total".into(), bytes_total.into());
                 cells.insert("current_file".into(), current_file.into());
+                cells.insert("estimate".into(), resource_estimate(bytes_total));
             }
             JobState::Done {
                 commit,
@@ -243,6 +244,7 @@ impl Job {
                 cells.insert("state".into(), "done".into());
                 cells.insert("commit".into(), commit.into());
                 cells.insert("bytes".into(), bytes.into());
+                cells.insert("estimate".into(), resource_estimate(bytes));
                 cells.insert("detail".into(), path.display().to_string().into());
             }
             JobState::Cancelled => {
@@ -255,6 +257,26 @@ impl Job {
         }
         row
     }
+}
+
+/// The resource ladder a pack of `weights_bytes` needs, stated the
+/// way the engine chooses at serve time. The figures are the pack
+/// itself: the GPU-resident tier must carry the weights on the card,
+/// the host-streamed tier carries them in host memory (the card then
+/// holds only a working set), and the disk-streamed tier leaves them
+/// on disk. Fifi picks the smallest tier that fits, automatically,
+/// at serve time — the runtime working set (KV cache, staging,
+/// activations) is family- and context-dependent and is admitted
+/// then, so a card sized exactly at `vram_bytes` still downshifts.
+pub(crate) fn resource_estimate(weights_bytes: u64) -> serde_json::Value {
+    serde_json::json!({
+        "vram_bytes": weights_bytes,
+        "ram_bytes": weights_bytes,
+        "disk_bytes": weights_bytes,
+        "mode": "auto: Fifi picks GPU-resident, host-streamed, or \
+                 disk-streamed at serve time; the lower tiers hold only \
+                 a working set on the GPU",
+    })
 }
 
 /// The shared hub bridge. Held by `AppState` as an `Arc`; every
@@ -474,9 +496,11 @@ impl HfHub {
             // The hub's own decoding: each `--` pair after the prefix
             // separates org from repo name.
             let repo = name["models--".len()..].replace("--", "/");
+            let bytes = dir_bytes(&dir.join("blobs"));
             models.push(serde_json::json!({
                 "repo": repo,
-                "bytes": dir_bytes(&dir.join("blobs")),
+                "bytes": bytes,
+                "estimate": resource_estimate(bytes),
                 "refs": ref_list(&dir.join("refs")),
                 "snapshots": snapshot_list(&dir),
             }));
@@ -1326,6 +1350,15 @@ mod tests {
             blob_link_target("a/b/c.safetensors", "cafe"),
             Path::new("../../../../blobs/cafe")
         );
+    }
+
+    #[test]
+    fn resource_estimates_state_the_tier_ladder() {
+        let est = resource_estimate(5_000_000_000);
+        assert_eq!(est["vram_bytes"], 5_000_000_000_u64);
+        assert_eq!(est["ram_bytes"], 5_000_000_000_u64);
+        assert_eq!(est["disk_bytes"], 5_000_000_000_u64);
+        assert!(est["mode"].as_str().expect("mode").contains("auto"));
     }
 
     #[test]
