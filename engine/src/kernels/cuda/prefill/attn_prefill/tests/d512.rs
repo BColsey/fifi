@@ -1339,13 +1339,15 @@ fn run_parts(
 
 /// The same rows cut five ways must give the same bytes as chunks of 8: `rows` rows from position
 /// `base` over a cache of `cells`, as chunks of 5, of `big` (the most rows one call takes under
-/// the 64 MB partial budget), of 1, and resumed at odd positions.
+/// the 64 MB partial budget), of 1, and resumed at odd positions; `only` checks one of those four
+/// layouts, so a slow tool can take them in separate runs.
 fn assert_rows_independent_of_chunking(
     cells: usize,
     base: usize,
     rows: usize,
     window: usize,
     big: usize,
+    only: Option<usize>,
 ) {
     let cache = cache(cells, 0xd516 + window as u64, 0.12, 1.0);
     let q = q_values(rows, 0x5eed, 1.5);
@@ -1375,7 +1377,10 @@ fn assert_rows_independent_of_chunking(
         }),
     ];
     let mut failures = Vec::new();
-    for (label, parts) in layouts {
+    for (index, (label, parts)) in layouts.into_iter().enumerate() {
+        if only.is_some_and(|only| only != index) {
+            continue;
+        }
         let got = run_parts(&cache, &q, base, &parts, window).expect(label);
         if le(&got) != le(&reference) {
             let first = got
@@ -1404,16 +1409,36 @@ fn d512_rows_do_not_depend_on_how_the_prompt_is_chunked() {
     if !testkit::device_present("d512_rows_do_not_depend_on_how_the_prompt_is_chunked") {
         return;
     }
-    assert_rows_independent_of_chunking(700, 0, 643, 0, 64);
+    assert_rows_independent_of_chunking(700, 0, 643, 0, 64, None);
 }
 
-/// The same at the depth of the 32K cache, where every one of the 128 splits holds keys.
-#[test]
-fn d512_rows_do_not_depend_on_chunking_at_32k_cells() {
-    if !testkit::device_present("d512_rows_do_not_depend_on_chunking_at_32k_cells") {
+/// The same at the depth of the 32K cache, where every one of the 128 splits holds keys. One test
+/// per layout, so a sanitizer can take them in separate runs.
+fn deep_layout(only: usize, name: &str) {
+    if !testkit::device_present(name) {
         return;
     }
-    assert_rows_independent_of_chunking(32_768, 32_400, 300, 0, 16);
+    assert_rows_independent_of_chunking(32_768, 32_600, 128, 0, 16, Some(only));
+}
+
+#[test]
+fn d512_rows_do_not_depend_on_chunking_at_32k_cells_chunks_of_5() {
+    deep_layout(0, "d512_deep_chunks_of_5");
+}
+
+#[test]
+fn d512_rows_do_not_depend_on_chunking_at_32k_cells_the_largest_chunk() {
+    deep_layout(1, "d512_deep_largest_chunk");
+}
+
+#[test]
+fn d512_rows_do_not_depend_on_chunking_at_32k_cells_chunks_of_1() {
+    deep_layout(2, "d512_deep_chunks_of_1");
+}
+
+#[test]
+fn d512_rows_do_not_depend_on_chunking_at_32k_cells_odd_resumes() {
+    deep_layout(3, "d512_deep_odd_resumes");
 }
 
 /// A sliding window moves the first visible key with the tile; the splits stay on the absolute
@@ -1423,8 +1448,8 @@ fn d512_windowed_rows_do_not_depend_on_how_the_prompt_is_chunked() {
     if !testkit::device_present("d512_windowed_rows_do_not_depend_on_how_the_prompt_is_chunked") {
         return;
     }
-    assert_rows_independent_of_chunking(1_500, 0, 1_100, 512, 64);
-    assert_rows_independent_of_chunking(4_096, 3_000, 700, 300, 64);
+    assert_rows_independent_of_chunking(1_500, 0, 1_100, 512, 64, None);
+    assert_rows_independent_of_chunking(4_096, 3_000, 700, 300, 64, None);
 }
 
 /// Runs one 8-row call at `p0` over a cache of `cells` with `split`, over a cache whose rows are

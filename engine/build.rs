@@ -614,17 +614,23 @@ impl CudaToolkit {
 
 /// Returns the SM numbers to compile for.
 ///
-/// `INFERENCE_CUDA_ARCHS` is a comma-separated list such as `86` or `72,86`.
-/// The default follows the target: aarch64 builds for Jetson Xavier (sm_72),
-/// other targets for RTX 30-series GPUs (sm_86).
+/// `INFERENCE_CUDA_ARCHS` is a comma-separated list such as `86` or `72,86`, an override. The
+/// default follows the target: aarch64 builds for Jetson Xavier (sm_72); other targets for every
+/// card the engine runs on, RTX 20 (sm_75), RTX 30 (sm_86) and RTX 40 (sm_89) series, with PTX for
+/// the newest so a newer card compiles the kernels at load. Each kernel chooses its path from the
+/// card it runs on, not from the build.
 fn cuda_archs() -> Vec<String> {
     let requested = match std::env::var("INFERENCE_CUDA_ARCHS") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => {
             let arch =
                 std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo sets CARGO_CFG_TARGET_ARCH");
-            let sm = if arch == "aarch64" { "72" } else { "86" };
-            return vec![sm.to_owned()];
+            let sms: &[&str] = if arch == "aarch64" {
+                &["72"]
+            } else {
+                &["75", "86", "89"]
+            };
+            return sms.iter().map(|sm| (*sm).to_owned()).collect();
         }
         Err(error) => panic!("INFERENCE_CUDA_ARCHS: {error}"),
     };
