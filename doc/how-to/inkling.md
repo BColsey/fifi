@@ -35,11 +35,6 @@ target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
 
 Native MLX builds on Apple Silicon use up to four attention projection workers for both formats. GGUF also uses mapped dense weights, direct packed Metal kernels where supported, grouped expert projections, and single-copy expert retention where all projections support direct packed kernels. Set `FIFI_INKLING_ATTN_CPU_WORKERS=1` to use one worker, or set the corresponding `FIFI_INKLING_GGUF_*` setting to `0` for a comparison. `FIFI_INKLING2_MINI_MLX=0` disables the native family. `FIFI_INKLING2_MINI_GGUF_MLX=0` disables GGUF serving.
 
-`FIFI_INKLING_GGUF_PERSISTENT_WORKERS=1` reuses a bounded CPU pool for
-the GGUF attention projections when multiple workers are configured.
-Idle workers park. The pool uses the planned worker stack size and
-returns the same row groups in their original order.
-
 | Artifact | Inspect | Load and generate | HTTP |
 | --- | --- | --- | --- |
 | Publisher NVFP4/MXFP8 safetensors | Yes | Real checkpoint, Metal experts | Raw, chat, and multi-turn WebGUI |
