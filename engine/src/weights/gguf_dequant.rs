@@ -19,8 +19,8 @@
 
 use super::gguf::GgufType;
 use super::gguf_tables::{
-    IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
-    KVALUES_IQ4NL,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use crate::EngError;
 
@@ -234,6 +234,24 @@ fn q6_k(b: &[u8], y: &mut [f32]) {
     }
 }
 
+fn iq1_s(b: &[u8], y: &mut [f32]) {
+    let scale = rd_f16(b, 0);
+    for (group, row) in y.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+        let high = rd_u16(b, 34 + 2 * group);
+        let d = scale * f32::from(2 * ((high >> 12) & 7) + 1);
+        let delta = if high & 0x8000 == 0 { 0.125 } else { -0.125 };
+        for (segment, values) in row.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let low = usize::from(b[2 + 4 * group + segment]);
+            let index = low | (usize::from((high >> (3 * segment)) & 7) << 8);
+            let grid = IQ1S_GRID[index];
+            for (lane, value) in values.iter_mut().enumerate() {
+                let code = (grid >> (2 * lane)) & 3;
+                *value = d * (f32::from(code) - 1.0 + delta);
+            }
+        }
+    }
+}
+
 fn iq2_xxs(b: &[u8], y: &mut [f32]) {
     let d = rd_f16(b, 0);
     for ib in 0..8 {
@@ -395,6 +413,7 @@ fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), 
         GgufType::Q6K => q6_k,
         GgufType::Q80 => q8_0,
         GgufType::Nvfp4 => nvfp4,
+        GgufType::Iq1S => iq1_s,
         GgufType::Iq2Xxs => iq2_xxs,
         GgufType::Iq2Xs => iq2_xs,
         GgufType::Iq2S => iq2_s,
@@ -541,6 +560,28 @@ pub fn dequantize(ty: GgufType, src: &[u8]) -> Result<Vec<f32>, EngError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iq1_s_matches_the_reference_grid_scales_and_signs() {
+        let mut block = std::array::from_fn::<_, 50, _>(|i| (i * 37 + 11) as u8);
+        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        let mut weights = [0.0; 256];
+        super::dequantize_into(super::GgufType::Iq1S, &block, &mut weights).unwrap();
+        assert_eq!(
+            weights[..8],
+            [-2.625, 0.375, 3.375, 3.375, 3.375, 0.375, 3.375, 0.375]
+        );
+        assert_eq!(
+            weights[112..120],
+            [
+                -1.875, -1.875, -16.875, -16.875, -16.875, -16.875, -1.875, -1.875
+            ]
+        );
+        assert_eq!(
+            weights[248..],
+            [-4.375, 5.625, 0.625, 0.625, -4.375, -4.375, 0.625, -4.375]
+        );
+    }
+
     use super::*;
 
     #[test]
