@@ -410,6 +410,7 @@ impl Raon1Model {
         self.spec
     }
 
+    #[cfg(feature = "native-cuda")]
     pub(crate) fn weights(&self) -> &GgufWeights {
         &self.weights
     }
