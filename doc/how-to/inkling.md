@@ -29,6 +29,8 @@ The GGUF inspector recognizes the mainline `inkling2_loop` and repository-root `
 
 ```sh
 FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
+  FIFI_MLX_WORKING_SET_MIB=6144 FIFI_INKLING_GGUF_PACKED_MLX=1 \
+  FIFI_INKLING_GGUF_MMAP_DENSE=1 FIFI_INKLING_ATTN_CPU_WORKERS=4 \
   target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
   --tokenizer-dir ~/models/inkling2-mini --context 192 --listen 127.0.0.1:18795
 ```
@@ -97,6 +99,18 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, both full checkpoints selected the reference token, and the fork matched all ten leading external-reference IDs. Both explicit file paths passed repeated raw completions and streamed chat at `71aa350c`. At `e9f74c2b`, each serving layout passed the matched single-copy, grouped projection and CPU worker trials below. The combined serving check is queued. |
 
 The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
+
+The release parity fixture runs seven positions on the full mixed-format checkpoint. It compares all 200,058 logits at every position, including a short final window and a follow-up decode. It checks that the grouped path actually visits experts fewer times. The focused tests separately check local and full attention boundaries, independent convolution streams, and a separate state slot for each of the 48 scheduled visits across all three core passes.
+
+From the engine directory, run the real-checkpoint comparison with four prefill rows.
+
+```sh
+FIFI_TEST_INKLING_CHECKPOINT="$HOME/models/inkling2-mini" \
+  FIFI_INKLING_PREFILL_ROWS=4 FIFI_MLX_WORKING_SET_MIB=5120 \
+  cargo test --release --locked --features native-mlx --lib \
+    family::inkling2_mini::text::tests::checkpoint_prefill_matches_serial_logits_and_followup \
+    -- --ignored --exact --test-threads=1
+```
 
 ### Original packed-cache control
 
