@@ -78,6 +78,9 @@ impl GgufTextWeights {
         let Some(cuda) = self.cuda.as_ref().filter(|cuda| cuda.streams_layer(layer)) else {
             return Ok(false);
         };
+        if let Some(ram) = &self.ram {
+            ram.observe(layer as usize, selected);
+        }
         let parts = [self.tensor(names[0])?, self.tensor(names[1])?];
         let dtype = |(tensor, _): (&Tensor, &[u8])| match tensor.kind {
             GgufType::Nvfp4 => Some(DenseDtype::GgufNvfp4),

@@ -133,6 +133,13 @@ impl MappedFile {
         .map_err(|error| crate::EngError::Checkpoint(format!("drop mapped expert cache: {error}")))
     }
 
+    /// Queue page-cache reads against the same inode that demand will access.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn prefetch(&self, bytes: std::ops::Range<usize>) -> std::io::Result<()> {
+        self.map
+            .advise_range(memmap2::Advice::WillNeed, bytes.start, bytes.len())
+    }
+
     pub fn len(&self) -> u64 {
         self.len
     }

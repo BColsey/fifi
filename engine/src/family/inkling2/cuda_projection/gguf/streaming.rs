@@ -12,10 +12,7 @@ pub(in crate::family::inkling2) struct RoutedExperts<'a> {
     pub input: &'a [f32],
 }
 
-pub(super) fn plan(hidden: usize, ff: usize) -> Result<Option<StreamBankPlan>, EngError> {
-    if std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() != Ok("1") {
-        return Ok(None);
-    }
+pub(super) fn plan(hidden: usize, ff: usize) -> Result<StreamBankPlan, EngError> {
     // BF16 gate/up and down are the largest pair. Part starts are 256-byte aligned.
     let matrix = hidden
         .checked_mul(ff)
@@ -30,7 +27,7 @@ pub(super) fn plan(hidden: usize, ff: usize) -> Result<Option<StreamBankPlan>, E
         .checked_mul(4)
         .and_then(|n| n.checked_add(4096))
         .ok_or_else(|| bad("GGUF stream scratch size overflows"))?;
-    StreamBankPlan::new(bank, 0, scratch).map(Some)
+    StreamBankPlan::new(bank, 0, scratch)
 }
 
 impl GgufCuda {
@@ -84,26 +81,17 @@ impl GgufCuda {
     ) -> Result<Vec<f32>, EngError> {
         let project = |part: usize, x: &[f32]| {
             let view = lease.part(id, part)?;
-            if view.tensor_scale == 0.0 {
-                return Ok(vec![0.0; view.shape[0] as usize]);
-            }
-            let mut values = self.step.project_streamed(
+            self.step.project_gguf(
                 &self.context,
-                lease.stream(),
-                route.dtypes[part],
-                view.data,
-                view.shape.map(|v| v as usize),
+                Some(lease.stream()),
+                (
+                    route.dtypes[part],
+                    view.data,
+                    view.shape.map(|v| v as usize),
+                    view.tensor_scale,
+                ),
                 x,
-            )?;
-            if view.tensor_scale != 1.0 {
-                for value in &mut values {
-                    *value *= view.tensor_scale;
-                    if !value.is_finite() {
-                        return Err(bad("streamed GGUF expert scale overflowed"));
-                    }
-                }
-            }
-            Ok::<_, EngError>(values)
+            )
         };
         let gates = project(0, route.input)?;
         // The GGUF stores complete gate rows followed by complete up rows.

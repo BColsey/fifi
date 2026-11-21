@@ -52,6 +52,8 @@ impl GgufCuda {
         spec: &super::TextSpec,
         layers: Vec<Nvfp4Layer<'_>>,
         file: &MappedFile,
+        direct: bool,
+        stream: bool,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
         let ff = spec.intermediate_size as usize;
@@ -65,7 +67,7 @@ impl GgufCuda {
         let plan = DensePlan::new(shape, hidden, spec.core.gate_rank as usize)?;
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
         let context = CudaContext::with_admission(&admission)?;
-        let stream_plan = streaming::plan(hidden, ff)?;
+        let stream_plan = stream.then(|| streaming::plan(hidden, ff)).transpose()?;
         let stream_bytes = stream_plan.map_or(0, |p| p.device_bytes());
         let demand = Demand {
             tensors,
@@ -93,11 +95,12 @@ impl GgufCuda {
         let stream_banks = stream_plan
             .map(|plan| crate::expert_tier::CudaStreamBanks::new(&context, plan).map(RefCell::new))
             .transpose()?;
-        let resident = ResidentExperts::load(&context, spec.n_routed_experts as u32, layers, file)?;
+        let resident =
+            ResidentExperts::load(&context, spec.n_routed_experts as u32, layers, file, direct)?;
         eprintln!(
             "Inkling GGUF CUDA projections {}",
             serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": tensors,
-                "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
+                "direct_resident_nvfp4": direct, "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
                 "resident_expert_bytes": resident.bytes(),
                 "resident_expert_layers": resident.placement().full_layers(),
                 "resident_expert_count": resident.placement().resident_experts()})
@@ -174,7 +177,20 @@ impl GgufCuda {
             .resident
             .ranges(expert.id, expert.part, [n / 2, n / 16])?
         {
-            return self.project_nvfp4(buffers, expert, x);
+            return match buffers {
+                residency::Weight::Original(raw) => self.step.project_gguf(
+                    &self.context,
+                    None,
+                    (
+                        crate::kernels::cuda::resident::dense_gemv::DenseDtype::GgufNvfp4,
+                        raw,
+                        expert.shape,
+                        expert.factor,
+                    ),
+                    x,
+                ),
+                residency::Weight::Converted(pair) => self.project_nvfp4(pair, expert, x),
+            };
         }
         let Packed { codes, scales } = &mut *self.packed.borrow_mut();
         let (codes, scales) = (&mut codes[..n / 2], &mut scales[..n / 16]);

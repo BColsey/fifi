@@ -97,20 +97,22 @@ impl DenseStep {
         })
     }
 
-    pub(super) fn project_streamed(
+    pub(super) fn project_gguf(
         &self,
         context: &CudaContext,
-        stream: &DeviceStream,
-        dtype: DenseDtype,
-        weight: DeviceRange<'_>,
-        [rows, cols]: [usize; 2],
+        stream: Option<&DeviceStream>,
+        (dtype, weight, [rows, cols], scale): (DenseDtype, DeviceRange<'_>, [usize; 2], f32),
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         if cols != x.len() {
             return Err(bad("streamed expert projection input width differs"));
         }
+        if scale == 0.0 {
+            return Ok(vec![0.0; rows]);
+        }
+        let stream = stream.unwrap_or(&self.stream);
         let output = self.range(Slot::Output, 0, rows)?;
-        self.run(context, stream, x, output, |input| {
+        let mut values = self.run(context, stream, x, output, |input| {
             context.dense_gemv(
                 stream,
                 DenseGemvCall {
@@ -121,7 +123,16 @@ impl DenseStep {
                     y: output,
                 },
             )
-        })
+        })?;
+        if scale != 1.0 {
+            for value in &mut values {
+                *value *= scale;
+                if !value.is_finite() {
+                    return Err(bad("GGUF expert scale overflowed"));
+                }
+            }
+        }
+        Ok(values)
     }
 
     pub(super) fn controller(

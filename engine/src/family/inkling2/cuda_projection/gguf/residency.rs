@@ -10,7 +10,7 @@ use crate::{
         Residency, place_gpu_layers,
     },
     family::mapped_file::MappedFile,
-    kernels::cuda::{CudaContext, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
     weights::repack_nvfp4_into,
 };
 
@@ -26,9 +26,19 @@ pub(in crate::family::inkling2) struct Nvfp4Layer<'a> {
     pub parts: [Nvfp4Stack<'a>; 2],
 }
 
+enum Bank {
+    Original(DeviceBuffer),
+    Converted(PackedBuffers),
+}
+
+pub(super) enum Weight<'a> {
+    Original(DeviceRange<'a>),
+    Converted([DeviceRange<'a>; 2]),
+}
+
 pub(super) struct ResidentExperts {
     placement: Residency,
-    banks: BTreeMap<u32, [Option<PackedBuffers>; 2]>,
+    banks: BTreeMap<u32, [Option<Bank>; 2]>,
 }
 
 impl ResidentExperts {
@@ -37,6 +47,7 @@ impl ResidentExperts {
         experts: u32,
         layers: Vec<Nvfp4Layer<'_>>,
         file: &MappedFile,
+        direct: bool,
     ) -> Result<Self, EngError> {
         let mut banks = BTreeMap::new();
         let Some(first) = layers.first() else {
@@ -54,6 +65,7 @@ impl ResidentExperts {
         let ids: Vec<_> = layers.iter().rev().map(|layer| layer.layer).collect();
         let mut source = Source {
             layers,
+            direct,
             file,
             experts,
         };
@@ -78,7 +90,7 @@ impl ResidentExperts {
         id: ExpertId,
         part: usize,
         lengths: [usize; 2],
-    ) -> Result<Option<[DeviceRange<'_>; 2]>, EngError> {
+    ) -> Result<Option<Weight<'_>>, EngError> {
         if self.placement.placement(id) != Placement::Gpu {
             return Ok(None);
         }
@@ -88,7 +100,14 @@ impl ResidentExperts {
             .and_then(|bank| bank.get(part))
             .and_then(Option::as_ref)
             .ok_or_else(|| bad("GGUF tier assigned an expert without a device bank"))?;
-        buffers.ranges_len(id.expert as usize, lengths).map(Some)
+        let index = id.expert as usize;
+        Ok(Some(match buffers {
+            Bank::Original(raw) => {
+                let len = lengths[0] + lengths[1];
+                Weight::Original(raw.range(index * len, len)?)
+            }
+            Bank::Converted(p) => Weight::Converted(p.ranges_len(index, lengths)?),
+        }))
     }
 
     pub(super) fn placement(&self) -> &Residency {
@@ -100,7 +119,10 @@ impl ResidentExperts {
             .values()
             .flatten()
             .flatten()
-            .map(|p| (p.codes.bytes() + p.scales.bytes()) as u64)
+            .map(|bank| match bank {
+                Bank::Original(raw) => raw.bytes() as u64,
+                Bank::Converted(p) => (p.codes.bytes() + p.scales.bytes()) as u64,
+            })
             .sum()
     }
 }
@@ -110,6 +132,7 @@ fn layer_bytes(layer: &Nvfp4Layer<'_>) -> u64 {
 }
 
 struct Source<'a> {
+    direct: bool,
     layers: Vec<Nvfp4Layer<'a>>,
     file: &'a MappedFile,
     experts: u32,
@@ -141,9 +164,15 @@ impl ExpertPayloadSource for Source<'_> {
         let size = part.bytes.len() / self.experts as usize;
         let offset = id.expert as usize * size;
         let n = part.shape[0] as usize * part.shape[1] as usize;
-        let mut data = vec![0; n / 2];
-        let mut scales = vec![0; n / 16];
-        repack_nvfp4_into(&part.bytes[offset..][..size], &mut data, &mut scales)?;
+        let raw = &part.bytes[offset..][..size];
+        let (data, scales) = if self.direct {
+            (raw.to_vec(), Vec::new())
+        } else {
+            let mut data = vec![0; n / 2];
+            let mut scales = vec![0; n / 16];
+            repack_nvfp4_into(raw, &mut data, &mut scales)?;
+            (data, scales)
+        };
         let tensor_scale = crate::family::inkling2::gguf_weights::expert_scale(
             part.tensor_scales,
             id.expert as usize,
@@ -167,7 +196,7 @@ impl ExpertPayloadSource for Source<'_> {
 struct Store<'a> {
     ctx: &'a CudaContext,
     experts: u32,
-    banks: &'a mut BTreeMap<u32, [Option<PackedBuffers>; 2]>,
+    banks: &'a mut BTreeMap<u32, [Option<Bank>; 2]>,
 }
 
 impl GpuExpertStore for Store<'_> {
@@ -186,15 +215,27 @@ impl GpuExpertStore for Store<'_> {
             .ok_or_else(|| bad("GGUF tier requested an unknown device bank"))?;
         if slot.is_none() {
             let count = self.experts as usize;
-            *slot = Some(PackedBuffers {
-                codes: self.ctx.allocate(data.len() * count)?,
-                scales: self.ctx.allocate(scales.len() * count)?,
+            let codes = self.ctx.allocate(data.len() * count)?;
+            *slot = Some(if scales.is_empty() {
+                Bank::Original(codes)
+            } else {
+                Bank::Converted(PackedBuffers {
+                    codes,
+                    scales: self.ctx.allocate(scales.len() * count)?,
+                })
             });
         }
         let bank = slot.as_ref().expect("allocated bank");
-        let [d, s] = bank.ranges_len(id.expert as usize, [data.len(), scales.len()])?;
-        self.ctx.upload_at(d.buffer(), d.offset(), data)?;
-        self.ctx.upload_at(s.buffer(), s.offset(), scales)
+        match bank {
+            Bank::Original(raw) => self
+                .ctx
+                .upload_at(raw, id.expert as usize * data.len(), data),
+            Bank::Converted(bank) => {
+                let [d, s] = bank.ranges_len(id.expert as usize, [data.len(), scales.len()])?;
+                self.ctx.upload_at(d.buffer(), d.offset(), data)?;
+                self.ctx.upload_at(s.buffer(), s.offset(), scales)
+            }
+        }
     }
 
     fn free_bytes(&self) -> Result<u64, EngError> {

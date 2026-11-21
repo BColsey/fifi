@@ -31,6 +31,10 @@ The Unsloth Inkling 2 Mini fixed-loop GGUF also works in the text pilot. Point `
 
 Both backends map the original packed weights from disk and decode or upload only selected expert payloads. The CUDA backend keeps BF16 dense projections resident and reuses a fixed device buffer for streamed BF16 and NVFP4 experts. Other GGUF quantization types supported by the CPU decoder run their projections on the host. The GGUF uses vectorized BF16 CUDA projections when CUDA is enabled. Set `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` to cap VRAM for compatible NVFP4 expert banks. The shared expert tier keeps complete banks for repeated core layers first and stops at its VRAM headroom. The remaining experts use the file mapping and bounded staging. Set `FIFI_INKLING_CUDA_STREAM_EXPERTS=1` to stage cold BF16 and NVFP4 expert pairs through FiFi's shared pinned CUDA banks. The GPU decodes the original GGUF NVFP4 blocks directly. Both banks are allocated before hot expert placement.
 
+Set `FIFI_INKLING_CUDA_DIRECT_RESIDENT=1` to keep original GGUF NVFP4 blocks in VRAM and use the direct CUDA kernel for those expert banks.
+
+For VRAM → RAM → SSD expert placement, set `FIFI_INKLING_CUDA_RAM_EXPERT_MIB=auto` or give a positive MiB budget. This enables shared pinned staging and automatic VRAM placement when no explicit VRAM budget is set. After GPU placement, FiFi warms file-backed expert layers within the process's host-memory allowance. Under a smaller allowance, FiFi uses the Qwen expert predictor before attention and asks Linux to read the predicted experts' two GGUF ranges into the page cache. The actual Inkling router determines which experts execute. The budget limits startup warming and advice per visit. Linux can reclaim or retain file pages as memory pressure changes. Set the RAM budget to zero to use ordinary demand paging.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

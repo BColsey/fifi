@@ -23,6 +23,8 @@ use super::cuda_projection::{
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod ram;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod streaming;
 
 const HEADER_LIMIT: u64 = 32 * 1024 * 1024;
@@ -511,6 +513,8 @@ impl GgufPlan {
                 tensors: self.tensors,
                 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
                 cuda: None,
+                #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+                ram: None,
             },
         ))
     }
@@ -521,11 +525,13 @@ pub(super) struct GgufTextWeights {
     tensors: Tensors,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     cuda: Option<GgufCuda>,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    ram: Option<ram::RamExperts>,
 }
 
 impl GgufTextWeights {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    pub(super) fn enable_cuda(&mut self, spec: &TextSpec) -> Result<(), EngError> {
+    pub(super) fn enable_cuda(&mut self, spec: &TextSpec, eps: f32) -> Result<(), EngError> {
         let mut uploads = Vec::new();
         for (name, tensor) in &self.tensors {
             if tensor.kind != GgufType::Bf16
@@ -548,14 +554,38 @@ impl GgufTextWeights {
                 shape: [rows, tensor.columns],
             });
         }
-        let budget = expert_residency_budget()?;
-        let layers = self.nvfp4_layers(spec, budget)?;
-        self.cuda = Some(GgufCuda::load(uploads, spec, layers, &self.mapping)?);
+        let ram_limit = ram::requested_limit()?;
+        let budget = if ram_limit.is_some_and(|limit| limit > 0)
+            && std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB").is_none()
+        {
+            u64::MAX
+        } else {
+            expert_residency_budget()?
+        };
+        let direct = std::env::var("FIFI_INKLING_CUDA_DIRECT_RESIDENT").as_deref() == Ok("1");
+        let layers = self.nvfp4_layers(spec, budget, direct)?;
+        let stream = ram_limit.is_some_and(|limit| limit > 0)
+            || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
+        let cuda = GgufCuda::load(uploads, spec, layers, &self.mapping, direct, stream)?;
+        self.ram = ram::RamExperts::plan(self, &cuda, spec, eps, ram_limit.unwrap_or(0))?;
+        self.cuda = Some(cuda);
         Ok(())
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    fn nvfp4_layers(&self, spec: &TextSpec, budget: u64) -> Result<Vec<Nvfp4Layer<'_>>, EngError> {
+    pub(super) fn predict_experts(&self, layer: usize, hidden: impl FnOnce() -> Vec<f32>) {
+        if let Some(ram) = &self.ram {
+            ram.predict(layer, hidden, &self.mapping);
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn nvfp4_layers(
+        &self,
+        spec: &TextSpec,
+        budget: u64,
+        direct: bool,
+    ) -> Result<Vec<Nvfp4Layer<'_>>, EngError> {
         let mut layers = Vec::new();
         let mut remaining = budget;
         for layer in expert_layer_order(spec) {
@@ -569,7 +599,7 @@ impl GgufTextWeights {
             if gate.kind != GgufType::Nvfp4 || down.kind != GgufType::Nvfp4 || bytes > remaining {
                 continue;
             }
-            if !can_repack(gate_bytes) || !can_repack(down_bytes) {
+            if !direct && (!can_repack(gate_bytes) || !can_repack(down_bytes)) {
                 continue;
             }
             let stack = |t: &Tensor, bytes, suffix| -> Result<Nvfp4Stack<'_>, EngError> {

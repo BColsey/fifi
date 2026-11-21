@@ -124,7 +124,7 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(&mut self) -> Result<(), EngError> {
-        self.weights.enable_cuda(&self.spec)
+        self.weights.enable_cuda(&self.spec, self.math.rms_norm_eps)
     }
 
     pub(super) fn vocab_size(&self) -> u32 {
@@ -262,6 +262,14 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
+        let query = self.weights.vec(
+            &format!("model.llm.attn_res.mlp_queries.{physical}"),
+            self.hidden(),
+        )?;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Weights::Gguf(weights) = &self.weights {
+            weights.predict_experts(physical, || stream.mix(0, &query));
+        }
         let inputs = self.attention_inputs(visit, &layer, stream, bank)?;
         let attn = self.attention(&layer, visit.attention, &inputs, state)?;
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
@@ -272,10 +280,6 @@ impl CpuForward {
             add(&mut stream.current, &attn, 1.0);
         }
 
-        let query = self.weights.vec(
-            &format!("model.llm.attn_res.mlp_queries.{physical}"),
-            self.hidden(),
-        )?;
         let mut mlp_input = stream.mix(0, &query);
         self.control(&mut mlp_input, bank, physical, &layer, Role::Mlp)?;
         self.norm(&mut mlp_input, &format!("{layer}.mlp_norm.weight"))?;
@@ -622,7 +626,7 @@ impl Stream {
     }
 }
 
-fn route(scores: &[f32], bias: &[f32], count: usize) -> Result<Vec<usize>, EngError> {
+pub(super) fn route(scores: &[f32], bias: &[f32], count: usize) -> Result<Vec<usize>, EngError> {
     let mut order: Vec<(usize, f32)> = scores
         .iter()
         .zip(bias)
