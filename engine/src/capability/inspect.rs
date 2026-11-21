@@ -92,7 +92,10 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
     for entry in entries {
         let entry = entry
             .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
-        let metadata = entry.metadata().map_err(|error| {
+        // `entry.metadata()` does not traverse symlinks, and every file
+        // of a hub-cache snapshot is a symlink into `blobs/` — follow the
+        // entry's path so hub layouts count as the files they point at.
+        let metadata = std::fs::metadata(entry.path()).map_err(|error| {
             checkpoint(format!("cannot stat {}: {error}", entry.path().display()))
         })?;
         if metadata.is_file() {
@@ -259,6 +262,21 @@ mod tests {
         assert_eq!(report.config_model_types, ["qwen3_5_moe"]);
         assert_eq!(report.tokenizer_present, ["tokenizer.json"]);
         assert_eq!(report.tokenizer_missing.len(), TOKENIZER_FILES.len() - 1);
+    }
+
+    #[test]
+    fn a_hub_cache_snapshot_of_symlinks_counts_as_files() {
+        // Every file of a hub-cache snapshot is a symlink into blobs/;
+        // the inventory must count the targets, not skip the links.
+        let dir = scratch("hubsnapshot");
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("weights"), vec![0u8; 80]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("blobs/weights", dir.join("model.safetensors")).unwrap();
+        let report = inspect(&dir, &dir).unwrap();
+        assert_eq!(report.safetensors_files, 1);
+        assert_eq!(report.weight_bytes(), 80);
     }
 
     #[test]
