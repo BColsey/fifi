@@ -22,7 +22,8 @@ fn gib(bytes: u64) -> String {
 }
 
 pub(super) fn probe_host_store() -> Result<(u64, u64), EngError> {
-    crate::family::mem::HostFacts::probe_or_bare("EXL3 expert bank", "EXL3 expert bank")
+    crate::family::mem::HostFacts::read("EXL3 expert bank", "EXL3 expert bank")
+        .map(|host| host.host_memory())
 }
 
 /// The resolved banked load: the slot count and the figures the start line reports.

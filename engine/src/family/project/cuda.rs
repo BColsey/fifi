@@ -1355,10 +1355,9 @@ fn load_inner(
         tensor.mapped = mapped;
     }
     if host_bytes != 0 {
-        let (_, available) = crate::family::mem::HostFacts::probe_or_bare(
-            "cuda mapped experts",
-            "cuda mapped experts",
-        )?;
+        let (_, available) =
+            crate::family::mem::HostFacts::read("cuda mapped experts", "cuda mapped experts")?
+                .host_memory();
         admit_mapped_experts(host_bytes, available)?;
         eprintln!(
             "cuda mapped experts: placing {host_bytes} bytes in host memory (available host/cgroup bytes {available})"

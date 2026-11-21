@@ -19,7 +19,7 @@
 
 mod host;
 
-pub(crate) use host::HostFacts;
+pub(crate) use host::{HostFacts, Provenance};
 
 use std::path::{Path, PathBuf};
 
@@ -83,7 +83,7 @@ pub(crate) struct Facts {
 impl Facts {
     /// The facts with the host read from the machine and no card or disk yet.
     pub(crate) fn read(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
-        Ok(Self::with_host(HostFacts::probe(label, root_label)?))
+        Ok(Self::with_host(HostFacts::read(label, root_label)?))
     }
 
     /// The facts around a host that is already read (or built by a test).

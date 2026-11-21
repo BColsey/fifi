@@ -1317,7 +1317,7 @@ fn lower_rung(
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
     };
-    let (_, host_available) = HostFacts::probe_or_bare("q36 cuda tiered", "Qwen36")?;
+    let (_, host_available) = HostFacts::read("q36 cuda tiered", "Qwen36")?.host_memory();
     match card_short::decide(&figures, host_available) {
         CardVerdict::Fits => Ok(None),
         CardVerdict::Refused { line } => {

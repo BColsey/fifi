@@ -1,8 +1,5 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-// Clamped in only on the CUDA build, where `family::mem` compiles.
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use crate::family::mem::HostFacts;
 use crate::{
     EngError,
     memory::MemoryPolicy,
@@ -467,26 +464,14 @@ fn serving_plan(
     ))
 }
 
-/// The host budget the serving and runner admissions size from: on the CUDA build the
-/// admission pair (`probe_or_bare`: the cgroup-aware budget, and the bare figure with a logged
-/// `cgroup budget unknown` line when the cgroup tree refuses) — the same figure the other
-/// families' host guards admit against. The plain host build keeps the bare meminfo figure
-/// (`family::mem` compiles only with the CUDA families), which the runner documents.
+/// The host budget the serving and runner admissions size from: the cgroup-aware budget of
+/// `family::mem`, or the bare figure with a logged line when the cgroup tree cannot be verified,
+/// the same figure the other families' host guards admit against.
 pub(super) fn host_available_bytes() -> Option<u64> {
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
-        HostFacts::probe_or_bare("Nemotron admission", "Nemotron35")
-            .map(|(_total, available)| available)
-            .ok()
-    }
-    #[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
-    {
-        // The cgroup-aware budget with the bare-figure fall-back: a probe that
-        // cannot verify the cgroup must not refuse a start the bare figure
-        // always served. The live tests still pin the fit against a cgroup
-        // where the probe verifies it.
-        crate::family::mem::HostFacts::probe_or_bare("Nemotron admission", "Nemotron admission")
-            .map(|(_total, available)| available)
+        crate::family::mem::HostFacts::read("Nemotron admission", "Nemotron35")
+            .map(|host| host.budget())
             .ok()
     }
     #[cfg(not(target_os = "linux"))]

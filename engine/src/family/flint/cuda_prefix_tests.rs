@@ -648,7 +648,7 @@ fn prefix_save_restore_envelope_under_guard() {
     // save. What must still hold after allocation is the floor: the OS
     // headroom the budget always requires (admit with charge 0 asserts
     // exactly os_floor <= available).
-    let budget = crate::family::mem::HostFacts::probe("Flint expert cache", "Flint")
+    let budget = crate::family::mem::HostFacts::read("Flint expert cache", "Flint")
         .expect("probe the host budget");
     budget
         .admit_for(0, "post-save floor")

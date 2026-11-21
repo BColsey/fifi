@@ -7,25 +7,40 @@
 
 use crate::EngError;
 
+/// How sure the host facts are about the cgroup clamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Provenance {
+    /// The process's cgroup tree was found, verified and read: the budget is the cgroup-clamped one.
+    Verified,
+    /// The tree could not be verified (a namespace root, a hybrid layout, a missing controller):
+    /// the budget is the bare `MemAvailable`. The text names what was refused.
+    Bare(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostFacts {
-    // The total and the floor are read by the CUDA-build facts paths
-    // (probe_or_bare and the admit pair); the plain host build only asks
-    // for the available budget.
-    #[allow(dead_code)]
     mem_total: u64,
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
+    provenance: Provenance,
 }
 
 impl HostFacts {
+    /// The host facts of this process: `/proc/meminfo` clamped by the process's cgroup tree.
+    ///
+    /// Every caller reads the host through this one function and gets the same answer for the
+    /// same machine. When the cgroup tree cannot be verified the facts carry the bare
+    /// `MemAvailable` figure and [`Provenance::Bare`], and one line is logged: a start inside a
+    /// container the probe cannot parse must keep serving on the figure it always served on, and
+    /// a memory refusal where a smaller setting fits is a defect. Only an unreadable or
+    /// inconsistent `/proc/meminfo` is an error.
     #[allow(
         dead_code,
-        reason = "the callers are Linux-only; the macOS test build exercises probe_in"
+        reason = "the callers are Linux-only; the macOS test build exercises read_in"
     )]
-    pub(crate) fn probe(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
-        Self::probe_in(
+    pub(crate) fn read(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
+        Self::read_in(
             label,
             root_label,
             std::path::Path::new("/proc"),
@@ -34,57 +49,50 @@ impl HostFacts {
         )
     }
 
-    /// The admission pair for facts paths that must not go dark inside a container: when the
-    /// cgroup probe refuses (a namespace root, for example), the pair falls back to the bare
-    /// `/proc/meminfo` figures and logs the refusal — those callers worked on the bare figure
-    /// before, so they keep it. Planning that sizes memory uses [`HostFacts::probe`] and
-    /// refuses instead; an optional feature may plan zero on the refusal. The plain Linux
-    /// build's Nemotron fit is one of these fall-back callers: a default start must keep
-    /// serving where the bare figure always served.
-    #[cfg(any(test, target_os = "linux"))]
-    #[allow(
-        dead_code,
-        reason = "the callers are Linux-only; the macOS test build keeps the pair compiled"
-    )]
-    pub(crate) fn probe_or_bare(
+    fn read_in(
         label: &'static str,
         root_label: &'static str,
-    ) -> Result<(u64, u64), EngError> {
-        match Self::probe(label, root_label) {
-            Ok(admission) => Ok(admission.host_memory()),
+        proc: &std::path::Path,
+        root: &std::path::Path,
+        pid: u32,
+    ) -> Result<Self, EngError> {
+        match Self::verified_in(label, root_label, proc, root, pid) {
+            Ok(facts) => Ok(facts),
             Err(refusal) => {
-                let text = std::fs::read_to_string("/proc/meminfo").map_err(|error| {
-                    EngError::MemoryPlan(format!(
-                        "{label} cannot read /proc/meminfo for the bare fallback: {error}"
-                    ))
-                })?;
-                Self::bare_fallback(label, root_label, &refusal, &text)
+                let meminfo = read_admission_file(label, &proc.join("meminfo"))?;
+                Self::bare(label, root_label, &refusal, &meminfo)
             }
         }
     }
 
-    /// The bare path of [`probe_or_bare`]: the machine-wide figures of the given meminfo
-    /// text, with one log line naming the refusal it replaced. Split out so a test can pin
-    /// that an unverified budget falls back to a figure instead of refusing.
-    #[cfg(any(test, target_os = "linux"))]
-    #[allow(
-        dead_code,
-        reason = "the callers are Linux-only; the macOS test build keeps the pair compiled"
-    )]
-    pub(crate) fn bare_fallback(
+    /// The bare figures of the given meminfo text, with one log line (per process) naming the
+    /// refusal they replace.
+    pub(crate) fn bare(
         label: &'static str,
         root_label: &'static str,
         refusal: &EngError,
         meminfo: &str,
-    ) -> Result<(u64, u64), EngError> {
-        let bare = Self::from_meminfo(label, meminfo, None)?;
-        eprintln!(
-            "{root_label}: cgroup budget unknown ({refusal:?}); using the bare MemAvailable figure"
-        );
-        Ok(bare.host_memory())
+    ) -> Result<Self, EngError> {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut facts = Self::from_meminfo(label, meminfo, None)?;
+        facts.provenance = Provenance::Bare(format!("{refusal:?}"));
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "{root_label}: cgroup budget unknown ({refusal:?}); using the bare MemAvailable figure"
+            );
+        }
+        Ok(facts)
     }
 
-    fn probe_in(
+    /// Whether the cgroup clamp was verified or the facts are the bare figures.
+    pub(crate) fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// The verified path: finds the process's cgroup tree, verifies it and reads every limit on
+    /// the way to the root. Refuses when anything cannot be verified; [`HostFacts::read`] turns
+    /// that refusal into the bare figures.
+    fn verified_in(
         label: &'static str,
         root_label: &'static str,
         proc: &std::path::Path,
@@ -99,9 +107,8 @@ impl HostFacts {
         Self::from_meminfo(label, &meminfo, cgroup_remaining_in(label, &root, &group)?)
     }
 
-    /// Private to `probe_in` except for the host tests of the memory plans, which build the
-    /// synthetic cgroup-clamped snapshot the CUDA start builds through `probe` (the same
-    /// seam as `probe_in`).
+    /// Private to `verified_in` except for the host tests of the memory plans, which build the
+    /// synthetic cgroup-clamped snapshot a start reads through `read` (the same seam).
     pub(crate) fn from_meminfo(
         label: &'static str,
         contents: &str,
@@ -118,6 +125,7 @@ impl HostFacts {
             mem_total: total,
             mem_available: available,
             cgroup_remaining,
+            provenance: Provenance::Verified,
         })
     }
 
@@ -487,7 +495,7 @@ mod tests {
         // starts_with(root) always walks up to root, so that branch stays
         // untriggered by design.
         // The root-label line only fires in the window between
-        // cgroup_from_proc's canonicalize and probe_in's own, so it is
+        // cgroup_from_proc's canonicalize and verified_in's own, so it is
         // pinned through root_error rather than produced end to end.
         assert_eq!(
             refusal_text::<()>(Err(root_error(ROOT_LABEL, std::io::Error::other("x")))),
@@ -642,11 +650,10 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
     fn an_unverified_budget_falls_back_to_the_bare_figure() {
         let refusal = EngError::MemoryPlan(String::from("admission: cannot map its process"));
-        let (total, available) = HostFacts::bare_fallback(
+        let bare = HostFacts::bare(
             LABEL,
             ROOT_LABEL,
             &refusal,
@@ -654,7 +661,8 @@ mod tests {
         )
         .unwrap();
         // The bare figures: machine-wide, no cgroup minimum applied.
-        assert_eq!((total, available), (32u64 << 30, 24u64 << 30));
+        assert_eq!(bare.host_memory(), (32u64 << 30, 24u64 << 30));
+        assert!(matches!(bare.provenance(), Provenance::Bare(text) if text.contains("cannot map")));
     }
 
     #[test]
@@ -662,7 +670,7 @@ mod tests {
         // The Xavier (L4T) runs hybrid cgroup v1 with a controller-less unified tree: the
         // membership's first line is a v1 controller line, not `0::`, and no memory limit
         // lives anywhere the unified reader looks. The capture pins that this layout refuses
-        // with the clean "cannot map" error — the refusal `probe_or_bare` turns into the
+        // with the clean "cannot map" error — the refusal `read` turns into the
         // bare `/proc/meminfo` fallback — before any filesystem access at all.
         let jetson: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/cgroup-jetson-20261118.json")).unwrap();
@@ -877,13 +885,13 @@ mod tests {
     #[test]
     fn a_namespace_root_applies_its_own_limit_or_falls_back_to_available_memory() {
         let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
-        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
         assert_eq!(budget.os_floor(), 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
-        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
         assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
@@ -917,7 +925,7 @@ mod tests {
     #[test]
     fn a_namespace_root_without_the_memory_controller_is_refused_clearly() {
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "cpu\n");
-        let result = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42);
+        let result = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42);
         assert!(matches!(result, Err(EngError::MemoryPlan(message))
                 if message.contains("complete cgroup2 root with the memory controller")));
     }
@@ -933,7 +941,8 @@ mod tests {
             "0::/\n1:devices:/elsewhere\n",
         ] {
             std::fs::write(proc_dir.join("self/cgroup"), membership).unwrap();
-            let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+            let budget =
+                HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
             // Machine-wide MemAvailable is 24 GiB, but only 6 GiB remain in this group.
             assert_eq!(budget.budget(), 6u64 << 30);
         }
@@ -1189,6 +1198,7 @@ mod tests {
             mem_total: 1,
             mem_available: u64::MAX,
             cgroup_remaining: None,
+            provenance: Provenance::Verified,
         };
         let floor = budget.os_floor();
         assert!(budget.admit(LABEL, u64::MAX).is_err());
@@ -1204,6 +1214,7 @@ mod tests {
             mem_total: required + floor,
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
+            provenance: Provenance::Verified,
         };
         assert!(
             exact.admit(LABEL, required).is_ok(),
@@ -1252,11 +1263,43 @@ mod tests {
         std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(group.join("memory.max"), "17179869184\n").unwrap();
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
-        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
         assert!(budget.admit(LABEL, 7u64 << 30).is_ok());
         assert!(budget.admit(LABEL, (7u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
-        assert!(HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+        assert!(HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+        // The one read does not fail closed: the same unverifiable tree reads as the bare
+        // figures with their provenance, so every caller of one machine gets one budget.
+        let bare = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert_eq!(bare.host_memory(), (32u64 << 30, 24u64 << 30));
+        assert!(matches!(bare.provenance(), Provenance::Bare(_)));
+    }
+
+    /// Every cgroup layout the verifier refuses reads as the bare figures through `read_in`,
+    /// where the old strict probe refused the start (Flash-Next, Flint) while the lenient one
+    /// carried on (check, Bolt, Nemotron, Qwen3.6): one rule for all of them.
+    #[test]
+    fn a_tree_the_verifier_refuses_reads_as_the_bare_figures_never_as_a_refusal() {
+        // A namespace root without the memory controller is refused by the verifier.
+        let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "cpu\n");
+        assert!(HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+        let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert!(matches!(read.provenance(), Provenance::Bare(_)), "{read:?}");
+        // The same root with the controller is verified, and its own limit applies.
+        let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
+        let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert_eq!(read.provenance(), &Provenance::Verified);
+        assert_eq!(read.budget(), 6u64 << 30);
+        // A membership file that maps the process nowhere.
+        let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
+        std::fs::write(proc_dir.join("self/cgroup"), "1:net_cls:/\n").unwrap();
+        assert!(HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+        let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert_eq!(read.budget(), 24u64 << 30, "the bare MemAvailable figure");
+        assert!(matches!(read.provenance(), Provenance::Bare(_)));
+        // An unreadable /proc/meminfo is the only refusal left.
+        std::fs::remove_file(proc_dir.join("meminfo")).unwrap();
+        assert!(HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
     }
 }

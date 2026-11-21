@@ -138,15 +138,15 @@ pub(super) fn admit_pageable<'a>(
     states: impl Iterator<Item = (&'a StateLayout, usize)>,
 ) -> Result<bool, EngError> {
     let required = pageable_required(states)?;
-    // The cgroup-aware figure the other admissions size from, with the bare
-    // MemAvailable figure when the cgroup tree refuses. A probe that cannot
-    // verify anything falls back and logs: it proceeds with the save the
-    // engine performed before the check, it does not take a feature away.
-    let available = match crate::family::mem::HostFacts::probe_or_bare(
+    // The cgroup-aware figure the other admissions size from (the bare
+    // MemAvailable figure when the cgroup tree cannot be verified). Only a host whose
+    // meminfo cannot be read proceeds without the check, so an optional save does not
+    // take a feature away.
+    let available = match crate::family::mem::HostFacts::read(
         "q36 pageable prefix",
         "q36 pageable prefix",
     ) {
-        Ok((_total, available)) => usize::try_from(available).unwrap_or(usize::MAX),
+        Ok(host) => usize::try_from(host.budget()).unwrap_or(usize::MAX),
         Err(error) => {
             eprintln!(
                 "q36 cuda: pageable prefix host budget: probe unavailable ({}); proceeding without the check",

@@ -908,10 +908,8 @@ impl Bolt {
         // the enclosing cgroup's limit) is checked first.
         admit_snapshot(
             total,
-            crate::family::mem::HostFacts::probe_or_bare(
-                "a Bolt prefix snapshot",
-                "a Bolt prefix snapshot",
-            ),
+            crate::family::mem::HostFacts::read("a Bolt prefix snapshot", "a Bolt prefix snapshot")
+                .map(|host| host.host_memory()),
         )?;
         let mut data = Vec::new();
         data.try_reserve_exact(total).map_err(|_| {
@@ -2248,7 +2246,9 @@ mod tests {
         let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
         let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
         // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
-        let bare = HostFacts::bare_fallback("test", "test", &refusal, meminfo).expect("bare");
+        let bare = HostFacts::bare("test", "test", &refusal, meminfo)
+            .expect("bare")
+            .host_memory();
         assert_eq!(bare.1, 2 << 30);
         assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
         assert!(

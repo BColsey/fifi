@@ -78,7 +78,7 @@ fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) ->
 /// tiered-prefix planners. A failed probe logs `refused` (each planner states its own
 /// fallback) and reads as no budget.
 fn admission_budget(probe: &'static str, refused: &str) -> Option<usize> {
-    HostFacts::probe(probe, "Qwen36")
+    HostFacts::read(probe, "Qwen36")
         .map(|admission| usize::try_from(admission.budget()).ok())
         .inspect_err(|error| {
             eprintln!("q36 cuda: {probe} host probe failed ({error:?}); {refused}")
