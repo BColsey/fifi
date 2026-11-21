@@ -285,7 +285,9 @@ pub(crate) fn choose_cuda_fit(
         &named,
         ContextLimits {
             ceiling: context.unwrap_or(MODEL_MAX_CONTEXT),
-            sufficient: FP16_SUFFICIENT_CONTEXT,
+            // A named context is the target: the first form that reaches it serves it, and
+            // when none does the longest context any form holds is served.
+            sufficient: context.unwrap_or(FP16_SUFFICIENT_CONTEXT),
         },
     ))
 }
@@ -534,6 +536,38 @@ mod tests {
             .unwrap()
             .expect("fits");
         assert_eq!((wide.form, wide.context), (KvDtype::Q8, 180_224));
+    }
+
+    #[test]
+    fn a_named_context_above_what_fp16_holds_goes_to_the_form_that_reaches_it() {
+        // fp16 holds 150,528 positions, more than the sufficient context, yet the named
+        // context is beyond it: int8 reaches the named value, so int8 serves it.
+        let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
+        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(262_144))
+            .unwrap()
+            .expect("fits");
+        let (_, _, int8_demand) = card_demand_model(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap();
+        assert!(admits_cuda(free, WEIGHTS, &int8_demand, 262_144));
+        assert_eq!((named.form, named.context), (KvDtype::Q8, 262_144));
+    }
+
+    #[test]
+    fn a_named_context_no_form_reaches_starts_at_the_longest_that_fits() {
+        // No form holds 262,144 positions on this card: the start does not refuse, it takes
+        // the form that holds the most and reports a context below the named value.
+        let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
+        let (_, _, int8_demand) = card_demand_model(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap();
+        assert!(!admits_cuda(free, WEIGHTS, &int8_demand, 262_144));
+        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(262_144))
+            .unwrap()
+            .expect("a smaller context fits");
+        assert_eq!(named.form, KvDtype::Q8);
+        assert!(
+            named.context < 262_144 && named.context > 100_352,
+            "{}",
+            named.context
+        );
+        assert!(admits_cuda(free, WEIGHTS, &int8_demand, named.context));
     }
 
     #[test]

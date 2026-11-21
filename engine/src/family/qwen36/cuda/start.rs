@@ -1391,13 +1391,62 @@ fn card_fit(
     };
     let modes = runtime_modes(&variant)?;
     let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+    let form = match fit.form {
+        KvDtype::Q8 => "int8",
+        KvDtype::F32 | KvDtype::Bf16 => "fp16",
+    };
+    if !settings.context_auto && fit.context < settings.context_limit {
+        eprintln!(
+            "q36 cuda: the named context_limit {} does not fit this card; starting at {}, the most the {form} KV cache holds beside the weights ({free} bytes free, {weights} bytes of weights)",
+            settings.context_limit, fit.context
+        );
+    } else {
+        eprintln!(
+            "q36 cuda: context {} with the {form} KV cache, chosen from the card ({free} bytes free, {weights} bytes of weights); set context_limit and kv_dtype to override",
+            fit.context
+        );
+    }
+    Ok(Some((variant, variant_plan)))
+}
+
+/// Positions the context is lowered by when the load's own admission refuses a context the card
+/// planned.
+const REPLAN_STEP: u32 = 4096;
+
+/// The plan of a start whose load refused the context the card planned: the same cache form at
+/// the largest context below the refused one that the card now holds, from a fresh read of the
+/// free bytes. `None` when the start named both settings (nothing was planned) or nothing
+/// smaller fits.
+fn replan_smaller(
+    projector: &CudaProjector,
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    model: &GgufModel,
+) -> Result<Option<(Q36Settings, StartupPlan)>, EngError> {
+    if !settings.context_auto || plan.paged.is_some() || plan.device_first_native.is_some() {
+        return Ok(None);
+    }
+    let weights = native_load_bytes(&model.weights, &model.plan().device_names())?;
+    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    let Some(fit) = choose_cuda_fit(
+        &settings.spec,
+        free,
+        weights,
+        Some(settings.kv),
+        Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+    )?
+    else {
+        return Ok(None);
+    };
+    let variant = Q36Settings {
+        context_limit: fit.context,
+        ..settings.clone()
+    };
+    let modes = runtime_modes(&variant)?;
+    let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
     eprintln!(
-        "q36 cuda: context {} with the {} KV cache, chosen from the card ({free} bytes free,          {weights} bytes of weights); set context_limit and kv_dtype to override",
-        fit.context,
-        match fit.form {
-            KvDtype::Q8 => "int8",
-            KvDtype::F32 | KvDtype::Bf16 => "fp16",
-        }
+        "q36 cuda: the load's admission refused {} positions ({free} bytes free now); starting at {}",
+        settings.context_limit, fit.context
     );
     Ok(Some((variant, variant_plan)))
 }
@@ -1451,7 +1500,7 @@ fn make(
     };
     // The lower rung: a GGUF start the card cannot carry whole serves the tiered path when card
     // plus host can, instead of refusing at the load's admission.
-    let (settings, plan, card_short) = match gguf.as_ref() {
+    let (mut settings, mut plan, card_short) = match gguf.as_ref() {
         Some((model, _)) => match lower_rung(&projector, &settings, &plan, model)? {
             Some((variant, variant_plan, short)) => (variant, variant_plan, Some(short)),
             None => (settings, plan, None),
@@ -1462,8 +1511,8 @@ fn make(
         // A full slot means `start` already has an answer; a closed channel means it gave up.
         let _ = announce.try_send(Ok(settings.clone()));
     }
-    let kv_cache = plan.reserve;
-    let fixed_admission = plan.modes.fixed_admission;
+    let mut kv_cache = plan.reserve;
+    let mut fixed_admission = plan.modes.fixed_admission;
     let tiered = tiered_plan_of(&settings);
     // The banked EXL3 load's leftovers (None on every resident path): the host store and the
     // figures the resolver build below needs. Declared here because the load match's arms are
@@ -1526,9 +1575,26 @@ fn make(
             device
         }
         (Some((model, _)), None) => {
-            projector
-                .load_model(model, load_options(kv_cache, fixed_admission))?
-                .device
+            match projector.load_model(model, load_options(kv_cache, fixed_admission)) {
+                Ok(loaded) => loaded.device,
+                // The card shrank between the plan and the load (a desktop process grew): plan
+                // once more, from a fresh read, one step below the refused context.
+                Err(refusal @ EngError::MemoryPlan(_)) => {
+                    let Some((variant, variant_plan)) =
+                        replan_smaller(&projector, &settings, &plan, model)?
+                    else {
+                        return Err(refusal);
+                    };
+                    settings = variant;
+                    plan = variant_plan;
+                    kv_cache = plan.reserve;
+                    fixed_admission = plan.modes.fixed_admission;
+                    projector
+                        .load_model(model, load_options(kv_cache, fixed_admission))?
+                        .device
+                }
+                Err(other) => return Err(other),
+            }
         }
         (Some((model, _)), Some(_)) => {
             let names = model.plan().device_names();
