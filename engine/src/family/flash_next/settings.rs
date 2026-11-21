@@ -534,38 +534,218 @@ impl FlashSettings {
     }
 }
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-#[derive(Clone, Copy)]
+/// How the prefill expert ring uploads its records.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::family::flash_next) enum RingUploads {
     Eager,
     Selected,
     Lookahead,
 }
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 impl RingUploads {
-    pub(in crate::family::flash_next) fn from_env() -> Result<Self, EngError> {
-        let enabled = |name: &str| match std::env::var_os(name) {
-            None => Ok(false),
-            Some(value) if value == "1" => Ok(true),
-            Some(_) => Err(EngError::BadRequest(format!(
-                "{name} must be unset or \"1\""
-            ))),
-        };
-        let selected = enabled("INFERENCE_FLASH_NEXT_RING_SELECTED")?;
-        let lookahead = enabled("INFERENCE_FLASH_NEXT_RING_LOOKAHEAD")?;
-        Ok(match (selected, lookahead) {
-            (_, true) => Self::Lookahead,
-            (true, false) => Self::Selected,
-            (false, false) => Self::Eager,
-        })
-    }
-
     pub(in crate::family::flash_next) fn label(self) -> &'static str {
         match self {
             Self::Eager => "eager",
             Self::Selected => "selected",
             Self::Lookahead => "lookahead",
+        }
+    }
+
+    /// The switch that chose this mode, `None` for the default.
+    fn switch(self) -> Option<&'static str> {
+        match self {
+            Self::Eager => None,
+            Self::Selected => Some(RING_SELECTED),
+            Self::Lookahead => Some(RING_LOOKAHEAD),
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const RING_SELECTED: &str = "INFERENCE_FLASH_NEXT_RING_SELECTED";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const RING_LOOKAHEAD: &str = "INFERENCE_FLASH_NEXT_RING_LOOKAHEAD";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const ROUTER_PROXY: &str = "INFERENCE_FLASH_NEXT_ROUTER_PROXY";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const DISK_PREFETCH: &str = "INFERENCE_FLASH_NEXT_DISK_PREFETCH";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const DISK_PREFETCH_JOIN: &str = "INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const VICTIM_BYTES: &str = "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES";
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+const VICTIM_SELECTIVE: &str = "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE";
+
+/// The expert-cache switches of the CUDA start, all off by default: the prefill ring's upload
+/// mode, the future-router probe, the disk-tier prefetch and the pinned-RAM victim cache. Each
+/// is strict: a value outside its stated set refuses the start, so a typo never reads as off.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::family::flash_next) struct CacheSwitches {
+    pub(in crate::family::flash_next) ring: RingUploads,
+    pub(in crate::family::flash_next) router_proxy: bool,
+    pub(in crate::family::flash_next) disk_prefetch_horizon: Option<usize>,
+    pub(in crate::family::flash_next) join_active_prefetch: bool,
+    pub(in crate::family::flash_next) victim_cache_bytes: usize,
+    pub(in crate::family::flash_next) selective_victims: bool,
+}
+
+/// The raw text of each switch, `None` when unset.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Clone, Copy, Default)]
+pub(in crate::family::flash_next) struct CacheSwitchText<'a> {
+    pub(in crate::family::flash_next) ring_selected: Option<&'a str>,
+    pub(in crate::family::flash_next) ring_lookahead: Option<&'a str>,
+    pub(in crate::family::flash_next) router_proxy: Option<&'a str>,
+    pub(in crate::family::flash_next) disk_prefetch: Option<&'a str>,
+    pub(in crate::family::flash_next) disk_prefetch_join: Option<&'a str>,
+    pub(in crate::family::flash_next) victim_bytes: Option<&'a str>,
+    pub(in crate::family::flash_next) victim_selective: Option<&'a str>,
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn unset_or_one(name: &str, raw: Option<&str>) -> Result<bool, EngError> {
+    match raw {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(EngError::BadRequest(format!(
+            "{name} must be unset or \"1\""
+        ))),
+    }
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl CacheSwitches {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in crate::family::flash_next) fn from_env() -> Result<Self, EngError> {
+        let read = |name: &str, raw: Result<String, std::env::VarError>| match raw {
+            Ok(text) => Ok(Some(text)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(EngError::BadRequest(format!("{name} must be text")))
+            }
+        };
+        let ring_selected = read(
+            RING_SELECTED,
+            std::env::var("INFERENCE_FLASH_NEXT_RING_SELECTED"),
+        )?;
+        let ring_lookahead = read(
+            RING_LOOKAHEAD,
+            std::env::var("INFERENCE_FLASH_NEXT_RING_LOOKAHEAD"),
+        )?;
+        let router_proxy = read(
+            ROUTER_PROXY,
+            std::env::var("INFERENCE_FLASH_NEXT_ROUTER_PROXY"),
+        )?;
+        let disk_prefetch = read(
+            DISK_PREFETCH,
+            std::env::var("INFERENCE_FLASH_NEXT_DISK_PREFETCH"),
+        )?;
+        let disk_prefetch_join = read(
+            DISK_PREFETCH_JOIN,
+            std::env::var("INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN"),
+        )?;
+        let victim_bytes = read(
+            VICTIM_BYTES,
+            std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES"),
+        )?;
+        let victim_selective = read(
+            VICTIM_SELECTIVE,
+            std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE"),
+        )?;
+        Self::from_text(CacheSwitchText {
+            ring_selected: ring_selected.as_deref(),
+            ring_lookahead: ring_lookahead.as_deref(),
+            router_proxy: router_proxy.as_deref(),
+            disk_prefetch: disk_prefetch.as_deref(),
+            disk_prefetch_join: disk_prefetch_join.as_deref(),
+            victim_bytes: victim_bytes.as_deref(),
+            victim_selective: victim_selective.as_deref(),
+        })
+    }
+
+    /// The text core of [`Self::from_env`], split out so every rule is testable: this crate
+    /// denies `unsafe_code`, so a test cannot carry the variables into the env reader.
+    pub(in crate::family::flash_next) fn from_text(
+        text: CacheSwitchText<'_>,
+    ) -> Result<Self, EngError> {
+        let selected = unset_or_one(RING_SELECTED, text.ring_selected)?;
+        let lookahead = unset_or_one(RING_LOOKAHEAD, text.ring_lookahead)?;
+        let ring = match (selected, lookahead) {
+            (_, true) => RingUploads::Lookahead,
+            (true, false) => RingUploads::Selected,
+            (false, false) => RingUploads::Eager,
+        };
+        let router_proxy = unset_or_one(ROUTER_PROXY, text.router_proxy)?;
+        let disk_prefetch_horizon = match text.disk_prefetch {
+            None => None,
+            Some("1") => Some(1),
+            Some("2") => Some(2),
+            Some(_) => {
+                return Err(EngError::BadRequest(format!(
+                    "{DISK_PREFETCH} must be unset, \"1\", or \"2\""
+                )));
+            }
+        };
+        let join_active_prefetch = unset_or_one(DISK_PREFETCH_JOIN, text.disk_prefetch_join)?;
+        if join_active_prefetch && disk_prefetch_horizon.is_none() {
+            return Err(EngError::BadRequest(format!(
+                "{DISK_PREFETCH_JOIN} needs an enabled disk prefetch horizon ({DISK_PREFETCH})"
+            )));
+        }
+        let victim_cache_bytes = match text.victim_bytes {
+            None => 0,
+            Some(value) => value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| EngError::BadRequest(format!("{VICTIM_BYTES} needs a byte count")))?,
+        };
+        let selective_victims = unset_or_one(VICTIM_SELECTIVE, text.victim_selective)?;
+        if selective_victims && victim_cache_bytes == 0 {
+            return Err(EngError::BadRequest(format!(
+                "{VICTIM_SELECTIVE} needs a nonzero {VICTIM_BYTES}"
+            )));
+        }
+        Ok(Self {
+            ring,
+            router_proxy,
+            disk_prefetch_horizon,
+            join_active_prefetch,
+            victim_cache_bytes,
+            selective_victims,
+        })
+    }
+
+    /// Why the prefill ring cannot be funded at this start, `None` when it can.
+    pub(in crate::family::flash_next) fn ring_unfunded_reason(
+        rows: usize,
+        ring_budget: u64,
+        disk_tier: bool,
+    ) -> Option<&'static str> {
+        if rows <= 1 {
+            Some("prefill runs one row at a time")
+        } else if ring_budget == 0 {
+            Some("the ring budget is 0")
+        } else if disk_tier {
+            Some("the disk tier has no host store to stream from")
+        } else {
+            None
+        }
+    }
+
+    /// Refuses a ring switch that the start would silently ignore. `reason` says why the ring is
+    /// not funded; the default upload mode asks for no ring and never refuses.
+    pub(in crate::family::flash_next) fn require_funded_ring(
+        &self,
+        reason: Option<&str>,
+    ) -> Result<(), EngError> {
+        match (self.ring.switch(), reason) {
+            (Some(switch), Some(reason)) => Err(EngError::BadRequest(format!(
+                "{switch} is set but the prefill ring is not funded: {reason}"
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -1406,6 +1586,227 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    fn switches(text: super::CacheSwitchText<'_>) -> Result<super::CacheSwitches, String> {
+        super::CacheSwitches::from_text(text).map_err(|error| error.describe())
+    }
+
+    #[test]
+    fn every_cache_switch_is_off_when_unset() {
+        let off = switches(super::CacheSwitchText::default()).unwrap();
+        assert_eq!(off.ring, super::RingUploads::Eager);
+        assert!(!off.router_proxy);
+        assert_eq!(off.disk_prefetch_horizon, None);
+        assert!(!off.join_active_prefetch);
+        assert_eq!(off.victim_cache_bytes, 0);
+        assert!(!off.selective_victims);
+    }
+
+    #[test]
+    fn the_ring_switches_take_only_one_and_lookahead_wins() {
+        use super::{CacheSwitchText as T, RingUploads};
+        let ring = |selected, lookahead| {
+            switches(T {
+                ring_selected: selected,
+                ring_lookahead: lookahead,
+                ..T::default()
+            })
+        };
+        assert_eq!(ring(Some("1"), None).unwrap().ring, RingUploads::Selected);
+        assert_eq!(ring(None, Some("1")).unwrap().ring, RingUploads::Lookahead);
+        assert_eq!(
+            ring(Some("1"), Some("1")).unwrap().ring,
+            RingUploads::Lookahead
+        );
+        for bad in ["", "0", "2", "yes", " 1"] {
+            assert_eq!(
+                ring(Some(bad), None).unwrap_err(),
+                "INFERENCE_FLASH_NEXT_RING_SELECTED must be unset or \"1\"",
+                "{bad:?}"
+            );
+            assert_eq!(
+                ring(None, Some(bad)).unwrap_err(),
+                "INFERENCE_FLASH_NEXT_RING_LOOKAHEAD must be unset or \"1\"",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_probe_and_prefetch_switches_are_strict() {
+        use super::CacheSwitchText as T;
+        assert!(
+            switches(T {
+                router_proxy: Some("1"),
+                ..T::default()
+            })
+            .unwrap()
+            .router_proxy
+        );
+        for bad in ["", "0", "2", "true"] {
+            assert_eq!(
+                switches(T {
+                    router_proxy: Some(bad),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_ROUTER_PROXY must be unset or \"1\"",
+                "{bad:?}"
+            );
+        }
+        for (text, horizon) in [("1", 1), ("2", 2)] {
+            let got = switches(T {
+                disk_prefetch: Some(text),
+                ..T::default()
+            })
+            .unwrap();
+            assert_eq!(got.disk_prefetch_horizon, Some(horizon));
+        }
+        for bad in ["", "0", "3", "on"] {
+            assert_eq!(
+                switches(T {
+                    disk_prefetch: Some(bad),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_DISK_PREFETCH must be unset, \"1\", or \"2\"",
+                "{bad:?}"
+            );
+        }
+        let joined = switches(T {
+            disk_prefetch: Some("1"),
+            disk_prefetch_join: Some("1"),
+            ..T::default()
+        })
+        .unwrap();
+        assert!(joined.join_active_prefetch);
+        assert!(
+            switches(T {
+                disk_prefetch_join: Some("1"),
+                ..T::default()
+            })
+            .unwrap_err()
+            .contains("needs an enabled disk prefetch horizon")
+        );
+        for bad in ["", "0", "2"] {
+            assert_eq!(
+                switches(T {
+                    disk_prefetch: Some("1"),
+                    disk_prefetch_join: Some(bad),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN must be unset or \"1\"",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_victim_cache_switches_are_strict_and_selective_needs_a_budget() {
+        use super::CacheSwitchText as T;
+        let sized = switches(T {
+            victim_bytes: Some(" 1073741824 "),
+            ..T::default()
+        })
+        .unwrap();
+        assert_eq!(sized.victim_cache_bytes, 1 << 30);
+        assert!(!sized.selective_victims);
+        for bad in ["", "1GiB", "-1", "1.5"] {
+            assert_eq!(
+                switches(T {
+                    victim_bytes: Some(bad),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs a byte count",
+                "{bad:?}"
+            );
+        }
+        let selective = switches(T {
+            victim_bytes: Some("4096"),
+            victim_selective: Some("1"),
+            ..T::default()
+        })
+        .unwrap();
+        assert!(selective.selective_victims);
+        // "0" used to read as off; it is refused like every other switch.
+        for bad in ["", "0", "2"] {
+            assert_eq!(
+                switches(T {
+                    victim_bytes: Some("4096"),
+                    victim_selective: Some(bad),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE must be unset or \"1\"",
+                "{bad:?}"
+            );
+        }
+        for bytes in [None, Some("0")] {
+            assert_eq!(
+                switches(T {
+                    victim_bytes: bytes,
+                    victim_selective: Some("1"),
+                    ..T::default()
+                })
+                .unwrap_err(),
+                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE needs a nonzero \
+                 INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ring_switch_with_no_funded_ring_is_refused_with_the_reason() {
+        use super::{CacheSwitchText as T, CacheSwitches};
+        let ring_on = |selected, lookahead| {
+            CacheSwitches::from_text(T {
+                ring_selected: selected,
+                ring_lookahead: lookahead,
+                ..T::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            CacheSwitches::ring_unfunded_reason(256, 1 << 30, false),
+            None
+        );
+        assert_eq!(
+            CacheSwitches::ring_unfunded_reason(1, 1 << 30, false),
+            Some("prefill runs one row at a time")
+        );
+        assert_eq!(
+            CacheSwitches::ring_unfunded_reason(256, 0, false),
+            Some("the ring budget is 0")
+        );
+        assert_eq!(
+            CacheSwitches::ring_unfunded_reason(256, 1 << 30, true),
+            Some("the disk tier has no host store to stream from")
+        );
+        // Unset switches ask for no ring, so an unfunded ring is not an error.
+        let off = ring_on(None, None);
+        for reason in [None, Some("the ring budget is 0")] {
+            off.require_funded_ring(reason).unwrap();
+        }
+        ring_on(Some("1"), None).require_funded_ring(None).unwrap();
+        assert_eq!(
+            ring_on(Some("1"), None)
+                .require_funded_ring(Some("the disk tier has no host store to stream from"))
+                .unwrap_err()
+                .describe(),
+            "INFERENCE_FLASH_NEXT_RING_SELECTED is set but the prefill ring is not funded: the \
+             disk tier has no host store to stream from"
+        );
+        assert_eq!(
+            ring_on(None, Some("1"))
+                .require_funded_ring(Some("prefill runs one row at a time"))
+                .unwrap_err()
+                .describe(),
+            "INFERENCE_FLASH_NEXT_RING_LOOKAHEAD is set but the prefill ring is not funded: \
+             prefill runs one row at a time"
+        );
     }
 
     #[test]

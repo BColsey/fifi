@@ -663,34 +663,10 @@ fn build_driver_resolving(
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
     let bulk_reader = ngram_bulk()? && rows > 1;
-    let router_proxy_enabled = match std::env::var_os("INFERENCE_FLASH_NEXT_ROUTER_PROXY") {
-        None => false,
-        Some(value) if value == "1" => true,
-        Some(_) => {
-            return Err(EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_ROUTER_PROXY must be unset or \"1\"".into(),
-            ));
-        }
-    };
-    let disk_prefetch_horizon = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH") {
-        None => None,
-        Some(value) if value == "1" => Some(1),
-        Some(value) if value == "2" => Some(2),
-        Some(_) => {
-            return Err(EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_DISK_PREFETCH must be unset, \"1\", or \"2\"".into(),
-            ));
-        }
-    };
-    let join_active_prefetch = match std::env::var_os("INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN") {
-        None => false,
-        Some(value) if value == "1" && disk_prefetch_horizon.is_some() => true,
-        Some(_) => {
-            return Err(EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_DISK_PREFETCH_JOIN needs value \"1\" and an enabled disk prefetch horizon".into(),
-            ));
-        }
-    };
+    let switches = crate::family::flash_next::settings::CacheSwitches::from_env()?;
+    let router_proxy_enabled = switches.router_proxy;
+    let disk_prefetch_horizon = switches.disk_prefetch_horizon;
+    let join_active_prefetch = switches.join_active_prefetch;
     let projection_on_card = ple_device()?;
     let ple_shape = (projection_on_card && rows > 1).then(|| PleDeviceShape {
         width: model.hyper.hidden() * model.hyper.branches(),
@@ -835,39 +811,13 @@ fn build_driver_resolving(
         let records = (horizon + 1) * super::disk_prefetch::CANDIDATES + 2;
         2 * prefetch_backing as u64 + records as u64 * record_bytes as u64
     });
-    let victim_budget = match std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES") {
-        Ok(text) => text.trim().parse::<usize>().map_err(|_| {
-            EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs a byte count".into(),
-            )
-        })?,
-        Err(std::env::VarError::NotPresent) => 0,
-        Err(_) => {
-            return Err(EngError::BadRequest(
-                "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_BYTES needs a byte count".into(),
-            ));
-        }
-    };
+    let victim_budget = switches.victim_cache_bytes;
     let victim_layout = (victim_budget > 0)
         .then(|| {
             super::victim_cache::VictimLayout::new(victim_budget, model.moe.top_k(), record_bytes)
         })
         .transpose()?;
-    let selective_victims =
-        match std::env::var("INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE").as_deref() {
-            Ok("1") => true,
-            Ok("0") | Err(std::env::VarError::NotPresent) => false,
-            _ => {
-                return Err(EngError::BadRequest(
-                    "INFERENCE_FLASH_NEXT_DISK_VICTIM_CACHE_SELECTIVE needs 0 or 1".into(),
-                ));
-            }
-        };
-    if selective_victims && victim_layout.is_none() {
-        return Err(EngError::BadRequest(
-            "selective write-back needs a Flash-Next disk victim cache budget".into(),
-        ));
-    }
+    let selective_victims = switches.selective_victims;
     let recent_bytes = if selective_victims {
         super::victim_cache::RecentPicks::bytes(layers, model.moe.experts())
     } else {
@@ -1211,8 +1161,14 @@ fn build_driver_resolving(
     // The prefill streaming ring refills its slots from the bank's store (demotion); the
     // disk rung has no store to stream from, so funding the ring under it would strand the
     // slots — every whole-chunk expert serves as a no-ring-entry through the rung's reads.
-    if rows > 1 && ring_budget > 0 && !matches!(host_plan.mode, HostMode::Disk) {
-        let uploads = crate::family::flash_next::settings::RingUploads::from_env()?;
+    let ring_reason = crate::family::flash_next::settings::CacheSwitches::ring_unfunded_reason(
+        rows,
+        ring_budget,
+        matches!(host_plan.mode, HostMode::Disk),
+    );
+    switches.require_funded_ring(ring_reason)?;
+    if ring_reason.is_none() {
+        let uploads = switches.ring;
         let slots = block.plan_ring(
             ctx,
             crate::family::flash_next::settings::ring_record_count(
@@ -1224,6 +1180,7 @@ fn build_driver_resolving(
             uploads,
         )?;
         if slots == 0 {
+            switches.require_funded_ring(Some("the ring budget cannot hold one full layer"))?;
             eprintln!(
                 "flash-next cuda: prefill ring not funded ({} bytes reserved); the union-admit \
              path serves prefill",
