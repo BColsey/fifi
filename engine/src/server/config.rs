@@ -121,6 +121,10 @@ pub(crate) struct EngineConfig {
     /// on; `false` renders demoted notices plain for this entry only.
     /// Like `think_replay`, the flag can only opt out: `true` is rejected.
     pub(crate) notice_toolwrap: Option<bool>,
+    /// The on-disk prefix cache of this engine: the one object every family that keeps saved
+    /// prefixes in memory takes (`dir`, `quota_bytes`, `enabled`). A family whose options object
+    /// also names it (`qwen36.kv_cache`, `gemma4.kv_cache`) is refused when both are set.
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -173,10 +177,45 @@ impl Config {
     pub(crate) fn from_file(path: &Path) -> Result<Config, StartupError> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| StartupError(format!("cannot read {}: {error}", path.display())))?;
-        let config: Config = serde_json::from_str(&text)
+        let mut config: Config = serde_json::from_str(&text)
             .map_err(|error| StartupError(format!("cannot parse {}: {error}", path.display())))?;
+        config.fold_kv_cache()?;
         config.check()?;
         Ok(config)
+    }
+
+    /// Moves each engine's `kv_cache` into the options object of its family, which is where the
+    /// family's start reads it, so every family takes one key at the engine. A family that keeps
+    /// no on-disk cache refuses the key, and a family whose options also carry it refuses both.
+    fn fold_kv_cache(&mut self) -> Result<(), StartupError> {
+        for (index, engine) in self.engines.iter_mut().enumerate() {
+            let Some(cache) = engine.kv_cache.take() else {
+                continue;
+            };
+            let refuse =
+                |why: &str| StartupError(format!("engines[{index}] sets kv_cache, which {why}"));
+            if engine.family == Q36_FAMILY || engine.family == DENSE_FAMILY {
+                let options = engine.qwen36.get_or_insert_with(Default::default);
+                if options.kv_cache.is_some() {
+                    return Err(refuse("qwen36.kv_cache also names: set it once"));
+                }
+                options.kv_cache = Some(cache);
+            } else if engine.family == GEMMA4_FAMILY {
+                let options = engine.gemma4.get_or_insert_with(Default::default);
+                if options.kv_cache.is_some() {
+                    return Err(refuse("gemma4.kv_cache also names: set it once"));
+                }
+                options.kv_cache = Some(cache);
+            } else if engine.family == FLINT_FAMILY {
+                return Err(refuse("the flint family has no GGUF disk tier yet"));
+            } else {
+                return Err(refuse(&format!(
+                    "the {} family does not keep an on-disk prefix cache",
+                    engine.family
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn check(&self) -> Result<(), StartupError> {
@@ -870,6 +909,58 @@ mod tests {
             r#""family": "fake""#,
             &format!(r#""family": "gemma4", "gemma4": {options}"#),
         )
+    }
+
+    #[test]
+    fn one_kv_cache_key_at_the_engine_reaches_the_family_that_keeps_a_cache() {
+        let at_engine = |family: &str, extra: &str| {
+            VALID.replace(
+                r#""family": "fake""#,
+                &format!(
+                    r#""family": "{family}", "kv_cache": {{"dir": "/c", "quota_bytes": 2147483648}}{extra}"#
+                ),
+            )
+        };
+        let want = crate::family::kv_disk::KvCacheOptions {
+            dir: Some("/c".into()),
+            quota_bytes: Some(2_147_483_648),
+            enabled: None,
+        };
+        let q36 = load(&at_engine("qwen3_6_35b_a3b", "")).expect("valid");
+        assert_eq!(
+            q36.engines[0]
+                .qwen36
+                .as_ref()
+                .and_then(|o| o.kv_cache.as_ref()),
+            Some(&want)
+        );
+        assert!(
+            q36.engines[0].kv_cache.is_none(),
+            "the key moved into the family"
+        );
+        let bolt = load(&at_engine("gemma4", "")).expect("valid");
+        assert_eq!(
+            bolt.engines[0]
+                .gemma4
+                .as_ref()
+                .and_then(|o| o.kv_cache.as_ref()),
+            Some(&want)
+        );
+        // The key at the engine and the same key in the family object is a conflict, not a merge.
+        let both = at_engine("gemma4", r#", "gemma4": {"kv_cache": {"dir": "/d"}}"#);
+        assert!(message(load(&both)).contains("set it once"));
+        // A family without an on-disk cache refuses it with its name.
+        let fake = VALID.replace(
+            r#""family": "fake""#,
+            r#""family": "fake", "kv_cache": {"dir": "/c"}"#,
+        );
+        assert!(message(load(&fake)).contains("does not keep an on-disk prefix cache"));
+        // The Flint pilot serves EXL3 packs, which have no disk tier: the key says so.
+        let flint = VALID.replace(
+            r#""family": "fake""#,
+            r#""family": "flint", "kv_cache": {"dir": "/c"}"#,
+        );
+        assert!(message(load(&flint)).contains("no GGUF disk tier yet"));
     }
 
     #[test]

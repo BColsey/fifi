@@ -73,7 +73,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
 | `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. A list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and serves the whole model across the cards, GGUF checkpoints only, with `tiered`, `kv_offload_host_bytes`, `capture` and speculation off. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
-| `kv_cache` | CUDA | on, in the user cache directory | An object that keeps saved prefixes on local disk, so a long conversation survives a restart and an eviction from pinned memory. Members: `dir` (an absolute path), `quota_bytes` (from 1 GiB) and `enabled` (`false` turns the cache off). See [below](#prefix-cache-on-disk-cuda). |
+| `kv_cache` | CUDA | on, in the user cache directory | An object, at the engine, that keeps saved prefixes on local disk, so a long conversation survives a restart and an eviction from pinned memory. Members: `dir` (an absolute path), `quota_bytes` (from 1 GiB) and `enabled` (`false` turns the cache off). See [below](#prefix-cache-on-disk-cuda). |
 | `tiered` | CUDA | off | Keep only some experts on the GPU. See [below](#tiered-experts-cuda). |
 | `draft_mode` | CUDA, `exl3` | `disabled` | Where speculative drafts come from: `disabled`, `ngram` (the tokens that followed the latest earlier occurrence of the context's tail) or `mtp` (the model's own MTP head, which needs `mtp_model_dir`; not usable yet). Any other value is refused. |
 | `num_draft_tokens` | CUDA, `exl3` | 2 | The most drafts one verify window carries, 1 to 16. |
@@ -96,13 +96,13 @@ Before saving a new host-backed pageable prefix (the opt-in pageable path; the d
 
 ### Prefix cache on disk (CUDA)
 
-`kv_cache` keeps the saved prefixes of a CUDA engine in a directory, so the next request of a long conversation reads its state from disk in seconds instead of processing the prompt again, also after a restart. Every family that keeps saved prefixes in host memory takes the same object: the Qwen3.6 GGUF engine (in its `qwen36` object) and the Bolt engine (in its `gemma4` object) use it today.
-It is on by default for a Qwen3.6 GGUF engine on one CUDA device and for the Bolt engine. It needs the family's host prefix store (`prefix_reuse` and, for Qwen3.6, the pinned prefix pool); with that off, or with EXL3 weights, or with more than one CUDA device, or when the host has too little free space, the cache stays off and says why in its start line. The cache serves GGUF loads only; an EXL3 engine runs without it.
+`kv_cache` keeps the saved prefixes of a CUDA engine in a directory, so the next request of a long conversation reads its state from disk in seconds instead of processing the prompt again, also after a restart. It is one key at the engine, the same for every family that keeps saved prefixes in host memory: the Qwen3.6 GGUF engine and the Bolt engine take it; a family without such a cache refuses the key. (The Qwen3.6 and Bolt options objects also accept it as `qwen36.kv_cache` and `gemma4.kv_cache`; naming it twice is refused.)
+It is on by default for a Qwen3.6 GGUF engine on one CUDA device and for the Bolt engine. It needs the family's host prefix store (`prefix_reuse` and, for Qwen3.6, the pinned prefix pool); with that off, or with EXL3 weights on a Qwen3.6 engine, or with more than one CUDA device, or when the host has too little free space, the cache stays off and says why in its start line. The Qwen3.6 cache serves GGUF loads only.
 
 While the cache is on it writes the conversations the engine has served (their exact token lists and the model state after them) to disk in `dir`, up to `quota_bytes` (at most 64 GiB by default). To keep nothing on disk, set `kv_cache.enabled` to `false` or `FIFI_KV_CACHE=0`; `--purge-kv-cache` removes what is there. The start line says all of this.
 
 ```json
-"qwen36": { "kv_cache": { "dir": "/var/cache/fifi/kv", "quota_bytes": 21474836480 } }
+"kv_cache": { "dir": "/var/cache/fifi/kv", "quota_bytes": 21474836480 }
 ```
 
 - `dir`: absolute. Created with mode 0700 when missing; an existing directory must be owner-only. One process owns a directory at a time. Without `dir` the cache uses `$XDG_CACHE_HOME/fifi/kv/<family>`, else `$HOME/.cache/fifi/kv/<family>` (`qwen36`, `gemma4`), so two families never share a directory by default. Two engines of one family need two directories.

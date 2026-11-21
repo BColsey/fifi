@@ -278,6 +278,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             context_limit: None,
             think_replay: None,
             notice_toolwrap: None,
+            kv_cache: None,
             fake: None,
             flash_next: None,
             qwen36: Some(discovered.options.clone()),

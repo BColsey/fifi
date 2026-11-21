@@ -191,6 +191,7 @@ mod tests {
             family: "fake".to_string(),
             think_replay: None,
             notice_toolwrap: None,
+            kv_cache: None,
             model: None,
             context_limit: None,
             fake: options,

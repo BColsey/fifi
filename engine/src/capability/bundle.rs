@@ -969,6 +969,7 @@ mod tests {
             flint: None,
             think_replay: None,
             notice_toolwrap: None,
+            kv_cache: None,
         };
         (dir, engine)
     }
@@ -1079,6 +1080,7 @@ mod tests {
             flint: None,
             think_replay: None,
             notice_toolwrap: None,
+            kv_cache: None,
         };
         // Deterministic env injection (the parity-test value), never the
         // process environment: tests must not depend on Q36_CACHE_LIMIT.
