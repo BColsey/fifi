@@ -206,7 +206,15 @@ The exact `8a6c6347` binary repeated the sustained comparison with the private-c
 
 Process-attributed disk reads fell by 33.8% on the first request and 33.6% on its repeat. Decode throughput rose by 17.4% and 13.5%. The first request took one second longer to produce its first token and completed 5.01 seconds sooner. The footprint metric excludes reclaimable mapped pages. Receipts `idle-sustain-private.json` and `idle-sustain-file-only.json` include the separate prefill and decode counters.
 
-The private/LRU control was repeated on `e9f74c2b`. The first request matched the earlier output and took 54.07 s, with 11.22 s to first token, 1.47 decode tok/s, 49.65 GB of logical expert reads, 38.52 GB of attributed disk reads, and zero swap-out pages. It completed 36 seconds before the next Xcode build started. That build overlapped the repeat, whose output also matched. The final-build host audit qualifies the first request for timing.
+The `e9f74c2b` binary repeated both arms at the same ceiling. Each served the same 14 prompt tokens and generated the same 64 greedy output tokens. The first private/LRU request finished 36 seconds before Xcode started. The subsequent private repeat overlapped Xcode. Both mapped requests passed the idle audit.
+
+| Request | Dense and expert retention | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (GB) | Peak process footprint (GB) | Swap-out pages |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| First | Private and LRU | 11.22 | 1.25 | 1.47 | 54.07 | 49.65 | 38.52 | 5.03 | 0 |
+| First | Mapped and file cache | 12.62 | 1.11 | 1.67 | 50.46 | 141.63 | 28.97 | 0.46 | 0 |
+| Repeat | Mapped and file cache | 8.73 | 1.60 | 1.74 | 45.01 | 141.63 | 24.03 | 0.46 | 0 |
+
+On the matched first request, attributed disk reads fell by 24.8% and decode throughput rose by 13.6%. The first token arrived 1.40 s later and the request finished 3.61 s sooner. The OS page cache was uncontrolled. The private repeat provides correctness evidence and stays outside the timing table.
 
 ### Idle-host budget and CPU worker comparison
 
