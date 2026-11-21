@@ -137,6 +137,7 @@ Do not modify or replace the model file while the server is running.
 | `threads` | 6 | CPU worker threads, 1 to 8. |
 | `timeout_ms` | 10,000 | Longest wait for one layer's CPU experts, 1 to 600,000. |
 | `preload` | `false` | `true` fills each layer's slots with its lowest-numbered experts before the first token. By default the slots start empty and fill as experts are used. |
+| `swaps_milli` | 250 | Bank swaps per token, in thousandths, 0 to 8,000. The default 250 buys one promotion per four tokens model-wide — sized for the blocking fill path. |
 
 Tiered mode refuses `capture: true` and `kv_dtype: q8`.
 It processes prompts one token per step and, by default, keeps no saved prefixes in host memory.
