@@ -1530,6 +1530,7 @@ mod tests {
                 piece_after_prefill: None,
                 request_piece: None,
                 prefill_pair: false,
+                cancel_prefill_pair: false,
                 log_final_prefill: false,
                 context_limit: None,
                 bank_reports: None,
