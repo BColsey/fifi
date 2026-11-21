@@ -782,6 +782,13 @@ const PERIODIC_TOKENS: usize = 16_384;
 /// the default spacings every periodic target is a block-spacing multiple, so the
 /// deeper-periodic guard never fires on the served families and only the tip's final partial
 /// chunk, at most the spacing in length, re-tiles.
+/// The block spacing of one prompt: the executor's configured spacing, sized to the prompt's tip
+/// when nothing sets it explicitly (see `session::block_spacing_for`).
+fn block_spacing(configured: Option<usize>, tip: Option<usize>) -> Option<usize> {
+    configured
+        .map(|configured| crate::family::session::block_spacing_for(tip.unwrap_or(0), configured))
+}
+
 fn save_points(
     plan: &PromptPlan<'_>,
     restored: usize,
@@ -1198,7 +1205,7 @@ fn start<E: ExecutorOps>(
             restored,
             executor.prefix_limits(),
             prefill_chunk,
-            executor.prefix_block_spacing(),
+            block_spacing(executor.prefix_block_spacing(), plan.boundary),
         )
     };
     for (point, kind) in points {

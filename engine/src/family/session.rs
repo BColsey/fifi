@@ -723,8 +723,8 @@ pub(crate) fn shadow_block_lcp_enabled() -> bool {
 /// rolling replacement per path.
 ///
 /// `ENGINESRV_PREFIX_BLOCK_TOKENS` sets the spacing
-/// (default 4,096, the simulated hybrid sweet spot; a value below 1 falls back to
-/// the default). The restore contract is unchanged.
+/// (a value below 1 falls back to the default). Unset, the spacing follows the prompt, between
+/// 1,024 and 4,096 tokens (`block_spacing_for`). The restore contract is unchanged.
 pub(crate) fn prefix_block_spacing() -> Option<usize> {
     static SPACING: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *SPACING.get_or_init(|| {
@@ -743,10 +743,31 @@ pub(crate) fn prefix_block_spacing() -> Option<usize> {
         let tokens = std::env::var_os("ENGINESRV_PREFIX_BLOCK_TOKENS")
             .and_then(|value| value.to_str().and_then(|text| text.parse::<usize>().ok()))
             .filter(|&tokens| tokens >= 1)
-            .unwrap_or(4_096);
+            .unwrap_or(DEFAULT_BLOCK_SPACING);
         Some(tokens)
     })
 }
+
+/// The spacing the block cut uses for a prompt whose tip is `tip` tokens, given the configured
+/// spacing. An explicit `ENGINESRV_PREFIX_BLOCK_TOKENS` (or any spacing but the default) is taken
+/// as given. Otherwise the spacing follows the prompt: an eighth of the tip rounded down to a
+/// power of two, never below 1,024 tokens (a finer index costs more than a turn saves) and never
+/// above the configured default. The cut then lands within an eighth of the tip, where a fixed
+/// 4,096 left a 4,000-token prompt with no cut at all.
+pub(crate) fn block_spacing_for(tip: usize, configured: usize) -> usize {
+    if configured != DEFAULT_BLOCK_SPACING
+        || std::env::var_os("ENGINESRV_PREFIX_BLOCK_TOKENS").is_some()
+    {
+        return configured;
+    }
+    let eighth = (tip / 8).max(1);
+    let floor_pow2 = 1usize << (usize::BITS - 1 - eighth.leading_zeros());
+    floor_pow2.max(MIN_AUTO_BLOCK_SPACING).min(configured)
+}
+
+/// The block spacing when nothing sets it, and the least an automatic spacing goes down to.
+const DEFAULT_BLOCK_SPACING: usize = 4_096;
+const MIN_AUTO_BLOCK_SPACING: usize = 1_024;
 
 /// Why a shadow block-LCP observation stands where it does: the class of the gap between what a
 /// block-granular restore could use and what the exact-key contract holds.
@@ -1810,10 +1831,27 @@ fn after_token(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_block_spacing_follows_the_prompt_between_1k_and_4k_tokens() {
+        // An eighth of the tip rounded down to a power of two, at least 1,024, at most 4,096.
+        assert_eq!(block_spacing_for(4_050, 4_096), 1_024);
+        assert_eq!(block_spacing_for(500, 4_096), 1_024);
+        assert_eq!(block_spacing_for(16_384, 4_096), 2_048);
+        assert_eq!(block_spacing_for(32_004, 4_096), 2_048);
+        assert_eq!(block_spacing_for(128_000, 4_096), 4_096);
+        // A spacing that is not the default was set by someone: it is taken as given.
+        assert_eq!(block_spacing_for(32_004, 64), 64);
+        assert_eq!(block_spacing_for(32_004, 8_192), 8_192);
+        // The cut a 4,050-token tip gets: 3,072 at 1,024, where 4,096 left none.
+        let cut = |spacing: usize| (4_050 - 1) / spacing * spacing;
+        assert_eq!(cut(block_spacing_for(4_050, 4_096)), 3_072);
+        assert_eq!(cut(4_096), 0);
+    }
+
     use super::{
         DecodePreparation, DecodeSession, Limits, PrefixIdentity, PrefixStore, Result, SaveKind,
         ShadowReason, SnapshotBudget, StoreLimits, TokenStepper, after_token, before_step,
-        check_prompt,
+        block_spacing_for, check_prompt,
     };
     use crate::{
         EngError,

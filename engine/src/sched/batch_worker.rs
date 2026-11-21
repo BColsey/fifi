@@ -397,7 +397,7 @@ fn setup_slot<E: ExecutorOps>(
             restored,
             executor.prefix_limits(),
             super::request_prefill_chunk(executor, &slot.session, prefill_chunk),
-            executor.prefix_block_spacing(),
+            super::block_spacing(executor.prefix_block_spacing(), plan.boundary),
         )
         .into()
     };
