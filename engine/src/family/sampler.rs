@@ -717,6 +717,64 @@ impl Sampler {
         )
     }
 
+    /// Whether a CUDA step may answer this sampler's draw from the device shortlist and the
+    /// softmax mass of the row ([`Sampler::sample_open_shortlist`]): an open-vocabulary draw
+    /// (`top_k` 0) at a positive temperature, with no capture armed (an armed sampler records the
+    /// full candidate list, which only the host walk has).
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        expect(dead_code, reason = "used by the CUDA device sampler")
+    )]
+    pub(crate) fn open_draw_on_device(&self) -> bool {
+        self.capture.is_none() && !self.params.is_greedy() && self.params.top_k == 0
+    }
+
+    /// Draws one token of an open-vocabulary row from its device top-20 and the softmax mass of
+    /// the whole row, with the host walk's token whenever the certificate holds. The one random
+    /// unit is taken first, exactly as the host walk takes it; when the unit lands where the mass
+    /// estimate could change the token (see [`open_pick`]) `row` supplies the full logits row and
+    /// the host walk answers with the same unit, so the token stream equals the host sampler's
+    /// for every seed. `mass` is the device sum of `exp((logit - top) / temperature)`.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        expect(dead_code, reason = "used by the CUDA device sampler")
+    )]
+    pub(crate) fn sample_open_shortlist(
+        &mut self,
+        ranked: &[(u32, f32)],
+        vocab: usize,
+        mass: f64,
+        row: impl FnOnce() -> Result<Vec<f32>, EngError>,
+    ) -> Result<u32, EngError> {
+        if !self.open_draw_on_device() {
+            return Err(EngError::BadRequest(
+                "device open draw requires non-greedy top_k 0 and no capture".to_owned(),
+            ));
+        }
+        check_shortlist(ranked, vocab)?;
+        if !mass.is_finite() || mass <= 0.0 {
+            return Err(invalid_logits(
+                "device softmax mass is not a positive finite sum",
+            ));
+        }
+        if self.first_top2_margin.is_none() && ranked.len() >= 2 {
+            self.first_top2_margin = Some(ranked[0].1 - ranked[1].1);
+        }
+        let unit = self.rng.next_unit();
+        if let Some(token) = open_pick(self.params, ranked, mass, unit) {
+            open_draws::note(false);
+            return Ok(token);
+        }
+        open_draws::note(true);
+        let logits = row()?;
+        if logits.len() != vocab {
+            return Err(invalid_logits(
+                "device open draw fallback row has the wrong width",
+            ));
+        }
+        pick_row(self.params, &logits, || unit, None).map(|(token, _)| token)
+    }
+
     /// The token and the number of kept candidates that `sample_with_keep` returns when the
     /// generator's next draw is `unit`. The generator does not move, so the call is repeatable.
     /// `unit` must lie in [0, 1); any other value, NaN included, fails with `BadRequest` before
@@ -737,6 +795,95 @@ impl Sampler {
             )));
         }
         pick_row(self.params, logits, || unit, None)
+    }
+}
+
+/// The largest relative error the device softmax mass can carry against the host's f64 total.
+/// The device adds f32 terms (`expf` of an f32 argument, relative error under 2.4e-6 at the
+/// weights that matter, and at most n / 2048 terms per thread summed in f32, under 1e-5 even
+/// when every addition rounds the same way) and reduces them in f64; the bound is three times the
+/// sum of the worst cases.
+pub(crate) const DEVICE_MASS_RELATIVE_BOUND: f64 = 3.0e-5;
+
+/// The token the host walk draws from a row whose ranked top-20 is `ranked`, when the device mass
+/// is enough to know it, else `None`. `unit` is the walk's one random unit.
+///
+/// The host walk adds the ranked weights in order, so the prefix sums of the twenty are the host's
+/// own bits. What the device adds is the total over the whole row, known to a relative error of
+/// at most [`DEVICE_MASS_RELATIVE_BOUND`]. With `top_p` 1 the target is `unit * total`: the token
+/// is the first prefix sum above it, certified when the target lies below the twentieth prefix sum
+/// and farther than the error bound from every prefix sum. With `top_p` below 1 the kept count is
+/// the first prefix sum at or above `top_p * total`, certified when no prefix sum lies within the
+/// bound of that threshold and one reaches it inside the twenty; the target `unit * kept mass`
+/// then uses only host-exact prefix sums.
+fn open_pick(params: SamplingParams, ranked: &[(u32, f32)], mass: f64, unit: f64) -> Option<u32> {
+    let top = f64::from(ranked.first()?.1);
+    let mut cumulative = Vec::with_capacity(ranked.len());
+    let mut running = 0.0_f64;
+    for &(_, logit) in ranked {
+        running += weight(logit, top, params.temperature);
+        cumulative.push(running);
+    }
+    let bound = DEVICE_MASS_RELATIVE_BOUND * mass;
+    let (kept, target) = if params.top_p >= 1.0 {
+        let target = unit * mass;
+        if cumulative.iter().any(|&sum| (sum - target).abs() <= bound) {
+            return None;
+        }
+        (cumulative.len(), target)
+    } else {
+        let threshold = params.top_p * mass;
+        let band = params.top_p * bound;
+        if cumulative
+            .iter()
+            .any(|&sum| (sum - threshold).abs() <= band)
+        {
+            return None;
+        }
+        let kept = cumulative.iter().position(|&sum| sum >= threshold)? + 1;
+        (kept, unit * cumulative[kept - 1])
+    };
+    // At top_p 1 the target may lie beyond the twenty: the full row decides.
+    let index = cumulative[..kept].iter().position(|&sum| sum > target);
+    match index {
+        Some(index) => Some(ranked[index].0),
+        None if params.top_p >= 1.0 => None,
+        None => Some(ranked[kept - 1].0),
+    }
+}
+
+/// Process-wide counts of open-vocabulary draws answered from the device shortlist and of those
+/// that read the full row, logged once per 4,096 draws.
+#[cfg_attr(
+    not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+    expect(dead_code, reason = "used by the CUDA device sampler")
+)]
+pub(crate) mod open_draws {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Records one draw; `fallback` is true when the full row answered it.
+    pub(crate) fn note(fallback: bool) {
+        let fallbacks =
+            FALLBACKS.fetch_add(u64::from(fallback), Ordering::Relaxed) + u64::from(fallback);
+        let draws = DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+        if draws.is_multiple_of(4096) {
+            eprintln!(
+                "sampler: {draws} open-vocabulary draws on the device shortlist, {fallbacks} \
+                 read the full row"
+            );
+        }
+    }
+
+    /// The draws and fallbacks counted so far.
+    #[cfg(test)]
+    pub(crate) fn counts() -> (u64, u64) {
+        (
+            DRAWS.load(Ordering::Relaxed),
+            FALLBACKS.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -3470,5 +3617,167 @@ mod tests {
         unarmed.record_device_greedy(7);
         assert!(unarmed.capture.is_none());
         assert_eq!(unarmed.rng_state(), unarmed_rng);
+    }
+}
+
+#[cfg(test)]
+mod open_draw_tests {
+    use super::{
+        DEVICE_MASS_RELATIVE_BOUND, Sampler, SamplingParams, SplitMix64, open_draws, open_pick,
+        pick_row, ranked_row, top_logit, weight,
+    };
+
+    const VOCAB: usize = 4096;
+
+    fn params(temperature: f64, top_p: f64) -> SamplingParams {
+        SamplingParams::new(temperature, top_p, 0).expect("valid params")
+    }
+
+    /// A row shaped like a language-model row: a few strong candidates over a long flat tail.
+    fn model_row(seed: u64, sharpness: f64) -> Vec<f32> {
+        let mut rng = SplitMix64::new(seed);
+        (0..VOCAB)
+            .map(|index| {
+                let noise = rng.next_unit() * 4.0;
+                let bump = if index < 12 {
+                    sharpness - index as f64
+                } else {
+                    0.0
+                };
+                (noise + bump) as f32
+            })
+            .collect()
+    }
+
+    /// The host's total: the ranked weights added in order, as the host walk adds them.
+    fn host_total(row: &[f32], temperature: f64) -> f64 {
+        let top = top_logit(row);
+        ranked_row(row).iter().fold(0.0, |sum, &(_, logit)| {
+            sum + weight(logit, top, temperature)
+        })
+    }
+
+    /// Every certified token equals the host walk's token for the same unit, whatever mass the
+    /// device reports within the error bound. Rows whose top twenty hold nearly all the mass
+    /// (a sharp head at a temperature of 0.7 or less) are certified for nearly every unit; flat
+    /// rows are left to the full row more often and never answered wrongly.
+    #[test]
+    fn a_certified_open_draw_is_the_host_token_for_the_same_unit() {
+        let (mut sharp_checked, mut sharp_certified) = (0_u64, 0_u64);
+        let (mut flat_checked, mut flat_certified) = (0_u64, 0_u64);
+        for (seed, sharpness) in [(1, 12.0), (2, 9.0), (3, 7.0), (4, 5.0)] {
+            let row = model_row(seed, sharpness);
+            let ranked: Vec<(u32, f32)> = ranked_row(&row).into_iter().take(20).collect();
+            for temperature in [0.3, 0.7, 1.0, 1.5] {
+                let total = host_total(&row, temperature);
+                for top_p in [1.0, 0.99, 0.95, 0.8, 0.5] {
+                    let settings = params(temperature, top_p);
+                    let bound = DEVICE_MASS_RELATIVE_BOUND;
+                    for scale in [1.0, 1.0 + 0.9 * bound, 1.0 - 0.9 * bound] {
+                        for step in 0..400 {
+                            let unit = (f64::from(step) + 0.5) / 400.0;
+                            let host = pick_row(settings, &row, || unit, None).expect("host").0;
+                            let sharp = sharpness >= 9.0 && temperature <= 0.7;
+                            let (checked, certified) = if sharp {
+                                (&mut sharp_checked, &mut sharp_certified)
+                            } else {
+                                (&mut flat_checked, &mut flat_certified)
+                            };
+                            *checked += 1;
+                            if let Some(token) = open_pick(settings, &ranked, total * scale, unit) {
+                                *certified += 1;
+                                assert_eq!(
+                                    token, host,
+                                    "seed {seed} T {temperature} p {top_p} scale {scale} unit {unit}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            sharp_certified * 100 > sharp_checked * 80,
+            "{sharp_certified} of {sharp_checked} sharp draws certified"
+        );
+        assert!(
+            flat_certified > 0,
+            "{flat_certified} of {flat_checked} flat draws certified"
+        );
+    }
+
+    /// A unit that lands inside the error band of a prefix sum, or past the twenty at top_p 1,
+    /// is never answered from the shortlist.
+    #[test]
+    fn a_unit_on_a_boundary_or_in_the_tail_is_left_to_the_full_row() {
+        let row = model_row(9, 8.0);
+        let ranked: Vec<(u32, f32)> = ranked_row(&row).into_iter().take(20).collect();
+        let settings = params(0.7, 1.0);
+        let total = host_total(&row, 0.7);
+        let top = f64::from(ranked[0].1);
+        let first = weight(ranked[0].1, top, 0.7);
+        // The first prefix sum is the weight of the best entry.
+        assert_eq!(open_pick(settings, &ranked, total, first / total), None);
+        assert_eq!(
+            open_pick(settings, &ranked, total, 0.999_999_9),
+            None,
+            "tail"
+        );
+        assert!(open_pick(settings, &ranked, total, first / total / 2.0).is_some());
+    }
+
+    /// The sampler takes its one unit before it knows whether the shortlist answers, so the
+    /// stream of tokens and the generator state equal the host sampler's for every seed.
+    #[test]
+    fn the_open_draw_matches_the_host_sampler_token_for_token_and_in_generator_state() {
+        let row = model_row(5, 6.0);
+        let ranked: Vec<(u32, f32)> = ranked_row(&row).into_iter().take(20).collect();
+        let before = open_draws::counts();
+        for seed in [0, 7, 99, u64::MAX] {
+            for (temperature, top_p) in [(0.7, 1.0), (1.0, 0.95), (0.7, 0.5)] {
+                let settings = params(temperature, top_p);
+                let mass = host_total(&row, temperature) * (1.0 + 1e-7);
+                let mut host = Sampler::new(settings, seed);
+                let mut device = Sampler::new(settings, seed);
+                for _ in 0..512 {
+                    let drawn = device
+                        .sample_open_shortlist(&ranked, VOCAB, mass, || Ok(row.clone()))
+                        .expect("open draw");
+                    assert_eq!(drawn, host.sample(&row).expect("host draw"));
+                }
+                assert_eq!(device.rng_state(), host.rng_state());
+            }
+        }
+        let after = open_draws::counts();
+        assert!(after.0 >= before.0 + 4 * 3 * 512, "draws are counted");
+    }
+
+    #[test]
+    fn the_open_draw_refuses_greedy_bounded_and_armed_samplers() {
+        let row = model_row(6, 6.0);
+        let ranked: Vec<(u32, f32)> = ranked_row(&row).into_iter().take(20).collect();
+        let draw = |sampler: &mut Sampler| {
+            sampler.sample_open_shortlist(&ranked, VOCAB, 10.0, || Ok(row.clone()))
+        };
+        assert!(!Sampler::greedy().open_draw_on_device());
+        assert!(draw(&mut Sampler::greedy()).is_err());
+        let bounded = SamplingParams::new(0.7, 1.0, 20).unwrap();
+        assert!(!Sampler::new(bounded, 1).open_draw_on_device());
+        let mut armed = Sampler::new(params(0.7, 1.0), 1);
+        assert!(armed.open_draw_on_device());
+        let _handle = armed.arm_capture(8);
+        assert!(!armed.open_draw_on_device());
+        assert!(draw(&mut armed).is_err());
+        let mut sampler = Sampler::new(params(0.7, 1.0), 1);
+        assert!(
+            sampler
+                .sample_open_shortlist(&ranked, VOCAB, f64::NAN, || Ok(row.clone()))
+                .is_err()
+        );
+        assert!(
+            sampler
+                .sample_open_shortlist(&ranked, VOCAB, 0.0, || Ok(row.clone()))
+                .is_err()
+        );
     }
 }

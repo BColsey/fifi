@@ -34,6 +34,17 @@ pub(super) fn device_sampling_supported(
 ) -> bool {
     vocab_matches && (params.is_greedy() || (!sync_each && (1..=20).contains(&params.top_k())))
 }
+
+/// The open-vocabulary draw (`top_k` 0 at a positive temperature) rides the same device
+/// shortlist with the softmax mass of the whole row beside it; the sampler certifies each draw
+/// against the mass bound and reads the full row only when it cannot.
+pub(super) fn device_open_supported(
+    params: SamplingParams,
+    sync_each: bool,
+    vocab_matches: bool,
+) -> bool {
+    vocab_matches && !sync_each && !params.is_greedy() && params.top_k() == 0
+}
 const HOST_WRITES_PER_TOKEN: u32 = 1;
 
 pub(super) fn parse_sync_each(value: Option<&str>) -> Result<bool, EngError> {
@@ -59,10 +70,12 @@ pub(super) fn check_mode(sync_each: bool, capture_requested: bool) -> Result<(),
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadStep {
     QueueShortlist,
+    QueueMass,
     QueuePairCopy,
     RecordEvent,
     ReadLogits,
     ReadShortlist,
+    ReadMass,
     ReadPair,
 }
 
@@ -70,6 +83,8 @@ pub(super) enum ReadStep {
 pub(super) struct ReadbackPlan {
     pub(super) logits_bytes: Option<usize>,
     pub(super) shortlist: bool,
+    /// The softmax mass of the row is queued after the shortlist and its partials are read.
+    pub(super) mass: bool,
 }
 
 impl ReadbackPlan {
@@ -90,12 +105,20 @@ impl ReadbackPlan {
         Ok(Self {
             logits_bytes,
             shortlist: false,
+            mass: false,
         })
     }
 
     pub(super) fn shortlist(vocab: usize) -> Result<Self, EngError> {
         let mut plan = Self::new(vocab, false)?;
         plan.shortlist = true;
+        Ok(plan)
+    }
+
+    /// The shortlist with the softmax mass of the row: what an open-vocabulary draw reads.
+    pub(super) fn open_shortlist(vocab: usize) -> Result<Self, EngError> {
+        let mut plan = Self::shortlist(vocab)?;
+        plan.mass = true;
         Ok(plan)
     }
 
@@ -106,12 +129,18 @@ impl ReadbackPlan {
         if self.shortlist {
             steps.push(ReadStep::QueueShortlist);
         }
+        if self.mass {
+            steps.push(ReadStep::QueueMass);
+        }
         steps.extend([ReadStep::QueuePairCopy, ReadStep::RecordEvent]);
         if self.logits_bytes.is_some() {
             steps.push(ReadStep::ReadLogits);
         }
         if self.shortlist {
             steps.push(ReadStep::ReadShortlist);
+        }
+        if self.mass {
+            steps.push(ReadStep::ReadMass);
         }
         steps.push(ReadStep::ReadPair);
         steps
@@ -123,7 +152,10 @@ impl ReadbackPlan {
         let first_read = self.steps().into_iter().position(|step| {
             matches!(
                 step,
-                ReadStep::ReadLogits | ReadStep::ReadShortlist | ReadStep::ReadPair
+                ReadStep::ReadLogits
+                    | ReadStep::ReadShortlist
+                    | ReadStep::ReadMass
+                    | ReadStep::ReadPair
             )
         });
         u32::from(first_read.is_some())

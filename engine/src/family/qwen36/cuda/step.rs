@@ -61,8 +61,8 @@ use super::{
     prefix::{CudaPrefillPath, CudaSavedPrefix, PendingPrefix},
     readback::{
         ReadbackPlan, SHORTLIST_VAR, SYNC_EACH_VAR, captured_report, check_mode,
-        device_sampling_supported, device_shortlist_enabled, eager_report, parse_sync_each,
-        refused_report, with_host_syncs,
+        device_open_supported, device_sampling_supported, device_shortlist_enabled, eager_report,
+        parse_sync_each, refused_report, with_host_syncs,
     },
     resources::{
         EmbedWeight, GlobalSpecs, GlobalWeights, HeadWeight, MoeSpecs, STEP_ROWS, StepResources,
@@ -106,7 +106,7 @@ use crate::{
             embed::{EmbedCall, EmbedNativeCall},
             embed_bf16::EmbedBf16Call,
             matvec_q::{MatvecCall, QuantType},
-            shortlist::{self, ShortlistCall},
+            shortlist::{self, ShortlistCall, ShortlistMassCall},
             step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
         },
     },
@@ -520,6 +520,11 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The stage itself, allocated for the plain layout when `route_stage_on` (see `RouteStage`).
     route_stage: Option<RouteStage>,
     shortlist_bytes: [u8; shortlist::RESULT_BYTES],
+    /// The f64 partials of the last softmax mass read back (little-endian).
+    mass_bytes: [u8; shortlist::MASS_PARTS * 8],
+    /// One over the temperature of the open-vocabulary draw the next token reads back for, or
+    /// `None` for every other read-back.
+    open_mass: Option<f32>,
     report: RunReport,
     prefill_report: PrefillReport,
     /// The engine's one host-backed prefix entry.
@@ -1019,6 +1024,8 @@ impl<'a> QwenResidentStep<'a> {
             route_stage_on,
             route_stage,
             shortlist_bytes: [0; shortlist::RESULT_BYTES],
+            mass_bytes: [0; shortlist::MASS_PARTS * 8],
+            open_mass: None,
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
             prefix: PrefixSlot::default(),
@@ -2005,7 +2012,11 @@ impl<'a> QwenResidentStep<'a> {
         }
         let mut plan = self.readback_plan(want_logits)?;
         if want_shortlist {
-            plan = ReadbackPlan::shortlist(self.res.dims.shape.vocab)?;
+            plan = if self.open_mass.is_some() {
+                ReadbackPlan::open_shortlist(self.res.dims.shape.vocab)?
+            } else {
+                ReadbackPlan::shortlist(self.res.dims.shape.vocab)?
+            };
         }
         // The start block is written at a committed boundary (the state is idle), then the step
         // is admitted; a refused write queues nothing. The marks stop reading meanwhile: the
@@ -2789,6 +2800,17 @@ impl<'a> QwenResidentStep<'a> {
                 },
             )?;
         }
+        if let (true, Some(inv_temperature)) = (plan.mass, self.open_mass) {
+            self.context.shortlist_mass(
+                &self.stream,
+                ShortlistMassCall {
+                    logits: self.view(Slot::Logits)?,
+                    scratch: self.view(Slot::ArgmaxPart)?,
+                    n: self.widths.verdict,
+                    inv_temperature,
+                },
+            )?;
+        }
         let pair_range = self.state.word(Word::ResultPair)?;
         self.context
             .copy_word_to_host(&self.stream, pair_range, &self.word)?;
@@ -2809,6 +2831,15 @@ impl<'a> QwenResidentStep<'a> {
             part.buffer()
                 .read_at(&self.stream, offset, &mut self.shortlist_bytes)?;
         }
+        if plan.mass {
+            let part = self.view(Slot::ArgmaxPart)?;
+            let offset = part
+                .offset()
+                .checked_add(shortlist::MASS_OFFSET)
+                .ok_or_else(|| EngError::MemoryPlan("mass readback offset overflows".to_owned()))?;
+            part.buffer()
+                .read_at(&self.stream, offset, &mut self.mass_bytes)?;
+        }
         let value = self.word.read_after(&self.event)?;
         Ok(ResultPair {
             token: value.token,
@@ -2823,13 +2854,18 @@ impl<'a> QwenResidentStep<'a> {
         sampler: &mut Sampler,
         sampler_vocab: usize,
     ) -> Result<Option<u32>, EngError> {
-        if !self.shortlist_on
-            || !device_sampling_supported(
-                sampler.params(),
-                self.sync_each,
-                sampler_vocab == self.widths.verdict,
-            )
-        {
+        let vocab_matches = sampler_vocab == self.widths.verdict;
+        if !self.shortlist_on {
+            return Ok(None);
+        }
+        if !device_sampling_supported(sampler.params(), self.sync_each, vocab_matches) {
+            if sampler.open_draw_on_device()
+                && device_open_supported(sampler.params(), self.sync_each, vocab_matches)
+            {
+                return self
+                    .open_device_token(token, sampler, sampler_vocab)
+                    .map(Some);
+            }
             return Ok(None);
         }
         if sampler.params().is_greedy() {
@@ -2842,6 +2878,37 @@ impl<'a> QwenResidentStep<'a> {
         sampler
             .sample_shortlist(&candidates, sampler_vocab)
             .map(Some)
+    }
+
+    /// One open-vocabulary token: the device ranks the top twenty and adds the softmax mass of
+    /// the row, and the sampler draws from them, reading the full logits row only for a draw its
+    /// certificate cannot settle.
+    fn open_device_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32, EngError> {
+        let temperature = sampler.params().temperature();
+        self.open_mass = Some((1.0 / temperature) as f32);
+        let ran = self.run_token_output(token, false, true);
+        self.open_mass = None;
+        ran?;
+        let candidates = self.shortlist_values()?;
+        let mass: f64 = self
+            .mass_bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|part| f64::from_le_bytes(*part))
+            .sum();
+        sampler.sample_open_shortlist(&candidates, sampler_vocab, mass, || {
+            let row = self.view(Slot::Logits)?;
+            let bytes = f32_bytes(sampler_vocab)?;
+            let out = &mut self.logits_bytes[..bytes];
+            row.buffer().read_at(&self.stream, row.offset(), out)?;
+            Ok(self.logits_values())
+        })
     }
 
     fn shortlist_values(&self) -> Result<Vec<(u32, f32)>, EngError> {

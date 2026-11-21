@@ -254,3 +254,54 @@ fn a_tiered_report_counts_every_layer_wait_and_blocking_write_as_a_sync() {
         "a plain step adds nothing"
     );
 }
+
+#[test]
+fn the_open_draw_adds_one_mass_launch_and_one_small_read_to_the_single_wait() {
+    let plan = ReadbackPlan::open_shortlist(VOCAB).expect("open plan");
+    assert_eq!(plan.logits_bytes, None);
+    assert!(plan.shortlist && plan.mass);
+    assert_eq!(
+        plan.steps(),
+        [
+            ReadStep::QueueShortlist,
+            ReadStep::QueueMass,
+            ReadStep::QueuePairCopy,
+            ReadStep::RecordEvent,
+            ReadStep::ReadShortlist,
+            ReadStep::ReadMass,
+            ReadStep::ReadPair,
+        ]
+    );
+    assert_eq!(plan.blocking_waits(), 1);
+    assert!(!ReadbackPlan::shortlist(VOCAB).expect("plan").mass);
+}
+
+#[test]
+fn only_the_open_vocabulary_draw_takes_the_mass_path() {
+    use super::readback::{device_open_supported, device_sampling_supported};
+    use crate::family::sampler::{Sampler, SamplingParams};
+    let open = SamplingParams::new(0.7, 1.0, 0).unwrap();
+    assert!(device_open_supported(open, false, true));
+    assert!(!device_open_supported(open, true, true), "sync each");
+    assert!(
+        !device_open_supported(open, false, false),
+        "vocabulary mismatch"
+    );
+    assert!(!device_open_supported(
+        Sampler::greedy().params(),
+        false,
+        true
+    ));
+    let bounded = SamplingParams::new(1.0, 0.95, 20).unwrap();
+    assert!(
+        !device_open_supported(bounded, false, true),
+        "top_k 1..=20 has its own path"
+    );
+    let wide = SamplingParams::new(1.0, 0.95, 40).unwrap();
+    assert!(
+        !device_open_supported(wide, false, true),
+        "top_k above 20 stays on the host"
+    );
+    // The K-row window rule is unchanged: it never sees the open draw.
+    assert!(!device_sampling_supported(open, false, true));
+}
