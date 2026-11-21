@@ -84,7 +84,11 @@ pub(crate) fn inspect(
         let Some(MetaValue::Array(array)) = header.meta(key) else {
             return Err(checkpoint_error(format!("{key} must be an array")));
         };
-        if array.elem_type != element_type || array.len != LAYERS as u64 {
+        // The published conversion stores head counts as I32. Positive counts
+        // have identical bytes in either integer encoding.
+        let type_matches =
+            array.elem_type == element_type || (element_type == 4 && array.elem_type == 5);
+        if !type_matches || array.len != LAYERS as u64 {
             return Err(checkpoint_error(format!(
                 "{key} has invalid element type or length"
             )));
@@ -97,9 +101,9 @@ pub(crate) fn inspect(
             .read_exact(&mut bytes[..LAYERS * width])
             .map_err(checkpoint_error)?;
         for (layer, bytes) in bytes[..LAYERS * width].chunks_exact(width).enumerate() {
-            let valid = match bytes {
-                &[value] => value == u8::from(layer % 6 != 5),
-                &[a, b, c, d] => u32::from_le_bytes([a, b, c, d]) == expected,
+            let valid = match *bytes {
+                [value] => value == u8::from(layer % 6 != 5),
+                [a, b, c, d] => u32::from_le_bytes([a, b, c, d]) == expected,
                 _ => unreachable!(),
             };
             if !valid {

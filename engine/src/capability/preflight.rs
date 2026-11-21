@@ -2715,9 +2715,9 @@ mod tests {
             key(&mut header, &format!("inkling2_loop.{name}"), 4);
             header.extend(value.to_le_bytes());
         }
-        for (name, count) in [("head_count", 24u32), ("head_count_kv", 8u32)] {
+        for (name, count) in [("head_count", 24i32), ("head_count_kv", 8i32)] {
             key(&mut header, &format!("inkling2_loop.attention.{name}"), 9);
-            header.extend(4u32.to_le_bytes());
+            header.extend(5u32.to_le_bytes());
             header.extend(24u64.to_le_bytes());
             for _ in 0..24 {
                 header.extend(count.to_le_bytes());
