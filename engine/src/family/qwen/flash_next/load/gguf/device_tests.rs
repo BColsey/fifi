@@ -23,6 +23,7 @@ fn argmax(values: &[f32]) -> usize {
 }
 
 #[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
 fn the_device_logits_follow_the_host_forward_on_the_small_model() {
     let small = write_small(7);
     let model: &'static GgufModel = Box::leak(Box::new(
@@ -80,6 +81,7 @@ fn time_run<S: TokenStepper>(driver: &mut S) -> f64 {
 /// five runs of 48 tokens after one warm-up run. It prints the figure; the check is that every
 /// run completes and the logits stay finite.
 #[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
 fn the_decode_time_per_token_on_the_small_model() {
     let small = write_small(7);
     let model: &'static GgufModel = Box::leak(Box::new(
@@ -102,4 +104,82 @@ fn the_decode_time_per_token_on_the_small_model() {
         "decode ms per token on the small model: median {:.3}, runs {times:.3?}",
         times[2]
     );
+}
+
+/// A tokenizer of eight single-letter tokens, the shape the family tests use.
+const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}}"#;
+
+/// A default start of the engine factory on a directory holding the small model and a
+/// tokenizer: the plan, the upload and the executor are the served ones, and the greedy tokens
+/// of a job equal the host forward's own greedy choice over the tokenizer's eight ids.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forward() {
+    use crate::{
+        family::{executor::GenerationState, flash_next::factory, sampler::Sampler},
+        sched::{
+            job::{Job, JobEvent},
+            worker::EngineNote,
+        },
+        tokenizer::{IncrementalDecoder, Tokenizer},
+    };
+    const NEW_TOKENS: usize = 6;
+    let small = write_small(7);
+    let dir = small.dir.path();
+    for (name, text) in [
+        ("tokenizer.json", TOKENIZER_JSON),
+        (
+            "tokenizer_config.json",
+            r#"{"eos_token":"h","chat_template":"{{ messages[0].content }}"}"#,
+        ),
+    ] {
+        std::fs::write(dir.join(name), text).expect("tokenizer file");
+    }
+    let prompt = [1u32, 2, 3];
+
+    let model: &'static GgufModel = Box::leak(Box::new(
+        GgufModel::open(&small.first)
+            .expect("open")
+            .expect("a qwen4exp model"),
+    ));
+    let reference = host::HostModel::load(model, 4).expect("host layers");
+    let mut tokens = prompt.to_vec();
+    let mut want = Vec::new();
+    for _ in 0..NEW_TOKENS {
+        let run = host::run(model, &reference, &tokens, 2).expect("host forward");
+        let last = run.logits.last().expect("logits");
+        let next = argmax(&last[..8]) as u32;
+        want.push(next);
+        tokens.push(next);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = factory::start_engine(
+        dir,
+        dir,
+        None,
+        false,
+        Some(Box::new(move |note| tx.send(note).expect("note"))),
+    )
+    .expect("the engine starts");
+    if let EngineNote::Failed(why) = rx.recv().expect("a note") {
+        panic!("the start failed: {why}");
+    }
+    let tokenizer = Tokenizer::from_bytes(TOKENIZER_JSON.as_bytes()).expect("tokenizer");
+    let state =
+        GenerationState::with_sampler(IncrementalDecoder::new(&tokenizer), Sampler::greedy())
+            .with_max_tokens(NEW_TOKENS as u32);
+    let (job, mut response) = Job::new(prompt.to_vec(), state).expect("job");
+    started.engine.handle().try_submit(job).expect("submit");
+    let mut got = Vec::new();
+    while let Some(event) = response.events.blocking_recv() {
+        match event {
+            JobEvent::Batch(batch) => got.extend(batch.tokens),
+            JobEvent::Error(error) => panic!("{error:?}"),
+            JobEvent::Started | JobEvent::Finished(_) => {}
+        }
+    }
+    eprintln!("engine tokens {got:?}, host greedy tokens {want:?}");
+    assert!(started.engine.shutdown().failure.is_none());
+    assert_eq!(got, want);
 }

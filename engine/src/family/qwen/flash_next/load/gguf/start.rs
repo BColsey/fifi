@@ -1,33 +1,71 @@
-//! The CUDA start of a Flash-Next GGUF: opens the card, plans the memory, prints the plan, and
-//! refuses to serve while a tensor type of the file has no decode kernel.
+//! The CUDA start of a Flash-Next GGUF: opens the card, plans the memory, prints the plan,
+//! refuses to serve while a tensor type of the file has no decode kernel, and serves a model
+//! whose routed experts all fit on the card.
 //!
 //! Order: the CUDA context (for the card's free memory), the host admission snapshot, the
-//! context the plan chooses when the entry sets none, the plan line, then the kernel check.
+//! context the plan chooses when the entry sets none, the plan line, the kernel check, the
+//! tokenizer, then the engine thread, which uploads the weights and builds the decode step.
 //! The plan runs first so that an operator whose model is refused still sees the tiers the
 //! start would use once the kernels exist.
 
-use std::convert::Infallible;
+use std::{path::Path, sync::Arc};
 
-use super::{GgufModel, plan::Card};
+use sha2::{Digest, Sha256};
+
+use super::{GgufModel, plan::Card, trunk::gguf_trunk};
 use crate::{
     EngError,
     family::{
         mem::Facts,
         project::cuda::CudaProjector,
-        qwen::flash_next::host_plan::{HOST_LABELS, HostMemory},
-        qwen::flash_next::settings::{
-            DEFAULT_CUDA_CONTEXT, FlashOptions, MAX_CUDA_CONTEXT, cuda_settings, default_context,
-            ring_budget_bytes,
+        qwen::flash_next::{
+            cuda::{
+                executor::{CudaRules, FlashCudaExecutor},
+                gguf_device::gguf_driver,
+                start::{BuildGuard, ple_threads},
+            },
+            host_plan::{HOST_LABELS, HostMemory},
+            settings::{
+                DEFAULT_CUDA_CONTEXT, DEFAULT_PREFILL_CHUNK, FlashOptions, MAX_CUDA_CONTEXT,
+                cuda_settings, default_context, ring_budget_bytes,
+            },
         },
+        session::PrefixIdentity,
     },
+    kernels::cuda::DeviceStream,
+    sched::worker::{Engine, ReadyNote, spawn_engine_noted},
+    tokenizer::{TokenizerBundle, TokenizerPin},
 };
 
-/// Plans the model on this machine and prints the plan. Returns the refusal that stands
-/// between the file and a served start; there is no serving path yet, so `Ok` never occurs.
+/// Host bytes one native tensor read holds while a tensor is uploaded.
+const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
+
+/// The pin of the tokenizer files found in `dir`: their own digests, so the load matches and
+/// logs nothing, and the vocabulary the model's head holds. A file that is absent pins zeros
+/// and is reported by the load.
+fn observed_pin(dir: &Path, vocab: u32) -> TokenizerPin {
+    let digest = |name: &str| -> [u8; 32] {
+        std::fs::read(dir.join(name)).map_or([0u8; 32], |bytes| Sha256::digest(bytes).into())
+    };
+    TokenizerPin {
+        tokenizer_json: digest("tokenizer.json"),
+        tokenizer_config_json: digest("tokenizer_config.json"),
+        chat_template_jinja: digest("chat_template.jinja"),
+        generation_config_json: digest("generation_config.json"),
+        vocab_size: vocab,
+    }
+}
+
+/// Plans the model on this machine, prints the plan, and starts the engine when every
+/// matrix type has a decode kernel and the routed experts all fit on the card. The tokenizer
+/// files are read from `tokenizer_dir`.
 pub(in crate::family::qwen::flash_next) fn start(
-    model: &GgufModel,
+    owned: GgufModel,
     options: Option<&FlashOptions>,
-) -> Result<Infallible, EngError> {
+    tokenizer_dir: &Path,
+    ready_note: ReadyNote,
+) -> Result<(Engine, TokenizerBundle, u32), EngError> {
+    let model = &owned;
     let mut options = options.cloned().unwrap_or_default();
     if options.cuda_decode == Some(false) {
         return Err(EngError::BadRequest(
@@ -91,11 +129,73 @@ pub(in crate::family::qwen::flash_next) fn start(
     if !gaps.is_empty() {
         return Err(model.kernel_refusal(&gaps));
     }
-    Err(EngError::Checkpoint(format!(
-        "Flash-Next GGUF {} is planned and every matrix type has a decode kernel, but the \
-         executor does not read GGUF weights yet",
-        model.first_path().display()
-    )))
+    let experts = model.config().dims.experts as usize;
+    let slots = load.context.plan.slots_per_layer();
+    if slots < experts {
+        return Err(EngError::MemoryPlan(format!(
+            "Flash-Next GGUF {}: the plan holds {slots} of {experts} experts per layer on the card \
+             and the rest in {}; the executor serves a model whose experts all fit on the card \
+             and does not stream experts from a GGUF yet",
+            model.first_path().display(),
+            tier_line(&load)
+        )));
+    }
+
+    let vocab = model.config().model_shape()?.vocab;
+    let bundle = TokenizerBundle::load(
+        tokenizer_dir,
+        &observed_pin(
+            tokenizer_dir,
+            u32::try_from(vocab).map_err(|_| refuse("the vocabulary overflows u32"))?,
+        ),
+    )?;
+    let sampler_vocab = usize::try_from(bundle.vocab_size())
+        .map_err(|_| refuse("the tokenizer vocabulary overflows usize"))?;
+    if sampler_vocab == 0 || sampler_vocab > vocab {
+        return Err(refuse(format!(
+            "the tokenizer has {sampler_vocab} ids and the model head {vocab}"
+        )));
+    }
+    let rules = CudaRules {
+        eos: Arc::from(bundle.eos_token_ids()),
+        sampler_vocab,
+    };
+    let header = model.weights.header();
+    let weights_digest: [u8; 32] = Sha256::new()
+        .chain_update(header.header_sha256())
+        .chain_update(header.tensors().len().to_le_bytes())
+        .finalize()
+        .into();
+    let tokenizer_digest: [u8; 32] =
+        Sha256::digest(std::fs::read(tokenizer_dir.join("tokenizer.json")).unwrap_or_default())
+            .into();
+    let identity = PrefixIdentity {
+        weights: crate::weights::sha256_hex(&weights_digest).into(),
+        tokenizer: crate::weights::sha256_hex(&tokenizer_digest).into(),
+    };
+    let prefill_chunk = options
+        .and_then(|options| options.prefill_chunk)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK) as usize;
+    let guard = BuildGuard::acquire()?;
+    let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
+        let mut guard = guard;
+        stages.begin("initializing CUDA");
+        let projector: &'static CudaProjector = Box::leak(Box::new(CudaProjector::new()?));
+        guard.commit();
+        let ctx = projector.context();
+        let stream: &'static DeviceStream = Box::leak(Box::new(ctx.stream()?));
+        stages.begin("uploading the weights");
+        let model: &'static GgufModel = Box::leak(Box::new(owned));
+        let weights = Box::leak(Box::new(gguf_trunk(model, ctx, true, UPLOAD_CHUNK_BYTES)?));
+        stages.begin("building the decode step");
+        let driver = gguf_driver(model, ctx, stream, weights, context as usize, ple_threads())?;
+        FlashCudaExecutor::new(driver, rules, identity)
+    })?;
+    Ok((engine, bundle, context))
+}
+
+fn refuse(detail: impl AsRef<str>) -> EngError {
+    EngError::Checkpoint(format!("Flash-Next GGUF start: {}", detail.as_ref()))
 }
 
 fn tier_line(load: &crate::family::qwen::flash_next::moe::load_plan::LoadPlan) -> String {

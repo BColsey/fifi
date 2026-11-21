@@ -8,8 +8,6 @@
 //! into a pack this struct owns, with the packs of the expert down projections and the shared
 //! expert. The routed experts are native stacks held on the card (`trunk::expert_key`).
 
-#![cfg_attr(not(test), expect(dead_code, reason = "no caller outside the tests"))]
-
 use super::step::{MoeBlock, refuse};
 use crate::{
     EngError,

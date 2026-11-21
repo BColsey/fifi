@@ -146,7 +146,7 @@ pub(in crate::family::qwen::flash_next) mod driver;
 mod driver_device_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
-mod executor;
+pub(in crate::family::qwen::flash_next) mod executor;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
 pub(in crate::family::qwen::flash_next) mod pack_feeds;

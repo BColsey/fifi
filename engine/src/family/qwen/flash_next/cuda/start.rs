@@ -98,7 +98,7 @@ use crate::{
 /// Threads of the host PLE projections (rows split over them). The two projection matvecs are
 /// DRAM-bandwidth-bound (131 MB per token), so more threads helps until the socket saturates;
 /// `INFERENCE_FLASH_NEXT_PLE_THREADS` overrides the default.
-fn ple_threads() -> usize {
+pub(in crate::family::qwen::flash_next) fn ple_threads() -> usize {
     std::env::var("INFERENCE_FLASH_NEXT_PLE_THREADS")
         .ok()
         .and_then(|text| text.parse::<usize>().ok())
@@ -148,19 +148,19 @@ fn already_built() -> EngError {
 
 /// Takes the one-engine flag; released on drop unless committed (a failure before the first leak
 /// owns nothing on the card).
-pub(super) struct BuildGuard {
+pub(in crate::family::qwen::flash_next) struct BuildGuard {
     committed: bool,
 }
 
 impl BuildGuard {
-    fn acquire() -> Result<Self, EngError> {
+    pub(in crate::family::qwen::flash_next) fn acquire() -> Result<Self, EngError> {
         CUDA_ENGINE_BUILT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| already_built())?;
         Ok(Self { committed: false })
     }
 
-    fn commit(&mut self) {
+    pub(in crate::family::qwen::flash_next) fn commit(&mut self) {
         self.committed = true;
     }
 }

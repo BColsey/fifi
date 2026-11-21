@@ -36,6 +36,18 @@ pub(crate) fn start_engine(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
+    // A GGUF checkpoint has no manifest and no `config.json`: it plans from its own metadata
+    // and tensor table and takes its own start.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
+        let (engine, bundle, context_limit) =
+            super::load::gguf::start::start(model, options, tokenizer_dir, ready_note)?;
+        return Ok(StartedEngine {
+            engine,
+            bundle,
+            context_limit,
+        });
+    }
     start_engine_resolved(
         model_dir,
         tokenizer_dir,
@@ -55,13 +67,6 @@ pub(crate) fn start_engine_resolved(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<(StartedEngine, FlashSettings), EngError> {
-    // A GGUF checkpoint has no manifest and no `config.json`: it plans from its own metadata
-    // and tensor table and takes its own start.
-    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    if let Some(model) = super::load::gguf::GgufModel::open(model_dir)? {
-        let never = super::load::gguf::start::start(&model, options)?;
-        match never {}
-    }
     let settings = FlashSettings::new(model_dir, tokenizer_dir, options, env)?;
     if settings.manifest_found_in_pack {
         eprintln!(

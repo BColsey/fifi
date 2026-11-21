@@ -3,8 +3,6 @@
 //! [`CardDevice`](super::device::CardDevice)'s; this device has no expert bank, so it reports no
 //! bank counters.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "no caller outside the tests"))]
-
 use std::ops::Range;
 
 use super::{
