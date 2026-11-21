@@ -119,6 +119,20 @@ impl MappedFile {
         })
     }
 
+    #[cfg(all(
+        feature = "native-cuda",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn drop_cache(&self, bytes: std::ops::Range<usize>) -> Result<(), crate::EngError> {
+        crate::weights::page_cache::drop_file_range(
+            &self.file,
+            bytes.start as u64,
+            bytes.len() as u64,
+        )
+        .map_err(|error| crate::EngError::Checkpoint(format!("drop mapped expert cache: {error}")))
+    }
+
     pub fn len(&self) -> u64 {
         self.len
     }

@@ -6,16 +6,24 @@ use std::{cell::RefCell, collections::BTreeMap};
 use super::{DEVICE_HEADROOM, DensePlan, DenseStep, DenseUpload, Resident, bad, upload_tensor};
 use crate::{
     EngError,
+    expert_tier::{ExpertId, Placement},
+    family::mapped_file::MappedFile,
     kernels::cuda::{
-        CudaContext, DeviceBuffer,
+        CudaContext, DeviceBuffer, DeviceRange,
         plan::{Demand, admit},
     },
     weights::{GgufType, repack_nvfp4_into},
 };
 
+mod residency;
+
+use residency::ResidentExperts;
+pub(in crate::family::inkling2) use residency::{Nvfp4Layer, Nvfp4Stack};
+
 pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
     dense: BTreeMap<String, Resident>,
+    resident: ResidentExperts,
     expert_codes: DeviceBuffer,
     expert_scales: DeviceBuffer,
     packed: RefCell<Packed>,
@@ -28,6 +36,8 @@ struct Packed {
 }
 
 pub(in crate::family::inkling2) struct ExpertView<'a> {
+    pub id: ExpertId,
+    pub part: usize,
     pub kind: GgufType,
     pub shape: [usize; 2],
     pub bytes: &'a [u8],
@@ -38,6 +48,8 @@ impl GgufCuda {
     pub(in crate::family::inkling2) fn load(
         dense: Vec<DenseUpload<'_>>,
         spec: &super::TextSpec,
+        layers: Vec<Nvfp4Layer<'_>>,
+        file: &MappedFile,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
         let ff = spec.intermediate_size as usize;
@@ -74,14 +86,19 @@ impl GgufCuda {
                 ))
             })
             .collect::<Result<_, EngError>>()?;
+        let resident = ResidentExperts::load(&context, spec.n_routed_experts as u32, layers, file)?;
         eprintln!(
             "Inkling GGUF CUDA projections {}",
             serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": tensors,
-                "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes})
+                "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
+                "resident_expert_bytes": resident.bytes(),
+                "resident_expert_layers": resident.placement().full_layers(),
+                "resident_expert_count": resident.placement().resident_experts()})
         );
         Ok(Self {
             step,
             dense,
+            resident,
             expert_codes,
             expert_scales,
             packed: RefCell::new(Packed {
@@ -115,13 +132,8 @@ impl GgufCuda {
         match expert.kind {
             GgufType::Bf16 => Some(self.bf16_expert(expert, x)),
             GgufType::Nvfp4 => {
-                // The GGUF unsigned scale 0xff has no E4M3FN representation.
-                if expert
-                    .bytes
-                    .as_chunks::<36>()
-                    .0
-                    .iter()
-                    .any(|b| b[..4].contains(&0xff))
+                if self.resident.placement().placement(expert.id) != Placement::Gpu
+                    && !can_repack(expert.bytes)
                 {
                     return None;
                 }
@@ -150,17 +162,40 @@ impl GgufCuda {
             return Ok(vec![0.0; expert.shape[0]]);
         }
         let n = expert.shape[0] * expert.shape[1];
+        if let Some(buffers) = self
+            .resident
+            .ranges(expert.id, expert.part, [n / 2, n / 16])?
+        {
+            return self.project_nvfp4(buffers, expert, x);
+        }
         let Packed { codes, scales } = &mut *self.packed.borrow_mut();
         let (codes, scales) = (&mut codes[..n / 2], &mut scales[..n / 16]);
         repack_nvfp4_into(expert.bytes, codes, scales)?;
         self.context.upload_at(&self.expert_codes, 0, codes)?;
         self.context.upload_at(&self.expert_scales, 0, scales)?;
-        self.context.nvfp4_matvec_range(
-            self.expert_codes.range(0, codes.len())?,
-            self.expert_scales.range(0, scales.len())?,
-            expert.factor,
-            expert.shape,
+        self.project_nvfp4(
+            [
+                self.expert_codes.range(0, codes.len())?,
+                self.expert_scales.range(0, scales.len())?,
+            ],
+            expert,
             x,
         )
     }
+
+    fn project_nvfp4(
+        &self,
+        [codes, scales]: [DeviceRange<'_>; 2],
+        expert: &ExpertView<'_>,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        self.context
+            .nvfp4_matvec_range(codes, scales, expert.factor, expert.shape, x)
+    }
+}
+
+pub(in crate::family::inkling2) fn can_repack(bytes: &[u8]) -> bool {
+    let (blocks, tail) = bytes.as_chunks::<36>();
+    // The GGUF unsigned scale 0xff has no E4M3FN representation.
+    tail.is_empty() && blocks.iter().all(|b| !b[..4].contains(&0xff))
 }

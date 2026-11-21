@@ -65,11 +65,7 @@ impl<'a> ExpertResidency<'a> {
         if budget == 0 {
             return Ok(plan);
         }
-        // Repeated core banks remove a transfer on every visit of each admitted layer.
-        let order = (spec.core.core_start..spec.core.core_end)
-            .chain(0..spec.core.core_start)
-            .chain(spec.core.core_end..spec.stored_layers());
-        for layer in order {
+        for layer in expert_layer_order(spec) {
             let [up, down] = expert_stacks(weights, layer)?;
             let bytes = [&up, &down]
                 .into_iter()
@@ -88,6 +84,13 @@ impl<'a> ExpertResidency<'a> {
     }
 }
 
+pub(super) fn expert_layer_order(spec: &TextSpec) -> impl Iterator<Item = usize> {
+    // Repeated core banks remove a transfer on every visit of each admitted layer.
+    (spec.core.core_start..spec.core.core_end)
+        .chain(0..spec.core.core_start)
+        .chain(spec.core.core_end..spec.stored_layers())
+}
+
 fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2], EngError> {
     let stack = |kind| -> Result<ExpertStack<'_>, EngError> {
         let name = format!("model.llm.layers.{layer}.mlp.experts.{kind}_weight");
@@ -100,7 +103,7 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
     Ok([stack("w13")?, stack("w2")?])
 }
 
-fn expert_residency_budget() -> Result<u64, EngError> {
+pub(super) fn expert_residency_budget() -> Result<u64, EngError> {
     let Some(value) = std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB") else {
         return Ok(0);
     };
@@ -255,16 +258,22 @@ impl PackedBuffers {
         expert: usize,
         weights: &ExpertMatrix<'_>,
     ) -> Result<[DeviceRange<'_>; 2], EngError> {
+        self.ranges_len(expert, [weights.codes.len(), weights.scales.len()])
+    }
+
+    fn ranges_len(
+        &self,
+        expert: usize,
+        [codes, scales]: [usize; 2],
+    ) -> Result<[DeviceRange<'_>; 2], EngError> {
         let offset = |bytes| {
             expert
                 .checked_mul(bytes)
                 .ok_or_else(|| bad("CUDA expert offset overflows"))
         };
         Ok([
-            self.codes
-                .range(offset(weights.codes.len())?, weights.codes.len())?,
-            self.scales
-                .range(offset(weights.scales.len())?, weights.scales.len())?,
+            self.codes.range(offset(codes)?, codes)?,
+            self.scales.range(offset(scales)?, scales)?,
         ])
     }
 }

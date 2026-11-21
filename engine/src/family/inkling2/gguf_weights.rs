@@ -11,14 +11,15 @@ use std::{
 use super::{LoopConfig, TextSpec, bad};
 use crate::{
     EngError,
+    expert_tier::ExpertId,
     family::mapped_file::MappedFile,
     weights::{GgufHeader, GgufType, MetaValue, dequantize_into},
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::cuda_projection::{
-    DenseUpload,
-    gguf::{ExpertView, GgufCuda},
+    DenseUpload, expert_layer_order, expert_residency_budget,
+    gguf::{ExpertView, GgufCuda, Nvfp4Layer, Nvfp4Stack, can_repack},
 };
 
 const HEADER_LIMIT: u64 = 32 * 1024 * 1024;
@@ -544,8 +545,54 @@ impl GgufTextWeights {
                 shape: [rows, tensor.columns],
             });
         }
-        self.cuda = Some(GgufCuda::load(uploads, spec)?);
+        let budget = expert_residency_budget()?;
+        let layers = self.nvfp4_layers(spec, budget)?;
+        self.cuda = Some(GgufCuda::load(uploads, spec, layers, &self.mapping)?);
         Ok(())
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn nvfp4_layers(&self, spec: &TextSpec, budget: u64) -> Result<Vec<Nvfp4Layer<'_>>, EngError> {
+        let mut layers = Vec::new();
+        let mut remaining = budget;
+        for layer in expert_layer_order(spec) {
+            if remaining == 0 {
+                break;
+            }
+            let prefix = format!("model.llm.layers.{layer}.mlp.experts");
+            let (gate, gate_bytes) = self.tensor(&format!("{prefix}.w13_weight"))?;
+            let (down, down_bytes) = self.tensor(&format!("{prefix}.w2_weight"))?;
+            let bytes = (gate_bytes.len() + down_bytes.len()) as u64;
+            if gate.kind != GgufType::Nvfp4 || down.kind != GgufType::Nvfp4 || bytes > remaining {
+                continue;
+            }
+            if !can_repack(gate_bytes) || !can_repack(down_bytes) {
+                continue;
+            }
+            let stack = |t: &Tensor, bytes, suffix| -> Result<Nvfp4Stack<'_>, EngError> {
+                let scale = format!("{prefix}.{suffix}_scale");
+                let tensor_scales = if self.tensors.contains_key(&scale) {
+                    Some(self.tensor(&scale)?.1)
+                } else {
+                    None
+                };
+                Ok(Nvfp4Stack {
+                    bytes,
+                    file_range: t.bytes.clone(),
+                    tensor_scales,
+                    shape: [t.rows as u32, t.columns as u32],
+                })
+            };
+            layers.push(Nvfp4Layer {
+                layer: layer as u32,
+                parts: [
+                    stack(gate, gate_bytes, "w13_weight")?,
+                    stack(down, down_bytes, "w2_weight")?,
+                ],
+            });
+            remaining -= bytes;
+        }
+        Ok(layers)
     }
 
     fn tensor(&self, name: &str) -> Result<(&Tensor, &[u8]), EngError> {
@@ -610,16 +657,38 @@ impl GgufTextWeights {
         project_rows(tensor, bytes, x, rows)
     }
 
-    pub(super) fn expert(&self, name: &str, id: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    pub(super) fn expert(&self, name: &str, id: ExpertId, x: &[f32]) -> Result<Vec<f32>, EngError> {
         let (tensor, bytes) = self.tensor(name)?;
-        if id >= tensor.planes || tensor.columns != x.len() {
-            return Err(bad(format!("bad GGUF expert {id} shape for {name}")));
+        let index = id.expert as usize;
+        if index >= tensor.planes || tensor.columns != x.len() {
+            return Err(bad(format!("bad GGUF expert {index} shape for {name}")));
         }
         let plane = bytes.len() / tensor.planes;
-        let payload = &bytes[id * plane..][..plane];
-        let factor = self.expert_factor(name, id, tensor.planes)?;
+        let payload = &bytes[index * plane..][..plane];
+        let factor = self.expert_factor(name, index, tensor.planes)?;
+        let gate_up = name.ends_with(".w13_weight");
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        let cuda_output = self.cuda.as_ref().and_then(|cuda| {
+            cuda.expert(
+                &ExpertView {
+                    id,
+                    part: usize::from(!gate_up),
+                    kind: tensor.kind,
+                    shape: [tensor.rows, tensor.columns],
+                    bytes: payload,
+                    factor,
+                },
+                x,
+            )
+        });
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        let mut output = match cuda_output {
+            Some(output) => output?,
+            None => self.expert_project(tensor, payload, factor, x)?,
+        };
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         let mut output = self.expert_project(tensor, payload, factor, x)?;
-        if name.ends_with(".w13_weight") {
+        if gate_up {
             let mid = output.len() / 2;
             output = (0..mid)
                 .flat_map(|row| [output[row], output[row + mid]])
@@ -646,18 +715,6 @@ impl GgufTextWeights {
         factor: f32,
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if let Some(cuda) = &self.cuda {
-            let view = ExpertView {
-                kind: tensor.kind,
-                shape: [tensor.rows, tensor.columns],
-                bytes,
-                factor,
-            };
-            if let Some(output) = cuda.expert(&view, x) {
-                return output;
-            }
-        }
         let mut output = project_rows(tensor, bytes, x, tensor.rows)?;
         if factor != 1.0 {
             for value in &mut output {

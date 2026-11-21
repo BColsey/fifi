@@ -10,7 +10,7 @@ use super::{
     cpu_weights::{NativeWeights, Weights},
     gguf_weights::{GgufPlan, Metadata, gguf_path},
 };
-use crate::EngError;
+use crate::{EngError, expert_tier::ExpertId};
 
 const MIX_EPS: f32 = 1e-6;
 
@@ -273,7 +273,7 @@ impl CpuForward {
         let mut mlp_input = stream.mix(0, &query);
         self.control(&mut mlp_input, bank, physical, &layer, Role::Mlp)?;
         self.norm(&mut mlp_input, &format!("{layer}.mlp_norm.weight"))?;
-        let mlp = self.moe(&format!("{layer}.mlp"), &mlp_input)?;
+        let mlp = self.moe(physical, &format!("{layer}.mlp"), &mlp_input)?;
         add(
             &mut stream.current,
             &self.mlp_conv(mlp, &layer, state)?,
@@ -380,7 +380,7 @@ impl CpuForward {
         Ok(())
     }
 
-    fn moe(&self, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+    fn moe(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
         let experts = self.spec.n_routed_experts as usize;
         let scores = self
             .weights
@@ -400,9 +400,13 @@ impl CpuForward {
         let activation = self.weights.activate(input)?;
         let mut output = vec![0.0; self.hidden()];
         for id in selected {
+            let key = ExpertId {
+                layer: layer as u32,
+                expert: u32::try_from(id).map_err(|_| bad("Inkling expert id overflows"))?,
+            };
             let pairs = self
                 .weights
-                .expert(&gate_up, id, activation.as_ref(), input)?;
+                .expert(&gate_up, key, activation.as_ref(), input)?;
             let middle: Vec<f32> = pairs
                 .as_chunks::<2>()
                 .0
@@ -416,7 +420,7 @@ impl CpuForward {
             let activation = self.weights.activate(&middle)?;
             let contribution = self
                 .weights
-                .expert(&down, id, activation.as_ref(), &middle)?;
+                .expert(&down, key, activation.as_ref(), &middle)?;
             add(
                 &mut output,
                 &contribution,

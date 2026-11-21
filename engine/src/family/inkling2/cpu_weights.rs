@@ -8,6 +8,7 @@ use std::{ops::Range, path::Path};
 use super::{TextSpec, bad, checkpoint};
 use crate::{
     EngError,
+    expert_tier::ExpertId,
     family::mapped_file::MappedFile,
     kernels::{
         nvfp4::E4M3_VALUES,
@@ -80,18 +81,18 @@ impl Weights {
     pub(super) fn expert(
         &self,
         name: &str,
-        expert: usize,
+        id: ExpertId,
         input: Option<&Activation>,
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
         match self {
             Self::Native(w) => w.expert(
                 name,
-                expert,
+                id.expert as usize,
                 input.ok_or_else(|| bad("missing native expert activation"))?,
                 x,
             ),
-            Self::Gguf(w) => w.expert(name, expert, x),
+            Self::Gguf(w) => w.expert(name, id, x),
         }
     }
 
