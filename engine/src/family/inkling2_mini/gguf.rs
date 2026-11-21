@@ -843,7 +843,7 @@ mod mapped_projection_tests {
                 if dtype == GgufType::Q6K {
                     row[208..210].copy_from_slice(&scale);
                 } else {
-                    for block in row.chunks_exact_mut(34) {
+                    for block in row.as_chunks_mut::<34>().0 {
                         block[..2].copy_from_slice(&scale);
                     }
                 }
