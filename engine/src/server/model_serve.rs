@@ -205,7 +205,7 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     };
     if family == RAON1_FAMILY && args.kv_dtype.is_some() {
         return Err(StartupError(format!(
-            "serve --model: --kv is not an option of the {RAON1_FAMILY} family"
+            "serve --model: --kv is not an option of the {family} family"
         )));
     }
 

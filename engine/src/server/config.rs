@@ -59,6 +59,7 @@ pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
     ("qwen35moe", crate::family::qwen::qwen36::factory::FAMILY),
     ("gemma4", crate::family::gemma::gemma4::FAMILY),
     (RAON1_ARCHITECTURE, RAON1_FAMILY),
+    ("flint", crate::family::flint::FAMILY),
 ];
 
 /// Why a GGUF architecture that is not in [`GGUF_ARCHITECTURE_FAMILIES`] is not served, for the
