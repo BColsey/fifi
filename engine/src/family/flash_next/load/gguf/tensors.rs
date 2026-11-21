@@ -169,7 +169,7 @@ pub(in crate::family::flash_next) struct KernelGap {
 /// Tensor types the CUDA decode path can read as stored blocks: the in-tree matvec kernels
 /// (`QuantType` of `kernels::cuda::resident::matvec_q`). A native-CUDA test keeps this list
 /// equal to what the weight upload accepts.
-pub(in crate::family::flash_next) const DECODE_BLOCK_TYPES: [GgufType; 8] = [
+pub(in crate::family::flash_next) const DECODE_BLOCK_TYPES: [GgufType; 18] = [
     GgufType::Q4K,
     GgufType::Q50,
     GgufType::Q6K,
@@ -178,13 +178,39 @@ pub(in crate::family::flash_next) const DECODE_BLOCK_TYPES: [GgufType; 8] = [
     GgufType::Q40,
     GgufType::Q3K,
     GgufType::Iq4Xs,
+    GgufType::Iq4Nl,
+    GgufType::Iq2Xxs,
+    GgufType::Iq2Xs,
+    GgufType::Iq2S,
+    GgufType::Iq3Xxs,
+    GgufType::Iq3S,
+    GgufType::Iq1S,
+    GgufType::Iq1M,
+    GgufType::Q20,
+    GgufType::Q2K,
 ];
 
-/// Tensor types the routed-expert kernel reads: the vendored matvec arms only. The in-house
-/// dense kernels (Q5_K, Q4_0, Q3_K, IQ4_XS) have no id-indexed expert form yet, so an expert
-/// matrix of those types is a gap although a dense matrix of the same type is not.
-pub(in crate::family::flash_next) const EXPERT_BLOCK_TYPES: [GgufType; 4] =
-    [GgufType::Q4K, GgufType::Q50, GgufType::Q6K, GgufType::Q80];
+/// Tensor types the routed-expert kernel reads: the vendored matvec arms and the in-house
+/// codebook kernels (every IQ type, Q2_0 and Q2_K). The in-house Q5_K, Q4_0 and Q3_K dense
+/// kernels have no id-indexed expert form, so an expert matrix of those types is a gap although
+/// a dense matrix of the same type is not.
+pub(in crate::family::flash_next) const EXPERT_BLOCK_TYPES: [GgufType; 15] = [
+    GgufType::Q4K,
+    GgufType::Q50,
+    GgufType::Q6K,
+    GgufType::Q80,
+    GgufType::Iq4Xs,
+    GgufType::Iq4Nl,
+    GgufType::Iq2Xxs,
+    GgufType::Iq2Xs,
+    GgufType::Iq2S,
+    GgufType::Iq3Xxs,
+    GgufType::Iq3S,
+    GgufType::Iq1S,
+    GgufType::Iq1M,
+    GgufType::Q20,
+    GgufType::Q2K,
+];
 
 /// What a role requires of its tensor's type.
 #[derive(Clone, Copy)]
@@ -823,30 +849,55 @@ mod cuda_tests {
             QuantType::Q40 => GgufType::Q40,
             QuantType::Q3K => GgufType::Q3K,
             QuantType::Iq4Xs => GgufType::Iq4Xs,
+            QuantType::Iq4Nl => GgufType::Iq4Nl,
+            QuantType::Iq2S => GgufType::Iq2S,
+            QuantType::Iq3Xxs => GgufType::Iq3Xxs,
+            QuantType::Iq2Xxs => GgufType::Iq2Xxs,
+            QuantType::Q20 => GgufType::Q20,
+            QuantType::Iq2Xs => GgufType::Iq2Xs,
+            QuantType::Iq3S => GgufType::Iq3S,
+            QuantType::Q2K => GgufType::Q2K,
+            QuantType::Iq1S => GgufType::Iq1S,
+            QuantType::Iq1M => GgufType::Iq1M,
         }
     }
 
+    /// Every matvec kernel format.
+    const ALL_KERNELS: [QuantType; 18] = [
+        QuantType::Q4K,
+        QuantType::Q50,
+        QuantType::Q6K,
+        QuantType::Q80,
+        QuantType::Q5K,
+        QuantType::Q40,
+        QuantType::Q3K,
+        QuantType::Iq4Xs,
+        QuantType::Iq4Nl,
+        QuantType::Iq2S,
+        QuantType::Iq3Xxs,
+        QuantType::Iq2Xxs,
+        QuantType::Q20,
+        QuantType::Iq2Xs,
+        QuantType::Iq3S,
+        QuantType::Q2K,
+        QuantType::Iq1S,
+        QuantType::Iq1M,
+    ];
+
     #[test]
-    fn the_expert_block_types_are_the_vendored_matvec_arms() {
-        // The vendored arms are the formats that carry a `ggml_type`; the in-house formats
-        // have none (`QuantType::ggml` is unreachable for them). Same exhaustive match.
-        let vendored = |quant: QuantType| match quant {
+    fn the_expert_block_types_are_the_vendored_arms_and_the_codebook_kernels() {
+        // The vendored arms carry a `ggml_type`; the in-house dense-only formats (Q5_K, Q4_0,
+        // Q3_K) have no id-indexed expert form; every codebook format has one. Same table, no
+        // wildcard.
+        let expert = |quant: QuantType| match quant {
             QuantType::Q4K | QuantType::Q50 | QuantType::Q6K | QuantType::Q80 => true,
-            QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs => false,
+            QuantType::Q5K | QuantType::Q40 | QuantType::Q3K => false,
+            _ => quant.is_codebook(),
         };
-        for quant in [
-            QuantType::Q4K,
-            QuantType::Q50,
-            QuantType::Q6K,
-            QuantType::Q80,
-            QuantType::Q5K,
-            QuantType::Q40,
-            QuantType::Q3K,
-            QuantType::Iq4Xs,
-        ] {
+        for quant in ALL_KERNELS {
             assert_eq!(
                 EXPERT_BLOCK_TYPES.contains(&gguf_type(quant)),
-                vendored(quant),
+                expert(quant),
                 "{quant:?}"
             );
         }
@@ -854,16 +905,7 @@ mod cuda_tests {
 
     #[test]
     fn the_decode_block_types_are_the_matvec_kernel_formats() {
-        let kernels = [
-            QuantType::Q4K,
-            QuantType::Q50,
-            QuantType::Q6K,
-            QuantType::Q80,
-            QuantType::Q5K,
-            QuantType::Q40,
-            QuantType::Q3K,
-            QuantType::Iq4Xs,
-        ];
+        let kernels = ALL_KERNELS;
         let mut from_kernels: Vec<u32> = kernels.map(|q| gguf_type(q).id()).to_vec();
         let mut listed: Vec<u32> = DECODE_BLOCK_TYPES.map(GgufType::id).to_vec();
         from_kernels.sort_unstable();

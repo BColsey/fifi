@@ -2,7 +2,7 @@ use super::{
     GgufModel,
     config::{ARCHITECTURE, GgufConfig},
     plan::Card,
-    tensors::{DECODE_BLOCK_TYPES, EXPERT_BLOCK_TYPES, Place, Role, TensorMap},
+    tensors::{DECODE_BLOCK_TYPES, EXPERT_BLOCK_TYPES, KernelGap, Place, Role, TensorMap},
     testkit::{REAL_EXPERT_TYPES, Spec, flash_kvs, write_flash, write_gguf},
 };
 use crate::{
@@ -289,30 +289,30 @@ fn a_missing_metadata_key_is_named() {
 }
 
 #[test]
-fn the_kernel_gaps_of_the_real_file_are_the_five_expert_types_without_a_decode_kernel() {
+fn the_real_file_has_no_kernel_gaps() {
+    // Its expert types (IQ2_S, IQ3_XXS, IQ4_NL, Q2_0, IQ4_XS, Q5_0) are all read by the
+    // vendored or the codebook expert kernel.
     let (_written, model) = open(&Spec::default());
     let gaps = model.kernel_gaps();
-    let names: Vec<&str> = gaps.iter().map(|gap| gap.ty.name()).collect();
-    assert_eq!(names.len(), 5, "{names:?}");
-    for want in ["IQ2_S", "IQ3_XXS", "IQ4_NL", "Q2_0", "IQ4_XS"] {
-        assert!(names.contains(&want), "{want} in {names:?}");
-    }
-    let count = |ty: GgufType| gaps.iter().find(|gap| gap.ty == ty).expect("gap").tensors;
-    let down = |ty: GgufType| REAL_EXPERT_TYPES.iter().filter(|(_, d)| *d == ty).count();
-    let gate_up = |ty: GgufType| REAL_EXPERT_TYPES.iter().filter(|(g, _)| *g == ty).count() * 2;
-    assert_eq!(count(GgufType::Iq4Nl), down(GgufType::Iq4Nl));
-    assert_eq!(count(GgufType::Q20), down(GgufType::Q20));
-    assert_eq!(count(GgufType::Iq2S), gate_up(GgufType::Iq2S));
-    assert_eq!(count(GgufType::Iq3Xxs), gate_up(GgufType::Iq3Xxs));
-    // IQ4_XS has a dense kernel and no expert kernel: only layer 47's gate and up are gaps.
-    assert_eq!(count(GgufType::Iq4Xs), gate_up(GgufType::Iq4Xs));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
+    let (_written, model) = open(&Spec::default());
+    let gaps = [KernelGap {
+        ty: GgufType::Q3K,
+        tensors: 3,
+        bytes: 3 << 30,
+        first: "blk.0.ffn_down_exps.weight".to_owned(),
+    }];
     let message = model.kernel_refusal(&gaps).describe();
     assert!(
         message.contains("cannot be served on CUDA yet"),
         "{message}"
     );
     assert!(
-        message.contains("IQ4_NL") && message.contains("blk.0.ffn_down_exps.weight"),
+        message.contains("Q3_K") && message.contains("blk.0.ffn_down_exps.weight"),
         "{message}"
     );
     assert!(
@@ -320,18 +320,19 @@ fn the_kernel_gaps_of_the_real_file_are_the_five_expert_types_without_a_decode_k
         "{message}"
     );
     assert!(
-        message.contains("routed-expert kernel reads Q4_K, Q5_0, Q6_K, Q8_0."),
+        message.contains("routed-expert kernel reads Q4_K, Q5_0, Q6_K, Q8_0, IQ4_XS"),
         "{message}"
     );
 }
 
 #[test]
-fn a_dense_iq4_xs_matrix_is_not_a_gap_and_an_expert_one_is() {
+fn a_dense_q3_k_matrix_is_not_a_gap_and_an_expert_one_is() {
     use super::tensors::has_decode_kernel;
-    assert!(has_decode_kernel(Place::Device, GgufType::Iq4Xs));
-    assert!(!has_decode_kernel(Place::Experts, GgufType::Iq4Xs));
+    assert!(has_decode_kernel(Place::Device, GgufType::Q3K));
+    assert!(!has_decode_kernel(Place::Experts, GgufType::Q3K));
     assert!(has_decode_kernel(Place::Experts, GgufType::Q4K));
-    assert_eq!(EXPERT_BLOCK_TYPES.len(), 4);
+    assert!(has_decode_kernel(Place::Experts, GgufType::Iq3Xxs));
+    assert_eq!(EXPERT_BLOCK_TYPES.len(), 15);
 }
 
 #[test]
@@ -339,7 +340,7 @@ fn a_file_of_supported_types_has_no_gaps() {
     let all = |_: Place, _: GgufType| true;
     let (_written, model) = open(&Spec::default());
     assert!(model.map().kernel_gaps(all).is_empty());
-    assert_eq!(DECODE_BLOCK_TYPES.len(), 8);
+    assert_eq!(DECODE_BLOCK_TYPES.len(), 18);
 }
 
 #[test]
