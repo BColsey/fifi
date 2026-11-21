@@ -427,6 +427,7 @@ pub(crate) fn flint_effective_for_build(
         let context = std::env::var_os("FIFI_FLINT_MLX_CONTEXT_LIMIT");
         let rows = std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL");
         let cache = std::env::var_os("FIFI_FLINT_MLX_CACHE_LIMIT");
+        let request_kv = std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV");
         let mut result = vec![
             row("backend", "mlx".into(), Origin::Derived),
             row(
@@ -446,6 +447,11 @@ pub(crate) fn flint_effective_for_build(
                 env_origin(&cache),
             ),
             mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
+            row(
+                "mlx_request_kv",
+                factory::request_sized_kv_enabled(request_kv.as_deref()).to_string(),
+                env_origin(&request_kv),
+            ),
         ];
         append_mlx_inputs(&mut result, true);
         let _ = served;
