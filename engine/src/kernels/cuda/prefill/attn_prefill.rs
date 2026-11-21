@@ -81,12 +81,12 @@ const WIDE_GROUP: usize = 4;
 /// The fewest keys per split of the wide kernel's fixed-stride plan.
 const WIDE_MIN_SPLIT_KEYS: usize = 128;
 
-/// The split plan of the wide kernel for a cache that holds at most `keys` visible keys (the
-/// cache rows of a linear call, the window plus a tile for a windowed one). The wide kernel cuts
-/// the visible range at a fixed absolute stride, `min_keys` keys per split, so a row's result
-/// does not depend on how its prompt is chunked; the stride is the capacity over the most
-/// splits a plan may take, at least [`WIDE_MIN_SPLIT_KEYS`], rounded up to a key tile of 32, and
-/// `max_splits` is the number of strides the capacity needs.
+/// The split plan of the wide kernel for a linear cache that holds at most `keys` visible keys.
+/// The wide kernel cuts the visible range at a fixed absolute stride, `min_keys` keys per split,
+/// so a row's result over the same cache bytes does not depend on the chunk that carries it; the
+/// stride is the capacity
+/// over the most splits a plan may take, at least [`WIDE_MIN_SPLIT_KEYS`], rounded up to a key
+/// tile of 32, and `max_splits` is the number of strides the capacity needs.
 pub(crate) fn cpf_attn_wide_split(keys: usize) -> Result<CpfAttnSplit, EngError> {
     if keys == 0 {
         return Err(rule("wide split", "a wide plan needs at least one key"));
@@ -98,6 +98,18 @@ pub(crate) fn cpf_attn_wide_split(keys: usize) -> Result<CpfAttnSplit, EngError>
     Ok(CpfAttnSplit {
         max_splits: keys.div_ceil(stride),
         min_keys: stride,
+    })
+}
+
+/// The split plan of the wide kernel for a sliding window. A tile sees the window and its own
+/// rows, and the first visible key is rounded down to a stride boundary so every tile cuts at the
+/// same absolute positions; the plan therefore holds one split more than the keys alone need.
+pub(crate) fn cpf_attn_wide_window_split(window: usize) -> Result<CpfAttnSplit, EngError> {
+    let keys = window.saturating_add(CPF_ATTN_TILE_ROWS);
+    let plan = cpf_attn_wide_split(keys)?;
+    Ok(CpfAttnSplit {
+        max_splits: (keys + plan.min_keys - 1).div_ceil(plan.min_keys),
+        min_keys: plan.min_keys,
     })
 }
 
@@ -1146,10 +1158,13 @@ fn check_wide(call: &AttnPrefillCall<'_>, views: &[AttnKvView<'_>; 2]) -> Result
 }
 
 /// The fixed-stride plan of a full wide launch must reach the last key a tile can see: the cache
-/// rows, or the window and one tile of rows.
+/// rows, or the window, one tile of rows and the stride the first visible key is rounded down by.
 fn check_wide_split(call: &AttnPrefillCall<'_>) -> Result<(), EngError> {
     let reach = if call.span.window > 0 {
-        usize::try_from(call.span.window).unwrap_or(usize::MAX) + CPF_ATTN_TILE_ROWS
+        usize::try_from(call.span.window)
+            .unwrap_or(usize::MAX)
+            .saturating_add(CPF_ATTN_TILE_ROWS)
+            .saturating_add(call.split.min_keys.saturating_sub(1))
     } else {
         call.shape.cache_rows
     };
@@ -1164,6 +1179,23 @@ fn check_wide_split(call: &AttnPrefillCall<'_>) -> Result<(), EngError> {
         ));
     }
     Ok(())
+}
+
+// A test switch that lets a plan past the host check, so the device-side check of the same rule
+// can be shown to refuse it.
+#[cfg(test)]
+thread_local! {
+    static SKIP_WIDE_SPLIT_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn wide_split_check_skipped() -> bool {
+    SKIP_WIDE_SPLIT_CHECK.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn wide_split_check_skipped() -> bool {
+    false
 }
 
 fn raw_kv<'b>(ctx: &CudaContext, view: &AttnKvView<'b>) -> Result<AttnKvRaw<'b>, EngError> {
@@ -1385,7 +1417,7 @@ impl CudaContext {
         };
         ints.ld = if call.proj.is_some() { ints.ld } else { 0 };
         check_span_split(&call)?;
-        if full && call.shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM {
+        if full && call.shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM && !wide_split_check_skipped() {
             check_wide_split(&call)?;
         }
         let bytes = cpf_attn_part_bytes(geometry(&call.shape), plan_of(&call.split))?;
@@ -1460,6 +1492,9 @@ impl CudaContext {
 fn i64_int(name: &str, value: i64) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule("exceeds i32", &format!("{name} is {value}")))
 }
+
+mod wide;
+pub(crate) use wide::{WideAttention, WideCall, WideGeometry, WideLoad};
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

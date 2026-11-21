@@ -69,10 +69,11 @@ __device__ inline void split_plan(int n_keys, int max_splits, int min_keys, int 
 }
 
 /* The split plan of a call at head_dim kHeadDim over `count` visible keys. The head_dim 512 path
- * splits at a fixed absolute stride: split s holds keys [s * min_keys, (s + 1) * min_keys) of
- * the visible range, whatever the query tile, so the partials a row receives, and the order the
- * combine sums them in, do not depend on how a prompt is cut into chunks (a split the row cannot
- * see is a neutral partial). The other head dimensions keep the per-tile plan. */
+ * splits at a fixed absolute stride: split s holds the keys of [(s0 + s) * min_keys,
+ * (s0 + s + 1) * min_keys), s0 being the stride index of the first visible key (see visible()),
+ * whatever the query tile, so the partials a row receives, and the order the combine sums them
+ * in, are the same for a row whichever chunk carries it, over the same cache bytes (a split the row
+ * cannot see is a neutral partial). The other head dimensions keep the per-tile plan. */
 template <int kHeadDim>
 __device__ inline void plan_splits(const Args &a, int count, int &chunk, int &n_active) {
     if (kHeadDim == 512) {
@@ -86,9 +87,13 @@ __device__ inline void plan_splits(const Args &a, int count, int &chunk, int &n_
 /* Visible keys of the query tile whose rows sit at positions p_first .. n_keys - 1: the union
  * of the rows' windows (attn_decode.cu:81-84 per row), from the first row's oldest visible
  * position to the last row's own; first is the position of visible key 0. sees() then cuts
- * each row to its own window. */
+ * each row to its own window. At head_dim 512 first is rounded down to a multiple of the split
+ * stride, so the splits and the key tiles inside them sit at the same absolute positions for
+ * every tile of every chunking; the keys before the window are masked by sees(). */
+template <int kHeadDim>
 __device__ inline void visible(const Args &a, int p_first, int n_keys, int &first, int &count) {
     first = a.window > 0 ? max(0, p_first + 1 - a.window) : 0;
+    if (kHeadDim == 512 && a.min_keys > 0) first = first / a.min_keys * a.min_keys;
     count = n_keys - first;
 }
 
@@ -156,7 +161,7 @@ __device__ inline bool block_of(const Args &a, int s, int kvh, int tile, Block &
         return true;
     }
     int count;
-    visible(a, a.p0 + b.t0, b.n_keys, b.first, count);
+    visible<kHeadDim>(a, a.p0 + b.t0, b.n_keys, b.first, count);
     int chunk, n_active;
     plan_splits<kHeadDim>(a, count, chunk, n_active);
     if (s >= n_active) return false;
@@ -741,7 +746,7 @@ __global__ void __launch_bounds__(kHeadDim < 128 ? 128 : kHeadDim) attn_prefill_
     const int tile_end = min(a.m, (tile + 1) * kQTile);
     const int n_keys = a.p0 + tile_end;
     int first, count;
-    visible(a, a.p0 + tile * kQTile, n_keys, first, count);
+    visible<kHeadDim>(a, a.p0 + tile * kQTile, n_keys, first, count);
     int chunk, n_active;
     if (a.mode == 2) n_active = a.max_splits;
     else plan_splits<kHeadDim>(a, count, chunk, n_active);
@@ -904,10 +909,12 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
           a->k_cache == views.k.payload && a->v_cache == views.v.payload))
         return false;
     if (a->head_dim == kD512 && !d512_views(views, *a)) return false;
-    /* The fixed-stride split plan of head_dim 512 must reach the last key a tile can see. */
+    /* The fixed-stride split plan of head_dim 512 must reach the last key a tile can see: the cache
+     * rows, or the window, one tile of rows and the stride the first visible key is rounded down by. */
     if (a->head_dim == kD512 && !segmented &&
         (long long)a->max_splits * a->min_keys <
-            (a->window > 0 ? (long long)a->window + kQTile : (long long)a->cache_rows))
+            (a->window > 0 ? (long long)a->window + kQTile + a->min_keys - 1
+                           : (long long)a->cache_rows))
         return false;
     /* Uniform q8: both planes q8 with matching group geometry. Mixed ("q8k"):
      * K q8, V f16. */

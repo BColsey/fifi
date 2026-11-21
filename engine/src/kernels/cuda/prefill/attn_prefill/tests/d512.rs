@@ -10,7 +10,10 @@
 //! The kernel rounds q, K, V and P to fp16 and accumulates in f32, so the bound is relative
 //! to the largest value of V, not to f32 rounding: `TOLERANCE` below.
 
-use super::super::{AttnKvLayout, AttnKvView, AttnScalarLayout, AttnStrides, cpf_attn_wide_split};
+use super::super::{
+    AttnKvLayout, AttnKvView, AttnScalarLayout, AttnStrides, cpf_attn_wide_split,
+    cpf_attn_wide_window_split,
+};
 use super::*;
 use crate::kernels::cuda::resident::attn_decode_gemma::AttnDecodeGemmaCall;
 use crate::tensor::Dtype;
@@ -153,11 +156,11 @@ fn shape(m: usize, cells: usize, p0: usize) -> AttnPrefillShape {
 }
 
 fn plan(shape: &AttnPrefillShape, window: usize) -> Result<CpfAttnSplit, EngError> {
-    cpf_attn_wide_split(if window > 0 {
-        window + CPF_ATTN_TILE_ROWS
+    if window > 0 {
+        cpf_attn_wide_window_split(window)
     } else {
-        shape.cache_rows
-    })
+        cpf_attn_wide_split(shape.cache_rows)
+    }
 }
 
 /// Device buffers of one prefill call: q, part, out and the status word.
@@ -1300,21 +1303,30 @@ fn d512_serves_sixteen_heads_over_one_kv_head_through_a_zero_stride_view() {
 }
 
 /// Runs `parts` (start position, rows) of one prompt in order over one cache and returns the
-/// output rows of the whole prompt.
-fn run_parts(cache: &Cache, q: &[f32], parts: &[(usize, usize)]) -> Result<Vec<f32>, EngError> {
+/// output rows of the parts, concatenated. `q` holds the rows of positions `q_origin ..` of the
+/// prompt.
+fn run_parts(
+    cache: &Cache,
+    q: &[f32],
+    q_origin: usize,
+    parts: &[(usize, usize)],
+    window: usize,
+) -> Result<Vec<f32>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
     let planes = upload(&ctx, cache);
     let row = HEADS * WIDE;
+    let span = CpfAttnSpan {
+        window: window as i64,
+        ring: 0,
+    };
     let mut out = Vec::new();
     for &(p0, m) in parts {
         let shape = shape(m, cache.cells, p0);
-        let split = plan(&shape, 0)?;
-        let io = io(&ctx, &shape, split, &q[p0 * row..(p0 + m) * row])?;
-        ctx.attn_prefill(
-            &stream,
-            call(shape, split, CpfAttnSpan::FULL, &planes, &io)?,
-        )?;
+        let split = plan(&shape, window)?;
+        let at = (p0 - q_origin) * row;
+        let io = io(&ctx, &shape, split, &q[at..at + m * row])?;
+        ctx.attn_prefill(&stream, call(shape, split, span, &planes, &io)?)?;
         stream.synchronize()?;
         out.extend(testkit::floats(&testkit::read_bytes(
             &ctx,
@@ -1325,40 +1337,50 @@ fn run_parts(cache: &Cache, q: &[f32], parts: &[(usize, usize)]) -> Result<Vec<f
     Ok(out)
 }
 
-/// A row's output is a function of its position and the cache alone: the same bytes whether the
-/// prompt runs as one chunk, as chunks of 8 or 5, or resumed at an odd position, so a prompt
-/// served from a restored prefix, in pieces of any size, or alone gives the same cache and logits.
-#[test]
-fn d512_rows_do_not_depend_on_how_the_prompt_is_chunked() {
-    if !testkit::device_present("d512_rows_do_not_depend_on_how_the_prompt_is_chunked") {
-        return;
-    }
-    let (rows, cells) = (643usize, 700usize);
-    let cache = cache(cells, 0xd516, 0.12, 1.0);
+/// The same rows cut five ways must give the same bytes as chunks of 8: `rows` rows from position
+/// `base` over a cache of `cells`, as chunks of 5, of `big` (the most rows one call takes under
+/// the 64 MB partial budget), of 1, and resumed at odd positions.
+fn assert_rows_independent_of_chunking(
+    cells: usize,
+    base: usize,
+    rows: usize,
+    window: usize,
+    big: usize,
+) {
+    let cache = cache(cells, 0xd516 + window as u64, 0.12, 1.0);
     let q = q_values(rows, 0x5eed, 1.5);
     let cut = |size: usize| -> Vec<(usize, usize)> {
         (0..rows)
             .step_by(size)
-            .map(|p0| (p0, size.min(rows - p0)))
+            .map(|at| (base + at, size.min(rows - at)))
             .collect()
     };
-    let whole = run_parts(&cache, &q, &[(0, rows)]).expect("one chunk");
+    let reference = run_parts(&cache, &q, base, &cut(8), window).expect("chunks of 8");
     let layouts = [
-        ("chunks of 8", cut(8)),
         ("chunks of 5", cut(5)),
-        ("chunks of 64", cut(64)),
-        (
-            "resumed at 13 and 301",
-            vec![(0, 13), (13, 288), (301, 342)],
-        ),
+        ("the largest chunk the part budget takes", cut(big)),
+        ("chunks of 1", cut(1)),
+        ("resumed at odd positions", {
+            let mut parts = Vec::new();
+            let mut at = 0;
+            for size in [13, 11, 7, 3, 15].into_iter().cycle() {
+                if at == rows {
+                    break;
+                }
+                let size = size.min(big).min(rows - at);
+                parts.push((base + at, size));
+                at += size;
+            }
+            parts
+        }),
     ];
     let mut failures = Vec::new();
     for (label, parts) in layouts {
-        let got = run_parts(&cache, &q, &parts).expect(label);
-        if le(&got) != le(&whole) {
+        let got = run_parts(&cache, &q, base, &parts, window).expect(label);
+        if le(&got) != le(&reference) {
             let first = got
                 .iter()
-                .zip(&whole)
+                .zip(&reference)
                 .position(|(a, b)| a.to_bits() != b.to_bits())
                 .unwrap_or(0);
             failures.push(format!(
@@ -1368,5 +1390,135 @@ fn d512_rows_do_not_depend_on_how_the_prompt_is_chunked() {
             ));
         }
     }
-    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(
+        failures.is_empty(),
+        "cells {cells} base {base} window {window}: {failures:#?}"
+    );
+}
+
+/// A row's output is a function of its position and the cache alone: the same bytes whether the
+/// prompt runs as chunks of 8, 5, 64 or 1 rows, or resumed at an odd position, so a prompt served
+/// from a restored prefix, in pieces of any size, or alone gives the same cache and logits.
+#[test]
+fn d512_rows_do_not_depend_on_how_the_prompt_is_chunked() {
+    if !testkit::device_present("d512_rows_do_not_depend_on_how_the_prompt_is_chunked") {
+        return;
+    }
+    assert_rows_independent_of_chunking(700, 0, 643, 0, 64);
+}
+
+/// The same at the depth of the 32K cache, where every one of the 128 splits holds keys.
+#[test]
+fn d512_rows_do_not_depend_on_chunking_at_32k_cells() {
+    if !testkit::device_present("d512_rows_do_not_depend_on_chunking_at_32k_cells") {
+        return;
+    }
+    assert_rows_independent_of_chunking(32_768, 32_400, 300, 0, 16);
+}
+
+/// A sliding window moves the first visible key with the tile; the splits stay on the absolute
+/// stride, so the windowed rows do not depend on the chunking either.
+#[test]
+fn d512_windowed_rows_do_not_depend_on_how_the_prompt_is_chunked() {
+    if !testkit::device_present("d512_windowed_rows_do_not_depend_on_how_the_prompt_is_chunked") {
+        return;
+    }
+    assert_rows_independent_of_chunking(1_500, 0, 1_100, 512, 64);
+    assert_rows_independent_of_chunking(4_096, 3_000, 700, 300, 64);
+}
+
+/// Runs one 8-row call at `p0` over a cache of `cells` with `split`, over a cache whose rows are
+/// all valid, and returns the call's result with the output and status bytes as they ended.
+fn call_with_plan(
+    cells: usize,
+    p0: usize,
+    rows: usize,
+    window: usize,
+    split: CpfAttnSplit,
+) -> (Result<(), EngError>, Vec<u8>, i32) {
+    let cache = cache(cells, 0xd517, 0.12, 1.0);
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let planes = upload(&ctx, &cache);
+    let shape = shape(rows, cells, p0);
+    let q = q_values(rows, 0x5eed, 1.5);
+    let io = io(&ctx, &shape, split, &q).expect("buffers");
+    let span = CpfAttnSpan {
+        window: window as i64,
+        ring: 0,
+    };
+    let result =
+        call(shape, split, span, &planes, &io).and_then(|call| ctx.attn_prefill(&stream, call));
+    if result.is_err() && super::super::wide_split_check_skipped() {
+        // A device-side refusal latches the context: nothing can be read back, and nothing was
+        // written because the launch never ran.
+        return (result, Vec::new(), 0);
+    }
+    stream.synchronize().expect("sync");
+    let out = testkit::read_bytes(&ctx, &io.out, io.out_bytes);
+    let status = i32::from_le_bytes(
+        testkit::read_bytes(&ctx, &io.status, 4)[..4]
+            .try_into()
+            .unwrap(),
+    );
+    (result, out, status)
+}
+
+/// One plan that cannot reach the last visible key: refused by the host check before any device
+/// write, and, with the host check skipped, by the device-side check of the same rule. The device
+/// refusal latches the backend of the thread, so each case runs in its own test.
+fn assert_unreachable_plan_refused(cells: usize, p0: usize, window: usize, split: CpfAttnSplit) {
+    let (result, out, status) = call_with_plan(cells, p0, 8, window, split);
+    let error = result.expect_err("the host check refuses").describe();
+    assert!(error.contains("wide split"), "{error}");
+    assert!(out.iter().all(|&b| b == OUT_FILL), "out untouched");
+    assert_eq!(status, 0, "status untouched");
+    super::super::SKIP_WIDE_SPLIT_CHECK.with(|skip| skip.set(true));
+    let (result, out, status) = call_with_plan(cells, p0, 8, window, split);
+    super::super::SKIP_WIDE_SPLIT_CHECK.with(|skip| skip.set(false));
+    let error = result.expect_err("the device check refuses").describe();
+    assert!(
+        !error.contains("wide split"),
+        "the device check refuses, not the host check: {error}"
+    );
+    assert!(out.is_empty() && status == 0, "refused on the device");
+}
+
+/// A linear cache of 4,096 cells planned for 2,048.
+#[test]
+fn d512_refuses_a_linear_plan_that_cannot_reach_the_last_key() {
+    if !testkit::device_present("d512_refuses_a_linear_plan_that_cannot_reach_the_last_key") {
+        return;
+    }
+    let split = cpf_attn_wide_split(2_048).expect("plan");
+    assert_unreachable_plan_refused(4_096, 3_000, 0, split);
+}
+
+/// A 512 window planned without the stride the first visible key is rounded down by.
+#[test]
+fn d512_refuses_a_window_plan_without_the_rounding_stride() {
+    if !testkit::device_present("d512_refuses_a_window_plan_without_the_rounding_stride") {
+        return;
+    }
+    let split = cpf_attn_wide_split(512 + CPF_ATTN_TILE_ROWS).expect("plan");
+    assert_unreachable_plan_refused(2_048, 1_500, 512, split);
+}
+
+/// A chunk whose partials do not fit the 64 MB budget at the stride plan of a deep cache is a
+/// memory-plan refusal that names the cap, and writes nothing.
+#[test]
+fn d512_refuses_a_chunk_whose_partials_exceed_the_part_cap() {
+    if !testkit::device_present("d512_refuses_a_chunk_whose_partials_exceed_the_part_cap") {
+        return;
+    }
+    let cells = 17_407;
+    let split = cpf_attn_wide_split(cells).expect("plan");
+    let (result, out, status) = call_with_plan(cells, 100, 64, 0, split);
+    let error = result.expect_err("over the cap");
+    assert!(
+        matches!(&error, EngError::MemoryPlan(text) if text.contains("part cap")),
+        "{error:?}"
+    );
+    assert!(out.iter().all(|&b| b == OUT_FILL));
+    assert_eq!(status, 0);
 }
