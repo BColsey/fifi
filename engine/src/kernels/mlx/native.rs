@@ -408,6 +408,14 @@ pub(crate) fn qualification_process_usage() -> Option<(u64, u64)> {
     (status == 0).then_some((read_bytes, footprint_bytes))
 }
 
+/// Reads the macOS counters used in opt-in phase measurements.
+pub(crate) fn process_io() -> Option<(u64, u64)> {
+    let mut reads = 0;
+    let mut peak = 0;
+    // Both outputs are valid for the duration of this call and are written on success.
+    (unsafe { ffi::mlx_process_io(&mut reads, &mut peak) } == 0).then_some((reads, peak))
+}
+
 #[cfg(test)]
 pub(crate) fn process_rss_bytes() -> Result<u64, EngError> {
     let mut bytes = 0;

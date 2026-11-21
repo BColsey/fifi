@@ -26,3 +26,34 @@ Use the model name from `GET /v1/models`. The worker supports one active sequenc
 For chat requests, disabling thinking sets the publisher's reasoning effort to 0.0. Inkling can still emit reasoning, so a short output limit can be reached before the first answer token. The server returns reasoning and answer text in their respective fields. [Publisher guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md#thinking-effort-set-it-everywhere)
 
 The GGUF inspector supports metadata preflight for the mainline layout. Native generation currently takes the original safetensors directory.
+
+## Check the serving contract
+
+Use a dedicated server on loopback with the original checkpoint and a context of at least 128 tokens. Start it with a JSON config of this form, substituting the absolute model path.
+
+```json
+{
+  "listen": "127.0.0.1:18795",
+  "api_key_env": "ENGINESRV_API_KEY",
+  "prefix_reuse": false,
+  "sample_trace": true,
+  "engines": [{
+    "id": "inkling",
+    "family": "inkling2_mini",
+    "model": "inkling",
+    "model_dir": "/path/to/inkling2-mini",
+    "tokenizer_dir": "/path/to/inkling2-mini",
+    "context_limit": 128
+  }]
+}
+```
+
+Launch it with the native opt-in and budget from above, using `enginesrv --config /path/to/config.json`. Run the suite from the repository root once the model is ready. Python 3.9 or later is sufficient.
+
+```sh
+python3 -B engine/tests/tools/check_inkling_serving.py \
+  --base-url http://127.0.0.1:18795 --model inkling \
+  --report /path/to/scratch/inkling-serving-evidence.json
+```
+
+The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its exclusion from usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp UD-IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
