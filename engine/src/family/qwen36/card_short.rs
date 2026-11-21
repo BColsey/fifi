@@ -12,8 +12,8 @@ use super::settings::{Q36Settings, TieredSettings, WeightFormat};
 use crate::family::expert_bank::bank_tier::{CardBudget, TierBudget, TierChoice, choose_tier};
 
 /// Host bytes the tiered path keeps beside the mapped experts: the CPU pool's scratch and the
-/// process heap. The same 1 GiB the mapped-expert admission of the loader keeps free.
-const HOST_OVERHEAD_BYTES: u64 = 1 << 30;
+/// process heap: the flat headroom the mapped-expert admission of the loader keeps free.
+const HOST_OVERHEAD_BYTES: u64 = crate::family::mem::HOST_HEADROOM_BYTES;
 
 /// The figures of one start's card admission, before any weight is uploaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

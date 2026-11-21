@@ -10,7 +10,7 @@ use super::QwenResidentStep;
 use crate::family::{executor::ExecutorOps, graph_state::book::Health};
 use crate::{
     EngError,
-    family::host_admit::HostAdmission,
+    family::mem::HostFacts,
     family::qwen36::window_logic,
     family::session::{
         DecodeSession, PrefixIdentity, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled,
@@ -78,8 +78,8 @@ fn planned_entries(checkpoint: usize, limit: usize, available: Option<usize>) ->
 /// tiered-prefix planners. A failed probe logs `refused` (each planner states its own
 /// fallback) and reads as no budget.
 fn admission_budget(probe: &'static str, refused: &str) -> Option<usize> {
-    HostAdmission::probe(probe, "Qwen36")
-        .map(|admission| usize::try_from(admission.available_budget()).ok())
+    HostFacts::probe(probe, "Qwen36")
+        .map(|admission| usize::try_from(admission.budget()).ok())
         .inspect_err(|error| {
             eprintln!("q36 cuda: {probe} host probe failed ({error:?}); {refused}")
         })

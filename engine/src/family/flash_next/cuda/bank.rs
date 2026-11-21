@@ -93,7 +93,7 @@ const MIB: u64 = 1 << 20;
 
 /// `MemTotal` and `MemAvailable` of the machine, in bytes. `available` is the caller's minimum of
 /// the host figure and every cgroup ancestor's remaining bytes (the CUDA start passes
-/// `family::host_admit::HostAdmission::host_memory`, the one snapshot its guard admits against;
+/// `family::mem::HostFacts::host_memory`, the one snapshot its guard admits against;
 /// see [`HostPinPlan::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HostMemory {
@@ -102,10 +102,10 @@ pub(super) struct HostMemory {
 }
 
 impl HostMemory {
-    /// The OS floor: a tenth of the RAM, at least 8 GiB. The same rule as the host
-    /// guard's floor in `family::host_admit`, so the plan's floor and the guard's agree.
+    /// The OS floor: the one rule in `family::mem`, which the host guard reads too, so the
+    /// plan's floor and the guard's agree.
     pub(super) fn os_floor(&self) -> u64 {
-        self.total.div_ceil(10).max(8 * GIB)
+        crate::family::mem::os_floor_of(self.total)
     }
 }
 
@@ -116,7 +116,7 @@ pub(super) struct HostTerms {
     /// (about 1.5 GiB), small host buffers (0.1 GiB). The start folds the two PLE projection
     /// matrices' F32 bytes into this figure, so the plan counts every byte the guard admits.
     pub(super) engine_heap: u64,
-    /// Kept free so the plan does not ride the line (exllamav3 keeps 2 GiB as well).
+    /// Kept free beyond the OS floor so the plan does not ride the line: the shared host margin.
     pub(super) margin: u64,
     /// The least page cache the n-gram table's random reads must keep. A floor, not a target: all
     /// RAM the plan leaves free is page cache. The default is 0, from measured cold n-gram row
@@ -145,7 +145,7 @@ impl HostTerms {
     /// (measured, see the field), two 4096-token chunks of n-gram staging (86 MB).
     pub(super) const DEFAULT: Self = Self {
         engine_heap: 3 * GIB,
-        margin: 2 * GIB,
+        margin: crate::family::mem::HOST_MARGIN_BYTES,
         ngram_cache_min: 0,
         ngram_staging_rows: 2 * 65_536,
         stream_slot_metadata: MIB,
@@ -186,7 +186,7 @@ impl HostPinPlan {
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
     /// On the CUDA path the plan and the guard read one admission snapshot: the start probes
-    /// `HostAdmission` once, builds `HostMemory.available` from its budget and guards the plan's
+    /// `HostFacts` once, builds `HostMemory.available` from its budget and guards the plan's
     /// `process_bytes` with the same figure (the guard also refuses a cgroup-namespace root,
     /// so run on the host).
     pub(super) fn new(

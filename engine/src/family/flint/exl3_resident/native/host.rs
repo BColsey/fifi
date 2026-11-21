@@ -102,7 +102,7 @@ fn admit_cached(
         .checked_add(packing.staging.checked_mul(2).ok_or_else(overflow)?)
         .and_then(|bytes| bytes.checked_add(metadata as u64))
         .ok_or_else(overflow)?;
-    crate::family::host_admit::HostAdmission::probe("Flint expert cache", "Flint")?
+    crate::family::mem::HostFacts::probe("Flint expert cache", "Flint")?
         .admit("Flint expert cache", required)?;
     plan::admit(
         &plan::Demand {

@@ -14,7 +14,7 @@ use crate::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
-        host_admit::HostAdmission,
+        mem::HostFacts,
         tier_budget::{HostBudget, VramBudget},
         tiered_classify::classify_reference,
     },
@@ -145,7 +145,7 @@ fn the_geometry_takes_the_plan_and_refuses_another_record_size() {
 #[test]
 fn the_os_floor_is_a_tenth_of_the_ram_with_an_8_gib_minimum() {
     // `HostMemory` carries figures its caller probed (the admission snapshot); the
-    // meminfo parsing itself lives in `family::host_admit` and is tested there.
+    // meminfo parsing itself lives in `family::mem` and is tested there.
     let memory = HostMemory {
         total: HOST_TOTAL,
         available: 50_000_000 * 1024,
@@ -252,16 +252,16 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
         ..HostTerms::DEFAULT
     };
     let admission = |cgroup| {
-        HostAdmission::from_meminfo(
+        HostFacts::from_meminfo(
             "the caller",
             "MemTotal: 67108864 kB\nMemAvailable: 62914560 kB\n",
             cgroup,
         )
         .unwrap()
     };
-    let memory_of = |admission: &HostAdmission| HostMemory {
+    let memory_of = |admission: &HostFacts| HostMemory {
         total: 64 * GIB,
-        available: admission.available_budget(),
+        available: admission.budget(),
     };
 
     // Uncapped the inclusive store plans and its bytes pass the guard on the same snapshot.

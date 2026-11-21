@@ -1189,9 +1189,11 @@ mod load_policy;
 mod model_tests;
 
 fn admit_mapped_experts(host_bytes: u64, available: u64) -> Result<(), EngError> {
-    let needed = host_bytes.checked_add(1 << 30).ok_or_else(|| {
-        EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
-    })?;
+    let needed = host_bytes
+        .checked_add(crate::family::mem::HOST_HEADROOM_BYTES)
+        .ok_or_else(|| {
+            EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
+        })?;
     if needed > available {
         return Err(EngError::MemoryPlan(format!(
             "cuda mapped experts: need {needed} host bytes including 1 GiB free, have {available}"
@@ -1353,7 +1355,7 @@ fn load_inner(
         tensor.mapped = mapped;
     }
     if host_bytes != 0 {
-        let (_, available) = crate::family::host_admit::HostAdmission::probe_or_bare(
+        let (_, available) = crate::family::mem::HostFacts::probe_or_bare(
             "cuda mapped experts",
             "cuda mapped experts",
         )?;

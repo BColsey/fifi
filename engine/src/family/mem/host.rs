@@ -1,4 +1,4 @@
-//! Host-RAM admission: the cgroup-aware guard the expert caches use.
+//! The host half of the memory facts: `/proc/meminfo` clamped by the process's cgroup tree.
 //!
 //! probe reads /proc/meminfo and the process's cgroup tree, and admit
 //! refuses a payload that would break the OS floor or the enclosing cgroup
@@ -7,7 +7,8 @@
 
 use crate::EngError;
 
-pub(crate) struct HostAdmission {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostFacts {
     // The total and the floor are read by the CUDA-build facts paths
     // (probe_or_bare and the admit pair); the plain host build only asks
     // for the available budget.
@@ -16,11 +17,9 @@ pub(crate) struct HostAdmission {
     mem_available: u64,
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
-    #[allow(dead_code)]
-    os_floor: u64,
 }
 
-impl HostAdmission {
+impl HostFacts {
     #[allow(
         dead_code,
         reason = "the callers are Linux-only; the macOS test build exercises probe_in"
@@ -38,7 +37,7 @@ impl HostAdmission {
     /// The admission pair for facts paths that must not go dark inside a container: when the
     /// cgroup probe refuses (a namespace root, for example), the pair falls back to the bare
     /// `/proc/meminfo` figures and logs the refusal — those callers worked on the bare figure
-    /// before, so they keep it. Planning that sizes memory uses [`HostAdmission::probe`] and
+    /// before, so they keep it. Planning that sizes memory uses [`HostFacts::probe`] and
     /// refuses instead; an optional feature may plan zero on the refusal. The plain Linux
     /// build's Nemotron fit is one of these fall-back callers: a default start must keep
     /// serving where the bare figure always served.
@@ -119,29 +118,43 @@ impl HostAdmission {
             mem_total: total,
             mem_available: available,
             cgroup_remaining,
-            os_floor: total.div_ceil(10).max(8u64 << 30),
         })
     }
 
     /// The byte budget admission admits against: `MemAvailable` clamped by every enclosing
-    /// cgroup's remaining bytes. The same figure [`HostAdmission::admit_for`] refuses against,
+    /// cgroup's remaining bytes. The same figure [`HostFacts::admit_for`] refuses against,
     /// so a host plan sized from it cannot disagree with the guard that checks it. Names no
     /// model family, so any family's host plan may reuse it.
-    pub(crate) fn available_budget(&self) -> u64 {
+    pub(crate) fn budget(&self) -> u64 {
         self.cgroup_remaining
             .map_or(self.mem_available, |remaining| {
                 remaining.min(self.mem_available)
             })
     }
 
-    /// `MemTotal` paired with [`HostAdmission::available_budget`], for host plans that carry
+    /// `MemTotal`, bytes.
+    pub(crate) fn total(&self) -> u64 {
+        self.mem_total
+    }
+
+    /// The bytes the OS keeps out of every host plan on this machine ([`os_floor_of`]).
+    pub(crate) fn os_floor(&self) -> u64 {
+        super::os_floor_of(self.mem_total)
+    }
+
+    /// The budget above the OS floor: what a plan may spend on the process and its stores.
+    pub(crate) fn spare(&self) -> u64 {
+        self.budget().saturating_sub(self.os_floor())
+    }
+
+    /// `MemTotal` paired with [`HostFacts::budget`], for host plans that carry
     /// both figures (the tier and bank plans read them as a pair).
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "the CUDA-build facts paths read the pair")
     )]
     pub(crate) fn host_memory(&self) -> (u64, u64) {
-        (self.mem_total, self.available_budget())
+        (self.mem_total, self.budget())
     }
 
     /// [`admit_for`] with the caller's label as the refusing name.
@@ -161,14 +174,14 @@ impl HostAdmission {
         allow(dead_code, reason = "the refusals are pinned by this module's tests")
     )]
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
-        let available = self.available_budget();
+        let available = self.budget();
         if required
-            .checked_add(self.os_floor)
+            .checked_add(self.os_floor())
             .is_none_or(|needed| needed > available)
         {
             return Err(EngError::MemoryPlan(format!(
                 "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
-                self.os_floor
+                self.os_floor()
             )));
         }
         Ok(())
@@ -434,7 +447,7 @@ mod tests {
             );
         };
         // Every reachable refusal, produced, not quoted from the source.
-        no_family(&refusal_text(HostAdmission::from_meminfo(
+        no_family(&refusal_text(HostFacts::from_meminfo(
             LABEL,
             "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
             None,
@@ -488,7 +501,7 @@ mod tests {
             42,
         )));
         assert_eq!(
-            refusal_text(HostAdmission::from_meminfo(
+            refusal_text(HostFacts::from_meminfo(
                 LABEL,
                 "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
                 None
@@ -542,7 +555,7 @@ mod tests {
     fn flint_label_refusals_keep_the_frozen_texts_in_full() {
         const FLINT: &str = "Flint expert cache";
         assert_eq!(
-            refusal_text(HostAdmission::from_meminfo(
+            refusal_text(HostFacts::from_meminfo(
                 FLINT,
                 "MemTotal: 1 kB\nMemAvailable: 2 kB\n",
                 None
@@ -584,9 +597,9 @@ mod tests {
     #[test]
     fn captured_cgroup_roots_match_real_admission() {
         let captures: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-views-20261028.json")).unwrap();
+            serde_json::from_str(include_str!("../testdata/cgroup-views-20261028.json")).unwrap();
         let hostns: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-hostns-20261028.json")).unwrap();
+            serde_json::from_str(include_str!("../testdata/cgroup-hostns-20261028.json")).unwrap();
         let host_files = captures["host"]["root_file_names"].as_array().unwrap();
         for name in ["cgroup.type", "memory.max", "memory.current"] {
             assert!(!host_files.iter().any(|value| value.as_str() == Some(name)));
@@ -633,7 +646,7 @@ mod tests {
     #[test]
     fn an_unverified_budget_falls_back_to_the_bare_figure() {
         let refusal = EngError::MemoryPlan(String::from("admission: cannot map its process"));
-        let (total, available) = HostAdmission::bare_fallback(
+        let (total, available) = HostFacts::bare_fallback(
             LABEL,
             ROOT_LABEL,
             &refusal,
@@ -652,7 +665,7 @@ mod tests {
         // with the clean "cannot map" error — the refusal `probe_or_bare` turns into the
         // bare `/proc/meminfo` fallback — before any filesystem access at all.
         let jetson: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-jetson-20261118.json")).unwrap();
+            serde_json::from_str(include_str!("../testdata/cgroup-jetson-20261118.json")).unwrap();
         let view = &jetson["jetson"];
         assert_eq!(view["unified_controllers"].as_str().unwrap(), "");
         let root = tempfile::tempdir().unwrap();
@@ -677,7 +690,7 @@ mod tests {
     #[test]
     fn captured_cgroup_host_member_maps_to_nested_group() {
         let captures: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cgroup-views-20261028.json")).unwrap();
+            serde_json::from_str(include_str!("../testdata/cgroup-views-20261028.json")).unwrap();
         let view = &captures["host"];
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().canonicalize().unwrap();
@@ -864,13 +877,13 @@ mod tests {
     #[test]
     fn a_namespace_root_applies_its_own_limit_or_falls_back_to_available_memory() {
         let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
-        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
-        assert_eq!(budget.os_floor, 8u64 << 30);
+        assert_eq!(budget.os_floor(), 8u64 << 30);
         // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
         assert!(budget.admit(LABEL, 1).is_err());
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
-        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
         // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
         assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
@@ -904,7 +917,7 @@ mod tests {
     #[test]
     fn a_namespace_root_without_the_memory_controller_is_refused_clearly() {
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "cpu\n");
-        let result = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42);
+        let result = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42);
         assert!(matches!(result, Err(EngError::MemoryPlan(message))
                 if message.contains("complete cgroup2 root with the memory controller")));
     }
@@ -920,10 +933,9 @@ mod tests {
             "0::/\n1:devices:/elsewhere\n",
         ] {
             std::fs::write(proc_dir.join("self/cgroup"), membership).unwrap();
-            let budget =
-                HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+            let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
             // Machine-wide MemAvailable is 24 GiB, but only 6 GiB remain in this group.
-            assert_eq!(budget.available_budget(), 6u64 << 30);
+            assert_eq!(budget.budget(), 6u64 << 30);
         }
     }
 
@@ -1011,7 +1023,7 @@ mod tests {
         );
         let remaining = remaining.unwrap();
         assert_eq!(remaining, Some(12u64 << 30));
-        let budget = HostAdmission::from_meminfo(
+        let budget = HostFacts::from_meminfo(
             LABEL,
             "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\n",
             remaining,
@@ -1022,34 +1034,34 @@ mod tests {
     }
 
     #[test]
-    fn available_budget_is_the_cgroup_minimum_in_either_order() {
+    fn budget_is_the_cgroup_minimum_in_either_order() {
         // The plan-facing accessor must hand a plan the same number the guard refuses against:
         // MemAvailable clamped by the cgroup remaining bytes, whichever side is smaller, and
         // the bare host figure when the cgroup is unlimited.
-        let unlimited = HostAdmission::from_meminfo(
+        let unlimited = HostFacts::from_meminfo(
             LABEL,
             "MemTotal: 67108864 kB\nMemAvailable: 25165824 kB\n",
             None,
         )
         .unwrap();
-        assert_eq!(unlimited.available_budget(), 24 << 30);
+        assert_eq!(unlimited.budget(), 24 << 30);
         assert_eq!(unlimited.host_memory(), (64 << 30, 24 << 30));
 
-        let cgroup_smaller = HostAdmission::from_meminfo(
+        let cgroup_smaller = HostFacts::from_meminfo(
             LABEL,
             "MemTotal: 67108864 kB\nMemAvailable: 25165824 kB\n",
             Some(12 << 30),
         )
         .unwrap();
-        assert_eq!(cgroup_smaller.available_budget(), 12 << 30);
+        assert_eq!(cgroup_smaller.budget(), 12 << 30);
 
-        let host_smaller = HostAdmission::from_meminfo(
+        let host_smaller = HostFacts::from_meminfo(
             LABEL,
             "MemTotal: 67108864 kB\nMemAvailable: 8388608 kB\n",
             Some(12 << 30),
         )
         .unwrap();
-        assert_eq!(host_smaller.available_budget(), 8 << 30);
+        assert_eq!(host_smaller.budget(), 8 << 30);
 
         // One budget for plan and guard: the last byte the guard admits is the accessor's
         // figure minus the OS floor (8 GiB of the 64 GiB host).
@@ -1109,7 +1121,7 @@ mod tests {
 
     #[test]
     fn host_snapshot_uses_mem_available_and_model_scaled_os_floor() {
-        let result = HostAdmission::from_meminfo(
+        let result = HostFacts::from_meminfo(
             LABEL,
             "MemTotal:       268435456 kB\nMemAvailable:    50331648 kB\n",
             None,
@@ -1120,7 +1132,7 @@ mod tests {
         );
         let budget = result.unwrap();
         assert_eq!(budget.mem_available, 48u64 << 30);
-        assert_eq!(budget.os_floor, 27_487_790_695);
+        assert_eq!(budget.os_floor(), 27_487_790_695);
         assert_eq!(budget.cgroup_remaining, None);
         assert!(budget.admit(LABEL, 256 * 47 * 1_603_584u64).is_ok());
     }
@@ -1129,20 +1141,19 @@ mod tests {
     fn host_snapshot_preserves_minimum_floor_and_finite_cgroup() {
         let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
         let floor = 8u64 << 30;
-        let budget = HostAdmission::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
-        assert_eq!(budget.os_floor, floor);
+        let budget = HostFacts::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
+        assert_eq!(budget.os_floor(), floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
         assert!(budget.admit(LABEL, 1).is_ok());
         assert!(budget.admit(LABEL, 2).is_err());
         assert!(
-            HostAdmission::from_meminfo(LABEL, text, Some(0))
+            HostFacts::from_meminfo(LABEL, text, Some(0))
                 .unwrap()
                 .admit(LABEL, 0)
                 .is_err()
         );
         let empty =
-            HostAdmission::from_meminfo(LABEL, "MemTotal: 1 kB\nMemAvailable: 0 kB\n", None)
-                .unwrap();
+            HostFacts::from_meminfo(LABEL, "MemTotal: 1 kB\nMemAvailable: 0 kB\n", None).unwrap();
         assert_eq!(empty.mem_available, 0);
         assert!(empty.admit(LABEL, 0).is_err());
     }
@@ -1166,7 +1177,7 @@ mod tests {
             "MemTotal: 1 kB\nMemAvailable: 18014398509481984 kB\n",
         ] {
             assert!(
-                HostAdmission::from_meminfo(LABEL, text, None).is_err(),
+                HostFacts::from_meminfo(LABEL, text, None).is_err(),
                 "{text:?}"
             );
         }
@@ -1174,32 +1185,32 @@ mod tests {
 
     #[test]
     fn host_budget_rejects_unrepresentable_payload_plus_floor() {
-        let budget = HostAdmission {
-            mem_total: u64::MAX,
+        let budget = HostFacts {
+            mem_total: 1,
             mem_available: u64::MAX,
             cgroup_remaining: None,
-            os_floor: 1,
         };
+        let floor = budget.os_floor();
         assert!(budget.admit(LABEL, u64::MAX).is_err());
-        assert!(budget.admit(LABEL, u64::MAX - 1).is_ok());
+        assert!(budget.admit(LABEL, u64::MAX - floor + 1).is_err());
+        assert!(budget.admit(LABEL, u64::MAX - floor).is_ok());
     }
 
     #[test]
     fn host_budget_accepts_exact_model_demand_only_after_os_floor() {
         let required = 256 * 47 * 1_603_584u64;
         let floor = 8u64 << 30;
-        let exact = HostAdmission {
+        let exact = HostFacts {
             mem_total: required + floor,
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
-            os_floor: floor,
         };
         assert!(
             exact.admit(LABEL, required).is_ok(),
             "exact model demand plus OS floor must admit"
         );
         assert!(
-            HostAdmission {
+            HostFacts {
                 mem_available: exact.mem_available - 1,
                 ..exact
             }
@@ -1207,7 +1218,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            HostAdmission {
+            HostFacts {
                 cgroup_remaining: Some(required + floor - 1),
                 ..exact
             }
@@ -1215,7 +1226,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            HostAdmission {
+            HostFacts {
                 cgroup_remaining: None,
                 ..exact
             }
@@ -1241,11 +1252,11 @@ mod tests {
         std::fs::write(directory.join("cgroup.subtree_control"), "memory\n").unwrap();
         std::fs::write(group.join("memory.max"), "17179869184\n").unwrap();
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
-        let budget = HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        let budget = HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
         assert!(budget.admit(LABEL, 7u64 << 30).is_ok());
         assert!(budget.admit(LABEL, (7u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
-        assert!(HostAdmission::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+        assert!(HostFacts::probe_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
     }
 }

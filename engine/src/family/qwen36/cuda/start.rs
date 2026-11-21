@@ -48,7 +48,7 @@ use crate::{
         QWEN3_6_35B_A3B,
         exl3::bank::{Exl3SlotResolver, ExpertStore},
         gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
-        host_admit::HostAdmission,
+        mem::HostFacts,
         project::cuda::{
             BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
             native_load_bytes, served_admission,
@@ -1317,7 +1317,7 @@ fn lower_rung(
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
     };
-    let (_, host_available) = HostAdmission::probe_or_bare("q36 cuda tiered", "Qwen36")?;
+    let (_, host_available) = HostFacts::probe_or_bare("q36 cuda tiered", "Qwen36")?;
     match card_short::decide(&figures, host_available) {
         CardVerdict::Fits => Ok(None),
         CardVerdict::Refused { line } => {

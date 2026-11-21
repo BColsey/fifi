@@ -22,7 +22,7 @@ fn gib(bytes: u64) -> String {
 }
 
 pub(super) fn probe_host_store() -> Result<(u64, u64), EngError> {
-    crate::family::host_admit::HostAdmission::probe_or_bare("EXL3 expert bank", "EXL3 expert bank")
+    crate::family::mem::HostFacts::probe_or_bare("EXL3 expert bank", "EXL3 expert bank")
 }
 
 /// The resolved banked load: the slot count and the figures the start line reports.
@@ -130,10 +130,10 @@ pub(super) fn decide(
     }))
 }
 
-/// The pageable routed-expert store keeps the larger of 2 GiB and 20% of physical RAM free.
+/// The pageable routed-expert store keeps the OS floor and the shared host margin free.
 fn admit_host(routed: u64, host: (u64, u64)) -> Result<(), EngError> {
     let (total, available) = host;
-    let margin = (2 << 30).max(total / 5);
+    let margin = crate::family::mem::os_floor_of(total) + crate::family::mem::HOST_MARGIN_BYTES;
     let budget = available.saturating_sub(margin);
     if routed > budget {
         return Err(refuse(format!(
@@ -176,9 +176,10 @@ mod tests {
         (6 << 30, 47 * 256 * per_member)
     }
 
-    /// A 16 GiB host with ~14 GiB available: the store fits under the 3.2 GiB margin.
+    /// A 32 GiB host with 30 GiB available: the store fits above the 8 GiB OS floor and the
+    /// 2 GiB host margin.
     fn host() -> Result<(u64, u64), EngError> {
-        Ok((16 << 30, 14 << 30))
+        Ok((32 << 30, 30 << 30))
     }
 
     fn reserve(hold: u64) -> Reserve {
@@ -305,7 +306,8 @@ mod tests {
     fn a_host_without_room_is_refused_before_any_slot() {
         let (dense, routed) = figures();
         // On mode: banking is requested even though the pack would fit, and the host refuses.
-        // Available 8 GiB under a 3.2 GiB margin (20% of 16): 4.8 GiB < ~10.1 GiB of experts.
+        // Available 8 GiB under the 10 GiB of OS floor and margin: nothing is left for the
+        // ~10.1 GiB of experts.
         let error = format!(
             "{:?}",
             decide(

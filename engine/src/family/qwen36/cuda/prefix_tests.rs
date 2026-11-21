@@ -143,8 +143,8 @@ fn pageable_peak_sums_shards_and_reserves_only_one_copy_temporary() {
 #[test]
 #[ignore = "requires a Linux process with MemoryMax=2G and more than 1.8 GiB initially available"]
 fn process_memory_limit_2_gib_admits_one_large_pageable_shard_and_refuses_two() {
-    let budget = crate::family::host_admit::HostAdmission::probe("test", "test").unwrap();
-    assert!(budget.available_budget() > 0);
+    let budget = crate::family::mem::HostFacts::probe("test", "test").unwrap();
+    assert!(budget.budget() > 0);
     let layout = StateLayout::new(&dims(), &options(KvMode::Fp16, 40_960)).unwrap();
     assert!(super::prefix::admit_pageable([(&layout, 32_767)].into_iter()).unwrap());
     assert!(

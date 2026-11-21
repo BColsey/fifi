@@ -16,7 +16,7 @@ use crate::{
             DEFAULT_CUDA_CONTEXT, FlashOptions, MAX_CUDA_CONTEXT, cuda_settings, default_context,
             ring_budget_bytes,
         },
-        host_admit::HostAdmission,
+        mem::Facts,
         project::cuda::CudaProjector,
     },
 };
@@ -42,8 +42,9 @@ pub(in crate::family::flash_next) fn start(
 
     let projector = CudaProjector::new()?;
     let card_memory = projector.memory_info()?;
-    let host_admission = HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?;
-    let (host_total, host_available) = host_admission.host_memory();
+    let facts = Facts::read("Flash-Next expert bank", "Flash-Next")?
+        .with_card(card_memory.free as u64, card_memory.total as u64);
+    let (host_total, host_available) = facts.host.host_memory();
     let ring_budget = ring_budget_bytes(
         std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
             .ok()

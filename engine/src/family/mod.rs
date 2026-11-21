@@ -71,8 +71,6 @@ pub(crate) mod slot_request;
 pub(crate) mod step_dims;
 // Pure host bookkeeping, compiled wherever it has a caller: every Linux
 // build (the admission fits need the cgroup-aware probe) and the test build.
-#[cfg(any(test, target_os = "linux"))]
-pub(crate) mod host_admit;
 pub(crate) mod host_memory;
 pub mod keys;
 #[allow(
@@ -88,6 +86,8 @@ pub mod keys;
 )]
 pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) mod mem;
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")

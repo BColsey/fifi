@@ -118,7 +118,7 @@ fn export_bytes(layout: &StateLayout, positions: usize) -> Result<(usize, usize)
     Ok((total, temporary))
 }
 
-pub(super) const HOST_HEADROOM: usize = 1 << 30;
+pub(super) const HOST_HEADROOM: usize = crate::family::mem::HOST_HEADROOM_BYTES as usize;
 
 pub(super) fn pageable_required<'a>(
     states: impl Iterator<Item = (&'a StateLayout, usize)>,
@@ -142,7 +142,7 @@ pub(super) fn admit_pageable<'a>(
     // MemAvailable figure when the cgroup tree refuses. A probe that cannot
     // verify anything falls back and logs: it proceeds with the save the
     // engine performed before the check, it does not take a feature away.
-    let available = match crate::family::host_admit::HostAdmission::probe_or_bare(
+    let available = match crate::family::mem::HostFacts::probe_or_bare(
         "q36 pageable prefix",
         "q36 pageable prefix",
     ) {

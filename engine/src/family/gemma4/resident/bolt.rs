@@ -908,7 +908,7 @@ impl Bolt {
         // the enclosing cgroup's limit) is checked first.
         admit_snapshot(
             total,
-            crate::family::host_admit::HostAdmission::probe_or_bare(
+            crate::family::mem::HostFacts::probe_or_bare(
                 "a Bolt prefix snapshot",
                 "a Bolt prefix snapshot",
             ),
@@ -2218,7 +2218,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
-        use crate::family::host_admit::HostAdmission;
+        use crate::family::mem::HostFacts;
         let one_gib = 1usize << 30;
         let meminfo = |available_gib: u64| {
             format!(
@@ -2228,14 +2228,14 @@ mod tests {
             )
         };
         // The budget is the available figure, clamped by the cgroup's remaining bytes.
-        let tight = HostAdmission::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
+        let tight = HostFacts::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
         let error = admit_snapshot(one_gib, Ok(tight.host_memory()))
             .expect_err("a cgroup with half a GiB left cannot back 1 GiB");
         assert!(
             matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
             "{error:?}"
         );
-        let roomy = HostAdmission::from_meminfo("test", &meminfo(20), None).expect("host");
+        let roomy = HostFacts::from_meminfo("test", &meminfo(20), None).expect("host");
         assert!(admit_snapshot(one_gib, Ok(roomy.host_memory())).is_ok());
     }
 
@@ -2243,12 +2243,12 @@ mod tests {
     /// cannot verify anything proceeds: the save is not refused for a host the probe cannot read.
     #[test]
     fn a_probe_that_cannot_read_the_host_falls_back_and_proceeds() {
-        use crate::family::host_admit::HostAdmission;
+        use crate::family::mem::HostFacts;
         let one_gib = 1usize << 30;
         let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
         let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
         // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
-        let bare = HostAdmission::bare_fallback("test", "test", &refusal, meminfo).expect("bare");
+        let bare = HostFacts::bare_fallback("test", "test", &refusal, meminfo).expect("bare");
         assert_eq!(bare.1, 2 << 30);
         assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
         assert!(

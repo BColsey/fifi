@@ -75,7 +75,7 @@ use crate::{
             },
             settings::{CudaSettings, FlashSettings},
         },
-        host_admit::HostAdmission,
+        mem::Facts,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
         session::DecodeSession,
         session::PrefixIdentity,
@@ -643,7 +643,9 @@ fn build_driver_resolving(
     // plan, the host pin plan and the final guard all read this pair, so the plan that sizes the
     // store cannot build from a figure the guard disagrees with (a cgroup-capped host used to
     // plan an inclusive store the guard then refused at load time).
-    let host_admission = HostAdmission::probe("Flash-Next expert bank", "Flash-Next")?;
+    let facts =
+        Facts::read("Flash-Next expert bank", "Flash-Next")?.with_card(free_vram, vram_total);
+    let host_admission = &facts.host;
     let (mem_total, mem_available) = host_admission.host_memory();
     let rows = wanted.prefill_rows as usize;
     let bulk_reader = ngram_bulk()? && rows > 1;

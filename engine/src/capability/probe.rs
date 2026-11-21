@@ -6,10 +6,10 @@
 //! report, and consolidating the loaders onto it is follow-up work, not a
 //! silent side effect of adding a report.
 
-// Clamped in only on the CUDA build, where `family::host_admit` compiles.
+// Clamped in only on the CUDA build, where `family::mem` compiles.
 use super::Probe;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use crate::family::host_admit::HostAdmission;
+use crate::family::mem::HostFacts;
 use serde::Serialize;
 
 /// Which native backends are compiled into this binary. A build fact, not
@@ -172,7 +172,7 @@ pub(crate) fn probe_host() -> HostFacts {
 fn read_meminfo() -> Result<(u64, u64), String> {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     {
-        HostAdmission::probe_or_bare("Hardware facts", "the host")
+        HostFacts::probe_or_bare("Hardware facts", "the host")
             .map_err(|error| format!("the host memory probe refused: {error:?}"))
     }
     #[cfg(all(not(feature = "native-cuda"), target_os = "linux"))]
@@ -238,10 +238,9 @@ mod tests {
         // admission budget equals it exactly, so both probe paths read one pair.
         let text = "MemTotal: 65467540 kB\nMemAvailable: 48156564 kB\n";
         let bare = parse_meminfo(text);
-        let admitted =
-            crate::family::host_admit::HostAdmission::from_meminfo("the caller", text, None)
-                .map(|admission| admission.host_memory())
-                .ok();
+        let admitted = crate::family::mem::HostFacts::from_meminfo("the caller", text, None)
+            .map(|admission| admission.host_memory())
+            .ok();
         assert_eq!(bare, admitted);
     }
 
