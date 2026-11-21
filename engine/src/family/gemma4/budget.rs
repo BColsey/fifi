@@ -72,6 +72,20 @@ const _: () = assert!(BOLT_AUTO_PROMPT_ROWS >= BOLT_PIECE_ROWS);
 )]
 pub(crate) const BOLT_AUTO_PROMPT_ROWS: usize = 8;
 
+/// Bolt's batching choices: idle prompts take whole pieces, and a pooled session that idles for the
+/// default interval is released. Other executors keep the worker's defaults until their batching
+/// is measured.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA executor answers the policy")
+)]
+pub(crate) fn bolt_batch_policy() -> crate::family::executor::BatchPolicy {
+    crate::family::executor::BatchPolicy {
+        idle_pieces: crate::family::executor::IDLE_PIECES_PER_TICK,
+        idle_trim: Some(crate::family::executor::DEFAULT_SESSION_IDLE_TRIM),
+    }
+}
+
 /// What one more session costs the sequence planner.
 #[cfg_attr(
     not(feature = "native-cuda"),
@@ -201,6 +215,14 @@ mod tests {
         assert_eq!(plan(6_144.0).seqs, 1);
         // 8,192 MiB: 2,897 MiB remain, 2,385 above the headroom: two more sessions.
         assert_eq!(plan(8_192.0).seqs, 3);
+    }
+
+    #[test]
+    fn bolt_opts_into_the_whole_piece_budget_and_the_thirty_second_trim() {
+        let policy = bolt_batch_policy();
+        assert_eq!(policy.idle_pieces, 8);
+        assert_eq!(policy.idle_trim, Some(std::time::Duration::from_secs(30)));
+        assert_ne!(policy, crate::family::executor::BatchPolicy::default());
     }
 
     #[test]

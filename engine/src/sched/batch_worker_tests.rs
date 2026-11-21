@@ -3041,3 +3041,20 @@ fn an_executor_whose_prefix_entries_do_not_share_session_memory_is_not_made_to_e
         "host-memory entries are not evicted for a device shortage"
     );
 }
+
+#[test]
+fn the_default_batch_policy_is_the_shared_budget_and_no_trim() {
+    use crate::family::executor::BatchPolicy;
+    let policy = BatchPolicy::default();
+    assert_eq!(
+        policy.idle_pieces, 1,
+        "one shared piece per tick while idle"
+    );
+    assert_eq!(policy.idle_trim, None, "no trim");
+    // An executor that overrides nothing answers the default: the fake executor of the seam tests
+    // and a bare one.
+    let fake = FakeExecutor::new(vec![], &[], 1);
+    assert_eq!(fake.batch_policy(), policy);
+    assert!(fake.can_admit_session());
+    assert!(fake.eviction_frees_session_memory());
+}

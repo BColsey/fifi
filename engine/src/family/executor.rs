@@ -267,7 +267,7 @@ pub(crate) trait ExecutorOps {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutorOps, GenerationState};
+    use super::{BatchPolicy, ExecutorOps, GenerationState};
     use crate::EngError;
     use crate::family::sampler::{Sampler, SamplingParams};
     use crate::family::session::{SaveKind, StoreLimits};
@@ -344,6 +344,10 @@ mod tests {
     fn an_executor_without_window_support_keeps_solo_defaults() {
         let mut executor = Bare;
         assert_eq!(executor.max_seqs(), 1);
+        // Nor does it opt into the batch worker's measured choices.
+        assert_eq!(executor.batch_policy(), BatchPolicy::default());
+        assert_eq!(executor.batch_policy().idle_pieces, 1);
+        assert_eq!(executor.batch_policy().idle_trim, None);
         assert!(matches!(
             executor.new_session(),
             Err(EngError::BadRequest(_))

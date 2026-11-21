@@ -220,10 +220,7 @@ mod device {
         /// Bolt's batching is measured: idle prompts take whole pieces, and a pooled session that
         /// idles for the default interval is released.
         fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
-            crate::family::executor::BatchPolicy {
-                idle_pieces: crate::family::executor::IDLE_PIECES_PER_TICK,
-                idle_trim: Some(crate::family::executor::DEFAULT_SESSION_IDLE_TRIM),
-            }
+            budget::bolt_batch_policy()
         }
 
         /// Whether the device has room for one more session's planes and the headroom. A probe
