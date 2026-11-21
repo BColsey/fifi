@@ -2,6 +2,8 @@ pub(crate) mod admission_sketch;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod card_fit;
 mod config;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod engine_announce;
 #[allow(
     dead_code,
     reason = "the worker and the server jobs run the seam and every family executor implements it; the allow covers the members only tests still reach"

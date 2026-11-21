@@ -38,6 +38,7 @@ use super::{
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{attach_tiered_parts, bank_slot_bytes, geometry_of, names_without_experts},
 };
+use crate::family::engine_announce::{Announcement, announce_failure, await_announced};
 use crate::family::exl3_merge_plan::{
     SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
 };
@@ -932,34 +933,10 @@ pub(crate) fn start(
         })?
     };
     let served = match resolved {
-        Some(receiver) => await_served(&receiver, || engine.handle().failure())?,
+        Some(receiver) => await_announced(&receiver, "q36 cuda", || engine.handle().failure())?,
         None => settings.clone(),
     };
     Ok((engine, bundle, served))
-}
-
-/// What the engine thread tells `start` about a card-chosen start: the settings it serves, or
-/// the failure that ended the start before the card was read.
-pub(super) type Announcement = Result<Q36Settings, String>;
-
-/// Waits for the engine thread's announcement. A closed channel means the thread ended without
-/// one; `failure` then supplies the cause the engine recorded.
-pub(super) fn await_served(
-    receiver: &std::sync::mpsc::Receiver<Announcement>,
-    failure: impl FnOnce() -> Option<String>,
-) -> Result<Q36Settings, EngError> {
-    let failed = |cause: String| {
-        EngError::Checkpoint(format!(
-            "q36 cuda start failed before the card plan: {cause}"
-        ))
-    };
-    match receiver.recv() {
-        Ok(Ok(served)) => Ok(served),
-        Ok(Err(cause)) => Err(failed(cause)),
-        Err(_) => Err(failed(failure().unwrap_or_else(|| {
-            "the engine thread ended without a cause".to_string()
-        }))),
-    }
 }
 
 fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<u64, EngError> {
@@ -1431,14 +1408,10 @@ fn make(
     rules: QwenRules,
     plan: StartupPlan,
     guard: BuildGuard,
-    announce: Option<std::sync::mpsc::SyncSender<Announcement>>,
+    announce: Option<std::sync::mpsc::SyncSender<Announcement<Q36Settings>>>,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let built = make_resolving(stages, settings, rules, plan, guard, announce.as_ref());
-    if let (Err(error), Some(announce)) = (&built, &announce) {
-        // Nothing was announced when the build failed before the card plan; after it the
-        // slot is taken and the failure reaches the engine state.
-        let _ = announce.try_send(Err(error.describe()));
-    }
+    announce_failure(&built, announce.as_ref());
     built
 }
 
@@ -1450,7 +1423,7 @@ fn make_resolving(
     rules: QwenRules,
     plan: StartupPlan,
     mut guard: BuildGuard,
-    announce: Option<&std::sync::mpsc::SyncSender<Announcement>>,
+    announce: Option<&std::sync::mpsc::SyncSender<Announcement<Q36Settings>>>,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
     let verify = plan.verify;
     let allow_unpinned = plan.allow_unpinned;

@@ -51,6 +51,7 @@ use super::{
     step::{FlashStep, SplitMoeAt},
     step_plan::StepPlan,
 };
+use crate::family::engine_announce::{Announcement, announce_failure, await_announced};
 use crate::family::expert_bank::{
     BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru,
     bank_tier::{RUNG_RING_SLOTS, TierChoice, rung_ring_placeholder_bytes},
@@ -219,34 +220,10 @@ pub(in crate::family::flash_next) fn start(
         )
     })?;
     let context = match resolved {
-        Some(receiver) => await_context(&receiver, || engine.handle().failure())?,
+        Some(receiver) => await_announced(&receiver, "Flash-Next", || engine.handle().failure())?,
         None => cuda.context,
     };
     Ok((engine, bundle, context))
-}
-
-/// What the engine thread tells `start` about the context: the one it chose, or the failure
-/// that ended the start before the memory plan.
-type ContextAnnouncement = Result<u32, String>;
-
-/// Waits for the engine thread's announcement. A closed channel means the thread ended without
-/// one; `failure` then supplies the cause the engine recorded.
-fn await_context(
-    receiver: &std::sync::mpsc::Receiver<ContextAnnouncement>,
-    failure: impl FnOnce() -> Option<String>,
-) -> Result<u32, EngError> {
-    let failed = |cause: String| {
-        EngError::Checkpoint(format!(
-            "Flash-Next start failed before the memory plan: {cause}"
-        ))
-    };
-    match receiver.recv() {
-        Ok(Ok(context)) => Ok(context),
-        Ok(Err(cause)) => Err(failed(cause)),
-        Err(_) => Err(failed(failure().unwrap_or_else(|| {
-            "the engine thread ended without a cause".to_string()
-        }))),
-    }
 }
 
 fn raw<'w>(weights: &'w CudaWeights, name: &str) -> Result<&'w DeviceBuffer, EngError> {
@@ -462,7 +439,7 @@ fn make(
     stages: &Stages<'_>,
     artifact: &Path,
     wanted: &CudaSettings,
-    announce: Option<std::sync::mpsc::SyncSender<ContextAnnouncement>>,
+    announce: Option<std::sync::mpsc::SyncSender<Announcement<u32>>>,
     rules: CudaRules,
     identity: PrefixIdentity,
     prefill_chunk: u32,
@@ -477,11 +454,7 @@ fn make(
         prefill_chunk,
         Some(guard),
     );
-    if let (Err(error), Some(announce)) = (&driver, &announce) {
-        // Nothing was announced when the build failed before the plan; after the plan the
-        // receiver has left, or its slot is taken, and the failure reaches the engine state.
-        let _ = announce.try_send(Err(error.describe()));
-    }
+    announce_failure(&driver, announce.as_ref());
     FlashCudaExecutor::new(driver?, rules, identity)
 }
 
@@ -617,12 +590,12 @@ pub(super) fn build_driver(
 
 /// [`build_driver`], and when `announce` is given the context of `wanted` is a placeholder: the
 /// memory plan picks it (see `default_context`), the start prints the choice and sends it
-/// through `announce` for `start` (`await_context`).
+/// through `announce` for `start` (`await_announced`).
 fn build_driver_resolving(
     stage: &dyn Fn(&'static str),
     artifact: &Path,
     wanted: &CudaSettings,
-    announce: Option<&std::sync::mpsc::SyncSender<ContextAnnouncement>>,
+    announce: Option<&std::sync::mpsc::SyncSender<Announcement<u32>>>,
     sampler_vocab: usize,
     prefill_chunk: u32,
     mut guard: Option<BuildGuard>,
@@ -1539,54 +1512,9 @@ impl StepDriver {
 #[cfg(test)]
 mod tests {
     use super::{
-        BankGeometry, ContextAnnouncement, HostMemory, HostPinPlan, HostTerms, await_context,
-        fill_from_profile, read_expert_stats,
+        BankGeometry, HostMemory, HostPinPlan, HostTerms, fill_from_profile, read_expert_stats,
     };
     use std::io::Write as _;
-    use std::sync::mpsc::sync_channel;
-
-    #[test]
-    fn the_start_takes_the_context_the_engine_thread_announced() {
-        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
-        sender.send(Ok(75_776)).expect("send");
-        assert_eq!(
-            await_context(&receiver, || panic!("no failure is asked for")).expect("context"),
-            75_776
-        );
-    }
-
-    #[test]
-    fn a_failure_before_the_memory_plan_is_the_start_failure() {
-        // The build reports its own error.
-        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
-        sender
-            .send(Err("no CUDA device".to_string()))
-            .expect("send");
-        let error = await_context(&receiver, || None)
-            .expect_err("failure")
-            .describe();
-        assert_eq!(
-            error,
-            "Flash-Next start failed before the memory plan: no CUDA device"
-        );
-        // The thread ended and dropped the sender: the engine's recorded cause is used.
-        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
-        drop(sender);
-        let error = await_context(&receiver, || Some("the pack is unreadable".to_string()))
-            .expect_err("failure")
-            .describe();
-        assert!(
-            error.ends_with("before the memory plan: the pack is unreadable"),
-            "{error}"
-        );
-        // No cause recorded: the text still says what happened.
-        let (sender, receiver) = sync_channel::<ContextAnnouncement>(1);
-        drop(sender);
-        let error = await_context(&receiver, || None)
-            .expect_err("failure")
-            .describe();
-        assert!(error.contains("ended without a cause"), "{error}");
-    }
 
     /// The Disk rung's refusals carry the plan's own byte counts, computed here from the same
     /// terms the plan uses: the floor refusal names every term, and the page-cache refusal names

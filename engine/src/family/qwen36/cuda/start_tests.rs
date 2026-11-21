@@ -6,11 +6,11 @@
 use super::dims::{KvMode, StepDims};
 use super::pinned::ROTARY_DIM;
 use super::start::{
-    Announcement, BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, allow_unpinned_wanted,
-    already_built, await_served, check_gguf_identity, check_sha256, check_tiered_start,
-    context_tokens, file_sha256, ignored_mlx_line, kv_bytes_per_position, kv_cache_bytes,
-    kv_mode_of, load_options, open_gguf, pinned_gguf, select_gguf, select_gguf_noted,
-    serve_kv_mode, sha256_wanted, step_options, tiered_plan_of,
+    BuildGuard, CUDA_ENGINE_BUILT, GGUF_BYTES, GGUF_NAME, allow_unpinned_wanted, already_built,
+    check_gguf_identity, check_sha256, check_tiered_start, context_tokens, file_sha256,
+    ignored_mlx_line, kv_bytes_per_position, kv_cache_bytes, kv_mode_of, load_options, open_gguf,
+    pinned_gguf, select_gguf, select_gguf_noted, serve_kv_mode, sha256_wanted, step_options,
+    tiered_plan_of,
 };
 use super::state_layout::KvPool;
 use crate::EngError;
@@ -619,50 +619,4 @@ fn the_card_plan_charges_the_cache_rates_the_pool_lays_out() {
             kv_dtype_name(kv)
         );
     }
-}
-
-#[test]
-fn the_start_takes_the_settings_the_engine_thread_announced() {
-    use std::sync::mpsc::sync_channel;
-    let served = Q36Settings {
-        context_limit: 150_528,
-        kv: KvDtype::Q8,
-        ..cuda_settings("{}")
-    };
-    let (sender, receiver) = sync_channel::<Announcement>(1);
-    sender.send(Ok(served.clone())).expect("send");
-    let got = await_served(&receiver, || panic!("no failure is asked for")).expect("settings");
-    assert_eq!((got.context_limit, got.kv), (150_528, KvDtype::Q8));
-}
-
-#[test]
-fn a_failure_before_the_card_plan_is_the_start_failure() {
-    use std::sync::mpsc::sync_channel;
-    let (sender, receiver) = sync_channel::<Announcement>(1);
-    sender
-        .send(Err("no CUDA device".to_string()))
-        .expect("send");
-    let error = await_served(&receiver, || None)
-        .expect_err("failure")
-        .describe();
-    assert!(
-        error.ends_with("before the card plan: no CUDA device"),
-        "{error}"
-    );
-    // The thread ended without announcing: the engine's recorded cause is used.
-    let (sender, receiver) = sync_channel::<Announcement>(1);
-    drop(sender);
-    let error = await_served(&receiver, || Some("the file is unreadable".to_string()))
-        .expect_err("failure")
-        .describe();
-    assert!(
-        error.ends_with("before the card plan: the file is unreadable"),
-        "{error}"
-    );
-    let (sender, receiver) = sync_channel::<Announcement>(1);
-    drop(sender);
-    let error = await_served(&receiver, || None)
-        .expect_err("failure")
-        .describe();
-    assert!(error.contains("ended without a cause"), "{error}");
 }
