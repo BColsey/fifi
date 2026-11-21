@@ -98,8 +98,10 @@ fn device_sequence(device: &mut Raon1Device) -> (Vec<u32>, Vec<Vec<f32>>) {
 
 fn read_u32s(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
@@ -107,8 +109,10 @@ fn read_rows(bytes: &[u8], vocab: usize) -> Vec<Vec<f32>> {
     bytes
         .chunks_exact(vocab * 4)
         .map(|row| {
-            row.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         })
         .collect()
@@ -228,7 +232,7 @@ fn the_device_stages_match_the_host_reference_for_the_first_layers() {
     let model = open_raon_1_mini_preview(&path, None).expect("open");
     let spec = model.spec();
     let hy = hyper(&model, spec).expect("hyperparameters");
-    let mut host: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut host: Vec<super::cuda::Stage> = Vec::new();
     let mut inp = host_embedding(&model, tokens);
     for layer in 0..layers {
         let mut sink = |name: &str, data: &[f32]| {

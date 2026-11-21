@@ -78,8 +78,10 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 fn f32_values(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -342,14 +344,18 @@ pub(crate) struct Raon1Device {
     cache: DeviceBuffer,
     cells: usize,
     vocab: usize,
-    trace: RefCell<Option<Vec<(String, Vec<f32>)>>>,
+    trace: RefCell<Option<Vec<Stage>>>,
 }
+
+/// One named stage of a traced feed.
+pub(crate) type Stage = (String, Vec<f32>);
 
 /// Which rows of a fed chunk run through the output head.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HeadRows {
     None,
     Last,
+    #[cfg(test)]
     All,
 }
 
@@ -487,11 +493,13 @@ impl Raon1Device {
 
     /// Records the named stages of the next feed as f32 vectors (residual, norm and gated mixer
     /// outputs per layer), for comparison with the host reference.
+    #[cfg(test)]
     pub(crate) fn trace_next_feed(&self) {
         *self.trace.borrow_mut() = Some(Vec::new());
     }
 
-    pub(crate) fn take_trace(&self) -> Vec<(String, Vec<f32>)> {
+    #[cfg(test)]
+    pub(crate) fn take_trace(&self) -> Vec<Stage> {
         self.trace.borrow_mut().take().unwrap_or_default()
     }
 
@@ -532,6 +540,7 @@ impl Raon1Device {
                 HeadRows::None => {}
                 HeadRows::Last if !last_piece => {}
                 HeadRows::Last => logits.push(self.head_row(piece.len() - 1)?),
+                #[cfg(test)]
                 HeadRows::All => {
                     for row in 0..piece.len() {
                         logits.push(self.head_row(row)?);
