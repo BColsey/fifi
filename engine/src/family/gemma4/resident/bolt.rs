@@ -316,13 +316,7 @@ pub(crate) struct WindowBuffers {
 /// What the rows of one step are.
 enum Rows<'a> {
     /// `m` consecutive positions of one sequence from `pos`: a prompt chunk or one decode token.
-    Chunk {
-        seq: &'a BoltSeq,
-        pos: usize,
-        /// A prompt chunk: its global layers may take the prefill attention. A decode token is
-        /// not, so a captured decode step never holds a launch that bakes its position.
-        prefill: bool,
-    },
+    Chunk { seq: &'a BoltSeq, pos: usize },
     /// One token of each of several sequences, in window order.
     Window { seqs: &'a [&'a BoltSeq] },
 }
@@ -1212,7 +1206,7 @@ impl Bolt {
             ));
         }
         self.grow_scratch(tokens.len())?;
-        self.decode_with_logits(seq, tokens, pos, logits, true)?;
+        self.decode_with_logits(seq, tokens, pos, logits)?;
         if !logits {
             self.stream.synchronize()?;
         }
@@ -1309,7 +1303,7 @@ impl Bolt {
     /// Runs one decode step for the token at the position and leaves the capped
     /// logits in the device buffer. Synchronizes once at the end.
     pub(crate) fn decode(&mut self, seq: &BoltSeq, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(seq, &[token], pos, true, false)
+        self.decode_with_logits(seq, &[token], pos, true)
     }
 
     /// Runs one step without the output norm and the logits projection, for prompt tokens
@@ -1323,7 +1317,7 @@ impl Bolt {
         token: u32,
         pos: usize,
     ) -> Result<(), EngError> {
-        self.decode_with_logits(seq, &[token], pos, false, true)
+        self.decode_with_logits(seq, &[token], pos, false)
     }
 
     fn decode_with_logits(
@@ -1332,7 +1326,6 @@ impl Bolt {
         tokens: &[u32],
         pos: usize,
         logits: bool,
-        prefill: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
         if pos.checked_add(m).is_none_or(|end| end > self.cells) {
@@ -1349,12 +1342,10 @@ impl Bolt {
             .write_at_enqueue(&self.stream, 0, &(pos as i32).to_le_bytes())?;
         seq.kv_len
             .write_at_enqueue(&self.stream, 0, &((pos as i32) + 1).to_le_bytes())?;
-        let rows = Rows::Chunk { seq, pos, prefill };
+        let rows = Rows::Chunk { seq, pos };
         let facts = DecodeGraphFacts {
             trace_armed: trace_dir().is_some(),
-            // A prompt chunk of any length is not a decode step: its prefill attention takes the
-            // position as a launch argument, which a captured graph would bake.
-            multi_token: m > 1 || prefill,
+            multi_token: m > 1,
             hidden: !logits,
         };
         if check_decode_graph(facts).is_ok() {
@@ -1517,11 +1508,7 @@ impl Bolt {
             pins: &[],
             holds: Vec::new(),
         };
-        let rows = Rows::Chunk {
-            seq,
-            pos,
-            prefill: false,
-        };
+        let rows = Rows::Chunk { seq, pos };
         let (exec, ()) = self
             .ctx
             .capture(&self.stream, plan, || self.decode_body(&rows, true, 1))?;
@@ -1650,15 +1637,10 @@ impl Bolt {
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
-        // A prompt chunk of a global layer runs the wide prefill attention when the device has it,
-        // whatever its length (a lone row included), so a row's cache cell and logits do not
-        // depend on how the prompt was cut; decode steps and windows keep the decode attention.
-        let wide = match rows {
-            Rows::Chunk { prefill: true, .. } => {
-                self.wide_prefill.as_ref().filter(|wide| wide.is_on())
-            }
-            _ => None,
-        };
+        // A prompt chunk of two or more rows on a global layer runs the wide prefill attention when
+        // the device has it and it is on; a lone row, and so every decode step, keeps the decode
+        // attention.
+        let wide = self.wide_prefill.as_ref().filter(|wide| wide.is_on());
         // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
         // row sits at cell `first`.
         let group =
@@ -1748,6 +1730,7 @@ impl Bolt {
                     (row + count) * kv_rows * 4,
                 );
                 if layer.global
+                    && count > 1
                     && let Some(wide) = wide
                 {
                     return wide.attend(
@@ -1791,7 +1774,7 @@ impl Bolt {
                 )
             };
         match rows {
-            Rows::Chunk { seq, pos, .. } => group(seq, 0, m, *pos),
+            Rows::Chunk { seq, pos } => group(seq, 0, m, *pos),
             Rows::Window { seqs } => seqs
                 .iter()
                 .enumerate()
@@ -2952,9 +2935,9 @@ mod tests {
             .map(|n| n.parse().expect("a prompt length"))
             .collect();
         // `BOLT_WIDE_WIDTHS` lists the other batch widths to compare, comma separated (default
-        // 5,3,1; empty for none).
+        // 5,3; empty for none).
         let widths: Vec<usize> = std::env::var("BOLT_WIDE_WIDTHS")
-            .unwrap_or_else(|_| "5,3,1".to_owned())
+            .unwrap_or_else(|_| "5,3".to_owned())
             .split(',')
             .filter(|n| !n.is_empty())
             .map(|n| n.parse().expect("a batch width"))
@@ -2993,9 +2976,14 @@ mod tests {
             let run = |model: &mut Bolt, wide: bool| run_width(model, wide, Bolt::PREFILL_BATCH);
             let (old, old_launches, old_time) = run(&mut model, false);
             let (new, new_launches, new_time) = run(&mut model, true);
-            // Pieces of any width, a lone row included, leave the logits of pieces of 8 bit for
-            // bit: the rows' cache cells and the attention of every row do not depend on the cut.
+            // Pieces of any width whose rows all sit in chunks of two or more leave the logits of
+            // pieces of 8 bit for bit: the wide attention of a row does not depend on the cut.
             for &width in &widths {
+                // A lone row at the end of a prompt takes the decode attention, so a width that
+                // leaves one differs from pieces of 8 by the attention paths' own difference.
+                if len % width == 1 || len % Bolt::PREFILL_BATCH == 1 {
+                    continue;
+                }
                 let (other, _, _) = run_width(&mut model, true, width);
                 assert!(
                     other

@@ -123,7 +123,7 @@ impl WideGate {
 }
 
 /// Whether a start with no override takes the wide path. It is held off until the quality arm
-/// passes in every stratum (the lone-row stratum is the open one); `FIFI_WIDE_PREFILL=1` starts
+/// passes in every stratum; `FIFI_WIDE_PREFILL=1` starts
 /// it on, `0` or `off` refuses the path altogether.
 pub(crate) const WIDE_PREFILL_DEFAULT_ON: bool = false;
 

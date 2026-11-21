@@ -56,7 +56,7 @@ impl Gemma {
             ));
         }
         self.grow_scratch(tokens.len())?;
-        self.decode_with_logits(tokens, pos, logits, true)?;
+        self.decode_with_logits(tokens, pos, logits)?;
         if !logits {
             self.stream.synchronize()?;
         }
@@ -127,13 +127,13 @@ impl Gemma {
     /// Runs one decode step for the token at the position and leaves the capped
     /// logits in the device buffer. Synchronizes once at the end.
     pub(crate) fn decode(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, true, false)
+        self.decode_with_logits(&[token], pos, true)
     }
 
     /// Runs one step without the output norm and the logits projection, for prompt tokens
     /// whose logits are never read. It queues the step and does not synchronize.
     pub(crate) fn decode_hidden(&mut self, token: u32, pos: usize) -> Result<(), EngError> {
-        self.decode_with_logits(&[token], pos, false, true)
+        self.decode_with_logits(&[token], pos, false)
     }
 
     fn decode_with_logits(
@@ -141,7 +141,6 @@ impl Gemma {
         tokens: &[u32],
         pos: usize,
         logits: bool,
-        prefill: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -180,7 +179,7 @@ impl Gemma {
         let mut current = 1usize;
         for layer in &self.layers {
             let (input, r1, r2, out) = layer_buffers(current);
-            self.decode_layer(layer, h[input], h[r1], h[r2], h[out], pos, m, prefill)?;
+            self.decode_layer(layer, h[input], h[r1], h[r2], h[out], pos, m)?;
             current = out;
         }
         if !logits {
@@ -242,7 +241,6 @@ impl Gemma {
         out: &super::Vector,
         pos: usize,
         m: usize,
-        prefill: bool,
     ) -> Result<(), EngError> {
         let ctx = &self.ctx;
         let stream = &self.stream;
@@ -401,12 +399,12 @@ impl Gemma {
             },
             pos,
         )?;
-        // A prompt chunk of a global layer, of any length, runs the wide prefill attention when
-        // the device has it; decode steps keep the decode attention.
+        // A prompt chunk of two or more rows on a global layer runs the wide prefill attention when
+        // the device has it; a lone row, and so every decode step, keeps the decode attention.
         let wide: Option<&WideAttention> = self
             .wide_prefill
             .as_ref()
-            .filter(|wide| prefill && layer.global && wide.is_on());
+            .filter(|wide| m > 1 && layer.global && wide.is_on());
         if let Some(wide) = wide {
             wide.attend(
                 ctx,
