@@ -993,7 +993,7 @@ impl InklingExpertSource {
         }
         let mut selected = 0_u128;
         let mut fits = 0;
-        for (index, row) in ids.chunks_exact(TOP_K).enumerate() {
+        for (index, row) in ids.as_chunks::<TOP_K>().0.iter().enumerate() {
             for &expert in row {
                 selected |= 1_u128 << expert;
             }

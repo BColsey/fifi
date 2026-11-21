@@ -113,7 +113,7 @@ fn router_matrix(stored: &[u8]) -> Result<Tensor, EngError> {
         ));
     }
     let mut transposed = vec![0; HIDDEN * EXPERTS * 4];
-    for (expert, row) in stored.chunks_exact(HIDDEN * 2).enumerate() {
+    for (expert, row) in stored.as_chunks::<{ HIDDEN * 2 }>().0.iter().enumerate() {
         for (feature, &word) in row.as_chunks::<2>().0.iter().enumerate() {
             if u16::from_le_bytes(word) & 0x7f80 == 0x7f80 {
                 return Err(EngError::Checkpoint(

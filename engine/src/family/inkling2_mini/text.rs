@@ -1,7 +1,7 @@
 //! Single-sequence native text decoding for the released fixed-loop checkpoint.
 use super::{
     CORE_START, EXPERTS, HIDDEN, InklingExpertSource, InklingRoutes, LayerVisit, MAX_CONTEXT,
-    PREFILL_ROWS_ENV,
+    PREFILL_ROWS_ENV, TOP_K,
     attention::InklingAttentionState,
     dense::DenseWeights,
     gguf, gguf_mlx, is_local,
@@ -123,7 +123,7 @@ struct PrefillRow {
 
 enum Experts {
     Mlx {
-        metal: MlxKernels,
+        metal: Box<MlxKernels>,
         cache: Box<MlxExpertCache>,
     },
     GgufReference(Arc<gguf::Weights>),
@@ -186,7 +186,7 @@ impl Decoder {
         Ok(Self {
             dense: DenseWeights::open(dir)?,
             experts: Experts::Mlx {
-                metal,
+                metal: Box::new(metal),
                 cache: Box::new(experts),
             },
             conv: Default::default(),
@@ -383,8 +383,8 @@ impl Decoder {
             let mut out = Vec::with_capacity(inputs.len() * HIDDEN);
             for ((input, experts), weights) in inputs
                 .iter()
-                .zip(routes.expert_ids().chunks_exact(super::TOP_K))
-                .zip(routes.weights().chunks_exact(super::TOP_K))
+                .zip(routes.expert_ids().as_chunks::<TOP_K>().0)
+                .zip(routes.weights().as_chunks::<TOP_K>().0)
             {
                 out.extend(match &mut self.experts {
                     Experts::GgufReference(source) => {
@@ -482,7 +482,7 @@ impl Decoder {
             let outputs = self.moe(layer, &prefix, &inputs)?;
             inputs.clear();
             let sconv = format!("{prefix}.mlp_sconv");
-            for (row, moe) in rows.iter_mut().zip(outputs.chunks_exact(HIDDEN)) {
+            for (row, moe) in rows.iter_mut().zip(outputs.as_chunks::<HIDDEN>().0) {
                 let m = conv(
                     &mut self.dense,
                     &mut self.conv,
@@ -590,7 +590,7 @@ impl Decoder {
             InklingConvStream::AttentionOutput,
             &attn,
         )?;
-        if i % 6 == 0 {
+        if i.is_multiple_of(6) {
             blocks.push(a);
         } else {
             for (x, v) in blocks.last_mut().unwrap().iter_mut().zip(a) {

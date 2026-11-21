@@ -236,11 +236,11 @@ fn q6_k(b: &[u8], y: &mut [f32]) {
 
 fn iq1_s(b: &[u8], y: &mut [f32]) {
     let d = rd_f16(b, 0);
-    for (group, output) in y.chunks_exact_mut(32).enumerate() {
+    for (group, output) in y.as_chunks_mut::<32>().0.iter_mut().enumerate() {
         let high = rd_u16(b, 34 + 2 * group);
         let scale = d * f32::from(2 * ((high >> 12) & 7) + 1);
         let delta = if high & 0x8000 == 0 { 0.125 } else { -0.125 };
-        for (index, weights) in output.chunks_exact_mut(8).enumerate() {
+        for (index, weights) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             let low = usize::from(b[2 + group * 4 + index]);
             let grid = IQ1S_GRID[low | (usize::from((high >> (3 * index)) & 7) << 8)];
             for (j, weight) in weights.iter_mut().enumerate() {
