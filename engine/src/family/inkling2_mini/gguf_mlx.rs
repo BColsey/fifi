@@ -1,7 +1,11 @@
-//! Experimental GGUF expert projection. Disk and host RAM retain GGUF bytes.
-//! The opt-in Metal path can project selected expert planes from their packed layout.
+//! GGUF expert projection. Disk and host RAM retain GGUF bytes.
+//! Metal projects supported expert planes directly from their packed layout.
 
-use std::{collections::VecDeque, rc::Rc, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    rc::Rc,
+    sync::Arc,
+};
 
 use half::bf16;
 
@@ -18,7 +22,7 @@ use super::{
 use crate::{
     EngError,
     kernels::MlxKernels,
-    tensor::{Dtype, ExecutionTensor, Tensor},
+    tensor::{Backing, Dtype, ExecutionTensor, Tensor},
     weights::{
         GgufType, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, dequantize_into,
         inkling_codebook_words,
@@ -100,6 +104,21 @@ pub(super) struct ExpertTimings {
     metal_readback_ns: u128,
     metal_readback_calls: u64,
     metal_activation_import_calls: u64,
+    gguf_file_read_bytes: u64,
+    gguf_unique_file_read_bytes: u64,
+    gguf_metal_staged_bytes: u64,
+    #[serde(skip)]
+    file_planes: HashSet<Key>,
+}
+
+impl ExpertTimings {
+    fn file_read(&mut self, name: &str, expert: usize, bytes: usize) {
+        let bytes = bytes as u64;
+        self.gguf_file_read_bytes += bytes;
+        if self.file_planes.insert((name.into(), expert)) {
+            self.gguf_unique_file_read_bytes += bytes;
+        }
+    }
 }
 
 pub(super) struct Experts {
@@ -186,13 +205,14 @@ impl Experts {
                     .import_tensor(&codebook(plane.dtype)?.expect("format has a codebook"))?;
                 self.codes.push((plane.dtype, table));
             }
-            let payload = Tensor::try_from_host(
+            let payload = Tensor::from_shared(
                 Dtype::U8,
                 vec![
                     plane.height as u32,
                     (plane.bytes.len() / plane.height) as u32,
                 ],
-                plane.bytes.clone(),
+                Backing::SharedVec(Arc::clone(&plane.bytes)),
+                0..plane.bytes.len(),
             )?;
             let projection = self.metal.import_tensor(&payload)?;
             return Ok((
@@ -364,6 +384,9 @@ impl Experts {
                 self.stats.misses += 1;
                 self.stats.read_bytes += plane.bytes.len() as u64;
                 self.stats.read_ranges += 1;
+                if let Some(timing) = &mut self.timing {
+                    timing.file_read(name, expert, plane.bytes.len());
+                }
                 if self.packed.limit != 0 {
                     self.stats.evictions += self.packed.put(
                         (name.into(), expert),
@@ -385,6 +408,7 @@ impl Experts {
                 })?;
             if let Some(timing) = &mut self.timing {
                 timing.staging_ns += staging_ns;
+                timing.gguf_metal_staged_bytes += bytes as u64;
             }
             let weight = Rc::new(projection);
             self.stats.evictions +=
@@ -563,6 +587,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gguf_read_amplification_counts_each_tensor_plane_once_per_phase() {
+        let mut timing = ExpertTimings::default();
+        timing.file_read("blk.0.ffn_gate_up_exps.weight", 3, 120);
+        timing.file_read("blk.0.ffn_gate_up_exps.weight", 3, 120);
+        timing.file_read("blk.0.ffn_down_exps.weight", 3, 80);
+        timing.file_read("blk.1.ffn_gate_up_exps.weight", 3, 130);
+        timing.file_read("blk.1.ffn_gate_up_exps.weight", 4, 130);
+        let phase = std::mem::take(&mut timing);
+        assert_eq!(phase.gguf_file_read_bytes, 580);
+        assert_eq!(phase.gguf_unique_file_read_bytes, 460);
+        timing.file_read("blk.0.ffn_gate_up_exps.weight", 3, 120);
+        assert_eq!(timing.gguf_unique_file_read_bytes, 120);
+    }
+
+    #[test]
     #[ignore = "requires complete Unsloth UD-IQ2_XXS fork weights at INKLING_GGUF_REFERENCE and Apple Metal"]
     fn packed_gguf_matvec_matches_released_expert_blocks() {
         let _lock = crate::native_test_lock();
@@ -689,6 +728,16 @@ mod tests {
                     let flushes = flush_total - flush_before;
                     let after = runtime.stats();
                     let timing = runtime.take_component_timings().unwrap();
+                    assert_eq!(
+                        timing.gguf_file_read_bytes,
+                        after.read_bytes - before.read_bytes
+                    );
+                    assert!(timing.gguf_unique_file_read_bytes <= timing.gguf_file_read_bytes);
+                    if case == "warm" {
+                        assert_eq!(timing.gguf_metal_staged_bytes, 0);
+                    } else {
+                        assert!(timing.gguf_metal_staged_bytes > 0);
+                    }
                     let calls = if batched { 2 } else { 16 };
                     assert_eq!(timing.metal_activation_import_calls, calls);
                     assert_eq!(timing.metal_readback_calls, calls);

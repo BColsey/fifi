@@ -800,7 +800,7 @@ pub(super) struct ExpertPlane {
     pub(super) width: usize,
     pub(super) height: usize,
     pub(super) dtype: GgufType,
-    pub(super) bytes: Vec<u8>,
+    pub(super) bytes: std::sync::Arc<Vec<u8>>,
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -819,7 +819,7 @@ impl Weights {
             width,
             height,
             dtype,
-            bytes,
+            bytes: std::sync::Arc::new(bytes),
         })
     }
 }

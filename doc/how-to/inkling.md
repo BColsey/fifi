@@ -401,6 +401,13 @@ Use these prompt values with `--prompt` and keep the context at 128 for the repo
 
 For the sustained 5 GiB storage comparison, set `FIFI_INKLING_MMAP_DENSE` and `FIFI_INKLING_FILE_CACHE_ONLY` to `0` in the private/LRU arm and `1` in the mapped/file-cache arm. For the longer-prefill comparison, keep both settings at `1` and change `FIFI_INKLING_PREFILL_ROWS` from `1` to `4`. Set `FIFI_INKLING_COMPONENT_TIMING=1` for the phase-level CPU, Metal, and logical dense I/O counters.
 
+For GGUF, the same timing output reports `gguf_file_read_bytes`,
+`gguf_unique_file_read_bytes`, and `gguf_metal_staged_bytes`. The first two
+show total file demand and one copy per distinct expert tensor plane in each
+phase. The last counts the packed or expanded weights staged for Metal,
+including weights served from the retained RAM tier. Use the benchmark's
+process-attributed disk counter to check physical SSD reads.
+
 ## Integration status
 
 The benchmark measurements used `e9f74c2b` on integration base `ee830759` with the measured settings selected explicitly. The newer local defaults enable native selection, CPU attention workers, and the qualified GGUF settings. Safetensors mapped storage and multi-row prefill remain explicit settings because their physical I/O gains varied by workload. Integration and publication are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
