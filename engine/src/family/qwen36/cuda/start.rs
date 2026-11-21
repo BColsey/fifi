@@ -1384,6 +1384,19 @@ fn load_need_of<'a>(
     }
 }
 
+/// Whether the step can run the int8 cache: its chunk prefill needs the prefill arena, which the
+/// plan's chunked prefill (the int8 cache's opt-in) provides. The answer is the prefill admission's
+/// own predicate (`needs_arena`), so the card choice never plans a form the step then refuses
+/// ("fixed prefill admission: this step cannot use a chunk arena").
+fn int8_cache_usable(plan: &StartupPlan) -> bool {
+    super::prefill_driver::needs_arena(
+        WeightLayout::Native,
+        KvMode::Int8G32,
+        false,
+        plan.modes.chunked,
+    )
+}
+
 /// The cache form and context of a start that left them to the card, asked before any weight is
 /// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
 /// its native tensors, so the choice charges what the load will. A start whose config fixes both
@@ -1409,6 +1422,7 @@ fn card_fit(
         &settings.spec,
         free,
         weights,
+        int8_cache_usable(plan),
         (!settings.kv_auto).then_some(settings.kv),
         (!settings.context_auto).then_some(settings.context_limit),
         &load_need_of(settings, plan),
@@ -1464,6 +1478,7 @@ fn replan_smaller(
         &settings.spec,
         free,
         weights,
+        true,
         Some(settings.kv),
         Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
         &load_need_of(settings, plan),

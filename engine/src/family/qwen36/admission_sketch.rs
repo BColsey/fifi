@@ -254,6 +254,7 @@ pub(crate) fn choose_cuda_fit(
     spec: &crate::family::spec::FamilySpec,
     free: u64,
     weights: u64,
+    int8_usable: bool,
     kv: Option<crate::family::qwen36::settings::KvDtype>,
     context: Option<u32>,
     load_need: &dyn Fn(crate::family::qwen36::settings::KvDtype, u32) -> Option<u64>,
@@ -287,6 +288,11 @@ pub(crate) fn choose_cuda_fit(
     let named: Vec<CacheForm<'_, KvDtype>> = candidates
         .into_iter()
         .filter(|candidate| kv.is_none_or(|fixed| fixed == candidate.form))
+        // The int8 cache runs through the chunk prefill arena; a step that cannot use the arena
+        // (the chunked prefill that gives int8 its arena is off) refuses it at the prefill admission. A start that left the form to
+        // the card only plans a form the step runs; a named form is the operator's. Which forms
+        // are eligible is decided here; how long a context each holds is the fit's.
+        .filter(|candidate| candidate.form != KvDtype::Q8 || int8_usable || kv == Some(KvDtype::Q8))
         .collect();
     Ok(plan_card_fit(
         CardBytes {
@@ -493,8 +499,16 @@ mod tests {
     #[test]
     fn a_roomy_card_keeps_fp16_at_the_model_maximum() {
         let free = free_for(KvDtype::F32, WEIGHTS, MODEL_MAX_CONTEXT);
-        let fit =
-            choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0)).unwrap();
+        let fit = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            true,
+            None,
+            None,
+            &|_, _| Some(0),
+        )
+        .unwrap();
         assert_eq!(
             fit,
             Some(CudaFit {
@@ -507,9 +521,17 @@ mod tests {
     #[test]
     fn fp16_is_kept_where_it_reaches_the_sufficient_context() {
         let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0))
-            .unwrap()
-            .expect("fits");
+        let fit = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            true,
+            None,
+            None,
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!(fit.form, KvDtype::F32);
         assert_eq!(fit.context, 150_528);
     }
@@ -517,9 +539,17 @@ mod tests {
     #[test]
     fn int8_is_chosen_where_fp16_falls_short_of_the_sufficient_context() {
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0))
-            .unwrap()
-            .expect("fits");
+        let fit = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            true,
+            None,
+            None,
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!(fit.form, KvDtype::Q8);
         assert!(fit.context > 150_000, "{}", fit.context);
         // The chosen context is the largest one that fits: one step more does not.
@@ -539,6 +569,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            true,
             Some(KvDtype::F32),
             None,
             &|_, _| Some(0),
@@ -551,6 +582,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            true,
             None,
             Some(65_536),
             &|_, _| Some(0),
@@ -563,6 +595,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            true,
             None,
             Some(180_224),
             &|_, _| Some(0),
@@ -581,6 +614,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            true,
             None,
             Some(262_144),
             &|_, _| Some(0),
@@ -603,6 +637,7 @@ mod tests {
             &QWEN3_6_35B_A3B,
             free,
             WEIGHTS,
+            true,
             None,
             Some(262_144),
             &|_, _| Some(0),
@@ -621,14 +656,23 @@ mod tests {
     #[test]
     fn a_card_that_carries_nothing_answers_none() {
         let free = free_for(KvDtype::Q8, WEIGHTS, 1024) - 1;
-        let fit =
-            choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0)).unwrap();
+        let fit = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            true,
+            None,
+            None,
+            &|_, _| Some(0),
+        )
+        .unwrap();
         assert_eq!(fit, None);
         assert_eq!(
             choose_cuda_fit(
                 &QWEN3_6_35B_A3B,
                 WEIGHTS - 1,
                 WEIGHTS,
+                true,
                 None,
                 None,
                 &|_, _| Some(0)
@@ -636,5 +680,45 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn int8_is_not_planned_where_the_step_cannot_run_it() {
+        // fp16 reaches 100,352 positions on this card, short of the sufficient context, so a
+        // step that can run the int8 cache gets it (above); one that cannot (the chunked prefill
+        // that gives int8 its arena is off) gets the longest fp16 context the card holds.
+        let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
+        let none = &|_, _| Some(0);
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, false, None, None, none)
+            .unwrap()
+            .expect("fits");
+        assert_eq!((fit.form, fit.context), (KvDtype::F32, 100_352));
+        // The same card, a named context fp16 cannot hold: fp16's longest, not an int8 start
+        // the prefill would refuse.
+        let named = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            false,
+            None,
+            Some(262_144),
+            none,
+        )
+        .unwrap()
+        .expect("fits");
+        assert_eq!((named.form, named.context), (KvDtype::F32, 100_352));
+        // A named int8 cache is the operator's and stays.
+        let asked = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            false,
+            Some(KvDtype::Q8),
+            None,
+            none,
+        )
+        .unwrap()
+        .expect("fits");
+        assert_eq!(asked.form, KvDtype::Q8);
     }
 }
