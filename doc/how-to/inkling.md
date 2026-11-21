@@ -370,3 +370,17 @@ FIFI_INKLING_PREFILL_ROWS=1 python3 -B engine/tests/tools/bench_inkling.py \
 ```
 
 The driver starts one server on an OS-assigned loopback port, sends two identical greedy requests, and checks that both reach the requested output limit. It writes the server config, startup and phase log, and a JSON receipt with wall time, request timings, process-attributed disk bytes, and system swap-page deltas on macOS. Existing Inkling environment settings carry through to the server. Use `--ceiling-mib auto` to remove a configured ceiling, `--tokenizer-dir` for a separate pinned bundle, and `--commit`, `--build`, and `--checkpoint-id` to record artifact provenance. The OS page cache is uncontrolled across runs.
+
+Use these prompt values with `--prompt` and keep the context at 128 for the reported safetensors comparisons. The driver validates the prompt length and both output counts. Run each arm in a fresh process and use a new output directory.
+
+| Workload | Prompt as a Python string expression | Prompt tokens | `--max-tokens` |
+| --- | --- | ---: | ---: |
+| Short | `"The capital of France is"` | 5 | 12 |
+| Longer prefill | `"Rivers flow into the sea. " * 8 + "Name a river in France."` | 62 | 8 |
+| Sustained decode | `"Write a detailed history of Paris, beginning with its earliest settlements."` | 14 | 64 |
+
+For the sustained 5 GiB storage comparison, set `FIFI_INKLING_MMAP_DENSE` and `FIFI_INKLING_FILE_CACHE_ONLY` to `0` in the private/LRU arm and `1` in the mapped/file-cache arm. For the longer-prefill comparison, keep both settings at `1` and change `FIFI_INKLING_PREFILL_ROWS` from `1` to `4`. Set `FIFI_INKLING_COMPONENT_TIMING=1` for the phase-level CPU, Metal, and logical dense I/O counters.
+
+## Integration status
+
+The tested native code is `e9f74c2b` on integration base `ee830759`. Later commits on `task/inkling2-mini-pr` record qualification evidence and launch instructions. Native selection and the performance settings are opt-in. Integration and publication of the native adapters, optimization commits, and benchmark results are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
