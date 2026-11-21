@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn an_architecture_outside_the_table_is_refused_naming_it_and_the_known_ones() {
-        for architecture in ["mamba9", "gemma4", "flint"] {
+        for architecture in ["mamba9", "gemma4", "flint", "qwen4exp", "nemotron_h_moe"] {
             let dir = directory_of_architecture(architecture);
             let error = discover(&args_for(dir.path())).unwrap_err().0;
             assert!(error.contains(architecture), "{error}");
