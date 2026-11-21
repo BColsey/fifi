@@ -236,47 +236,6 @@ pub fn check_humanizer_config(json: &[u8]) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The Bolt identity a weights file states in its own header, for a directory with no
-/// `config.json`: the architecture and the integer and float keys that fix the text stack. The
-/// loader checks every tensor against the same geometry, so the header is the whole gate.
-#[cfg(any(feature = "native-cuda", test))]
-pub fn check_bolt_header(header: &crate::weights::GgufHeader) -> Result<(), EngError> {
-    use crate::weights::MetaValue;
-    let bad = |message: String| EngError::Checkpoint(format!("gemma4 GGUF header: {message}"));
-    match header.meta("general.architecture") {
-        Some(MetaValue::String(name)) if name == "gemma4" => {}
-        _ => return Err(bad("general.architecture is not gemma4".into())),
-    }
-    for (key, expected) in [
-        ("gemma4.block_count", 42u32),
-        ("gemma4.context_length", 65_536),
-        ("gemma4.embedding_length", 2560),
-        ("gemma4.embedding_length_per_layer_input", 256),
-        ("gemma4.feed_forward_length", 10_240),
-        ("gemma4.attention.head_count", 8),
-        ("gemma4.attention.key_length", 512),
-        ("gemma4.attention.key_length_swa", 256),
-        ("gemma4.attention.value_length", 512),
-        ("gemma4.attention.value_length_swa", 256),
-        ("gemma4.attention.sliding_window", 512),
-        ("gemma4.attention.shared_kv_layers", 18),
-    ] {
-        match header.meta(key) {
-            Some(MetaValue::U32(found)) if *found == expected => {}
-            Some(MetaValue::U32(found)) => {
-                return Err(bad(format!(
-                    "{key} is {found}, the Bolt E4B has {expected}"
-                )));
-            }
-            _ => return Err(bad(format!("{key} is missing or not an integer"))),
-        }
-    }
-    match header.meta("gemma4.final_logit_softcapping") {
-        Some(MetaValue::F32(found)) if (*found - 30.0).abs() < 1e-6 => Ok(()),
-        _ => Err(bad("gemma4.final_logit_softcapping is not 30".into())),
-    }
-}
-
 /// The strict configuration check for the Nemotron 3.5 Bolt E4B checkpoint
 /// (`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16`): the base Gemma 4 architecture
 /// with two KV heads and eighteen shared-K/V layers. The multimodal checkpoint

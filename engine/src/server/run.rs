@@ -653,7 +653,20 @@ fn start_gemma4(
     #[cfg(feature = "native-cuda")]
     {
         let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        match gemma4::serve::bolt_configured(&model_directory) {
+        // A directory with no `config.json` is the weights file alone: its header states the
+        // same geometry.
+        let gate = gemma4::serve::bolt_configured(&model_directory).or_else(|error| {
+            if model_directory.join("config.json").exists() {
+                return Err(error);
+            }
+            crate::family::gguf_select::check_header_identity(
+                &config.model_dir,
+                "gemma4",
+                crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_KEYS,
+                Some(crate::family::spec::NEMOTRON_BOLT_E4B_GGUF_SOFTCAP),
+            )
+        });
+        match gate {
             Ok(()) => {
                 let started = gemma4::serve::start_bolt_engine(
                     &config.model_dir,

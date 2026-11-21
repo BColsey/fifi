@@ -21,16 +21,9 @@ use {super::config, crate::EngError};
 /// family. A directory that is not a Bolt checkpoint fails the check.
 #[cfg(any(feature = "native-cuda", test))]
 pub(crate) fn bolt_configured(model_dir: &Path) -> Result<(), EngError> {
-    match fs::read(model_dir.join("config.json")) {
-        Ok(json) => config::check_bolt_config(&json),
-        // A directory of the weights file alone: the header states the same identity.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let (_, files) = crate::family::gguf_select::candidates(model_dir)?;
-            let header = crate::weights::shared_header(&files[0].path, 256 << 20)?;
-            config::check_bolt_header(&header)
-        }
-        Err(error) => Err(EngError::Checkpoint(format!("gemma4 config.json: {error}"))),
-    }
+    let json = fs::read(model_dir.join("config.json"))
+        .map_err(|error| EngError::Checkpoint(format!("gemma4 config.json: {error}")))?;
+    config::check_bolt_config(&json)
 }
 
 #[cfg(feature = "native-cuda")]
@@ -75,56 +68,6 @@ mod tests {
         assert_eq!(found, dir);
         assert_eq!(files.len(), 1);
         bolt_configured(&found).expect("the Bolt config gate passes beside the file");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_directory_of_the_weights_file_alone_passes_on_its_header_and_a_wrong_header_does_not() {
-        let dir = scratch("header");
-        let kv_u32 =
-            |key: &str, value: u32| crate::tokenizer::gguf::tests::kv_u32_for_tests(key, value);
-        let mut kvs = vec![crate::tokenizer::gguf::tests::kv_string_for_tests(
-            "general.architecture",
-            "gemma4",
-        )];
-        for (key, value) in [
-            ("gemma4.block_count", 42u32),
-            ("gemma4.context_length", 65_536),
-            ("gemma4.embedding_length", 2560),
-            ("gemma4.embedding_length_per_layer_input", 256),
-            ("gemma4.feed_forward_length", 10_240),
-            ("gemma4.attention.head_count", 8),
-            ("gemma4.attention.key_length", 512),
-            ("gemma4.attention.key_length_swa", 256),
-            ("gemma4.attention.value_length", 512),
-            ("gemma4.attention.value_length_swa", 256),
-            ("gemma4.attention.sliding_window", 512),
-            ("gemma4.attention.shared_kv_layers", 18),
-        ] {
-            kvs.push(kv_u32(key, value));
-        }
-        kvs.push(crate::tokenizer::gguf::tests::kv_f32_for_tests(
-            "gemma4.final_logit_softcapping",
-            30.0,
-        ));
-        std::fs::write(
-            dir.join("bolt.gguf"),
-            crate::tokenizer::gguf::tests::gguf_file(&kvs),
-        )
-        .expect("write weights");
-        bolt_configured(&dir).expect("the header is the Bolt E4B's");
-        kvs[1] = kv_u32("gemma4.block_count", 30);
-        std::fs::write(
-            dir.join("bolt.gguf"),
-            crate::tokenizer::gguf::tests::gguf_file(&kvs),
-        )
-        .expect("write weights");
-        let error = bolt_configured(&dir).expect_err("another depth is refused");
-        assert!(
-            error.describe().contains("block_count"),
-            "{}",
-            error.describe()
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
