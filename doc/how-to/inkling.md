@@ -33,6 +33,7 @@ The GGUF adapters advance prompt tokens serially and can group expert projection
 FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
   FIFI_MLX_WORKING_SET_MIB=6144 FIFI_INKLING_GGUF_PACKED_MLX=1 \
   FIFI_INKLING_GGUF_MMAP_DENSE=1 FIFI_INKLING_ATTN_CPU_WORKERS=4 \
+  FIFI_INKLING_GGUF_BATCH_EXPERTS=1 FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1 \
   target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
   --tokenizer-dir ~/models/inkling2-mini --context 192 --listen 127.0.0.1:18795
 ```
@@ -98,7 +99,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced all 3,909 cache misses under byte-weighted LRU. All 4,388 repeated expert selections within the same token’s core passes hit the cache. Across tokens, 3,991 of 6,632 repeated selections hit. Layers 23 and 22 accounted for the most logical reads. Adjacent expert coalescing saved 312 read ranges on the first request and 282 on its repeat, measured against a one-range-per-expert-tensor replay with identical payload bytes. Frequency-based replay increased logical payload reads by 3.7%. The idle-host sustained comparison measured about 34% less process-attributed disk I/O with mapped weights and file-cache retention. Keep mapped storage opt-in. |
 | 4 | Measure placement | On the safetensors short repeat, 11 decode steps spent 1.68 s in CPU attention, 3.90 s in expert staging including 2.80 s of demand reads, and 1.11 s in synchronized Metal readback. Real-weight one-row QKV tests favored four CPU workers over the widened Metal path. The short end-to-end safetensors run showed a small decode gain with four workers. The GGUF experiments below test attention workers and grouped readback separately. |
 | 5 | Verify scaling | At a 192-token context, preflight rejected all three artifacts with a 1 GiB ceiling. The safetensors plan required 3,471,813,632 bytes, and each GGUF plan required 1,206,322,432 bytes. The mini applied the 5 GiB, 6 GiB and automatic ceilings in the idle-host run below. Automatic sizing incurred swap-outs on the first request and hit every expert on the repeat. The larger-device planner unit test uses simulated 24, 48 and 96 GiB working sets. |
-| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, both full checkpoints selected the reference token, and the fork matched all ten leading external-reference IDs. Both explicit file paths passed repeated raw completions and streamed chat at `71aa350c`. At `e9f74c2b`, each serving layout passed the matched single-copy, grouped projection and CPU worker trials below. The combined flags passed raw and streamed chat on the fork. The equivalent mainline check is queued. |
+| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, both full checkpoints selected the reference token, and the fork matched all ten leading external-reference IDs. Both explicit file paths passed repeated raw completions and streamed chat at `71aa350c`. At `e9f74c2b`, each serving layout passed the matched single-copy, grouped projection and CPU worker trials below. Both also passed repeated raw completions and streamed chat with all three flags enabled. |
 
 The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
 
@@ -326,16 +327,18 @@ The same `e9f74c2b` procedure ran on the mainline artifact. No competing build w
 
 Four workers reduced repeat attention projection time from 14.27 s in both controls to 7.25 s. Grouped execution reduced expert readbacks from 12,288 to 1,536 and repeat readback time from 5.59–5.68 s to 2.19 s. Single-copy retention lowered peak footprint by 1.21–1.24 GB. The same first-request logical payloads produced a 3.70 GB spread in physical traffic between the controls.
 
-### Combined GGUF settings on the Unsloth fork
+### Combined GGUF settings
 
-The `e9f74c2b` build enabled four CPU workers, grouped Metal readback, and single-copy expert retention at the same 6 GiB ceiling and 192-token context. Both raw responses matched the preceding 12-token controls. They finished more than 28 seconds before the next Xcode build started. The subsequent streamed chat returned separate reasoning and “Paris,” then stopped at EOS after 56 completion tokens. Xcode overlapped the chat, which serves as a correctness check.
+The `e9f74c2b` build enabled four CPU workers, grouped Metal readback, and single-copy expert retention at the same 6 GiB ceiling and 192-token context. Each layout's raw responses matched its preceding 12-token controls. The last raw request finished 28 seconds before the next Xcode build on the fork and 38 seconds before it on mainline. The subsequent streamed chats returned separate reasoning and “Paris,” then stopped at EOS after 56 completion tokens. Xcode overlapped the chats, which serve as correctness checks.
 
-| Request | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (MB) | Peak process footprint (GB) | Swap-out pages |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| First | 6.65 | 0.75 | 0.78 | 20.83 | 3.10 | 4,757.52 | 3.54 | 0 |
-| Repeat | 3.69 | 1.36 | 0.97 | 15.02 | 0 | 3.42 | 3.54 | 0 |
+| Layout | Request | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (MB) | Peak process footprint (GB) | Swap-out pages |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unsloth fork | First | 6.65 | 0.75 | 0.78 | 20.83 | 3.10 | 4,757.52 | 3.54 | 0 |
+| Unsloth fork | Repeat | 3.69 | 1.36 | 0.97 | 15.02 | 0 | 3.42 | 3.54 | 0 |
+| Mainline | First | 10.07 | 0.50 | 0.68 | 26.15 | 3.10 | 4,598.03 | 3.50 | 0 |
+| Mainline | Repeat | 3.65 | 1.37 | 0.98 | 14.93 | 0 | 0.07 | 3.50 | 0 |
 
-Repeat decode rose from 0.58 to 0.97 tok/s and repeat wall time fell from about 25.8 s to 15.0 s. Peak footprint fell by about 1 GB. The first request read 4.76 GB from disk, above both controls with the same logical expert payload. The OS page cache was uncontrolled.
+Repeat decode rose from 0.58 to 0.97–0.98 tok/s. Repeat wall time fell from about 25.8 s to about 15 s on both layouts. Peak footprint fell by about 1 GB. The first request read 4.76 GB on the fork and 4.60 GB on mainline, above their controls with the same logical expert payload. The OS page cache was uncontrolled.
 
 ### Speculative read replay
 
