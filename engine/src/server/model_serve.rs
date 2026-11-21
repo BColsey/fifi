@@ -546,7 +546,7 @@ pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
                 .unwrap_or_else(|| args.model_dir.clone()),
             family: family.to_string(),
             model: None,
-            context_limit: (discovered.family == RAON1_FAMILY)
+            context_limit: (family == RAON1_FAMILY)
                 .then_some(args.context_limit)
                 .flatten(),
             think_replay: None,

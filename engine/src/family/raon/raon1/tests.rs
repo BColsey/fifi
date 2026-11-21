@@ -372,7 +372,7 @@ fn a_wrong_type_fails_naming_the_tensor_and_both_types() {
     let error = rejection(open(&metadata(spec, "raon1"), &tensors, spec));
     assert!(error.contains("token_embd.weight"), "{error}");
     assert!(error.contains("F16"), "{error}");
-    assert!(error.contains("Q4_K"), "{error}");
+    assert!(error.contains("no kernel route"), "{error}");
 }
 
 #[test]
@@ -393,9 +393,9 @@ fn a_swapped_dim_pair_fails_naming_both_shapes() {
 }
 
 #[test]
-fn a_down_expert_type_swap_fails_naming_the_layer_tensor() {
+fn a_down_expert_type_other_than_the_published_one_opens_when_a_kernel_reads_it() {
     let spec = tiny_spec();
-    // layer 1 is Q5_0 in the spec's table; Q8_0 there must fail.
+    // layer 1 is Q5_0 in the spec's table; Q8_0 there opens, and so does Q5_0 on a Q8_0 layer.
     let mut tensors = file_tensors(spec);
     replace(
         &mut tensors,
@@ -403,22 +403,24 @@ fn a_down_expert_type_swap_fails_naming_the_layer_tensor() {
         GgufType::Q80,
         vec![spec.moe_inter, spec.hidden, spec.experts],
     );
-    let error = rejection(open(&metadata(spec, "raon1"), &tensors, spec));
-    assert!(
-        error.contains("blk.1.ffn_down_exps.weight") && error.contains("expected Q5_0"),
-        "{error}"
-    );
-    // layer 2 is Q8_0 in the spec's table; Q5_0 there must fail.
-    let mut tensors = file_tensors(spec);
     replace(
         &mut tensors,
         "blk.2.ffn_down_exps.weight",
         GgufType::Q50,
         vec![spec.moe_inter, spec.hidden, spec.experts],
     );
+    open(&metadata(spec, "raon1"), &tensors, spec).expect("kernel-readable types open");
+    // A type no kernel reads is refused by name.
+    let mut tensors = file_tensors(spec);
+    replace(
+        &mut tensors,
+        "blk.1.ffn_down_exps.weight",
+        GgufType::F16,
+        vec![spec.moe_inter, spec.hidden, spec.experts],
+    );
     let error = rejection(open(&metadata(spec, "raon1"), &tensors, spec));
     assert!(
-        error.contains("blk.2.ffn_down_exps.weight") && error.contains("expected Q8_0"),
+        error.contains("blk.1.ffn_down_exps.weight") && error.contains("F16"),
         "{error}"
     );
 }

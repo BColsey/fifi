@@ -534,6 +534,19 @@ fn check_metadata(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> 
     Ok(())
 }
 
+/// The quantized types the shared kernels read natively.
+const KERNEL_QUANTS: [GgufType; 4] = [GgufType::Q4K, GgufType::Q50, GgufType::Q6K, GgufType::Q80];
+
+/// A quantized role takes any type a kernel reads, so other quantizations and fine-tunes open;
+/// a float role takes only its own type.
+fn type_accepted(published: GgufType, found: GgufType) -> bool {
+    if KERNEL_QUANTS.contains(&published) {
+        KERNEL_QUANTS.contains(&found)
+    } else {
+        found == published
+    }
+}
+
 fn check_tensors(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
     let inventory = spec.inventory();
     for tensor in header.tensors() {
@@ -552,9 +565,10 @@ fn check_tensors(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
             .tensor(&expected.name)
             .ok_or_else(|| reject(format!("tensor {} is missing", expected.name)))?;
         let ty = tensor.ggml_type();
-        if ty != expected.ty {
+        if !type_accepted(expected.ty, ty) {
             return Err(reject(format!(
-                "tensor {} has type {}, expected {}",
+                "tensor {} has type {}, which no kernel route takes for this role (the published \
+                 file has {}; a quantized role takes Q4_K, Q5_0, Q6_K or Q8_0)",
                 expected.name,
                 ty.name(),
                 expected.ty.name()

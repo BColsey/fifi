@@ -1,0 +1,692 @@
+//! Device tests of the block_ops row operations against host references, at ragged shapes
+//! (one row, seven rows, row strides wider than the row, a cache position past zero, split keys).
+//! Device runs go through the card lease only, one test thread.
+use super::*;
+use crate::kernels::cuda::resident::block_ops::{MlaShape, RdaInputs, RowOutputs};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
+
+struct Rig {
+    ctx: CudaContext,
+    stream: DeviceStream,
+}
+
+fn rig(test: &str) -> Option<Rig> {
+    if !testkit::device_present(test) {
+        return None;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    Some(Rig { ctx, stream })
+}
+
+impl Rig {
+    fn up(&self, values: &[f32]) -> DeviceBuffer {
+        testkit::upload_f32(&self.ctx, values)
+    }
+
+    fn zeros(&self, count: usize) -> DeviceBuffer {
+        testkit::upload_filled(&self.ctx, 0, count * 4)
+    }
+
+    fn zero_bytes(&self, bytes: usize) -> DeviceBuffer {
+        testkit::upload_filled(&self.ctx, 0, bytes)
+    }
+
+    fn run(&self, op: BlockOp<'_>) {
+        self.ctx.block_op(&self.stream, op).expect("block op");
+        self.stream.synchronize().expect("drain");
+    }
+
+    fn read(&self, buffer: &DeviceBuffer, count: usize) -> Vec<f32> {
+        testkit::floats(&testkit::read_bytes(&self.ctx, buffer, count * 4))
+    }
+}
+
+fn whole(buffer: &DeviceBuffer) -> DeviceRange<'_> {
+    buffer.range(0, buffer.bytes()).expect("range")
+}
+
+fn data(seed: u64, count: usize, scale: f32) -> Vec<f32> {
+    let mut rng = testkit::Rng::new(seed);
+    (0..count).map(|_| rng.normal() as f32 * scale).collect()
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn assert_close(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
+    assert_eq!(got.len(), want.len(), "{name}: length");
+    let range = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst <= tolerance * range,
+        "{name}: worst difference {worst} over range {range} exceeds {tolerance}"
+    );
+}
+
+/// The q8_1 rows read back as f32: `d * q` per value, rows at the padded stride.
+fn dequant_q8(bytes: &[u8], rows: usize, width: usize) -> Vec<f32> {
+    let stride = q8_1_bytes(width, 1).expect("row bytes");
+    let mut out = Vec::new();
+    for row in 0..rows {
+        for block in 0..width / 32 {
+            let at = row * stride + block * 36;
+            let d = half::f16::from_le_bytes([bytes[at], bytes[at + 1]]).to_f32();
+            out.extend((0..32).map(|i| d * f32::from(bytes[at + 4 + i] as i8)));
+        }
+    }
+    out
+}
+
+fn rows_of(b: &DeviceBuffer, from: usize, rows: usize, per: usize) -> DeviceRange<'_> {
+    b.range(from * per * 4, rows * per * 4).expect("slice")
+}
+
+fn q8_tolerance(values: &[f32]) -> f32 {
+    // One code step of a 32-value block is amax / 127; half of it is the rounding bound.
+    values
+        .chunks(32)
+        .map(|b| b.iter().fold(0f32, |a, v| a.max(v.abs())))
+        .fold(0f32, f32::max)
+        / 127.0
+}
+
+#[test]
+fn fill_writes_the_value() {
+    let Some(r) = rig("block_ops fill") else {
+        return;
+    };
+    let buffer = r.zeros(37);
+    r.run(BlockOp::fill(37, 2.5, whole(&buffer)).expect("op"));
+    assert!(r.read(&buffer, 37).iter().all(|&v| v == 2.5));
+}
+
+#[test]
+fn rms_rows_matches_the_host_for_wide_strides_and_ragged_rows() {
+    let Some(r) = rig("block_ops rms_rows") else {
+        return;
+    };
+    for (n, d, ld) in [(1usize, 576usize, 576usize), (7, 576, 608), (3, 2560, 2560)] {
+        let x = data(11 + n as u64, n * ld, 1.0);
+        let w = data(5, d, 1.0);
+        let (xb, wb) = (r.up(&x), r.up(&w));
+        let y = r.zeros(n * d);
+        let q8 = r.zero_bytes(q8_1_bytes(d, n).expect("q8"));
+        r.run(
+            BlockOp::rms_rows(
+                n,
+                d,
+                ld,
+                1e-5,
+                whole(&xb),
+                whole(&wb),
+                Some(whole(&y)),
+                Some(whole(&q8)),
+            )
+            .expect("op"),
+        );
+        let mut want = Vec::new();
+        for t in 0..n {
+            let row = &x[t * ld..t * ld + d];
+            let scale = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / d as f32 + 1e-5).sqrt();
+            want.extend(row.iter().zip(&w).map(|(v, w)| v * scale * w));
+        }
+        let got = r.read(&y, n * d);
+        assert_close("rms f32", &got, &want, 1e-5);
+        let codes = dequant_q8(&testkit::read_bytes(&r.ctx, &q8, q8.bytes()), n, d);
+        let tol = q8_tolerance(&want);
+        assert!(
+            codes.iter().zip(&want).all(|(a, b)| (a - b).abs() <= tol),
+            "rms q8 rows differ beyond one code step"
+        );
+    }
+}
+
+#[test]
+fn situ_and_gated_quant_match_the_host() {
+    let Some(r) = rig("block_ops situ_quant") else {
+        return;
+    };
+    let (rows, w, ld) = (7usize, 96usize, 224usize);
+    let gate = data(21, rows * ld, 3.0);
+    let up = data(22, rows * ld, 30.0);
+    let (gb, ub) = (r.up(&gate), r.up(&up));
+    let y = r.zeros(rows * w);
+    let q8 = r.zero_bytes(q8_1_bytes(w, rows).expect("q8"));
+    r.run(
+        BlockOp::situ_quant(
+            rows,
+            w,
+            ld,
+            ld,
+            (4.0, 25.0),
+            whole(&gb),
+            whole(&ub),
+            RowOutputs {
+                q8: Some(whole(&q8)),
+                f32: Some(whole(&y)),
+            },
+        )
+        .expect("op"),
+    );
+    let mut want = Vec::new();
+    for t in 0..rows {
+        for i in 0..w {
+            let (g, u) = (gate[t * ld + i], up[t * ld + i]);
+            want.push((g / 4.0).tanh() * 4.0 * sigmoid(g) * ((u / 25.0).tanh() * 25.0));
+        }
+    }
+    assert_close("situ f32", &r.read(&y, rows * w), &want, 1e-5);
+    let codes = dequant_q8(&testkit::read_bytes(&r.ctx, &q8, q8.bytes()), rows, w);
+    let tol = q8_tolerance(&want);
+    assert!(codes.iter().zip(&want).all(|(a, b)| (a - b).abs() <= tol));
+    // The gated form, with and without the gate.
+    let x = data(23, rows * w, 1.0);
+    let g = data(24, rows * w, 2.0);
+    let (xb, gb) = (r.up(&x), r.up(&g));
+    let out = r.zeros(rows * w);
+    r.run(
+        BlockOp::gated_quant(
+            rows,
+            w,
+            whole(&xb),
+            Some(whole(&gb)),
+            RowOutputs {
+                q8: None,
+                f32: Some(whole(&out)),
+            },
+        )
+        .expect("op"),
+    );
+    let want: Vec<f32> = x.iter().zip(&g).map(|(x, g)| x * sigmoid(*g)).collect();
+    assert_close("gated", &r.read(&out, rows * w), &want, 1e-5);
+    r.run(
+        BlockOp::gated_quant(
+            rows,
+            w,
+            whole(&xb),
+            None,
+            RowOutputs {
+                q8: None,
+                f32: Some(whole(&out)),
+            },
+        )
+        .expect("op"),
+    );
+    assert_close("plain", &r.read(&out, rows * w), &x, 1e-6);
+}
+
+fn f16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn the_mixed_residual_read_apply_and_mean_match_the_host() {
+    let Some(r) = rig("block_ops hc") else { return };
+    let (h, hc, mix) = (64usize, 4usize, 17usize);
+    for n in [1usize, 7] {
+        let inp = data(31 + n as u64, n * hc * h, 1.0);
+        let fn_w: Vec<f32> = data(32, mix * hc * h, 0.05)
+            .into_iter()
+            .map(|v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let base = data(33, mix, 0.5);
+        let scale = [0.7f32, 0.9, 0.3, 0.2];
+        let (ib, wb) = (r.up(&inp), r.up_bytes(&f16_bytes(&fn_w)));
+        let (bb, sb) = (r.up(&base), r.up(&scale));
+        let (branch, post, comb) = (r.zeros(n * h), r.zeros(n * hc), r.zeros(n * 16));
+        r.run(
+            BlockOp::hc_read(
+                n,
+                h,
+                1e-5,
+                2.0,
+                whole(&ib),
+                whole(&wb),
+                whole(&bb),
+                whole(&sb),
+                whole(&branch),
+                whole(&post),
+                whole(&comb),
+            )
+            .expect("op"),
+        );
+        let (mut want_branch, mut want_post, mut want_comb) = (vec![], vec![], vec![]);
+        for t in 0..n {
+            let x = &inp[t * hc * h..(t + 1) * hc * h];
+            let rms = (x.iter().map(|v| v * v).sum::<f32>() / (hc * h) as f32 + 1e-5).sqrt();
+            let mixes: Vec<f32> = (0..mix)
+                .map(|m| {
+                    fn_w[m * hc * h..(m + 1) * hc * h]
+                        .iter()
+                        .zip(x)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        / rms
+                })
+                .collect();
+            let pre: Vec<f32> = (0..hc)
+                .map(|s| sigmoid(mixes[s] * scale[0] + base[s]))
+                .collect();
+            want_post
+                .extend((0..hc).map(|s| 2.0 * sigmoid(mixes[hc + s] * scale[1] + base[hc + s])));
+            let z = |j: usize, q: usize| mixes[8 + j * 3 + q] * scale[2] + base[8 + j * 3 + q];
+            let helmert = |i: usize, j: usize| {
+                let v = if i <= j {
+                    1.0
+                } else if i == j + 1 {
+                    -((j + 1) as f32)
+                } else {
+                    0.0
+                };
+                v / (((j + 1) * (j + 2)) as f32).sqrt()
+            };
+            let mut e = [[0f32; 4]; 4];
+            let mut rho = 0f32;
+            for i in 0..4 {
+                for xx in 0..4 {
+                    for j in 0..3 {
+                        for q in 0..3 {
+                            e[i][xx] += helmert(xx, q) * z(j, q) * helmert(i, j);
+                        }
+                    }
+                    let chart = 0.5 * if i == xx { 1.0 } else { 0.0 } + 0.125;
+                    rho = rho.max(-e[i][xx] / chart);
+                }
+            }
+            let rho = 1.0 + rho.max(0.0);
+            let gamma = sigmoid(scale[3]);
+            let mut c = [0f32; 16];
+            for i in 0..4 {
+                for xx in 0..4 {
+                    let ident = if i == xx { 1.0 } else { 0.0 };
+                    let phi = e[i][xx] / rho + 0.5 * ident + 0.125;
+                    c[i + xx * 4] = ident + gamma * (phi - ident);
+                }
+            }
+            want_comb.extend(c);
+            want_branch.extend((0..h).map(|k| (0..hc).map(|s| x[s * h + k] * pre[s]).sum::<f32>()));
+        }
+        assert_close("branch", &r.read(&branch, n * h), &want_branch, 1e-4);
+        assert_close("post", &r.read(&post, n * hc), &want_post, 1e-4);
+        assert_close("comb", &r.read(&comb, n * 16), &want_comb, 1e-4);
+        // apply: out[dst] = sum_src comb[dst + 4 src] inp[src] + post[dst] branch
+        let out = r.zeros(n * hc * h);
+        r.run(
+            BlockOp::hc_apply(
+                n,
+                h,
+                whole(&ib),
+                whole(&branch),
+                whole(&post),
+                whole(&comb),
+                whole(&out),
+            )
+            .expect("op"),
+        );
+        let mut want = vec![0f32; n * hc * h];
+        for t in 0..n {
+            for dst in 0..hc {
+                for k in 0..h {
+                    let mut acc = 0f32;
+                    for src in 0..hc {
+                        acc += inp[(t * hc + src) * h + k] * want_comb[t * 16 + dst + src * 4];
+                    }
+                    want[(t * hc + dst) * h + k] =
+                        acc + want_branch[t * h + k] * want_post[t * hc + dst];
+                }
+            }
+        }
+        assert_close("apply", &r.read(&out, n * hc * h), &want, 1e-4);
+        let mean = r.zeros(h);
+        r.run(BlockOp::hc_mean(n - 1, h, whole(&ib), whole(&mean)).expect("op"));
+        let row = n - 1;
+        let want: Vec<f32> = (0..h)
+            .map(|k| (0..hc).map(|s| inp[(row * hc + s) * h + k]).sum::<f32>() / 4.0)
+            .collect();
+        assert_close("mean", &r.read(&mean, h), &want, 1e-6);
+    }
+}
+
+impl Rig {
+    fn up_bytes(&self, bytes: &[u8]) -> DeviceBuffer {
+        self.ctx.upload(bytes).expect("upload")
+    }
+}
+
+#[test]
+fn the_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
+    let Some(r) = rig("block_ops rda_scan") else {
+        return;
+    };
+    let (heads, hd, n) = (3usize, 128usize, 7usize);
+    let width = heads * hd;
+    let q = data(41, n * width, 1.0);
+    let k = data(42, n * width, 1.0);
+    let v = data(43, n * width, 1.0);
+    let g1 = data(44, n * width, 0.5);
+    let dt = data(45, width, 0.3);
+    let a = [0.4f32, 0.8, 1.2];
+    let beta = data(46, n * heads, 1.0);
+    let delta = data(47, n * heads, 1.0);
+    let norm_w = data(48, hd, 1.0);
+    let g2 = data(49, n * width, 1.0);
+    let bufs: Vec<DeviceBuffer> = [&q, &k, &v, &g1, &dt, &a[..], &beta, &delta, &norm_w, &g2]
+        .iter()
+        .map(|d| r.up(d))
+        .collect();
+    let host_scan = |from: usize, to: usize, state: &mut Vec<f32>| -> Vec<f32> {
+        let mut out = vec![0f32; (to - from) * width];
+        for head in 0..heads {
+            let s = &mut state[head * hd * hd..(head + 1) * hd * hd]; // s[w * hd + u]
+            for t in from..to {
+                let col =
+                    |buf: &[f32]| buf[t * width + head * hd..t * width + (head + 1) * hd].to_vec();
+                let (mut qv, mut kv) = (col(&q), col(&k));
+                for x in [&mut qv, &mut kv] {
+                    let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+                    x.iter_mut().for_each(|v| *v /= norm);
+                }
+                let bi = beta[t * heads + head];
+                let de = bi + delta[t * heads + head];
+                let sp = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+                let fold = (sp(-bi) - sp(-de)).exp();
+                let bscan = sigmoid(bi);
+                let mut o = vec![0f32; hd];
+                for w in 0..hd {
+                    let mut sk = 0f32;
+                    for u in 0..hd {
+                        let raw = (g1[t * width + head * hd + u] + dt[head * hd + u]) * a[head];
+                        s[w * hd + u] *= (-5.0 * sigmoid(-raw)).exp();
+                        sk += s[w * hd + u] * kv[u];
+                    }
+                    let dw = (v[t * width + head * hd + w] * fold - sk) * bscan;
+                    let mut acc = 0f32;
+                    for u in 0..hd {
+                        s[w * hd + u] += kv[u] * dw;
+                        acc += s[w * hd + u] * qv[u];
+                    }
+                    o[w] = acc / (hd as f32).sqrt();
+                }
+                let rn = 1.0 / (o.iter().map(|v| v * v).sum::<f32>() / hd as f32 + 1e-5).sqrt();
+                for w in 0..hd {
+                    out[(t - from) * width + head * hd + w] =
+                        o[w] * rn * norm_w[w] * sigmoid(g2[t * width + head * hd + w]);
+                }
+            }
+        }
+        out
+    };
+    let state = r.zeros(heads * hd * hd);
+    let out = r.zeros(n * width);
+    let mut host_state = vec![0f32; heads * hd * hd];
+    // Two calls (3 rows, then 4 rows) against one host pass: the state carries over.
+    for (from, to) in [(0usize, 3usize), (3, n)] {
+        let rows = to - from;
+        let slice = |b, per: usize| rows_of(b, from, rows, per);
+        r.run(
+            BlockOp::rda_scan(
+                rows,
+                heads,
+                hd,
+                -5.0,
+                1e-5,
+                RdaInputs {
+                    q: slice(&bufs[0], width),
+                    k: slice(&bufs[1], width),
+                    v: slice(&bufs[2], width),
+                    g1: slice(&bufs[3], width),
+                    dt_bias: whole(&bufs[4]),
+                    a: whole(&bufs[5]),
+                    beta: slice(&bufs[6], heads),
+                    delta: slice(&bufs[7], heads),
+                    norm_w: whole(&bufs[8]),
+                    g2: slice(&bufs[9], width),
+                },
+                whole(&state),
+                out.range(from * width * 4, rows * width * 4).expect("out"),
+            )
+            .expect("op"),
+        );
+        let want = host_scan(from, to, &mut host_state);
+        assert_close(
+            "scan",
+            &r.read(&out, n * width)[from * width..to * width],
+            &want,
+            2e-3,
+        );
+    }
+}
+
+#[test]
+fn the_latent_attention_matches_the_host_with_split_keys() {
+    let Some(r) = rig("block_ops mla") else {
+        return;
+    };
+    let (heads, nope, rope, rank) = (8usize, 128usize, 64usize, 512usize);
+    let (n, pos0, cells) = (3usize, 300usize, 320usize);
+    let shape = MlaShape {
+        n,
+        heads,
+        nope,
+        rope,
+        rank,
+    };
+    let qb = data(51, n * heads * (nope + rope), 1.0);
+    let wk_b = data(52, heads * rank * nope, 0.1);
+    let kv = data(53, n * (rank + rope), 1.0);
+    let norm_w = data(54, rank, 1.0);
+    let (qbb, wkb, kvb, nwb) = (r.up(&qb), r.up(&wk_b), r.up(&kv), r.up(&norm_w));
+    let qeff = r.zeros(n * heads * (rank + rope));
+    r.run(BlockOp::mla_q_absorb(shape, whole(&qbb), whole(&wkb), whole(&qeff)).expect("op"));
+    let got = r.read(&qeff, n * heads * (rank + rope));
+    let mut want = Vec::new();
+    for t in 0..n {
+        for h in 0..heads {
+            let q = &qb[(t * heads + h) * (nope + rope)..(t * heads + h + 1) * (nope + rope)];
+            want.extend((0..rank).map(|c| {
+                (0..nope)
+                    .map(|d| wk_b[(h * rank + c) * nope + d] * q[d])
+                    .sum::<f32>()
+            }));
+            want.extend(&q[nope..]);
+        }
+    }
+    assert_close("q absorb", &got, &want, 1e-4);
+    // The cache holds earlier positions filled with random latents; the op appends rows 300..302.
+    let history = data(55, pos0 * (rank + rope), 1.0);
+    let mut cache_values = history.clone();
+    cache_values.extend(vec![0f32; (cells - pos0) * (rank + rope)]);
+    let cache = r.up_bytes(&f16_bytes(&cache_values));
+    r.run(
+        BlockOp::mla_kv_prep(
+            n,
+            rank,
+            rope,
+            pos0,
+            cells,
+            1e-6,
+            whole(&kvb),
+            whole(&nwb),
+            whole(&cache),
+        )
+        .expect("op"),
+    );
+    let raw = testkit::read_bytes(&r.ctx, &cache, cache.bytes());
+    let rows: Vec<f32> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
+        .collect();
+    let round = |v: f32| half::f16::from_f32(v).to_f32();
+    let mut keys: Vec<Vec<f32>> = (0..pos0)
+        .map(|p| {
+            history[p * (rank + rope)..(p + 1) * (rank + rope)]
+                .iter()
+                .map(|&v| round(v))
+                .collect()
+        })
+        .collect();
+    for t in 0..n {
+        let row = &kv[t * (rank + rope)..(t + 1) * (rank + rope)];
+        let scale =
+            1.0 / (row[..rank].iter().map(|v| v * v).sum::<f32>() / rank as f32 + 1e-6).sqrt();
+        let mut key: Vec<f32> = (0..rank)
+            .map(|i| round(row[i] * scale * norm_w[i]))
+            .collect();
+        key.extend(row[rank..].iter().map(|&v| round(v)));
+        let at = (pos0 + t) * (rank + rope);
+        assert_close("cache row", &rows[at..at + rank + rope], &key, 1e-3);
+        keys.push(key);
+    }
+    // Attention over two splits of 160 keys; compare the combined mix.
+    let (splits, per_split) = (2usize, 160usize);
+    let part = r.zeros(n * (heads / 8) * splits * 8 * (rank + 4));
+    let scale = 1.0 / 192f32.sqrt();
+    r.run(
+        BlockOp::mla_attn(
+            shape,
+            pos0,
+            splits,
+            per_split,
+            scale,
+            whole(&qeff),
+            whole(&cache),
+            whole(&part),
+        )
+        .expect("op"),
+    );
+    let mix = r.zeros(n * heads * rank);
+    r.run(BlockOp::mla_reduce(n, heads, rank, splits, whole(&part), whole(&mix)).expect("op"));
+    let got = r.read(&mix, n * heads * rank);
+    let qe = r.read(&qeff, n * heads * (rank + rope));
+    let mut want = Vec::new();
+    for t in 0..n {
+        let visible = pos0 + t + 1;
+        for h in 0..heads {
+            let q = &qe[(t * heads + h) * (rank + rope)..(t * heads + h + 1) * (rank + rope)];
+            let scores: Vec<f32> = keys[..visible]
+                .iter()
+                .map(|k| k.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>() * scale)
+                .collect();
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - mx).exp()).collect();
+            let total: f32 = exps.iter().sum();
+            for c in 0..rank {
+                want.push(
+                    exps.iter()
+                        .zip(&keys[..visible])
+                        .map(|(p, k)| p * k[c])
+                        .sum::<f32>()
+                        / total,
+                );
+            }
+        }
+    }
+    assert_close("mix", &got, &want, 2e-3);
+    // Projection through wv_b.
+    let v_dim = 128usize;
+    let wv_b = data(56, heads * v_dim * rank, 0.1);
+    let (wvb, out) = (r.up(&wv_b), r.zeros(n * heads * v_dim));
+    r.run(
+        BlockOp::mla_project(n, heads, rank, v_dim, whole(&mix), whole(&wvb), whole(&out))
+            .expect("op"),
+    );
+    let mut want = Vec::new();
+    for t in 0..n {
+        for h in 0..heads {
+            let m = &got[(t * heads + h) * rank..(t * heads + h + 1) * rank];
+            want.extend((0..v_dim).map(|v| {
+                (0..rank)
+                    .map(|c| wv_b[(h * v_dim + v) * rank + c] * m[c])
+                    .sum::<f32>()
+            }));
+        }
+    }
+    assert_close("project", &r.read(&out, n * heads * v_dim), &want, 1e-4);
+}
+
+#[test]
+fn the_biased_router_matches_the_host() {
+    let Some(r) = rig("block_ops moe_route") else {
+        return;
+    };
+    let (h, e, k) = (256usize, 16usize, 4usize);
+    for n in [1usize, 7] {
+        let x = data(61 + n as u64, n * h, 1.0);
+        let w = data(62, e * h, 0.2);
+        let bias = data(63, e, 0.3);
+        let (xb, wb, bb) = (r.up(&x), r.up(&w), r.up(&bias));
+        let ids = r.zero_bytes(n * k * 4);
+        let weights = r.zeros(n * k);
+        r.run(
+            BlockOp::moe_route(
+                n,
+                h,
+                e,
+                k,
+                true,
+                6.1035156e-5,
+                whole(&xb),
+                whole(&wb),
+                whole(&bb),
+                whole(&ids),
+                whole(&weights),
+            )
+            .expect("op"),
+        );
+        let got_ids: Vec<i32> = testkit::read_bytes(&r.ctx, &ids, n * k * 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        let got_w = r.read(&weights, n * k);
+        for t in 0..n {
+            let probs: Vec<f32> = (0..e)
+                .map(|ex| sigmoid((0..h).map(|i| w[ex * h + i] * x[t * h + i]).sum()))
+                .collect();
+            let mut order: Vec<usize> = (0..e).collect();
+            order.sort_by(|&a, &b| {
+                (probs[b] + bias[b])
+                    .total_cmp(&(probs[a] + bias[a]))
+                    .then(a.cmp(&b))
+            });
+            let picked = &order[..k];
+            let total: f32 = picked
+                .iter()
+                .map(|&i| probs[i])
+                .sum::<f32>()
+                .max(6.1035156e-5);
+            for (slot, &ex) in picked.iter().enumerate() {
+                assert_eq!(got_ids[t * k + slot], ex as i32, "token {t} slot {slot}");
+                assert!((got_w[t * k + slot] - probs[ex] / total).abs() < 1e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn refusals_name_the_slot() {
+    let Some(r) = rig("block_ops refusals") else {
+        return;
+    };
+    let small = r.zeros(4);
+    let err = r
+        .ctx
+        .block_op(
+            &r.stream,
+            BlockOp::fill(64, 1.0, whole(&small)).expect("op"),
+        )
+        .expect_err("short range refused");
+    assert!(matches!(err, crate::EngError::BadRequest(_)), "{err:?}");
+}

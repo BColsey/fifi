@@ -35,17 +35,14 @@ use crate::kernels::cuda::resident::block_ops::{
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
-use crate::kernels::cuda::resident::matvec_q::MatvecCall;
+use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
-use crate::weights::{GgufType, dequantize};
+use crate::weights::dequantize;
 
 /// Token rows per chunk: the scratch is sized for this many.
 pub(crate) const CHUNK: usize = 256;
-
-/// Upper bound of the stream-k fixup scratch of the batched GEMM, for the memory plan.
-const MMQ_FIXUP_BOUND: usize = 16 << 20;
 
 const HIDDEN: usize = 2560;
 const STREAMS: usize = 4;
@@ -154,6 +151,7 @@ struct LayerNames {
     up_shexp: String,
     down_shexp: String,
     moe: bool,
+    layer: usize,
 }
 
 struct SiteNames {
@@ -220,6 +218,7 @@ impl LayerNames {
             up_shexp: n("ffn_up_shexp.weight"),
             down_shexp: n("ffn_down_shexp.weight"),
             moe: layer >= spec.leading_dense,
+            layer,
         }
     }
 }
@@ -290,7 +289,7 @@ impl Scratch {
     }
 
     /// The device bytes of the scratch of one chunk.
-    fn bytes(vocab: usize) -> u64 {
+    fn bytes(vocab: usize, fixup: u64) -> u64 {
         let c = CHUNK;
         let f = |count: usize| (count * 4) as u64;
         let q = |width: usize, rows: usize| q8(width, rows) as u64;
@@ -323,7 +322,7 @@ impl Scratch {
             + f(c * WIDTH)
             + f(c * DENSE_INTER)
             + mmq_q8_bytes(DENSE_INTER, c).expect("mmq q8 size") as u64
-            + MMQ_FIXUP_BOUND as u64
+            + fixup
             + mmq_q8_bytes(HIDDEN, c * USED).expect("mmq q8 size") as u64
             + f(c * USED) * 4
     }
@@ -390,8 +389,12 @@ impl Raon1Device {
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let tensors = crate::family::project::cuda::native_load_bytes(model.weights(), &name_refs)?;
         let mla_factor_bytes = (spec.mla_layers.len() * 2 * HEADS * RANK * HEAD_DIM * 4) as u64;
-        let fixed =
-            tensors + mla_factor_bytes + Scratch::bytes(vocab) + state_bytes(spec) + HEADROOM;
+        let fixup = ctx.mmq_fixup_bytes()? as u64;
+        let fixed = tensors
+            + mla_factor_bytes
+            + Scratch::bytes(vocab, fixup)
+            + state_bytes(spec)
+            + HEADROOM;
         let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
         let room = free.checked_sub(fixed).ok_or_else(|| {
             plan_error(format!(
@@ -424,7 +427,7 @@ impl Raon1Device {
         announce(cells);
         let reserve = Reserve {
             kv_cache: cells as u64 * KV_BYTES_PER_POSITION,
-            work: mla_factor_bytes + Scratch::bytes(vocab) + state_bytes(spec),
+            work: mla_factor_bytes + Scratch::bytes(vocab, fixup) + state_bytes(spec),
             headroom: HEADROOM,
         };
         let loader = BorrowedLoader::new(&ctx)?;
@@ -591,6 +594,10 @@ impl Raon1Device {
         let (k, rows) = (weight.k(), weight.n_rows());
         if n > 8
             && k.is_multiple_of(256)
+            && matches!(
+                weight.quant(),
+                QuantType::Q4K | QuantType::Q6K | QuantType::Q80
+            )
             && let Some(f32_rows) = x.f32
         {
             let q8_range = self.sc.mmq_q8.range(0, mmq_q8_bytes(k, n)?)?;
@@ -697,15 +704,21 @@ impl Raon1Device {
         Ok(())
     }
 
+    /// One embedding row, dequantized on the host from the type the file stores it in.
     fn embedding_row(&self, token: u32) -> Result<Vec<f32>, EngError> {
-        let row_bytes = HIDDEN / 256 * 144;
+        let name = "token_embd.weight";
+        let ty = self
+            .model
+            .header()
+            .tensor(name)
+            .ok_or_else(|| EngError::Checkpoint(format!("raon1: tensor {name} is missing")))?
+            .ggml_type();
+        let row_bytes = (HIDDEN as u64 / ty.block_elems() * ty.block_bytes()) as usize;
         let mut bytes = vec![0u8; row_bytes];
-        self.model.weights().read_range(
-            "token_embd.weight",
-            u64::from(token) * row_bytes as u64,
-            &mut bytes,
-        )?;
-        dequantize(GgufType::Q4K, &bytes)
+        self.model
+            .weights()
+            .read_range(name, u64::from(token) * row_bytes as u64, &mut bytes)?;
+        dequantize(ty, &bytes)
     }
 
     fn run_chunk(&mut self, tokens: &[u32], pos0: usize) -> Result<(), EngError> {
@@ -1158,6 +1171,19 @@ impl Raon1Device {
             sc.ids.range(0, n * USED * 4)?,
             sc.weights.range(0, n * USED * 4)?,
         )?)?;
+        if self.trace.borrow().is_some() {
+            let mut bytes = vec![0u8; n * USED * 4];
+            sc.ids.read_at(&self.stream, 0, &mut bytes)?;
+            let ids = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c) as f32)
+                .collect();
+            if let Some(trace) = self.trace.borrow_mut().as_mut() {
+                trace.push((format!("moe_ids-{}", names.layer), ids));
+            }
+        }
         // The shared expert first: its output is the base the routed picks are summed onto.
         self.mv(&names.gate_shexp, sc.cur_rows(), &sc.ffn_gate, n)?;
         self.mv(&names.up_shexp, sc.cur_rows(), &sc.ffn_up, n)?;
@@ -1173,7 +1199,11 @@ impl Raon1Device {
         self.mv(&names.down_shexp, Rows::q8(&sc.q8_ffn), &sc.shared, n)?;
         let gu_row = USED * 2 * MOE_INTER * 4;
         let stride = 2 * MOE_INTER;
-        if n > 8 {
+        let grouped = |name: &str| {
+            self.native(name)
+                .is_ok_and(|w| matches!(w.quant(), QuantType::Q4K | QuantType::Q6K))
+        };
+        if n > 8 && grouped(&names.gate_exps) && grouped(&names.up_exps) {
             self.grouped_gate_up(names, n, gu_row, stride)?;
         } else {
             let gu_span = ((USED - 1) * stride + MOE_INTER) * 4;

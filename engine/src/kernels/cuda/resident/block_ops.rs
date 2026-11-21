@@ -464,3 +464,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| block_ops_launch(stream_raw, &raw))
     }
 }
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod tests;

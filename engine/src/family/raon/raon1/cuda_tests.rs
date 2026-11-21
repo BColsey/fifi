@@ -22,6 +22,10 @@ const NEAR_TIE: f32 = 0.1;
 /// The fewest ids two top-20 sets must share.
 const MIN_OVERLAP: usize = 15;
 
+/// The largest difference over range accepted for a stage of the first layers; the measured
+/// noise floor is reported per layer by the stage tests.
+const STAGE_TOLERANCE: f32 = 3e-2;
+
 /// Greedy tokens decoded one at a time after the prompt.
 const DECODED: usize = 12;
 
@@ -217,28 +221,55 @@ fn the_host_reference_agrees_with_the_device_logits_at_every_position() {
     );
 }
 
-/// The per-layer stages of the first layers, device against host, for locating a defect.
-#[test]
-fn the_device_stages_match_the_host_reference_for_the_first_layers() {
-    let Some(path) = model_path() else { return };
-    if !device_present("the_device_stages_match_the_host_reference_for_the_first_layers") {
-        return;
-    }
-    let layers: usize = std::env::var("RAON_STAGE_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let tokens = &PROMPT[..4];
-    let model = open_raon_1_mini_preview(&path, None).expect("open");
+/// A deterministic prompt of ids spread over the vocabulary (not text).
+fn synthetic_tokens(count: usize) -> Vec<u32> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    (0..count)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            1000 + ((state >> 33) % 200_000) as u32
+        })
+        .collect()
+}
+
+/// The per-layer stages of the first `layers` layers, device against host. The device feeds
+/// `tokens[..split]` untraced, then traces the feed of the rest; the host runs the whole
+/// sequence and its rows from `split` on are compared. Prints the difference over the range of
+/// every stage, and for every MoE layer the routed experts of the device against the host's
+/// top six by biased score with the host's margin to the seventh. Returns the stages whose
+/// difference exceeds `tolerance` of their range and the routing disagreements.
+fn compare_stages(
+    path: &std::path::Path,
+    tokens: &[u32],
+    split: usize,
+    layers: usize,
+    tolerance: f32,
+) -> (Vec<String>, Vec<String>) {
+    let model = open_raon_1_mini_preview(path, None).expect("open");
     let spec = model.spec();
     let hy = hyper(&model, spec).expect("hyperparameters");
+    let (hc, h, ne, nu) = (
+        spec.streams as usize,
+        spec.hidden as usize,
+        spec.experts as usize,
+        hy.used_experts,
+    );
+    let nt = tokens.len();
     let mut host: Vec<super::cuda::Stage> = Vec::new();
     let mut inp = host_embedding(&model, tokens);
     for layer in 0..layers {
         let mut sink = |name: &str, data: &[f32]| {
-            if ["attn_norm", "hc_attn_out", "ffn_norm", "l_out"]
-                .iter()
-                .any(|stage| name == format!("{stage}-{layer}"))
+            if [
+                "attn_norm",
+                "hc_attn_out",
+                "ffn_norm",
+                "l_out",
+                "ffn_moe_probs_biased",
+            ]
+            .iter()
+            .any(|stage| name == format!("{stage}-{layer}"))
             {
                 host.push((name.to_owned(), data.to_vec()));
             }
@@ -246,43 +277,144 @@ fn the_device_stages_match_the_host_reference_for_the_first_layers() {
         inp = attn_half(&model, spec, &hy, &inp, layer, &mut sink).expect("attention half");
         inp = ffn_half(&model, spec, &hy, &inp, layer, &mut sink, None).expect("ffn half");
     }
-    let mut device = Raon1Device::load(&path, Some(4096), &mut |_| {}).expect("device load");
+    let mut device = Raon1Device::load(path, Some(nt.max(4096).next_multiple_of(256)), &mut |_| {})
+        .expect("device load");
     device.reset().expect("reset");
-    device.trace_next_feed();
-    device.feed(tokens, 0, HeadRows::None).expect("traced feed");
-    let traced = device.take_trace();
-    let mut bad = Vec::new();
-    for (name, want) in &host {
-        let Some((_, got)) = traced.iter().find(|(n, _)| n == name) else {
-            panic!("the device trace has no stage {name}");
-        };
-        assert_eq!(want.len(), got.len(), "{name}: length");
-        let range = want.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-6);
-        let diff = want
-            .iter()
-            .zip(got)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        eprintln!(
-            "{name:16} max abs diff {diff:.5} of range {range:.4} ({:.2e})",
-            diff / range
-        );
-        if diff / range > 3e-2 || !diff.is_finite() {
-            bad.push(name.clone());
-        }
+    if split > 0 {
+        device
+            .feed(&tokens[..split], 0, HeadRows::None)
+            .expect("prefix feed");
     }
+    device.trace_next_feed();
+    device
+        .feed(&tokens[split..], split, HeadRows::None)
+        .expect("traced feed");
+    let traced = device.take_trace();
+    // A chunked feed traces the same stage once per chunk: join them in order.
+    let joined = |name: &str| -> Vec<f32> {
+        traced
+            .iter()
+            .filter(|(n, _)| n == name)
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect()
+    };
+    let (mut bad, mut routing) = (Vec::new(), Vec::new());
+    for layer in 0..layers {
+        for stage in ["attn_norm", "hc_attn_out", "ffn_norm", "l_out"] {
+            let name = format!("{stage}-{layer}");
+            let (_, all) = host.iter().find(|(n, _)| *n == name).expect("host stage");
+            let per_token = all.len() / nt;
+            let want = &all[split * per_token..];
+            let got = joined(&name);
+            assert_eq!(want.len(), got.len(), "{name}: length");
+            let range = want.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-6);
+            let diff = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "{name:16} diff {diff:.5} of range {range:.4} ({:.2e})",
+                diff / range
+            );
+            if diff / range > tolerance || !diff.is_finite() {
+                bad.push(name);
+            }
+        }
+        let Some((_, biased)) = host
+            .iter()
+            .find(|(n, _)| *n == format!("ffn_moe_probs_biased-{layer}"))
+        else {
+            continue;
+        };
+        let ids = joined(&format!("moe_ids-{layer}"));
+        let mut flips = 0;
+        for t in split..nt {
+            let row = &biased[t * ne..(t + 1) * ne];
+            let order = top_k(row, nu + 1);
+            let margin = row[order[nu - 1]] - row[order[nu]];
+            let mut host_set: Vec<usize> = order[..nu].to_vec();
+            host_set.sort_unstable();
+            let at = (t - split) * nu;
+            let mut dev_set: Vec<usize> = ids[at..at + nu].iter().map(|&v| v as usize).collect();
+            dev_set.sort_unstable();
+            if host_set != dev_set {
+                flips += 1;
+                routing.push(format!("layer {layer} token {t}: margin {margin:.5}"));
+            }
+        }
+        eprintln!(
+            "moe-{layer:<11} routed sets differ at {flips} of {} tokens",
+            nt - split
+        );
+    }
+    let _ = (hc, h);
+    (bad, routing)
+}
+
+fn stage_layers(default: usize) -> usize {
+    std::env::var("RAON_STAGE_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The per-layer stages of the first layers (all 25 with `RAON_STAGE_LAYERS=25`), for locating
+/// a defect and for reading the noise floor.
+#[test]
+fn the_device_stages_match_the_host_reference_for_the_first_layers() {
+    let Some(path) = model_path() else { return };
+    if !device_present("the_device_stages_match_the_host_reference_for_the_first_layers") {
+        return;
+    }
+    let (bad, routing) = compare_stages(&path, &PROMPT[..4], 0, stage_layers(4), STAGE_TOLERANCE);
+    eprintln!("routing disagreements: {routing:?}");
     assert!(
         bad.is_empty(),
-        "stages differ beyond 3e-2 of range: {bad:?}"
+        "stages differ beyond {STAGE_TOLERANCE} of range: {bad:?}"
     );
 }
 
-/// The fork's final logits over the frozen 42-token fixture prompt: an oracle independent of the
-/// host reference. The device's top three must be the same ids, within the quantization noise.
+/// A prompt past one chunk: the delta-rule state and the convolution history carry across the
+/// chunk boundary at 256 tokens.
 #[test]
-fn the_device_top_logits_match_the_fork_on_the_fixture_prompt() {
+fn the_device_stages_match_across_a_chunk_boundary() {
     let Some(path) = model_path() else { return };
-    if !device_present("the_device_top_logits_match_the_fork_on_the_fixture_prompt") {
+    if !device_present("the_device_stages_match_across_a_chunk_boundary") {
+        return;
+    }
+    let tokens = synthetic_tokens(300);
+    let (bad, routing) = compare_stages(&path, &tokens, 0, stage_layers(4), STAGE_TOLERANCE);
+    eprintln!("routing disagreements: {routing:?}");
+    assert!(
+        bad.is_empty(),
+        "stages differ beyond {STAGE_TOLERANCE} of range: {bad:?}"
+    );
+}
+
+/// A decode step over more than 1,024 keys: the latent attention splits the keys and reduces the
+/// partial softmaxes.
+#[test]
+fn the_device_stages_match_with_split_key_attention() {
+    let Some(path) = model_path() else { return };
+    if !device_present("the_device_stages_match_with_split_key_attention") {
+        return;
+    }
+    let tokens = synthetic_tokens(1101);
+    let (bad, routing) = compare_stages(&path, &tokens, 1100, stage_layers(4), STAGE_TOLERANCE);
+    eprintln!("routing disagreements: {routing:?}");
+    assert!(
+        bad.is_empty(),
+        "stages differ beyond {STAGE_TOLERANCE} of range: {bad:?}"
+    );
+}
+
+/// Final logits recorded by an independent implementation over the frozen 42-token fixture
+/// prompt, separate from the host reference. The device's top three must be the same ids, within the quantization noise.
+#[test]
+fn the_device_top_logits_match_the_recorded_logits_on_the_fixture_prompt() {
+    let Some(path) = model_path() else { return };
+    if !device_present("the_device_top_logits_match_the_recorded_logits_on_the_fixture_prompt") {
         return;
     }
     const FIXTURE: [u32; 42] = [
@@ -291,7 +423,7 @@ fn the_device_top_logits_match_the_fork_on_the_fixture_prompt() {
         46, 254733, 27335, 44, 4565, 46, 124319, 156431, 44, 235664, 73629, 177858, 9678, 444,
         2452, 44, 3248,
     ];
-    const FORK_TOP3: [(usize, f32); 3] = [(44, 21.71462), (58, 19.871094), (369, 19.577736)];
+    const RECORDED_TOP3: [(usize, f32); 3] = [(44, 21.71462), (58, 19.871094), (369, 19.577736)];
     let mut device = Raon1Device::load(&path, Some(4096), &mut |_| {}).expect("device load");
     device.reset().expect("reset");
     let rows = device
@@ -299,9 +431,9 @@ fn the_device_top_logits_match_the_fork_on_the_fixture_prompt() {
         .expect("fixture feed");
     let row = &rows[0];
     let top = top_k(row, 3);
-    for (rank, &(id, want)) in FORK_TOP3.iter().enumerate() {
+    for (rank, &(id, want)) in RECORDED_TOP3.iter().enumerate() {
         eprintln!(
-            "rank {rank}: fork {id} {want:.4} | device {} {:.4}",
+            "rank {rank}: recorded {id} {want:.4} | device {} {:.4}",
             top[rank], row[top[rank]]
         );
         assert_eq!(top[rank], id, "rank {rank} id");

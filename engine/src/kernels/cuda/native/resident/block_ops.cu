@@ -756,8 +756,11 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             const size_t smem = (size_t)kMlaGroup * kMlaWidth * 4 +
                                 (size_t)kMlaTile * kMlaRowHalves * 2 +
                                 (size_t)kMlaGroup * kMlaTile * 4;
-            static thread_local bool configured = false;
-            if (!configured) {
+            // The dynamic shared-memory limit is a per-device attribute of the function.
+            static bool configured[16] = {};
+            int device = 0;
+            if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) device = 0;
+            if (!configured[device]) {
                 Failure failure;
                 failure.record(cudaFuncSetAttribute(mla_attn_kernel,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -765,7 +768,7 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                                INFERENCE_CUDA_STAGE_LAUNCH);
                 report_stage(out_stage, failure.stage);
                 if (!failure.ok()) return (int)failure.err;
-                configured = true;
+                configured[device] = true;
             }
             mla_attn_kernel<<<dim3((unsigned)n, (unsigned)(heads / kMlaGroup), (unsigned)splits),
                               256, smem, s>>>((const float *)p[0], (const __half *)p[1],
