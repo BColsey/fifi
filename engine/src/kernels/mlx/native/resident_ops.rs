@@ -2850,7 +2850,7 @@ impl Context {
         codes: Option<&ExecutionTensor>,
         dtype: crate::weights::GgufType,
     ) -> Result<ExecutionTensor, EngError> {
-        use crate::weights::GgufType;
+        use crate::weights::{GgufType, inkling_codebook_words};
         let operation = "Inkling GGUF packed matvec";
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
@@ -2862,7 +2862,8 @@ impl Context {
                 "Inkling GGUF matvec expects one F32 row and a U8 matrix",
             ));
         };
-        if !matches!(dtype, GgufType::Iq1S | GgufType::Q20 | GgufType::Nvfp4)
+        let codebook_words = inkling_codebook_words(dtype);
+        if (!matches!(dtype, GgufType::Q20 | GgufType::Nvfp4) && codebook_words.is_none())
             || width == 0
             || rows == 0
             || payload.dtype() != Dtype::U8
@@ -2872,18 +2873,15 @@ impl Context {
         {
             return Err(bad_request("Inkling GGUF matvec has invalid block layout"));
         }
-        let code_array = match (dtype, codes) {
-            (GgufType::Iq1S, Some(codes))
-                if codes.dtype() == Dtype::U32 && codes.shape() == [2048] =>
+        let code_array = match (codebook_words, codes) {
+            (Some(words), Some(codes))
+                if codes.dtype() == Dtype::U32 && codes.shape() == [words] =>
             {
                 check_owner(operation, state, codes)?;
                 codes.storage.native_array()
             }
-            (GgufType::Iq1S, _) => {
-                return Err(bad_request("Inkling IQ1_S matvec requires its codebook"));
-            }
-            (_, None) => ffi::NULL_ARRAY,
-            _ => return Err(bad_request("unexpected Inkling GGUF matvec codebook")),
+            (None, None) => ffi::NULL_ARRAY,
+            _ => return Err(bad_request("Inkling GGUF matvec has an invalid codebook")),
         };
         let dims = native_ints(operation, &[width, rows, stride, dtype.id()])?;
         let layout = shape::dequantize(operation, &[1, rows])?;

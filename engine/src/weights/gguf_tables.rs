@@ -2217,3 +2217,16 @@ pub(crate) const IQ1S_GRID: [u16; 2048] = [
     0xaa00, 0xaa02, 0xaa08, 0xaa0a, 0xaa20, 0xaa22, 0xaa28, 0xaa2a, 0xaa51, 0xaa54, 0xaa56, 0xaa80,
     0xaa82, 0xaa88, 0xaa8a, 0xaa95, 0xaaa0, 0xaaa2, 0xaaa8, 0xaaaa,
 ];
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn inkling_codebook_words(dtype: super::gguf::GgufType) -> Option<u32> {
+    use super::gguf::GgufType;
+    let words = match dtype {
+        GgufType::Iq1S => IQ1S_GRID.len(),
+        GgufType::Iq2Xxs => 2 * IQ2XXS_GRID.len(),
+        GgufType::Iq2Xs => 2 * IQ2XS_GRID.len(),
+        GgufType::Iq2S => 2 * IQ2S_GRID.len(),
+        _ => return None,
+    };
+    Some(words as u32)
+}

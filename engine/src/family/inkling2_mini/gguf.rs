@@ -517,9 +517,21 @@ pub(super) fn projection_scratch_bytes() -> u64 {
     (ROWS_PER_READ * 2 * HIDDEN * 4 + PADDED_VOCAB as usize * 4 + 256 * HIDDEN * 4) as u64
 }
 
+pub(super) fn packed_mlx_enabled() -> bool {
+    std::env::var_os("FIFI_INKLING_GGUF_PACKED_MLX").is_some_and(|value| value == "1")
+}
+
 pub(super) fn native_scratch_bytes() -> u64 {
-    // Packed plane, converted F32 plane, Metal import and allocator workspace.
-    projection_scratch_bytes() + 4 * LARGEST_PLANE_F32_BYTES as u64
+    // Reserve the existing general plane workspace, plus four resident U32
+    // codebooks and a second copy to cover their host upload in packed mode.
+    const CODEBOOK_BYTES: u64 = (2048 + 2 * (256 + 512 + 1024)) * 4;
+    projection_scratch_bytes()
+        + 4 * LARGEST_PLANE_F32_BYTES as u64
+        + if packed_mlx_enabled() {
+            2 * CODEBOOK_BYTES
+        } else {
+            0
+        }
 }
 
 pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, EngError> {
