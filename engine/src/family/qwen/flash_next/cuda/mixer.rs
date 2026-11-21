@@ -28,9 +28,7 @@ use crate::{
     family::{AttentionKind, exl3_pack::layer_name},
     kernels::cuda::{
         DeviceRange,
-        prefill::gdn_scan_seq::{
-            GDN_SCAN_EPS, GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes,
-        },
+        prefill::gdn_scan_seq::{GDN_SCAN_EPS, GdnScanSeqCall, ScanShape, ScanWeights, scan_bytes},
         resident::{
             attn_prep::{AttnPrepCall, AttnPrepShape, RopeParams, SlotMode},
             gdn_conv::{ConvCall, ConvShape, conv_bytes},
@@ -175,7 +173,7 @@ impl FlashStep<'_> {
                 o_out: head(&core, need.o_out)?,
                 status: None,
             },
-            GdnForm::FLASH_NEXT,
+            self.gdn_form,
         )?;
 
         self.project(

@@ -24,16 +24,22 @@
 
 pub(super) mod config;
 pub(in crate::family::qwen::flash_next) mod feeds;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod device_tests;
 #[cfg(test)]
 mod host;
 pub(super) mod ngram;
 pub(super) mod plan;
+#[cfg(test)]
+mod smallmodel;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super) mod start;
 pub(super) mod tensors;
 #[cfg(test)]
 mod testkit;
 mod weight_map;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) mod trunk;
 
 use std::path::Path;
 

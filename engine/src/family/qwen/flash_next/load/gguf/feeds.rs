@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     EngError,
-    family::flash_next::cuda::{
+    family::qwen::flash_next::cuda::{
         pack_feeds::{EmbeddingRows, PackFeeds},
         ple_feed::{HostMatrix, HostProjection, PleFeed, PleVectors},
     },

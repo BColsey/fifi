@@ -28,6 +28,10 @@ mod bank_tests;
 mod disk_prefetch;
 #[cfg(test)]
 mod driver_glue_tests;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) mod gguf_device;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::qwen::flash_next) mod gguf_moe;
 mod moe_block;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod moe_block_device_tests;

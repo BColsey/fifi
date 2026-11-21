@@ -71,11 +71,15 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
+        prefill::gdn_scan_seq::GdnForm,
         resident::{
+            dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape},
             exl3::Exl3Job,
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
+            matvec_q::MatvecCall,
+            quantize_q8_1::{QuantizeCall, q8_1_bytes},
             step_params::{OFFSET_POS, OFFSET_STATUS},
         },
     },
@@ -108,6 +112,11 @@ pub(super) struct FlashStep<'a> {
     /// the block output to the stream instead.
     zeros: DeviceBuffer,
     pub(super) layers: std::ops::Range<usize>,
+    /// The q8_1 pack of the activation the native projections read: one row, padded.
+    xq: DeviceBuffer,
+    /// The scan's rules: the Hugging Face head order of the EXL3 pack, or the tiled order of a
+    /// GGUF.
+    pub(super) gdn_form: GdnForm,
     /// The plan's row count: every launch takes `m` rows with `m <= rows` (decode is 1, a chunk
     /// is its token count). The slots hold this many rows.
     pub(super) rows: usize,
@@ -133,12 +142,32 @@ impl<'a> FlashStep<'a> {
             ctx,
             stream,
             weights,
-            model_config,
+            model_shape(model_config)?,
             positions,
             rows,
             layers,
             false,
         )
+    }
+
+    /// Runs the DeltaNet scan in `form` (the tiled head order of a GGUF).
+    pub(in crate::family::qwen::flash_next) fn with_gdn_form(mut self, form: GdnForm) -> Self {
+        self.gdn_form = form;
+        self
+    }
+
+    /// The step over a model whose shape the caller already has (a GGUF, which carries no
+    /// `config.json`): `kinds` is true for the QSA layers.
+    pub(in crate::family::qwen::flash_next) fn from_shape(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        shape: (ModelShape, Vec<bool>),
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::build(ctx, stream, weights, shape, positions, rows, layers, false)
     }
 
     /// The shared-prefill owner, with dense and routed scratch from the shared plan.
@@ -155,7 +184,7 @@ impl<'a> FlashStep<'a> {
             ctx,
             stream,
             weights,
-            model_config,
+            model_shape(model_config)?,
             positions,
             rows,
             layers,
@@ -171,13 +200,12 @@ impl<'a> FlashStep<'a> {
         ctx: &'a CudaContext,
         stream: &'a DeviceStream,
         weights: &'a CudaWeights,
-        model_config: &[u8],
+        (model, kinds): (ModelShape, Vec<bool>),
         positions: usize,
         rows: usize,
         layers: std::ops::Range<usize>,
         shared_prefill: bool,
     ) -> Result<Self, EngError> {
-        let (model, kinds) = model_shape(model_config)?;
         let geometry = FlashGeometry::new(&model, &kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
             return Err(refuse(format!(
@@ -200,6 +228,22 @@ impl<'a> FlashStep<'a> {
             ctx.arena(&tensors)?
         };
         let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
+        // The widest activation a native projection reads: the hidden width, the attention and
+        // DeltaNet output widths and the expert widths; at least 64 KiB.
+        let widest = [
+            geometry.hidden,
+            geometry.qsa.q_width(),
+            geometry.delta.value_width(),
+            geometry.inter,
+            geometry.shared_inter,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let q8_bytes = q8_1_bytes(widest, 1)
+            .ok_or_else(|| refuse("the activation pack size overflows".into()))?
+            .max(64 << 10);
+        let xq = ctx.upload(&vec![0u8; q8_bytes])?;
         let step = Self {
             ctx,
             stream,
@@ -213,6 +257,8 @@ impl<'a> FlashStep<'a> {
             scratch,
             zeros,
             layers,
+            xq,
+            gdn_form: GdnForm::FLASH_NEXT,
             rows,
             prefill_window: Cell::new(false),
             poisoned: Cell::new(false),
@@ -471,6 +517,13 @@ impl<'a> FlashStep<'a> {
         m: usize,
     ) -> Result<(), EngError> {
         self.check_rows(m)?;
+        match self.weights.get(prefix) {
+            Some(CudaWeight::Native { weight, .. }) => {
+                return self.project_native(weight, x, out, m);
+            }
+            None => return self.project_dense_pair(prefix, x, out, m),
+            Some(_) => {}
+        }
         let weight = self.exl3(prefix)?;
         if self.shared_prefill() {
             let launch = Launch {
@@ -498,6 +551,98 @@ impl<'a> FlashStep<'a> {
         // contiguous single-row call cannot express.
         let [_, n] = weight.shape;
         self.exl3_jobs(prefix, x, out, n, 0, m)
+    }
+
+    /// One native matvec: the activation is quantized to q8_1 into the step's pack, then the
+    /// matvec of the weight's type reads the stored blocks. One row only.
+    fn project_native(
+        &self,
+        weight: &crate::kernels::cuda::NativeWeight,
+        x: DeviceRange<'_>,
+        out: DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        if m != 1 {
+            return Err(refuse(format!(
+                "a native projection takes one row, the step has {m}"
+            )));
+        }
+        let (k, rows) = (weight.k(), weight.n_rows());
+        let pack =
+            q8_1_bytes(k, 1).ok_or_else(|| refuse("the activation pack overflows".into()))?;
+        let x_q8 = self.xq.range(0, pack)?;
+        self.ctx.quantize_q8_1(
+            self.stream,
+            QuantizeCall {
+                x,
+                y: x_q8,
+                k,
+                ncols: 1,
+            },
+        )?;
+        self.ctx.matvec_q(
+            self.stream,
+            MatvecCall {
+                ty: weight.quant(),
+                w: weight.buffer().range(0, weight.buffer().bytes())?,
+                x_q8,
+                y: out,
+                k,
+                rows,
+                ncols: 1,
+            },
+        )
+    }
+
+    /// A projection stored as two half-precision tensors under `prefix.q` and `prefix.k` (the
+    /// GGUF indexer: queries then the key): two dense matvecs into the first and the last
+    /// columns of `out`.
+    fn project_dense_pair(
+        &self,
+        prefix: &str,
+        x: DeviceRange<'_>,
+        out: DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        if m != 1 {
+            return Err(refuse(format!(
+                "{prefix} is a dense pair, which takes one row, the step has {m}"
+            )));
+        }
+        let cols = self.geometry.hidden;
+        let mut at = 0usize;
+        for suffix in ["q", "k"] {
+            let name = format!("{prefix}.{suffix}");
+            let Some(CudaWeight::Raw { ty, buffer, .. }) = self.weights.get(&name) else {
+                return Err(refuse(format!(
+                    "{prefix} is not an uploaded matrix or dense pair"
+                )));
+            };
+            let dtype = match ty {
+                GgufType::F16 => DenseDtype::F16,
+                GgufType::Bf16 => DenseDtype::Bf16,
+                other => return Err(refuse(format!("{name} is {other:?}, not a half tensor"))),
+            };
+            let rows = buffer.bytes() / 2 / cols;
+            self.ctx.dense_gemv(
+                self.stream,
+                DenseGemvCall {
+                    shape: DenseGemvShape::packed(1, rows, cols),
+                    dtype,
+                    w: buffer.range(0, buffer.bytes())?,
+                    x,
+                    y: out.buffer().range(out.offset() + at * F32, rows * F32)?,
+                },
+            )?;
+            at += rows;
+        }
+        if at * F32 != out.bytes() {
+            return Err(refuse(format!(
+                "{prefix} has {at} output columns, the row slot holds {}",
+                out.bytes() / F32
+            )));
+        }
+        Ok(())
     }
 
     /// The projection of `m` rows into `n` floats at column `col_off` of a `ld`-wide row
@@ -578,6 +723,15 @@ impl<'a> FlashStep<'a> {
         row: &DeviceRange<'_>,
         m: usize,
     ) -> Result<(), EngError> {
+        if let Some((first, _, _)) = parts.first()
+            && matches!(self.weights.get(first), Some(CudaWeight::Native { .. }))
+        {
+            // Native weights have no grouped launch: one projection each.
+            for &(prefix, col, n) in parts {
+                self.project(prefix, x, Self::columns(row, col, n)?, m)?;
+            }
+            return Ok(());
+        }
         let (xh, z, flag) = (
             self.slot(Slot::Exl3Xh)?,
             self.slot(Slot::Exl3Z)?,
@@ -715,7 +869,7 @@ impl<'a> FlashStep<'a> {
 
     // ------------------------------------------------------------------ the MoE seam
 
-    pub(super) fn moe_dims(&self, m: usize) -> MoeDims {
+    pub(in crate::family::qwen::flash_next) fn moe_dims(&self, m: usize) -> MoeDims {
         MoeDims {
             rows: m,
             hidden: self.geometry.hidden,

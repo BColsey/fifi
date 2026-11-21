@@ -1057,3 +1057,21 @@ fn the_record_store_reads_the_first_and_last_expert_of_the_real_layout() {
     assert_eq!(store.record_bytes_at(47), index.record_bytes(47).unwrap());
     assert_eq!(store.record_bytes(), index.max_record_bytes());
 }
+
+#[test]
+fn the_small_model_opens_maps_and_runs_the_host_forward() {
+    let small = super::smallmodel::write_small(7);
+    let model = GgufModel::open(&small.first)
+        .expect("open")
+        .expect("a qwen4exp model");
+    assert_eq!(model.map().mapped(), model.map().total());
+    assert!(model.map().unmapped().is_empty());
+    assert_eq!(model.config().layers(), 4);
+    assert!(model.kernel_gaps().is_empty(), "{:?}", model.kernel_gaps());
+    let host = super::host::HostModel::load(&model, 4).expect("host layers");
+    let run = super::host::run(&model, &host, &[5, 9, 200], 2).expect("host forward");
+    assert_eq!(run.logits.len(), 3);
+    assert!(run.logits.iter().flatten().all(|v| v.is_finite()));
+    // Different tokens give different logits.
+    assert_ne!(run.logits[0], run.logits[1]);
+}

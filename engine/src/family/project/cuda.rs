@@ -242,6 +242,19 @@ pub(crate) struct CudaWeights {
 }
 
 impl CudaWeights {
+    /// Own weights a caller uploaded itself under names it chose (the names must be unique).
+    /// Unlike [`Self::from_exl3`] this checks no layout: the caller mixes native blocks and
+    /// raw tensors as its step reads them.
+    pub(crate) fn from_weights(weights: Vec<CudaWeight>) -> Result<Self, EngError> {
+        let names: Vec<_> = weights.iter().map(CudaWeight::name).collect();
+        let index = load_index(&names)?;
+        Ok(Self {
+            weights,
+            index,
+            times: LoadTimes::default(),
+        })
+    }
+
     /// Own an explicit EXL3 load after its source adapter checked the stored metadata.
     pub(crate) fn from_exl3(weights: Vec<CudaWeight>) -> Result<Self, EngError> {
         let mut loaded = Self {

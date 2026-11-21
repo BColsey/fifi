@@ -61,15 +61,15 @@ pub(in super::super) enum StateSlot {
 
 /// The sizes the driver checks and splits the layers by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DriverShape {
+pub(in crate::family::qwen::flash_next) struct DriverShape {
     /// Decoder layers the device runs.
-    pub(super) layers: usize,
+    pub(in crate::family::qwen::flash_next) layers: usize,
     /// The layer whose attention read follows the PLE update.
-    pub(super) ple_layer: usize,
+    pub(in crate::family::qwen::flash_next) ple_layer: usize,
     /// Positions the K/V caches hold: the context limit of the driver.
-    pub(super) positions: usize,
+    pub(in crate::family::qwen::flash_next) positions: usize,
     /// The sizes of one token start.
-    pub(super) start: StartShape,
+    pub(in crate::family::qwen::flash_next) start: StartShape,
 }
 
 /// Where the wall time of the last token went. The layer launches are queued, but each MoE block
@@ -247,7 +247,9 @@ pub(crate) trait ResumesState: StepperPositions {
 }
 
 /// The device side of a token. It is the sink of the token start.
-pub(super) trait TokenDevice: StartSink {
+pub(in crate::family::qwen::flash_next) trait TokenDevice:
+    StartSink
+{
     /// Clears the per-token flags (the EXL3 flag and the status word). Called once per token, after
     /// the start is written and before the first layer.
     fn begin_token(&mut self) -> Result<()>;
@@ -285,7 +287,7 @@ pub(super) trait TokenDevice: StartSink {
 }
 
 /// The token driver: a [`TokenStepper`] over a device and its feeds.
-pub(super) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
+pub(in crate::family::qwen::flash_next) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
     device: D,
     feeds: F,
     shape: DriverShape,
@@ -301,7 +303,11 @@ pub(super) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
 }
 
 impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
-    pub(super) fn new(device: D, feeds: F, shape: DriverShape) -> Result<Self> {
+    pub(in crate::family::qwen::flash_next) fn new(
+        device: D,
+        feeds: F,
+        shape: DriverShape,
+    ) -> Result<Self> {
         super::driver::chunk::prof::check_switch_spelling()?;
         if shape.layers == 0 || shape.ple_layer >= shape.layers || shape.positions == 0 {
             return Err(EngError::BadRequest(format!(
