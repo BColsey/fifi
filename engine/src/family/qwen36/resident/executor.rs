@@ -40,7 +40,8 @@
 //! decoder tests only. A run of one row is a one-token step, as in the Flash-Next executor, and a
 //! chunk equals the steps within the chunk-parity tolerance, not bit for bit. A chunk routes as its
 //! decoder holds (`Routing::Device`, the default, routes on the device; `Routing::Host` keeps the
-//! host-routed reference), and every decode step keeps device routing. A Q36 chunk has no page set,
+//! host-routed reference), and a decode step routes as the decoder holds too. A decoder whose routed
+//! experts are staged from disk holds `Routing::Host` for every chunk and step. A Q36 chunk has no page set,
 //! so the Flash-Next rule that opens page sets once has no counterpart here.
 //!
 //! A failed prefill: a denied growth permit or a bad token in chunk k leaves chunks 1 to k - 1
