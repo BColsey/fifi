@@ -463,7 +463,7 @@ mod device {
     /// `model_path` is the model directory or one `.gguf` file in it. A directory with several
     /// `.gguf` files serves the highest-precision one that the device memory admits; `seqs`
     /// is the explicit session count or the count the free memory funds. Several sessions turn
-    /// the position-only prefix snapshot off and the decode graph off, and the start line says so.
+    /// the decode graph off, and the start line says so; prefix reuse works at every count.
     pub(crate) fn start_bolt_engine(
         model_path: &Path,
         tokenizer_dir: &Path,
@@ -493,6 +493,11 @@ mod device {
             }
             let plan = plan_sessions(&model, ask.seqs)?;
             eprintln!("gemma4 bolt: {}", plan.describe());
+            if plan.seqs == 1 && prompt_rows.is_some() {
+                eprintln!(
+                    "gemma4 bolt: prompt_rows has no effect with one session: it sets how many prompt rows are fed per tick while several sessions share the model"
+                );
+            }
             if plan.seqs > 1 {
                 model.reserve_window(plan.seqs)?;
                 model.use_decode_graph(false);
@@ -834,11 +839,25 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
         fn a_saved_prefix_restores_into_another_session_and_matches_a_cold_run() {
+            restore_matches_a_cold_run(300);
+        }
+
+        /// The same past the 512-cell sliding window of the local layers and with planes larger
+        /// than the 8 MiB zero chunk (20,000 positions: 10 MB per global plane range, 5 MB per
+        /// local one). The largest range a snapshot can copy is 16 MB (32,768 cells of 512), under
+        /// the 64 MiB staging chunk of a device copy, so one copy never splits a range.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn a_long_saved_prefix_restores_bit_exact_past_the_window_and_the_copy_chunk() {
+            restore_matches_a_cold_run(20_000);
+        }
+
+        fn restore_matches_a_cold_run(base_len: usize) {
             let mut serve = serve_of(bolt::load(&pinned_bolt(), None).expect("load"));
             let mut source = serve.new_session().expect("source");
             let mut target = serve.new_session().expect("target");
             let mut cold = serve.new_session().expect("cold");
-            let base = prompt(300, 0);
+            let base = prompt(base_len, 0);
             let extended: Vec<u32> = base.iter().copied().chain(prompt(40, 5_000)).collect();
 
             serve.reset(&mut source).expect("reset");
