@@ -13,6 +13,8 @@ use crate::{EngError, checkpoint_json::UniqueValue, weights::read_stored_header}
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod mlx;
+mod routes;
+pub use routes::InklingRoutes;
 
 pub(crate) const FAMILY: &str = "inkling2_mini";
 pub(crate) const MODEL_TYPE: &str = "inkling2_loop";
@@ -24,6 +26,9 @@ const CORE_END: usize = 18;
 const PASSES: usize = 3;
 const EXPERTS: usize = 128;
 const TOP_K: usize = 8;
+const ROUTE_SCALE: f32 = 8.0;
+const GATE_CAP: f32 = 4.0;
+const UP_CAP: f32 = 25.0;
 const HIDDEN: usize = 2304;
 const INTERMEDIATE: usize = 1152;
 const QUERY_HEADS: usize = 24;
@@ -64,6 +69,10 @@ struct TextConfig {
     n_routed_experts: usize,
     num_experts_per_tok: usize,
     n_shared_experts: usize,
+    mlp_gate_softcap: f32,
+    mlp_up_softcap: f32,
+    route_scale: f32,
+    use_gate_bias: bool,
     loop_config: LoopConfig,
 }
 
@@ -130,6 +139,10 @@ fn validate_config(bytes: &[u8]) -> Result<(), EngError> {
         || text.n_routed_experts != EXPERTS
         || text.num_experts_per_tok != TOP_K
         || text.n_shared_experts != 0
+        || text.mlp_gate_softcap != GATE_CAP
+        || text.mlp_up_softcap != UP_CAP
+        || text.route_scale != ROUTE_SCALE
+        || !text.use_gate_bias
         || config.quantization_config.quant_method != "modelopt"
         || config.quantization_config.quant_algo != "NVFP4"
     {

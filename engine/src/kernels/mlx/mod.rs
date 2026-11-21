@@ -2174,6 +2174,23 @@ impl MlxKernels {
         self.context.act_mul(g_in, u_in)
     }
 
+    pub(crate) fn inkling_activation(
+        &mut self,
+        gate_up: &ExecutionTensor,
+        weights: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.inkling_activation(gate_up, weights)
+    }
+
+    pub(crate) fn inkling_merge(
+        &mut self,
+        down: &ExecutionTensor,
+        rows: u32,
+        picks: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.inkling_merge(down, rows, picks)
+    }
+
     /// The moe_combine fused kernel: the un-sort, gate, choice sum, shared fold, cast.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_combine(
