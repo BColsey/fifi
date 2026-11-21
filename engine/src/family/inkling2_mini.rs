@@ -1,4 +1,4 @@
-//! Checkpoint geometry and text memory plan for the fixed-loop Inkling 2 Mini release.
+//! Checkpoint geometry, text memory planning, and packed expert reads for Inkling 2 Mini.
 
 use std::{collections::BTreeMap, fs::File, ops::Range, path::Path};
 
@@ -10,6 +10,9 @@ use super::{
     plan_decision::{PlanDecision, PlanFixity},
 };
 use crate::{EngError, checkpoint_json::UniqueValue, weights::read_stored_header};
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod mlx;
 
 pub(crate) const FAMILY: &str = "inkling2_mini";
 pub(crate) const MODEL_TYPE: &str = "inkling2_loop";
@@ -184,9 +187,6 @@ struct WeightPlan {
     text_resident: u64,
     vision: u64,
     expert_storage: [u64; LAYERS],
-    routed_per_layer: [u64; LAYERS],
-    coalesced_reads: [usize; LAYERS],
-    scattered_reads: [usize; LAYERS],
 }
 
 fn tensor_bytes(tensor: &TensorInfo) -> u64 {
@@ -198,50 +198,298 @@ enum ExpertRegion {
     Shared(Range<u64>),
 }
 
-/// Sort by the physical expert slot and merge only adjacent selected slots.
-fn expert_read_runs(
-    regions: &[ExpertRegion],
-    experts: &[usize],
-) -> Result<Vec<Range<u64>>, EngError> {
-    if experts.is_empty() || experts.iter().any(|&expert| expert >= EXPERTS) {
-        return Err(EngError::BadRequest(
-            "Inkling expert selection is empty or out of range".into(),
-        ));
+struct ProjectionRegions {
+    rows: usize,
+    cols: usize,
+    weight: ExpertRegion,
+    scale: ExpertRegion,
+    amax: Option<ExpertRegion>,
+    denominator: Option<ExpertRegion>,
+}
+
+/// A validated Inkling 2 Mini checkpoint and its packed expert tensor locations.
+pub struct InklingExpertSource {
+    shard: File,
+    len: u64,
+    layers: Vec<[ProjectionRegions; 2]>,
+    weights: WeightPlan,
+}
+
+/// Byte ranges in caller staging for one packed projection.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InklingExpertProjection {
+    /// Logical dimensions in compact expert, output row, input column order.
+    pub shape: [usize; 3],
+    /// Raw NVFP4 bytes or MXFP8 E4M3 bytes.
+    pub weight: Range<usize>,
+    /// Raw E4M3 scales for NVFP4 or E8M0 scales for MXFP8.
+    pub scale: Range<usize>,
+    /// Per-expert little-endian F32 values for NVFP4.
+    pub amax: Option<Range<usize>>,
+    /// One shared little-endian F32 value for NVFP4.
+    pub denominator: Option<Range<usize>>,
+}
+
+struct ExpertRead {
+    offset: u64,
+    destination: Range<usize>,
+}
+
+/// A compact expert selection that can be read into caller-owned staging.
+pub struct InklingExpertPlan<'a> {
+    source: &'a InklingExpertSource,
+    compact_slots: Vec<u32>,
+    gate_up: InklingExpertProjection,
+    down: InklingExpertProjection,
+    reads: Vec<ExpertRead>,
+    read_bytes: usize,
+    staging_bytes: usize,
+    alignment: usize,
+}
+
+impl InklingExpertSource {
+    /// Opens and validates the config, index and shard header without reading expert payloads.
+    pub fn open(dir: &Path) -> Result<Self, EngError> {
+        let guard = crate::storage_guard::LocalGuard::new()?;
+        let config_path = dir.join("config.json");
+        let index_path = dir.join("model.safetensors.index.json");
+        let shard_path = dir.join(SHARD);
+        for path in [&config_path, &index_path, &shard_path] {
+            guard.check(path, "model weights")?;
+        }
+        validate_config(&std::fs::read(config_path).map_err(checkpoint_error)?)?;
+        let index = parse_json(&std::fs::read(index_path).map_err(checkpoint_error)?)?;
+        let mut shard = File::open(shard_path).map_err(checkpoint_error)?;
+        let len = shard.metadata().map_err(checkpoint_error)?.len();
+        let (data_start, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT)?;
+        let entries = entries.into_iter().collect();
+        let weights = weight_plan(&index, &entries)?;
+        let layers = (0..LAYERS)
+            .map(|layer| expert_regions(&entries, data_start, layer))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            shard,
+            len,
+            layers,
+            weights,
+        })
     }
-    let mut sorted = experts.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut ranges = Vec::new();
-    for region in regions {
-        match region {
-            ExpertRegion::Slices { start, stride } => {
-                for run in sorted.chunk_by(|&left, &right| left + 1 == right) {
-                    let first = run[0] as u64;
-                    let end = first + run.len() as u64;
-                    ranges.push((start + first * stride)..(start + end * stride));
-                }
+
+    /// Plans selected expert reads for a stored layer. Each tensor begins at a
+    /// multiple of the power-of-two alignment in the caller's staging slice.
+    pub fn plan(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        alignment: usize,
+    ) -> Result<InklingExpertPlan<'_>, EngError> {
+        let [gate_up, down] = self.layers.get(layer).ok_or_else(|| {
+            EngError::BadRequest(format!("Inkling expert layer {layer} is out of range"))
+        })?;
+        if !alignment.is_power_of_two() {
+            return Err(EngError::BadRequest(
+                "Inkling expert staging alignment must be a power of two".into(),
+            ));
+        }
+        if experts.is_empty() || experts.iter().any(|&expert| expert >= EXPERTS) {
+            return Err(EngError::BadRequest(
+                "Inkling expert selection is empty or out of range".into(),
+            ));
+        }
+        let mut selected = [false; EXPERTS];
+        for &expert in experts {
+            selected[expert] = true;
+        }
+        let mut slots = [0; EXPERTS];
+        let mut sorted = Vec::new();
+        for (expert, selected) in selected.into_iter().enumerate() {
+            if selected {
+                slots[expert] = sorted.len() as u32;
+                sorted.push(expert);
             }
-            ExpertRegion::Shared(range) => ranges.push(range.clone()),
+        }
+        let compact_slots = experts.iter().map(|&expert| slots[expert]).collect();
+        let mut reads = Vec::new();
+        let mut staging_bytes = 0usize;
+        let mut plan_region = |region: &ExpertRegion| -> Result<Range<usize>, EngError> {
+            let start = staging_bytes
+                .checked_next_multiple_of(alignment)
+                .ok_or_else(staging_overflow)?;
+            staging_bytes = start;
+            let mut push = |source: Range<u64>| -> Result<(), EngError> {
+                let bytes =
+                    usize::try_from(source.end - source.start).map_err(|_| staging_overflow())?;
+                let end = staging_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(staging_overflow)?;
+                reads.push(ExpertRead {
+                    offset: source.start,
+                    destination: staging_bytes..end,
+                });
+                staging_bytes = end;
+                Ok(())
+            };
+            match region {
+                ExpertRegion::Slices { start, stride } => {
+                    for run in sorted.chunk_by(|&left, &right| left + 1 == right) {
+                        let first = run[0] as u64;
+                        let end = first + run.len() as u64;
+                        push((start + first * stride)..(start + end * stride))?;
+                    }
+                }
+                ExpertRegion::Shared(range) => push(range.clone())?,
+            }
+            Ok(start..staging_bytes)
+        };
+        let mut projection = |regions: &ProjectionRegions| -> Result<_, EngError> {
+            Ok(InklingExpertProjection {
+                shape: [sorted.len(), regions.rows, regions.cols],
+                weight: plan_region(&regions.weight)?,
+                scale: plan_region(&regions.scale)?,
+                amax: regions.amax.as_ref().map(&mut plan_region).transpose()?,
+                denominator: regions
+                    .denominator
+                    .as_ref()
+                    .map(&mut plan_region)
+                    .transpose()?,
+            })
+        };
+        let gate_up = projection(gate_up)?;
+        let down = projection(down)?;
+        let read_bytes = reads.iter().map(|read| read.destination.len()).sum();
+        Ok(InklingExpertPlan {
+            source: self,
+            compact_slots,
+            gate_up,
+            down,
+            reads,
+            read_bytes,
+            staging_bytes,
+            alignment,
+        })
+    }
+}
+
+fn staging_overflow() -> EngError {
+    EngError::MemoryPlan("Inkling expert staging size exceeds host limits".into())
+}
+
+impl InklingExpertPlan<'_> {
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+
+    /// Minimum staging length, including alignment gaps.
+    pub fn staging_bytes(&self) -> usize {
+        self.staging_bytes
+    }
+
+    /// Total payload bytes transferred from the shard.
+    pub fn read_bytes(&self) -> usize {
+        self.read_bytes
+    }
+
+    pub fn read_count(&self) -> usize {
+        self.reads.len()
+    }
+
+    /// One compact slot per requested expert, in request order including duplicates.
+    pub fn compact_slots(&self) -> &[u32] {
+        &self.compact_slots
+    }
+
+    /// Packed gate and up projection (w13).
+    pub fn gate_up(&self) -> &InklingExpertProjection {
+        &self.gate_up
+    }
+
+    /// Packed down projection (w2).
+    pub fn down(&self) -> &InklingExpertProjection {
+        &self.down
+    }
+
+    /// Reads packed bytes directly into staging, leaving alignment gaps untouched.
+    /// An undersized slice is rejected before I/O. A failed read may partially
+    /// overwrite staging, which the caller must discard.
+    pub fn read_into(&self, scratch: &mut [u8]) -> Result<(), EngError> {
+        if scratch.len() < self.staging_bytes {
+            return Err(EngError::BadRequest(format!(
+                "Inkling expert staging needs {} bytes, received {}",
+                self.staging_bytes,
+                scratch.len()
+            )));
+        }
+        let check_len = || -> Result<(), EngError> {
+            let observed = self
+                .source
+                .shard
+                .metadata()
+                .map_err(checkpoint_error)?
+                .len();
+            if observed != self.source.len {
+                return Err(checkpoint_error(format!(
+                    "shard length changed from {} to {observed}",
+                    self.source.len
+                )));
+            }
+            Ok(())
+        };
+        check_len()?;
+        for read in &self.reads {
+            read_exact_at(
+                &self.source.shard,
+                &mut scratch[read.destination.clone()],
+                read.offset,
+            )
+            .map_err(|error| {
+                checkpoint_error(format!("expert read at {}: {error}", read.offset))
+            })?;
+        }
+        check_len()
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(dst, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::{
+        io::{Error, ErrorKind},
+        os::windows::fs::FileExt,
+    };
+
+    while !dst.is_empty() {
+        match file.seek_read(dst, offset) {
+            Ok(0) => return Err(Error::from(ErrorKind::UnexpectedEof)),
+            Ok(bytes) => {
+                offset += bytes as u64;
+                dst = &mut dst[bytes..];
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
-    Ok(ranges)
+    Ok(())
 }
 
 fn expert_regions(
     entries: &BTreeMap<String, TensorInfo>,
     data_start: u64,
     layer: usize,
-) -> Result<Vec<ExpertRegion>, EngError> {
-    let mut regions = Vec::new();
+) -> Result<[ProjectionRegions; 2], EngError> {
     let nvfp4 = layer < 20;
     let group = if nvfp4 { 16 } else { 32 };
-    // w13 packs gate and up rows together. w2 projects to the hidden dimension.
-    for (projection, rows, cols) in [
-        ("w13", INTERMEDIATE * 2, HIDDEN),
-        ("w2", HIDDEN, INTERMEDIATE),
-    ] {
-        let stem = format!("model.llm.layers.{layer}.mlp.experts.{projection}_weight");
-        let mut get = |suffix: &str, dtype: Dtype, shape: &[usize], per_expert: bool| {
+    let projection = |name, rows, cols| -> Result<ProjectionRegions, EngError> {
+        let stem = format!("model.llm.layers.{layer}.mlp.experts.{name}_weight");
+        let get = |suffix: &str,
+                   dtype: Dtype,
+                   shape: &[usize],
+                   per_expert: bool|
+         -> Result<_, EngError> {
             let key = format!("{stem}{suffix}");
             let info = entries
                 .get(&key)
@@ -253,39 +501,42 @@ fn expert_regions(
             }
             let start = data_start + info.data_offsets.0 as u64;
             let stored = tensor_bytes(info);
-            let region = if per_expert {
+            Ok(if per_expert {
                 ExpertRegion::Slices {
                     start,
                     stride: stored / EXPERTS as u64,
                 }
             } else {
                 ExpertRegion::Shared(start..start + stored)
-            };
-            regions.push(region);
-            Ok(())
+            })
         };
-        if nvfp4 {
-            get("", Dtype::U8, &[EXPERTS, rows, cols / 2], true)?;
-            get(
-                "_scale",
-                Dtype::F8_E4M3,
-                &[EXPERTS, rows, cols / group],
-                true,
-            )?;
-            get("_amax", Dtype::F32, &[EXPERTS], true)?;
-            get("_outer_scale_denominator", Dtype::F32, &[1], false)?;
+        let (weight_dtype, packed_cols, scale_dtype) = if nvfp4 {
+            (Dtype::U8, cols / 2, Dtype::F8_E4M3)
         } else {
-            get("", Dtype::F8_E4M3, &[EXPERTS, rows, cols], true)?;
-            get("_scale", Dtype::U8, &[EXPERTS, rows, cols / group], true)?;
-        }
-    }
-    Ok(regions)
+            (Dtype::F8_E4M3, cols, Dtype::U8)
+        };
+        Ok(ProjectionRegions {
+            rows,
+            cols,
+            weight: get("", weight_dtype, &[EXPERTS, rows, packed_cols], true)?,
+            scale: get("_scale", scale_dtype, &[EXPERTS, rows, cols / group], true)?,
+            amax: nvfp4
+                .then(|| get("_amax", Dtype::F32, &[EXPERTS], true))
+                .transpose()?,
+            denominator: nvfp4
+                .then(|| get("_outer_scale_denominator", Dtype::F32, &[1], false))
+                .transpose()?,
+        })
+    };
+    Ok([
+        projection("w13", INTERMEDIATE * 2, HIDDEN)?,
+        projection("w2", HIDDEN, INTERMEDIATE)?,
+    ])
 }
 
 fn weight_plan(
     index: &WeightIndex,
-    data_start: u64,
-    entries: BTreeMap<String, TensorInfo>,
+    entries: &BTreeMap<String, TensorInfo>,
 ) -> Result<WeightPlan, EngError> {
     if index.weight_map.len() != entries.len()
         || index
@@ -298,7 +549,7 @@ fn weight_plan(
     }
     let mut plan = WeightPlan::default();
     let mut expert_tensors = 0;
-    for (key, tensor) in &entries {
+    for (key, tensor) in entries {
         let bytes = tensor_bytes(tensor);
         if key.starts_with("model.visual.") {
             plan.vision += bytes;
@@ -323,16 +574,6 @@ fn weight_plan(
     }
     if expert_tensors != 20 * 8 + 4 * 4 {
         return Err(checkpoint_error("unexpected number of expert tensors"));
-    }
-    let adjacent: [usize; TOP_K] = std::array::from_fn(|i| i);
-    let spread: [usize; TOP_K] = std::array::from_fn(|i| 2 * i);
-    for layer in 0..LAYERS {
-        let regions = expert_regions(&entries, data_start, layer)?;
-        let grouped = expert_read_runs(&regions, &adjacent)?;
-        let scattered = expert_read_runs(&regions, &spread)?;
-        plan.routed_per_layer[layer] = grouped.iter().map(|range| range.end - range.start).sum();
-        plan.coalesced_reads[layer] = grouped.len();
-        plan.scattered_reads[layer] = scattered.len();
     }
     Ok(plan)
 }
@@ -376,38 +617,34 @@ fn state_plan(context: u32) -> Result<StatePlan, EngError> {
 }
 
 pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecision>, EngError> {
-    let guard = crate::storage_guard::LocalGuard::new()?;
-    let config_path = dir.join("config.json");
-    let index_path = dir.join("model.safetensors.index.json");
-    let shard_path = dir.join(SHARD);
-    for path in [&config_path, &index_path, &shard_path] {
-        guard.check(path, "model weights")?;
+    let source = InklingExpertSource::open(dir)?;
+    let mut routed_per_layer = [0; LAYERS];
+    let mut coalesced_reads = [0; LAYERS];
+    let mut scattered_reads = [0; LAYERS];
+    let adjacent: [usize; TOP_K] = std::array::from_fn(|i| i);
+    let spread: [usize; TOP_K] = std::array::from_fn(|i| 2 * i);
+    for layer in 0..LAYERS {
+        let grouped = source.plan(layer, &adjacent, 1)?;
+        routed_per_layer[layer] = grouped.read_bytes() as u64;
+        coalesced_reads[layer] = grouped.read_count();
+        scattered_reads[layer] = source.plan(layer, &spread, 1)?.read_count();
     }
-    validate_config(&std::fs::read(config_path).map_err(checkpoint_error)?)?;
-    let index = parse_json(&std::fs::read(index_path).map_err(checkpoint_error)?)?;
-    let mut shard = File::open(shard_path).map_err(checkpoint_error)?;
-    let len = shard.metadata().map_err(checkpoint_error)?.len();
-    let (data_start, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT)?;
-    let weights = weight_plan(&index, data_start, entries.into_iter().collect())?;
+    let weights = &source.weights;
     let context = context.unwrap_or(MAX_CONTEXT);
     let state = state_plan(context)?;
-    let routed_peak = weights
-        .routed_per_layer
-        .into_iter()
-        .max()
-        .expect("24 layers");
+    let routed_peak = routed_per_layer.into_iter().max().expect("24 layers");
     let schedule = visits();
     let state_slots = schedule[VISITS - 1].state_slot + 1;
     let core_visits = schedule.iter().filter(|visit| visit.pass.is_some()).count();
     let routed_uncached: u64 = schedule
         .iter()
-        .map(|visit| weights.routed_per_layer[visit.weight_layer])
+        .map(|visit| routed_per_layer[visit.weight_layer])
         .sum();
     let core_resident: u64 = weights.expert_storage[CORE_START..CORE_END].iter().sum();
     let outside_core: u64 = schedule
         .iter()
         .filter(|visit| visit.pass.is_none())
-        .map(|visit| weights.routed_per_layer[visit.weight_layer])
+        .map(|visit| routed_per_layer[visit.weight_layer])
         .sum();
     let expert_storage: u64 = weights.expert_storage.iter().sum();
     let row = |name: &str, chosen: String, fixed_at| PlanDecision {
@@ -449,10 +686,7 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
             "exact expert read ranges",
             format!(
                 "adjacent versus scattered top-8 IDs need {} vs {} ranges for NVFP4 and {} vs {} for MXFP8",
-                weights.coalesced_reads[0],
-                weights.scattered_reads[0],
-                weights.coalesced_reads[20],
-                weights.scattered_reads[20],
+                coalesced_reads[0], scattered_reads[0], coalesced_reads[20], scattered_reads[20],
             ),
             PlanFixity::Load,
         ),
@@ -535,23 +769,130 @@ mod tests {
         for (table, layer, bytes, grouped, individual) in
             [(&nv, 0, 35_831_880, 8, 50), (&mx, 20, 65_691_648, 4, 32)]
         {
-            let regions = expert_regions(table, 1024, layer).unwrap();
+            let source = InklingExpertSource {
+                shard: tempfile::tempfile().unwrap(),
+                len: 0,
+                layers: vec![expert_regions(table, 1024, layer).unwrap()],
+                weights: WeightPlan::default(),
+            };
             for (ids, count) in [
                 (adjacent.as_slice(), grouped),
                 (scattered.as_slice(), individual),
             ] {
-                let runs = expert_read_runs(&regions, ids).unwrap();
-                assert_eq!(runs.len(), count);
-                assert_eq!(
-                    runs.iter().map(|run| run.end - run.start).sum::<u64>(),
-                    bytes
-                );
-                assert!(runs.iter().all(|run| run.start >= 1024));
+                let plan = source.plan(0, ids, 1).unwrap();
+                assert_eq!(plan.read_count(), count);
+                assert_eq!(plan.read_bytes(), bytes);
+                assert_eq!(plan.staging_bytes(), bytes);
+                assert!(plan.reads.iter().all(|run| run.offset >= 1024));
+                assert_eq!(plan.gate_up().shape, [8, INTERMEDIATE * 2, HIDDEN]);
+                assert_eq!(plan.down().shape, [8, HIDDEN, INTERMEDIATE]);
+                assert_eq!(plan.gate_up().amax.is_some(), layer == 0);
+                assert_eq!(plan.down().denominator.is_some(), layer == 0);
             }
-            assert!(expert_read_runs(&regions, &[128]).is_err());
+            assert!(source.plan(0, &[128], 1).is_err());
         }
         assert!(expert_regions(&mx, 0, 0).is_err());
         nv.remove("model.llm.layers.0.mlp.experts.w2_weight_amax");
         assert!(expert_regions(&nv, 0, 0).is_err());
+    }
+
+    #[test]
+    fn selected_experts_read_packed_regions_into_aligned_compact_staging() {
+        use std::io::Write;
+
+        let mut shard = tempfile::tempfile().unwrap();
+        let mut contents = vec![255; 32];
+        let mut slices = |stride: usize, tag: u8| {
+            let start = contents.len() as u64;
+            for expert in 0..EXPERTS {
+                contents.extend(std::iter::repeat_n(tag + expert as u8, stride));
+            }
+            ExpertRegion::Slices {
+                start,
+                stride: stride as u64,
+            }
+        };
+        let mut gate_up = ProjectionRegions {
+            rows: 4,
+            cols: 4,
+            weight: slices(3, 1),
+            scale: slices(2, 10),
+            amax: Some(slices(4, 20)),
+            denominator: None,
+        };
+        let mut down = ProjectionRegions {
+            rows: 4,
+            cols: 2,
+            weight: slices(2, 30),
+            scale: slices(1, 40),
+            amax: Some(slices(4, 50)),
+            denominator: None,
+        };
+        let mut shared = |tag| {
+            let start = contents.len() as u64;
+            contents.extend([tag; 4]);
+            Some(ExpertRegion::Shared(start..start + 4))
+        };
+        gate_up.denominator = shared(60);
+        down.denominator = shared(70);
+        shard.write_all(&contents).unwrap();
+        let source = InklingExpertSource {
+            shard,
+            len: contents.len() as u64,
+            layers: vec![[gate_up, down]],
+            weights: WeightPlan::default(),
+        };
+
+        let alignment = 16_384;
+        let plan = source.plan(0, &[7, 2, 3, 7], alignment).unwrap();
+        assert_eq!(plan.alignment(), alignment);
+        assert_eq!(plan.compact_slots(), &[2, 0, 1, 2]);
+        assert_eq!(plan.read_count(), 14);
+        assert_eq!(plan.read_bytes(), 56);
+        assert_eq!(plan.gate_up().shape, [3, 4, 4]);
+        assert_eq!(plan.down().shape, [3, 4, 2]);
+        assert_eq!(plan.staging_bytes(), 7 * alignment + 4);
+        let mut staging = vec![255; plan.staging_bytes() + 1];
+        plan.read_into(&mut staging).unwrap();
+
+        for (ordinal, (range, expected)) in [
+            (&plan.gate_up().weight, vec![3, 3, 3, 4, 4, 4, 8, 8, 8]),
+            (&plan.gate_up().scale, vec![12, 12, 13, 13, 17, 17]),
+            (
+                plan.gate_up().amax.as_ref().unwrap(),
+                [[22; 4], [23; 4], [27; 4]].concat(),
+            ),
+            (plan.gate_up().denominator.as_ref().unwrap(), vec![60; 4]),
+            (&plan.down().weight, vec![32, 32, 33, 33, 37, 37]),
+            (&plan.down().scale, vec![42, 43, 47]),
+            (
+                plan.down().amax.as_ref().unwrap(),
+                [[52; 4], [53; 4], [57; 4]].concat(),
+            ),
+            (plan.down().denominator.as_ref().unwrap(), vec![70; 4]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(range.start, ordinal * alignment);
+            assert_eq!(staging[range.clone()], expected);
+            assert_eq!(staging[range.end], 255);
+        }
+
+        source.shard.set_len(source.len - 1).unwrap();
+        let mut too_small = vec![255; plan.staging_bytes() - 1];
+        assert!(matches!(
+            plan.read_into(&mut too_small),
+            Err(EngError::BadRequest(_))
+        ));
+        assert!(too_small.iter().all(|&byte| byte == 255));
+        assert!(matches!(
+            plan.read_into(&mut staging),
+            Err(EngError::Checkpoint(_))
+        ));
+        assert!(source.plan(0, &[], alignment).is_err());
+        assert!(source.plan(0, &[1], 3).is_err());
+        assert!(source.plan(1, &[1], alignment).is_err());
+        assert!(source.plan(0, &[1], 1usize << (usize::BITS - 1)).is_err());
     }
 }
