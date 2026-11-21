@@ -1,6 +1,6 @@
 //! Checkpoint geometry, text memory planning, and packed expert reads for Inkling 2 Mini.
 
-use std::{collections::BTreeMap, fs::File, ops::Range, path::Path};
+use std::{collections::BTreeMap, ffi::OsStr, fs::File, ops::Range, path::Path};
 
 use safetensors::{Dtype, tensor::TensorInfo};
 use serde::Deserialize;
@@ -40,6 +40,13 @@ const CORE_END: usize = 18;
 const PASSES: usize = 3;
 const EXPERTS: usize = 128;
 const TOP_K: usize = 8;
+const MAX_PREFILL_ROWS: usize = 16;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+const PREFILL_WORKSPACE_PER_ROW: usize = 1 << 20;
+const PREFILL_ROWS_ENV: &str = "FIFI_INKLING_PREFILL_ROWS";
 const ROUTE_SCALE: f32 = 8.0;
 const GATE_CAP: f32 = 4.0;
 const UP_CAP: f32 = 25.0;
@@ -791,7 +798,19 @@ pub(crate) struct HeaderPlan {
     pub(crate) budget_fit: Option<bool>,
 }
 
-pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<HeaderPlan, EngError> {
+fn requested_prefill_rows(setting: Option<&OsStr>, context: u32) -> usize {
+    setting
+        .and_then(OsStr::to_str)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_PREFILL_ROWS.min(context as usize))
+}
+
+pub(crate) fn inspect(
+    dir: &Path,
+    context: Option<u32>,
+    requested_rows: Option<u32>,
+) -> Result<HeaderPlan, EngError> {
     let source = InklingExpertSource::open(dir)?;
     let mut routed_per_layer = [0; LAYERS];
     let mut coalesced_reads = [0; LAYERS];
@@ -830,6 +849,16 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<HeaderPlan, En
     };
     let page_size = mac_stage_page_size();
     let staging_bytes = source.one_token_staging_bytes(page_size)?;
+    let requested = if let Some(rows) = requested_rows {
+        if !(1..=MAX_PREFILL_ROWS as u32).contains(&rows) {
+            return Err(EngError::BadRequest(format!(
+                "Inkling prefill rows must be between 1 and {MAX_PREFILL_ROWS}"
+            )));
+        }
+        rows.min(context) as usize
+    } else {
+        requested_prefill_rows(std::env::var_os(PREFILL_ROWS_ENV).as_deref(), context)
+    };
     let resident = source.projected_resident_bytes();
     let mut rows = vec![
         row(
@@ -890,7 +919,17 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<HeaderPlan, En
             PlanFixity::Load,
         ),
     ];
-    let (budget, budget_fit) = mlx_budget_row(resident, staging_bytes, &state)?;
+    let requested_staging = source.prefill_staging_bytes(requested, page_size)?;
+    rows.push(row(
+        "Inkling prefill request",
+        format!(
+            "{requested} requested rows after context limit; {requested_staging} B peak staging for up to {} unique experts per visit; observed expert union depends on prompt routing",
+            (requested * TOP_K).min(EXPERTS),
+        ),
+        PlanFixity::Load,
+    ));
+    let (budget, budget_fit) =
+        mlx_budget_row(&source, staging_bytes, page_size, &state, requested)?;
     rows.push(budget);
     Ok(HeaderPlan {
         decisions: rows,
@@ -902,15 +941,46 @@ impl InklingExpertSource {
     /// Peak one-token staging arena for all physical layers. Expert choice
     /// changes the disk ranges; each layer’s selected tensor widths are fixed.
     pub fn one_token_staging_bytes(&self, page_size: usize) -> Result<u64, EngError> {
-        let experts: [usize; TOP_K] = std::array::from_fn(|id| id);
+        Ok(self.prefill_staging_bytes(1, page_size)? as u64)
+    }
+
+    fn prefill_staging_bytes(&self, rows: usize, page_size: usize) -> Result<usize, EngError> {
+        let routes = rows * TOP_K;
+        let experts: [usize; EXPERTS] = std::array::from_fn(|id| id);
         (0..self.layers.len()).try_fold(0, |peak, layer| {
-            let plan = self.plan(layer, &experts, page_size)?;
-            let [_, _, end] = route_page_offsets(plan.staging_bytes(), TOP_K, page_size)?;
+            let plan = self.plan(layer, &experts[..routes.min(EXPERTS)], page_size)?;
+            let [_, _, end] = route_page_offsets(plan.staging_bytes(), routes, page_size)?;
             let allocation = end
                 .checked_next_multiple_of(page_size)
                 .ok_or_else(staging_overflow)?;
-            Ok(peak.max(allocation as u64))
+            Ok(peak.max(allocation))
         })
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn reserve_prefill_window(
+        &self,
+        requested: usize,
+        page_size: usize,
+        headroom: usize,
+        mut reserve: impl FnMut(usize) -> Result<bool, EngError>,
+    ) -> Result<(usize, usize), EngError> {
+        if requested <= 1 || headroom == 0 {
+            return Ok((1, 0));
+        }
+        let solo_bytes = self.prefill_staging_bytes(1, page_size)?;
+        for rows in (2..=requested).rev() {
+            let stage_bytes = self.prefill_staging_bytes(rows, page_size)?;
+            // Charge the enlarged stage and all row-private workspace.
+            let extra = (stage_bytes - solo_bytes) + rows * PREFILL_WORKSPACE_PER_ROW;
+            if extra <= headroom && reserve(stage_bytes)? {
+                return Ok((rows, extra));
+            }
+        }
+        Ok((1, 0))
     }
 }
 
@@ -940,7 +1010,10 @@ impl InklingExpertSource {
     }
 }
 
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 fn working_set_remaining(
     device: crate::family::mlx_budget::DeviceBudget,
     charges: &[(&'static str, u64)],
@@ -956,6 +1029,9 @@ fn working_set_remaining(
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
     let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? else {
+        eprintln!(
+            "Inkling 2 Mini: automatic Metal budget disabled; base allocations unchecked; expert_cache_budget_bytes=0"
+        );
         return Ok(0);
     };
     let source = InklingExpertSource::open(dir)?;
@@ -968,11 +1044,13 @@ fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
 }
 
 fn mlx_budget_row(
-    resident: u64,
+    source: &InklingExpertSource,
     staging: u64,
+    page_size: usize,
     state: &StatePlan,
+    requested: usize,
 ) -> Result<(PlanDecision, Option<bool>), EngError> {
-    let charges = base_charges(resident, staging, state);
+    let charges = base_charges(source.projected_resident_bytes(), staging, state);
     let plan = format!(
         "{} B projected working set for the listed tensor and staging charges",
         charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
@@ -983,22 +1061,38 @@ fn mlx_budget_row(
             factory::check_backend().is_ok(),
         )? {
         match working_set_remaining(device, &charges) {
-            Ok(remaining) => (
-                format!(
-                    "{plan}; {device}; up to {remaining} B for optional shared-memory expert cache"
-                ),
-                Some(true),
-            ),
+            Ok(remaining) => {
+                let remaining = usize::try_from(remaining).map_err(|_| staging_overflow())?;
+                let (rows, extra) =
+                    source.reserve_prefill_window(requested, page_size, remaining, |_| Ok(true))?;
+                let cache = remaining - extra;
+                (
+                    format!(
+                        "{plan}; {device}; up to {rows} prefill rows by budget, with {extra} B extra stage/workspace and {cache} B optional expert cache at that width; arena allocation may lower the width"
+                    ),
+                    Some(true),
+                )
+            }
             Err(error) => (format!("{plan}; {}", error.describe()), Some(false)),
         }
     } else {
-        (format!("{plan}; automatic Metal budget disabled"), None)
+        (
+            format!(
+                "{plan}; automatic Metal budget disabled; base allocations unchecked, one prefill row and 0 B expert cache"
+            ),
+            None,
+        )
     };
     #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
-    let (chosen, fit) = (
-        format!("{plan}; Metal budget unavailable in this build"),
-        None,
-    );
+    let (chosen, fit) = {
+        let _ = (page_size, requested);
+        (
+            format!(
+                "{plan}; Metal budget unavailable in this build; prefill rows admitted by budget are unknown"
+            ),
+            None,
+        )
+    };
     Ok((
         PlanDecision {
             name: "Apple Silicon working set".into(),
@@ -1029,11 +1123,78 @@ mod tests {
     fn cache_charges_repeat_state_but_bound_local_context() {
         let short = state_plan(512).unwrap();
         assert_eq!(short.kv, 48 * 512 * 4096);
+        let just_over_window = state_plan(1025).unwrap();
+        assert_eq!(just_over_window.kv, 201_359_360);
+        assert_eq!(
+            just_over_window.kv_index,
+            57_344 * size_of::<usize>() as u64
+        );
         let long = state_plan(4096).unwrap();
         assert_eq!(long.kv, 40 * 1024 * 4096 + 8 * 4096 * 4096);
         assert_eq!(long.convolution, 1_916_928);
         assert_eq!((long.local, long.full), (40, 8));
         assert!(state_plan(MAX_CONTEXT + 1).is_err());
+    }
+
+    #[test]
+    fn working_set_plans_exact_bounds_on_simulated_macs() {
+        use crate::family::mlx_budget::DeviceBudget;
+
+        // Released safetensors inventory, with the embedding streamed one row
+        // at a time. The aligned staging bound is checked by the fixture below.
+        const RESIDENT: u64 = 2_292_575_232;
+        const STAGING: u64 = 65_732_608;
+        let state = state_plan(4096).unwrap();
+        let charges = base_charges(RESIDENT, STAGING, &state);
+        assert_eq!(
+            charges,
+            [
+                ("projected_resident_text_bytes", RESIDENT),
+                ("bf16_kv_bytes", 301_989_888),
+                ("kv_row_index_bytes", 73_728 * size_of::<usize>() as u64),
+                ("bf16_convolution_history_bytes", 1_916_928),
+                ("one_token_shared_staging_bytes", STAGING),
+            ]
+        );
+        // The reference totals use Apple Silicon's eight-byte pointers. A
+        // portable 32-bit test projects its own index cost instead.
+        let pointer_adjustment = 73_728 * (8 - size_of::<usize>() as u64);
+        let exact_minimum = 3_736_546_304 - pointer_adjustment;
+        let remaining = |bytes| working_set_remaining(DeviceBudget::new(bytes).unwrap(), &charges);
+        let error = remaining(exact_minimum - 1).unwrap_err();
+        assert!(matches!(error, EngError::MemoryPlan(_)));
+        assert!(
+            error
+                .describe()
+                .contains("pressure_margin_bytes=1073741824")
+        );
+        assert_eq!(remaining(exact_minimum).unwrap(), 0);
+        assert_eq!(remaining(exact_minimum + 1).unwrap(), 1);
+        assert_eq!(
+            remaining(24 << 30).unwrap(),
+            22_033_257_472 + pointer_adjustment
+        );
+        assert_eq!(
+            remaining(48 << 30).unwrap(),
+            47_803_061_248 + pointer_adjustment
+        );
+        assert_eq!(
+            remaining(96 << 30).unwrap(),
+            99_342_668_800 + pointer_adjustment
+        );
+
+        let max_context = state_plan(MAX_CONTEXT).unwrap();
+        let max_charges = base_charges(RESIDENT, STAGING, &max_context);
+        let remaining_at_max =
+            |bytes| working_set_remaining(DeviceBudget::new(bytes).unwrap(), &max_charges);
+        assert!(matches!(
+            remaining_at_max(24 << 30),
+            Err(EngError::MemoryPlan(_))
+        ));
+        assert_eq!(
+            remaining_at_max(48 << 30).unwrap(),
+            13_510_693_888 + 8_429_568 * (8 - size_of::<usize>() as u64)
+        );
     }
 
     #[test]
@@ -1092,6 +1253,30 @@ mod tests {
                 assert_eq!(plan.down().shape, [8, HIDDEN, INTERMEDIATE]);
                 assert_eq!(plan.gate_up().amax.is_some(), layer == 0);
                 assert_eq!(plan.down().denominator.is_some(), layer == 0);
+            }
+            if layer == 20 {
+                let page = 16_384;
+                assert_eq!(source.one_token_staging_bytes(page).unwrap(), 65_732_608);
+                assert_eq!(source.prefill_staging_bytes(2, page).unwrap(), 131_416_064);
+                assert_eq!(
+                    source.prefill_staging_bytes(16, page).unwrap(),
+                    1_051_099_136
+                );
+                let exact_extra = 67_780_608;
+                let reserve = |headroom| {
+                    source
+                        .reserve_prefill_window(2, page, headroom, |_| Ok(true))
+                        .unwrap()
+                };
+                assert_eq!(reserve(0), (1, 0));
+                assert_eq!(reserve(exact_extra - 1), (1, 0));
+                assert_eq!(reserve(exact_extra), (2, exact_extra));
+                assert_eq!(
+                    source
+                        .reserve_prefill_window(2, page, exact_extra, |_| Ok(false))
+                        .unwrap(),
+                    (1, 0)
+                );
             }
             assert!(source.plan(0, &[128], 1).is_err());
         }
