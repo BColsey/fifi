@@ -854,6 +854,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engines_list_carries_the_refusal_of_a_failed_engine() {
+        let broken = testkit::failing_engine();
+        let entry = testkit::entry("e1", "model-a", &broken, 4_096);
+        testkit::wait_for_state(&entry.handle, EngineState::Error);
+        let state = Arc::new(AppState::new(testkit::API_KEY, vec![entry]));
+        let (status, _headers, body) = testkit::send(
+            &router(state),
+            testkit::get("/v1/engines", Some(testkit::API_KEY)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        let engine = &body["engines"][0];
+        assert_eq!(engine["state"], "error");
+        assert!(engine.get("load_stage").is_none(), "{engine}");
+        assert!(
+            engine["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("fixture load failure"),
+            "{engine}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_runtime_route_refuses_a_request_without_the_token() {
+        let (state, _engine) = one_engine_state();
+        let app = router(state);
+        for (method, uri) in [
+            ("GET", "/v1/engines"),
+            ("POST", "/v1/engines"),
+            ("DELETE", "/v1/engines/e1"),
+            ("GET", "/v1/hf/search?q=a"),
+            ("GET", "/v1/hf/cache"),
+            ("GET", "/v1/hf/tree?repo=a/b"),
+            ("GET", "/v1/hf/downloads"),
+            ("POST", "/v1/hf/downloads"),
+            ("DELETE", "/v1/hf/downloads/1"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from("{}"))
+                .expect("request");
+            let (status, _headers, _body) = testkit::send(&app, request).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn engines_list_distinguishes_runtime_added_engines() {
         let (state, _engine) = one_engine_state();
         let late = testkit::engine(Vec::new());

@@ -564,6 +564,8 @@ export interface EngineSummary {
   model_dir: string;
   state: EngineState;
   load_stage?: string;
+  /** Present only after a failure: the loader's own refusal. */
+  error?: EngineErrorInfo;
   context_limit: number;
   runtime_added: boolean;
 }

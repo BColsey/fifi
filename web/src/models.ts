@@ -356,7 +356,9 @@ export class ModelsView {
         const state = document.createElement("td");
         state.textContent = engine.state === "loading" && engine.load_stage !== undefined
           ? `loading (${engine.load_stage})`
-          : engine.state;
+          : engine.error !== undefined
+            ? `${engine.state}: ${engine.error.message}`
+            : engine.state;
         const model = document.createElement("td");
         model.textContent = engine.model;
         const action = document.createElement("td");

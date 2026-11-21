@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use super::error::ServerError;
-use super::state::{AppState, RemoveRefused};
+use super::state::{AppState, RemoveRefused, engine_error_info};
 use super::wire::state_name;
 use crate::EngError;
 
@@ -30,15 +30,26 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json:
         .entries()
         .iter()
         .map(|entry| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "id": entry.id,
                 "model": entry.model,
                 "model_dir": entry.model_dir.display().to_string(),
                 "state": state_name(entry.handle.state()),
-                "load_stage": entry.handle.load_stage(),
                 "context_limit": entry.context_limit,
                 "runtime_added": state.owns_engine(&entry.id),
-            })
+            });
+            let cells = row.as_object_mut().expect("row is an object");
+            // The stage and the failure are present only when there is
+            // one, as on the models list: a refused start says why.
+            if let Some(stage) = entry.handle.load_stage() {
+                cells.insert("load_stage".into(), stage.into());
+            }
+            if let Some(error) = engine_error_info(entry)
+                && let Ok(error) = serde_json::to_value(error)
+            {
+                cells.insert("error".into(), error);
+            }
+            row
         })
         .collect();
     Json(serde_json::json!({ "engines": engines }))

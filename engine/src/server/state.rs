@@ -520,16 +520,7 @@ impl AppState {
                 model: entry.model.clone(),
                 state: state_name(entry.handle.state()),
                 load_stage: entry.handle.load_stage(),
-                error: entry.handle.failure_info().map(|failure| EngineErrorInfo {
-                    code: failure.code,
-                    stage: failure.stage,
-                    message: failure.message,
-                    retry: match failure.retry {
-                        RetryClass::AfterCorrection => "after_correction",
-                        RetryClass::Unknown => "unknown",
-                    },
-                    suggestion: suggestion_for(failure.code),
-                }),
+                error: engine_error_info(entry),
             };
             match models.iter_mut().find(|model| model.id == entry.model) {
                 Some(model) => model.engines.push(info),
@@ -538,6 +529,22 @@ impl AppState {
         }
         ModelList::new(models)
     }
+}
+
+/// The recorded failure of one engine in the wire form both the
+/// models list and the runtime engine list carry: the stage that
+/// refused it (for example `admission`) and the loader's own message.
+pub(crate) fn engine_error_info(entry: &EngineEntry) -> Option<EngineErrorInfo> {
+    entry.handle.failure_info().map(|failure| EngineErrorInfo {
+        code: failure.code,
+        stage: failure.stage,
+        message: failure.message,
+        retry: match failure.retry {
+            RetryClass::AfterCorrection => "after_correction",
+            RetryClass::Unknown => "unknown",
+        },
+        suggestion: suggestion_for(failure.code),
+    })
 }
 
 /// The corrective action the recorded code justifies, and no more:

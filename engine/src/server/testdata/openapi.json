@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "ca0c6d8ad6545d5c2b1925f3e56ae115654048ddcb35b3f95ffa9a3b4a1a14d5",
+ "x-source-sha256": "7aa6c39d31f0926b126e84c68e1647bd6502bcffa328c6e6f69605e873a46e0a",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -2463,7 +2463,6 @@
      "model",
      "model_dir",
      "state",
-     "load_stage",
      "context_limit",
      "runtime_added"
     ],
@@ -2483,7 +2482,11 @@
       "description": "The engine state name, as /v1/system reports it."
      },
      "load_stage": {
-      "type": "string"
+      "type": "string",
+      "description": "Present only while state is loading."
+     },
+     "error": {
+      "$ref": "#/components/schemas/EngineError"
      },
      "context_limit": {
       "type": "integer"

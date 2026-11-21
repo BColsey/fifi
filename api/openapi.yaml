@@ -1801,8 +1801,7 @@ components:
     EngineSummary:
       type: object
       required:
-        [id, model, model_dir, state, load_stage, context_limit,
-         runtime_added]
+        [id, model, model_dir, state, context_limit, runtime_added]
       description: >-
         One engine of the runtime API: the fields the GUI's model
         page needs, including the directory the weights came from.
@@ -1818,6 +1817,9 @@ components:
           description: The engine state name, as /v1/system reports it.
         load_stage:
           type: string
+          description: Present only while state is loading.
+        error:
+          $ref: "#/components/schemas/EngineError"
         context_limit:
           type: integer
         runtime_added:
