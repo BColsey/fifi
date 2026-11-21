@@ -20,7 +20,7 @@ mod inventory;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use inventory::Role;
 pub use inventory::TensorPath;
 

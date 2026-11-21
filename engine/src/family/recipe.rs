@@ -303,12 +303,17 @@ pub(crate) enum Role {
     OProj,
     QNorm,
     KNorm,
-    /// The gated DeltaNet projections, convolution and recurrence parameters.
+    /// The gated DeltaNet projections, convolution and recurrence parameters (the decay, the
+    /// write and mix rates, the time-step bias and the output norm).
     DeltaQkv,
     DeltaGate,
     DeltaOut,
     DeltaConv,
     DeltaDecay,
+    DeltaAlpha,
+    DeltaBeta,
+    DeltaDtBias,
+    DeltaNorm,
     /// The QSA indexer projection.
     IndexProj,
     FfnNorm,

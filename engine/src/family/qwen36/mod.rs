@@ -54,6 +54,8 @@ mod mtp_pack_tests;
 mod pair_router_report;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod preflight;
+#[cfg(test)]
+mod recipe_map;
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")

@@ -102,6 +102,15 @@ const EXPERT_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80
 const EMBD_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
 
 impl Role {
+    /// The GGUF name of the tensor of this role: `blk.N.` and the suffix for a layer's role, the
+    /// whole name for a global one.
+    pub(crate) fn tensor_name(self, layer: Option<usize>) -> String {
+        match layer {
+            Some(layer) => format!("blk.{layer}.{}", self.suffix()),
+            None => self.suffix().to_owned(),
+        }
+    }
+
     /// Whole tensor name for the three global roles, else the part after `blk.N.`.
     fn suffix(self) -> &'static str {
         match self {
@@ -325,10 +334,7 @@ fn expected(
     role: Role,
     layer: Option<usize>,
 ) -> Result<ExpectedTensor, EngError> {
-    let name = match layer {
-        Some(layer) => format!("blk.{layer}.{}", role.suffix()),
-        None => role.suffix().to_owned(),
-    };
+    let name = role.tensor_name(layer);
     let dims = role.dims(spec)?;
     Ok(ExpectedTensor { name, role, dims })
 }
