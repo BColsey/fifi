@@ -116,6 +116,38 @@ pub(crate) struct FakeOptions {
 }
 
 impl EngineConfig {
+    /// The on-disk prefix cache object of this engine, whichever family's options carry it, and
+    /// the subdirectory of the default location that family keeps its cache in. `None` for a
+    /// family that has no such cache.
+    #[cfg_attr(
+        not(all(feature = "native-cuda", target_os = "linux")),
+        allow(dead_code, reason = "only the CUDA purge reads it")
+    )]
+    pub(crate) fn kv_cache_options(
+        &self,
+    ) -> Option<(
+        Option<&crate::family::kv_disk::KvCacheOptions>,
+        &'static str,
+    )> {
+        if self.family == Q36_FAMILY || self.family == DENSE_FAMILY {
+            Some((
+                self.qwen36
+                    .as_ref()
+                    .and_then(|options| options.kv_cache.as_ref()),
+                "qwen36",
+            ))
+        } else if self.family == GEMMA4_FAMILY {
+            Some((
+                self.gemma4
+                    .as_ref()
+                    .and_then(|options| options.kv_cache.as_ref()),
+                "gemma4",
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn model_name(&self) -> String {
         self.model.clone().unwrap_or_else(|| self.family.clone())
     }

@@ -3,6 +3,8 @@ mod config;
 #[cfg(feature = "native-cuda")]
 pub(crate) mod executor;
 mod gguf;
+#[cfg(feature = "native-cuda")]
+mod kv_tier;
 mod prompt;
 #[cfg(feature = "native-cuda")]
 pub(crate) mod resident;

@@ -101,12 +101,14 @@ mod device {
 
     use super::super::budget;
     use super::super::config::MaxSeqs;
+    use super::super::kv_tier::{self, BoltDisk};
     use super::super::resident::bolt::{self, Bolt, BoltSeq, BoltSnapshot, CELLS, VOCAB};
     use crate::{
         EngError,
         family::{
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
+            kv_disk::{self as kv_cache, KV_CACHE_DEFAULT_ON, KvCacheSettings},
             seq_plan::{SeqInputs, plan_seqs},
             session::{
                 DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, ShadowLcp,
@@ -115,7 +117,7 @@ mod device {
             window::{self, WindowRows},
         },
         sched::{
-            job::{PrefixHit, PrefixReport},
+            job::{PrefixHit, PrefixReport, PrefixTier},
             worker::{ReadyNote, spawn_engine_noted},
         },
         tokenizer::DecodeBatch,
@@ -157,6 +159,10 @@ mod device {
         prefix_hit: PrefixHit,
         prefix_uncached: u32,
         prefix_shadow: Option<ShadowLcp>,
+        /// The on-disk tier behind the host store, when it runs.
+        disk: Option<BoltDisk>,
+        /// The tier facts of the last restore, for `prefix_report`.
+        prefix_tier: PrefixTier,
     }
 
     /// The store's explicit one-tip shape (no roots, no periodic points),
@@ -275,6 +281,7 @@ mod device {
             self.prefix_hit = PrefixHit::Miss;
             self.prefix_uncached = 0;
             self.prefix_shadow = None;
+            self.prefix_tier = PrefixTier::default();
             st.core.reset(&mut Step {
                 model: &mut self.model,
                 seq: &st.seq,
@@ -340,10 +347,15 @@ mod device {
         ) -> Result<bool, EngError> {
             let identity = self.identity.clone();
             let model = &self.model;
-            st.core
-                .save_prefix(&mut self.prefix, key, identity, st.pos, kind, || {
-                    model.snapshot_seq(&st.seq, st.pos)
-                })
+            let saved =
+                st.core
+                    .save_prefix(&mut self.prefix, key, identity, st.pos, kind, || {
+                        model.snapshot_seq(&st.seq, st.pos)
+                    })?;
+            if saved && let Some(disk) = self.disk.as_mut() {
+                disk.spill_over_watermark(&self.prefix);
+            }
+            Ok(saved)
         }
 
         /// Writes the saved entry into the (reset) session and moves its position to the entry's.
@@ -356,6 +368,12 @@ mod device {
         ) -> Result<usize, EngError> {
             let identity = self.identity.clone();
             let model = &self.model;
+            // The host store missed or holds a shorter prefix: the disk may hold a longer one.
+            if let Some(disk) = self.disk.as_mut() {
+                disk.promote(&mut self.prefix, &identity, prompt, &|cells| {
+                    model.snapshot_layer_bytes(cells)
+                });
+            }
             let BoltSession { core, pos, seq } = st;
             let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
                 model.restore_seq(seq, saved)?;
@@ -366,6 +384,7 @@ mod device {
             self.prefix_hit = self.prefix.restored_kind().into();
             self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
             self.prefix_shadow = self.prefix.shadow_report();
+            self.prefix_tier = kv_tier::restore_tier(self.disk.as_mut(), covered);
             Ok(covered)
         }
 
@@ -386,8 +405,44 @@ mod device {
                 restore_drops: self.prefix.restore_drop_count(),
                 evictions: self.prefix.eviction_count(),
                 save_side: self.prefix.save_side_totals(),
-                tier: Default::default(),
+                tier: self.prefix_tier,
             })
+        }
+
+        /// Whether the disk tier has saves the engine thread should advance while it waits.
+        fn background_pending(&self) -> bool {
+            self.disk.as_ref().is_some_and(BoltDisk::pending)
+        }
+
+        /// Copies a bounded part of the pending saves to the writer: a few MiB per call, which a
+        /// batching worker makes between ticks and an idle one every 2 ms.
+        fn background_step(&mut self) {
+            self.with_disk(|disk, _, layer_bytes| disk.pump_emit(layer_bytes));
+        }
+
+        /// A graceful stop: writes the tips that exist only in host memory, within the tier's
+        /// bound.
+        fn background_drain(&mut self) {
+            self.with_disk(|disk, prefix, layer_bytes| disk.drain(prefix, layer_bytes));
+        }
+    }
+
+    impl BoltServe {
+        /// Runs `work` on the disk tier with the layer sizes of a snapshot of any length.
+        fn with_disk(
+            &mut self,
+            work: impl FnOnce(
+                &mut BoltDisk,
+                &mut PrefixStore<BoltSnapshot, PrefixIdentity>,
+                kv_tier::LayerBytes<'_>,
+            ),
+        ) {
+            let model = &self.model;
+            if let Some(disk) = self.disk.as_mut() {
+                work(disk, &mut self.prefix, &|cells| {
+                    model.snapshot_layer_bytes(cells)
+                });
+            }
         }
     }
 
@@ -491,7 +546,15 @@ mod device {
         ready_note: ReadyNote,
         seqs: MaxSeqs,
         prompt_rows: Option<usize>,
+        kv_cache: Option<KvCacheSettings>,
     ) -> Result<StartedEngine, EngError> {
+        let tier_plan = kv_cache::plan(
+            kv_cache.as_ref(),
+            &kv_cache::KvEnv::from_process().for_family("gemma4"),
+            KV_CACHE_DEFAULT_ON,
+            kv_cache::free_bytes,
+        )
+        .map_err(|message| EngError::BadRequest(format!("engine config: {message}")))?;
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
         let bundle = crate::tokenizer::gemma::load(tokenizer_dir)?;
         let eos = bundle.eos_token_ids().to_vec();
@@ -527,16 +590,37 @@ mod device {
                     plan.seqs
                 );
             }
+            // What names this load to an entry kept outside the process: the checkpoint, the
+            // pinned tokenizer and template, the layout of a snapshot and the numeric path.
+            let load = kv_tier::load_identity(
+                &model.weights_identity,
+                &model.snapshot_layer_bytes(1),
+                bolt::attn_split_wanted()?,
+            );
+            let identity = PrefixIdentity {
+                weights: load.weights.as_str().into(),
+                tokenizer: load.tokenizer.as_str().into(),
+                template: load.template.as_str().into(),
+            };
+            let disk = match &tier_plan {
+                kv_cache::Plan::Off(reason) => {
+                    eprintln!("gemma4 bolt: kv disk tier off: {reason}");
+                    None
+                }
+                kv_cache::Plan::On { resolved, origin } => BoltDisk::open(resolved, origin, &load),
+            };
             let serve = BoltServe {
                 model,
                 eos: eos.clone(),
                 prefix: PrefixStore::with_limits(ONE_TIP),
-                identity: PrefixIdentity::default(),
+                identity,
                 max_seqs: plan.seqs,
                 prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
+                disk,
+                prefix_tier: PrefixTier::default(),
             };
             if plan.seqs > 1 {
                 eprintln!(
@@ -830,6 +914,8 @@ mod device {
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
+                disk: None,
+                prefix_tier: PrefixTier::default(),
             }
         }
 

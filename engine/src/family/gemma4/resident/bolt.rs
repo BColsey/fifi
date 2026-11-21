@@ -231,10 +231,25 @@ pub(crate) struct BoltSeq {
 /// `fed` times the cost of one position. It restores into any sequence.
 pub(crate) struct BoltSnapshot {
     fed: usize,
-    data: Vec<u8>,
+    /// Shared so the disk tier can read it in chunks while the store still owns the entry.
+    data: std::rc::Rc<Vec<u8>>,
 }
 
 impl BoltSnapshot {
+    /// A snapshot of `fed` cells whose bytes came from another tier (a disk read), laid out as
+    /// `Bolt::snapshot_layer_bytes(fed)` says.
+    pub(crate) fn from_parts(fed: usize, data: Vec<u8>) -> Self {
+        Self {
+            fed,
+            data: std::rc::Rc::new(data),
+        }
+    }
+
+    /// A second owner of the bytes, for the disk tier to copy out of.
+    pub(crate) fn hold(&self) -> std::rc::Rc<Vec<u8>> {
+        std::rc::Rc::clone(&self.data)
+    }
+
     /// The positions the snapshot covers.
     pub(crate) fn fed(&self) -> usize {
         self.fed
@@ -376,6 +391,9 @@ pub(crate) struct Bolt {
     pub(crate) graph_mode: DecodeGraphMode,
     /// The logits rows of a window, present once `reserve_window` ran.
     window: Option<WindowBuffers>,
+    /// What names the checkpoint to an entry kept outside this process: its header digest, a
+    /// sample of every tensor and its length and modification time.
+    pub(crate) weights_identity: String,
 }
 
 fn embed_scale() -> f32 {
@@ -444,6 +462,11 @@ pub(crate) fn load_choosing(
     }
     let path = choice.chosen.path.as_path();
     let (weights, spelling) = super::super::open_bolt_weights(path, header_sha256)?;
+    let weights_identity = crate::weights::sha256_hex(
+        &crate::weights::gguf_identity_digest(weights.header(), path, None)
+            .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
+    )
+    .to_string();
     let demand = bolt_demand(choice.chosen.bytes, split)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     let mut layers = Vec::with_capacity(LAYERS);
@@ -685,6 +708,7 @@ pub(crate) fn load_choosing(
         graph: None,
         graph_seq: 0,
         window: None,
+        weights_identity,
     })
 }
 
@@ -764,6 +788,21 @@ impl Bolt {
         [plane(codes), plane(scales), plane(codes), plane(scales)]
     }
 
+    /// The bytes of each physical layer's part of a snapshot of `fed` cells, in the order the
+    /// snapshot stores them. Their sum is the snapshot's size; each is one object of a disk entry.
+    pub(crate) fn snapshot_layer_bytes(&self, fed: usize) -> Vec<usize> {
+        self.layers
+            .iter()
+            .filter(|layer| layer.physical())
+            .map(|layer| {
+                Self::snapshot_ranges(layer.head, fed)
+                    .iter()
+                    .map(|plane| plane.iter().map(|range| range.1).sum::<usize>())
+                    .sum()
+            })
+            .collect()
+    }
+
     /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
     /// later request restores into any sequence, so it holds at most one sequence's cache
     /// (`CELLS` positions) and is allocated only for the cells it covers; a host whose available
@@ -816,7 +855,7 @@ impl Bolt {
                 }
             }
         }
-        Ok(BoltSnapshot { fed, data })
+        Ok(BoltSnapshot::from_parts(fed, data))
     }
 
     /// Writes a snapshot into `seq`: the cells `0..fed` of every plane. The cells above are left

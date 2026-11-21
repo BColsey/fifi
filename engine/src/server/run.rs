@@ -30,21 +30,19 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-/// Empties the prefix cache directory of every Qwen3.6 engine of `config`: the environment's,
-/// else the engine's `kv_cache.dir`, else the default location. A directory that holds
-/// anything besides a cache is refused and left alone.
+/// Empties the prefix cache directory of every engine of `config` whose family keeps one: the
+/// environment's, else the engine's `kv_cache.dir`, else the family's default location. A
+/// directory that holds anything besides a cache is refused and left alone. Each directory is
+/// emptied once, however many engines name it.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn purge_kv_caches(config: &Config) -> Result<(), StartupError> {
-    use crate::family::{kv_disk as kv_cache, qwen36::factory::FAMILY};
-    let env = kv_cache::KvEnv::from_process();
+    use crate::family::kv_disk as kv_cache;
+    let mut done: Vec<std::path::PathBuf> = Vec::new();
     for engine in &config.engines {
-        if engine.family != FAMILY {
+        let Some((options, family_dir)) = engine.kv_cache_options() else {
             continue;
-        }
-        let options = engine
-            .qwen36
-            .as_ref()
-            .and_then(|options| options.kv_cache.as_ref());
+        };
+        let env = kv_cache::KvEnv::from_process().for_family(family_dir);
         let Some(dir) = kv_cache::purge_dir(options, &env).map_err(StartupError)? else {
             eprintln!(
                 "kv cache purge: engine {} has no cache directory (set kv_cache.dir)",
@@ -52,6 +50,9 @@ fn purge_kv_caches(config: &Config) -> Result<(), StartupError> {
             );
             continue;
         };
+        if done.contains(&dir) {
+            continue;
+        }
         let report = kv_cache::purge(&dir).map_err(StartupError)?;
         eprintln!(
             "kv cache purge: engine {}: {} entries, {} B removed from {}",
@@ -60,6 +61,7 @@ fn purge_kv_caches(config: &Config) -> Result<(), StartupError> {
             report.bytes,
             dir.display()
         );
+        done.push(dir);
     }
     Ok(())
 }
@@ -628,6 +630,15 @@ fn start_gemma4(
                         .gemma4
                         .as_ref()
                         .and_then(gemma4::Gemma4Options::prompt_rows),
+                    config
+                        .gemma4
+                        .as_ref()
+                        .and_then(|options| options.kv_cache.as_ref())
+                        .map(crate::family::kv_disk::KvCacheOptions::checked)
+                        .transpose()
+                        .map_err(|message| {
+                            EngError::BadRequest(format!("engine config: {message}"))
+                        })?,
                 )?;
                 Ok(StartedEngine {
                     engine: started.engine,

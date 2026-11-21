@@ -70,6 +70,13 @@ pub(crate) struct Gemma4Options {
         allow(dead_code, reason = "only the CUDA starter reads the share")
     )]
     pub(crate) prompt_rows: Option<PromptRows>,
+    /// The on-disk prefix cache: the same object every family takes (`dir`, `quota_bytes`,
+    /// `enabled`). Absent means the default.
+    #[cfg_attr(
+        not(feature = "native-cuda"),
+        allow(dead_code, reason = "only the CUDA starter reads the cache settings")
+    )]
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
 }
 
 /// A prompt share per tick: from one planned piece (`BOLT_PIECE_ROWS`) to 4,096 rows. The worker

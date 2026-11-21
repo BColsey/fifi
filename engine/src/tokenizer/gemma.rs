@@ -27,6 +27,19 @@ const NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN: TokenizerPin = TokenizerPin {
     vocab_size: 262_144,
 };
 
+/// The digests of the pinned tokenizer file and chat template, which a loaded bundle matches
+/// byte for byte: what a persisted prefix names as the text it was built from.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starter names the pinned files")
+)]
+pub(crate) fn pinned_digests() -> ([u8; 32], [u8; 32]) {
+    (
+        NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN.tokenizer_json,
+        NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN.chat_template_jinja,
+    )
+}
+
 /// Loads files pinned to `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16@49843eed`.
 pub fn load(dir: &Path) -> Result<TokenizerBundle, EngError> {
     TokenizerBundle::load(dir, &NEMOTRON_35_BOLT_E4B_BF16_REV_49843EED_PIN)
