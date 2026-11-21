@@ -787,7 +787,7 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("{name}: {error}"))
 }
 
-fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
+pub(super) fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     StreamedCheckpoint::open_local(dir, 64 << 20)
 }
 
@@ -1346,7 +1346,7 @@ impl Q36Executor {
     }
 }
 
-fn device_reserve(
+pub(super) fn device_reserve(
     shape: &HostShape,
     activation: Activation,
     cache: KvDtype,

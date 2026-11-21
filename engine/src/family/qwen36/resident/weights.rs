@@ -370,6 +370,10 @@ fn page_range(range: &RoleRange) -> PageRange {
 }
 
 impl ExpertSlices {
+    pub(super) fn new(stacks: [SlicedWeight; 3], f32_scales: bool) -> Self {
+        Self { stacks, f32_scales }
+    }
+
     fn layout(&self, ckpt: &StreamedCheckpoint, count: u32) -> Result<ExpertLayout, EngError> {
         let [gate, up, down] = &self.stacks;
         let page = HostPages::page_size();
@@ -400,7 +404,7 @@ impl ExpertSlices {
         })
     }
 
-    fn bytes(&self, ckpt: &StreamedCheckpoint, count: u32) -> Result<u64, EngError> {
+    pub(super) fn bytes(&self, ckpt: &StreamedCheckpoint, count: u32) -> Result<u64, EngError> {
         u64::try_from(self.layout(ckpt, count)?.down.end)
             .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))
     }
@@ -492,7 +496,7 @@ impl RMoe {
             shared_up: front.shared_up,
             shared_down: front.shared_down,
             shared_scalar_t: front.shared_scalar_t,
-            experts: Experts::Disk(Box::new(ExpertSlices { stacks, f32_scales })),
+            experts: Experts::Disk(Box::new(ExpertSlices::new(stacks, f32_scales))),
         }
     }
 

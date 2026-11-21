@@ -350,7 +350,7 @@ pub(crate) fn collect(config: Option<&crate::server::config::Config>) -> BundleI
             config
                 .engines
                 .iter()
-                .map(|engine| engine_input(engine, &facts))
+                .map(|engine| engine_input(engine, &facts, config.prefix_reuse))
                 .collect()
         })
         .unwrap_or_default();
@@ -378,6 +378,7 @@ pub(crate) fn collect(config: Option<&crate::server::config::Config>) -> BundleI
 fn engine_input(
     engine: &crate::server::config::EngineConfig,
     facts: &HardwareFacts,
+    prefix_reuse: Option<bool>,
 ) -> EngineInput {
     let candidate = Candidate {
         family: Some(engine.family.clone()),
@@ -415,7 +416,9 @@ fn engine_input(
         preflight::preflight(&engine.model_dir, &engine.tokenizer_dir, &candidate, facts)
             .map_err(|error| super::describe_error(&error));
     let env = crate::family::qwen36::settings::Q36Env::from_process(&engine.model_dir);
-    let effective = effective_rows(engine, &env);
+    let prefix_reuse =
+        prefix_reuse.unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
+    let effective = effective_rows(engine, &env, prefix_reuse);
     EngineInput {
         id: engine.id.clone(),
         family: engine.family.clone(),
@@ -430,9 +433,11 @@ fn engine_input(
 fn effective_rows(
     engine: &crate::server::config::EngineConfig,
     env: &crate::family::qwen36::settings::Q36Env,
+    prefix_reuse: bool,
 ) -> Result<Vec<Value>, String> {
-    use crate::family::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
-    use crate::family::qwen36::settings::Q36Settings;
+    use crate::family::qwen36::factory::{
+        DENSE_FAMILY, FAMILY, backend_of_build, settings_with_prefix_reuse,
+    };
     let rows = if engine.family == crate::family::flint::FAMILY {
         Some(super::effective::flint_effective_for_build(
             engine.flint.as_ref(),
@@ -468,12 +473,13 @@ fn effective_rows(
     } else {
         crate::family::spec::QWEN3_6_35B_A3B
     };
-    let settings = Q36Settings::new_for_family(
+    let settings = settings_with_prefix_reuse(
         &engine.model_dir,
         &engine.tokenizer_dir,
         engine.qwen36.as_ref(),
         env,
         backend,
+        prefix_reuse,
         spec,
     )
     .map_err(|error| super::describe_error(&error))?;
@@ -973,7 +979,7 @@ mod tests {
     }
 
     fn flash_load_plan_detail(engine: &crate::server::config::EngineConfig) -> String {
-        let input = super::engine_input(engine, &synthetic_facts());
+        let input = super::engine_input(engine, &synthetic_facts(), None);
         let report = input
             .preflight
             .expect("a refusal is a report, not an error");
@@ -1050,7 +1056,7 @@ mod tests {
         // same no-rows answer as before this wiring.
         let (_dir, engine) =
             flash_engine(crate::family::flash_next::settings::FlashOptions::default());
-        let input = super::engine_input(&engine, &synthetic_facts());
+        let input = super::engine_input(&engine, &synthetic_facts(), None);
         let report = input.preflight.expect("a report");
         assert!(report.decisions.is_empty());
         assert!(report.checks.iter().any(|check| {
@@ -1086,7 +1092,7 @@ mod tests {
         };
         // Deliberately NOT asserting row count or keys: the resolver owns
         // the surface; the bundle only carries it with origins attached.
-        let rows = super::effective_rows(&engine, &env).expect("rows");
+        let rows = super::effective_rows(&engine, &env, false).expect("rows");
         assert!(!rows.is_empty(), "real rows: {rows:?}");
         assert!(
             rows.iter()

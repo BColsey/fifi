@@ -434,8 +434,8 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             }));
             continue;
         }
-        use crate::family::qwen36::factory::backend_of_build;
-        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+        use crate::family::qwen36::factory::{backend_of_build, settings_with_prefix_reuse};
+        use crate::family::qwen36::settings::Q36Env;
         let env = Q36Env::from_process(&engine.model_dir);
         let backend = backend_of_build();
         let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {
@@ -443,12 +443,16 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
         } else {
             crate::family::spec::QWEN3_6_35B_A3B
         };
-        let settings = Q36Settings::new_for_family(
+        let prefix_reuse = config
+            .prefix_reuse
+            .unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
+        let settings = settings_with_prefix_reuse(
             &engine.model_dir,
             &engine.tokenizer_dir,
             engine.qwen36.as_ref(),
             &env,
             backend,
+            prefix_reuse,
             spec,
         )
         .map_err(|error| {
@@ -458,9 +462,6 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
                 super::describe_error(&error)
             )
         })?;
-        let prefix_reuse = config
-            .prefix_reuse
-            .unwrap_or_else(|| crate::server::run::default_prefix_reuse(engine));
         if prefix_reuse {
             settings
                 .check_prefix_reuse_cap(true)

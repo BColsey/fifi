@@ -5,6 +5,8 @@
 //! per token. The portable parts (`layout`, `tiny`) run on Linux. The graph builders need the Mac GPU.
 
 mod chunk_plan;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(in crate::family::qwen36) mod context_plan;
 mod kv_plan;
 mod layout;
 
