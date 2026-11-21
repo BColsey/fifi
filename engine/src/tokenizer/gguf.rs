@@ -197,6 +197,8 @@ pub(crate) struct GgufTokenizer {
     eom_id: Option<u32>,
     /// The token the chat template ends an assistant message with, see [`template_turn_end`].
     turn_end: Option<u32>,
+    /// The line that says a spec's template stands in for a header that carries none.
+    template_note: Option<String>,
     /// The bytes of a `generation_config.json` beside the weights file, when there is one.
     generation_config: Option<Vec<u8>>,
     add_bos: bool,
@@ -258,6 +260,11 @@ impl GgufTokenizer {
             optional_id("tokenizer.ggml.padding_token_id"),
             optional_id("tokenizer.ggml.unknown_token_id"),
         );
+        let architecture = match header.meta("general.architecture") {
+            Some(MetaValue::String(name)) => Some(name.clone()),
+            _ => None,
+        };
+        let mut template_note = None;
         let chat_template = match header.meta("tokenizer.chat_template") {
             Some(MetaValue::String(template)) if template.len() > TEMPLATE_CAP_BYTES => {
                 return Err(reject(format!(
@@ -266,7 +273,19 @@ impl GgufTokenizer {
                 )));
             }
             Some(MetaValue::String(template)) => template.clone(),
-            _ => return Err(reject("tokenizer.chat_template is missing")),
+            _ => match architecture
+                .as_deref()
+                .and_then(crate::family::spec::chat_template_fallback)
+            {
+                Some(row) => {
+                    template_note = Some(format!(
+                        "chat template: the GGUF carries none; using the template of the {} spec",
+                        row.spec
+                    ));
+                    row.template.to_owned()
+                }
+                None => return Err(reject("tokenizer.chat_template is missing")),
+            },
         };
         let turn_end = template_turn_end(&tokens, &types, &chat_template);
         let (eot_id, eom_id) = (
@@ -287,6 +306,7 @@ impl GgufTokenizer {
             eot_id,
             eom_id,
             turn_end,
+            template_note,
             generation_config: path
                 .parent()
                 .and_then(|dir| std::fs::read(dir.join("generation_config.json")).ok()),
@@ -484,10 +504,13 @@ pub(crate) fn bundle_from_gguf(path: &Path) -> Result<TokenizerBundle, EngError>
         tokenizer.tokens.len(),
         tokenizer.merges.len()
     );
-    TokenizerBundle::from_parts(tokenizer.parts()?, None, vec![note])
+    let mut notes = vec![note];
+    notes.extend(tokenizer.template_note.clone());
+    TokenizerBundle::from_parts(tokenizer.parts()?, None, notes)
 }
 
-/// The first GGUF file of `dir`, by name, whose header carries a vocabulary and a chat template:
+/// The first GGUF file of `dir`, by name, whose header carries a vocabulary and a chat template (or
+/// whose architecture has a spec template to stand in for it):
 /// the file a start builds its tokenizer from when no `tokenizer.json` sits beside the weights.
 /// A draft model's file without a template is skipped; later shards of a split model hold no
 /// tokenizer keys and are never first. `None` when no file qualifies.
@@ -512,13 +535,20 @@ pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, 
         let Ok(header) = crate::weights::shared_header(&file, HEADER_CAP_BYTES) else {
             continue;
         };
+        // A file with no template qualifies when a spec names one for its architecture.
+        let has_template = matches!(
+            header.meta("tokenizer.chat_template"),
+            Some(MetaValue::String(_))
+        ) || matches!(
+            header.meta("general.architecture"),
+            Some(MetaValue::String(name))
+                if crate::family::spec::chat_template_fallback(name).is_some()
+        );
         if matches!(
             header.meta("tokenizer.ggml.tokens"),
             Some(MetaValue::Array(_))
-        ) && matches!(
-            header.meta("tokenizer.chat_template"),
-            Some(MetaValue::String(_))
-        ) {
+        ) && has_template
+        {
             return Ok(Some(file));
         }
     }
@@ -618,6 +648,18 @@ pub(crate) mod tests {
 
     fn kv_string(key: &str, value: &str) -> Vec<u8> {
         kv(key, 8, &string(value))
+    }
+
+    pub(crate) fn kv_string_for_tests(key: &str, value: &str) -> Vec<u8> {
+        kv_string(key, value)
+    }
+
+    pub(crate) fn kv_u32_for_tests(key: &str, value: u32) -> Vec<u8> {
+        kv(key, 4, &value.to_le_bytes())
+    }
+
+    pub(crate) fn kv_f32_for_tests(key: &str, value: f32) -> Vec<u8> {
+        kv(key, 6, &value.to_le_bytes())
     }
 
     fn kv_array(key: &str, elem_type: u32, items: &[Vec<u8>]) -> Vec<u8> {
@@ -751,6 +793,93 @@ pub(crate) mod tests {
         assert_eq!(bundle.tokenizer().encode("a b").expect("encode"), [4, 7]);
         assert_eq!(bundle.tokenizer().encode("z").expect("encode"), [8]);
         assert_eq!(bundle.tokenizer().decode(&[4, 7]).expect("decode"), "a b");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A space-marker vocabulary file of `architecture` whose header has no chat template.
+    fn space_marker_file_without_template(architecture: &str) -> PathBuf {
+        let tokens = [
+            "<pad>",
+            "<eos>",
+            "<bos>",
+            "<unk>",
+            "a",
+            "b",
+            "\u{2581}",
+            "\u{2581}b",
+            "<0x7A>",
+        ];
+        let types = [3, 3, 3, 3, 1, 1, 1, 1, 6];
+        let mut kvs = vocabulary_kvs(
+            "gemma4",
+            &tokens,
+            &types,
+            &["\u{2581} b"],
+            "unused",
+            1,
+            vec![kv(
+                "tokenizer.ggml.unknown_token_id",
+                4,
+                &3u32.to_le_bytes(),
+            )],
+        );
+        kvs.retain(|entry| !entry.starts_with(&string("tokenizer.chat_template")));
+        kvs[0] = kv_string("general.architecture", architecture);
+        write_temp(&gguf_file(&kvs))
+    }
+
+    #[test]
+    fn a_file_with_no_chat_template_takes_the_one_its_spec_names_and_says_so() {
+        let path = space_marker_file_without_template("gemma4");
+        let tokenizer = GgufTokenizer::read(&path).expect("the spec supplies the template");
+        let note = tokenizer
+            .template_note
+            .clone()
+            .expect("the fallback is logged");
+        assert!(
+            note.contains("carries none")
+                && note.contains(crate::family::spec::NEMOTRON_BOLT_E4B.name),
+            "{note}"
+        );
+        let parts = tokenizer.parts().expect("parts");
+        assert_eq!(
+            parts.chat_template,
+            crate::family::spec::chat_template_fallback("gemma4")
+                .expect("row")
+                .template
+                .as_bytes()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_directory_of_a_file_without_a_template_is_found_when_a_spec_names_one() {
+        let dir = std::env::temp_dir().join(format!("gguf-vocab-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let with_row = space_marker_file_without_template("gemma4");
+        std::fs::copy(&with_row, dir.join("bolt.gguf")).expect("copy");
+        assert_eq!(
+            super::vocabulary_gguf(&dir).expect("scan"),
+            Some(dir.join("bolt.gguf"))
+        );
+        std::fs::remove_file(dir.join("bolt.gguf")).expect("remove");
+        let without_row = space_marker_file_without_template("someother");
+        std::fs::copy(&without_row, dir.join("other.gguf")).expect("copy");
+        assert_eq!(super::vocabulary_gguf(&dir).expect("scan"), None);
+        let _ = std::fs::remove_file(with_row);
+        let _ = std::fs::remove_file(without_row);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_with_no_chat_template_and_no_spec_row_is_refused_by_name() {
+        let path = space_marker_file_without_template("someother");
+        let error = GgufTokenizer::read(&path).err().expect("refused");
+        assert!(
+            error.describe().contains("chat_template is missing"),
+            "{error:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

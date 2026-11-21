@@ -43,12 +43,14 @@ const FAKE_FAMILY: &str = super::fake::FAMILY;
 
 /// The families that a GGUF `general.architecture` identifies, so a directory holding only the
 /// weights file starts with no `config.json` and no `--family`. One line per architecture: a
-/// family adds its line once a start from a GGUF-only directory works for it. Not listed:
+/// family adds its line once a start from a GGUF-only directory serves a chat. Not listed:
 /// Flash-Next `qwen4exp` (its loader stops on quantization kernels that do not exist yet, such as
-/// IQ2_S), Nemotron `nemotron_h_moe` (its entry needs an options block), Bolt `gemma4` (it reads a
-/// `config.json`) and Flint.
-pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] =
-    &[("qwen35moe", crate::family::qwen36::factory::FAMILY)];
+/// IQ2_S), Nemotron `nemotron_h_moe` (its entry needs an options block), Raon `raon1` (its CUDA
+/// serving is not on main) and Flint.
+pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
+    ("qwen35moe", crate::family::qwen36::factory::FAMILY),
+    ("gemma4", crate::family::gemma4::FAMILY),
+];
 
 /// The architectures of [`GGUF_ARCHITECTURE_FAMILIES`], for refusal text.
 pub(crate) fn known_gguf_architectures() -> String {

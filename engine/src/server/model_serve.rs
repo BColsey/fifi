@@ -37,6 +37,12 @@ pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Whether a family's engine entry carries the Qwen3.6 options block (the Qwen3.6 families);
+/// every other family starts from a bare entry.
+fn uses_qwen36_options(family: &str) -> bool {
+    DETECTABLE_FAMILIES.iter().any(|(name, _)| *name == family)
+}
+
 /// The families that a GGUF `general.architecture` identifies when the directory has no
 /// `config.json`.
 const ARCHITECTURE_FAMILIES: &[(&str, &str)] = crate::server::config::GGUF_ARCHITECTURE_FAMILIES;
@@ -153,6 +159,18 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     }
 
     let family = select_family(args, &inspection)?;
+    if !uses_qwen36_options(&family) {
+        for (flag, given) in [
+            ("--kv", args.kv_dtype.is_some()),
+            ("--context", args.context_limit.is_some()),
+        ] {
+            if given {
+                return Err(StartupError(format!(
+                    "serve --model: {flag} is not an option of the {family} family; write a --config file"
+                )));
+            }
+        }
+    }
     let weight_format = select_weight_format(has_gguf, has_safetensors);
 
     let options = crate::family::qwen36::settings::Q36Options {
@@ -270,7 +288,11 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         sample_trace: false,
         web_dir: None,
         engines: vec![EngineConfig {
-            id: "q36".to_string(),
+            id: if uses_qwen36_options(&discovered.family) {
+                "q36".to_string()
+            } else {
+                discovered.family.clone()
+            },
             model_dir: args.model_dir.clone(),
             tokenizer_dir: discovered.tokenizer_dir.clone(),
             family: discovered.family.clone(),
@@ -281,7 +303,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             kv_cache: None,
             fake: None,
             flash_next: None,
-            qwen36: Some(discovered.options.clone()),
+            qwen36: uses_qwen36_options(&discovered.family).then(|| discovered.options.clone()),
             nemotron: None,
             gemma4: None,
             flint: None,
@@ -295,6 +317,20 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
 pub(crate) fn config_json(config: &Config) -> String {
     use serde_json::json;
     let engine = &config.engines[0];
+    if !uses_qwen36_options(&engine.family) {
+        let document = json!({
+            "listen": config.listen,
+            "api_key_env": config.api_key_env,
+            "prefix_reuse": config.prefix_reuse,
+            "engines": [{
+                "id": engine.id,
+                "family": engine.family,
+                "model_dir": engine.model_dir.display().to_string(),
+                "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
+            }],
+        });
+        return serde_json::to_string_pretty(&document).expect("the built config is valid JSON");
+    }
     let mut q36 = serde_json::Map::new();
     if let Some(options) = &engine.qwen36 {
         if let Some(value) = &options.weight_format {
@@ -883,7 +919,7 @@ mod tests {
 
     #[test]
     fn an_architecture_outside_the_table_is_refused_naming_it_and_the_known_ones() {
-        for architecture in ["mamba9", "gemma4", "flint", "qwen4exp", "nemotron_h_moe"] {
+        for architecture in ["mamba9", "flint", "qwen4exp", "nemotron_h_moe", "raon1"] {
             let dir = directory_of_architecture(architecture);
             let error = discover(&args_for(dir.path())).unwrap_err().0;
             assert!(error.contains(architecture), "{error}");
@@ -903,5 +939,31 @@ mod tests {
         let discovered = discover(&args_for(dir.path())).expect("discovers");
         assert_eq!(discovered.family, crate::family::qwen36::factory::FAMILY);
         assert_eq!(discovered.weight_format, "gguf");
+    }
+
+    #[test]
+    fn a_row_outside_the_qwen_families_starts_from_a_bare_entry_that_prints_as_it_starts() {
+        for (architecture, family) in crate::server::config::GGUF_ARCHITECTURE_FAMILIES {
+            if super::uses_qwen36_options(family) {
+                continue;
+            }
+            let dir = directory_of_architecture(architecture);
+            let args = args_for(dir.path());
+            let discovered = discover(&args).expect("discovers");
+            let config = super::config_from(&discovered, &args);
+            let engine = &config.engines[0];
+            assert_eq!(engine.family, *family);
+            assert!(engine.qwen36.is_none(), "{architecture}: a bare entry");
+            let printed = super::config_json(&config);
+            let path = dir.path().join("printed.json");
+            std::fs::write(&path, &printed).expect("write");
+            let again = Config::from_file(&path)
+                .unwrap_or_else(|error| panic!("{architecture}: {}", error.0));
+            assert_eq!(again.engines[0].family, *family);
+            let mut with_flag = args_for(dir.path());
+            with_flag.context_limit = Some(4096);
+            let error = discover(&with_flag).unwrap_err().0;
+            assert!(error.contains("--context is not an option"), "{error}");
+        }
     }
 }

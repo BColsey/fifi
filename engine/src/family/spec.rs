@@ -467,6 +467,30 @@ const fn bolt_e4b_attention() -> [AttentionKind; 42] {
 
 const NEMOTRON_BOLT_E4B_LAYERS: [AttentionKind; 42] = bolt_e4b_attention();
 
+/// A chat template that a spec names for a weights file whose header carries none, found by the
+/// file's `general.architecture`. A family adds a row here, not code: the GGUF tokenizer reader
+/// takes the template from the row and logs which spec supplied it.
+pub struct TemplateFallback {
+    /// The name of the spec that supplies the template.
+    pub spec: &'static str,
+    pub architecture: &'static str,
+    pub template: &'static str,
+}
+
+/// The templates of the specs that name one.
+pub const CHAT_TEMPLATE_FALLBACKS: &[TemplateFallback] = &[TemplateFallback {
+    spec: NEMOTRON_BOLT_E4B.name,
+    architecture: "gemma4",
+    template: include_str!("../../testdata/gemma4/chat_template.jinja"),
+}];
+
+/// The row for a `general.architecture`, if a spec names a template for it.
+pub fn chat_template_fallback(architecture: &str) -> Option<&'static TemplateFallback> {
+    CHAT_TEMPLATE_FALLBACKS
+        .iter()
+        .find(|row| row.architecture == architecture)
+}
+
 /// The Nemotron 3.5 Bolt E4B family:
 /// `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16`, model type `gemma4` (text
 /// `gemma4_text`), served through the base Gemma 4 architecture.
