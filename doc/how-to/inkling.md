@@ -180,6 +180,17 @@ The `8a6c6347` binary compared one row with four rows for the same 62 input and 
 
 Four-row prefill reduced the first request’s time to first token by 9.40 s and the repeat’s by 6.18 s. It reduced logical expert payload reads during prefill by 36.8%, with traffic during decode unchanged. Attributed disk reads fell by 23.7% on the first request and rose by 7.8% on the repeat. Receipts `idle-long-file-only.json` and `idle-long-window4.json` include per-phase read ranges and byte counts.
 
+The `e9f74c2b` release repeated the same comparison with all four responses matching. The OS page cache was uncontrolled and both arms passed the host audit.
+
+| Request | Prefill rows | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (GB) | Peak process footprint (GB) | Swap-out pages |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| First | 1 | 31.57 | 1.96 | 1.90 | 35.26 | 126.92 | 11.01 | 0.46 | 0 |
+| First | 4 | 25.43 | 2.44 | 1.89 | 29.14 | 85.00 | 12.25 | 0.65 | 0 |
+| Repeat | 1 | 32.30 | 1.92 | 1.94 | 35.91 | 126.92 | 11.68 | 0.46 | 0 |
+| Repeat | 4 | 23.96 | 2.59 | 1.95 | 27.56 | 85.00 | 10.63 | 0.65 | 0 |
+
+On the final build, four rows shortened time to first token by 6.14 s on the first request and 8.34 s on the repeat. Logical reads fell by 41.92 GB per request. Attributed disk reads rose by 11.2% on the first request and fell by 9.0% on the repeat.
+
 ### Sustained decode at 5 GiB
 
 The `8a6c6347` server processed 14 prompt and 64 greedy output tokens. Each policy served the same prompt twice in one process, with the mapped process first. All four responses returned identical text about the history of Paris and reached the 64-token limit. The OS page cache was uncontrolled. A local iOS CI worker started during the first request, and Xcode began building during the first private-cache request. These measurements characterize the contention case.
