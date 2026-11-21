@@ -1,6 +1,9 @@
 //! Single-layer experiment. Every arm gets the same independently routed pieces.
 
-use super::*;
+use super::{
+    prefill_pair::{PairStaging, StageLoader, StagePeak, wave_experts},
+    *,
+};
 use crate::family::{
     mlx_budget::{DeviceBudget, PRESSURE_MARGIN},
     prefill::mlx::{local_expert_ids, sorted_expert_ids},
@@ -11,7 +14,7 @@ use std::{rc::Rc, time::Instant};
 
 const HIDDEN: u32 = 2048;
 const TOP_K: u32 = 6;
-const WAVE_SLOTS: usize = 64;
+const WAVE_SLOTS: usize = PairStaging::Waves64.slots();
 
 struct Piece {
     input: ExecutionTensor,
@@ -151,98 +154,6 @@ fn staged_pieces(
     Ok(outputs)
 }
 
-#[derive(Default)]
-struct WaveOutputs {
-    arrays: Vec<ExecutionTensor>,
-    pair_positions: Vec<usize>,
-}
-
-impl WaveOutputs {
-    fn restore_order(self, k: &mut MlxKernels, token_rows: u32) -> Result<ExecutionTensor> {
-        let pairs = (token_rows * TOP_K) as usize;
-        assert_eq!(self.pair_positions.len(), pairs);
-        let mut inverse = vec![u32::MAX; pairs];
-        for (encoded, original) in self.pair_positions.into_iter().enumerate() {
-            assert_eq!(inverse[original], u32::MAX, "pair emitted twice");
-            inverse[original] = encoded as u32;
-        }
-        assert!(inverse.iter().all(|&rank| rank < pairs as u32));
-        let arrays = self.arrays.iter().collect::<Vec<_>>();
-        let joined = k.concatenate(&arrays, 0)?;
-        let inverse = k.import_tensor(&id_tensor(&inverse)?)?;
-        let ordered = k.take(&joined, &inverse, 0)?;
-        k.reshape(&ordered, &[token_rows, TOP_K, HIDDEN])
-    }
-}
-
-fn wave_pieces(
-    k: &mut MlxKernels,
-    source: &super::super::weights::FlintCheckpoint,
-    stem: &str,
-    pieces: &[Piece],
-    union: &[u32],
-    staging: &mut Staging,
-) -> Result<Vec<ExecutionTensor>> {
-    // MLX argsort is stable. Preserve the same tie order within each expert.
-    let positions_by_expert = pieces
-        .iter()
-        .map(|piece| {
-            let mut slots = vec![Vec::new(); 256];
-            for (pair, &expert) in piece.experts.iter().enumerate() {
-                slots[expert as usize].push(pair);
-            }
-            slots
-        })
-        .collect::<Vec<_>>();
-    let mut all_outputs = (0..pieces.len())
-        .map(|_| WaveOutputs::default())
-        .collect::<Vec<_>>();
-    for wave in union.chunks(WAVE_SLOTS) {
-        let wave_positions = positions_by_expert
-            .iter()
-            .map(|slots| {
-                wave.iter()
-                    .flat_map(|&expert| slots[expert as usize].iter().copied())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let selected = pieces
-            .iter()
-            .zip(&wave_positions)
-            .flat_map(|(piece, positions)| positions.iter().map(|&pair| piece.experts[pair]))
-            .collect::<Vec<_>>();
-        let (weights, local, pages) = staging.load(k, source, stem, wave, &selected)?;
-        let mut start = 0;
-        for ((piece, positions), saved) in pieces.iter().zip(wave_positions).zip(&mut all_outputs) {
-            if positions.is_empty() {
-                continue;
-            }
-            let count = positions.len() as u32;
-            let end = start + count;
-            let ids = k.slice(&local, &[start], &[end])?;
-            let ids = k.bound_indices(&ids, wave.len() as u32)?;
-            let token_rows = positions
-                .iter()
-                .map(|&pair| pair as u32 / TOP_K)
-                .collect::<Vec<_>>();
-            let token_rows = k.import_tensor(&id_tensor(&token_rows)?)?;
-            let sorted = k.take(&piece.input, &token_rows, 0)?;
-            let sorted = k.reshape(&sorted, &[count, 1, HIDDEN])?;
-            let output = sorted_expert_pairs(k, &weights, &sorted, &ids)?;
-            k.evaluate(&[&output])?;
-            saved.arrays.push(output);
-            saved.pair_positions.extend(positions);
-            start = end;
-        }
-        retire_stage(k, &pieces[0].input, weights, local, pages)?;
-    }
-    all_outputs
-        .into_iter()
-        .zip(pieces)
-        .map(|(outputs, piece)| outputs.restore_order(k, piece.input.shape()[0]))
-        .collect()
-}
-
 #[test]
 #[ignore = "requires the published Flint weights and an admitted Mac GPU window"]
 fn two_piece_prefill_reuse_preserves_layer_output() -> Result<()> {
@@ -338,7 +249,25 @@ fn two_piece_prefill_reuse_preserves_layer_output() -> Result<()> {
                     outputs
                 }
                 "union" => staged_pieces(&mut k, &checkpoint, stem, &pieces, &mut staging)?,
-                _ => wave_pieces(&mut k, &checkpoint, stem, &pieces, &union, &mut staging)?,
+                _ => {
+                    let mut peak = StagePeak::default();
+                    let mut loader = StageLoader {
+                        source: &checkpoint,
+                        stem,
+                        coalesce: true,
+                        peak: &mut peak,
+                    };
+                    let routed = wave_experts(
+                        &mut k,
+                        &mut loader,
+                        [&pieces[0].input, &pieces[1].input],
+                        [&pieces[0].experts, &pieces[1].experts],
+                        &union,
+                    )?;
+                    staging.peak_experts = peak.experts;
+                    staging.peak_mapped_bytes = peak.mapped_bytes;
+                    Vec::from(routed)
+                }
             };
             assert_eq!(routed.len(), pieces.len());
             let mut output = Vec::new();

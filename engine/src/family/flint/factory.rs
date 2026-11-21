@@ -59,9 +59,39 @@ pub(crate) fn request_prefill_enabled(setting: Option<&std::ffi::OsStr>) -> bool
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn prefill_pair_enabled(setting: Option<&std::ffi::OsStr>) -> bool {
-    setting.is_some_and(|value| value == "1")
-        && request_prefill_enabled(std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref())
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillPairPolicy {
+    Off,
+    Shared,
+    Auto,
+    Waves64,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl PrefillPairPolicy {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shared => "shared",
+            Self::Auto => "auto",
+            Self::Waves64 => "waves64",
+        }
+    }
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prefill_pair_policy(setting: Option<&std::ffi::OsStr>) -> PrefillPairPolicy {
+    let policy = match setting.and_then(std::ffi::OsStr::to_str) {
+        Some("1") => PrefillPairPolicy::Shared,
+        Some("auto") => PrefillPairPolicy::Auto,
+        Some("waves64") => PrefillPairPolicy::Waves64,
+        _ => return PrefillPairPolicy::Off,
+    };
+    if request_prefill_enabled(std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref()) {
+        policy
+    } else {
+        PrefillPairPolicy::Off
+    }
 }
 
 /// MLX freed-buffer cache limit selection (the OnceLock reader lives in

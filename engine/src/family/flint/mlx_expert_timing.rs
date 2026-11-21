@@ -25,6 +25,13 @@ pub(super) struct ForwardTiming {
     layer: LayerReads,
 }
 
+pub(super) struct PairTiming {
+    pub(super) piece_rows: [u32; 2],
+    pub(super) stage_slots: usize,
+    pub(super) peak_experts: usize,
+    pub(super) peak_mapped_bytes: usize,
+}
+
 impl ForwardTiming {
     pub(super) fn begin(k: &MlxKernels, position: u32) -> Option<Self> {
         enabled().then(|| Self {
@@ -45,7 +52,7 @@ impl ForwardTiming {
         k: &MlxKernels,
         rows: u32,
         full_kv_rows: u32,
-        piece_rows: Option<[u32; 2]>,
+        pair: Option<PairTiming>,
     ) {
         let forward_ns = self.started.elapsed().as_nanos() as u64;
         let end = qualification_expert_reads();
@@ -65,8 +72,11 @@ impl ForwardTiming {
             "expert_probe_stages": layer.stages - self.layer.stages,
             "expert_record_stages": layer.record_stages - self.layer.record_stages,
         });
-        if let Some(widths) = piece_rows {
-            event["piece_rows"] = serde_json::json!(widths);
+        if let Some(pair) = pair {
+            event["piece_rows"] = serde_json::json!(pair.piece_rows);
+            event["expert_stage_slots"] = serde_json::json!(pair.stage_slots);
+            event["peak_stage_experts"] = serde_json::json!(pair.peak_experts);
+            event["peak_stage_mapped_bytes"] = serde_json::json!(pair.peak_mapped_bytes);
         }
         eprintln!("{EVENT} {event}");
     }
