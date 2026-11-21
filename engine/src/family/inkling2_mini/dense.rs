@@ -12,7 +12,7 @@ use super::{
     CORE_START, HEADER_LIMIT, SHARD, checkpoint_error, gguf, gguf_dense, parse_json, read_exact_at,
     read_stored_header, validate_config, weight_plan,
 };
-use crate::{EngError, storage_guard::LocalGuard};
+use crate::{EngError, family::mapped_file::MappedFile, storage_guard::LocalGuard};
 
 pub struct DenseWeights(Backend);
 
@@ -97,8 +97,13 @@ impl DenseWeights {
     }
 }
 
+enum DenseShard {
+    Buffered(File),
+    Mapped(MappedFile),
+}
+
 struct SafetensorDense {
-    shard: File,
+    shard: DenseShard,
     len: u64,
     data_start: u64,
     entries: BTreeMap<String, DenseEntry>,
@@ -123,7 +128,8 @@ impl SafetensorDense {
         validate_config(&std::fs::read(config).map_err(checkpoint_error)?)?;
         let index = parse_json(&std::fs::read(index).map_err(checkpoint_error)?)?;
         let mut shard = File::open(shard).map_err(checkpoint_error)?;
-        let len = shard.metadata().map_err(checkpoint_error)?.len();
+        let metadata = shard.metadata().map_err(checkpoint_error)?;
+        let len = metadata.len();
         let (data_start, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT)?;
         let entries: BTreeMap<_, _> = entries.into_iter().collect();
         weight_plan(&index, &entries)?;
@@ -144,6 +150,15 @@ impl SafetensorDense {
                 )
             })
             .collect();
+        let shard = if std::env::var_os("FIFI_INKLING_MMAP_DENSE").is_some_and(|value| value == "1")
+        {
+            let modified = metadata.modified().map_err(checkpoint_error)?;
+            DenseShard::Mapped(
+                MappedFile::from_file(shard, len, modified).map_err(checkpoint_error)?,
+            )
+        } else {
+            DenseShard::Buffered(shard)
+        };
         Ok(Self {
             shard,
             len,
@@ -159,7 +174,9 @@ impl SafetensorDense {
     /// Reads flattened BF16 or F32 weights as F32, including small tensors of rank above one.
     pub fn vector(&self, name: &str) -> Result<Vec<f32>, EngError> {
         let entry = self.entry(name)?;
-        Ok(widen(entry.info.dtype, self.resident(name, entry)?))
+        self.with_bytes(name, entry, full_range(entry), true, |bytes| {
+            widen(entry.info.dtype, bytes)
+        })
     }
 
     /// Reads flattened BF16 weights at their stored precision.
@@ -170,13 +187,14 @@ impl SafetensorDense {
                 "dense weight {name} must be BF16"
             )));
         }
-        Ok(self
-            .resident(name, entry)?
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&word| bf16::from_bits(u16::from_le_bytes(word)))
-            .collect())
+        self.with_bytes(name, entry, full_range(entry), true, |bytes| {
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&word| bf16::from_bits(u16::from_le_bytes(word)))
+                .collect()
+        })
     }
 
     pub fn row(&self, name: &str, row: usize) -> Result<Vec<f32>, EngError> {
@@ -188,10 +206,9 @@ impl SafetensorDense {
             )));
         }
         let bytes = row_range(&entry.info, row..row + 1);
-        if let Some(resident) = entry.bytes.get() {
-            return Ok(widen(entry.info.dtype, &resident[bytes]));
-        }
-        Ok(widen(entry.info.dtype, &self.read(name, entry, bytes)?))
+        self.with_bytes(name, entry, bytes, false, |bytes| {
+            widen(entry.info.dtype, bytes)
+        })
     }
 
     pub fn matvec(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
@@ -216,26 +233,27 @@ impl SafetensorDense {
         }
         let row_size = width * (entry.info.dtype.bitsize() / 8);
         let selected = row_range(&entry.info, rows);
-        let resident = &self.resident(name, entry)?[selected];
-        if entry.info.dtype == Dtype::BF16 && resident.len() / row_size >= PARALLEL_BF16_ROWS {
-            let workers = std::thread::available_parallelism()
-                .map_or(1, |count| count.get().min(MAX_BF16_WORKERS));
-            if workers > 1 {
-                return Ok(parallel_bf16_rows(resident, input, workers));
+        self.with_bytes(name, entry, selected, true, |resident| {
+            if entry.info.dtype == Dtype::BF16 && resident.len() / row_size >= PARALLEL_BF16_ROWS {
+                let workers = std::thread::available_parallelism()
+                    .map_or(1, |count| count.get().min(MAX_BF16_WORKERS));
+                if workers > 1 {
+                    return parallel_bf16_rows(resident, input, workers);
+                }
             }
-        }
-        let project = |row: &[u8]| match entry.info.dtype {
-            Dtype::BF16 => dot_bf16(row, input),
-            Dtype::F32 => row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(input)
-                .map(|(&word, &value)| f32::from_le_bytes(word) * value)
-                .sum(),
-            _ => unreachable!("only BF16 and F32 dense tensors are loaded"),
-        };
-        Ok(resident.chunks_exact(row_size).map(project).collect())
+            let project = |row: &[u8]| match entry.info.dtype {
+                Dtype::BF16 => dot_bf16(row, input),
+                Dtype::F32 => row
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(input)
+                    .map(|(&word, &value)| f32::from_le_bytes(word) * value)
+                    .sum(),
+                _ => unreachable!("only BF16 and F32 dense tensors are loaded"),
+            };
+            resident.chunks_exact(row_size).map(project).collect()
+        })
     }
 
     fn entry(&self, name: &str) -> Result<&DenseEntry, EngError> {
@@ -253,23 +271,59 @@ impl SafetensorDense {
         }
     }
 
-    fn resident<'a>(&self, name: &str, entry: &'a DenseEntry) -> Result<&'a [u8], EngError> {
-        if let Some(bytes) = entry.bytes.get() {
-            return Ok(bytes);
+    fn with_bytes<T>(
+        &self,
+        name: &str,
+        entry: &DenseEntry,
+        range: Range<usize>,
+        retain: bool,
+        use_bytes: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T, EngError> {
+        match &self.shard {
+            DenseShard::Mapped(shard) => {
+                shard.check_unchanged().map_err(checkpoint_error)?;
+                let invalid = || {
+                    checkpoint_error(format!("dense weight {name} mapped range is out of bounds"))
+                };
+                if range.end > full_range(entry).end {
+                    return Err(invalid());
+                }
+                let tensor = usize::try_from(self.data_start)
+                    .ok()
+                    .and_then(|start| start.checked_add(entry.info.data_offsets.0))
+                    .ok_or_else(invalid)?;
+                let start = tensor.checked_add(range.start).ok_or_else(invalid)?;
+                let end = tensor.checked_add(range.end).ok_or_else(invalid)?;
+                let bytes = shard.as_ref().get(start..end).ok_or_else(invalid)?;
+                let result = use_bytes(bytes);
+                shard.check_unchanged().map_err(checkpoint_error)?;
+                Ok(result)
+            }
+            DenseShard::Buffered(shard) => {
+                if let Some(bytes) = entry.bytes.get() {
+                    return Ok(use_bytes(&bytes[range]));
+                }
+                if retain {
+                    let bytes = self.read(shard, name, entry, full_range(entry))?;
+                    let bytes = entry.bytes.get_or_init(|| bytes);
+                    Ok(use_bytes(&bytes[range]))
+                } else {
+                    let bytes = self.read(shard, name, entry, range)?;
+                    Ok(use_bytes(&bytes))
+                }
+            }
         }
-        let (start, end) = entry.info.data_offsets;
-        let bytes = self.read(name, entry, 0..end - start)?;
-        Ok(entry.bytes.get_or_init(|| bytes))
     }
 
     fn read(
         &self,
+        shard: &File,
         name: &str,
         entry: &DenseEntry,
         range: Range<usize>,
     ) -> Result<Box<[u8]>, EngError> {
         let check_len = || {
-            let observed = self.shard.metadata().map_err(checkpoint_error)?.len();
+            let observed = shard.metadata().map_err(checkpoint_error)?.len();
             if observed != self.len {
                 return Err(checkpoint_error(format!(
                     "shard length changed from {} to {observed}",
@@ -287,7 +341,7 @@ impl SafetensorDense {
         })?;
         bytes.resize(range.len(), 0);
         let offset = self.data_start + entry.info.data_offsets.0 as u64 + range.start as u64;
-        read_exact_at(&self.shard, &mut bytes, offset).map_err(|error| {
+        read_exact_at(shard, &mut bytes, offset).map_err(|error| {
             checkpoint_error(format!("dense weight {name} read at {offset}: {error}"))
         })?;
         check_len()?;
@@ -314,6 +368,11 @@ fn parallel_bf16_rows(weights: &[u8], input: &[f32], workers: usize) -> Vec<f32>
         }
     });
     logits
+}
+
+fn full_range(entry: &DenseEntry) -> Range<usize> {
+    let (start, end) = entry.info.data_offsets;
+    0..end - start
 }
 
 fn row_range(info: &TensorInfo, rows: Range<usize>) -> Range<usize> {
@@ -421,7 +480,7 @@ mod tests {
         shard.write_all(&[0; 11]).unwrap();
         shard.write_all(&bytes).unwrap();
         let dense = SafetensorDense {
-            shard,
+            shard: DenseShard::Buffered(shard),
             len: 11 + bytes.len() as u64,
             data_start: 11,
             entries: BTreeMap::from([(
@@ -448,5 +507,63 @@ mod tests {
             &**dense.entry("matrix").unwrap().bytes.get().unwrap(),
             &bytes
         );
+    }
+    #[test]
+    fn mapped_dense_projects_exact_bytes_and_rejects_a_changed_shard() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let values = [1.0, 2.0, 4.0, -1.0];
+        let bytes: Vec<_> = values
+            .into_iter()
+            .flat_map(|value| bf16::from_f32(value).to_bits().to_le_bytes())
+            .collect();
+        file.write_all(&[0; 11]).unwrap();
+        file.write_all(&bytes).unwrap();
+        let shard = File::open(file.path()).unwrap();
+        let metadata = shard.metadata().unwrap();
+        let len = metadata.len();
+        let mapped = MappedFile::from_file(shard, len, metadata.modified().unwrap()).unwrap();
+        let dense = SafetensorDense {
+            shard: DenseShard::Mapped(mapped),
+            len,
+            data_start: 11,
+            entries: BTreeMap::from([(
+                "matrix".into(),
+                DenseEntry {
+                    info: TensorInfo {
+                        dtype: Dtype::BF16,
+                        shape: vec![2, 2],
+                        data_offsets: (0, bytes.len()),
+                    },
+                    bytes: OnceCell::new(),
+                },
+            )]),
+        };
+        assert_eq!(dense.row("matrix", 1).unwrap(), [4.0, -1.0]);
+        assert_eq!(dense.vector("matrix").unwrap(), values);
+        assert_eq!(dense.bf16("matrix").unwrap(), values.map(bf16::from_f32));
+        assert_eq!(dense.matvec("matrix", &[2.0, 3.0]).unwrap(), [8.0, 5.0]);
+        assert_eq!(
+            dense.matvec_rows("matrix", &[2.0, 3.0], 1..2).unwrap(),
+            [5.0]
+        );
+        let entry = dense.entry("matrix").unwrap();
+        assert!(entry.bytes.get().is_none());
+        assert!(
+            dense
+                .with_bytes("matrix", entry, 0..bytes.len() + 1, false, |_| ())
+                .is_err()
+        );
+
+        // The output of an operation that observes mutation is discarded.
+        assert!(
+            dense
+                .with_bytes("matrix", entry, 0..2, false, |_| {
+                    file.write_all(&[0]).unwrap();
+                })
+                .is_err()
+        );
+        file.as_file().set_len(0).unwrap();
+        assert!(dense.row("matrix", 0).is_err());
+        assert!(dense.matvec("matrix", &[2.0, 3.0]).is_err());
     }
 }
