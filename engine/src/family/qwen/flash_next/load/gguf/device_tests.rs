@@ -3,6 +3,9 @@
 //! PLE feed) and through the host forward over the same file. The weights are one set of bytes;
 //! the device quantizes its activations to q8_1 and widens some tensors to half precision, so the
 //! logits agree to a tolerance and the arg-max agrees exactly.
+//!
+//! Each test needs the card and holds a CUDA adapter lease for its process, and a process holds
+//! at most two: run them by name, one per process, with `--ignored`.
 
 use super::{GgufModel, host, smallmodel::write_small, trunk::gguf_trunk};
 use crate::{

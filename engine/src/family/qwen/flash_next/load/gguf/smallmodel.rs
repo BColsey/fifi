@@ -128,7 +128,7 @@ fn bf16_bits(value: f32) -> u16 {
 /// and 32 signed bytes per block.
 fn q8_0(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() / 32 * 34);
-    for block in values.chunks_exact(32) {
+    for block in values.as_chunks::<32>().0 {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d == 0.0 { 0.0 } else { 1.0 / d };

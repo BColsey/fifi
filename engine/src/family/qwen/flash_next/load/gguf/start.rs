@@ -173,9 +173,7 @@ pub(in crate::family::qwen::flash_next) fn start(
         weights: crate::weights::sha256_hex(&weights_digest).into(),
         tokenizer: crate::weights::sha256_hex(&tokenizer_digest).into(),
     };
-    let prefill_chunk = options
-        .and_then(|options| options.prefill_chunk)
-        .unwrap_or(DEFAULT_PREFILL_CHUNK) as usize;
+    let prefill_chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK) as usize;
     let guard = BuildGuard::acquire()?;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
         let mut guard = guard;
