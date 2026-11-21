@@ -44,6 +44,8 @@ const _: () = assert!(
 );
 const _: () = assert!(MASS_OFFSET + MASS_PARTS * 8 == MASS_SCRATCH_BYTES);
 const _: () = assert!(SCRATCH_BYTES <= MASS_OFFSET);
+// The mass launch runs in the scratch the decode step lends the argmax partials.
+const _: () = assert!(MASS_SCRATCH_BYTES <= super::step_params::ARGMAX_PART_BYTES);
 /// Mirror of `inference_cuda_shortlist_rows_args`.
 #[repr(C)]
 struct RowsArgs {
