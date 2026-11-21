@@ -1985,7 +1985,7 @@ extern "C" int inference_mlx_inkling_gguf(
     mlx_fast_metal_kernel kernel = mlx_fast_metal_kernel_new(
         "inkling_gguf_packed_matvec", in_names, out_names, source, header, true, false);
     mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
-    // Non-IQ1_S templates never use the codebook input.
+    // Q2_0 and NVFP4 never use the codebook input.
     const mlx_array operands[] = {activation, payload, codes.ctx ? codes : payload};
     mlx_vector_array inputs = mlx_vector_array_new_data(operands, 3);
     mlx_vector_array outputs = mlx_vector_array_new();

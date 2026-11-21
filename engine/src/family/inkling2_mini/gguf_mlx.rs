@@ -6,17 +6,18 @@ use std::{collections::VecDeque, rc::Rc, sync::Arc};
 use half::bf16;
 
 use super::{
-    gguf::{ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights},
+    gguf::{ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights, packed_mlx_enabled},
     mlx::MlxExpertCacheStats,
 };
 use crate::{
     EngError,
     kernels::MlxKernels,
     tensor::{Dtype, ExecutionTensor, Tensor},
-    weights::{GgufType, IQ1S_GRID, dequantize_into},
+    weights::{
+        GgufType, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, dequantize_into,
+        inkling_codebook_words,
+    },
 };
-
-const PACKED_ENV: &str = "FIFI_INKLING_GGUF_PACKED_MLX";
 
 type Key = (String, usize);
 
@@ -75,6 +76,9 @@ enum Projection {
 #[derive(Default, serde::Serialize)]
 struct ProjectionStats {
     iq1_s: u64,
+    iq2_xxs: u64,
+    iq2_xs: u64,
+    iq2_s: u64,
     q2_0: u64,
     nvfp4: u64,
     expanded_cpu_transpose: u64,
@@ -87,7 +91,7 @@ pub(super) struct Experts {
     packed: Cache<ExpertPlane>,
     resident: Cache<Projection>,
     packed_enabled: bool,
-    codes: Option<ExecutionTensor>,
+    codes: Vec<(GgufType, ExecutionTensor)>,
     projections: ProjectionStats,
     stats: MlxExpertCacheStats,
 }
@@ -106,8 +110,8 @@ impl Experts {
             metal,
             packed: Cache::new(ram),
             resident: Cache::new(headroom - ram),
-            packed_enabled: std::env::var_os(PACKED_ENV).is_some_and(|value| value == "1"),
-            codes: None,
+            packed_enabled: packed_mlx_enabled(),
+            codes: Vec::new(),
             projections: ProjectionStats::default(),
             stats: MlxExpertCacheStats::default(),
         })
@@ -130,19 +134,21 @@ impl Experts {
                 "projections": std::mem::take(&mut self.projections),
                 "resident_bytes": self.resident.bytes,
                 "packed_ram_bytes": self.packed.bytes,
+                "codebook_bytes": self.codes.iter().map(|(_, codes)| codes.byte_len()).sum::<u64>(),
             })
         );
     }
 
     fn stage_projection(&mut self, plane: &ExpertPlane) -> Result<(Projection, usize), EngError> {
+        let needs_codes = inkling_codebook_words(plane.dtype).is_some();
         if self.packed_enabled
-            && matches!(
-                plane.dtype,
-                GgufType::Iq1S | GgufType::Q20 | GgufType::Nvfp4
-            )
+            && (needs_codes || matches!(plane.dtype, GgufType::Q20 | GgufType::Nvfp4))
         {
-            if plane.dtype == GgufType::Iq1S && self.codes.is_none() {
-                self.codes = Some(self.metal.import_tensor(&iq1_s_codes()?)?);
+            if needs_codes && !self.codes.iter().any(|(format, _)| *format == plane.dtype) {
+                let table = self
+                    .metal
+                    .import_tensor(&codebook(plane.dtype)?.expect("format has a codebook"))?;
+                self.codes.push((plane.dtype, table));
             }
             let payload = Tensor::try_from_host(
                 Dtype::U8,
@@ -237,11 +243,15 @@ impl Experts {
         let activation = self.metal.import_tensor(&activation)?;
         let projected = match weight.as_ref() {
             Projection::Packed(payload, format) => {
-                let codes = (*format == GgufType::Iq1S)
-                    .then_some(self.codes.as_ref())
-                    .flatten();
+                let codes = self
+                    .codes
+                    .iter()
+                    .find_map(|(kind, table)| (kind == format).then_some(table));
                 let count = match format {
                     GgufType::Iq1S => &mut self.projections.iq1_s,
+                    GgufType::Iq2Xxs => &mut self.projections.iq2_xxs,
+                    GgufType::Iq2Xs => &mut self.projections.iq2_xs,
+                    GgufType::Iq2S => &mut self.projections.iq2_s,
                     GgufType::Q20 => &mut self.projections.q2_0,
                     GgufType::Nvfp4 => &mut self.projections.nvfp4,
                     _ => unreachable!("packed formats were validated when staged"),
@@ -280,15 +290,30 @@ impl Experts {
     }
 }
 
-fn iq1_s_codes() -> Result<Tensor, EngError> {
-    Tensor::try_from_host(
-        Dtype::U32,
-        vec![IQ1S_GRID.len() as u32],
-        IQ1S_GRID
+fn codebook(format: GgufType) -> Result<Option<Tensor>, EngError> {
+    let Some(words) = inkling_codebook_words(format) else {
+        return Ok(None);
+    };
+    let bytes = match format {
+        GgufType::Iq1S => IQ1S_GRID
             .iter()
             .flat_map(|&word| u32::from(word).to_le_bytes())
             .collect(),
-    )
+        GgufType::Iq2Xxs => IQ2XXS_GRID
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+        GgufType::Iq2Xs => IQ2XS_GRID
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+        GgufType::Iq2S => IQ2S_GRID
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+        _ => unreachable!("codebook formats were validated"),
+    };
+    Tensor::try_from_host(Dtype::U32, vec![words], bytes).map(Some)
 }
 
 fn decode_rows(plane: &ExpertPlane) -> Result<Tensor, EngError> {
@@ -335,11 +360,13 @@ mod tests {
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let source = Weights::open(std::path::Path::new(&file)).unwrap();
         let mut metal = MlxKernels::try_new().unwrap();
-        let codes = metal.import_tensor(&iq1_s_codes().unwrap()).unwrap();
         for (name, format) in [
             ("blk.0.ffn_gate_up_exps.weight", GgufType::Iq1S),
             ("blk.0.ffn_down_exps.weight", GgufType::Q20),
             ("blk.5.ffn_down_exps.weight", GgufType::Nvfp4),
+            ("blk.5.ffn_gate_up_exps.weight", GgufType::Iq2Xxs),
+            ("blk.9.ffn_gate_up_exps.weight", GgufType::Iq2Xs),
+            ("blk.16.ffn_gate_up_exps.weight", GgufType::Iq2S),
         ] {
             let info = source.header().tensor(name).unwrap();
             assert_eq!(info.ggml_type(), format);
@@ -365,8 +392,11 @@ mod tests {
             .unwrap();
             let w = metal.import_tensor(&weight).unwrap();
             let a = metal.import_tensor(&activation).unwrap();
+            let codes = codebook(format)
+                .unwrap()
+                .map(|tensor| metal.import_tensor(&tensor).unwrap());
             let got = metal
-                .inkling_gguf_matvec(&a, &w, (format == GgufType::Iq1S).then_some(&codes), format)
+                .inkling_gguf_matvec(&a, &w, codes.as_ref(), format)
                 .unwrap();
             assert!(
                 metal
