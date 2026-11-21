@@ -213,9 +213,26 @@ pub(super) fn plan_prefill(
     }))
 }
 
+/// Why a set FIFI_Q36_MLX_DISK_EXPERTS does not stage experts from disk, or
+/// `None` when it is unset or takes effect.
+fn disk_experts_ignored(value: Option<&std::ffi::OsStr>, device_sizing: bool) -> Option<String> {
+    let value = value?;
+    if value != "1" {
+        return Some(format!(
+            "{:?} is not 1, so the experts stay resident",
+            value.to_string_lossy()
+        ));
+    }
+    (!device_sizing).then(|| {
+        "device sizing is off; set FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB, so the experts stay resident"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::rules_of;
+    use super::{disk_experts_ignored, rules_of};
+    use std::ffi::OsStr;
 
     #[test]
     fn program_budget_is_forwarded_to_executor_rules() {
@@ -442,28 +459,6 @@ mod tests {
             "the override reaches dense as well"
         );
     }
-}
-
-/// Why a set FIFI_Q36_MLX_DISK_EXPERTS does not stage experts from disk, or
-/// `None` when it is unset or takes effect.
-fn disk_experts_ignored(value: Option<&std::ffi::OsStr>, device_sizing: bool) -> Option<String> {
-    let value = value?;
-    if value != "1" {
-        return Some(format!(
-            "{:?} is not 1, so the experts stay resident",
-            value.to_string_lossy()
-        ));
-    }
-    (!device_sizing).then(|| {
-        "device sizing is off; set FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB, so the experts stay resident"
-            .to_string()
-    })
-}
-
-#[cfg(test)]
-mod disk_experts_note_tests {
-    use super::disk_experts_ignored;
-    use std::ffi::OsStr;
 
     #[test]
     fn a_set_switch_that_does_not_take_effect_says_why() {
