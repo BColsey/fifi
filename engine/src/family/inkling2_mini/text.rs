@@ -252,6 +252,13 @@ impl Decoder {
         }
     }
 
+    pub(super) fn gguf_metal_memory_stats(&self) -> Option<crate::kernels::MemoryStats> {
+        match &self.experts {
+            Experts::GgufMlx(cache) => cache.memory_stats(),
+            _ => None,
+        }
+    }
+
     pub(super) fn report_component_timings(&mut self, phase: &str) {
         if let (Some(cpu), Experts::Mlx { cache, .. }) = (&mut self.timing, &mut self.experts) {
             eprintln!(

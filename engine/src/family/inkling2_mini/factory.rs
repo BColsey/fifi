@@ -146,7 +146,7 @@ fn launch(
             None => super::text::Decoder::open(&root, context)?,
         };
         if let Some(start) = load_start {
-            start.report("load", decoder.expert_cache_stats());
+            start.report("load", decoder.expert_cache_stats(), &decoder);
         }
         Ok((
             executor::Executor::new(decoder, eos, context as usize),
@@ -204,7 +204,8 @@ mod executor {
                 || std::env::var_os("FIFI_INKLING_EXPERT_TIMING").is_some_and(|value| value == "1")
         }
 
-        pub(super) fn report(&self, phase: &str, end: MlxExpertCacheStats) {
+        pub(super) fn report(&self, phase: &str, end: MlxExpertCacheStats, decoder: &Decoder) {
+            let metal = decoder.gguf_metal_memory_stats();
             let io = crate::kernels::mlx::native::process_io();
             let disk = self.io.zip(io).and_then(|(a, b)| b.0.checked_sub(a.0));
             eprintln!(
@@ -215,6 +216,9 @@ mod executor {
                     "expert_read_bytes": end.read_bytes - self.cache.read_bytes,
                     "expert_read_ranges": end.read_ranges - self.cache.read_ranges,
                     "cached_bytes": end.cached_bytes,
+                    "mlx_process_active_bytes": metal.as_ref().map(|v| v.active),
+                    "mlx_process_pool_bytes": metal.as_ref().map(|v| v.cache),
+                    "mlx_process_peak_active_bytes": metal.as_ref().map(|v| v.peak),
                     "hits": end.hits - self.cache.hits, "misses": end.misses - self.cache.misses,
                     "evictions": end.evictions - self.cache.evictions,
                     "staging_allocations": end.staging_allocations - self.cache.staging_allocations,
@@ -257,7 +261,7 @@ mod executor {
                 } else {
                     "prefill"
                 };
-                phase.report(name, end);
+                phase.report(name, end, &self.stepper.decoder);
                 self.stepper.decoder.report_component_timings(name);
             }
             eprintln!(
@@ -365,7 +369,7 @@ mod executor {
             if !self.first_sample && self.phase.is_some() && self.stepper.fed > fed {
                 let end = self.stepper.decoder.expert_cache_stats();
                 if let Some(phase) = self.phase.take() {
-                    phase.report("prefill", end);
+                    phase.report("prefill", end, &self.stepper.decoder);
                     self.stepper.decoder.report_component_timings("prefill");
                 }
                 self.phase = Some(Phase::new(end));

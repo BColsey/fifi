@@ -6,7 +6,7 @@ use std::{collections::VecDeque, rc::Rc, sync::Arc};
 use half::bf16;
 
 use super::{
-    gguf::{ExpertPlane, Weights},
+    gguf::{ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights},
     mlx::MlxExpertCacheStats,
 };
 use crate::{
@@ -78,13 +78,21 @@ impl Experts {
         // Metal and RAM share physical memory. The combined capacity is charged
         // against one admission budget, independent of which tier serves a hit.
         let ram = headroom / 4;
+        let mut metal = MlxKernels::try_new()?;
+        // Bound deferred retirements on this adapter. The allocator pool is
+        // shared by the process, so changing its limit would affect other engines.
+        metal.set_retire_cap(LARGEST_PLANE_F32_BYTES as u64)?;
         Ok(Self {
             source,
-            metal: MlxKernels::try_new()?,
+            metal,
             packed: Cache::new(ram),
             resident: Cache::new(headroom - ram),
             stats: MlxExpertCacheStats::default(),
         })
+    }
+
+    pub(super) fn memory_stats(&self) -> Option<crate::kernels::MemoryStats> {
+        self.metal.memory_stats().ok()
     }
 
     pub(super) fn stats(&self) -> MlxExpertCacheStats {
