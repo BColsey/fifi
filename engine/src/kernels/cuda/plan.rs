@@ -87,6 +87,15 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
         GgufType::Q50 => Some((32, 22)),
         GgufType::Q5K => Some((256, 176)),
         GgufType::Q40 => Some((32, 18)),
+        // The in-house codebook matvec types (native/resident/matvec_gguf.cu).
+        GgufType::Iq4Nl => Some((32, 18)),
+        GgufType::Q20 => Some((64, 18)),
+        GgufType::Iq2Xxs => Some((256, 66)),
+        GgufType::Iq2Xs => Some((256, 74)),
+        GgufType::Iq2S => Some((256, 82)),
+        GgufType::Iq3Xxs => Some((256, 98)),
+        GgufType::Iq3S => Some((256, 110)),
+        GgufType::Iq4Xs => Some((256, 136)),
         _ => None,
     }
 }
@@ -515,6 +524,28 @@ mod tests {
             native_device_bytes("w", GgufType::Q40, &[32, 5]),
             Ok(5 * 18)
         );
+        // The codebook types take the native plan with the CPU oracle's block geometry.
+        for (ty, values, bytes) in [
+            (GgufType::Iq4Nl, 32u64, 18u64),
+            (GgufType::Q20, 64, 18),
+            (GgufType::Iq2Xxs, 256, 66),
+            (GgufType::Iq2Xs, 256, 74),
+            (GgufType::Iq2S, 256, 82),
+            (GgufType::Iq3Xxs, 256, 98),
+            (GgufType::Iq3S, 256, 110),
+            (GgufType::Iq4Xs, 256, 136),
+        ] {
+            assert_eq!(
+                (values, bytes),
+                (ty.block_elems(), ty.block_bytes()),
+                "{ty:?}"
+            );
+            assert_eq!(
+                native_device_bytes("w", ty, &[values * 2, 5]),
+                Ok(5 * 2 * bytes),
+                "{ty:?}"
+            );
+        }
         assert!(matches!(
             native_device_bytes("w", GgufType::Q3K, &[256, 8]),
             Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q3K")
