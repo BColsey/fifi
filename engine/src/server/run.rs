@@ -241,16 +241,15 @@ fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
         .ok();
 }
 
-fn load_sampling_defaults(config: &EngineConfig) -> Result<LoadedDefaults, EngError> {
-    if config.family == inkling2_mini::FAMILY {
+fn load_sampling_defaults(config: &EngineConfig) -> Result<(LoadedDefaults, std::path::PathBuf), EngError> {
+    let directory = if config.family == inkling2_mini::FAMILY {
         // The publisher pin includes generation_config.json in the tokenizer bundle.
         storage_guard::require_local(&config.tokenizer_dir, "Inkling tokenizer")?;
-        SamplingDefaults::from_model_dir(&config.tokenizer_dir)
+        config.tokenizer_dir.clone()
     } else {
-        // A model path may name one `.gguf` file; side files sit beside it.
-        let directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        SamplingDefaults::from_model_dir(&directory)
-    }
+        crate::family::gguf_select::directory_of(&config.model_dir)
+    };
+    Ok((SamplingDefaults::from_model_dir(&directory)?, directory))
 }
 
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the
@@ -307,7 +306,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
                 describe(&error)
             ))
         })?;
-        let loaded = load_sampling_defaults(config).map_err(|error| {
+        let (loaded, defaults_directory) = load_sampling_defaults(config).map_err(|error| {
             StartupError(format!(
                 "engine {} failed to start: {}",
                 config.id,
@@ -361,7 +360,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
         // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
         // the template already wins over anything set here.
         apply_replay_overrides(&config.id, &mut bundle, config)?;
-        let generation = model_directory.join("generation_config.json");
+        let generation = defaults_directory.join("generation_config.json");
         // The label comes from the loader result, not from a second `exists` call, so the file
         // cannot change between the read and the log line.
         eprintln!(
@@ -916,6 +915,7 @@ mod tests {
         let load = |config| {
             super::load_sampling_defaults(config)
                 .unwrap()
+                .0
                 .values
                 .temperature
         };
