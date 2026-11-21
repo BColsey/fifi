@@ -7,6 +7,8 @@ pub(crate) mod expert_store;
 mod gguf;
 mod gguf_dequant;
 mod gguf_tables;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use gguf_tables::IQ1S_GRID;
 /// The IQ4_NL value table, re-exported for the native table pin test
 /// (kernels/cuda/resident/matvec_q/tests.rs): the CUDA copy must equal these bytes.
 #[cfg(all(test, feature = "native-cuda"))]

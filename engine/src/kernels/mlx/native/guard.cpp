@@ -1886,6 +1886,46 @@ extern "C" int inference_mlx_inkling_expert_kernel(
 }
 
 
+// dims describes [input width, output rows, packed row bytes, GGML type].
+extern "C" int inference_mlx_inkling_gguf(
+    mlx_array* output, mlx_array activation, mlx_array payload, mlx_array codes,
+    const int* dims, const char* source, const char* header, mlx_stream stream) noexcept {
+  return run_selected_operation(output, stream, [&] {
+    const char* input_names[] = {"activation", "payload", "codes"};
+    const char* output_names[] = {"result"};
+    mlx_vector_string in_names = mlx_vector_string_new_data(input_names, 3);
+    mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 1);
+    mlx_fast_metal_kernel kernel = mlx_fast_metal_kernel_new(
+        "inkling_gguf_packed_matvec", in_names, out_names, source, header, true, false);
+    mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+    // Non-IQ1_S templates never use the codebook input.
+    const mlx_array operands[] = {activation, payload, codes.ctx ? codes : payload};
+    mlx_vector_array inputs = mlx_vector_array_new_data(operands, 3);
+    mlx_vector_array outputs = mlx_vector_array_new();
+    const int shape[] = {1, dims[1]};
+    int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                  inputs.ctx && outputs.ctx) ? 0 : 1;
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_output_arg(
+        config, shape, 2, MLX_FLOAT32);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(config, 32, dims[1], 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "WIDTH", dims[0]);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "ROW_BYTES", dims[2]);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "FORMAT", dims[3]);
+    if (status == 0) status = mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+    if (status == 0 && mlx_vector_array_size(outputs) != 1) status = 1;
+    if (status == 0) status = mlx_vector_array_get(output, outputs, 0);
+    int released = mlx_vector_array_free(outputs);
+    released |= mlx_vector_array_free(inputs);
+    mlx_fast_metal_kernel_config_free(config);
+    mlx_fast_metal_kernel_free(kernel);
+    released |= mlx_vector_string_free(out_names);
+    released |= mlx_vector_string_free(in_names);
+    return status != 0 ? status : released;
+  });
+}
+
+
 // The router_topk fused kernel (Q36 decode MoE): the stable top-k selection of
 // one router probability row plus the renormalized gates in ONE launch,
 // replacing negate, argsort, slice, clamp, take, the k-sum, the divide and the

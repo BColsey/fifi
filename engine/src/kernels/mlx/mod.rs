@@ -2154,6 +2154,17 @@ impl MlxKernels {
         self.context.act_mul(g_in, u_in)
     }
 
+    pub(crate) fn inkling_gguf_matvec(
+        &mut self,
+        activation: &ExecutionTensor,
+        payload: &ExecutionTensor,
+        codes: Option<&ExecutionTensor>,
+        dtype: crate::weights::GgufType,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context
+            .inkling_gguf_matvec(activation, payload, codes, dtype)
+    }
+
     pub(crate) fn inkling_activation(
         &mut self,
         gate_up: &ExecutionTensor,

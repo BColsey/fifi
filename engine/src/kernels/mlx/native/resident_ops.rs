@@ -66,6 +66,7 @@ pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal
 const INKLING_ACTIVATION_SOURCE: &str =
     concat!(include_str!("inkling_activation.body.metal"), "\0");
 const INKLING_MERGE_SOURCE: &str = concat!(include_str!("inkling_merge.body.metal"), "\0");
+const INKLING_GGUF_SOURCE: &str = concat!(include_str!("inkling_gguf.body.metal"), "\0");
 const INKLING_HEADER: &str = concat!(include_str!("inkling_experts.header.metal"), "\0");
 const INKLING_NVFP4_SOURCE: &str = concat!(include_str!("inkling_nvfp4.body.metal"), "\0");
 const INKLING_MXFP8_SOURCE: &str = concat!(include_str!("inkling_mxfp8.body.metal"), "\0");
@@ -2840,6 +2841,67 @@ impl Context {
             return Err(bad_request("Inkling down output and route count disagree"));
         }
         self.inkling_expert_kernel(label, down, None, [rows, width, picks], None)
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_gguf_matvec(
+        &mut self,
+        activation: &ExecutionTensor,
+        payload: &ExecutionTensor,
+        codes: Option<&ExecutionTensor>,
+        dtype: crate::weights::GgufType,
+    ) -> Result<ExecutionTensor, EngError> {
+        use crate::weights::GgufType;
+        let operation = "Inkling GGUF packed matvec";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_f32_operand(operation, state, activation)?;
+        check_owner(operation, state, payload)?;
+        let (&[1, width], &[rows, stride]) = (activation.shape(), payload.shape()) else {
+            return Err(bad_request(
+                "Inkling GGUF matvec expects one F32 row and a U8 matrix",
+            ));
+        };
+        if !matches!(dtype, GgufType::Iq1S | GgufType::Q20 | GgufType::Nvfp4)
+            || width == 0
+            || rows == 0
+            || payload.dtype() != Dtype::U8
+            || !u64::from(width).is_multiple_of(dtype.block_elems())
+            || u64::from(stride) != u64::from(width) / dtype.block_elems() * dtype.block_bytes()
+            || u64::from(rows) * u64::from(stride) > u64::from(u32::MAX)
+        {
+            return Err(bad_request("Inkling GGUF matvec has invalid block layout"));
+        }
+        let code_array = match (dtype, codes) {
+            (GgufType::Iq1S, Some(codes))
+                if codes.dtype() == Dtype::U32 && codes.shape() == [2048] =>
+            {
+                check_owner(operation, state, codes)?;
+                codes.storage.native_array()
+            }
+            (GgufType::Iq1S, _) => {
+                return Err(bad_request("Inkling IQ1_S matvec requires its codebook"));
+            }
+            (_, None) => ffi::NULL_ARRAY,
+            _ => return Err(bad_request("unexpected Inkling GGUF matvec codebook")),
+        };
+        let dims = native_ints(operation, &[width, rows, stride, dtype.id()])?;
+        let layout = shape::dequantize(operation, &[1, rows])?;
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_elementwise(operation, &layout, stream, |slot| unsafe {
+            ffi::mlx_inkling_gguf(
+                slot,
+                activation.storage.native_array(),
+                payload.storage.native_array(),
+                code_array,
+                dims.as_ptr(),
+                INKLING_GGUF_SOURCE.as_ptr().cast(),
+                INKLING_HEADER.as_ptr().cast(),
+                stream,
+            )
+        })?;
+        Ok(elementwise_result(state, output, layout))
     }
 
     fn inkling_expert_kernel(
