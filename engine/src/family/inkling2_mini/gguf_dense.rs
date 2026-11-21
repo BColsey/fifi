@@ -3,16 +3,23 @@
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use super::{
-    CONV_TAPS, CORE_END, CORE_START, HIDDEN, LAYERS, checkpoint_error, gguf::Weights,
-    gguf_metadata::Layout, is_local,
+    CONV_TAPS, CORE_END, CORE_START, HIDDEN, LAYERS, checkpoint_error,
+    gguf::{ATTENTION_WORKER_STACK_BYTES, RowWorkers, Weights},
+    gguf_metadata::Layout,
+    is_local,
 };
-use crate::{EngError, family::mapped_file::MappedFile};
+use crate::{
+    EngError,
+    family::mapped_file::MappedFile,
+    kernels::{CpuPool, nvfp4_cpu::WaitPolicy},
+};
 
 pub(super) struct Dense {
     source: Arc<Weights>,
     entries: BTreeMap<String, Entry>,
     mapping: Option<MappedFile>,
     attention_workers: usize,
+    attention_pool: Option<Box<CpuPool>>,
 }
 
 struct Entry {
@@ -189,12 +196,29 @@ impl Dense {
         let mapping = (mapped_bytes > 0)
             .then(|| source.map_projection_source())
             .transpose()?;
+        let attention_pool = (attention_workers > 1
+            && std::env::var_os("FIFI_INKLING_GGUF_PERSISTENT_WORKERS")
+                .is_some_and(|value| value == "1"))
+        .then(|| {
+            CpuPool::with_worker_stack(
+                attention_workers,
+                WaitPolicy::Park,
+                "inkling-gguf-attention",
+                ATTENTION_WORKER_STACK_BYTES,
+            )
+            .map(Box::new)
+        })
+        .transpose()?;
+        if attention_pool.is_some() {
+            eprintln!("Inkling 2 Mini GGUF: attention_worker_pool={attention_workers}");
+        }
         Ok((
             Self {
                 source,
                 entries,
                 mapping,
                 attention_workers,
+                attention_pool,
             },
             mapped_bytes,
         ))
@@ -260,6 +284,11 @@ impl Dense {
     ) -> Result<Vec<f32>, EngError> {
         let entry = self.entry(name)?;
         let workers = attention_workers_for(&entry.name, self.attention_workers);
+        let workers = self
+            .attention_pool
+            .as_deref()
+            .filter(|_| workers > 1)
+            .map_or(RowWorkers::Scoped(workers), RowWorkers::Pooled);
         if let Some(mapping) = self.mapping.as_ref().filter(|_| entry.mapped_len > 0) {
             return self.source.project_mapped(
                 &entry.name,

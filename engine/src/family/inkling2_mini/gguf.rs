@@ -1,6 +1,6 @@
 //! Tensor validation and bounded reads for the two fixed-loop GGUF formats.
 
-use std::{fs::File, io::BufReader, ops::Range, path::Path, time::SystemTime};
+use std::{fs::File, io::BufReader, ops::Range, path::Path, sync::OnceLock, time::SystemTime};
 
 use super::timing::DenseIo;
 use super::{
@@ -12,13 +12,21 @@ use super::{
 use crate::{
     EngError,
     family::mapped_file::MappedFile,
+    kernels::CpuPool,
     weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
 };
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) const DENSE_MAPPING_ENV: &str = "FIFI_INKLING_GGUF_MMAP_DENSE";
 const ROWS_PER_READ: usize = 256;
-const ATTENTION_WORKER_STACK_BYTES: usize = 256 << 10;
+pub(super) const ATTENTION_WORKER_STACK_BYTES: usize = 256 << 10;
+
+#[derive(Clone, Copy)]
+pub(super) enum RowWorkers<'a> {
+    Scoped(usize),
+    Pooled(&'a CpuPool),
+}
+
 const MAX_ATTENTION_PROJECTION_DIM: usize = QUERY_HEADS * HEAD_DIM as usize;
 pub(super) const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
 const PADDED_VOCAB: u64 = 201_024;
@@ -368,7 +376,7 @@ impl Weights {
         input: &[f32],
         dense: bool,
     ) -> Result<Vec<f32>, EngError> {
-        self.project_with_workers(name, plane, rows, input, dense, 1)
+        self.project_with_workers(name, plane, rows, input, dense, RowWorkers::Scoped(1))
     }
 
     pub(super) fn project_with_workers(
@@ -378,7 +386,7 @@ impl Weights {
         rows: Range<usize>,
         input: &[f32],
         dense: bool,
-        workers: usize,
+        workers: RowWorkers<'_>,
     ) -> Result<Vec<f32>, EngError> {
         let tensor = self.tensor(name)?;
         let (width, height, dtype, row_bytes) = matrix(tensor)?;
@@ -417,7 +425,7 @@ impl Weights {
         input: &[f32],
         mapping: &MappedFile,
         admitted_bytes: u64,
-        workers: usize,
+        workers: RowWorkers<'_>,
     ) -> Result<Vec<f32>, EngError> {
         let tensor = self.tensor(name)?;
         let (width, height, dtype, row_bytes) = matrix(tensor)?;
@@ -583,13 +591,36 @@ pub(super) fn finish_expert_visit(merged: Vec<f32>) -> Result<Vec<half::bf16>, E
 
 fn project_row_groups(
     rows: Range<usize>,
-    workers: usize,
+    policy: RowWorkers<'_>,
     project: impl Fn(Range<usize>) -> Result<Vec<f32>, EngError> + Sync,
 ) -> Result<Vec<f32>, EngError> {
+    let workers = match policy {
+        RowWorkers::Scoped(count) => count,
+        RowWorkers::Pooled(pool) => pool.threads(),
+    };
     if workers <= 1 || rows.len() <= 1 {
         return project(rows);
     }
     let rows_per_worker = rows.len().div_ceil(workers);
+    if let RowWorkers::Pooled(pool) = policy {
+        let chunks = rows.len().div_ceil(rows_per_worker);
+        let slots: Vec<_> = (0..chunks).map(|_| OnceLock::new()).collect();
+        pool.run(chunks, |index| {
+            let start = rows.start + index * rows_per_worker;
+            let end = (start + rows_per_worker).min(rows.end);
+            slots[index]
+                .set(project(start..end))
+                .expect("each GGUF projection chunk runs once");
+        });
+        let mut out = Vec::with_capacity(rows.len());
+        for slot in slots {
+            out.extend(
+                slot.into_inner()
+                    .expect("completed GGUF projection chunk")?,
+            );
+        }
+        return Ok(out);
+    }
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for start in rows.clone().step_by(rows_per_worker) {
@@ -827,6 +858,17 @@ impl Weights {
 #[cfg(test)]
 mod mapped_projection_tests {
     use super::*;
+    use crate::kernels::nvfp4_cpu::WaitPolicy;
+
+    fn attention_pool(workers: usize) -> CpuPool {
+        CpuPool::with_worker_stack(
+            workers,
+            WaitPolicy::Park,
+            "gguf-test",
+            ATTENTION_WORKER_STACK_BYTES,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn gguf_attention_worker_admission_covers_pread_buffers_and_stacks() {
@@ -840,6 +882,7 @@ mod mapped_projection_tests {
 
     #[test]
     fn parallel_quantized_attention_preserves_uneven_q6_k_and_q8_0_rows() {
+        let pool = attention_pool(4);
         let input: Vec<_> = (0..256).map(|i| (i % 11) as f32 / 16. - 0.25).collect();
         for (dtype, row_bytes) in [(GgufType::Q6K, 210), (GgufType::Q80, 272)] {
             let mut weights = vec![0; row_bytes * 11];
@@ -868,15 +911,18 @@ mod mapped_projection_tests {
                 .map(f32::to_bits)
                 .collect::<Vec<_>>()
             };
-            let serial = run(1);
+            let serial = run(RowWorkers::Scoped(1));
             assert_ne!(serial[0], serial[10]);
-            assert_eq!(serial, run(4));
+            assert_eq!(serial, run(RowWorkers::Scoped(4)));
+            assert_eq!(serial, run(RowWorkers::Pooled(&pool)));
+            assert_eq!(serial, run(RowWorkers::Pooled(&pool)));
         }
     }
 
     #[test]
     fn mapped_projection_matches_buffered_gates_and_bounds_the_selected_rows() {
         use std::io::Write;
+        let pool = attention_pool(4);
 
         let mut artifact = tempfile::NamedTempFile::new().unwrap();
         let name = "output.weight";
@@ -912,12 +958,12 @@ mod mapped_projection_tests {
         let input = [0.5, 0.25, -0.75];
         let before = weights.project(name, 0, 0..257, &input, true).unwrap();
         let after = weights
-            .project_mapped(name, 0..1, &input, &mapping, 12, 1)
+            .project_mapped(name, 0..1, &input, &mapping, 12, RowWorkers::Scoped(1))
             .unwrap();
         assert_eq!(before[0].to_bits(), after[0].to_bits());
         assert!(
             weights
-                .project_mapped(name, 1..2, &input, &mapping, 12, 1)
+                .project_mapped(name, 1..2, &input, &mapping, 12, RowWorkers::Scoped(1))
                 .is_err()
         );
         // Expert callers use the same read helpers without charging dense bytes.
@@ -934,10 +980,17 @@ mod mapped_projection_tests {
         assert_eq!(io.snapshot().mapped_span_bytes, 12);
         let before_io = io.snapshot();
         let parallel = weights
-            .project_with_workers(name, 0, 0..257, &input, true, 4)
+            .project_with_workers(name, 0, 0..257, &input, true, RowWorkers::Pooled(&pool))
             .unwrap();
         let mapped = weights
-            .project_mapped(name, 0..257, &input, &mapping, 257 * 12, 4)
+            .project_mapped(
+                name,
+                0..257,
+                &input,
+                &mapping,
+                257 * 12,
+                RowWorkers::Pooled(&pool),
+            )
             .unwrap();
         let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
         assert_eq!(bits(before.clone()), bits(parallel));
@@ -950,7 +1003,7 @@ mod mapped_projection_tests {
         artifact.as_file().set_len(0).unwrap();
         assert!(
             weights
-                .project_mapped(name, 0..1, &input, &mapping, 12, 1)
+                .project_mapped(name, 0..1, &input, &mapping, 12, RowWorkers::Pooled(&pool))
                 .is_err()
         );
     }
