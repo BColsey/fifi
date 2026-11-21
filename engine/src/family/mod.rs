@@ -69,7 +69,6 @@ pub(crate) mod recipe;
 pub(crate) mod slot_request;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) mod step_dims;
-pub(crate) mod host_memory;
 pub mod keys;
 #[allow(
     dead_code,
@@ -87,6 +86,9 @@ pub(crate) mod kv_format;
 // The memory facts and the numbers every host plan shares. The host reader inside is compiled
 // where it has a caller: every Linux build (the admission fits need the cgroup-aware probe)
 // and the test build.
+#[cfg(any(test, target_os = "linux"))]
+#[allow(dead_code, reason = "read only by the frozen EXL3 expert store")]
+pub(crate) mod host_admit;
 pub(crate) mod mem;
 #[cfg(any(
     test,

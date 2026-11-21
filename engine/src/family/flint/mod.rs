@@ -100,7 +100,7 @@ pub(crate) fn prefix_reuse_env(value: std::result::Result<String, std::env::VarE
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 pub(in crate::family::flint) fn derived_retention_cap(
-    memory: Option<crate::family::host_memory::MacMemory>,
+    memory: Option<crate::family::mem::MacMemory>,
     weights: u64,
 ) -> Option<u64> {
     memory.map(|memory| memory.budget().saturating_sub(weights))
@@ -162,7 +162,7 @@ pub(in crate::family::flint) fn retention_cap_from_env(
 pub(in crate::family::flint) fn retention_cap_for(
     opt_in: bool,
     env_raw: Option<&std::ffi::OsStr>,
-    memory: impl FnOnce() -> Option<crate::family::host_memory::MacMemory>,
+    memory: impl FnOnce() -> Option<crate::family::mem::MacMemory>,
     weights: impl FnOnce() -> Result<u64, String>,
 ) -> Result<u64, String> {
     if !opt_in {

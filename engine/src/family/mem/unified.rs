@@ -1,4 +1,4 @@
-//! Host-memory planning shared by the MLX families: the share of unified memory a start may
+//! Unified-memory planning shared by the MLX families (the `Facts` of a Mac): the share of unified memory a start may
 //! use, the bytes of a checkpoint's routed experts read from its shard headers, and whether a
 //! model, a session reserve and a saved prefix fit a budget. Pure functions, compiled on every
 //! host so the settings of every family and the tests read the same numbers.
@@ -210,18 +210,14 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), any(test, target_os = "linux")))]
 pub(crate) fn physical_memory_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kib = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    kib.checked_mul(1024)
+    super::HostFacts::physical_total()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
+    None
 }
 
 /// The layer index of a routed expert tensor name (`...layers.N...switch_mlp...`), which Qwen3.6
@@ -319,7 +315,7 @@ const CONTEXT_STEP: u32 = 1024;
 
 /// What the host and the model directory say, read once at start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HostFacts {
+pub(crate) struct MacHostFacts {
     /// Physical (unified) memory in bytes.
     pub(crate) memory_bytes: u64,
     /// What Metal recommends as a working set, where this build has Metal.
@@ -338,7 +334,7 @@ pub(crate) struct HostDefaults {
     pub(crate) cache_limit_bytes: u64,
 }
 
-impl HostFacts {
+impl MacHostFacts {
     /// Reads the physical memory of this host and the shard bytes under `model_dir`. `None` when
     /// either is unknown (no memory probe, no shard): the caller then keeps the settings as they
     /// were before derivation existed, with their original refusals.
@@ -380,7 +376,7 @@ impl HostFacts {
 /// multiple of 1024 positions, at least 4,096. `None` when the model and the fixed part leave no
 /// room for that floor, or `per_position` is 0.
 pub(crate) fn largest_context(
-    facts: HostFacts,
+    facts: MacHostFacts,
     budget: u64,
     per_position: u64,
     fixed_bytes: u64,
@@ -397,7 +393,7 @@ pub(crate) fn largest_context(
 
 /// The refusal of a host whose derived budget cannot hold the model and the session reserve.
 pub(crate) fn shortfall_text(
-    facts: HostFacts,
+    facts: MacHostFacts,
     budget: u64,
     reserve: u64,
     context_limit: u32,
@@ -425,7 +421,7 @@ pub(crate) fn shortfall_text(
 
 pub(crate) use self::ExpertBytes as ExpertFacts;
 
-impl HostFacts {
+impl MacHostFacts {
     /// The facts of a start that streams its routed experts: the model keeps everything except
     /// the expert tensors resident, plus one stage of experts.
     pub(crate) fn staged(self, experts: ExpertFacts) -> Self {

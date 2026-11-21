@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::{
     EngError,
-    family::{device_budget::DeviceReserve, host_memory::MacMemory},
+    family::{device_budget::DeviceReserve, mem::MacMemory},
 };
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
@@ -50,8 +50,8 @@ impl DeviceBudget {
         if !enabled() {
             return Ok(None);
         }
-        crate::family::host_memory::ceiling_from_env()?;
-        let memory = crate::family::host_memory::mac_memory().ok_or_else(|| {
+        crate::family::mem::ceiling_from_env()?;
+        let memory = crate::family::mem::mac_memory().ok_or_else(|| {
             EngError::MemoryPlan("the unified memory of this host is unknown".into())
         })?;
         Self::from_memory(memory).map(Some)
@@ -67,8 +67,8 @@ impl DeviceBudget {
             return Ok(Some(device));
         }
         let (Some(memory), Some(model)) = (
-            crate::family::host_memory::mac_memory(),
-            crate::family::host_memory::shard_bytes(model_dir),
+            crate::family::mem::mac_memory(),
+            crate::family::mem::shard_bytes(model_dir),
         ) else {
             return Ok(None);
         };
@@ -167,12 +167,12 @@ impl fmt::Display for DeviceBudget {
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled() -> bool {
     std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
-        || std::env::var_os(crate::family::host_memory::CEILING_MIB).is_some()
+        || std::env::var_os(crate::family::mem::CEILING_MIB).is_some()
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn configured_ceiling() -> Result<Option<u64>, EngError> {
-    crate::family::host_memory::ceiling_from_env()
+    crate::family::mem::ceiling_from_env()
 }
 
 /// The packed `.weight` payload bytes that `is_resident` keeps in memory, read from the
@@ -192,7 +192,7 @@ pub(super) fn packed_payload_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::host_memory::parse_ceiling;
+    use crate::family::mem::parse_ceiling;
     use std::ffi::OsStr;
 
     #[test]

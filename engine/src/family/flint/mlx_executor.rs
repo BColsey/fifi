@@ -176,7 +176,7 @@ impl FlintExecutor {
         let retention_cap = super::retention_cap_for(
             super::prefix_reuse_opt_in(),
             std::env::var_os("FIFI_FLINT_PREFIX_BUDGET_BYTES").as_deref(),
-            crate::family::host_memory::mac_memory,
+            crate::family::mem::mac_memory,
             || weights_charge(root),
         )
         .map_err(EngError::Checkpoint)?;

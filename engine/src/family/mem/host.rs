@@ -105,6 +105,13 @@ impl HostFacts {
         }
     }
 
+    /// `MemTotal` alone, from `/proc/meminfo`: what a plan that only needs the machine's size
+    /// asks for (the unified-memory fractions), with no cgroup read.
+    pub(crate) fn physical_total() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        meminfo_bytes("the host", &text, "MemTotal:").ok()
+    }
+
     /// Whether the cgroup clamp was verified or the facts are the bare figures.
     pub(crate) fn provenance(&self) -> &Provenance {
         &self.provenance

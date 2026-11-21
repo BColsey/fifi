@@ -17,6 +17,15 @@
 // the numbers below are plain arithmetic and exist everywhere.
 #[cfg(any(test, target_os = "linux"))]
 mod host;
+mod unified;
+
+// The Mac half of the facts: unified-memory fractions, Metal's working set and the expert bytes
+// of a checkpoint. Every item keeps the gating it has in `unified`.
+#[allow(
+    unused_imports,
+    reason = "read by the MLX starts and the tests; a given build reads a subset"
+)]
+pub(crate) use unified::*;
 
 #[cfg(any(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "the name a caller matches a provenance on")]

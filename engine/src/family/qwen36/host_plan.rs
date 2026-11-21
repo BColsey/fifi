@@ -23,8 +23,8 @@ const GIB: u64 = 1 << 30;
 #[cfg(test)]
 const MIB: u64 = 1 << 20;
 
-pub(crate) use crate::family::host_memory::{
-    ExpertFacts, HostFacts, expert_facts, gib, largest_context, shortfall_text,
+pub(crate) use crate::family::mem::{
+    ExpertFacts, MacHostFacts as HostFacts, expert_facts, gib, largest_context, shortfall_text,
 };
 
 /// One value of the startup line: its name, its number, and where the number came from.
@@ -171,11 +171,11 @@ mod tests {
     fn a_directory_without_shards_gives_no_facts() {
         let dir = std::env::temp_dir().join(format!("host-plan-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(crate::family::host_memory::shard_bytes(&dir), None);
+        assert_eq!(crate::family::mem::shard_bytes(&dir), None);
         std::fs::write(dir.join("a.safetensors"), [0u8; 10]).unwrap();
         std::fs::write(dir.join("b.safetensors"), [0u8; 5]).unwrap();
         std::fs::write(dir.join("c.json"), [0u8; 100]).unwrap();
-        assert_eq!(crate::family::host_memory::shard_bytes(&dir), Some(15));
+        assert_eq!(crate::family::mem::shard_bytes(&dir), Some(15));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

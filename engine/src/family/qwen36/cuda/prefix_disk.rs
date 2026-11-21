@@ -15,13 +15,13 @@ use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
-        host_admit::HostAdmission,
         kv_disk::{
             Capture, DiskTier, FamilyContract, Held, Hit, KvDisk, LoadIdentity, MIN_POSITIONS,
             PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, Resolved, SlotBytes,
             Stored, drain_bound, host_memory_is_short, hurry_flag, restore_report,
             retry_while_removed, spill_candidates, spill_picks, start_line, stop_picks,
         },
+        mem::HostFacts,
         session::SaveKind,
     },
     kernels::cuda::PinnedBuf,
@@ -174,9 +174,9 @@ impl QwenResidentStep<'_> {
             .prefix_pins
             .as_ref()
             .map_or(0, |pool| pool.bytes() / (pool.retained_entries() + 1));
-        let available = HostAdmission::probe("Qwen36 kv disk", "Qwen36")
+        let available = HostFacts::read("Qwen36 kv disk", "Qwen36")
             .ok()
-            .map(|admission| admission.available_budget());
+            .map(|admission| admission.budget());
         host_memory_is_short(available, HOST_HEADROOM as u64, entry as u64)
     }
 

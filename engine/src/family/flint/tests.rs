@@ -289,8 +289,8 @@ fn flint_prefix_reuse_opt_in_is_constant_false_off_the_store_targets() {
 
 /// The retention-cap arithmetic is pure so the host suite pins it,
 /// including the too-small-headroom refusal.
-fn mac(memory_gib: u64) -> crate::family::host_memory::MacMemory {
-    crate::family::host_memory::MacMemory {
+fn mac(memory_gib: u64) -> crate::family::mem::MacMemory {
+    crate::family::mem::MacMemory {
         physical_bytes: memory_gib << 30,
         metal_bytes: None,
         ceiling_bytes: None,

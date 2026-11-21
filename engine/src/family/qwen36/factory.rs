@@ -9,7 +9,7 @@
 //! a clear error naming both features and never touches a file.
 
 use super::settings::{Backend, Q36Env, Q36Options, Q36Settings};
-use crate::family::host_memory::EntryFit;
+use crate::family::mem::EntryFit;
 use crate::{
     EngError,
     family::{FamilySpec, QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE, flash_next::factory::StartedEngine},

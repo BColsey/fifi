@@ -111,7 +111,7 @@ pub(crate) fn start(
         let force_stream = disk_setting == DiskExperts::On;
         let device = match device {
             Some(device) => Some(device),
-            None => match crate::family::host_memory::sizing_for(
+            None => match crate::family::mem::sizing_for(
                 &owned.artifact,
                 owned.mlx_staged_cap,
                 force_stream,
