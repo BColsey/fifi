@@ -591,28 +591,28 @@ fn start_inkling2(
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     use crate::family::inkling2;
-    if !inkling2::cpu_reference_enabled() {
-        return Err(EngError::BadRequest(format!(
-            "Inkling 2 Mini CPU serving requires a 64-bit build with {}=1",
-            inkling2::CPU_REFERENCE_ENV
-        )));
-    }
+    let backend = inkling2::TextBackend::from_env()?
+        .ok_or_else(|| EngError::BadRequest(inkling2::enable_text_backend()))?;
     #[cfg(target_pointer_width = "64")]
     {
-        let (engine, bundle) =
-            inkling2::start_cpu(&config.model_dir, &config.tokenizer_dir, ready_note)?;
+        let (engine, bundle) = inkling2::start_engine(
+            backend,
+            &config.model_dir,
+            &config.tokenizer_dir,
+            ready_note,
+        )?;
         Ok(StartedEngine {
             engine,
             bundle: Arc::new(bundle),
-            context_limit: inkling2::CPU_CONTEXT_LIMIT,
+            context_limit: inkling2::TEXT_CONTEXT_LIMIT,
             effective: Vec::new(),
         })
     }
     #[cfg(not(target_pointer_width = "64"))]
     {
-        let _ = (config, ready_note);
+        let _ = (backend, config, ready_note);
         Err(EngError::BadRequest(
-            "Inkling 2 Mini CPU needs a 64-bit build".into(),
+            "Inkling text serving requires a 64-bit build".into(),
         ))
     }
 }

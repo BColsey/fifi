@@ -86,3 +86,25 @@ fn rejects_variable_loops_invalid_head_geometry_and_duplicate_local_layers() {
     config["text_config"]["local_layer_ids"] = json!([0, 0]);
     assert!(spec(&config).is_err());
 }
+
+#[test]
+fn text_backends_require_a_single_supported_opt_in() {
+    use super::TextBackend::{self, Cpu, Cuda};
+
+    assert!(matches!(TextBackend::select(false, false), Ok(None)));
+    assert!(TextBackend::select(true, true).is_err());
+    if cfg!(target_pointer_width = "64") {
+        assert!(matches!(TextBackend::select(true, false), Ok(Some(Cpu))));
+    } else {
+        assert!(TextBackend::select(true, false).is_err());
+    }
+    if cfg!(all(
+        feature = "native-cuda",
+        target_os = "linux",
+        target_pointer_width = "64"
+    )) {
+        assert!(matches!(TextBackend::select(false, true), Ok(Some(Cuda))));
+    } else {
+        assert!(TextBackend::select(false, true).is_err());
+    }
+}

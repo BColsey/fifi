@@ -5,7 +5,7 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use super::{
-    Attention, CPU_CONTEXT_LIMIT, LayerVisit, TextSpec, bad, cpu_attention::VisitState,
+    Attention, LayerVisit, TEXT_CONTEXT_LIMIT, TextSpec, bad, cpu_attention::VisitState,
     cpu_weights::Weights,
 };
 use crate::EngError;
@@ -104,6 +104,11 @@ impl CpuForward {
 
     pub(super) fn hidden(&self) -> usize {
         self.spec.hidden_size as usize
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn enable_cuda(&mut self) -> Result<(), EngError> {
+        self.weights.enable_cuda(&self.spec)
     }
 
     pub(super) fn vocab_size(&self) -> u32 {
@@ -443,12 +448,12 @@ impl CpuConfig {
 impl TextMath {
     fn validate(&self, context: usize, spec: &TextSpec) -> Result<(), EngError> {
         if context == 0
-            || context > CPU_CONTEXT_LIMIT as usize
+            || context > TEXT_CONTEXT_LIMIT as usize
             || context > self.log_scaling_n_floor
             || context > spec.model_max_length as usize
         {
             return Err(bad(format!(
-                "invalid CPU reference context, expected 1..={CPU_CONTEXT_LIMIT} and at most the log-scale floor"
+                "invalid CPU reference context, expected 1..={TEXT_CONTEXT_LIMIT} and at most the log-scale floor"
             )));
         }
         // The CPU pilot accepts the released Mini attention and convolution sizes.
@@ -592,7 +597,7 @@ fn native_cpu_logits() {
 #[test]
 #[ignore = "requires a leased CUDA device and the native Mini checkpoint"]
 fn native_cuda_logits() {
-    logits_probe(|model| model.weights.enable_cuda(&model.spec).unwrap());
+    logits_probe(|model| model.enable_cuda().unwrap());
 }
 
 #[cfg(test)]

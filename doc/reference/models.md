@@ -7,7 +7,7 @@
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
-| `inkling2_loop` | Inkling 2 Mini | CPU pilot | projection tests | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
+| `inkling2_loop` | Inkling 2 Mini | CPU pilot | opt-in | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
 | `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
@@ -21,9 +21,9 @@ A content pin does not qualify another quantization or checkpoint for quality.
 
 ## Inkling 2 Mini
 
-On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`. The CPU pilot supports raw completions and plain-text chat, with one active sequence and at most 128 tokens including the prompt.
+On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`. On a 64-bit Linux build with `native-cuda`, set `FIFI_INKLING_CUDA_REFERENCE=1` instead to run the BF16 and packed expert projections on the first visible CUDA device. Set `CUDA_VISIBLE_DEVICES` to choose the card. Set only one Inkling backend flag. Both pilots support raw completions and plain-text chat, with one active sequence and at most 128 tokens including the prompt. Routing, attention, KV and convolution state run on the host.
 
-`enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. With the CPU pilot enabled it also checks the pinned tokenizer and the short-context settings used for serving. The pilot uses F32 KV.
+`enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. With a pilot enabled it also checks the pinned tokenizer and the short-context settings. CUDA admission checks available device memory at startup.
 
 ## Tokenizer files
 

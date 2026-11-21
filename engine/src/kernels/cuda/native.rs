@@ -550,7 +550,6 @@ unsafe extern "C" {
         workspace: *const WorkspaceRaw,
         out_stage: *mut c_int,
     ) -> c_int;
-    #[cfg(test)]
     #[link_name = "inference_cuda_mxfp8_gemv_ws"]
     #[allow(clippy::too_many_arguments, reason = "mirrors native/f8_gemv.h")]
     fn mxfp8_gemv_ws_raw(
@@ -1571,7 +1570,6 @@ pub(super) fn f8_gemv(
 }
 
 /// MXFP8 uses the same workspace as E4M3 F8 and one E8M0 byte per 32 columns.
-#[cfg(test)]
 pub(super) fn mxfp8_gemv(
     codes: &RawDevice,
     scales: &RawDevice,

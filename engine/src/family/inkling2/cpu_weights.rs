@@ -1,6 +1,6 @@
 //! Read-only weight access for the Inkling short-context reference.
 
-#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::cuda_projection::{CudaProjection, DenseUpload};
 
 use std::{ops::Range, path::Path};
@@ -20,7 +20,7 @@ pub(super) struct Weights {
     metadata: ShardReader,
     mapping: MappedFile,
     isa: Isa,
-    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     cuda: Option<CudaProjection>,
 }
 
@@ -90,18 +90,18 @@ impl Weights {
             metadata,
             mapping,
             isa: Isa::detect(),
-            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             cuda: None,
         })
     }
 
-    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(&mut self, spec: &TextSpec) -> Result<(), EngError> {
         self.cuda = Some(CudaProjection::load(self, spec)?);
         Ok(())
     }
 
-    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn dense_uploads(&self, spec: &TextSpec) -> Result<Vec<DenseUpload<'_>>, EngError> {
         let mut uploads = Vec::new();
         for (name, tensor) in self.metadata.tensors() {
@@ -192,7 +192,7 @@ impl Weights {
                 "{name} projection dimensions disagree with its input or output"
             )));
         }
-        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Some(cuda) = &self.cuda
             && data.width == 2
         {
@@ -234,7 +234,7 @@ impl Weights {
         if weights.outer == 0.0 {
             return Ok(vec![0.0; weights.shape[0]]);
         }
-        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Some(cuda) = &self.cuda {
             return cuda.expert(&weights, x);
         }

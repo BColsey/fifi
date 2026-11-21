@@ -1050,7 +1050,6 @@ impl CudaContext {
     }
 
     /// Projects through E4M3FN codes with an E8M0 exponent for each block of 32.
-    #[cfg(test)]
     pub(crate) fn mxfp8_matvec(
         &self,
         codes: &DeviceBuffer,

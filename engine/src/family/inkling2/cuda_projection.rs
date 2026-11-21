@@ -1,14 +1,14 @@
-//! CUDA probe for the short-context text reference.
+//! CUDA projections for the short-context text backend.
 //!
 //! BF16 projections reside on the device. The selected experts reuse four
 //! packed staging pairs. Routing, attention, and each visit's state stay on
 //! the host so the projection changes can be compared with the CPU oracle.
 
-use std::{collections::BTreeMap, env, path::Path};
+use std::collections::BTreeMap;
 
 use super::{
     TextSpec, bad,
-    cpu_weights::{ExpertMatrix, ExpertPacking, Weights, mxfp8_dot},
+    cpu_weights::{ExpertMatrix, ExpertPacking, Weights},
 };
 use crate::{
     EngError,
@@ -238,6 +238,8 @@ impl CudaProjection {
 #[test]
 #[ignore = "requires the native Mini checkpoint, runs without a CUDA device"]
 fn native_cuda_projection_plan() {
+    use std::{env, path::Path};
+
     let dir = env::var_os("FIFI_INKLING_MODEL_DIR").expect("set FIFI_INKLING_MODEL_DIR");
     let path = Path::new(&dir);
     let spec = TextSpec::from_config(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
@@ -275,6 +277,8 @@ fn native_cuda_projection_plan() {
 #[test]
 #[ignore = "requires a leased CUDA device"]
 fn packed_mxfp8_cuda_matches_cpu() {
+    use super::cpu_weights::mxfp8_dot;
+
     let context = CudaContext::new().unwrap();
     let mut codes = [0x38; 128];
     codes[32..64].fill(0xb8);

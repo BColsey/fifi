@@ -8,7 +8,6 @@ mod cpu_forward;
 #[cfg(target_pointer_width = "64")]
 mod cpu_weights;
 #[cfg(all(
-    test,
     feature = "native-cuda",
     target_os = "linux",
     target_pointer_width = "64"
@@ -20,7 +19,7 @@ mod serve;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use cpu_forward::inspect_cpu_config;
 #[cfg(target_pointer_width = "64")]
-pub(crate) use serve::start_cpu;
+pub(crate) use serve::start_engine;
 
 pub(crate) use checkpoint::inspect_checkpoint;
 use serde::Deserialize;
@@ -28,12 +27,60 @@ use serde::Deserialize;
 use crate::{EngError, checkpoint_json::UniqueValue};
 
 pub(crate) const FAMILY: &str = "inkling2_loop";
-pub(crate) const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
-pub(crate) const CPU_CONTEXT_LIMIT: u32 = 128;
+const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
+const CUDA_REFERENCE_ENV: &str = "FIFI_INKLING_CUDA_REFERENCE";
+pub(crate) const TEXT_CONTEXT_LIMIT: u32 = 128;
 
-pub(crate) fn cpu_reference_enabled() -> bool {
-    cfg!(target_pointer_width = "64")
-        && std::env::var_os(CPU_REFERENCE_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextBackend {
+    Cpu,
+    Cuda,
+}
+
+impl TextBackend {
+    pub(crate) fn from_env() -> Result<Option<Self>, EngError> {
+        let enabled = |flag| std::env::var_os(flag).as_deref() == Some(std::ffi::OsStr::new("1"));
+        Self::select(enabled(CPU_REFERENCE_ENV), enabled(CUDA_REFERENCE_ENV))
+    }
+
+    fn select(cpu: bool, cuda: bool) -> Result<Option<Self>, EngError> {
+        match (cpu, cuda) {
+            (false, false) => Ok(None),
+            (true, true) => Err(EngError::BadRequest(format!(
+                "select one Inkling backend with {CPU_REFERENCE_ENV}=1 or {CUDA_REFERENCE_ENV}=1"
+            ))),
+            (true, false) if cfg!(target_pointer_width = "64") => Ok(Some(Self::Cpu)),
+            (false, true)
+                if cfg!(all(
+                    feature = "native-cuda",
+                    target_os = "linux",
+                    target_pointer_width = "64"
+                )) =>
+            {
+                Ok(Some(Self::Cuda))
+            }
+            (true, false) => Err(EngError::BadRequest(
+                "Inkling CPU serving requires a 64-bit build".into(),
+            )),
+            (false, true) => Err(EngError::BadRequest(
+                "Inkling CUDA serving requires a 64-bit Linux build with native-cuda".into(),
+            )),
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+}
+
+pub(crate) fn enable_text_backend() -> String {
+    format!(
+        "Set {CPU_REFERENCE_ENV}=1 or {CUDA_REFERENCE_ENV}=1 to enable experimental Inkling text serving."
+    )
 }
 
 #[derive(Deserialize)]

@@ -109,7 +109,6 @@ impl NemotronShardReader {
     }
 
     #[cfg(all(
-        test,
         feature = "native-cuda",
         target_os = "linux",
         target_pointer_width = "64"

@@ -595,12 +595,15 @@ fn inkling2_preflight(
     candidate: &Candidate,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::inkling2::{self, CPU_CONTEXT_LIMIT, CPU_REFERENCE_ENV, FAMILY, TextSpec};
+    use crate::family::inkling2::{self, FAMILY, TEXT_CONTEXT_LIMIT, TextBackend, TextSpec};
 
-    let enabled = inkling2::cpu_reference_enabled();
-    let context = candidate
-        .context_limit
-        .unwrap_or(if enabled { CPU_CONTEXT_LIMIT } else { 8192 });
+    let selection = TextBackend::from_env();
+    let backend = selection.as_ref().ok().copied().flatten();
+    let context = candidate.context_limit.unwrap_or(if backend.is_some() {
+        TEXT_CONTEXT_LIMIT
+    } else {
+        8192
+    });
     let config = std::fs::read(model_dir.join("config.json"))
         .map_err(|error| crate::EngError::Checkpoint(format!("read Inkling config.json: {error}")))
         .and_then(|bytes| TextSpec::from_config(&bytes).map(|spec| (spec, bytes)));
@@ -609,15 +612,14 @@ fn inkling2_preflight(
             report_inkling2_plan(&mut checks, &spec, context);
             report_inkling2_checkpoint(&mut checks, model_dir, &spec);
             #[cfg(target_pointer_width = "64")]
-            if enabled && !checks.iter().any(|check| check.status == CheckStatus::Fail) {
-                report_inkling2_cpu(
-                    &mut checks,
-                    &spec,
-                    &_bytes,
-                    candidate,
-                    context,
-                    tokenizer_dir,
-                );
+            if let Some(backend) = backend
+                && !checks.iter().any(|check| check.status == CheckStatus::Fail)
+            {
+                checks.push(inkling2_backend_check(
+                    backend,
+                    candidate.kv_dtype.as_deref(),
+                    || inkling2::inspect_cpu_config(&_bytes, &spec, context, tokenizer_dir),
+                ));
             }
         }
         Err(error) => checks.push(Check::new(
@@ -627,15 +629,14 @@ fn inkling2_preflight(
         )),
     }
 
-    let servable = enabled && !checks.iter().any(|check| check.status == CheckStatus::Fail);
-    if !enabled {
-        checks.push(Check::new(
-            "generation backend",
-            CheckStatus::Fail,
-            format!(
-                "Inkling 2 Mini CPU serving requires a 64-bit build with {CPU_REFERENCE_ENV}=1"
-            ),
-        ));
+    let servable =
+        backend.is_some() && !checks.iter().any(|check| check.status == CheckStatus::Fail);
+    if backend.is_none() {
+        let detail = match selection {
+            Err(error) => super::describe_error(&error),
+            _ => inkling2::enable_text_backend(),
+        };
+        checks.push(Check::new("generation backend", CheckStatus::Fail, detail));
     }
     PreflightReport {
         model_dir: model_dir.to_path_buf(),
@@ -665,12 +666,8 @@ fn inkling2_preflight(
         next_step: if servable {
             "Use the Inkling family in an enginesrv config to try short-context text generation."
                 .into()
-        } else if enabled {
-            "Address the failed Inkling CPU checks above.".into()
         } else {
-            format!(
-                "Set {CPU_REFERENCE_ENV}=1 to check the experimental short-context CPU backend."
-            )
+            "Address the failed Inkling checks above.".into()
         },
     }
 }
@@ -694,33 +691,30 @@ fn report_inkling2_checkpoint(
 }
 
 #[cfg(target_pointer_width = "64")]
-fn report_inkling2_cpu(
-    checks: &mut Vec<Check>,
-    spec: &crate::family::inkling2::TextSpec,
-    bytes: &[u8],
-    candidate: &Candidate,
-    context: u32,
-    tokenizer_dir: &Path,
-) {
-    let (status, detail) = if candidate
-        .kv_dtype
-        .as_deref()
-        .is_some_and(|dtype| dtype != "f32")
-    {
-        (CheckStatus::Fail, "Inkling CPU uses F32 KV".to_string())
+fn inkling2_backend_check(
+    backend: crate::family::inkling2::TextBackend,
+    kv_dtype: Option<&str>,
+    validate: impl FnOnce() -> Result<(), crate::EngError>,
+) -> Check {
+    let (status, detail) = if kv_dtype.is_some_and(|dtype| dtype != "f32") {
+        (
+            CheckStatus::Fail,
+            "Inkling text serving uses host F32 KV".into(),
+        )
     } else {
-        match crate::family::inkling2::inspect_cpu_config(bytes, spec, context, tokenizer_dir) {
+        match validate() {
             Ok(()) => (
                 CheckStatus::Warn,
                 format!(
-                    "experimental CPU text backend, F32 KV, one sequence, at most {} total tokens",
-                    crate::family::inkling2::CPU_CONTEXT_LIMIT
+                    "experimental {} text backend, host F32 KV, one sequence, at most {} total tokens",
+                    backend.name(),
+                    crate::family::inkling2::TEXT_CONTEXT_LIMIT
                 ),
             ),
             Err(error) => (CheckStatus::Fail, super::describe_error(&error)),
         }
     };
-    checks.push(Check::new("generation backend", status, detail));
+    Check::new("generation backend", status, detail)
 }
 
 fn report_inkling2_plan(

@@ -1,8 +1,8 @@
-//! The opt-in CPU executor uses the shared token session and sampler.
+//! Both reference backends use the shared token session and sampler.
 
 use std::path::Path;
 
-use super::{CPU_CONTEXT_LIMIT, cpu_forward::CpuForward};
+use super::{TEXT_CONTEXT_LIMIT, TextBackend, cpu_forward::CpuForward};
 use crate::{
     EngError,
     family::{
@@ -13,7 +13,8 @@ use crate::{
     tokenizer::{DecodeBatch, TokenizerBundle},
 };
 
-pub(crate) fn start_cpu(
+pub(crate) fn start_engine(
+    backend: TextBackend,
     model_dir: &Path,
     tokenizer_dir: &Path,
     ready_note: ReadyNote,
@@ -25,15 +26,35 @@ pub(crate) fn start_cpu(
     // Bound the time before the worker can observe cancellation during prefill.
     let engine = spawn_engine_noted(1, ready_note, move |stages| {
         stages.begin("weights");
-        let forward = CpuForward::open(&model_dir, CPU_CONTEXT_LIMIT as usize)?;
+        let forward = CpuForward::open(&model_dir, TEXT_CONTEXT_LIMIT as usize)?;
         forward.validate_tokenizer(vocab_size, &eos)?;
-        Ok((CpuExecutor { forward, eos }, DecodeSession::default()))
+        let forward = match backend {
+            TextBackend::Cpu => forward,
+            TextBackend::Cuda => {
+                stages.begin("CUDA projections");
+                cuda_forward(forward)?
+            }
+        };
+        Ok((TextExecutor { forward, eos }, DecodeSession::default()))
     })?;
     Ok((engine, bundle))
 }
 
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn cuda_forward(mut forward: CpuForward) -> Result<CpuForward, EngError> {
+    forward.enable_cuda()?;
+    Ok(forward)
+}
+
+#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+fn cuda_forward(_forward: CpuForward) -> Result<CpuForward, EngError> {
+    Err(EngError::BadRequest(
+        "Inkling CUDA serving requires a 64-bit Linux build with native-cuda".into(),
+    ))
+}
+
 impl TokenStepper for CpuForward {
-    const OPERATION: &'static str = "inkling2_cpu";
+    const OPERATION: &'static str = "inkling2_text";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         self.token(token, false).map(|_| ())
@@ -56,12 +77,12 @@ impl TokenStepper for CpuForward {
     }
 }
 
-struct CpuExecutor {
+struct TextExecutor {
     forward: CpuForward,
     eos: Vec<u32>,
 }
 
-impl ExecutorOps for CpuExecutor {
+impl ExecutorOps for TextExecutor {
     type Session = DecodeSession;
 
     fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
