@@ -762,9 +762,8 @@ fn stage_disk_experts(
         .map(|&bytes| u32::from_le_bytes(bytes))
         .collect();
     // Preserve the group order while remapping the expert IDs into the compact stack.
-    let mut experts = selected.clone();
-    experts.sort_unstable();
-    experts.dedup();
+    use crate::family::prefill::mlx::{local_expert_ids, sorted_expert_ids};
+    let experts = sorted_expert_ids(&selected);
     if let Some(cache) = cache.filter(|_| experts.len() == 6)
         && let Ok(route) = <&[u32; 6]>::try_from(selected.as_slice())
     {
@@ -773,13 +772,10 @@ fn stage_disk_experts(
         trace_expert_accesses(stem, 1, &experts);
         return Ok((rows, shared));
     }
-    let mut remapped = Vec::with_capacity(bytes.len());
-    for id in selected {
-        let slot = experts
-            .binary_search(&id)
-            .map_err(|_| EngError::Checkpoint("Flint expert remap lost a selected ID".into()))?;
-        remapped.extend_from_slice(&(slot as u32).to_le_bytes());
-    }
+    let remapped = local_expert_ids(&selected, &experts)?
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
     let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
     let (stack, local, _pages) = if pipeline {
         let coalesce_reads = expert_read_runs().coalesce(x.shape()[0]);

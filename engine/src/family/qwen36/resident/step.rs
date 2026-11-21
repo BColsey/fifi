@@ -161,8 +161,14 @@ pub(super) fn run(
                 moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
             (RFeedForward::Moe(w), Routing::Host) => {
-                let (out, (selection, probs)) =
-                    moe::step(&mut ctx, shape, w, &mid, &layer.post_norm)?;
+                let (out, (selection, probs)) = moe::step_with_checkpoint(
+                    &mut ctx,
+                    shape,
+                    w,
+                    &mid,
+                    &layer.post_norm,
+                    Some(ckpt),
+                )?;
                 if mode == StepMode::Record {
                     host_routes.push(selection.iter().map(|pick| pick.0).collect());
                     host_probs.push(probs);
