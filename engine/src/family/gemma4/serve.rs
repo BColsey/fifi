@@ -109,12 +109,15 @@ mod device {
             flash_next::factory::StartedEngine,
             seq_plan::{SeqInputs, plan_seqs},
             session::{
-                DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, StoreLimits,
-                TokenStepper,
+                DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, ShadowLcp,
+                StoreLimits, TokenStepper,
             },
             window::{self, WindowRows},
         },
-        sched::worker::{ReadyNote, spawn_engine_noted},
+        sched::{
+            job::{PrefixHit, PrefixReport},
+            worker::{ReadyNote, spawn_engine_noted},
+        },
         tokenizer::DecodeBatch,
     };
 
@@ -149,6 +152,11 @@ mod device {
         max_seqs: usize,
         /// The prompt rows the worker feeds per tick while sessions share the model.
         prompt_rows: usize,
+        /// The kind of the entry the last restore used, the prompt tokens it shared beyond the
+        /// restored prefix and the shadow lookup, for `prefix_report`.
+        prefix_hit: PrefixHit,
+        prefix_uncached: u32,
+        prefix_shadow: Option<ShadowLcp>,
     }
 
     /// The store's explicit one-tip shape (no roots, no periodic points),
@@ -243,6 +251,10 @@ mod device {
         }
 
         fn reset(&mut self, st: &mut Self::Session) -> Result<(), EngError> {
+            // The restore facts of the report do not survive a job.
+            self.prefix_hit = PrefixHit::Miss;
+            self.prefix_uncached = 0;
+            self.prefix_shadow = None;
             st.core.reset(&mut Step {
                 model: &mut self.model,
                 seq: &st.seq,
@@ -325,10 +337,35 @@ mod device {
             let identity = self.identity.clone();
             let model = &self.model;
             let BoltSession { core, pos, seq } = st;
-            core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
+            let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
                 model.restore_seq(seq, saved)?;
                 *pos = saved.fed();
                 Ok(())
+            })?;
+            // The restore facts of the report, read now: the store moves on with the job's saves.
+            self.prefix_hit = self.prefix.restored_kind().into();
+            self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
+            self.prefix_shadow = self.prefix.shadow_report();
+            Ok(covered)
+        }
+
+        /// The entries the store holds, the host bytes of their copies, and the facts of the
+        /// last restore, for the request log and the usage report.
+        fn prefix_report(&self) -> Option<PrefixReport> {
+            let stored = self.prefix.roots_len() + self.prefix.entries_len();
+            Some(PrefixReport {
+                entries: u32::try_from(stored).unwrap_or(u32::MAX),
+                bytes: self
+                    .prefix
+                    .snapshots()
+                    .map(|snapshot| snapshot.bytes() as u64)
+                    .sum(),
+                hit: self.prefix_hit,
+                uncached_shared: self.prefix_uncached,
+                shadow: self.prefix_shadow,
+                restore_drops: self.prefix.restore_drop_count(),
+                evictions: self.prefix.eviction_count(),
+                save_side: self.prefix.save_side_totals(),
             })
         }
     }
@@ -471,6 +508,9 @@ mod device {
                 identity: PrefixIdentity::default(),
                 max_seqs: plan.seqs,
                 prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
+                prefix_hit: PrefixHit::Miss,
+                prefix_uncached: 0,
+                prefix_shadow: None,
             };
             if plan.seqs > 1 {
                 eprintln!(
@@ -761,6 +801,9 @@ mod device {
                 identity: PrefixIdentity::default(),
                 max_seqs: 3,
                 prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
+                prefix_hit: PrefixHit::Miss,
+                prefix_uncached: 0,
+                prefix_shadow: None,
             }
         }
 

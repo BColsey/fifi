@@ -239,6 +239,20 @@ impl BoltSnapshot {
     pub(crate) fn fed(&self) -> usize {
         self.fed
     }
+
+    /// The host bytes the snapshot holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// Admits `bytes` of snapshot against the host's available memory, less the OS floor and the
+/// enclosing cgroup's remaining bytes.
+fn admit_snapshot(
+    bytes: usize,
+    host: &crate::family::host_admit::HostAdmission,
+) -> Result<(), EngError> {
+    host.admit_for(bytes as u64, "a Bolt prefix snapshot")
 }
 
 /// The logits rows of a window: the raw head output and its softcap, one vocabulary row per
@@ -738,8 +752,9 @@ impl Bolt {
 
     /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
     /// later request restores into any sequence, so it holds at most one sequence's cache
-    /// (`CELLS` positions) and is allocated only for the cells it covers; a host that cannot
-    /// hold it refuses with a memory-plan error and nothing is stored.
+    /// (`CELLS` positions) and is allocated only for the cells it covers; a host whose available
+    /// memory (less the OS floor) cannot hold it refuses with a memory-plan error and nothing
+    /// is stored.
     pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
         if fed > CELLS {
             return Err(EngError::ContextLimit(
@@ -754,6 +769,13 @@ impl Bolt {
                 }
             }
         }
+        // Linux grants an allocation it cannot back and kills the process later, so the
+        // allocation cannot be what refuses: the host's available memory (with the OS floor and
+        // the enclosing cgroup's limit) is checked first.
+        admit_snapshot(
+            total,
+            &crate::family::host_admit::HostAdmission::probe("a Bolt prefix snapshot", "the host")?,
+        )?;
         let mut data = Vec::new();
         data.try_reserve_exact(total).map_err(|_| {
             EngError::MemoryPlan(format!(
@@ -1990,6 +2012,32 @@ mod tests {
             crate::kernels::cuda::plan::admit(&demand, allocations + demand.headroom),
             Ok(allocations + demand.headroom)
         );
+    }
+
+    #[test]
+    fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
+        use crate::family::host_admit::HostAdmission;
+        let meminfo = |available_gib: u64| {
+            format!(
+                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
+                32 * (1 << 20),
+                available_gib * (1 << 20)
+            )
+        };
+        let one_gib = 1usize << 30;
+        // 32 GiB host: the floor is 8 GiB, so a 1 GiB snapshot needs 9 GiB available.
+        let tight = HostAdmission::from_meminfo("test", &meminfo(8), None).expect("host");
+        let error = admit_snapshot(one_gib, &tight).expect_err("8 GiB available is not enough");
+        assert!(
+            matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
+            "{error:?}"
+        );
+        let roomy = HostAdmission::from_meminfo("test", &meminfo(20), None).expect("host");
+        assert!(admit_snapshot(one_gib, &roomy).is_ok());
+        // A cgroup that leaves less than the snapshot refuses whatever the host has.
+        let capped =
+            HostAdmission::from_meminfo("test", &meminfo(20), Some(1 << 30)).expect("host");
+        assert!(admit_snapshot(one_gib, &capped).is_err());
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
