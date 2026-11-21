@@ -3,7 +3,7 @@ use super::{
     CORE_START, EXPERTS, HIDDEN, InklingExpertSource, InklingRoutes, LayerVisit, MAX_CONTEXT,
     attention::InklingAttentionState,
     dense::DenseWeights,
-    gguf, is_local,
+    gguf, gguf_mlx, is_local,
     mlx::{MlxExpertCache, MlxExpertCacheStats},
     sconv::{InklingConvState, InklingConvStream, InklingConvTaps},
     timing::{self, measure},
@@ -134,6 +134,7 @@ enum Experts {
         cache: Box<MlxExpertCache>,
     },
     GgufReference(Arc<gguf::Weights>),
+    GgufMlx(Box<gguf_mlx::Experts>),
 }
 
 #[derive(Default, serde::Serialize)]
@@ -201,19 +202,40 @@ impl Decoder {
     /// Opens the portable GGUF projections in the common text graph for parity checks.
     /// Uses bounded host reads and a single token row per visit.
     pub fn open_gguf_reference(path: &Path, context: u32) -> Result<Self, EngError> {
+        Self::open_gguf(path, context, false)
+    }
+
+    /// Opens the experimental GGUF Metal expert path in the shared text graph.
+    pub fn open_gguf_native(path: &Path, context: u32) -> Result<Self, EngError> {
+        Self::open_gguf(path, context, true)
+    }
+
+    fn open_gguf(path: &Path, context: u32, native: bool) -> Result<Self, EngError> {
         if !(1..=MAX_CONTEXT).contains(&context) {
             return Err(EngError::BadRequest("Invalid Inkling context limit".into()));
         }
         let state = super::state_plan(context)?;
-        let charges = super::base_charges(0, gguf::projection_scratch_bytes(), &state);
-        if let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? {
-            super::working_set_remaining(device, &charges)?;
-        }
+        let scratch = if native {
+            gguf_mlx::scratch_bytes()
+        } else {
+            gguf::projection_scratch_bytes()
+        };
+        let charges = super::base_charges(0, scratch, &state);
+        let headroom = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)?
+            .map_or(Ok(0), |device| {
+                super::working_set_remaining(device, &charges)
+            })?;
         let source = Arc::new(gguf::Weights::open(path)?);
         let dense = DenseWeights::from_gguf(Arc::clone(&source))?;
+        let experts = if native {
+            let headroom = usize::try_from(headroom).map_err(|_| super::staging_overflow())?;
+            Experts::GgufMlx(Box::new(gguf_mlx::Experts::open(source, headroom)?))
+        } else {
+            Experts::GgufReference(source)
+        };
         Ok(Self {
             dense,
-            experts: Experts::GgufReference(source),
+            experts,
             conv: Default::default(),
             attention: Default::default(),
             position: 0,
@@ -228,6 +250,7 @@ impl Decoder {
         match &self.experts {
             Experts::Mlx { cache, .. } => cache.stats(),
             Experts::GgufReference(_) => MlxExpertCacheStats::default(),
+            Experts::GgufMlx(cache) => cache.stats(),
         }
     }
 
@@ -317,16 +340,19 @@ impl Decoder {
             InklingRoutes::from_logits(&logits, bias.as_slice().try_into().map_err(|_| invalid())?)
         })?;
         let Experts::Mlx { metal, cache } = &mut self.experts else {
-            let Experts::GgufReference(source) = &self.experts else {
-                unreachable!()
-            };
             let mut out = Vec::with_capacity(inputs.len() * HIDDEN);
             for ((input, experts), weights) in inputs
                 .iter()
                 .zip(routes.expert_ids().chunks_exact(super::TOP_K))
                 .zip(routes.weights().chunks_exact(super::TOP_K))
             {
-                out.extend(source.moe_row(layer, input, experts, weights)?);
+                out.extend(match &mut self.experts {
+                    Experts::GgufReference(source) => {
+                        source.moe_row(layer, input, experts, weights)?
+                    }
+                    Experts::GgufMlx(cache) => cache.row(layer, input, experts, weights)?,
+                    Experts::Mlx { .. } => unreachable!(),
+                });
             }
             return Ok(out);
         };
@@ -568,10 +594,23 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a complete Unsloth UD-IQ2_XXS fork GGUF at INKLING_GGUF_REFERENCE"]
+    #[ignore = "requires a complete Unsloth UD-IQ2_XXS GGUF at INKLING_GGUF_REFERENCE"]
     fn fork_gguf_reference_first_token_matches_oracle() {
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let mut decoder = Decoder::open_gguf_reference(Path::new(&file), 128).unwrap();
+        assert_capital_probe(&mut decoder);
+    }
+
+    #[test]
+    #[ignore = "requires complete Unsloth GGUF weights at INKLING_GGUF_REFERENCE and Apple Metal"]
+    fn gguf_native_first_token_matches_oracle() {
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let mut decoder = Decoder::open_gguf_native(Path::new(&file), 128).unwrap();
+        assert_capital_probe(&mut decoder);
+        assert!(decoder.expert_cache_stats().read_ranges > 0);
+    }
+
+    fn assert_capital_probe(decoder: &mut Decoder) {
         let start = std::time::Instant::now();
         decoder
             .advance_rows(&[371, 151451, 149879, 151194])

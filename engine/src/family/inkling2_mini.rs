@@ -18,6 +18,8 @@ pub mod gguf;
 mod gguf_dense;
 pub mod gguf_metadata;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod gguf_mlx;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod mlx;
 mod routes;
 pub mod sconv;
