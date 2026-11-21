@@ -149,6 +149,24 @@ impl GgufNgramRows {
     }
 }
 
+impl crate::family::qwen::flash_next::cuda::ple_feed::NgramRowSource for GgufNgramRows {
+    fn row_count(&self) -> u64 {
+        self.rows
+    }
+    fn row(&self, row: u64) -> Result<Vec<f32>, EngError> {
+        GgufNgramRows::row(self, row)
+    }
+    fn multipliers(&self) -> &[i64] {
+        &self.hash.multipliers
+    }
+    fn vocab(&self) -> &[i64] {
+        &self.hash.vocab
+    }
+    fn offsets(&self) -> &[i64] {
+        &self.hash.offsets
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

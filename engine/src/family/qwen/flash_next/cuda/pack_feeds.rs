@@ -34,11 +34,29 @@ fn take_pending<T>(pending: &mut VecDeque<Pending<T>>, token: u32) -> Result<T, 
     )))
 }
 
-pub(super) struct PackFeeds {
+/// The initial residual stream of a token: its embedding row once per hyper-connection branch.
+/// The pack reads a BF16 table; a GGUF reads a quantized one.
+pub(in crate::family::qwen::flash_next) trait EmbeddingRows {
+    /// `branches * hidden` values of `token`.
+    fn stream_row(&self, token: u32) -> Result<Vec<f32>, EngError>;
+}
+
+/// The embedding of the EXL3 pack.
+struct PackEmbedding {
     source: &'static StreamedCheckpoint,
-    ple: PleFeed,
     hidden: usize,
     branches: usize,
+}
+
+impl EmbeddingRows for PackEmbedding {
+    fn stream_row(&self, token: u32) -> Result<Vec<f32>, EngError> {
+        stream_row(self.source, token, self.hidden, self.branches)
+    }
+}
+
+pub(in crate::family::qwen::flash_next) struct PackFeeds {
+    embedding: Box<dyn EmbeddingRows>,
+    ple: PleFeed,
     pending: VecDeque<Pending<Gathered>>,
     reader: Option<RowReader>,
     profile: Option<FeedProfile>,
@@ -62,11 +80,26 @@ impl PackFeeds {
         branches: usize,
         reader: Option<RowReader>,
     ) -> Self {
-        Self {
-            source,
+        Self::with_embedding(
+            Box::new(PackEmbedding {
+                source,
+                hidden,
+                branches,
+            }),
             ple,
-            hidden,
-            branches,
+            reader,
+        )
+    }
+
+    /// Feeds over any embedding source and PLE feed.
+    pub(in crate::family::qwen::flash_next) fn with_embedding(
+        embedding: Box<dyn EmbeddingRows>,
+        ple: PleFeed,
+        reader: Option<RowReader>,
+    ) -> Self {
+        Self {
+            embedding,
+            ple,
             pending: VecDeque::new(),
             reader,
             profile: None,
@@ -97,7 +130,7 @@ impl PackFeeds {
             time_feed(profile.as_mut().map(|p| &mut p.token_embedding), || {
                 tokens
                     .iter()
-                    .map(|&token| stream_row(self.source, token, self.hidden, self.branches))
+                    .map(|&token| self.embedding.stream_row(token))
                     .collect()
             });
         let block = time_feed(profile.as_mut().map(|p| &mut p.bulk_join), || read.wait());
@@ -155,7 +188,7 @@ impl TokenFeeds for PackFeeds {
         let mut pending = VecDeque::with_capacity(tokens.len());
         for (i, &token) in tokens.iter().enumerate() {
             let stream = time_feed(timing.as_mut().map(|p| &mut p.token_embedding), || {
-                stream_row(self.source, token, self.hidden, self.branches)
+                self.embedding.stream_row(token)
             })?;
             let (ple_embedding, rows) =
                 time_feed(timing.as_mut().map(|p| &mut p.serial_ngram), || {

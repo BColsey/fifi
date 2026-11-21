@@ -23,6 +23,7 @@
 )]
 
 pub(super) mod config;
+pub(in crate::family::qwen::flash_next) mod feeds;
 #[cfg(test)]
 mod host;
 pub(super) mod ngram;
@@ -44,7 +45,10 @@ use self::{
 use crate::{
     EngError,
     family::{gguf_select, recipe::Global},
-    weights::{GgufLimits, GgufWeights, MetaValue},
+    weights::{
+        ExpertTensorNames, GgufExpertIndex, GgufLimits, GgufWeights, MetaValue,
+        gguf_experts::GgufRecordStore,
+    },
 };
 
 /// Bounds of the open: the metadata of a model with a 250,000-token vocabulary is about 10 MB;
@@ -57,7 +61,7 @@ const LIMITS: GgufLimits = GgufLimits {
 /// An opened Flash-Next GGUF: the checkpoint, its configuration and its tensor map.
 #[derive(Debug)]
 pub(in super::super) struct GgufModel {
-    pub(super) weights: GgufWeights,
+    pub(super) weights: std::sync::Arc<GgufWeights>,
     pub(super) config: GgufConfig,
     pub(super) map: TensorMap,
 }
@@ -98,7 +102,7 @@ impl GgufModel {
             let config = GgufConfig::read(&weights)?;
             let map = TensorMap::build(weights.header(), &config)?;
             return Ok(Some(Self {
-                weights,
+                weights: std::sync::Arc::new(weights),
                 config,
                 map,
             }));
@@ -126,6 +130,31 @@ impl GgufModel {
             .get(Global::NgramTable, None)
             .ok_or_else(|| EngError::Checkpoint("Flash-Next GGUF: no n-gram table".into()))?;
         GgufNgramRows::open(&self.weights, table, self.config.hash.clone())
+    }
+
+    /// The placement of every routed expert in the files: shard, offset, size and type per
+    /// layer, built by the shared GGUF expert index.
+    pub(in crate::family::qwen::flash_next) fn expert_index(&self) -> Result<GgufExpertIndex, EngError> {
+        let dims = &self.config.dims;
+        GgufExpertIndex::new(
+            self.weights.header(),
+            self.weights.shard_lens(),
+            &ExpertTensorNames::llama_cpp(),
+            self.config.layers(),
+            dims.experts as usize,
+            (dims.hidden as usize, dims.moe_inter as usize),
+            None,
+        )
+        .map_err(|error| EngError::Checkpoint(format!("Flash-Next GGUF experts: {error:?}")))
+    }
+
+    /// The routed experts as an [`ExpertRecordStore`](crate::weights::expert_store): one
+    /// positioned read per slice, records of each layer's own size.
+    pub(in crate::family::qwen::flash_next) fn record_store(&self) -> Result<GgufRecordStore, EngError> {
+        Ok(GgufRecordStore::new(
+            std::sync::Arc::clone(&self.weights),
+            self.expert_index()?,
+        ))
     }
 
     /// The tensor types of this file that no CUDA decode kernel reads yet.

@@ -100,16 +100,16 @@ pub(super) struct TokenTimes {
 
 /// The start vectors of a token.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct StartVectors {
+pub(in crate::family::qwen::flash_next) struct StartVectors {
     /// `branches * hidden`: the embedding row once per branch.
-    pub(super) stream: Vec<f32>,
+    pub(in crate::family::qwen::flash_next) stream: Vec<f32>,
     /// `ple_embed`: the PLE embedding of the token (its n-gram rows).
-    pub(super) ple_embedding: Vec<f32>,
+    pub(in crate::family::qwen::flash_next) ple_embedding: Vec<f32>,
 }
 
 /// Wall times nested inside the chunk driver's `begin(host feeds)` phase.
 #[derive(Clone, Copy, Default)]
-pub(super) struct FeedProfile {
+pub(in crate::family::qwen::flash_next) struct FeedProfile {
     pub(super) serial_rows: usize,
     pub(super) bulk_rows: usize,
     pub(super) token_embedding: Duration,
@@ -137,7 +137,7 @@ impl std::fmt::Display for FeedProfile {
 }
 
 /// The host side of a token: the embedding table and the PLE feed.
-pub(super) trait TokenFeeds {
+pub(in crate::family::qwen::flash_next) trait TokenFeeds {
     /// The start vectors of `token`. Reads the pack and the n-gram table; changes no state.
     fn begin(&mut self, token: u32) -> Result<StartVectors>;
     /// The start vectors of a whole chunk, in order. The default reads one token at a time,

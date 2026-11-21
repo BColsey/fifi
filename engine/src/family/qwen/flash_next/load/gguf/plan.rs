@@ -34,7 +34,7 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 }
 
 /// What the plan reads from the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::family::qwen::flash_next) struct GgufSizes {
     pub(in crate::family::qwen::flash_next) shape: TierShape,
     /// Device bytes of the resident trunk in the forms the executor holds it in.
@@ -47,6 +47,10 @@ pub(in crate::family::qwen::flash_next) struct GgufSizes {
     pub(in crate::family::qwen::flash_next) record_bytes_max: u64,
     /// The routed experts of all layers, as stored.
     pub(in crate::family::qwen::flash_next) expert_bytes: u64,
+    /// Bytes of one expert record in each layer. The tier shape's uniform expert is the mean
+    /// of these, so the plan's bank bytes are exact only for a bank whose slots in each layer
+    /// hold that layer's own record size.
+    pub(in crate::family::qwen::flash_next) layer_record_bytes: Vec<u64>,
 }
 
 /// What the machine offers: the card's free memory after the CUDA context exists, and the
@@ -65,26 +69,19 @@ impl GgufModel {
         let layers = self.config.layers();
         let experts = u64::from(self.config.dims.experts);
         let top_k = self.config.dims.top_k as usize;
-        let mut total = 0u64;
-        let mut record_max = 0u64;
+        let index = self.expert_index()?;
+        let mut per_layer = Vec::with_capacity(layers);
         for layer in 0..layers {
-            let mut layer_bytes = 0u64;
-            for role in [Wanted::ExpertGate, Wanted::ExpertUp, Wanted::ExpertDown] {
-                let tensor = self
-                    .map
-                    .get(role, Some(layer))
-                    .ok_or_else(|| refuse(format!("layer {layer} has no {role:?} tensor")))?;
-                if tensor.bytes % experts != 0 {
-                    return Err(refuse(format!(
-                        "{} has {} bytes, which do not divide over {experts} experts",
-                        tensor.name, tensor.bytes
-                    )));
-                }
-                layer_bytes += tensor.bytes;
-            }
-            total += layer_bytes;
-            record_max = record_max.max(layer_bytes / experts);
+            per_layer.push(
+                index
+                    .record_bytes(layer)
+                    .map_err(|error| refuse(format!("layer {layer}: {error:?}")))?,
+            );
         }
+        let total = index
+            .total_bytes()
+            .map_err(|error| refuse(format!("{error:?}")))?;
+        let record_max = index.max_record_bytes();
         let count = layers as u64 * experts;
         let shape = TierShape {
             layers,
@@ -110,6 +107,7 @@ impl GgufModel {
             ngram_bytes: ngram,
             record_bytes_max: record_max,
             expert_bytes: total,
+            layer_record_bytes: per_layer,
         })
     }
 

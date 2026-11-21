@@ -82,7 +82,7 @@ pub(super) mod load;
 #[cfg(test)]
 mod load_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod ple_feed;
+pub(in crate::family::qwen::flash_next) mod ple_feed;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod stream_io;
 
@@ -145,6 +145,6 @@ mod driver_device_tests;
 mod executor;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
-mod pack_feeds;
+pub(in crate::family::qwen::flash_next) mod pack_feeds;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::qwen::flash_next) mod start;

@@ -54,6 +54,68 @@ fn le_i64(bytes: &[u8], what: &str) -> Result<Vec<i64>, EngError> {
     Ok(words.iter().map(|w| i64::from_le_bytes(*w)).collect())
 }
 
+/// Where the rows of the n-gram table come from: a table of `row_count` rows of values and the
+/// hash constants that map n-grams to rows. Implemented by the EXL3 file ([`NgramRows`]) and by
+/// a GGUF tensor, so one feed serves both formats. `Sync`: the rows of the next token may be
+/// gathered on another thread while the card works.
+pub(in crate::family) trait NgramRowSource: Sync {
+    /// Rows in the table, the single virtual table the step addresses.
+    fn row_count(&self) -> u64;
+    /// Reads and decodes global row `row`.
+    fn row(&self, row: u64) -> Result<Vec<f32>, EngError>;
+    /// The layer multipliers of the hash.
+    fn multipliers(&self) -> &[i64];
+    /// The vocabulary size of every head.
+    fn vocab(&self) -> &[i64];
+    /// The first global row of every head.
+    fn offsets(&self) -> &[i64];
+    /// A pool that reads many rows at once, for the chunked prefill. A source without one
+    /// refuses; the feed then reads row by row.
+    fn reader(&self, _threads: usize) -> Result<RowReader, EngError> {
+        Err(EngError::BadRequest(
+            "this n-gram source has no bulk row reader".to_string(),
+        ))
+    }
+}
+
+/// Reads and decodes the rows of `plan`, in plan order. Takes no lock, so it may run on another
+/// thread while the device works: the rows depend on the token history only.
+pub(in crate::family) fn gather_rows(
+    rows: &dyn NgramRowSource,
+    plan: &RowPlan,
+) -> Result<Gathered, EngError> {
+    let rows = plan
+        .rows
+        .iter()
+        .map(|&(_, row)| {
+            let row = u64::from(row);
+            Ok((row, rows.row(row)?))
+        })
+        .collect::<Result<Vec<_>, EngError>>()?;
+    Ok(Gathered::Serial(rows))
+}
+
+impl NgramRowSource for NgramRows {
+    fn row_count(&self) -> u64 {
+        self.rows()
+    }
+    fn row(&self, row: u64) -> Result<Vec<f32>, EngError> {
+        NgramRows::row(self, row)
+    }
+    fn multipliers(&self) -> &[i64] {
+        &self.multipliers
+    }
+    fn vocab(&self) -> &[i64] {
+        &self.vocab
+    }
+    fn offsets(&self) -> &[i64] {
+        &self.offsets
+    }
+    fn reader(&self, threads: usize) -> Result<RowReader, EngError> {
+        NgramRows::reader(self, threads)
+    }
+}
+
 /// The n-gram file with its decoder and hash tensors: global row to values. `Sync`, so the rows of
 /// the next token can be gathered on another thread while the card works (asserted below).
 pub(in crate::family) struct NgramRows {
@@ -106,15 +168,7 @@ impl NgramRows {
     /// Reads and decodes the rows of `plan`, in plan order. Takes `&self` and no lock, so it may
     /// run on another thread while the device works: the rows depend on the token history only.
     pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
-        let rows = plan
-            .rows
-            .iter()
-            .map(|&(_, row)| {
-                let row = u64::from(row);
-                Ok((row, self.row(row)?))
-            })
-            .collect::<Result<Vec<_>, EngError>>()?;
-        Ok(Gathered::Serial(rows))
+        gather_rows(self, plan)
     }
 
     /// Reads and decodes global row `row`.
@@ -562,6 +616,23 @@ pub(in crate::family) struct PleVectors {
 }
 
 impl PleVectors {
+    /// The vectors from values another format already decoded: the three norms as `w` of the
+    /// zero-centred form (`ple::step` applies `1 + w`) and the convolution, `width * kernel`
+    /// values with channel `c` at `c * kernel`.
+    pub(in crate::family) fn from_parts(
+        norm_key: Vec<f32>,
+        norm_query: Vec<f32>,
+        norm_conv: Vec<f32>,
+        conv: Vec<f32>,
+    ) -> Self {
+        Self {
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv,
+        }
+    }
+
     /// Reads the vectors of the PLE block of `layer` from the pack, and the host route over its
     /// two projections on `threads` threads. Widths come from `shape`.
     pub(in crate::family) fn read(
@@ -611,15 +682,15 @@ impl PleVectors {
 /// The weights `ple::step` and `ple::plan_rows` read, borrowed field by field so that the
 /// projection can be borrowed mutably beside them.
 fn step_weights<'a>(
-    rows: &'a NgramRows,
+    rows: &'a dyn NgramRowSource,
     vectors: &'a PleVectors,
     table: &'a [FeedWeight; 1],
     table_rows: &'a [u64; 1],
 ) -> PleWeights<'a, FeedWeight> {
     PleWeights {
-        multipliers: &rows.multipliers,
-        vocab: &rows.vocab,
-        offsets: &rows.offsets,
+        multipliers: rows.multipliers(),
+        vocab: rows.vocab(),
+        offsets: rows.offsets(),
         shards: table,
         shard_rows: table_rows,
         weight_scale: WEIGHT_SCALE,
@@ -635,7 +706,7 @@ fn step_weights<'a>(
 /// The host PLE step with its state.
 pub(in crate::family) struct PleFeed {
     shape: PleShape,
-    rows: NgramRows,
+    rows: Box<dyn NgramRowSource>,
     vectors: PleVectors,
     projection: Box<dyn PleProjection>,
     /// The device route's hand-off: when set, [`PleFeed::set_fixed`] installs a precomputed
@@ -696,15 +767,15 @@ impl PleProjection for SharedFixed {
 impl PleFeed {
     pub(in crate::family) fn new(
         shape: PleShape,
-        rows: NgramRows,
+        rows: impl NgramRowSource + 'static,
         vectors: PleVectors,
         projection: Box<dyn PleProjection>,
     ) -> Self {
-        let table_rows = [rows.rows()];
+        let table_rows = [rows.row_count()];
         Self {
             state: PleState::new(&shape),
             shape,
-            rows,
+            rows: Box::new(rows),
             vectors,
             projection,
             fixed: None,
@@ -713,25 +784,25 @@ impl PleFeed {
         }
     }
 
-    /// The n-gram table, which a caller may read from another thread (`NgramRows` is `Sync`).
-    pub(in crate::family) fn rows(&self) -> &NgramRows {
-        &self.rows
+    /// The n-gram table, which a caller may read from another thread (the source is `Sync`).
+    pub(in crate::family) fn rows(&self) -> &dyn NgramRowSource {
+        self.rows.as_ref()
     }
 
     /// A feed whose projections come from [`FixedProjection::set`]: the device route installs
     /// each row's pair there, and the host step consumes it unchanged.
     pub(in crate::family) fn with_fixed(
         shape: PleShape,
-        rows: NgramRows,
+        rows: impl NgramRowSource + 'static,
         vectors: PleVectors,
         fixed: std::rc::Rc<FixedProjection>,
     ) -> Self {
         let projection = Box::new(SharedFixed(std::rc::Rc::clone(&fixed)));
-        let table_rows = [rows.rows()];
+        let table_rows = [rows.row_count()];
         Self {
             state: PleState::new(&shape),
             shape,
-            rows,
+            rows: Box::new(rows),
             vectors,
             projection,
             fixed: Some(fixed),
@@ -761,7 +832,12 @@ impl PleFeed {
     }
 
     fn weights(&self) -> PleWeights<'_, FeedWeight> {
-        step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows)
+        step_weights(
+            self.rows.as_ref(),
+            &self.vectors,
+            &self.table,
+            &self.table_rows,
+        )
     }
 
     /// The rows `token` needs after the tokens already fed.
@@ -802,7 +878,7 @@ impl PleFeed {
 
     /// Reads and decodes the rows of `plan` (see [`NgramRows::gather`]).
     pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
-        self.rows.gather(plan)
+        gather_rows(self.rows.as_ref(), plan)
     }
 
     /// The PLE embedding of `token` as the chunk feeds assemble it: planned against the
@@ -847,7 +923,12 @@ impl PleFeed {
                 projection: self.projection.as_mut(),
                 value: None,
             };
-            let weights = step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows);
+            let weights = step_weights(
+                self.rows.as_ref(),
+                &self.vectors,
+                &self.table,
+                &self.table_rows,
+            );
             if profile {
                 crate::family::qwen::flash_next::cuda::driver::chunk::prof::add(14, t.elapsed());
                 t = std::time::Instant::now();

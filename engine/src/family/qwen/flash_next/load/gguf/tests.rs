@@ -935,3 +935,125 @@ fn the_weight_map_names_each_recipe_role_and_gives_its_stored_type() {
     assert!(map.global(Global::HeadSite(SiteTensor::Norm)).is_some());
     assert_eq!(map.global(Global::FinalNorm), None);
 }
+
+#[test]
+fn the_feeds_of_a_synthetic_model_have_the_widths_the_driver_expects() {
+    use crate::family::qwen::flash_next::cuda::driver::TokenFeeds;
+    let written = write_flash(&Spec::default());
+    let model: &'static GgufModel = Box::leak(Box::new(
+        GgufModel::open(&written.first)
+            .expect("open")
+            .expect("a qwen4exp model"),
+    ));
+    let mut feeds = super::feeds::gguf_feeds(model, 2).expect("feeds");
+    let start = feeds.begin(5).expect("start vectors");
+    assert_eq!(start.stream.len(), 4 * 2560);
+    assert_eq!(start.ple_embedding.len(), 16 * 160);
+    let update = feeds.ple_update(5, &start.stream).expect("ple update");
+    assert_eq!(update.len(), 4 * 2560);
+    assert!(update.iter().all(|v| v.is_finite()));
+    let refused = feeds.begin(248_320).expect_err("outside the vocabulary");
+    assert!(
+        refused
+            .describe()
+            .contains("outside the 248320 embedding rows"),
+        "{}",
+        refused.describe()
+    );
+}
+
+/// The GGUF feed against the host step: the same tokens through the feed (preloaded F32
+/// projections, gathered rows) and through `ple::step` over a projector that decodes from the
+/// file on every call. Needs FIFI_FLASH_GGUF.
+#[test]
+fn real_file_feed_equals_the_host_ple_step() {
+    use crate::family::qwen::flash_next::{cuda::driver::TokenFeeds, ple};
+    let Some(model) = real_model() else {
+        eprintln!("skipped: FIFI_FLASH_GGUF is unset");
+        return;
+    };
+    let model: &'static GgufModel = Box::leak(Box::new(model));
+    let mut feeds = super::feeds::gguf_feeds(model, 8).expect("feeds");
+    let host = super::host::HostModel::load(model, 2).expect("host layers");
+    let ngram = model.ngram().expect("table");
+    let mut projector = super::host::HostProjector::new(&model.weights, &ngram, 8);
+    let weights = host.view();
+    let mut state = ple::PleState::new(&host.shape.ple);
+    let tokens = [760u32, 6511, 314, 9338, 369];
+    let mut worst = 0f32;
+    for (at, &token) in tokens.iter().enumerate() {
+        let start = feeds.begin(token).expect("start");
+        // The host embedding: the row of the same table through the host projector.
+        let row = crate::family::project::Projector::rows(&mut projector, weights.embed, &[token])
+            .expect("embedding row");
+        assert_eq!(start.stream, row.repeat(4), "token {at}");
+        // A stream that differs per token and branch.
+        let stream: Vec<f32> = (0..start.stream.len())
+            .map(|i| ((i * 31 + at * 7) % 101) as f32 * 0.01 - 0.5)
+            .collect();
+        let got = feeds.ple_update(token, &stream).expect("feed update");
+        let want = ple::step(
+            &mut projector,
+            &host.shape.ple,
+            &weights.ple,
+            &mut state,
+            token,
+            &stream,
+        )
+        .expect("host step");
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            worst = worst.max((g - w).abs());
+        }
+    }
+    eprintln!("max abs difference between the feed and the host step: {worst}");
+    assert!(worst < 1e-4, "{worst}");
+}
+
+#[test]
+fn the_plans_uniform_expert_is_the_mean_of_the_layers_own_records() {
+    let (_written, model) = open(&Spec::default());
+    let sizes = model.sizes().expect("sizes");
+    let layers = 48u64;
+    assert_eq!(sizes.layer_record_bytes.len(), 48);
+    let sum: u64 = sizes.layer_record_bytes.iter().sum();
+    // One slot in every layer costs the sum of the layers' records when each layer's slot is
+    // its own record size, and the plan charges `slot_cost`: the same to within rounding.
+    assert!(sizes.shape.slot_cost() >= sum);
+    assert!(sizes.shape.slot_cost() - sum < layers);
+    // Slots as large as the largest record in every layer would cost more: the plan is exact
+    // only for a bank sized per layer.
+    assert!(layers * sizes.record_bytes_max > sum + sum / 20);
+    // The records come from the shared index, layer by layer.
+    let index = model.expert_index().expect("index");
+    for (layer, &bytes) in sizes.layer_record_bytes.iter().enumerate() {
+        assert_eq!(index.record_bytes(layer).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn the_record_store_reads_the_first_and_last_expert_of_the_real_layout() {
+    use crate::weights::expert_store::{ExpertRecordStore, RecordSite};
+    let (written, model) = open(&Spec::default());
+    let index = model.expert_index().expect("index");
+    // Write a marker into the last expert's down slice of layer 47 and read it back through
+    // the store: the offset is past 2^32 bytes in a sparse file.
+    let slices = index.slices(47, 511).expect("slices");
+    written.patch(slices.down.name, slices.down.tensor_offset, &[7, 8, 9]);
+    let store = model.record_store().expect("store");
+    let record = store
+        .read_records(&[RecordSite {
+            layer: 47,
+            expert: 511,
+        }])
+        .expect("read");
+    let gate_up = slices.gate.file_range.end - slices.gate.file_range.start
+        + slices.up.file_range.end
+        - slices.up.file_range.start;
+    assert_eq!(
+        &record[0][gate_up as usize..gate_up as usize + 3],
+        &[7, 8, 9]
+    );
+    assert_eq!(store.record_bytes_at(47), index.record_bytes(47).unwrap());
+    assert_eq!(store.record_bytes(), index.max_record_bytes());
+}
