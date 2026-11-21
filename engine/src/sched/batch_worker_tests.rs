@@ -114,6 +114,10 @@ struct WindowFake {
     session_cap: Option<usize>,
     /// The sessions built so far, the seed included.
     created: usize,
+    /// A cap a test raises while the engine runs; it replaces `session_cap` when set.
+    live_cap: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// A pause per window, so a stream stays live for a while in a test.
+    window_delay: Option<Duration>,
     /// The window row that is denied its growth every time.
     deny_slot: Option<usize>,
     /// How long the fake lets the engine idle before the pool trims; `None` never trims.
@@ -152,6 +156,8 @@ impl WindowFake {
             prompt_share: None,
             session_cap: None,
             created: 1,
+            live_cap: None,
+            window_delay: None,
             deny_slot: None,
             idle_trim: None,
             idle_pieces: 8,
@@ -215,7 +221,11 @@ impl ExecutorOps for WindowFake {
 
     fn new_session(&mut self) -> Result<Row, EngError> {
         self.note("new_session");
-        if self.session_cap.is_some_and(|cap| self.created >= cap) {
+        let cap = match &self.live_cap {
+            Some(live) => Some(live.load(Ordering::SeqCst)),
+            None => self.session_cap,
+        };
+        if cap.is_some_and(|cap| self.created >= cap) {
             return Err(EngError::MemoryPlan(
                 "the device holds no more sessions".into(),
             ));
@@ -327,6 +337,9 @@ impl ExecutorOps for WindowFake {
         generations: &mut [&mut GenerationState],
     ) -> Result<Vec<Result<DecodeBatch, EngError>>, EngError> {
         self.note("window");
+        if let Some(delay) = self.window_delay {
+            std::thread::sleep(delay);
+        }
         lock(&self.log).windows.push(
             rows.iter()
                 .map(|row| row.fake.history(&row.state).to_vec())
@@ -2674,4 +2687,120 @@ fn the_pool_releases_sessions_by_their_own_idle_age() {
     pool.give_at(1, now - Duration::from_secs(60));
     pool.trim(now, 0);
     assert_eq!(pool.free.len(), 2);
+}
+
+/// Every event of a job, `Started` included, until its channel closes.
+fn raw_events(mut handle: JobHandle) -> Vec<JobEvent> {
+    let deadline = Instant::now() + WAIT;
+    let mut events = Vec::new();
+    loop {
+        match handle.events.try_recv() {
+            Ok(event) => events.push(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return events,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "worker did not close the job");
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// An engine of two sessions that the device can hold one of: the first job holds it for about
+/// two seconds of windows, so a second job finds no session and waits.
+fn waiting_engine(
+    log: &Log,
+) -> (Engine, JobHandle, JobHandle, Arc<std::sync::atomic::AtomicBool>) {
+    let mut fake = WindowFake::new(log);
+    fake.max = 2;
+    fake.session_cap = Some(1);
+    fake.window_delay = Some(Duration::from_millis(4));
+    let (engine, release) = start(fake);
+    let (long, long_events) = job(&[0], 600);
+    let (waiter, waiter_events) = job(&[1], 3);
+    let cancel = Arc::clone(&waiter.generation.cancel);
+    engine.handle().try_submit(long).expect("long");
+    engine.handle().try_submit(waiter).expect("waiter");
+    release.send(()).expect("load");
+    (engine, long_events, waiter_events, cancel)
+}
+
+#[test]
+fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
+    let log = Log::default();
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
+    wait(|| engine.handle().queued() == 1);
+    assert_eq!(
+        engine.handle().queued(),
+        1,
+        "the waiting job keeps its ticket"
+    );
+    let waiter = raw_events(waiter_events);
+    let started = waiter
+        .iter()
+        .filter(|event| matches!(event, JobEvent::Started))
+        .count();
+    assert_eq!(started, 1, "{waiter:?}");
+    assert_eq!(
+        usage(&waiter).completion_tokens,
+        3,
+        "it runs once a session frees"
+    );
+    assert_eq!(engine.handle().queued(), 0);
+    collect(long_events);
+    engine.shutdown();
+}
+
+#[test]
+fn a_waiting_job_that_is_cancelled_ends_while_the_stream_still_runs() {
+    let log = Log::default();
+    let (engine, long_events, waiter_events, cancel) = waiting_engine(&log);
+    wait(|| engine.handle().queued() == 1);
+    cancel.store(true, Ordering::SeqCst);
+    waiter_events.cancel();
+    let waiter = raw_events(waiter_events);
+    assert_eq!(finish(&waiter), DecodeFinish::Cancelled);
+    assert_eq!(engine.handle().queued(), 0, "its ticket is released");
+    // The stream it waited behind is still decoding.
+    let long = collect(long_events);
+    assert_eq!(usage(&long).completion_tokens, 600);
+    engine.shutdown();
+}
+
+#[test]
+fn a_waiting_job_is_cancelled_when_the_engine_shuts_down() {
+    let log = Log::default();
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
+    wait(|| engine.handle().queued() == 1);
+    engine.shutdown();
+    let waiter = raw_events(waiter_events);
+    assert_eq!(finish(&waiter), DecodeFinish::Cancelled);
+    drop(long_events);
+}
+
+#[test]
+fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live() {
+    let log = Log::default();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let mut fake = WindowFake::new(&log);
+    fake.max = 2;
+    fake.live_cap = Some(Arc::clone(&live));
+    fake.window_delay = Some(Duration::from_millis(5));
+    let (engine, release) = start(fake);
+    let (long, long_events) = job(&[0], 800);
+    let (waiter, waiter_events) = job(&[1], 3);
+    engine.handle().try_submit(long).expect("long");
+    engine.handle().try_submit(waiter).expect("waiter");
+    release.send(()).expect("load");
+    wait(|| engine.handle().queued() == 1);
+    // The device lets go of memory; no slot frees. The waiting job's timed retry finds it.
+    live.store(2, Ordering::SeqCst);
+    let waiter = collect(waiter_events);
+    assert_eq!(usage(&waiter).completion_tokens, 3);
+    let long = collect(long_events);
+    assert_eq!(
+        usage(&long).completion_tokens,
+        800,
+        "the stream outlived the wait"
+    );
+    engine.shutdown();
 }

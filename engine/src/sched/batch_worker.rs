@@ -10,8 +10,8 @@
 //! trusted.
 
 use super::{
-    ActiveJob, EngineState, Message, PromptPlan, Shared, cancel_unstarted, classified, drain,
-    engine_error, evict_for_retry, lock, prompt_tokens, reject, save_points, span,
+    ActiveJob, EngineState, Message, PromptPlan, QueueTicket, Shared, cancel_unstarted, classified,
+    drain, engine_error, evict_for_retry, lock, prompt_tokens, reject, save_points, span,
 };
 use crate::EngError;
 use crate::family::executor::ExecutorOps;
@@ -236,6 +236,22 @@ impl<'a, S> Pool<'a, S> {
         }
         TickCounters::add(&self.counters.sessions_trimmed, released);
     }
+}
+
+/// How long a job that capacity refused waits before it asks again while every slot stays live:
+/// memory can come back without a slot freeing (another process lets go), and a cancel by the
+/// client is noticed within the same interval.
+const WAIT_RETRY: Duration = Duration::from_secs(1);
+
+/// A job that capacity refused while other slots were live. It keeps its queue ticket, so the
+/// engine still counts it as queued and the queue's bound does not grow by one.
+struct Waiting {
+    job: Job,
+    ticket: QueueTicket,
+    /// The live slots at the refusal: the job asks again when fewer are live.
+    live: usize,
+    /// The time of its next timed retry.
+    retry_at: Instant,
 }
 
 fn register(shared: &Shared, job: &Job) {
@@ -605,9 +621,7 @@ pub(super) fn work<E: ExecutorOps>(
     let policy = executor.batch_policy();
     let mut pool = Pool::new(session, &shared.ticks, policy.idle_trim);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
-    // The job that capacity refused while other slots were live, and the number of live slots at
-    // the refusal.
-    let mut waiting: Option<(Job, usize)> = None;
+    let mut waiting: Option<Waiting> = None;
     // `iteration_rows` is the engine's per-tick row budget (the rows the engine was spawned
     // with). A tick feeds at most one planned piece of prompt rows beside the decode rows, so
     // the budget is never below the piece: a smaller one only slows every cold prompt, while a
@@ -620,16 +634,25 @@ pub(super) fn work<E: ExecutorOps>(
         // Pooled sessions that have idled for the trim interval go, even while other streams
         // run; an idle engine keeps one.
         pool.trim(Instant::now(), usize::from(slots.is_empty()));
+        // A waiting job whose client has gone is cancelled now, not at its next retry.
+        if let Some(held) =
+            waiting.take_if(|held| held.job.generation.cancel.load(Ordering::SeqCst))
+        {
+            unregister(shared, &held.job);
+            cancel_unstarted(held.job);
+        }
         // Bound queue polling as well as live sessions. A stream of cancelled submissions
         // must not starve the jobs already decoding.
         for _ in 0..QUEUE_CAPACITY {
             if slots.len() == max_seqs {
                 break;
             }
-            // A job that capacity refused waits at the head of the line, ahead of the queue,
-            // and is retried when a slot has freed since its refusal.
-            let (job, fresh) = match waiting.take() {
-                Some((job, at)) if slots.len() < at => (job, false),
+            // A job that capacity refused waits at the head of the line, ahead of the queue. It
+            // asks again when a slot has freed since its refusal and once a second otherwise.
+            let (job, ticket, fresh) = match waiting.take() {
+                Some(held) if slots.len() < held.live || Instant::now() >= held.retry_at => {
+                    (held.job, held.ticket, false)
+                }
                 Some(held) => {
                     waiting = Some(held);
                     break;
@@ -662,8 +685,7 @@ pub(super) fn work<E: ExecutorOps>(
                         shared.stop.store(true, Ordering::SeqCst);
                         break;
                     };
-                    drop(ticket);
-                    (job, true)
+                    (job, ticket, true)
                 }
             };
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
@@ -671,6 +693,7 @@ pub(super) fn work<E: ExecutorOps>(
                     unregister(shared, &job);
                 }
                 cancel_unstarted(job);
+                drop(ticket);
                 continue;
             }
             if fresh {
@@ -683,7 +706,10 @@ pub(super) fn work<E: ExecutorOps>(
             let cancel = Arc::clone(&job.generation.cancel);
             let prompt_len = prompt_tokens(&job.prompt);
             match admit(executor, &mut pool, job, prefill_chunk) {
-                Ok(slot) => slots.push(slot),
+                Ok(slot) => {
+                    drop(ticket);
+                    slots.push(slot);
+                }
                 Err((error, job_back)) => {
                     if matches!(error, EngError::Backend { .. }) {
                         native_failed(shared, jobs, &error);
@@ -696,7 +722,12 @@ pub(super) fn work<E: ExecutorOps>(
                         // The sessions the live slots hold are what the memory is spent on:
                         // the job waits for one to finish instead of failing. Only a lone job
                         // that cannot be admitted at all is refused.
-                        waiting = Some((*job_back, slots.len()));
+                        waiting = Some(Waiting {
+                            job: *job_back,
+                            ticket,
+                            live: slots.len(),
+                            retry_at: Instant::now() + WAIT_RETRY,
+                        });
                         break;
                     }
                     if matches!(error, EngError::MemoryPlan(_)) && cancel.load(Ordering::SeqCst) {
@@ -1078,9 +1109,9 @@ pub(super) fn work<E: ExecutorOps>(
         }
     }
     // Shutdown needs no further executor calls.
-    if let Some((job, _)) = waiting {
-        unregister(shared, &job);
-        cancel_unstarted(job);
+    if let Some(held) = waiting {
+        unregister(shared, &held.job);
+        cancel_unstarted(held.job);
     }
     for mut slot in slots {
         cancelled(&mut slot);
