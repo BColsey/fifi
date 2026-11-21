@@ -66,9 +66,23 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | --- | --- | --- |
 | 1 | Verify native text serving | On `f45062d7`, raw HTTP and the WebGUI produced “Paris.” The browser used the model picker and received a completed SSE stream. On `4138d0df`, the follow-up supplied all three messages and displayed “France” with a 144-token output allowance. Both streams ended at EOS. The 68-token control reached its limit before visible answer text. Complete the HTTP contract suite, including disconnect recovery. |
 | 2 | Qualify bounded prefill | `c651c820` adds opt-in visit-major prefill. Two-row prefill was bitwise equal to serial for all 200,058 logits at each of six prompt positions and a follow-up. On a repeated 62-token prompt producing eight identical tokens at 5 GiB, time to first token rose from 36.39 s to 44.44 s, and process-attributed reads rose from 19.92 GB to 33.30 GB. Verify the later union-aware implementation at the same ceiling. |
-| 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced every cache miss under byte-weighted LRU. Frequency-based replay increased logical payload reads by 3.7%. Compare file-backed dense weights and OS-only retention on matching hardware requests. |
+| 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced all 3,909 cache misses under byte-weighted LRU. All 4,388 repeated expert selections within the same token’s core passes hit the cache. Across tokens, 3,991 of 6,632 repeated selections hit. Layers 23 and 22 accounted for the most logical reads. Frequency-based replay increased logical payload reads by 3.7%. Repeat the storage comparison below in reverse order and on longer workloads. |
 | 4 | Measure placement | Measure CPU projections, output head, routing, attention, demand reads, staging, Metal submission and synchronized readback. Verify numerical parity before changing placement. |
 | 5 | Verify scaling | Run automatic sizing, at least two explicit ceilings, and an undersized-server admission test. Check peak physical footprint, swap and the retained cache bound. Treat larger-device plans as simulations. |
-| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. Validate real artifacts through the family loader, sampler, GPU and server before advertising either layout for generation. Track vision and DSpark independently. |
+| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Verify HTTP generation and packed-GPU parity for each layout. Track vision and DSpark independently. |
 
 The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
+
+
+### Initial 5 GiB storage comparison
+
+These repeated requests used `4138d0df`, the publisher safetensors, a 128-token context, five input tokens and twelve greedy output tokens on the 16 GiB M4 mini. All four runs returned identical text and recorded zero system swap-outs. Each configuration ran in a fresh process with two identical requests. The OS page cache was uncontrolled.
+
+| Dense weights | Packed expert retention | TTFT (s) | Decode (tok/s) | Wall (s) | Expert reads (GB) | Process-attributed disk reads (GB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Private | LRU | 3.41 | 1.52 | 10.66 | 9.60 | 6.70 |
+| Mapped | LRU | 4.74 | 1.41 | 12.52 | 9.60 | 7.98 |
+| Private | File cache only | 3.85 | 1.48 | 11.28 | 29.43 | 6.17 |
+| Mapped | File cache only | 3.60 | 1.56 | 10.65 | 29.43 | 5.78 |
+
+Set `FIFI_INKLING_MMAP_DENSE=1` to map safetensor dense weights and `FIFI_INKLING_FILE_CACHE_ONLY=1` to leave expert retention to macOS. A file-cache hit still contributes to the engine’s logical reads. File-backed pages can also be reclaimed under memory pressure. The fourth row merits further testing across prompt lengths and working-set ceilings.
