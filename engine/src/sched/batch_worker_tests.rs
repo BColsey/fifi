@@ -2709,7 +2709,12 @@ fn raw_events(mut handle: JobHandle) -> Vec<JobEvent> {
 /// two seconds of windows, so a second job finds no session and waits.
 fn waiting_engine(
     log: &Log,
-) -> (Engine, JobHandle, JobHandle, Arc<std::sync::atomic::AtomicBool>) {
+) -> (
+    Engine,
+    JobHandle,
+    JobHandle,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut fake = WindowFake::new(log);
     fake.max = 2;
     fake.session_cap = Some(1);
@@ -2803,4 +2808,34 @@ fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live(
         "the stream outlived the wait"
     );
     engine.shutdown();
+}
+
+#[test]
+fn a_stop_during_a_piece_ends_the_tick_before_the_next_prompt() {
+    // Two cold prompts take whole pieces in one idle tick. The first piece is held while the stop
+    // flag is raised without cancelling any job (the window in which a shutdown has stored the
+    // flag and not yet cancelled the jobs): the second prompt is not fed.
+    let log = Log::default();
+    let (hold, entered, unblock) = gate();
+    let mut fake = WindowFake::new(&log);
+    fake.hold_prefill = Some(hold);
+    let (engine, release) = start(fake);
+    let (first, first_events) = job(&[0; 8], 1);
+    let (second, second_events) = job(&[1; 8], 1);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
+    entered.recv_timeout(WAIT).expect("entered");
+    engine.handle().shared.stop.store(true, Ordering::SeqCst);
+    unblock.send(()).expect("release");
+    // The worker ends on its own; no shutdown call cancels the jobs and hides the difference.
+    wait(|| engine.handle().state() == EngineState::Stopped);
+    let fed = lock(&log)
+        .calls
+        .iter()
+        .filter(|call| call.starts_with("prefill:"))
+        .count();
+    assert_eq!(fed, 1, "only the held piece ran");
+    engine.shutdown();
+    drop((first_events, second_events));
 }
