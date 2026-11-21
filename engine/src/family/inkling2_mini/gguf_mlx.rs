@@ -6,7 +6,6 @@ use std::{collections::VecDeque, rc::Rc, sync::Arc};
 use half::bf16;
 
 use super::{
-    HIDDEN, INTERMEDIATE,
     gguf::{ExpertPlane, Weights},
     mlx::MlxExpertCacheStats,
 };
@@ -16,14 +15,6 @@ use crate::{
     tensor::{Dtype, ExecutionTensor, Tensor},
     weights::dequantize_into,
 };
-
-const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
-
-pub(super) fn scratch_bytes() -> u64 {
-    // Packed expert input, converted F32 plane, resident import and allocator
-    // workspace, in addition to the common text decoder's temporary projections.
-    super::gguf::projection_scratch_bytes() + 4 * LARGEST_PLANE_F32_BYTES as u64
-}
 
 type Key = (String, usize);
 

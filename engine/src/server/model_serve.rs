@@ -152,10 +152,10 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 
     let family = select_family(args, &inspection)?;
     let weight_format = if family == inkling2_mini::FAMILY {
-        if has_safetensors {
-            "safetensors"
-        } else {
+        if !inspection.has_inkling_safetensors() && inspection.inkling_ggufs().next().is_some() {
             "gguf"
+        } else {
+            "safetensors"
         }
     } else {
         select_weight_format(has_gguf, has_safetensors)
@@ -328,13 +328,15 @@ fn select_family(
             types
                 .iter()
                 .any(|t| inspection.config_model_types.iter().any(|seen| seen == t))
+                || (types.contains(&inkling2_mini::MODEL_TYPE)
+                    && inspection.inkling_ggufs().next().is_some())
         })
         .map(|(name, _)| *name)
         .collect();
     match matches.pop() {
         Some(name) if matches.is_empty() => Ok(name.to_string()),
         _ => Err(StartupError(format!(
-            "serve --model: cannot identify the family from config.json (model_type {:?}); pass --family. Detectable families: {}",
+            "serve --model: cannot identify the family from config.json (model_type {:?}) or a recognized GGUF header; pass --family. Detectable families: {}",
             inspection.config_model_types,
             detectable_names()
         ))),
@@ -430,6 +432,41 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.resize(32, 0);
         bytes
+    }
+
+    #[test]
+    fn discover_inkling_gguf_text_with_optional_sidecars() {
+        fn gguf_arch(arch: &str) -> Vec<u8> {
+            let mut bytes = minimal_gguf();
+            bytes.truncate(24);
+            bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+            let key = b"general.architecture";
+            bytes.extend((key.len() as u64).to_le_bytes());
+            bytes.extend(key);
+            bytes.extend(8u32.to_le_bytes());
+            bytes.extend((arch.len() as u64).to_le_bytes());
+            bytes.extend(arch.as_bytes());
+            bytes.resize(bytes.len().next_multiple_of(32), 0);
+            bytes
+        }
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        for (filename, arch) in [
+            ("mini.gguf", "inkling2"),
+            ("mmproj.gguf", "clip"),
+            ("draft.gguf", "dflash"),
+        ] {
+            std::fs::write(model.path().join(filename), gguf_arch(arch)).unwrap();
+        }
+        let found = discover(&ModelServeArgs {
+            model_dir: model.path().into(),
+            tokenizer_dir: Some(tokenizer.path().into()),
+            ..ModelServeArgs::default()
+        })
+        .unwrap();
+        assert_eq!(found.family, "inkling2_mini");
+        assert_eq!(found.weight_format, "gguf");
+        assert_eq!(found.tokenizer_dir, tokenizer.path());
     }
 
     fn copy_tokenizer(dir: &Path) {

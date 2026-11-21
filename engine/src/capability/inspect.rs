@@ -67,6 +67,42 @@ pub struct ModelInspection {
 }
 
 impl ModelInspection {
+    pub(crate) fn has_inkling_safetensors(&self) -> bool {
+        self.safetensors_files > 0
+            && self
+                .config_model_types
+                .iter()
+                .any(|kind| kind == crate::family::inkling2_mini::MODEL_TYPE)
+    }
+
+    pub(crate) fn inkling_ggufs(&self) -> impl Iterator<Item = &GgufFact> {
+        self.gguf_files
+            .iter()
+            .filter(|file| file.inkling2_loop.is_some())
+    }
+
+    pub(crate) fn inkling_gguf(&self) -> Result<Option<&GgufFact>, EngError> {
+        if self.has_inkling_safetensors() {
+            return Ok(None);
+        }
+        let mut files = self.inkling_ggufs();
+        let selected = files.next();
+        if files.next().is_some() {
+            return Err(checkpoint(
+                "select one Inkling 2 Mini text GGUF per model directory".into(),
+            ));
+        }
+        if let Some(file) = selected {
+            if let Some(Err(error)) = &file.inkling2_loop {
+                return Err(checkpoint(error.clone()));
+            }
+            if let Some(Err(error)) = &file.inkling2_tensors {
+                return Err(checkpoint(error.clone()));
+            }
+        }
+        Ok(selected)
+    }
+
     /// Total checkpoint bytes on disk: GGUF payloads plus safetensors
     /// shards. This is the preflight's weight figure: what the loader
     /// uploads or maps, before any residency policy.
