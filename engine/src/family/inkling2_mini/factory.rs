@@ -115,12 +115,16 @@ fn launch(
     context: u32,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
+    let load_start = executor::Phase::start_if_enabled();
     let bundle = load_tokenizer(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
     let root = model_dir.to_owned();
     eprintln!("Inkling 2 Mini: experimental single-sequence text serving, context_limit={context}");
     let engine = crate::sched::worker::spawn_engine_noted(1, ready_note, move |_| {
         let decoder = super::text::Decoder::open(&root, context)?;
+        if let Some(start) = load_start {
+            start.report("load", decoder.expert_cache_stats());
+        }
         Ok((
             executor::Executor::new(decoder, eos, context as usize),
             crate::family::session::DecodeSession::default(),
@@ -153,11 +157,52 @@ mod executor {
 
     use super::super::{UNPADDED_VOCAB, mlx::MlxExpertCacheStats, text::Decoder};
 
+    pub(super) struct Phase {
+        started: std::time::Instant,
+        io: Option<(u64, u64)>,
+        cache: MlxExpertCacheStats,
+    }
+
+    impl Phase {
+        fn new(cache: MlxExpertCacheStats) -> Self {
+            Self {
+                started: std::time::Instant::now(),
+                io: crate::kernels::mlx::native::process_io(),
+                cache,
+            }
+        }
+
+        pub(super) fn start_if_enabled() -> Option<Self> {
+            (std::env::var_os("FIFI_INKLING_EXPERT_TIMING").as_deref()
+                == Some(std::ffi::OsStr::new("1")))
+            .then(|| Self::new(MlxExpertCacheStats::default()))
+        }
+
+        pub(super) fn report(&self, phase: &str, end: MlxExpertCacheStats) {
+            let io = crate::kernels::mlx::native::process_io();
+            let disk = self.io.zip(io).and_then(|(a, b)| b.0.checked_sub(a.0));
+            eprintln!(
+                "inkling_phase {}",
+                serde_json::json!({
+                    "phase": phase, "elapsed_us": self.started.elapsed().as_micros(),
+                    "process_disk_read_bytes": disk, "lifetime_peak_footprint_bytes": io.map(|v| v.1),
+                    "expert_read_bytes": end.read_bytes - self.cache.read_bytes,
+                    "expert_read_ranges": end.read_ranges - self.cache.read_ranges,
+                    "hits": end.hits - self.cache.hits, "misses": end.misses - self.cache.misses,
+                    "evictions": end.evictions - self.cache.evictions,
+                    "staging_allocations": end.staging_allocations - self.cache.staging_allocations,
+                })
+            );
+        }
+    }
+
     pub(super) struct Executor {
         stepper: Stepper,
         eos: Vec<u32>,
         context: usize,
         trace_cache: bool,
+        phase: Option<Phase>,
+        first_sample: bool,
         trace_start: Option<MlxExpertCacheStats>,
     }
 
@@ -170,6 +215,8 @@ mod executor {
                 trace_cache: std::env::var_os("FIFI_INKLING_EXPERT_TIMING")
                     .is_some_and(|value| value == "1"),
                 trace_start: None,
+                phase: None,
+                first_sample: false,
             }
         }
 
@@ -178,6 +225,16 @@ mod executor {
                 return;
             };
             let end = self.stepper.decoder.expert_cache_stats();
+            if let Some(phase) = self.phase.take() {
+                phase.report(
+                    if self.first_sample {
+                        "decode"
+                    } else {
+                        "prefill"
+                    },
+                    end,
+                );
+            }
             eprintln!(
                 "inkling_expert_timing {}",
                 serde_json::json!({
@@ -210,6 +267,12 @@ mod executor {
             self.decoder.advance(token)?;
             self.fed += 1;
             Ok(())
+        }
+
+        fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+            let result = self.decoder.advance_rows(tokens);
+            self.fed = self.decoder.position();
+            result
         }
 
         fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
@@ -245,6 +308,10 @@ mod executor {
             session.reset(&mut self.stepper)
         }
 
+        fn prefill_piece(&self) -> Option<usize> {
+            Some(self.stepper.decoder.prefill_rows())
+        }
+
         fn prefill(&mut self, session: &mut Self::Session, tokens: &[u32]) -> Result<(), EngError> {
             let result = session.prefill(&mut self.stepper, tokens, self.context);
             if result.is_err() {
@@ -258,6 +325,7 @@ mod executor {
             session: &mut Self::Session,
             generation: &mut GenerationState,
         ) -> Result<DecodeBatch, EngError> {
+            let fed = self.stepper.fed;
             let result = session.decode(
                 &mut self.stepper,
                 generation,
@@ -267,6 +335,16 @@ mod executor {
                     context_limit: self.context,
                 },
             );
+            // DecodeSession leaves the final prompt token pending until the first
+            // sampler call. Charge this feed and its output head to prefill.
+            if !self.first_sample && self.phase.is_some() && self.stepper.fed > fed {
+                let end = self.stepper.decoder.expert_cache_stats();
+                let next = Phase::new(end);
+                if let Some(phase) = self.phase.replace(next) {
+                    phase.report("prefill", end);
+                }
+                self.first_sample = true;
+            }
             match &result {
                 Ok(batch) if batch.finish.is_some() => self.report_cache_trace(true),
                 Err(_) => self.report_cache_trace(false),
@@ -277,7 +355,10 @@ mod executor {
 
         fn boundary(&mut self, _session: &mut Self::Session) {
             if self.trace_cache {
-                self.trace_start = Some(self.stepper.decoder.expert_cache_stats());
+                let cache = self.stepper.decoder.expert_cache_stats();
+                self.trace_start = Some(cache);
+                self.phase = Some(Phase::new(cache));
+                self.first_sample = false;
             }
         }
     }

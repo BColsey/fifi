@@ -478,6 +478,8 @@ pub struct MlxExpertCache {
     entries: VecDeque<CachedExpert>,
     denominators: [Option<[Option<[u8; 4]>; 2]>; LAYERS],
     staging: Option<HostPages>,
+    staging_rows: usize,
+    trace_routes: bool,
     stats: MlxExpertCacheStats,
 }
 
@@ -496,8 +498,43 @@ impl MlxExpertCache {
             entries: VecDeque::new(),
             denominators: [None; LAYERS],
             staging: None,
+            staging_rows: 1,
+            trace_routes: std::env::var_os("FIFI_INKLING_ROUTE_TRACE").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
             stats: MlxExpertCacheStats::default(),
         }
+    }
+
+    /// Use the working-set headroom already available to the expert cache.
+    /// The single-token arena was charged by the base plan.
+    pub(super) fn configure_prefill(&mut self, requested: usize) -> Result<usize, EngError> {
+        if requested <= 1 || self.max_bytes == 0 {
+            return Ok(1);
+        }
+        let page_size = HostPages::page_size();
+        let solo_bytes = peak_prefill_staging(&self.source, 1, page_size)?;
+        for rows in (2..=requested.min(MAX_ROUTED_ROWS)).rev() {
+            let stage_bytes = peak_prefill_staging(&self.source, rows, page_size)?;
+            // Cover row-private residuals, readback and the repeated input and
+            // expert projection/activation intermediates. Charge all window rows.
+            let row_workspace = rows * PREFILL_WORKSPACE_PER_ROW;
+            let extra = (stage_bytes - solo_bytes) + row_workspace;
+            if extra > self.max_bytes {
+                continue;
+            }
+            match HostPages::try_new(stage_bytes) {
+                Ok(pages) => {
+                    self.staging = Some(pages);
+                    self.staging_rows = rows;
+                    self.max_bytes -= extra;
+                    self.stats.staging_allocations += 1;
+                    return Ok(rows);
+                }
+                Err(EngError::MemoryPlan(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(1)
     }
 
     pub fn stats(&self) -> MlxExpertCacheStats {
@@ -524,7 +561,7 @@ impl MlxExpertCache {
         self.forward_impl(kernels, layer, routes, input, true, None)
     }
 
-    /// Runs one token to completion using a shared arena for consecutive calls.
+    /// Runs routed rows to completion using a shared arena for consecutive calls.
     /// The next input import synchronizes the device and flushes the prior visit's
     /// retired page handles, so arena reuse ordinarily adds no synchronization.
     pub fn forward_quantized_readback(
@@ -534,10 +571,15 @@ impl MlxExpertCache {
         routes: &InklingRoutes,
         input: &Tensor,
     ) -> Result<Tensor, EngError> {
-        if routes.rows() != 1 || input.dtype() != Dtype::F32 || input.shape() != [1, HIDDEN as u32]
-        {
+        RoutePages::validate(routes, HostPages::page_size())?;
+        if routes.rows() > self.staging_rows {
             return Err(EngError::BadRequest(
-                "Inkling reusable staging requires one F32 token row".into(),
+                "Inkling routed rows exceed the admitted staging window".into(),
+            ));
+        }
+        if input.dtype() != Dtype::F32 || input.shape() != [routes.rows() as u32, HIDDEN as u32] {
+            return Err(EngError::BadRequest(
+                "Inkling reusable staging requires F32 input matching the routed rows".into(),
             ));
         }
         if kernels.owner_key() != self.owner {
@@ -549,12 +591,8 @@ impl MlxExpertCache {
         let mut pages = match self.staging.take() {
             Some(pages) => pages,
             None => {
-                let bytes = self
-                    .source
-                    .one_token_staging_bytes(HostPages::page_size())?;
-                let bytes = usize::try_from(bytes).map_err(|_| {
-                    EngError::MemoryPlan("Inkling expert staging exceeds host limits".into())
-                })?;
+                let bytes =
+                    peak_prefill_staging(&self.source, self.staging_rows, HostPages::page_size())?;
                 let pages = HostPages::try_new(bytes)?;
                 self.stats.staging_allocations += 1;
                 pages
@@ -633,10 +671,30 @@ impl MlxExpertCache {
         self.stats.misses += u64::from(misses.count_ones());
         let stage = MlxRoutedExpertStage::read_with_fill(kernels, &plan, pages, |bytes| {
             let plan = plan.expert_plan();
+            let read_start = self.trace_routes.then(std::time::Instant::now);
             if plan.read_count() > 0 {
                 plan.read_into(bytes)?;
                 self.stats.read_bytes += plan.read_bytes() as u64;
                 self.stats.read_ranges += plan.read_count() as u64;
+            }
+
+            if let Some(start) = read_start {
+                let read_us = start.elapsed().as_micros();
+                let ids = |mask: u128| {
+                    (0..EXPERTS)
+                        .filter(|id| mask & (1_u128 << id) != 0)
+                        .collect::<Vec<_>>()
+                };
+                eprintln!(
+                    "inkling_route {}",
+                    serde_json::json!({
+                        "visit": self.stats.visits, "layer": layer, "rows": routes.rows(),
+                        "selected": ids(selected), "missing": ids(misses),
+                        "expert_bytes": expert_ranges(plan, 0).map(|r| r.len()).sum::<usize>(),
+                        "read_bytes": plan.read_bytes(), "read_us": read_us,
+                        "capacity_bytes": self.max_bytes,
+                    })
+                );
             }
 
             let denominator_ranges = [plan.gate_up(), plan.down()].map(|p| p.denominator.clone());
@@ -715,6 +773,25 @@ impl MlxExpertCache {
         });
         Ok(())
     }
+}
+
+const PREFILL_WORKSPACE_PER_ROW: usize = 1 << 20;
+
+fn peak_prefill_staging(
+    source: &InklingExpertSource,
+    rows: usize,
+    page_size: usize,
+) -> Result<usize, EngError> {
+    let routes = rows * TOP_K;
+    let experts: [usize; EXPERTS] = std::array::from_fn(|id| id);
+    (0..source.layers.len()).try_fold(0, |peak, layer| {
+        let plan = source.plan(layer, &experts[..routes.min(EXPERTS)], page_size)?;
+        let [_, _, end] = super::route_page_offsets(plan.staging_bytes(), routes, page_size)?;
+        let bytes = end
+            .checked_next_multiple_of(page_size)
+            .ok_or_else(super::staging_overflow)?;
+        Ok(peak.max(bytes))
+    })
 }
 
 fn expert_ranges(plan: &InklingExpertPlan<'_>, slot: usize) -> impl Iterator<Item = Range<usize>> {
@@ -968,7 +1045,7 @@ mod tests {
         assert_eq!(bytes(&mut kernels, &bypassed), expected);
         drop((previous, hit, partial, different_layer, bypassed));
 
-        let mut reuse = MlxExpertCache::new(&kernels, source, capacity);
+        let mut reuse = MlxExpertCache::new(&kernels, Arc::clone(&source), capacity);
         for routes in [&first, &next, &changed_set] {
             let refreshed = reuse
                 .forward_quantized_readback(&mut kernels, 0, routes, &host_input)
@@ -984,6 +1061,60 @@ mod tests {
         }
         assert_eq!(reuse.stats().staging_allocations, 1);
         assert_eq!(reuse.stats().staging_fallback_syncs, 0);
+
+        let setup_row = |offset: usize, logits: f32| {
+            let mut row = [-20.0; EXPERTS];
+            row[offset..offset + TOP_K].fill(logits);
+            row
+        };
+        let logits = [setup_row(0, 1.0), setup_row(1, 0.5)];
+        let bias = [0.; EXPERTS];
+        let routes = InklingRoutes::from_logits(&logits, &bias).unwrap();
+        let make_input = |values: &[f32]| {
+            Tensor::try_from_host(
+                Dtype::F32,
+                vec![values.len() as u32, HIDDEN as u32],
+                values
+                    .iter()
+                    .flat_map(|&value| {
+                        std::iter::once(value)
+                            .chain(std::iter::repeat_n(0.0, HIDDEN - 1))
+                            .flat_map(f32::to_le_bytes)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let input = make_input(&[1.0, -0.5]);
+        let single = peak_prefill_staging(&source, 1, page).unwrap();
+        let double = peak_prefill_staging(&source, 2, page).unwrap();
+        let charge = double - single + 2 * PREFILL_WORKSPACE_PER_ROW;
+        let mut fallback = MlxExpertCache::new(&kernels, Arc::clone(&source), charge - 1);
+        assert_eq!(fallback.configure_prefill(2).unwrap(), 1);
+        assert!(fallback.staging.is_none());
+        let mut batch = MlxExpertCache::new(&kernels, Arc::clone(&source), charge);
+        assert_eq!(batch.configure_prefill(3).unwrap(), 2);
+        assert_eq!(batch.max_bytes, 0);
+        let output = batch
+            .forward_quantized_readback(&mut kernels, 0, &routes, &input)
+            .unwrap();
+        let actual = output.host_bytes().unwrap();
+        let mut solo = MlxExpertCache::new(&kernels, source, 0);
+        for (index, value) in [1.0, -0.5].into_iter().enumerate() {
+            let routes = InklingRoutes::from_logits(&logits[index..=index], &bias).unwrap();
+            let output = solo
+                .forward_quantized_readback(&mut kernels, 0, &routes, &make_input(&[value]))
+                .unwrap();
+            let width = HIDDEN * size_of::<f32>();
+            assert_eq!(
+                &actual[index * width..(index + 1) * width],
+                output.host_bytes().unwrap()
+            );
+        }
+        assert_eq!(batch.stats().misses, TOP_K as u64 + 1);
+        assert_eq!(solo.stats().misses, 2 * TOP_K as u64);
+        assert!(batch.stats().read_bytes < solo.stats().read_bytes);
+        assert_eq!(batch.stats().staging_allocations, 1);
     }
 
     #[test]

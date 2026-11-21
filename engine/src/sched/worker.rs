@@ -2306,6 +2306,35 @@ mod tests {
     }
 
     #[test]
+    fn solo_worker_adopts_the_executor_prefill_piece_above_the_spawn_default() {
+        let log = new_log();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        spy.piece = Some(3);
+        let engine = start_spy(1, spy);
+        let (job, events) = job(&[1, 2, 3, 4, 5, 6, 7]);
+        engine.handle().try_submit(job).expect("submit");
+        let events = collect(events);
+        assert!(
+            matches!(events.last(), Some(JobEvent::Finished(usage))
+                if usage.prompt_tokens == 7
+                    && usage.prefill_pieces == PrefillPieces { count: 3, max_rows: 3 }),
+            "the prompt finishes in three pieces: {events:?}",
+        );
+        assert_eq!(
+            calls(&log),
+            strings(&[
+                "reset",
+                "boundary",
+                "prefill:3",
+                "prefill:3",
+                "prefill:1",
+                "decode"
+            ]),
+        );
+        engine.shutdown();
+    }
+
+    #[test]
     fn cancellation_uses_the_updated_depth_piece_not_the_startup_maximum() {
         let log = new_log();
         let state = generation();

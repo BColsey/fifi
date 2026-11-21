@@ -19,6 +19,7 @@
 #include <mutex>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <libproc.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
@@ -371,6 +372,19 @@ extern "C" int inference_mlx_array_new_data_managed_payload(
 extern "C" size_t inference_page_size() noexcept {
   const long size = sysconf(_SC_PAGESIZE);
   return size > 0 ? static_cast<size_t>(size) : 0;
+}
+
+// Kernel-attributed disk reads and process-lifetime peak physical footprint.
+extern "C" int inference_mlx_process_io(std::uint64_t* read_bytes,
+                                       std::uint64_t* peak_bytes) noexcept {
+  rusage_info_v4 usage{};
+  const int status = proc_pid_rusage(getpid(), RUSAGE_INFO_V4,
+                                     reinterpret_cast<rusage_info_t*>(&usage));
+  if (status == 0) {
+    *read_bytes = usage.ri_diskio_bytesread;
+    *peak_bytes = usage.ri_lifetime_max_phys_footprint;
+  }
+  return status;
 }
 
 extern "C" int inference_mlx_process_rss_bytes(std::uint64_t* bytes) noexcept {
