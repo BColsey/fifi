@@ -401,6 +401,10 @@ Use these prompt values with `--prompt` and keep the context at 128 for the repo
 
 For the sustained 5 GiB storage comparison, set `FIFI_INKLING_MMAP_DENSE` and `FIFI_INKLING_FILE_CACHE_ONLY` to `0` in the private/LRU arm and `1` in the mapped/file-cache arm. For the longer-prefill comparison, keep both settings at `1` and change `FIFI_INKLING_PREFILL_ROWS` from `1` to `4`. Set `FIFI_INKLING_COMPONENT_TIMING=1` for the phase-level CPU, Metal, and logical dense I/O counters.
 
+With GGUF, `FIFI_INKLING_ROUTE_TRACE=1` writes ordered expert selections,
+plane sizes and cache counters for each visit. Use a separate trace run
+when comparing throughput.
+
 For GGUF, the same timing output reports `gguf_file_read_bytes`,
 `gguf_unique_file_read_bytes`, and `gguf_metal_staged_bytes`. The first two
 show total file demand and one copy per distinct expert tensor plane in each
