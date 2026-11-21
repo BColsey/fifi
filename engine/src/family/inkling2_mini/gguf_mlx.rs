@@ -6,7 +6,11 @@ use std::{collections::VecDeque, rc::Rc, sync::Arc};
 use half::bf16;
 
 use super::{
-    gguf::{ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights, packed_mlx_enabled},
+    LAYERS,
+    gguf::{
+        ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights, packed_mlx_enabled,
+        single_copy_experts_enabled,
+    },
     mlx::MlxExpertCacheStats,
     timing::{self, measure},
 };
@@ -111,7 +115,8 @@ impl Experts {
     pub(super) fn open(source: Arc<Weights>, headroom: usize) -> Result<Self, EngError> {
         // Metal and RAM share physical memory. The combined capacity is charged
         // against one admission budget, independent of which tier serves a hit.
-        let ram = headroom / 4;
+        let single_copy = single_copy_experts_enabled() && all_experts_have_packed_kernels(&source);
+        let ram = if single_copy { 0 } else { headroom / 4 };
         let mut metal = MlxKernels::try_new()?;
         // Bound deferred retirements on this adapter. The allocator pool is
         // shared by the process, so changing its limit would affect other engines.
@@ -147,6 +152,8 @@ impl Experts {
             serde_json::json!({
                 "phase": phase,
                 "packed_enabled": self.packed_enabled,
+                "retained_ram_capacity_bytes": self.packed.limit,
+                "retained_metal_capacity_bytes": self.resident.limit,
                 "projections": std::mem::take(&mut self.projections),
                 "resident_bytes": self.resident.bytes,
                 "packed_ram_bytes": self.packed.bytes,
@@ -157,9 +164,7 @@ impl Experts {
 
     fn stage_projection(&mut self, plane: &ExpertPlane) -> Result<(Projection, usize), EngError> {
         let needs_codes = inkling_codebook_words(plane.dtype).is_some();
-        if self.packed_enabled
-            && (needs_codes || matches!(plane.dtype, GgufType::Q20 | GgufType::Nvfp4))
-        {
+        if self.packed_enabled && packed_format(plane.dtype) {
             if needs_codes && !self.codes.iter().any(|(format, _)| *format == plane.dtype) {
                 let table = self
                     .metal
@@ -236,9 +241,13 @@ impl Experts {
                 self.stats.misses += 1;
                 self.stats.read_bytes += plane.bytes.len() as u64;
                 self.stats.read_ranges += 1;
-                self.stats.evictions +=
-                    self.packed
-                        .put((name.into(), expert), plane.bytes.len(), Rc::clone(&plane));
+                if self.packed.limit != 0 {
+                    self.stats.evictions += self.packed.put(
+                        (name.into(), expert),
+                        plane.bytes.len(),
+                        Rc::clone(&plane),
+                    );
+                }
                 plane
             };
             if plane.width != input.len() || plane.height != height {
@@ -330,6 +339,29 @@ impl Experts {
     }
 }
 
+/// Expanded formats can still benefit from keeping a smaller packed host
+/// copy. Fully packed checkpoints retain the same bytes in the Metal buffer.
+fn all_experts_have_packed_kernels(source: &Weights) -> bool {
+    (0..LAYERS).all(|layer| {
+        ["ffn_gate_up_exps", "ffn_down_exps"]
+            .into_iter()
+            .all(|projection| {
+                source
+                    .header()
+                    .tensor(&format!("blk.{layer}.{projection}.weight"))
+                    .is_some_and(|tensor| {
+                        let format = tensor.ggml_type();
+                        inkling_codebook_words(format).is_some()
+                            || matches!(format, GgufType::Q20 | GgufType::Nvfp4)
+                    })
+            })
+    })
+}
+
+fn packed_format(format: GgufType) -> bool {
+    inkling_codebook_words(format).is_some() || matches!(format, GgufType::Q20 | GgufType::Nvfp4)
+}
+
 fn codebook(format: GgufType) -> Result<Option<Tensor>, EngError> {
     let Some(words) = inkling_codebook_words(format) else {
         return Ok(None);
@@ -399,6 +431,7 @@ mod tests {
         let _lock = crate::native_test_lock();
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let source = Weights::open(std::path::Path::new(&file)).unwrap();
+        assert!(all_experts_have_packed_kernels(&source));
         let mut metal = MlxKernels::try_new().unwrap();
         for (name, format) in [
             ("blk.0.ffn_gate_up_exps.weight", GgufType::Iq1S),
