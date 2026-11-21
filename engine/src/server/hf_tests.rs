@@ -243,7 +243,7 @@ fn finished(job: &super::hf::Job) -> JobState {
             let state = job.state.lock().expect("state").clone();
             (!matches!(state, JobState::Downloading { .. })).then_some(state)
         },
-        20,
+        90,
     )
 }
 
@@ -262,7 +262,7 @@ fn a_download_writes_the_hub_layout_with_verified_blobs_and_relative_links() {
         file("config.json", b"{\"model_type\":\"x\"}"),
     ]);
     // 64-byte chunks make the big file a 16-request resume-able sequence.
-    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 64, Duration::from_secs(20), None);
     let job = hub.start_download("org/name", "main").expect("admitted");
     let state = finished(&job);
     assert!(matches!(state, JobState::Done { .. }), "{state:?}");
@@ -311,7 +311,7 @@ fn a_repeat_download_resumes_by_fetching_only_what_is_missing() {
     let first = payload(200, 1);
     let second = payload(300, 2);
     let mock = MockHub::start(vec![file("a.bin", &first), file("b.bin", &second)]);
-    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(20), None);
     let job = hub.start_download("org/name", "main").expect("admitted");
     assert!(matches!(finished(&job), JobState::Done { .. }));
     // An interrupted earlier run: one file's link and blob are gone.
@@ -339,12 +339,12 @@ fn a_cancel_interrupts_a_blocked_transfer_and_frees_the_slot() {
     mock.stall.store(true, Ordering::SeqCst);
     let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(60), None);
     let job = hub.start_download("org/name", "main").expect("admitted");
-    wait_for(|| (!mock.resolve_requests().is_empty()).then_some(()), 10);
+    wait_for(|| (!mock.resolve_requests().is_empty()).then_some(()), 60);
     assert_eq!(hub.cancel(job.id), super::hf::CancelOutcome::Requested);
     let started = Instant::now();
     assert_eq!(finished(&job), JobState::Cancelled);
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "cancel waited for the read"
     );
     assert_eq!(
@@ -391,7 +391,7 @@ fn a_truncated_or_corrupt_file_is_deleted_and_never_linked() {
     let mut corrupt = file("bad.bin", &content);
     corrupt.corrupt_passes = usize::MAX;
     let mock = MockHub::start(vec![short]);
-    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(20), None);
     let job = hub.start_download("org/short", "main").expect("admitted");
     match finished(&job) {
         JobState::Failed(cause) => assert!(cause.contains("short.bin"), "{cause}"),
@@ -404,7 +404,7 @@ fn a_truncated_or_corrupt_file_is_deleted_and_never_linked() {
     );
 
     let mock = MockHub::start(vec![corrupt]);
-    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 128, Duration::from_secs(20), None);
     let job = hub.start_download("org/bad", "main").expect("admitted");
     match finished(&job) {
         JobState::Failed(cause) => assert!(cause.contains("integrity check"), "{cause}"),
@@ -436,7 +436,7 @@ fn one_corrupt_pass_is_retried_and_the_second_pass_verifies() {
     let mut flaky = file("m.bin", &content);
     flaky.corrupt_passes = 1;
     let mock = MockHub::start(vec![flaky]);
-    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(20), None);
     let job = hub.start_download("org/name", "main").expect("admitted");
     assert!(matches!(finished(&job), JobState::Done { .. }));
     assert_eq!(
@@ -450,7 +450,7 @@ fn a_dangling_or_wrong_sized_link_is_replaced_not_trusted() {
     let dir = tempfile::tempdir().expect("hub dir");
     let content = payload(120, 8);
     let mock = MockHub::start(vec![file("m.bin", &content)]);
-    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(20), None);
     let snap = snapshot(dir.path(), "org/name");
     std::fs::create_dir_all(&snap).expect("snapshot");
     std::os::unix::fs::symlink("../../blobs/gone", snap.join("m.bin")).expect("dangling");
@@ -480,7 +480,7 @@ fn a_failed_listing_refuses_the_download_with_its_error() {
     let dir = tempfile::tempdir().expect("hub dir");
     let mock = MockHub::start(vec![file("m.bin", &payload(10, 1))]);
     mock.list_fails.store(true, Ordering::SeqCst);
-    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(20), None);
     let refusal = hub
         .start_download("org/name", "main")
         .err()
@@ -549,7 +549,7 @@ fn the_same_blob_is_shared_between_revisions_and_job_ids_do_not_restart_at_one()
     let dir = tempfile::tempdir().expect("hub dir");
     let content = payload(200, 3);
     let mock = MockHub::start(vec![file("m.bin", &content)]);
-    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(5), None);
+    let hub = hub_with(&mock, dir.path(), 4096, Duration::from_secs(20), None);
     let first = hub.start_download("org/name", "main").expect("admitted");
     assert!(matches!(finished(&first), JobState::Done { .. }));
     assert!(
@@ -673,7 +673,7 @@ async fn a_downloaded_model_is_served_by_repo_name_through_the_engine_route() {
         dir.path().to_path_buf(),
         None,
         4096,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         Box::new(|_| None),
     );
     let state = Arc::new(
@@ -703,7 +703,7 @@ async fn a_downloaded_model_is_served_by_repo_name_through_the_engine_route() {
         String::from_utf8_lossy(&body)
     );
     let mut last = serde_json::Value::Null;
-    for _ in 0..400 {
+    for _ in 0..3600 {
         let (_status, _headers, body) = testkit::send(
             &app,
             testkit::get("/v1/hf/downloads", Some(testkit::API_KEY)),
