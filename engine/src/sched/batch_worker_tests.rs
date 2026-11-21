@@ -64,6 +64,10 @@ struct WindowFake {
     log: Log,
     hold: Option<Gate>,
     hold_prefill: Option<Gate>,
+    /// A gate the test arms while the engine runs: the next reset takes it, signals that it
+    /// entered, and waits to be released. It holds the worker inside a call so that a job
+    /// submitted meanwhile is certain to meet a live slot.
+    armed_hold: Option<Arc<Mutex<Option<Gate>>>>,
     failure: Option<Failure>,
     deny_session: bool,
     /// When set, the denied `new_session` marks this flag cancelled first: the test hook
@@ -141,6 +145,7 @@ impl WindowFake {
             log: Arc::clone(log),
             hold: None,
             hold_prefill: None,
+            armed_hold: None,
             failure: None,
             deny_session: false,
             cancel_denied_session: None,
@@ -293,6 +298,14 @@ impl ExecutorOps for WindowFake {
 
     fn reset(&mut self, row: &mut Row) -> Result<(), EngError> {
         self.note("reset");
+        let armed = self
+            .armed_hold
+            .as_ref()
+            .and_then(|armed| lock(armed).take());
+        if let Some((entered, release)) = armed {
+            entered.send(()).expect("signal armed reset");
+            release.recv_timeout(WAIT).expect("release armed reset");
+        }
         let call = self.reset_calls;
         self.reset_calls += 1;
         if let Some((at, _)) = self.fail_reset_call.as_ref()
@@ -317,6 +330,7 @@ impl ExecutorOps for WindowFake {
             entered.send(()).expect("signal prefill");
             release.recv_timeout(WAIT).expect("release prefill");
         }
+
         let call = self.prefill_calls;
         self.prefill_calls += 1;
         if self
@@ -476,6 +490,28 @@ fn gate() -> (Gate, mpsc::Receiver<()>, mpsc::Sender<()>) {
     let (entered, observed) = mpsc::channel();
     let (release, held) = mpsc::channel();
     ((entered, held), observed, release)
+}
+
+/// Submits two jobs to an idle engine so that the second finds the first live: the armed gate
+/// holds the worker inside the first job's admission (its reset) until the second is in the queue, so
+/// the worker admits it on its next pass whatever the scheduling of the host. Returns the two
+/// handles. The engine's fake must have been given `armed_hold`.
+fn submit_two_live(
+    engine: &Engine,
+    armed: &Arc<Mutex<Option<Gate>>>,
+    first: (Job, JobHandle),
+    second: (Job, JobHandle),
+) -> (JobHandle, JobHandle) {
+    let (entered, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    *lock(armed) = Some((entered, held));
+    engine.handle().try_submit(first.0).expect("first");
+    observed
+        .recv_timeout(WAIT)
+        .expect("the worker entered the first admission");
+    engine.handle().try_submit(second.0).expect("second");
+    release.send(()).expect("release");
+    (first.1, second.1)
 }
 
 /// Hold factory completion until all initial jobs have entered the bounded queue.
@@ -2316,19 +2352,32 @@ fn a_finished_session_serves_the_next_job_without_a_new_allocation() {
 #[test]
 fn two_live_jobs_allocate_one_session_and_return_both_to_the_pool() {
     let log = Log::default();
-    let (engine, release) = start(WindowFake::new(&log));
+    let armed = Arc::new(Mutex::new(None));
+    let mut fake = WindowFake::new(&log);
+    fake.armed_hold = Some(Arc::clone(&armed));
+    let (engine, release) = start(fake);
+    // Round one: both jobs are in the queue when the worker starts, so both are live together.
+    let (first, first_events) = job(&[0], 3);
+    let (second, second_events) = job(&[1], 3);
+    engine.handle().try_submit(first).expect("first");
+    engine.handle().try_submit(second).expect("second");
     release.send(()).expect("load");
-    for _ in 0..2 {
-        let (first, first_events) = job(&[0], 3);
-        let (second, second_events) = job(&[1], 3);
-        engine.handle().try_submit(first).expect("first");
-        engine.handle().try_submit(second).expect("second");
-        collect(first_events);
-        collect(second_events);
-    }
+    collect(first_events);
+    collect(second_events);
+    // Round two: the armed gate holds the worker in the first admission until the second job is
+    // queued, so the pair is live together however the host schedules the threads.
+    let (first_events, second_events) =
+        submit_two_live(&engine, &armed, job(&[0], 3), job(&[1], 3));
+    collect(first_events);
+    collect(second_events);
+    // The counters move at admission, before the events they belong to: nothing to wait for.
     let counts = snapshot(&engine);
     assert_eq!(counts.sessions_created, 1, "{counts:?}");
-    assert_eq!(counts.sessions_reused + counts.sessions_created, 3);
+    assert_eq!(
+        counts.sessions_reused + counts.sessions_created,
+        3,
+        "{counts:?}"
+    );
     engine.shutdown();
 }
 
@@ -2393,14 +2442,17 @@ fn a_thousand_admit_and_cancel_cycles_never_allocate_past_the_cap() {
 #[test]
 fn the_sessions_of_a_failed_window_are_dropped_not_pooled() {
     let log = Log::default();
+    let armed = Arc::new(Mutex::new(None));
     let mut fake = WindowFake::new(&log);
     fake.failure = Some(Failure::Local);
+    fake.armed_hold = Some(Arc::clone(&armed));
     let (engine, release) = start(fake);
-    release.send(()).expect("load");
+    // Both jobs are in the queue when the worker starts, so the first window has two rows.
     let (first, first_events) = job(&[0], 3);
     let (second, second_events) = job(&[1], 3);
     engine.handle().try_submit(first).expect("first");
     engine.handle().try_submit(second).expect("second");
+    release.send(()).expect("load");
     for events in [first_events, second_events] {
         let events = collect(events);
         assert!(
@@ -2412,10 +2464,10 @@ fn the_sessions_of_a_failed_window_are_dropped_not_pooled() {
         );
     }
     let before = snapshot(&engine).sessions_created;
-    let (third, third_events) = job(&[0], 2);
-    let (fourth, fourth_events) = job(&[1], 2);
-    engine.handle().try_submit(third).expect("third");
-    engine.handle().try_submit(fourth).expect("fourth");
+    // The next pair is live together: the armed gate holds the worker in the first admission
+    // until the second job is queued.
+    let (third_events, fourth_events) =
+        submit_two_live(&engine, &armed, job(&[0], 2), job(&[1], 2));
     collect(third_events);
     collect(fourth_events);
     let after = snapshot(&engine).sessions_created;
@@ -2733,6 +2785,7 @@ fn raw_events(mut handle: JobHandle) -> Vec<JobEvent> {
 /// two seconds of windows, so a second job finds no session and waits.
 fn waiting_engine(
     log: &Log,
+    long_tokens: u32,
 ) -> (
     Engine,
     JobHandle,
@@ -2743,9 +2796,10 @@ fn waiting_engine(
     fake.max = 2;
     fake.session_cap = Some(1);
     fake.evictions = 0;
+    fake.script_tokens = (long_tokens as usize).max(fake.script_tokens);
     fake.window_delay = Some(Duration::from_millis(4));
     let (engine, release) = start(fake);
-    let (long, long_events) = job(&[0], 600);
+    let (long, long_events) = job(&[0], long_tokens);
     let (waiter, waiter_events) = job(&[1], 3);
     let cancel = Arc::clone(&waiter.generation.cancel);
     engine.handle().try_submit(long).expect("long");
@@ -2784,7 +2838,7 @@ fn wait_until_waiting(log: &Log) {
 #[test]
 fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
     let log = Log::default();
-    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600);
     // Queued is also 1 while the job still sits in the channel: wait until it has been taken
     // out, refused and made to wait, and only then ask.
     wait_until_waiting(&log);
@@ -2812,30 +2866,54 @@ fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
 #[test]
 fn a_waiting_job_that_is_cancelled_ends_while_the_stream_still_runs() {
     let log = Log::default();
-    let (engine, mut long_events, waiter_events, cancel) = waiting_engine(&log);
+    // The stream cannot finish inside the test: it is ended by its own cancel at the end.
+    let (engine, mut long_events, waiter_events, cancel) = waiting_engine(&log, 1_000_000);
+    let mut waiter_events = waiter_events;
     wait_until_waiting(&log);
-    let cancelled_at = Instant::now();
     cancel.store(true, Ordering::SeqCst);
-    let waiter = raw_events(waiter_events);
-    // Noticed on the next pass of the loop, not at the one-second retry.
+    // Count the stream's batches that arrive until the waiter's end. A cancel seen on the next
+    // pass of the loop ends the waiter within a tick or two; one seen only at the one-second
+    // retry would let hundreds of batches through. The count is of ticks, not of time, so a
+    // loaded host does not move it.
+    let deadline = Instant::now() + WAIT;
+    let mut batches_meanwhile = 0usize;
+    let mut ended = Vec::new();
+    let waiter = loop {
+        while let Ok(event) = waiter_events.events.try_recv() {
+            ended.push(event);
+        }
+        while let Ok(event) = long_events.events.try_recv() {
+            if matches!(event, JobEvent::Batch(_)) {
+                batches_meanwhile += 1;
+            }
+        }
+        if ended
+            .iter()
+            .any(|event| matches!(event, JobEvent::Finished(_) | JobEvent::Error(_)))
+        {
+            break ended;
+        }
+        assert!(Instant::now() < deadline, "the waiter did not end");
+        std::thread::yield_now();
+    };
     assert!(
-        cancelled_at.elapsed() < Duration::from_millis(500),
-        "the cancel took {:?}",
-        cancelled_at.elapsed()
+        batches_meanwhile <= 20,
+        "the cancel waited for the retry: {batches_meanwhile} batches of the stream passed"
     );
     assert_eq!(finish(&waiter), DecodeFinish::Cancelled);
-    assert_eq!(engine.handle().queued(), 0, "its ticket is released");
+    // Its ticket goes when the worker drops the job it held, just after the event.
+    wait(|| engine.handle().queued() == 0);
     // The stream it waited behind is still decoding.
     assert!(still_running(&mut long_events));
-    let long = collect(long_events);
-    assert_eq!(usage(&long).completion_tokens, 600);
+    long_events.cancel();
+    collect(long_events);
     engine.shutdown();
 }
 
 #[test]
 fn a_waiting_job_is_cancelled_when_the_engine_shuts_down() {
     let log = Log::default();
-    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600);
     wait(|| engine.handle().queued() == 1);
     engine.shutdown();
     let waiter = raw_events(waiter_events);
@@ -2851,9 +2929,11 @@ fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live(
     fake.max = 2;
     fake.live_cap = Some(Arc::clone(&live));
     fake.evictions = 0;
+    fake.script_tokens = 1_000_000;
     fake.window_delay = Some(Duration::from_millis(5));
     let (engine, release) = start(fake);
-    let (long, mut long_events) = job(&[0], 800);
+    // The stream cannot finish inside the test: it is ended by its own cancel at the end.
+    let (long, mut long_events) = job(&[0], 1_000_000);
     let (waiter, waiter_events) = job(&[1], 3);
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
@@ -2868,12 +2948,8 @@ fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live(
         still_running(&mut long_events),
         "the waiter ran only after the stream ended"
     );
-    let long = collect(long_events);
-    assert_eq!(
-        usage(&long).completion_tokens,
-        800,
-        "the stream outlived the wait"
-    );
+    long_events.cancel();
+    collect(long_events);
     engine.shutdown();
 }
 
@@ -2974,9 +3050,10 @@ fn a_retry_that_cannot_fit_does_not_allocate_and_one_that_can_does() {
     fake.fits = Some(Arc::clone(&fits));
     // No prefix entry to evict, so the first refusal is a single allocation attempt.
     fake.evictions = 0;
+    fake.script_tokens = 1_000_000;
     fake.window_delay = Some(Duration::from_millis(5));
     let (engine, release) = start(fake);
-    let (long, mut long_events) = job(&[0], 1_000);
+    let (long, mut long_events) = job(&[0], 1_000_000);
     let (waiter, waiter_events) = job(&[1], 3);
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
@@ -2996,6 +3073,7 @@ fn a_retry_that_cannot_fit_does_not_allocate_and_one_that_can_does() {
     fits.store(true, Ordering::SeqCst);
     assert_eq!(usage(&collect(waiter_events)).completion_tokens, 3);
     assert!(still_running(&mut long_events));
+    long_events.cancel();
     collect(long_events);
     engine.shutdown();
 }
