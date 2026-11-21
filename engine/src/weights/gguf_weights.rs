@@ -27,20 +27,13 @@ use super::gguf::{GgufHeader, GgufTensor, GgufType};
 use super::gguf_split::shard_name_of;
 use crate::EngError;
 
-/// Tensor types the CUDA path loads. Q4_K, Q6_K, Q8_0, Q5_K, Q4_0 and Q3_K hold the
-/// matrices (the in-house dequantizing GEMM decodes the last three natively); F32 and F16
-/// hold norms and small tables.
-const SUPPORTED_TYPES: [GgufType; 9] = [
-    GgufType::F32,
-    GgufType::F16,
-    GgufType::Q4K,
-    GgufType::Q6K,
-    GgufType::Q80,
-    GgufType::Q50,
-    GgufType::Q5K,
-    GgufType::Q40,
-    GgufType::Q3K,
-];
+/// Tensor types the CUDA path loads: F32 and F16 hold norms and small tables, every quantized
+/// type of the native plan (`kernels::cuda::plan`) holds matrices, and Q3_K is read here
+/// although the plan refuses it. Which role takes which type is the model open's rule.
+fn supported_type(ty: GgufType) -> bool {
+    matches!(ty, GgufType::F32 | GgufType::F16 | GgufType::Q3K)
+        || crate::kernels::cuda::plan::is_native_type(ty)
+}
 
 /// Size limits checked before anything large is allocated.
 #[derive(Debug, Clone, Copy)]
@@ -410,7 +403,7 @@ fn check_tensor(
     let ty = tensor.ggml_type();
     // A BF16 norm or gate vector is widened to F32 at load, so it is a supported tensor.
     let widened = ty == GgufType::Bf16 && tensor.is_small_half_vector();
-    if check_types && !SUPPORTED_TYPES.contains(&ty) && !widened {
+    if check_types && !supported_type(ty) && !widened {
         return Err(checkpoint(format!(
             "tensor {} has unsupported type {}",
             tensor.name(),
@@ -638,13 +631,13 @@ mod tests {
         let f32s = fixture("f32.blocks");
         let entries = [
             entry("norm", GgufType::F32, &f32s),
-            entry("blk.0.ffn_down", GgufType::Q2K, &blocks),
+            entry("blk.0.ffn_down", GgufType::Q41, &blocks),
         ];
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(&dir, &gguf(&[], &entries));
         expect_checkpoint(
             GgufWeights::open(&path, LIMITS, None),
-            "tensor blk.0.ffn_down has unsupported type Q2_K",
+            "tensor blk.0.ffn_down has unsupported type Q4_1",
         );
     }
 

@@ -1512,7 +1512,7 @@ fn the_default_layout_is_tiled() {
 
 #[test]
 fn a_native_load_refuses_an_unsupported_type_naming_the_tensor() {
-    // The GGUF reader takes every in-house type (`SUPPORTED_TYPES`), so a file can carry
+    // The GGUF reader takes every in-house type (`supported_type`), so a file can carry
     // a type the native plan refuses: Q3_K is held back until its chunk, expert and
     // embedding wiring is qualified, so the model open keeps it out and the plan
     // refuses it. The plan function that
@@ -2240,7 +2240,7 @@ fn a_q3k_tensor_opens_but_the_native_plan_refuses_it_before_any_device_call() {
     if !device_present(NAME) {
         return;
     }
-    // The reader takes Q3_K (`SUPPORTED_TYPES`); the model open keeps it out (its
+    // The reader takes Q3_K (`supported_type`); the model open keeps it out (its
     // chunk, expert and embedding wiring is not qualified), and the native plan
     // refuses it the same way, naming the tensor, with the device untouched.
     let dir = tempfile::tempdir().expect("create the fixture directory");

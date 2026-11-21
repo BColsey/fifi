@@ -103,6 +103,12 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
     }
 }
 
+/// True for the quantized types a native upload can place: the one table every loader checks
+/// against, so a type gains a loader arm by gaining a block geometry above.
+pub(crate) const fn is_native_type(ty: GgufType) -> bool {
+    native_block(ty).is_some()
+}
+
 /// Device bytes of the tensor `name` after a native upload: the file's own
 /// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K, Q8_0, Q5_K and Q4_0. There is no
 /// 8-row rule and no tile-column rule: any row count from one up loads, and `dims[0]` must be
