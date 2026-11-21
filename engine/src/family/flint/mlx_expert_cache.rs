@@ -56,8 +56,9 @@ fn minimum_cache_bytes(per_expert: u64, page: u64) -> u64 {
 }
 
 /// Read the MiB setting and fit it to the bytes available. A value that cannot
-/// hold the smallest useful cache is refused; a budget that cannot hold it
-/// skips the cache; a budget below the setting shrinks the cache to fit.
+/// hold the smallest useful cache, or a budget that cannot hold it, skips the
+/// cache; a budget below the setting shrinks the cache to fit. Only a value
+/// that is not a MiB count is refused.
 fn size_cache(
     setting: Option<&std::ffi::OsStr>,
     per_expert: u64,
@@ -79,8 +80,8 @@ fn size_cache(
         .ok_or_else(|| EngError::MemoryPlan(format!("{CACHE_MIB} overflows bytes")))?;
     let minimum = minimum_cache_bytes(per_expert, page);
     if cap < minimum {
-        return Err(EngError::MemoryPlan(format!(
-            "Flint expert cache needs {minimum} bytes for {ROUTES} slots per routed layer, with {cap} bytes requested"
+        return Ok(Sizing::Skip(format!(
+            "{cap} bytes requested, and the smallest cache needs {minimum} for {ROUTES} slots per routed layer"
         )));
     }
     let usable = cap.min(available);
@@ -137,7 +138,7 @@ pub(super) fn plan(
     let empty = || (0..LAYERS).map(|_| None).collect();
     let page = HostPages::page_size() as u64;
     let setting = std::env::var_os(CACHE_MIB);
-    let (mut slots, usable, mut reduced) = match size_cache(
+    let (slots, usable, reduced) = match size_cache(
         setting.as_deref(),
         source.bytes_per_routed_expert(),
         page,
@@ -154,27 +155,48 @@ pub(super) fn plan(
             reduced,
         } => (slots, usable, reduced),
     };
-    let minimum_slots = ROUTED_LAYERS * ROUTES;
-    // Each layer's pages are page aligned, so the allocated bytes can exceed
-    // the slot arithmetic; shrink until the allocation fits.
-    loop {
-        let (layers, bytes) = build_layers(source, slots)?;
-        if bytes <= usable {
-            if reduced {
+    match fit_allocation(slots, usable, ROUTED_LAYERS * ROUTES, |slots| {
+        build_layers(source, slots)
+    })? {
+        Some((layers, bytes, slots, shrunk)) => {
+            if reduced || shrunk {
                 eprintln!("flint: {CACHE_MIB} reduced to {slots} slots to fit the device budget");
             }
             eprintln!("flint: MLX expert cache bytes={bytes} slots={slots}");
-            return Ok((layers, bytes));
+            Ok((layers, bytes))
         }
-        if slots <= minimum_slots {
+        None => {
             eprintln!(
-                "flint: {CACHE_MIB} ignored: the smallest cache allocates {bytes} bytes, with {usable} bytes available"
+                "flint: {CACHE_MIB} ignored: the smallest cache allocates more than the {usable} bytes available"
             );
-            return Ok((empty(), 0));
+            Ok((empty(), 0))
         }
-        reduced = true;
+    }
+}
+
+/// Allocate `slots` with `build`, which returns the allocation and its byte
+/// size. Each layer's pages are page aligned, so the size can exceed the slot
+/// arithmetic: shrink the slot count in proportion until the allocation fits
+/// `usable`, and give up (`None`) when even `minimum` slots do not. The flag
+/// says whether the slot count shrank.
+fn fit_allocation<T>(
+    mut slots: usize,
+    usable: u64,
+    minimum: usize,
+    mut build: impl FnMut(usize) -> Result<(T, u64)>,
+) -> Result<Option<(T, u64, usize, bool)>> {
+    let mut shrunk = false;
+    loop {
+        let (built, bytes) = build(slots)?;
+        if bytes <= usable {
+            return Ok(Some((built, bytes, slots, shrunk)));
+        }
+        if slots <= minimum {
+            return Ok(None);
+        }
+        shrunk = true;
         let fitted = (slots as u128 * u128::from(usable) / u128::from(bytes)) as usize;
-        slots = fitted.min(slots - 1).max(minimum_slots);
+        slots = fitted.min(slots - 1).max(minimum);
     }
 }
 
@@ -335,8 +357,35 @@ mod tests {
                 "{bad:?}"
             );
         }
-        assert!(size_cache(os("1"), PER_EXPERT, PAGE, u64::MAX).is_err());
         assert!(size_cache(os("18446744073709551615"), PER_EXPERT, PAGE, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_setting_below_the_smallest_cache_skips_it_like_a_small_budget() {
+        for mib in ["1", "100"] {
+            assert!(
+                matches!(
+                    size_cache(os(mib), PER_EXPERT, PAGE, u64::MAX).unwrap(),
+                    Sizing::Skip(_)
+                ),
+                "{mib}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allocation_shrinks_until_page_alignment_fits_and_gives_up_at_the_minimum() {
+        // Each slot takes 1.25 units of room, so the arithmetic count overshoots the budget.
+        let build = |slots: usize| Ok::<_, EngError>((slots, slots as u64 * 125 / 100));
+        let fitted = fit_allocation(1000, 800, 10, build).unwrap().unwrap();
+        assert!(fitted.1 <= 800 && fitted.0 < 1000 && fitted.3);
+        assert!(fitted.0 >= 600, "shrinks in proportion, not to the floor");
+        let exact = fit_allocation(100, 125, 10, build).unwrap().unwrap();
+        assert_eq!((exact.0, exact.2, exact.3), (100, 100, false));
+        assert!(fit_allocation(1000, 5, 10, build).unwrap().is_none());
+        let failing =
+            |_: usize| Err::<((), u64), _>(EngError::BadRequest("allocation failed".into()));
+        assert!(fit_allocation(100, 125, 10, failing).is_err());
     }
 
     #[test]
