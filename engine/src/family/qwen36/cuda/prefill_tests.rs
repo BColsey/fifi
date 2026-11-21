@@ -1012,9 +1012,11 @@ fn model_refuses_each_guard() {
     let mut facts = valid.clone();
     facts.layers[3].stacks[2].n_rows -= 2_048; // one matrix short.
     refuse(&facts, 40, "prefill chunk: stack shape");
+    // A projection beside siblings of the other q8_1 layout is not refused: each layout reads
+    // its own buffer (`Q8Cursor`).
     let mut facts = valid.clone();
     facts.layers[3].dense[1].1 = Some(QuantType::Q4K); // AttnK beside Q8_0 siblings.
-    refuse(&facts, 40, "prefill chunk: q8 layout");
+    assert!(check_model(&facts, 40).is_ok());
 }
 /// One row per refusal of `ChunkRun::new`'s check.
 #[test]

@@ -343,12 +343,12 @@ fn mixer_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
             S::OOut,
             cpf_dn_scan_out_bytes(m, d.value_heads, d.value_dim)?,
             DScan,
-            DQuant,
+            DOut,
         ),
         (S::Q8OD, q8_1_bytes(d.value_width, m)?, DQuant, DOut),
         (S::ProjA, word_bytes(&[m, a.ld])?, AProj, AFlash),
         (S::Q, q_bytes(m, a.heads_q), APrep, AFlash),
-        (S::AttnOut, word_bytes(&[m, a.q_width])?, AFlash, AQuant),
+        (S::AttnOut, word_bytes(&[m, a.q_width])?, AFlash, AOut),
         (S::Q8OA, q8_1_bytes(a.q_width, m)?, AQuant, AOut),
     ])
 }
