@@ -30,8 +30,8 @@ fn row_dot(row: &[u8], input: &Q8gRow) -> f32 {
     for ((block, activation), &scale) in blocks.iter().zip(values).zip(&input.d) {
         let weights = block[2..].as_ptr().cast::<i8>();
         let activation = activation.as_ptr();
-        // SAFETY: Both slices contain 32 bytes and vld1q_s8 supports
-        // unaligned loads at both offsets. This function enables dotprod.
+        // This function enables dotprod and vld1q_s8 supports unaligned reads.
+        // SAFETY: Both 32-byte slices contain their two full vector loads.
         let product = unsafe {
             let low = vdotq_s32(vdupq_n_s32(0), vld1q_s8(weights), vld1q_s8(activation));
             vdotq_s32(low, vld1q_s8(weights.add(16)), vld1q_s8(activation.add(16)))
