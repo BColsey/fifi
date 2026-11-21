@@ -46,6 +46,7 @@ pub use gguf::{
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
 };
+pub(crate) use gguf_dequant::{dot_q6_k, dot_q8_0};
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
 pub(crate) use shard::read_stored_header;

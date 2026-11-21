@@ -251,6 +251,7 @@ pub struct Weights {
     header: GgufHeader,
     modified: Option<SystemTime>,
     dense_io: Option<DenseIo>,
+    packed_dot: bool,
 }
 
 impl Weights {
@@ -267,6 +268,8 @@ impl Weights {
             header,
             modified: metadata.modified().ok(),
             dense_io: DenseIo::start_if_enabled(),
+            packed_dot: std::env::var_os("FIFI_INKLING_GGUF_PACKED_DOT")
+                .is_some_and(|value| value == "1"),
         })
     }
 
@@ -275,7 +278,12 @@ impl Weights {
             .modified
             .ok_or_else(|| checkpoint_error("GGUF modification time unavailable"))?;
         let file = self.file.try_clone().map_err(checkpoint_error)?;
-        MappedFile::from_file(file, self.header.file_len(), modified).map_err(checkpoint_error)
+        let mapping = MappedFile::from_file(file, self.header.file_len(), modified)
+            .map_err(checkpoint_error)?;
+        if self.packed_dot {
+            eprintln!("Inkling 2 Mini GGUF: packed_attention_dot=on");
+        }
+        Ok(mapping)
     }
 
     pub fn header(&self) -> &GgufHeader {
@@ -449,6 +457,7 @@ impl Weights {
                 row_bytes,
                 &bytes[range.start * row_bytes..range.end * row_bytes],
                 input,
+                self.packed_dot,
             )
         })?;
         if let Some(io) = &self.dense_io {
@@ -617,6 +626,7 @@ fn project_packed_rows(
     row_bytes: usize,
     bytes: &[u8],
     input: &[f32],
+    packed_dot: bool,
 ) -> Result<Vec<f32>, EngError> {
     let rows = bytes.chunks_exact(row_bytes);
     let result = match dtype {
@@ -626,6 +636,22 @@ fn project_packed_rows(
         GgufType::Bf16 => rows
             .map(|row| super::dense::dot_bf16_le_scalar(row, input))
             .collect(),
+        GgufType::Q6K
+            if packed_dot
+                && input.len().is_multiple_of(256)
+                && row_bytes == input.len() / 256 * 210 =>
+        {
+            rows.map(|row| crate::weights::dot_q6_k(row, input))
+                .collect()
+        }
+        GgufType::Q80
+            if packed_dot
+                && input.len().is_multiple_of(32)
+                && row_bytes == input.len() / 32 * 34 =>
+        {
+            rows.map(|row| crate::weights::dot_q8_0(row, input))
+                .collect()
+        }
         _ => {
             let mut values = vec![0.; input.len()];
             rows.map(|row| {
@@ -840,27 +866,36 @@ mod mapped_projection_tests {
 
     #[test]
     fn parallel_quantized_attention_preserves_uneven_q6_k_and_q8_0_rows() {
-        let input: Vec<_> = (0..256).map(|i| (i % 11) as f32 / 16. - 0.25).collect();
-        for (dtype, row_bytes) in [(GgufType::Q6K, 210), (GgufType::Q80, 272)] {
+        let input: Vec<_> = (0..512).map(|i| (i % 11) as f32 / 13. - 0.25).collect();
+        for (dtype, row_bytes) in [(GgufType::Q6K, 420), (GgufType::Q80, 544)] {
             let mut weights = vec![0; row_bytes * 11];
             for (index, row) in weights.chunks_exact_mut(row_bytes).enumerate() {
-                row.fill((index * 7 + 1) as u8);
-                let scale = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+                for (offset, value) in row.iter_mut().enumerate() {
+                    *value = (index * 7 + offset * 13 + 1) as u8;
+                }
+                let scale = |block| {
+                    half::f16::from_f32(0.125 + block as f32 / 64.)
+                        .to_bits()
+                        .to_le_bytes()
+                };
                 if dtype == GgufType::Q6K {
-                    row[208..210].copy_from_slice(&scale);
+                    for (i, block) in row.as_chunks_mut::<210>().0.iter_mut().enumerate() {
+                        block[208..210].copy_from_slice(&scale(i));
+                    }
                 } else {
-                    for block in row.as_chunks_mut::<34>().0 {
-                        block[..2].copy_from_slice(&scale);
+                    for (i, block) in row.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+                        block[..2].copy_from_slice(&scale(i));
                     }
                 }
             }
-            let run = |workers| {
+            let run = |workers, packed_dot| {
                 project_row_groups(0..11, workers, |range| {
                     project_packed_rows(
                         dtype,
                         row_bytes,
                         &weights[range.start * row_bytes..range.end * row_bytes],
                         &input,
+                        packed_dot,
                     )
                 })
                 .unwrap()
@@ -868,9 +903,11 @@ mod mapped_projection_tests {
                 .map(f32::to_bits)
                 .collect::<Vec<_>>()
             };
-            let serial = run(1);
-            assert_ne!(serial[0], serial[10]);
-            assert_eq!(serial, run(4));
+            let reference = run(1, false);
+            assert_ne!(reference[0], reference[10]);
+            assert_eq!(run(4, false), reference);
+            assert_eq!(run(1, true), reference);
+            assert_eq!(run(4, true), reference);
         }
     }
 
@@ -907,6 +944,7 @@ mod mapped_projection_tests {
             header,
             modified: meta.modified().ok(),
             dense_io: Some(DenseIo::default()),
+            packed_dot: true,
         };
         let mapping = weights.map_projection_source().unwrap();
         let input = [0.5, 0.25, -0.75];
@@ -973,7 +1011,7 @@ mod mapped_projection_tests {
             let mut values = vec![0.; input.len()];
             crate::weights::dequantize_into(dtype, &row, &mut values).unwrap();
             let reference: f32 = values.iter().zip(&input).map(|(w, x)| w * x).sum();
-            let mapped = project_packed_rows(dtype, row.len(), &row, &input).unwrap();
+            let mapped = project_packed_rows(dtype, row.len(), &row, &input, true).unwrap();
             assert_eq!(mapped[0].to_bits(), reference.to_bits(), "{dtype:?}");
         }
     }
