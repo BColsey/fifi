@@ -83,6 +83,12 @@ impl Dtype {
 #[derive(Debug, Clone)]
 pub(crate) enum Backing {
     Bytes(Arc<[u8]>),
+    // Keeps the original read buffer when an existing Vec must be shared.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    SharedVec(Arc<Vec<u8>>),
     Mapped(Arc<memmap2::Mmap>),
 }
 
@@ -92,6 +98,11 @@ impl Deref for Backing {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Bytes(bytes) => bytes,
+            #[cfg(any(
+                test,
+                all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+            ))]
+            Self::SharedVec(bytes) => bytes,
             Self::Mapped(bytes) => bytes,
         }
     }
@@ -160,5 +171,26 @@ impl Tensor {
 
     pub fn host_bytes(&self) -> Option<&[u8]> {
         Some(&self.bytes[self.range.clone()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_vec_tensor_keeps_the_original_read_allocation() {
+        let bytes = Arc::new(vec![0, 1, 2, 3, 4, 5]);
+        let original = bytes[1..5].as_ptr();
+        let tensor = Tensor::from_shared(
+            Dtype::U8,
+            vec![2, 2],
+            Backing::SharedVec(Arc::clone(&bytes)),
+            1..5,
+        )
+        .unwrap();
+        drop(bytes);
+        assert_eq!(tensor.host_bytes().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(tensor.host_bytes().unwrap().as_ptr(), original);
     }
 }
