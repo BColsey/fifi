@@ -3,8 +3,11 @@
 //! with `--test-threads=1`; the model test reads the Q8_0 file from `BOLT_Q8_FILE`.
 
 use super::bolt::{
-    ATTN_SPLIT_MAX, ATTN_SPLIT_MIN_KEYS, Bolt, CELLS, HEAD_COLUMNS, VOCAB, attn_part_bytes,
+    ATTN_SPLIT_MAX, ATTN_SPLIT_MIN_KEYS, Bolt, HEAD_COLUMNS, VOCAB, attn_part_bytes,
 };
+
+/// The cells of the caches these tests build themselves; the model under test plans its own.
+const CELLS: usize = 32_768;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
 };
