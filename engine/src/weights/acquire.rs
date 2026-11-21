@@ -4,7 +4,12 @@
 //! it for a [`Completion`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::{io::SeekFrom, sync::Mutex};
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+use std::{fs::File, io::IoSliceMut, os::unix::fs::FileExt};
+use std::{
+    io::{Read, SeekFrom},
+    sync::Mutex,
+};
 
 use super::indexed::{check_shard_set, parse_weight_map};
 use super::{
@@ -97,7 +102,42 @@ pub struct Ticket {
 /// check enforces. A memory reservation arrives with a later slice.
 pub struct StreamedWeights {
     header: ShardHeader,
-    reader: Mutex<Box<dyn ShardIo + Send>>,
+    reader: Reader,
+}
+
+enum Reader {
+    Seek(Mutex<Box<dyn ShardIo + Send>>),
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    File(File),
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+struct AtOffset<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl Read for AtOffset<'_> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.file.read_at(dst, self.offset)?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+
+    fn read_vectored(&mut self, dst: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        let count = rustix::io::preadv(self.file, dst, self.offset)?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn positioned_reads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FIFI_MLX_POSITIONED_READS").is_some_and(|value| value == "1")
+    })
 }
 
 impl StreamedWeights {
@@ -106,14 +146,51 @@ impl StreamedWeights {
         byte_len: u64,
         max_header_bytes: u64,
     ) -> Result<Self, EngError> {
+        let header = Self::read_header(reader.as_mut(), byte_len, max_header_bytes)?;
+        Ok(Self {
+            header,
+            reader: Reader::Seek(Mutex::new(reader)),
+        })
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn open_file(
+        file: std::fs::File,
+        byte_len: u64,
+        max_header_bytes: u64,
+    ) -> Result<Self, EngError> {
+        #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+        if positioned_reads() {
+            return Self::open_positioned(file, byte_len, max_header_bytes);
+        }
+        Self::open(Box::new(file), byte_len, max_header_bytes)
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    fn open_positioned(
+        mut file: File,
+        byte_len: u64,
+        max_header_bytes: u64,
+    ) -> Result<Self, EngError> {
+        let header = Self::read_header(&mut file, byte_len, max_header_bytes)?;
+        Ok(Self {
+            header,
+            reader: Reader::File(file),
+        })
+    }
+
+    fn read_header(
+        reader: &mut dyn ShardIo,
+        byte_len: u64,
+        max_header_bytes: u64,
+    ) -> Result<ShardHeader, EngError> {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(|error| EngError::Checkpoint(format!("shard seek failed: {error}")))?;
-        let header = ShardHeader::read(&mut reader, byte_len, max_header_bytes)?;
-        Ok(Self {
-            header,
-            reader: Mutex::new(reader),
-        })
+        ShardHeader::read(reader, byte_len, max_header_bytes)
     }
 
     /// The absolute byte position of `key`'s data within this shard's file
@@ -323,27 +400,37 @@ impl StreamedWeights {
         key: &str,
         start: u64,
         bytes: usize,
-        read: impl FnOnce(&mut dyn ShardIo) -> std::io::Result<()>,
+        read: impl FnOnce(&mut dyn Read) -> std::io::Result<()>,
     ) -> Result<(), EngError> {
         let position =
             self.header.data_start().checked_add(start).ok_or_else(|| {
                 EngError::Checkpoint(format!("tensor {key:?}: offset overflows u64"))
             })?;
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|_| read_failure(key, "reader lock poisoned"))?;
-        // The stamp is taken after the reader lock is held, so the measured wall is
-        // seek + read_exact; lock wait is not included.
-        let clock = read_stats::now();
-        let outcome = reader
-            .seek(SeekFrom::Start(position))
-            .and_then(|_| read(reader.as_mut()))
-            .map_err(|error| read_failure(key, &error.to_string()));
+        let (clock, outcome) = match &self.reader {
+            Reader::Seek(reader) => {
+                let mut reader = reader
+                    .lock()
+                    .map_err(|_| read_failure(key, "reader lock poisoned"))?;
+                // The original timing excludes lock acquisition.
+                let clock = read_stats::now();
+                let outcome = reader
+                    .seek(SeekFrom::Start(position))
+                    .and_then(|_| read(reader.as_mut()));
+                (clock, outcome)
+            }
+            #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+            Reader::File(file) => (
+                read_stats::now(),
+                read(&mut AtOffset {
+                    file,
+                    offset: position,
+                }),
+            ),
+        };
         if let Some(clock) = clock {
             read_stats::record(bytes as u64, clock.elapsed());
         }
-        outcome
+        outcome.map_err(|error| read_failure(key, &error.to_string()))
     }
 }
 
@@ -460,7 +547,68 @@ impl StreamedCheckpoint {
         shards: Vec<(String, Box<dyn ShardIo + Send>, u64)>,
         max_header_bytes: u64,
     ) -> Result<Self, EngError> {
-        let weight_map = parse_weight_map(index)?;
+        Self::open_shards(
+            parse_weight_map(index)?,
+            shards,
+            max_header_bytes,
+            StreamedWeights::open,
+        )
+    }
+
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn open_files(
+        index: &[u8],
+        shards: Vec<(String, std::fs::File, u64)>,
+        max_header_bytes: u64,
+    ) -> Result<Self, EngError> {
+        Self::open_shards(
+            parse_weight_map(index)?,
+            shards,
+            max_header_bytes,
+            StreamedWeights::open_file,
+        )
+    }
+
+    /// Opens the local indexed shards for the resident MLX model loaders.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn open_local(
+        dir: &std::path::Path,
+        max_header_bytes: u64,
+    ) -> Result<Self, EngError> {
+        let guard = crate::storage_guard::LocalGuard::new()?;
+        guard.check(dir, "model weights")?;
+        let index_path = dir.join("model.safetensors.index.json");
+        guard.check(&index_path, "model weights")?;
+        let index = std::fs::read(&index_path)
+            .map_err(|error| EngError::Checkpoint(format!("{}: {error}", index_path.display())))?;
+        let weight_map = parse_weight_map(&index)?;
+        let names: BTreeSet<_> = weight_map.values().collect();
+        let mut shards = Vec::with_capacity(names.len());
+        for name in names {
+            let path = dir.join(name);
+            guard.check(&path, "model weights")?;
+            let error = |cause| EngError::Checkpoint(format!("{}: {cause}", path.display()));
+            let file = File::open(&path).map_err(error)?;
+            let bytes = file.metadata().map_err(error)?.len();
+            shards.push((name.clone(), file, bytes));
+        }
+        Self::open_shards(
+            weight_map,
+            shards,
+            max_header_bytes,
+            StreamedWeights::open_file,
+        )
+    }
+
+    fn open_shards<R>(
+        weight_map: BTreeMap<String, String>,
+        shards: Vec<(String, R, u64)>,
+        max_header_bytes: u64,
+        open: impl Fn(R, u64, u64) -> Result<StreamedWeights, EngError>,
+    ) -> Result<Self, EngError> {
         let mut names = BTreeSet::new();
         for (name, _, _) in &shards {
             if !names.insert(name.as_str()) {
@@ -474,18 +622,15 @@ impl StreamedCheckpoint {
         let mut stores = Vec::with_capacity(shards.len());
         let mut positions = BTreeMap::new();
         for (name, reader, byte_len) in shards {
-            let store =
-                StreamedWeights::open(reader, byte_len, max_header_bytes).map_err(|error| {
-                    match error {
-                        EngError::Checkpoint(message) => {
-                            EngError::Checkpoint(format!("shard {name:?}: {message}"))
-                        }
-                        EngError::MemoryPlan(message) => {
-                            EngError::MemoryPlan(format!("shard {name:?}: {message}"))
-                        }
-                        other => other,
-                    }
-                })?;
+            let store = open(reader, byte_len, max_header_bytes).map_err(|error| match error {
+                EngError::Checkpoint(message) => {
+                    EngError::Checkpoint(format!("shard {name:?}: {message}"))
+                }
+                EngError::MemoryPlan(message) => {
+                    EngError::MemoryPlan(format!("shard {name:?}: {message}"))
+                }
+                other => other,
+            })?;
             positions.insert(name, stores.len());
             stores.push(store);
         }
@@ -728,6 +873,71 @@ mod tests {
             Completion::Ready(tensor) => tensor.host_bytes().unwrap().to_vec(),
             Completion::Missing => panic!("{key} is missing"),
         }
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn positioned_shard_handles_concurrent_ranges_and_a_partial_vectored_read() {
+        use std::io::{Seek, Write};
+
+        let payload: Vec<u8> = (0..24).collect();
+        let (bytes, _) = shard(&[("experts", "U32", vec![6, 1], payload.clone())]);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        let store = StreamedWeights::open_positioned(
+            file.try_clone().unwrap(),
+            bytes.len() as u64,
+            1 << 20,
+        )
+        .unwrap();
+        let cursor = file.seek(SeekFrom::Start(9)).unwrap();
+        std::thread::scope(|scope| {
+            for first in [0u32, 2, 4] {
+                let store = &store;
+                let payload = &payload;
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        let mut contiguous = [0; 8];
+                        store
+                            .read_slice_run_into("experts", first, 2, &mut contiguous)
+                            .unwrap();
+                        let start = first as usize * 4;
+                        assert_eq!(contiguous, payload[start..start + 8]);
+                        let mut a = [0; 4];
+                        let mut b = [0; 4];
+                        store
+                            .read_slice_run_scattered(
+                                "experts",
+                                first,
+                                &mut [IoSliceMut::new(&mut a), IoSliceMut::new(&mut b)],
+                            )
+                            .unwrap();
+                        assert_eq!(a, contiguous[..4]);
+                        assert_eq!(b, contiguous[4..]);
+                    }
+                });
+            }
+        });
+        assert_eq!(file.stream_position().unwrap(), cursor);
+
+        file.set_len(bytes.len() as u64 - 2).unwrap();
+        let mut a = [0xAB; 4];
+        let mut b = [0xAB; 4];
+        let result = store.read_slice_run_scattered(
+            "experts",
+            4,
+            &mut [IoSliceMut::new(&mut a), IoSliceMut::new(&mut b)],
+        );
+        assert!(matches!(
+            result,
+            Err(EngError::Backend {
+                operation: "weight_read",
+                ..
+            })
+        ));
+        assert_eq!(a, payload[16..20]);
+        assert_eq!(b, [20, 21, 0xAB, 0xAB]);
+        assert_eq!(file.stream_position().unwrap(), cursor);
     }
 
     #[test]
