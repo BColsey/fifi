@@ -118,36 +118,34 @@ impl<'b> BlockOp<'b> {
             .write(1, out, bytes(&[h, 4])?))
     }
 
-    /// Delta-rule scan with a decay per key channel, then the per-head RMS norm and the sigmoid
-    /// output gate. `state` is `[heads][128][128]` and carries over between calls.
+    /// The inputs of the shared delta-rule scan, from the Raon projections: the `[q | k | v]`
+    /// conv rows (`qkv`, `v` scaled by the fold of its beta and delta logits), one decay value per
+    /// key channel (`decay`) and the projection rows `[z | beta logits]` (`proj`, rows of
+    /// `heads * head_dim + heads` floats).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn rda_scan(
+    pub(crate) fn rda_pack(
         n: usize,
         heads: usize,
         head_dim: usize,
         lower_bound: f32,
-        norm_eps: f32,
         inputs: RdaInputs<'b>,
-        state: DeviceRange<'b>,
-        out: DeviceRange<'b>,
+        outputs: RdaPacked<'b>,
     ) -> Result<Self, EngError> {
         let width = bytes(&[heads, head_dim])?;
         let row = bytes(&[n, width, 4])?;
-        Ok(
-            Self::new(6, &[n, heads, head_dim], &[lower_bound, norm_eps])?
-                .read(0, inputs.q, row)
-                .read(1, inputs.k, row)
-                .read(2, inputs.v, row)
-                .read(3, inputs.g1, row)
-                .read(4, inputs.dt_bias, bytes(&[width, 4])?)
-                .read(5, inputs.a, bytes(&[heads, 4])?)
-                .read(6, inputs.beta, bytes(&[n, heads, 4])?)
-                .read(7, inputs.delta, bytes(&[n, heads, 4])?)
-                .read(8, inputs.norm_w, bytes(&[head_dim, 4])?)
-                .read(9, inputs.g2, row)
-                .write(10, state, bytes(&[heads, head_dim, head_dim, 4])?)
-                .write(11, out, row),
-        )
+        Ok(Self::new(6, &[n, heads, head_dim], &[lower_bound])?
+            .read(0, inputs.q, row)
+            .read(1, inputs.k, row)
+            .read(2, inputs.v, row)
+            .read(3, inputs.g1, row)
+            .read(4, inputs.dt_bias, bytes(&[width, 4])?)
+            .read(5, inputs.a, bytes(&[heads, 4])?)
+            .read(6, inputs.beta, bytes(&[n, heads, 4])?)
+            .read(7, inputs.delta, bytes(&[n, heads, 4])?)
+            .read(8, inputs.g2, row)
+            .write(9, outputs.qkv, bytes(&[n, 3, width, 4])?)
+            .write(10, outputs.decay, row)
+            .write(11, outputs.proj, bytes(&[n, width + heads, 4])?))
     }
 
     /// The absorbed query of every head: `[wk_b[h] . q_nope | q_rope]`.
@@ -332,7 +330,14 @@ pub(crate) struct MlaShape {
     pub(crate) rank: usize,
 }
 
-/// The input ranges of the delta-rule scan.
+/// The ranges `rda_pack` writes for the shared delta scan.
+pub(crate) struct RdaPacked<'b> {
+    pub(crate) qkv: DeviceRange<'b>,
+    pub(crate) decay: DeviceRange<'b>,
+    pub(crate) proj: DeviceRange<'b>,
+}
+
+/// The Raon ranges `rda_pack` reads.
 pub(crate) struct RdaInputs<'b> {
     pub(crate) q: DeviceRange<'b>,
     pub(crate) k: DeviceRange<'b>,
@@ -342,7 +347,6 @@ pub(crate) struct RdaInputs<'b> {
     pub(crate) a: DeviceRange<'b>,
     pub(crate) beta: DeviceRange<'b>,
     pub(crate) delta: DeviceRange<'b>,
-    pub(crate) norm_w: DeviceRange<'b>,
     pub(crate) g2: DeviceRange<'b>,
 }
 

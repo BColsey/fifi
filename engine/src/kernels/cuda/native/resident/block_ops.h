@@ -1,7 +1,7 @@
 /*
  * Launch entry of block_ops: the row operations of a hybrid decoder block that are not
  * shared with another resident kernel yet (the convolution is `gdn_conv`, the norm is `add_rmsnorm_q8`, the stream-mixing apply is `hyper_mix_apply`): the four-stream mixed residual with its stream-mixing matrix, a
- * delta-rule scan with a decay per key channel, absorbed latent attention over one shared
+ * inputs of the shared delta-rule scan (its decay per key channel), absorbed latent attention over one shared
  * key/value head, the SiTU activation with its q8_1 quantize.
  * Launch-only: nothing here allocates, copies or synchronizes. Every operation works on
  * `n` token rows at once, so decode (n = 1) and prefill chunks share the entry.
@@ -32,11 +32,12 @@ extern "C" {
  *             p2 base f32 [17]; p3 scale f32 [4]; p4 branch f32 [n][h] (W); p5 post f32
  *             [n][4] (W); p6 comb f32 [n][16] (W). i0 n; i1 h. f0 epsilon; f1 magnitude.
  * 4 HC_MEAN   p0 resid f32 [rows][4*h]; p1 out f32 [h] (W). i0 row; i1 h.
- * 6 RDA_SCAN  p0 q; p1 k; p2 v; p3 g1; each f32 [n][heads*hd]; p4 dt_bias f32 [heads*hd];
- *             p5 a f32 [heads]; p6 beta f32 [n][heads]; p7 delta f32 [n][heads]; p8
- *             norm_w f32 [hd]; p9 g2 f32 [n][heads*hd]; p10 state f32 [heads][hd][hd]
- *             (RW); p11 out f32 [n][heads*hd] (W). i0 n; i1 heads; i2 hd (128).
- *             f0 gate lower bound; f1 norm epsilon.
+ * 6 RDA_PACK  the inputs of the shared delta scan. p0 q; p1 k; p2 v; p3 g1; each f32
+ *             [n][heads*hd]; p4 dt_bias f32 [heads*hd]; p5 a f32 [heads]; p6 beta f32
+ *             [n][heads]; p7 delta f32 [n][heads]; p8 g2 f32 [n][heads*hd]; p9 qkv f32
+ *             [n][3*heads*hd] (W: q, k, and v scaled by the fold of its beta and delta);
+ *             p10 decay f32 [n][heads*hd] (W); p11 proj f32 [n][heads*hd + heads] (W: g2,
+ *             then the beta logits). i0 n; i1 heads; i2 hd (128). f0 gate lower bound.
  * 7 MLA_Q_ABSORB p0 qb f32 [n][heads*(nope+rope)]; p1 wk_b f32 [heads][rank][nope];
  *             p2 qeff f32 [n][heads][rank+rope] (W). i0 n; i1 heads; i2 nope; i3 rope;
  *             i4 rank.
@@ -62,7 +63,7 @@ extern "C" {
 enum {
     INFERENCE_CUDA_BLOCK_OP_HC_READ = 1,
     INFERENCE_CUDA_BLOCK_OP_HC_MEAN = 4,
-    INFERENCE_CUDA_BLOCK_OP_RDA_SCAN = 6,
+    INFERENCE_CUDA_BLOCK_OP_RDA_PACK = 6,
     INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB = 7,
     INFERENCE_CUDA_BLOCK_OP_MLA_KV_PREP = 8,
     INFERENCE_CUDA_BLOCK_OP_MLA_ATTN = 9,

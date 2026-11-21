@@ -222,68 +222,39 @@ __global__ void fill_kernel(float *p, int count, float value) {
     if (i < count) p[i] = value;
 }
 
-/* ---- delta-rule scan with a decay per key channel ----------------------------------- */
+/* ---- inputs of the shared delta-rule scan ------------------------------------------ */
 
-/* One block per head, two threads per value channel w: each holds half of the state column
- * S[:][w] in registers. The per-token q, k and decay vectors are shared through smem; the
- * two halves of a pair add their partial dot products with one shuffle. */
-__global__ void __launch_bounds__(2 * kRdaDim) rda_scan_kernel(
+/* The shared sequential scan (prefill/gdn_scan_seq, CHANNEL_DECAY form) reads the conv rows as
+ * [q | k | v] of width 3 * w, a projection row [z | beta logits] and one decay value per key
+ * channel. One block per token writes those from the Raon inputs: q and k copied, v scaled by the
+ * per-head fold of its beta and delta logits, the decay exp(lower_bound * sigmoid(-(g1 + dt_bias)
+ * * a)) of every channel, z copied from the output-gate rows and the beta logits. */
+__global__ void __launch_bounds__(256) rda_pack_kernel(
     const float *q, const float *k, const float *v, const float *g1, const float *dt_bias,
-    const float *a, const float *beta, const float *delta, const float *norm_w, const float *g2,
-    float *state, float *out, int n, int heads, float lower_bound, float norm_eps) {
-    constexpr int kHalf = kRdaDim / 2;
-    __shared__ float qs[kRdaDim], ks[kRdaDim], decay[kRdaDim];
-    __shared__ float scratch[32];
-    const int head = blockIdx.x;
-    const int w = threadIdx.x >> 1;
-    const int half = threadIdx.x & 1;
-    const int width = heads * kRdaDim;
-    const float qscale = 1.0f / sqrtf((float)kRdaDim);
-    float s[kHalf];
-    float *col = state + ((size_t)head * kRdaDim + w) * kRdaDim + half * kHalf;
-#pragma unroll
-    for (int u = 0; u < kHalf; ++u) s[u] = col[u];
-    for (int t = 0; t < n; ++t) {
-        const size_t at = (size_t)t * width + (size_t)head * kRdaDim + w;
-        const float qv = q[at], kv = k[at];
-        const float own = half == 0 ? 1.0f : 0.0f;
-        const float qn = block_sum(own * qv * qv, scratch);
-        const float kn = block_sum(own * kv * kv, scratch);
-        if (half == 0) {
-            qs[w] = qv * (1.0f / fmaxf(sqrtf(qn), 1e-6f));
-            ks[w] = kv * (1.0f / fmaxf(sqrtf(kn), 1e-6f));
-            const float raw = (g1[at] + dt_bias[head * kRdaDim + w]) * a[head];
-            decay[w] = expf(lower_bound * sigmoid_f(-raw));
-        }
-        const float bi = beta[(size_t)t * heads + head];
-        const float de = bi + delta[(size_t)t * heads + head];
-        const float fold = expf(softplus_f(-bi) - softplus_f(-de));
-        const float vs = v[at] * fold;
-        const float bscan = sigmoid_f(bi);
-        __syncthreads();
-        float sk = 0.0f;
-#pragma unroll
-        for (int u = 0; u < kHalf; ++u) {
-            s[u] *= decay[half * kHalf + u];
-            sk += s[u] * ks[half * kHalf + u];
-        }
-        sk += __shfl_xor_sync(0xffffffffu, sk, 1);
-        const float dw = (vs - sk) * bscan;
-        float acc = 0.0f;
-#pragma unroll
-        for (int u = 0; u < kHalf; ++u) {
-            s[u] += ks[half * kHalf + u] * dw;
-            acc += s[u] * qs[half * kHalf + u];
-        }
-        acc += __shfl_xor_sync(0xffffffffu, acc, 1);
-        const float o = acc * qscale;
-        const float ss = block_sum(own * o * o, scratch);
-        const float rn = 1.0f / sqrtf(ss / (float)kRdaDim + norm_eps);
-        if (half == 0) out[at] = o * rn * norm_w[w] * sigmoid_f(g2[at]);
-        __syncthreads();
+    const float *a, const float *beta, const float *delta, const float *g2, float *qkv,
+    float *decay, float *proj, int heads, float lower_bound) {
+    __shared__ float fold[256];
+    const int t = blockIdx.x;
+    const int w = heads * kRdaDim;
+    const size_t row = (size_t)t * w;
+    const size_t proj_row = (size_t)t * (w + heads);
+    if (threadIdx.x < heads) {
+        const float bi = beta[(size_t)t * heads + threadIdx.x];
+        const float de = bi + delta[(size_t)t * heads + threadIdx.x];
+        fold[threadIdx.x] = expf(softplus_f(-bi) - softplus_f(-de));
+        proj[proj_row + w + threadIdx.x] = bi;
     }
-#pragma unroll
-    for (int u = 0; u < kHalf; ++u) col[u] = s[u];
+    __syncthreads();
+    for (int i = threadIdx.x; i < w; i += blockDim.x) {
+        const int h = i / kRdaDim;
+        float *dst = qkv + (size_t)t * 3 * w;
+        dst[i] = q[row + i];
+        dst[w + i] = k[row + i];
+        dst[2 * w + i] = v[row + i] * fold[h];
+        const float raw = (g1[row + i] + dt_bias[i]) * a[h];
+        decay[row + i] = expf(lower_bound * sigmoid_f(-raw));
+        proj[proj_row + i] = g2[row + i];
+    }
 }
 
 /* ---- absorbed latent attention ------------------------------------------------------ */
@@ -543,7 +514,7 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                 (const float *)p[0], (float *)p[1], (int)row, (int)h);
             return launch_status(out_stage);
         }
-        case INFERENCE_CUDA_BLOCK_OP_RDA_SCAN: {
+        case INFERENCE_CUDA_BLOCK_OP_RDA_PACK: {
             const long long n = i[0], heads = i[1], hd = i[2];
             if (n < 1 || n > 65536 || heads < 1 || heads > 256 || hd != kRdaDim)
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -553,16 +524,16 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             slots.use(5, heads * 4, false);
             slots.use(6, n * heads * 4, false);
             slots.use(7, n * heads * 4, false);
-            slots.use(8, hd * 4, false);
-            slots.use(9, n * w * 4, false);
-            slots.use(10, heads * hd * hd * 4, true);
-            slots.use(11, n * w * 4, true);
+            slots.use(8, n * w * 4, false);
+            slots.use(9, n * 3 * w * 4, true);
+            slots.use(10, n * w * 4, true);
+            slots.use(11, n * (w + heads) * 4, true);
             if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            rda_scan_kernel<<<(unsigned)heads, 2 * kRdaDim, 0, s>>>(
+            rda_pack_kernel<<<(unsigned)n, 256, 0, s>>>(
                 (const float *)p[0], (const float *)p[1], (const float *)p[2], (const float *)p[3],
                 (const float *)p[4], (const float *)p[5], (const float *)p[6], (const float *)p[7],
-                (const float *)p[8], (const float *)p[9], (float *)p[10], (float *)p[11], (int)n,
-                (int)heads, f[0], f[1]);
+                (const float *)p[8], (float *)p[9], (float *)p[10], (float *)p[11], (int)heads,
+                f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MLA_Q_ABSORB: {

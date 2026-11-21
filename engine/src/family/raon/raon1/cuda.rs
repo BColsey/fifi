@@ -22,6 +22,9 @@ use crate::EngError;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
+use crate::kernels::cuda::prefill::gdn_scan_seq::{
+    GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
+};
 use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
 use crate::kernels::cuda::prefill::mmq_mmid::{
     IdsGuardCall, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
@@ -29,20 +32,18 @@ use crate::kernels::cuda::prefill::mmq_mmid::{
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
 use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
-use crate::kernels::cuda::resident::block_ops::{
-    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RowOutputs,
-};
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
+use crate::kernels::cuda::resident::block_ops::{
+    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RdaPacked, RowOutputs,
+};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
-use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
+use crate::kernels::cuda::resident::hyper::{HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
-use crate::kernels::cuda::resident::router::{
-    RouterLogitsCall, RouterShape, RouterSigmoidCall,
-};
+use crate::kernels::cuda::resident::router::{RouterLogitsCall, RouterShape, RouterSigmoidCall};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 use crate::weights::dequantize;
 
@@ -260,6 +261,9 @@ struct Scratch {
     conv_q: DeviceBuffer,
     conv_k: DeviceBuffer,
     conv_v: DeviceBuffer,
+    scan_qkv: DeviceBuffer,
+    scan_decay: DeviceBuffer,
+    scan_proj: DeviceBuffer,
     g1: DeviceBuffer,
     g2: DeviceBuffer,
     fa: DeviceBuffer,
@@ -814,7 +818,15 @@ impl Raon1Device {
             sc.post.range(0, n * STREAMS * 4)?,
             sc.comb.range(0, n * 16 * 4)?,
         )?)?;
-        self.norm_rows(n, HIDDEN, self.hy.norm_eps, &sc.branch, self.raw(norm)?, &sc.cur, &sc.q8_cur)
+        self.norm_rows(
+            n,
+            HIDDEN,
+            self.hy.norm_eps,
+            &sc.branch,
+            self.raw(norm)?,
+            &sc.cur,
+            &sc.q8_cur,
+        )
     }
 
     /// The stream update of one half: `out = comb * resid + post * proj`.
@@ -905,12 +917,11 @@ impl Raon1Device {
             }
         }
         let state_bytes = HEADS * HEAD_DIM * HEAD_DIM * 4;
-        self.run(BlockOp::rda_scan(
+        self.run(BlockOp::rda_pack(
             n,
             HEADS,
             HEAD_DIM,
             self.hy.gate_lower_bound,
-            self.hy.norm_eps,
             RdaInputs {
                 q: sc.conv_q.range(0, row)?,
                 k: sc.conv_k.range(0, row)?,
@@ -920,12 +931,48 @@ impl Raon1Device {
                 a: self.raw(&names.ssm_a)?,
                 beta: sc.beta.range(0, n * HEADS * 4)?,
                 delta: sc.delta.range(0, n * HEADS * 4)?,
-                norm_w: self.raw(&names.ssm_norm)?,
                 g2: sc.g2.range(0, row)?,
             },
-            self.state.range(rda * state_bytes, state_bytes)?,
-            sc.scan_out.range(0, row)?,
+            RdaPacked {
+                qkv: sc.scan_qkv.range(0, 3 * row)?,
+                decay: sc.scan_decay.range(0, row)?,
+                proj: sc.scan_proj.range(0, n * (WIDTH + HEADS) * 4)?,
+            },
         )?)?;
+        // The shared sequential scan: q/k L2 norms in the ggml form, a decay per key channel, a
+        // sigmoid output gate over the per-head RMS norm.
+        self.ctx.gdn_scan_seq_channel_decay(
+            &self.stream,
+            GdnChannelScanCall {
+                shape: ScanShape {
+                    m: n,
+                    p0: 0,
+                    ctx_tokens: n,
+                    n_k_heads: HEADS,
+                    n_v_heads: HEADS,
+                    head_dim: HEAD_DIM,
+                    conv_ld: 3 * WIDTH,
+                    ld: WIDTH + HEADS,
+                    z_off: 0,
+                    beta_off: WIDTH,
+                    alpha_off: WIDTH,
+                },
+                eps: GDN_SCAN_EPS,
+                norm_eps: self.hy.norm_eps,
+                conv: sc.scan_qkv.range(0, 3 * row)?,
+                proj: sc.scan_proj.range(0, n * (WIDTH + HEADS) * 4)?,
+                decay: sc.scan_decay.range(0, row)?,
+                norm_w: self.raw(&names.ssm_norm)?,
+                state: self.state.range(rda * state_bytes, state_bytes)?,
+                o_out: sc.scan_out.range(0, row)?,
+                status: None,
+            },
+            GdnForm {
+                key_heads: GdnKeyHeads::Tiled,
+                l2: GdnL2::Ggml,
+                gate: GdnGate::Sigmoid,
+            },
+        )?;
         self.quantize(n, WIDTH, &sc.scan_out, None, Rows::q8(&sc.q8_wide))?;
         self.mv(
             &names.attn_output,
@@ -1387,6 +1434,9 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         conv_q: f(c * WIDTH)?,
         conv_k: f(c * WIDTH)?,
         conv_v: f(c * WIDTH)?,
+        scan_qkv: f(c * 3 * WIDTH)?,
+        scan_decay: f(c * WIDTH)?,
+        scan_proj: f(c * (WIDTH + HEADS))?,
         g1: f(c * WIDTH)?,
         g2: f(c * WIDTH)?,
         fa: f(c * TIME_RANK)?,

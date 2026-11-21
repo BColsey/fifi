@@ -2,7 +2,10 @@
 //! (one row, seven rows, row strides wider than the row, a cache position past zero, split keys).
 //! Device runs go through the card lease only, one test thread.
 use super::*;
-use crate::kernels::cuda::resident::block_ops::{MlaShape, RdaInputs, RowOutputs};
+use crate::kernels::cuda::prefill::gdn_scan_seq::{
+    GDN_SCAN_EPS, GdnChannelScanCall, GdnForm, GdnGate, GdnKeyHeads, GdnL2, ScanShape,
+};
+use crate::kernels::cuda::resident::block_ops::{MlaShape, RdaInputs, RdaPacked, RowOutputs};
 use crate::kernels::cuda::resident::hyper::{HyperApplyCall, HyperMixApplyCall, HyperShape};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 
@@ -374,8 +377,8 @@ impl Rig {
 }
 
 #[test]
-fn the_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
-    let Some(r) = rig("block_ops rda_scan") else {
+fn the_packed_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
+    let Some(r) = rig("block_ops rda_pack and the shared scan") else {
         return;
     };
     let (heads, hd, n) = (3usize, 128usize, 7usize);
@@ -394,6 +397,9 @@ fn the_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
         .iter()
         .map(|d| r.up(d))
         .collect();
+    let packed_qkv = r.zeros(n * 3 * width);
+    let packed_decay = r.zeros(n * width);
+    let packed_proj = r.zeros(n * (width + heads));
     let host_scan = |from: usize, to: usize, state: &mut Vec<f32>| -> Vec<f32> {
         let mut out = vec![0f32; (to - from) * width];
         for head in 0..heads {
@@ -444,12 +450,11 @@ fn the_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
         let rows = to - from;
         let slice = |b, per: usize| rows_of(b, from, rows, per);
         r.run(
-            BlockOp::rda_scan(
+            BlockOp::rda_pack(
                 rows,
                 heads,
                 hd,
                 -5.0,
-                1e-5,
                 RdaInputs {
                     q: slice(&bufs[0], width),
                     k: slice(&bufs[1], width),
@@ -459,14 +464,51 @@ fn the_delta_scan_matches_the_host_and_carries_its_state_between_calls() {
                     a: whole(&bufs[5]),
                     beta: slice(&bufs[6], heads),
                     delta: slice(&bufs[7], heads),
-                    norm_w: whole(&bufs[8]),
                     g2: slice(&bufs[9], width),
                 },
-                whole(&state),
-                out.range(from * width * 4, rows * width * 4).expect("out"),
+                RdaPacked {
+                    qkv: rows_of(&packed_qkv, from, rows, 3 * width),
+                    decay: rows_of(&packed_decay, from, rows, width),
+                    proj: rows_of(&packed_proj, from, rows, width + heads),
+                },
             )
             .expect("op"),
         );
+        r.ctx
+            .gdn_scan_seq_channel_decay(
+                &r.stream,
+                GdnChannelScanCall {
+                    shape: ScanShape {
+                        m: rows,
+                        p0: 0,
+                        ctx_tokens: rows,
+                        n_k_heads: heads,
+                        n_v_heads: heads,
+                        head_dim: hd,
+                        conv_ld: 3 * width,
+                        ld: width + heads,
+                        z_off: 0,
+                        beta_off: width,
+                        alpha_off: width,
+                    },
+                    eps: GDN_SCAN_EPS,
+                    norm_eps: 1e-5,
+                    conv: rows_of(&packed_qkv, from, rows, 3 * width),
+                    proj: rows_of(&packed_proj, from, rows, width + heads),
+                    decay: rows_of(&packed_decay, from, rows, width),
+                    norm_w: whole(&bufs[8]),
+                    state: whole(&state),
+                    o_out: out.range(from * width * 4, rows * width * 4).expect("out"),
+                    status: None,
+                },
+                GdnForm {
+                    key_heads: GdnKeyHeads::Tiled,
+                    l2: GdnL2::Ggml,
+                    gate: GdnGate::Sigmoid,
+                },
+            )
+            .expect("shared scan");
+        r.stream.synchronize().expect("drain");
         let want = host_scan(from, to, &mut host_state);
         assert_close(
             "scan",
@@ -709,7 +751,11 @@ fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
             .collect();
         for t in 0..n {
             let mut order: Vec<usize> = (0..e).collect();
-            order.sort_by(|&a, &b| logits[t * e + b].total_cmp(&logits[t * e + a]).then(a.cmp(&b)));
+            order.sort_by(|&a, &b| {
+                logits[t * e + b]
+                    .total_cmp(&logits[t * e + a])
+                    .then(a.cmp(&b))
+            });
             assert_eq!(
                 &plain[t * k..(t + 1) * k],
                 &order[..k].iter().map(|&i| i as i32).collect::<Vec<_>>()[..]
@@ -746,7 +792,13 @@ fn the_mixing_apply_with_an_identity_matrix_is_the_in_place_apply() {
     let gate = data(72, m * b, 1.0);
     let block = data(73, m * h, 1.0);
     let identity: Vec<f32> = (0..m * b * b)
-        .map(|i| if (i % (b * b)) % (b + 1) == 0 { 1.0 } else { 0.0 })
+        .map(|i| {
+            if (i % (b * b)) % (b + 1) == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect();
     let (xb, gb, bb, mb) = (r.up(&x), r.up(&gate), r.up(&block), r.up(&identity));
     let shape = HyperShape {
@@ -783,7 +835,10 @@ fn the_mixing_apply_with_an_identity_matrix_is_the_in_place_apply() {
     r.stream.synchronize().expect("drain");
     let (mixed, in_place) = (r.read(&out, m * b * h), r.read(&xb, m * b * h));
     assert!(
-        mixed.iter().zip(&in_place).all(|(a, b)| a.to_bits() == b.to_bits()),
+        mixed
+            .iter()
+            .zip(&in_place)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "the two applies differ"
     );
 }
