@@ -90,7 +90,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | Priority | Work | Evidence and remaining checks |
 | --- | --- | --- |
 | 1 | Verify native text serving | On `f45062d7`, raw HTTP and the WebGUI produced “Paris.” The browser used the model picker and received a completed SSE stream. On `4138d0df`, the follow-up supplied all three messages and displayed “France” with a 144-token output allowance. Both streams ended at EOS. The 68-token control reached its limit before visible answer text. All 12 HTTP cases passed at `8a6c6347`, including cancellation and the following independent raw request. |
-| 2 | Qualify bounded prefill | `c651c820` adds opt-in visit-major prefill. Two-row prefill was bitwise equal to serial for all 200,058 logits at each of six prompt positions and a follow-up. On a repeated 62-token prompt producing eight identical tokens at 5 GiB, time to first token rose from 36.39 s to 44.44 s, and process-attributed reads rose from 19.92 GB to 33.30 GB. At `8a6c6347`, four rows also matched every serial logit on real weights, including the first row after prefill. Two-row parity passed again on the `71aa350c` release test build. Measure the four-row latency and I/O on an idle host. |
+| 2 | Qualify bounded prefill | `c651c820` adds opt-in visit-major prefill. Two-row prefill was bitwise equal to serial for all 200,058 logits at each of six prompt positions and a follow-up. On a repeated 62-token prompt producing eight identical tokens at 5 GiB, the early two-row run increased time to first token from 36.39 s to 44.44 s and attributed reads from 19.92 GB to 33.30 GB. At `8a6c6347`, four rows also matched every serial logit on real weights, including the first row after prefill. The idle-host mapped-weight comparison below measured a 6–9 second reduction in time to first token with four rows, with mixed physical I/O results. Two- and four-row parity also passed on the `71aa350c` release test build. |
 | 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced all 3,909 cache misses under byte-weighted LRU. All 4,388 repeated expert selections within the same token’s core passes hit the cache. Across tokens, 3,991 of 6,632 repeated selections hit. Layers 23 and 22 accounted for the most logical reads. Adjacent expert coalescing saved 312 read ranges on the first request and 282 on its repeat, measured against a one-range-per-expert-tensor replay with identical payload bytes. Frequency-based replay increased logical payload reads by 3.7%. The idle-host sustained comparison measured about 34% less process-attributed disk I/O with mapped weights and file-cache retention. Keep mapped storage opt-in. |
 | 4 | Measure placement | On the safetensors short repeat, 11 decode steps spent 1.68 s in CPU attention, 3.90 s in expert staging including 2.80 s of demand reads, and 1.11 s in synchronized Metal readback. Real-weight one-row QKV tests favored four CPU workers over the widened Metal path. The short end-to-end safetensors run showed a small decode gain with four workers. The GGUF experiments below test attention workers and grouped readback separately. |
 | 5 | Verify scaling | At a 192-token context, preflight rejected all three artifacts with a 1 GiB ceiling. The safetensors plan required 3,471,813,632 bytes, and each GGUF plan required 1,206,322,432 bytes. The mini applied the 5 GiB, 6 GiB and automatic ceilings in the idle-host run below. Automatic sizing incurred swap-outs on the first request and hit every expert on the repeat. The larger-device planner checks use simulated budgets. |
@@ -137,6 +137,19 @@ The same `8a6c6347` binary processed 62 input and eight greedy output tokens wit
 | Repeat | Mapped and file cache | 61.27 | 1.01 | 1.00 | 68.30 | 126.92 | 32.15 | 0.46 | 0 |
 
 Attributed disk reads fell by 30.1% and 24.9%. The first request’s time to first token increased by 4.34 s. The private-cache repeat coincided with 37,250 system-wide swap-out pages, which limits the throughput comparison. macOS can reclaim the mapped pages, and their total residency is outside the process footprint column.
+
+### Idle-host four-row prefill at 5 GiB
+
+The `8a6c6347` binary compared one row with four rows for the same 62 input and eight greedy output tokens. Both used mapped dense weights and file-cache-only expert retention. Each ran twice in its own server process, with the one-row process first. All four outputs matched. No competing build was detected. The OS page cache was uncontrolled.
+
+| Request | Prefill rows | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (GB) | Peak process footprint (GB) | Swap-out pages |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| First | 1 | 30.35 | 2.04 | 2.24 | 33.48 | 126.92 | 7.78 | 0.39 | 0 |
+| First | 4 | 20.95 | 2.96 | 2.17 | 24.19 | 85.00 | 5.93 | 0.50 | 0 |
+| Repeat | 1 | 27.09 | 2.29 | 2.22 | 30.24 | 126.92 | 5.54 | 0.39 | 0 |
+| Repeat | 4 | 20.91 | 2.97 | 2.15 | 24.16 | 85.00 | 5.98 | 0.50 | 0 |
+
+Four-row prefill reduced the first request’s time to first token by 9.40 s and the repeat’s by 6.18 s. It reduced logical expert payload reads during prefill by 36.8%, with traffic during decode unchanged. Attributed disk reads fell by 23.7% on the first request and rose by 7.8% on the repeat. Receipts `idle-long-file-only.json` and `idle-long-window4.json` include per-phase read ranges and byte counts.
 
 ### Sustained decode at 5 GiB
 
