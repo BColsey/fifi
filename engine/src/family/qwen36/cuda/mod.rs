@@ -179,9 +179,6 @@ mod prefix_shape;
 mod prefix_tests;
 #[cfg(test)]
 mod r5_fmt;
-mod readback;
-#[cfg(test)]
-mod readback_tests;
 mod resources;
 #[cfg(test)]
 mod resources_tests;
@@ -189,12 +186,12 @@ mod resources_tests;
 mod rollback_window_device_tests;
 #[cfg(test)]
 mod router_tests;
+use crate::family::decode_step::{readback, run_report, verdict};
+#[cfg(test)]
+mod peer_payload_tests;
 mod rules;
 #[cfg(test)]
 mod rules_tests;
-mod run_report;
-#[cfg(test)]
-mod run_report_tests;
 mod section_timing;
 #[cfg(all(test, feature = "native-cuda"))]
 #[path = "section_timing_device_tests.rs"]
@@ -230,8 +227,5 @@ mod tests;
 mod tiered_load;
 mod tiered_step;
 mod trace;
-mod verdict;
-#[cfg(test)]
-mod verdict_tests;
 #[cfg(test)]
 mod window_bench_device_tests;

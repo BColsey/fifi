@@ -100,8 +100,8 @@ fn the_prefill_report_accumulates_until_a_reset() {
 /// The fixture report: two pieces of 128 and 1 tokens, which feed 127 and 1 rows, so one chunk of
 /// 127 rows and one one-row feed.
 fn fixture_report() -> super::run_report::PrefillReport {
+    use super::ChunkVerdict;
     use super::run_report::{StepKind, StepRecord};
-    use super::step::ChunkVerdict;
 
     let mut report = super::run_report::PrefillReport::default();
     report.refill(
@@ -109,7 +109,7 @@ fn fixture_report() -> super::run_report::PrefillReport {
         741_200_000,
         65_536,
         800_000_000,
-        super::dims::KvMode::Fp16,
+        super::KvMode::Fp16,
         crate::family::project::cuda::WeightLayout::Native,
         false,
     );
@@ -159,7 +159,7 @@ fn take_job_line_returns_once_until_a_reset() {
         0,
         0,
         0,
-        super::dims::KvMode::Fp16,
+        super::KvMode::Fp16,
         crate::family::project::cuda::WeightLayout::Native,
         false,
     );
@@ -203,8 +203,8 @@ fn c1_reset_clears_lookup_facts_without_requiring_another_restore() {
 }
 
 #[derive(Default)]
-struct PrefixHostStep {
-    fed: usize,
+pub(crate) struct PrefixHostStep {
+    pub(crate) fed: usize,
     report: PrefillReport,
 }
 
@@ -239,7 +239,7 @@ fn refill_prefix_report(report: &mut PrefillReport) {
         0,
         0,
         0,
-        super::dims::KvMode::Fp16,
+        super::KvMode::Fp16,
         crate::family::project::cuda::WeightLayout::Native,
         false,
     );
@@ -469,65 +469,4 @@ fn c1_all_denied_is_a_miss_and_fatal_restore_remains_an_error() {
         "failed import is not a hit"
     );
     assert_eq!(slot.entries_len(), 1);
-}
-
-#[test]
-fn peer_payload_tracks_published_shards_through_replacement_and_eviction() {
-    use super::state::{
-        StateIdentity,
-        export::{DeltaExport, ExportedState, KvExport},
-    };
-    use super::{common_tests, dims::KvMode, prefix::stored_prefix_report};
-
-    let mut store = PrefixSlot::with_limits(StoreLimits {
-        roots: 1,
-        entries: 1,
-    });
-    let lookup = PrefixReport {
-        hit: PrefixHit::Root,
-        uncached_shared: 7,
-        ..PrefixReport::default()
-    };
-    let totals = |slot: &PrefixSlot<Vec<ExportedState>, u8>| {
-        let report = stored_prefix_report(slot, lookup);
-        assert_eq!((report.hit, report.uncached_shared), (PrefixHit::Root, 7));
-        (report.entries, report.bytes)
-    };
-    let identity = StateIdentity::new(&common_tests::dims(), KvMode::Fp16);
-    let save = |slot: &mut _, key: &[u32], kind| {
-        let mut session = DecodeSession::default();
-        let mut step = PrefixHostStep::default();
-        session.prefill(&mut step, key, 2048).unwrap();
-        let rows = step.fed;
-        let shard = |rec, conv, k, v| ExportedState {
-            identity: identity.clone(),
-            tokens: rows,
-            delta: vec![DeltaExport {
-                recurrent: vec![0.0; rec],
-                conv: vec![0.0; conv],
-            }],
-            kv: vec![KvExport {
-                planes: vec![vec![0; k * rows], vec![0; v * rows]],
-            }],
-        };
-        assert!(
-            session
-                .save_prefix(slot, key, 0, rows, kind, || Ok(vec![
-                    shard(2, 1, 1, 2),
-                    shard(1, 3, 4, 2),
-                ]))
-                .unwrap()
-        );
-    };
-    // The two shards retain 28 fixed bytes plus nine bytes per committed row.
-    assert_eq!(totals(&store), (0, 0));
-    save(&mut store, &[7, 6], SaveKind::Root);
-    assert_eq!(totals(&store), (1, 37));
-    save(&mut store, &[1, 2, 3], SaveKind::Tip);
-    assert_eq!(totals(&store), (2, 83));
-    save(&mut store, &[3, 4, 5, 6], SaveKind::Tip);
-    save(&mut store, &[3, 4, 5, 6], SaveKind::Tip);
-    assert_eq!(totals(&store), (2, 92));
-    assert!(store.evict_lru_one(None));
-    assert_eq!(totals(&store), (1, 37));
 }

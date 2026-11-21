@@ -18,7 +18,7 @@
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Decision {
+pub(crate) enum Decision {
     /// Hand the pair's status to `commit_step`. A clean status commits and yields `token`; a
     /// non-zero status is refused there (the state is poisoned). `token` is 0 and unused when
     /// the status is not clean: the filler token of a flagged row never reaches the sampler.
@@ -28,7 +28,7 @@ pub(super) enum Decision {
 }
 
 /// Maps the status before the token: a flagged row is never judged by its token.
-pub(super) fn decide(pair: ResultPair, vocab: usize) -> Decision {
+pub(crate) fn decide(pair: ResultPair, vocab: usize) -> Decision {
     if pair.status.0 != 0 {
         return Decision::Commit {
             token: 0,
@@ -43,7 +43,7 @@ pub(super) fn decide(pair: ResultPair, vocab: usize) -> Decision {
     }
 }
 
-pub(super) fn bad_token_error(token: i32) -> EngError {
+pub(crate) fn bad_token_error(token: i32) -> EngError {
     EngError::Backend {
         operation: "sample",
         message: format!("the device argmax chose token {token}, outside the vocabulary"),
@@ -51,7 +51,7 @@ pub(super) fn bad_token_error(token: i32) -> EngError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FailureAction {
+pub(crate) enum FailureAction {
     /// Nothing was queued: take the admitted step back (`cancel_enqueue`).
     Cancel,
     /// Work may be queued: poison the state.
@@ -61,7 +61,7 @@ pub(super) enum FailureAction {
 /// `entered` counts the ops of the body that were entered, the failing one included. Op 1 is
 /// `step_begin`, a single wrapper that queues nothing when it refuses; any later op may have
 /// queued work (a block is entered whole), so any `run_block` error poisons.
-pub(super) fn action_for(entered: usize) -> FailureAction {
+pub(crate) fn action_for(entered: usize) -> FailureAction {
     if entered <= 1 {
         FailureAction::Cancel
     } else {
@@ -74,6 +74,6 @@ pub(super) fn action_for(entered: usize) -> FailureAction {
 /// rule of [`action_for`] would read "the first op refused to launch, nothing ran" and take the
 /// step back. The failed sync counts as having entered the next op, so the rule poisons.
 #[must_use]
-pub(super) fn entered_after_failed_sync(entered: usize) -> usize {
+pub(crate) fn entered_after_failed_sync(entered: usize) -> usize {
     entered + 1
 }

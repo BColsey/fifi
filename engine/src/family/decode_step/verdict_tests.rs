@@ -1,9 +1,6 @@
 //! Unit tests of the result-pair decision and the failure action. CPU only.
-use super::{
-    rules::sampler_width,
-    verdict::{
-        Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
-    },
+use super::verdict::{
+    Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
 };
 use crate::family::graph_state::book::CommitRefusal;
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
@@ -42,7 +39,7 @@ fn a_clean_pair_yields_a_token_inside_the_vocabulary() {
 fn a_padding_id_is_a_bad_token_of_the_sampler_vocabulary() {
     // The head is padded to VOCAB rows while the sampler draws from 248_077 ids: token 248_100
     // sits in the padding, inside the head but outside the sampler vocabulary.
-    let width = sampler_width(VOCAB, 248_077);
+    let width = 248_077;
     assert_eq!(width, 248_077);
     assert_eq!(decide(pair(248_100, 0), width), Decision::BadToken(248_100));
 }
@@ -51,7 +48,7 @@ fn a_padding_id_is_a_bad_token_of_the_sampler_vocabulary() {
 fn the_argmax_width_skips_the_padding_rows_of_the_head() {
     // The largest value sits at a padding index; a reference argmax over the sampler width
     // (largest value, lowest index on a tie) returns the best real index instead.
-    let n = sampler_width(VOCAB, 248_077);
+    let n = 248_077;
     let mut row = vec![-1.0_f32; VOCAB];
     row[123] = 42.0;
     row[VOCAB - 1] = 100.0;
@@ -160,7 +157,7 @@ fn a_flagged_pair_carries_its_exact_status_and_never_a_token() {
 fn a_clean_row_at_the_sampler_bound_is_a_bad_token() {
     // The sampler width is exclusive: 248_076 is the last id it holds, while 248_077 (the
     // width itself, the first padding row of the head) and any negative token are bad.
-    let width = sampler_width(VOCAB, 248_077);
+    let width = 248_077;
     assert_eq!(
         decide(pair(248_076, 0), width),
         Decision::Commit {

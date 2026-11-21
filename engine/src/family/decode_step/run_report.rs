@@ -37,13 +37,13 @@ impl CaptureOutcome {
 /// reached it (an event wait, or a blocking host-to-device write, which returns when the copy
 /// finished behind the queued work). A plain step adds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct HostSyncs {
-    pub(super) waits: u32,
-    pub(super) writes: u32,
+pub(crate) struct HostSyncs {
+    pub(crate) waits: u32,
+    pub(crate) writes: u32,
 }
 
 impl HostSyncs {
-    pub(super) fn add(&mut self, other: HostSyncs) {
+    pub(crate) fn add(&mut self, other: HostSyncs) {
         self.waits += other.waits;
         self.writes += other.writes;
     }
@@ -85,7 +85,7 @@ pub(crate) struct PieceRecord {
     pub(crate) ns: u64,
 }
 
-/// The plain tag of one chunk-gate verdict: the verdict enum itself is pub(super) in the step, so
+/// The plain tag of one chunk-gate verdict: the verdict enum itself is pub(crate) in the step, so
 /// the report keeps the label only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkVerdictTag {
@@ -109,14 +109,14 @@ impl ChunkVerdictTag {
         }
     }
 
-    pub(crate) const fn of(verdict: &super::step::ChunkVerdict) -> Self {
+    pub(crate) const fn of(verdict: &super::ChunkVerdict) -> Self {
         match verdict {
-            super::step::ChunkVerdict::Ready { .. } => Self::Ready,
-            super::step::ChunkVerdict::TiledLayout => Self::TiledLayout,
-            super::step::ChunkVerdict::Kv8 => Self::Kv8,
-            super::step::ChunkVerdict::Tiered => Self::Tiered,
-            super::step::ChunkVerdict::Q6KWeight => Self::Q6KWeight,
-            super::step::ChunkVerdict::NoArena => Self::NoArena,
+            super::ChunkVerdict::Ready { .. } => Self::Ready,
+            super::ChunkVerdict::TiledLayout => Self::TiledLayout,
+            super::ChunkVerdict::Kv8 => Self::Kv8,
+            super::ChunkVerdict::Tiered => Self::Tiered,
+            super::ChunkVerdict::Q6KWeight => Self::Q6KWeight,
+            super::ChunkVerdict::NoArena => Self::NoArena,
         }
     }
 }
@@ -153,7 +153,7 @@ fn bracket(items: &[String]) -> String {
 /// Pure host values, so it is its own type: RunReport stays Copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PrefillReport {
-    pub(super) prefix_lookup: PrefixReport,
+    pub(crate) prefix_lookup: PrefixReport,
     steps: Vec<StepRecord>,
     n_prefilled: usize,
     n_fed: usize,
@@ -170,14 +170,14 @@ pub(crate) struct PrefillReport {
     arena_bytes: usize,
     part_bytes: usize,
     budget_bytes: usize,
-    kv_mode: Option<super::dims::KvMode>,
+    kv_mode: Option<super::KvMode>,
     layout: crate::family::project::cuda::WeightLayout,
     capture_on: bool,
     logged: bool,
 }
 
 /// Capture lookup facts before this request's saves and evictions can change them.
-pub(super) fn prefix_lookup<S, P>(
+pub(crate) fn prefix_lookup<S, P>(
     prefix: &PrefixSlot<S, P>,
     prompt: &[u32],
     covered: usize,
@@ -192,7 +192,7 @@ pub(super) fn prefix_lookup<S, P>(
 }
 
 impl PrefillReport {
-    pub(super) fn observe_prefix_lookup<S, P>(
+    pub(crate) fn observe_prefix_lookup<S, P>(
         &mut self,
         prefix: &PrefixSlot<S, P>,
         prompt: &[u32],
@@ -267,14 +267,14 @@ impl PrefillReport {
         self.pieces.push(PieceRecord { tokens, ns });
     }
 
-    pub(crate) fn note_feed_rows(&mut self, verdict: &super::step::ChunkVerdict, rows: usize) {
+    pub(crate) fn note_feed_rows(&mut self, verdict: &super::ChunkVerdict, rows: usize) {
         self.verdict = Some(ChunkVerdictTag::of(verdict));
         self.path_taken = Some(match verdict {
-            super::step::ChunkVerdict::Ready { .. } => PathTag::Chunk,
+            super::ChunkVerdict::Ready { .. } => PathTag::Chunk,
             _ => PathTag::PerToken,
         });
         self.m_sess = match verdict {
-            super::step::ChunkVerdict::Ready { m_sess } => Some(*m_sess),
+            super::ChunkVerdict::Ready { m_sess } => Some(*m_sess),
             _ => None,
         };
         self.feed_rows_calls.push(rows);
@@ -292,7 +292,7 @@ impl PrefillReport {
         arena_bytes: usize,
         part_bytes: usize,
         budget_bytes: usize,
-        kv_mode: super::dims::KvMode,
+        kv_mode: super::KvMode,
         layout: crate::family::project::cuda::WeightLayout,
         capture_on: bool,
     ) {

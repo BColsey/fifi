@@ -1,6 +1,13 @@
 pub(crate) mod admission_sketch;
 pub(crate) mod card_fit;
 mod config;
+// Gated with the CUDA families: the step's result pair and kernels are device types.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "report and cache-form helpers that the CUDA step reaches only under test or tracing"
+)]
+pub(crate) mod decode_step;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod engine_announce;
 #[allow(
