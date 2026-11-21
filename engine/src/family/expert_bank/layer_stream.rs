@@ -418,6 +418,13 @@ pub(crate) trait ExpertTransport {
     /// The visits that read `slot` are queued: the next copy into it may follow them on the
     /// stream.
     fn release(&mut self, slot: usize) -> Result<(), EngError>;
+
+    /// The seconds the compute stream stalled on each layer's copy, measured on the compute
+    /// stream itself (the layer number and the seconds, one entry per wait), and forgets them.
+    /// A transport that cannot measure it answers nothing and the report uses the host's wait.
+    fn take_stalls(&mut self) -> Result<Vec<(usize, f64)>, EngError> {
+        Ok(Vec::new())
+    }
 }
 
 impl<T: ExpertTransport + ?Sized> ExpertTransport for &mut T {
@@ -438,6 +445,10 @@ impl<T: ExpertTransport + ?Sized> ExpertTransport for &mut T {
 
     fn release(&mut self, slot: usize) -> Result<(), EngError> {
         (**self).release(slot)
+    }
+
+    fn take_stalls(&mut self) -> Result<Vec<(usize, f64)>, EngError> {
+        (**self).take_stalls()
     }
 }
 
@@ -713,6 +724,19 @@ impl<'a, T: ExpertTransport> LayerMajor<'a, T> {
             }
             report.layers.push(row);
         }
+        // The compute stream's own stall replaces the host's wait where the transport has it:
+        // the host also waits behind earlier compute, which is not copy time.
+        let mut stalled: Vec<Option<f64>> = vec![None; report.layers.len()];
+        for (layer, seconds) in self.transport.take_stalls()? {
+            if let Some(slot) = stalled.get_mut(layer) {
+                *slot = Some(slot.unwrap_or(0.0) + seconds);
+            }
+        }
+        for (row, stall) in report.layers.iter_mut().zip(stalled) {
+            if let Some(seconds) = stall {
+                row.exposed_seconds = seconds;
+            }
+        }
         Ok(report)
     }
 }
@@ -918,6 +942,8 @@ mod tests {
         copy_s: f64,
         /// The layer each staging slot holds.
         owner: Vec<Option<usize>>,
+        /// What `take_stalls` answers.
+        stalls: Vec<(usize, f64)>,
     }
 
     impl ExpertTransport for Fake<'_> {
@@ -950,6 +976,10 @@ mod tests {
                 bytes: ticket.1,
                 seconds: self.copy_s,
             })
+        }
+
+        fn take_stalls(&mut self) -> Result<Vec<(usize, f64)>, EngError> {
+            Ok(std::mem::take(&mut self.stalls))
         }
 
         fn release(&mut self, slot: usize) -> Result<(), EngError> {
@@ -1014,6 +1044,7 @@ mod tests {
             layers: layers.to_vec(),
             copy_s: 0.01,
             owner: vec![None; plan.staging_slots().max(1)],
+            stalls: Vec::new(),
         };
         let mut driver = LayerMajor::new(plan, layers, rule, fake).unwrap();
         driver.run(recipe).unwrap()
@@ -1174,6 +1205,40 @@ mod tests {
     }
 
     #[test]
+    fn the_transports_stall_replaces_the_hosts_wait() {
+        let layers = model(3);
+        let plan = streamed_plan(&layers);
+        let log = std::cell::RefCell::new(Log::default());
+        let fake = Fake {
+            log: &log,
+            layers: layers.clone(),
+            copy_s: 0.5,
+            owner: vec![None; 2],
+            stalls: vec![(0, 0.25), (1, 0.125), (1, 0.125)],
+        };
+        let mut recipe = Recipe {
+            log: &log,
+            layers: 3,
+            pieces: vec![8],
+            picks: vec![1],
+            predicted: None,
+        };
+        let mut driver =
+            LayerMajor::new(&plan, &layers, UploadRule::pinned_defaults(2), fake).unwrap();
+        let report = driver.run(&mut recipe).unwrap();
+        assert_eq!(report.layers[0].exposed_seconds, 0.25);
+        assert_eq!(report.layers[1].exposed_seconds, 0.25);
+        // Layer 2 reported no stall: the host's wait stays.
+        assert!(report.layers[2].exposed_seconds < 0.1);
+        // Copy 0.5 s per layer, 0.5 s stalled of 1.5 s: a third of the copy was exposed.
+        assert!(
+            (report.overlap() - (1.0 - 0.5 / 1.5)).abs() < 0.05,
+            "{}",
+            report.overlap()
+        );
+    }
+
+    #[test]
     fn a_plan_for_another_model_is_refused() {
         let layers = model(4);
         let plan = streamed_plan(&layers);
@@ -1183,6 +1248,7 @@ mod tests {
             layers: layers.clone(),
             copy_s: 0.0,
             owner: vec![None; 2],
+            stalls: Vec::new(),
         };
         assert!(
             LayerMajor::new(&plan, &layers[..3], UploadRule::pinned_defaults(2), fake).is_err()

@@ -320,6 +320,32 @@ impl Drop for MappedStaging {
 }
 
 impl NativeWeight {
+    /// A weight over a device buffer the caller fills with the file's native blocks, for a
+    /// stack that is staged into the buffer after the weight exists. The buffer must hold
+    /// exactly the bytes of `n_rows` rows of `k` values.
+    pub(crate) fn from_buffer(
+        buffer: DeviceBuffer,
+        quant: QuantType,
+        k: usize,
+        n_rows: usize,
+        experts: Option<usize>,
+    ) -> Result<Self, EngError> {
+        let want = quant.weight_bytes(n_rows, k);
+        if want != Some(buffer.bytes()) {
+            return Err(EngError::BadRequest(format!(
+                "a native weight of {n_rows} rows of {k} values holds {want:?} bytes, the buffer has {}",
+                buffer.bytes()
+            )));
+        }
+        Ok(Self {
+            buffer,
+            quant,
+            k,
+            n_rows,
+            experts,
+        })
+    }
+
     /// Rows (output values per token) of the weight: the TOTAL row count, which for a
     /// rank-3 stack is `experts` consecutive matrices of `n_rows / experts` rows each
     /// (the depth rides `experts()`).

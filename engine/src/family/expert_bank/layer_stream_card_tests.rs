@@ -213,6 +213,7 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
                             buf: index,
                             offset: at,
                         },
+                        shape: None,
                     })
                     .collect(),
             );
@@ -227,6 +228,7 @@ fn run(layers: usize, from_file: bool, rule: UploadRule, predicted: Option<Vec<u
                     file: Arc::clone(&file),
                     offset,
                 },
+                shape: None,
             })
             .collect();
     }
@@ -397,6 +399,7 @@ fn pinned_stream_rate_and_overlap() {
                         buf: layer,
                         offset: s * stack,
                     },
+                    shape: None,
                 })
                 .collect::<Vec<_>>(),
         );
@@ -454,5 +457,133 @@ fn pinned_stream_rate_and_overlap() {
             "compute per layer {} ms: compute only {compute_only:.3} s, streamed wall {wall:.3} s; {report}",
             (compute_only * 1000.0 / layers as f64) as u32
         );
+    }
+}
+
+/// Stack bytes of Q8_0 blocks with a finite scale and arbitrary quants.
+fn q8_0_stack(seed: u8, rows: usize, k: usize) -> Vec<u8> {
+    let blocks = rows * (k / 32);
+    let mut out = Vec::with_capacity(blocks * 34);
+    for block in 0..blocks {
+        out.extend_from_slice(&[0x00, 0x2c]); // f16 0.0625
+        out.extend((0..32).map(|i| {
+            (block as u8)
+                .wrapping_mul(7)
+                .wrapping_add((i as u8).wrapping_mul(13))
+                .wrapping_add(seed)
+        }));
+    }
+    out
+}
+
+/// A stack staged into its slot is read by the same matvec as a resident copy of the same bytes
+/// and gives the same bits, for two layers of different size sharing the slots.
+#[test]
+#[ignore = "needs a GPU (under 1 GiB)"]
+fn a_staged_stack_reads_bit_identical_to_a_resident_one() {
+    use super::layer_stream_card::StackShape;
+    use crate::kernels::cuda::{
+        NativeWeight,
+        resident::{
+            matvec_q::QuantType,
+            quantize_q8_1::{QuantizeCall, q8_1_bytes},
+        },
+    };
+    assert!(device_present("staged native weight"), "a GPU is required");
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.shared_context();
+    let compute = Rc::new(ctx.stream().expect("stream"));
+    let k = 256usize;
+    let experts = 8usize;
+    // Two layers of different row counts per expert: different bytes, one slot pair.
+    let rows_per_expert = [64usize, 96];
+    let mut store = Vec::new();
+    let mut spans = Vec::new();
+    let mut bytes_of = Vec::new();
+    for (layer, rows) in rows_per_expert.iter().enumerate() {
+        let n_rows = experts * rows;
+        let bytes = q8_0_stack(layer as u8 + 1, n_rows, k);
+        let mut buffer = ctx.pinned_buf(bytes.len()).expect("pinned");
+        buffer.write(0, &bytes).expect("fill");
+        store.push(buffer);
+        spans.push(vec![StackSpan {
+            bytes: bytes.len(),
+            home: StackHome::Pinned {
+                buf: layer,
+                offset: 0,
+            },
+            shape: Some(StackShape {
+                quant: QuantType::Q80,
+                k,
+                n_rows,
+            }),
+        }]);
+        bytes_of.push((bytes, n_rows));
+    }
+    let mut transport = CardTransport::new(
+        Rc::clone(&ctx),
+        Rc::clone(&compute),
+        experts,
+        spans,
+        store,
+        2,
+    )
+    .expect("transport");
+    let activation: Vec<u8> = (0..k)
+        .flat_map(|i| (((i * 37 % 101) as f32 - 50.0) / 25.0).to_le_bytes())
+        .collect();
+    let x = ctx.upload(&activation).expect("x");
+    let pack = ctx.allocate(q8_1_bytes(k, 1).expect("pack")).expect("pack");
+    ctx.quantize_q8_1(
+        &compute,
+        QuantizeCall {
+            x: x.range(0, x.bytes()).expect("x"),
+            y: pack.range(0, pack.bytes()).expect("pack"),
+            k,
+            ncols: 1,
+        },
+    )
+    .expect("quantize");
+    for (layer, (bytes, n_rows)) in bytes_of.iter().enumerate() {
+        let slot = layer % 2;
+        let ticket = transport
+            .begin(layer, &UploadSet::Whole, slot)
+            .expect("begin");
+        transport.wait(ticket).expect("wait");
+        let resident = NativeWeight::from_buffer(
+            ctx.upload(bytes).expect("resident"),
+            QuantType::Q80,
+            k,
+            *n_rows,
+            Some(experts),
+        )
+        .expect("resident weight");
+        let out_bytes = n_rows * 4;
+        let y_resident = ctx.allocate(out_bytes).expect("y");
+        let y_staged = ctx.allocate(out_bytes).expect("y");
+        ctx.matvec_native(
+            &compute,
+            &resident,
+            pack.range(0, pack.bytes()).expect("pack"),
+            y_resident.range(0, out_bytes).expect("y"),
+            1,
+        )
+        .expect("resident matvec");
+        let staged = transport.staged(layer, slot, 0).expect("staged weight");
+        assert_eq!(staged.n_rows(), *n_rows);
+        ctx.matvec_native(
+            &compute,
+            staged,
+            pack.range(0, pack.bytes()).expect("pack"),
+            y_staged.range(0, out_bytes).expect("y"),
+            1,
+        )
+        .expect("staged matvec");
+        let (mut a, mut b) = (vec![0u8; out_bytes], vec![0u8; out_bytes]);
+        y_resident.read_at(&compute, 0, &mut a).expect("read");
+        y_staged.read_at(&compute, 0, &mut b).expect("read");
+        assert!(a.iter().any(|&byte| byte != 0), "the matvec produced zeros");
+        assert_eq!(a, b, "layer {layer}: staged against resident");
+        transport.release(slot).expect("release");
     }
 }

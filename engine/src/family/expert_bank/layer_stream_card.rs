@@ -4,11 +4,12 @@
 //!
 //! Layout. A layer has one or more stacks (gate, up, down), each `experts` equal records in the
 //! file's own quantization; the launches address expert `e` of a stack at `e * stack_bytes /
-//! experts`. A staging slot holds one device buffer per stack index, sized for the largest layer's
-//! stack at that index, so a whole-layer copy and a subset copy both leave expert `e` at its
-//! natural offset and the router's ids index the staged stack unchanged. A layer's stacks of a
-//! different size or quantization are read through [`CardTransport::stack`], which returns the
-//! exact byte range of this layer in the slot.
+//! experts`. A staging slot holds, for each distinct (stack index, byte count, shape) of the
+//! model, one device buffer of exactly that size, so a stack the transport staged can be a
+//! [`NativeWeight`] over its own buffer ([`CardTransport::staged`]): the launches that read a
+//! resident stack read the staged one unchanged, and layers of different size or quantization
+//! each get a buffer that fits them. A whole-layer copy and a subset copy both leave expert `e`
+//! at its natural offset, so the router's ids index the staged stack unchanged.
 //!
 //! Order. `begin` makes the copy stream wait for the slot's `used` event (recorded on the compute
 //! stream by `release`, so a copy never overwrites bytes a launch still reads), queues the
@@ -28,7 +29,8 @@ use super::layer_stream::{ExpertTransport, TransferReport, UploadSet};
 use crate::{
     EngError,
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, PinnedBuf, TimingEvent,
+        CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, NativeWeight, PinnedBuf,
+        TimingEvent, resident::matvec_q::QuantType,
     },
 };
 
@@ -44,25 +46,67 @@ pub(crate) enum StackHome {
     File { file: Arc<File>, offset: u64 },
 }
 
+/// The quantization and shape of a stack, when the staged copy is read as a [`NativeWeight`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StackShape {
+    pub(crate) quant: QuantType,
+    pub(crate) k: usize,
+    /// Rows of the whole stack (experts times rows of one expert).
+    pub(crate) n_rows: usize,
+}
+
 /// One stack of one layer.
 pub(crate) struct StackSpan {
     pub(crate) bytes: usize,
     pub(crate) home: StackHome,
+    pub(crate) shape: Option<StackShape>,
 }
 
-/// What `begin` hands back: the slot, the bytes queued and the host seconds spent reading files.
+/// What `begin` hands back: the layer, the slot, the bytes queued and the host seconds spent
+/// reading files.
 pub(crate) struct CardTicket {
+    layer: usize,
     slot: usize,
     bytes: u64,
     read_seconds: f64,
 }
 
+/// One staged stack: a raw buffer, or a native weight over one.
+enum Stage {
+    Raw(DeviceBuffer),
+    Native(NativeWeight),
+}
+
+impl Stage {
+    fn buffer(&self) -> &DeviceBuffer {
+        match self {
+            Self::Raw(buffer) => buffer,
+            Self::Native(weight) => weight.buffer(),
+        }
+    }
+}
+
+/// The key of a staging buffer: its stack index, byte count and shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StageKey {
+    stack: usize,
+    bytes: usize,
+    shape: Option<StackShape>,
+}
+
 struct Slot {
-    stacks: Vec<DeviceBuffer>,
+    stages: Vec<Stage>,
     bounce: Option<PinnedBuf>,
     used: DeviceEvent,
     used_recorded: bool,
     copied: DeviceEvent,
+    start: TimingEvent,
+    end: TimingEvent,
+}
+
+/// A pair of timing events on the compute stream around its wait for a slot's copy.
+struct StallPair {
+    layer: usize,
     start: TimingEvent,
     end: TimingEvent,
 }
@@ -74,9 +118,13 @@ pub(crate) struct CardTransport {
     copy: DeviceStream,
     experts: usize,
     layers: Vec<Vec<StackSpan>>,
+    /// `stage_of[layer][stack]` indexes every slot's `stages`.
+    stage_of: Vec<Vec<usize>>,
     store: Vec<PinnedBuf>,
     slots: Vec<Slot>,
     read_seconds: f64,
+    stalls: Vec<StallPair>,
+    spare_stalls: Vec<(TimingEvent, TimingEvent)>,
 }
 
 impl CardTransport {
@@ -120,15 +168,24 @@ impl CardTransport {
                 }
             }
         }
-        let widest: Vec<usize> = (0..stacks)
-            .map(|stack| {
-                layers
-                    .iter()
-                    .map(|spans| spans[stack].bytes)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
+        let mut keys: Vec<StageKey> = Vec::new();
+        let mut stage_of: Vec<Vec<usize>> = Vec::with_capacity(layers.len());
+        for spans in &layers {
+            let mut row = Vec::with_capacity(stacks);
+            for (stack, span) in spans.iter().enumerate() {
+                let key = StageKey {
+                    stack,
+                    bytes: span.bytes,
+                    shape: span.shape,
+                };
+                let at = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+                    keys.push(key);
+                    keys.len() - 1
+                });
+                row.push(at);
+            }
+            stage_of.push(row);
+        }
         let any_file = layers
             .iter()
             .flatten()
@@ -141,12 +198,22 @@ impl CardTransport {
         let copy = ctx.stream()?;
         let mut staged = Vec::with_capacity(slots);
         for _ in 0..slots {
-            let mut buffers = Vec::with_capacity(stacks);
-            for bytes in &widest {
-                buffers.push(ctx.allocate(*bytes)?);
+            let mut stages = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let buffer = ctx.allocate(key.bytes)?;
+                stages.push(match key.shape {
+                    Some(shape) => Stage::Native(NativeWeight::from_buffer(
+                        buffer,
+                        shape.quant,
+                        shape.k,
+                        shape.n_rows,
+                        Some(experts),
+                    )?),
+                    None => Stage::Raw(buffer),
+                });
             }
             staged.push(Slot {
-                stacks: buffers,
+                stages,
                 bounce: if any_file {
                     Some(ctx.pinned_buf(bounce_bytes)?)
                 } else {
@@ -165,10 +232,28 @@ impl CardTransport {
             copy,
             experts,
             layers,
+            stage_of,
             store,
             slots: staged,
             read_seconds: 0.0,
+            stalls: Vec::new(),
+            spare_stalls: Vec::new(),
         })
+    }
+
+    fn stage(&self, layer: usize, slot: usize, stack: usize) -> Result<&Stage, EngError> {
+        let index = self
+            .stage_of
+            .get(layer)
+            .and_then(|row| row.get(stack))
+            .copied()
+            .ok_or_else(|| {
+                transport_error(format!("layer {layer} stack {stack} does not exist"))
+            })?;
+        self.slots
+            .get(slot)
+            .and_then(|s| s.stages.get(index))
+            .ok_or_else(|| transport_error(format!("slot {slot} does not exist")))
     }
 
     /// The exact bytes of stack `stack` of `layer` in staging slot `slot`.
@@ -178,19 +263,24 @@ impl CardTransport {
         slot: usize,
         stack: usize,
     ) -> Result<DeviceRange<'_>, EngError> {
-        let bytes = self
-            .layers
-            .get(layer)
-            .and_then(|spans| spans.get(stack))
-            .map(|span| span.bytes)
-            .ok_or_else(|| {
-                transport_error(format!("layer {layer} stack {stack} does not exist"))
-            })?;
-        self.slots
-            .get(slot)
-            .and_then(|s| s.stacks.get(stack))
-            .ok_or_else(|| transport_error(format!("slot {slot} stack {stack} does not exist")))?
-            .range(0, bytes)
+        let buffer = self.stage(layer, slot, stack)?.buffer();
+        buffer.range(0, buffer.bytes())
+    }
+
+    /// Stack `stack` of `layer` in `slot` as a native weight over its staging buffer. Refuses a
+    /// stack declared without a shape.
+    pub(crate) fn staged(
+        &self,
+        layer: usize,
+        slot: usize,
+        stack: usize,
+    ) -> Result<&NativeWeight, EngError> {
+        match self.stage(layer, slot, stack)? {
+            Stage::Native(weight) => Ok(weight),
+            Stage::Raw(_) => Err(transport_error(format!(
+                "layer {layer} stack {stack} was declared without a quantization shape"
+            ))),
+        }
     }
 
     /// The event recorded on the copy stream after the slot's copies: the compute stream waits
@@ -242,6 +332,7 @@ impl ExpertTransport for CardTransport {
         if slot >= self.slots.len() {
             return Err(transport_error(format!("slot {slot} does not exist")));
         }
+        let stage_of = &self.stage_of[layer];
         let state = &mut self.slots[slot];
         if state.used_recorded {
             self.copy.wait(&state.used)?;
@@ -281,7 +372,7 @@ impl ExpertTransport for CardTransport {
         let mut bytes = 0u64;
         let mut bounce_at = 0usize;
         for (index, span) in spans.iter().enumerate() {
-            let dst = &state.stacks[index];
+            let dst = state.stages[stage_of[index]].buffer();
             // Where this stack's bytes sit in host memory: a pinned buffer and offset.
             let (from_file, base) = match &span.home {
                 StackHome::Pinned { buf, offset } => (false, (*buf, *offset)),
@@ -324,6 +415,7 @@ impl ExpertTransport for CardTransport {
         self.copy.record(&state.copied)?;
         self.read_seconds += read_seconds;
         Ok(CardTicket {
+            layer,
             slot,
             bytes,
             read_seconds,
@@ -334,7 +426,20 @@ impl ExpertTransport for CardTransport {
         let state = &mut self.slots[ticket.slot];
         state.copied.synchronize()?;
         // Launches queued on the compute stream after this point read the slot behind its copy.
+        // Timing events around the wait measure how long the compute stream sat blocked on the
+        // copy: the part of the copy that compute did not hide.
+        let (start, end) = match self.spare_stalls.pop() {
+            Some(pair) => pair,
+            None => (self.ctx.event_timing()?, self.ctx.event_timing()?),
+        };
+        self.compute.record_timing(&start)?;
         self.compute.wait(&state.copied)?;
+        self.compute.record_timing(&end)?;
+        self.stalls.push(StallPair {
+            layer: ticket.layer,
+            start,
+            end,
+        });
         // The copies are complete: the bounce buffer may be written again by the host. The pinned
         // stores are only read after load and need no release.
         if let Some(bounce) = state.bounce.as_mut()
@@ -347,6 +452,20 @@ impl ExpertTransport for CardTransport {
             bytes: ticket.bytes,
             seconds: f64::from(millis) / 1000.0 + ticket.read_seconds,
         })
+    }
+
+    fn take_stalls(&mut self) -> Result<Vec<(usize, f64)>, EngError> {
+        if self.stalls.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.compute.synchronize()?;
+        let mut out = Vec::with_capacity(self.stalls.len());
+        for pair in self.stalls.drain(..) {
+            let millis = pair.start.elapsed_ms_since(&pair.end)?;
+            out.push((pair.layer, f64::from(millis) / 1000.0));
+            self.spare_stalls.push((pair.start, pair.end));
+        }
+        Ok(out)
     }
 
     fn release(&mut self, slot: usize) -> Result<(), EngError> {
