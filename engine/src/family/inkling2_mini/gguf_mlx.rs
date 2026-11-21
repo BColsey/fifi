@@ -1,5 +1,5 @@
 //! Experimental GGUF expert projection. Disk and host RAM retain GGUF bytes.
-//! Metal stores expanded F32 planes so all supported GGUF codes use one math path.
+//! The opt-in Metal path can project selected expert planes from their packed layout.
 
 use std::{collections::VecDeque, rc::Rc, sync::Arc};
 
@@ -13,8 +13,10 @@ use crate::{
     EngError,
     kernels::MlxKernels,
     tensor::{Dtype, ExecutionTensor, Tensor},
-    weights::dequantize_into,
+    weights::{GgufType, IQ1S_GRID, dequantize_into},
 };
+
+const PACKED_ENV: &str = "FIFI_INKLING_GGUF_PACKED_MLX";
 
 type Key = (String, usize);
 
@@ -65,11 +67,28 @@ impl<T> Cache<T> {
     }
 }
 
+enum Projection {
+    Packed(ExecutionTensor, GgufType),
+    Expanded(ExecutionTensor),
+}
+
+#[derive(Default, serde::Serialize)]
+struct ProjectionStats {
+    iq1_s: u64,
+    q2_0: u64,
+    nvfp4: u64,
+    expanded_cpu_transpose: u64,
+    expanded_metal_transpose: u64,
+}
+
 pub(super) struct Experts {
     source: Arc<Weights>,
     metal: MlxKernels,
     packed: Cache<ExpertPlane>,
-    resident: Cache<ExecutionTensor>,
+    resident: Cache<Projection>,
+    packed_enabled: bool,
+    codes: Option<ExecutionTensor>,
+    projections: ProjectionStats,
     stats: MlxExpertCacheStats,
 }
 
@@ -87,6 +106,9 @@ impl Experts {
             metal,
             packed: Cache::new(ram),
             resident: Cache::new(headroom - ram),
+            packed_enabled: std::env::var_os(PACKED_ENV).is_some_and(|value| value == "1"),
+            codes: None,
+            projections: ProjectionStats::default(),
             stats: MlxExpertCacheStats::default(),
         })
     }
@@ -97,6 +119,56 @@ impl Experts {
 
     pub(super) fn stats(&self) -> MlxExpertCacheStats {
         self.stats
+    }
+
+    pub(super) fn report_projections(&mut self, phase: &str) {
+        eprintln!(
+            "inkling_gguf_projection {}",
+            serde_json::json!({
+                "phase": phase,
+                "packed_enabled": self.packed_enabled,
+                "projections": std::mem::take(&mut self.projections),
+                "resident_bytes": self.resident.bytes,
+                "packed_ram_bytes": self.packed.bytes,
+            })
+        );
+    }
+
+    fn stage_projection(&mut self, plane: &ExpertPlane) -> Result<(Projection, usize), EngError> {
+        if self.packed_enabled
+            && matches!(
+                plane.dtype,
+                GgufType::Iq1S | GgufType::Q20 | GgufType::Nvfp4
+            )
+        {
+            if plane.dtype == GgufType::Iq1S && self.codes.is_none() {
+                self.codes = Some(self.metal.import_tensor(&iq1_s_codes()?)?);
+            }
+            let payload = Tensor::try_from_host(
+                Dtype::U8,
+                vec![
+                    plane.height as u32,
+                    (plane.bytes.len() / plane.height) as u32,
+                ],
+                plane.bytes.clone(),
+            )?;
+            let projection = self.metal.import_tensor(&payload)?;
+            return Ok((
+                Projection::Packed(projection, plane.dtype),
+                plane.bytes.len(),
+            ));
+        }
+
+        let expanded = if self.packed_enabled {
+            let rows = self.metal.import_tensor(&decode_rows(plane)?)?;
+            self.metal.transpose(&rows, &[1, 0])?
+        } else {
+            self.metal.import_tensor(&decode_transposed(plane)?)?
+        };
+        Ok((
+            Projection::Expanded(expanded),
+            plane.width * plane.height * 4,
+        ))
     }
 
     pub(super) fn row(
@@ -149,12 +221,11 @@ impl Experts {
                     "GGUF Metal expert projection shape mismatch",
                 ));
             }
-            let weight = Rc::new(self.metal.import_tensor(&decode_transposed(&plane)?)?);
-            self.stats.evictions += self.resident.put(
-                (name.into(), expert),
-                plane.width * plane.height * 4,
-                Rc::clone(&weight),
-            );
+            let (projection, bytes) = self.stage_projection(&plane)?;
+            let weight = Rc::new(projection);
+            self.stats.evictions +=
+                self.resident
+                    .put((name.into(), expert), bytes, Rc::clone(&weight));
             self.stats.cached_bytes = self.packed.bytes + self.resident.bytes;
             weight
         };
@@ -164,7 +235,33 @@ impl Experts {
             input.iter().flat_map(|value| value.to_le_bytes()).collect(),
         )?;
         let activation = self.metal.import_tensor(&activation)?;
-        let projected = self.metal.mm(&activation, &weight)?;
+        let projected = match weight.as_ref() {
+            Projection::Packed(payload, format) => {
+                let codes = (*format == GgufType::Iq1S)
+                    .then_some(self.codes.as_ref())
+                    .flatten();
+                let count = match format {
+                    GgufType::Iq1S => &mut self.projections.iq1_s,
+                    GgufType::Q20 => &mut self.projections.q2_0,
+                    GgufType::Nvfp4 => &mut self.projections.nvfp4,
+                    _ => unreachable!("packed formats were validated when staged"),
+                };
+                let result =
+                    self.metal
+                        .inkling_gguf_matvec(&activation, payload, codes, *format)?;
+                *count += 1;
+                result
+            }
+            Projection::Expanded(expanded) => {
+                let result = self.metal.mm(&activation, expanded)?;
+                if self.packed_enabled {
+                    self.projections.expanded_metal_transpose += 1;
+                } else {
+                    self.projections.expanded_cpu_transpose += 1;
+                }
+                result
+            }
+        };
         let host = self.metal.readback(&projected)?;
         if host.shape() != [1, height as u32] || host.dtype() != Dtype::F32 {
             return Err(super::checkpoint_error(
@@ -181,6 +278,32 @@ impl Experts {
             .map(|&word| f32::from_le_bytes(word))
             .collect())
     }
+}
+
+fn iq1_s_codes() -> Result<Tensor, EngError> {
+    Tensor::try_from_host(
+        Dtype::U32,
+        vec![IQ1S_GRID.len() as u32],
+        IQ1S_GRID
+            .iter()
+            .flat_map(|&word| u32::from(word).to_le_bytes())
+            .collect(),
+    )
+}
+
+fn decode_rows(plane: &ExpertPlane) -> Result<Tensor, EngError> {
+    let stride = plane.bytes.len() / plane.height;
+    let mut row = vec![0.; plane.width];
+    let mut out = Vec::with_capacity(plane.width * plane.height * 4);
+    for block_row in plane.bytes.chunks_exact(stride) {
+        dequantize_into(plane.dtype, block_row, &mut row)?;
+        out.extend(row.iter().flat_map(|v| v.to_le_bytes()));
+    }
+    Tensor::try_from_host(
+        Dtype::F32,
+        vec![plane.height as u32, plane.width as u32],
+        out,
+    )
 }
 
 fn decode_transposed(plane: &ExpertPlane) -> Result<Tensor, EngError> {
@@ -204,6 +327,71 @@ fn decode_transposed(plane: &ExpertPlane) -> Result<Tensor, EngError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires complete Unsloth UD-IQ2_XXS fork weights at INKLING_GGUF_REFERENCE and Apple Metal"]
+    fn packed_gguf_matvec_matches_released_expert_blocks() {
+        let _lock = crate::native_test_lock();
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let source = Weights::open(std::path::Path::new(&file)).unwrap();
+        let mut metal = MlxKernels::try_new().unwrap();
+        let codes = metal.import_tensor(&iq1_s_codes().unwrap()).unwrap();
+        for (name, format) in [
+            ("blk.0.ffn_gate_up_exps.weight", GgufType::Iq1S),
+            ("blk.0.ffn_down_exps.weight", GgufType::Q20),
+            ("blk.5.ffn_down_exps.weight", GgufType::Nvfp4),
+        ] {
+            let info = source.header().tensor(name).unwrap();
+            assert_eq!(info.ggml_type(), format);
+            let full_stride = info.dims()[0] / format.block_elems() * format.block_bytes();
+            let stride = 2 * format.block_bytes() as usize;
+            let width = 2 * format.block_elems() as usize;
+            let mut packed = vec![0; 2 * stride];
+            for (row, dst) in packed.chunks_exact_mut(stride).enumerate() {
+                source
+                    .read_range(name, row as u64 * full_stride, dst)
+                    .unwrap();
+            }
+            let x: Vec<_> = (0..width)
+                .map(|i| ((i % 17) as f32 - 8.) * 0.0625)
+                .collect();
+            let weight =
+                Tensor::try_from_host(Dtype::U8, vec![2, stride as u32], packed.clone()).unwrap();
+            let activation = Tensor::try_from_host(
+                Dtype::F32,
+                vec![1, width as u32],
+                x.iter().flat_map(|value| value.to_le_bytes()).collect(),
+            )
+            .unwrap();
+            let w = metal.import_tensor(&weight).unwrap();
+            let a = metal.import_tensor(&activation).unwrap();
+            let got = metal
+                .inkling_gguf_matvec(&a, &w, (format == GgufType::Iq1S).then_some(&codes), format)
+                .unwrap();
+            assert!(
+                metal
+                    .inkling_gguf_matvec(&a, &w, None, GgufType::F32)
+                    .is_err()
+            );
+            let got = metal.readback(&got).unwrap();
+            assert_eq!(got.shape(), [1, 2]);
+            let mut decoded = vec![0.; width];
+            for (row, bytes) in packed.chunks_exact(stride).enumerate() {
+                dequantize_into(format, bytes, &mut decoded).unwrap();
+                let want = x.iter().zip(&decoded).map(|(x, w)| x * w).sum::<f32>();
+                let bound = x
+                    .iter()
+                    .zip(&decoded)
+                    .map(|(x, w)| (x * w).abs())
+                    .sum::<f32>();
+                let actual = f32::from_le_bytes(got.host_bytes().unwrap().as_chunks::<4>().0[row]);
+                assert!(
+                    (actual - want).abs() <= 2e-5 * bound.max(1.0),
+                    "{name} row {row}: {actual} != {want}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn cache_evicts_least_recent_and_respects_byte_limit() {

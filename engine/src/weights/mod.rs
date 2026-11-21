@@ -16,6 +16,13 @@ mod gguf_encode;
 pub(crate) mod gguf_experts;
 mod gguf_split;
 mod gguf_tables;
+<<<<<<< HEAD
+=======
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use gguf_tables::IQ1S_GRID;
+/// The IQ4_NL value table, re-exported for the native table pin test
+/// (kernels/cuda/resident/matvec_q/tests.rs): the CUDA copy must equal these bytes.
+>>>>>>> 8de73e1bd (perf(inkling): run packed GGUF expert projections directly on Metal)
 #[cfg(all(test, feature = "native-cuda"))]
 pub(crate) use gguf_tables::KSIGNS_IQ2XS;
 /// The lookup tables of the lattice and non-linear GGUF types, re-exported for the CUDA

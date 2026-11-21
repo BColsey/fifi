@@ -260,6 +260,11 @@ impl Decoder {
     }
 
     pub(super) fn report_component_timings(&mut self, phase: &str) {
+        if timing::enabled()
+            && let Experts::GgufMlx(cache) = &mut self.experts
+        {
+            cache.report_projections(phase);
+        }
         if let (Some(cpu), Experts::Mlx { cache, .. }) = (&mut self.timing, &mut self.experts) {
             eprintln!(
                 "inkling_components {}",
