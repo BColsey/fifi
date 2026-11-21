@@ -1312,10 +1312,8 @@ mod tests {
     fn a_pinned_entry_survives_the_disk_cache_byte_exact_in_both_kv_formats() {
         use crate::family::{
             expert_bank::disk_store::DiskMiss,
-            qwen36::{
-                cuda::prefix_shape::EntryShape,
-                kv_cache::{Capture, KvDisk, LoadIdentity, Push, WriteSpec},
-            },
+            kv_disk::{Capture, FamilyContract, KvDisk, LoadIdentity, Push, WriteSpec},
+            qwen36::cuda::prefix_shape::entry_slab,
         };
         let ctx = CudaContext::new().expect("native CUDA context");
         let stream = ctx.stream().expect("stream");
@@ -1353,7 +1351,7 @@ mod tests {
             pool.invalidate().unwrap();
             let pending = pool.begin(&ctx, &stream, &state, None).unwrap();
             let saved = pool.finish(&ctx, &stream, &state, pending).unwrap();
-            let shape = EntryShape::of(&state.layout, positions).unwrap();
+            let shape = entry_slab(&state.layout, positions).unwrap();
             // The device's bytes of the entry, object by object: the Delta state, then each layer.
             let objects_of = |state: &ResidentState| -> Vec<Vec<u8>> {
                 let mut delta = vec![0; delta_len];
@@ -1385,6 +1383,13 @@ mod tests {
                 template: "p".into(),
                 numeric_path: format!("{mode:?}"),
                 layout: "device-test".into(),
+                family: FamilyContract {
+                    adapter: "qwen36.cuda",
+                    backend: "cuda.single-card",
+                    snapshot_schema: "qwen36.compact-state.v1",
+                    payload_abi: "delta-f32.kv-compact.v1",
+                    position_policy: "absolute-rope-from-zero",
+                },
             };
             let (mut cache, _) =
                 KvDisk::open(&dir.path().join(format!("{mode:?}")), 1 << 30, &load).unwrap();

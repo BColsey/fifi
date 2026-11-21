@@ -1733,7 +1733,7 @@ fn kv_disk_blocker(settings: &Q36Settings) -> Option<&'static str> {
 /// it, and says in one line whether it runs. A malformed override stops the start; a directory
 /// that cannot be used leaves the tier off.
 fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Result<(), EngError> {
-    use crate::family::qwen36::{kv_cache, settings::KV_CACHE_DEFAULT_ON};
+    use crate::family::kv_disk::{self as kv_cache, KV_CACHE_DEFAULT_ON};
     if let Some(reason) = kv_disk_blocker(settings) {
         eprintln!("q36 cuda: kv disk tier off: {reason}");
         return Ok(());

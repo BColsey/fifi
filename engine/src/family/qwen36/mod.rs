@@ -47,15 +47,6 @@ pub(crate) mod krow;
 #[cfg(test)]
 mod krow_step_pin_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the CUDA step is the caller; helpers kept for the start path and the tests"
-    )
-)]
-pub(crate) mod kv_cache;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod mtp_pack;
 #[cfg(test)]
 mod mtp_pack_tests;

@@ -35,7 +35,7 @@ use tokio::net::TcpListener;
 /// anything besides a cache is refused and left alone.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 fn purge_kv_caches(config: &Config) -> Result<(), StartupError> {
-    use crate::family::qwen36::{factory::FAMILY, kv_cache};
+    use crate::family::{kv_disk as kv_cache, qwen36::factory::FAMILY};
     let env = kv_cache::KvEnv::from_process();
     for engine in &config.engines {
         if engine.family != FAMILY {
@@ -874,7 +874,7 @@ fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
                 }
                 eprintln!("enginesrv: second stop signal: not waiting for unsaved prefixes");
                 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-                crate::family::qwen36::kv_cache::request_hurry();
+                crate::family::kv_disk::request_hurry();
             });
             return;
         }

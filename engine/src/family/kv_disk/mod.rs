@@ -1,5 +1,12 @@
-//! The on-disk tier of the Qwen3.6 prefix store: saved prefixes that outlive a restart and an
-//! eviction from pinned host memory.
+//! The on-disk tier of a family's prefix store: saved prefixes that outlive a restart and an
+//! eviction from host memory. Shared by every family that wires it; a family supplies the
+//! identity of its loads (`LoadIdentity`), where an entry's bytes sit in its slab (`SlabLayout`)
+//! and the calls into its own prefix store, and takes the policy (when to spill, how long a stop
+//! may wait, the quota and the directory) and the files from here.
+//!
+//! An entry is object 0, the family's fixed state (the recurrent state of a hybrid model), then
+//! one object per attention layer. A family with no fixed state needs a one-line change to
+//! `build_manifest` (see the hand-back list of unwired families).
 //!
 //! The module is host-only and holds no CUDA type, so its tests run without the card. An entry is
 //! a fixed list of byte objects (the DeltaNet state first, then one object per attention layer)
@@ -11,6 +18,17 @@
 //! One process owns a cache directory (an advisory lock on `LOCK`), one writer thread streams
 //! chunks to disk behind the request path, and one index in memory answers lookups. The byte quota
 //! covers manifests and objects; the least recently used entry goes first.
+
+mod config;
+mod slab;
+mod tier;
+
+pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
+pub(crate) use slab::{Put, Run, SlabLayout};
+pub(crate) use tier::{
+    DiskTier, Held, Hit, PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, SlotBytes,
+    start_line,
+};
 
 use crate::family::expert_bank::{
     disk_store::{
@@ -50,7 +68,7 @@ pub(crate) const CHUNK_BYTES: usize = 8 << 20;
 const WRITER_QUEUE: usize = 4;
 
 const SCOPE_SEED: &[u8] = b"fifi-kv-scope-v1\0";
-const BILLING_SEED: &[u8] = b"fifi-kv-billing-q36\0";
+const BILLING_SEED: &[u8] = b"fifi-kv-billing-v1\0";
 const LOCK_FILE: &str = "LOCK";
 const MARKER_FILE: &str = "CACHE.json";
 
@@ -106,6 +124,20 @@ pub(crate) struct LoadIdentity {
     pub(crate) numeric_path: String,
     /// The capacity-independent shape of an entry (layer counts, state sizes, KV geometry).
     pub(crate) layout: String,
+    /// The family and backend that wrote the entry, the schema of its saved state, the layout of
+    /// its payload bytes and its rule for token positions. Each names a contract: an entry is
+    /// read only by a load that names the same one.
+    pub(crate) family: FamilyContract,
+}
+
+/// The parts of an entry's identity that a family fixes by its code, not by the checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FamilyContract {
+    pub(crate) adapter: &'static str,
+    pub(crate) backend: &'static str,
+    pub(crate) snapshot_schema: &'static str,
+    pub(crate) payload_abi: &'static str,
+    pub(crate) position_policy: &'static str,
 }
 
 impl LoadIdentity {
@@ -126,15 +158,15 @@ impl LoadIdentity {
             weight_layout_digest: digest("layout", &self.layout),
             tokenizer_digest: digest("tokenizer", &self.tokenizer),
             template_digest: digest("template", &self.template),
-            adapter_id: "qwen36.cuda".to_owned(),
-            backend_id: "cuda.single-card".to_owned(),
-            snapshot_schema: "qwen36.compact-state.v1".to_owned(),
-            payload_abi: "delta-f32.kv-compact.v1".to_owned(),
+            adapter_id: self.family.adapter.to_owned(),
+            backend_id: self.family.backend.to_owned(),
+            snapshot_schema: self.family.snapshot_schema.to_owned(),
+            payload_abi: self.family.payload_abi.to_owned(),
             numeric_recipe_digest: digest(
                 "numeric",
                 &format!("recipe-v{NUMERIC_RECIPE_VERSION}; {}", self.numeric_path),
             ),
-            position_policy_digest: digest("position", "absolute-rope-from-zero"),
+            position_policy_digest: digest("position", self.family.position_policy),
             render_mode: "chat".to_owned(),
             kv_layout_digest: digest("kv-layout", &self.layout),
         }
@@ -1226,7 +1258,7 @@ fn build_manifest(shared: &Shared, job: &Current) -> Result<Manifest, String> {
         byte_offset: 0,
         byte_length: delta.file_bytes,
         at_p: p,
-        schema: "qwen36.delta-f32.v1".to_owned(),
+        schema: shared.identity.snapshot_schema.clone(),
     });
     for (layer, dep) in job.installed.iter().skip(1).enumerate() {
         manifest.page_versions.push(PageVersion {
@@ -1418,9 +1450,9 @@ pub(crate) fn hurry_flag() -> &'static AtomicBool {
 }
 
 /// The environment names that override the `kv_cache` member.
-pub(crate) const DIR_ENV: &str = "Q36_KV_CACHE_DIR";
-pub(crate) const QUOTA_ENV: &str = "Q36_KV_CACHE_QUOTA_BYTES";
-pub(crate) const SWITCH_ENV: &str = "Q36_KV_CACHE";
+pub(crate) const DIR_ENV: &str = "FIFI_KV_CACHE_DIR";
+pub(crate) const QUOTA_ENV: &str = "FIFI_KV_CACHE_QUOTA_BYTES";
+pub(crate) const SWITCH_ENV: &str = "FIFI_KV_CACHE";
 
 /// The raw values of the environment overrides.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1435,10 +1467,12 @@ pub(crate) struct KvEnv {
 impl KvEnv {
     pub(crate) fn from_process() -> Self {
         let get = |name: &str| std::env::var(name).ok();
+        // The names of the first family to wire the cache keep working.
+        let named = |name: &str, old: &str| get(name).or_else(|| get(old));
         Self {
-            dir: get(DIR_ENV),
-            quota: get(QUOTA_ENV),
-            switch: get(SWITCH_ENV),
+            dir: named(DIR_ENV, "Q36_KV_CACHE_DIR"),
+            quota: named(QUOTA_ENV, "Q36_KV_CACHE_QUOTA_BYTES"),
+            switch: named(SWITCH_ENV, "Q36_KV_CACHE"),
             xdg_cache_home: get("XDG_CACHE_HOME"),
             home: get("HOME"),
         }
@@ -1448,7 +1482,7 @@ impl KvEnv {
 /// The directory `--purge-kv-cache` empties for one engine: the environment's, else the config
 /// member's, else the default location. `None` when none can be named.
 pub(crate) fn purge_dir(
-    options: Option<&crate::family::qwen36::settings::KvCacheOptions>,
+    options: Option<&KvCacheOptions>,
     env: &KvEnv,
 ) -> Result<Option<PathBuf>, String> {
     if let Some(dir) = env.dir.as_deref() {
@@ -1477,10 +1511,10 @@ pub(crate) enum Plan {
 
 /// Decides whether the tier runs and where, from the config member, the environment and the
 /// build's default. The environment wins over the config, except that `kv_cache.enabled: false`
-/// is not undone by `Q36_KV_CACHE_DIR` alone (only `Q36_KV_CACHE=1` does that). A malformed environment value is an
+/// is not undone by `FIFI_KV_CACHE_DIR` alone (only `FIFI_KV_CACHE=1` does that). A malformed environment value is an
 /// error (a typo must not silently turn the cache off or point it elsewhere).
 pub(crate) fn plan(
-    config: Option<&crate::family::qwen36::settings::KvCacheSettings>,
+    config: Option<&KvCacheSettings>,
     env: &KvEnv,
     default_on: bool,
     free: impl Fn(&Path) -> Option<u64>,
@@ -1519,7 +1553,7 @@ pub(crate) fn plan(
         (true, "environment")
     } else if config_enabled == Some(false) {
         // An explicit off in the config wins over a directory named in the environment; only
-        // `Q36_KV_CACHE=1` overrides it.
+        // `FIFI_KV_CACHE=1` overrides it.
         return Ok(Plan::Off("kv_cache.enabled is false".into()));
     } else if env_dir.is_some() {
         (true, "environment")
@@ -1532,7 +1566,8 @@ pub(crate) fn plan(
     };
     if !wanted {
         return Ok(Plan::Off(
-            "not configured: set kv_cache.dir in the qwen36 object or Q36_KV_CACHE_DIR".into(),
+            "not configured: set kv_cache.dir in the engine's family object or FIFI_KV_CACHE_DIR"
+                .into(),
         ));
     }
     let wanted = Wanted {
@@ -1551,5 +1586,4 @@ pub(crate) fn plan(
 }
 
 #[cfg(test)]
-#[path = "kv_cache_tests.rs"]
 mod tests;

@@ -236,44 +236,15 @@ pub(crate) struct Q36Options {
     /// `draft_rollback` `device` and the EXL3 pack.
     pub(crate) draft_verify: Option<String>,
     /// The on-disk prefix cache of the CUDA arm: saved prefixes that survive a restart and an
-    /// eviction from pinned host memory. Absent means the default (see `KV_CACHE_DEFAULT_ON`).
-    pub(crate) kv_cache: Option<KvCacheOptions>,
-}
-
-/// The default of the on-disk prefix cache when the config and the environment say nothing.
-/// Off until the flip is announced: only a `kv_cache.dir`, `kv_cache.enabled: true`, or the
-/// environment turns it on.
-pub(crate) const KV_CACHE_DEFAULT_ON: bool = false;
-
-/// The `kv_cache` member of the `qwen36` object.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct KvCacheOptions {
-    /// The cache directory, absolute. Naming it turns the cache on. Created 0700 when missing;
-    /// one process owns it at a time. Absent means the user cache directory
-    /// (`$XDG_CACHE_HOME/fifi/kv`, else `$HOME/.cache/fifi/kv`).
-    pub(crate) dir: Option<PathBuf>,
-    /// The byte quota of the directory, from 1 GiB. Absent means a quarter of the free space of
-    /// the filesystem at start, at most 64 GiB; under 4 GiB the cache stays off.
-    pub(crate) quota_bytes: Option<u64>,
-    /// `true` turns the cache on at the default directory, `false` keeps it off whatever else
-    /// is set. Absent follows the default of the build.
-    pub(crate) enabled: Option<bool>,
-}
-
-/// The checked `kv_cache` member: what the operator asked for, before the host is probed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct KvCacheSettings {
-    pub(crate) enabled: Option<bool>,
-    pub(crate) dir: Option<PathBuf>,
-    pub(crate) quota_bytes: Option<u64>,
+    /// eviction from pinned host memory. Absent means the default (see `kv_disk::KV_CACHE_DEFAULT_ON`).
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheOptions>,
 }
 
 fn kv_cache_settings(
     options: &Q36Options,
     backend: Backend,
     devices: &[usize],
-) -> Result<Option<KvCacheSettings>, EngError> {
+) -> Result<Option<crate::family::kv_disk::KvCacheSettings>, EngError> {
     let Some(cache) = &options.kv_cache else {
         return Ok(None);
     };
@@ -288,26 +259,7 @@ fn kv_cache_settings(
                 .into(),
         ));
     }
-    if let Some(dir) = &cache.dir
-        && !dir.is_absolute()
-    {
-        return Err(bad(format!(
-            "kv_cache.dir must be an absolute path, got {}",
-            dir.display()
-        )));
-    }
-    if let Some(quota) = cache.quota_bytes
-        && quota < (1 << 30)
-    {
-        return Err(bad(format!(
-            "kv_cache.quota_bytes must be at least 1073741824 (1 GiB), got {quota}"
-        )));
-    }
-    Ok(Some(KvCacheSettings {
-        enabled: cache.enabled,
-        dir: cache.dir.clone(),
-        quota_bytes: cache.quota_bytes,
-    }))
+    cache.checked().map(Some).map_err(bad)
 }
 
 /// How a verify window runs its rows (`draft_verify`).
@@ -1093,7 +1045,7 @@ pub(crate) struct Q36Settings {
     /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
     pub(crate) cuda_devices: Vec<usize>,
     /// The on-disk prefix cache, or `None` when the member is absent.
-    pub(crate) kv_cache: Option<KvCacheSettings>,
+    pub(crate) kv_cache: Option<crate::family::kv_disk::KvCacheSettings>,
     /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
     /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
     /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
@@ -1983,8 +1935,8 @@ mod tests {
         tokenizer_pin_for_spec,
     };
     use super::{
-        KvCacheSettings, QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat,
-        check_window_rows, rollback_mode_name, rollback_of, verify_mode_name, verify_of,
+        QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
+        rollback_mode_name, rollback_of, verify_mode_name, verify_of,
     };
     use crate::EngError;
     use crate::family::session::StoreLimits;
@@ -2068,7 +2020,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             named.kv_cache,
-            Some(KvCacheSettings {
+            Some(crate::family::kv_disk::KvCacheSettings {
                 enabled: Some(true),
                 dir: Some(PathBuf::from("/c")),
                 quota_bytes: Some(2_147_483_648),
@@ -2076,7 +2028,7 @@ mod tests {
         );
         assert_eq!(
             cuda_offload(r#"{"kv_cache":{}}"#).unwrap().kv_cache,
-            Some(KvCacheSettings::default())
+            Some(crate::family::kv_disk::KvCacheSettings::default())
         );
         for (body, needle) in [
             (r#"{"kv_cache":{"dir":"relative/path"}}"#, "absolute"),

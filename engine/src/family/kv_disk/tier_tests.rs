@@ -1,7 +1,8 @@
-//! The step logic of the disk tier, without the card: a slot is memory, the cache is a real one in
-//! a scratch directory, and the entry shape is three small objects.
+//! The disk tier's logic, without any family: a slot is memory, the cache is a real one in a
+//! scratch directory, and an entry is three small objects.
+use super::super::FamilyContract;
+use super::super::{LoadIdentity, spill_candidates};
 use super::*;
-use crate::family::qwen36::cuda::prefix_shape::{EntryShape, Run};
 
 const OBJECT: usize = 8192;
 
@@ -18,22 +19,16 @@ impl SlotBytes for Memory {
     }
 }
 
-fn shape_of(_positions: usize) -> Result<EntryShape, EngError> {
-    Ok(EntryShape {
-        delta: Run {
-            slab: 0,
-            bytes: OBJECT,
-        },
-        layers: vec![
-            vec![Run {
-                slab: OBJECT,
-                bytes: OBJECT,
-            }],
-            vec![Run {
-                slab: 2 * OBJECT,
-                bytes: OBJECT,
-            }],
-        ],
+fn shape_of(_positions: usize) -> Result<SlabLayout, EngError> {
+    Ok(SlabLayout {
+        objects: (0..3)
+            .map(|at| {
+                vec![Run {
+                    slab: at * OBJECT,
+                    bytes: OBJECT,
+                }]
+            })
+            .collect(),
     })
 }
 
@@ -44,12 +39,19 @@ fn load() -> LoadIdentity {
         template: "p".into(),
         numeric_path: "steps".into(),
         layout: "l".into(),
+        family: FamilyContract {
+            adapter: "test",
+            backend: "host",
+            snapshot_schema: "test.state.v1",
+            payload_abi: "test.payload.v1",
+            position_policy: "absolute",
+        },
     }
 }
 
 fn tier(dir: &std::path::Path) -> DiskTier {
     let (cache, _) = KvDisk::open(&dir.join("cache"), 1 << 30, &load()).unwrap();
-    DiskTier::new(cache, 2)
+    DiskTier::new("test engine", cache, 2)
 }
 
 fn key(len: usize, seed: u32) -> Vec<u32> {
@@ -285,12 +287,12 @@ fn the_start_line_names_the_directory_the_privacy_and_the_wait() {
         quota_bytes: 64 << 30,
     };
     let report = OpenReport::default();
-    let line = start_line(&resolved, "default", &report, 4);
+    let line = start_line("test engine", &resolved, "default", &report, 4);
     for needle in [
         "/var/cache/fifi/kv",
         "exact token lists",
         "kv_cache.enabled false",
-        "Q36_KV_CACHE=0",
+        "FIFI_KV_CACHE=0",
         "a second stop signal ends the wait",
         "up to 300 s",
     ] {

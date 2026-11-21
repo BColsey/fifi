@@ -50,6 +50,18 @@ pub(in crate::family) mod graph_state;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod host_admit;
 pub mod keys;
+#[allow(
+    dead_code,
+    reason = "the CUDA families are the callers today; helpers kept for the start path and the tests"
+)]
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(
+        unused_imports,
+        reason = "the re-exports are used by the CUDA families only"
+    )
+)]
+pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
 #[cfg(any(
     test,

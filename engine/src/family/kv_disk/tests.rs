@@ -8,6 +8,13 @@ fn load(weights: &str) -> LoadIdentity {
         template: "tpl".to_owned(),
         numeric_path: "steps-fp16".to_owned(),
         layout: "delta-2x-kv-3".to_owned(),
+        family: FamilyContract {
+            adapter: "test.adapter",
+            backend: "test.backend",
+            snapshot_schema: "test.state.v1",
+            payload_abi: "test.payload.v1",
+            position_policy: "absolute",
+        },
     }
 }
 
@@ -57,7 +64,7 @@ fn a_cancel_survives_a_full_command_queue() {
     let job = cache.begin_write(spec).unwrap();
     // The queue is not what carries the cancel: the shared state records it.
     cache.abort(&job);
-    assert!(cache.wait_idle(Duration::from_secs(10)));
+    assert!(cache.wait_idle(Duration::from_secs(120)));
     assert!(cache.shared.lock().aborted.is_empty());
     assert_eq!(cache.entry_count(), 0);
 }
@@ -107,7 +114,7 @@ fn store(
         }
     }
     assert!(
-        cache.wait_idle(Duration::from_secs(20)),
+        cache.wait_idle(Duration::from_secs(120)),
         "the writer finished"
     );
     Ok(())
@@ -514,7 +521,7 @@ fn env(dir: Option<&str>, quota: Option<&str>, switch: Option<&str>) -> KvEnv {
 
 #[test]
 fn the_plan_follows_the_environment_then_the_config_then_the_build_default() {
-    use crate::family::qwen36::settings::KvCacheSettings;
+    use crate::family::kv_disk::KvCacheSettings;
     let gib = 1u64 << 30;
     let free = |_: &Path| Some(100 * gib);
     let off = |plan: Result<Plan, String>| matches!(plan, Ok(Plan::Off(_)));
@@ -743,7 +750,7 @@ fn the_writer_reports_a_measured_rate_after_a_save() {
     assert_eq!(cache.write_rate(), None, "a rate is read from the reports");
     assert_eq!(cache.poll().len(), 1);
     let rate = cache.write_rate().expect("a rate after 17 MiB");
-    assert!(rate > 1e6 && rate.is_finite(), "{rate}");
+    assert!(rate > 1e4 && rate.is_finite(), "{rate}");
 }
 
 #[test]

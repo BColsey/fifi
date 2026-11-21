@@ -8,18 +8,17 @@
 //! so the disk tier adds no second restore code. Every failure here is a logged miss.
 use super::super::{
     prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes},
-    prefix_shape::{EntryShape, Put, Run},
+    prefix_shape::entry_slab,
     state::{LAYOUT_TAG, pinned::PinnedSnapshot},
 };
 use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
-        expert_bank::disk_store::DiskMiss,
-        qwen36::kv_cache::{
-            ASSUMED_WRITE_RATE, CHUNK_BYTES, Candidate, Capture, KvDisk, LoadIdentity,
-            MIN_POSITIONS, OpenReport, Push, ReadStats, Resolved, WriteEvent, WriteJob, WriteSpec,
-            drain_bound, hurry_flag, spill_candidates, watermark,
+        kv_disk::{
+            Capture, DiskTier, FamilyContract, Held, Hit, KvDisk, LoadIdentity, MIN_POSITIONS,
+            PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, Resolved, SlotBytes,
+            drain_bound, hurry_flag, spill_candidates, start_line,
         },
         session::SaveKind,
     },
@@ -28,510 +27,28 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
-/// Bytes the engine thread copies out of a held slot per prefill piece.
-pub(super) const PUMP_PREFILL_BYTES: usize = 64 << 20;
-/// Bytes copied per decode token.
-pub(super) const PUMP_EMIT_BYTES: usize = 4 << 20;
-/// Bytes copied per idle poll.
-pub(super) const PUMP_IDLE_BYTES: usize = 64 << 20;
-/// Saves that may wait behind the copy in progress. Each holds its pinned slot.
-const QUEUE_DEPTH: usize = 2;
+/// What the shared disk tier calls this engine in its log lines.
+const TIER_LABEL: &str = "q36 cuda";
+
+/// What a Qwen3.6 single-card CUDA load fixes about the entries it writes.
+const CONTRACT: FamilyContract = FamilyContract {
+    adapter: "qwen36.cuda",
+    backend: "cuda.single-card",
+    snapshot_schema: "qwen36.compact-state.v1",
+    payload_abi: "delta-f32.kv-compact.v1",
+    position_policy: "absolute-rope-from-zero",
+};
+
 /// Lookups one restore may spend on entries that turn out damaged.
 const PROMOTE_ATTEMPTS: usize = 3;
 /// The least time between two logged background failures.
 const BACKGROUND_ERROR_GAP: Duration = Duration::from_secs(30);
-/// Consecutive failed writes (a full or read-only disk) after which the tier stops writing.
-const WRITE_FAILURES_BEFORE_PAUSE: u32 = 3;
-/// How long the tier stays away from the disk after those failures.
-const WRITE_PAUSE: Duration = Duration::from_secs(600);
-
-/// Why an entry goes to disk. The disk is used only when pinned memory is short.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reason {
-    /// The store passed its watermark: this is one of the entries the next saves push out.
-    Watermark,
-    /// The engine is stopping and this entry exists only in memory.
-    Stop,
-}
-
-impl Reason {
-    fn name(self) -> &'static str {
-        match self {
-            Reason::Watermark => "watermark",
-            Reason::Stop => "stop",
-        }
-    }
-}
-
-/// The bytes of a held slot, read without moving them. The pinned buffer is the only production
-/// source; a test supplies memory.
-pub(super) trait SlotBytes {
-    fn read(&self, at: usize, out: &mut [u8]) -> Result<(), EngError>;
-}
-
 impl SlotBytes for RefCell<PinnedBuf> {
     fn read(&self, at: usize, out: &mut [u8]) -> Result<(), EngError> {
         self.borrow().read(at, out)
-    }
-}
-
-/// A pinned entry waiting to be copied to disk, holding its slot.
-struct Held {
-    reason: Reason,
-    slot: Rc<dyn SlotBytes>,
-    key: Vec<u32>,
-    capture: Capture,
-    positions: usize,
-    /// The bytes of the entry's objects.
-    bytes: u64,
-}
-
-/// The copy in progress: which run, and how far into it.
-struct Copying {
-    job: WriteJob,
-    held: Held,
-    runs: Vec<Run>,
-    at: usize,
-    within: usize,
-}
-
-impl Copying {
-    /// The bytes of the entry not yet handed to the writer.
-    fn remaining(&self) -> u64 {
-        let rest: usize = self.runs[self.at..].iter().map(|run| run.bytes).sum();
-        (rest - self.within) as u64
-    }
-}
-
-/// What the last disk restore cost, kept until the restore's report is built.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Hit {
-    key_len: usize,
-    bytes: u64,
-    ms: f64,
-}
-
-/// Entries and bytes written for one reason.
-#[derive(Default, Clone, Copy)]
-struct Spilled {
-    entries: u64,
-    bytes: u64,
-}
-
-#[derive(Default)]
-struct Counters {
-    watermark: Spilled,
-    stop: Spilled,
-    /// Spills dropped before they were written: their slot was needed by a save.
-    dropped: u64,
-    saved: u64,
-    skipped: u64,
-    failed: u64,
-    restored: u64,
-    missed: u64,
-}
-
-pub(super) struct DiskTier {
-    cache: KvDisk,
-    /// Saves waiting for the copy in progress, oldest first, at most `QUEUE_DEPTH`.
-    queued: Vec<Held>,
-    copying: Option<Copying>,
-    /// Jobs whose bytes are all handed to the writer and that have not reported yet.
-    finishing: usize,
-    /// The reason of every job that has begun and not yet reported.
-    inflight: Vec<(u64, Reason)>,
-    /// The retained slots of the pinned pool, which set the watermark.
-    retained: usize,
-    hit: Option<Hit>,
-    counters: Counters,
-    /// Writes that failed one after another since the last one that worked.
-    failures: u32,
-    /// While set and in the future, nothing is queued: the disk refused several writes in a row.
-    paused_until: Option<Instant>,
-}
-
-impl DiskTier {
-    fn new(cache: KvDisk, retained: usize) -> Self {
-        Self {
-            cache,
-            queued: Vec::new(),
-            copying: None,
-            finishing: 0,
-            inflight: Vec::new(),
-            retained,
-            hit: None,
-            counters: Counters::default(),
-            failures: 0,
-            paused_until: None,
-        }
-    }
-
-    /// Whether the tier is staying away from the disk at `now`. The pause ends by itself.
-    fn paused(&mut self, now: Instant) -> bool {
-        match self.paused_until {
-            Some(until) if now < until => true,
-            Some(_) => {
-                self.paused_until = None;
-                self.failures = 0;
-                eprintln!("q36 cuda: kv disk writes resume after the pause");
-                false
-            }
-            None => false,
-        }
-    }
-
-    /// Records one failed write; after `WRITE_FAILURES_BEFORE_PAUSE` in a row drops what waits and
-    /// pauses, with one line instead of one per save.
-    fn note_failure(&mut self, now: Instant) {
-        self.counters.failed += 1;
-        self.failures += 1;
-        if self.failures >= WRITE_FAILURES_BEFORE_PAUSE && self.paused_until.is_none() {
-            self.paused_until = Some(now + WRITE_PAUSE);
-            let waiting = self.queued.drain(..).count();
-            self.counters.dropped += waiting as u64;
-            eprintln!(
-                "q36 cuda: kv disk: {} writes failed in a row; no writes for {} s ({waiting} waiting spills dropped)",
-                self.failures,
-                WRITE_PAUSE.as_secs()
-            );
-        }
-    }
-
-    /// When no pinned slot is free and spills hold them, drops the spills (counted) so a save or
-    /// a restore can take a slot instead of failing or waiting. Returns how many were dropped.
-    fn drop_spills_for_slots(&mut self, free_slots: usize, needed_by: &str) -> usize {
-        if free_slots > 0 {
-            return 0;
-        }
-        let mut dropped = self.queued.drain(..).count();
-        if let Some(copying) = self.copying.take() {
-            self.cache.abort(&copying.job);
-            self.inflight.retain(|(id, _)| *id != copying.job.id());
-            dropped += 1;
-        }
-        if dropped > 0 {
-            self.counters.dropped += dropped as u64;
-            eprintln!(
-                "q36 cuda: kv disk: {dropped} spills dropped, their pinned slots are needed by {needed_by}"
-            );
-        }
-        dropped
-    }
-
-    /// Copies up to `budget` bytes of pending saves to the writer and logs what finished.
-    /// `shape_of` names the objects of an entry of a given number of positions.
-    fn pump(&mut self, shape_of: &dyn Fn(usize) -> Result<EntryShape, EngError>, budget: usize) {
-        // The writer sends a job's report before it releases the job, so an idle cache means
-        // every report is already waiting: read the flag first, then the reports.
-        let idle = self.cache.is_idle();
-        for event in self.cache.poll() {
-            self.finishing = self.finishing.saturating_sub(1);
-            match event {
-                WriteEvent::Done {
-                    id,
-                    positions,
-                    bytes,
-                    ms,
-                } => {
-                    self.counters.saved += 1;
-                    self.failures = 0;
-                    let why = take_reason(&mut self.inflight, id);
-                    let spilled = match why {
-                        Reason::Watermark => &mut self.counters.watermark,
-                        Reason::Stop => &mut self.counters.stop,
-                    };
-                    spilled.entries += 1;
-                    spilled.bytes += bytes;
-                    eprintln!(
-                        "q36 cuda: kv disk saved {positions} positions, {bytes} B ({}), {ms:.1} ms; to disk so far: {}",
-                        why.name(),
-                        self.counters.summary()
-                    );
-                }
-                WriteEvent::Failed { id, reason } => {
-                    take_reason(&mut self.inflight, id);
-                    self.note_failure(Instant::now());
-                    eprintln!("q36 cuda: kv disk save failed: {reason}");
-                }
-            }
-        }
-        if idle && self.copying.is_none() {
-            self.finishing = 0;
-        }
-        let mut left = budget;
-        while left > 0 {
-            if self.copying.is_none() {
-                if self.queued.is_empty() {
-                    return;
-                }
-                // Tips go before periodic and block entries, each oldest first.
-                let next = self
-                    .queued
-                    .iter()
-                    .position(|held| held.capture == Capture::Tip)
-                    .unwrap_or(0);
-                let held = self.queued.remove(next);
-                let shape = match shape_of(held.positions) {
-                    Ok(shape) => shape,
-                    Err(error) => {
-                        eprintln!("q36 cuda: kv disk save skipped: {error:?}");
-                        continue;
-                    }
-                };
-                let spec = WriteSpec {
-                    tokens: held.key.clone(),
-                    capture: held.capture,
-                    object_bytes: shape.object_bytes(),
-                };
-                let evicted_before = self.cache.evicted();
-                match self.cache.begin_write(spec) {
-                    Ok(job) => {
-                        self.inflight.push((job.id(), held.reason));
-                        let evicted = self.cache.evicted() - evicted_before;
-                        if evicted > 0 {
-                            eprintln!(
-                                "q36 cuda: kv disk quota: {evicted} least recently used entries removed to make room for {} positions",
-                                held.positions
-                            );
-                        }
-                        self.copying = Some(Copying {
-                            job,
-                            runs: shape.flat(),
-                            held,
-                            at: 0,
-                            within: 0,
-                        });
-                    }
-                    Err(skip) => {
-                        self.counters.skipped += 1;
-                        eprintln!(
-                            "q36 cuda: kv disk save skipped for {} positions: {skip}",
-                            held.positions
-                        );
-                        continue;
-                    }
-                }
-            }
-            let Some(copying) = self.copying.as_mut() else {
-                return;
-            };
-            match copy_chunk(copying, left.min(CHUNK_BYTES)) {
-                Ok((chunk, done)) => {
-                    let sent = chunk.len();
-                    match self.cache.push(&copying.job, chunk) {
-                        Push::Sent => left = left.saturating_sub(sent.max(1)),
-                        Push::Full(back) => {
-                            // Put the cursor back: the writer is behind, try again later.
-                            rewind(copying, back.len());
-                            return;
-                        }
-                        Push::Dead => {
-                            self.note_failure(Instant::now());
-                            eprintln!("q36 cuda: kv disk save failed: the writer stopped");
-                            self.copying = None;
-                            return;
-                        }
-                    }
-                    if done {
-                        self.copying = None;
-                        self.finishing += 1;
-                    }
-                }
-                Err(error) => {
-                    self.cache.abort(&copying.job);
-                    self.inflight.retain(|(id, _)| *id != copying.job.id());
-                    self.counters.failed += 1;
-                    eprintln!("q36 cuda: kv disk save failed: {error:?}");
-                    self.copying = None;
-                }
-            }
-        }
-    }
-
-    /// The disk half of a graceful stop: `tips` are the entries only in memory, newest first.
-    /// Waiting spills that are tips stay (behind them), anything else is dropped. Pumps the
-    /// writer until it is done, the bound from `bound_of(remaining bytes, measured rate)` passes
-    /// or `hurry` is set.
-    fn drain(
-        &mut self,
-        mut tips: Vec<Held>,
-        left_in_memory: usize,
-        shape_of: &dyn Fn(usize) -> Result<EntryShape, EngError>,
-        hurry: &AtomicBool,
-        bound_of: &dyn Fn(u64, Option<f64>) -> Duration,
-    ) {
-        if self.paused(Instant::now()) {
-            eprintln!(
-                "q36 cuda: kv disk stop: writes are paused after repeated failures; {} unsaved entries stay in memory only",
-                tips.len() + self.queued.len()
-            );
-            return;
-        }
-        tips.retain(|held| !self.has(&held.key));
-        let mut dropped = 0usize;
-        // A waiting spill that is a tip stays (behind the new ones); anything else goes.
-        for held in std::mem::take(&mut self.queued) {
-            if held.capture == Capture::Tip {
-                tips.push(Held {
-                    reason: Reason::Stop,
-                    ..held
-                });
-            } else {
-                dropped += 1;
-            }
-        }
-        if self
-            .copying
-            .as_ref()
-            .is_some_and(|copying| copying.held.capture != Capture::Tip)
-            && let Some(copying) = self.copying.take()
-        {
-            self.cache.abort(&copying.job);
-            self.inflight.retain(|(id, _)| *id != copying.job.id());
-            dropped += 1;
-        }
-        self.queued = tips;
-        if !self.pending() {
-            eprintln!(
-                "q36 cuda: kv disk stop: no tip exists only in memory; to disk: {}",
-                self.counters.summary()
-            );
-            return;
-        }
-        let remaining: u64 = self.queued.iter().map(|held| held.bytes).sum::<u64>()
-            + self.copying.as_ref().map_or(0, Copying::remaining);
-        let rate = self.cache.write_rate();
-        let bound = bound_of(remaining, rate);
-        let count = self.queued.len() + usize::from(self.copying.is_some());
-        eprintln!(
-            "q36 cuda: kv disk stop: {count} tips only in memory ({remaining} B to move), {dropped} waiting spills dropped, {left_in_memory} other entries stay in memory only; waiting at most {:.0} s at {}; a second stop signal ends the wait",
-            bound.as_secs_f64(),
-            rate.map_or_else(
-                || format!("an assumed {:.0} MB/s", ASSUMED_WRITE_RATE / 1e6),
-                |rate| format!("the measured {:.0} MB/s", rate / 1e6)
-            )
-        );
-        let began = Instant::now();
-        let mut hurried = false;
-        while self.pending() && began.elapsed() < bound {
-            if hurry.load(Ordering::SeqCst) {
-                hurried = true;
-                break;
-            }
-            self.pump(shape_of, PUMP_IDLE_BYTES);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        if self.pending() {
-            if let Some(copying) = self.copying.take() {
-                self.cache.abort(&copying.job);
-            }
-            eprintln!(
-                "q36 cuda: kv disk stop: gave up after {:.1} s ({}) with {} saves unwritten; to disk: {}",
-                began.elapsed().as_secs_f64(),
-                if hurried {
-                    "second stop signal"
-                } else {
-                    "the bound passed"
-                },
-                self.queued.len() + self.finishing,
-                self.counters.summary()
-            );
-        } else {
-            eprintln!(
-                "q36 cuda: kv disk stop: tips written in {:.1} s; to disk: {}",
-                began.elapsed().as_secs_f64(),
-                self.counters.summary()
-            );
-        }
-    }
-
-    /// Reads `candidate` from disk, handing every verified byte to `place` (slab offset, bytes).
-    /// A miss is logged and counted. The error says whether the entry was damaged or gone and
-    /// has been removed, so another lookup may name a shorter stored prefix; any other miss
-    /// leaves the prompt to a cold prefill.
-    fn read_into(
-        &mut self,
-        candidate: &Candidate,
-        prompt: &[u32],
-        shape: &EntryShape,
-        place: &mut Put<'_>,
-    ) -> Result<ReadStats, bool> {
-        let read = self.cache.read(
-            candidate,
-            prompt,
-            &shape.object_bytes(),
-            &mut |object, offset, bytes| {
-                shape
-                    .scatter(object, offset, bytes, place)
-                    .map_err(|error| DiskMiss::Refused(format!("{error:?}")))
-            },
-        );
-        read.map_err(|miss| {
-            self.counters.missed += 1;
-            let removed = matches!(miss, DiskMiss::Corrupt(_) | DiskMiss::Absent);
-            eprintln!(
-                "q36 cuda: kv disk miss for {} tokens ({miss}){}",
-                candidate.key_len,
-                if removed {
-                    "; the entry is removed"
-                } else {
-                    "; the prompt is prefilled"
-                }
-            );
-            removed
-        })
-    }
-
-    fn pending(&self) -> bool {
-        !self.queued.is_empty() || self.copying.is_some() || self.finishing > 0
-    }
-
-    /// Whether `key` is already on disk, waiting for the writer or being copied.
-    fn has(&self, key: &[u32]) -> bool {
-        self.queued.iter().any(|held| held.key == key)
-            || self.copying.as_ref().is_some_and(|c| c.held.key == key)
-            || self.cache.has_exact(key)
-    }
-
-    /// Adds a spill behind the copy in progress. A waiting tip that the new tip extends is dead;
-    /// a full queue drops its least valuable entry (a periodic one before a tip, oldest first),
-    /// or the offer itself when it is a periodic entry and every waiter is a tip.
-    fn enqueue(&mut self, offer: Held) {
-        if self.has(&offer.key) {
-            return;
-        }
-        if self.paused(Instant::now()) {
-            self.counters.skipped += 1;
-            return;
-        }
-        if offer.capture == Capture::Tip {
-            let before = self.queued.len();
-            self.queued.retain(|held| {
-                !(held.capture == Capture::Tip
-                    && held.key.len() < offer.key.len()
-                    && offer.key.starts_with(&held.key))
-            });
-            self.counters.skipped += (before - self.queued.len()) as u64;
-        }
-        if self.queued.len() >= QUEUE_DEPTH {
-            let victim = self
-                .queued
-                .iter()
-                .position(|held| held.capture == Capture::Periodic)
-                .or_else(|| (offer.capture == Capture::Tip).then_some(0));
-            let Some(at) = victim else {
-                self.counters.dropped += 1;
-                return;
-            };
-            self.queued.remove(at);
-            self.counters.dropped += 1;
-        }
-        self.queued.push(offer);
     }
 }
 
@@ -550,7 +67,7 @@ fn held_of(
     if positions < MIN_POSITIONS {
         return None;
     }
-    let shape = EntryShape::of(layout, positions).ok()?;
+    let shape = entry_slab(layout, positions).ok()?;
     Some(Held {
         reason,
         slot: state.hold(),
@@ -587,6 +104,7 @@ impl QwenResidentStep<'_> {
             tokenizer: self.prefix_identity.tokenizer.to_string(),
             template: self.prefix_identity.template.to_string(),
             numeric_path: format!("{:?}", CudaPrefillPath::Steps(layout.kv.mode)),
+            family: CONTRACT,
             layout: format!(
                 "{LAYOUT_TAG}; delta {} layers rec {} conv {}; kv {} layers {:?} {per_token} B/token/layer",
                 layout.delta.layers,
@@ -618,8 +136,11 @@ impl QwenResidentStep<'_> {
             .map_or(1, |pool| pool.retained_entries());
         match KvDisk::open(&resolved.dir, resolved.quota_bytes, &self.load_identity()) {
             Ok((cache, report)) => {
-                eprintln!("{}", start_line(resolved, origin, &report, retained));
-                self.disk = Some(DiskTier::new(cache, retained));
+                eprintln!(
+                    "{}",
+                    start_line(TIER_LABEL, resolved, origin, &report, retained)
+                );
+                self.disk = Some(DiskTier::new(TIER_LABEL, cache, retained));
             }
             Err(error) => {
                 eprintln!(
@@ -723,7 +244,7 @@ impl QwenResidentStep<'_> {
     fn pump_disk(&mut self, budget: usize) {
         let layout = *self.state.layout();
         if let Some(tier) = self.disk.as_mut() {
-            tier.pump(&|positions| EntryShape::of(&layout, positions), budget);
+            tier.pump(&|positions| entry_slab(&layout, positions), budget);
         }
     }
 
@@ -763,7 +284,7 @@ impl QwenResidentStep<'_> {
         tier.drain(
             tips,
             left_in_memory,
-            &|positions| EntryShape::of(&layout, positions),
+            &|positions| entry_slab(&layout, positions),
             hurry_flag(),
             &drain_bound,
         );
@@ -817,7 +338,7 @@ impl QwenResidentStep<'_> {
             );
             return false;
         }
-        let shape = match EntryShape::of(&layout, positions) {
+        let shape = match entry_slab(&layout, positions) {
             Ok(shape) => shape,
             Err(error) => {
                 eprintln!("q36 cuda: kv disk restore skipped: {error:?}");
@@ -925,82 +446,3 @@ impl QwenResidentStep<'_> {
         tier
     }
 }
-
-/// The first line of a started tier: where it lives, how much it may hold, what it found, what it
-/// keeps (the conversations' exact tokens), how to turn it off, and how long a stop may wait.
-fn start_line(resolved: &Resolved, origin: &str, report: &OpenReport, retained: usize) -> String {
-    format!(
-        "q36 cuda: kv disk tier on ({origin}), dir {dir}, quota {quota} B, {} entries of this load found ({} of other loads, {} removed, {} stray objects removed), {} B used; written only when pinned memory is short (from {} of {retained} entries) and at a graceful stop, which may wait up to {} s for unsaved prefixes (a second stop signal ends the wait); conversations (their exact token lists and model state) persist on disk at {dir} up to {quota} B; turn it off with kv_cache.enabled false or Q36_KV_CACHE=0; purge with --purge-kv-cache",
-        report.entries,
-        report.foreign,
-        report.dropped,
-        report.orphans,
-        report.used_bytes,
-        watermark(retained),
-        drain_bound(u64::MAX, None).as_secs(),
-        dir = resolved.dir.display(),
-        quota = resolved.quota_bytes,
-    )
-}
-
-/// The reason a finished job was started for (a stopped one reads as the watermark).
-fn take_reason(inflight: &mut Vec<(u64, Reason)>, id: u64) -> Reason {
-    inflight
-        .iter()
-        .position(|(job, _)| *job == id)
-        .map_or(Reason::Watermark, |at| inflight.remove(at).1)
-}
-
-impl Counters {
-    /// The totals by reason, for a log line.
-    fn summary(&self) -> String {
-        format!(
-            "{} entries {} B at the watermark, {} entries {} B at a stop, {} dropped",
-            self.watermark.entries,
-            self.watermark.bytes,
-            self.stop.entries,
-            self.stop.bytes,
-            self.dropped
-        )
-    }
-}
-
-/// Reads the next chunk of at most `max` bytes from the held slot. The second value is true once
-/// the last byte of the entry has been read.
-fn copy_chunk(copying: &mut Copying, max: usize) -> Result<(Vec<u8>, bool), EngError> {
-    let mut out = Vec::new();
-    let slot = &copying.held.slot;
-    while out.len() < max && copying.at < copying.runs.len() {
-        let run = copying.runs[copying.at];
-        let take = (run.bytes - copying.within).min(max - out.len());
-        let from = out.len();
-        out.resize(from + take, 0);
-        slot.read(run.slab + copying.within, &mut out[from..])?;
-        copying.within += take;
-        if copying.within == run.bytes {
-            copying.at += 1;
-            copying.within = 0;
-        }
-    }
-    Ok((out, copying.at == copying.runs.len()))
-}
-
-/// Moves the cursor back by `bytes`, undoing a chunk the writer did not take.
-fn rewind(copying: &mut Copying, mut bytes: usize) {
-    while bytes > 0 {
-        if copying.within == 0 {
-            if copying.at == 0 {
-                return;
-            }
-            copying.at -= 1;
-            copying.within = copying.runs[copying.at].bytes;
-        }
-        let back = copying.within.min(bytes);
-        copying.within -= back;
-        bytes -= back;
-    }
-}
-
-#[cfg(test)]
-#[path = "prefix_disk_tests.rs"]
-mod tests;
