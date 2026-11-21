@@ -3281,7 +3281,7 @@ mod tests {
                 let after = crate::family::stored::qualification_expert_reads();
                 let reads = after.slice_reads - before.slice_reads;
                 let bytes = after.read_bytes - before.read_bytes;
-                assert!(reads >= 9 && reads % 9 == 0);
+                assert!(reads >= 9 && reads.is_multiple_of(9));
                 assert_eq!(bytes, (reads / 9) * ffn_file_bytes);
                 assert_eq!(streamed.decoder.kernels.qualification_page_copies(), copies);
                 println!(
