@@ -517,7 +517,8 @@ impl FlashExecutor {
         let sparse_enabled = std::env::var_os("FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL")
             .is_some_and(|value| value == "1");
         let sparse_prefill_bytes = match chunk {
-            Some(rows) if sparse_enabled => (remaining - cost.workspace(rows)?)
+            Some(rows) if sparse_enabled => remaining
+                .saturating_sub(cost.workspace(rows)?)
                 .min(crate::family::prefill::mlx::PREFILL_RETIRE_CAP),
             _ => 0,
         };
