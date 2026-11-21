@@ -117,9 +117,11 @@ static_assert(sizeof(inference_cuda_router_logits_strided_args) == 64 &&
               offsetof(inference_cuda_router_logits_strided_args, n_expert) == 56 &&
               offsetof(inference_cuda_router_logits_strided_args, logit_stride) == 60,
               "router logits strided layout");
-static_assert(sizeof(inference_cuda_router_sigmoid_args) == 80 &&
+static_assert(sizeof(inference_cuda_router_sigmoid_args) == 96 &&
               offsetof(inference_cuda_router_sigmoid_args, status) == 48 &&
-              offsetof(inference_cuda_router_sigmoid_args, top_k) == 72, "router sigmoid layout");
+              offsetof(inference_cuda_router_sigmoid_args, top_k) == 72 &&
+              offsetof(inference_cuda_router_sigmoid_args, bias) == 80 &&
+              offsetof(inference_cuda_router_sigmoid_args, bias_bytes) == 88, "router sigmoid layout");
 #endif
 
 #endif

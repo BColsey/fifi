@@ -33,8 +33,7 @@ use crate::kernels::cuda::native::resident::hyper::hyper_read_reference_launch;
 use crate::kernels::cuda::native::resident::hyper::{
     HYPER_MAX_BRANCHES, HYPER_MAX_HIDDEN, HYPER_MAX_M, HYPER_MAX_RANK, HYPER_MAX_WIDTH,
     HyperApplyRaw, HyperDims, HyperMixApplyRaw, HyperReadBytes, HyperReadRaw, dims_width,
-    hyper_apply_launch, hyper_mix_apply_launch,
-    hyper_read_launch, read_need,
+    hyper_apply_launch, hyper_mix_apply_launch, hyper_read_launch, read_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 

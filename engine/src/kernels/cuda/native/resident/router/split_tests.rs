@@ -36,6 +36,8 @@ fn select() -> RouterSigmoidArgsRaw {
         m: 1,
         n_expert: 8,
         top_k: 6,
+        bias: std::ptr::null(),
+        bias_bytes: 0,
     }
 }
 
