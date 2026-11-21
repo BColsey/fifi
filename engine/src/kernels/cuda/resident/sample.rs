@@ -1,12 +1,12 @@
-//! The device sampler of the Gemma 4 Humanizer decode step: one launch that reads
+//! The device sampler of a resident decode step: one launch that reads
 //! the logits row on the device and writes the chosen token id, its log
 //! probability and a status word. The logits row never leaves the device.
 //!
-//! [CudaContext::sample_gemma] queues the kernel on a [DeviceStream] and returns
+//! [CudaContext::sample] queues the kernel on a [DeviceStream] and returns
 //! when it is queued.
 //!
 //! Every refusal is a BadRequest and happens before any native call: the backend is
-//! usable; n is a multiple of 32 in 32..=4194304; the temperature is finite; top_k is
+//! usable; n is in 1..=4194304 (the sampler width, which need not be a multiple of anything); the temperature is finite; top_k is
 //! 0 or up to n; top_p is in (0, 1]; min_p is in [0, 1); the logits and the scratch
 //! row hold n floats at 4-byte alignment and do not overlap; the three outputs hold
 //! four bytes each and overlap neither the logits nor the scratch row.
@@ -19,7 +19,7 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::native::resident::sample_gemma::{SampleGemmaRaw, sample_gemma_launch};
+use crate::kernels::cuda::native::resident::sample::{SampleRaw, sample_launch};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SampleParams {
@@ -31,7 +31,7 @@ pub(crate) struct SampleParams {
     pub(crate) position: u64,
 }
 
-pub(crate) struct SampleGemmaCall<'b> {
+pub(crate) struct SampleCall<'b> {
     pub(crate) token: DeviceRange<'b>,
     pub(crate) logprob: DeviceRange<'b>,
     pub(crate) status: DeviceRange<'b>,
@@ -42,17 +42,17 @@ pub(crate) struct SampleGemmaCall<'b> {
 }
 
 impl CudaContext {
-    pub(crate) fn sample_gemma(
+    pub(crate) fn sample(
         &self,
         stream: &DeviceStream,
-        call: SampleGemmaCall<'_>,
+        call: SampleCall<'_>,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.plan_sample(&call)?;
-        self.launch_on(stream, |stream_raw| sample_gemma_launch(stream_raw, &raw))
+        self.launch_on(stream, |stream_raw| sample_launch(stream_raw, &raw))
     }
 
-    fn plan_sample<'b>(&self, call: &SampleGemmaCall<'b>) -> Result<SampleGemmaRaw<'b>, EngError> {
+    fn plan_sample<'b>(&self, call: &SampleCall<'b>) -> Result<SampleRaw<'b>, EngError> {
         let (token, logprob, status, probs, logits) = (
             self.raw_range(&call.token)?,
             self.raw_range(&call.logprob)?,
@@ -60,9 +60,9 @@ impl CudaContext {
             self.raw_range(&call.probs)?,
             self.raw_range(&call.logits)?,
         );
-        if !(32..=4_194_304).contains(&call.n) || !call.n.is_multiple_of(32) {
+        if !(1..=4_194_304).contains(&call.n) {
             return Err(EngError::BadRequest(format!(
-                "the sampler needs n a multiple of 32 up to 4194304, got {}",
+                "the sampler needs n in 1 to 4194304, got {}",
                 call.n
             )));
         }
@@ -115,7 +115,7 @@ impl CudaContext {
         require_apart(&token_claim, &logprob_claim)?;
         require_apart(&token_claim, &status_claim)?;
         require_apart(&logprob_claim, &status_claim)?;
-        Ok(SampleGemmaRaw {
+        Ok(SampleRaw {
             token,
             logprob,
             status,

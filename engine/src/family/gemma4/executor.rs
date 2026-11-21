@@ -8,7 +8,7 @@
 //! the KV8 planes: a cell is written when a token is fed and read only below the
 //! position word, so a reset that clears the history and the position is exact.
 //!
-//! Sampling happens on the device (sample_gemma); this adapter never reads the
+//! Sampling happens on the device (sample); this adapter never reads the
 //! logits row back. It reads a token id, its log probability and a status word per step.
 //!
 //! Limits:
@@ -19,7 +19,7 @@
 use super::resident::{CELLS, Gemma, VOCAB};
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
-use crate::kernels::cuda::resident::sample_gemma::{SampleGemmaCall, SampleParams};
+use crate::kernels::cuda::resident::sample::{SampleCall, SampleParams};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 
@@ -199,9 +199,9 @@ impl DeviceSampler {
         logits: DeviceRange<'_>,
         params: SampleParams,
     ) -> Result<(u32, f32), EngError> {
-        ctx.sample_gemma(
+        ctx.sample(
             stream,
-            SampleGemmaCall {
+            SampleCall {
                 token: self.token.range(0, 4)?,
                 logprob: self.logprob.range(0, 4)?,
                 status: self.status.range(0, 4)?,

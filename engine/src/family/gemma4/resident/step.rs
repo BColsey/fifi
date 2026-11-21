@@ -582,7 +582,7 @@ impl Gemma {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::cuda::resident::sample_gemma::{SampleGemmaCall, SampleParams};
+    use crate::kernels::cuda::resident::sample::{SampleCall, SampleParams};
 
     fn logits(model: &Gemma) -> Vec<f32> {
         let mut bytes = vec![0u8; VOCAB * 4];
@@ -604,9 +604,9 @@ mod tests {
         let logprob = ctx.allocate(4).expect("log probability");
         let status = ctx.upload(&[0u8; 4]).expect("status");
         let probs = ctx.allocate(VOCAB * 4).expect("probabilities");
-        ctx.sample_gemma(
+        ctx.sample(
             &model.stream,
-            SampleGemmaCall {
+            SampleCall {
                 token: token.range(0, 4).expect("token"),
                 logprob: logprob.range(0, 4).expect("log probability"),
                 status: status.range(0, 4).expect("status"),

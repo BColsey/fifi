@@ -112,7 +112,7 @@ pub(crate) mod router;
 pub(crate) mod router_rows;
 pub(crate) mod row_add;
 pub(crate) mod row_scale;
-pub(crate) mod sample_gemma;
+pub(crate) mod sample;
 pub(crate) mod shortlist;
 pub(crate) mod softcap;
 pub(crate) mod sparse_decode;

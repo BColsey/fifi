@@ -93,7 +93,7 @@ pub(in crate::kernels::cuda) mod router;
 pub(in crate::kernels::cuda) mod router_rows;
 pub(in crate::kernels::cuda) mod row_add;
 pub(in crate::kernels::cuda) mod row_scale;
-pub(in crate::kernels::cuda) mod sample_gemma;
+pub(in crate::kernels::cuda) mod sample;
 pub(in crate::kernels::cuda) mod shortlist;
 pub(in crate::kernels::cuda) mod softcap;
 pub(in crate::kernels::cuda) mod sparse_decode;

@@ -1,4 +1,4 @@
-//! Raw FFI to inference_cuda_sample_gemma_launch of native/resident/sample_gemma.cu.
+//! Raw FFI to inference_cuda_sample_launch of native/resident/sample.cu.
 //!
 //! Safety invariants: RawRange::new proved each range in bounds; this module
 //! re-proves sizes, alignment, parameter ranges and the separation of the three
@@ -11,17 +11,17 @@ use std::mem::offset_of;
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
 unsafe extern "C" {
-    #[link_name = "inference_cuda_sample_gemma_launch"]
-    fn sample_gemma_launch_raw(
-        args: *const SampleGemmaArgsRepr,
+    #[link_name = "inference_cuda_sample_launch"]
+    fn sample_launch_raw(
+        args: *const SampleArgsRepr,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
 }
 
-/// Mirror of inference_cuda_sample_gemma_args, field for field.
+/// Mirror of inference_cuda_sample_args, field for field.
 #[repr(C)]
-struct SampleGemmaArgsRepr {
+struct SampleArgsRepr {
     token: *mut c_void,
     logprob: *mut c_void,
     status: *mut c_void,
@@ -39,24 +39,24 @@ struct SampleGemmaArgsRepr {
 }
 
 const _: () = assert!(
-    size_of::<SampleGemmaArgsRepr>() == 80
-        && offset_of!(SampleGemmaArgsRepr, token) == 0
-        && offset_of!(SampleGemmaArgsRepr, logprob) == 8
-        && offset_of!(SampleGemmaArgsRepr, status) == 16
-        && offset_of!(SampleGemmaArgsRepr, probs) == 24
-        && offset_of!(SampleGemmaArgsRepr, logits) == 32
-        && offset_of!(SampleGemmaArgsRepr, n) == 40
-        && offset_of!(SampleGemmaArgsRepr, temperature) == 44
-        && offset_of!(SampleGemmaArgsRepr, top_k) == 48
-        && offset_of!(SampleGemmaArgsRepr, top_p) == 52
-        && offset_of!(SampleGemmaArgsRepr, min_p) == 56
-        && offset_of!(SampleGemmaArgsRepr, seed_lo) == 60
-        && offset_of!(SampleGemmaArgsRepr, seed_hi) == 64
-        && offset_of!(SampleGemmaArgsRepr, pos_lo) == 68
-        && offset_of!(SampleGemmaArgsRepr, pos_hi) == 72
+    size_of::<SampleArgsRepr>() == 80
+        && offset_of!(SampleArgsRepr, token) == 0
+        && offset_of!(SampleArgsRepr, logprob) == 8
+        && offset_of!(SampleArgsRepr, status) == 16
+        && offset_of!(SampleArgsRepr, probs) == 24
+        && offset_of!(SampleArgsRepr, logits) == 32
+        && offset_of!(SampleArgsRepr, n) == 40
+        && offset_of!(SampleArgsRepr, temperature) == 44
+        && offset_of!(SampleArgsRepr, top_k) == 48
+        && offset_of!(SampleArgsRepr, top_p) == 52
+        && offset_of!(SampleArgsRepr, min_p) == 56
+        && offset_of!(SampleArgsRepr, seed_lo) == 60
+        && offset_of!(SampleArgsRepr, seed_hi) == 64
+        && offset_of!(SampleArgsRepr, pos_lo) == 68
+        && offset_of!(SampleArgsRepr, pos_hi) == 72
 );
 
-pub(in crate::kernels::cuda) struct SampleGemmaRaw<'a> {
+pub(in crate::kernels::cuda) struct SampleRaw<'a> {
     pub(in crate::kernels::cuda) token: RawRange<'a>,
     pub(in crate::kernels::cuda) logprob: RawRange<'a>,
     pub(in crate::kernels::cuda) status: RawRange<'a>,
@@ -71,7 +71,7 @@ pub(in crate::kernels::cuda) struct SampleGemmaRaw<'a> {
     pub(in crate::kernels::cuda) position: u64,
 }
 
-fn check(call: &SampleGemmaRaw<'_>) -> Result<(), DeviceFailure> {
+fn check(call: &SampleRaw<'_>) -> Result<(), DeviceFailure> {
     let bytes = call.n.checked_mul(4).ok_or_else(invalid_argument)?;
     let sized = call.probs.bytes >= bytes && call.logits.bytes >= bytes;
     let small = |r: &RawRange<'_>| r.bytes >= 4 && r.offset.is_multiple_of(4);
@@ -87,8 +87,7 @@ fn check(call: &SampleGemmaRaw<'_>) -> Result<(), DeviceFailure> {
             apart = apart && out.apart(&Span::of(other, 4));
         }
     }
-    let params = (32..=4_194_304).contains(&call.n)
-        && call.n.is_multiple_of(32)
+    let params = (1..=4_194_304).contains(&call.n)
         && call.temperature.is_finite()
         && call.top_k <= call.n
         && call.top_p > 0.0
@@ -108,12 +107,12 @@ fn check(call: &SampleGemmaRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-pub(in crate::kernels::cuda) fn sample_gemma_launch(
+pub(in crate::kernels::cuda) fn sample_launch(
     stream: &RawStream,
-    call: &SampleGemmaRaw<'_>,
+    call: &SampleRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     check(call)?;
-    let args = SampleGemmaArgsRepr {
+    let args = SampleArgsRepr {
         token: call.token.address(),
         logprob: call.logprob.address(),
         status: call.status.address(),
@@ -131,6 +130,6 @@ pub(in crate::kernels::cuda) fn sample_gemma_launch(
     };
     let mut stage = STAGE_NONE;
     // SAFETY: check proved the extents and the parameter ranges; the adapter repeats them.
-    let status = unsafe { sample_gemma_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe { sample_launch_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }

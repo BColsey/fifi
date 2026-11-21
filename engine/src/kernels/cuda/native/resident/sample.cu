@@ -1,4 +1,4 @@
-/* Device sampler of the Gemma 4 Humanizer decode step.
+/* Device sampler of a resident decode step (shared by every family).
  *
  * The logits row is consumed on the device. One block computes the maximum, the
  * temperature-scaled exponential and its sum, derives the min-p, top-k and top-p
@@ -16,7 +16,7 @@
 
 #include "abi.h"
 #include "device.h"
-#include "resident/sample_gemma.h"
+#include "resident/sample.h"
 
 namespace {
 
@@ -132,7 +132,7 @@ __device__ float uniform01(unsigned int seed_lo, unsigned int seed_hi, unsigned 
     return (float)(w >> 8) * (1.0f / 16777216.0f);
 }
 
-__global__ void sample_gemma_kernel(const float *logits, float *probs, int n, float temperature,
+__global__ void sample_kernel(const float *logits, float *probs, int n, float temperature,
                                     int top_k, float top_p, float min_p, unsigned int seed_lo,
                                     unsigned int seed_hi, unsigned int pos_lo, unsigned int pos_hi,
                                     unsigned int *token, float *logprob, unsigned int *status) {
@@ -314,7 +314,7 @@ bool apart(const void *a, size_t ab, const void *b, size_t bb) {
 
 }  // namespace
 
-extern "C" int inference_cuda_sample_gemma_launch(const inference_cuda_sample_gemma_args *args,
+extern "C" int inference_cuda_sample_launch(const inference_cuda_sample_args *args,
                                                   void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -322,7 +322,7 @@ extern "C" int inference_cuda_sample_gemma_launch(const inference_cuda_sample_ge
         if (args->token == NULL || args->logprob == NULL || args->status == NULL ||
             args->probs == NULL || args->logits == NULL)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
-        if (args->n < 32 || args->n > 4194304 || args->n % 32 != 0) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->n < 1 || args->n > 4194304) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (!isfinite(args->temperature)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (args->top_k < 0 || args->top_k > args->n) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (!(args->top_p > 0.0f) || args->top_p > 1.0f) return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -338,7 +338,7 @@ extern "C" int inference_cuda_sample_gemma_launch(const inference_cuda_sample_ge
             !apart(args->status, 4, args->token, 4) || !apart(args->status, 4, args->logprob, 4))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        sample_gemma_kernel<<<1, kThreads, 0, (cudaStream_t)stream>>>(
+        sample_kernel<<<1, kThreads, 0, (cudaStream_t)stream>>>(
             (const float *)args->logits, (float *)args->probs, args->n, args->temperature,
             args->top_k, args->top_p, args->min_p, args->seed_lo, args->seed_hi, args->pos_lo,
             args->pos_hi, (unsigned int *)args->token, (float *)args->logprob,
