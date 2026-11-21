@@ -568,6 +568,7 @@ fn check_tensors(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
 }
 
 pub mod reference;
+pub(crate) mod serve;
 
 #[cfg(test)]
 mod tests;
