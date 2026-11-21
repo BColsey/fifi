@@ -626,3 +626,43 @@ fn a_tensor_over_the_one_gib_limit_fails_the_open_with_memory_plan() {
     let message = rejection(open_sparse_f32(1 << 28));
     assert_eq!(message, "gguf model: tensor token_embd.weight is missing");
 }
+
+#[test]
+fn a_next_token_prediction_block_beyond_the_layers_is_skipped_not_refused() {
+    let spec = TWO_LAYER_SPEC;
+    let mut counts = spec_counts(&spec);
+    counts[0] += 1;
+    let mut kvs = metadata("qwen35moe", counts);
+    kvs.push(kv_u32("qwen35moe.nextn_predict_layers", 1));
+    let mut tensors = file_tensors(&spec);
+    let before = tensors.len();
+    for name in [
+        "blk.2.nextn.eh_proj.weight",
+        "blk.2.attn_q.weight",
+        "blk.2.ffn_up_exps.weight",
+    ] {
+        tensors.push(FileTensor::new(name, GgufType::F32, vec![8]));
+    }
+    let model = open(&kvs, &tensors, &spec).expect("the file opens");
+    assert_eq!(model.plan().tensors().count(), before);
+    assert!(
+        model
+            .plan()
+            .tensors()
+            .all(|(name, _)| !name.starts_with("blk.2.")),
+        "the block after the layers is not in the plan"
+    );
+}
+
+#[test]
+fn an_extra_block_without_the_next_token_key_is_still_refused() {
+    let spec = TWO_LAYER_SPEC;
+    let mut counts = spec_counts(&spec);
+    counts[0] += 1;
+    let kvs = metadata("qwen35moe", counts);
+    let message = rejection(open(&kvs, &file_tensors(&spec), &spec));
+    assert!(
+        message.contains("block_count is 3, expected 2"),
+        "{message}"
+    );
+}

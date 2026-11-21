@@ -20,6 +20,7 @@ mod flint_tests;
 mod hf;
 #[cfg(test)]
 mod hf_tests;
+mod local_models;
 mod messages;
 mod model_serve;
 mod pieces;

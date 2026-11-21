@@ -131,8 +131,15 @@ fn open_with_spec(
     let inventory = Inventory::for_spec(spec)?;
     let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
     weights.require_single_file("the Qwen3.6 GGUF engine")?;
-    check_metadata(weights.header(), spec)?;
-    let pairs = match_tensors(weights.header(), &inventory, spec.name)?;
+    let nextn = nextn_layers(weights.header())?;
+    check_metadata(weights.header(), spec, nextn)?;
+    if nextn > 0 {
+        eprintln!(
+            "gguf model: skipping the {nextn} next-token prediction block(s) blk.{}..: the {} spec has no MTP head",
+            spec.layers, spec.name
+        );
+    }
+    let pairs = match_tensors(weights.header(), &inventory, spec.name, spec.layers, nextn)?;
     let mut tensors = Vec::with_capacity(pairs.len());
     for (expected, tensor) in pairs {
         tensors.push(classify(expected, tensor)?);
@@ -148,7 +155,19 @@ fn reject(message: impl Into<String>) -> EngError {
     EngError::Checkpoint(format!("gguf model: {}", message.into()))
 }
 
-fn check_metadata(header: &GgufHeader, spec: &FamilySpec) -> Result<(), EngError> {
+/// The blocks after the model's own layers that a file carries for next-token prediction:
+/// `qwen35moe.nextn_predict_layers`, zero when the key is absent. They are data of the file,
+/// never a reason to refuse it.
+fn nextn_layers(header: &GgufHeader) -> Result<u32, EngError> {
+    let key = format!("{ARCHITECTURE}.nextn_predict_layers");
+    if header.meta(&key).is_none() {
+        return Ok(0);
+    }
+    u32::try_from(meta_count(header, &key)?)
+        .map_err(|_| reject(format!("metadata key {key} is out of range")))
+}
+
+fn check_metadata(header: &GgufHeader, spec: &FamilySpec, nextn: u32) -> Result<(), EngError> {
     match header.meta("general.architecture") {
         Some(MetaValue::String(found)) if found == ARCHITECTURE => {}
         Some(MetaValue::String(found)) => {
@@ -160,7 +179,7 @@ fn check_metadata(header: &GgufHeader, spec: &FamilySpec) -> Result<(), EngError
         None => return Err(reject("metadata key general.architecture is missing")),
     }
     let counts = [
-        ("block_count", spec.layers),
+        ("block_count", spec.layers + nextn),
         ("embedding_length", spec.hidden),
         ("expert_count", spec.experts),
         ("expert_used_count", spec.top_k),
@@ -193,8 +212,17 @@ fn match_tensors<'a>(
     header: &'a GgufHeader,
     inventory: &'a Inventory,
     family: &str,
+    layers: u32,
+    nextn: u32,
 ) -> Result<Vec<(&'a ExpectedTensor, &'a GgufTensor)>, EngError> {
+    // The tensors of the next-token prediction blocks are skipped, not matched.
+    let skipped = |name: &str| {
+        (layers..layers + nextn).any(|block| name.starts_with(&format!("blk.{block}.")))
+    };
     for tensor in header.tensors() {
+        if skipped(tensor.name()) {
+            continue;
+        }
         if inventory.get(tensor.name()).is_none() {
             return Err(reject(format!(
                 "tensor {} is not in the {family} inventory",

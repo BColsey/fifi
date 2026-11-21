@@ -193,20 +193,41 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 /// anything else shaped like `org/repo` resolves to the hub cache
 /// snapshot of its `main` ref, and anything else is left for
 /// discovery to reject in its own words.
-fn resolve_model_dir(args: &ModelServeArgs) -> ModelServeArgs {
+fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupError> {
     let text = args.model_dir.to_string_lossy();
-    if !args.model_dir.exists()
-        && let Some(snapshot) = super::hf::cached_main_snapshot(&text)
-    {
+    if args.model_dir.exists() {
+        return Ok(args.clone());
+    }
+    if let Some(snapshot) = super::hf::cached_main_snapshot(&text) {
         eprintln!(
             "model: {text} resolved to the hub cache at {}",
             snapshot.display()
         );
         let mut resolved = args.clone();
         resolved.model_dir = snapshot;
-        return resolved;
+        return Ok(resolved);
     }
-    args.clone()
+    // A plain name: look in the local stores before saying it is not a directory.
+    if super::local_models::is_plain_name(&text) {
+        let stores = super::local_models::Stores::from_env();
+        if let Some(found) = super::local_models::resolve(&text, &stores)? {
+            eprintln!(
+                "model: {text} resolved to {} in {}",
+                found.dir.display(),
+                found.store
+            );
+            let mut resolved = args.clone();
+            resolved.model_dir = found.dir;
+            return Ok(resolved);
+        }
+        return Err(StartupError(format!(
+            "serve --model: nothing local is named {text} (looked in {}, {} and {}); download it first, for example from the model page of the web console or with `hf download <org/repo>`, or pass the directory",
+            stores.models.display(),
+            stores.ollama.display(),
+            stores.hub.display()
+        )));
+    }
+    Ok(args.clone())
 }
 
 /// Discover the model, run the non-probing preflight, and build the
@@ -216,7 +237,7 @@ fn resolve_model_dir(args: &ModelServeArgs) -> ModelServeArgs {
 pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
     // An `org/repo` id names a hub-cache download (the GUI's model
     // page, or `hf download`); a literal existing path always wins.
-    let args = resolve_model_dir(args);
+    let args = resolve_model_dir(args)?;
     let discovered = discover(&args)?;
 
     // The preflight of a serving process: every check that needs no
