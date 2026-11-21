@@ -251,6 +251,106 @@ fn disk_experts_row() -> EffectiveSetting {
     row("mlx_disk_experts", text, env_origin(&value))
 }
 
+/// A switch that is on only for `1`, rendered with the first condition the executor also needs
+/// when it is not met, and with the value named when it is not `1`.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn conditional_switch_text(value: Option<&std::ffi::OsStr>, unmet: &[(bool, &str)]) -> String {
+    match value {
+        None => "false".into(),
+        Some(flag) if flag == "1" => match unmet.iter().find(|(met, _)| !met) {
+            None => "true".into(),
+            Some((_, why)) => format!("true (ignored: {why})"),
+        },
+        Some(flag) => format!("false (ignored: {:?} is not 1)", flag.to_string_lossy()),
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn request_prefill_text(
+    value: Option<&std::ffi::OsStr>,
+    device_sizing: bool,
+    chained_prefill: bool,
+) -> String {
+    conditional_switch_text(
+        value,
+        &[
+            (device_sizing, "device sizing is off"),
+            (!chained_prefill, "chained prefill is on"),
+        ],
+    )
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn request_kv_text(
+    value: Option<&std::ffi::OsStr>,
+    compact_kv: bool,
+    device_sizing: bool,
+) -> String {
+    conditional_switch_text(
+        value,
+        &[
+            (compact_kv, "compact KV is off"),
+            (device_sizing, "device sizing is off"),
+        ],
+    )
+}
+
+/// The pair path needs request-sized prefill, the shared-page pipeline and disk-backed experts;
+/// the last is decided when the model opens, so a pair that meets the other two reports it.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn prefill_pair_text(
+    value: Option<&std::ffi::OsStr>,
+    request_prefill: bool,
+    pipeline: bool,
+) -> String {
+    let parsed = matches!(
+        value.and_then(std::ffi::OsStr::to_str),
+        Some("1" | "auto" | "waves64")
+    );
+    match value {
+        None => "false".into(),
+        Some(_) if !parsed => format!(
+            "false (ignored: {:?} is not 1, auto or waves64)",
+            value.map(|v| v.to_string_lossy()).unwrap_or_default()
+        ),
+        Some(_) => match [
+            (request_prefill, "request prefill is not active"),
+            (pipeline, "the shared-page pipeline is off"),
+        ]
+        .iter()
+        .find(|(met, _)| !met)
+        {
+            Some((_, why)) => format!("true (ignored: {why})"),
+            None => "true (applies only with disk-backed experts)".into(),
+        },
+    }
+}
+
+/// The policy the executor will run: off whenever the pair path is off.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn prefill_pair_policy_text(parsed: &str, request_prefill: bool, pipeline: bool) -> String {
+    if parsed != "off" && !(request_prefill && pipeline) {
+        format!("off (the {parsed} policy is not active: the pair path is off)")
+    } else {
+        parsed.to_string()
+    }
+}
+
 fn mlx_switch_text(value: Option<&std::ffi::OsStr>) -> String {
     match value {
         None => "false".into(),
@@ -430,6 +530,14 @@ pub(crate) fn flint_effective_for_build(
         let request_kv = std::env::var_os("FIFI_FLINT_MLX_REQUEST_KV");
         let request_prefill = std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL");
         let prefill_pair = std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR");
+        let conditions = factory::switch_conditions();
+        let (sizing, chained, compact, pipeline) = (
+            conditions.device_sizing,
+            conditions.chained_prefill,
+            conditions.compact_kv,
+            conditions.pipeline,
+        );
+        let request_prefill_on = factory::request_prefill_enabled(request_prefill.as_deref());
         let pair_policy = factory::prefill_pair_policy(prefill_pair.as_deref());
         let mut result = vec![
             row("backend", "mlx".into(), Origin::Derived),
@@ -451,23 +559,23 @@ pub(crate) fn flint_effective_for_build(
             ),
             row(
                 "mlx_request_prefill",
-                factory::request_prefill_enabled(request_prefill.as_deref()).to_string(),
+                request_prefill_text(request_prefill.as_deref(), sizing, chained),
                 env_origin(&request_prefill),
             ),
             row(
                 "mlx_prefill_pair",
-                (pair_policy != factory::PrefillPairPolicy::Off).to_string(),
+                prefill_pair_text(prefill_pair.as_deref(), request_prefill_on, pipeline),
                 env_origin(&prefill_pair),
             ),
             row(
                 "mlx_prefill_pair_policy",
-                pair_policy.label().into(),
+                prefill_pair_policy_text(pair_policy.label(), request_prefill_on, pipeline),
                 env_origin(&prefill_pair),
             ),
             mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
             row(
                 "mlx_request_kv",
-                factory::request_sized_kv_enabled(request_kv.as_deref()).to_string(),
+                request_kv_text(request_kv.as_deref(), compact, sizing),
                 env_origin(&request_kv),
             ),
         ];
@@ -972,6 +1080,67 @@ mod tests {
         let bad = super::legacy_read_runs_text(Some(OsStr::new("yes")));
         assert!(
             bad.starts_with("off (FIFI_FLINT_MLX_EXPERT_READ_RUNS takes precedence; ignored: ")
+        );
+    }
+
+    #[test]
+    fn the_flint_request_rows_name_the_condition_that_stops_them() {
+        use std::ffi::OsStr;
+        let one = Some(OsStr::new("1"));
+        assert_eq!(super::request_prefill_text(None, true, false), "false");
+        assert_eq!(super::request_prefill_text(one, true, false), "true");
+        assert_eq!(
+            super::request_prefill_text(one, false, false),
+            "true (ignored: device sizing is off)"
+        );
+        assert_eq!(
+            super::request_prefill_text(one, true, true),
+            "true (ignored: chained prefill is on)"
+        );
+        assert_eq!(
+            super::request_prefill_text(Some(OsStr::new("yes")), true, false),
+            "false (ignored: \"yes\" is not 1)"
+        );
+        assert_eq!(super::request_kv_text(one, true, true), "true");
+        assert_eq!(
+            super::request_kv_text(one, false, true),
+            "true (ignored: compact KV is off)"
+        );
+        assert_eq!(
+            super::request_kv_text(one, true, false),
+            "true (ignored: device sizing is off)"
+        );
+        assert_eq!(super::request_kv_text(None, false, false), "false");
+    }
+
+    #[test]
+    fn the_flint_pair_rows_follow_the_executors_conditions() {
+        use std::ffi::OsStr;
+        let value = |text: &'static str| Some(OsStr::new(text));
+        assert_eq!(super::prefill_pair_text(None, true, true), "false");
+        for text in ["1", "auto", "waves64"] {
+            assert_eq!(
+                super::prefill_pair_text(value(text), true, true),
+                "true (applies only with disk-backed experts)"
+            );
+        }
+        assert_eq!(
+            super::prefill_pair_text(value("auto"), false, true),
+            "true (ignored: request prefill is not active)"
+        );
+        assert_eq!(
+            super::prefill_pair_text(value("auto"), true, false),
+            "true (ignored: the shared-page pipeline is off)"
+        );
+        assert_eq!(
+            super::prefill_pair_text(value("2"), true, true),
+            "false (ignored: \"2\" is not 1, auto or waves64)"
+        );
+        assert_eq!(super::prefill_pair_policy_text("off", true, true), "off");
+        assert_eq!(super::prefill_pair_policy_text("auto", true, true), "auto");
+        assert_eq!(
+            super::prefill_pair_policy_text("auto", true, false),
+            "off (the auto policy is not active: the pair path is off)"
         );
     }
 }

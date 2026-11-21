@@ -94,6 +94,25 @@ pub(crate) fn prefill_pair_policy(setting: Option<&std::ffi::OsStr>) -> PrefillP
     }
 }
 
+/// What the Flint request switches depend on, as the executor reads it, for the effective view.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct SwitchConditions {
+    pub(crate) device_sizing: bool,
+    pub(crate) chained_prefill: bool,
+    pub(crate) compact_kv: bool,
+    pub(crate) pipeline: bool,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn switch_conditions() -> SwitchConditions {
+    SwitchConditions {
+        device_sizing: crate::family::mlx_budget::enabled(),
+        chained_prefill: super::mlx_forward::prefill_chain_flagged(),
+        compact_kv: super::mlx_state::compact_kv_flagged(),
+        pipeline: super::mlx_model::expert_pipeline_flagged(),
+    }
+}
+
 /// MLX freed-buffer cache limit selection (the OnceLock reader lives in
 /// `mlx_model`, which is Mac-gated; see the rollback documentation there).
 #[cfg(any(
