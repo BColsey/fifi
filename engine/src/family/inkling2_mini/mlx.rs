@@ -1,6 +1,8 @@
 //! Import one selected expert set from bounded host pages and project in its stored format.
 
-use super::{InklingExpertPlan, InklingExpertProjection};
+use super::{
+    HIDDEN, InklingExpertPlan, InklingExpertProjection, InklingExpertSource, InklingRoutes, TOP_K,
+};
 use crate::{
     EngError,
     kernels::{
@@ -16,6 +18,156 @@ pub struct MlxExpertStage {
     down: Projection,
 }
 
+/// The disk ranges and page capacity for one token-major routed batch.
+pub struct MlxRoutedExpertPlan<'a> {
+    experts: InklingExpertPlan<'a>,
+    routes: &'a InklingRoutes,
+    ids_offset: usize,
+    weight_offset: usize,
+    end: usize,
+}
+
+impl<'a> MlxRoutedExpertPlan<'a> {
+    /// Plans the selected weights and their compact route metadata before any I/O.
+    pub fn new(
+        source: &'a InklingExpertSource,
+        layer: usize,
+        routes: &'a InklingRoutes,
+    ) -> Result<Self, EngError> {
+        let count = routes.expert_ids().len();
+        // Both packed projections have HIDDEN output values per route.
+        // Reject batches above the Metal kernel's element-index limit before I/O.
+        if count == 0 || count > u32::MAX as usize / HIDDEN {
+            return Err(EngError::BadRequest(
+                "Inkling Metal staging requires a nonempty batch within native index limits".into(),
+            ));
+        }
+        let page_size = HostPages::page_size();
+        let experts = source.plan(layer, routes.expert_ids(), page_size)?;
+        let overflow = || EngError::MemoryPlan("Inkling route staging size overflows".into());
+        let route_bytes = count.checked_mul(4).ok_or_else(overflow)?;
+        let ids_offset = experts
+            .staging_bytes()
+            .checked_next_multiple_of(page_size)
+            .ok_or_else(overflow)?;
+        let weight_offset = ids_offset
+            .checked_add(route_bytes)
+            .and_then(|end| end.checked_next_multiple_of(page_size))
+            .ok_or_else(overflow)?;
+        let end = weight_offset
+            .checked_add(route_bytes)
+            .ok_or_else(overflow)?;
+        Ok(Self {
+            experts,
+            routes,
+            ids_offset,
+            weight_offset,
+            end,
+        })
+    }
+
+    pub fn staging_bytes(&self) -> usize {
+        self.end
+    }
+
+    pub fn expert_plan(&self) -> &InklingExpertPlan<'_> {
+        &self.experts
+    }
+
+    fn write_route_pages(&self, pages: &mut [u8]) -> [PageRange; 2] {
+        let count = self.routes.expert_ids().len();
+        let ids = &mut pages[self.ids_offset..self.ids_offset + count * 4];
+        for (word, slot) in ids
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.experts.compact_slots())
+        {
+            *word = slot.to_le_bytes();
+        }
+        for (word, weight) in pages[self.weight_offset..self.end]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.routes.weights())
+        {
+            *word = weight.to_le_bytes();
+        }
+        [
+            PageRange {
+                offset: self.ids_offset,
+                dtype: Dtype::U32,
+                shape: vec![count as u32],
+            },
+            PageRange {
+                offset: self.weight_offset,
+                dtype: Dtype::F32,
+                shape: vec![count as u32],
+            },
+        ]
+    }
+}
+
+/// One staged weight-only routed expert block. Route metadata stays on the
+/// same pages as the weights. The block accepts F32 input and returns F32
+/// storage with BF16-rounded values at the checkpoint's projection boundaries.
+pub struct MlxRoutedExpertStage {
+    experts: MlxExpertStage,
+    ids: BoundedIndices,
+    weights: ExecutionTensor,
+    rows: u32,
+}
+
+impl MlxRoutedExpertStage {
+    /// Imports packed weights and route metadata together without synchronization.
+    /// Keep the page pins until all consuming graphs have finished. Drop the
+    /// stage, release its pins, and synchronize before reusing the arena.
+    pub fn read(
+        kernels: &mut MlxKernels,
+        plan: &MlxRoutedExpertPlan<'_>,
+        pages: &mut HostPages,
+    ) -> Result<Self, EngError> {
+        let (experts, routing) =
+            MlxExpertStage::read_pages(kernels, &plan.experts, Some(plan), pages)?;
+        let [ids, weights] = routing.try_into().map_err(|_| EngError::Backend {
+            operation: "Inkling expert staging",
+            message: "native import returned a different route tensor count".into(),
+        })?;
+        // The selected expert plan supplies the compact IDs and their bound.
+        let ids = BoundedIndices::from_clamped(ids, plan.experts.gate_up().shape[0] as u32);
+        Ok(Self {
+            experts,
+            ids,
+            weights,
+            rows: plan.routes.rows() as u32,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        kernels: &mut MlxKernels,
+        input: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        let width = HIDDEN as u32;
+        if input.dtype() != Dtype::F32 || input.shape() != [self.rows, width] {
+            return Err(EngError::BadRequest(
+                "Inkling routed expert input must be F32 [tokens, hidden] for the staged routes"
+                    .into(),
+            ));
+        }
+        let input = if self.rows == 1 {
+            input.share()
+        } else {
+            kernels.repeat(input, TOP_K as u32, 0)?
+        };
+        let input = kernels.reshape(&input, &[input.shape()[0], 1, width])?;
+        let gate_up = self.experts.project_gate_up(kernels, &input, &self.ids)?;
+        let activation = kernels.inkling_activation(&gate_up, &self.weights)?;
+        let down = self.experts.project_down(kernels, &activation, &self.ids)?;
+        kernels.inkling_merge(&down, self.rows, TOP_K as u32)
+    }
+}
+
 impl MlxExpertStage {
     /// Reads directly into reusable pages and imports both packed projections together.
     /// Create the plan with `HostPages::page_size()` alignment. Use F32 inputs for
@@ -27,6 +179,15 @@ impl MlxExpertStage {
         plan: &InklingExpertPlan<'_>,
         pages: &mut HostPages,
     ) -> Result<Self, EngError> {
+        Ok(Self::read_pages(kernels, plan, None, pages)?.0)
+    }
+
+    fn read_pages(
+        kernels: &mut MlxKernels,
+        plan: &InklingExpertPlan<'_>,
+        routes: Option<&MlxRoutedExpertPlan<'_>>,
+        pages: &mut HostPages,
+    ) -> Result<(Self, Vec<ExecutionTensor>), EngError> {
         kernels.check_ready()?;
         let page_size = HostPages::page_size();
         if page_size == 0 || !plan.alignment().is_multiple_of(page_size) {
@@ -40,6 +201,13 @@ impl MlxExpertStage {
             operation: "Inkling expert staging",
             message: "host pages are still in use by a previous stage".into(),
         })?;
+        if let Some(routes) = routes
+            && bytes.len() < routes.staging_bytes()
+        {
+            return Err(EngError::BadRequest(
+                "Inkling expert and route metadata exceed the staging arena".into(),
+            ));
+        }
         plan.read_into(bytes)?;
         let mut scale_ranges = Vec::new();
         for projection in projections {
@@ -47,14 +215,20 @@ impl MlxExpertStage {
                 scale_ranges.push(range);
             }
         }
-        let (weights, multipliers) = kernels.import_packed_pages(pages, &stages, &scale_ranges)?;
+        let scale_count = scale_ranges.len();
+        if let Some(routes) = routes {
+            scale_ranges.extend(routes.write_route_pages(bytes));
+        }
+        let (weights, mut multipliers) =
+            kernels.import_packed_pages(pages, &stages, &scale_ranges)?;
         let [gate_up, down] = weights.try_into().map_err(|_| EngError::Backend {
             operation: "Inkling expert staging",
             message: "native import returned a different packed tensor count".into(),
         })?;
         // The two projections of a layer share their format.
+        let routing = multipliers.split_off(scale_count);
         let mut multipliers = multipliers.into_iter();
-        Ok(Self {
+        let stage = Self {
             gate_up: Projection {
                 weight: gate_up,
                 multipliers: multipliers.next(),
@@ -63,7 +237,8 @@ impl MlxExpertStage {
                 weight: down,
                 multipliers: multipliers.next(),
             },
-        })
+        };
+        Ok((stage, routing))
     }
 
     pub fn project_gate_up(
@@ -170,6 +345,69 @@ fn normalize_multipliers(
 mod tests {
     use super::*;
     use crate::{kernels::PackedWeight, tensor::Tensor};
+
+    #[test]
+    fn routed_activation_and_merge_round_at_the_bf16_boundaries() {
+        let _lock = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let import = |kernels: &mut MlxKernels, shape: Vec<u32>, values: &[f32]| {
+            let bytes = values.iter().copied().flat_map(f32::to_le_bytes).collect();
+            let host = Tensor::try_from_host(Dtype::F32, shape, bytes).unwrap();
+            kernels.import_tensor(&host).unwrap()
+        };
+        let data = |kernels: &mut MlxKernels, tensor: &ExecutionTensor| {
+            kernels
+                .readback(tensor)
+                .unwrap()
+                .host_bytes()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let bf16 = |value: f32| {
+            let bits = value.to_bits();
+            f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+        };
+        let raw = [64.0, -80.0, -12.0, 26.25, 3.5, 1.1, -2.3, -7.2];
+        let route_weights = [0.25, 1.75];
+        let gate_up = import(&mut kernels, vec![2, 1, 4], &raw);
+        let weights = import(&mut kernels, vec![2], &route_weights);
+        let output = kernels.inkling_activation(&gate_up, &weights).unwrap();
+        assert_eq!(output.shape(), [2, 1, 2]);
+        let expected: Vec<_> = raw
+            .chunks_exact(2)
+            .enumerate()
+            .map(|(i, row)| {
+                let g = bf16(row[0]);
+                let u = bf16(row[1]);
+                let sigmoid = 1.0 / (1.0 + (-g).exp());
+                let gate = 4.0 * (g / 4.0).tanh();
+                let up = 25.0 * (u / 25.0).tanh();
+                bf16(((gate * sigmoid) * up) * route_weights[i / 2])
+            })
+            .collect();
+        assert_eq!(data(&mut kernels, &output), expected);
+
+        let rows = [
+            1e8, 0.1, 1.0, 0.2, -1e8, 0.3, 3.0, 0.4, 0.0, 0.5, 0.0, 0.6, 0.0, 0.7, 0.0, 0.8,
+        ];
+        let down = import(&mut kernels, vec![8, 1, 2], &rows);
+        let output = kernels.inkling_merge(&down, 1, 8).unwrap();
+        assert_eq!(output.shape(), [1, 2]);
+        let expected: Vec<_> = (0..2)
+            .map(|col| {
+                let sum = rows
+                    .chunks_exact(2)
+                    .fold(0.0, |acc, row| acc + bf16(row[col]));
+                bf16(sum)
+            })
+            .collect();
+        assert_eq!(data(&mut kernels, &output), expected);
+    }
 
     #[test]
     fn scales_reordered_nvfp4_routes_on_metal() {

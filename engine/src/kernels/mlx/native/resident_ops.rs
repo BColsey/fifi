@@ -63,6 +63,10 @@ pub(super) const DELTA_MIDDLE_SOURCE: &str =
 
 pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal"), "\0");
 
+const INKLING_ACTIVATION_SOURCE: &str =
+    concat!(include_str!("inkling_activation.body.metal"), "\0");
+const INKLING_MERGE_SOURCE: &str = concat!(include_str!("inkling_merge.body.metal"), "\0");
+
 pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.metal"), "\0");
 
 pub(super) const ATTN_GATE_SOURCE: &str = concat!(include_str!("attn_gate.body.metal"), "\0");
@@ -2775,6 +2779,93 @@ impl Context {
         };
         expected.complete(&h, built)?;
         Ok(state.resident(h, Dtype::Bf16, vec![rows, ncol], byte_len))
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_activation(
+        &mut self,
+        gate_up: &ExecutionTensor,
+        weights: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling capped activation";
+        let &[rows, 1, combined] = gate_up.shape() else {
+            return Err(bad_request(
+                "Inkling gate/up must have shape [routes, 1, 2 * width]",
+            ));
+        };
+        if combined == 0 || !combined.is_multiple_of(2) || weights.shape() != [rows] {
+            return Err(bad_request(
+                "Inkling gate/up and route weight shapes disagree",
+            ));
+        }
+        self.inkling_expert_kernel(label, gate_up, Some(weights), rows, combined / 2, 1)
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_merge(
+        &mut self,
+        down: &ExecutionTensor,
+        rows: u32,
+        picks: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling expert merge";
+        let &[routes, 1, width] = down.shape() else {
+            return Err(bad_request(
+                "Inkling down output must have shape [routes, 1, hidden]",
+            ));
+        };
+        if picks == 0 || rows.checked_mul(picks) != Some(routes) {
+            return Err(bad_request("Inkling down output and route count disagree"));
+        }
+        self.inkling_expert_kernel(label, down, None, rows, width, picks)
+    }
+
+    fn inkling_expert_kernel(
+        &mut self,
+        label: &'static str,
+        projected: &ExecutionTensor,
+        weights: Option<&ExecutionTensor>,
+        rows: u32,
+        width: u32,
+        picks: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_f32_operand(label, state, projected)?;
+        let projected_elements = projected.byte_len() / Dtype::F32.byte_width();
+        if projected_elements > u64::from(u32::MAX) {
+            return Err(bad_request(
+                "Inkling expert kernel input exceeds Metal index limits",
+            ));
+        }
+        let items = rows
+            .checked_mul(width)
+            .ok_or_else(|| bad_request("Inkling expert grid overflows"))?;
+        let dims = native_ints(label, &[rows, width, items, picks])?;
+        let (shape, weight_array, source) = match weights {
+            Some(weights) => {
+                check_f32_operand(label, state, weights)?;
+                (
+                    vec![rows, 1, width],
+                    weights.storage.native_array(),
+                    INKLING_ACTIVATION_SOURCE,
+                )
+            }
+            None => (vec![rows, width], ffi::NULL_ARRAY, INKLING_MERGE_SOURCE),
+        };
+        let layout = shape::dequantize(label, &shape)?;
+        clear_message();
+        let stream = state.stream.0;
+        let output = dispatch_elementwise(label, &layout, stream, |slot| unsafe {
+            ffi::mlx_inkling_expert_kernel(
+                slot,
+                projected.storage.native_array(),
+                weight_array,
+                dims.as_ptr(),
+                source.as_ptr().cast(),
+                stream,
+            )
+        })?;
+        Ok(elementwise_result(state, output, layout))
     }
 
     /// Runs the gdn_post fused kernel: o = bf16(rms_norm(core) * silu(z)).

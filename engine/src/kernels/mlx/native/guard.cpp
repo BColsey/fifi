@@ -1817,6 +1817,50 @@ extern "C" int inference_mlx_act_mul(
   });
 }
 
+// Inkling uses one kernel for weighted capped activation and one for the FP32
+// merge of BF16 expert rows. dims contains rows, width, work items, and picks.
+extern "C" int inference_mlx_inkling_expert_kernel(
+    mlx_array* output, mlx_array projected, mlx_array route_weights, const int* dims,
+    const char* source, mlx_stream stream) noexcept {
+  return run_selected_operation(output, stream, [&] {
+    const bool activation = route_weights.ctx != nullptr;
+    const char* input_names[] = {"projected", "n_items", "route_weights"};
+    const char* output_names[] = {"result"};
+    const size_t input_count = activation ? 3 : 2;
+    mlx_vector_string in_names = mlx_vector_string_new_data(input_names, input_count);
+    mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 1);
+    mlx_fast_metal_kernel kernel = mlx_fast_metal_kernel_new(
+        activation ? "inkling_capped_activation" : "inkling_expert_merge",
+        in_names, out_names, source, kFusedPrefillHeader, true, false);
+    mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+    mlx_array n_items = mlx_array_new_int(dims[2]);
+    const mlx_array operands[] = {projected, n_items, route_weights};
+    mlx_vector_array inputs = mlx_vector_array_new_data(operands, input_count);
+    mlx_vector_array outputs = mlx_vector_array_new();
+    const int output_shape[] = {dims[0], activation ? 1 : dims[1], dims[1]};
+    int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                  n_items.ctx && inputs.ctx && outputs.ctx) ? 0 : 1;
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_output_arg(
+        config, output_shape, activation ? 3 : 2, MLX_FLOAT32);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(config, dims[2], 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+    if (status == 0) status = mlx_fast_metal_kernel_config_add_template_arg_int(config, "WIDTH", dims[1]);
+    if (status == 0 && !activation) status =
+        mlx_fast_metal_kernel_config_add_template_arg_int(config, "PICKS", dims[3]);
+    if (status == 0) status = mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+    if (status == 0 && mlx_vector_array_size(outputs) != 1) status = 1;
+    if (status == 0) status = mlx_vector_array_get(output, outputs, 0);
+    int released = mlx_vector_array_free(outputs);
+    released |= mlx_vector_array_free(inputs);
+    released |= mlx_array_free(n_items);
+    mlx_fast_metal_kernel_config_free(config);
+    mlx_fast_metal_kernel_free(kernel);
+    released |= mlx_vector_string_free(out_names);
+    released |= mlx_vector_string_free(in_names);
+    return status != 0 ? status : released;
+  });
+}
+
 
 // The router_topk fused kernel (Q36 decode MoE): the stable top-k selection of
 // one router probability row plus the renormalized gates in ONE launch,
