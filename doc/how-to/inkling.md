@@ -27,6 +27,8 @@ For chat requests, disabling thinking sets the publisher's reasoning effort to 0
 
 The GGUF inspector recognizes the mainline `inkling2_loop` and repository-root `inkling2` layouts. Both experimental text adapters need the pinned publisher tokenizer. Use a directory containing one text GGUF or pass the selected model file, including files with a `.gguf_file` suffix.
 
+The GGUF adapters advance prompt tokens serially and can group expert projections within each visit. The safetensors worker can group multiple prompt tokens per visit.
+
 ```sh
 FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
   FIFI_MLX_WORKING_SET_MIB=6144 FIFI_INKLING_GGUF_PACKED_MLX=1 \
@@ -279,6 +281,8 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 `FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1` uses the full already-admitted expert budget for packed Metal buffers when every stored expert projection has a direct packed kernel. Set it alongside `FIFI_INKLING_GGUF_PACKED_MLX=1`. The application retains one copy of each cached packed projection. The phase trace reports the two tier capacities and retained payload bytes. Use the same ceiling with and without the flag when comparing it.
 
 `FIFI_MLX_ADAPT_EXPERT_CACHE=1` applies to the publisher safetensors host cache. The decoder halves its admitted expert retention limit after a macOS warning and clears retained experts after a critical event. It checks the event before staging a visit or when resetting the decoder. The reduced cap lasts until server restart. KV and staging allocations stay within the original plan. The SDK smoke check registered and reused the observer. At `e9f74c2b`, observer-enabled and control servers at 5 GiB returned identical 12-token completions on the first and repeated requests. Both engine logs showed zero pressure-triggered cache trims. Event-driven trimming and its I/O impact remain unmeasured on real workloads. [Apple Dispatch memory-pressure documentation](https://developer.apple.com/documentation/Dispatch/DISPATCH_SOURCE_TYPE_MEMORYPRESSURE)
+
+The idle-host observer control also reproduced the original five-input, twelve-output benchmark at `e9f74c2b`. At 5 GiB, the repeat ran at 1.86 decode tok/s with 9.60 GB of logical expert reads, 5.86 GB of process-attributed disk reads, a 4.85 GB peak footprint, and zero swap-out pages. The output matched the original control. The two observer runs used an uncontrolled OS page cache.
 
 `FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. At `e9f74c2b`, the real fork test matched projected expert vectors and merged visit outputs bitwise across seven layers, including zero-retention and eviction cases. With warm retention, total grouped MLX import and readback synchronizations fell from 32 to four per visit. Combined packed, single-copy, grouped and four-worker probes on both real layouts each recorded 480 expert readbacks across 240 visits. Both selected token 152717. The fork matched the ordered top ten from the external reference with cosine similarity 0.999973.
 
