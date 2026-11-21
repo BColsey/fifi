@@ -1615,6 +1615,9 @@ mod tests {
             }
             self.note(format!("pair:{first_piece}+{}", tokens.len() - first_piece));
             self.inner.prefill(st, tokens)?;
+            if let Some(flag) = self.cancel_after_prefill.take() {
+                flag.store(true, Ordering::SeqCst);
+            }
             Ok(true)
         }
 
@@ -2353,6 +2356,63 @@ mod tests {
             assert_eq!(calls(&log), strings(calls_expected));
             assert_eq!(spy.history(&session), tokens);
             assert_eq!((pieces.count, pieces.max_rows), (2, 4));
+        }
+    }
+
+    #[test]
+    fn cancelling_after_pair_prefill_preserves_the_following_job() {
+        for first in [512, 1024] {
+            let log = new_log();
+            let state = generation();
+            let mut spy = Spy::new(vec![vec![0], vec![EOS]], &log);
+            spy.prefill_pair = true;
+            spy.cancel_after_prefill = Some(Arc::clone(&state.cancel));
+            let engine = start_spy(first, spy);
+            let handle = engine.handle();
+            let (cancelled, events) = Job::new(vec![1; first + 2], state).expect("job");
+            handle.try_submit(cancelled).expect("submit");
+            assert_eq!(
+                collect(events),
+                vec![
+                    batch(&[], "", Some(DecodeFinish::Cancelled)),
+                    finished_pieces(
+                        (first + 2) as u32,
+                        0,
+                        0,
+                        Some(PrefixReport::default()),
+                        PrefillPieces {
+                            count: 2,
+                            max_rows: first as u32
+                        },
+                    ),
+                ],
+            );
+            let (follow_up, events) = job(&[2]);
+            handle.try_submit(follow_up).expect("submit following job");
+            assert_eq!(
+                collect(events),
+                vec![
+                    batch(&[0], "a", None),
+                    batch(&[EOS], "", Some(DecodeFinish::Stop)),
+                    finished(&log, 1, 2),
+                ],
+            );
+            assert_eq!(
+                calls(&log),
+                vec![
+                    "reset".into(),
+                    "boundary".into(),
+                    format!("pair:{first}+2"),
+                    "decode".into(),
+                    "reset".into(),
+                    "boundary".into(),
+                    "prefill:1".into(),
+                    "decode".into(),
+                    "decode".into(),
+                ],
+            );
+            assert_eq!(handle.state(), EngineState::Ready);
+            engine.shutdown();
         }
     }
 
