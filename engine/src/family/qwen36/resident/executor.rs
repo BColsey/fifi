@@ -909,13 +909,14 @@ impl Q36Executor {
         settings: &Q36Settings,
         rules: Q36Rules,
         device: DeviceBudget,
+        disk_experts: bool,
     ) -> Result<(Self, Q36Session)> {
         Self::open_with_placement(
             &settings.artifact,
             settings.cache_limit,
             rules,
             &settings.spec,
-            Some((device, settings)),
+            Some((device, settings, disk_experts)),
         )
     }
 
@@ -924,7 +925,7 @@ impl Q36Executor {
         cache_limit: u64,
         rules: Q36Rules,
         spec: &FamilySpec,
-        placement: Option<(DeviceBudget, &Q36Settings)>,
+        placement: Option<(DeviceBudget, &Q36Settings, bool)>,
     ) -> Result<(Self, Q36Session)> {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
@@ -933,7 +934,7 @@ impl Q36Executor {
         let shape = shape_of(&config, spec)?;
         admit(&shape, &rules)?;
         let plan = placement
-            .map(|(device, settings)| {
+            .map(|(device, settings, _)| {
                 let retained =
                     (settings.prefix_reuse || rules.max_seqs > 1).then_some(rules.session_cap);
                 let context = usize::try_from(rules.context_limit)
@@ -947,6 +948,7 @@ impl Q36Executor {
                     retained,
                 )?
                 .max(settings.prefill_reserve);
+                device.remaining("Qwen MLX pre-import", &[("session_reserve_bytes", reserve)])?;
                 Ok::<_, EngError>(ExpertDevicePlan {
                     device,
                     reserve,
@@ -954,11 +956,27 @@ impl Q36Executor {
                 })
             })
             .transpose()?;
-        let ckpt: &'static StreamedCheckpoint = Box::leak(Box::new(open_checkpoint(artifact)?));
-        let host = HostWeights::load(ckpt, spec, &config)?;
+        let ckpt = open_checkpoint(artifact)?;
+        let disk_experts = placement.is_some_and(|(_, _, disk_experts)| disk_experts);
+        if let Some(plan) = plan {
+            use crate::family::keys::{KeyClass, KeyRole, classify};
+            plan.device.check_packed_payload_floor(
+                "Qwen MLX pre-import",
+                &ckpt,
+                plan.reserve,
+                |key| match classify(key, spec) {
+                    Ok((KeyClass::EmbedTokens, _)) => false,
+                    Ok((KeyClass::ExpertStack { .. }, KeyRole::Packed)) => !disk_experts,
+                    Ok((_, KeyRole::Packed)) => true,
+                    _ => false,
+                },
+            )?;
+        }
+        let host = HostWeights::load(&ckpt, spec, &config)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.set_cache_limit(cache_limit)?;
-        Self::from_parts_with_placement(kernels, ckpt, host, rules, plan)
+        let ckpt = Box::leak(Box::new(ckpt));
+        Self::from_parts_with_placement(kernels, ckpt, host, rules, plan.filter(|_| disk_experts))
     }
 
     /// Builds the executor from loaded parts. The rules are checked again before the import, so a
@@ -2506,6 +2524,75 @@ mod tests {
             matches!(&error, Some(EngError::Checkpoint(m)) if m.contains("model.safetensors.index.json")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn mlx_preimport_rejects_qwen_weight_floor_without_payload_reads() {
+        use crate::{family::qwen36::fixtures::checkpoint_files, weights::acquire_read};
+        let _serial = crate::native_test_lock();
+        for (spec, disk_experts) in [
+            (&TINY_GQA, false),
+            (&TINY_GQA, true),
+            (&tiny::TINY_DENSE, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let entries = tiny::entries(spec);
+            let floor: u64 = entries
+                .iter()
+                .filter(|(key, dtype, _, _)| {
+                    *dtype == "U32"
+                        && key.ends_with(".weight")
+                        && !key.contains(".embed_tokens.")
+                        && !(disk_experts && key.contains(".switch_mlp."))
+                })
+                .map(|(_, _, _, bytes)| bytes.len() as u64)
+                .sum();
+            assert!(floor > 0);
+            let (index, shard) = checkpoint_files(entries);
+            let config = tiny::config(spec);
+            std::fs::write(dir.path().join("config.json"), &config).unwrap();
+            std::fs::write(dir.path().join("model.safetensors.index.json"), index).unwrap();
+            std::fs::write(dir.path().join("m.safetensors"), shard).unwrap();
+            let mut settings = serving(Q36Options::default());
+            settings.artifact = dir.path().to_path_buf();
+            settings.spec = *spec;
+            settings.prefill_reserve = 0;
+            let rules = || Q36Rules {
+                session_cap: 16 << 20,
+                ..chunk_rules()
+            };
+            let shape = shape_of(&config, spec).unwrap();
+            let reserve = device_reserve(
+                &shape,
+                Activation::F32,
+                KvDtype::F32,
+                CHUNK_LIMIT as usize,
+                settings.cache_limit,
+                None,
+            )
+            .unwrap();
+
+            acquire_read::reset();
+            acquire_read::set(true);
+            let refused = Q36Executor::open_for_device(
+                &settings,
+                rules(),
+                DeviceBudget::new(reserve + floor - 1).unwrap(),
+                disk_experts,
+            );
+            acquire_read::set(false);
+            assert_eq!(acquire_read::snapshot(), (0, 0, 0));
+            assert!(matches!(refused, Err(EngError::MemoryPlan(m))
+                if m.contains("Qwen MLX pre-import")
+                && m.contains(&format!("packed_weight_payload_floor_bytes={floor}"))));
+            let (_executor, _session) = Q36Executor::open_for_device(
+                &settings,
+                rules(),
+                DeviceBudget::new(4 << 30).unwrap(),
+                disk_experts,
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -58,6 +58,36 @@ impl DeviceBudget {
         self.bytes().min(configured.unwrap_or(u64::MAX))
     }
 
+    /// Refuse a model when its mandatory packed payloads alone exceed the
+    /// budget left for weights. The loader still charges the full resident
+    /// tensors and staging pages after import.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn check_packed_payload_floor(
+        self,
+        family: &str,
+        ckpt: &crate::weights::StreamedCheckpoint,
+        reserve: u64,
+        is_resident: impl Fn(&str) -> bool,
+    ) -> Result<(), EngError> {
+        let weights = ckpt
+            .names()
+            .filter(|key| key.ends_with(".weight") && is_resident(key))
+            .try_fold(0u64, |total, key| {
+                total.checked_add(ckpt.stored_byte_len(key)?)
+            })
+            .ok_or_else(|| {
+                EngError::MemoryPlan(format!("{family} packed payload bytes overflow"))
+            })?;
+        self.remaining(
+            family,
+            &[
+                ("packed_weight_payload_floor_bytes", weights),
+                ("session_reserve_bytes", reserve),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The space left after the resident charges and the family's reserve.
     pub(crate) fn remaining(
         self,

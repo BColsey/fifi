@@ -103,8 +103,8 @@ pub(crate) fn start(
         if let Some(reason) = disk_experts_ignored(disk_setting.as_deref(), device.is_some()) {
             eprintln!("q36: FIFI_Q36_MLX_DISK_EXPERTS ignored: {reason}");
         }
-        let (mut executor, session) = if let Some(device) = device.filter(|_| disk_experts) {
-            Q36Executor::open_for_device(&owned, rules, device)?
+        let (mut executor, session) = if let Some(device) = device {
+            Q36Executor::open_for_device(&owned, rules, device, disk_experts)?
         } else {
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
         };

@@ -1,5 +1,6 @@
 //! Resident Flash-Next session state, with the step's check, poison, and commit.
 
+use super::super::step::ModelShape;
 use super::ops::{Bytes, dim, short_import, zeros};
 use super::prefill::qsa::{QsaBatch, check_batch};
 use super::qsa::{capacity, check_cache};
@@ -19,12 +20,16 @@ const F32_BYTES: u64 = 4;
 /// cache and appends the same rows at every position, so the growth does not depend on the
 /// position. It makes no native call. `commit` checks the charge against the stored bytes.
 pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngError> {
-    let d = weights.shape.qsa.dims();
     let layers = weights
         .layers
         .iter()
         .filter(|layer| matches!(layer.attn, RAttn::Qsa(_)))
         .count();
+    qsa_bytes_per_position(&weights.shape, layers)
+}
+
+fn qsa_bytes_per_position(shape: &ModelShape, layers: usize) -> Result<u64, EngError> {
+    let d = shape.qsa.dims();
     use crate::family::kv_format::{KvFormat, KvRowShape};
     let overflow = || EngError::MemoryPlan("qsa growth bytes overflow u64".into());
     let kv = KvFormat::F32
@@ -37,6 +42,55 @@ pub(super) fn qsa_growth_bytes(weights: &ResidentWeights) -> Result<u64, EngErro
     kv.checked_add(index)
         .and_then(|bytes| bytes.checked_mul(u64::try_from(layers).ok()?))
         .ok_or_else(overflow)
+}
+
+struct FixedStateShapes {
+    rec: [u32; 3],
+    ring: [u32; 2],
+    ple: [u32; 2],
+}
+
+impl FixedStateShapes {
+    fn new(shape: &ModelShape) -> Result<Self, EngError> {
+        let d = &shape.delta;
+        let ple = shape.ple.dims();
+        let cols = (ple.conv_kernel - 1)
+            .checked_mul(ple.ngram)
+            .ok_or_else(|| EngError::MemoryPlan("ple ring width overflows".into()))?;
+        Ok(Self {
+            rec: [
+                dim(d.value_heads())?,
+                dim(d.key_dim())?,
+                dim(d.value_dim())?,
+            ],
+            ring: [dim(d.conv_dim())?, dim(d.conv_kernel() - 1)?],
+            ple: [dim(shape.hyper.width())?, cols],
+        })
+    }
+}
+
+/// Prices the zero state and all context rows from model geometry alone.
+pub(super) fn state_bytes_at_context(
+    shape: &ModelShape,
+    kinds: &[bool],
+    positions: u32,
+) -> Result<u64, EngError> {
+    let fixed = FixedStateShapes::new(shape)?;
+    let qsa_layers = kinds.iter().filter(|&&qsa| qsa).count();
+    let delta_layers = kinds.len() - qsa_layers;
+    let bytes = |dims: &[u32]| {
+        dims.iter()
+            .try_fold(F32_BYTES, |n, &dim| n.checked_mul(u64::from(dim)))
+    };
+    let context = qsa_bytes_per_position(shape, qsa_layers)?.checked_mul(u64::from(positions));
+    let total = || {
+        bytes(&fixed.rec)?
+            .checked_add(bytes(&fixed.ring)?)?
+            .checked_mul(u64::try_from(delta_layers).ok()?)?
+            .checked_add(bytes(&fixed.ple)?)?
+            .checked_add(context?)
+    };
+    total().ok_or_else(|| EngError::MemoryPlan("Flash-Next session bytes overflow".into()))
 }
 
 /// Bytes that a chunk of `rows` tokens adds to the stored QSA caches: `rows` positions of
@@ -161,25 +215,15 @@ impl ResidentState {
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
     ) -> Result<Self, EngError> {
-        let d = &weights.shape.delta;
-        let rec = vec![
-            dim(d.value_heads())?,
-            dim(d.key_dim())?,
-            dim(d.value_dim())?,
-        ];
-        let ring = vec![dim(d.conv_dim())?, dim(d.conv_kernel() - 1)?];
-        let ple = weights.shape.ple.dims();
-        let cols = (ple.conv_kernel - 1)
-            .checked_mul(ple.ngram)
-            .ok_or_else(|| EngError::MemoryPlan("ple ring width overflows".into()))?;
+        let fixed = FixedStateShapes::new(&weights.shape)?;
         let mut sources: Vec<Tensor> = Vec::new();
         for layer in &weights.layers {
             if matches!(layer.attn, RAttn::Delta(_)) {
-                sources.push(zeros(rec.clone())?);
-                sources.push(zeros(ring.clone())?);
+                sources.push(zeros(fixed.rec.to_vec())?);
+                sources.push(zeros(fixed.ring.to_vec())?);
             }
         }
-        sources.push(zeros(vec![dim(weights.shape.hyper.width())?, cols])?);
+        sources.push(zeros(fixed.ple.to_vec())?);
         let refs: Vec<&Tensor> = sources.iter().collect();
         let mut got = kernels.import_many(&refs)?.into_iter();
         let mut next = || got.next().ok_or_else(short_import);
