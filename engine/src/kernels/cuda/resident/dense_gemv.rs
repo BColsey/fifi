@@ -1,10 +1,5 @@
-//! The dense half-precision matvec of the Flash-Next step on the device. Its one user is the PLE
-//! block: the key projection `[10240, 2560]` and the value projection `[2560, 2560]`, stored F16 in
-//! the EXL3 pack, once per token in the layer that has the block. The host matvec of the same
-//! projections measures 2.6 to 3.4 ms a token (p99 7 to 14 ms; the S2 feeds bench) against about 0.07 ms on the device. The
-//! DeltaNet `b` and `a` gates do not use it: they take the router's strided F32 dot, widened at
-//! upload, as Qwen3.6's gates do. BF16 weights (the official checkpoint) are accepted. The formula
-//! and the layouts are in `native/resident/dense_gemv.h`.
+//! The shared dense F16/BF16 projection for the Flash-Next PLE and Inkling CUDA stages.
+//! Activations and results stay in device buffers between launches.
 //!
 //! [`CudaContext::dense_gemv`] queues one kernel on a [`DeviceStream`] and returns. It allocates
 //! nothing, copies nothing and never synchronizes; a fault in the queued work surfaces at the next
@@ -13,10 +8,6 @@
 //! Every refusal is a `BadRequest` and happens before any native call, because a status from the
 //! native layer other than an allocation failure latches the backend terminal. A refused call
 //! changes nothing.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

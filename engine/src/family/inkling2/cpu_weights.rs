@@ -221,6 +221,25 @@ impl Weights {
             .collect())
     }
 
+    pub(super) fn controller(
+        &self,
+        [down, gain, forget]: [&str; 3],
+        input: &[f32],
+        [rank, hidden]: [usize; 2],
+    ) -> Result<[Vec<f32>; 2], EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some(cuda) = &self.cuda
+            && let Some(result) = cuda.controller([down, gain, forget], input, [rank, hidden])
+        {
+            return result;
+        }
+        let reduced = self.project(down, input, rank)?;
+        Ok([
+            self.project(gain, &reduced, hidden)?,
+            self.project(forget, &reduced, hidden)?,
+        ])
+    }
+
     pub(super) fn activate(&self, x: &[f32]) -> Result<Activation, EngError> {
         Activation::new(x).map_err(|error| bad(format!("prep expert activation: {error}")))
     }

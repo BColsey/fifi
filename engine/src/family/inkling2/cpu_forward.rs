@@ -353,17 +353,15 @@ impl CpuForward {
         for half in gate.chunks_exact_mut(self.hidden()) {
             rms_norm(half, MIX_EPS);
         }
-        let reduced = self.weights.project(
-            &format!("{ctrl}.down_weight"),
+        let [gain, forget] = self.weights.controller(
+            [
+                &format!("{ctrl}.down_weight"),
+                &format!("{ctrl}.gain_weight"),
+                &format!("{ctrl}.forget_weight"),
+            ],
             &gate,
-            self.spec.core.gate_rank as usize,
+            [self.spec.core.gate_rank as usize, self.hidden()],
         )?;
-        let gain = self
-            .weights
-            .project(&format!("{ctrl}.gain_weight"), &reduced, self.hidden())?;
-        let forget =
-            self.weights
-                .project(&format!("{ctrl}.forget_weight"), &reduced, self.hidden())?;
         for (((value, message), gain), forget) in
             input.iter_mut().zip(message).zip(gain).zip(forget)
         {

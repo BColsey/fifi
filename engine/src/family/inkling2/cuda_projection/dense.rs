@@ -1,0 +1,177 @@
+//! Launch BF16 projections on one stream. Controller reductions live in the
+//! same fixed arena as the input and output rows.
+
+use std::{cell::RefCell, mem::size_of};
+
+use crate::{
+    EngError,
+    kernels::cuda::{
+        ArenaTensor, CudaContext, DeviceArena, DeviceRange, DeviceStream, PinnedBuf, plan_arena,
+        resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
+    },
+};
+
+use super::{Resident, bad};
+
+#[repr(usize)]
+enum Slot {
+    Input,
+    Reduced,
+    Output,
+}
+
+pub(super) struct DensePlan {
+    tensors: [ArenaTensor; 3],
+    pub(super) device_bytes: usize,
+}
+
+impl DensePlan {
+    pub(super) fn new(
+        [rows, columns]: [usize; 2],
+        hidden: usize,
+        rank: usize,
+    ) -> Result<Self, EngError> {
+        // The controller reuses the input slot for neither its reduction nor its outputs.
+        let controller_width = hidden
+            .checked_mul(2)
+            .ok_or_else(|| bad("CUDA controller output width overflows"))?;
+        let extents = [
+            float_bytes(columns)?,
+            float_bytes(rank)?,
+            float_bytes(rows.max(controller_width))?,
+        ];
+        let tensors = extents.map(|bytes| ArenaTensor {
+            bytes,
+            first: 0,
+            last: 0,
+        });
+        let device_bytes = plan_arena(&tensors)?.total;
+        Ok(Self {
+            tensors,
+            device_bytes,
+        })
+    }
+}
+
+pub(super) struct DenseStep {
+    stream: DeviceStream,
+    arena: DeviceArena,
+    transfer: RefCell<PinnedBuf>,
+}
+
+impl DenseStep {
+    pub(super) fn new(context: &CudaContext, plan: &DensePlan) -> Result<Self, EngError> {
+        Ok(Self {
+            stream: context.stream()?,
+            arena: context.arena(&plan.tensors)?,
+            transfer: RefCell::new(
+                context.pinned_buf(
+                    plan.tensors[Slot::Input as usize]
+                        .bytes
+                        .max(plan.tensors[Slot::Output as usize].bytes),
+                )?,
+            ),
+        })
+    }
+
+    pub(super) fn project(
+        &self,
+        context: &CudaContext,
+        weight: &Resident,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        let output = self.range(Slot::Output, 0, weight.shape[0])?;
+        self.run(context, x, output, |input| {
+            self.launch(context, weight, input, output)
+        })
+    }
+
+    pub(super) fn controller(
+        &self,
+        context: &CudaContext,
+        [down, gain, forget]: [&Resident; 3],
+        x: &[f32],
+    ) -> Result<[Vec<f32>; 2], EngError> {
+        let rank = down.shape[0];
+        let width = gain.shape[0];
+        let reduced = self.range(Slot::Reduced, 0, rank)?;
+        let all = self.range(Slot::Output, 0, width + forget.shape[0])?;
+        let first = self.range(Slot::Output, 0, width)?;
+        let second = self.range(Slot::Output, width, forget.shape[0])?;
+        let mut values = self.run(context, x, all, |input| {
+            self.launch(context, down, input, reduced)?;
+            self.launch(context, gain, reduced, first)?;
+            self.launch(context, forget, reduced, second)
+        })?;
+        let forget = values.split_off(width);
+        Ok([values, forget])
+    }
+
+    fn launch(
+        &self,
+        context: &CudaContext,
+        weight: &Resident,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let [rows, cols] = weight.shape;
+        let shape = DenseGemvShape::packed(1, rows, cols);
+        let need = dense_gemv_bytes(shape)?;
+        context.dense_gemv(
+            &self.stream,
+            DenseGemvCall {
+                shape,
+                dtype: DenseDtype::Bf16,
+                w: weight.codes.range(0, need.w)?,
+                x,
+                y,
+            },
+        )
+    }
+
+    fn run(
+        &self,
+        context: &CudaContext,
+        x: &[f32],
+        output: DeviceRange<'_>,
+        enqueue: impl FnOnce(DeviceRange<'_>) -> Result<(), EngError>,
+    ) -> Result<Vec<f32>, EngError> {
+        if !x.iter().all(|value| value.is_finite()) {
+            return Err(bad("CUDA BF16 projection requires finite input"));
+        }
+        let input = self.range(Slot::Input, 0, x.len())?;
+        let bytes: Vec<_> = x.iter().map(|&value| value.to_ne_bytes()).collect();
+        let mut transfer = self.transfer.borrow_mut();
+        transfer.write(0, bytes.as_flattened())?;
+        context.copy_from_pinned(&self.stream, &mut transfer, 0, input)?;
+        let result = enqueue(input)
+            .and_then(|()| context.copy_to_pinned(&self.stream, output, &mut transfer, 0));
+        // Even a refused launch may follow an accepted input copy.
+        let waited = transfer.synchronize(&self.stream);
+        result?;
+        waited?;
+
+        let mut bytes = vec![[0; size_of::<f32>()]; output.bytes() / size_of::<f32>()];
+        transfer.read(0, bytes.as_flattened_mut())?;
+        let values: Vec<_> = bytes.into_iter().map(f32::from_ne_bytes).collect();
+        if !values.iter().all(|value| value.is_finite()) {
+            return Err(bad("CUDA BF16 projection produced a nonfinite output"));
+        }
+        Ok(values)
+    }
+
+    fn range(&self, slot: Slot, skip: usize, len: usize) -> Result<DeviceRange<'_>, EngError> {
+        let slot = self.arena.tensor(slot as usize)?;
+        let skip = float_bytes(skip)?;
+        let bytes = float_bytes(len)?;
+        if skip.checked_add(bytes).is_none_or(|end| end > slot.bytes()) {
+            return Err(bad("CUDA BF16 projection exceeds its arena slot"));
+        }
+        slot.buffer().range(slot.offset() + skip, bytes)
+    }
+}
+
+fn float_bytes(len: usize) -> Result<usize, EngError> {
+    len.checked_mul(size_of::<f32>())
+        .ok_or_else(|| bad("CUDA BF16 projection byte count overflows"))
+}

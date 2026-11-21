@@ -25,7 +25,7 @@ On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling
 
 `enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. With a pilot enabled it also checks the pinned tokenizer and the short-context settings. CUDA admission checks available device memory at startup.
 
-For the CUDA pilot, `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` optionally reserves a budget for packed expert banks. The loader places complete banks for the repeated core layers first and includes their bytes in device admission. A budget of zero uses streamed experts. Use `FIFI_INKLING_CUDA_PROFILE=1` to log per-token time by projection and upload phase.
+For the CUDA pilot, `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` optionally reserves a budget for packed expert banks. The loader places complete banks for the repeated core layers first and includes their bytes in device admission. A budget of zero uses streamed experts. Use `FIFI_INKLING_CUDA_PROFILE=1` to log per-token time by projection and upload phase. Set `FIFI_INKLING_CUDA_DENSE_STREAM=1` to use the experimental vectorized BF16 projections. This path queues all three controller matrices on one stream and copies only the final gain and forget rows back to the host.
 
 ## Tokenizer files
 

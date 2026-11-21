@@ -23,6 +23,10 @@ use crate::{
     },
 };
 
+mod dense;
+
+use dense::{DensePlan, DenseStep};
+
 const DEVICE_HEADROOM: u64 = 256 * 1024 * 1024;
 
 pub(super) struct DenseUpload<'a> {
@@ -114,13 +118,19 @@ struct Plan<'a> {
     dense: Vec<DenseUpload<'a>>,
     resident: ExpertResidency<'a>,
     stages: Vec<Stage>,
+    dense_step: Option<DensePlan>,
     demand: Demand,
     admission: Admission,
     workspace_bytes: u64,
 }
 
 impl<'a> Plan<'a> {
-    fn new(weights: &'a Weights, spec: &TextSpec, budget: u64) -> Result<Self, EngError> {
+    fn new(
+        weights: &'a Weights,
+        spec: &TextSpec,
+        budget: u64,
+        stream_dense: bool,
+    ) -> Result<Self, EngError> {
         let dense = weights.dense_uploads(spec)?;
         let resident = ExpertResidency::plan(weights, spec, budget)?;
         let stages = stages(spec)?;
@@ -142,9 +152,21 @@ impl<'a> Plan<'a> {
             .chain(stages.iter().map(|stage| stage.shape))
             .fold([0, 0], |[rows, cols], [r, c]| [rows.max(r), cols.max(c)]);
         let (admission, workspace_bytes) = CudaContext::fixed_projection_plan(shape)?;
+        let dense_step = stream_dense
+            .then(|| {
+                DensePlan::new(
+                    shape,
+                    spec.hidden_size as usize,
+                    spec.core.gate_rank as usize,
+                )
+            })
+            .transpose()?;
+        let arena_bytes = dense_step
+            .as_ref()
+            .map_or(0, |plan| plan.device_bytes as u64);
         let demand = Demand {
             tensors,
-            work,
+            work: work.checked_add(arena_bytes).ok_or_else(overflow)?,
             kv_cache: 0,
             headroom: DEVICE_HEADROOM,
         };
@@ -152,6 +174,7 @@ impl<'a> Plan<'a> {
             dense,
             resident,
             stages,
+            dense_step,
             demand,
             admission,
             workspace_bytes,
@@ -170,12 +193,17 @@ impl<'a> Plan<'a> {
             ..self.demand
         };
         let budget = admit(&with_workspace, u64::MAX)?;
+        let arena_bytes = self
+            .dense_step
+            .as_ref()
+            .map_or(0, |plan| plan.device_bytes as u64);
         Ok(serde_json::json!({
             "resident_projection_count": self.dense.len(),
             "resident_bf16_bytes": self.demand.tensors - self.resident.bytes,
             "resident_expert_bytes": self.resident.bytes,
             "resident_expert_layers": self.resident.layers,
-            "packed_expert_staging_bytes": self.demand.work,
+            "packed_expert_staging_bytes": self.demand.work - arena_bytes,
+            "dense_stream_arena_bytes": arena_bytes,
             "workspace_bound_bytes": self.workspace_bytes,
             "device_kv_bytes": self.demand.kv_cache,
             "headroom_bytes": self.demand.headroom,
@@ -255,6 +283,7 @@ struct ProjectionTimes {
 }
 
 pub(super) struct CudaProjection {
+    dense_step: Option<DenseStep>,
     dense: BTreeMap<String, Resident>,
     resident: BTreeMap<String, PackedBuffers>,
     stages: Vec<Staging>,
@@ -265,11 +294,17 @@ pub(super) struct CudaProjection {
 impl CudaProjection {
     pub(super) fn load(weights: &Weights, spec: &TextSpec) -> Result<Self, EngError> {
         let budget = expert_residency_budget()?;
-        let plan = Plan::new(weights, spec, budget)?;
+        let stream_dense = std::env::var("FIFI_INKLING_CUDA_DENSE_STREAM").as_deref() == Ok("1");
+        let plan = Plan::new(weights, spec, budget, stream_dense)?;
         eprintln!("Inkling CUDA projections {}", plan.receipt()?);
         let context = CudaContext::with_admission(&plan.admission)?;
         // The fixed workspace is already charged to cudaMemGetInfo.
         admit(&plan.demand, context.memory_info()?.free as u64)?;
+        let dense_step = plan
+            .dense_step
+            .as_ref()
+            .map(|plan| DenseStep::new(&context, plan))
+            .transpose()?;
         let dense = plan
             .dense
             .into_iter()
@@ -311,6 +346,7 @@ impl CudaProjection {
             })
             .collect::<Result<_, EngError>>()?;
         Ok(Self {
+            dense_step,
             dense,
             resident,
             stages,
@@ -356,17 +392,12 @@ impl CudaProjection {
         shape: [usize; 2],
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
-        let projection = self
-            .dense
-            .get(name)
-            .filter(|projection| projection.shape == shape)
-            .ok_or_else(|| {
-                bad(format!(
-                    "no resident BF16 projection with matching shape for {name}"
-                ))
-            })?;
+        let projection = self.projection(name, shape)?;
         let start = self.times.as_ref().map(|_| Instant::now());
-        let output = self.context.bf16_matvec(&projection.codes, shape, x);
+        let output = match &self.dense_step {
+            Some(step) => step.project(&self.context, projection, x),
+            None => self.context.bf16_matvec(&projection.codes, shape, x),
+        };
         self.record(start, |times, elapsed| {
             if name == "model.llm.unembed.weight" {
                 times.head += elapsed;
@@ -375,6 +406,38 @@ impl CudaProjection {
             }
         });
         output
+    }
+
+    fn projection(&self, name: &str, shape: [usize; 2]) -> Result<&Resident, EngError> {
+        self.dense
+            .get(name)
+            .filter(|projection| projection.shape == shape)
+            .ok_or_else(|| {
+                bad(format!(
+                    "no resident BF16 projection with matching shape for {name}"
+                ))
+            })
+    }
+
+    pub(super) fn controller(
+        &self,
+        names: [&str; 3],
+        x: &[f32],
+        [rank, hidden]: [usize; 2],
+    ) -> Option<Result<[Vec<f32>; 2], EngError>> {
+        let step = self.dense_step.as_ref()?;
+        Some((|| {
+            let [down, gain, forget] = names;
+            let weights = [
+                self.projection(down, [rank, x.len()])?,
+                self.projection(gain, [hidden, rank])?,
+                self.projection(forget, [hidden, rank])?,
+            ];
+            let start = self.times.as_ref().map(|_| Instant::now());
+            let output = step.controller(&self.context, weights, x);
+            self.record(start, |times, elapsed| times.dense += elapsed);
+            output
+        })())
     }
 
     pub(super) fn expert(
@@ -438,7 +501,7 @@ fn native_cuda_projection_plan() {
     let path = Path::new(&dir);
     let spec = TextSpec::from_config(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let weights = Weights::open(path, &spec).unwrap();
-    let plan = Plan::new(&weights, &spec, 0).unwrap();
+    let plan = Plan::new(&weights, &spec, 0, false).unwrap();
     assert!(
         plan.dense
             .iter()
@@ -466,14 +529,15 @@ fn native_cuda_projection_plan() {
     assert!(plan.demand.tensors < 3 * 1024 * 1024 * 1024);
     assert!(plan.demand.work < 16 * 1024 * 1024);
     let budget = 6144 * 1024 * 1024;
-    let resident = Plan::new(&weights, &spec, budget).unwrap();
+    let resident = Plan::new(&weights, &spec, budget, true).unwrap();
     assert_eq!(resident.resident.layers, (6..17).collect::<Vec<_>>());
     assert!(resident.resident.bytes <= budget);
     assert_eq!(
         resident.resident.stacks.len(),
         resident.resident.layers.len() * 2,
     );
-    let all = Plan::new(&weights, &spec, u64::MAX).unwrap();
+    assert!(resident.dense_step.as_ref().unwrap().device_bytes > 0);
+    let all = Plan::new(&weights, &spec, u64::MAX, true).unwrap();
     assert_eq!(all.resident.layers.len(), spec.stored_layers());
     println!("streamed {}", plan.receipt().unwrap());
     println!("resident {}", resident.receipt().unwrap());

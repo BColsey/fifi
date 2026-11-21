@@ -1,5 +1,5 @@
 //! Raw FFI to `inference_cuda_dense_gemv_launch` of `native/resident/dense_gemv.cu` (declared in
-//! `native/resident/dense_gemv.h`): the dense half-precision matvec of the Flash-Next step.
+//! `native/resident/dense_gemv.h`): the shared dense half-precision matvec.
 //! Child of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
@@ -13,10 +13,6 @@
 //! - The argument struct is a live local that the entry reads only during the call. Its `repr(C)`
 //!   mirror is private here and pinned by `const` asserts to the field order of `dense_gemv.h`.
 //!   No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the Flash-Next CUDA step")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
