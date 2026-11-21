@@ -134,6 +134,7 @@ pub(crate) struct FlashExecutor {
     context_limit: usize,
     /// The chunk size of the batched prefill, set by `plan_prefill`. `None` means one-token steps.
     chunk: Option<u32>,
+    prefill_wave_cap: u32,
     mlx_plan: Option<MlxExecutionPlan>,
     /// The chunk size that the open prefill page sets serve, or 0 when none are open.
     open_tokens: u32,
@@ -162,6 +163,7 @@ struct FlashStep<'a> {
     decoder: &'a mut ResidentDecoder<'static>,
     state: &'a mut ResidentState,
     chunk: Option<u32>,
+    prefill_wave_cap: u32,
     open_tokens: &'a mut u32,
     #[cfg(test)]
     log: &'a std::sync::Mutex<ChunkLog>,
@@ -171,7 +173,8 @@ impl FlashStep<'_> {
     fn open_prefill(&mut self, tokens: u32) -> Result<()> {
         if *self.open_tokens != tokens {
             *self.open_tokens = 0;
-            self.decoder.open_prefill_waves(tokens, PREFILL_WAVE_CAP)?;
+            self.decoder
+                .open_prefill_waves(tokens, self.prefill_wave_cap)?;
             *self.open_tokens = tokens;
             #[cfg(test)]
             {
@@ -276,6 +279,20 @@ fn session_reserve(
     Ok((reserve, prefix))
 }
 
+fn prefill_wave_cap(value: Option<&std::ffi::OsStr>) -> Result<u32> {
+    value.map_or(Ok(PREFILL_WAVE_CAP), |value| {
+        value
+            .to_str()
+            .and_then(|text| text.parse::<u32>().ok())
+            .filter(|cap| (1..=PREFILL_WAVE_CAP).contains(cap))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "FIFI_FLASH_NEXT_MLX_PREFILL_WAVE_CAP must be between 1 and {PREFILL_WAVE_CAP}"
+                ))
+            })
+    })
+}
+
 impl FlashExecutor {
     /// Call it on the engine thread. `cache_limit` is the MLX allocator cache limit in bytes.
     #[cfg(test)]
@@ -294,6 +311,8 @@ impl FlashExecutor {
         device: Option<DeviceBudget>,
         prefix_reuse: bool,
     ) -> Result<(Self, FlashSession)> {
+        let wave_cap =
+            prefill_wave_cap(std::env::var_os("FIFI_FLASH_NEXT_MLX_PREFILL_WAVE_CAP").as_deref())?;
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
         let preflight = device
@@ -329,7 +348,9 @@ impl FlashExecutor {
         let mut kernels = MlxKernels::try_new()?;
         kernels.set_cache_limit(cache_limit)?;
         let ckpt = Box::leak(Box::new(ckpt));
-        Self::from_parts(kernels, ckpt, &flash, rules)
+        let (mut executor, session) = Self::from_parts(kernels, ckpt, &flash, rules)?;
+        executor.prefill_wave_cap = wave_cap;
+        Ok((executor, session))
     }
 
     /// The caller may drop `flash` afterwards.
@@ -361,6 +382,7 @@ impl FlashExecutor {
             rules,
             context_limit,
             chunk: None,
+            prefill_wave_cap: PREFILL_WAVE_CAP,
             mlx_plan: None,
             open_tokens: 0,
             #[cfg(test)]
@@ -380,6 +402,7 @@ impl FlashExecutor {
             decoder: &mut self.decoder,
             state,
             chunk: self.chunk,
+            prefill_wave_cap: self.prefill_wave_cap,
             open_tokens: &mut self.open_tokens,
             #[cfg(test)]
             log: &self.log,
@@ -411,7 +434,22 @@ impl FlashExecutor {
         }
         let set_bytes = u64::try_from(set_bytes).map_err(|_| too_big("the expert set"))?;
         let page = u64::try_from(page).map_err(|_| too_big("the page size"))?;
-        prefill_plan::admission_cost(experts, top_k, set_bytes.div_ceil(u64::from(experts)), page)
+        let mut cost = prefill_plan::admission_cost(
+            experts,
+            top_k,
+            set_bytes.div_ceil(u64::from(experts)),
+            page,
+        )?;
+        if self.prefill_wave_cap < cost.experts {
+            cost = cost.with_wave_cap(self.prefill_wave_cap)?;
+            // A smaller stack can waste up to one page per packed range even when the full
+            // stack is aligned. Reserve weight, scale and bias padding for all three projections.
+            cost.fixed = cost
+                .fixed
+                .checked_add(u64::from(cost.sets) * 9 * page)
+                .ok_or_else(|| too_big("expert stage padding"))?;
+        }
+        Ok(cost)
     }
 
     /// Called on the engine thread with a freshly opened session. Reserve its maximum
@@ -484,7 +522,11 @@ impl FlashExecutor {
                 remaining_bytes: plan.terms.remaining(),
                 base_charges: charges.into(),
                 device: device.map(DeviceBudget::ceiling_report),
-                workspace: [("sparse_workspace_bytes", self.decoder.sparse_prefill_bytes)].into(),
+                workspace: [
+                    ("dense_workspace_bytes", plan.workspace_bytes),
+                    ("sparse_workspace_bytes", self.decoder.sparse_prefill_bytes),
+                ]
+                .into(),
             }),
         ));
         let path = match plan.chunk {
@@ -501,8 +543,11 @@ impl FlashExecutor {
             terms
         };
         Ok(Some(format!(
-            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} sparse_workspace_bytes={} {terms}",
-            settings.cache_limit, self.decoder.sparse_prefill_bytes,
+            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} wave_cap={} dense_workspace_bytes={} sparse_workspace_bytes={} {terms}",
+            settings.cache_limit,
+            self.prefill_wave_cap,
+            plan.workspace_bytes,
+            self.decoder.sparse_prefill_bytes,
         )))
     }
 
@@ -543,18 +588,23 @@ impl FlashExecutor {
         let cost = self.prefill_cost()?;
         let remaining = terms.remaining();
         let chunk = prefill_plan::admitted_chunk(&cost, remaining, max_rows)?;
+        let workspace_bytes = chunk.map_or(Ok(0), |rows| cost.workspace(rows))?;
         let sparse_enabled = std::env::var_os("FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL")
             .is_some_and(|value| value == "1");
         let sparse_prefill_bytes = match chunk {
-            Some(rows) if sparse_enabled => remaining
-                .saturating_sub(cost.workspace(rows)?)
+            Some(_) if sparse_enabled => remaining
+                .saturating_sub(workspace_bytes)
                 .min(crate::family::prefill::mlx::PREFILL_RETIRE_CAP),
             _ => 0,
         };
         self.close_prefill();
         self.chunk = chunk;
         self.decoder.sparse_prefill_bytes = sparse_prefill_bytes;
-        Ok(PrefillPlan { chunk, terms })
+        Ok(PrefillPlan {
+            chunk,
+            terms,
+            workspace_bytes,
+        })
     }
 
     fn prefill_path(&self) -> PrefillPath {
@@ -1466,13 +1516,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prefill_wave_cap_accepts_only_the_supported_range() {
+        use std::ffi::OsStr;
+
+        assert_eq!(prefill_wave_cap(None).unwrap(), PREFILL_WAVE_CAP);
+        for cap in [1, 320, PREFILL_WAVE_CAP] {
+            assert_eq!(
+                prefill_wave_cap(Some(OsStr::new(&cap.to_string()))).unwrap(),
+                cap
+            );
+        }
+        for invalid in ["", "0", "513", "-1", "enabled"] {
+            assert!(
+                matches!(
+                    prefill_wave_cap(Some(OsStr::new(invalid))),
+                    Err(EngError::BadRequest(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+    }
+
     /// The plan reads the weights and the decode pool from the decoder and subtracts the cache and
     /// the reserve. A budget of exactly the workspace of 8 rows gives 8, one byte less gives 4
     /// (the next candidate), and a budget that holds only the weights and the pool gives `None`.
     #[test]
     fn the_plan_follows_the_budget_the_weights_the_cache_and_the_reserve() {
         let _serial = crate::native_test_lock();
-        let (mut executor, _session) = build(rules(vec![], VOCAB));
+        let (mut executor, mut session) = build(rules(vec![], VOCAB));
         assert_eq!(executor.prefill_chunk(), None, "before planning");
         let workspace = |executor: &FlashExecutor, rows| {
             executor.prefill_cost().unwrap().workspace(rows).unwrap()
@@ -1532,6 +1604,21 @@ mod tests {
             "one byte less"
         );
         assert_eq!(plan(held, 0, 0), None, "no room for a chunk");
+
+        executor.prefill_wave_cap = 1;
+        let cost = executor.prefill_cost().unwrap();
+        assert_eq!(cost.set_experts(8).unwrap(), 1, "bounded stages");
+        let workspace_bytes = cost.workspace(8).unwrap();
+        let plan = executor
+            .plan_prefill(held + workspace_bytes, 0, 0, 8)
+            .unwrap();
+        assert_eq!(plan.chunk, Some(8));
+        assert_eq!(plan.workspace_bytes, workspace_bytes);
+        let (step, _) = executor.split(&mut session.state);
+        assert_eq!(
+            step.prefill_wave_cap, 1,
+            "the planned cap reaches the staging path"
+        );
     }
 
     #[test]
