@@ -248,6 +248,54 @@ fn the_upload_ring_grows_for_a_wider_chunk_and_the_bytes_still_land_in_file_orde
     );
 }
 
+/// The rates of the native and the tiled upload of one 576 MiB Q4_K tensor, read from memory so
+/// that the file is not the limit. Manual: run explicitly under the card lease.
+#[test]
+#[ignore = "manual upload rate under the GPU lease"]
+fn the_native_and_tiled_uploads_report_their_rates() {
+    const NAME: &str = "the_native_and_tiled_uploads_report_their_rates";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let (k, n_rows) = (4096, 262_144);
+    let row_bytes = k / 256 * 144;
+    let source: Vec<u8> = (0..n_rows * row_bytes).map(|i| (i % 251) as u8).collect();
+    let tensor = QuantTensor {
+        name: "w",
+        ty: GgufType::Q4K,
+        n_rows,
+        k,
+        source_len: source.len(),
+    };
+    for pass in 0..2 {
+        let started = std::time::Instant::now();
+        let native = ctx
+            .upload_native(tensor, CHUNK_LIMIT, &mut |at, buf| {
+                buf.copy_from_slice(&source[at..at + buf.len()]);
+                Ok(())
+            })
+            .expect("native upload");
+        let native_seconds = started.elapsed().as_secs_f64();
+        drop(native);
+        let started = std::time::Instant::now();
+        let tiled = ctx
+            .upload_tiled(tensor, CHUNK_LIMIT, &mut |at, buf| {
+                buf.copy_from_slice(&source[at..at + buf.len()]);
+                Ok(())
+            })
+            .expect("tiled upload");
+        let tiled_seconds = started.elapsed().as_secs_f64();
+        drop(tiled);
+        let gb = source.len() as f64 / 1e9;
+        println!(
+            "pass {pass}: native {:.1} GB/s ({native_seconds:.3} s), tiled {:.1} GB/s ({tiled_seconds:.3} s) for {gb:.2} GB",
+            gb / native_seconds,
+            gb / tiled_seconds
+        );
+    }
+}
+
 #[test]
 fn a_failed_read_of_a_native_upload_frees_the_allocation() {
     const NAME: &str = "a_failed_read_of_a_native_upload_frees_the_allocation";

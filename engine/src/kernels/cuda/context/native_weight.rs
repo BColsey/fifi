@@ -158,6 +158,37 @@ impl CudaContext {
         })
     }
 
+    /// Runs `run` on the page-locked ring (made, or widened, to hold `capacity` bytes) and
+    /// drains it afterwards, so that no copy still reads a staging buffer or writes the device
+    /// allocation when this returns. `Ok(None)` when page-locked memory is not available, with
+    /// `run` not called.
+    pub(super) fn with_upload_ring<R>(
+        &self,
+        capacity: usize,
+        run: impl FnOnce(&mut UploadRing) -> Result<R, EngError>,
+    ) -> Result<Option<R>, EngError> {
+        let mut held = self.upload_ring.borrow_mut();
+        if held.as_ref().is_some_and(|ring| ring.capacity < capacity) {
+            // A wider chunk than the ring was made for: the old ring goes first.
+            if let Some(mut old) = held.take() {
+                old.drain()?;
+            }
+        }
+        if held.is_none() {
+            match UploadRing::new(self, capacity) {
+                Ok(ring) => *held = Some(ring),
+                Err(EngError::MemoryPlan(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(ring) = held.as_mut() else {
+            return Ok(None);
+        };
+        let result = run(ring);
+        let drained = ring.drain();
+        result.and_then(|value| drained.map(|()| Some(value)))
+    }
+
     /// Uploads the chunks of `plan` into `buffer` through the page-locked ring, reading chunk
     /// n + 1 from the file while chunk n is copied. `Ok(false)` when the ring cannot be had
     /// (page-locked memory is not available), with nothing written.
@@ -169,63 +200,45 @@ impl CudaContext {
         chunk_bytes: usize,
         read: BlockReader<'_>,
     ) -> Result<bool, EngError> {
-        let mut held = self.upload_ring.borrow_mut();
-        if held
-            .as_ref()
-            .is_some_and(|ring| ring.capacity < chunk_bytes)
-        {
-            // A wider chunk than the ring was made for: the old ring goes first.
-            if let Some(mut old) = held.take() {
-                old.drain()?;
+        let uploaded = self.with_upload_ring(chunk_bytes, |ring| {
+            for first in (0..plan.rows).step_by(plan.per_chunk) {
+                let bytes = plan.count_of(first) * row_bytes;
+                let offset = first * row_bytes;
+                self.stage_chunk(ring, buffer, offset, bytes, |part| read(offset, part))?;
             }
-        }
-        if held.is_none() {
-            match UploadRing::new(self, chunk_bytes) {
-                Ok(ring) => *held = Some(ring),
-                Err(EngError::MemoryPlan(_)) => return Ok(false),
-                Err(error) => return Err(error),
-            }
-        }
-        let Some(ring) = held.as_mut() else {
-            return Ok(false);
-        };
-        let result = self.run_ring(ring, buffer, plan, row_bytes, read);
-        // Whatever happened, no copy may still read a buffer or write the device allocation
-        // when this returns.
-        let drained = ring.drain();
-        result.and(drained).map(|()| true)
+            Ok(())
+        })?;
+        Ok(uploaded.is_some())
     }
 
-    fn run_ring(
+    /// Fills the next staging buffer of `ring` through `fill` (once its previous copy is done)
+    /// and queues its copy to `buffer` at `offset`.
+    pub(super) fn stage_chunk(
         &self,
         ring: &mut UploadRing,
         buffer: &DeviceBuffer,
-        plan: &RowChunkPlan,
-        row_bytes: usize,
-        read: BlockReader<'_>,
+        offset: usize,
+        bytes: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), EngError>,
     ) -> Result<(), EngError> {
-        for first in (0..plan.rows).step_by(plan.per_chunk) {
-            let bytes = plan.count_of(first) * row_bytes;
-            let offset = first * row_bytes;
-            let slot = &mut ring.slots[ring.next];
-            ring.next ^= 1;
-            if slot.in_flight {
-                slot.in_flight = false;
-                slot.buffer.wait(&slot.copied)?;
-            }
-            slot.buffer.fill(bytes, |part| read(offset, part))?;
-            if let Some(cache) = &buffer.alloc_cache {
-                cache.settle()?;
-            }
-            self.copy_from_pinned(
-                &ring.stream,
-                &mut slot.buffer,
-                0,
-                buffer.range(offset, bytes)?,
-            )?;
-            ring.stream.record(&slot.copied)?;
-            slot.in_flight = true;
+        let slot = &mut ring.slots[ring.next];
+        ring.next ^= 1;
+        if slot.in_flight {
+            slot.in_flight = false;
+            slot.buffer.wait(&slot.copied)?;
         }
+        slot.buffer.fill(bytes, fill)?;
+        if let Some(cache) = &buffer.alloc_cache {
+            cache.settle()?;
+        }
+        self.copy_from_pinned(
+            &ring.stream,
+            &mut slot.buffer,
+            0,
+            buffer.range(offset, bytes)?,
+        )?;
+        ring.stream.record(&slot.copied)?;
+        slot.in_flight = true;
         Ok(())
     }
 

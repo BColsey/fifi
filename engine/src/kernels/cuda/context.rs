@@ -1191,6 +1191,32 @@ impl CudaContext {
         let raw = self.owned(buffer)?;
         let name = plan.tensor.name;
         let mut source = host_source(name, plan.per_chunk * plan.group_src)?;
+        // The tiles of a chunk are repacked straight into a page-locked staging buffer while the
+        // copy of the previous chunk runs; without page-locked memory they go through a
+        // pageable buffer.
+        let tile_bytes = plan.per_chunk * plan.group_bytes;
+        let ringed = self.with_upload_ring(tile_bytes, |ring| {
+            for first in (0..plan.groups).step_by(plan.per_chunk) {
+                let part = plan
+                    .tiled
+                    .with_groups(plan.per_chunk.min(plan.groups - first));
+                let src = &mut source[..part.groups() * plan.group_src];
+                read(first * plan.group_src, src)?;
+                let bytes = part.groups() * plan.group_bytes;
+                self.stage_chunk(ring, buffer, first * plan.group_bytes, bytes, |dst| {
+                    let vecs = TileVec::from_bytes_mut(dst).ok_or_else(|| {
+                        EngError::BadRequest(format!(
+                            "tensor {name}: the pinned staging buffer is not 16-byte aligned"
+                        ))
+                    })?;
+                    repack_chunk(name, part, src, vecs)
+                })?;
+            }
+            Ok(())
+        })?;
+        if ringed.is_some() {
+            return Ok(());
+        }
         let mut staging = host_tiles(name, plan.per_chunk * plan.group_vecs())?;
         for first in (0..plan.groups).step_by(plan.per_chunk) {
             let part = plan

@@ -212,6 +212,14 @@ impl TileVec {
         }
     }
 
+    /// The bytes as tile vectors, when they sit on a 16-byte boundary and hold whole vectors.
+    pub(super) fn from_bytes_mut(bytes: &mut [u8]) -> Option<&mut [Self]> {
+        // SAFETY: every byte pattern is a valid `TileVec` (`repr(C)` over `[u8; 16]`), and
+        // `align_to_mut` returns the exact aligned middle of the slice.
+        let (head, middle, tail) = unsafe { bytes.align_to_mut::<Self>() };
+        (head.is_empty() && tail.is_empty()).then_some(middle)
+    }
+
     pub(super) fn as_bytes_mut(vecs: &mut [Self]) -> &mut [u8] {
         // SAFETY: as in `as_bytes`; the exclusive borrow of `vecs` passes to
         // the returned slice, and every byte pattern is a valid `[u8; 16]`.
@@ -1778,6 +1786,19 @@ mod tests {
             };
             assert!(!shape.fits(), "{n_rows} x {k}");
         }
+    }
+
+    #[test]
+    fn bytes_become_tile_vectors_only_on_a_boundary_and_in_whole_vectors() {
+        let mut vecs = vec![TileVec::default(); 4];
+        let bytes = TileVec::as_bytes_mut(&mut vecs);
+        assert_eq!(
+            TileVec::from_bytes_mut(bytes).map(|found| found.len()),
+            Some(4)
+        );
+        // A slice that starts one byte in, or ends mid-vector, is not a tile run.
+        assert!(TileVec::from_bytes_mut(&mut bytes[1..]).is_none());
+        assert!(TileVec::from_bytes_mut(&mut bytes[..63]).is_none());
     }
 
     #[test]
