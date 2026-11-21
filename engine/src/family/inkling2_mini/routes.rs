@@ -13,6 +13,13 @@ pub struct InklingRoutes {
 impl InklingRoutes {
     /// Selects experts from FP32 router logits and a shared FP32 selection bias.
     pub fn from_logits(logits: &[[f32; EXPERTS]], bias: &[f32; EXPERTS]) -> Result<Self, EngError> {
+        Self::from_rows(logits.iter().copied(), bias)
+    }
+
+    pub(crate) fn from_rows(
+        logits: impl ExactSizeIterator<Item = [f32; EXPERTS]>,
+        bias: &[f32; EXPERTS],
+    ) -> Result<Self, EngError> {
         if bias.iter().any(|value| !value.is_finite()) {
             return Err(EngError::BadRequest(
                 "Inkling router selection bias must be finite".into(),

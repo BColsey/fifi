@@ -220,11 +220,25 @@ struct ProjectionRegions {
     denominator: Option<ExpertRegion>,
 }
 
-/// A validated Inkling 2 Mini checkpoint and its packed expert tensor locations.
+struct RouterRegions {
+    weight_offset: u64,
+    bias_offset: u64,
+}
+
+/// One stored layer's router parameters.
+pub struct InklingRouterWeights {
+    /// Row-major little-endian BF16 matrix in expert, hidden column order.
+    pub weight: Vec<u8>,
+    /// Finite F32 routing bias, in expert order.
+    pub bias: [f32; EXPERTS],
+}
+
+/// A validated Inkling 2 Mini checkpoint and its router and packed expert tensor locations.
 pub struct InklingExpertSource {
     shard: File,
     len: u64,
     layers: Vec<[ProjectionRegions; 2]>,
+    routers: Vec<RouterRegions>,
     weights: WeightPlan,
 }
 
@@ -261,7 +275,7 @@ pub struct InklingExpertPlan<'a> {
 }
 
 impl InklingExpertSource {
-    /// Opens and validates the config, index and shard header without reading expert payloads.
+    /// Opens and validates the config, index and shard header without reading tensor payloads.
     pub fn open(dir: &Path) -> Result<Self, EngError> {
         let guard = crate::storage_guard::LocalGuard::new()?;
         let config_path = dir.join("config.json");
@@ -280,12 +294,55 @@ impl InklingExpertSource {
         let layers = (0..LAYERS)
             .map(|layer| expert_regions(&entries, data_start, layer))
             .collect::<Result<_, _>>()?;
+        let routers = (0..LAYERS)
+            .map(|layer| router_regions(&entries, data_start, layer))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             shard,
             len,
             layers,
+            routers,
             weights,
         })
+    }
+
+    /// Reads the BF16 router matrix and F32 bias for a stored weight layer.
+    pub fn read_router(&self, layer: usize) -> Result<InklingRouterWeights, EngError> {
+        let router = self.routers.get(layer).ok_or_else(|| {
+            EngError::BadRequest(format!("Inkling router layer {layer} is out of range"))
+        })?;
+        self.check_shard_len()?;
+        let mut weight = vec![0; EXPERTS * HIDDEN * size_of::<u16>()];
+        let mut bias_bytes = [[0; size_of::<f32>()]; EXPERTS];
+        for (name, bytes, offset) in [
+            ("weight", weight.as_mut_slice(), router.weight_offset),
+            ("bias", bias_bytes.as_flattened_mut(), router.bias_offset),
+        ] {
+            read_exact_at(&self.shard, bytes, offset).map_err(|error| {
+                checkpoint_error(format!(
+                    "layer {layer} router {name} read at {offset}: {error}"
+                ))
+            })?;
+        }
+        self.check_shard_len()?;
+        let bias = bias_bytes.map(f32::from_le_bytes);
+        if let Some(expert) = bias.iter().position(|value| !value.is_finite()) {
+            return Err(checkpoint_error(format!(
+                "layer {layer} router bias for expert {expert} is not finite"
+            )));
+        }
+        Ok(InklingRouterWeights { weight, bias })
+    }
+
+    fn check_shard_len(&self) -> Result<(), EngError> {
+        let observed = self.shard.metadata().map_err(checkpoint_error)?.len();
+        if observed != self.len {
+            return Err(checkpoint_error(format!(
+                "shard length changed from {} to {observed}",
+                self.len
+            )));
+        }
+        Ok(())
     }
 
     /// Plans selected expert reads for a stored layer. Each tensor begins at a
@@ -432,22 +489,7 @@ impl InklingExpertPlan<'_> {
                 scratch.len()
             )));
         }
-        let check_len = || -> Result<(), EngError> {
-            let observed = self
-                .source
-                .shard
-                .metadata()
-                .map_err(checkpoint_error)?
-                .len();
-            if observed != self.source.len {
-                return Err(checkpoint_error(format!(
-                    "shard length changed from {} to {observed}",
-                    self.source.len
-                )));
-            }
-            Ok(())
-        };
-        check_len()?;
+        self.source.check_shard_len()?;
         for read in &self.reads {
             read_exact_at(
                 &self.source.shard,
@@ -458,7 +500,7 @@ impl InklingExpertPlan<'_> {
                 checkpoint_error(format!("expert read at {}: {error}", read.offset))
             })?;
         }
-        check_len()
+        self.source.check_shard_len()
     }
 }
 
@@ -487,6 +529,30 @@ fn read_exact_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> std::io::R
         }
     }
     Ok(())
+}
+
+fn router_regions(
+    entries: &BTreeMap<String, TensorInfo>,
+    data_start: u64,
+    layer: usize,
+) -> Result<RouterRegions, EngError> {
+    let stem = format!("model.llm.layers.{layer}.mlp.gate");
+    let offset = |name: &str, dtype: Dtype, shape: &[usize]| {
+        let key = format!("{stem}.{name}");
+        let info = entries
+            .get(&key)
+            .ok_or_else(|| checkpoint_error(format!("missing {key}")))?;
+        if info.dtype != dtype || info.shape != shape {
+            return Err(checkpoint_error(format!(
+                "unexpected storage layout for {key}"
+            )));
+        }
+        Ok(data_start + info.data_offsets.0 as u64)
+    };
+    Ok(RouterRegions {
+        weight_offset: offset("weight", Dtype::BF16, &[EXPERTS, HIDDEN])?,
+        bias_offset: offset("bias", Dtype::F32, &[EXPERTS])?,
+    })
 }
 
 fn expert_regions(
@@ -786,6 +852,7 @@ mod tests {
                 shard: tempfile::tempfile().unwrap(),
                 len: 0,
                 layers: vec![expert_regions(table, 1024, layer).unwrap()],
+                routers: Vec::new(),
                 weights: WeightPlan::default(),
             };
             for (ids, count) in [
@@ -807,6 +874,115 @@ mod tests {
         assert!(expert_regions(&mx, 0, 0).is_err());
         nv.remove("model.llm.layers.0.mlp.experts.w2_weight_amax");
         assert!(expert_regions(&nv, 0, 0).is_err());
+    }
+
+    #[test]
+    fn router_layout_requires_official_shapes_and_dtypes() {
+        const WEIGHT: &str = "model.llm.layers.3.mlp.gate.weight";
+        const BIAS: &str = "model.llm.layers.3.mlp.gate.bias";
+        let mut entries = BTreeMap::from([
+            (
+                WEIGHT.to_string(),
+                TensorInfo {
+                    dtype: Dtype::BF16,
+                    shape: vec![EXPERTS, HIDDEN],
+                    data_offsets: (0, EXPERTS * HIDDEN * size_of::<u16>()),
+                },
+            ),
+            (
+                BIAS.to_string(),
+                TensorInfo {
+                    dtype: Dtype::F32,
+                    shape: vec![EXPERTS],
+                    data_offsets: (0, EXPERTS * size_of::<f32>()),
+                },
+            ),
+        ]);
+        for (key, dtype, shape) in [
+            (WEIGHT, Dtype::F16, vec![EXPERTS, HIDDEN]),
+            (WEIGHT, Dtype::BF16, vec![HIDDEN, EXPERTS]),
+            (BIAS, Dtype::BF16, vec![EXPERTS]),
+            (BIAS, Dtype::F32, vec![EXPERTS, 1]),
+        ] {
+            let original = entries[key].clone();
+            let changed = entries.get_mut(key).unwrap();
+            changed.dtype = dtype;
+            changed.shape = shape;
+            assert!(matches!(
+                router_regions(&entries, 1024, 3),
+                Err(EngError::Checkpoint(message)) if message.contains(key)
+            ));
+            entries.insert(key.to_string(), original);
+        }
+        entries.remove(BIAS);
+        assert!(matches!(
+            router_regions(&entries, 1024, 3),
+            Err(EngError::Checkpoint(message)) if message.contains(BIAS)
+        ));
+    }
+
+    #[test]
+    fn router_reads_exact_payloads_from_the_validated_shard() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let bias = std::array::from_fn::<_, EXPERTS, _>(|i| i as f32 - 64.0);
+        let weight: Vec<u8> = (0..EXPERTS * HIDDEN)
+            .flat_map(|i| (0x3f00u16 | (i % 128) as u16).to_le_bytes())
+            .collect();
+        let bias_len = EXPERTS * size_of::<f32>();
+        let header = serde_json::json!({
+            "model.llm.layers.0.mlp.gate.bias": {
+                "dtype": "F32",
+                "shape": [EXPERTS],
+                "data_offsets": [0, bias_len],
+            },
+            "model.llm.layers.0.mlp.gate.weight": {
+                "dtype": "BF16",
+                "shape": [EXPERTS, HIDDEN],
+                "data_offsets": [bias_len, bias_len + weight.len()],
+            },
+        })
+        .to_string();
+        let mut shard = tempfile::tempfile().unwrap();
+        shard
+            .write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        shard.write_all(header.as_bytes()).unwrap();
+        for value in bias {
+            shard.write_all(&value.to_le_bytes()).unwrap();
+        }
+        shard.write_all(&weight).unwrap();
+        let len = shard.metadata().unwrap().len();
+        shard.rewind().unwrap();
+        let (data_start, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT).unwrap();
+        let routers = vec![router_regions(&entries.into_iter().collect(), data_start, 0).unwrap()];
+        let mut source = InklingExpertSource {
+            shard,
+            len,
+            layers: Vec::new(),
+            routers,
+            weights: WeightPlan::default(),
+        };
+        let actual = source.read_router(0).unwrap();
+        assert_eq!(actual.weight, weight);
+        assert_eq!(actual.bias, bias);
+        assert!(matches!(
+            source.read_router(1),
+            Err(EngError::BadRequest(_))
+        ));
+
+        let bias_offset = data_start + 5 * size_of::<f32>() as u64;
+        source.shard.seek(SeekFrom::Start(bias_offset)).unwrap();
+        source.shard.write_all(&f32::NAN.to_le_bytes()).unwrap();
+        assert!(matches!(
+            source.read_router(0),
+            Err(EngError::Checkpoint(message)) if message.contains("bias for expert 5")
+        ));
+        source.shard.set_len(len - 1).unwrap();
+        assert!(matches!(
+            source.read_router(0),
+            Err(EngError::Checkpoint(message)) if message.contains("shard length changed")
+        ));
     }
 
     #[test]
@@ -853,6 +1029,7 @@ mod tests {
             shard,
             len: contents.len() as u64,
             layers: vec![[gate_up, down]],
+            routers: Vec::new(),
             weights: WeightPlan::default(),
         };
 
