@@ -174,8 +174,14 @@ pub(super) fn build_tiered(
     )
     .map_err(|error| checkpoint(format!("{error:?}")))?;
     // The shexp refusal beside the routed one: the chunk facts assert a Q4_K
-    // shared expert, so the attach proves it before the banks exist.
-    require_q4k_shexp(header, layers).map_err(|error| checkpoint(format!("{error:?}")))?;
+    // shared expert, so a start that asks for the tiered chunk path proves it
+    // before the banks exist. The per-token tiered path reads the shared expert
+    // in whatever type the file stores it (the pinned Q4_K_M file keeps it Q8_0).
+    if super::prefill::tiered_chunk_enabled(
+        std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+    ) {
+        require_q4k_shexp(header, layers).map_err(|error| checkpoint(format!("{error:?}")))?;
+    }
     let mapped = MappedFile::open(gguf, header.file_len())
         .map_err(|error| checkpoint(format!("mapping {}: {error}", gguf.display())))?;
     let region: Arc<dyn MappedRegion> = Arc::new(mapped);
