@@ -71,6 +71,7 @@ pub(crate) use gguf_split::write_two_shard_set;
 pub(crate) use gguf_split::{ShardName, shard_name_of};
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
+pub(crate) use shard::read_stored_header;
 pub use shard::{HeaderEntry, ShardHeader};
 pub use tiered::{LoadLimits, ShardIo, TieredWeights};
 

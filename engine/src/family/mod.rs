@@ -69,6 +69,7 @@ pub(crate) mod host_shape;
     )
 )]
 pub(crate) mod host_store;
+pub mod inkling2_mini;
 pub mod keys;
 #[allow(
     dead_code,

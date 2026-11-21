@@ -247,6 +247,17 @@ fn evaluate(
         checks.push(Check::new("host memory", CheckStatus::Info, note.clone()));
     }
 
+    use crate::family::inkling2_mini;
+    if candidate.family.as_deref() == Some(inkling2_mini::FAMILY)
+        || (candidate.family.is_none()
+            && inspection
+                .config_model_types
+                .iter()
+                .any(|kind| kind == inkling2_mini::MODEL_TYPE))
+    {
+        return inkling2_mini_preflight(model_dir, tokenizer_dir, candidate, checks);
+    }
+
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
     if family_name == Some(crate::family::gemma::gemma4::FAMILY)
@@ -659,6 +670,61 @@ fn any_failed(checks: &[Check]) -> bool {
 
 fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
+}
+
+/// Inkling's header plan is available before a serving backend is wired up.
+fn inkling2_mini_preflight(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    candidate: &Candidate,
+    mut checks: Vec<Check>,
+) -> PreflightReport {
+    use crate::family::inkling2_mini;
+    let plan = if candidate.kv_dtype.as_deref().is_some_and(|kv| kv != "bf16") {
+        Err(crate::EngError::BadRequest(
+            "Inkling 2 Mini currently prices BF16 KV".into(),
+        ))
+    } else {
+        inkling2_mini::inspect(model_dir, candidate.context_limit)
+    };
+    let decisions = match plan {
+        Ok(rows) => {
+            checks.push(Check::new(
+                "Inkling 2 Mini checkpoint",
+                CheckStatus::Pass,
+                "fixed loop and mixed expert storage verified from headers".into(),
+            ));
+            rows
+        }
+        Err(error) => {
+            checks.push(Check::new(
+                "Inkling 2 Mini checkpoint",
+                CheckStatus::Fail,
+                super::describe_error(&error),
+            ));
+            Vec::new()
+        }
+    };
+    checks.push(Check::new(
+        "text execution",
+        CheckStatus::Fail,
+        "Inkling 2 Mini text execution is pending".into(),
+    ));
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family: Some(inkling2_mini::FAMILY.into()),
+        verdict: Verdict::Unsupported,
+        dimensions: Dimensions {
+            compatibility: Compatibility::Unsupported,
+            qualification: Qualification::Unverified,
+            resource_fit: ResourceFit::Unknown,
+        },
+        checks,
+        decisions,
+        estimate: None,
+        next_step: "Use the header plan to size the text executor and qualify it against the reference model.".into(),
+    }
 }
 
 fn shallow_preflight(
