@@ -119,10 +119,6 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[cfg(test)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a C entry's flat argument list: type, two buffers, count, table pointer and size, stream, stage"
-    )]
     #[link_name = "inference_cuda_dequant_gguf_launch"]
     fn dequant_gguf_launch_raw(
         ty: c_int,

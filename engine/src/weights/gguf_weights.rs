@@ -872,10 +872,10 @@ mod tests {
     fn open_any_type_accepts_what_open_refuses_by_type() {
         let blocks = fixture("q5_k.blocks");
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write(&dir, &gguf(&[], &[entry("w", GgufType::Q2K, &blocks)]));
+        let path = write(&dir, &gguf(&[], &[entry("w", GgufType::Q41, &blocks)]));
         expect_checkpoint(
             GgufWeights::open(&path, LIMITS, None),
-            "unsupported type Q2_K",
+            "unsupported type Q4_1",
         );
         GgufWeights::open_any_type(&path, LIMITS, None).expect("types are the caller's to judge");
     }
