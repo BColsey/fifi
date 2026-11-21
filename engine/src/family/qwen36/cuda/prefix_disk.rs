@@ -95,28 +95,37 @@ fn kind_of(capture: Capture) -> SaveKind {
     }
 }
 
+/// What a disk entry of this step was built under: the checkpoint, tokenizer and template digests
+/// and the state layout. The KV form (fp16 or int8) is part of the layout and of the numeric path,
+/// so an entry written under one form is never found by a load of the other.
+fn load_identity_of(
+    identity: &crate::family::session::PrefixIdentity,
+    layout: &super::super::state_layout::StateLayout,
+) -> LoadIdentity {
+    let per_token: usize = layout
+        .kv
+        .prefix_ranges(0, 1)
+        .map_or(0, |ranges| ranges.iter().map(|range| range.bytes).sum());
+    LoadIdentity {
+        weights: identity.weights.to_string(),
+        tokenizer: identity.tokenizer.to_string(),
+        template: identity.template.to_string(),
+        numeric_path: format!("{:?}", CudaPrefillPath::Steps(layout.kv.mode)),
+        family: CONTRACT,
+        layout: format!(
+            "{LAYOUT_TAG}; delta {} layers rec {} conv {}; kv {} layers {:?} {per_token} B/token/layer",
+            layout.delta.layers,
+            layout.delta.rec_values,
+            layout.delta.conv_values,
+            layout.kv.layers,
+            layout.kv.mode,
+        ),
+    }
+}
+
 impl QwenResidentStep<'_> {
     fn load_identity(&self) -> LoadIdentity {
-        let layout = self.state.layout();
-        let per_token: usize = layout
-            .kv
-            .prefix_ranges(0, 1)
-            .map_or(0, |ranges| ranges.iter().map(|range| range.bytes).sum());
-        LoadIdentity {
-            weights: self.prefix_identity.weights.to_string(),
-            tokenizer: self.prefix_identity.tokenizer.to_string(),
-            template: self.prefix_identity.template.to_string(),
-            numeric_path: format!("{:?}", CudaPrefillPath::Steps(layout.kv.mode)),
-            family: CONTRACT,
-            layout: format!(
-                "{LAYOUT_TAG}; delta {} layers rec {} conv {}; kv {} layers {:?} {per_token} B/token/layer",
-                layout.delta.layers,
-                layout.delta.rec_values,
-                layout.delta.conv_values,
-                layout.kv.layers,
-                layout.kv.mode,
-            ),
-        }
+        load_identity_of(&self.prefix_identity, self.state.layout())
     }
 
     /// Opens the disk tier at `resolved`, or logs why the tier stays off. It runs after the pinned
@@ -432,5 +441,57 @@ impl QwenResidentStep<'_> {
     pub(super) fn restore_tier(&mut self, covered: usize) -> PrefixTier {
         let source = self.restore_source.take();
         restore_report(self.disk.as_mut(), covered, source, PrefixSource::Pinned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::{
+        dims::{KvMode, StepDims},
+        start::step_options,
+        state_layout::StateLayout,
+    };
+    use super::*;
+    use crate::family::{
+        QWEN3_6_35B_A3B, gguf_model::Inventory, qwen36::host::HostShape, session::PrefixIdentity,
+    };
+
+    fn identity() -> PrefixIdentity {
+        PrefixIdentity {
+            weights: "weights".into(),
+            tokenizer: "tokenizer".into(),
+            template: "template".into(),
+        }
+    }
+
+    fn namespace_under(mode: KvMode, context: u32) -> [u8; 32] {
+        let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen36::settings::ROTARY_DIM,
+        )
+        .unwrap();
+        let dims = StepDims::new(&shape, &inventory).unwrap();
+        let options = step_options(
+            context,
+            crate::family::project::cuda::WeightLayout::Native,
+            mode,
+        )
+        .unwrap();
+        let layout = StateLayout::new(&dims, &options).unwrap();
+        let load = load_identity_of(&identity(), &layout);
+        assert!(load.is_complete());
+        load.namespace()
+    }
+
+    #[test]
+    fn an_fp16_entry_is_never_found_by_an_int8_cache() {
+        let fp16 = namespace_under(KvMode::Fp16, 32_768);
+        let int8 = namespace_under(KvMode::Int8G32, 32_768);
+        assert_ne!(fp16, int8, "the two cache forms share a namespace");
+        // The same form at the same size is the same namespace (an entry survives a restart), and
+        // the capacity does not enter it (an entry survives a different planned context).
+        assert_eq!(fp16, namespace_under(KvMode::Fp16, 32_768));
+        assert_eq!(int8, namespace_under(KvMode::Int8G32, 65_536));
     }
 }

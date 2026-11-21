@@ -160,6 +160,11 @@ impl LoadIdentity {
             && !self.layout.is_empty()
     }
 
+    /// The namespace of every entry of this load: two loads share an entry only when this is equal.
+    pub(crate) fn namespace(&self) -> [u8; 32] {
+        self.record().namespace()
+    }
+
     fn record(&self) -> Identity {
         let digest =
             |tag: &str, text: &str| H64::from_digest(sha256(&[tag.as_bytes(), text.as_bytes()]));
