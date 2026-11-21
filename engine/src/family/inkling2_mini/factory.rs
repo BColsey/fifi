@@ -214,6 +214,7 @@ mod executor {
                     "process_disk_read_bytes": disk, "lifetime_peak_footprint_bytes": io.map(|v| v.1),
                     "expert_read_bytes": end.read_bytes - self.cache.read_bytes,
                     "expert_read_ranges": end.read_ranges - self.cache.read_ranges,
+                    "cached_bytes": end.cached_bytes,
                     "hits": end.hits - self.cache.hits, "misses": end.misses - self.cache.misses,
                     "evictions": end.evictions - self.cache.evictions,
                     "staging_allocations": end.staging_allocations - self.cache.staging_allocations,

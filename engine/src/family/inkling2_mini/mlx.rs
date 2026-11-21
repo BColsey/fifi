@@ -580,6 +580,14 @@ impl MlxExpertCache {
         )
     }
 
+    /// Disable packed retention after the shared prefill allocation has been admitted.
+    pub(super) fn disable_retention(&mut self) {
+        self.max_bytes = 0;
+        self.stats.evictions += self.entries.len() as u64;
+        self.entries.clear();
+        self.stats.cached_bytes = 0;
+    }
+
     pub(super) fn capacity_bytes(&self) -> usize {
         self.max_bytes
     }
@@ -1167,9 +1175,16 @@ mod tests {
             .forward_quantized_readback(&mut kernels, 0, &overlapping, &input)
             .unwrap();
         assert_eq!(output.shape(), [2, HIDDEN as u32]);
-        let mut batch = MlxExpertCache::new(&kernels, Arc::clone(&source), charge);
+        let spare = page;
+        let mut batch = MlxExpertCache::new(&kernels, Arc::clone(&source), charge + spare);
         assert_eq!(batch.configure_prefill(2).unwrap(), 2);
-        assert_eq!(batch.max_bytes, 0);
+        assert_eq!(batch.capacity_bytes(), spare);
+        let capacity = batch.staging_capacity;
+        batch.disable_retention();
+        assert_eq!(batch.capacity_bytes(), 0);
+        assert_eq!(batch.staging_rows, 2);
+        assert_eq!(batch.staging_capacity, capacity);
+        assert!(batch.staging.is_some());
         let output = batch
             .forward_quantized_readback(&mut kernels, 0, &routes, &input)
             .unwrap();
@@ -1195,6 +1210,16 @@ mod tests {
         assert_eq!(solo.stats().misses, 2 * TOP_K as u64);
         assert!(batch.stats().read_bytes < solo.stats().read_bytes);
         assert_eq!(batch.stats().staging_allocations, 1);
+        let before = batch.stats();
+        let device_result = batch
+            .forward_quantized_readback(&mut kernels, 0, &routes, &input)
+            .unwrap();
+        assert_eq!(device_result.host_bytes().unwrap(), actual);
+        let repeated = batch.stats();
+        assert_eq!(repeated.hits, 0);
+        assert_eq!(repeated.misses - before.misses, TOP_K as u64 + 1);
+        assert_eq!(repeated.cached_bytes, 0);
+        assert_eq!(repeated.staging_allocations, 1);
     }
 
     #[test]
