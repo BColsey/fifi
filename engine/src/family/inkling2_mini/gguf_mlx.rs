@@ -39,6 +39,9 @@ struct Entry<T> {
 
 struct Cache<T> {
     entries: VecDeque<Entry<T>>,
+    protected: VecDeque<Entry<T>>,
+    protected_bytes: usize,
+    protected_limit: usize,
     bytes: usize,
     limit: usize,
 }
@@ -47,19 +50,36 @@ impl<T> Cache<T> {
     fn new(limit: usize) -> Self {
         Self {
             entries: VecDeque::new(),
+            protected: VecDeque::new(),
+            protected_bytes: 0,
+            protected_limit: 0,
             bytes: 0,
             limit,
         }
     }
 
     fn get(&mut self, name: &str, expert: usize) -> Option<Rc<T>> {
-        let position = self
-            .entries
-            .iter()
-            .position(|entry| entry.key.0 == name && entry.key.1 == expert)?;
+        let matches = |entry: &Entry<T>| entry.key.0 == name && entry.key.1 == expert;
+        if let Some(position) = self.protected.iter().position(matches) {
+            let entry = self.protected.remove(position)?;
+            let value = Rc::clone(&entry.value);
+            self.protected.push_back(entry);
+            return Some(value);
+        }
+        let position = self.entries.iter().position(matches)?;
         let entry = self.entries.remove(position)?;
         let value = Rc::clone(&entry.value);
-        self.entries.push_back(entry);
+        if entry.bytes <= self.protected_limit {
+            self.protected_bytes += entry.bytes;
+            self.protected.push_back(entry);
+            while self.protected_bytes > self.protected_limit {
+                let demoted = self.protected.pop_front().expect("tracked protected bytes");
+                self.protected_bytes -= demoted.bytes;
+                self.entries.push_back(demoted);
+            }
+        } else {
+            self.entries.push_back(entry);
+        }
         Some(value)
     }
 
@@ -69,8 +89,13 @@ impl<T> Cache<T> {
         }
         let mut evicted = 0;
         while self.bytes > self.limit - bytes {
-            self.bytes -= self.entries.pop_front().expect("tracked cache bytes").bytes;
             evicted += 1;
+            let Some(victim) = self.entries.pop_front() else {
+                // The incoming plane would itself be the oldest probationary
+                // entry. Keep the protected planes and dispatch without caching it.
+                return evicted;
+            };
+            self.bytes -= victim.bytes;
         }
         self.entries.push_back(Entry { key, bytes, value });
         self.bytes += bytes;
@@ -142,6 +167,14 @@ impl Experts {
         // against one admission budget, independent of which tier serves a hit.
         let single_copy = single_copy_experts_enabled() && all_experts_have_packed_kernels(&source);
         let ram = if single_copy { 0 } else { headroom / 4 };
+        let mut resident = Cache::new(headroom - ram);
+        if single_copy
+            && std::env::var_os("FIFI_INKLING_GGUF_SEGMENTED_LRU").is_some_and(|value| value == "1")
+        {
+            // A second access promotes a plane. New admissions and demotions
+            // share the remaining space. Both queues use the same Metal budget.
+            resident.protected_limit = resident.limit - resident.limit.div_ceil(10);
+        }
         let mut metal = MlxKernels::try_new()?;
         // Bound deferred retirements on this adapter. The allocator pool is
         // shared by the process, so changing its limit would affect other engines.
@@ -156,7 +189,7 @@ impl Experts {
             source,
             metal,
             packed: Cache::new(ram),
-            resident: Cache::new(headroom - ram),
+            resident,
             packed_enabled: packed_mlx_enabled(),
             batched_enabled,
             batched_visits: 0,
@@ -191,6 +224,7 @@ impl Experts {
                 "batched_visits": std::mem::take(&mut self.batched_visits),
                 "retained_ram_capacity_bytes": self.packed.limit,
                 "retained_metal_capacity_bytes": self.resident.limit,
+                "protected_metal_capacity_bytes": self.resident.protected_limit,
                 "projections": std::mem::take(&mut self.projections),
                 "resident_bytes": self.resident.bytes,
                 "packed_ram_bytes": self.packed.bytes,
@@ -629,6 +663,39 @@ fn decode_transposed(plane: &ExpertPlane) -> Result<Tensor, EngError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segmented_lru_retains_a_reused_plane_during_new_admissions() {
+        let mut cache = Cache::new(10);
+        cache.protected_limit = 9;
+        for id in 0..3 {
+            assert_eq!(cache.put(("gate".into(), id), 3, Rc::new(id)), 0);
+        }
+        assert_eq!(*cache.get("gate", 0).unwrap(), 0);
+        for id in 3..6 {
+            assert_eq!(cache.put(("gate".into(), id), 3, Rc::new(id)), 1);
+        }
+        assert_eq!(*cache.get("gate", 0).unwrap(), 0);
+        assert!(cache.get("gate", 1).is_none());
+        assert_eq!(cache.bytes, 9);
+        assert_eq!(cache.protected_bytes, 3);
+    }
+
+    #[test]
+    fn segmented_lru_demotes_by_bytes_and_can_skip_an_incoming_plane() {
+        let mut cache = Cache::new(16);
+        cache.protected_limit = 9;
+        for (id, bytes) in [(0, 6), (1, 4), (2, 6)] {
+            cache.put(("gate".into(), id), bytes, Rc::new(id));
+        }
+        assert!(cache.get("gate", 0).is_some());
+        assert!(cache.get("gate", 1).is_some());
+        assert_eq!(cache.protected_bytes, 4);
+        assert_eq!(cache.put(("down".into(), 3), 13, Rc::new(3)), 3);
+        assert_eq!(cache.bytes, 4);
+        assert!(cache.get("down", 3).is_none());
+        assert!(cache.get("gate", 1).is_some());
+    }
 
     #[test]
     fn gguf_read_amplification_counts_each_tensor_plane_once_per_phase() {
