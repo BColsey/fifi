@@ -27,6 +27,10 @@ On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling
 
 For the CUDA pilot, `FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB` optionally reserves a budget for packed expert banks. The loader places complete banks for the repeated core layers first and includes their bytes in device admission. A budget of zero uses streamed experts. Use `FIFI_INKLING_CUDA_PROFILE=1` to log per-token time by projection and upload phase. Set `FIFI_INKLING_CUDA_DENSE_STREAM=1` to use the experimental vectorized BF16 projections. This path queues all three controller matrices on one stream and copies only the final gain and forget rows back to the host.
 
+The Unsloth Inkling 2 Mini fixed-loop GGUF also works in the text pilot. Point `model_dir` to the GGUF file or a directory with one text GGUF, and use the original Thinking Machines tokenizer files in `tokenizer_dir`. For `enginesrv check`, give the GGUF directory and pass `--tokenizer-dir` separately.
+
+Both backends map the original packed weights from disk and decode or upload only selected expert payloads. The CUDA backend keeps BF16 dense projections resident and reuses a fixed device buffer for streamed BF16 and NVFP4 experts. Other GGUF quantization types supported by the CPU decoder run their projections on the host. The GGUF uses vectorized BF16 CUDA projections when CUDA is enabled.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

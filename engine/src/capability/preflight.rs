@@ -551,6 +551,18 @@ fn identify_family(
         ));
         return Some(crate::family::inkling2::FAMILY.to_string());
     }
+    if inspection
+        .gguf_files
+        .iter()
+        .any(|fact| fact.architecture.as_deref() == Some("inkling2"))
+    {
+        checks.push(Check::new(
+            "family",
+            CheckStatus::Pass,
+            "GGUF architecture inkling2 selects the Inkling family".into(),
+        ));
+        return Some(crate::family::inkling2::FAMILY.into());
+    }
     // Inference, deliberately narrow: only a `config.json` model_type that
     // a family's spec itself accepts. Anything else asks the user to name
     // the family rather than guessing at GB-scale consequences.
@@ -604,26 +616,67 @@ fn inkling2_preflight(
     } else {
         8192
     });
-    let config = std::fs::read(model_dir.join("config.json"))
-        .map_err(|error| crate::EngError::Checkpoint(format!("read Inkling config.json: {error}")))
-        .and_then(|bytes| TextSpec::from_config(&bytes).map(|spec| (spec, bytes)));
-    match config {
-        Ok((spec, _bytes)) => {
-            report_inkling2_plan(&mut checks, &spec, context);
-            report_inkling2_checkpoint(&mut checks, model_dir, &spec);
-            #[cfg(target_pointer_width = "64")]
-            if let Some(backend) = backend
-                && !checks.iter().any(|check| check.status == CheckStatus::Fail)
-            {
-                checks.push(inkling2_backend_check(
-                    backend,
-                    candidate.kv_dtype.as_deref(),
-                    || inkling2::inspect_cpu_config(&_bytes, &spec, context, tokenizer_dir),
+    #[cfg(target_pointer_width = "64")]
+    let gguf = inkling2::gguf_path(model_dir);
+    #[cfg(not(target_pointer_width = "64"))]
+    let gguf = Ok::<Option<PathBuf>, crate::EngError>(None);
+    match gguf {
+        #[cfg(target_pointer_width = "64")]
+        Ok(Some(path)) => match inkling2::GgufPlan::open(&path) {
+            Ok(plan) => {
+                report_inkling2_plan(&mut checks, &plan.spec, context);
+                checks.push(Check::new(
+                    "Inkling checkpoint",
+                    CheckStatus::Pass,
+                    format!(
+                        "{} GGUF text tensors validated",
+                        plan.header.tensors().len()
+                    ),
                 ));
+                if let Some(backend) = backend {
+                    checks.push(inkling2_backend_check(
+                        backend,
+                        candidate.kv_dtype.as_deref(),
+                        || inkling2::inspect_gguf_config(&plan, context, tokenizer_dir),
+                    ));
+                }
+            }
+            Err(error) => checks.push(Check::new(
+                "Inkling checkpoint",
+                CheckStatus::Fail,
+                super::describe_error(&error),
+            )),
+        },
+        Ok(_) => {
+            let config = std::fs::read(model_dir.join("config.json"))
+                .map_err(|error| {
+                    crate::EngError::Checkpoint(format!("read Inkling config.json: {error}"))
+                })
+                .and_then(|bytes| TextSpec::from_config(&bytes).map(|spec| (spec, bytes)));
+            match config {
+                Ok((spec, _bytes)) => {
+                    report_inkling2_plan(&mut checks, &spec, context);
+                    report_inkling2_checkpoint(&mut checks, model_dir, &spec);
+                    #[cfg(target_pointer_width = "64")]
+                    if let Some(backend) = backend
+                        && !checks.iter().any(|check| check.status == CheckStatus::Fail)
+                    {
+                        checks.push(inkling2_backend_check(
+                            backend,
+                            candidate.kv_dtype.as_deref(),
+                            || inkling2::inspect_cpu_config(&_bytes, &spec, context, tokenizer_dir),
+                        ));
+                    }
+                }
+                Err(error) => checks.push(Check::new(
+                    "Inkling config",
+                    CheckStatus::Fail,
+                    super::describe_error(&error),
+                )),
             }
         }
         Err(error) => checks.push(Check::new(
-            "Inkling config",
+            "Inkling checkpoint",
             CheckStatus::Fail,
             super::describe_error(&error),
         )),

@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     TextSpec, bad,
-    cpu_weights::{ExpertMatrix, ExpertPacking, Weights},
+    cpu_weights::{ExpertMatrix, ExpertPacking, NativeWeights as Weights},
 };
 use crate::{
     EngError,
@@ -24,6 +24,7 @@ use crate::{
 };
 
 mod dense;
+pub(super) mod gguf;
 
 use dense::{DensePlan, DenseStep};
 

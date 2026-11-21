@@ -5,8 +5,10 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use super::{
-    Attention, LayerVisit, TEXT_CONTEXT_LIMIT, TextSpec, bad, cpu_attention::VisitState,
-    cpu_weights::Weights,
+    Attention, LayerVisit, TEXT_CONTEXT_LIMIT, TextSpec, bad,
+    cpu_attention::VisitState,
+    cpu_weights::{NativeWeights, Weights},
+    gguf_weights::{GgufPlan, Metadata, gguf_path},
 };
 use crate::EngError;
 
@@ -82,13 +84,21 @@ impl Role {
 
 impl CpuForward {
     pub(super) fn open(directory: &Path, context: usize) -> Result<Self, EngError> {
-        let config = fs::read(directory.join("config.json"))
-            .map_err(|error| bad(format!("read text configuration: {error}")))?;
-        let spec = TextSpec::from_config(&config)?;
-        let config = CpuConfig::parse(&config, &spec, context)?;
+        let (spec, config, weights) = if let Some(path) = gguf_path(directory)? {
+            let plan = GgufPlan::open(&path)?;
+            let config = CpuConfig::from_gguf(&plan, context)?;
+            let (spec, weights) = plan.map(&path)?;
+            (spec, config, Weights::Gguf(Box::new(weights)))
+        } else {
+            let bytes = fs::read(directory.join("config.json"))
+                .map_err(|error| bad(format!("read text configuration: {error}")))?;
+            let spec = TextSpec::from_config(&bytes)?;
+            let config = CpuConfig::parse(&bytes, &spec, context)?;
+            let weights = NativeWeights::open(directory, &spec)?;
+            (spec, config, Weights::Native(Box::new(weights)))
+        };
         let visits = spec.visits();
         let state = (0..visits.len()).map(|_| VisitState::default()).collect();
-        let weights = Weights::open(directory, &spec)?;
         Ok(Self {
             spec,
             math: config.text_config,
@@ -390,7 +400,9 @@ impl CpuForward {
         let activation = self.weights.activate(input)?;
         let mut output = vec![0.0; self.hidden()];
         for id in selected {
-            let pairs = self.weights.expert(&gate_up, id, &activation, input)?;
+            let pairs = self
+                .weights
+                .expert(&gate_up, id, activation.as_ref(), input)?;
             let middle: Vec<f32> = pairs
                 .as_chunks::<2>()
                 .0
@@ -402,7 +414,9 @@ impl CpuForward {
                 })
                 .collect();
             let activation = self.weights.activate(&middle)?;
-            let contribution = self.weights.expert(&down, id, &activation, &middle)?;
+            let contribution = self
+                .weights
+                .expert(&down, id, activation.as_ref(), &middle)?;
             add(
                 &mut output,
                 &contribution,
@@ -429,6 +443,21 @@ pub(crate) fn inspect_cpu_config(
     )
 }
 
+pub(crate) fn inspect_gguf_config(
+    plan: &GgufPlan,
+    context: u32,
+    tokenizer_dir: &Path,
+) -> Result<(), EngError> {
+    let config = CpuConfig::from_gguf(plan, context as usize)?;
+    let bundle = crate::tokenizer::inkling2::load(tokenizer_dir)?;
+    validate_tokenizer(
+        plan.spec.unpadded_vocab_size as u32,
+        config.eos_token_id,
+        bundle.vocab_size(),
+        bundle.eos_token_ids(),
+    )
+}
+
 fn validate_tokenizer(
     model_vocab: u32,
     model_eos: u32,
@@ -444,6 +473,42 @@ fn validate_tokenizer(
 }
 
 impl CpuConfig {
+    fn from_gguf(plan: &GgufPlan, context: usize) -> Result<Self, EngError> {
+        let meta = Metadata::new(&plan.header);
+        let int = |key| {
+            meta.integer(&format!("inkling2.{key}"))
+                .map(|value| value as usize)
+        };
+        let float = |key| meta.float(&format!("inkling2.{key}"));
+        let eos = meta.integer("tokenizer.ggml.eos_token_id")?;
+        if eos >= plan.spec.unpadded_vocab_size {
+            return Err(bad("GGUF EOS is outside the unpadded vocabulary"));
+        }
+        let math = TextMath {
+            d_rel: int("attention.relative_length")?,
+            rel_extent: int("attention.relative_extent")?,
+            sconv_kernel_size: int("shortconv.l_cache")?,
+            rms_norm_eps: float("attention.layer_norm_rms_epsilon")?,
+            qk_l2_clip_threshold: float("attention.qk_clip")?,
+            rel_l2_clip_threshold: float("attention.relative_clip")?,
+            log_scaling_n_floor: int("attention.log_scale_floor")?,
+            final_logit_softcapping: float("final_logit_softcapping")?,
+            mlp_gate_softcap: float("activation.situ_beta")?,
+            mlp_up_softcap: float("activation.situ_linear_beta")?,
+            route_scale: float("expert_weights_scale")?,
+            q_bias: false,
+            o_bias: false,
+            attn_res_normalize_values: true,
+            use_value_norm_no_gamma: true,
+            use_gate_bias: true,
+        };
+        math.validate(context, &plan.spec)?;
+        Ok(Self {
+            eos_token_id: eos as u32,
+            text_config: math,
+        })
+    }
+
     fn parse(bytes: &[u8], spec: &TextSpec, context: usize) -> Result<Self, EngError> {
         let config: Self = serde_json::from_slice(bytes)
             .map_err(|error| bad(format!("read text forward parameters: {error}")))?;

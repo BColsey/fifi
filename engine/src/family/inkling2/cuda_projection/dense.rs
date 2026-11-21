@@ -6,7 +6,8 @@ use std::{cell::RefCell, mem::size_of};
 use crate::{
     EngError,
     kernels::cuda::{
-        ArenaTensor, CudaContext, DeviceArena, DeviceRange, DeviceStream, PinnedBuf, plan_arena,
+        ArenaTensor, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
+        plan_arena,
         resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
     },
 };
@@ -80,9 +81,19 @@ impl DenseStep {
         weight: &Resident,
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
-        let output = self.range(Slot::Output, 0, weight.shape[0])?;
+        self.project_buffer(context, &weight.codes, weight.shape, x)
+    }
+
+    pub(super) fn project_buffer(
+        &self,
+        context: &CudaContext,
+        codes: &DeviceBuffer,
+        shape: [usize; 2],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        let output = self.range(Slot::Output, 0, shape[0])?;
         self.run(context, x, output, |input| {
-            self.launch(context, weight, input, output)
+            self.launch(context, codes, shape, input, output)
         })
     }
 
@@ -99,9 +110,9 @@ impl DenseStep {
         let first = self.range(Slot::Output, 0, width)?;
         let second = self.range(Slot::Output, width, forget.shape[0])?;
         let mut values = self.run(context, x, all, |input| {
-            self.launch(context, down, input, reduced)?;
-            self.launch(context, gain, reduced, first)?;
-            self.launch(context, forget, reduced, second)
+            self.launch(context, &down.codes, down.shape, input, reduced)?;
+            self.launch(context, &gain.codes, gain.shape, reduced, first)?;
+            self.launch(context, &forget.codes, forget.shape, reduced, second)
         })?;
         let forget = values.split_off(width);
         Ok([values, forget])
@@ -110,11 +121,11 @@ impl DenseStep {
     fn launch(
         &self,
         context: &CudaContext,
-        weight: &Resident,
+        codes: &DeviceBuffer,
+        [rows, cols]: [usize; 2],
         x: DeviceRange<'_>,
         y: DeviceRange<'_>,
     ) -> Result<(), EngError> {
-        let [rows, cols] = weight.shape;
         let shape = DenseGemvShape::packed(1, rows, cols);
         let need = dense_gemv_bytes(shape)?;
         context.dense_gemv(
@@ -122,7 +133,7 @@ impl DenseStep {
             DenseGemvCall {
                 shape,
                 dtype: DenseDtype::Bf16,
-                w: weight.codes.range(0, need.w)?,
+                w: codes.range(0, need.w)?,
                 x,
                 y,
             },

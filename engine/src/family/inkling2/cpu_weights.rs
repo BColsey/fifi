@@ -16,12 +16,100 @@ use crate::{
     weights::nemotron_shards::NemotronShardReader as ShardReader,
 };
 
-pub(super) struct Weights {
+pub(super) struct NativeWeights {
     metadata: ShardReader,
     mapping: MappedFile,
     isa: Isa,
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     cuda: Option<CudaProjection>,
+}
+
+pub(super) enum Weights {
+    Native(Box<NativeWeights>),
+    Gguf(Box<super::gguf_weights::GgufTextWeights>),
+}
+
+impl Weights {
+    pub(super) fn vec(&self, name: &str, len: usize) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Native(w) => w.vec(name, len),
+            Self::Gguf(w) => w.vec(name, len),
+        }
+    }
+
+    pub(super) fn row(&self, name: &str, row: usize, cols: usize) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Native(w) => w.row(name, row, cols),
+            Self::Gguf(w) => w.row(name, row, cols),
+        }
+    }
+
+    pub(super) fn project(&self, name: &str, x: &[f32], rows: usize) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Native(w) => w.project(name, x, rows),
+            Self::Gguf(w) => w.project(name, x, rows),
+        }
+    }
+
+    pub(super) fn controller(
+        &self,
+        [down, gain, forget]: [&str; 3],
+        x: &[f32],
+        [rank, hidden]: [usize; 2],
+    ) -> Result<[Vec<f32>; 2], EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some(cuda) = self.cuda_projection()
+            && let Some(result) = cuda.controller([down, gain, forget], x, [rank, hidden])
+        {
+            return result;
+        }
+        let reduced = self.project(down, x, rank)?;
+        Ok([
+            self.project(gain, &reduced, hidden)?,
+            self.project(forget, &reduced, hidden)?,
+        ])
+    }
+
+    pub(super) fn activate(&self, x: &[f32]) -> Result<Option<Activation>, EngError> {
+        match self {
+            Self::Native(w) => w.activate(x).map(Some),
+            Self::Gguf(_) => Ok(None),
+        }
+    }
+
+    pub(super) fn expert(
+        &self,
+        name: &str,
+        expert: usize,
+        input: Option<&Activation>,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Native(w) => w.expert(
+                name,
+                expert,
+                input.ok_or_else(|| bad("missing native expert activation"))?,
+                x,
+            ),
+            Self::Gguf(w) => w.expert(name, expert, x),
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn enable_cuda(&mut self, spec: &TextSpec) -> Result<(), EngError> {
+        match self {
+            Self::Native(w) => w.enable_cuda(spec),
+            Self::Gguf(w) => w.enable_cuda(spec),
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn cuda_projection(&self) -> Option<&CudaProjection> {
+        match self {
+            Self::Native(w) => w.cuda_projection(),
+            Self::Gguf(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +169,7 @@ impl Floats<'_> {
     }
 }
 
-impl Weights {
+impl NativeWeights {
     pub(super) fn open(directory: &Path, spec: &TextSpec) -> Result<Self, EngError> {
         let (path, metadata) = checkpoint::open_checkpoint(directory, spec)?;
         let mapping = MappedFile::open(&path, metadata.file_len())
@@ -219,25 +307,6 @@ impl Weights {
                 .sum::<f32>()
             })
             .collect())
-    }
-
-    pub(super) fn controller(
-        &self,
-        [down, gain, forget]: [&str; 3],
-        input: &[f32],
-        [rank, hidden]: [usize; 2],
-    ) -> Result<[Vec<f32>; 2], EngError> {
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if let Some(cuda) = &self.cuda
-            && let Some(result) = cuda.controller([down, gain, forget], input, [rank, hidden])
-        {
-            return result;
-        }
-        let reduced = self.project(down, input, rank)?;
-        Ok([
-            self.project(gain, &reduced, hidden)?,
-            self.project(forget, &reduced, hidden)?,
-        ])
     }
 
     pub(super) fn activate(&self, x: &[f32]) -> Result<Activation, EngError> {
