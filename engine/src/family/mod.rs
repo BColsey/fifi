@@ -61,14 +61,6 @@ pub(crate) mod gguf_select;
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
 pub(crate) mod host_shape;
-#[allow(
-    dead_code,
-    reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"
-)]
-pub(crate) mod recipe;
-pub(crate) mod slot_request;
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) mod step_dims;
 pub mod keys;
 #[allow(
     dead_code,
@@ -83,6 +75,14 @@ pub mod keys;
 )]
 pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
+#[allow(
+    dead_code,
+    reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"
+)]
+pub(crate) mod recipe;
+pub(crate) mod slot_request;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) mod step_dims;
 // The memory facts and the numbers every host plan shares. The host reader inside is compiled
 // where it has a caller: every Linux build (the admission fits need the cgroup-aware probe)
 // and the test build.
