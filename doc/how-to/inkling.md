@@ -235,6 +235,21 @@ Two fresh processes ran the same five prompt tokens and generated the same twelv
 
 The mapped repeat read 0.46 GB more from disk and took 0.68 s longer. Its prefill and decode accessed 54.79 GB of logical mapped dense spans, which can overlap the same file pages many times. The results reinforce the need to measure physical I/O for each workload before choosing a policy.
 
+### Real-weight safetensors QKV placement
+
+The `71aa350c` release fixture timed the query, key, and value projections on layers 0 and 5. Each cell is the median of nine trials on the M4 mini in milliseconds. The Metal trials include copying the output back. The weight transpose, widening, and import are timed separately.
+
+| Layer | Rows | CPU, one worker | CPU, four workers | Metal, serial | Metal, batched |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1 | 1.15 | 0.44 | 2.64 | — |
+| 0 | 4 | 4.66 | 1.76 | 5.80 | 1.37 |
+| 0 | 16 | 19.00 | 6.98 | 22.08 | 1.58 |
+| 5 | 1 | 1.13 | 0.44 | 2.55 | — |
+| 5 | 4 | 4.74 | 1.66 | 5.30 | 1.43 |
+| 5 | 16 | 19.14 | 6.63 | 24.31 | 2.64 |
+
+The four-worker CPU projections were bitwise equal to the serial reference. Batched Metal was fastest on the 16-row shapes and added 47.19 MB of FP32 weight payload per layer after about 49–54 ms to widen and import it. The Metal projections passed the fixture's numerical tolerance and changed some rounded BF16 values. One-row CPU projection remains the serving path. These are projection timings. The request-level comparison appears in the 5 GiB budget table.
+
 ### Packed GGUF first-logit probes at 6 GiB
 
 Both variants used the same real IQ2_XXS checkpoints, mapped dense projections, a 128-token context, and the same five prompt token IDs. Each execution stopped at the first output logit vector. The OS page cache was uncontrolled.
