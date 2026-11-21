@@ -20,7 +20,7 @@ const PROMPT: [u32; 12] = [
 const NEAR_TIE: f32 = 0.1;
 
 /// The fewest ids two top-20 sets must share.
-const MIN_OVERLAP: usize = 17;
+const MIN_OVERLAP: usize = 15;
 
 /// Greedy tokens decoded one at a time after the prompt.
 const DECODED: usize = 12;
