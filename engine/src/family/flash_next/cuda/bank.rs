@@ -619,6 +619,7 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
+    use super::super::bank_source::DiskReadTiming;
     use super::super::disk_prefetch::{CANDIDATES, DiskPrefetch, Target};
     use super::super::victim_cache::{Key as VictimKey, RecentPicks, VictimIndex, VictimLayout};
     use super::{
@@ -632,10 +633,12 @@ pub(super) mod device {
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
     };
     use std::{
+        cell::Cell,
         sync::atomic::{AtomicU64, Ordering},
         time::Instant,
     };
 
+    #[derive(Clone, Copy)]
     struct DecodeForecast<'a> {
         position: u64,
         predicted: &'a [i32],
@@ -647,6 +650,14 @@ pub(super) mod device {
         memory: PinnedBuf,
         hits: u64,
         writebacks: u64,
+    }
+
+    #[derive(Clone, Copy, Default, serde::Serialize)]
+    struct RefillTiming {
+        requested_records: u64,
+        demand_ns: u64,
+        device_tail_ns: u64,
+        read: DiskReadTiming,
     }
 
     pub(in crate::family::flash_next) struct DeviceBank {
@@ -661,6 +672,7 @@ pub(super) mod device {
         source: Option<&'static crate::family::flash_next::cuda::bank_source::RungSource>,
         disk_prefetch: Option<DiskPrefetch>,
         victim_cache: Option<VictimCache>,
+        refill_timing: Option<Cell<[RefillTiming; 2]>>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -754,6 +766,7 @@ pub(super) mod device {
                 source: retained,
                 disk_prefetch: None,
                 victim_cache: None,
+                refill_timing: None,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1062,9 +1075,33 @@ pub(super) mod device {
             self.disk_prefetch.as_ref().map(DiskPrefetch::horizon)
         }
 
+        pub(in crate::family::flash_next::cuda) fn enable_refill_timing(&mut self) {
+            if self.source.is_some() {
+                self.refill_timing = Some(Cell::default());
+            }
+        }
+
+        fn update_refill_timing(&self, decode: bool, update: impl FnOnce(&mut RefillTiming)) {
+            if let Some(profile) = &self.refill_timing {
+                let mut phases = profile.get();
+                update(&mut phases[usize::from(decode)]);
+                profile.set(phases);
+            }
+        }
+
         /// The rung's decode miss line for the turn boundary; `None`
         /// when this bank never read through the rung (no disk tier).
         pub(in crate::family::flash_next) fn decode_miss_line(&self) -> Option<String> {
+            if let Some(profile) = &self.refill_timing {
+                for (name, timing) in ["prefill", "decode"].into_iter().zip(profile.take()) {
+                    if timing.requested_records != 0 || timing.device_tail_ns != 0 {
+                        eprintln!(
+                            "flash-next disk refill {name}: {}",
+                            serde_json::json!(timing)
+                        );
+                    }
+                }
+            }
             let line = self.source?.decode_miss_line()?;
             if let Some(prefetch) = &self.disk_prefetch {
                 eprintln!("{}", prefetch.report());
@@ -1094,6 +1131,9 @@ pub(super) mod device {
 
         /// Starts a fresh decode turn's rung counters and route history.
         pub(in crate::family::flash_next) fn reset_decode_misses(&mut self) {
+            if let Some(profile) = &self.refill_timing {
+                profile.take();
+            }
             if let Some(prefetch) = &self.disk_prefetch {
                 prefetch.cancel();
             }
@@ -1171,7 +1211,9 @@ pub(super) mod device {
             misses: &[u16],
             forecast: Option<DecodeForecast<'_>>,
         ) -> Result<Vec<Vec<u8>>, EngError> {
-            let read = |experts: &[u16]| {
+            let start = self.refill_timing.as_ref().map(|_| Instant::now());
+            let mut timing = start.map(|_| DiskReadTiming::default());
+            let result = self.resolve_disk_records(layer, misses, forecast, |experts| {
                 if experts.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1181,8 +1223,25 @@ pub(super) mod device {
                             "a no-place copy needs the disk rung's retained record source".into(),
                         )
                     })?
-                    .read_packed(layer, experts)
-            };
+                    .read_demand_timed(layer, experts, timing.as_mut())
+            });
+            if let (Some(start), Some(timing)) = (start, timing) {
+                self.update_refill_timing(forecast.is_some(), |phase| {
+                    phase.requested_records += misses.len() as u64;
+                    phase.demand_ns += start.elapsed().as_nanos() as u64;
+                    phase.read.add(timing);
+                });
+            }
+            result
+        }
+
+        fn resolve_disk_records(
+            &self,
+            layer: usize,
+            misses: &[u16],
+            forecast: Option<DecodeForecast<'_>>,
+            mut read: impl FnMut(&[u16]) -> Result<Vec<Vec<u8>>, EngError>,
+        ) -> Result<Vec<Vec<u8>>, EngError> {
             let Some((prefetch, forecast)) = self.disk_prefetch.as_ref().zip(forecast) else {
                 return read(misses);
             };
@@ -1276,6 +1335,7 @@ pub(super) mod device {
             // The bank stream can save victims and upload hits while the
             // exact SSD reads are running. Only actual misses reach the reader.
             let packed = self.read_disk_records(layer, &misses, Some(forecast))?;
+            let tail_started = self.refill_timing.as_ref().map(|_| Instant::now());
             let cache = self.victim_cache.as_mut().expect("victim cache enabled");
             let mut packed = packed.into_iter();
             for (op, hit) in copies.ops.iter().zip(hits) {
@@ -1291,6 +1351,11 @@ pub(super) mod device {
                 cache.memory.synchronize(&self.stream)?;
                 cache.hits += hit_count as u64;
                 cache.writebacks += writebacks;
+            }
+            if let Some(start) = tail_started {
+                self.update_refill_timing(true, |phase| {
+                    phase.device_tail_ns += start.elapsed().as_nanos() as u64;
+                });
             }
             Ok(())
         }
@@ -1327,6 +1392,7 @@ pub(super) mod device {
             if copies.ops.is_empty() {
                 return Ok(());
             }
+            let tail_started = self.refill_timing.as_ref().map(|_| Instant::now());
             let geometry: BankGeometry = *self.state.geometry();
             let layer = copies.layer;
             let Some(bank) = self.slots.get(layer) else {
@@ -1377,7 +1443,7 @@ pub(super) mod device {
             }
             // The loop's `store` (the layer's `&mut` place) still owns the borrow: reuse it,
             // so the pinned buffer's synchronize mutates the same handle the copies wrote.
-            match store {
+            let result = match store {
                 Some(store) => store.synchronize(&self.stream),
                 None => {
                     self.stream.synchronize()?;
@@ -1386,7 +1452,13 @@ pub(super) mod device {
                         None => Ok(()),
                     }
                 }
+            };
+            if let Some(start) = tail_started {
+                self.update_refill_timing(forecast.is_some(), |phase| {
+                    phase.device_tail_ns += start.elapsed().as_nanos() as u64;
+                });
             }
+            result
         }
 
         /// Reads one host place back (tests): the pinned buffer must have no copy outstanding.

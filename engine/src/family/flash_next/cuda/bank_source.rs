@@ -41,7 +41,7 @@ use std::{
     collections::HashMap,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// One component extent: the shard file it lives in, the exact extent
@@ -419,6 +419,34 @@ pub(in crate::family::flash_next) struct RungSource {
     /// batch and per closed step (see [`DecodeMisses`]). Only the decode
     /// path observes; the fill and the union-admit never do.
     decode_misses: DecodeMisses,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub(super) struct DiskReadTiming {
+    pub(super) records: u64,
+    ring_wait_ns: u64,
+    parse_ns: u64,
+    pack_ns: u64,
+}
+
+fn timed<T>(counter: Option<&mut u64>, work: impl FnOnce() -> T) -> T {
+    let Some(counter) = counter else {
+        return work();
+    };
+    let start = Instant::now();
+    let result = work();
+    *counter += start.elapsed().as_nanos() as u64;
+    result
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl DiskReadTiming {
+    pub(super) fn add(&mut self, timing: Self) {
+        self.records += timing.records;
+        self.ring_wait_ns += timing.ring_wait_ns;
+        self.parse_ns += timing.parse_ns;
+        self.pack_ns += timing.pack_ns;
+    }
 }
 
 /// The rung's decode miss mix: one observation per layer of a decode
@@ -860,37 +888,75 @@ impl RungSource {
         layer: usize,
         experts: &[u16],
     ) -> Result<Vec<Vec<u8>>, EngError> {
+        self.read_packed_timed(reader, layer, experts, None)
+    }
+
+    pub(super) fn read_demand_timed(
+        &self,
+        layer: usize,
+        experts: &[u16],
+        timing: Option<&mut DiskReadTiming>,
+    ) -> Result<Vec<Vec<u8>>, EngError> {
+        self.read_packed_timed(&self.store, layer, experts, timing)
+    }
+
+    fn read_packed_timed(
+        &self,
+        reader: &RingRecords,
+        layer: usize,
+        experts: &[u16],
+        mut timing: Option<&mut DiskReadTiming>,
+    ) -> Result<Vec<Vec<u8>>, EngError> {
         let mut packed = Vec::with_capacity(experts.len());
         for chunk in experts.chunks(reader.max_batch()) {
             let sites: Vec<RecordSite> = chunk
                 .iter()
                 .map(|&expert| RecordSite { layer, expert })
                 .collect();
-            let leases = reader.read_records(&sites)?;
+            let leases = timed(
+                timing.as_deref_mut().map(|stage| &mut stage.ring_wait_ns),
+                || reader.read_records(&sites),
+            )?;
             packed.extend(
                 chunk
                     .iter()
                     .zip(leases)
                     .map(|(&expert, lease)| {
                         let index = self.site_index(layer, expert);
-                        let matrices = parse_spans(
-                            &lease,
-                            &self.spans[index],
-                            self.checkpoint,
-                            layer,
-                            expert,
+                        let matrices = timed(
+                            timing.as_deref_mut().map(|stage| &mut stage.parse_ns),
+                            || {
+                                parse_spans(
+                                    &lease,
+                                    &self.spans[index],
+                                    self.checkpoint,
+                                    layer,
+                                    expert,
+                                )
+                            },
                         )?;
-                        self.layout
-                            .pack_matrices([&matrices[0], &matrices[1], &matrices[2]])
-                            .map_err(|error| {
-                                pack_error(format!(
-                                    "layer {layer} expert {expert}: {}",
-                                    error.describe()
-                                ))
-                            })
+                        timed(
+                            timing.as_deref_mut().map(|stage| &mut stage.pack_ns),
+                            || {
+                                self.layout.pack_matrices([
+                                    &matrices[0],
+                                    &matrices[1],
+                                    &matrices[2],
+                                ])
+                            },
+                        )
+                        .map_err(|error| {
+                            pack_error(format!(
+                                "layer {layer} expert {expert}: {}",
+                                error.describe()
+                            ))
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
+        }
+        if let Some(timing) = timing {
+            timing.records += packed.len() as u64;
         }
         Ok(packed)
     }
@@ -910,30 +976,15 @@ impl RungSource {
         &self,
         step: &[Vec<u16>],
     ) -> Result<(f64, f64, f64), EngError> {
-        let (mut in_reads, mut in_parse, mut in_pack) = (0.0f64, 0.0f64, 0.0f64);
+        let mut timing = DiskReadTiming::default();
         for (layer, misses) in step.iter().enumerate() {
-            for chunk in misses.chunks(self.slots.max(1)) {
-                let sites: Vec<RecordSite> = chunk
-                    .iter()
-                    .map(|&expert| RecordSite { layer, expert })
-                    .collect();
-                let phase = std::time::Instant::now();
-                let leases = self.store.read_records(&sites)?;
-                in_reads += phase.elapsed().as_secs_f64() * 1000.0;
-                for (&expert, lease) in chunk.iter().zip(leases) {
-                    let index = self.site_index(layer, expert);
-                    let phase = std::time::Instant::now();
-                    let matrices =
-                        parse_spans(&lease, &self.spans[index], self.checkpoint, layer, expert)?;
-                    in_parse += phase.elapsed().as_secs_f64() * 1000.0;
-                    let phase = std::time::Instant::now();
-                    self.layout
-                        .pack_matrices([&matrices[0], &matrices[1], &matrices[2]])?;
-                    in_pack += phase.elapsed().as_secs_f64() * 1000.0;
-                }
-            }
+            self.read_demand_timed(layer, misses, Some(&mut timing))?;
         }
-        Ok((in_reads, in_parse, in_pack))
+        Ok((
+            timing.ring_wait_ns as f64 / 1e6,
+            timing.parse_ns as f64 / 1e6,
+            timing.pack_ns as f64 / 1e6,
+        ))
     }
 }
 

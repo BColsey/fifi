@@ -164,6 +164,10 @@ pub(in crate::family::flash_next) mod prof {
         }
     }
 
+    pub(in crate::family::flash_next) fn check_switch_env(name: &str) -> Result<bool> {
+        check_switch_value(name, read_switch_env(name).as_deref())
+    }
+
     /// Validates the switches for startup's arena/owner binding.
     pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
         for name in [
@@ -171,8 +175,7 @@ pub(in crate::family::flash_next) mod prof {
             "INFERENCE_FLASH_NEXT_DRAIN_TICK",
             "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
         ] {
-            let value = read_switch_env(name);
-            check_switch_value(name, value.as_deref())?;
+            check_switch_env(name)?;
         }
         Ok(())
     }

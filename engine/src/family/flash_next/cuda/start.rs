@@ -627,6 +627,8 @@ fn build_driver_resolving(
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
     super::driver::chunk::prof::check_switch_spelling()?;
+    let refill_timing =
+        super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_DISK_PROFILE")?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -1092,6 +1094,9 @@ fn build_driver_resolving(
         fill_source,
         retained_source,
     )?;
+    if refill_timing {
+        bank.enable_refill_timing();
+    }
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()
