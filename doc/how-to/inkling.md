@@ -89,7 +89,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 
 | Priority | Work | Evidence and remaining checks |
 | --- | --- | --- |
-| 1 | Verify native text serving | On `f45062d7`, raw HTTP and the WebGUI produced “Paris.” The browser used the model picker and received a completed SSE stream. On `4138d0df`, the follow-up supplied all three messages and displayed “France” with a 144-token output allowance. Both streams ended at EOS. The 68-token control reached its limit before visible answer text. All 12 HTTP cases passed at `8a6c6347`, including cancellation and the following independent raw request. |
+| 1 | Verify native text serving | The WebGUI used the normal model picker and displayed “Paris” followed by “France” at `4138d0df` and again at `e9f74c2b`. The follow-up supplied all three messages. With a 144-token output allowance, both streams returned separate reasoning and visible text, then ended at EOS. The earlier 68-token control reached its limit before visible answer text. All 12 HTTP cases passed at `8a6c6347`, including cancellation and the following independent raw request. |
 | 2 | Qualify bounded prefill | `c651c820` adds opt-in visit-major prefill. Two-row prefill was bitwise equal to serial for all 200,058 logits at each of six prompt positions and a follow-up. On a repeated 62-token prompt producing eight identical tokens at 5 GiB, the early two-row run increased time to first token from 36.39 s to 44.44 s and attributed reads from 19.92 GB to 33.30 GB. At `8a6c6347`, four rows also matched every serial logit on real weights, including the first row after prefill. The idle-host mapped-weight comparison below measured a 6–9 second reduction in time to first token with four rows, with mixed physical I/O results. Two- and four-row parity also passed on the `71aa350c` release test build. |
 | 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced all 3,909 cache misses under byte-weighted LRU. All 4,388 repeated expert selections within the same token’s core passes hit the cache. Across tokens, 3,991 of 6,632 repeated selections hit. Layers 23 and 22 accounted for the most logical reads. Adjacent expert coalescing saved 312 read ranges on the first request and 282 on its repeat, measured against a one-range-per-expert-tensor replay with identical payload bytes. Frequency-based replay increased logical payload reads by 3.7%. The idle-host sustained comparison measured about 34% less process-attributed disk I/O with mapped weights and file-cache retention. Keep mapped storage opt-in. |
 | 4 | Measure placement | On the safetensors short repeat, 11 decode steps spent 1.68 s in CPU attention, 3.90 s in expert staging including 2.80 s of demand reads, and 1.11 s in synchronized Metal readback. Real-weight one-row QKV tests favored four CPU workers over the widened Metal path. The short end-to-end safetensors run showed a small decode gain with four workers. The GGUF experiments below test attention workers and grouped readback separately. |
@@ -98,6 +98,18 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 
 The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
 
+### Original packed-cache control
+
+The early safetensors experiments processed five prompt tokens and twelve greedy output tokens in a 128-token context. Every repeat returned the same text. The original server retained entire selected expert sets. The `f45062d7` worker retained individual experts and reused one Metal staging arena. The OS page cache was uncontrolled.
+
+| Binary and ceiling | Repeat TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (GB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original pre-commit text binary, 5 GiB | 3.74 | 1.34 | 1.44 | 11.38 | 28.82 | 6.37 |
+| `f45062d7`, 5 GiB | 3.56 | 1.40 | 1.64 | 10.29 | 9.60 | 6.47 |
+| `f45062d7`, 5 GiB reproduction | 3.34 | 1.50 | 1.65 | 10.03 | 9.60 | 6.55 |
+| `f45062d7`, 6 GiB | 3.27 | 1.53 | 1.74 | 9.59 | 7.41 | 6.40 |
+
+The repeated 5 GiB control reproduced the logical read reduction with a modest decode gain. Attributed disk reads were higher in both 5 GiB per-expert runs. The early collector did not collect phase-separated process footprint.
 
 ### Initial 5 GiB storage comparison
 
