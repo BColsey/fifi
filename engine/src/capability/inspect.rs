@@ -41,6 +41,11 @@ pub struct GgufFact {
     /// `general.architecture` from the header, when it is a string.
     pub architecture: Option<String>,
     pub tensor_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_loop:
+        Option<Result<crate::family::inkling2_mini::gguf_metadata::Geometry, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inkling2_tensors: Option<Result<(), String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -68,6 +73,53 @@ pub struct ModelInspection {
 }
 
 impl ModelInspection {
+    pub(crate) fn has_inkling_safetensors(&self) -> bool {
+        self.safetensors_files > 0
+            && self
+                .config_model_types
+                .iter()
+                .any(|kind| kind == crate::family::inkling2_mini::MODEL_TYPE)
+    }
+
+    pub(crate) fn inkling_ggufs(&self) -> impl Iterator<Item = &GgufFact> {
+        self.gguf_files
+            .iter()
+            .filter(|file| file.inkling2_loop.is_some())
+    }
+
+    pub(crate) fn inkling_gguf(&self) -> Result<Option<&GgufFact>, EngError> {
+        // A corrupt header does not identify its architecture, so it cannot be
+        // distinguished from a second text checkpoint during startup.
+        if !self.gguf_errors.is_empty() {
+            return Err(checkpoint(self.gguf_errors.join("; ")));
+        }
+        if self.has_inkling_safetensors() {
+            return Ok(None);
+        }
+        let mut files = self.inkling_ggufs();
+        let selected = files.next();
+        if files.next().is_some() {
+            return Err(checkpoint(
+                "select one Inkling 2 Mini text GGUF per model directory".into(),
+            ));
+        }
+        if selected.is_none() && self.model_dir.is_file() {
+            return Err(checkpoint(format!(
+                "{} is not an Inkling 2 Mini text GGUF",
+                self.model_dir.display()
+            )));
+        }
+        if let Some(file) = selected {
+            if let Some(Err(error)) = &file.inkling2_loop {
+                return Err(checkpoint(error.clone()));
+            }
+            if let Some(Err(error)) = &file.inkling2_tensors {
+                return Err(checkpoint(error.clone()));
+            }
+        }
+        Ok(selected)
+    }
+
     /// Total checkpoint bytes on disk: GGUF payloads plus safetensors
     /// shards. This is the preflight's weight figure: what the loader
     /// uploads or maps, before any residency policy.
@@ -170,7 +222,7 @@ pub fn inspect(model_path: &Path, tokenizer_dir: &Path) -> Result<ModelInspectio
     let mut safetensors_bytes = 0u64;
     for (path, file) in &found {
         // A file asked for by path is a GGUF whatever its name (an Ollama blob has none).
-        if from_file || file.name.ends_with(".gguf") {
+        if from_file || file.name.ends_with(".gguf") || file.name.ends_with(".gguf_file") {
             match gguf_fact(path, file.bytes) {
                 Ok(mut fact) => {
                     fact.file.clone_from(&file.name);
@@ -227,11 +279,44 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
         Some(MetaValue::String(value)) => Some(value.clone()),
         _ => None,
     };
+    let inkling2_loop =
+        matches!(architecture.as_deref(), Some("inkling2_loop" | "inkling2")).then(|| {
+            // main reads the header through shared_header, which keeps no reader; the
+            // geometry inspection needs positioned reads, so it opens its own.
+            let mut reader = match std::fs::File::open(path) {
+                Ok(file) => std::io::BufReader::new(file),
+                Err(error) => {
+                    return Err(super::describe_error(&checkpoint(format!(
+                        "cannot open {}: {error}",
+                        path.display()
+                    ))));
+                }
+            };
+            crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
+                .map_err(|error| super::describe_error(&error))
+        });
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf_file"))
+        && architecture.as_deref() != Some("inkling2_loop")
+    {
+        return Err(checkpoint(
+            ".gguf_file requires the inkling2_loop architecture".into(),
+        ));
+    }
+    let inkling2_tensors = inkling2_loop.as_ref().and_then(|geometry| {
+        geometry.as_ref().ok().map(|_| {
+            crate::family::inkling2_mini::gguf::validate_tensors(&header)
+                .map_err(|error| super::describe_error(&error))
+        })
+    });
     Ok(GgufFact {
         file: String::new(),
         file_bytes,
         architecture,
         tensor_count: header.tensors().len(),
+        inkling2_loop,
+        inkling2_tensors,
     })
 }
 

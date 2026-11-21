@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{EngError, checkpoint_json::UniqueValue, weights::read_stored_header};
 
+pub mod gguf_metadata;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod mlx;
 mod routes;
