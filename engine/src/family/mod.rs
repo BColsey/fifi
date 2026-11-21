@@ -58,6 +58,16 @@ pub(crate) mod gguf_select;
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
 pub(crate) mod host_shape;
+/// The shared plan of a prefix store whose entries live in host memory.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(all(feature = "native-cuda", target_os = "linux")),
+    allow(
+        dead_code,
+        reason = "the CUDA starts are the callers; host builds test the plan"
+    )
+)]
+pub(crate) mod host_store;
 pub mod keys;
 #[allow(
     dead_code,

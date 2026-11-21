@@ -674,6 +674,7 @@ fn start_gemma4(
                         .map_err(|message| {
                             EngError::BadRequest(format!("engine config: {message}"))
                         })?,
+                    _prefix_reuse,
                 )?;
                 Ok(StartedEngine {
                     engine: started.engine,
@@ -740,7 +741,8 @@ fn entry_prefix_reuse(engine: &EngineConfig, file_flag: Option<bool>, flint_opt_
 }
 
 /// The unset-key default: on only where reuse is qualified - the Flash-Next
-/// CUDA resume and the Qwen3.6 CUDA serve (the 2026-11-13 qualification) -
+/// CUDA resume, the Qwen3.6 CUDA serve (the 2026-11-13 qualification) and the Bolt
+/// serve (its host-copy store, funded from the host memory at start) -
 /// and only on the CUDA build; every other family and every other build
 /// keeps the stock full prefill, because the boundary marking alone splits
 /// the prefill and changes greedy text (measured on Flash-Next: same prompt,
@@ -772,6 +774,9 @@ pub(crate) fn default_prefix_reuse_with(
     }
     match engine.family.as_str() {
         factory::FAMILY => true,
+        // Bolt's store is host memory sized by the start: a host that cannot fund one entry
+        // turns it off at start and says so.
+        gemma4::FAMILY => true,
         q36_factory::FAMILY => {
             let tiered = engine.qwen36.as_ref().is_some_and(|o| o.tiered.is_some());
             !(tiered || p2p_env == Some(std::ffi::OsStr::new("1")))
@@ -1124,7 +1129,7 @@ mod tests {
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         {
             match family {
-                factory::FAMILY => true,
+                factory::FAMILY | crate::family::gemma::gemma4::FAMILY => true,
                 q36_factory::FAMILY => {
                     let tiered = q36.as_ref().is_some_and(|o| o.tiered.is_some());
                     !tiered && !p2p

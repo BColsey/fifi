@@ -300,29 +300,6 @@ impl BoltSnapshot {
     }
 }
 
-/// Admits `bytes` of snapshot against the host's available memory: the cgroup-aware budget, or the
-/// bare `MemAvailable` figure when the cgroup tree cannot be read (the probe logs which). A probe
-/// that cannot verify anything proceeds with a log line, as the other prefix stores do: an
-/// optional save must not turn a host whose cgroup layout the probe cannot parse into a host
-/// where every save is refused and prefix reuse disappears silently.
-fn admit_snapshot(bytes: usize, host: Result<(u64, u64), EngError>) -> Result<(), EngError> {
-    match host {
-        Ok((_total, available)) if (bytes as u64) > available => {
-            Err(EngError::MemoryPlan(format!(
-                "a Bolt prefix snapshot needs {bytes} bytes and the host budget is {available} bytes"
-            )))
-        }
-        Ok(_) => Ok(()),
-        Err(error) => {
-            eprintln!(
-                "gemma4 bolt: prefix snapshot host budget: probe unavailable ({}); proceeding without the check",
-                error.describe()
-            );
-            Ok(())
-        }
-    }
-}
-
 /// The logits rows of a window: the raw head output and its softcap, one vocabulary row per
 /// sequence. Allocated only for an engine that serves more than one sequence.
 pub(crate) struct WindowBuffers {
@@ -979,10 +956,10 @@ impl Bolt {
         // Linux grants an allocation it cannot back and kills the process later, so the
         // allocation cannot be what refuses: the host's available memory (with the OS floor and
         // the enclosing cgroup's limit) is checked first.
-        admit_snapshot(
+        crate::family::host_store::admit_entry(
+            "a Bolt prefix snapshot",
             total,
-            crate::family::mem::HostFacts::read("a Bolt prefix snapshot", "a Bolt prefix snapshot")
-                .map(|host| host.host_memory()),
+            crate::family::mem::HostFacts::read("a Bolt prefix snapshot", "a Bolt prefix snapshot"),
         )?;
         let mut data = Vec::new();
         data.try_reserve_exact(total).map_err(|_| {
@@ -2313,51 +2290,6 @@ mod tests {
             crate::kernels::cuda::plan::admit(&demand, allocations + demand.headroom),
             Ok(allocations + demand.headroom)
         );
-    }
-
-    #[test]
-    fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = |available_gib: u64| {
-            format!(
-                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
-                32 * (1 << 20),
-                available_gib * (1 << 20)
-            )
-        };
-        // The budget is the available figure, clamped by the cgroup's remaining bytes.
-        let tight = HostFacts::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
-        let error = admit_snapshot(one_gib, Ok(tight.host_memory()))
-            .expect_err("a cgroup with half a GiB left cannot back 1 GiB");
-        assert!(
-            matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
-            "{error:?}"
-        );
-        let roomy = HostFacts::from_meminfo("test", &meminfo(20), None).expect("host");
-        assert!(admit_snapshot(one_gib, Ok(roomy.host_memory())).is_ok());
-    }
-
-    /// A cgroup layout the probe cannot parse falls back to the bare figure, and a probe that
-    /// cannot verify anything proceeds: the save is not refused for a host the probe cannot read.
-    #[test]
-    fn a_probe_that_cannot_read_the_host_falls_back_and_proceeds() {
-        use crate::family::mem::HostFacts;
-        let one_gib = 1usize << 30;
-        let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
-        let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
-        // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
-        let bare = HostFacts::bare("test", "test", &refusal, meminfo)
-            .expect("bare")
-            .host_memory();
-        assert_eq!(bare.1, 2 << 30);
-        assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
-        assert!(
-            admit_snapshot(3 << 30, Ok(bare)).is_err(),
-            "the bare figure still refuses"
-        );
-        // Both probes failing: the save proceeds, as the other stores' saves do.
-        assert!(admit_snapshot(one_gib, Err(refusal)).is_ok());
     }
 
     #[test]

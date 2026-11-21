@@ -68,6 +68,7 @@ mod device {
         family::{
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
+            host_store::{HostStorePlan, largest_entry_bytes},
             kv_disk::{
                 self as kv_cache, DiskOwner, DiskParts, HostStoreDisk, KvCacheSettings,
                 PUMP_EMIT_BYTES,
@@ -99,7 +100,7 @@ mod device {
     pub(crate) struct BoltServe {
         model: Bolt,
         eos: Vec<u32>,
-        /// One-tip prefix store (no roots, no periodic points). An entry is a copy of the saving
+        /// Prefix store with no roots and one entry for each session the host funds. An entry is a copy of the saving
         /// session's cache cells below its position, held in host memory: a restore writes it
         /// into any session, so reuse works whatever the number of sessions and whichever
         /// pooled session serves the next request. Host memory, not a device slab, because the
@@ -129,8 +130,9 @@ mod device {
         prefix_tier: PrefixTier,
     }
 
-    /// The store's explicit one-tip shape (no roots, no periodic points),
-    /// shared by the executor, the start wiring and the tests.
+    /// The store's one-tip shape (no roots, no periodic points), for the tests that drive the
+    /// executor with a fixed store.
+    #[cfg(test)]
     const ONE_TIP: StoreLimits = StoreLimits {
         roots: 0,
         entries: 1,
@@ -287,10 +289,10 @@ mod device {
             crate::family::session::check_prompt(prompt_tokens, self.model.cells())
         }
 
-        /// The store's explicit one-tip shape, so the worker's save-point
+        /// The limits of the store itself, so the worker's save-point
         /// planning sees what the store really keeps.
         fn prefix_limits(&self) -> StoreLimits {
-            ONE_TIP
+            self.prefix.limits()
         }
 
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
@@ -566,6 +568,22 @@ mod device {
         )
     }
 
+    /// The prefix store the start gives the executor, and the plan behind it. It holds host copies
+    /// of up to a whole session's cache, one entry for each conversation the engine serves at
+    /// once, as many as the host funds. A configuration that turns reuse off keeps nothing. No
+    /// roots: a prompt has no stable head to pin. `host` reads the host facts and runs only when
+    /// reuse is on.
+    fn prefix_store(
+        prefix_reuse: bool,
+        budget: impl FnOnce() -> Option<u64>,
+        sessions: usize,
+        cells: usize,
+    ) -> (PrefixStore<BoltSnapshot, PrefixIdentity>, HostStorePlan) {
+        let entry_bytes = largest_entry_bytes(budget::bolt_kv_bytes_per_position(), cells as u64);
+        let plan = HostStorePlan::for_start(prefix_reuse, entry_bytes, budget, sessions);
+        (PrefixStore::with_limits(plan.limits(0)), plan)
+    }
+
     /// `model_path` is the model directory or one `.gguf` file in it. A directory with several
     /// `.gguf` files serves the highest-precision one that the device memory admits; `seqs`
     /// is the explicit session count or the count the free memory funds. Several sessions turn
@@ -577,6 +595,7 @@ mod device {
         seqs: MaxSeqs,
         prompt_rows: Option<usize>,
         kv_cache: Option<KvCacheSettings>,
+        prefix_reuse: bool,
     ) -> Result<StartedEngine, EngError> {
         let tier_plan = kv_cache::plan_tier(kv_cache.as_ref(), "gemma4", TIER_LABEL)?;
         let (_, files) = crate::family::gguf_select::candidates(model_path)?;
@@ -636,14 +655,21 @@ mod device {
                 tokenizer: load.tokenizer.as_str().into(),
                 template: load.template.as_str().into(),
             };
+            let (prefix, store) = prefix_store(
+                prefix_reuse,
+                || kv_cache::default_host_budget(crate::family::mem::process_resident_bytes()),
+                plan.seqs,
+                model.cells(),
+            );
+            eprintln!("gemma4 bolt: {}", store.describe());
             let disk = tier_plan.as_ref().and_then(|(resolved, origin)| {
-                HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
+                HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, store.entries.max(1))
             });
             let mut serve = BoltServe {
                 prompt_rows: prompt_rows.unwrap_or(model.rows),
                 model,
                 eos: eos.clone(),
-                prefix: PrefixStore::with_limits(ONE_TIP),
+                prefix,
                 identity,
                 max_seqs: plan.seqs,
                 prefix_hit: PrefixHit::Miss,
@@ -685,6 +711,38 @@ mod device {
     #[cfg(test)]
     mod prefix_tests {
         use super::*;
+
+        const GIB: u64 = 1 << 30;
+
+        /// The start builds its store through `prefix_store`, so these cases are what a start does
+        /// with the flag, the host and the session count.
+        #[test]
+        fn the_start_gives_the_store_the_flag_the_sessions_and_the_host() {
+            let roomy = || Some(48 * GIB);
+            // Reuse off keeps no entries and never reads the host.
+            let (store, plan) = prefix_store(false, || panic!("the host is not read"), 4, 32_768);
+            assert_eq!((store.limits().roots, store.limits().entries), (0, 0));
+            assert!(plan.configured_off);
+            // Reuse on keeps one entry for each session, and no roots.
+            for sessions in [1, 2, 4, 8] {
+                let (store, _) = prefix_store(true, roomy, sessions, 32_768);
+                assert_eq!(
+                    (store.limits().roots, store.limits().entries),
+                    (0, sessions),
+                    "{sessions} sessions"
+                );
+            }
+            // A budget that funds two entries bounds a larger engine.
+            let two = || Some(2 * 952 * (1 << 20));
+            assert_eq!(prefix_store(true, two, 8, 32_768).0.limits().entries, 2);
+            // A budget under one entry keeps the store planned, with its saves waiting on the host.
+            let busy = || Some(GIB / 2);
+            let (store, plan) = prefix_store(true, busy, 4, 32_768);
+            assert_eq!(store.limits().entries, 1);
+            assert!(!plan.funded && plan.on());
+            // A machine whose memory is unknown keeps one entry.
+            assert_eq!(prefix_store(true, || None, 4, 32_768).0.limits().entries, 1);
+        }
 
         /// Panics when no Bolt Q8_0 file is configured: an explicit
         /// `--ignored` run without `BOLT_Q8_FILE` is a setup error, not a pass.

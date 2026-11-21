@@ -3,7 +3,7 @@
 Chat clients send the whole conversation with every request.
 Without reuse, the engine processes every token of that history again on each turn, so replies take longer to start as the conversation grows.
 
-With `"prefix_reuse": true` in the configuration file, the engine saves its state at the end of each finished turn. An omitted key resolves per family at startup: on for the qualified reuse paths (Flash-Next CUDA and Qwen3.6 CUDA on the CUDA build, since the 2026-11-13 qualification), off for every other family - the boundary marking alone would only split their prefill and change their outputs.
+With `"prefix_reuse": true` in the configuration file, the engine saves its state at the end of each finished turn. An omitted key resolves per family at startup: on for the qualified reuse paths (Flash-Next CUDA, Qwen3.6 CUDA and the Gemma 4 family on its CUDA serve, Bolt, on the CUDA build), off for every other family - the boundary marking alone would only split their prefill and change their outputs. On Bolt the engine also checks the host at start and at every save; see [Bolt](memory.md#bolt).
 When the next request starts with the same tokens, the engine restores that state and processes only the new part.
 On a long conversation this turns tens of seconds of prompt processing into a few seconds.
 
@@ -30,6 +30,7 @@ With the disk cache (see the [configuration reference](../reference/configuratio
 | --- | --- |
 | Qwen3.6, Apple Silicon | yes; off in the shipped Mac file |
 | Qwen3.6, CUDA | yes; on in all shipped CUDA files |
+| Bolt (Gemma 4 family), CUDA | yes; on by default, saved prefixes are host copies, funded from the free host memory |
 | Flint, Apple Silicon | experimental: also set `FIFI_FLINT_PREFIX_REUSE=1` |
 | Flint, CUDA | experimental: also set `FIFI_FLINT_PREFIX_REUSE=1`; `kv_profile` `f16` only |
 
