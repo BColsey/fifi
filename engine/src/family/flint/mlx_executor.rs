@@ -183,7 +183,9 @@ impl FlintExecutor {
         if retention_cap > 0 {
             eprintln!("flint prefix retention cap {retention_cap} bytes");
         }
-        let device = crate::family::mlx_budget::DeviceBudget::detect()?;
+        // A host too small for the resident model sizes from its own budget and streams the
+        // routed experts; one that holds the model keeps the plain import.
+        let device = crate::family::mlx_budget::DeviceBudget::detect_or_implied(root)?;
         let reserve = device
             .map(|device| {
                 let charges = device_session_charges(retention_cap)?;

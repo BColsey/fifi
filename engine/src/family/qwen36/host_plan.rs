@@ -22,10 +22,9 @@
 use std::path::Path;
 
 const GIB: u64 = 1 << 30;
+#[cfg(test)]
 const MIB: u64 = 1 << 20;
 
-/// The smallest OS floor: below this the desktop session itself starts to page.
-const MIN_OS_FLOOR_BYTES: u64 = 4 * GIB;
 /// The allocator cache limit bounds.
 const MIN_CACHE_LIMIT_BYTES: u64 = GIB;
 const MAX_CACHE_LIMIT_BYTES: u64 = 8 * GIB;
@@ -67,13 +66,10 @@ impl HostFacts {
     }
 
     pub(crate) fn defaults(self) -> HostDefaults {
-        let os_floor_bytes = (self.memory_bytes / 6)
-            .div_ceil(MIB)
-            .saturating_mul(MIB)
-            .max(MIN_OS_FLOOR_BYTES);
+        let prefill_budget_bytes = crate::family::host_memory::host_budget(self.memory_bytes);
         HostDefaults {
-            os_floor_bytes,
-            prefill_budget_bytes: self.memory_bytes.saturating_sub(os_floor_bytes),
+            os_floor_bytes: self.memory_bytes.saturating_sub(prefill_budget_bytes),
+            prefill_budget_bytes,
             cache_limit_bytes: (self.memory_bytes / 9 / GIB * GIB)
                 .clamp(MIN_CACHE_LIMIT_BYTES, MAX_CACHE_LIMIT_BYTES),
         }
@@ -155,44 +151,32 @@ pub(crate) fn shortfall_text(
     ))
 }
 
-#[cfg(target_os = "macos")]
-fn physical_memory_bytes() -> Option<u64> {
-    // The absolute path: a PATH lookup fails under a restricted PATH or sandbox.
-    let out = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+pub(crate) use crate::family::host_memory::ExpertBytes as ExpertFacts;
+
+impl HostFacts {
+    /// The facts of a start that streams its routed experts: the model keeps everything except
+    /// the expert tensors resident, plus one stage of experts.
+    pub(crate) fn staged(self, experts: ExpertFacts) -> Self {
+        Self {
+            model_bytes: crate::family::host_memory::staged_model_bytes(self.model_bytes, experts),
+            ..self
+        }
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Reads the routed expert bytes of the checkpoint under `model_dir`.
+pub(crate) fn expert_facts(model_dir: &Path) -> Option<ExpertFacts> {
+    crate::family::host_memory::expert_bytes_in(model_dir)
+}
+
 fn physical_memory_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kib = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    kib.checked_mul(1024)
+    crate::family::host_memory::physical_memory_bytes()
 }
 
 /// The summed length of the top-level `*.safetensors` files (symlinks followed), the way the
 /// loader opens them. `None` when the directory cannot be read or holds no shard.
 fn weights_bytes(model_dir: &Path) -> Option<u64> {
-    let mut total = 0u64;
-    let mut shards = 0u32;
-    for entry in std::fs::read_dir(model_dir).ok()? {
-        let path = entry.ok()?.path();
-        if path.extension().is_some_and(|ext| ext == "safetensors") {
-            total = total.checked_add(std::fs::metadata(&path).ok()?.len())?;
-            shards += 1;
-        }
-    }
-    (shards > 0).then_some(total)
+    crate::family::host_memory::shard_bytes(model_dir)
 }
 
 #[cfg(test)]
@@ -320,5 +304,20 @@ mod tests {
         std::fs::write(dir.join("c.json"), [0u8; 100]).unwrap();
         assert_eq!(weights_bytes(&dir), Some(15));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_staged_start_keeps_everything_but_the_experts_and_one_stage() {
+        let host = facts(16);
+        let experts = ExpertFacts {
+            total_bytes: 18_119_393_280,
+            stage_bytes: 452_984_832,
+        };
+        let staged = host.staged(experts);
+        assert_eq!(staged.memory_bytes, host.memory_bytes);
+        assert_eq!(
+            staged.model_bytes,
+            20_402_000_000 - 18_119_393_280 + 452_984_832
+        );
     }
 }

@@ -40,7 +40,8 @@ pub(crate) fn start(
         expert_prefetch: settings.expert_prefetch,
     };
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |_| {
-        let device = crate::family::mlx_budget::DeviceBudget::detect()?;
+        let device =
+            crate::family::mlx_budget::DeviceBudget::detect_or_implied(&settings.artifact)?;
         let (mut executor, session) = FlashExecutor::open_with_admission(
             &settings.artifact,
             settings.cache_limit,

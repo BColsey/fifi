@@ -1,7 +1,7 @@
 //! The host-derived MLX defaults, through the settings resolver.
 
-use super::host_plan::HostFacts;
-use super::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+use super::host_plan::{ExpertFacts, HostFacts};
+use super::settings::{Backend, DiskExperts, Q36Env, Q36Options, Q36Settings};
 use crate::EngError;
 use std::path::Path;
 
@@ -322,4 +322,67 @@ fn the_moe_family_shares_the_rule() {
     .expect("a smaller context fits");
     assert!(got.context_limit > 150_000 && got.context_limit < 262_144);
     assert!(got.derived.contains(&"context_limit"));
+}
+
+/// The routed experts of the 4-bit Qwen3.6 35B-A3B pack: 16.9 GiB, with 0.42 GiB in the largest
+/// layer.
+const EXPERTS: ExpertFacts = ExpertFacts {
+    total_bytes: 18_119_393_280,
+    stage_bytes: 452_984_832,
+};
+
+fn env_with_experts(memory_gib: u64, disk_experts: DiskExperts) -> Q36Env {
+    Q36Env {
+        experts: Some(EXPERTS),
+        disk_experts,
+        ..env(memory_gib)
+    }
+}
+
+/// What each host class chooses for a start that sets nothing. The 16 GiB and 24 GiB hosts
+/// cannot hold the 19.0 GiB model next to its session, so they stream the routed experts from
+/// disk at the full context; a 36 GiB host and larger keep everything resident.
+#[test]
+fn a_host_that_cannot_hold_the_model_streams_its_experts_by_default() {
+    for (memory_gib, staged) in [(16, true), (24, true), (36, false), (64, false)] {
+        let got = resolve(None, &env_with_experts(memory_gib, DiskExperts::Auto))
+            .unwrap_or_else(|error| panic!("{memory_gib} GiB: {error:?}"));
+        assert_eq!(
+            got.mlx_staged_cap.is_some(),
+            staged,
+            "{memory_gib} GiB host"
+        );
+        assert_eq!(got.context_limit, 262_144, "{memory_gib} GiB host");
+        let budget = got.prefill_budget.unwrap();
+        println!(
+            "{memory_gib} GiB host: staged={staged} context={} budget={budget} reserve={}",
+            got.context_limit, got.prefill_reserve
+        );
+        if let Some(cap) = got.mlx_staged_cap {
+            assert_eq!(cap, budget);
+        }
+    }
+}
+
+/// `0` keeps the experts resident, so a host that cannot hold them is refused as before, and
+/// a model whose headers say nothing about experts keeps its refusal.
+#[test]
+fn the_override_zero_and_unreadable_experts_keep_the_refusal() {
+    let off = resolve(None, &env_with_experts(16, DiskExperts::Off));
+    assert!(refusal(off).contains("the model needs 19.0 GiB"));
+    let unknown = Q36Env {
+        experts: None,
+        ..env_with_experts(16, DiskExperts::Auto)
+    };
+    assert!(refusal(resolve(None, &unknown)).contains("the model needs 19.0 GiB"));
+    // `1` behaves like automatic.
+    let on = resolve(None, &env_with_experts(16, DiskExperts::On)).unwrap();
+    assert!(on.mlx_staged_cap.is_some());
+}
+
+/// A host too small even for the staged model is still refused, with the resident numbers.
+#[test]
+fn a_host_too_small_for_the_staged_model_is_refused() {
+    let tiny = resolve(None, &env_with_experts(4, DiskExperts::Auto));
+    assert!(refusal(tiny).contains("short by"));
 }

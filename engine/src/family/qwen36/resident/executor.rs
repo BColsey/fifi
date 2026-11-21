@@ -935,8 +935,7 @@ impl Q36Executor {
         admit(&shape, &rules)?;
         let plan = placement
             .map(|(device, settings, _)| {
-                let retained =
-                    (settings.prefix_reuse || rules.max_seqs > 1).then_some(rules.session_cap);
+                let retained = (settings.prefix_reuse || rules.max_seqs > 1).then_some(rules.session_cap);
                 let context = usize::try_from(rules.context_limit)
                     .map_err(|_| EngError::MemoryPlan("context exceeds platform size".into()))?;
                 let reserve = device_reserve(

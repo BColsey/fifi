@@ -711,6 +711,11 @@ pub(crate) struct Q36Env {
     /// The host memory and the model's shard bytes, for the MLX values that no member and no
     /// variable sets (`host_plan`). `None` keeps every such value required, as before.
     pub(crate) host: Option<HostFacts>,
+    /// The routed expert bytes of the checkpoint, for a Mac start whose resident model does not
+    /// fit the host and streams its experts instead.
+    pub(crate) experts: Option<host_plan::ExpertFacts>,
+    /// `FIFI_Q36_MLX_DISK_EXPERTS`: automatic unless set to `0` or `1`.
+    pub(crate) disk_experts: DiskExperts,
 }
 
 impl Q36Env {
@@ -724,6 +729,9 @@ impl Q36Env {
             kv_geometric: std::env::var("Q36_KV_GEOMETRIC").ok(),
             spec_step_window: std::env::var("Q36_SPEC_STEP_WINDOW").ok(),
             host: HostFacts::probe(model_dir),
+            experts: host_plan::expert_facts(model_dir),
+            disk_experts: DiskExperts::of(std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").as_deref())
+                .0,
         }
     }
 }
@@ -1067,6 +1075,9 @@ pub(crate) struct Q36Settings {
     /// The one startup line that names the host facts and the source of each value; present only
     /// when at least one value was derived.
     pub(crate) host_note: Option<String>,
+    /// Set when the resident model does not fit the host memory but its experts streamed from
+    /// disk do: the Mac start then streams them, under this many bytes of host budget.
+    pub(crate) mlx_staged_cap: Option<u64>,
 }
 
 fn bad(message: String) -> EngError {
@@ -1521,6 +1532,17 @@ impl Q36Settings {
         // A start that names no context and cannot hold the model plus the reserve at the default
         // takes the largest context that fits the derived budget. The reserve is linear in the
         // context (`derived_reserve`), so the fixed part is its value at zero positions.
+        // The host facts of a MoE start that streams its routed experts, when it may (the variable
+        // is not `0`) and the headers say how many expert bytes there are.
+        let staged_host = (backend == Backend::Mlx
+            && spec.feed_forward.is_none()
+            && env.disk_experts != DiskExperts::Off)
+            .then(|| {
+                env.host
+                    .zip(env.experts)
+                    .map(|(host, experts)| host.staged(experts))
+            })
+            .flatten();
         let mut context_from_host = false;
         if options.context_limit.is_none()
             && matches!(reserve, ReservePlan::Derive)
@@ -1531,8 +1553,15 @@ impl Q36Settings {
             if host_plan::shortfall_text(host, budget, default_reserve, context_limit).is_some() {
                 let per_position = cache_growth_per_position(&spec, kv, activation)?;
                 let fixed = derived_reserve(&spec, kv, activation, 0, cache_limit)?;
-                if let Some(chosen) = host_plan::largest_context(host, budget, per_position, fixed)
-                {
+                let chosen =
+                    host_plan::largest_context(host, budget, per_position, fixed).or_else(|| {
+                        // No context fits the resident model: size it for a start that streams
+                        // the routed experts from disk, which is what the start will do.
+                        staged_host.and_then(|staged| {
+                            host_plan::largest_context(staged, budget, per_position, fixed)
+                        })
+                    });
+                if let Some(chosen) = chosen {
                     context_limit = chosen.min(context_limit);
                     context_from_host = true;
                 }
@@ -1569,11 +1598,27 @@ impl Q36Settings {
                 derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
             }
         };
+        let mut mlx_staged_cap = None;
         if let (Some(budget), Some(host)) = (budget_from_host, env.host)
             && let Some(text) =
                 host_plan::shortfall_text(host, budget, prefill_reserve, context_limit)
         {
-            return Err(bad(text));
+            // A resident model that does not fit is not a refusal when its experts streamed from
+            // disk do fit: the start streams them under the host budget.
+            match staged_host {
+                Some(staged)
+                    if host_plan::shortfall_text(
+                        staged,
+                        budget,
+                        prefill_reserve,
+                        context_limit,
+                    )
+                    .is_none() =>
+                {
+                    mlx_staged_cap = Some(budget);
+                }
+                _ => return Err(bad(text)),
+            }
         }
         let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
@@ -1792,6 +1837,7 @@ impl Q36Settings {
             ignored_mlx_keys,
             derived,
             host_note,
+            mlx_staged_cap,
         })
     }
 
@@ -1820,13 +1866,7 @@ impl Q36Settings {
         if !prefix_reuse || self.backend == Backend::Cuda {
             return Ok(());
         }
-        let growth = cache_growth_per_position(&self.spec, self.kv, self.activation)?;
-        let fixed = delta_state_bytes(&self.spec)?;
-        let required = growth
-            .checked_mul(2)
-            .and_then(|twice| twice.checked_mul(u64::from(self.context_limit)))
-            .and_then(|cache| cache.checked_add(fixed))
-            .ok_or_else(|| bad("the prefix_reuse cap requirement overflows u64".into()))?;
+        let (growth, fixed, required) = self.prefix_reuse_requirement()?;
         if self.session_cap < required {
             let (cap, limit) = (self.session_cap, self.context_limit);
             let message = format!(
@@ -1835,6 +1875,19 @@ impl Q36Settings {
             return Err(bad(message));
         }
         Ok(())
+    }
+
+    /// The cache bytes per position, the fixed DeltaNet bytes, and the session cap that the live
+    /// session plus one saved entry need at the context limit.
+    fn prefix_reuse_requirement(&self) -> Result<(u64, u64, u64), EngError> {
+        let growth = cache_growth_per_position(&self.spec, self.kv, self.activation)?;
+        let fixed = delta_state_bytes(&self.spec)?;
+        let required = growth
+            .checked_mul(2)
+            .and_then(|twice| twice.checked_mul(u64::from(self.context_limit)))
+            .and_then(|cache| cache.checked_add(fixed))
+            .ok_or_else(|| bad("the prefix_reuse cap requirement overflows u64".into()))?;
+        Ok((growth, fixed, required))
     }
 }
 
@@ -1899,48 +1952,30 @@ pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, 
 #[cfg(test)]
 mod kv_bytes_golden_tests;
 
-/// Why a set FIFI_Q36_MLX_DISK_EXPERTS does not stage the routed experts from disk.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DiskExpertsIgnored {
-    /// Only the value `1` enables the switch.
-    NotOne(String),
-    /// The switch needs an active Metal working-set limit.
-    SizingOff,
+/// The FIFI_Q36_MLX_DISK_EXPERTS override of where the routed experts live on the Mac.
+/// Automatic (unset) streams them from disk when the resident model does not fit; `1` says the
+/// same explicitly; `0` keeps them resident and refuses a start that does not fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DiskExperts {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
-impl DiskExpertsIgnored {
-    /// What the operator can change so the switch takes effect.
-    pub(crate) fn fix(&self) -> &'static str {
-        match self {
-            Self::NotOne(_) => "set it to 1, or the experts stay resident",
-            Self::SizingOff => {
-                "set FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB, or the experts stay resident"
-            }
+impl DiskExperts {
+    /// The setting of a variable value, and why a value that is neither `0` nor `1` is ignored.
+    pub(crate) fn of(value: Option<&std::ffi::OsStr>) -> (Self, Option<String>) {
+        match value {
+            None => (Self::Auto, None),
+            Some(value) if value == "1" => (Self::On, None),
+            Some(value) if value == "0" => (Self::Off, None),
+            Some(value) => (
+                Self::Auto,
+                Some(format!("{:?} is not 0 or 1", value.to_string_lossy())),
+            ),
         }
     }
-}
-
-impl std::fmt::Display for DiskExpertsIgnored {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotOne(value) => write!(f, "{value:?} is not 1"),
-            Self::SizingOff => f.write_str("device sizing is off"),
-        }
-    }
-}
-
-/// Why a set FIFI_Q36_MLX_DISK_EXPERTS has no effect, or `None` when it is unset or takes effect.
-pub(crate) fn disk_experts_ignored(
-    value: Option<&std::ffi::OsStr>,
-    device_sizing: bool,
-) -> Option<DiskExpertsIgnored> {
-    let value = value?;
-    if value != "1" {
-        return Some(DiskExpertsIgnored::NotOne(
-            value.to_string_lossy().into_owned(),
-        ));
-    }
-    (!device_sizing).then_some(DiskExpertsIgnored::SizingOff)
 }
 
 #[cfg(test)]
@@ -3188,6 +3223,7 @@ mod tests {
                 ignored_mlx_keys: Vec::new(),
                 derived: Vec::new(),
                 host_note: None,
+                mlx_staged_cap: None,
             }
         );
         assert_eq!(MLX_DEFAULT_CONTEXT_LIMIT, 262_144);
@@ -4510,16 +4546,20 @@ mod speculation_arming {
     }
 
     #[test]
-    fn a_set_disk_experts_switch_that_does_not_take_effect_says_why() {
-        use super::{DiskExpertsIgnored, disk_experts_ignored};
+    fn the_disk_experts_variable_is_auto_on_off_or_ignored() {
+        use super::DiskExperts;
         use std::ffi::OsStr;
-        assert_eq!(disk_experts_ignored(None, false), None);
-        assert_eq!(disk_experts_ignored(Some(OsStr::new("1")), true), None);
-        let off = disk_experts_ignored(Some(OsStr::new("1")), false).unwrap();
-        assert_eq!(off, DiskExpertsIgnored::SizingOff);
-        assert_eq!(off.to_string(), "device sizing is off");
-        assert!(off.fix().contains("FIFI_MLX_WORKING_SET_MIB"));
-        let bad = disk_experts_ignored(Some(OsStr::new("true")), true).unwrap();
-        assert_eq!(bad.to_string(), "\"true\" is not 1");
+        assert_eq!(DiskExperts::of(None), (DiskExperts::Auto, None));
+        assert_eq!(
+            DiskExperts::of(Some(OsStr::new("1"))),
+            (DiskExperts::On, None)
+        );
+        assert_eq!(
+            DiskExperts::of(Some(OsStr::new("0"))),
+            (DiskExperts::Off, None)
+        );
+        let (setting, reason) = DiskExperts::of(Some(OsStr::new("true")));
+        assert_eq!(setting, DiskExperts::Auto);
+        assert_eq!(reason.as_deref(), Some("\"true\" is not 0 or 1"));
     }
 }

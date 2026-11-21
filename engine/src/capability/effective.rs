@@ -238,6 +238,19 @@ pub(crate) fn q36_effective(
         append_mlx_inputs(&mut rows, false);
         if !dense {
             rows.push(disk_experts_row());
+            rows.push(row(
+                "mlx_expert_placement",
+                match settings.mlx_staged_cap {
+                    Some(_) => "disk (derived: the resident model does not fit the host budget)",
+                    None => "by the device budget, resident when it fits",
+                }
+                .into(),
+                if settings.mlx_staged_cap.is_some() {
+                    Origin::Derived
+                } else {
+                    Origin::Default
+                },
+            ));
         }
     }
     rows
@@ -251,18 +264,20 @@ fn mlx_switch(key: &'static str, name: &str) -> EffectiveSetting {
     row(key, mlx_switch_text(value.as_deref()), env_origin(&value))
 }
 
-/// The Qwen disk-experts switch, with the reason the start gives when it has no effect.
+/// The Qwen disk-experts override: automatic when unset, `on` for `1`, `off` for `0`, and a
+/// value that is neither is named as ignored.
 fn disk_experts_row() -> EffectiveSetting {
-    use crate::family::qwen36::settings::{DiskExpertsIgnored, disk_experts_ignored};
+    use crate::family::qwen36::settings::DiskExperts;
     let value = std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS");
-    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    let sizing = crate::family::mlx_budget::enabled();
-    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
-    let sizing = false;
-    let text = match disk_experts_ignored(value.as_deref(), sizing) {
-        None => mlx_switch_text(value.as_deref()),
-        Some(reason @ DiskExpertsIgnored::SizingOff) => format!("true (ignored: {reason})"),
-        Some(reason) => format!("false (ignored: {reason})"),
+    let (setting, ignored) = DiskExperts::of(value.as_deref());
+    let label = match setting {
+        DiskExperts::Auto => "auto",
+        DiskExperts::On => "on",
+        DiskExperts::Off => "off",
+    };
+    let text = match ignored {
+        Some(reason) => format!("{label} (ignored: {reason})"),
+        None => label.to_string(),
     };
     row("mlx_disk_experts", text, env_origin(&value))
 }
@@ -367,6 +382,18 @@ fn prefill_pair_policy_text(parsed: &str, request_prefill: bool, pipeline: bool)
     }
 }
 
+/// The expert staging switches are automatic: unset, the start turns them on when its experts
+/// stream from disk. A set variable decides (`on` is the one enabling value, `0` is off) and
+/// any other value is named as ignored and counted off.
+fn staging_switch_text(value: Option<&std::ffi::OsStr>, on: &str) -> String {
+    match value {
+        None => "auto (on when the experts stream from disk)".into(),
+        Some(value) if value == on => "on".into(),
+        Some(value) if value == "0" => "off".into(),
+        Some(value) => format!("off (ignored: {:?} is not {on})", value.to_string_lossy()),
+    }
+}
+
 fn mlx_switch_text(value: Option<&std::ffi::OsStr>) -> String {
     match value {
         None => "false".into(),
@@ -406,14 +433,7 @@ fn read_runs_row(flint: bool) -> EffectiveSetting {
 }
 
 fn read_runs_text(value: Option<&std::ffi::OsStr>) -> String {
-    match value {
-        None => "off".into(),
-        Some(value) if value == "prefill" => "prefill".into(),
-        Some(value) => format!(
-            "off (ignored: {:?} is not prefill)",
-            value.to_string_lossy()
-        ),
-    }
+    staging_switch_text(value, "prefill")
 }
 
 fn legacy_read_runs_text(value: Option<&std::ffi::OsStr>) -> String {
@@ -444,15 +464,24 @@ fn overlap_row(flint: bool) -> EffectiveSetting {
             ),
             Origin::Environment,
         ),
-        None => mlx_switch("mlx_overlap_expert_reads", "FIFI_MLX_OVERLAP_EXPERT_READS"),
+        None => {
+            let shared = std::env::var_os("FIFI_MLX_OVERLAP_EXPERT_READS");
+            row(
+                "mlx_overlap_expert_reads",
+                staging_switch_text(shared.as_deref(), "1"),
+                env_origin(&shared),
+            )
+        }
     }
 }
 
 fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>, flint: bool) {
     rows.push(mlx_switch("mlx_auto_budget", "FIFI_MLX_AUTO_BUDGET"));
-    rows.push(mlx_switch(
+    let positioned = std::env::var_os("FIFI_MLX_POSITIONED_READS");
+    rows.push(row(
         "mlx_positioned_reads",
-        "FIFI_MLX_POSITIONED_READS",
+        staging_switch_text(positioned.as_deref(), "1"),
+        env_origin(&positioned),
     ));
     rows.push(read_runs_row(flint));
     rows.push(overlap_row(flint));
@@ -1076,11 +1105,11 @@ mod tests {
     #[test]
     fn the_read_run_rows_name_ignored_values_and_the_flint_variable_that_wins() {
         use std::ffi::OsStr;
-        assert_eq!(super::read_runs_text(None), "off");
         assert_eq!(
-            super::read_runs_text(Some(OsStr::new("prefill"))),
-            "prefill"
+            super::read_runs_text(None),
+            "auto (on when the experts stream from disk)"
         );
+        assert_eq!(super::read_runs_text(Some(OsStr::new("prefill"))), "on");
         assert_eq!(
             super::read_runs_text(Some(OsStr::new("1"))),
             "off (ignored: \"1\" is not prefill)"
@@ -1157,6 +1186,24 @@ mod tests {
         assert_eq!(
             super::prefill_pair_policy_text("auto", true, false),
             "off (the auto policy is not active: the pair path is off)"
+        );
+    }
+
+    #[test]
+    fn the_staging_rows_are_automatic_unless_a_variable_decides() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            super::staging_switch_text(None, "1"),
+            "auto (on when the experts stream from disk)"
+        );
+        assert_eq!(super::staging_switch_text(Some(OsStr::new("1")), "1"), "on");
+        assert_eq!(
+            super::staging_switch_text(Some(OsStr::new("0")), "1"),
+            "off"
+        );
+        assert_eq!(
+            super::staging_switch_text(Some(OsStr::new("1")), "prefill"),
+            "off (ignored: \"1\" is not prefill)"
         );
     }
 }

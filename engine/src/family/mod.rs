@@ -53,6 +53,7 @@ pub(in crate::family) mod graph_state;
 // build (the admission fits need the cgroup-aware probe) and the test build.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod host_admit;
+pub(crate) mod host_memory;
 pub mod keys;
 #[allow(
     dead_code,
@@ -93,7 +94,7 @@ pub(crate) mod plan_rows;
 /// The shared prefill core promoted from the first chunked family: the admission arithmetic
 /// (device-free) and the CUDA arena-fill and chunk-driver primitives. Family plans stay with
 /// their families; nothing here names one.
-pub(in crate::family) mod prefill;
+pub(crate) mod prefill;
 #[allow(
     dead_code,
     reason = "the Qwen3.6 host and CUDA loads, the Flash-Next MoE/PLE blocks and the Nemotron host projector run the seam; the allow covers the adapters only tests still reach"

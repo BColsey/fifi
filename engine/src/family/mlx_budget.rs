@@ -40,6 +40,41 @@ impl DeviceBudget {
         }
     }
 
+    /// The budget of a start that sets none: what Metal recommends, capped at the host budget
+    /// when the host plan derived one.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn implied(cap: u64) -> Result<Self, EngError> {
+        let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
+        Ok(Self {
+            ceiling: Some(cap.min(device.recommended)),
+            ..device
+        })
+    }
+
+    /// The budget of a start that sets none and whose resident model does not fit the host
+    /// memory: the host budget, which makes the family choose by fit (streaming its routed
+    /// experts) instead of importing everything. `None` when the model fits or the memory is
+    /// unknown, so a start that fits behaves as it always did.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn detect_or_implied(model_dir: &std::path::Path) -> Result<Option<Self>, EngError> {
+        if let Some(device) = Self::detect()? {
+            return Ok(Some(device));
+        }
+        let (Some(memory), Some(model)) = (
+            crate::family::host_memory::physical_memory_bytes(),
+            crate::family::host_memory::shard_bytes(model_dir),
+        ) else {
+            return Ok(None);
+        };
+        let Some(budget) = crate::family::host_memory::implied_cap(model, memory) else {
+            return Ok(None);
+        };
+        eprintln!(
+            "mlx: the resident model needs {model} bytes and the host budget is {budget}; sizing from the host budget"
+        );
+        Self::implied(budget).map(Some)
+    }
+
     pub(crate) fn bytes(self) -> u64 {
         self.recommended.min(self.ceiling.unwrap_or(u64::MAX))
     }
