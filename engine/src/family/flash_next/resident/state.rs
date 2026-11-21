@@ -1,7 +1,7 @@
 //! Resident Flash-Next session state, with the step's check, poison, and commit.
 
 use super::ops::{Bytes, dim, short_import, zeros};
-use super::prefill::qsa::check_chunk_dense;
+use super::prefill::qsa::{QsaBatch, check_batch};
 use super::qsa::check_cache;
 use super::weights::{RAttn, ResidentWeights};
 use crate::{
@@ -256,9 +256,13 @@ impl ResidentState {
     }
 
     /// Host checks before a chunk of `rows` tokens. They make no native call. On error the state is
-    /// unchanged and not poisoned. A chunk whose last row passes the dense QSA limit returns
-    /// `ContextLimit`, also when the one-token path allows that position.
-    pub(super) fn check_chunk(&self, weights: &ResidentWeights, rows: u32) -> Result<(), EngError> {
+    /// unchanged and not poisoned. The QSA mode must cover the whole chunk.
+    pub(super) fn check_chunk(
+        &self,
+        weights: &ResidentWeights,
+        rows: u32,
+        batch: QsaBatch,
+    ) -> Result<(), EngError> {
         self.check_step(weights)?;
         if rows == 0 {
             return Err(EngError::BadRequest(
@@ -270,7 +274,7 @@ impl ResidentState {
         }
         for state in &self.layers {
             if let LayerState::Qsa { len, .. } = state {
-                check_chunk_dense(&weights.shape.qsa, *len, self.pos, rows)?;
+                check_batch(&weights.shape.qsa, *len, self.pos, rows, batch)?;
             }
         }
         Ok(())

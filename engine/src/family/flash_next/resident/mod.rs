@@ -97,6 +97,8 @@ struct ResidentDecoder<'c> {
     /// The prefill page sets, open from `open_prefill` to `close_prefill`. They drop after the
     /// adapter like the decode pool.
     prefill_pages: Option<prefill::step::Open>,
+    /// Spare planner bytes allowed for one sparse QSA batch in a layer.
+    sparse_prefill_bytes: u64,
     /// The engine's session budget. Each step charges its QSA growth here. The cap is `u64::MAX`
     /// until the executor sets the admitted value.
     budget: SessionBudget,
@@ -149,6 +151,7 @@ impl<'c> ResidentDecoder<'c> {
             slots,
             expert_prefetch: prefetch::Prefetch::default(),
             prefill_pages: None,
+            sparse_prefill_bytes: 0,
             budget: SessionBudget::new(u64::MAX),
             #[cfg(test)]
             route_trace: None,
@@ -228,8 +231,8 @@ impl<'c> ResidentDecoder<'c> {
     }
 
     /// Runs `tokens` as a prefill and publishes the state after them. Up to the dense QSA limit
-    /// the tokens run as one chunk, and the rest run as one-token `Prompt` steps on the sparse
-    /// path. The last token runs in `mode`: `Prompt` runs no head, `Generate` also returns the
+    /// the tokens run as one chunk. The sparse suffix uses bounded batches when admitted, and
+    /// one-token steps otherwise. The last token runs in `mode`: `Prompt` runs no head, `Generate` also returns the
     /// greedy token, and `Record` adds the logits and the post-MoE residual of every layer, all
     /// for the last row only. See `prefill::step::prefill`.
     fn prefill(
