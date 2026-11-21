@@ -21,7 +21,6 @@ pub mod exl3_cpu;
 mod exl3_cpu_avx2;
 mod exl3_cpu_avx512;
 mod exl3_cpu_pool;
-pub(crate) use exl3_cpu_pool::Exl3Pool as CpuPool;
 pub mod expert_cpu;
 pub mod expert_cpu_avx2;
 pub mod expert_cpu_q8g;
