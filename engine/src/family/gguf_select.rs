@@ -51,7 +51,11 @@ pub(crate) fn is_gguf_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    if is_gguf(path) {
+    if is_gguf(path)
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf_file"))
+    {
         return true;
     }
     let mut magic = [0u8; 4];
