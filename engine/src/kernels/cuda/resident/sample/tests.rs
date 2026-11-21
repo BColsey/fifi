@@ -348,3 +348,143 @@ fn a_draw_at_the_sampler_width_of_a_model_takes_what_time() {
         );
     }
 }
+
+/// One draw from the ranked top `count` of `row`, through the shortlist entry point.
+fn draw_from_shortlist(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    ranked: &[(f32, u32)],
+    params: ShortlistDraw,
+) -> (u32, u32) {
+    let count = ranked.len();
+    let mut bytes = Vec::with_capacity(count * 8 + 4);
+    for &(logit, id) in ranked {
+        bytes.extend_from_slice(&logit.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let record = ctx.upload(&bytes).expect("upload");
+    let token = testkit::upload_filled(ctx, 0, 4);
+    let logprob = testkit::upload_filled(ctx, 0, 4);
+    let status = testkit::upload_filled(ctx, 0, 4);
+    ctx.sample_shortlist(
+        stream,
+        SampleShortlistCall {
+            token: token.range(0, 4).expect("token"),
+            logprob: logprob.range(0, 4).expect("logprob"),
+            status: status.range(0, 4).expect("status"),
+            entries: record.range(0, count * 8).expect("entries"),
+            flag: record.range(count * 8, 4).expect("flag"),
+            count,
+            draw: params,
+        },
+    )
+    .expect("shortlist draw");
+    stream.synchronize().expect("drain");
+    let id = testkit::read_bytes(ctx, &token, 4);
+    let state = testkit::read_bytes(ctx, &status, 4);
+    (
+        u32::from_le_bytes([id[0], id[1], id[2], id[3]]),
+        u32::from_le_bytes([state[0], state[1], state[2], state[3]]),
+    )
+}
+
+#[test]
+fn the_shortlist_draws_follow_the_host_sampler_distribution() {
+    use crate::family::sampler::{Sampler, SamplingParams};
+    if !testkit::device_present("shortlist draw distribution") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let n = 1000;
+    let row = model_like_row(n);
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|&a, &b| {
+        row[b as usize]
+            .total_cmp(&row[a as usize])
+            .then_with(|| a.cmp(&b))
+    });
+    let draws = 6000u64;
+    for (temperature, top_p, top_k) in [(1.0f64, 0.95f64, 20u32), (0.7, 1.0, 20), (1.3, 0.9, 8)] {
+        let ranked: Vec<(f32, u32)> = order[..20].iter().map(|&i| (row[i as usize], i)).collect();
+        let mut device = vec![0u32; n];
+        for position in 0..draws {
+            let (id, status) = draw_from_shortlist(
+                &ctx,
+                &stream,
+                &ranked,
+                ShortlistDraw {
+                    temperature: temperature as f32,
+                    top_k: top_k as usize,
+                    top_p: top_p as f32,
+                    seed: 0x5eed,
+                    position,
+                },
+            );
+            assert_eq!(status, 0);
+            device[id as usize] += 1;
+        }
+        let mut host = vec![0u32; n];
+        let mut sampler = Sampler::new(
+            SamplingParams::new(temperature, top_p, top_k).expect("params"),
+            0xfeed,
+        );
+        for _ in 0..draws {
+            host[sampler.sample(&row).expect("host draw") as usize] += 1;
+        }
+        let (statistic, df) = two_sample_chi_square(&device, &host);
+        let bound = df as f64 + 5.0 * (2.0 * df as f64).sqrt();
+        assert!(
+            statistic < bound,
+            "T {temperature} top_p {top_p} top_k {top_k}: chi-square {statistic:.1} over {df} cells, bound {bound:.1}"
+        );
+    }
+}
+
+#[test]
+fn a_shortlist_draw_keeps_the_status_bits_it_does_not_own() {
+    if !testkit::device_present("shortlist draw status") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let ranked = [(2.0f32, 7u32), (1.0, 3), (0.5, 9)];
+    let mut bytes = Vec::new();
+    for &(logit, id) in &ranked {
+        bytes.extend_from_slice(&logit.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let record = ctx.upload(&bytes).expect("upload");
+    let token = testkit::upload_filled(&ctx, 0, 4);
+    let logprob = testkit::upload_filled(&ctx, 0, 4);
+    let status = ctx.upload(&8u32.to_le_bytes()).expect("upload");
+    ctx.sample_shortlist(
+        &stream,
+        SampleShortlistCall {
+            token: token.range(0, 4).expect("token"),
+            logprob: logprob.range(0, 4).expect("logprob"),
+            status: status.range(0, 4).expect("status"),
+            entries: record.range(0, 24).expect("entries"),
+            flag: record.range(24, 4).expect("flag"),
+            count: 3,
+            draw: ShortlistDraw {
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 1,
+                position: 0,
+            },
+        },
+    )
+    .expect("greedy shortlist draw");
+    stream.synchronize().expect("drain");
+    let picked = testkit::read_bytes(&ctx, &token, 4);
+    let kept = testkit::read_bytes(&ctx, &status, 4);
+    assert_eq!(
+        u32::from_le_bytes([picked[0], picked[1], picked[2], picked[3]]),
+        7
+    );
+    assert_eq!(u32::from_le_bytes([kept[0], kept[1], kept[2], kept[3]]), 8);
+}

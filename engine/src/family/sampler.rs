@@ -635,6 +635,16 @@ impl Sampler {
         }
     }
 
+    /// Records a token the device drew from its ranked shortlist: the decision is the selected id
+    /// alone, as for the device greedy path (the candidates stayed on the card).
+    pub(crate) fn record_device_draw(&self, token: u32) {
+        if self.capture.is_some() {
+            let mut observation = SampleObservation::default();
+            observation.fill_greedy(token);
+            self.record(&observation);
+        }
+    }
+
     /// Appends one recorded decision. The selected entry's probability comes from
     /// the observation's own candidates — the selected entry is always present
     /// there — so no walk is repeated.

@@ -1353,6 +1353,28 @@ fn gguf_prefix_identity(
     })
 }
 
+/// The device bytes the load's own admission asks for beside the weights at a cache form and
+/// context: the cache, the work and the headroom of the plan that start would run.
+fn load_need_of<'a>(
+    settings: &'a Q36Settings,
+    plan: &'a StartupPlan,
+) -> impl Fn(KvDtype, u32) -> Option<u64> + 'a {
+    move |kv, context| {
+        let variant = Q36Settings {
+            kv,
+            context_limit: context,
+            ..settings.clone()
+        };
+        let modes = runtime_modes(&variant).ok()?;
+        let probe = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes).ok()?;
+        let reserve = load_options(probe.reserve, probe.modes.fixed_admission).reserve;
+        probe
+            .reserve
+            .checked_add(reserve.work)?
+            .checked_add(reserve.headroom)
+    }
+}
+
 /// The cache form and context of a start that left them to the card, asked before any weight is
 /// uploaded. The free bytes are the ones the load's admission compares and the weight bytes are
 /// its native tensors, so the choice charges what the load will. A start whose config fixes both
@@ -1380,6 +1402,7 @@ fn card_fit(
         weights,
         (!settings.kv_auto).then_some(settings.kv),
         (!settings.context_auto).then_some(settings.context_limit),
+        &load_need_of(settings, plan),
     )?
     else {
         return Ok(None);
@@ -1434,6 +1457,7 @@ fn replan_smaller(
         weights,
         Some(settings.kv),
         Some(settings.context_limit.saturating_sub(REPLAN_STEP)),
+        &load_need_of(settings, plan),
     )?
     else {
         return Ok(None);

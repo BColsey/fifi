@@ -245,7 +245,8 @@ pub(crate) const FP16_SUFFICIENT_CONTEXT: u32 = 131_072;
 /// uploaded and the weight bytes the load pins. `kv` and `context` name what the config fixed;
 /// an absent one is chosen by the shared card-fit rule (`family::card_fit`), fed with this
 /// family's charges: the cache at the candidate context, the DeltaNet state, the staged int8
-/// rows and the admission margins. fp16 is preferred; the ceiling is the named context, else
+/// rows and the admission margins, never less than `load_need`, the cache, work and headroom
+/// the load itself admits. fp16 is preferred; the ceiling is the named context, else
 /// [`MODEL_MAX_CONTEXT`].
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn choose_cuda_fit(
@@ -254,14 +255,24 @@ pub(crate) fn choose_cuda_fit(
     weights: u64,
     kv: Option<crate::family::qwen36::settings::KvDtype>,
     context: Option<u32>,
+    load_need: &dyn Fn(crate::family::qwen36::settings::KvDtype, u32) -> Option<u64>,
 ) -> Result<Option<CudaFit>, crate::EngError> {
     use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
     use crate::family::qwen36::settings::KvDtype;
 
     let (_, _, fp16_demand) = card_demand_model(spec, KvDtype::F32)?;
     let (_, _, int8_demand) = card_demand_model(spec, KvDtype::Q8)?;
-    let fp16 = |context: u32| fp16_demand(context).ok()?.total_after_weights().ok();
-    let int8 = |context: u32| int8_demand(context).ok()?.total_after_weights().ok();
+    // What the load's own admission asks for beside the weights (the cache, the work and the
+    // headroom it keeps) is a floor under the sketch's sum: a plan that passes the sketch and
+    // fails the load would send the start down to the tiered rung.
+    let fp16 = |context: u32| {
+        let sketch = fp16_demand(context).ok()?.total_after_weights().ok()?;
+        Some(sketch.max(load_need(KvDtype::F32, context)?))
+    };
+    let int8 = |context: u32| {
+        let sketch = int8_demand(context).ok()?.total_after_weights().ok()?;
+        Some(sketch.max(load_need(KvDtype::Q8, context)?))
+    };
     let candidates = [
         CacheForm {
             form: KvDtype::F32,
@@ -481,7 +492,8 @@ mod tests {
     #[test]
     fn a_roomy_card_keeps_fp16_at_the_model_maximum() {
         let free = free_for(KvDtype::F32, WEIGHTS, MODEL_MAX_CONTEXT);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None).unwrap();
+        let fit =
+            choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0)).unwrap();
         assert_eq!(
             fit,
             Some(CudaFit {
@@ -494,7 +506,7 @@ mod tests {
     #[test]
     fn fp16_is_kept_where_it_reaches_the_sufficient_context() {
         let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None)
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0))
             .unwrap()
             .expect("fits");
         assert_eq!(fit.form, KvDtype::F32);
@@ -504,7 +516,7 @@ mod tests {
     #[test]
     fn int8_is_chosen_where_fp16_falls_short_of_the_sufficient_context() {
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None)
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0))
             .unwrap()
             .expect("fits");
         assert_eq!(fit.form, KvDtype::Q8);
@@ -522,19 +534,40 @@ mod tests {
     fn a_named_cache_form_or_context_is_taken_as_given() {
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
         // The form is fixed: only that form is weighed, whatever the other would reach.
-        let fixed = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, Some(KvDtype::F32), None)
-            .unwrap()
-            .expect("fits");
+        let fixed = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            Some(KvDtype::F32),
+            None,
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!((fixed.form, fixed.context), (KvDtype::F32, 100_352));
         // The context is fixed and fp16 holds it: fp16 serves exactly that context.
-        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(65_536))
-            .unwrap()
-            .expect("fits");
+        let named = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            None,
+            Some(65_536),
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!((named.form, named.context), (KvDtype::F32, 65_536));
         // The context is fixed, fp16 cannot hold it and int8 can: int8 serves it.
-        let wide = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(180_224))
-            .unwrap()
-            .expect("fits");
+        let wide = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            None,
+            Some(180_224),
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         assert_eq!((wide.form, wide.context), (KvDtype::Q8, 180_224));
     }
 
@@ -543,9 +576,16 @@ mod tests {
         // fp16 holds 150,528 positions, more than the sufficient context, yet the named
         // context is beyond it: int8 reaches the named value, so int8 serves it.
         let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
-        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(262_144))
-            .unwrap()
-            .expect("fits");
+        let named = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            None,
+            Some(262_144),
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("fits");
         let (_, _, int8_demand) = card_demand_model(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap();
         assert!(admits_cuda(free, WEIGHTS, &int8_demand, 262_144));
         assert_eq!((named.form, named.context), (KvDtype::Q8, 262_144));
@@ -558,9 +598,16 @@ mod tests {
         let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
         let (_, _, int8_demand) = card_demand_model(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap();
         assert!(!admits_cuda(free, WEIGHTS, &int8_demand, 262_144));
-        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(262_144))
-            .unwrap()
-            .expect("a smaller context fits");
+        let named = choose_cuda_fit(
+            &QWEN3_6_35B_A3B,
+            free,
+            WEIGHTS,
+            None,
+            Some(262_144),
+            &|_, _| Some(0),
+        )
+        .unwrap()
+        .expect("a smaller context fits");
         assert_eq!(named.form, KvDtype::Q8);
         assert!(
             named.context < 262_144 && named.context > 100_352,
@@ -573,10 +620,19 @@ mod tests {
     #[test]
     fn a_card_that_carries_nothing_answers_none() {
         let free = free_for(KvDtype::Q8, WEIGHTS, 1024) - 1;
-        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None).unwrap();
+        let fit =
+            choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None, &|_, _| Some(0)).unwrap();
         assert_eq!(fit, None);
         assert_eq!(
-            choose_cuda_fit(&QWEN3_6_35B_A3B, WEIGHTS - 1, WEIGHTS, None, None).unwrap(),
+            choose_cuda_fit(
+                &QWEN3_6_35B_A3B,
+                WEIGHTS - 1,
+                WEIGHTS,
+                None,
+                None,
+                &|_, _| Some(0)
+            )
+            .unwrap(),
             None
         );
     }

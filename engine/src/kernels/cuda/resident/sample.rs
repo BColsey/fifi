@@ -19,7 +19,9 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::native::resident::sample::{SampleRaw, sample_launch};
+use crate::kernels::cuda::native::resident::sample::{
+    SampleRaw, SampleShortlistRaw, sample_launch, sample_shortlist_launch,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SampleParams {
@@ -29,6 +31,30 @@ pub(crate) struct SampleParams {
     pub(crate) min_p: f32,
     pub(crate) seed: u64,
     pub(crate) position: u64,
+}
+
+/// The settings of a draw from a ranked shortlist. The `seed` and `position` choose the uniform,
+/// as for the full-row draw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ShortlistDraw {
+    pub(crate) temperature: f32,
+    pub(crate) top_k: usize,
+    pub(crate) top_p: f32,
+    pub(crate) seed: u64,
+    pub(crate) position: u64,
+}
+
+/// A draw from the record of a shortlist launch: `entries` holds `count` ranked
+/// (logit, id) pairs and `flag` the record's non-finite word. The chosen id, its log
+/// probability and the status bits (OR-ed into `status`, never cleared) are written on the device.
+pub(crate) struct SampleShortlistCall<'b> {
+    pub(crate) token: DeviceRange<'b>,
+    pub(crate) logprob: DeviceRange<'b>,
+    pub(crate) status: DeviceRange<'b>,
+    pub(crate) entries: DeviceRange<'b>,
+    pub(crate) flag: DeviceRange<'b>,
+    pub(crate) count: usize,
+    pub(crate) draw: ShortlistDraw,
 }
 
 pub(crate) struct SampleCall<'b> {
@@ -50,6 +76,62 @@ impl CudaContext {
         self.ensure_usable()?;
         let raw = self.plan_sample(&call)?;
         self.launch_on(stream, |stream_raw| sample_launch(stream_raw, &raw))
+    }
+
+    /// One draw from a ranked shortlist already on the device; see [`SampleShortlistCall`].
+    pub(crate) fn sample_shortlist(
+        &self,
+        stream: &DeviceStream,
+        call: SampleShortlistCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let d = call.draw;
+        if !(1..=64).contains(&call.count) {
+            return Err(EngError::BadRequest(format!(
+                "a shortlist draw takes 1 to 64 entries, got {}",
+                call.count
+            )));
+        }
+        if !d.temperature.is_finite() || d.top_k > call.count || !(d.top_p > 0.0 && d.top_p <= 1.0)
+        {
+            return Err(EngError::BadRequest(
+                "the shortlist draw needs a finite temperature, top_k within the entries and top_p in (0, 1]"
+                    .to_owned(),
+            ));
+        }
+        require_fit("shortlist entries", &call.entries, call.count * 8, 4)?;
+        require_fit("shortlist flag", &call.flag, 4, 4)?;
+        require_fit("token", &call.token, 4, 4)?;
+        require_fit("logprob", &call.logprob, 4, 4)?;
+        require_fit("status", &call.status, 4, 4)?;
+        let claims = [
+            Claim::of("entries", &call.entries, call.count * 8),
+            Claim::of("flag", &call.flag, 4),
+            Claim::of("token", &call.token, 4),
+            Claim::of("logprob", &call.logprob, 4),
+            Claim::of("status", &call.status, 4),
+        ];
+        for (i, a) in claims.iter().enumerate() {
+            for b in &claims[i + 1..] {
+                require_apart(a, b)?;
+            }
+        }
+        let raw = SampleShortlistRaw {
+            token: self.raw_range(&call.token)?,
+            logprob: self.raw_range(&call.logprob)?,
+            status: self.raw_range(&call.status)?,
+            entries: self.raw_range(&call.entries)?,
+            flag: self.raw_range(&call.flag)?,
+            count: call.count,
+            temperature: d.temperature,
+            top_k: d.top_k,
+            top_p: d.top_p,
+            seed: d.seed,
+            position: d.position,
+        };
+        self.launch_on(stream, |stream_raw| {
+            sample_shortlist_launch(stream_raw, &raw)
+        })
     }
 
     fn plan_sample<'b>(&self, call: &SampleCall<'b>) -> Result<SampleRaw<'b>, EngError> {

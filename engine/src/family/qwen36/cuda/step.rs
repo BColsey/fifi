@@ -106,6 +106,7 @@ use crate::{
             embed::{EmbedCall, EmbedNativeCall},
             embed_bf16::EmbedBf16Call,
             matvec_q::QuantType,
+            sample::{SampleShortlistCall, ShortlistDraw},
             shortlist::{self, ShortlistCall, ShortlistMassCall},
             step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
         },
@@ -525,6 +526,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// One over the temperature of the open-vocabulary draw the next token reads back for, or
     /// `None` for every other read-back.
     open_mass: Option<f32>,
+    /// The settings of a token drawn on the device from the ranked shortlist, set around one run.
+    draw: Option<ShortlistDraw>,
     report: RunReport,
     prefill_report: PrefillReport,
     /// The engine's one host-backed prefix entry.
@@ -1002,6 +1005,7 @@ impl<'a> QwenResidentStep<'a> {
             shortlist_bytes: [0; shortlist::RESULT_BYTES],
             mass_bytes: [0; shortlist::MASS_PARTS * 8],
             open_mass: None,
+            draw: None,
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
             prefix: PrefixSlot::default(),
@@ -1990,6 +1994,8 @@ impl<'a> QwenResidentStep<'a> {
         if want_shortlist {
             plan = if self.open_mass.is_some() {
                 ReadbackPlan::open_shortlist(self.res.dims.shape.vocab)?
+            } else if self.draw.is_some() {
+                ReadbackPlan::drawn_shortlist(self.res.dims.shape.vocab)?
             } else {
                 ReadbackPlan::shortlist(self.res.dims.shape.vocab)?
             };
@@ -2779,6 +2785,9 @@ impl<'a> QwenResidentStep<'a> {
                 },
             )?;
         }
+        if let (true, Some(draw)) = (plan.draw, self.draw) {
+            self.queue_draw(draw)?;
+        }
         let pair_range = self.state.word(Word::ResultPair)?;
         self.context
             .copy_word_to_host(&self.stream, pair_range, &self.word)?;
@@ -2815,6 +2824,33 @@ impl<'a> QwenResidentStep<'a> {
         })
     }
 
+    /// Queues the draw from the ranked shortlist into the result pair: the drawn id replaces the
+    /// argmax in the pair's token word, the status bits are OR-ed into its status word, and the
+    /// log probability goes to the four spare bytes after the mass partials of the scratch.
+    fn queue_draw(&mut self, draw: ShortlistDraw) -> Result<(), EngError> {
+        let pair = self.state.word(Word::ResultPair)?;
+        let part = self.view(Slot::ArgmaxPart)?;
+        let record = part
+            .offset()
+            .checked_add(shortlist::RESULT_OFFSET)
+            .ok_or_else(|| EngError::MemoryPlan("shortlist record offset overflows".to_owned()))?;
+        let spare = part
+            .offset()
+            .checked_add(shortlist::MASS_SCRATCH_BYTES)
+            .ok_or_else(|| EngError::MemoryPlan("shortlist spare offset overflows".to_owned()))?;
+        let entries = shortlist::K;
+        let call = SampleShortlistCall {
+            token: pair.buffer().range(pair.offset(), 4)?,
+            status: pair.buffer().range(pair.offset() + 4, 4)?,
+            logprob: part.buffer().range(spare, 4)?,
+            entries: part.buffer().range(record, entries * 8)?,
+            flag: part.buffer().range(record + entries * 8, 4)?,
+            count: entries.min(self.widths.verdict),
+            draw,
+        };
+        self.context.sample_shortlist(&self.stream, call)
+    }
+
     /// Returns None before any step when the request needs the full host sampler.
     pub(super) fn try_device_shortlist_token(
         &mut self,
@@ -2841,11 +2877,19 @@ impl<'a> QwenResidentStep<'a> {
             sampler.record_device_greedy(selected);
             return Ok(Some(selected));
         }
-        self.run_token_output(token, false, true)?;
-        let candidates = self.shortlist_values()?;
-        sampler
-            .sample_shortlist(&candidates, sampler_vocab)
-            .map(Some)
+        let params = sampler.params();
+        self.draw = Some(ShortlistDraw {
+            temperature: params.temperature() as f32,
+            top_k: params.top_k() as usize,
+            top_p: params.top_p() as f32,
+            seed: sampler.seed(),
+            position: self.state.tokens() as u64,
+        });
+        let drawn = self.run_token_output(token, false, true);
+        self.draw = None;
+        let drawn = drawn?;
+        sampler.record_device_draw(drawn);
+        Ok(Some(drawn))
     }
 
     /// One open-vocabulary token: the device ranks the top twenty and adds the softmax mass of

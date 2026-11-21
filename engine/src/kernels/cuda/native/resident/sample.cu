@@ -305,6 +305,82 @@ __global__ void sample_kernel(const float *logits, float *probs, int n, float te
     }
 }
 
+
+struct ShortlistEntry {
+    float logit;
+    unsigned int id;
+};
+
+constexpr int kShortlistMax = 64;
+
+/* One thread: the shortlist has at most 64 entries, so the draw is a few dozen operations. */
+__global__ void sample_shortlist_kernel(const ShortlistEntry *entries, const unsigned int *flag,
+                                        int count, float temperature, int top_k, float top_p,
+                                        unsigned int seed_lo, unsigned int seed_hi,
+                                        unsigned int pos_lo, unsigned int pos_hi,
+                                        unsigned int *token, float *logprob, unsigned int *status) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (*flag != 0u) {
+        atomicOr(status, 4u);
+        token[0] = 0u;
+        logprob[0] = 0.0f;
+        return;
+    }
+    int valid = 0;
+    while (valid < count && entries[valid].id != 0xFFFFFFFFu) ++valid;
+    if (valid == 0) {
+        atomicOr(status, 2u);
+        token[0] = 0u;
+        logprob[0] = 0.0f;
+        return;
+    }
+    if (!(temperature > 0.0f)) {
+        token[0] = entries[0].id;
+        logprob[0] = 0.0f;
+        return;
+    }
+    const int keep = (top_k > 0 && top_k < valid) ? top_k : valid;
+    const float inv_temperature = 1.0f / temperature;
+    const float peak = entries[0].logit;
+    float p[kShortlistMax];
+    float total = 0.0f;
+    for (int i = 0; i < keep; ++i) {
+        p[i] = expf((entries[i].logit - peak) * inv_temperature);
+        total += p[i];
+    }
+    int cut = keep;
+    if (top_p < 1.0f) {
+        float acc = 0.0f;
+        for (int i = 0; i < keep; ++i) {
+            acc += p[i];
+            if (acc >= top_p * total) {
+                cut = i + 1;
+                break;
+            }
+        }
+    }
+    float kept = 0.0f;
+    for (int i = 0; i < cut; ++i) kept += p[i];
+    if (!(kept > 0.0f)) {
+        atomicOr(status, 2u);
+        token[0] = 0u;
+        logprob[0] = 0.0f;
+        return;
+    }
+    const float walk = uniform01(seed_lo, seed_hi, pos_lo, pos_hi) * kept;
+    int chosen = cut - 1;
+    float cumulative = 0.0f;
+    for (int i = 0; i < cut; ++i) {
+        cumulative += p[i];
+        if (cumulative > walk) {
+            chosen = i;
+            break;
+        }
+    }
+    token[0] = entries[chosen].id;
+    logprob[0] = logf(p[chosen] / kept);
+}
+
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
 
 bool apart(const void *a, size_t ab, const void *b, size_t bb) {
@@ -341,6 +417,42 @@ extern "C" int inference_cuda_sample_launch(const inference_cuda_sample_args *ar
         sample_kernel<<<1, kThreads, 0, (cudaStream_t)stream>>>(
             (const float *)args->logits, (float *)args->probs, args->n, args->temperature,
             args->top_k, args->top_p, args->min_p, args->seed_lo, args->seed_hi, args->pos_lo,
+            args->pos_hi, (unsigned int *)args->token, (float *)args->logprob,
+            (unsigned int *)args->status);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_sample_shortlist_launch(const inference_cuda_sample_shortlist_args *args,
+                                                      void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->token == NULL || args->logprob == NULL || args->status == NULL ||
+            args->entries == NULL || args->flag == NULL)
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->count < 1 || args->count > kShortlistMax) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!isfinite(args->temperature)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->top_k < 0 || args->top_k > args->count) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!(args->top_p > 0.0f) || args->top_p > 1.0f) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!aligned(args->token, 4) || !aligned(args->logprob, 4) || !aligned(args->status, 4) ||
+            !aligned(args->entries, 4) || !aligned(args->flag, 4))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const size_t bytes = (size_t)args->count * sizeof(ShortlistEntry);
+        if (!apart(args->token, 4, args->entries, bytes) || !apart(args->logprob, 4, args->entries, bytes) ||
+            !apart(args->status, 4, args->entries, bytes) || !apart(args->token, 4, args->flag, 4) ||
+            !apart(args->logprob, 4, args->flag, 4) || !apart(args->status, 4, args->flag, 4) ||
+            !apart(args->entries, bytes, args->flag, 4) || !apart(args->token, 4, args->logprob, 4) ||
+            !apart(args->token, 4, args->status, 4) || !apart(args->logprob, 4, args->status, 4))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure failure;
+        sample_shortlist_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(
+            (const ShortlistEntry *)args->entries, (const unsigned int *)args->flag, args->count,
+            args->temperature, args->top_k, args->top_p, args->seed_lo, args->seed_hi, args->pos_lo,
             args->pos_hi, (unsigned int *)args->token, (float *)args->logprob,
             (unsigned int *)args->status);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

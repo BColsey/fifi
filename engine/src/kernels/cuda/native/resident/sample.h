@@ -40,6 +40,34 @@ _Static_assert(sizeof(inference_cuda_sample_args) == 80 && offsetof(inference_cu
 int inference_cuda_sample_launch(const inference_cuda_sample_args *args, void *stream,
                                        int *out_stage);
 
+
+/* One draw from a ranked shortlist already on the device (the record of the shortlist launch):
+ * `entries` holds `count` (logit f32, id u32) pairs, larger logit first, unused ones with id
+ * 0xFFFFFFFF; `flag` is the record's non_finite word. Writes the chosen id, its log probability
+ * (over the kept set) and ORs the status word (2 empty set, 4 non-finite input); the status word
+ * is not cleared, so a caller that owns bits there keeps them. temperature <= 0 takes entry 0.
+ * top_k 0 keeps all `count` entries, else the first top_k; top_p (0, 1] keeps the smallest
+ * prefix whose mass reaches top_p of the kept mass. The uniform is Philox-4x32-10 of (seed, pos),
+ * as in the full-row sampler. count 1..64. Launch-only. */
+typedef struct inference_cuda_sample_shortlist_args {
+    void *token;          /* u32 out */
+    void *logprob;        /* f32 out */
+    void *status;         /* u32 in/out, OR-ed */
+    const void *entries;  /* count * 8 bytes */
+    const void *flag;     /* u32 */
+    int count;
+    float temperature;
+    int top_k;
+    float top_p;
+    unsigned int seed_lo;
+    unsigned int seed_hi;
+    unsigned int pos_lo;
+    unsigned int pos_hi;
+} inference_cuda_sample_shortlist_args;
+
+int inference_cuda_sample_shortlist_launch(const inference_cuda_sample_shortlist_args *args,
+                                           void *stream, int *out_stage);
+
 #ifdef __cplusplus
 }
 #endif

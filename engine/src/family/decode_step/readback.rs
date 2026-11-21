@@ -71,6 +71,8 @@ pub(crate) fn check_mode(sync_each: bool, capture_requested: bool) -> Result<(),
 pub(crate) enum ReadStep {
     QueueShortlist,
     QueueMass,
+    /// The device draws the token from the ranked shortlist into the result pair.
+    QueueDraw,
     QueuePairCopy,
     RecordEvent,
     ReadLogits,
@@ -85,6 +87,8 @@ pub(crate) struct ReadbackPlan {
     pub(crate) shortlist: bool,
     /// The softmax mass of the row is queued after the shortlist and its partials are read.
     pub(crate) mass: bool,
+    /// The token is drawn on the device from the shortlist: the shortlist is not read back.
+    pub(crate) draw: bool,
 }
 
 impl ReadbackPlan {
@@ -106,12 +110,21 @@ impl ReadbackPlan {
             logits_bytes,
             shortlist: false,
             mass: false,
+            draw: false,
         })
     }
 
     pub(crate) fn shortlist(vocab: usize) -> Result<Self, EngError> {
         let mut plan = Self::new(vocab, false)?;
         plan.shortlist = true;
+        Ok(plan)
+    }
+
+    /// The shortlist drawn on the device: the result pair carries the drawn token and nothing
+    /// else leaves the card.
+    pub(crate) fn drawn_shortlist(vocab: usize) -> Result<Self, EngError> {
+        let mut plan = Self::shortlist(vocab)?;
+        plan.draw = true;
         Ok(plan)
     }
 
@@ -132,11 +145,14 @@ impl ReadbackPlan {
         if self.mass {
             steps.push(ReadStep::QueueMass);
         }
+        if self.draw {
+            steps.push(ReadStep::QueueDraw);
+        }
         steps.extend([ReadStep::QueuePairCopy, ReadStep::RecordEvent]);
         if self.logits_bytes.is_some() {
             steps.push(ReadStep::ReadLogits);
         }
-        if self.shortlist {
+        if self.shortlist && !self.draw {
             steps.push(ReadStep::ReadShortlist);
         }
         if self.mass {
