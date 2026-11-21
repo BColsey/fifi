@@ -2,6 +2,7 @@
 
 use std::{fs::File, io::BufReader, ops::Range, path::Path, time::SystemTime};
 
+use super::timing::DenseIo;
 use super::{
     CONV_TAPS, CORE_END, CORE_START, EXPERTS, HEAD_DIM, HEADER_LIMIT, HIDDEN, INTERMEDIATE,
     KV_HEADS, LAYERS, QUERY_HEADS, checkpoint_error,
@@ -246,6 +247,7 @@ pub struct Weights {
     file: File,
     header: GgufHeader,
     modified: Option<SystemTime>,
+    dense_io: Option<DenseIo>,
 }
 
 impl Weights {
@@ -261,6 +263,7 @@ impl Weights {
             file,
             header,
             modified: metadata.modified().ok(),
+            dense_io: DenseIo::start_if_enabled(),
         })
     }
 
@@ -277,6 +280,24 @@ impl Weights {
     }
 
     pub fn read_range(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<(), EngError> {
+        self.read_range_classified(name, offset, dst, false)
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn dense_io_snapshot(&self) -> super::timing::DenseIoStats {
+        self.dense_io
+            .as_ref()
+            .map(DenseIo::snapshot)
+            .unwrap_or_default()
+    }
+
+    fn read_range_classified(
+        &self,
+        name: &str,
+        offset: u64,
+        dst: &mut [u8],
+        dense: bool,
+    ) -> Result<(), EngError> {
         let tensor = self.tensor(name)?;
         if offset
             .checked_add(dst.len() as u64)
@@ -288,6 +309,9 @@ impl Weights {
         }
         self.check_len()?;
         read_exact_at(&self.file, dst, tensor.abs_offset() + offset).map_err(checkpoint_error)?;
+        if dense && let Some(io) = &self.dense_io {
+            io.file_read(dst.len());
+        }
         self.check_len()
     }
 
@@ -312,9 +336,9 @@ impl Weights {
         Layout::from_header(&self.header).expect("validated Inkling GGUF layout")
     }
 
-    pub(super) fn values(&self, tensor: &GgufTensor) -> Result<Vec<f32>, EngError> {
+    pub(super) fn values(&self, tensor: &GgufTensor, dense: bool) -> Result<Vec<f32>, EngError> {
         let mut bytes = self.buffer(tensor.name(), tensor.byte_len() as usize)?;
-        self.read_range(tensor.name(), 0, &mut bytes)?;
+        self.read_range_classified(tensor.name(), 0, &mut bytes, dense)?;
         crate::weights::dequantize(tensor.ggml_type(), &bytes)
     }
 
@@ -327,7 +351,7 @@ impl Weights {
             )));
         }
         let mut bytes = self.buffer(name, row_bytes)?;
-        self.read_range(name, (row * row_bytes) as u64, &mut bytes)?;
+        self.read_range_classified(name, (row * row_bytes) as u64, &mut bytes, true)?;
         let mut values = vec![0.; width];
         crate::weights::dequantize_into(dtype, &bytes, &mut values)?;
         Ok(values)
@@ -339,6 +363,7 @@ impl Weights {
         plane: usize,
         rows: std::ops::Range<usize>,
         input: &[f32],
+        dense: bool,
     ) -> Result<Vec<f32>, EngError> {
         let tensor = self.tensor(name)?;
         let (width, height, dtype, row_bytes) = matrix(tensor)?;
@@ -354,7 +379,12 @@ impl Weights {
         for start in (rows.start..rows.end).step_by(ROWS_PER_READ) {
             let count = ROWS_PER_READ.min(rows.end - start);
             let bytes = &mut bytes[..count * row_bytes];
-            self.read_range(name, ((plane * height + start) * row_bytes) as u64, bytes)?;
+            self.read_range_classified(
+                name,
+                ((plane * height + start) * row_bytes) as u64,
+                bytes,
+                dense,
+            )?;
             for row in bytes.chunks_exact(row_bytes) {
                 crate::weights::dequantize_into(dtype, row, &mut values)?;
                 result.push(values.iter().zip(input).map(|(w, x)| w * x).sum());
@@ -396,6 +426,9 @@ impl Weights {
             checkpoint_error(format!("mapped GGUF tensor {name} is out of bounds"))
         })?;
         let result = project_packed_rows(dtype, row_bytes, bytes, input)?;
+        if let Some(io) = &self.dense_io {
+            io.mapped_access(bytes.len());
+        }
         mapping.check_unchanged().map_err(checkpoint_error)?;
         Ok(result)
     }
@@ -422,7 +455,7 @@ impl Weights {
             input,
             selected,
             routes,
-            |name, plane, rows, input| self.project(name, plane, 0..rows, input),
+            |name, plane, rows, input| self.project(name, plane, 0..rows, input, false),
         )
     }
 
@@ -443,9 +476,10 @@ impl Weights {
         let gate = format!("blk.{layer}.ffn_gate_up_exps");
         let down = format!("blk.{layer}.ffn_down_exps");
         let scale = |prefix: &str| -> Result<Vec<f32>, EngError> {
-            self.header
-                .tensor(&format!("{prefix}.scale"))
-                .map_or_else(|| Ok(vec![1.; EXPERTS]), |tensor| self.values(tensor))
+            self.header.tensor(&format!("{prefix}.scale")).map_or_else(
+                || Ok(vec![1.; EXPERTS]),
+                |tensor| self.values(tensor, false),
+            )
         };
         let gate_scale = scale(&gate)?;
         let down_scale = scale(&down)?;
@@ -656,13 +690,15 @@ mod mapped_projection_tests {
         header.extend(name.as_bytes());
         header.extend(2_u32.to_le_bytes());
         header.extend(3_u64.to_le_bytes());
-        header.extend(2_u64.to_le_bytes());
+        header.extend(257_u64.to_le_bytes());
         header.extend(0_u32.to_le_bytes());
         header.extend(0_u64.to_le_bytes());
         header.resize(header.len().next_multiple_of(32), 0);
         artifact.write_all(&header).unwrap();
-        for weight in [1.0_f32, -2.0, 3.0, 4.0, 5.0, 1.0] {
-            artifact.write_all(&weight.to_le_bytes()).unwrap();
+        for _ in 0..257 {
+            for weight in [1.0_f32, -2.0, 3.0] {
+                artifact.write_all(&weight.to_le_bytes()).unwrap();
+            }
         }
         let file = File::open(artifact.path()).unwrap();
         let meta = file.metadata().unwrap();
@@ -672,10 +708,11 @@ mod mapped_projection_tests {
             file,
             header,
             modified: meta.modified().ok(),
+            dense_io: Some(DenseIo::default()),
         };
         let mapping = weights.map_projection_source().unwrap();
         let input = [0.5, 0.25, -0.75];
-        let before = weights.project(name, 0, 0..1, &input).unwrap();
+        let before = weights.project(name, 0, 0..257, &input, true).unwrap();
         let after = weights
             .project_mapped(name, 0..1, &input, &mapping, 12)
             .unwrap();
@@ -685,6 +722,18 @@ mod mapped_projection_tests {
                 .project_mapped(name, 1..2, &input, &mapping, 12)
                 .is_err()
         );
+        // Expert callers use the same read helpers without charging dense bytes.
+        weights.project(name, 0, 0..257, &input, false).unwrap();
+        weights.read_range(name, 0, &mut [0; 12]).unwrap();
+        let tensor = weights.tensor(name).unwrap();
+        weights.values(tensor, false).unwrap();
+        weights.values(tensor, true).unwrap();
+        weights.row(name, 0).unwrap();
+        let io = weights.dense_io.as_ref().unwrap();
+        assert_eq!(io.snapshot().file_ranges, 4);
+        assert_eq!(io.snapshot().file_bytes, 2 * 257 * 12 + 12);
+        assert_eq!(io.snapshot().mapped_accesses, 1);
+        assert_eq!(io.snapshot().mapped_span_bytes, 12);
         artifact.as_file().set_len(0).unwrap();
         assert!(
             weights

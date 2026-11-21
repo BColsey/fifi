@@ -10,6 +10,7 @@ const ATTN_WORKERS_ENV: &str = "FIFI_INKLING_ATTN_CPU_WORKERS";
 const QKV_WEIGHTS: [&str; 3] = ["wq_du.weight", "wk_dv.weight", "wv_dv.weight"];
 use safetensors::{Dtype, tensor::TensorInfo};
 
+use super::timing::DenseIo;
 use super::{
     CORE_START, HEADER_LIMIT, SHARD, checkpoint_error, gguf, gguf_dense, parse_json, read_exact_at,
     read_stored_header, validate_config, weight_plan,
@@ -50,6 +51,14 @@ impl DenseWeights {
         match &self.0 {
             Backend::Gguf(dense) => dense.has_mapping(),
             Backend::Safetensors(_) => false,
+        }
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn io_snapshot(&self) -> super::timing::DenseIoStats {
+        match &self.0 {
+            Backend::Safetensors(w) => w.io.as_ref().map(DenseIo::snapshot).unwrap_or_default(),
+            Backend::Gguf(w) => w.io_snapshot(),
         }
     }
 
@@ -131,6 +140,7 @@ struct SafetensorDense {
     data_start: u64,
     entries: BTreeMap<String, DenseEntry>,
     attention_workers: usize,
+    io: Option<DenseIo>,
 }
 
 struct DenseEntry {
@@ -194,6 +204,7 @@ impl SafetensorDense {
             data_start,
             entries,
             attention_workers,
+            io: DenseIo::start_if_enabled(),
         })
     }
 
@@ -324,6 +335,9 @@ impl SafetensorDense {
                 let end = tensor.checked_add(range.end).ok_or_else(invalid)?;
                 let bytes = shard.as_ref().get(start..end).ok_or_else(invalid)?;
                 let result = use_bytes(bytes);
+                if let Some(io) = &self.io {
+                    io.mapped_access(bytes.len());
+                }
                 shard.check_unchanged().map_err(checkpoint_error)?;
                 Ok(result)
             }
@@ -372,6 +386,9 @@ impl SafetensorDense {
         read_exact_at(shard, &mut bytes, offset).map_err(|error| {
             checkpoint_error(format!("dense weight {name} read at {offset}: {error}"))
         })?;
+        if let Some(io) = &self.io {
+            io.file_read(bytes.len());
+        }
         check_len()?;
         Ok(bytes.into_boxed_slice())
     }
@@ -573,6 +590,7 @@ mod tests {
             len: 11 + bytes.len() as u64,
             data_start: 11,
             attention_workers: 1,
+            io: Some(DenseIo::default()),
             entries: BTreeMap::from([(
                 "matrix".into(),
                 DenseEntry {
@@ -589,10 +607,16 @@ mod tests {
         assert_eq!(dense.shape("matrix").unwrap(), [2, 9]);
         assert_eq!(dense.row("matrix", 1).unwrap(), second);
         assert!(dense.row("matrix", 2).is_err());
+        let io = dense.io.as_ref().unwrap();
+        assert_eq!(io.snapshot().file_ranges, 1);
+        assert_eq!(io.snapshot().file_bytes, 18);
         assert!(dense.entry("matrix").unwrap().bytes.get().is_none());
         assert_eq!(dense.matvec_rows("matrix", &[1.0; 9], 1..2).unwrap(), [6.0],);
         assert_eq!(dense.matvec("matrix", &[1.0; 9]).unwrap(), [45.0, 6.0]);
         assert!(dense.matvec("matrix", &[1.0; 8]).is_err());
+        assert_eq!(io.snapshot().file_ranges, 2);
+        assert_eq!(io.snapshot().file_bytes, (18 + bytes.len()) as u64);
+        assert_eq!(io.snapshot().mapped_accesses, 0);
         assert_eq!(
             &**dense.entry("matrix").unwrap().bytes.get().unwrap(),
             &bytes
@@ -617,6 +641,7 @@ mod tests {
             len,
             data_start: 11,
             attention_workers: 1,
+            io: Some(DenseIo::default()),
             entries: BTreeMap::from([(
                 "matrix".into(),
                 DenseEntry {
@@ -637,6 +662,12 @@ mod tests {
             dense.matvec_rows("matrix", &[2.0, 3.0], 1..2).unwrap(),
             [5.0]
         );
+        let io = dense.io.as_ref().unwrap();
+        let stats = io.snapshot();
+        assert_eq!(stats.file_ranges, 0);
+        assert_eq!(stats.file_bytes, 0);
+        assert_eq!(stats.mapped_accesses, 5);
+        assert_eq!(stats.mapped_span_bytes, 32);
         let entry = dense.entry("matrix").unwrap();
         assert!(entry.bytes.get().is_none());
         assert!(

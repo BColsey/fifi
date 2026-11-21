@@ -190,28 +190,26 @@ mod executor {
         started: std::time::Instant,
         io: Option<(u64, u64)>,
         cache: MlxExpertCacheStats,
+        dense_io: timing::DenseIoStats,
     }
 
     impl Phase {
-        fn new(cache: MlxExpertCacheStats) -> Self {
+        fn new(cache: MlxExpertCacheStats, dense_io: timing::DenseIoStats) -> Self {
             Self {
                 started: std::time::Instant::now(),
                 io: crate::kernels::mlx::native::process_io(),
                 cache,
+                dense_io,
             }
         }
 
         pub(super) fn start_if_enabled() -> Option<Self> {
-            Self::enabled().then(|| Self::new(MlxExpertCacheStats::default()))
-        }
-
-        fn enabled() -> bool {
-            timing::enabled()
-                || std::env::var_os("FIFI_INKLING_EXPERT_TIMING").is_some_and(|value| value == "1")
+            timing::phase_enabled().then(|| Self::new(Default::default(), Default::default()))
         }
 
         pub(super) fn report(&self, phase: &str, end: MlxExpertCacheStats, decoder: &Decoder) {
             let metal = decoder.gguf_metal_memory_stats();
+            let dense_io = decoder.dense_io_snapshot().since(self.dense_io);
             let io = crate::kernels::mlx::native::process_io();
             let disk = self.io.zip(io).and_then(|(a, b)| b.0.checked_sub(a.0));
             eprintln!(
@@ -221,6 +219,10 @@ mod executor {
                     "process_disk_read_bytes": disk, "lifetime_peak_footprint_bytes": io.map(|v| v.1),
                     "expert_read_bytes": end.read_bytes - self.cache.read_bytes,
                     "expert_read_ranges": end.read_ranges - self.cache.read_ranges,
+                    "dense_file_read_bytes": dense_io.file_bytes,
+                    "dense_file_read_ranges": dense_io.file_ranges,
+                    "dense_mapped_span_bytes": dense_io.mapped_span_bytes,
+                    "dense_mapped_accesses": dense_io.mapped_accesses,
                     "cached_bytes": end.cached_bytes,
                     "mlx_process_active_bytes": metal.as_ref().map(|v| v.active),
                     "mlx_process_pool_bytes": metal.as_ref().map(|v| v.cache),
@@ -249,7 +251,7 @@ mod executor {
                 stepper: Stepper { decoder, fed: 0 },
                 eos,
                 context,
-                trace_cache: Phase::enabled(),
+                trace_cache: timing::phase_enabled(),
                 trace_start: None,
                 phase: None,
                 first_sample: false,
@@ -378,7 +380,7 @@ mod executor {
                     phase.report("prefill", end, &self.stepper.decoder);
                     self.stepper.decoder.report_component_timings("prefill");
                 }
-                self.phase = Some(Phase::new(end));
+                self.phase = Some(Phase::new(end, self.stepper.decoder.dense_io_snapshot()));
                 self.first_sample = true;
             }
             match &result {
@@ -393,7 +395,7 @@ mod executor {
             if self.trace_cache {
                 let cache = self.stepper.decoder.expert_cache_stats();
                 self.trace_start = Some(cache);
-                self.phase = Some(Phase::new(cache));
+                self.phase = Some(Phase::new(cache, self.stepper.decoder.dense_io_snapshot()));
                 self.first_sample = false;
             }
         }
