@@ -1851,6 +1851,50 @@ pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, 
 #[cfg(test)]
 mod kv_bytes_golden_tests;
 
+/// Why a set FIFI_Q36_MLX_DISK_EXPERTS does not stage the routed experts from disk.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiskExpertsIgnored {
+    /// Only the value `1` enables the switch.
+    NotOne(String),
+    /// The switch needs an active Metal working-set limit.
+    SizingOff,
+}
+
+impl DiskExpertsIgnored {
+    /// What the operator can change so the switch takes effect.
+    pub(crate) fn fix(&self) -> &'static str {
+        match self {
+            Self::NotOne(_) => "set it to 1, or the experts stay resident",
+            Self::SizingOff => {
+                "set FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB, or the experts stay resident"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DiskExpertsIgnored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOne(value) => write!(f, "{value:?} is not 1"),
+            Self::SizingOff => f.write_str("device sizing is off"),
+        }
+    }
+}
+
+/// Why a set FIFI_Q36_MLX_DISK_EXPERTS has no effect, or `None` when it is unset or takes effect.
+pub(crate) fn disk_experts_ignored(
+    value: Option<&std::ffi::OsStr>,
+    device_sizing: bool,
+) -> Option<DiskExpertsIgnored> {
+    let value = value?;
+    if value != "1" {
+        return Some(DiskExpertsIgnored::NotOne(
+            value.to_string_lossy().into_owned(),
+        ));
+    }
+    (!device_sizing).then_some(DiskExpertsIgnored::SizingOff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4334,5 +4378,19 @@ mod speculation_arming {
                 .expect("a disabled entry feeds no window")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_set_disk_experts_switch_that_does_not_take_effect_says_why() {
+        use super::{DiskExpertsIgnored, disk_experts_ignored};
+        use std::ffi::OsStr;
+        assert_eq!(disk_experts_ignored(None, false), None);
+        assert_eq!(disk_experts_ignored(Some(OsStr::new("1")), true), None);
+        let off = disk_experts_ignored(Some(OsStr::new("1")), false).unwrap();
+        assert_eq!(off, DiskExpertsIgnored::SizingOff);
+        assert_eq!(off.to_string(), "device sizing is off");
+        assert!(off.fix().contains("FIFI_MLX_WORKING_SET_MIB"));
+        let bad = disk_experts_ignored(Some(OsStr::new("true")), true).unwrap();
+        assert_eq!(bad.to_string(), "\"true\" is not 1");
     }
 }

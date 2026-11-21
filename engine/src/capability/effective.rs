@@ -219,9 +219,9 @@ pub(crate) fn q36_effective(
     ];
     if backend == Backend::Mlx && super::probe::CompiledBackends::of_this_build().mlx {
         rows.push(row("backend", "mlx".into(), Origin::Derived));
-        append_mlx_inputs(&mut rows);
+        append_mlx_inputs(&mut rows, false);
         if !dense {
-            rows.push(mlx_switch("mlx_disk_experts", "FIFI_Q36_MLX_DISK_EXPERTS"));
+            rows.push(disk_experts_row());
         }
     }
     rows
@@ -233,6 +233,22 @@ pub(crate) fn q36_effective(
 fn mlx_switch(key: &'static str, name: &str) -> EffectiveSetting {
     let value = std::env::var_os(name);
     row(key, mlx_switch_text(value.as_deref()), env_origin(&value))
+}
+
+/// The Qwen disk-experts switch, with the reason the start gives when it has no effect.
+fn disk_experts_row() -> EffectiveSetting {
+    use crate::family::qwen36::settings::{DiskExpertsIgnored, disk_experts_ignored};
+    let value = std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS");
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    let sizing = crate::family::mlx_budget::enabled();
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    let sizing = false;
+    let text = match disk_experts_ignored(value.as_deref(), sizing) {
+        None => mlx_switch_text(value.as_deref()),
+        Some(reason @ DiskExpertsIgnored::SizingOff) => format!("true (ignored: {reason})"),
+        Some(reason) => format!("false (ignored: {reason})"),
+    };
+    row("mlx_disk_experts", text, env_origin(&value))
 }
 
 fn mlx_switch_text(value: Option<&std::ffi::OsStr>) -> String {
@@ -251,27 +267,79 @@ fn env_origin<T>(value: &Option<T>) -> Origin {
     }
 }
 
-fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>) {
+/// The expert read-run policy. A value other than `prefill` is reported as off with the value
+/// named. For Flint, FIFI_FLINT_MLX_EXPERT_READ_RUNS (off, `prefill` or `1`) takes precedence
+/// when set, and the row says so.
+fn read_runs_row(flint: bool) -> EffectiveSetting {
+    let legacy = flint
+        .then(|| std::env::var_os("FIFI_FLINT_MLX_EXPERT_READ_RUNS"))
+        .flatten();
+    if legacy.is_some() {
+        return row(
+            "mlx_expert_read_runs",
+            legacy_read_runs_text(legacy.as_deref()),
+            Origin::Environment,
+        );
+    }
+    let shared = std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS");
+    row(
+        "mlx_expert_read_runs",
+        read_runs_text(shared.as_deref()),
+        env_origin(&shared),
+    )
+}
+
+fn read_runs_text(value: Option<&std::ffi::OsStr>) -> String {
+    match value {
+        None => "off".into(),
+        Some(value) if value == "prefill" => "prefill".into(),
+        Some(value) => format!(
+            "off (ignored: {:?} is not prefill)",
+            value.to_string_lossy()
+        ),
+    }
+}
+
+fn legacy_read_runs_text(value: Option<&std::ffi::OsStr>) -> String {
+    let name = "FIFI_FLINT_MLX_EXPERT_READ_RUNS";
+    match value {
+        Some(value) if value == "prefill" => format!("prefill ({name} takes precedence)"),
+        Some(value) if value == "1" => format!("on ({name} takes precedence)"),
+        Some(value) => format!(
+            "off ({name} takes precedence; ignored: {:?} is not prefill or 1)",
+            value.to_string_lossy()
+        ),
+        None => "off".into(),
+    }
+}
+
+/// Whether the shared expert overlaps the CPU reads. For Flint, FIFI_FLINT_MLX_EXPERT_PIPELINE
+/// takes precedence when set.
+fn overlap_row(flint: bool) -> EffectiveSetting {
+    let legacy = flint
+        .then(|| std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE"))
+        .flatten();
+    match legacy {
+        Some(value) => row(
+            "mlx_overlap_expert_reads",
+            format!(
+                "{} (FIFI_FLINT_MLX_EXPERT_PIPELINE takes precedence)",
+                value == "1"
+            ),
+            Origin::Environment,
+        ),
+        None => mlx_switch("mlx_overlap_expert_reads", "FIFI_MLX_OVERLAP_EXPERT_READS"),
+    }
+}
+
+fn append_mlx_inputs(rows: &mut Vec<EffectiveSetting>, flint: bool) {
     rows.push(mlx_switch("mlx_auto_budget", "FIFI_MLX_AUTO_BUDGET"));
     rows.push(mlx_switch(
         "mlx_positioned_reads",
         "FIFI_MLX_POSITIONED_READS",
     ));
-    let read_runs = std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS");
-    rows.push(row(
-        "mlx_expert_read_runs",
-        if read_runs.as_deref().is_some_and(|value| value == "prefill") {
-            "prefill"
-        } else {
-            "off"
-        }
-        .into(),
-        env_origin(&read_runs),
-    ));
-    rows.push(mlx_switch(
-        "mlx_overlap_expert_reads",
-        "FIFI_MLX_OVERLAP_EXPERT_READS",
-    ));
+    rows.push(read_runs_row(flint));
+    rows.push(overlap_row(flint));
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     {
         use crate::family::mlx_budget;
@@ -324,7 +392,7 @@ pub(crate) fn flash_mlx_effective(
         mlx_switch("mlx_sparse_prefill", "FIFI_FLASH_NEXT_MLX_SPARSE_PREFILL"),
         mlx_switch("mlx_capacity_kv", "FIFI_FLASH_NEXT_MLX_CAPACITY_KV"),
     ];
-    append_mlx_inputs(&mut rows);
+    append_mlx_inputs(&mut rows, false);
     rows
 }
 
@@ -379,7 +447,7 @@ pub(crate) fn flint_effective_for_build(
             ),
             mlx_switch("mlx_compact_kv", "FIFI_FLINT_MLX_COMPACT_KV"),
         ];
-        append_mlx_inputs(&mut result);
+        append_mlx_inputs(&mut result, true);
         let _ = served;
         Ok(result)
     }
@@ -855,5 +923,31 @@ mod tests {
                 "{other:?}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_read_run_rows_name_ignored_values_and_the_flint_variable_that_wins() {
+        use std::ffi::OsStr;
+        assert_eq!(super::read_runs_text(None), "off");
+        assert_eq!(
+            super::read_runs_text(Some(OsStr::new("prefill"))),
+            "prefill"
+        );
+        assert_eq!(
+            super::read_runs_text(Some(OsStr::new("1"))),
+            "off (ignored: \"1\" is not prefill)"
+        );
+        assert_eq!(
+            super::legacy_read_runs_text(Some(OsStr::new("1"))),
+            "on (FIFI_FLINT_MLX_EXPERT_READ_RUNS takes precedence)"
+        );
+        assert_eq!(
+            super::legacy_read_runs_text(Some(OsStr::new("prefill"))),
+            "prefill (FIFI_FLINT_MLX_EXPERT_READ_RUNS takes precedence)"
+        );
+        let bad = super::legacy_read_runs_text(Some(OsStr::new("yes")));
+        assert!(
+            bad.starts_with("off (FIFI_FLINT_MLX_EXPERT_READ_RUNS takes precedence; ignored: ")
+        );
     }
 }
