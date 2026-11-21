@@ -8,6 +8,7 @@ pub struct IncrementalDecoder {
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
+    preserve_inkling_sections: bool,
 }
 
 impl IncrementalDecoder {
@@ -18,6 +19,14 @@ impl IncrementalDecoder {
             ids: Vec::new(),
             prefix: String::new(),
             prefix_index: 0,
+            preserve_inkling_sections: false,
+        }
+    }
+
+    pub(crate) fn inkling_chat(tok: &Tokenizer) -> Self {
+        Self {
+            preserve_inkling_sections: true,
+            ..Self::new(tok)
         }
     }
 
@@ -26,6 +35,20 @@ impl IncrementalDecoder {
             return Err(EngError::Checkpoint(
                 "token id outside tokenizer vocab".to_string(),
             ));
+        }
+        if self.preserve_inkling_sections {
+            use super::toolcall::{INKLING_END, INKLING_TEXT, INKLING_THINKING};
+            let section = match id {
+                200_004 => Some(INKLING_TEXT),
+                200_008 => Some(INKLING_THINKING),
+                200_010 => Some(INKLING_END),
+                _ => None,
+            };
+            if let Some(section) = section {
+                let mut tail = self.finish()?;
+                tail.push_str(section);
+                return Ok(tail);
+            }
         }
         let chunk = tokenizers::step_decode_stream(
             &self.tokenizer,

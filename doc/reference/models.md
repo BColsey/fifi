@@ -8,6 +8,8 @@
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
 | `gemma4` | Nemotron Bolt E4B | no | Bolt E4B only | A compatible Bolt E4B GGUF. Other Gemma4 checkpoints are not served. |
+| `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md) |
+| `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
@@ -32,6 +34,7 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | GGUF with F16, Q4_K, Q5_0, Q6_K and Q8_0 tensors | Qwen3.6 on CUDA |
 | EXL3 | Qwen3.6 and Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
+| Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini on Apple Silicon |
 
 ## Context limits
 
@@ -42,3 +45,4 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | Flint, Apple Silicon | 32,768 | 32,768 |
 | Flint, CUDA | 131,072 | 262,144 |
 | Nemotron 3.5 Super | set in config | |
+| Inkling 2 Mini, Apple Silicon | 1,024 | Configurable up to the model limit of 1,048,576, subject to admission |

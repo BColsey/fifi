@@ -1,8 +1,10 @@
 //! Import one selected expert set from bounded host pages and project in its stored format.
 
+use std::{collections::VecDeque, ops::Range, sync::Arc};
+
 use super::{
     EXPERTS, HIDDEN, InklingExpertPlan, InklingExpertProjection, InklingExpertSource,
-    InklingRoutes, TOP_K,
+    InklingRoutes, LAYERS, TOP_K,
 };
 use crate::{
     EngError,
@@ -10,7 +12,7 @@ use crate::{
         BoundedIndices, HostPages, MlxKernels, PackedPages, PageRange, QuantizationMode,
         QuantizationSpec, ResidentPackedWeight,
     },
-    tensor::{Dtype, ExecutionTensor, Tensor},
+    tensor::{Dtype, ExecutionTensor, OwnerKey, Tensor},
 };
 
 const MAX_ROUTED_ROWS: usize = u32::MAX as usize / HIDDEN / TOP_K;
@@ -133,9 +135,7 @@ pub struct MlxExpertStage {
 pub struct MlxRoutedExpertPlan<'a> {
     experts: InklingExpertPlan<'a>,
     routes: &'a InklingRoutes,
-    ids_offset: usize,
-    weight_offset: usize,
-    end: usize,
+    routing: RoutePages,
 }
 
 impl<'a> MlxRoutedExpertPlan<'a> {
@@ -145,62 +145,83 @@ impl<'a> MlxRoutedExpertPlan<'a> {
         layer: usize,
         routes: &'a InklingRoutes,
     ) -> Result<Self, EngError> {
-        let count = routes.expert_ids().len();
+        let page_size = HostPages::page_size();
+        RoutePages::validate(routes, page_size)?;
+        let experts = source.plan(layer, routes.expert_ids(), page_size)?;
+        Self::from_experts(experts, routes, page_size)
+    }
+
+    fn from_experts(
+        experts: InklingExpertPlan<'a>,
+        routes: &'a InklingRoutes,
+        page_size: usize,
+    ) -> Result<Self, EngError> {
+        let routing = RoutePages::new(routes, experts.staging_bytes(), page_size)?;
+        Ok(Self {
+            experts,
+            routes,
+            routing,
+        })
+    }
+
+    pub fn staging_bytes(&self) -> usize {
+        self.routing.end
+    }
+
+    pub fn expert_plan(&self) -> &InklingExpertPlan<'_> {
+        &self.experts
+    }
+}
+
+struct RoutePages {
+    ids_offset: usize,
+    weight_offset: usize,
+    end: usize,
+}
+
+impl RoutePages {
+    fn validate(routes: &InklingRoutes, page_size: usize) -> Result<(), EngError> {
         // Both packed projections have HIDDEN output values per route.
-        // Reject batches above the Metal kernel's element-index limit before I/O.
         if !(1..=MAX_ROUTED_ROWS).contains(&routes.rows()) {
             return Err(EngError::BadRequest(
                 "Inkling Metal staging requires a nonempty batch within native index limits".into(),
             ));
         }
-        let page_size = HostPages::page_size();
-        let experts = source.plan(layer, routes.expert_ids(), page_size)?;
-        let overflow = || EngError::MemoryPlan("Inkling route staging size overflows".into());
-        let route_bytes = count.checked_mul(4).ok_or_else(overflow)?;
-        let ids_offset = experts
-            .staging_bytes()
-            .checked_next_multiple_of(page_size)
-            .ok_or_else(overflow)?;
-        let weight_offset = ids_offset
-            .checked_add(route_bytes)
-            .and_then(|end| end.checked_next_multiple_of(page_size))
-            .ok_or_else(overflow)?;
-        let end = weight_offset
-            .checked_add(route_bytes)
-            .ok_or_else(overflow)?;
+        if page_size == 0 {
+            return Err(EngError::Backend {
+                operation: "Inkling route staging",
+                message: "the OS page size query failed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn new(routes: &InklingRoutes, start: usize, page_size: usize) -> Result<Self, EngError> {
+        let [ids_offset, weight_offset, end] =
+            super::route_page_offsets(start, routes.expert_ids().len(), page_size)?;
         Ok(Self {
-            experts,
-            routes,
             ids_offset,
             weight_offset,
             end,
         })
     }
 
-    pub fn staging_bytes(&self) -> usize {
-        self.end
-    }
-
-    pub fn expert_plan(&self) -> &InklingExpertPlan<'_> {
-        &self.experts
-    }
-
-    fn write_route_pages(&self, pages: &mut [u8]) -> [PageRange; 2] {
-        let count = self.routes.expert_ids().len();
+    fn write(
+        &self,
+        pages: &mut [u8],
+        routes: &InklingRoutes,
+        slots: impl IntoIterator<Item = u32>,
+    ) -> [PageRange; 2] {
+        let count = routes.expert_ids().len();
         let ids = &mut pages[self.ids_offset..self.ids_offset + count * 4];
-        for (word, slot) in ids
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(self.experts.compact_slots())
-        {
+        for (word, slot) in ids.as_chunks_mut::<4>().0.iter_mut().zip(slots) {
             *word = slot.to_le_bytes();
         }
         for (word, weight) in pages[self.weight_offset..self.end]
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
-            .zip(self.routes.weights())
+            .zip(routes.weights())
         {
             *word = weight.to_le_bytes();
         }
@@ -224,9 +245,31 @@ impl<'a> MlxRoutedExpertPlan<'a> {
 /// storage with BF16-rounded values at the checkpoint's projection boundaries.
 pub struct MlxRoutedExpertStage {
     experts: MlxExpertStage,
+    routing: StagedRoutes,
+}
+
+struct StagedRoutes {
     ids: BoundedIndices,
     weights: ExecutionTensor,
     rows: u32,
+}
+
+impl StagedRoutes {
+    fn new(
+        routing: Vec<ExecutionTensor>,
+        routes: &InklingRoutes,
+        expert_count: u32,
+    ) -> Result<Self, EngError> {
+        let [ids, weights] = routing.try_into().map_err(|_| EngError::Backend {
+            operation: "Inkling expert staging",
+            message: "native import returned a different route tensor count".into(),
+        })?;
+        Ok(Self {
+            ids: BoundedIndices::from_clamped(ids, expert_count),
+            weights,
+            rows: routes.rows() as u32,
+        })
+    }
 }
 
 impl MlxRoutedExpertStage {
@@ -238,20 +281,20 @@ impl MlxRoutedExpertStage {
         plan: &MlxRoutedExpertPlan<'_>,
         pages: &mut HostPages,
     ) -> Result<Self, EngError> {
+        Self::read_with_fill(kernels, plan, pages, |bytes| plan.experts.read_into(bytes))
+    }
+
+    fn read_with_fill(
+        kernels: &mut MlxKernels,
+        plan: &MlxRoutedExpertPlan<'_>,
+        pages: &mut HostPages,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), EngError>,
+    ) -> Result<Self, EngError> {
         let (experts, routing) =
-            MlxExpertStage::read_pages(kernels, &plan.experts, Some(plan), pages)?;
-        let [ids, weights] = routing.try_into().map_err(|_| EngError::Backend {
-            operation: "Inkling expert staging",
-            message: "native import returned a different route tensor count".into(),
-        })?;
-        // The selected expert plan supplies the compact IDs and their bound.
-        let ids = BoundedIndices::from_clamped(ids, plan.experts.gate_up().shape[0] as u32);
-        Ok(Self {
-            experts,
-            ids,
-            weights,
-            rows: plan.routes.rows() as u32,
-        })
+            MlxExpertStage::read_pages(kernels, &plan.experts, Some(plan), pages, fill)?;
+        let routing =
+            StagedRoutes::new(routing, plan.routes, plan.experts.gate_up().shape[0] as u32)?;
+        Ok(Self { experts, routing })
     }
 
     pub fn forward(
@@ -259,7 +302,8 @@ impl MlxRoutedExpertStage {
         kernels: &mut MlxKernels,
         input: &ExecutionTensor,
     ) -> Result<ExecutionTensor, EngError> {
-        self.forward_impl(kernels, input, None)
+        self.experts
+            .forward_routed(kernels, input, &self.routing, false)
     }
 
     /// Applies the layer's activation quantizer at both expert projections.
@@ -270,41 +314,47 @@ impl MlxRoutedExpertStage {
         kernels: &mut MlxKernels,
         input: &ExecutionTensor,
     ) -> Result<ExecutionTensor, EngError> {
-        let mode = self.experts.gate_up.weight.quantization().mode;
-        self.forward_impl(kernels, input, Some(mode))
+        self.experts
+            .forward_routed(kernels, input, &self.routing, true)
     }
+}
 
-    fn forward_impl(
+fn validate_routed_input(input: &ExecutionTensor, rows: u32) -> Result<(), EngError> {
+    if input.dtype() != Dtype::F32 || input.shape() != [rows, HIDDEN as u32] {
+        return Err(EngError::BadRequest(
+            "Inkling routed expert input must be F32 [tokens, hidden] for the staged routes".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl MlxExpertStage {
+    fn forward_routed(
         &self,
         kernels: &mut MlxKernels,
         input: &ExecutionTensor,
-        quantization: Option<QuantizationMode>,
+        routing: &StagedRoutes,
+        quantized: bool,
     ) -> Result<ExecutionTensor, EngError> {
         let width = HIDDEN as u32;
-        if input.dtype() != Dtype::F32 || input.shape() != [self.rows, width] {
-            return Err(EngError::BadRequest(
-                "Inkling routed expert input must be F32 [tokens, hidden] for the staged routes"
-                    .into(),
-            ));
-        }
+        validate_routed_input(input, routing.rows)?;
+        let quantization = quantized.then(|| self.gate_up.weight.quantization().mode);
         let input = match quantization {
             Some(mode) => kernels.inkling_quantized_rows(input, mode)?,
             None => input.share(),
         };
-        let input = if self.rows == 1 {
+        let input = if routing.rows == 1 {
             input
         } else {
             kernels.repeat(&input, TOP_K as u32, 0)?
         };
         let input = kernels.reshape(&input, &[input.shape()[0], 1, width])?;
-        let gate_up = self.experts.project_gate_up(kernels, &input, &self.ids)?;
-        let activation = kernels.inkling_activation(&gate_up, &self.weights, quantization)?;
-        let down = self.experts.project_down(kernels, &activation, &self.ids)?;
-        kernels.inkling_merge(&down, self.rows, TOP_K as u32)
+        let gate_up = self.project_gate_up(kernels, &input, &routing.ids)?;
+        let activation = kernels.inkling_activation(&gate_up, &routing.weights, quantization)?;
+        let down = self.project_down(kernels, &activation, &routing.ids)?;
+        kernels.inkling_merge(&down, routing.rows, TOP_K as u32)
     }
-}
 
-impl MlxExpertStage {
     /// Reads directly into reusable pages and imports both packed projections together.
     /// Create the plan with `HostPages::page_size()` alignment. Use F32 inputs for
     /// scaled NVFP4 projections. The caller maps routes with the plan's compact slots.
@@ -315,7 +365,7 @@ impl MlxExpertStage {
         plan: &InklingExpertPlan<'_>,
         pages: &mut HostPages,
     ) -> Result<Self, EngError> {
-        Ok(Self::read_pages(kernels, plan, None, pages)?.0)
+        Ok(Self::read_pages(kernels, plan, None, pages, |bytes| plan.read_into(bytes))?.0)
     }
 
     fn read_pages(
@@ -323,6 +373,7 @@ impl MlxExpertStage {
         plan: &InklingExpertPlan<'_>,
         routes: Option<&MlxRoutedExpertPlan<'_>>,
         pages: &mut HostPages,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), EngError>,
     ) -> Result<(Self, Vec<ExecutionTensor>), EngError> {
         kernels.check_ready()?;
         let page_size = HostPages::page_size();
@@ -344,7 +395,7 @@ impl MlxExpertStage {
                 "Inkling expert and route metadata exceed the staging arena".into(),
             ));
         }
-        plan.read_into(bytes)?;
+        fill(bytes)?;
         let mut scale_ranges = Vec::new();
         for projection in projections {
             if let Some(range) = normalize_multipliers(bytes, projection)? {
@@ -353,7 +404,11 @@ impl MlxExpertStage {
         }
         let scale_count = scale_ranges.len();
         if let Some(routes) = routes {
-            scale_ranges.extend(routes.write_route_pages(bytes));
+            scale_ranges.extend(routes.routing.write(
+                bytes,
+                routes.routes,
+                routes.experts.compact_slots().iter().copied(),
+            ));
         }
         let (weights, mut multipliers) =
             kernels.import_packed_pages(pages, &stages, &scale_ranges)?;
@@ -394,6 +449,287 @@ impl MlxExpertStage {
     ) -> Result<ExecutionTensor, EngError> {
         self.down.run(kernels, input, ids)
     }
+}
+
+/// Counters for visits through an opt-in Inkling expert cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MlxExpertCacheStats {
+    pub visits: u64,
+    pub fully_cached_visits: u64,
+    /// Hits, misses and evictions count distinct experts, not routed picks.
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    /// Logical shard bytes and ranges successfully read into staging.
+    pub read_bytes: u64,
+    pub read_ranges: u64,
+    pub staging_allocations: u64,
+    pub staging_fallback_syncs: u64,
+    pub cached_bytes: usize,
+}
+
+/// Byte-bounded LRU of packed checkpoint payloads indexed by physical layer and expert.
+/// On each visit, a single Metal staging arena receives cached slabs and coalesced
+/// missing reads in compact order. The budget covers retained raw expert payloads.
+pub struct MlxExpertCache {
+    source: Arc<InklingExpertSource>,
+    owner: OwnerKey,
+    max_bytes: usize,
+    entries: VecDeque<CachedExpert>,
+    denominators: [Option<[Option<[u8; 4]>; 2]>; LAYERS],
+    staging: Option<HostPages>,
+    stats: MlxExpertCacheStats,
+}
+
+struct CachedExpert {
+    layer: usize,
+    expert: usize,
+    bytes: Box<[u8]>,
+}
+
+impl MlxExpertCache {
+    pub fn new(kernels: &MlxKernels, source: Arc<InklingExpertSource>, max_bytes: usize) -> Self {
+        Self {
+            source,
+            owner: kernels.owner_key(),
+            max_bytes,
+            entries: VecDeque::new(),
+            denominators: [None; LAYERS],
+            staging: None,
+            stats: MlxExpertCacheStats::default(),
+        }
+    }
+
+    pub fn stats(&self) -> MlxExpertCacheStats {
+        self.stats
+    }
+
+    pub fn forward(
+        &mut self,
+        kernels: &mut MlxKernels,
+        layer: usize,
+        routes: &InklingRoutes,
+        input: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.forward_impl(kernels, layer, routes, input, false, None)
+    }
+
+    pub fn forward_quantized(
+        &mut self,
+        kernels: &mut MlxKernels,
+        layer: usize,
+        routes: &InklingRoutes,
+        input: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.forward_impl(kernels, layer, routes, input, true, None)
+    }
+
+    /// Runs one token to completion using a shared arena for consecutive calls.
+    /// The next input import synchronizes the device and flushes the prior visit's
+    /// retired page handles, so arena reuse ordinarily adds no synchronization.
+    pub fn forward_quantized_readback(
+        &mut self,
+        kernels: &mut MlxKernels,
+        layer: usize,
+        routes: &InklingRoutes,
+        input: &Tensor,
+    ) -> Result<Tensor, EngError> {
+        if routes.rows() != 1 || input.dtype() != Dtype::F32 || input.shape() != [1, HIDDEN as u32]
+        {
+            return Err(EngError::BadRequest(
+                "Inkling reusable staging requires one F32 token row".into(),
+            ));
+        }
+        if kernels.owner_key() != self.owner {
+            return Err(EngError::BadRequest(
+                "Inkling cache must belong to the active Metal owner".into(),
+            ));
+        }
+        let input = kernels.import_tensor(input)?;
+        let mut pages = match self.staging.take() {
+            Some(pages) => pages,
+            None => {
+                let bytes = self
+                    .source
+                    .one_token_staging_bytes(HostPages::page_size())?;
+                let bytes = usize::try_from(bytes).map_err(|_| {
+                    EngError::MemoryPlan("Inkling expert staging exceeds host limits".into())
+                })?;
+                let pages = HostPages::try_new(bytes)?;
+                self.stats.staging_allocations += 1;
+                pages
+            }
+        };
+        if pages.in_use() {
+            self.stats.staging_fallback_syncs += 1;
+            kernels.evaluate(&[&input])?;
+            if pages.in_use() {
+                return Err(EngError::Backend {
+                    operation: "Inkling expert staging",
+                    message: "previous visit still holds the staging arena after synchronization"
+                        .into(),
+                });
+            }
+        }
+        let output = self.forward_impl(kernels, layer, routes, &input, true, Some(&mut pages))?;
+        let result = kernels.readback(&output)?;
+        drop(output);
+        pages.release();
+        self.staging = Some(pages);
+        Ok(result)
+    }
+
+    fn forward_impl(
+        &mut self,
+        kernels: &mut MlxKernels,
+        layer: usize,
+        routes: &InklingRoutes,
+        input: &ExecutionTensor,
+        quantized: bool,
+        pages: Option<&mut HostPages>,
+    ) -> Result<ExecutionTensor, EngError> {
+        kernels.check_ready()?;
+        if kernels.owner_key() != self.owner || input.owner_key() != self.owner {
+            return Err(EngError::BadRequest(
+                "Inkling cache and input must belong to the active Metal owner".into(),
+            ));
+        }
+        let page_size = HostPages::page_size();
+        RoutePages::validate(routes, page_size)?;
+        validate_routed_input(input, routes.rows() as u32)?;
+        let selected = routes
+            .expert_ids()
+            .iter()
+            .fold(0_u128, |set, &expert| set | (1_u128 << expert));
+        let cached = self
+            .entries
+            .iter()
+            .filter(|entry| entry.layer == layer)
+            .fold(0_u128, |set, entry| set | (1_u128 << entry.expert));
+        let misses = selected & !cached;
+        let is_missing = |expert| misses & (1_u128 << expert) != 0;
+        let shared = self.denominators.get(layer).copied().flatten();
+        let source = Arc::clone(&self.source);
+        let plan = source.plan_with_missing(
+            layer,
+            routes.expert_ids(),
+            page_size,
+            is_missing,
+            shared.is_none(),
+        )?;
+        let plan = MlxRoutedExpertPlan::from_experts(plan, routes, page_size)?;
+        let mut temporary;
+        let pages = match pages {
+            Some(pages) => pages,
+            None => {
+                temporary = HostPages::try_new(plan.staging_bytes())?;
+                self.stats.staging_allocations += 1;
+                &mut temporary
+            }
+        };
+        self.stats.visits += 1;
+        self.stats.fully_cached_visits += u64::from(misses == 0);
+        self.stats.hits += u64::from((selected & cached).count_ones());
+        self.stats.misses += u64::from(misses.count_ones());
+        let stage = MlxRoutedExpertStage::read_with_fill(kernels, &plan, pages, |bytes| {
+            let plan = plan.expert_plan();
+            if plan.read_count() > 0 {
+                plan.read_into(bytes)?;
+                self.stats.read_bytes += plan.read_bytes() as u64;
+                self.stats.read_ranges += plan.read_count() as u64;
+            }
+
+            let denominator_ranges = [plan.gate_up(), plan.down()].map(|p| p.denominator.clone());
+            if let Some(shared) = shared {
+                for (range, value) in denominator_ranges.into_iter().zip(shared) {
+                    if let (Some(range), Some(value)) = (range, value) {
+                        bytes[range].copy_from_slice(&value);
+                    }
+                }
+            } else {
+                self.denominators[layer] = Some(
+                    denominator_ranges
+                        .map(|range| range.map(|range| bytes[range].try_into().unwrap())),
+                );
+            }
+
+            let experts = || {
+                (0..EXPERTS)
+                    .filter(|expert| selected & (1_u128 << expert) != 0)
+                    .enumerate()
+            };
+            for (slot, expert) in experts().filter(|&(_, expert)| !is_missing(expert)) {
+                let position = self
+                    .entries
+                    .iter()
+                    .position(|entry| entry.layer == layer && entry.expert == expert)
+                    .unwrap();
+                let entry = self.entries.remove(position).unwrap();
+                let mut stored = entry.bytes.as_ref();
+                for destination in expert_ranges(plan, slot) {
+                    let (part, rest) = stored.split_at(destination.len());
+                    bytes[destination].copy_from_slice(part);
+                    stored = rest;
+                }
+                self.entries.push_back(entry);
+            }
+            for (slot, expert) in experts().filter(|&(_, expert)| is_missing(expert)) {
+                self.retain_expert(layer, expert, plan, slot, bytes)?;
+            }
+            Ok(())
+        })?;
+        stage
+            .experts
+            .forward_routed(kernels, input, &stage.routing, quantized)
+    }
+
+    fn retain_expert(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        plan: &InklingExpertPlan<'_>,
+        slot: usize,
+        staging: &[u8],
+    ) -> Result<(), EngError> {
+        let len: usize = expert_ranges(plan, slot).map(|range| range.len()).sum();
+        if len > self.max_bytes {
+            return Ok(());
+        }
+        while self.stats.cached_bytes > self.max_bytes - len {
+            let entry = self.entries.pop_front().unwrap();
+            self.stats.cached_bytes -= entry.bytes.len();
+            self.stats.evictions += 1;
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| {
+            EngError::MemoryPlan("Inkling packed expert cache allocation failed".into())
+        })?;
+        for source in expert_ranges(plan, slot) {
+            bytes.extend_from_slice(&staging[source]);
+        }
+        self.stats.cached_bytes += len;
+        self.entries.push_back(CachedExpert {
+            layer,
+            expert,
+            bytes: bytes.into_boxed_slice(),
+        });
+        Ok(())
+    }
+}
+
+fn expert_ranges(plan: &InklingExpertPlan<'_>, slot: usize) -> impl Iterator<Item = Range<usize>> {
+    [plan.gate_up(), plan.down()]
+        .into_iter()
+        .flat_map(move |p| {
+            [Some(&p.weight), Some(&p.scale), p.amax.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(move |range| {
+                    let stride = range.len() / p.shape[0];
+                    let start = range.start + slot * stride;
+                    start..start + stride
+                })
+        })
 }
 
 struct Projection {
@@ -481,6 +817,174 @@ fn normalize_multipliers(
 mod tests {
     use super::*;
     use crate::kernels::PackedWeight;
+
+    #[test]
+    fn resident_expert_cache_uses_fresh_routes_and_evicts_by_layer() {
+        use std::io::Write;
+
+        use crate::family::inkling2_mini::{ExpertRegion, ProjectionRegions, WeightPlan};
+
+        let _lock = crate::native_test_lock();
+        let mut shard = tempfile::tempfile().unwrap();
+        let mut offset = 0_u64;
+        let mut tensor = |stride: usize, values: &[u8; 2]| {
+            let start = offset;
+            for expert in 0..EXPERTS {
+                shard.write_all(&vec![values[expert % 2]; stride]).unwrap();
+            }
+            offset += (EXPERTS * stride) as u64;
+            ExpertRegion::Slices {
+                start,
+                stride: stride as u64,
+            }
+        };
+        let mut projection = |rows: usize, cols: usize| ProjectionRegions {
+            rows,
+            cols,
+            weight: tensor(rows * cols / 2, &[0x22, 0x44]),
+            scale: tensor(rows * cols / 16, &[0x38, 0x38]),
+            // 0x3f3f3f3f encodes the same positive finite F32 in every slot.
+            amax: Some(tensor(4, &[0x3f, 0x3f])),
+            denominator: None,
+        };
+        let mut layers: Vec<_> = (0..2)
+            .map(|_| [projection(128, HIDDEN), projection(HIDDEN, 64)])
+            .collect();
+        let denominator = 1.0_f32.to_le_bytes();
+        shard.write_all(&denominator).unwrap();
+        for layer in &mut layers {
+            for projection in layer {
+                projection.denominator = Some(ExpertRegion::Shared(offset..offset + 4));
+            }
+        }
+        let source = Arc::new(InklingExpertSource {
+            shard,
+            len: offset + 4,
+            layers,
+            routers: Vec::new(),
+            weights: WeightPlan::default(),
+        });
+        let routes = |offset: usize, reverse: bool| {
+            let mut row = [-20.0; EXPERTS];
+            for i in 0..TOP_K {
+                row[offset + i] = if reverse {
+                    i as f32 / 4.0
+                } else {
+                    -(i as f32) / 2.0
+                };
+            }
+            InklingRoutes::from_logits(&[row], &[0.0; EXPERTS]).unwrap()
+        };
+        let first = routes(0, false);
+        let next = routes(0, true);
+        let changed_set = routes(1, false);
+        assert_ne!(first.expert_ids(), next.expert_ids());
+
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let host_input = Tensor::try_from_host(
+            Dtype::F32,
+            vec![1, HIDDEN as u32],
+            std::iter::once(1.0_f32)
+                .chain(std::iter::repeat_n(0.0, HIDDEN - 1))
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        )
+        .unwrap();
+        let input = kernels.import_tensor(&host_input).unwrap();
+        let page = HostPages::page_size();
+        let full = source.plan(0, first.expert_ids(), page).unwrap();
+        let new_expert = source.plan(0, &[TOP_K], page).unwrap();
+        let shared = 2 * size_of::<f32>();
+        let capacity = full.read_bytes() - shared;
+        let mut cache = MlxExpertCache::new(&kernels, Arc::clone(&source), capacity);
+
+        // Build all four graphs before readback, including graphs built before eviction.
+        let previous = cache.forward(&mut kernels, 0, &first, &input).unwrap();
+        let hit = cache.forward(&mut kernels, 0, &next, &input).unwrap();
+        let before = cache.stats();
+        let partial = cache
+            .forward(&mut kernels, 0, &changed_set, &input)
+            .unwrap();
+        let after = cache.stats();
+        assert_eq!(after.hits - before.hits, 7);
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(
+            after.read_bytes - before.read_bytes,
+            (new_expert.read_bytes() - shared) as u64
+        );
+        assert_eq!(
+            after.read_ranges - before.read_ranges,
+            (new_expert.read_count() - 2) as u64
+        );
+
+        let different_layer = cache
+            .forward(&mut kernels, 1, &changed_set, &input)
+            .unwrap();
+        assert_eq!(
+            cache.stats(),
+            MlxExpertCacheStats {
+                visits: 4,
+                fully_cached_visits: 1,
+                hits: 15,
+                misses: 17,
+                evictions: 9,
+                read_bytes: (full.read_bytes() * 2 + new_expert.read_bytes() - shared) as u64,
+                read_ranges: (full.read_count() * 2 + new_expert.read_count() - 2) as u64,
+                staging_allocations: 4,
+                staging_fallback_syncs: 0,
+                cached_bytes: capacity,
+            },
+        );
+
+        let bytes = |kernels: &mut MlxKernels, output: &ExecutionTensor| {
+            kernels
+                .readback(output)
+                .unwrap()
+                .host_bytes()
+                .unwrap()
+                .to_vec()
+        };
+        let control = |kernels: &mut MlxKernels, routes| {
+            let plan = MlxRoutedExpertPlan::new(&source, 0, routes).unwrap();
+            let mut pages = HostPages::try_new(plan.staging_bytes()).unwrap();
+            let stage = MlxRoutedExpertStage::read(kernels, &plan, &mut pages).unwrap();
+            let result = stage.forward(kernels, &input).unwrap();
+            bytes(kernels, &result)
+        };
+        let expected = control(&mut kernels, &next);
+        let expected_partial = control(&mut kernels, &changed_set);
+        assert_eq!(bytes(&mut kernels, &hit), expected);
+        assert_eq!(bytes(&mut kernels, &partial), expected_partial);
+        assert_eq!(bytes(&mut kernels, &different_layer), expected_partial);
+        assert_ne!(bytes(&mut kernels, &previous), expected);
+        assert_ne!(expected_partial, expected);
+
+        let mut disabled = MlxExpertCache::new(&kernels, Arc::clone(&source), capacity / TOP_K - 1);
+        let bypassed = disabled.forward(&mut kernels, 0, &next, &input).unwrap();
+        assert_eq!(disabled.stats().misses, TOP_K as u64);
+        assert_eq!(disabled.stats().read_bytes, full.read_bytes() as u64);
+        assert_eq!(disabled.stats().read_ranges, full.read_count() as u64);
+        assert_eq!(disabled.stats().cached_bytes, 0);
+        assert_eq!(bytes(&mut kernels, &bypassed), expected);
+        drop((previous, hit, partial, different_layer, bypassed));
+
+        let mut reuse = MlxExpertCache::new(&kernels, source, capacity);
+        for routes in [&first, &next, &changed_set] {
+            let refreshed = reuse
+                .forward_quantized_readback(&mut kernels, 0, routes, &host_input)
+                .unwrap();
+            let layout = MlxRoutedExpertPlan::new(&reuse.source, 0, routes).unwrap();
+            let mut pages = HostPages::try_new(layout.staging_bytes()).unwrap();
+            let stage = MlxRoutedExpertStage::read(&mut kernels, &layout, &mut pages).unwrap();
+            let reference = stage.forward_quantized(&mut kernels, &input).unwrap();
+            assert_eq!(
+                refreshed.host_bytes().unwrap(),
+                bytes(&mut kernels, &reference)
+            );
+        }
+        assert_eq!(reuse.stats().staging_allocations, 1);
+        assert_eq!(reuse.stats().staging_fallback_syncs, 0);
+    }
 
     #[test]
     fn inkling_quantizers_match_scale_and_midpoint_cases() {

@@ -11,14 +11,22 @@ use super::{
 };
 use crate::{EngError, checkpoint_json::UniqueValue, weights::read_stored_header};
 
+pub mod attention;
+pub mod dense;
+pub(crate) mod factory;
 pub mod gguf_metadata;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod mlx;
 mod routes;
+pub mod sconv;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod text;
 pub use routes::InklingRoutes;
 
 pub(crate) const FAMILY: &str = "inkling2_mini";
 pub(crate) const MODEL_TYPE: &str = "inkling2_loop";
+pub(crate) const DEFAULT_CONTEXT: u32 = 1024;
+const UNPADDED_VOCAB: usize = 200_058;
 const SHARD: &str = "model-00001-of-00001.safetensors";
 const LAYERS: usize = 24;
 const VISITS: usize = 48;
@@ -57,6 +65,18 @@ struct TextConfig {
     num_attention_heads: usize,
     num_key_value_heads: u64,
     head_dim: u64,
+    d_rel: u64,
+    rel_extent: u32,
+    q_bias: bool,
+    o_bias: bool,
+    log_scaling_n_floor: u32,
+    log_scaling_alpha: f32,
+    rms_norm_eps: f32,
+    use_value_norm_no_gamma: bool,
+    qk_l2_clip_threshold: f32,
+    rel_l2_clip_threshold: f32,
+    final_logit_softcapping: f32,
+    attn_res_normalize_values: bool,
     swa_num_attention_heads: usize,
     swa_num_key_value_heads: u64,
     swa_head_dim: u64,
@@ -127,11 +147,23 @@ fn validate_config(bytes: &[u8]) -> Result<(), EngError> {
         || text.num_attention_heads != QUERY_HEADS
         || text.num_key_value_heads != KV_HEADS
         || text.head_dim != HEAD_DIM
+        || text.d_rel != 16
+        || text.rel_extent != WINDOW
+        || text.q_bias
+        || text.o_bias
+        || text.log_scaling_n_floor != 8192
+        || text.log_scaling_alpha != 0.1
+        || text.rms_norm_eps != 1e-6
+        || !text.use_value_norm_no_gamma
+        || text.qk_l2_clip_threshold != 22.627_417
+        || text.rel_l2_clip_threshold != 8.0
+        || text.final_logit_softcapping != 30.0
+        || !text.attn_res_normalize_values
         || text.swa_num_attention_heads != QUERY_HEADS
         || text.swa_num_key_value_heads != KV_HEADS
         || text.swa_head_dim != HEAD_DIM
         || text.vocab_size != 201_024
-        || text.unpadded_vocab_size != 200_058
+        || text.unpadded_vocab_size != UNPADDED_VOCAB
         || text.model_max_length != MAX_CONTEXT
         || !text.local_layer_ids.into_iter().eq(local)
         || text.sliding_window_size != WINDOW
@@ -198,7 +230,8 @@ struct IndexMetadata {
 
 #[derive(Default)]
 struct WeightPlan {
-    text_resident: u64,
+    text_bytes: u64,
+    embedding_bytes: u64,
     vision: u64,
     expert_storage: [u64; LAYERS],
 }
@@ -354,6 +387,17 @@ impl InklingExpertSource {
         experts: &[usize],
         alignment: usize,
     ) -> Result<InklingExpertPlan<'_>, EngError> {
+        self.plan_with_missing(layer, experts, alignment, |_| true, true)
+    }
+
+    fn plan_with_missing(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        alignment: usize,
+        is_missing: impl Fn(usize) -> bool,
+        read_shared: bool,
+    ) -> Result<InklingExpertPlan<'_>, EngError> {
         let [gate_up, down] = self.layers.get(layer).ok_or_else(|| {
             EngError::BadRequest(format!("Inkling expert layer {layer} is out of range"))
         })?;
@@ -387,28 +431,35 @@ impl InklingExpertSource {
                 .checked_next_multiple_of(alignment)
                 .ok_or_else(staging_overflow)?;
             staging_bytes = start;
-            let mut push = |source: Range<u64>| -> Result<(), EngError> {
+            let mut place = |source: Range<u64>, read: bool| -> Result<(), EngError> {
                 let bytes =
                     usize::try_from(source.end - source.start).map_err(|_| staging_overflow())?;
                 let end = staging_bytes
                     .checked_add(bytes)
                     .ok_or_else(staging_overflow)?;
-                reads.push(ExpertRead {
-                    offset: source.start,
-                    destination: staging_bytes..end,
-                });
+                if read {
+                    reads.push(ExpertRead {
+                        offset: source.start,
+                        destination: staging_bytes..end,
+                    });
+                }
                 staging_bytes = end;
                 Ok(())
             };
             match region {
                 ExpertRegion::Slices { start, stride } => {
-                    for run in sorted.chunk_by(|&left, &right| left + 1 == right) {
+                    for run in sorted.chunk_by(|&left, &right| {
+                        left + 1 == right && is_missing(left) == is_missing(right)
+                    }) {
                         let first = run[0] as u64;
                         let end = first + run.len() as u64;
-                        push((start + first * stride)..(start + end * stride))?;
+                        place(
+                            (start + first * stride)..(start + end * stride),
+                            is_missing(run[0]),
+                        )?;
                     }
                 }
-                ExpertRegion::Shared(range) => push(range.clone())?,
+                ExpertRegion::Shared(range) => place(range.clone(), read_shared)?,
             }
             Ok(start..staging_bytes)
         };
@@ -439,6 +490,31 @@ impl InklingExpertSource {
             alignment,
         })
     }
+}
+
+/// Offsets and unrounded length of the compact U32 expert IDs and F32 gates.
+fn route_page_offsets(
+    weights_end: usize,
+    routes: usize,
+    page_size: usize,
+) -> Result<[usize; 3], EngError> {
+    if !page_size.is_power_of_two() {
+        return Err(EngError::BadRequest(
+            "Inkling route staging requires a power-of-two page size".into(),
+        ));
+    }
+    let route_bytes = routes.checked_mul(4).ok_or_else(staging_overflow)?;
+    let ids = weights_end
+        .checked_next_multiple_of(page_size)
+        .ok_or_else(staging_overflow)?;
+    let gates = ids
+        .checked_add(route_bytes)
+        .and_then(|end| end.checked_next_multiple_of(page_size))
+        .ok_or_else(staging_overflow)?;
+    let end = gates
+        .checked_add(route_bytes)
+        .ok_or_else(staging_overflow)?;
+    Ok([ids, gates, end])
 }
 
 fn staging_overflow() -> EngError {
@@ -644,7 +720,10 @@ fn weight_plan(
                 plan.expert_storage[layer] += bytes;
                 expert_tensors += 1;
             } else {
-                plan.text_resident += bytes;
+                plan.text_bytes += bytes;
+                if key == "model.llm.embed.weight" {
+                    plan.embedding_bytes = bytes;
+                }
             }
         } else {
             return Err(checkpoint_error(format!(
@@ -661,6 +740,7 @@ fn weight_plan(
 #[derive(Debug, PartialEq, Eq)]
 struct StatePlan {
     kv: u64,
+    kv_index: u64,
     convolution: u64,
     local: usize,
     full: usize,
@@ -688,15 +768,25 @@ fn state_plan(context: u32) -> Result<StatePlan, EngError> {
     // output convolutions each keep hidden channels. All four retain taps - 1 rows.
     let channels = 2 * (KV_HEADS * HEAD_DIM + HIDDEN as u64);
     let convolution = VISITS as u64 * channels * (CONV_TAPS - 1) * 2;
+    let pointer = std::mem::size_of::<usize>() as u64;
+    let kv_index = pointer
+        * (local as u64 * u64::from(context.min(WINDOW).next_power_of_two())
+            + full as u64 * u64::from(context.next_power_of_two()));
     Ok(StatePlan {
         kv,
+        kv_index,
         convolution,
         local,
         full,
     })
 }
 
-pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecision>, EngError> {
+pub(crate) struct HeaderPlan {
+    pub(crate) decisions: Vec<PlanDecision>,
+    pub(crate) budget_fit: Option<bool>,
+}
+
+pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<HeaderPlan, EngError> {
     let source = InklingExpertSource::open(dir)?;
     let mut routed_per_layer = [0; LAYERS];
     let mut coalesced_reads = [0; LAYERS];
@@ -710,7 +800,7 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
         scattered_reads[layer] = source.plan(layer, &spread, 1)?.read_count();
     }
     let weights = &source.weights;
-    let context = context.unwrap_or(MAX_CONTEXT);
+    let context = context.unwrap_or(DEFAULT_CONTEXT);
     let state = state_plan(context)?;
     let routed_peak = routed_per_layer.into_iter().max().expect("24 layers");
     let schedule = visits();
@@ -733,7 +823,10 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
         alternatives: Vec::new(),
         fixed_at,
     };
-    Ok(vec![
+    let page_size = mac_stage_page_size();
+    let staging_bytes = source.one_token_staging_bytes(page_size)?;
+    let resident = source.projected_resident_bytes();
+    let mut rows = vec![
         row(
             "decoder loop",
             format!(
@@ -745,7 +838,7 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
             "text weight inventory",
             format!(
                 "{} B non-expert text, {} B routed experts (20 NVFP4 layers, 4 MXFP8)",
-                weights.text_resident, expert_storage
+                weights.text_bytes, expert_storage
             ),
             PlanFixity::Load,
         ),
@@ -757,8 +850,8 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
         row(
             "text state",
             format!(
-                "{} B BF16 KV at {context} tokens ({} full, {} local visits), {} B BF16 convolution history",
-                state.kv, state.full, state.local, state.convolution
+                "{} B BF16 KV at {context} tokens ({} full, {} local visits), {} B KV row indices, {} B BF16 convolution history",
+                state.kv, state.full, state.local, state.kv_index, state.convolution
             ),
             PlanFixity::Start,
         ),
@@ -784,7 +877,132 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
             ),
             PlanFixity::Load,
         ),
-    ])
+        row(
+            "Apple Silicon streamed text plan",
+            format!(
+                "{resident} B upper bound for host-resident non-expert weights, {staging_bytes} B for one Metal-accessible host staging arena, {expert_storage} B of local checkpoint-backed expert payload"
+            ),
+            PlanFixity::Load,
+        ),
+    ];
+    let (budget, budget_fit) = mlx_budget_row(resident, staging_bytes, &state)?;
+    rows.push(budget);
+    Ok(HeaderPlan {
+        decisions: rows,
+        budget_fit,
+    })
+}
+
+impl InklingExpertSource {
+    /// Peak one-token staging arena for all physical layers. Expert choice
+    /// changes the disk ranges; each layer’s selected tensor widths are fixed.
+    pub fn one_token_staging_bytes(&self, page_size: usize) -> Result<u64, EngError> {
+        let experts: [usize; TOP_K] = std::array::from_fn(|id| id);
+        (0..self.layers.len()).try_fold(0, |peak, layer| {
+            let plan = self.plan(layer, &experts, page_size)?;
+            let [_, _, end] = route_page_offsets(plan.staging_bytes(), TOP_K, page_size)?;
+            let allocation = end
+                .checked_next_multiple_of(page_size)
+                .ok_or_else(staging_overflow)?;
+            Ok(peak.max(allocation as u64))
+        })
+    }
+}
+
+fn mac_stage_page_size() -> usize {
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    return crate::kernels::HostPages::page_size();
+
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    return 16_384; // Apple Silicon staging projection without a Metal runtime.
+}
+
+fn base_charges(resident: u64, staging: u64, state: &StatePlan) -> [(&'static str, u64); 5] {
+    [
+        ("projected_resident_text_bytes", resident),
+        ("bf16_kv_bytes", state.kv),
+        ("kv_row_index_bytes", state.kv_index),
+        ("bf16_convolution_history_bytes", state.convolution),
+        ("one_token_shared_staging_bytes", staging),
+    ]
+}
+
+impl InklingExpertSource {
+    fn projected_resident_bytes(&self) -> u64 {
+        // Dense matrices and routers retain their checkpoint dtype on the host.
+        // The embedding reads one row per token and retains no full matrix.
+        self.weights.text_bytes - self.weights.embedding_bytes
+    }
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn working_set_remaining(
+    device: crate::family::mlx_budget::DeviceBudget,
+    charges: &[(&'static str, u64)],
+) -> Result<u64, EngError> {
+    let mut charges = charges.to_vec();
+    charges.push((
+        "pressure_margin_bytes",
+        crate::family::mlx_budget::PRESSURE_MARGIN,
+    ));
+    device.remaining("Inkling 2 Mini", &charges)
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
+    let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? else {
+        return Ok(0);
+    };
+    let source = InklingExpertSource::open(dir)?;
+    let staging = source.one_token_staging_bytes(mac_stage_page_size())?;
+    let state = state_plan(context)?;
+    let charges = base_charges(source.projected_resident_bytes(), staging, &state);
+    let remaining = working_set_remaining(device, &charges)?;
+    eprintln!("Inkling 2 Mini: {device} {charges:?} expert_cache_budget_bytes={remaining}");
+    usize::try_from(remaining).map_err(|_| staging_overflow())
+}
+
+fn mlx_budget_row(
+    resident: u64,
+    staging: u64,
+    state: &StatePlan,
+) -> Result<(PlanDecision, Option<bool>), EngError> {
+    let charges = base_charges(resident, staging, state);
+    let plan = format!(
+        "{} B projected working set for the listed tensor and staging charges",
+        charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
+    );
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    let (chosen, fit) = if let Some(device) =
+        crate::family::mlx_budget::DeviceBudget::detect_with_default(
+            factory::check_backend().is_ok(),
+        )? {
+        match working_set_remaining(device, &charges) {
+            Ok(remaining) => (
+                format!(
+                    "{plan}; {device}; up to {remaining} B for optional shared-memory expert cache"
+                ),
+                Some(true),
+            ),
+            Err(error) => (format!("{plan}; {}", error.describe()), Some(false)),
+        }
+    } else {
+        (format!("{plan}; automatic Metal budget disabled"), None)
+    };
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    let (chosen, fit) = (
+        format!("{plan}; Metal budget unavailable in this build"),
+        None,
+    );
+    Ok((
+        PlanDecision {
+            name: "Apple Silicon working set".into(),
+            chosen,
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Load,
+        },
+        fit,
+    ))
 }
 
 #[cfg(test)]

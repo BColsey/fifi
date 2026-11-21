@@ -286,6 +286,8 @@ pub(super) fn admit(
         engine: entry.id.clone(),
     };
     log.set_id(&head.id);
+    let is_inkling_chat = matches!(&reply, ReplyMode::Chat { .. })
+        && entry.bundle.tool_grammar() == ToolGrammar::Inkling;
     let parser = match reply {
         ReplyMode::Chat { start, tools } => ReplyParser::with_grammar(
             start,
@@ -295,7 +297,11 @@ pub(super) fn admit(
         ),
         ReplyMode::Raw => ReplyParser::raw(),
     };
-    let decoder = IncrementalDecoder::new(entry.bundle.tokenizer());
+    let decoder = if is_inkling_chat {
+        IncrementalDecoder::inkling_chat(entry.bundle.tokenizer())
+    } else {
+        IncrementalDecoder::new(entry.bundle.tokenizer())
+    };
     let mut sampler = Sampler::from_entropy(sampling);
     let mut trace = None;
     if sample_trace {
@@ -413,7 +419,10 @@ pub(crate) fn warm_flag_on() -> bool {
 fn reply_start(bundle: &TokenizerBundle, prompt: &[u32]) -> Start {
     // The exact Flint template appends only <|assistant|>, never an open think block.
     // Tail decoding skips that special role token and could expose a historical <think>.
-    if bundle.tool_grammar() == ToolGrammar::Flint {
+    if matches!(
+        bundle.tool_grammar(),
+        ToolGrammar::Flint | ToolGrammar::Inkling
+    ) {
         return Start::Content;
     }
     const OPEN: &str = "<think>\n";

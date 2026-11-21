@@ -56,10 +56,16 @@ impl ChatTemplate {
         env.set_unknown_method_callback(unknown_method);
         // The engine loads one template per process. The owned source keeps the
         // environment free of lifetimes without leaking the bytes.
-        env.add_template_owned("chat", without_generation_tags(&normalize_newlines(source)))
-            .map_err(|error| {
-                EngError::Checkpoint(format!("chat_template.jinja syntax error: {error}"))
-            })?;
+        let grammar = ToolGrammar::for_template(source);
+        let normalized = normalize_newlines(source);
+        let template = if grammar == ToolGrammar::Inkling {
+            inkling_template(&normalized)
+        } else {
+            without_generation_tags(&normalized)
+        };
+        env.add_template_owned("chat", template).map_err(|error| {
+            EngError::Checkpoint(format!("chat_template.jinja syntax error: {error}"))
+        })?;
         let demote_mid_system = demotion_fixes_mid_system(&env);
         // Only the pinned Qwen3.6 template is eligible for the replay
         // default: it is the one template with an A/B. Other templates that
@@ -88,7 +94,7 @@ impl ChatTemplate {
         }
         Ok(Self {
             env,
-            grammar: ToolGrammar::for_template(source),
+            grammar,
             chatml_delimiters: source.contains("<|im_start|>") && source.contains("<|im_end|>"),
             demote_mid_system,
             think_replay,
@@ -236,6 +242,14 @@ fn normalize_newlines(source: &str) -> String {
     source.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+// Hugging Face's generation blocks annotate assistant spans for training. MiniJinja
+// only needs the rendered text. Substitute a true block with the same whitespace controls.
+fn inkling_template(source: &str) -> String {
+    source
+        .replace("{%- generation -%}", "{%- if true -%}")
+        .replace("{%- endgeneration -%}", "{%- endif -%}")
+}
+
 /// Two probe renders at load decide whether demoting a mid-list system
 /// message to a marked user turn fixes this template: [user, system, user]
 /// must be rejected by the template itself, and the demoted candidate
@@ -364,6 +378,31 @@ fn build_context(
     let rows = messages
         .as_array_mut()
         .expect("message_context returns an array");
+    if template.grammar == ToolGrammar::Inkling {
+        if !tools.is_empty()
+            || msgs
+                .iter()
+                .any(|msg| !msg.tool_calls.is_empty() || matches!(msg.role, super::Role::Tool))
+        {
+            return Err(EngError::BadRequest(
+                "Inkling 2 Mini experimental serving accepts text chat without tools".into(),
+            ));
+        }
+        for row in rows.iter_mut() {
+            if row["role"] == "developer" {
+                row["role"] = serde_json::json!("system");
+            }
+        }
+        match thinking {
+            Thinking::Default => {}
+            Thinking::On => {
+                context.insert("reasoning_effort".into(), serde_json::json!("high"));
+            }
+            Thinking::Off => {
+                context.insert("reasoning_effort".into(), serde_json::json!("none"));
+            }
+        }
+    }
     if template.grammar == ToolGrammar::Qwen {
         // Legacy clients have always rendered developer messages as system messages and
         // ignored reasoning replay. Keep that contract unless think replay is enabled:
@@ -604,5 +643,25 @@ mod limit_tests {
             .render(&messages, &[], Thinking::Default)
             .expect("renders");
         assert!(text.contains("turn 4999"));
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    use super::*;
+
+    #[test]
+    fn inkling_generation_annotations_keep_their_whitespace_controls() {
+        let source = "a \n{%- generation -%}\n {{ value }} \n{%- endgeneration -%}\n b";
+        let mut env = minijinja::Environment::new();
+        assert!(env.add_template("original", source).is_err());
+        let rewritten = inkling_template(source);
+        env.add_template("rewritten", &rewritten).unwrap();
+        let text = env
+            .get_template("rewritten")
+            .unwrap()
+            .render(minijinja::context!(value => "answer"))
+            .unwrap();
+        assert_eq!(text, "aanswerb");
     }
 }

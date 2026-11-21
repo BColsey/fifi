@@ -1,4 +1,4 @@
-//! `enginesrv serve --model <dir>`: the simplified startup.
+//! `enginesrv serve --model <path>`: the simplified startup.
 //!
 //! A front end, not a second loader. Discovery reads the directory the
 //! way `capability::inspect` already does; the chosen settings go into
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::capability::probe::{CompiledBackends, HardwareFacts};
 use crate::capability::{Probe, describe_error, inspect, preflight};
+use crate::family::inkling2_mini;
 use crate::server::config::{Config, EngineConfig, StartupError};
 
 /// The families `--model` can identify and start. One row per
@@ -35,6 +36,7 @@ pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
         crate::family::qwen::qwen36::factory::DENSE_FAMILY,
         crate::family::QWEN3_8_27B_DENSE.model_types,
     ),
+    (inkling2_mini::FAMILY, &[inkling2_mini::MODEL_TYPE]),
 ];
 
 /// Whether a family's engine entry carries the Qwen3.6 options block (the Qwen3.6 families);
@@ -42,6 +44,10 @@ pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
 fn uses_qwen36_options(family: &str) -> bool {
     DETECTABLE_FAMILIES.iter().any(|(name, _)| *name == family)
 }
+
+/// The families that a GGUF `general.architecture` identifies when the directory has no
+/// `config.json`.
+const ARCHITECTURE_FAMILIES: &[(&str, &str)] = crate::server::config::GGUF_ARCHITECTURE_FAMILIES;
 
 /// The listen address of a simplified startup, matching the shipped
 /// configurations (loopback; `listen_address` rejects anything else).
@@ -116,13 +122,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
     }
     if parsed.model_dir.as_os_str().is_empty() {
         return Err(StartupError(format!(
-            "serve --model: --model <dir|file.gguf|name> is required\n{USAGE}"
+            "serve --model: --model <path> is required\n{USAGE}"
         )));
     }
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <dir|file.gguf|name> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve --model <path> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -153,7 +159,7 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
-        .unwrap_or_else(|| default_tokenizer_dir(&args.model_dir));
+        .unwrap_or_else(|| crate::family::gguf_select::directory_of(&args.model_dir));
     let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
@@ -179,7 +185,15 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
             }
         }
     }
-    let weight_format = select_weight_format(has_gguf, has_safetensors);
+    let weight_format = if family == inkling2_mini::FAMILY {
+        if !inspection.has_inkling_safetensors() && inspection.inkling_ggufs().next().is_some() {
+            "gguf"
+        } else {
+            "safetensors"
+        }
+    } else {
+        select_weight_format(has_gguf, has_safetensors)
+    };
 
     let options = crate::family::qwen::qwen36::settings::Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
@@ -358,7 +372,8 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
 /// Assemble the in-memory `Config` — the document a `--config` file
 /// would carry, headed for the identical serve path.
 fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
-    let simplified = uses_qwen36_options(&discovered.family);
+    let inkling = discovered.family == inkling2_mini::FAMILY;
+    let simplified = !inkling && uses_qwen36_options(&discovered.family);
     let mut config = bare_config(args, &discovered.family);
     let engine = &mut config.engines[0];
     engine.tokenizer_dir = discovered.tokenizer_dir.clone();
@@ -366,16 +381,12 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         engine.id = "q36".to_string();
         engine.qwen36 = Some(discovered.options.clone());
     }
+    if inkling {
+        engine.id = "inkling".to_string();
+        engine.context_limit = args.context_limit;
+    }
     config
 }
-
-/// The configuration a supervised worker reads for a family that has
-/// no simplified startup (Flash-Next): the bare entry a `--config`
-/// file carries, with the family named rather than detected and every
-/// option left to its default. `serve --model` still refuses such a
-/// family on its own, because a command line has nothing to name it
-/// by.
-pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
     Config {
         listen: args
             .listen
@@ -441,17 +452,22 @@ pub(crate) fn config_json(config: &Config) -> String {
             q36.insert("kv_dtype".into(), json!(value));
         }
     }
+    let mut entry = json!({
+        "id": engine.id,
+        "family": engine.family,
+        "model_dir": engine.model_dir.display().to_string(),
+        "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
+    });
+    if engine.qwen36.is_some() {
+        entry["qwen36"] = json!(q36);
+    } else if let Some(context_limit) = engine.context_limit {
+        entry["context_limit"] = json!(context_limit);
+    }
     let document = json!({
         "listen": config.listen,
         "api_key_env": config.api_key_env,
         "prefix_reuse": config.prefix_reuse,
-        "engines": [{
-            "id": engine.id,
-            "family": engine.family,
-            "model_dir": engine.model_dir.display().to_string(),
-            "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
-            "qwen36": q36,
-        }],
+        "engines": [entry],
     });
     serde_json::to_string_pretty(&document).expect("the built config is valid JSON")
 }
@@ -545,19 +561,25 @@ fn select_family(
             detectable_names()
         )));
     }
+    // The explicitly chosen file is authoritative even in a mixed model directory.
+    if args.model_dir.is_file() && inspection.inkling_ggufs().next().is_some() {
+        return Ok(inkling2_mini::FAMILY.into());
+    }
     let mut matches: Vec<&str> = DETECTABLE_FAMILIES
         .iter()
         .filter(|(_, types)| {
             types
                 .iter()
                 .any(|t| inspection.config_model_types.iter().any(|seen| seen == t))
+                || (types.contains(&inkling2_mini::MODEL_TYPE)
+                    && inspection.inkling_ggufs().next().is_some())
         })
         .map(|(name, _)| *name)
         .collect();
     // A directory with no `config.json` model_type is identified by the architecture its weights
     // file declares.
     if matches.is_empty() {
-        matches = crate::server::config::GGUF_ARCHITECTURE_FAMILIES
+        matches = ARCHITECTURE_FAMILIES
             .iter()
             .filter(|(architecture, _)| {
                 inspection
@@ -576,27 +598,9 @@ fn select_family(
                 .iter()
                 .filter_map(|fact| fact.architecture.as_deref())
                 .collect();
-            if inspection.config_model_types.is_empty()
-                && seen.is_empty()
-                && !inspection.gguf_files.is_empty()
-            {
-                return Err(StartupError(format!(
-                    "serve --model: {} names no general.architecture, so no family can be chosen from it; known architectures: {}; pass --family (detectable families: {}) or write a --config file",
-                    inspection.weights_path.display(),
-                    crate::server::config::known_gguf_architectures(),
-                    detectable_names()
-                )));
-            }
             if inspection.config_model_types.is_empty() && !seen.is_empty() {
-                let why: String = seen
-                    .iter()
-                    .filter_map(|architecture| {
-                        crate::server::config::gguf_architecture_note(architecture)
-                    })
-                    .map(|note| format!(" ({note})"))
-                    .collect();
                 return Err(StartupError(format!(
-                    "serve --model: no family serves the GGUF architecture {}{why}; known architectures: {}; pass --family or write a --config file",
+                    "serve --model: no family serves the GGUF architecture {}; known architectures: {}; pass --family or write a --config file",
                     seen.join(", "),
                     crate::server::config::known_gguf_architectures()
                 )));
@@ -699,6 +703,92 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.resize(32, 0);
         bytes
+    }
+
+    fn gguf_arch(arch: &str) -> Vec<u8> {
+        let mut bytes = minimal_gguf();
+        bytes.truncate(24);
+        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend((key.len() as u64).to_le_bytes());
+        bytes.extend(key);
+        bytes.extend(8u32.to_le_bytes());
+        bytes.extend((arch.len() as u64).to_le_bytes());
+        bytes.extend(arch.as_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes
+    }
+
+    #[test]
+    fn discover_inkling_gguf_text_with_optional_sidecars() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        for (filename, arch) in [
+            ("mini.gguf", "inkling2"),
+            ("mmproj.gguf", "clip"),
+            ("draft.gguf", "dflash"),
+        ] {
+            std::fs::write(model.path().join(filename), gguf_arch(arch)).unwrap();
+        }
+        let found = discover(&ModelServeArgs {
+            model_dir: model.path().into(),
+            tokenizer_dir: Some(tokenizer.path().into()),
+            ..ModelServeArgs::default()
+        })
+        .unwrap();
+        assert_eq!(found.family, "inkling2_mini");
+        assert_eq!(found.weight_format, "gguf");
+        assert_eq!(found.tokenizer_dir, tokenizer.path());
+    }
+
+    #[test]
+    fn explicit_inkling_gguf_selects_one_file_and_resolves_the_tokenizer() {
+        let model = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let fork = model.path().join("fork.gguf");
+        let mainline = model.path().join("mainline.gguf_file");
+        std::fs::write(&fork, gguf_arch("inkling2")).unwrap();
+        std::fs::write(&mainline, gguf_arch("inkling2_loop")).unwrap();
+        std::fs::write(model.path().join("malformed-draft.gguf"), b"GGUF-broken").unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"qwen3_5_moe"}"#,
+        )
+        .unwrap();
+        std::fs::write(model.path().join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(external.path().join("chat_template.jinja"), b"template").unwrap();
+
+        for (path, tokenizer_dir, expected_dir, basename, present) in [
+            (&fork, None, model.path(), "fork.gguf", "tokenizer.json"),
+            (
+                &mainline,
+                Some(external.path().to_owned()),
+                external.path(),
+                "mainline.gguf_file",
+                "chat_template.jinja",
+            ),
+        ] {
+            let found = discover(&ModelServeArgs {
+                model_dir: path.clone(),
+                tokenizer_dir,
+                ..ModelServeArgs::default()
+            })
+            .unwrap();
+            assert_eq!(found.family, "inkling2_mini");
+            assert_eq!(found.weight_format, "gguf");
+            assert_eq!(found.tokenizer_dir, expected_dir);
+
+            let report = crate::capability::inspect::inspect(path, &found.tokenizer_dir).unwrap();
+            assert_eq!(report.model_dir, *path);
+            assert_eq!(report.files.len(), 1);
+            assert_eq!(report.gguf_files.len(), 1);
+            assert_eq!(report.gguf_files[0].file, basename);
+            assert!(report.gguf_errors.is_empty(), "{:?}", report.gguf_errors);
+            assert_eq!(report.tokenizer_present, [present]);
+        }
+        let directory = crate::capability::inspect::inspect(model.path(), model.path()).unwrap();
+        assert_eq!(directory.inkling_ggufs().count(), 2);
+        assert_eq!(directory.gguf_errors.len(), 1);
     }
 
     fn copy_tokenizer(dir: &Path) {
