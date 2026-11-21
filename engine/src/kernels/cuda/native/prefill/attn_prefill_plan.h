@@ -35,6 +35,14 @@ constexpr Arm select(int dsplit_ptx, size_t optin_limit, int device_threads,
                ? Arm::simt : Arm::none;
 }
 
+/* The head_dim 512 part kernel runs only from sm_80 PTX (its body traps below that), on a
+ * device that can launch 512 threads and opt in to its dynamic shared memory. */
+constexpr bool d512_available(int ptx, size_t optin_limit, size_t static_bytes,
+                              size_t dynamic_bytes, int device_threads, int kernel_threads) {
+    return ptx >= 80 && fits_threads(device_threads, kernel_threads, 512) &&
+           fits(optin_limit, static_bytes, dynamic_bytes);
+}
+
 /* Fixed Q and key tiles, with model head dimension deciding the byte count. */
 constexpr size_t simt_bytes(int rows, int tile, int head_dim) {
     return size_t(rows + 2 * tile) * size_t(head_dim) * 2;
@@ -66,6 +74,14 @@ static_assert(select(75, 65535, 1024, 0, 98304, 1024, 0, 65536, 1024) == Arm::no
 static_assert(select(80, 101376, 1024, 0, 98304, 511, 0, 65536, 1024) == Arm::simt, "fast threads");
 static_assert(select(80, 101376, 127, 0, 98304, 1024, 0, 65536, 1024) == Arm::none, "device threads");
 static_assert(select(75, 65536, 1024, 0, 98304, 1024, 0, 65536, 127) == Arm::none, "SIMT threads");
+
+static_assert(d512_available(86, 101376, 0, 81920, 1024, 512), "d512 on the 3090");
+static_assert(d512_available(80, 166912, 0, 81920, 1024, 512), "d512 on sm_80");
+static_assert(!d512_available(72, 101376, 0, 81920, 1024, 512), "d512 on sm_72 (Xavier)");
+static_assert(!d512_available(86, 65536, 0, 81920, 1024, 512), "d512 below an 80 KB opt-in");
+static_assert(!d512_available(86, 101376, 24576, 81920, 1024, 512), "d512 static bytes");
+static_assert(!d512_available(86, 101376, 0, 81920, 256, 512), "d512 device threads");
+static_assert(!d512_available(86, 101376, 0, 81920, 1024, 384), "d512 kernel threads");
 
 }  // namespace attn_prefill_plan
 #endif

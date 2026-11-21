@@ -1367,21 +1367,57 @@ Failure enqueue_q8(const Args &k, inference_cuda_attn_kv_pair views, void *strea
     return failure;
 }
 
+/* The head_dim 512 part kernel on one device: whether the loaded code and the device can run
+ * it (PTX of at least sm_80, 512 threads, and the 80 KB of dynamic shared memory within the
+ * device's per-block opt-in), and the opt-in itself, which CUDA keeps per function and device.
+ * Successes are cached by device; a failed query is not. */
+struct D512Arm {
+    bool ok;
+    cudaError_t err;
+};
+
+D512Arm d512_arm(int device) {
+    static std::mutex arms_mutex;
+    static std::map<int, D512Arm> arms;
+    std::lock_guard<std::mutex> lock(arms_mutex);
+    const auto it = arms.find(device);
+    if (it != arms.end()) return it->second;
+    D512Arm arm = {false, cudaSuccess};
+    int limit = 0, device_threads = 0;
+    arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (arm.err == cudaSuccess)
+        arm.err = cudaDeviceGetAttribute(&device_threads, cudaDevAttrMaxThreadsPerBlock, device);
+    cudaFuncAttributes attr = {};
+    if (arm.err == cudaSuccess) arm.err = cudaFuncGetAttributes(&attr, attn_prefill_part_q8_d512_k);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ok = attn_prefill_plan::d512_available(attr.ptxVersion, limit > 0 ? size_t(limit) : 0,
+                                               attr.sharedSizeBytes, kD512SmemBytes,
+                                               device_threads, attr.maxThreadsPerBlock);
+    if (arm.ok)
+        arm.err = cudaFuncSetAttribute(attn_prefill_part_q8_d512_k,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       kD512SmemBytes);
+    if (arm.err == cudaSuccess) arms.emplace(device, arm);
+    return arm;
+}
+
 /* The head_dim 512 q8 path: attn_prefill_part_q8_d512_k over grid (q_tiles, n_kv_head, splits)
- * with 80 KB of dynamic shared memory (opted in once per process), then the shared combine. */
+ * with 80 KB of dynamic shared memory, then the shared combine. The wrapper asks
+ * inference_cuda_attn_prefill_d512_supported before any call, so an unsupported device never
+ * reaches this point. */
 static Failure enqueue_q8_d512(const Args &k, inference_cuda_attn_kv_pair views, void *stream) {
     Failure failure;
-    static const cudaError_t arm_error = []() -> cudaError_t {
-        return cudaFuncSetAttribute(attn_prefill_part_q8_d512_k,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    kD512SmemBytes);
-    }();
-    if (arm_error != cudaSuccess) {
-        failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);
-        if (cudaPeekAtLastError() == arm_error)
+    int device = -1;
+    failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+    D512Arm arm = {false, cudaSuccess};
+    if (failure.ok()) arm = d512_arm(device);
+    if (failure.ok() && arm.err != cudaSuccess) {
+        failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
+        if (cudaPeekAtLastError() == arm.err)
             (void)cudaGetLastError();  // consume the duplicate of the reported arm failure
-        return failure;
     }
+    if (failure.ok() && !arm.ok) failure.record(cudaErrorInvalidConfiguration, INFERENCE_CUDA_STAGE_LAUNCH);
+    if (!failure.ok()) return failure;
     if (k.mode != 2) {
         const int q_tiles = (k.m + kQTile - 1) / kQTile;
         attn_prefill_part_q8_d512_k<<<dim3(q_tiles, k.n_kv_head, k.mode == 1 ? 1 : k.max_splits),
@@ -1559,6 +1595,26 @@ extern "C" int inference_cuda_attn_prefill_q8_tiled_launch(
     }
 }
 #endif
+/* Whether the calling thread's current device can run the head_dim 512 part kernel (see
+ * d512_arm); a pure query that launches nothing, so the wrapper can refuse before any call. */
+extern "C" int inference_cuda_attn_prefill_d512_supported(int *out_supported) {
+    try {
+        if (out_supported == NULL) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        *out_supported = 0;
+        int device = -1;
+        cudaError_t err = cudaGetDevice(&device);
+        if (err == cudaSuccess) {
+            const D512Arm arm = d512_arm(device);
+            err = arm.err;
+            if (err == cudaSuccess) *out_supported = arm.ok ? 1 : 0;
+        }
+        (void)cudaGetLastError();
+        return (int)err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
 /* Null-tolerant writer for the route report (mirrors report_stage in device.h). */
 static inline void report_route(int *out_route, int route) {
     if (out_route != NULL) {
@@ -1596,7 +1652,7 @@ extern "C" int inference_cuda_attn_prefill_q8_tiled_route(
                 return (int)failure.err;
             }
         }
-        if (use_tiled) {
+        if (use_tiled && k.head_dim != kD512) {
             report_route(out_route, 2);  // predicate reject: old kernel + counted fallback
             static const bool logged = [] {
                 fprintf(stderr,

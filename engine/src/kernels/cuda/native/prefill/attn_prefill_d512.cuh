@@ -28,7 +28,8 @@ constexpr int kD512Threads = 512;                               // 2 row groups 
 constexpr int kD512DimPart = kD512 / 8;                         // dims per warp
 constexpr int kD512PlaneBytes = kD512KeyTile * kD512 * 2;       // one fp16 K or V tile
 constexpr int kD512StageBytes = 2 * kD512PlaneBytes;
-constexpr int kD512ExchangeBytes = 2 * 8 * 2 * 32 * 16;         // [row group][dim part][n8][lane] f32x4
+// [row group][dim part][n8 block][lane] float4
+constexpr int kD512ExchangeBytes = 2 * 8 * 2 * 32 * 16;
 constexpr int kD512SmemBytes = 2 * kD512StageBytes + kD512ExchangeBytes;
 static_assert(kD512SmemBytes == 81920, "d512 shared memory");
 static_assert(kTile % kD512KeyTile == 0, "the d512 key tile divides the split granule");
@@ -55,7 +56,7 @@ __device__ inline void d512_load_raw(const Args &a, const Block &b,
                               (size_t)kvh * views.v.payload_head_stride_bytes + 8 * lane;
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-        const int group = 8 * h + (lane >> 2);  // dims 256 h + 8 lane lie in group size 32 group
+        const int group = 8 * h + (lane >> 2);  // the 32-value group of dims 256 h + 8 lane .. + 7
         r.k[h] = *reinterpret_cast<const uint2 *>(kp + 256 * h);
         r.v[h] = *reinterpret_cast<const uint2 *>(vp + 256 * h);
         r.ks[h] = affine_scalar(views.k.scales, views.k.scale_dtype,
@@ -141,8 +142,9 @@ __global__ void __launch_bounds__(kD512Threads, 1)
             for (int hi = 0; hi < 2; ++hi) {
                 float2 v = make_float2(0.f, 0.f);
                 if (t < b.tile_end) {
-                    const float *q = a.q + ((size_t)t * a.n_head + kvh * kD512Group + head) * kD512 +
-                                     kD512DimPart * dp + 16 * ks + 8 * hi + c;
+                    const float *q =
+                        a.q + ((size_t)t * a.n_head + kvh * kD512Group + head) * kD512 +
+                        kD512DimPart * dp + 16 * ks + 8 * hi + c;
                     v = *reinterpret_cast<const float2 *>(q);
                 }
                 const __half2 h2 = __floats2half2_rn(v.x, v.y);
@@ -221,7 +223,6 @@ __global__ void __launch_bounds__(kD512Threads, 1)
         /* Scale and mask in natural units; a tile every row fully sees skips the mask. */
         const bool full = b.first + base + kD512KeyTile - 1 <= a.p0 + b.t0 &&
                           (a.window == 0 || b.first + base > b.max_p - a.window) &&
-                          (a.mode != 1 || base + kD512KeyTile <= b.k_end) &&
                           base + kD512KeyTile <= b.k_end;
         bool vis[2][4];
         float x[2][4];
@@ -295,7 +296,9 @@ __global__ void __launch_bounds__(kD512Threads, 1)
             mma_16816(o[2 * jp + 1], pa, vb[2], vb[3]);
         }
 
-        if (more) d512_store_stage(raw, k_signed, v_signed, d512smem + ((n + 1) & 1) * kD512StageBytes);
+        if (more)
+            d512_store_stage(raw, k_signed, v_signed,
+                             d512smem + ((n + 1) & 1) * kD512StageBytes);
         __syncthreads();  // tile n + 1 visible; this stage and the exchange free
     }
 
@@ -310,8 +313,10 @@ __global__ void __launch_bounds__(kD512Threads, 1)
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int dim = kD512DimPart * dp + 8 * j + c;
-        *reinterpret_cast<float2 *>(b.accs + (size_t)cell_r0 * kD512 + dim) = make_float2(o[j][0], o[j][1]);
-        *reinterpret_cast<float2 *>(b.accs + (size_t)cell_r1 * kD512 + dim) = make_float2(o[j][2], o[j][3]);
+        *reinterpret_cast<float2 *>(b.accs + (size_t)cell_r0 * kD512 + dim) =
+            make_float2(o[j][0], o[j][1]);
+        *reinterpret_cast<float2 *>(b.accs + (size_t)cell_r1 * kD512 + dim) =
+            make_float2(o[j][2], o[j][3]);
     }
 #else
     __trap();

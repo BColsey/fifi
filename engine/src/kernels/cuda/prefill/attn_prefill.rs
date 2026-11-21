@@ -36,7 +36,7 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::attn_prefill::{
-    AttnKvRaw, AttnPrefillLaunch, AttnPrefillRaw, attn_prefill_launch,
+    AttnKvRaw, AttnPrefillLaunch, AttnPrefillRaw, attn_prefill_d512_supported, attn_prefill_launch,
 };
 use crate::kernels::cuda::resident::attn_prep::{HEAD_DIM, MAX_ROWS, MAX_TOKENS};
 use crate::tensor::Dtype;
@@ -1103,6 +1103,14 @@ impl CudaContext {
     /// after the stream drained. The split is the caller's: the driver passes the launch
     /// plan's ([`cpf_attn_launch_plan`]).
     ///
+    /// Head dimension 512 ([`CPF_ATTN_WIDE_HEAD_DIM`]) runs its own part kernel (16 warps of a
+    /// 32-row tile of one kv head, 80 KB of dynamic shared memory, one block per SM), then the
+    /// same combine. It takes Q8 affine planes only, with four query heads per kv head,
+    /// 32-value groups, no bias and 16-byte aligned payload rows and heads; every other
+    /// combination, and a device whose PTX is below sm_80 or whose shared-memory opt-in is
+    /// below 80 KB, is a `BadRequest` before any device write. The part and combine entries
+    /// ([`Self::attn_prefill_part`], [`Self::attn_prefill_combine`]) take the same path.
+    ///
     /// Positions require `p0 >= 0` and `p0 + m <= MAX_ROWS`; linear calls additionally need
     /// `p0 + m <= cache_rows`. Rust and C refuse bad bounds, also re-checked on the device
     /// (no partial, NaN `out`, mask 8 of the optional status word). A chunk whose partials
@@ -1225,6 +1233,28 @@ impl CudaContext {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Refuses a head_dim 512 call on a device that cannot run its kernel (PTX below sm_80,
+    /// as on a Xavier build, or an opt-in below 80 KB of shared memory per block), before any
+    /// device write: the kernel would otherwise trap and latch the context. A failed query
+    /// is not latched either.
+    fn check_wide_device(&self) -> Result<(), EngError> {
+        let _dispatch = self.enter()?;
+        match attn_prefill_d512_supported() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(rule(
+                "device",
+                &format!(
+                    "head_dim {CPF_ATTN_WIDE_HEAD_DIM} needs sm_80 PTX and an 80 KB shared \
+                     memory opt-in per block, which this device or build does not provide"
+                ),
+            )),
+            Err(status) => Err(crate::kernels::cuda::diagnostic_backend_error(
+                "attn_prefill head_dim 512 device query",
+                status,
+            )),
+        }
+    }
+
     fn attn_prefill_enqueue(
         &self,
         stream: &DeviceStream,
@@ -1278,6 +1308,9 @@ impl CudaContext {
         check_fit(&call, &need)?;
         check_apart(&call, &need)?;
         check_kv_views(self, &call, &need)?;
+        if call.shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM {
+            self.check_wide_device()?;
+        }
         ints.max_splits = to_int("max_splits", call.split.max_splits)?;
         ints.min_keys = to_int("min_keys", call.split.min_keys)?;
         ints.window = i64_int("window", call.span.window)?;

@@ -70,8 +70,10 @@
  * Legacy F16: head_dim 128/256 and GQA 1/8. Tagged Q8 affine: D64/128/256 and any positive integral
  * GQA within the 64MiB partial budget; D512 (sm_80+, attn_prefill_d512.cuh) takes exactly GQA 4,
  * both planes Q8 with 32-value groups, no bias and 16-byte aligned payload rows and heads, and
- * uses 80 KB of dynamic shared memory (one 512-thread block per SM); F32 Q and accumulators, independent F16/BF16/F32 scalar
- * planes, optional bias, no temporary F16 cache. Q8 reads only keys visible to each row;
+ * uses 80 KB of dynamic shared memory (one 512-thread block per SM). inference_cuda_attn_prefill_
+ * d512_supported tells whether the current device can run it. F32 Q and accumulators, independent
+ * F16/BF16/F32 scalar planes, optional bias, no temporary F16 cache. Q8 reads only keys visible
+ * to each row;
  * signed/G32/F16-scale/no-bias is Q8_0-equivalent separated planes, not the raw interleaved GGUF
  * block layout. In both paths, every geometry value stays a run-time argument and a value the entry
  * refuses returns INFERENCE_CUDA_INVALID_ARGUMENT before any launch, never an assertion inside a
@@ -165,6 +167,11 @@ typedef struct inference_cuda_attn_prefill_args {
  * Zero means an unsupported geometry. */
 size_t inference_cuda_attn_prefill_part_floats(int m, int n_kv_head, int head_dim,
                                                int max_splits, int group);
+/* Writes 1 to *out_supported when the calling thread's current device can run the head_dim 512
+ * kernel (PTX of at least sm_80 and a per-block shared-memory opt-in of at least 80 KB), else 0.
+ * It launches nothing; the Rust wrapper refuses a head_dim 512 call on a 0 before any device
+ * write. */
+int inference_cuda_attn_prefill_d512_supported(int *out_supported);
 int inference_cuda_attn_prefill_launch(const inference_cuda_attn_prefill_args *args,
                                        void *stream, int *out_stage);
 

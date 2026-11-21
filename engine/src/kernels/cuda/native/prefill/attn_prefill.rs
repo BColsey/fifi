@@ -159,6 +159,8 @@ unsafe extern "C" {
         max_splits: c_int,
         group: c_int,
     ) -> usize;
+    #[link_name = "inference_cuda_attn_prefill_d512_supported"]
+    fn attn_prefill_d512_supported_raw(out_supported: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_attn_prefill_launch"]
     fn attn_prefill_launch_raw(
         args: *const AttnPrefillArgsRaw,
@@ -613,6 +615,22 @@ fn c_args(io: &AttnPrefillRaw<'_>, views: Option<&AttnKvPairRaw>) -> AttnPrefill
             .as_ref()
             .map_or(std::ptr::null(), |s| s.address().cast_const()),
         kv_views: views.map_or(std::ptr::null(), std::ptr::from_ref),
+    }
+}
+
+/// Whether the calling thread's current device can run the head_dim 512 kernel (PTX of at
+/// least sm_80 and a shared-memory opt-in of 80 KB per block): a host-only query that
+/// launches nothing. The error is the raw status of a failed query.
+pub(in crate::kernels::cuda) fn attn_prefill_d512_supported() -> Result<bool, c_int> {
+    let mut supported: c_int = 0;
+    // SAFETY: `supported` is a live, writable `c_int` for the whole call; the entry writes it
+    // and keeps no pointer. It reads device attributes and launches, allocates and copies
+    // nothing, and runs under the dispatch guard on the thread that owns the context.
+    let status = unsafe { attn_prefill_d512_supported_raw(&mut supported) };
+    if status == 0 {
+        Ok(supported != 0)
+    } else {
+        Err(status)
     }
 }
 
