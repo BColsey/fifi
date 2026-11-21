@@ -258,7 +258,7 @@ impl Decoder {
             context,
             failed: false,
             prefill_rows: 1,
-            timing: None,
+            timing: timing::enabled().then(CpuTimings::default),
         })
     }
 
@@ -282,21 +282,25 @@ impl Decoder {
     }
 
     pub(super) fn report_component_timings(&mut self, phase: &str) {
-        if timing::enabled()
-            && let Experts::GgufMlx(cache) = &mut self.experts
-        {
-            cache.report_projections(phase);
-        }
-        if let (Some(cpu), Experts::Mlx { cache, .. }) = (&mut self.timing, &mut self.experts) {
-            eprintln!(
-                "inkling_components {}",
-                serde_json::json!({
-                    "phase": phase,
-                    "cpu": std::mem::take(cpu),
-                    "experts": cache.take_component_timings(),
-                })
-            );
-        }
+        let Some(cpu) = &mut self.timing else {
+            return;
+        };
+        let experts = match &mut self.experts {
+            Experts::Mlx { cache, .. } => serde_json::json!(cache.take_component_timings()),
+            Experts::GgufMlx(cache) => {
+                cache.report_projections(phase);
+                serde_json::json!(cache.take_component_timings())
+            }
+            Experts::GgufReference(_) => serde_json::Value::Null,
+        };
+        eprintln!(
+            "inkling_components {}",
+            serde_json::json!({
+                "phase": phase,
+                "cpu": std::mem::take(cpu),
+                "experts": experts,
+            })
+        );
     }
 
     pub fn reset(&mut self) {
@@ -699,6 +703,7 @@ mod tests {
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let mut decoder = Decoder::open_gguf_native(Path::new(&file), 128).unwrap();
         assert_capital_probe(&mut decoder);
+        decoder.report_component_timings("five_token_probe");
         assert!(decoder.expert_cache_stats().read_ranges > 0);
     }
 

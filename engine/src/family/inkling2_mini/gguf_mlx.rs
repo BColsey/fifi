@@ -8,6 +8,7 @@ use half::bf16;
 use super::{
     gguf::{ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights, packed_mlx_enabled},
     mlx::MlxExpertCacheStats,
+    timing::{self, measure},
 };
 use crate::{
     EngError,
@@ -85,6 +86,15 @@ struct ProjectionStats {
     expanded_metal_transpose: u64,
 }
 
+#[derive(Default, serde::Serialize)]
+pub(super) struct ExpertTimings {
+    demand_read_ns: u128,
+    staging_ns: u128,
+    metal_input_import_ns: u128,
+    metal_dispatch_ns: u128,
+    metal_readback_ns: u128,
+}
+
 pub(super) struct Experts {
     source: Arc<Weights>,
     metal: MlxKernels,
@@ -94,6 +104,7 @@ pub(super) struct Experts {
     codes: Vec<(GgufType, ExecutionTensor)>,
     projections: ProjectionStats,
     stats: MlxExpertCacheStats,
+    timing: Option<ExpertTimings>,
 }
 
 impl Experts {
@@ -114,6 +125,7 @@ impl Experts {
             codes: Vec::new(),
             projections: ProjectionStats::default(),
             stats: MlxExpertCacheStats::default(),
+            timing: timing::enabled().then(ExpertTimings::default),
         })
     }
 
@@ -123,6 +135,10 @@ impl Experts {
 
     pub(super) fn stats(&self) -> MlxExpertCacheStats {
         self.stats
+    }
+
+    pub(super) fn take_component_timings(&mut self) -> Option<ExpertTimings> {
+        self.timing.as_mut().map(std::mem::take)
     }
 
     pub(super) fn report_projections(&mut self, phase: &str) {
@@ -213,7 +229,10 @@ impl Experts {
                 self.stats.hits += 1;
                 plane
             } else {
-                let plane = Rc::new(self.source.read_expert(name, expert)?);
+                let plane = Rc::new(measure(
+                    self.timing.as_mut().map(|t| &mut t.demand_read_ns),
+                    || self.source.read_expert(name, expert),
+                )?);
                 self.stats.misses += 1;
                 self.stats.read_bytes += plane.bytes.len() as u64;
                 self.stats.read_ranges += 1;
@@ -227,7 +246,14 @@ impl Experts {
                     "GGUF Metal expert projection shape mismatch",
                 ));
             }
-            let (projection, bytes) = self.stage_projection(&plane)?;
+            let mut staging_ns = 0;
+            let (projection, bytes) =
+                measure(self.timing.is_some().then_some(&mut staging_ns), || {
+                    self.stage_projection(&plane)
+                })?;
+            if let Some(timing) = &mut self.timing {
+                timing.staging_ns += staging_ns;
+            }
             let weight = Rc::new(projection);
             self.stats.evictions +=
                 self.resident
@@ -235,44 +261,58 @@ impl Experts {
             self.stats.cached_bytes = self.packed.bytes + self.resident.bytes;
             weight
         };
-        let activation = Tensor::try_from_host(
-            Dtype::F32,
-            vec![1, input.len() as u32],
-            input.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        let activation = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_input_import_ns),
+            || {
+                let activation = Tensor::try_from_host(
+                    Dtype::F32,
+                    vec![1, input.len() as u32],
+                    input.iter().flat_map(|value| value.to_le_bytes()).collect(),
+                )?;
+                self.metal.import_tensor(&activation)
+            },
         )?;
-        let activation = self.metal.import_tensor(&activation)?;
-        let projected = match weight.as_ref() {
-            Projection::Packed(payload, format) => {
-                let codes = self
-                    .codes
-                    .iter()
-                    .find_map(|(kind, table)| (kind == format).then_some(table));
-                let count = match format {
-                    GgufType::Iq1S => &mut self.projections.iq1_s,
-                    GgufType::Iq2Xxs => &mut self.projections.iq2_xxs,
-                    GgufType::Iq2Xs => &mut self.projections.iq2_xs,
-                    GgufType::Iq2S => &mut self.projections.iq2_s,
-                    GgufType::Q20 => &mut self.projections.q2_0,
-                    GgufType::Nvfp4 => &mut self.projections.nvfp4,
-                    _ => unreachable!("packed formats were validated when staged"),
+        let projected = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_dispatch_ns),
+            || {
+                let output = match weight.as_ref() {
+                    Projection::Packed(payload, format) => {
+                        let codes = self
+                            .codes
+                            .iter()
+                            .find_map(|(kind, table)| (kind == format).then_some(table));
+                        let count = match format {
+                            GgufType::Iq1S => &mut self.projections.iq1_s,
+                            GgufType::Iq2Xxs => &mut self.projections.iq2_xxs,
+                            GgufType::Iq2Xs => &mut self.projections.iq2_xs,
+                            GgufType::Iq2S => &mut self.projections.iq2_s,
+                            GgufType::Q20 => &mut self.projections.q2_0,
+                            GgufType::Nvfp4 => &mut self.projections.nvfp4,
+                            _ => unreachable!("packed formats were validated when staged"),
+                        };
+                        let result =
+                            self.metal
+                                .inkling_gguf_matvec(&activation, payload, codes, *format)?;
+                        *count += 1;
+                        result
+                    }
+                    Projection::Expanded(expanded) => {
+                        let result = self.metal.mm(&activation, expanded)?;
+                        if self.packed_enabled {
+                            self.projections.expanded_metal_transpose += 1;
+                        } else {
+                            self.projections.expanded_cpu_transpose += 1;
+                        }
+                        result
+                    }
                 };
-                let result =
-                    self.metal
-                        .inkling_gguf_matvec(&activation, payload, codes, *format)?;
-                *count += 1;
-                result
-            }
-            Projection::Expanded(expanded) => {
-                let result = self.metal.mm(&activation, expanded)?;
-                if self.packed_enabled {
-                    self.projections.expanded_metal_transpose += 1;
-                } else {
-                    self.projections.expanded_cpu_transpose += 1;
-                }
-                result
-            }
-        };
-        let host = self.metal.readback(&projected)?;
+                Ok::<_, EngError>(output)
+            },
+        )?;
+        let host = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_readback_ns),
+            || self.metal.readback(&projected),
+        )?;
         if host.shape() != [1, height as u32] || host.dtype() != Dtype::F32 {
             return Err(super::checkpoint_error(
                 "GGUF Metal expert output shape mismatch",
