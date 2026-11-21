@@ -196,6 +196,19 @@ The `8a6c6347` runs used private dense weights and LRU with the same five prompt
 
 The automatic run retained 6,347,464,200 bytes of expert weights and hit every routed expert on the repeat. The first request coincided with 75,980 system-wide swap-out pages. The competing-build run recorded 170,004 swap-out pages and 3.24 GB of process-attributed reads on the automatic repeat. The idle run still shows a first-request memory pressure cost, even though the automatic repeat performed no disk reads. The four-worker short run used the same logical read bytes as its 5 GiB control, and repeat wall time decreased by 0.27 s. Repetition across fresh processes is needed to separate placement effects from OS cache variability. Metal’s recommendation describes GPU resource allocations. [Apple Metal working-set documentation](https://developer.apple.com/documentation/metal/mtldevice/recommendedmaxworkingsetsize)
 
+### Short storage control at `71aa350c`
+
+Two fresh processes ran the same five prompt tokens and generated the same twelve greedy output tokens twice at 5 GiB. The mapped process ran first. An initial private process was stopped while a build occupied the mini, so the private row uses the retry after the device became idle. No competing builds were detected during either reported run. The runs were separated by about fifteen minutes, and the OS page cache was uncontrolled.
+
+| Request | Dense and expert retention | TTFT (s) | Prefill (tok/s) | Decode (tok/s) | Wall (s) | Logical expert reads (GB) | Attributed disk reads (GB) | Peak process footprint (GB) | Swap-out pages |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| First | Private and LRU | 4.56 | 1.10 | 1.57 | 11.56 | 9.99 | 6.84 | 4.85 | 0 |
+| First | Mapped and file cache | 6.97 | 0.72 | 1.73 | 13.31 | 29.43 | 9.15 | 0.47 | 0 |
+| Repeat | Private and LRU | 3.00 | 1.67 | 1.91 | 8.75 | 9.60 | 4.82 | 4.85 | 0 |
+| Repeat | Mapped and file cache | 3.17 | 1.58 | 1.76 | 9.43 | 29.43 | 5.28 | 0.47 | 0 |
+
+The mapped repeat read 0.46 GB more from disk and took 0.68 s longer. Its prefill and decode accessed 54.79 GB of logical mapped dense spans, which can overlap the same file pages many times. The results reinforce the need to measure physical I/O for each workload before choosing a policy.
+
 ### Packed GGUF first-logit probes at 6 GiB
 
 Both variants used the same real IQ2_XXS checkpoints, mapped dense projections, a 128-token context, and the same five prompt token IDs. Each execution stopped at the first output logit vector. The OS page cache was uncontrolled.
@@ -226,9 +239,9 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 
 `FIFI_MLX_ADAPT_EXPERT_CACHE=1` applies to the publisher safetensors host cache. The decoder halves its admitted expert retention limit after a macOS warning and clears retained experts after a critical event. It checks the event before staging a visit or when resetting the decoder. The reduced cap lasts until server restart. KV and staging allocations stay within the original plan. The SDK smoke check registered and reused the observer. Test the integrated runtime and capture naturally occurring pressure events before comparing physical I/O. [Apple Dispatch memory-pressure documentation](https://developer.apple.com/documentation/Dispatch/DISPATCH_SOURCE_TYPE_MEMORYPRESSURE)
 
-`FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. Compare this flag with the same single-copy cache setting and inspect actual synchronization counts and complete model logits before using it for timing.
+`FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. At `e9f74c2b`, the real fork test matched projected expert vectors and merged visit outputs bitwise across seven layers, including zero-retention and eviction cases. With warm retention, total grouped MLX import and readback synchronizations fell from 32 to four per visit. Combined packed, single-copy, grouped and four-worker probes on both real layouts each recorded 480 expert readbacks across 240 visits. Both selected token 152717. The fork matched the ordered top ten from the external reference with cosine similarity 0.999973.
 
-`FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. The `e9f74c2b` preflight verified this charge and the independent grouped-expert charge on both real files. With both optimizations enabled, each GGUF preflight required 1,263,707,392 bytes and rejected a 1 GiB ceiling. Verify full logits and measure CPU time, disk bytes, and request latency at the same ceiling.
+`FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. At `e9f74c2b`, all 200,058 first-generation logits after a five-token prompt matched bitwise with one and four workers on each real file. Preflight verified the independent grouped-expert and worker charges on both files. With both optimizations enabled, each GGUF preflight required 1,263,707,392 bytes and rejected a 1 GiB ceiling. Matched request latency, CPU time and SSD byte measurements remain in progress.
 
 ### Speculative read replay
 
