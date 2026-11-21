@@ -1216,9 +1216,15 @@ fn start<E: ExecutorOps>(
     };
     for (point, kind) in points {
         let head = span(plan.tokens, next, point)?;
-        if let ControlFlow::Break(()) =
-            prefill_chunks(executor, session, head, prefill_chunk, cancel, pieces)?
-        {
+        if let ControlFlow::Break(()) = prefill_chunks(
+            executor,
+            session,
+            head,
+            prefill_chunk,
+            cancel,
+            pieces,
+            false,
+        )? {
             return Ok(ControlFlow::Break(()));
         }
         if cancel.load(Ordering::SeqCst) {
@@ -1229,10 +1235,16 @@ fn start<E: ExecutorOps>(
         executor.save_prefix(session, span(plan.tokens, 0, point)?, kind)?;
     }
     let tail = span(plan.tokens, next, plan.tokens.len())?;
-    Ok(
-        prefill_chunks(executor, session, tail, prefill_chunk, cancel, pieces)?
-            .map_continue(|()| restored),
-    )
+    Ok(prefill_chunks(
+        executor,
+        session,
+        tail,
+        prefill_chunk,
+        cancel,
+        pieces,
+        generation.remaining_tokens() != Some(0),
+    )?
+    .map_continue(|()| restored))
 }
 
 fn request_prefill_chunk<E: ExecutorOps>(
@@ -1260,6 +1272,7 @@ fn prefill_chunks<E: ExecutorOps>(
     prefill_chunk: usize,
     cancel: &AtomicBool,
     pieces: &mut PrefillPieces,
+    final_tail: bool,
 ) -> Result<ControlFlow<()>, EngError> {
     let mut remaining = tokens;
     while !remaining.is_empty() {
@@ -1294,7 +1307,11 @@ fn prefill_chunks<E: ExecutorOps>(
         // The executor's prefill error passes through unchanged: this is shared scheduler
         // code, and a piece-index prefix would reach HTTP 400 clients of every family on
         // default-off paths. The piece shape is recorded in the request log instead.
-        executor.prefill(session, piece)?;
+        if final_tail && rest.is_empty() && !cancel.load(Ordering::SeqCst) {
+            executor.prefill_for_decode(session, piece)?;
+        } else {
+            executor.prefill(session, piece)?;
+        }
         pieces.count = pieces.count.saturating_add(1);
         pieces.max_rows = pieces
             .max_rows
@@ -1470,6 +1487,7 @@ mod tests {
         piece_after_prefill: Option<usize>,
         request_piece: Option<std::num::NonZeroUsize>,
         prefill_pair: bool,
+        log_final_prefill: bool,
         cancel_prefill_pair: bool,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
@@ -1512,6 +1530,7 @@ mod tests {
                 piece_after_prefill: None,
                 request_piece: None,
                 prefill_pair: false,
+                log_final_prefill: false,
                 context_limit: None,
                 bank_reports: None,
                 background_steps: Arc::new(AtomicUsize::new(0)),
@@ -1620,6 +1639,17 @@ mod tests {
                 flag.store(true, Ordering::SeqCst);
             }
             Ok(())
+        }
+
+        fn prefill_for_decode(
+            &mut self,
+            st: &mut Self::Session,
+            toks: &[u32],
+        ) -> Result<(), EngError> {
+            if self.log_final_prefill {
+                self.note(format!("final_prefill:{}", toks.len()));
+            }
+            self.prefill(st, toks)
         }
 
         fn try_prefill_pair(
@@ -2352,6 +2382,59 @@ mod tests {
     }
 
     #[test]
+    fn final_prefill_hook_runs_only_after_prefix_saves_and_with_generation_budget() {
+        for (max_tokens, expected) in [
+            (
+                1,
+                &[
+                    "prefill:3",
+                    "save_prefix:3",
+                    "prefill:4",
+                    "final_prefill:2",
+                    "prefill:2",
+                ][..],
+            ),
+            (
+                0,
+                &["prefill:3", "save_prefix:3", "prefill:4", "prefill:2"][..],
+            ),
+        ] {
+            let log = new_log();
+            let mut spy = Spy::new(vec![], &log);
+            spy.log_final_prefill = true;
+            let mut session = <Spy as ExecutorOps>::Session::default();
+            let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+            let plan = super::PromptPlan {
+                tokens: &tokens,
+                root: None,
+                boundary: Some(3),
+            };
+            let mut pieces = crate::sched::job::PrefillPieces::default();
+            let generation = generation().with_max_tokens(max_tokens);
+            assert!(
+                super::start(
+                    &mut spy,
+                    &mut session,
+                    &plan,
+                    4,
+                    &generation,
+                    &mut pieces,
+                    false,
+                )
+                .unwrap()
+                .is_continue()
+            );
+            let calls = calls(&log);
+            let prefill_calls: Vec<&str> = calls
+                .iter()
+                .map(String::as_str)
+                .filter(|call| call.contains("prefill:") || call.starts_with("save_prefix:"))
+                .collect();
+            assert_eq!(prefill_calls, expected);
+        }
+    }
+
+    #[test]
     fn paired_prefill_reports_two_pieces_and_preserves_the_fallback() {
         use crate::sched::job::PrefillPieces;
 
@@ -2373,6 +2456,7 @@ mod tests {
                     4,
                     &AtomicBool::new(false),
                     &mut pieces,
+                    false,
                 )
                 .unwrap()
                 .is_continue()

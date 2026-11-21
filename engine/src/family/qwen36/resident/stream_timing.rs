@@ -6,13 +6,18 @@ use super::{decoder::StepMode, weights::ExpertPages, weights::ResidentWeights};
 use crate::{EngError, kernels::MlxKernels};
 
 #[cfg(feature = "native-fault-qualification")]
-use crate::family::mlx_stream_stats::StreamSnapshot;
+use crate::family::{
+    mlx_stream_stats::StreamSnapshot,
+    stored::{ExpertReadStats, qualification_expert_reads},
+};
 
 pub(super) struct ForwardTiming {
     #[cfg(feature = "native-fault-qualification")]
     counters: StreamSnapshot,
     #[cfg(feature = "native-fault-qualification")]
     position: u32,
+    #[cfg(feature = "native-fault-qualification")]
+    dense_reads: Option<ExpertReadStats>,
     host_route_ns: u64,
     stages: u32,
     stage_fill_ns: u64,
@@ -33,9 +38,11 @@ impl ForwardTiming {
             let enabled = *ENABLED.get_or_init(|| {
                 std::env::var_os("FIFI_Q36_MLX_STREAM_TIMING").is_some_and(|value| value == "1")
             });
-            (enabled && weights.streams_experts()).then(|| Self {
+            let dense = enabled && weights.stages_dense();
+            (dense || (enabled && weights.streams_experts())).then(|| Self {
                 counters: StreamSnapshot::begin(k),
                 position,
+                dense_reads: dense.then(qualification_expert_reads),
                 host_route_ns: 0,
                 stages: 0,
                 stage_fill_ns: 0,
@@ -95,6 +102,13 @@ impl ForwardTiming {
             row["stage_lifetime_ns"] = self.stage_lifetime_ns.into();
             row["peak_stage_bytes"] = self.peak_stage_bytes.into();
             row["peak_stage_experts"] = self.peak_stage_experts.into();
+            if let Some(before) = self.dense_reads {
+                let after = qualification_expert_reads();
+                row["dense_ffn_read_bytes"] =
+                    after.read_bytes.saturating_sub(before.read_bytes).into();
+                row["dense_ffn_slice_reads"] =
+                    after.slice_reads.saturating_sub(before.slice_reads).into();
+            }
             eprintln!("qwen36_stream_timing {row}");
         }
         #[cfg(not(feature = "native-fault-qualification"))]

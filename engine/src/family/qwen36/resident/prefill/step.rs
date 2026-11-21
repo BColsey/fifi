@@ -121,26 +121,7 @@ pub(in super::super) fn prefill(
 ) -> Result<StepResult, EngError> {
     let rows = row_count(tokens)?;
     state.check_chunk(&decoder.weights, decoder.context_limit, rows)?; // the whole prompt
-    // The depth-aware split: a deterministic function of the
-    // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
-    // see the same boundaries on a recompute. It applies to both KV forms.
-    // The flash-prefill kernel materializes no score matrix, so under its whole
-    // eligibility the budget split is moot and an unbounded budget keeps full chunks. Without
-    // it, `Q36_PREFILL_QUERY_SLICE` (opt-in) moves the budget from the chunk to the query
-    // block that `attn::chunk` runs.
-    let score_bound = prefill_score_bound(
-        decoder.weights.shape.attn.heads_q as u32,
-        decoder.weights.shape.attn.heads_kv as u32,
-        decoder.weights.shape.attn.head_dim as u32,
-        decoder.weights.kv,
-    )?;
-    let parts = depth_ranges(
-        state.pos(),
-        rows,
-        decoder.chunk_rows,
-        repeat_count(&decoder.weights.shape)?,
-        score_bound,
-    )?;
+    let parts = chunk_ranges(decoder, state.pos(), rows)?;
     let mut result = None;
     for (index, &(start, stop)) in parts.iter().enumerate() {
         let part = usize::try_from(start)
@@ -162,6 +143,33 @@ pub(in super::super) fn prefill(
         )?);
     }
     result.ok_or_else(|| bad("a prefill needs at least one token"))
+}
+
+pub(in super::super) fn chunk_ranges(
+    decoder: &ResidentDecoder<'_>,
+    pos: u32,
+    rows: u32,
+) -> Result<Vec<(u32, u32)>, EngError> {
+    // The depth-aware split: a deterministic function of the
+    // prompt length, the start position, and the chunk setting, so snapshots and prefix reuse
+    // see the same boundaries on a recompute. It applies to both KV forms.
+    // The flash-prefill kernel materializes no score matrix, so under its whole
+    // eligibility the budget split is moot and an unbounded budget keeps full chunks. Without
+    // it, `Q36_PREFILL_QUERY_SLICE` (opt-in) moves the budget from the chunk to the query
+    // block that `attn::chunk` runs.
+    let score_bound = prefill_score_bound(
+        decoder.weights.shape.attn.heads_q as u32,
+        decoder.weights.shape.attn.heads_kv as u32,
+        decoder.weights.shape.attn.head_dim as u32,
+        decoder.weights.kv,
+    )?;
+    depth_ranges(
+        pos,
+        rows,
+        decoder.chunk_rows,
+        repeat_count(&decoder.weights.shape)?,
+        score_bound,
+    )
 }
 
 /// Runs `tokens` as one chunk with the retire cap `cap`. Tests use it to set a small cap. The gated

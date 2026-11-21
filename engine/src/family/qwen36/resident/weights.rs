@@ -802,6 +802,12 @@ impl ResidentWeights {
         self.disk_layers().next().is_some()
     }
 
+    pub(super) fn stages_dense(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| matches!(layer.feed_forward, RFeedForward::StagedDense(_)))
+    }
+
     pub(super) fn dense_stage_bytes(&self) -> Result<u64, EngError> {
         self.layers
             .iter()
