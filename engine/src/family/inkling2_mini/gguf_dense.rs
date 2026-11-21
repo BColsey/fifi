@@ -6,17 +6,19 @@ use super::{
     CONV_TAPS, CORE_END, CORE_START, HIDDEN, LAYERS, checkpoint_error, gguf::Weights,
     gguf_metadata::Layout, is_local,
 };
-use crate::EngError;
+use crate::{EngError, family::mapped_file::MappedFile};
 
 pub(super) struct Dense {
     source: Arc<Weights>,
     entries: BTreeMap<String, Entry>,
+    mapping: Option<MappedFile>,
 }
 
 struct Entry {
     name: String,
     shape: Vec<usize>,
     transform: Transform,
+    mapped_len: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -28,7 +30,7 @@ enum Transform {
 }
 
 impl Dense {
-    pub(super) fn new(source: Arc<Weights>) -> Result<Self, EngError> {
+    pub(super) fn new(source: Arc<Weights>, mapping_budget: u64) -> Result<(Self, u64), EngError> {
         let mut entries = BTreeMap::new();
         let mut add = |canonical: String, name: String, shape: Option<Vec<usize>>, transform| {
             let tensor = source
@@ -43,6 +45,7 @@ impl Dense {
                     name,
                     shape,
                     transform,
+                    mapped_len: 0,
                 },
             );
             Ok::<_, EngError>(())
@@ -173,7 +176,32 @@ impl Dense {
                 )?;
             }
         }
-        Ok(Self { source, entries })
+        let mapped_bytes = if mapping_budget == 0 {
+            0
+        } else {
+            reserve_projections(&source, &mut entries, mapping_budget)?
+        };
+        let mapping = (mapped_bytes > 0)
+            .then(|| source.map_projection_source())
+            .transpose()?;
+        Ok((
+            Self {
+                source,
+                entries,
+                mapping,
+            },
+            mapped_bytes,
+        ))
+    }
+
+    #[cfg(all(
+        test,
+        feature = "native-mlx",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub(super) fn has_mapping(&self) -> bool {
+        self.mapping.is_some()
     }
 
     pub(super) fn shape(&self, name: &str) -> Result<&[usize], EngError> {
@@ -219,7 +247,13 @@ impl Dense {
         input: &[f32],
         rows: Range<usize>,
     ) -> Result<Vec<f32>, EngError> {
-        self.source.project(&self.entry(name)?.name, 0, rows, input)
+        let entry = self.entry(name)?;
+        if let Some(mapping) = self.mapping.as_ref().filter(|_| entry.mapped_len > 0) {
+            return self
+                .source
+                .project_mapped(&entry.name, rows, input, mapping, entry.mapped_len);
+        }
+        self.source.project(&entry.name, 0, rows, input)
     }
 
     pub(super) fn loop_query(&self, layer: usize, stream: usize) -> Result<Vec<f32>, EngError> {
@@ -246,5 +280,93 @@ impl Dense {
         self.entries
             .get(name)
             .ok_or_else(|| checkpoint_error(format!("missing GGUF text weight {name}")))
+    }
+}
+
+/// Charge each selected packed tensor's complete page span. The accounting
+/// intentionally permits overlap between adjacent tensor spans.
+fn reserve_projections(
+    source: &Weights,
+    entries: &mut BTreeMap<String, Entry>,
+    budget: u64,
+) -> Result<u64, EngError> {
+    let page_size = super::mac_stage_page_size() as u64;
+    if page_size == 0 {
+        return Err(checkpoint_error("GGUF dense mapping page size unavailable"));
+    }
+    let mut candidates: Vec<_> = entries
+        .values_mut()
+        .filter_map(|entry| projection_uses(&entry.name).map(|uses| (uses, entry)))
+        .collect();
+    candidates.sort_unstable_by(|(a, left), (b, right)| b.cmp(a).then(left.name.cmp(&right.name)));
+    let mut remaining = budget;
+    for (_, entry) in candidates {
+        let tensor = source
+            .header()
+            .tensor(&entry.name)
+            .expect("validated tensor");
+        let packed_bytes = if entry.name == "output.weight" {
+            let padded_rows = tensor.dims()[1];
+            tensor.byte_len() / padded_rows * super::UNPADDED_VOCAB as u64
+        } else {
+            tensor.byte_len()
+        };
+        let span = page_span(tensor.abs_offset(), packed_bytes, page_size)?;
+        if span <= remaining {
+            remaining -= span;
+            entry.mapped_len = packed_bytes;
+        }
+    }
+    Ok(budget - remaining)
+}
+
+fn page_span(offset: u64, bytes: u64, page: u64) -> Result<u64, EngError> {
+    (offset % page)
+        .checked_add(bytes)
+        .and_then(|len| len.checked_next_multiple_of(page))
+        .ok_or_else(super::staging_overflow)
+}
+
+fn projection_uses(name: &str) -> Option<usize> {
+    if name == "output.weight" {
+        return Some(1);
+    }
+    let (layer, suffix) = name.strip_prefix("blk.")?.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    let projection = matches!(
+        suffix,
+        "attn_q.weight"
+            | "attn_k.weight"
+            | "attn_v.weight"
+            | "attn_output.weight"
+            | "attn_rel.weight"
+            | "attn_gate.weight"
+            | "attn_sink_proj.weight"
+            | "attn_k_conv_proj.weight"
+            | "attn_v_conv_proj.weight"
+            | "ffn_gate_inp.weight"
+    );
+    let looped = (CORE_START..CORE_END).contains(&layer);
+    if projection {
+        return Some(if looped { 3 } else { 1 });
+    }
+    (looped && suffix.starts_with("loop_") && suffix.ends_with(".weight")).then_some(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_mapping_selects_only_recurring_projections_and_charges_page_spans() {
+        assert_eq!(projection_uses("blk.6.attn_q.weight"), Some(3));
+        assert_eq!(projection_uses("blk.6.loop_attn_down.weight"), Some(2));
+        assert_eq!(projection_uses("blk.20.ffn_gate_inp.weight"), Some(1));
+        assert_eq!(projection_uses("output.weight"), Some(1));
+        assert_eq!(projection_uses("token_embd.weight"), None);
+        assert_eq!(projection_uses("blk.6.ffn_gate_up_exps.weight"), None);
+        assert_eq!(projection_uses("blk.6.attn_rel_bias.weight"), None);
+        assert_eq!(page_span(16380, 8, 16384).unwrap(), 32768);
+        assert_eq!(page_span(16384, 16384, 16384).unwrap(), 16384);
     }
 }
