@@ -675,6 +675,7 @@ pub(super) mod device {
         refill_timing: Option<Cell<[RefillTiming; 2]>>,
         trace_prefill_routes: bool,
         exact_prefill_groups: bool,
+        prefill_wave_layer: Option<usize>,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -771,6 +772,7 @@ pub(super) mod device {
                 refill_timing: None,
                 trace_prefill_routes: false,
                 exact_prefill_groups: false,
+                prefill_wave_layer: None,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1095,6 +1097,23 @@ pub(super) mod device {
 
         pub(in crate::family::flash_next::cuda) fn uses_exact_prefill_groups(&self) -> bool {
             self.exact_prefill_groups
+        }
+
+        pub(in crate::family::flash_next::cuda) fn enable_prefill_waves(
+            &mut self,
+            layer: usize,
+        ) -> Result<(), EngError> {
+            if self.source.is_none() || layer >= self.state.geometry().layers {
+                return Err(EngError::BadRequest(
+                    "INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER needs a valid layer of a Flash-Next disk bank".into(),
+                ));
+            }
+            self.prefill_wave_layer = Some(layer);
+            Ok(())
+        }
+
+        pub(in crate::family::flash_next::cuda) fn uses_prefill_waves(&self, layer: usize) -> bool {
+            self.prefill_wave_layer == Some(layer)
         }
 
         pub(in crate::family::flash_next::cuda) fn trace_prefill_chunk(

@@ -38,6 +38,7 @@ use crate::family::project::cuda::exl3_jobs::{
     Lists, PairPlan, Scratch, Table, jobs_call, paired_scratch, plan_jobs, plan_pairs, read_ids,
     write_lists,
 };
+use crate::family::project::exl3_jobs_plan::plan_subset_pairs;
 use crate::{
     EngError,
     family::{
@@ -86,6 +87,15 @@ pub(in crate::family) trait PrefillStore: SlotResolver {
         _picks: &[i32],
         _dims: &MoeDims,
     ) -> Result<Option<Vec<(usize, MoeDims)>>, EngError> {
+        Ok(None)
+    }
+
+    /// Optional subsets of original pair indices. A wave can span the full chunk.
+    fn expert_waves(
+        &self,
+        _picks: &[i32],
+        _dims: &MoeDims,
+    ) -> Result<Option<Vec<Vec<usize>>>, EngError> {
         Ok(None)
     }
 
@@ -472,6 +482,31 @@ fn slice_at<'b>(
     })
 }
 
+fn run_expert_waves(
+    projector: &Projector<'_>,
+    bufs: &Bufs<'_>,
+    dims: &MoeDims,
+    bank: &mut impl PrefillStore,
+    picks: &[i32],
+    waves: Vec<Vec<usize>>,
+) -> Result<(), EngError> {
+    let pair = projector.launch.ctx.exl3_jobs_pair_enabled()?;
+    for original_pairs in waves {
+        let wanted: Vec<_> = original_pairs
+            .iter()
+            .map(|&index| picks[index] as usize)
+            .collect();
+        // The store drains the preceding wave's reads before replacing slots.
+        let slots = bank.resolve_slots(projector.launch.stream, &wanted)?;
+        let members = bank.members()?;
+        let plan = plan_subset_pairs(&slots, &original_pairs, members[0].members, dims.top_k)?;
+        routed_plan(projector, members, bufs, dims, plan, pair)?;
+    }
+    combine(projector, bufs, dims)?;
+    split::mark(projector.launch.stream, "combine");
+    Ok(())
+}
+
 /// Stages 10-17 of one banked chunk layer: the shared expert once for the whole chunk, then the
 /// routed experts and the combine per sub-block, because the launches of one block read every
 /// pick of its rows together and the bank holds only `slots` members. The whole chunk's picks
@@ -517,6 +552,9 @@ pub(in crate::family) fn run_store(
     // per-sub-block readback, a blocking drain of the stream, is gone. The mapping stays
     // per sub-block: one sub-block's picks fit the slots together, a whole chunk's need not.
     let picks = read_ids(projector.launch, bufs.ids, dims)?;
+    if !reads_routes_first && let Some(waves) = bank.expert_waves(&picks, dims)? {
+        return run_expert_waves(projector, bufs, dims, bank, &picks, waves);
+    }
     let route_groups = bank.route_groups(&picks, dims)?;
     let sub = route_groups.as_deref().unwrap_or(sub);
     let pair = projector.launch.ctx.exl3_jobs_pair_enabled()?;

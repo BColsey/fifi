@@ -25,6 +25,47 @@
 use super::moe_block::pick_union;
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) fn plan_expert_waves(
+    picks: &[i32],
+    slot_row: &[i32],
+    slots: usize,
+) -> Result<Vec<Vec<usize>>, crate::EngError> {
+    use crate::EngError;
+    if slots == 0 {
+        return Err(EngError::BadRequest(
+            "Flash-Next expert waves need a slot".into(),
+        ));
+    }
+    // Wave zero serves the original GPU hits before any cold wave can evict them.
+    let mut groups = vec![Vec::new()];
+    let mut group_of = vec![None; slot_row.len()];
+    let mut cold = 0;
+    for (pair, &id) in picks.iter().enumerate() {
+        let expert = usize::try_from(id)
+            .ok()
+            .filter(|&expert| expert < slot_row.len())
+            .ok_or_else(|| {
+                EngError::ModelOutput("Flash-Next expert wave saw an invalid router pick".into())
+            })?;
+        let group = *group_of[expert].get_or_insert_with(|| {
+            if slot_row[expert] >= 0 {
+                0
+            } else {
+                let next = 1 + cold / slots;
+                cold += 1;
+                next
+            }
+        });
+        if group == groups.len() {
+            groups.push(Vec::new());
+        }
+        groups[group].push(pair);
+    }
+    groups.retain(|group| !group.is_empty());
+    Ok(groups)
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) fn exact_route_groups(
     picks: &[i32],
     top_k: usize,
@@ -316,6 +357,19 @@ pub(in crate::family::flash_next) mod device {
     }
 
     impl PrefillStore for LayerStore<'_> {
+        fn expert_waves(
+            &self,
+            picks: &[i32],
+            dims: &MoeDims,
+        ) -> Result<Option<Vec<Vec<usize>>>, EngError> {
+            let bank = &self.adapter.bank;
+            if dims.rows <= 1 || !bank.uses_prefill_waves(self.layer) {
+                return Ok(None);
+            }
+            super::plan_expert_waves(picks, bank.slot_row(self.layer)?, bank.geometry().slots)
+                .map(Some)
+        }
+
         fn route_groups(
             &self,
             picks: &[i32],

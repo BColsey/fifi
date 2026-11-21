@@ -633,6 +633,19 @@ fn build_driver_resolving(
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_PREFILL_ROUTE_TRACE")?;
     let exact_prefill_groups =
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_PREFILL_EXACT_GROUPS")?;
+    let prefill_wave_layer = std::env::var_os("INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER")
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    EngError::BadRequest(
+                        "INFERENCE_FLASH_NEXT_PREFILL_WAVE_LAYER needs a zero-based layer number"
+                            .into(),
+                    )
+                })
+        })
+        .transpose()?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -1109,6 +1122,10 @@ fn build_driver_resolving(
         if bank.uses_exact_prefill_groups() {
             eprintln!("flash-next cuda: exact disk prefill groups enabled");
         }
+    }
+    if let Some(layer) = prefill_wave_layer {
+        bank.enable_prefill_waves(layer)?;
+        eprintln!("flash-next cuda: disk prefill expert waves enabled at layer {layer}");
     }
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",

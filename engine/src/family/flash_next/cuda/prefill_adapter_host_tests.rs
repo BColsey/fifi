@@ -3,10 +3,41 @@
 //! repeats, which is the mapping the golden's admit arm pins. Cardless: everything here runs on
 //! the policy and the slot row, the parts of the contract that live on the host.
 
-use super::prefill_adapter::{AdmitPlan, drain_before_admit, exact_route_groups, ring_slots};
+use super::prefill_adapter::{
+    AdmitPlan, drain_before_admit, exact_route_groups, plan_expert_waves, ring_slots,
+};
 use crate::EngError;
 use crate::family::expert_bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use std::cell::RefCell;
+
+#[test]
+fn expert_waves_dispatch_gpu_hits_first_and_group_every_cold_pair_once() {
+    let row = [-1, 0, 1, -1, -1, -1, -1];
+    let picks = [4, 1, 5, 4, 3, 6, 2, 3, 5];
+    assert_eq!(
+        plan_expert_waves(&picks, &row, 3).unwrap(),
+        [vec![1, 6], vec![0, 2, 3, 4, 7, 8], vec![5]]
+    );
+    assert_eq!(
+        plan_expert_waves(&[4, 5, 4], &row, 1).unwrap(),
+        [vec![0, 2], vec![1]]
+    );
+    assert!(plan_expert_waves(&[-1], &row, 3).is_err());
+}
+
+#[test]
+fn subset_jobs_keep_original_row_and_rank_after_slot_sort() {
+    let plan = crate::family::project::exl3_jobs_plan::plan_subset_pairs(
+        &[6, 3, 6, 3],
+        &[1, 5, 8, 10],
+        7,
+        3,
+    )
+    .unwrap();
+    assert_eq!(plan.counts, [0, 0, 0, 2, 0, 0, 2]);
+    assert_eq!(plan.order, [1, 3, 0, 2]);
+    assert_eq!(plan.scatter, [5, 10, 1, 8]);
+}
 
 #[test]
 fn exact_groups_keep_whole_rows_and_count_shared_experts_once() {

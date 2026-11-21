@@ -80,6 +80,37 @@ pub(in crate::family) fn plan_pairs(
     })
 }
 
+/// Jobs over a subset of the routed pairs. Every result retains its original
+/// row and rank destination in the full chunk.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family) fn plan_subset_pairs(
+    slots: &[usize],
+    original_pairs: &[usize],
+    members: usize,
+    top_k: usize,
+) -> Result<PairPlan, EngError> {
+    if slots.len() != original_pairs.len() || top_k == 0 {
+        return Err(EngError::BadRequest(
+            "EXL3 expert wave needs one slot for each original pair".into(),
+        ));
+    }
+    let slots: Vec<i32> = slots
+        .iter()
+        .copied()
+        .map(i32::try_from)
+        .collect::<Result<_, _>>()
+        .map_err(|_| EngError::BadRequest("EXL3 expert wave has an invalid slot".into()))?;
+    let mut plan = plan_pairs(&slots, members, 1)?;
+    for (row, pair) in plan.order.iter_mut().zip(&mut plan.scatter) {
+        let original = original_pairs[*pair as usize];
+        *pair = i32::try_from(original).map_err(|_| {
+            EngError::BadRequest("EXL3 expert wave has an out-of-range destination".into())
+        })?;
+        *row = (original / top_k) as i32;
+    }
+    Ok(plan)
+}
+
 /// The most rows of one job of a routed expert: the narrowest CTA (64 rows). An expert holds a few
 /// dozen rows of a chunk, and a wider CTA would decode no fewer weights and run mostly idle warps.
 pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
