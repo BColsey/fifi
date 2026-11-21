@@ -53,11 +53,15 @@ pub(crate) mod gguf_select;
 // Gated with the CUDA families because the book reads the kernels' resident step params
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
+pub(crate) mod host_shape;
 #[allow(
     dead_code,
     reason = "the interface of the shared resident step: a family reaches it through its recipe as each family moves onto the step"
 )]
 pub(crate) mod recipe;
+pub(crate) mod slot_request;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) mod step_dims;
 // Pure host bookkeeping, compiled wherever it has a caller: every Linux
 // build (the admission fits need the cgroup-aware probe) and the test build.
 #[cfg(any(test, target_os = "linux"))]
