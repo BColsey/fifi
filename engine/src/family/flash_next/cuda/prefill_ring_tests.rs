@@ -1,7 +1,7 @@
 //! The prefill ring's stream plan: layer-major, skipping the banked experts, ring slots by
 //! round-robin.
 
-use super::prefill_ring::{StreamEntry, plan_from_rows};
+use super::prefill_ring::{SelectedOnce, StreamEntry, plan_from_rows};
 use crate::family::expert_bank::NO_PLACE;
 
 fn entry(layer: u16, expert: u16, place: u32, slot: u16) -> StreamEntry {
@@ -45,4 +45,15 @@ fn skips_experts_without_a_place() {
     let rows: Vec<&[i32]> = vec![[-1i32, 0, -1].as_slice()];
     let prows: Vec<&[u32]> = vec![[NO_PLACE, 5, NO_PLACE].as_slice()];
     assert!(plan_from_rows(&rows, &prows, 3, 4).is_empty());
+}
+
+#[test]
+fn a_second_selected_issue_for_one_layer_is_refused_until_the_chunk_restarts() {
+    let mut once = SelectedOnce::default();
+    once.claim(0).unwrap();
+    once.claim(1).unwrap();
+    let error = once.claim(1).unwrap_err().describe();
+    assert!(error.contains("layer 1 twice"), "{error}");
+    once.reset();
+    once.claim(1).unwrap();
 }

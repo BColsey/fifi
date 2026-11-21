@@ -208,6 +208,15 @@ fn selected_ring_copies_unique_misses_and_preserves_reads_across_wrap() {
     for (bytes, (layer, expert)) in got.chunks_exact(record).zip([(0, 4), (0, 7), (2, 4)]) {
         assert_eq!(bytes, expected(layer, expert, record));
     }
+
+    // A second issue for one layer in the same chunk is refused; a new chunk reopens it.
+    ring.replan(&bank);
+    ring.issue_selected(ctx, &mut bank, 0, &[4]).unwrap();
+    let error = ring
+        .issue_selected(ctx, &mut bank, 0, &[4, 7])
+        .unwrap_err()
+        .describe();
+    assert!(error.contains("layer 0 twice"), "{error}");
 }
 
 #[test]

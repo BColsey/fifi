@@ -53,9 +53,34 @@ pub(super) fn plan_from_rows(
     entries
 }
 
+/// Allows one selected-expert issue per layer in a chunk: a second call would start the next
+/// layer's prediction copies again over slots still marked as issued.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[derive(Default)]
+pub(super) struct SelectedOnce {
+    last: Option<usize>,
+}
+
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+impl SelectedOnce {
+    pub(super) fn claim(&mut self, layer: usize) -> Result<(), crate::EngError> {
+        if self.last == Some(layer) {
+            return Err(crate::EngError::BadRequest(format!(
+                "the prefill ring issued the selected experts of layer {layer} twice in one chunk"
+            )));
+        }
+        self.last = Some(layer);
+        Ok(())
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) mod device {
-    use super::{NO_PLACE, StreamEntry, plan_from_rows};
+    use super::{NO_PLACE, SelectedOnce, StreamEntry, plan_from_rows};
     use crate::{
         EngError,
         family::{expert_bank::BankGeometry, flash_next::cuda::bank::device::DeviceBank},
@@ -88,6 +113,7 @@ pub(super) mod device {
         /// When enabled, the current layer's issued entries. Only these slots have copy
         /// obligations for the layer. The eager path tracks its horizon with `issued`.
         selected: Option<Vec<StreamEntry>>,
+        selected_once: SelectedOnce,
         lookahead: Option<Lookahead>,
         record: usize,
         ring: usize,
@@ -126,6 +152,7 @@ pub(super) mod device {
                 freed: 0,
                 issued: 0,
                 selected: None,
+                selected_once: SelectedOnce::default(),
                 lookahead: None,
                 record: geometry.record_bytes,
                 ring,
@@ -323,6 +350,7 @@ pub(super) mod device {
                     "the prefill ring can issue selected experts only for its current layer".into(),
                 ));
             }
+            self.selected_once.claim(layer)?;
             let mut wanted = vec![false; bank.geometry().experts];
             for &expert in picks {
                 *wanted.get_mut(expert).ok_or_else(|| {
@@ -357,6 +385,7 @@ pub(super) mod device {
         pub(in crate::family::flash_next) fn begin_chunk(&mut self) {
             self.freed = 0;
             self.issued = 0;
+            self.selected_once.reset();
             if let Some(selected) = &mut self.selected {
                 selected.clear();
             }
