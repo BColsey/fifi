@@ -406,7 +406,11 @@ components:
           type: string
         value:
           type: string
-          description: The resolved value, rendered exactly (bytes stay bytes).
+          description: >-
+            The resolved value, rendered exactly (bytes stay bytes). A Mac
+            switch row can carry an `(ignored: ...)` suffix that says why the
+            start does not act on the value, for example `false (ignored:
+            "true" is not 1)` or `true (ignored: device sizing is off)`.
         origin:
           type: string
           enum:

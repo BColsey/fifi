@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "42ca5cdcf60cb9da7502ebbec237e49a7d282e6816cbc26f6ea33bbdd8347db1",
+ "x-source-sha256": "0fedeb0b6d569f5032c7092ff50530db2e047d6095886a3b4314ca92bd95d032",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -507,7 +507,7 @@
      },
      "value": {
       "type": "string",
-      "description": "The resolved value, rendered exactly (bytes stay bytes)."
+      "description": "The resolved value, rendered exactly (bytes stay bytes). A Mac switch row can carry an `(ignored: ...)` suffix that says why the start does not act on the value, for example `false (ignored: \"true\" is not 1)` or `true (ignored: device sizing is off)`."
      },
      "origin": {
       "type": "string",
