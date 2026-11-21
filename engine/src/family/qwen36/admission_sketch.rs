@@ -52,7 +52,8 @@ pub(crate) fn fixed_staging_rows(context_limit: usize) -> usize {
 /// 19.0 GiB Q4_K_M checkpoint showed ~275 MiB less free-after-weights than a
 /// fresh probe-context process, plus ~555 MiB against `nvidia-smi` free
 /// (n=1). Charged as one floor, never as a precise term.
-pub(crate) const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 = 384 << 20;
+pub(crate) const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 =
+    crate::family::mem::DEVICE.runtime_overhead_floor;
 
 /// Compose the sketch from the exact state terms. `kv_bytes` is the whole
 /// cache at the requested context; `fixed_state_bytes` the model's fixed

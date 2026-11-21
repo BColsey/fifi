@@ -179,17 +179,16 @@ impl TierInputs {
             ADMISSION_UNCERTAINTY_BAND_BYTES, FIXED_ADMISSION_MARGIN_BYTES,
             PREFILL_PART_CHARGE_BYTES, PREFILL_SPARE_MIN_BYTES,
         };
-        /// The serving process's own CUDA-context floor, charged as one term.
-        /// Qwen3.6's measured value (2026-11-03 qualification, n=1), borrowed
-        /// until Flash-Next measures its own floor: unqualified for Flash-Next.
-        const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 = 384 << 20;
+        // The runtime floor of the device policy table, charged as one term: Qwen3.6's
+        // measured value, borrowed until Flash-Next measures its own.
+        let runtime_overhead_floor = crate::family::mem::DEVICE.runtime_overhead_floor;
         Self {
             shape,
             vram: VramBudget {
                 usable: free_vram,
                 non_expert: trunk_bytes.saturating_add(state_bytes),
                 state: PREFILL_PART_CHARGE_BYTES as u64,
-                arena: RUNTIME_OVERHEAD_FLOOR_BYTES,
+                arena: runtime_overhead_floor,
                 desktop_reserve: FIXED_ADMISSION_MARGIN_BYTES as u64
                     + PREFILL_SPARE_MIN_BYTES as u64
                     + ADMISSION_UNCERTAINTY_BAND_BYTES,

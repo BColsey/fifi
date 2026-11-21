@@ -42,16 +42,17 @@ pub(in crate::family::flash_next) fn start(
     eprintln!("{}", model.summary());
 
     let projector = CudaProjector::new()?;
-    let card_memory = projector.memory_info()?;
-    let facts = Facts::read("Flash-Next expert bank", "Flash-Next")?
-        .with_card(card_memory.free as u64, card_memory.total as u64);
+    let facts = Facts::read_with_card("Flash-Next expert bank", "Flash-Next", || {
+        let card = projector.memory_info()?;
+        Ok((card.free as u64, card.total as u64))
+    })?;
     let ring_budget = ring_budget_bytes(
         std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
             .ok()
             .as_deref(),
     )?;
     let card = Card {
-        free_vram: card_memory.free as u64,
+        free_vram: facts.card_free(),
         host: HostMemory::of(&facts.host),
         ring_budget,
     };

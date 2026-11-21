@@ -266,7 +266,7 @@ pub(super) fn attach_tiered_parts(
 }
 
 /// The device bytes kept free beside the banks: the loader's headroom (1 GiB).
-const ADMISSION_RESERVE: u64 = 1 << 30;
+const ADMISSION_RESERVE: u64 = crate::family::mem::DEVICE.load_headroom;
 
 /// Whether the router-guess expert prefetch runs: `Q36_TIERED_GUESS=1`. The flag exists
 /// so the prefetch (new behaviour in the tiered token path) ships dark until it is

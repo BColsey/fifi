@@ -491,7 +491,7 @@ impl StepResources {
 }
 
 /// VRAM kept free beyond the sparse planes when admitting them (probe value; 4e-3 measures it).
-const DEFAULT_SPARSE_HEADROOM: u64 = 2 << 30;
+const DEFAULT_SPARSE_HEADROOM: u64 = crate::family::mem::DEVICE.sparse_headroom;
 
 /// R3 admission: exact geometry from the session shape, `context_tokens` as the cell capacity
 /// (never a reduced one), and a fail-open outcome — any refusal or error leaves dense Q8

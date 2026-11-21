@@ -15,22 +15,24 @@ use crate::EngError;
 /// `CPF_ATTN_PART_CAP` (64 MiB). A kernel-side plan defines its part charge
 /// from the kernel constant and const-asserts the two agree, so a retuned
 /// kernel cap cannot leave this copy behind.
-pub(crate) const PREFILL_PART_CHARGE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const PREFILL_PART_CHARGE_BYTES: usize = crate::family::mem::DEVICE.part_charge as usize;
 
 /// The headroom the fixed CUDA admission keeps below measured free VRAM
 /// before any charge (`budget = free - margin`). Canonical value: the runtime
 /// path in `cuda::prefill_driver` aliases this constant.
-pub(crate) const FIXED_ADMISSION_MARGIN_BYTES: usize = 256 << 20;
+pub(crate) const FIXED_ADMISSION_MARGIN_BYTES: usize =
+    crate::family::mem::DEVICE.admission_margin as usize;
 
 /// The minimum spare the fixed CUDA admission leaves after every charge
 /// (`SPARE_MIN` in `cuda::prefill_plan`). Canonical value.
-pub(crate) const PREFILL_SPARE_MIN_BYTES: usize = 64 << 20;
+pub(crate) const PREFILL_SPARE_MIN_BYTES: usize = crate::family::mem::DEVICE.spare_min as usize;
 
 /// The measurement gap an estimate cannot close: probe free VRAM versus the
 /// serving process's own post-load reading varies by a few hundred MiB with
 /// driver state and baseline residency. Slack within this band of the budget
 /// boundary is reported as borderline; load-time admission decides.
-pub(crate) const ADMISSION_UNCERTAINTY_BAND_BYTES: u64 = 128 << 20;
+pub(crate) const ADMISSION_UNCERTAINTY_BAND_BYTES: u64 =
+    crate::family::mem::DEVICE.uncertainty_band;
 
 /// The step of the context search, and the least context it tries.
 pub(crate) const CONTEXT_SEARCH_STEP: u32 = 1024;

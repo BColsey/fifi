@@ -32,7 +32,7 @@ pub(crate) const MODEL_CONTEXT_LIMIT: u32 = 262_144;
 
 /// Device bytes every load keeps free beside its weights and named
 /// charges, whatever the expert placement.
-pub(crate) const FLINT_HEADROOM_BYTES: u64 = 512 << 20;
+pub(crate) const FLINT_HEADROOM_BYTES: u64 = crate::family::mem::DEVICE.flint_headroom;
 
 /// The offload count that names every routed layer, as in the TabbyAPI key.
 pub(crate) const ALL_LAYERS: usize = 999;
@@ -289,7 +289,7 @@ impl BankRequest {
 /// included, peak 61 to 71 MiB past 22,900 MiB. One more expert in every routed layer costs 72 MiB
 /// (47 layers of 1,603,584 B), so 160 MiB is a little over two experts per layer and brings the
 /// peak under that bound.
-pub(crate) const BANK_MARGIN_BYTES: u64 = 160 << 20;
+pub(crate) const BANK_MARGIN_BYTES: u64 = crate::family::mem::DEVICE.flint_bank_margin;
 
 /// What a device has for the expert bank: `free` bytes, of which `fixed` (non-routed weights,
 /// KV cache, work, headroom and the bank margin) are spoken for, and `per_slot` bytes for one

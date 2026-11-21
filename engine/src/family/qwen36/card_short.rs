@@ -28,8 +28,12 @@ pub(crate) struct CardFigures {
     pub(crate) kv_cache: u64,
     /// The work bytes the load reserves.
     pub(crate) work: u64,
-    /// The headroom the admission keeps free.
+    /// The headroom the resident admission keeps free.
     pub(crate) headroom: u64,
+    /// The headroom the card-tiered load's bank admission keeps free (it runs with the fixed
+    /// admission off, so it keeps the legacy headroom, not the resident one). The slots the
+    /// ladder promises must fit it, or the bank admission refuses the plan the ladder made.
+    pub(crate) tiered_headroom: u64,
     /// Device bytes of one expert slot in one layer.
     pub(crate) slot_bytes: u64,
     /// Layers of the model.
@@ -60,6 +64,16 @@ pub(crate) struct CardShort {
     pub(crate) free: u64,
     /// Bytes of routed experts the host serves.
     pub(crate) host_bytes: u64,
+    /// The most slots per layer the card carries beside the rest of the load, with the tiered
+    /// load's headroom kept free (an upper bound the bank sizing may lower).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the ladder's promise; the tests check it against the bank admission"
+        )
+    )]
+    pub(crate) slots: usize,
 }
 
 impl CardShort {
@@ -110,14 +124,16 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
             expert_bytes: figures.expert_bytes,
             slot_bytes: figures.slot_bytes,
             min_slots: figures.top_k,
+            carry_reserve: figures.tiered_headroom.saturating_sub(figures.headroom),
         }),
     };
     match choose_tier(&budget) {
-        Ok(TierChoice::CardTiered { host_bytes, .. }) => CardVerdict::Short(CardShort {
+        Ok(TierChoice::CardTiered { host_bytes, slots }) => CardVerdict::Short(CardShort {
             short_by: needed.saturating_sub(figures.free),
             needed,
             free: figures.free,
             host_bytes,
+            slots,
         }),
         Ok(_) => CardVerdict::Fits,
         Err(refusal) => CardVerdict::Refused {
@@ -174,6 +190,7 @@ mod tests {
             kv_cache: 671_088_640,
             work: 0,
             headroom: GIB,
+            tiered_headroom: GIB,
             slot_bytes: 1_769_472,
             layers: 40,
             experts: 256,
@@ -309,5 +326,44 @@ mod tests {
             ..tiered
         };
         assert_eq!(unchanged, base, "nothing else moves");
+    }
+
+    /// The bytes the carried slots and the tiered load's own non-expert bytes take, headroom
+    /// included: what `admit_banks` compares to the free bytes.
+    fn tiered_need(figures: &CardFigures, slots: usize, tiered_headroom: u64) -> u64 {
+        let non_expert = figures.tensors - figures.expert_bytes + figures.kv_cache + figures.work;
+        non_expert + tiered_headroom + slots as u64 * figures.slot_bytes * figures.layers as u64
+    }
+
+    /// The slots a card-tiered load needs fit its own admission: every slot the ladder carries
+    /// leaves the tiered headroom (1 GiB) free. With the resident headroom (256 MiB) in the
+    /// ladder, up to 768 MiB of slots were promised and then refused by the bank admission.
+    #[test]
+    fn the_ladder_promises_only_slots_the_tiered_admission_keeps_its_headroom_for() {
+        let mut over_promised = 0;
+        for free in (6u64..=12).flat_map(|gib| (0..8).map(move |step| gib * GIB + step * (GIB / 8)))
+        {
+            let resident = CardFigures {
+                headroom: 256 << 20,
+                tiered_headroom: 256 << 20,
+                ..figures(free)
+            };
+            // The ladder as it was: told only the resident headroom.
+            if let CardVerdict::Short(short) = decide(&resident, 64 * GIB) {
+                over_promised += usize::from(tiered_need(&resident, short.slots, GIB) > free);
+            }
+            // The ladder now: told the headroom the tiered admission keeps.
+            let told = CardFigures {
+                tiered_headroom: GIB,
+                ..resident
+            };
+            if let CardVerdict::Short(short) = decide(&told, 64 * GIB) {
+                assert!(tiered_need(&told, short.slots, GIB) <= free, "{free}");
+            }
+        }
+        assert!(
+            over_promised > 0,
+            "the old inputs promised slots the admission refuses"
+        );
     }
 }

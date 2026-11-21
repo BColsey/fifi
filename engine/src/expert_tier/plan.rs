@@ -4,7 +4,7 @@ use super::{ExpertId, residency::Residency};
 use crate::EngError;
 
 /// VRAM the tier leaves free after its resident experts and the family's dense weight cache.
-pub const VRAM_HEADROOM_BYTES: u64 = 3 << 30;
+pub const VRAM_HEADROOM_BYTES: u64 = crate::family::mem::DEVICE.expert_tier_headroom;
 
 /// How many MoE layers keep their routed experts on the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

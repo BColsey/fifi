@@ -48,7 +48,7 @@ pub(crate) fn bolt_kv_bytes_per_position() -> Option<u64> {
 /// The resident admission folds it into the demand through the shared
 /// `plan::admit`, the same headroom rule the other resident executors use, so
 /// an exact fit of the allocations alone is refused.
-pub(crate) const BOLT_HEADROOM_BYTES: u64 = 512 << 20;
+pub(crate) const BOLT_HEADROOM_BYTES: u64 = crate::family::mem::DEVICE.bolt_headroom;
 
 /// Bytes one extra session holds beside its cache planes: the raw and the capped logits row its
 /// slot adds to the window buffers, and its two position words.

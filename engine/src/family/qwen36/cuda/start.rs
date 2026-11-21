@@ -48,7 +48,7 @@ use crate::{
         QWEN3_6_35B_A3B,
         exl3::bank::{Exl3SlotResolver, ExpertStore},
         gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
-        mem::HostFacts,
+        mem::Facts,
         project::cuda::{
             BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
             native_load_bytes, served_admission,
@@ -423,7 +423,7 @@ fn prefill_flag(
 }
 /// Legacy admission headroom. The global free-after-load floor stays at 1 GiB even when
 /// fixed admission uses its measured margin; `work: 0` is explained by `load_options`.
-const HEADROOM: u64 = 1 << 30;
+const HEADROOM: u64 = crate::family::mem::DEVICE.load_headroom;
 
 pub(super) static CUDA_ENGINE_BUILT: AtomicBool = AtomicBool::new(false);
 
@@ -1301,7 +1301,15 @@ fn lower_rung(
     let tensors = native_load_bytes(&model.weights, &names)?;
     let resident = native_load_bytes(&model.weights, &resident_names)?;
     let geometry = geometry_of(&dims);
-    let free = u64::try_from(projector.memory_info()?.free).unwrap_or(u64::MAX);
+    // The card and the host of this decision, read together.
+    let facts = Facts::read_with_card("q36 cuda tiered", "Qwen36", || {
+        let card = projector.memory_info()?;
+        Ok((
+            u64::try_from(card.free).unwrap_or(u64::MAX),
+            u64::try_from(card.total).unwrap_or(u64::MAX),
+        ))
+    })?;
+    let free = facts.card_free();
     let figures = CardFigures {
         free,
         tensors,
@@ -1311,13 +1319,15 @@ fn lower_rung(
             .reserve
             .work,
         headroom: prefill_headroom(plan.modes.fixed_admission) as u64,
+        // The tiered variant runs with the fixed admission off: its banks admit with the legacy
+        // headroom, so the ladder promises slots against that one.
+        tiered_headroom: prefill_headroom(false) as u64,
         slot_bytes: bank_slot_bytes(geometry)?,
         layers: dims.shape.kinds.len(),
         experts: dims.shape.moe.experts,
         top_k: dims.shape.moe.top_k,
     };
-    let (_, host_available) = HostFacts::read("q36 cuda tiered", "Qwen36")?.host_memory();
-    match card_short::decide(&figures, host_available) {
+    match card_short::decide(&figures, facts.host.budget()) {
         CardVerdict::Fits => Ok(None),
         CardVerdict::Refused { line } => {
             eprintln!("{line}");

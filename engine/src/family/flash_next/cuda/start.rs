@@ -616,9 +616,17 @@ fn build_driver_resolving(
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
     register_served_kernels(projector.context())?;
-    let card_memory = projector.memory_info()?;
-    let free_vram = card_memory.free as u64;
-    let vram_total = card_memory.total as u64;
+    // The one read of the start: the host (`MemAvailable` clamped by the enclosing cgroup
+    // limits) and the card, together. The tier plan, the host pin plan and the final guard all
+    // read this snapshot, so the plan that sizes the store cannot build from a figure the guard
+    // disagrees with (a cgroup-capped host used to plan an inclusive store the guard then
+    // refused at load time).
+    let facts = Facts::read_with_card("Flash-Next expert bank", "Flash-Next", || {
+        let card = projector.memory_info()?;
+        Ok((card.free as u64, card.total as u64))
+    })?;
+    let free_vram = facts.card_free();
+    let vram_total = facts.card.map_or(0, |card| card.total);
 
     stage("opening the pack");
     let files = FlashPackFiles::open(artifact)?;
@@ -640,12 +648,6 @@ fn build_driver_resolving(
         model.moe.top_k(),
         report.expert_bytes,
     )?;
-    // One admission snapshot: `MemAvailable` clamped by the enclosing cgroup limits. The tier
-    // plan, the host pin plan and the final guard all read this pair, so the plan that sizes the
-    // store cannot build from a figure the guard disagrees with (a cgroup-capped host used to
-    // plan an inclusive store the guard then refused at load time).
-    let facts =
-        Facts::read("Flash-Next expert bank", "Flash-Next")?.with_card(free_vram, vram_total);
     let host_admission = &facts.host;
     let mem_available = host_admission.budget();
     let rows = wanted.prefill_rows as usize;

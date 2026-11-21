@@ -9,7 +9,7 @@ use crate::{
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) const PRESSURE_MARGIN: u64 = 1 << 30;
+pub(crate) const PRESSURE_MARGIN: u64 = crate::family::mem::DEVICE.unified_pressure_margin;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceBudget {

@@ -13,6 +13,7 @@
 // The facts are read by the CUDA-build starts; the host build compiles them without a reader.
 #![allow(dead_code, reason = "the CUDA-build starts read the facts")]
 
+mod device;
 // The host facts exist on every target: `/proc` and the cgroup tree on Linux, the unified memory
 // of `unified` on a Mac.
 mod host;
@@ -28,6 +29,8 @@ mod unified;
     reason = "read by the MLX starts and the tests; a given build reads a subset"
 )]
 pub(crate) use unified::*;
+
+pub(crate) use device::DEVICE;
 
 #[allow(unused_imports, reason = "the name a caller matches a provenance on")]
 pub(crate) use host::{HostFacts, Provenance};
@@ -157,6 +160,25 @@ impl Facts {
     /// The facts with the host read from the machine and no card or disk yet.
     pub(crate) fn read(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
         Ok(Self::with_host(HostFacts::read(label, root_label)?))
+    }
+
+    /// The facts of one start's first moment: the host and the card read together, so a plan
+    /// that sizes the card and the host reads one snapshot of both. `card` returns the card's
+    /// `(free, total)` bytes (the one CUDA query stays in the caller; this module holds no CUDA
+    /// type).
+    pub(crate) fn read_with_card(
+        label: &'static str,
+        root_label: &'static str,
+        card: impl FnOnce() -> Result<(u64, u64), EngError>,
+    ) -> Result<Self, EngError> {
+        let host = HostFacts::read(label, root_label)?;
+        let (free, total) = card()?;
+        Ok(Self::with_host(host).with_card(free, total))
+    }
+
+    /// The card's free bytes, 0 when no card was read.
+    pub(crate) fn card_free(&self) -> u64 {
+        self.card.map_or(0, |card| card.free)
     }
 
     /// The facts around a host that is already read (or built by a test).

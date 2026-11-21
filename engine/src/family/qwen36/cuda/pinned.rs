@@ -17,7 +17,7 @@ use crate::{
 pub(super) const ROTARY_DIM: u32 = super::super::settings::ROTARY_DIM;
 /// Less than this many bytes free after the load is a typed refusal, not an error.
 /// The default floor; `min_free_after_load` carries the `Q36_CUDA_MIN_FREE_MIB` override of it.
-const MIN_FREE_AFTER_LOAD_DEFAULT: usize = 1 << 30;
+const MIN_FREE_AFTER_LOAD_DEFAULT: usize = crate::family::mem::DEVICE.load_headroom as usize;
 const MIN_FREE_MIB_VAR: &str = "Q36_CUDA_MIN_FREE_MIB";
 const MIN_FREE_MIB_FLOOR: usize = 256;
 const MIN_FREE_MIB_CAP: usize = 4096;

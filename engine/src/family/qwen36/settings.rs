@@ -1118,7 +1118,7 @@ fn at_least_one(key: &str, value: Option<u64>) -> Result<Option<u64>, EngError> 
 /// The pressure margin of a derived prefill reserve: the same 1 GiB the
 /// shipped Mac Studio profile carries on top of its plan sum (the
 /// constants test pins that sum byte for byte).
-const DERIVED_RESERVE_MARGIN_BYTES: u64 = 1 << 30;
+const DERIVED_RESERVE_MARGIN_BYTES: u64 = crate::family::mem::DEVICE.unified_pressure_margin;
 
 /// What becomes of the chunked-prefill reserve. A reserve without a
 /// budget is a mistake, because nothing would read it. A budget without

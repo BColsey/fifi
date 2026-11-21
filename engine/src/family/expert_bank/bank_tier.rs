@@ -95,6 +95,10 @@ pub(crate) struct CardBudget {
     pub(crate) slot_bytes: u64,
     /// The fewest slots per layer a token's picks need.
     pub(crate) min_slots: usize,
+    /// Device bytes the carried banks must leave free beyond the `demand`'s own non-expert part:
+    /// what the card-tiered load's admission keeps free in excess of the resident load's
+    /// headroom the `demand` was summed with. Zero when both keep the same.
+    pub(crate) carry_reserve: u64,
 }
 
 impl CardBudget {
@@ -170,12 +174,17 @@ impl TierBudget {
     /// experts.
     fn card_tiered(&self, card: &CardBudget) -> Result<TierChoice, EngError> {
         let overflow = || tier_error("the card byte counts overflow".into());
-        let resident = card.demand.checked_sub(card.expert_bytes).ok_or_else(|| {
-            tier_error(format!(
-                "the {} expert bytes exceed the {}-byte load demand",
-                card.expert_bytes, card.demand
-            ))
-        })?;
+        let resident = card
+            .demand
+            .checked_sub(card.expert_bytes)
+            .ok_or_else(|| {
+                tier_error(format!(
+                    "the {} expert bytes exceed the {}-byte load demand",
+                    card.expert_bytes, card.demand
+                ))
+            })?
+            .checked_add(card.carry_reserve)
+            .ok_or_else(overflow)?;
         let per_slot_of_layers = card
             .slot_bytes
             .checked_mul(self.layers as u64)
@@ -382,6 +391,7 @@ mod tests {
                 expert_bytes: 700,
                 slot_bytes: 5,
                 min_slots: 2,
+                carry_reserve: 0,
             }),
         }
     }
