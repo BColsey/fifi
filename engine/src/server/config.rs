@@ -41,6 +41,22 @@ pub(crate) const FAMILIES: [&str; 7] = [
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
 
+/// The families that a GGUF `general.architecture` identifies, so a directory holding only the
+/// weights file starts with no `config.json` and no `--family`. One line per architecture: a
+/// family adds its line once a start from a GGUF-only directory works for it (Flash-Next
+/// `qwen4exp`, Nemotron `nemotron_h_moe`, Bolt `gemma4` and Flint are not listed yet).
+pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] =
+    &[("qwen35moe", crate::family::qwen36::factory::FAMILY)];
+
+/// The architectures of [`GGUF_ARCHITECTURE_FAMILIES`], for refusal text.
+pub(crate) fn known_gguf_architectures() -> String {
+    GGUF_ARCHITECTURE_FAMILIES
+        .iter()
+        .map(|(architecture, _)| *architecture)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The port of another service on the same Mac. The server never binds it.
 const REFUSED_PORT: u16 = 8788;
 

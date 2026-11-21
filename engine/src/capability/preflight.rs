@@ -231,6 +231,8 @@ fn evaluate(
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
+    // A GGUF directory with no tokenizer files starts from the vocabulary in the weights.
+    gguf_tokenizer_check(inspection, &mut checks);
     if family_name == Some(crate::family::qwen36::factory::FAMILY) {
         // `None` when this binary has no GPU backend at all;
         // `backend_of_build`'s fallback arm must not masquerade as one.
@@ -555,6 +557,23 @@ fn identify_family(
         ));
         return Some(crate::family::qwen36::factory::FAMILY.to_string());
     }
+    let by_architecture = inspection.gguf_files.iter().find_map(|fact| {
+        crate::server::config::GGUF_ARCHITECTURE_FAMILIES
+            .iter()
+            .find(|(architecture, _)| fact.architecture.as_deref() == Some(*architecture))
+            .map(|&(architecture, family)| (fact, architecture, family))
+    });
+    if let Some((fact, architecture, family)) = by_architecture {
+        checks.push(Check::new(
+            "family",
+            CheckStatus::Pass,
+            format!(
+                "{} has architecture {architecture}, which is the {family} family",
+                fact.file
+            ),
+        ));
+        return Some(family.to_string());
+    }
     checks.push(Check::new(
         "family",
         CheckStatus::Fail,
@@ -564,6 +583,33 @@ fn identify_family(
         ),
     ));
     None
+}
+
+/// A directory with GGUF weights and no tokenizer files starts from the vocabulary in the GGUF
+/// header: the check that asked for the four files is replaced by one that builds the tokenizer
+/// from the file's own header. A directory that has the files keeps the file check.
+fn gguf_tokenizer_check(inspection: &ModelInspection, checks: &mut Vec<Check>) {
+    if inspection.tokenizer_missing.is_empty() {
+        return;
+    }
+    let Ok(Some(path)) = crate::tokenizer::gguf::vocabulary_gguf(&inspection.model_dir) else {
+        return;
+    };
+    checks.retain(|check| check.name != "tokenizer files");
+    let built = crate::tokenizer::gguf::GgufTokenizer::read(&path)
+        .and_then(|tokenizer| tokenizer.parts().map(|_| ()));
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    checks.push(match built {
+        Ok(()) => Check::new(
+            "tokenizer files",
+            CheckStatus::Pass,
+            format!("the tokenizer is read from {file}"),
+        ),
+        Err(error) => Check::new("tokenizer files", CheckStatus::Fail, error.describe()),
+    });
 }
 
 fn any_failed(checks: &[Check]) -> bool {
@@ -2164,6 +2210,38 @@ mod tests {
             report.checks
         );
         assert!(report.decisions.is_empty());
+    }
+
+    /// A directory holding one GGUF of architecture `qwen35moe` with its own tokenizer and no
+    /// other file.
+    fn gguf_only_directory() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("model.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf("qwen35moe", "gpt2", "raon"),
+        )
+        .expect("write the weights file");
+        dir
+    }
+
+    #[test]
+    fn a_gguf_only_directory_is_identified_by_its_architecture_and_needs_no_tokenizer_files() {
+        let dir = gguf_only_directory();
+        let candidate = super::Candidate {
+            family: None,
+            context_limit: None,
+            kv_dtype: None,
+            prefill_rows: None,
+        };
+        let report = super::preflight(dir.path(), dir.path(), &candidate, &cuda_facts(22 << 30))
+            .expect("report");
+        assert_eq!(
+            report.family.as_deref(),
+            Some(crate::family::qwen36::factory::FAMILY)
+        );
+        let check = check_named(&report, "tokenizer files");
+        assert_eq!(check.status, super::CheckStatus::Pass, "{}", check.detail);
+        assert!(check.detail.contains("model.gguf"), "{}", check.detail);
     }
 
     fn cuda_facts(free_vram: u64) -> super::super::probe::HardwareFacts {

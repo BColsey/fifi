@@ -37,6 +37,10 @@ pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The families that a GGUF `general.architecture` identifies when the directory has no
+/// `config.json`.
+const ARCHITECTURE_FAMILIES: &[(&str, &str)] = crate::server::config::GGUF_ARCHITECTURE_FAMILIES;
+
 /// The listen address of a simplified startup, matching the shipped
 /// configurations (loopback; `listen_address` rejects anything else).
 const DEFAULT_LISTEN: &str = "127.0.0.1:18791";
@@ -394,13 +398,41 @@ fn select_family(
         })
         .map(|(name, _)| *name)
         .collect();
+    // A directory with no `config.json` model_type is identified by the architecture its weights
+    // file declares.
+    if matches.is_empty() {
+        matches = ARCHITECTURE_FAMILIES
+            .iter()
+            .filter(|(architecture, _)| {
+                inspection
+                    .gguf_files
+                    .iter()
+                    .any(|fact| fact.architecture.as_deref() == Some(*architecture))
+            })
+            .map(|(_, family)| *family)
+            .collect();
+    }
     match matches.pop() {
         Some(name) if matches.is_empty() => Ok(name.to_string()),
-        _ => Err(StartupError(format!(
-            "serve --model: cannot identify the family from config.json (model_type {:?}); pass --family. Detectable families: {}",
-            inspection.config_model_types,
-            detectable_names()
-        ))),
+        _ => {
+            let seen: Vec<&str> = inspection
+                .gguf_files
+                .iter()
+                .filter_map(|fact| fact.architecture.as_deref())
+                .collect();
+            if inspection.config_model_types.is_empty() && !seen.is_empty() {
+                return Err(StartupError(format!(
+                    "serve --model: no family serves the GGUF architecture {}; known architectures: {}; pass --family or write a --config file",
+                    seen.join(", "),
+                    crate::server::config::known_gguf_architectures()
+                )));
+            }
+            Err(StartupError(format!(
+                "serve --model: cannot identify the family from config.json (model_type {:?}); pass --family. Detectable families: {}",
+                inspection.config_model_types,
+                detectable_names()
+            )))
+        }
     }
 }
 
@@ -824,5 +856,51 @@ mod tests {
                 assert!(error.0.contains("no GPU backend"), "{}", error.0);
             }
         }
+    }
+
+    /// A directory of one tiny GGUF of the given architecture and nothing else.
+    fn directory_of_architecture(architecture: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("model.gguf"),
+            crate::tokenizer::gguf::tests::tiny_gguf(architecture, "gpt2", "raon"),
+        )
+        .expect("write");
+        dir
+    }
+
+    #[test]
+    fn every_architecture_of_the_shared_table_identifies_its_family() {
+        for (architecture, family) in crate::server::config::GGUF_ARCHITECTURE_FAMILIES {
+            let dir = directory_of_architecture(architecture);
+            let discovered = discover(&args_for(dir.path()))
+                .unwrap_or_else(|error| panic!("{architecture}: {}", error.0));
+            assert_eq!(discovered.family, *family, "{architecture}");
+            assert_eq!(discovered.weight_format, "gguf");
+        }
+    }
+
+    #[test]
+    fn an_architecture_outside_the_table_is_refused_naming_it_and_the_known_ones() {
+        for architecture in ["mamba9", "gemma4", "flint"] {
+            let dir = directory_of_architecture(architecture);
+            let error = discover(&args_for(dir.path())).unwrap_err().0;
+            assert!(error.contains(architecture), "{error}");
+            assert!(error.contains("known architectures: qwen35moe"), "{error}");
+        }
+    }
+
+    /// The real Qwen3.6 GGUF (`QWEN36_GGUF_FILE`), reached through a symlink in a scratch
+    /// directory (never in a model directory): no config.json and no --family, and the
+    /// architecture names the family.
+    #[test]
+    #[ignore = "needs QWEN36_GGUF_FILE, the Qwen3.6 GGUF"]
+    fn the_real_qwen36_gguf_alone_in_a_directory_starts_the_qwen36_family() {
+        let real = std::env::var("QWEN36_GGUF_FILE").expect("QWEN36_GGUF_FILE names the file");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&real, dir.path().join("model.gguf")).expect("symlink");
+        let discovered = discover(&args_for(dir.path())).expect("discovers");
+        assert_eq!(discovered.family, crate::family::qwen36::factory::FAMILY);
+        assert_eq!(discovered.weight_format, "gguf");
     }
 }
