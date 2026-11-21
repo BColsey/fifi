@@ -320,13 +320,9 @@ fn observe(case: Case) -> Result<Observation, EngError> {
     })
 }
 
-#[test]
-fn q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning() {
-    if !testkit::device_present(
-        "q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning",
-    ) {
-        return;
-    }
+/// The cases of the Q8 affine grid: every head dimension below 512 over mixed group sizes,
+/// scalar dtypes, windows and the segmented path, plus the D64 case of 128 active splits.
+fn grid_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for (dim, group, group_size, signed, scalar, bias) in [
         (64, 3, 16, true, Dtype::F16, Some(Dtype::F32)),
@@ -380,6 +376,17 @@ fn q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning() {
         gate: false,
         segmented: false,
     });
+    cases
+}
+
+#[test]
+fn q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning() {
+    if !testkit::device_present(
+        "q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning",
+    ) {
+        return;
+    }
+    let cases = grid_cases();
     for case in cases {
         let result = observe(case).expect("Q8 affine device phase");
         assert_eq!(result.status, 0);
@@ -421,3 +428,58 @@ fn q8_affine_rows_match_f64_and_refuse_invalid_views_without_poisoning() {
         );
     }
 }
+
+fn digest(values: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(le(values));
+    format!("{:x}", hash.finalize())
+}
+
+/// The output bytes of the Q8 grid (every head dimension below 512) and of the fp16 D256 path,
+/// pinned by SHA-256: adding the head_dim 512 kernel must not move a bit of the others. The
+/// digests were taken from the tree before that kernel existed.
+#[test]
+fn head_dims_below_512_keep_their_bytes() {
+    if !testkit::device_present("head_dims_below_512_keep_their_bytes") {
+        return;
+    }
+    let mut seen = Vec::new();
+    for case in grid_cases() {
+        let result = observe(case).expect("Q8 affine device phase");
+        assert_eq!(result.status, 0);
+        seen.push(digest(&result.actual));
+    }
+    let f16 = || -> Result<Vec<f32>, EngError> {
+        let shape = qwen(37, 100, 63);
+        let split = plan_for(37, 2, 100);
+        let fx = Fx::new(shape, split, 0x5eed, false, false)?;
+        fx.run()?;
+        Ok(fx.out_values())
+    };
+    seen.push(digest(&f16().expect("fp16 device phase")));
+    assert_eq!(seen, FROZEN_DIGESTS, "the digests of this run:\n{seen:#?}");
+}
+
+const FROZEN_DIGESTS: [&str; 20] = [
+    "8c24acf5af04c9e59cbee8e581cfad90098e25377b305174ae9e805752d78af7",
+    "2ecacc6359a844bc739e297e77fe9c30184d8699b45fe82cf34ff2346dee2ac5",
+    "c2c871d3c92281a80c74008168f35bfe9bbcf65b0a96ca25a19ed47f07ae936f",
+    "730108d3a171bdc37b1adb769d3127cac84475a655480c40be4f1e735c29e7d7",
+    "e09e30c1df10a9e527104bf4173175e201a0abee09456282a8a288d68faa3803",
+    "879c270407070355e21776c111dc81050247c8c8e411b9c710cec322a64c4359",
+    "9e202fe235bb17c34ece95eb1960f94bc613d3851250e646d61112c19ff01bd5",
+    "35b57390fc0fe093c96d0c2819c91f072d62610e8293aaa90afd558dd0a4f135",
+    "0a199af896c6af95391447e55a2f52ff3878b4a597ce032f643b615cc68413f4",
+    "bc8defa863d90f52e04695f96fffe6a99f76d0507928124ed9a630efc050e2cb",
+    "9fa6169724bc2c9ac2b4988bd1e420c56525a7f6e5c83d4d6ef20136e381f24f",
+    "e98cb642f56e95d3aa944fe5475ab7cce346fac92732c4149a0219384560535b",
+    "65e6d0d434e99072992307eb255746ecd108b8baa44eb58fb01b5c1026c44ba8",
+    "6dce508a544a1cf6c0f1c08edbcba1ab3b0ec64635647024a38f8a34f6ca5dbd",
+    "849ae219d4901efec891b04911880ea8650f42b4a2b8a1c27e576ce43cbbcbd9",
+    "9e03f6c51e54516a133c48b48342170bfda9c44a27d146103bc1003d99325133",
+    "dff39b837a9bb7c27883aecfbc41fc6583c829db427eae190dca78bccaaaa3ad",
+    "c81b2fcd6821a4084631d2f1470c8adc9a982b6ce491a5c5e72960640556553e",
+    "b07848c833ed78eba58d41d889827c66d4d7274c720d7291fe80f3e11f5c6e4f",
+    "656b65def80886e6ab96886a5c3eb5639030996e687f3b3574ad5b34bcb3537c",
+];
