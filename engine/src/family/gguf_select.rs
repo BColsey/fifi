@@ -14,10 +14,13 @@
     )
 )]
 
-use crate::EngError;
+use crate::{EngError, weights::shard_name_of};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// One candidate weights file.
+/// One candidate weights file. A split set (`<name>-00001-of-0000N.gguf` and its siblings)
+/// is one candidate: `path` is its first present shard and `bytes` the sum over the present
+/// shards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GgufFile {
     pub(crate) path: PathBuf,
@@ -68,9 +71,16 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
                 model.display()
             )));
         }
-        let bytes = std::fs::metadata(model)
+        let mut bytes = std::fs::metadata(model)
             .map_err(|error| read(error, model))?
             .len();
+        if let Some(name) = shard_name_of(model) {
+            bytes = (1..=name.count)
+                .filter(|&number| number != name.number)
+                .filter_map(|number| std::fs::metadata(name.sibling(model, number)).ok())
+                .filter(std::fs::Metadata::is_file)
+                .fold(bytes, |sum, meta| sum + meta.len());
+        }
         let dir = match model.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
@@ -84,15 +94,41 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
         ));
     }
     let mut files = Vec::new();
+    // Shards of one set, keyed by (stem, count): the lowest shard number seen and the bytes.
+    let mut sets: BTreeMap<(String, u32), (u32, GgufFile)> = BTreeMap::new();
     for entry in std::fs::read_dir(model).map_err(|error| read(error, model))? {
         let path = entry.map_err(|error| read(error, model))?.path();
         if is_gguf(&path) && path.is_file() {
             let bytes = std::fs::metadata(&path)
                 .map_err(|error| read(error, &path))?
                 .len();
-            files.push(GgufFile { path, bytes });
+            match shard_name_of(&path) {
+                Some(name) => {
+                    let slot = sets.entry((name.stem, name.count)).or_insert_with(|| {
+                        (
+                            name.number,
+                            GgufFile {
+                                path: path.clone(),
+                                bytes: 0,
+                            },
+                        )
+                    });
+                    if name.number < slot.0 {
+                        *slot = (
+                            name.number,
+                            GgufFile {
+                                path,
+                                bytes: slot.1.bytes,
+                            },
+                        );
+                    }
+                    slot.1.bytes += bytes;
+                }
+                None => files.push(GgufFile { path, bytes }),
+            }
         }
     }
+    files.extend(sets.into_values().map(|(_, file)| file));
     if files.is_empty() {
         return Err(EngError::Checkpoint(format!(
             "no .gguf weights file in {}",
@@ -193,6 +229,49 @@ mod tests {
                 "m-q4_k_pure.gguf"
             ]
         );
+    }
+
+    #[test]
+    fn the_shards_of_one_set_are_one_candidate_sized_by_the_sum() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "big-00002-of-00003.gguf", 30);
+        write(dir.path(), "big-00001-of-00003.gguf", 5);
+        write(dir.path(), "big-00003-of-00003.gguf", 40);
+        write(dir.path(), "small.gguf", 60);
+        // Another set of the same stem with a different count stays apart.
+        write(dir.path(), "big-00001-of-00002.gguf", 7);
+        let (_, files) = candidates(dir.path()).expect("candidates");
+        assert_eq!(
+            names(&files),
+            [
+                "big-00001-of-00003.gguf",
+                "small.gguf",
+                "big-00001-of-00002.gguf"
+            ]
+        );
+        assert_eq!(files[0].bytes, 75);
+        assert_eq!(files[2].bytes, 7);
+    }
+
+    #[test]
+    fn an_incomplete_set_is_still_a_candidate_named_by_its_first_present_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "m-00002-of-00004.gguf", 30);
+        write(dir.path(), "m-00004-of-00004.gguf", 20);
+        let (_, files) = candidates(dir.path()).expect("candidates");
+        assert_eq!(names(&files), ["m-00002-of-00004.gguf"]);
+        assert_eq!(files[0].bytes, 50);
+    }
+
+    #[test]
+    fn a_path_to_one_shard_is_sized_by_every_shard_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "m-00001-of-00002.gguf", 10);
+        write(dir.path(), "m-00002-of-00002.gguf", 25);
+        let (found, files) = candidates(&dir.path().join("m-00002-of-00002.gguf")).expect("shard");
+        assert_eq!(found, dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes, 35);
     }
 
     #[test]

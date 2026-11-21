@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use self::load_policy::{LoadPolicy, evict_model, recover, retry_on_oom};
+use self::load_policy::{LoadPolicy, evict_model, recover_files, retry_on_oom};
 use super::Projector;
 use crate::{
     EngError,
@@ -1366,7 +1366,9 @@ fn load_inner(
     // Before admission: the free figure of an integrated GPU counts cache as
     // free, so evicting first lets the allocator find that memory.
     if policy.evict_file {
-        evict_model(weights.file())?;
+        for file in weights.files() {
+            evict_model(file)?;
+        }
     }
     admit(knobs, total, options.reserve)?;
     let drop_file = policy.drop_file(weights.file(), options.drop_page_cache);
@@ -1425,7 +1427,9 @@ fn transfer(
     // A tiled load's scan read every Q6_K, Q8_0 and Q5_0 tensor once and refilled the
     // cache; a native load ran no scan.
     if policy.evict_file {
-        evict_model(weights.file())?;
+        for file in weights.files() {
+            evict_model(file)?;
+        }
     }
     let mut loaded = CudaWeights {
         weights: Vec::with_capacity(tensors.len()),
@@ -1447,13 +1451,19 @@ fn transfer(
                 &policy,
                 knobs.oom_retries,
                 || upload_fused_inproj(knobs, weights, tensor, sibs, layout),
-                || recover(weights.file(), policy.retry_pause),
+                || recover_files(weights.files(), policy.retry_pause),
             )?;
             // The fused upload read every sibling's range, so every sibling's pages are
             // evictable exactly like the pushed tensor's own range (review F5).
             if let Some(file) = drop_file {
                 for &slot in &sib_positions {
                     let sib = tensors[slot].tensor;
+                    // A split set keeps each tensor in its own shard file.
+                    let file = if weights.is_split() {
+                        weights.file_of(sib)
+                    } else {
+                        file
+                    };
                     cuda::drop_page_cache(file, sib.abs_offset(), sib.byte_len())?;
                 }
             }
@@ -1477,11 +1487,16 @@ fn transfer(
                         planned_tensor.mapped,
                     )
                 },
-                || recover(weights.file(), policy.retry_pause),
+                || recover_files(weights.files(), policy.retry_pause),
             )?
         };
         loaded.weights.push(weight);
         if let Some(file) = drop_file {
+            let file = if weights.is_split() {
+                weights.file_of(tensor)
+            } else {
+                file
+            };
             cuda::drop_page_cache(file, tensor.abs_offset(), tensor.byte_len())?;
         }
     }

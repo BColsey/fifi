@@ -130,6 +130,7 @@ fn open_with_spec(
 ) -> Result<GgufModel, EngError> {
     let inventory = Inventory::for_spec(spec)?;
     let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+    weights.require_single_file("the Qwen3.6 GGUF engine")?;
     check_metadata(weights.header(), spec)?;
     let pairs = match_tensors(weights.header(), &inventory, spec.name)?;
     let mut tensors = Vec::with_capacity(pairs.len());

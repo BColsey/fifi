@@ -97,8 +97,12 @@ pub(super) fn evict_model(file: &File) -> Result<(), EngError> {
     cuda::drop_page_cache(file, 0, 0)
 }
 
-pub(super) fn recover(file: &File, pause: Duration) -> Result<(), EngError> {
-    evict_model(file)?;
+/// Drops the cached pages of every file of the checkpoint (one file, or each shard of a
+/// split set), then waits `pause`.
+pub(super) fn recover_files(files: &[File], pause: Duration) -> Result<(), EngError> {
+    for file in files {
+        evict_model(file)?;
+    }
     std::thread::sleep(pause);
     Ok(())
 }

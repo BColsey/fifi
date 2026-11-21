@@ -6,6 +6,7 @@ pub mod exl3;
 pub(crate) mod expert_store;
 mod gguf;
 mod gguf_dequant;
+mod gguf_split;
 mod gguf_tables;
 /// The IQ4_NL value table, re-exported for the native table pin test
 /// (kernels/cuda/resident/matvec_q/tests.rs): the CUDA copy must equal these bytes.
@@ -42,6 +43,7 @@ pub use gguf::{
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
 };
+pub(crate) use gguf_split::shard_name_of;
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
 pub use shard::{HeaderEntry, ShardHeader};

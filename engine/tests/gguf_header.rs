@@ -690,7 +690,9 @@ fn overlapping_tensors_are_rejected() {
 
 #[test]
 fn data_start_beyond_the_file_is_rejected() {
-    let g = Gguf::new().kv(kv_str("general.architecture", "test"));
+    let g = Gguf::new()
+        .kv(kv_str("general.architecture", "test"))
+        .tensor(ti("a", &[32], 20, 0));
     let header = g.header();
     // File ends inside the alignment padding.
     let file_len = header.len() as u64;
@@ -699,6 +701,16 @@ fn data_start_beyond_the_file_is_rejected() {
         GgufHeader::from_bytes(&header, file_len, LIMIT),
         "data section starts beyond the end",
     );
+}
+
+#[test]
+fn a_file_without_tensors_may_end_at_its_header() {
+    let g = Gguf::new().kv(kv_str("general.architecture", "test"));
+    let header = g.header();
+    let file_len = header.len() as u64;
+    assert!(!header.len().is_multiple_of(32));
+    let parsed = GgufHeader::from_bytes(&header, file_len, LIMIT).expect("metadata-only file");
+    assert!(parsed.tensors().is_empty());
 }
 
 #[test]

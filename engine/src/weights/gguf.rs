@@ -12,13 +12,14 @@
 //! - Metadata arrays may nest up to four levels deep. Deeper nesting fails.
 //! - Tensor data offsets may leave gaps and may appear in any table order.
 //!   Only overlap, misalignment, and out-of-file ranges fail.
-//! - The data start is the padded header end, even when the file has no tensors.
+//! - The data start is the padded header end, even when the file has no tensors. A file
+//!   with no tensors may end short of it.
 //! - A tensor dimension of zero fails.
 //! - Metadata keys may be up to 65,535 bytes. Tensor names follow the format
 //!   limit and must be shorter than 64 bytes.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{ErrorKind, Read},
     ops::Range,
 };
@@ -294,6 +295,7 @@ pub struct GgufTensor {
     abs_offset: u64,
     byte_len: u64,
     element_count: u64,
+    shard: usize,
 }
 
 impl GgufTensor {
@@ -311,9 +313,14 @@ impl GgufTensor {
     pub fn data_offset(&self) -> u64 {
         self.data_offset
     }
-    /// Offset from the start of the file.
+    /// Offset from the start of the file that holds the tensor. In a split set that is
+    /// the tensor's own shard file; see [`Self::shard`].
     pub fn abs_offset(&self) -> u64 {
         self.abs_offset
+    }
+    /// Zero-based index of the shard file that holds the tensor (always 0 outside a split set).
+    pub fn shard(&self) -> usize {
+        self.shard
     }
     pub fn byte_len(&self) -> u64 {
         self.byte_len
@@ -338,6 +345,7 @@ pub struct GgufHeader {
     header_sha256: [u8; 32],
     metadata: Vec<(String, MetaValue)>,
     tensors: Vec<GgufTensor>,
+    by_name: HashMap<String, usize>,
     split: Option<SplitInfo>,
 }
 
@@ -564,6 +572,7 @@ fn parse_tensor<R: Read + ?Sized>(src: &mut Src<'_, R>) -> Result<GgufTensor, En
         abs_offset: 0,
         byte_len,
         element_count,
+        shard: 0,
     })
 }
 
@@ -661,10 +670,10 @@ impl GgufHeader {
         }
 
         let mut tensors = Vec::with_capacity(tensor_count.min(4096) as usize);
-        let mut names = HashSet::new();
+        let mut by_name = HashMap::with_capacity(tensor_count.min(4096) as usize);
         for _ in 0..tensor_count {
             let tensor = parse_tensor(&mut src)?;
-            if !names.insert(tensor.name.clone()) {
+            if by_name.insert(tensor.name.clone(), tensors.len()).is_some() {
                 return bad(format!("duplicate tensor name {}", tensor.name));
             }
             tensors.push(tensor);
@@ -682,7 +691,9 @@ impl GgufHeader {
             .checked_add(alignment - 1)
             .map(|v| v / alignment * alignment)
             .map_or_else(|| bad("data start overflows"), Ok)?;
-        if data_start > file_len {
+        // A file without tensors (shard 1 of a split set holds only metadata) may end at its
+        // header, short of the padded data start: its data section is empty.
+        if data_start > file_len && !tensors.is_empty() {
             return bad("the data section starts beyond the end of the file");
         }
         for tensor in &mut tensors {
@@ -727,8 +738,66 @@ impl GgufHeader {
             header_sha256,
             metadata,
             tensors,
+            by_name,
             split,
         })
+    }
+
+    /// Joins the headers of one split set into a single view: the metadata of shard 1 and
+    /// every shard's tensors, in shard order. Each tensor keeps its own shard's absolute
+    /// offset and records the shard in [`GgufTensor::shard`]. `headers` must be ordered by
+    /// shard number and have passed [`check_split_set`]; the first header supplies the
+    /// version, data start, header length, file length and header digest of the result.
+    ///
+    /// A later shard may carry only split keys. Any other key it holds must have the value
+    /// shard 1 has (arrays compare by element type and length, since their contents are not
+    /// kept), and its `general.alignment`, when present, must be a valid alignment.
+    pub fn merge_split(headers: Vec<GgufHeader>) -> Result<Self, EngError> {
+        let refs: Vec<&GgufHeader> = headers.iter().collect();
+        check_split_set(&refs)?;
+        for (index, header) in headers.iter().enumerate() {
+            let no = header.split().map_or(u64::MAX, |info| info.no);
+            if no != index as u64 {
+                return bad(format!(
+                    "shard headers are out of order: position {index} holds split.no {no}"
+                ));
+            }
+        }
+        let mut headers = headers.into_iter();
+        let Some(mut merged) = headers.next() else {
+            return bad("split set is empty");
+        };
+        for (offset, header) in headers.enumerate() {
+            let shard = offset + 1;
+            for (key, value) in header.metadata() {
+                if key.starts_with("split.") {
+                    continue;
+                }
+                match find(&merged.metadata, key) {
+                    Some(first) if meta_agrees(first, value) => {}
+                    Some(_) => {
+                        return bad(format!(
+                            "shard {} of the split set disagrees with shard 1 on metadata key {key}",
+                            shard + 1
+                        ));
+                    }
+                    None => {
+                        return bad(format!(
+                            "shard {} of the split set has metadata key {key}, which shard 1 lacks",
+                            shard + 1
+                        ));
+                    }
+                }
+            }
+            for mut tensor in header.tensors {
+                tensor.shard = shard;
+                merged
+                    .by_name
+                    .insert(tensor.name.clone(), merged.tensors.len());
+                merged.tensors.push(tensor);
+            }
+        }
+        Ok(merged)
     }
 
     /// Parses a header from a byte slice that holds at least the header bytes.
@@ -772,7 +841,7 @@ impl GgufHeader {
         &self.tensors
     }
     pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
-        self.tensors.iter().find(|t| t.name == name)
+        self.by_name.get(name).map(|&index| &self.tensors[index])
     }
     pub fn split(&self) -> Option<SplitInfo> {
         self.split
@@ -789,6 +858,15 @@ impl GgufHeader {
             ));
         }
         Ok(())
+    }
+}
+
+/// Whether a later shard's value for a key equals shard 1's. Array contents are not
+/// retained, so arrays agree when their element type and length do.
+fn meta_agrees(first: &MetaValue, other: &MetaValue) -> bool {
+    match (first, other) {
+        (MetaValue::Array(a), MetaValue::Array(b)) => a.elem_type == b.elem_type && a.len == b.len,
+        _ => first == other,
     }
 }
 
