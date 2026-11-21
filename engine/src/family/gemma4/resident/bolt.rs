@@ -432,6 +432,9 @@ pub(crate) fn bolt_demand(
     })
 }
 
+/// Device bytes kept free beside the demand when several sessions are planned.
+const SESSION_PLAN_SLACK_BYTES: u64 = 256 << 20;
+
 /// The KV cells per physical layer a card carries beside `weights_bytes` while `sessions`
 /// sessions each hold that many: the largest count up to the model maximum whose first session's
 /// cache, the shared scratch, the headroom and the cache and fixed bytes of every further session
@@ -450,6 +453,14 @@ pub(crate) fn plan_cells(
     let scratch = scratch_bytes(attn_split_armed)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
     let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
+    // Allocations of the first session that the admission demand does not list (measured on the
+    // 3090: the sessions planner found 196 MiB less free after the first session than the demand
+    // predicts), kept free so that a planned session count survives them.
+    let unlisted = if extra > 0 {
+        SESSION_PLAN_SLACK_BYTES
+    } else {
+        0
+    };
     let charge = |cells: u32| {
         let cache = u64::from(cells).checked_mul(per_position)?;
         let further = cache
@@ -458,6 +469,7 @@ pub(crate) fn plan_cells(
         cache
             .checked_add(scratch)?
             .checked_add(super::super::budget::BOLT_HEADROOM_BYTES)?
+            .checked_add(unlisted)?
             .checked_add(further)
     };
     let ceiling = u32::try_from(MAX_CELLS)
@@ -2259,8 +2271,11 @@ mod tests {
     /// The sessions the planner funds once `cells` are resident beside the weights.
     fn funded_sessions(free: u64, weights: u64, cells: usize) -> usize {
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
+        // What the first session holds beyond its admission demand, as measured on the 3090.
+        const UNLISTED_BYTES: u64 = 196 << 20;
         let demand = bolt_demand(weights, true, cells).expect("demand");
-        let after_first = free.saturating_sub(demand.tensors + demand.kv_cache + demand.work);
+        let after_first =
+            free.saturating_sub(demand.tensors + demand.kv_cache + demand.work + UNLISTED_BYTES);
         let plan = plan_seqs(
             SeqInputs {
                 free: after_first,
