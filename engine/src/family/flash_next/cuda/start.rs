@@ -938,12 +938,13 @@ fn build_driver_resolving(
         None => String::new(),
     };
     eprintln!(
-        "flash-next cuda: {tier_name} ({speed_class}){rung_word}, {} pinned host bytes",
-        host_plan.store_bytes
+        "flash-next cuda: {tier_name} ({speed_class}){rung_word}, {} pinned host bytes; {}",
+        host_plan.store_bytes,
+        host_admission.provenance_note()
     );
     // The guard reads the same snapshot the plan sized from, and the PLE bytes already ride
     // inside `process_bytes` (the `engine_heap` term), so plan and guard admit one figure.
-    host_admission.admit_for(
+    host_admission.admit_process_bytes(
         host_plan.process_bytes,
         "Flash-Next expert bank and PLE projections",
     )?;

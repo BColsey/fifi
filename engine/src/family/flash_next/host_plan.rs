@@ -24,55 +24,7 @@ use crate::{
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 
-/// The machine as a host plan reads it: `MemTotal`, the budget (`available`: `MemAvailable`
-/// clamped by every cgroup ancestor's remaining bytes) and the bytes of the budget the plan keeps
-/// back (`floor`).
-///
-/// The floor is the OS floor of `family::mem` while the host is the binding limit, and less while
-/// a cgroup is (a cgroup already fences the process off from the host; see
-/// `HostFacts::spare`). The plan and the host guard read one `HostFacts`, so their figures agree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::family::flash_next) struct HostMemory {
-    pub(in crate::family::flash_next) total: u64,
-    pub(in crate::family::flash_next) available: u64,
-    floor: u64,
-}
-
-impl HostMemory {
-    /// The memory of one start's host facts: the figures the guard admits against.
-    #[cfg(any(test, target_os = "linux"))]
-    pub(in crate::family::flash_next) fn of(host: &crate::family::mem::HostFacts) -> Self {
-        Self {
-            total: host.total(),
-            available: host.budget(),
-            floor: host.kept_back(),
-        }
-    }
-
-    /// A memory with a floor read elsewhere (the report path carries it from the host facts).
-    pub(in crate::family::flash_next) fn with_floor(
-        total: u64,
-        available: u64,
-        floor: u64,
-    ) -> Self {
-        Self {
-            total,
-            available,
-            floor,
-        }
-    }
-
-    /// A memory from a probed pair `(MemTotal, budget)` with no cgroup knowledge: the host is
-    /// taken as the binding limit and the whole OS floor is kept back.
-    pub(in crate::family::flash_next) fn from_pair(total: u64, available: u64) -> Self {
-        Self::with_floor(total, available, crate::family::mem::os_floor_of(total))
-    }
-
-    /// The bytes of the budget kept back.
-    pub(in crate::family::flash_next) fn os_floor(&self) -> u64 {
-        self.floor
-    }
-}
+pub(in crate::family::flash_next) use crate::family::mem::HostMemory;
 
 /// The host side of one plan: the machine and the terms the process needs beside the store. The
 /// context choice and the start's host plan are built from one frame, so they cannot read the
@@ -126,7 +78,7 @@ pub(in crate::family::flash_next) struct HostTerms {
 pub(in crate::family::flash_next) const NGRAM_STAGING_BYTES_PER_ROW: u64 = 160 * 4 + 8 + 8;
 
 impl HostTerms {
-    /// The defaults for the 62 GiB host: 3 GiB heap, 2 GiB margin, no n-gram page-cache floor
+    /// The defaults for the 62 GiB host: 3 GiB heap, the shared host margin (2 GiB), no n-gram page-cache floor
     /// (measured, see the field), two 4096-token chunks of n-gram staging (86 MB).
     pub(in crate::family::flash_next) const DEFAULT: Self = Self {
         engine_heap: 3 * GIB,
@@ -170,10 +122,10 @@ impl HostPinPlan {
     /// - the process and the OS floor exceed `available`, or
     /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
-    /// On the CUDA path the plan and the guard read one admission snapshot: the start probes
-    /// `HostFacts` once, builds `HostMemory.available` from its budget and guards the plan's
-    /// `process_bytes` with the same figure (the guard also refuses a cgroup-namespace root,
-    /// so run on the host).
+    /// On the CUDA path the plan and the guard read one admission snapshot: the start reads
+    /// `HostFacts` once, builds `HostMemory` from it (the budget and what it keeps back) and
+    /// guards the plan's `process_bytes` with `HostFacts::admit_process_bytes` on the same facts.
+    /// A cgroup tree that cannot be verified reads as the bare `MemAvailable` figure.
     pub(in crate::family::flash_next) fn new(
         geometry: &BankGeometry,
         mode: HostMode,

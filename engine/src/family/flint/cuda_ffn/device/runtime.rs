@@ -355,7 +355,7 @@ impl State {
             .saturating_add(health_len);
         let budget = crate::family::mem::HostFacts::read("Flint expert cache", "Flint")?;
         budget
-            .admit_for(charge, "flint cuda prefix snapshot")
+            .admit_payload(charge, "flint cuda prefix snapshot")
             .inspect_err(|_| {
                 eprintln!(
                     "flint cuda prefix save refused: committed {committed} rows, host charge {charge} bytes"

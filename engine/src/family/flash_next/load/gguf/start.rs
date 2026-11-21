@@ -83,9 +83,10 @@ pub(in crate::family::flash_next) fn start(
     };
     let load = plan.at_context(u64::from(context), kv, floor)?;
     eprintln!(
-        "{load}; serving {} slots per layer; expert tier: {}",
+        "{load}; serving {} slots per layer; expert tier: {}; {}",
         load.context.plan.slots_per_layer(),
-        tier_line(&load)
+        tier_line(&load),
+        facts.host.provenance_note()
     );
 
     let gaps = model.kernel_gaps();

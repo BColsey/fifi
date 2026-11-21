@@ -651,7 +651,7 @@ fn prefix_save_restore_envelope_under_guard() {
     let budget = crate::family::mem::HostFacts::read("Flint expert cache", "Flint")
         .expect("probe the host budget");
     budget
-        .admit_for(0, "post-save floor")
+        .admit_payload(0, "post-save floor")
         .expect("the host floor must still hold after the snapshot is live");
 }
 

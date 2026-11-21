@@ -228,6 +228,9 @@ fn evaluate(
 ) -> PreflightReport {
     let mut checks = Vec::new();
     inventory_checks(inspection, &mut checks);
+    if let Some(note) = &facts.host.mem_provenance {
+        checks.push(Check::new("host memory", CheckStatus::Info, note.clone()));
+    }
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
@@ -2262,6 +2265,7 @@ mod tests {
                 mem_total_bytes: Probe::Unavailable("test".into()),
                 mem_available_bytes: Probe::Unavailable("test".into()),
                 mem_floor_bytes: None,
+                mem_provenance: None,
                 cpu_threads: 1,
             },
         }

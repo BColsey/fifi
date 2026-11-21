@@ -411,7 +411,7 @@ pub(super) mod device {
     impl DeviceBank {
         /// Allocates the buffers, writes the host places and fills every slot from `source`.
         /// Returns when the device holds the fill. `plan` is the host budget the caller admitted
-        /// (`HostPinPlan::new`, plus the cgroup-aware host guard's `admit_for` on the CUDA path):
+        /// (`HostPinPlan::new`, plus the cgroup-aware host guard's `admit_process_bytes` on the CUDA path):
         /// it must be for this bank's mode and place count, so a store is never pinned unchecked.
         pub(in crate::family::flash_next) fn build(
             ctx: &CudaContext,

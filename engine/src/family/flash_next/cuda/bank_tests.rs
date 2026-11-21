@@ -258,7 +258,7 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
     .unwrap();
     assert!(
         uncapped
-            .admit_for(inclusive.process_bytes, "the caller")
+            .admit_process_bytes(inclusive.process_bytes, "the caller")
             .is_ok()
     );
 
@@ -273,7 +273,7 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
     // plan's figure unchanged — the same call the start makes.
     assert!(
         capped
-            .admit_for(exclusive.process_bytes, "the caller")
+            .admit_process_bytes(exclusive.process_bytes, "the caller")
             .is_ok()
     );
 
@@ -1621,7 +1621,7 @@ fn the_mode_override_forces_or_refuses_and_never_falls_back() {
 }
 
 /// One frame: where the context choice (`TierPlan`) answers a host, the start's own host plan
-/// (`HostPinPlan`) and the host guard (`HostFacts::admit_for`), over the same facts and the same
+/// (`HostPinPlan`) and the host guard (`HostFacts::admit_process_bytes`), over the same facts and the same
 /// terms, answer it too, with the same tier. Before the two read one frame, the context choice
 /// charged the memory in use plus 2 + 1 + 1 GiB and the start charged the OS floor plus
 /// 3 + 2 GiB, so a host between the two figures was planned and then refused.
@@ -1698,7 +1698,7 @@ fn the_tier_plan_ok_implies_the_host_pin_plan_and_the_guard_ok_across_hosts_and_
                                             &terms,
                                         ),
                                     }?;
-                                    host.admit_for(host_plan.process_bytes, "the test")?;
+                                    host.admit_process_bytes(host_plan.process_bytes, "the test")?;
                                     Ok(tier)
                                 });
                         if outcome.as_ref().ok() != Some(&plan.store_tier()) {
@@ -1753,7 +1753,7 @@ fn a_default_start_under_a_cgroup_cap_plans_the_disk_tier_and_the_guard_admits_i
         HostPinPlan::choose_store_tier(&geometry, &memory, &HostTerms::DEFAULT, ring).unwrap();
     assert_eq!(tier, TierChoice::Disk);
     let host_plan = HostPinPlan::new_disk(&geometry, &memory, &HostTerms::DEFAULT, ring).unwrap();
-    host.admit_for(host_plan.process_bytes, "the capped start")
+    host.admit_process_bytes(host_plan.process_bytes, "the capped start")
         .expect("the guard admits the bytes the plan charged");
     assert_eq!(
         host_plan.os_floor, 0,

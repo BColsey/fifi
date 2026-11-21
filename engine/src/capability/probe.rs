@@ -59,6 +59,9 @@ pub struct HostFacts {
     /// a start does. Not part of the report; `None` plans with the whole OS floor.
     #[serde(skip)]
     pub(crate) mem_floor_bytes: Option<u64>,
+    /// How the budget was read (`HostFacts::provenance_note`); not part of the report JSON.
+    #[serde(skip)]
+    pub(crate) mem_provenance: Option<String>,
     pub cpu_threads: usize,
 }
 
@@ -155,19 +158,21 @@ fn probe_cuda() -> CudaFacts {
 /// `cgroup budget unknown` line, so nothing that worked inside a container
 /// goes dark.
 pub(crate) fn probe_host() -> HostFacts {
-    let (total, available, floor) = read_meminfo().map_or_else(
+    let (total, available, floor, provenance) = read_meminfo().map_or_else(
         |reason| {
             (
                 Probe::Unavailable(reason.clone()),
                 Probe::Unavailable(reason),
                 None,
+                None,
             )
         },
-        |(total, available, floor)| {
+        |(total, available, floor, note)| {
             (
                 Probe::Measured(total),
                 Probe::Measured(available),
                 Some(floor),
+                Some(note),
             )
         },
     );
@@ -175,15 +180,23 @@ pub(crate) fn probe_host() -> HostFacts {
         mem_total_bytes: total,
         mem_available_bytes: available,
         mem_floor_bytes: floor,
+        mem_provenance: provenance,
         cpu_threads: std::thread::available_parallelism().map_or(1, usize::from),
     }
 }
 
-fn read_meminfo() -> Result<(u64, u64, u64), String> {
+fn read_meminfo() -> Result<(u64, u64, u64, String), String> {
     #[cfg(target_os = "linux")]
     {
         crate::family::mem::HostFacts::read("Hardware facts", "the host")
-            .map(|host| (host.total(), host.budget(), host.kept_back()))
+            .map(|host| {
+                (
+                    host.total(),
+                    host.budget(),
+                    host.kept_back(),
+                    host.provenance_note(),
+                )
+            })
             .map_err(|error| format!("the host memory probe refused: {error:?}"))
     }
     #[cfg(not(target_os = "linux"))]

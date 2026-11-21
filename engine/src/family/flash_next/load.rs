@@ -1345,6 +1345,7 @@ mod tests {
                 mem_total_bytes: Probe::Measured(64u64 << 30),
                 mem_available_bytes: Probe::Measured(32u64 << 30),
                 mem_floor_bytes: None,
+                mem_provenance: None,
                 cpu_threads: 8,
             },
         }

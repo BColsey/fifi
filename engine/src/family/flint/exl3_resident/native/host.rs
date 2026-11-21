@@ -103,7 +103,7 @@ fn admit_cached(
         .and_then(|bytes| bytes.checked_add(metadata as u64))
         .ok_or_else(overflow)?;
     crate::family::mem::HostFacts::read("Flint expert cache", "Flint")?
-        .admit("Flint expert cache", required)?;
+        .admit_payload(required, "Flint expert cache")?;
     plan::admit(
         &plan::Demand {
             tensors: packing.bytes as u64,

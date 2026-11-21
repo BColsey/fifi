@@ -1,9 +1,10 @@
 //! The host half of the memory facts: `/proc/meminfo` clamped by the process's cgroup tree.
 //!
-//! probe reads /proc/meminfo and the process's cgroup tree, and admit
-//! refuses a payload that would break the OS floor or the enclosing cgroup
-//! limit. Every refusal names the caller that refused; the frozen
-//! families' exact texts are pinned by the full-text tests in this module.
+//! [`HostFacts::read`] reads `/proc/meminfo` and the process's cgroup tree (or, when the tree
+//! cannot be verified, the bare figures with their provenance). The admission checks refuse a
+//! payload that would break the OS floor, the enclosing cgroup limit, or the process's own
+//! overhead inside it. Every refusal names the caller that refused; the frozen families' exact
+//! texts are pinned by the full-text tests in this module.
 
 use crate::EngError;
 
@@ -24,6 +25,8 @@ pub(crate) struct HostFacts {
     // None means a confirmed unlimited cgroup, never a failed limit read.
     cgroup_remaining: Option<u64>,
     provenance: Provenance,
+    // This process's resident set when the facts were read; 0 when it could not be read.
+    process_rss: u64,
 }
 
 impl HostFacts {
@@ -56,13 +59,15 @@ impl HostFacts {
         root: &std::path::Path,
         pid: u32,
     ) -> Result<Self, EngError> {
-        match Self::verified_in(label, root_label, proc, root, pid) {
-            Ok(facts) => Ok(facts),
+        let mut facts = match Self::verified_in(label, root_label, proc, root, pid) {
+            Ok(facts) => facts,
             Err(refusal) => {
                 let meminfo = read_admission_file(label, &proc.join("meminfo"))?;
-                Self::bare(label, root_label, &refusal, &meminfo)
+                Self::bare(label, root_label, &refusal, &meminfo)?
             }
-        }
+        };
+        facts.process_rss = resident_set_bytes(proc);
+        Ok(facts)
     }
 
     /// The bare figures of the given meminfo text, with one log line (per process) naming the
@@ -82,6 +87,22 @@ impl HostFacts {
             );
         }
         Ok(facts)
+    }
+
+    /// One line for a start line or a report: the budget and whether its cgroup clamp was
+    /// verified or the bare `MemAvailable` figure stands in for it.
+    pub(crate) fn provenance_note(&self) -> String {
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        match &self.provenance {
+            Provenance::Verified => format!(
+                "host budget {:.1} GiB, cgroup limit verified",
+                gib(self.budget())
+            ),
+            Provenance::Bare(reason) => format!(
+                "host budget {:.1} GiB, cgroup limit unverified (bare MemAvailable): {reason}",
+                gib(self.budget())
+            ),
+        }
     }
 
     /// Whether the cgroup clamp was verified or the facts are the bare figures.
@@ -126,11 +147,12 @@ impl HostFacts {
             mem_available: available,
             cgroup_remaining,
             provenance: Provenance::Verified,
+            process_rss: 0,
         })
     }
 
     /// The byte budget admission admits against: `MemAvailable` clamped by every enclosing
-    /// cgroup's remaining bytes. The same figure [`HostFacts::admit_for`] refuses against,
+    /// cgroup's remaining bytes. The same figure the admission checks refuse against,
     /// so a host plan sized from it cannot disagree with the guard that checks it. Names no
     /// model family, so any family's host plan may reuse it.
     pub(crate) fn budget(&self) -> u64 {
@@ -162,11 +184,35 @@ impl HostFacts {
             .map_or(above_floor, |remaining| remaining.min(above_floor))
     }
 
-    /// The bytes of the budget a plan keeps back: the budget less what [`HostFacts::spare`]
-    /// allows spending. The whole OS floor while the host is the binding limit, less while a
-    /// cgroup is.
+    /// The bytes of the budget a plan with its own process terms keeps back: the budget less
+    /// what [`HostFacts::spare`] allows spending. The whole OS floor while the host is the binding
+    /// limit, less while a cgroup is.
     pub(crate) fn kept_back(&self) -> u64 {
         self.budget() - self.spare()
+    }
+
+    /// What this process still adds to its own footprint beyond the payload an admission names:
+    /// heap growth, the CUDA context's host side, staging and allocator slack. Taken from the
+    /// resident set now (the process is about to roughly double what it holds while it loads)
+    /// plus the shared host margin.
+    pub(crate) fn process_overhead(&self) -> u64 {
+        self.process_rss.saturating_add(super::HOST_MARGIN_BYTES)
+    }
+
+    /// What an admission that charges only its payload may spend: [`HostFacts::spare`], and
+    /// inside a binding cgroup (where no OS floor is charged) the cgroup's remainder less the
+    /// process's own overhead, so a payload that fills the cgroup cannot be killed by the heap
+    /// the process still has to grow.
+    pub(crate) fn payload_spare(&self) -> u64 {
+        let above_floor = self.mem_available.saturating_sub(self.os_floor());
+        self.cgroup_remaining.map_or(above_floor, |remaining| {
+            above_floor.min(remaining.saturating_sub(self.process_overhead()))
+        })
+    }
+
+    /// The bytes of the budget a payload-only admission keeps back.
+    pub(crate) fn payload_kept_back(&self) -> u64 {
+        self.budget() - self.payload_spare()
     }
 
     /// `MemTotal` paired with [`HostFacts::budget`], for host plans that carry
@@ -179,36 +225,61 @@ impl HostFacts {
         (self.mem_total, self.budget())
     }
 
-    /// [`admit_for`] with the caller's label as the refusing name.
+    /// [`HostFacts::admit_payload`] with the caller's label as the refusing name.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "the refusals are pinned by this module's tests")
     )]
     pub(crate) fn admit(&self, label: &'static str, required: u64) -> Result<(), EngError> {
-        self.admit_for(required, label)
+        self.admit_payload(required, label)
     }
 
-    /// The admission check with the caller's name in the refusal, so a prefix
-    /// snapshot refusal does not masquerade as another caller's
-    /// (the refusal names the caller).
+    /// The admission check for a payload (a store, a snapshot, a pinned pool): the payload must
+    /// fit [`HostFacts::payload_spare`], so the process's own overhead is always charged beside
+    /// it and no caller can leave it out. The refusal names the caller.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "the refusals are pinned by this module's tests")
     )]
-    pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
+    pub(crate) fn admit_payload(&self, required: u64, what: &str) -> Result<(), EngError> {
+        self.admit_within(required, what, self.payload_spare())
+    }
+
+    /// The admission check for bytes that already include the process's own terms (a plan that
+    /// charges its heap, margin and staging itself, as the Flash-Next host plan does): they must
+    /// fit [`HostFacts::spare`]. A caller that charges only a payload uses
+    /// [`HostFacts::admit_payload`].
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the refusals are pinned by this module's tests")
+    )]
+    pub(crate) fn admit_process_bytes(&self, required: u64, what: &str) -> Result<(), EngError> {
+        self.admit_within(required, what, self.spare())
+    }
+
+    fn admit_within(&self, required: u64, what: &str, spare: u64) -> Result<(), EngError> {
         let available = self.budget();
-        let kept_back = self.kept_back();
-        if self.spare() == 0
-            || required
-                .checked_add(kept_back)
-                .is_none_or(|needed| needed > available)
-        {
+        if spare == 0 || required > spare {
             return Err(EngError::MemoryPlan(format!(
-                "{what} needs {required} bytes plus {kept_back} bytes for the OS floor. Available host/cgroup budget: {available} bytes."
+                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
+                available.saturating_sub(spare)
             )));
         }
         Ok(())
     }
+}
+
+/// This process's resident set in bytes (`VmRSS` of `<proc>/self/status`), 0 when unreadable.
+fn resident_set_bytes(proc: &std::path::Path) -> u64 {
+    std::fs::read_to_string(proc.join("self/status"))
+        .ok()
+        .and_then(|text| {
+            let line = text.lines().find_map(|line| line.strip_prefix("VmRSS:"))?;
+            let mut fields = line.split_whitespace();
+            let kib = fields.next()?.parse::<u64>().ok()?;
+            (fields.next() == Some("kB")).then(|| kib.saturating_mul(1024))
+        })
+        .unwrap_or(0)
 }
 
 fn meminfo_bytes(label: &'static str, contents: &str, name: &str) -> Result<u64, EngError> {
@@ -902,17 +973,22 @@ mod tests {
         let (_root, _proc, directory, proc_dir) = namespace_root("8589934592\n", "memory\n");
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
-        assert_eq!(budget.os_floor(), 8u64 << 30);
-        // 6 GiB left in the cgroup: the cgroup is the binding limit, the OS floor is not charged
-        // inside it, and the whole 6 GiB is spendable.
-        assert!(budget.admit(LABEL, 6u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (6u64 << 30) + 1).is_err());
+        assert_eq!(budget.os_floor(), crate::family::mem::os_floor_of(32 << 30));
+        // 6 GiB left in the cgroup: the cgroup is the binding limit, so the OS floor is not
+        // charged inside it. A plan that carries its own process terms may spend the whole 6 GiB;
+        // a payload keeps the process's overhead (the 2 GiB host margin here, no resident set
+        // in this fixture) back inside it.
+        assert!(budget.admit_process_bytes(6u64 << 30, LABEL).is_ok());
+        assert!(budget.admit_process_bytes((6u64 << 30) + 1, LABEL).is_err());
+        assert!(budget.admit(LABEL, 4u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (4u64 << 30) + 1).is_err());
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
-        // MemAvailable is 24 GiB; the floor is max(8 GiB, 10% of 32 GiB) = 8 GiB.
-        assert!(budget.admit(LABEL, 16u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (16u64 << 30) + 1).is_err());
+        // MemAvailable is 24 GiB; the floor of a 32 GiB host is a fifth of it.
+        let spare = (24u64 << 30) - crate::family::mem::os_floor_of(32 << 30);
+        assert!(budget.admit(LABEL, spare).is_ok());
+        assert!(budget.admit(LABEL, spare + 1).is_err());
     }
 
     #[test]
@@ -1055,8 +1131,14 @@ mod tests {
             remaining,
         )
         .unwrap();
-        assert!(budget.admit(LABEL, 12u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (12u64 << 30) + 1).is_err());
+        assert!(budget.admit_process_bytes(12u64 << 30, LABEL).is_ok());
+        assert!(
+            budget
+                .admit_process_bytes((12u64 << 30) + 1, LABEL)
+                .is_err()
+        );
+        assert!(budget.admit(LABEL, 10u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (10u64 << 30) + 1).is_err());
     }
 
     #[test]
@@ -1094,8 +1176,26 @@ mod tests {
         // with the host binding it is the available figure minus the 8 GiB OS floor of the
         // 64 GiB host.
         assert_eq!(cgroup_smaller.spare(), 12 << 30);
-        assert!(cgroup_smaller.admit(LABEL, 12u64 << 30).is_ok());
-        assert!(cgroup_smaller.admit(LABEL, (12u64 << 30) + 1).is_err());
+        assert!(
+            cgroup_smaller
+                .admit_process_bytes(12u64 << 30, LABEL)
+                .is_ok()
+        );
+        assert!(
+            cgroup_smaller
+                .admit_process_bytes((12u64 << 30) + 1, LABEL)
+                .is_err()
+        );
+        assert_eq!(
+            cgroup_smaller.payload_spare(),
+            10 << 30,
+            "the process overhead stays back"
+        );
+        assert_eq!(
+            unlimited.payload_spare(),
+            unlimited.spare(),
+            "uncapped: the floor covers it"
+        );
         assert_eq!(unlimited.spare(), 16 << 30);
         assert_eq!(unlimited.kept_back(), 8 << 30);
         assert_eq!(
@@ -1184,12 +1284,12 @@ mod tests {
     #[test]
     fn host_snapshot_preserves_minimum_floor_and_finite_cgroup() {
         let text = "MemAvailable: 25165824 kB\nMemFree: 0 kB\nMemTotal: 33554432 kB\n";
-        let floor = 8u64 << 30;
+        let floor = crate::family::mem::os_floor_of(32u64 << 30);
         let budget = HostFacts::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
         assert_eq!(budget.os_floor(), floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
-        assert!(budget.admit(LABEL, floor + 1).is_ok());
-        assert!(budget.admit(LABEL, floor + 2).is_err());
+        assert!(budget.admit_process_bytes(floor + 1, LABEL).is_ok());
+        assert!(budget.admit_process_bytes(floor + 2, LABEL).is_err());
         assert!(
             HostFacts::from_meminfo(LABEL, text, Some(0))
                 .unwrap()
@@ -1230,10 +1330,11 @@ mod tests {
     #[test]
     fn host_budget_rejects_unrepresentable_payload_plus_floor() {
         let budget = HostFacts {
-            mem_total: 1,
+            mem_total: 40 << 30,
             mem_available: u64::MAX,
             cgroup_remaining: None,
             provenance: Provenance::Verified,
+            process_rss: 0,
         };
         let floor = budget.os_floor();
         assert!(budget.admit(LABEL, u64::MAX).is_err());
@@ -1246,13 +1347,14 @@ mod tests {
         let required = 256 * 47 * 1_603_584u64;
         let floor = 8u64 << 30;
         let exact = HostFacts {
-            mem_total: required + floor,
+            mem_total: 40 << 30,
             mem_available: required + floor,
             cgroup_remaining: Some(required + floor),
             provenance: Provenance::Verified,
+            process_rss: 0,
         };
         assert!(
-            exact.admit(LABEL, required).is_ok(),
+            exact.admit_process_bytes(required, LABEL).is_ok(),
             "exact model demand plus OS floor must admit"
         );
         assert!(
@@ -1260,7 +1362,7 @@ mod tests {
                 mem_available: exact.mem_available - 1,
                 ..exact.clone()
             }
-            .admit(LABEL, required)
+            .admit_process_bytes(required, LABEL)
             .is_err()
         );
         assert!(
@@ -1268,7 +1370,7 @@ mod tests {
                 cgroup_remaining: Some(required),
                 ..exact.clone()
             }
-            .admit(LABEL, required)
+            .admit_process_bytes(required, LABEL)
             .is_ok(),
             "a cgroup that holds the payload is not asked to hold the OS floor as well"
         );
@@ -1277,7 +1379,7 @@ mod tests {
                 cgroup_remaining: Some(required - 1),
                 ..exact.clone()
             }
-            .admit(LABEL, required)
+            .admit_process_bytes(required, LABEL)
             .is_err()
         );
         assert!(
@@ -1285,7 +1387,7 @@ mod tests {
                 cgroup_remaining: None,
                 ..exact.clone()
             }
-            .admit(LABEL, required)
+            .admit_process_bytes(required, LABEL)
             .is_ok(),
             "an unlimited cgroup still obeys host availability and the OS floor"
         );
@@ -1309,8 +1411,14 @@ mod tests {
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
-        assert!(budget.admit(LABEL, 15u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (15u64 << 30) + 1).is_err());
+        assert!(budget.admit_process_bytes(15u64 << 30, LABEL).is_ok());
+        assert!(
+            budget
+                .admit_process_bytes((15u64 << 30) + 1, LABEL)
+                .is_err()
+        );
+        assert!(budget.admit(LABEL, 13u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (13u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
         assert!(HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
         // The one read does not fail closed: the same unverifiable tree reads as the bare
@@ -1345,5 +1453,43 @@ mod tests {
         // An unreadable /proc/meminfo is the only refusal left.
         std::fs::remove_file(proc_dir.join("meminfo")).unwrap();
         assert!(HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
+    }
+
+    /// A payload inside a binding cgroup keeps the process's own overhead back: the Flint expert
+    /// cache charges only its payload, and under `MemoryMax=12G` a payload that fills the cgroup
+    /// would be killed by the heap and CUDA context the process still grows while it loads.
+    #[test]
+    fn a_payload_under_a_twelve_gib_cap_keeps_the_process_overhead_back() {
+        const FLINT: &str = "Flint expert cache";
+        // 62 GiB host, 50 GiB available, a 12 GiB cgroup with 1.5 GiB of it already resident.
+        let meminfo = "MemTotal: 65011712 kB\nMemAvailable: 52428800 kB\n";
+        let mut host =
+            HostFacts::from_meminfo(FLINT, meminfo, Some(12 * (1 << 30) - (3 << 29))).unwrap();
+        host.process_rss = 3 << 29;
+        assert_eq!(host.process_overhead(), (3 << 29) + (2 << 30));
+        // 10.5 GiB remain in the cgroup; 3.5 GiB of overhead leave 7 GiB for the payload.
+        assert_eq!(host.payload_spare(), 7 << 30);
+        assert!(host.admit(FLINT, 7 << 30).is_ok());
+        let refusal = host.admit(FLINT, 9 << 30).unwrap_err().describe();
+        assert!(refusal.contains("Flint expert cache needs"), "{refusal}");
+        // The same host without a cap charges the floor, as before.
+        let uncapped = HostFacts::from_meminfo(FLINT, meminfo, None).unwrap();
+        assert_eq!(uncapped.payload_spare(), (50u64 << 30) - 8 * (1 << 30));
+    }
+
+    /// The resident set comes from `<proc>/self/status`, and a missing file reads as zero.
+    #[test]
+    fn the_process_overhead_reads_the_resident_set() {
+        let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
+        std::fs::write(
+            proc_dir.join("self/status"),
+            "Name:\tx\nVmRSS:\t  2097152 kB\n",
+        )
+        .unwrap();
+        let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert_eq!(read.process_rss, 2 << 30);
+        std::fs::remove_file(proc_dir.join("self/status")).unwrap();
+        let read = HostFacts::read_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
+        assert_eq!(read.process_rss, 0);
     }
 }
