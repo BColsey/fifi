@@ -431,12 +431,26 @@ fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
     for tensor in inventory.tensors() {
         match tensor.path() {
             TensorPath::DeviceTiled => {
-                // Routed experts and the embedding gather stay on the vendored
-                // kernels; dense projections add the in-house dequant types.
+                // The embedding gather stays on the vendored kernels; routed experts add the
+                // codebook types; dense projections add those and the other dequant types.
                 let want: &[GgufType] = match tensor.role {
-                    Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps | Role::TokenEmbd => {
-                        &[GgufType::Q4K, GgufType::Q6K, GgufType::Q80]
-                    }
+                    Role::TokenEmbd => &[GgufType::Q4K, GgufType::Q6K, GgufType::Q80],
+                    Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps => &[
+                        GgufType::Q4K,
+                        GgufType::Q6K,
+                        GgufType::Q80,
+                        GgufType::Iq4Nl,
+                        GgufType::Iq4Xs,
+                        GgufType::Iq2Xxs,
+                        GgufType::Iq2Xs,
+                        GgufType::Iq2S,
+                        GgufType::Iq3Xxs,
+                        GgufType::Iq3S,
+                        GgufType::Iq1S,
+                        GgufType::Iq1M,
+                        GgufType::Q20,
+                        GgufType::Q2K,
+                    ],
                     _ => &[
                         GgufType::Q4K,
                         GgufType::Q5K,

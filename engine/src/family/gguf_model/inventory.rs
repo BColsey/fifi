@@ -88,7 +88,7 @@ const DELTA_ROLES: [Role; 9] = [
 // the codebook types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
 // Q2_0) and Q2_K, whose decoders are shared by the decode matvec and the GEMM.
 // Q3_K is held back until its chunk, expert and embedding wiring is qualified;
-// routed experts and the embedding gather stay on the vendored path.
+// the embedding gather stays on the vendored path.
 const DENSE_TILED_TYPES: [GgufType; 16] = [
     GgufType::Q4K,
     GgufType::Q5K,
@@ -108,9 +108,26 @@ const DENSE_TILED_TYPES: [GgufType; 16] = [
     GgufType::Q2K,
 ];
 const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
-/// Routed experts run the vendored MMVQ path only: the in-house dequant types have no
-/// expert kernel, so they are refused at the open, naming the tensor.
-const EXPERT_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
+/// Routed experts: the vendored MMVQ and MMQ types, and the codebook types (IQ4_NL, IQ4_XS,
+/// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0) and Q2_K, whose decode expert
+/// matvec and grouped dequantizing GEMM are the in-house kernels. Any other type is refused at
+/// the open, naming the tensor.
+const EXPERT_TYPES: [GgufType; 14] = [
+    GgufType::Q4K,
+    GgufType::Q6K,
+    GgufType::Q80,
+    GgufType::Iq4Nl,
+    GgufType::Iq4Xs,
+    GgufType::Iq2Xxs,
+    GgufType::Iq2Xs,
+    GgufType::Iq2S,
+    GgufType::Iq3Xxs,
+    GgufType::Iq3S,
+    GgufType::Iq1S,
+    GgufType::Iq1M,
+    GgufType::Q20,
+    GgufType::Q2K,
+];
 /// The native embedding gather reads the vendored blocks only.
 const EMBD_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
 
@@ -183,7 +200,7 @@ impl Role {
 
     fn allowed_types(self) -> &'static [GgufType] {
         match self {
-            // Routed experts: the vendored expert kernels only.
+            // Routed experts: the vendored expert kernels and the in-house codebook kernels.
             Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps => &EXPERT_TYPES,
             // The embedding gather decodes Q4_K blocks natively.
             Role::TokenEmbd => &EMBD_TYPES,

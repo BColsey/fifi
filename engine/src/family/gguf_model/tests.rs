@@ -301,8 +301,37 @@ fn a_q5_k_expert_stack_fails_the_open_naming_the_tensor() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
+        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
+}
+
+#[test]
+fn a_codebook_expert_stack_opens() {
+    let spec = TWO_LAYER_SPEC;
+    for ty in [
+        GgufType::Iq4Xs,
+        GgufType::Iq2S,
+        GgufType::Iq3Xxs,
+        GgufType::Q2K,
+    ] {
+        let kvs = metadata("qwen35moe", spec_counts(&spec));
+        let mut tensors = file_tensors(&spec);
+        for name in [
+            "blk.1.ffn_gate_exps.weight",
+            "blk.1.ffn_up_exps.weight",
+            "blk.1.ffn_down_exps.weight",
+        ] {
+            let dims = if name.contains("down") {
+                vec![256, 512, 16]
+            } else {
+                vec![512, 256, 16]
+            };
+            replace(&mut tensors, name, ty, dims);
+        }
+        let model = open(&kvs, &tensors, &spec)
+            .unwrap_or_else(|error| panic!("{ty:?} expert stacks must open: {error:?}"));
+        assert_eq!(model.plan.tensors().count(), tensors.len(), "{ty:?}");
+    }
 }
 
 #[test]
