@@ -611,8 +611,8 @@ fn check_storage(storage: AttnKvStorage, dim: usize) -> Result<(), EngError> {
             "invalid KV payload extent or affine group size",
         ));
     }
-    if matches!(storage, AttnKvStorage::Q8Affine { .. })
-        && [64, 128, 256, CPF_ATTN_WIDE_HEAD_DIM].contains(&dim)
+    if let AttnKvStorage::Q8Affine { group_size, .. } = storage
+        && ([64, 128, 256].contains(&dim) || (dim == CPF_ATTN_WIDE_HEAD_DIM && group_size == 32))
     {
         return Ok(());
     }
