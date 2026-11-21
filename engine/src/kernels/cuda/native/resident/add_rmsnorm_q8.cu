@@ -26,6 +26,7 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "quantize.cuh"
 #pragma GCC diagnostic pop
+#include "resident/q8_1_store.cuh"
 
 namespace {
 
@@ -85,17 +86,7 @@ __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const f
     const int i = (int)(b * kQk8_1) + lane;
     const float xi = i < n ? h[i] * rstd * w[i] : 0.0f;
     if (i < n) norm_out[i] = xi;
-    float amax = fabsf(xi);
-    float sum = xi;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-      sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    }
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-    y[b].qs[lane] = q;
-    if (lane == 0) y[b].ds = make_half2(d, sum);
+    store_q8_1_block(&y[b], xi);
   }
 }
 

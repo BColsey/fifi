@@ -27,6 +27,7 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "quantize.cuh"
 #pragma GCC diagnostic pop
+#include "resident/q8_1_store.cuh"
 
 namespace {
 
@@ -55,17 +56,7 @@ __global__ void swiglu_q8_k(const float *gu, int n_ff, int64_t slot_stride, bloc
   for (int64_t b = warp; b < padded / kQk8_1; b += nwarps) {
     const int i = (int)(b * kQk8_1) + lane;
     const float xi = i < n_ff ? (glu_done ? g[i] : silu(g[i]) * g[n_ff + i]) : 0.0f;
-    float amax = fabsf(xi);
-    float sum = xi;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-      sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    }
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-    row[b].qs[lane] = q;
-    if (lane == 0) row[b].ds = make_half2(d, sum);
+    store_q8_1_block(&row[b], xi);
   }
 }
 

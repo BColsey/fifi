@@ -15,6 +15,14 @@
 #include "device.h"
 #include "resident/block_ops.h"
 
+// The vendored header defines block_q8_1 and keeps static host helpers that are unreferenced in
+// this glue TU (the quantize_q8_1 glue includes it the same way).
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "quantize.cuh"
+#pragma GCC diagnostic pop
+#include "resident/q8_1_store.cuh"
+
 namespace {
 
 constexpr int kQ8Block = 36;     /* bytes of one block_q8_1: half2 ds + 32 codes */
@@ -65,20 +73,6 @@ __device__ float block_sum(float v, float *scratch) {
 __host__ __device__ size_t q8_row_bytes(long long k) {
     const long long padded = (k + kQ8Padding - 1) / kQ8Padding * kQ8Padding;
     return (size_t)(padded / 32) * kQ8Block;
-}
-
-/* One warp quantizes one 32-value block: lane `lane` holds element `lane`. */
-__device__ void quant_block(unsigned char *dst, float x) {
-    const int lane = threadIdx.x & 31;
-    const float amax = warp_max(fabsf(x));
-    const float sum = warp_sum(x);
-    const float d = amax / 127.0f;
-    const int q = amax == 0.0f ? 0 : (int)roundf(x / d);
-    reinterpret_cast<int8_t *>(dst + 4)[lane] = (int8_t)q;
-    if (lane == 0) {
-        reinterpret_cast<__half *>(dst)[0] = __float2half(d);
-        reinterpret_cast<__half *>(dst)[1] = __float2half(sum);
-    }
 }
 
 /* Zeroes the padding blocks of one row after its `k / 32` live blocks. */
@@ -225,7 +219,7 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float *x, const flo
     __syncthreads();
     unsigned char *qrow = q8 + (size_t)t * q8_row_bytes(d);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    for (int b = warp; b < d / 32; b += warps) quant_block(qrow + (size_t)b * kQ8Block, row[b * 32 + lane]);
+    for (int b = warp; b < d / 32; b += warps) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), row[b * 32 + lane]);
     zero_q8_tail(qrow, d);
 }
 
@@ -239,7 +233,7 @@ __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const 
         float v = x[at];
         if (g != NULL) v *= sigmoid_f(g[at]);
         if (y != NULL) y[at] = v;
-        if (qrow != NULL) quant_block(qrow + (size_t)b * kQ8Block, v);
+        if (qrow != NULL) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), v);
     }
     if (qrow != NULL) zero_q8_tail(qrow, w);
 }
@@ -258,7 +252,7 @@ __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, cons
         const float act = tanhf(g / beta) * beta * sigmoid_f(g);
         const float upq = lb > 0.0f ? tanhf(u / lb) * lb : u;
         if (y != NULL) y[(size_t)t * w + i] = act * upq;
-        if (qrow != NULL) quant_block(qrow + (size_t)b * kQ8Block, act * upq);
+        if (qrow != NULL) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), act * upq);
     }
     if (qrow != NULL) zero_q8_tail(qrow, w);
 }
@@ -266,27 +260,6 @@ __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, cons
 __global__ void fill_kernel(float *p, int count, float value) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) p[i] = value;
-}
-
-/* ---- causal short convolution -------------------------------------------------------- */
-
-__global__ void conv_silu_kernel(const float *x, const float *w, float *hist, float *y, int n,
-                                 int c) {
-    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= c) return;
-    const float w0 = w[ch * 4], w1 = w[ch * 4 + 1], w2 = w[ch * 4 + 2], w3 = w[ch * 4 + 3];
-    float m3 = hist[ch], m2 = hist[c + ch], m1 = hist[2 * c + ch];
-    for (int t = 0; t < n; ++t) {
-        const float x0 = x[(size_t)t * c + ch];
-        const float acc = w0 * m3 + w1 * m2 + w2 * m1 + w3 * x0;
-        y[(size_t)t * c + ch] = acc * sigmoid_f(acc);
-        m3 = m2;
-        m2 = m1;
-        m1 = x0;
-    }
-    hist[ch] = m3;
-    hist[c + ch] = m2;
-    hist[2 * c + ch] = m1;
 }
 
 /* ---- delta-rule scan with a decay per key channel ----------------------------------- */
@@ -717,19 +690,6 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
             hc_mean_kernel<<<(unsigned)((h + 255) / 256), 256, 0, s>>>(
                 (const float *)p[0], (float *)p[1], (int)row, (int)h);
-            return launch_status(out_stage);
-        }
-        case INFERENCE_CUDA_BLOCK_OP_CONV_SILU: {
-            const long long n = i[0], c = i[1];
-            if (n < 1 || n > 65536 || c < 1 || c > 65536) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            slots.use(0, n * c * 4, false);
-            slots.use(1, c * 4 * 4, false);
-            slots.use(2, 3 * c * 4, true);
-            slots.use(3, n * c * 4, true);
-            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            conv_silu_kernel<<<(unsigned)((c + 255) / 256), 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (float *)p[2], (float *)p[3], (int)n,
-                (int)c);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_RDA_SCAN: {

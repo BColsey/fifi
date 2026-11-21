@@ -289,6 +289,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/prefill/flint_qk.h",
     "src/kernels/cuda/native/resident/dense_gemv.h",
     "src/kernels/cuda/native/resident/hyper.h",
+    "src/kernels/cuda/native/resident/q8_1_store.cuh",
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",
     "src/kernels/cuda/native/resident/qsa_select.h",

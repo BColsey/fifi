@@ -33,6 +33,7 @@ use crate::kernels::cuda::resident::block_ops::{
     BlockOp, MLA_GROUP, MlaShape, RdaInputs, RowOutputs,
 };
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
+use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::MatvecCall;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
@@ -63,6 +64,8 @@ const MOE_INTER: usize = 1088;
 const DENSE_INTER: usize = 12_032;
 const TIME_RANK: usize = 128;
 const CONV_TAPS: usize = 3;
+/// Rows per thread of the multi-row convolution kernel; shorter chunks use the one-row kernel.
+const CONV_ROWS_PER_THREAD: usize = 16;
 /// Bytes of KV cache per position: seven attention layers of 576 f16 values.
 const KV_BYTES_PER_POSITION: u64 = 7 * MLA_ROW as u64 * 2;
 /// Device bytes kept free beside the weights, the scratch and the cache.
@@ -821,14 +824,23 @@ impl Raon1Device {
         .into_iter()
         .enumerate()
         {
-            self.run(BlockOp::conv_silu(
-                n,
-                WIDTH,
-                input.range(0, row)?,
-                self.raw(&names.conv[which])?,
-                self.hist.range(hist_at(which), CONV_TAPS * WIDTH * 4)?,
-                output.range(0, row)?,
-            )?)?;
+            let call = ConvCall {
+                shape: ConvShape {
+                    m: n,
+                    channels: WIDTH,
+                    ld: WIDTH,
+                },
+                proj: input.range(0, row)?,
+                weights: self.raw(&names.conv[which])?,
+                state: self.hist.range(hist_at(which), CONV_TAPS * WIDTH * 4)?,
+                out: output.range(0, row)?,
+            };
+            if n >= CONV_ROWS_PER_THREAD {
+                self.ctx
+                    .gdn_conv_rows(&self.stream, call, CONV_ROWS_PER_THREAD)?;
+            } else {
+                self.ctx.gdn_conv(&self.stream, call)?;
+            }
         }
         let state_bytes = HEADS * HEAD_DIM * HEAD_DIM * 4;
         self.run(BlockOp::rda_scan(

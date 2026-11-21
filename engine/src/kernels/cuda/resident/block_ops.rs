@@ -166,23 +166,6 @@ impl<'b> BlockOp<'b> {
             .write(1, out, bytes(&[h, 4])?))
     }
 
-    /// Causal width-4 convolution with SiLU over `c` channels, continuing from `hist` (the three
-    /// previous inputs, oldest first) and leaving the last three inputs there.
-    pub(crate) fn conv_silu(
-        n: usize,
-        c: usize,
-        x: DeviceRange<'b>,
-        weight: DeviceRange<'b>,
-        hist: DeviceRange<'b>,
-        y: DeviceRange<'b>,
-    ) -> Result<Self, EngError> {
-        Ok(Self::new(5, &[n, c], &[])?
-            .read(0, x, bytes(&[n, c, 4])?)
-            .read(1, weight, bytes(&[c, 16])?)
-            .write(2, hist, bytes(&[3, c, 4])?)
-            .write(3, y, bytes(&[n, c, 4])?))
-    }
-
     /// Delta-rule scan with a decay per key channel, then the per-head RMS norm and the sigmoid
     /// output gate. `state` is `[heads][128][128]` and carries over between calls.
     #[allow(clippy::too_many_arguments)]
