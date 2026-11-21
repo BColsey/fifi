@@ -27,7 +27,7 @@ struct Trace {
     windows: Vec<Vec<Vec<u32>>>,
     draws: Vec<(u32, u32)>,
     /// Every save point that fired: (key length, kind). The calls trace keeps its
-    /// kind-less `save:N` shape; the kind assertion reads this instead (S4).
+    /// kind-less `save:N` shape; the kind assertion reads this instead.
     saves: Vec<(usize, SaveKind)>,
 }
 
@@ -68,6 +68,9 @@ struct WindowFake {
     /// entered, and waits to be released. It holds the worker inside a call so that a job
     /// submitted meanwhile is certain to meet a live slot.
     armed_hold: Option<Arc<Mutex<Option<Gate>>>>,
+    /// The same for the next window: the fake takes the gate, signals that it entered, and waits
+    /// to be released.
+    armed_window: Option<Arc<Mutex<Option<Gate>>>>,
     failure: Option<Failure>,
     deny_session: bool,
     /// When set, the denied `new_session` marks this flag cancelled first: the test hook
@@ -108,7 +111,7 @@ struct WindowFake {
     fail_reset_call: Option<(usize, EngError)>,
     /// The number of `reset` calls so far, for the indexed failure below.
     reset_calls: usize,
-    /// The pinned block prefix-match spacing (S4): `None` keeps every save-point
+    /// The pinned block prefix-match spacing: `None` keeps every save-point
     /// walk on the no-block path regardless of the flipped environment default.
     spacing: Option<usize>,
     /// The prompt rows per tick the fake asks the worker for; `None` keeps the worker's rule.
@@ -146,6 +149,7 @@ impl WindowFake {
             hold: None,
             hold_prefill: None,
             armed_hold: None,
+            armed_window: None,
             failure: None,
             deny_session: false,
             cancel_denied_session: None,
@@ -330,7 +334,6 @@ impl ExecutorOps for WindowFake {
             entered.send(()).expect("signal prefill");
             release.recv_timeout(WAIT).expect("release prefill");
         }
-
         let call = self.prefill_calls;
         self.prefill_calls += 1;
         if self
@@ -375,6 +378,14 @@ impl ExecutorOps for WindowFake {
         generations: &mut [&mut GenerationState],
     ) -> Result<Vec<Result<DecodeBatch, EngError>>, EngError> {
         self.note("window");
+        let armed = self
+            .armed_window
+            .as_ref()
+            .and_then(|armed| lock(armed).take());
+        if let Some((entered, release)) = armed {
+            entered.send(()).expect("signal armed window");
+            release.recv_timeout(WAIT).expect("release armed window");
+        }
         if let Some(delay) = self.window_delay {
             std::thread::sleep(delay);
         }
@@ -436,7 +447,7 @@ impl ExecutorOps for WindowFake {
     }
 
     fn prefix_block_spacing(&self) -> Option<usize> {
-        // Pinned per test (S4): the fake never reads the environment, so the
+        // Pinned per test: the fake never reads the environment, so the
         // batch save-point walk runs with a controlled spacing, not the
         // flipped default.
         self.spacing
@@ -493,9 +504,10 @@ fn gate() -> (Gate, mpsc::Receiver<()>, mpsc::Sender<()>) {
 }
 
 /// Submits two jobs to an idle engine so that the second finds the first live: the armed gate
-/// holds the worker inside the first job's admission (its reset) until the second is in the queue, so
-/// the worker admits it on its next pass whatever the scheduling of the host. Returns the two
-/// handles. The engine's fake must have been given `armed_hold`.
+/// holds the worker inside the first job's admission (its reset) until the second is in the queue.
+/// The worker then takes the second job through `try_recv` in the same admission pass, before the
+/// tick, whatever the scheduling of the host. Returns the two handles. The engine's fake must have
+/// been given `armed_hold`.
 fn submit_two_live(
     engine: &Engine,
     armed: &Arc<Mutex<Option<Gate>>>,
@@ -734,7 +746,7 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
 fn a_batch_block_save_fires_once_and_the_restart_saves_nothing() {
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
-    // Pinned spacing (S4): the fake overrides the environment, so this batch case
+    // Pinned spacing: the fake overrides the environment, so this batch case
     // runs the block path with a controlled spacing instead of the flipped default.
     // With spacing 1,500 and the tip at 20,000, the periodic multiple 16,384 fires
     // first and the last block boundary below the tip is 19,500 - a distinct Block
@@ -2781,11 +2793,13 @@ fn raw_events(mut handle: JobHandle) -> Vec<JobEvent> {
     }
 }
 
-/// An engine of two sessions that the device can hold one of: the first job holds it for about
-/// two seconds of windows, so a second job finds no session and waits.
+/// An engine of two sessions that the device can hold one of: the first job (`long_tokens` of
+/// output, a window every 4 ms) holds it, so a second job finds no session and waits. `armed` is
+/// the gate the fake takes at its next window, for a test that freezes the worker there.
 fn waiting_engine(
     log: &Log,
     long_tokens: u32,
+    armed: &Arc<Mutex<Option<Gate>>>,
 ) -> (
     Engine,
     JobHandle,
@@ -2797,6 +2811,7 @@ fn waiting_engine(
     fake.session_cap = Some(1);
     fake.evictions = 0;
     fake.script_tokens = (long_tokens as usize).max(fake.script_tokens);
+    fake.armed_window = Some(Arc::clone(armed));
     fake.window_delay = Some(Duration::from_millis(4));
     let (engine, release) = start(fake);
     let (long, long_events) = job(&[0], long_tokens);
@@ -2838,7 +2853,7 @@ fn wait_until_waiting(log: &Log) {
 #[test]
 fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
     let log = Log::default();
-    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600);
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600, &Arc::default());
     // Queued is also 1 while the job still sits in the channel: wait until it has been taken
     // out, refused and made to wait, and only then ask.
     wait_until_waiting(&log);
@@ -2866,41 +2881,41 @@ fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
 #[test]
 fn a_waiting_job_that_is_cancelled_ends_while_the_stream_still_runs() {
     let log = Log::default();
+    let armed = Arc::new(Mutex::new(None));
     // The stream cannot finish inside the test: it is ended by its own cancel at the end.
-    let (engine, mut long_events, waiter_events, cancel) = waiting_engine(&log, 1_000_000);
-    let mut waiter_events = waiter_events;
+    let (engine, mut long_events, mut waiter_events, cancel) = waiting_engine(&log, 12_000, &armed);
     wait_until_waiting(&log);
+    // Freeze the worker inside a window, so that the cancel below is set while it cannot look.
+    let (entered, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    *lock(&armed) = Some((entered, held));
+    observed
+        .recv_timeout(WAIT)
+        .expect("the worker is inside a window");
     cancel.store(true, Ordering::SeqCst);
-    // Count the stream's batches that arrive until the waiter's end. A cancel seen on the next
-    // pass of the loop ends the waiter within a tick or two; one seen only at the one-second
-    // retry would let hundreds of batches through. The count is of ticks, not of time, so a
-    // loaded host does not move it.
-    let deadline = Instant::now() + WAIT;
-    let mut batches_meanwhile = 0usize;
+    // Arm the next window, then let the worker go: it finishes this tick, and the next pass of
+    // its loop must end the waiter before that pass's window. A cancel seen only at the
+    // one-second retry would leave the waiter alive at the next window.
+    let (entered_next, observed_next) = mpsc::channel();
+    let (release_next, held_next) = mpsc::channel();
+    *lock(&armed) = Some((entered_next, held_next));
+    release.send(()).expect("release the first window");
+    observed_next
+        .recv_timeout(WAIT)
+        .expect("the worker reached the next window");
+    // The worker is frozen again, and the event of the waiter's end was sent before it got here.
     let mut ended = Vec::new();
-    let waiter = loop {
-        while let Ok(event) = waiter_events.events.try_recv() {
-            ended.push(event);
-        }
-        while let Ok(event) = long_events.events.try_recv() {
-            if matches!(event, JobEvent::Batch(_)) {
-                batches_meanwhile += 1;
-            }
-        }
-        if ended
-            .iter()
-            .any(|event| matches!(event, JobEvent::Finished(_) | JobEvent::Error(_)))
-        {
-            break ended;
-        }
-        assert!(Instant::now() < deadline, "the waiter did not end");
-        std::thread::yield_now();
-    };
+    while let Ok(event) = waiter_events.events.try_recv() {
+        ended.push(event);
+    }
     assert!(
-        batches_meanwhile <= 20,
-        "the cancel waited for the retry: {batches_meanwhile} batches of the stream passed"
+        ended
+            .iter()
+            .any(|event| matches!(event, JobEvent::Finished(_) | JobEvent::Error(_))),
+        "the cancel waited for the retry: {ended:?}"
     );
-    assert_eq!(finish(&waiter), DecodeFinish::Cancelled);
+    assert_eq!(finish(&ended), DecodeFinish::Cancelled);
+    release_next.send(()).expect("release the second window");
     // Its ticket goes when the worker drops the job it held, just after the event.
     wait(|| engine.handle().queued() == 0);
     // The stream it waited behind is still decoding.
@@ -2913,7 +2928,7 @@ fn a_waiting_job_that_is_cancelled_ends_while_the_stream_still_runs() {
 #[test]
 fn a_waiting_job_is_cancelled_when_the_engine_shuts_down() {
     let log = Log::default();
-    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600);
+    let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log, 600, &Arc::default());
     wait(|| engine.handle().queued() == 1);
     engine.shutdown();
     let waiter = raw_events(waiter_events);
@@ -2929,11 +2944,11 @@ fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live(
     fake.max = 2;
     fake.live_cap = Some(Arc::clone(&live));
     fake.evictions = 0;
-    fake.script_tokens = 1_000_000;
+    fake.script_tokens = 12_000;
     fake.window_delay = Some(Duration::from_millis(5));
     let (engine, release) = start(fake);
     // The stream cannot finish inside the test: it is ended by its own cancel at the end.
-    let (long, mut long_events) = job(&[0], 1_000_000);
+    let (long, mut long_events) = job(&[0], 12_000);
     let (waiter, waiter_events) = job(&[1], 3);
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
@@ -3050,10 +3065,10 @@ fn a_retry_that_cannot_fit_does_not_allocate_and_one_that_can_does() {
     fake.fits = Some(Arc::clone(&fits));
     // No prefix entry to evict, so the first refusal is a single allocation attempt.
     fake.evictions = 0;
-    fake.script_tokens = 1_000_000;
+    fake.script_tokens = 12_000;
     fake.window_delay = Some(Duration::from_millis(5));
     let (engine, release) = start(fake);
-    let (long, mut long_events) = job(&[0], 1_000_000);
+    let (long, mut long_events) = job(&[0], 12_000);
     let (waiter, waiter_events) = job(&[1], 3);
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
