@@ -44,12 +44,21 @@ pub(super) fn step(
     let permit = decoder.budget.acquire_growth(growth)?;
     #[cfg(feature = "native-fault-qualification")]
     let timing = super::stream_timing::begin(&decoder.kernels, state.pos());
+    #[cfg(feature = "native-fault-qualification")]
+    let position = state.pos();
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(cache) = decoder.decode_cache.as_mut().filter(|cache| cache.active()) {
+        cache.stats = super::decode_cache::CopyStats::default();
+    }
     let old = state.begin();
     let result = run(decoder, state, old, permit, token, mode);
     decoder.slots.release_lent();
     #[cfg(feature = "native-fault-qualification")]
     if let (Ok(_), Some(timing)) = (&result, timing) {
         timing.finish(&decoder.kernels, 1, mode, "step");
+        if let Some(cache) = decoder.decode_cache.as_ref().filter(|cache| cache.active()) {
+            super::stream_timing::record_decode_cache(position, cache.stats);
+        }
     }
     result
 }
@@ -134,6 +143,11 @@ fn run(
             &shape.moe,
             &layer.moe,
             &mut decoder.slots,
+            decoder
+                .decode_cache
+                .as_mut()
+                .filter(|cache| mode == StepMode::Logits && cache.active())
+                .map(|cache| (cache, index)),
             &read.mixed,
         )?;
         #[cfg(feature = "native-fault-qualification")]

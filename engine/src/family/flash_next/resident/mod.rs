@@ -5,6 +5,8 @@
 //! checkpoint.
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+mod decode_cache;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod deltanet;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) mod executor;
@@ -98,6 +100,7 @@ struct ResidentDecoder<'c> {
     weights: ResidentWeights,
     /// The fixed expert page pool: `POOL_SETS` sets sized for the largest layer.
     slots: ExpertSlots,
+    decode_cache: Option<decode_cache::DecodeCache>,
     /// Default-off, record-only expert hints. Never changes the demand path.
     expert_prefetch: prefetch::Prefetch,
     /// The prefill page sets, open from `open_prefill` to `close_prefill`. They drop after the
@@ -155,6 +158,7 @@ impl<'c> ResidentDecoder<'c> {
             ckpt,
             weights,
             slots,
+            decode_cache: None,
             expert_prefetch: prefetch::Prefetch::default(),
             prefill_pages: None,
             sparse_prefill_bytes: 0,
@@ -194,7 +198,14 @@ impl<'c> ResidentDecoder<'c> {
 
     /// Replaces `state` with a zero state. On error `state` is unchanged.
     fn reset(&mut self, state: &mut ResidentState) -> Result<(), EngError> {
+        self.release_decode_cache();
         state.reset(&mut self.kernels, &self.weights)
+    }
+
+    fn release_decode_cache(&mut self) {
+        if let Some(cache) = &mut self.decode_cache {
+            cache.release();
+        }
     }
 
     /// Saves `state` as a snapshot that shares its arrays and charges the session budget. See

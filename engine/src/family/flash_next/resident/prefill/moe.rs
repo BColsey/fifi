@@ -356,7 +356,8 @@ mod tests {
             consts: &weights.consts,
         };
         let moe_w = &weights.layers[0].moe;
-        let (out, _) = step_paged(&mut ctx, ckpt, &weights.shape.moe, moe_w, slots, &x).unwrap();
+        let (out, _) =
+            step_paged(&mut ctx, ckpt, &weights.shape.moe, moe_w, slots, None, &x).unwrap();
         values(kernels, &out).unwrap()
     }
 

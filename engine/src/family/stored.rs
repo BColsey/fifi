@@ -538,7 +538,7 @@ impl StackLayout {
         })
     }
 
-    fn roles(&self) -> impl Iterator<Item = (&'static str, &RoleRange)> {
+    pub(crate) fn roles(&self) -> impl Iterator<Item = (&'static str, &RoleRange)> {
         [("weight", &self.payload), ("scales", &self.scales)]
             .into_iter()
             .chain(self.biases.as_ref().map(|range| ("biases", range)))

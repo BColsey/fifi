@@ -70,6 +70,7 @@ use super::super::{
 };
 use super::{
     ResidentDecoder, StepMode,
+    decode_cache::{self, DecodeCache},
     qsa::MAX_POSITIONS,
     slots::SetLayout,
     state::{ResidentSnapshot, ResidentState},
@@ -167,6 +168,7 @@ struct FlashStep<'a> {
     chunk: Option<u32>,
     prefill_wave_cap: u32,
     open_tokens: &'a mut u32,
+    use_decode_cache: bool,
     #[cfg(test)]
     log: &'a std::sync::Mutex<ChunkLog>,
 }
@@ -219,6 +221,11 @@ impl TokenStepper for FlashStep<'_> {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+        if self.use_decode_cache
+            && let Some(cache) = &mut self.decoder.decode_cache
+        {
+            cache.start()?;
+        }
         self.decoder
             .step(self.state, token, StepMode::Logits)?
             .logits
@@ -341,6 +348,14 @@ impl FlashExecutor {
         } else {
             None
         };
+        let decode_cache_slots =
+            decode_cache::configured_slots(std::env::var_os(decode_cache::ENV).as_deref())?;
+        if decode_cache_slots > 0 && device.is_none() {
+            return Err(EngError::BadRequest(format!(
+                "{} requires FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB",
+                decode_cache::ENV
+            )));
+        }
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
         let preflight = device
@@ -380,6 +395,13 @@ impl FlashExecutor {
         let (mut executor, session) = Self::from_parts(kernels, ckpt, &flash, rules)?;
         executor.prefill_wave_cap = wave_cap;
         executor.prefix_budget = prefix_budget;
+        if decode_cache_slots > 0 {
+            executor.decoder.decode_cache = Some(DecodeCache::plan(
+                ckpt,
+                &executor.decoder.weights,
+                decode_cache_slots,
+            )?);
+        }
         Ok((executor, session))
     }
 
@@ -435,6 +457,7 @@ impl FlashExecutor {
             chunk: self.chunk,
             prefill_wave_cap: self.prefill_wave_cap,
             open_tokens: &mut self.open_tokens,
+            use_decode_cache: false,
             #[cfg(test)]
             log: &self.log,
         };
@@ -504,6 +527,13 @@ impl FlashExecutor {
                 memory,
             )
         };
+        let (decode_cache_slots, decode_cache_bytes, decode_cache_map_bytes) = self
+            .decoder
+            .decode_cache
+            .as_ref()
+            .map_or((0, 0, 0), |cache| {
+                (cache.slots(), cache.charge_bytes(), cache.mapping_bytes())
+            });
         let budget = device
             .map(|device| device.prefill(settings.prefill_budget))
             .or(settings.prefill_budget);
@@ -529,6 +559,11 @@ impl FlashExecutor {
             self.prefix_budget,
             state_overlap,
         )?;
+        // The metadata is present in both phases. The host mapping and prefill workspace
+        // are admitted against the common base independently.
+        let reserve = reserve
+            .checked_add(decode_cache_bytes - decode_cache_map_bytes)
+            .ok_or_else(overflow)?;
         // This executor streams local shards and has no S3 cache.
         let plan = self.plan_prefill(budget, 0, reserve, cap)?;
         let charges = [
@@ -537,7 +572,19 @@ impl FlashExecutor {
             ("session_reserve_bytes", reserve),
         ];
         if let Some(device) = device {
-            device.remaining("Flash-Next MLX", &charges)?;
+            if decode_cache_map_bytes == 0 {
+                device.remaining("Flash-Next MLX", &charges)?;
+            } else {
+                device.remaining(
+                    "Flash-Next MLX decode cache",
+                    &[
+                        charges[0],
+                        charges[1],
+                        charges[2],
+                        ("decode_cache_map_bytes", decode_cache_map_bytes),
+                    ],
+                )?;
+            }
         }
         let reason = if plan.chunk.is_some() {
             PrefillReason::Admitted
@@ -575,7 +622,7 @@ impl FlashExecutor {
             terms
         };
         Ok(Some(format!(
-            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} wave_cap={} dense_workspace_bytes={} sparse_workspace_bytes={} {terms}",
+            "flash-next prefill: {path}; max_rows={cap} positions={positions} state_bytes={state} prefix_bytes={prefix} mlx_cache_limit_bytes={} pressure_margin_bytes={PRESSURE_MARGIN} wave_cap={} dense_workspace_bytes={} sparse_workspace_bytes={} decode_cache_slots={decode_cache_slots} decode_cache_bytes={decode_cache_bytes} decode_cache_map_bytes={decode_cache_map_bytes} {terms}",
             settings.cache_limit,
             self.prefill_wave_cap,
             plan.workspace_bytes,
@@ -685,6 +732,7 @@ impl ExecutorOps for FlashExecutor {
     }
 
     fn prefill(&mut self, st: &mut FlashSession, toks: &[u32]) -> Result<()> {
+        self.decoder.release_decode_cache();
         let FlashSession { state, core } = st;
         let (mut step, limits) = self.split(state);
         core.prefill(&mut step, toks, limits.context_limit)
@@ -698,11 +746,17 @@ impl ExecutorOps for FlashExecutor {
         self.close_prefill();
         let FlashSession { state, core } = st;
         let (mut step, limits) = self.split(state);
-        core.decode(&mut step, generation, &limits)
+        step.use_decode_cache = core.history().len() > core.prompt_len();
+        let result = core.decode(&mut step, generation, &limits);
+        if result.as_ref().map_or(true, |batch| batch.finish.is_some()) {
+            self.decoder.release_decode_cache();
+        }
+        result
     }
 
-    /// No transient routing or draft state exists: the page sets return at the end of each step.
-    fn boundary(&mut self, _st: &mut FlashSession) {}
+    fn boundary(&mut self, _st: &mut FlashSession) {
+        self.decoder.release_decode_cache();
+    }
 
     /// Shares the resident state as an entry of this executor's prefix store, saved as `kind`
     /// (a pinned root at the first system message or a tip at the last boundary; the worker
@@ -1789,6 +1843,29 @@ mod tests {
             .unwrap();
         assert_eq!(executor.prefill_chunk(), None, "{line}");
         assert!(line.contains(&format!("prefix_bytes={state}")), "{line}");
+        let cache = DecodeCache::plan(executor.decoder.ckpt, &executor.decoder.weights, 1).unwrap();
+        let mapping = cache.mapping_bytes();
+        let metadata = cache.charge_bytes() - mapping;
+        executor.decoder.decode_cache = Some(cache);
+        let denied =
+            crate::family::mlx_budget::DeviceBudget::new(auto_base + metadata + mapping - 1)
+                .unwrap();
+        assert!(matches!(
+            executor.configure_prefill(&session, &settings, false, Some(denied)),
+            Err(EngError::MemoryPlan(message)) if message.contains("decode_cache_map_bytes")
+        ));
+        let admitted =
+            crate::family::mlx_budget::DeviceBudget::new(auto_base + metadata + four.max(mapping))
+                .unwrap();
+        let line = executor
+            .configure_prefill(&session, &settings, false, Some(admitted))
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.prefill_chunk(), Some(4), "{line}");
+        assert!(
+            line.contains(&format!("decode_cache_map_bytes={mapping}")),
+            "{line}"
+        );
         settings.cache_limit = u64::MAX;
         assert!(matches!(
             executor.configure_prefill(&session, &settings, false, None),
@@ -2070,6 +2147,38 @@ mod tests {
         executor
             .save_prefix(session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
             .unwrap()
+    }
+
+    #[test]
+    fn serving_decode_cache_is_turn_local_and_preserves_sampled_output() {
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) =
+            build_with(Embedding::TokenDependent, rules(vec![], VOCAB));
+        executor.prefill(&mut session, &PREFIX_PROMPT).unwrap();
+        let control = tokens_of(&decode_all(
+            &mut executor,
+            &mut session,
+            &mut seeded_generation(6),
+        ));
+        executor.decoder.decode_cache =
+            Some(DecodeCache::plan(executor.decoder.ckpt, &executor.decoder.weights, 1).unwrap());
+        executor.reset(&mut session).unwrap();
+        executor.prefill(&mut session, &PREFIX_PROMPT).unwrap();
+        let mut generation = seeded_generation(6);
+        let first = executor.decode(&mut session, &mut generation).unwrap();
+        assert!(!executor.decoder.decode_cache.as_ref().unwrap().active());
+        let second = executor.decode(&mut session, &mut generation).unwrap();
+        assert!(executor.decoder.decode_cache.as_ref().unwrap().active());
+
+        let mut tokens = first.tokens;
+        tokens.extend(second.tokens);
+        tokens.extend(tokens_of(&decode_all(
+            &mut executor,
+            &mut session,
+            &mut generation,
+        )));
+        assert_eq!(tokens, control);
+        assert!(!executor.decoder.decode_cache.as_ref().unwrap().active());
     }
 
     #[test]

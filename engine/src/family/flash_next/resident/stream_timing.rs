@@ -65,6 +65,16 @@ pub(super) fn record_prefill_release(
     eprintln!("flash_next_prefill_release {event}");
 }
 
+pub(super) fn record_decode_cache(position: u32, stats: super::decode_cache::CopyStats) {
+    let event = serde_json::json!({
+        "position": position,
+        "hit_bytes": stats.hit_bytes,
+        "placement_bytes": stats.placement_bytes,
+        "copy_ns": stats.copy_ns,
+    });
+    eprintln!("flash_next_decode_cache {event}");
+}
+
 impl ForwardTiming {
     pub(super) fn finish(self, kernels: &MlxKernels, rows: u32, mode: StepMode, route: &str) {
         let mut row = self.counters.finish(kernels);
