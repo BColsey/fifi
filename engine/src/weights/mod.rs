@@ -70,6 +70,7 @@ pub use gguf_encode::{encode_q8_0, is_plain_float, plain_float_as_q8_0};
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,
 };
+pub(crate) use gguf_dequant::{dot_q6_k, dot_q8_0};
 pub use gguf_identity::{TENSOR_SAMPLE, gguf_identity_digest};
 pub(crate) use gguf_split::shard_name_of;
 #[cfg(test)]

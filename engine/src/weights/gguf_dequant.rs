@@ -84,6 +84,22 @@ fn q8_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// Dot a validated Q8_0 row without materializing the widened weights.
+pub(crate) fn dot_q8_0(weights: &[u8], input: &[f32]) -> f32 {
+    let (blocks, tail) = weights.as_chunks::<34>();
+    let (inputs, input_tail) = input.as_chunks::<32>();
+    debug_assert!(tail.is_empty() && input_tail.is_empty() && blocks.len() == inputs.len());
+    // Match f32::sum, including the sign of an all-negative-zero result.
+    let mut result = -0.0_f32;
+    for (block, input) in blocks.iter().zip(inputs) {
+        let d = rd_f16(block, 0);
+        for (&quant, &value) in block[2..].iter().zip(input) {
+            result += (d * f32::from(quant as i8)) * value;
+        }
+    }
+    result
+}
+
 /// Q5_0: `d`, the 32 high bits `qh` and 16 bytes of low nibbles. Element `j`
 /// (0..16) takes the low nibble of `qs[j]`, element `j + 16` the high nibble;
 /// bit `i` of `qh` is the fifth bit of element `i`. The quant is `(0..32) - 16`.
@@ -212,6 +228,7 @@ fn q5_k(b: &[u8], y: &mut [f32]) {
     }
 }
 
+#[inline]
 fn q6_k(b: &[u8], y: &mut [f32]) {
     let d = rd_f16(b, 208);
     for half in 0..2 {
@@ -232,6 +249,23 @@ fn q6_k(b: &[u8], y: &mut [f32]) {
             out[l + 96] = d * f32::from(sc[is + 6] as i8) * q4 as f32;
         }
     }
+}
+
+/// Widen just one Q6_K block at a time, using the reference decoder.
+pub(crate) fn dot_q6_k(weights: &[u8], input: &[f32]) -> f32 {
+    let (blocks, tail) = weights.as_chunks::<210>();
+    let (inputs, input_tail) = input.as_chunks::<256>();
+    debug_assert!(tail.is_empty() && input_tail.is_empty() && blocks.len() == inputs.len());
+    let mut widened = [0.0; 256];
+    let mut result = -0.0_f32;
+    for (block, input) in blocks.iter().zip(inputs) {
+        q6_k(block, &mut widened);
+        // Keep one accumulator across blocks to preserve the reference row order.
+        for (&weight, &value) in widened.iter().zip(input) {
+            result += weight * value;
+        }
+    }
+    result
 }
 
 fn iq1_s(b: &[u8], y: &mut [f32]) {
