@@ -115,9 +115,9 @@ The paired run on the same layer 1 shard alternated scalar and NEON with each th
 | 4 | 10.47 ms | 3.56 ms | 11.10 ms | 3.89 ms |
 | 6 | 8.60 ms | 3.10 ms | 8.89 ms | 3.45 ms |
 
-At four threads the paired median was 2.94 times faster. All four- and six-thread arms recorded zero SSD reads and zero page-ins. The first one-thread scalar process attributed 28.2 MB of reads across setup and its calls, and the remaining one-thread processes recorded zero. This step measures the CPU expert layer. Full-model quality and a default selection remain open. [Per-arm measurements](../../scripts/benchmarks/mac-m4-nemotron35-neon-ab.csv)
+At four threads the paired median was 2.94 times faster. All four- and six-thread arms recorded zero SSD reads and zero page-ins. The first one-thread scalar process attributed 28.2 MB of reads across setup and its calls, and the remaining one-thread processes recorded zero. This step measures the CPU expert layer. Full-model quality and a default selection remain open.
 
-Repeat the same profiler command with `--compare-neon` and a fresh output directory.
+Run the profiler in a fresh process with `FIFI_NEM35_CPU_NEON=1` to measure the NEON kernel.
 
 ## See also
 
