@@ -14,6 +14,7 @@ use super::layout::{
     with_f32_scales,
 };
 use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
+use super::stream_timing::ForwardTiming;
 use crate::{
     EngError,
     family::{
@@ -523,6 +524,7 @@ impl RMoe {
         ckpt: Option<&StreamedCheckpoint>,
         selected: &[u32],
         rows: u32,
+        timing: Option<&mut ForwardTiming>,
     ) -> Result<Option<(ExpertPages, Vec<u32>)>, EngError> {
         let Some(slices) = self.disk() else {
             return Ok(None);
@@ -533,7 +535,9 @@ impl RMoe {
         let local = local_expert_ids(selected, &experts)?;
         let coalesce = rows > 1 && slices.staging.read_runs;
         Ok(Some((
-            slices.stage(kernels, ckpt, &experts, coalesce)?,
+            ForwardTiming::load_stage(timing, &experts, coalesce, || {
+                slices.stage(kernels, ckpt, &experts, coalesce)
+            })?,
             local,
         )))
     }
