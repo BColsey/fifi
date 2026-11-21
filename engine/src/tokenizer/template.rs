@@ -41,7 +41,7 @@ impl ChatTemplate {
         env.set_unknown_method_callback(unknown_method);
         // The engine loads one template per process. The owned source keeps the
         // environment free of lifetimes without leaking the bytes.
-        env.add_template_owned("chat", normalize_newlines(source))
+        env.add_template_owned("chat", without_generation_tags(&normalize_newlines(source)))
             .map_err(|error| {
                 EngError::Checkpoint(format!("chat_template.jinja syntax error: {error}"))
             })?;
@@ -160,6 +160,37 @@ impl ChatTemplate {
         let template = self.env.get_template("chat").map_err(render_defect)?;
         template.render(context).map_err(render_error)
     }
+}
+
+/// Training-oriented chat templates mark the assistant span with `{% generation %}` and
+/// `{% endgeneration %}`, a Hugging Face extension that renders nothing. The tags become an
+/// always-true `if` block so the dash and whitespace controls of the tag keep their effect.
+fn without_generation_tags(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let (before, tag_and_after) = rest.split_at(open);
+        out.push_str(before);
+        let Some(close) = tag_and_after.find("%}") else {
+            out.push_str(tag_and_after);
+            return out;
+        };
+        let tag = &tag_and_after[..close + 2];
+        let inner = &tag[2..tag.len() - 2];
+        let name = inner.trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        let replacement = match name {
+            "generation" => Some(("generation", "if true")),
+            "endgeneration" => Some(("endgeneration", "endif")),
+            _ => None,
+        };
+        match replacement {
+            Some((word, with)) => out.push_str(&tag.replacen(word, with, 1)),
+            None => out.push_str(tag),
+        }
+        rest = &tag_and_after[close + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // Jinja turns every newline sequence in template text into "\n".
@@ -447,5 +478,35 @@ fn render_error(error: Error) -> EngError {
         EngError::BadRequest(format!("chat template rejected the request: {error}"))
     } else {
         render_defect(error)
+    }
+}
+
+#[cfg(test)]
+mod generation_tag_tests {
+    use super::without_generation_tags;
+
+    #[test]
+    fn generation_tags_become_an_always_true_block_that_keeps_the_dash_controls() {
+        assert_eq!(
+            without_generation_tags("a {%- generation %} b {%- endgeneration -%} c"),
+            "a {%- if true %} b {%- endif -%} c"
+        );
+        assert_eq!(
+            without_generation_tags("{% generation %}x{% endgeneration %}"),
+            "{% if true %}x{% endif %}"
+        );
+    }
+
+    #[test]
+    fn other_tags_and_unclosed_tags_pass_through_unchanged() {
+        let source =
+            "{% if generation %}{{ generation }}{% endif %} {% for i in x %}{% endfor %} {%";
+        assert_eq!(without_generation_tags(source), source);
+    }
+
+    #[test]
+    fn a_template_without_the_tags_keeps_its_bytes() {
+        let source = include_str!("../../testdata/chat_template.jinja");
+        assert_eq!(without_generation_tags(source), source);
     }
 }

@@ -2645,6 +2645,8 @@ const STRING_METHOD_CASES: &[(&str, Option<&str>)] = &[
     ("''.split(',')", Some("[\"\"]")),
     ("''.split()", Some("[]")),
     ("'  \\t\\nxx  '.lstrip()", Some("\"xx  \"")),
+    ("'  \\t\\nxx  '.strip()", Some("\"xx\"")),
+    ("'\\nxyx\\n'.strip('\\n')", Some("\"xyx\"")),
     ("'  xx \\t\\n '.rstrip()", Some("\"  xx\"")),
     ("'xyxhixyx'.lstrip('xy')", Some("\"hixyx\"")),
     ("'xyxhixyx'.rstrip('xy')", Some("\"xyxhi\"")),

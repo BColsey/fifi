@@ -1,8 +1,8 @@
 //! Python `str` methods that chat templates call.
 //!
 //! The reference stack renders templates with Python, so a template can call
-//! `startswith`, `endswith`, `split`, `lstrip`, and `rstrip` on a string. This
-//! module ports those five methods with the Python argument rules: positional
+//! `startswith`, `endswith`, `split`, `strip`, `lstrip`, and `rstrip` on a string. This
+//! module ports those six methods with the Python argument rules: positional
 //! and keyword forms, `None` defaults, tuple prefixes, character-index slices,
 //! and the Unicode whitespace set of `str.isspace`. A call that raises a
 //! `TypeError` or `ValueError` in Python returns an error here.
@@ -16,14 +16,23 @@ enum Side {
     End,
 }
 
+/// The ends of a string that `strip` trims.
+#[derive(Clone, Copy)]
+enum Ends {
+    Start,
+    End,
+    Both,
+}
+
 /// Runs the named method, or returns `None` when the engine does not port it.
 pub(super) fn call(text: &str, method: &str, args: &[Value]) -> Option<Result<Value, Error>> {
     let result = match method {
         "startswith" => affix(text, method, args, Side::Start),
         "endswith" => affix(text, method, args, Side::End),
         "split" => split(text, args),
-        "lstrip" => strip(text, method, args, Side::Start),
-        "rstrip" => strip(text, method, args, Side::End),
+        "strip" => strip(text, method, args, Ends::Both),
+        "lstrip" => strip(text, method, args, Ends::Start),
+        "rstrip" => strip(text, method, args, Ends::End),
         _ => return None,
     };
     Some(result)
@@ -317,7 +326,7 @@ fn chars_argument<'a>(method: &str, value: Option<&'a Value>) -> Result<Option<&
     }
 }
 
-fn strip(text: &str, method: &str, args: &[Value], side: Side) -> Result<Value, Error> {
+fn strip(text: &str, method: &str, args: &[Value], side: Ends) -> Result<Value, Error> {
     let positional = positional_only(method, args)?;
     if positional.len() > 1 {
         return Err(type_error(
@@ -327,10 +336,12 @@ fn strip(text: &str, method: &str, args: &[Value], side: Side) -> Result<Value, 
     }
     let characters = chars_argument(method, positional.first())?;
     let stripped = match (characters, side) {
-        (None, Side::Start) => text.trim_start_matches(is_python_space),
-        (None, Side::End) => text.trim_end_matches(is_python_space),
-        (Some(set), Side::Start) => text.trim_start_matches(|c| set.contains(c)),
-        (Some(set), Side::End) => text.trim_end_matches(|c| set.contains(c)),
+        (None, Ends::Start) => text.trim_start_matches(is_python_space),
+        (None, Ends::End) => text.trim_end_matches(is_python_space),
+        (None, Ends::Both) => text.trim_matches(is_python_space),
+        (Some(set), Ends::Both) => text.trim_matches(|c| set.contains(c)),
+        (Some(set), Ends::Start) => text.trim_start_matches(|c| set.contains(c)),
+        (Some(set), Ends::End) => text.trim_end_matches(|c| set.contains(c)),
     };
     Ok(Value::from(stripped))
 }
