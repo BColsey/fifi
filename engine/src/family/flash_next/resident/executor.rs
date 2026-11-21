@@ -81,7 +81,8 @@ use crate::{
         mlx_budget::{DeviceBudget, PRESSURE_MARGIN},
         mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         session::{
-            DecodeSession, Limits, PrefixSlot, SaveKind, StoreLimits, TokenStepper, check_prompt,
+            DecodeSession, Limits, PrefixSlot, SaveKind, SnapshotBudget, StoreLimits, TokenStepper,
+            check_prompt,
         },
     },
     kernels::{HostPages, MlxKernels},
@@ -128,6 +129,7 @@ impl PrefillPath {
 pub(crate) struct FlashExecutor {
     /// The saved prefix. It is declared first, so its arrays drop before the decoder does.
     prefix: PrefixSlot<ResidentSnapshot, PrefillPath>,
+    prefix_budget: Option<u64>,
     decoder: ResidentDecoder<'static>,
     rules: FlashRules,
     /// The number of positions that the decoder accepts, `qsa::MAX_POSITIONS`.
@@ -257,6 +259,7 @@ fn session_reserve(
     state: u64,
     cache_limit: u64,
     prefix_limits: Option<StoreLimits>,
+    prefix_budget: Option<u64>,
     state_overlap: u64,
 ) -> Result<(u64, u64)> {
     let overflow = || EngError::MemoryPlan("Flash-Next prefill session reserve overflows".into());
@@ -266,7 +269,8 @@ fn session_reserve(
             .checked_add(limits.entries)
             .and_then(|slots| u64::try_from(slots).ok())
             .ok_or_else(overflow)?;
-        state.checked_mul(slots).ok_or_else(overflow)?
+        let full = state.checked_mul(slots).ok_or_else(overflow)?;
+        prefix_budget.map_or(full, |budget| budget.min(full))
     } else {
         0
     };
@@ -277,6 +281,23 @@ fn session_reserve(
         .and_then(|n| n.checked_add(PRESSURE_MARGIN))
         .ok_or_else(overflow)?;
     Ok((reserve, prefix))
+}
+
+fn prefix_budget_bytes(value: Option<&std::ffi::OsStr>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.parse::<u64>().ok())
+                .filter(|&bytes| bytes > 0)
+                .ok_or_else(|| {
+                    EngError::BadRequest(
+                        "FIFI_FLASH_NEXT_MLX_PREFIX_BUDGET_BYTES must be a positive byte count"
+                            .into(),
+                    )
+                })
+        })
+        .transpose()
 }
 
 fn prefill_wave_cap(value: Option<&std::ffi::OsStr>) -> Result<u32> {
@@ -313,6 +334,13 @@ impl FlashExecutor {
     ) -> Result<(Self, FlashSession)> {
         let wave_cap =
             prefill_wave_cap(std::env::var_os("FIFI_FLASH_NEXT_MLX_PREFILL_WAVE_CAP").as_deref())?;
+        let prefix_budget = if prefix_reuse {
+            prefix_budget_bytes(
+                std::env::var_os("FIFI_FLASH_NEXT_MLX_PREFIX_BUDGET_BYTES").as_deref(),
+            )?
+        } else {
+            None
+        };
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
         let preflight = device
@@ -323,6 +351,7 @@ impl FlashExecutor {
                     state,
                     cache_limit,
                     prefix_reuse.then(StoreLimits::default),
+                    prefix_budget,
                     state,
                 )?;
                 device.remaining(
@@ -350,6 +379,7 @@ impl FlashExecutor {
         let ckpt = Box::leak(Box::new(ckpt));
         let (mut executor, session) = Self::from_parts(kernels, ckpt, &flash, rules)?;
         executor.prefill_wave_cap = wave_cap;
+        executor.prefix_budget = prefix_budget;
         Ok((executor, session))
     }
 
@@ -378,6 +408,7 @@ impl FlashExecutor {
         };
         let executor = Self {
             prefix: PrefixSlot::default(),
+            prefix_budget: None,
             decoder,
             rules,
             context_limit,
@@ -495,6 +526,7 @@ impl FlashExecutor {
             state,
             settings.cache_limit,
             prefix_reuse.then(|| self.prefix.limits()),
+            self.prefix_budget,
             state_overlap,
         )?;
         // This executor streams local shards and has no S3 cache.
@@ -680,10 +712,33 @@ impl ExecutorOps for FlashExecutor {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
         let fed = fed_positions(&st.state);
-        st.core
-            .save_prefix(&mut self.prefix, key, path, fed, kind, || {
-                decoder.snapshot(&st.state)
-            })
+        if let Some(limit) = self.prefix_budget {
+            let incoming = st.state.snapshot_bytes()?;
+            let budget = SnapshotBudget {
+                limit,
+                incoming,
+                size: &ResidentSnapshot::charged_bytes,
+            };
+            let saved = st.core.save_prefix_budgeted(
+                &mut self.prefix,
+                key,
+                path,
+                fed,
+                kind,
+                budget,
+                || decoder.snapshot(&st.state),
+            )?;
+            #[cfg(feature = "native-fault-qualification")]
+            if !saved && incoming > limit {
+                super::stream_timing::record_prefix_budget_refusal(st.state.pos(), incoming, limit);
+            }
+            Ok(saved)
+        } else {
+            st.core
+                .save_prefix(&mut self.prefix, key, path, fed, kind, || {
+                    decoder.snapshot(&st.state)
+                })
+        }
     }
 
     fn restore_prefix(&mut self, st: &mut FlashSession, prompt: &[u32]) -> Result<usize> {
@@ -1520,6 +1575,23 @@ mod tests {
     }
 
     #[test]
+    fn prefix_budget_accepts_only_positive_byte_counts() {
+        use std::ffi::OsStr;
+
+        assert_eq!(prefix_budget_bytes(None).unwrap(), None);
+        assert_eq!(
+            prefix_budget_bytes(Some(OsStr::new("268435456"))).unwrap(),
+            Some(256 << 20)
+        );
+        for invalid in ["0", "-1", "256MiB", "18446744073709551616"] {
+            assert!(matches!(
+                prefix_budget_bytes(Some(OsStr::new(invalid))),
+                Err(EngError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
     fn prefill_wave_cap_accepts_only_the_supported_range() {
         use std::ffi::OsStr;
 
@@ -1693,6 +1765,30 @@ mod tests {
             executor.configure_prefill(&session, &settings, false, Some(device)),
             Err(EngError::MemoryPlan(_))
         ));
+        let device = crate::family::mlx_budget::DeviceBudget::new(auto_base + four + 4096).unwrap();
+        let line = executor
+            .configure_prefill(&session, &settings, true, Some(device))
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.prefill_chunk(), None, "{line}");
+        executor.prefix_budget = Some(4096);
+        let line = executor
+            .configure_prefill(&session, &settings, true, Some(device))
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.prefill_chunk(), Some(4), "{line}");
+        assert!(line.contains("prefix_bytes=4096"), "{line}");
+        assert!(
+            line.contains(&format!("state_overlap_bytes={state}")),
+            "{line}"
+        );
+        executor.prefix_budget = Some(u64::MAX);
+        let line = executor
+            .configure_prefill(&session, &settings, true, Some(device))
+            .unwrap()
+            .unwrap();
+        assert_eq!(executor.prefill_chunk(), None, "{line}");
+        assert!(line.contains(&format!("prefix_bytes={state}")), "{line}");
         settings.cache_limit = u64::MAX;
         assert!(matches!(
             executor.configure_prefill(&session, &settings, false, None),
@@ -1974,6 +2070,45 @@ mod tests {
         executor
             .save_prefix(session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
             .unwrap()
+    }
+
+    #[test]
+    fn prefix_budget_refuses_oversized_saves_and_preserves_the_tip() {
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) = build(rules(vec![], VOCAB));
+        let key = &PREFIX_PROMPT[..KEY];
+        executor.prefill(&mut session, key).unwrap();
+        let charge = session.state.snapshot_bytes().unwrap();
+        let live = executor.decoder.session_used();
+
+        executor.prefix_budget = Some(charge - 1);
+        assert!(!executor.save_prefix(&session, key, SaveKind::Tip).unwrap());
+        assert_eq!(executor.prefix.key_len(), None);
+        assert_eq!(executor.decoder.session_used(), live);
+
+        executor.prefix_budget = Some(charge);
+        assert!(executor.save_prefix(&session, key, SaveKind::Tip).unwrap());
+        assert_eq!(executor.decoder.session_used(), live + charge);
+
+        executor.reset(&mut session).unwrap();
+        let longer = &PREFIX_PROMPT[..KEY + 1];
+        executor.prefill(&mut session, longer).unwrap();
+        assert!(session.state.snapshot_bytes().unwrap() > charge);
+        let used = executor.decoder.session_used();
+        assert!(
+            !executor
+                .save_prefix(&session, longer, SaveKind::Tip)
+                .unwrap()
+        );
+        assert_eq!(executor.decoder.session_used(), used);
+
+        executor.reset(&mut session).unwrap();
+        assert_eq!(
+            executor
+                .restore_prefix(&mut session, &PREFIX_PROMPT)
+                .unwrap(),
+            KEY
+        );
     }
 
     #[test]

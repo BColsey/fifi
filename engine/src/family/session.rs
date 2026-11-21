@@ -457,8 +457,7 @@ impl DecodeSession {
     /// Reserves the incoming snapshot against the host bytes that survive the room step.
     /// A tip can spend its own superseded snapshot to fit the replacement.
     ///
-    /// The Flash executor compiles only under `test` or `native-cuda` on Linux
-    /// (`flash_next/cuda/mod.rs`), so a plain non-test build has no caller.
+    /// The native Flash-Next executors use this when enforcing a snapshot byte limit.
     #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)] // the store's save seam: key/path/fed/kind plus the snapshot budget
     pub(crate) fn save_prefix_budgeted<S, P: PartialEq>(
