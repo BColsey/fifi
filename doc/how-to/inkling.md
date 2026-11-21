@@ -86,3 +86,15 @@ These repeated requests used `4138d0df`, the publisher safetensors, a 128-token 
 | Mapped | File cache only | 3.60 | 1.56 | 10.65 | 29.43 | 5.78 |
 
 Set `FIFI_INKLING_MMAP_DENSE=1` to map safetensor dense weights and `FIFI_INKLING_FILE_CACHE_ONLY=1` to leave expert retention to macOS. A file-cache hit still contributes to the engine’s logical reads. File-backed pages can also be reclaimed under memory pressure. The fourth row merits further testing across prompt lengths and working-set ceilings.
+
+## Reproduce a first and repeat benchmark
+
+Run the driver from the repository root with the release server binary and a new output directory.
+
+```sh
+FIFI_INKLING_PREFILL_ROWS=1 python3 -B engine/tests/tools/bench_inkling.py \
+  --server engine/target/release/enginesrv --model ~/models/inkling2-mini \
+  --output-dir /path/to/scratch/inkling-5g --ceiling-mib 5120 --max-tokens 12
+```
+
+The driver starts one server on an OS-assigned loopback port, sends two identical greedy requests, and checks that both reach the requested output limit. It writes the server config, startup and phase log, and a JSON receipt with wall time, request timings, process-attributed disk bytes, and system swap-page deltas on macOS. Existing Inkling environment settings carry through to the server. Use `--ceiling-mib auto` to remove a configured ceiling, `--tokenizer-dir` for a separate pinned bundle, and `--commit`, `--build`, and `--checkpoint-id` to record artifact provenance. The OS page cache is uncontrolled across runs.
