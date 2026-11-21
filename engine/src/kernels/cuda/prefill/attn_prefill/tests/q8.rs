@@ -438,10 +438,26 @@ fn digest(values: &[f32]) -> String {
 
 /// The output bytes of the Q8 grid (every head dimension below 512) and of the fp16 D256 path,
 /// pinned by SHA-256: adding the head_dim 512 kernel must not move a bit of the others. The
-/// digests were taken from the tree before that kernel existed.
+/// digests were taken from the tree before that kernel existed, on an sm_86 card; other devices
+/// skip the test.
 #[test]
 fn head_dims_below_512_keep_their_bytes() {
     if !testkit::device_present("head_dims_below_512_keep_their_bytes") {
+        return;
+    }
+    // Exact float hashes depend on the device and the toolchain: the digests are sm_86's.
+    let capability = {
+        let ctx = CudaContext::new().expect("context");
+        ctx.device_attributes()
+            .expect("device attributes")
+            .compute_capability
+    };
+    if capability != (8, 6) {
+        println!(
+            "SKIPPED head_dims_below_512_keep_their_bytes: the digests were taken on sm_86, \
+             this device is sm_{}{}",
+            capability.0, capability.1
+        );
         return;
     }
     let mut seen = Vec::new();
