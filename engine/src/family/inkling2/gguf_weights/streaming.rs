@@ -5,7 +5,6 @@ use crate::{
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
     family::inkling2::cuda_projection::gguf::streaming::{ExpertRows, PrefillRoute, RoutedExperts},
     kernels::cuda::resident::dense_gemv::DenseDtype,
-    weights::GgufType,
 };
 
 struct Source<'a> {
@@ -72,11 +71,7 @@ impl GgufTextWeights {
         layer: u32,
     ) -> Result<Option<(Source<'_>, [DenseDtype; 2])>, EngError> {
         let parts = [self.tensor(names[0])?, self.tensor(names[1])?];
-        let dtype = |(tensor, _): (&Tensor, &[u8])| match tensor.kind {
-            GgufType::Nvfp4 => Some(DenseDtype::GgufNvfp4),
-            GgufType::Bf16 => Some(DenseDtype::Bf16),
-            _ => None,
-        };
+        let dtype = |(tensor, _): (&Tensor, &[u8])| self.cuda.as_ref()?.expert_dtype(tensor.kind);
         let [Some(gate), Some(down)] = parts.map(dtype) else {
             return Ok(None);
         };

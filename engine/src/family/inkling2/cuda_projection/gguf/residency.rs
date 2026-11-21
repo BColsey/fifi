@@ -1,4 +1,4 @@
-//! Adapt contiguous NVFP4 stacks in a GGUF mapping to the shared expert tier.
+//! Adapt contiguous GGUF expert stacks to the shared expert tier.
 
 use std::{collections::BTreeMap, ops::Range};
 
@@ -7,23 +7,23 @@ use crate::{
     EngError,
     expert_tier::{
         ExpertId, ExpertPayload, ExpertPayloadSource, GpuExpertStore, GpuLayerPlan, Placement,
-        Residency, place_gpu_layers,
+        Residency, VRAM_HEADROOM_BYTES, auto_fit_gpu_layers, place_gpu_layers,
     },
     family::mapped_file::MappedFile,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
     weights::repack_nvfp4_into,
 };
 
-pub(in crate::family::inkling2) struct Nvfp4Stack<'a> {
+pub(in crate::family::inkling2) struct ExpertStack<'a> {
     pub bytes: &'a [u8],
     pub file_range: Range<usize>,
     pub tensor_scales: Option<&'a [u8]>,
     pub shape: [u32; 2],
 }
 
-pub(in crate::family::inkling2) struct Nvfp4Layer<'a> {
+pub(in crate::family::inkling2) struct ExpertLayer<'a> {
     pub layer: u32,
-    pub parts: [Nvfp4Stack<'a>; 2],
+    pub parts: [ExpertStack<'a>; 2],
 }
 
 enum Bank {
@@ -42,10 +42,10 @@ pub(super) struct ResidentExperts {
 }
 
 impl ResidentExperts {
-    pub(super) fn load(
+    pub(super) fn load_nvfp4(
         ctx: &CudaContext,
         experts: u32,
-        layers: Vec<Nvfp4Layer<'_>>,
+        layers: Vec<ExpertLayer<'_>>,
         file: &MappedFile,
         direct: bool,
     ) -> Result<Self, EngError> {
@@ -83,6 +83,50 @@ impl ResidentExperts {
             &mut source,
         )?;
         Ok(Self { placement, banks })
+    }
+
+    /// Packed tensors can have different sizes in each layer. Allocate both
+    /// parts before admitting the layer so driver rounding cannot consume headroom.
+    pub(super) fn load_packed(
+        ctx: &CudaContext,
+        experts: u32,
+        layers: Vec<ExpertLayer<'_>>,
+        file: &MappedFile,
+        budget: u64,
+    ) -> Result<Self, EngError> {
+        let mut residency = Self {
+            placement: Residency::default(),
+            banks: BTreeMap::new(),
+        };
+        let mut remaining = budget;
+        for layer in layers {
+            let bytes = layer_bytes(&layer);
+            let free = ctx.memory_info()?.free as u64;
+            if bytes > remaining || auto_fit_gpu_layers(free, 0, bytes, 1) == 0 {
+                continue;
+            }
+            let [gate, down] = layer.parts;
+            let w13 = ctx.allocate(gate.bytes.len())?;
+            let w2 = ctx.allocate(down.bytes.len())?;
+            if (ctx.memory_info()?.free as u64) < VRAM_HEADROOM_BYTES {
+                continue;
+            }
+            ctx.upload_at(&w13, 0, gate.bytes)?;
+            ctx.upload_at(&w2, 0, down.bytes)?;
+            file.drop_cache(gate.file_range)?;
+            file.drop_cache(down.file_range)?;
+            residency.banks.insert(
+                layer.layer,
+                [Some(Bank::Original(w13)), Some(Bank::Original(w2))],
+            );
+            for expert in 0..experts {
+                residency
+                    .placement
+                    .mark_expert(layer.layer, expert, experts);
+            }
+            remaining -= bytes;
+        }
+        Ok(residency)
     }
 
     pub(super) fn ranges(
@@ -127,19 +171,19 @@ impl ResidentExperts {
     }
 }
 
-fn layer_bytes(layer: &Nvfp4Layer<'_>) -> u64 {
+fn layer_bytes(layer: &ExpertLayer<'_>) -> u64 {
     layer.parts.iter().map(|part| part.bytes.len() as u64).sum()
 }
 
 struct Source<'a> {
     direct: bool,
-    layers: Vec<Nvfp4Layer<'a>>,
+    layers: Vec<ExpertLayer<'a>>,
     file: &'a MappedFile,
     experts: u32,
 }
 
 impl Source<'_> {
-    fn layer(&self, layer: u32) -> Result<&Nvfp4Layer<'_>, EngError> {
+    fn layer(&self, layer: u32) -> Result<&ExpertLayer<'_>, EngError> {
         self.layers
             .iter()
             .find(|entry| entry.layer == layer)

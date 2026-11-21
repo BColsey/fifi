@@ -1,5 +1,4 @@
-//! Take BF16 matrices from the GGUF mapping and reuse Inkling's CUDA projection
-//! kernels. Cold experts reuse fixed staging buffers.
+//! Project directly from mapped GGUF matrices. Cold experts reuse fixed staging buffers.
 
 use std::{cell::RefCell, collections::BTreeMap};
 
@@ -11,6 +10,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange,
         plan::{Demand, admit},
+        resident::dense_gemv::DenseDtype,
     },
     sched::job::PrefillBankReport,
     weights::{GgufType, repack_nvfp4_into},
@@ -21,11 +21,12 @@ mod residency;
 pub(in crate::family::inkling2) mod streaming;
 
 use residency::ResidentExperts;
-pub(in crate::family::inkling2) use residency::{Nvfp4Layer, Nvfp4Stack};
+pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
 
 pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
-    dense: BTreeMap<String, Resident>,
+    dense: BTreeMap<String, (Resident, DenseDtype)>,
+    packed_gguf: bool,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
     prefill_report: Option<RefCell<PrefillBankReport>>,
@@ -34,6 +35,18 @@ pub(in crate::family::inkling2) struct GgufCuda {
     expert_scales: DeviceBuffer,
     packed: RefCell<Packed>,
     context: CudaContext,
+}
+
+pub(in crate::family::inkling2) struct GgufDenseUpload<'a> {
+    pub matrix: DenseUpload<'a>,
+    pub dtype: DenseDtype,
+}
+
+pub(in crate::family::inkling2) struct Options {
+    pub direct: bool,
+    pub packed: bool,
+    pub stream: bool,
+    pub budget: u64,
 }
 
 struct Packed {
@@ -52,22 +65,34 @@ pub(in crate::family::inkling2) struct ExpertView<'a> {
 
 impl GgufCuda {
     pub(in crate::family::inkling2) fn load(
-        dense: Vec<DenseUpload<'_>>,
+        dense: Vec<GgufDenseUpload<'_>>,
         spec: &super::TextSpec,
-        layers: Vec<Nvfp4Layer<'_>>,
+        layers: Vec<ExpertLayer<'_>>,
         file: &MappedFile,
-        direct: bool,
-        stream: bool,
+        Options {
+            direct,
+            packed,
+            stream,
+            budget,
+        }: Options,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
         let ff = spec.intermediate_size as usize;
         let rows = hidden.max(2 * ff);
         let shape = dense.iter().fold([rows, hidden.max(ff)], |[r, c], item| {
-            [r.max(item.shape[0]), c.max(item.shape[1])]
+            [r.max(item.matrix.shape[0]), c.max(item.matrix.shape[1])]
         });
         let elements = rows * hidden.max(ff);
         let stage = [2 * elements, elements / 16];
-        let tensors: u64 = dense.iter().map(|item| item.codes.len() as u64).sum();
+        let tensors: u64 = dense
+            .iter()
+            .map(|item| item.matrix.codes.len() as u64)
+            .sum();
+        let bf16_bytes: u64 = dense
+            .iter()
+            .filter(|item| item.dtype == DenseDtype::Bf16)
+            .map(|item| item.matrix.codes.len() as u64)
+            .sum();
         let plan = DensePlan::new(shape, hidden, spec.core.gate_rank as usize)?;
         let (admission, _) = CudaContext::fixed_projection_plan(shape)?;
         let context = CudaContext::with_admission(&admission)?;
@@ -85,26 +110,33 @@ impl GgufCuda {
         let expert_scales = context.allocate(stage[1])?;
         let dense: BTreeMap<_, _> = dense
             .into_iter()
-            .map(|item| {
-                let codes = upload_tensor(&context, item.codes)?;
+            .map(|GgufDenseUpload { matrix, dtype }| {
+                let codes = upload_tensor(&context, matrix.codes)?;
                 Ok((
-                    item.name.into(),
-                    Resident {
-                        codes,
-                        shape: item.shape,
-                    },
+                    matrix.name.into(),
+                    (
+                        Resident {
+                            codes,
+                            shape: matrix.shape,
+                        },
+                        dtype,
+                    ),
                 ))
             })
             .collect::<Result<_, EngError>>()?;
         let stream_banks = stream_plan
             .map(|plan| crate::expert_tier::CudaStreamBanks::new(&context, plan).map(RefCell::new))
             .transpose()?;
-        let resident =
-            ResidentExperts::load(&context, spec.n_routed_experts as u32, layers, file, direct)?;
+        let experts = spec.n_routed_experts as u32;
+        let resident = if packed {
+            ResidentExperts::load_packed(&context, experts, layers, file, budget)?
+        } else {
+            ResidentExperts::load_nvfp4(&context, experts, layers, file, direct)?
+        };
         eprintln!(
             "Inkling GGUF CUDA projections {}",
-            serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": tensors,
-                "direct_resident_nvfp4": direct, "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
+            serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": bf16_bytes, "resident_dense_bytes": tensors, "packed_gguf": packed,
+                "direct_resident_nvfp4": direct || packed, "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
                 "resident_expert_bytes": resident.bytes(),
                 "resident_expert_layers": resident.placement().full_layers(),
                 "resident_expert_count": resident.placement().resident_experts()})
@@ -112,6 +144,7 @@ impl GgufCuda {
         Ok(Self {
             step,
             dense,
+            packed_gguf: packed,
             resident,
             cache: RefCell::default(),
             prefill_report: (stream
@@ -134,13 +167,35 @@ impl GgufCuda {
         rows: usize,
         x: &[f32],
     ) -> Option<Result<Vec<f32>, EngError>> {
-        let resident = self.dense.get(name)?;
+        let (resident, dtype) = self.dense.get(name)?;
         if resident.shape != [rows, x.len()] {
             return Some(Err(bad(format!(
                 "bad GGUF CUDA projection shape for {name}"
             ))));
         }
-        Some(self.step.project(&self.context, resident, x))
+        Some(if *dtype == DenseDtype::Bf16 {
+            self.step.project(&self.context, resident, x)
+        } else {
+            resident
+                .codes
+                .range(0, resident.codes.bytes())
+                .and_then(|raw| {
+                    self.step.project_gguf(
+                        &self.context,
+                        None,
+                        (*dtype, raw, resident.shape, 1.0),
+                        x,
+                    )
+                })
+        })
+    }
+
+    pub(in crate::family::inkling2) fn expert_dtype(&self, kind: GgufType) -> Option<DenseDtype> {
+        if self.packed_gguf || matches!(kind, GgufType::Bf16 | GgufType::Nvfp4) {
+            DenseDtype::from_gguf(kind)
+        } else {
+            None
+        }
     }
 
     pub(in crate::family::inkling2) fn expert(
@@ -148,6 +203,11 @@ impl GgufCuda {
         expert: &ExpertView<'_>,
         x: &[f32],
     ) -> Option<Result<Vec<f32>, EngError>> {
+        if self.packed_gguf {
+            let dtype = self.expert_dtype(expert.kind)?;
+            return (self.resident.placement().placement(expert.id) == Placement::Gpu)
+                .then(|| self.resident_packed_expert(expert, dtype, x));
+        }
         match expert.kind {
             GgufType::Bf16 => Some(self.bf16_expert(expert, x)),
             GgufType::Nvfp4 => {
@@ -160,6 +220,26 @@ impl GgufCuda {
             }
             _ => None,
         }
+    }
+
+    fn resident_packed_expert(
+        &self,
+        expert: &ExpertView<'_>,
+        dtype: DenseDtype,
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        let Some(residency::Weight::Original(raw)) =
+            self.resident
+                .ranges(expert.id, expert.part, [expert.bytes.len(), 0])?
+        else {
+            return Err(bad("resident GGUF expert has no original packed weight"));
+        };
+        self.step.project_gguf(
+            &self.context,
+            None,
+            (dtype, raw, expert.shape, expert.factor),
+            x,
+        )
     }
 
     fn bf16_expert(&self, expert: &ExpertView<'_>, x: &[f32]) -> Result<Vec<f32>, EngError> {
@@ -189,12 +269,7 @@ impl GgufCuda {
                 residency::Weight::Original(raw) => self.step.project_gguf(
                     &self.context,
                     None,
-                    (
-                        crate::kernels::cuda::resident::dense_gemv::DenseDtype::GgufNvfp4,
-                        raw,
-                        expert.shape,
-                        expert.factor,
-                    ),
+                    (DenseDtype::GgufNvfp4, raw, expert.shape, expert.factor),
                     x,
                 ),
                 residency::Weight::Converted(pair) => self.project_nvfp4(pair, expert, x),

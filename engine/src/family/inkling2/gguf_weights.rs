@@ -19,8 +19,11 @@ use crate::{
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::cuda_projection::{
     DenseUpload, expert_layer_order, expert_residency_budget,
-    gguf::{ExpertView, GgufCuda, Nvfp4Layer, Nvfp4Stack, can_repack},
+    gguf::{ExpertLayer, ExpertStack, ExpertView, GgufCuda, GgufDenseUpload, can_repack},
 };
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+use crate::kernels::cuda::resident::dense_gemv::DenseDtype;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod ram;
@@ -537,10 +540,13 @@ impl GgufTextWeights {
         eps: f32,
         host_reserve: u64,
     ) -> Result<(), EngError> {
+        let packed = std::env::var("FIFI_INKLING_CUDA_PACKED_GGUF").as_deref() == Ok("1");
         let mut uploads = Vec::new();
         for (name, tensor) in &self.tensors {
-            if tensor.kind != GgufType::Bf16
-                || tensor.planes != 1
+            let Some(dtype) = dense_dtype(tensor.kind, packed) else {
+                continue;
+            };
+            if tensor.planes != 1
                 || tensor.rows == 1
                 || name == "model.llm.embed.weight"
                 || !matches!(tensor.vector_order, VectorOrder::Stored)
@@ -553,10 +559,14 @@ impl GgufTextWeights {
                 tensor.rows
             };
             let (_, payload) = self.tensor(name)?;
-            uploads.push(DenseUpload {
-                name,
-                codes: &payload[..rows * tensor.columns * 2],
-                shape: [rows, tensor.columns],
+            let row_bytes = payload.len() / tensor.rows;
+            uploads.push(GgufDenseUpload {
+                matrix: DenseUpload {
+                    name,
+                    codes: &payload[..rows * row_bytes],
+                    shape: [rows, tensor.columns],
+                },
+                dtype,
             });
         }
         let ram_limit = ram::requested_limit()?;
@@ -569,10 +579,22 @@ impl GgufTextWeights {
                 expert_residency_budget()?
             };
         let direct = std::env::var("FIFI_INKLING_CUDA_DIRECT_RESIDENT").as_deref() == Ok("1");
-        let layers = self.nvfp4_layers(spec, budget, direct)?;
-        let stream =
-            tiered || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
-        let mut cuda = GgufCuda::load(uploads, spec, layers, &self.mapping, direct, stream)?;
+        let layers = self.expert_layers(spec, budget, direct, packed)?;
+        let stream = packed
+            || tiered
+            || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
+        let mut cuda = GgufCuda::load(
+            uploads,
+            spec,
+            layers,
+            &self.mapping,
+            super::cuda_projection::gguf::Options {
+                direct,
+                packed,
+                stream,
+                budget,
+            },
+        )?;
         if reuse {
             let layout = ram::cold_stacks(self, &cuda, spec)?
                 .into_iter()
@@ -598,12 +620,13 @@ impl GgufTextWeights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    fn nvfp4_layers(
+    fn expert_layers(
         &self,
         spec: &TextSpec,
         budget: u64,
         direct: bool,
-    ) -> Result<Vec<Nvfp4Layer<'_>>, EngError> {
+        packed: bool,
+    ) -> Result<Vec<ExpertLayer<'_>>, EngError> {
         let mut layers = Vec::new();
         let mut remaining = budget;
         for layer in expert_layer_order(spec) {
@@ -614,29 +637,37 @@ impl GgufTextWeights {
             let (gate, gate_bytes) = self.tensor(&format!("{prefix}.w13_weight"))?;
             let (down, down_bytes) = self.tensor(&format!("{prefix}.w2_weight"))?;
             let bytes = (gate_bytes.len() + down_bytes.len()) as u64;
-            if gate.kind != GgufType::Nvfp4 || down.kind != GgufType::Nvfp4 || bytes > remaining {
+            let supported = if packed {
+                DenseDtype::from_gguf(gate.kind).is_some()
+                    && DenseDtype::from_gguf(down.kind).is_some()
+            } else {
+                gate.kind == GgufType::Nvfp4 && down.kind == GgufType::Nvfp4
+            };
+            if !supported || bytes > remaining {
                 continue;
             }
-            if !direct && (!can_repack(gate_bytes) || !can_repack(down_bytes)) {
+            if !packed && !direct && (!can_repack(gate_bytes) || !can_repack(down_bytes)) {
                 continue;
             }
-            let stack = |t: &Tensor, bytes, suffix| -> Result<Nvfp4Stack<'_>, EngError> {
+            let stack = |t: &Tensor, bytes, suffix| -> Result<ExpertStack<'_>, EngError> {
                 let tensor_scales = self.scale_bytes(&format!("{prefix}.{suffix}"))?;
-                Ok(Nvfp4Stack {
+                Ok(ExpertStack {
                     bytes,
                     file_range: t.bytes.clone(),
                     tensor_scales,
                     shape: [t.rows as u32, t.columns as u32],
                 })
             };
-            layers.push(Nvfp4Layer {
+            layers.push(ExpertLayer {
                 layer: layer as u32,
                 parts: [
                     stack(gate, gate_bytes, "w13_weight")?,
                     stack(down, down_bytes, "w2_weight")?,
                 ],
             });
-            remaining -= bytes;
+            if !packed {
+                remaining -= bytes;
+            }
         }
         Ok(layers)
     }
@@ -764,6 +795,15 @@ impl GgufTextWeights {
             }
         }
         Ok(output)
+    }
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn dense_dtype(kind: GgufType, packed: bool) -> Option<DenseDtype> {
+    if packed || kind == GgufType::Bf16 {
+        DenseDtype::from_gguf(kind)
+    } else {
+        None
     }
 }
 

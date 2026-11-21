@@ -115,10 +115,7 @@ pub(super) fn cold_stacks(
                 .0)
         };
         let parts = [part("w13")?, part("w2")?];
-        if !parts
-            .iter()
-            .all(|t| matches!(t.kind, super::GgufType::Bf16 | super::GgufType::Nvfp4))
-        {
+        if !parts.iter().all(|t| cuda.expert_dtype(t.kind).is_some()) {
             continue;
         }
         stacks.push(Stack {
