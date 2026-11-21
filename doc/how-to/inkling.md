@@ -146,6 +146,12 @@ The 16 GiB M4 mini reported a Metal recommendation of 12,713,115,648 bytes. For 
 
 The automatic repeat retained 6,347,464,200 bytes and hit every routed expert. macOS still attributed 3.24 GB of disk reads to the process, with 170,004 system swap-out pages during the request. This run overlapped the local iOS CI build. Record an idle-host comparison before assessing the automatic sizing policy’s impact on swap and throughput. Metal’s recommendation describes GPU resource allocations. [Apple Metal working-set documentation](https://developer.apple.com/documentation/metal/mtldevice/recommendedmaxworkingsetsize)
 
+### Cache experiments awaiting device qualification
+
+`FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1` uses the full already-admitted expert budget for packed Metal buffers when every stored expert projection has a direct packed kernel. Set it alongside `FIFI_INKLING_GGUF_PACKED_MLX=1`. The application retains one copy of each cached packed projection. The phase trace reports the two tier capacities and retained payload bytes. Use the same ceiling with and without the flag when comparing it.
+
+`FIFI_MLX_ADAPT_EXPERT_CACHE=1` applies to the publisher safetensors host cache. The decoder halves its admitted expert retention limit after a macOS warning and clears retained experts after a critical event. It checks the event before staging a visit or when resetting the decoder. The reduced cap lasts until server restart. KV and staging allocations stay within the original plan. Test the no-event path on the mini and capture naturally occurring pressure events before comparing physical I/O. [Apple Dispatch memory-pressure documentation](https://developer.apple.com/documentation/Dispatch/DISPATCH_SOURCE_TYPE_MEMORYPRESSURE)
+
 ### Speculative read replay
 
 The measured 5 GiB route trace spent 9.13 s in demand reads across 1,536 visits. Two historical predictors used the previous token’s route at the same visit or the latest route for the same physical layer. Both would issue zero speculative reads under a one- or two-visit lookahead because all their predicted experts were already cached when they would have issued. At a simulated 1 GiB expert cache, the better two-visit predictor by byte precision would read 16.63 GB ahead, including 11.08 GB unused at its target visit. This replay models logical payloads. The runtime retains demand-only scheduling.
