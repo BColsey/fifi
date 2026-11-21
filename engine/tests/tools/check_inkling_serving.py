@@ -96,6 +96,7 @@ def fold_stream(frames, chat):
     text, reasoning = [], []
     reply_id = None
     finish = None
+    usage = None
     assistant_role = False
     done = False
     for frame in frames:
@@ -129,6 +130,8 @@ def fold_stream(frames, chat):
         else:
             require("usage" not in packet, "usage on non-terminal chunk")
     require(done, "missing [DONE]")
+    require(usage is not None, "terminal chunk missing usage")
+    assert usage is not None
     return {
         "text": "".join(text), "reasoning": "".join(reasoning), "finish": finish,
         "usage": {key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")},
@@ -165,9 +168,11 @@ def run_suite(server, args, report):
         return reply["tokens"]
 
     def request(label, path, payload, streaming=False):
-        case = report["cases"][label] = {"request": {**payload, "stream": streaming}}
+        case: dict = {"request": {**payload, "stream": streaming}}
+        report["cases"][label] = case
         if streaming:
-            case["events"] = frames = []
+            frames = []
+            case["events"] = frames
             with server.request(path, {**payload, "stream": True}) as response:
                 for frame in stream_events(response):
                     frames.append(frame)
