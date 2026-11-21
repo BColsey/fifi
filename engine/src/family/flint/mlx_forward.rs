@@ -835,22 +835,38 @@ pub(super) fn grouped_experts(
     let repeated = k.repeat(x, 6, 0)?;
     let sorted_x = k.take(&repeated, &order, 0)?;
     let sorted_x = k.reshape(&sorted_x, &[pairs, 1, hidden])?;
-    let gate = k.gather_qmm_sorted_bounded(&sorted_x, &w.gate, &sorted_ids)?;
-    let up = k.gather_qmm_sorted_bounded(&sorted_x, &w.up, &sorted_ids)?;
-    let gate = k.silu(&gate)?;
-    let product = k.binary(BinaryOp::Mul, &gate, &up)?;
-    #[cfg(test)]
-    stage_fence(k, "ffn_gate_up", &product)?;
-    let output = k.gather_qmm_sorted_bounded(&product, &w.down, &sorted_ids)?;
-    let output = k.reshape(&output, &[pairs, hidden])?;
-    #[cfg(test)]
-    stage_fence(k, "ffn_down", &output)?;
+    let output = sorted_expert_pairs(k, w, &sorted_x, &sorted_ids)?;
     // Restore token/rank order before BF16 weighted reduction, not after it.
     let order = k.u32_to_f32(&order)?;
     let inverse = k.argsort(&order, 0)?;
     let ordered = k.take(&output, &inverse, 0)?;
     k.reshape(&ordered, &[tokens, 6, hidden])
 }
+
+fn sorted_expert_pairs(
+    k: &mut MlxKernels,
+    w: &SwiGlu,
+    sorted_x: &ExecutionTensor,
+    sorted_ids: &BoundedIndices,
+) -> Result<ExecutionTensor> {
+    let pairs = sorted_x.shape()[0];
+    let hidden = sorted_x.shape()[2];
+    let gate = k.gather_qmm_sorted_bounded(sorted_x, &w.gate, sorted_ids)?;
+    let up = k.gather_qmm_sorted_bounded(sorted_x, &w.up, sorted_ids)?;
+    let gate = k.silu(&gate)?;
+    let product = k.binary(BinaryOp::Mul, &gate, &up)?;
+    #[cfg(test)]
+    stage_fence(k, "ffn_gate_up", &product)?;
+    let output = k.gather_qmm_sorted_bounded(&product, &w.down, sorted_ids)?;
+    let output = k.reshape(&output, &[pairs, hidden])?;
+    #[cfg(test)]
+    stage_fence(k, "ffn_down", &output)?;
+    Ok(output)
+}
+
+#[cfg(all(test, feature = "native-fault-qualification"))]
+#[path = "mlx_prefill_reuse_fixture.rs"]
+mod prefill_reuse_fixture;
 
 #[cfg(test)]
 pub(super) fn import_f32(
