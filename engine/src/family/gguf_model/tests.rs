@@ -301,7 +301,7 @@ fn a_q4_1_expert_stack_fails_the_open_naming_the_tensor() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q4_1, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
+        "gguf: tensor blk.1.ffn_gate_exps.weight has unsupported type Q4_1"
     );
 }
 
@@ -400,7 +400,7 @@ fn a_q4_1_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type Q4_1, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
+        "gguf: tensor blk.1.attn_k.weight has unsupported type Q4_1"
     );
 }
 

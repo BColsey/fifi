@@ -89,8 +89,10 @@ fn read_f32(stream: &DeviceStream, buffer: &DeviceBuffer, n: usize) -> Vec<f32> 
     let mut bytes = vec![0u8; n * 4];
     buffer.read_at(stream, 0, &mut bytes).expect("read back");
     bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
@@ -121,7 +123,7 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         return;
     };
     let stream = ctx.stream().expect("stream");
-    let mut rng = Rng(0x5107_ed_2545_f491);
+    let mut rng = Rng(0x0051_07ed_2545_f491);
     let (gate_ty, up_ty, down_ty) = (GgufType::Iq3Xxs, GgufType::Q4K, GgufType::Iq4Xs);
     let gate_bytes = blocks(gate_ty, E * INTER, HIDDEN, &mut rng);
     let up_bytes = blocks(up_ty, E * INTER, HIDDEN, &mut rng);
