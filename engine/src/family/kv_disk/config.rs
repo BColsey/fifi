@@ -4,10 +4,11 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// The default of the on-disk prefix cache when the config and the environment say nothing. Off
-/// until the flip is announced: only a `kv_cache.dir`, `kv_cache.enabled: true`, or the
-/// environment turns it on.
-pub(crate) const KV_CACHE_DEFAULT_ON: bool = false;
+/// The default of the on-disk prefix cache when the config and the environment say nothing: on,
+/// at the default directory and quota. `kv_cache.enabled: false` or `FIFI_KV_CACHE=0` turns it
+/// off; the cache also stays off when the host cannot name a directory or has too little free
+/// space.
+pub(crate) const KV_CACHE_DEFAULT_ON: bool = true;
 
 /// The least quota an operator may set.
 const QUOTA_MIN_BYTES: u64 = 1 << 30;
