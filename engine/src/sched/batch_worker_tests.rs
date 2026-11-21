@@ -2742,6 +2742,7 @@ fn waiting_engine(
     let mut fake = WindowFake::new(log);
     fake.max = 2;
     fake.session_cap = Some(1);
+    fake.evictions = 0;
     fake.window_delay = Some(Duration::from_millis(4));
     let (engine, release) = start(fake);
     let (long, long_events) = job(&[0], 600);
@@ -2766,14 +2767,17 @@ fn still_running(handle: &mut JobHandle) -> bool {
     }
 }
 
-/// Waits until the fake has refused a session to the waiting job: from then on the job is out of
-/// the channel and waiting.
-fn wait_until_refused(log: &Log) {
+/// Waits until the refused job is waiting: the fake has refused it a session and the worker has
+/// gone on to a window, so the admission, including any eviction retries, is over. A caller that
+/// acted on the first refusal alone would race the admission loop, which a cancel or a freed
+/// session ends early.
+fn wait_until_waiting(log: &Log) {
     wait(|| {
-        lock(log)
-            .calls
+        let calls = &lock(log).calls;
+        calls
             .iter()
-            .any(|call| call == "new_session_refused")
+            .position(|call| call == "new_session_refused")
+            .is_some_and(|at| calls[at..].iter().any(|call| call == "window"))
     });
 }
 
@@ -2783,7 +2787,7 @@ fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
     let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
     // Queued is also 1 while the job still sits in the channel: wait until it has been taken
     // out, refused and made to wait, and only then ask.
-    wait_until_refused(&log);
+    wait_until_waiting(&log);
     assert_eq!(
         engine.handle().queued(),
         1,
@@ -2808,14 +2812,21 @@ fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
 #[test]
 fn a_waiting_job_that_is_cancelled_ends_while_the_stream_still_runs() {
     let log = Log::default();
-    let (engine, long_events, waiter_events, cancel) = waiting_engine(&log);
-    wait(|| engine.handle().queued() == 1);
+    let (engine, mut long_events, waiter_events, cancel) = waiting_engine(&log);
+    wait_until_waiting(&log);
+    let cancelled_at = Instant::now();
     cancel.store(true, Ordering::SeqCst);
-    waiter_events.cancel();
     let waiter = raw_events(waiter_events);
+    // Noticed on the next pass of the loop, not at the one-second retry.
+    assert!(
+        cancelled_at.elapsed() < Duration::from_millis(500),
+        "the cancel took {:?}",
+        cancelled_at.elapsed()
+    );
     assert_eq!(finish(&waiter), DecodeFinish::Cancelled);
     assert_eq!(engine.handle().queued(), 0, "its ticket is released");
     // The stream it waited behind is still decoding.
+    assert!(still_running(&mut long_events));
     let long = collect(long_events);
     assert_eq!(usage(&long).completion_tokens, 600);
     engine.shutdown();
@@ -2839,18 +2850,24 @@ fn a_job_refused_for_memory_asks_again_when_memory_returns_with_every_slot_live(
     let mut fake = WindowFake::new(&log);
     fake.max = 2;
     fake.live_cap = Some(Arc::clone(&live));
+    fake.evictions = 0;
     fake.window_delay = Some(Duration::from_millis(5));
     let (engine, release) = start(fake);
-    let (long, long_events) = job(&[0], 800);
+    let (long, mut long_events) = job(&[0], 800);
     let (waiter, waiter_events) = job(&[1], 3);
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
     release.send(()).expect("load");
-    wait(|| engine.handle().queued() == 1);
+    wait_until_waiting(&log);
     // The device lets go of memory; no slot frees. The waiting job's timed retry finds it.
     live.store(2, Ordering::SeqCst);
     let waiter = collect(waiter_events);
     assert_eq!(usage(&waiter).completion_tokens, 3);
+    // The stream is still running: without the timer the waiter would only have run when it ended.
+    assert!(
+        still_running(&mut long_events),
+        "the waiter ran only after the stream ended"
+    );
     let long = collect(long_events);
     assert_eq!(
         usage(&long).completion_tokens,
@@ -2964,7 +2981,7 @@ fn a_retry_that_cannot_fit_does_not_allocate_and_one_that_can_does() {
     engine.handle().try_submit(long).expect("long");
     engine.handle().try_submit(waiter).expect("waiter");
     release.send(()).expect("load");
-    wait_until_refused(&log);
+    wait_until_waiting(&log);
     std::thread::sleep(Duration::from_millis(2_300));
     let asked = lock(&log)
         .calls
