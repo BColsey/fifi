@@ -157,11 +157,10 @@ impl GgufModel {
         };
         EngError::Checkpoint(format!(
             "Flash-Next GGUF {} cannot be served on CUDA yet: no decode kernel reads {}. The \
-             dense kernels read {}; the routed-expert kernel reads {}.",
+             dense and routed-expert kernels read {}.",
             self.first_path().display(),
             listed.join(", "),
-            names(&tensors::DECODE_BLOCK_TYPES),
-            names(&tensors::EXPERT_BLOCK_TYPES)
+            names(&crate::weights::GgufType::native_types())
         ))
     }
 

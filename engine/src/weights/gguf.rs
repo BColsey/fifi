@@ -217,6 +217,14 @@ impl GgufType {
         )
     }
 
+    /// Every type with a native kernel, in id order.
+    pub fn native_types() -> Vec<Self> {
+        (0..64)
+            .filter_map(|id| Self::from_id(id).ok())
+            .filter(|ty| ty.has_native_kernel())
+            .collect()
+    }
+
     /// Weights per block. A row length must be a multiple of this value.
     pub fn block_elems(self) -> u64 {
         match self {

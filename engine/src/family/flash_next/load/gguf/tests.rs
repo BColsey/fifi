@@ -2,7 +2,7 @@ use super::{
     GgufModel,
     config::{ARCHITECTURE, GgufConfig},
     plan::Card,
-    tensors::{DECODE_BLOCK_TYPES, EXPERT_BLOCK_TYPES, KernelGap, Place, Role, TensorMap},
+    tensors::{KernelGap, Place, Role, TensorMap},
     testkit::{REAL_EXPERT_TYPES, Spec, flash_kvs, write_flash, write_gguf},
 };
 use crate::{
@@ -301,7 +301,7 @@ fn the_real_file_has_no_kernel_gaps() {
 fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
     let (_written, model) = open(&Spec::default());
     let gaps = [KernelGap {
-        ty: GgufType::Q3K,
+        ty: GgufType::Q41,
         tensors: 3,
         bytes: 3 << 30,
         first: "blk.0.ffn_down_exps.weight".to_owned(),
@@ -312,27 +312,24 @@ fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
         "{message}"
     );
     assert!(
-        message.contains("Q3_K") && message.contains("blk.0.ffn_down_exps.weight"),
+        message.contains("Q4_1") && message.contains("blk.0.ffn_down_exps.weight"),
         "{message}"
     );
     assert!(
-        message.contains("dense kernels read Q4_K, Q5_0, Q6_K, Q8_0"),
-        "{message}"
-    );
-    assert!(
-        message.contains("routed-expert kernel reads Q4_K, Q5_0, Q6_K, Q8_0, IQ4_XS"),
+        message.contains("dense and routed-expert kernels read Q4_K"),
         "{message}"
     );
 }
 
 #[test]
-fn a_dense_q3_k_matrix_is_not_a_gap_and_an_expert_one_is() {
+fn a_native_matrix_is_not_a_gap_anywhere_and_q4_1_is_one() {
     use super::tensors::has_decode_kernel;
     assert!(has_decode_kernel(Place::Device, GgufType::Q3K));
-    assert!(!has_decode_kernel(Place::Experts, GgufType::Q3K));
+    assert!(has_decode_kernel(Place::Experts, GgufType::Q3K));
     assert!(has_decode_kernel(Place::Experts, GgufType::Q4K));
     assert!(has_decode_kernel(Place::Experts, GgufType::Iq3Xxs));
-    assert_eq!(EXPERT_BLOCK_TYPES.len(), 15);
+    assert!(!has_decode_kernel(Place::Experts, GgufType::Q41));
+    assert_eq!(GgufType::native_types().len(), 18);
 }
 
 #[test]
@@ -340,7 +337,7 @@ fn a_file_of_supported_types_has_no_gaps() {
     let all = |_: Place, _: GgufType| true;
     let (_written, model) = open(&Spec::default());
     assert!(model.map().kernel_gaps(all).is_empty());
-    assert_eq!(DECODE_BLOCK_TYPES.len(), 18);
+    assert_eq!(GgufType::native_types().len(), 18);
 }
 
 #[test]

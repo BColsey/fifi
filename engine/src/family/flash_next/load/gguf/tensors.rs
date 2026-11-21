@@ -166,52 +166,6 @@ pub(in crate::family::flash_next) struct KernelGap {
     pub(in crate::family::flash_next) first: String,
 }
 
-/// Tensor types the CUDA decode path can read as stored blocks: the in-tree matvec kernels
-/// (`QuantType` of `kernels::cuda::resident::matvec_q`). A native-CUDA test keeps this list
-/// equal to what the weight upload accepts.
-pub(in crate::family::flash_next) const DECODE_BLOCK_TYPES: [GgufType; 18] = [
-    GgufType::Q4K,
-    GgufType::Q50,
-    GgufType::Q6K,
-    GgufType::Q80,
-    GgufType::Q5K,
-    GgufType::Q40,
-    GgufType::Q3K,
-    GgufType::Iq4Xs,
-    GgufType::Iq4Nl,
-    GgufType::Iq2Xxs,
-    GgufType::Iq2Xs,
-    GgufType::Iq2S,
-    GgufType::Iq3Xxs,
-    GgufType::Iq3S,
-    GgufType::Iq1S,
-    GgufType::Iq1M,
-    GgufType::Q20,
-    GgufType::Q2K,
-];
-
-/// Tensor types the routed-expert kernel reads: the vendored matvec arms and the in-house
-/// codebook kernels (every IQ type, Q2_0 and Q2_K). The in-house Q5_K, Q4_0 and Q3_K dense
-/// kernels have no id-indexed expert form, so an expert matrix of those types is a gap although
-/// a dense matrix of the same type is not.
-pub(in crate::family::flash_next) const EXPERT_BLOCK_TYPES: [GgufType; 15] = [
-    GgufType::Q4K,
-    GgufType::Q50,
-    GgufType::Q6K,
-    GgufType::Q80,
-    GgufType::Iq4Xs,
-    GgufType::Iq4Nl,
-    GgufType::Iq2Xxs,
-    GgufType::Iq2Xs,
-    GgufType::Iq2S,
-    GgufType::Iq3Xxs,
-    GgufType::Iq3S,
-    GgufType::Iq1S,
-    GgufType::Iq1M,
-    GgufType::Q20,
-    GgufType::Q2K,
-];
-
 /// What a role requires of its tensor's type.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -821,14 +775,11 @@ impl TensorMap {
     }
 }
 
-/// Whether the in-tree CUDA decode kernels read a matrix of `ty` served from `place` as stored
-/// blocks: the dense matvec kernels for the trunk, the expert kernel for the routed experts.
-pub(in crate::family::flash_next) fn has_decode_kernel(place: Place, ty: GgufType) -> bool {
-    if place == Place::Experts {
-        EXPERT_BLOCK_TYPES.contains(&ty)
-    } else {
-        DECODE_BLOCK_TYPES.contains(&ty)
-    }
+/// Whether the in-tree CUDA kernels read a matrix of `ty` served from `place` as stored blocks:
+/// the dense matvec kernels for the trunk, the expert kernels for the routed experts. Every type
+/// of the shared native list has both (`GgufType::has_native_kernel`).
+pub(in crate::family::flash_next) fn has_decode_kernel(_place: Place, ty: GgufType) -> bool {
+    ty.has_native_kernel()
 }
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -837,8 +788,7 @@ mod cuda_tests {
     use crate::kernels::cuda::resident::matvec_q::QuantType;
 
     /// The GGUF type each matvec kernel format reads. The match has no wildcard: a kernel
-    /// format added to `QuantType` stops this test compiling until the table and
-    /// [`DECODE_BLOCK_TYPES`] are updated together.
+    /// format added to `QuantType` stops this test compiling until the table is updated.
     fn gguf_type(quant: QuantType) -> GgufType {
         match quant {
             QuantType::Q4K => GgufType::Q4K,
@@ -884,37 +834,21 @@ mod cuda_tests {
         QuantType::Iq1M,
     ];
 
+    /// The format layer's list of natively served types, the plan's block table and the kernel
+    /// formats are one set with one geometry.
     #[test]
-    fn the_expert_block_types_are_the_vendored_arms_and_the_codebook_kernels() {
-        // The vendored arms carry a `ggml_type`; the in-house dense-only formats (Q5_K, Q4_0,
-        // Q3_K) have no id-indexed expert form; every codebook format has one. Same table, no
-        // wildcard.
-        let expert = |quant: QuantType| match quant {
-            QuantType::Q4K | QuantType::Q50 | QuantType::Q6K | QuantType::Q80 => true,
-            QuantType::Q5K | QuantType::Q40 | QuantType::Q3K => false,
-            _ => quant.is_codebook(),
-        };
-        for quant in ALL_KERNELS {
-            assert_eq!(
-                EXPERT_BLOCK_TYPES.contains(&gguf_type(quant)),
-                expert(quant),
-                "{quant:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_decode_block_types_are_the_matvec_kernel_formats() {
-        let kernels = ALL_KERNELS;
-        let mut from_kernels: Vec<u32> = kernels.map(|q| gguf_type(q).id()).to_vec();
-        let mut listed: Vec<u32> = DECODE_BLOCK_TYPES.map(GgufType::id).to_vec();
+    fn the_native_type_list_is_the_kernel_formats() {
+        let mut from_kernels: Vec<u32> = ALL_KERNELS.map(|q| gguf_type(q).id()).to_vec();
+        let mut listed: Vec<u32> = GgufType::native_types().iter().map(|ty| ty.id()).collect();
         from_kernels.sort_unstable();
         listed.sort_unstable();
         assert_eq!(listed, from_kernels);
-        for quant in kernels {
+        for quant in ALL_KERNELS {
             let ty = gguf_type(quant);
             assert_eq!(ty.block_elems() as usize, quant.block_size(), "{ty:?}");
             assert_eq!(ty.block_bytes() as usize, quant.block_bytes(), "{ty:?}");
+            assert!(has_decode_kernel(Place::Experts, ty), "{ty:?}");
+            assert!(has_decode_kernel(Place::Device, ty), "{ty:?}");
         }
     }
 }

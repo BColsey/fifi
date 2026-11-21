@@ -53,8 +53,8 @@ use crate::{
             mmq_dense::{MmqDenseCall, MmqDenseInputCall},
             mmq_facts::MmqFacts,
             mmq_mmid::{
-                DqMmidCall, IdsGuardCall, MmidIds, MmidIdsOut, MmidLaunchCall, MmidQuantCall,
-                MmidShape, MmidWeight, mmq_type_of,
+                IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedX, mmq_type_of, routed_gemm,
+                routed_quantize,
             },
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
             swiglu_rows::SwigluRowsCall,
@@ -780,122 +780,8 @@ pub(super) fn shared_cols(dims: &MoeDims) -> [(usize, usize); 2] {
     ]
 }
 
-/// The `MmidWeight` of one routed stack (stages 13a, 13b, 16): the whole stack buffer, its
-/// type, `k` values per expert row, the expert's `n` rows, and the per-expert byte stride
-/// derived from the type.
-pub(super) fn routed_weight<'a>(
-    stack: &'a NativeWeight,
-    _dims: &MoeDims,
-    k: usize,
-    n: usize,
-) -> Result<MmidWeight<'a>, EngError> {
-    let quant = stack.quant();
-    let stride_bytes = quant.weight_bytes(n, k).ok_or_else(|| {
-        EngError::BadRequest(format!(
-            "prefill chunk: the {quant:?} stride of {n} rows of {k} values overflows"
-        ))
-    })?;
-    Ok(MmidWeight {
-        base: whole(stack.buffer())?,
-        quant,
-        k,
-        n,
-        stride_bytes,
-    })
-}
-
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
-}
-
-/// What one routed GEMM of a stage reads: the vendored grouped MMQ reads the q8_1 columns `q8`,
-/// the in-house dequantizing GEMM the f32 `rows` (the token rows of the gate and up input, or
-/// the slot rows of the down input when `per_slot`), so a stage quantizes only for the stacks
-/// that need it.
-pub(super) struct RoutedX<'a> {
-    pub(super) q8: DeviceRange<'a>,
-    pub(super) rows: DeviceRange<'a>,
-    pub(super) row_stride: usize,
-    pub(super) per_slot: bool,
-}
-
-/// One routed GEMM of `weight` over `ids`: the dequantizing GEMM for the in-house types, the
-/// vendored grouped MMQ for the rest. `dst` receives the f32 slot rows at stride `ld`.
-#[allow(clippy::too_many_arguments)] // one launch description: weight, ids, input, output, scratch
-pub(super) fn routed_gemm(
-    ctx: &crate::kernels::cuda::CudaContext,
-    stream: &crate::kernels::cuda::DeviceStream,
-    weight: &NativeWeight,
-    dims: &MoeDims,
-    ids: &MmidIds<'_>,
-    x: &RoutedX<'_>,
-    ld: usize,
-    dst: DeviceRange<'_>,
-    fixup: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    let n = weight.n_rows() / weight.experts().unwrap_or(1);
-    let routed = routed_weight(weight, dims, weight.k(), n)?;
-    if gemm_dq_ty(weight.quant()) {
-        ctx.gemm_dq_mmid(
-            stream,
-            DqMmidCall {
-                shape: ids.shape(),
-                weight: routed,
-                ids,
-                x: x.rows,
-                x_row_stride: x.row_stride,
-                x_per_slot: x.per_slot,
-                y: dst,
-                ld,
-            },
-        )
-    } else {
-        ctx.mmq_mmid_launch(
-            stream,
-            MmidLaunchCall {
-                shape: ids.shape(),
-                weight: routed,
-                ids,
-                y: x.q8,
-                dst,
-                ld,
-                fixup,
-            },
-        )
-    }
-}
-
-/// The q8_1 quantize feeding the stacks of one stage (`gather` for the down input, else the
-/// scatter of the gate and up input): one quantize at the layout of the first stack that rides
-/// the vendored MMQ, none when every stack rides the dequantizing GEMM.
-#[allow(clippy::too_many_arguments)] // one quantize description: ids, stacks, packing, shape, buffers
-pub(super) fn routed_quantize(
-    ctx: &crate::kernels::cuda::CudaContext,
-    stream: &crate::kernels::cuda::DeviceStream,
-    ids: &MmidIds<'_>,
-    stacks: &[&NativeWeight],
-    gather: bool,
-    packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
-    k: usize,
-    x: DeviceRange<'_>,
-    y: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    let Some(vendored) = stacks.iter().find(|w| !gemm_dq_ty(w.quant())) else {
-        return Ok(());
-    };
-    let call = MmidQuantCall {
-        packing,
-        quant: vendored.quant(),
-        k,
-        row_stride: k,
-        x,
-        y,
-    };
-    if gather {
-        ctx.mmq_quantize_gather_ids(stream, ids, call)
-    } else {
-        ctx.mmq_quantize_scatter_ids(stream, ids, call)
-    }
 }
 
 pub(super) struct BufFacts {
@@ -1756,14 +1642,9 @@ impl ChunkRun<'_, '_> {
     }
 }
 
-/// True when the dequantizing GEMM serves the type, for a dense projection and for a routed
-/// expert stack alike: it reads the f32 activation rows directly, so no q8_1 quantize pass
-/// feeds the role and it imposes no q8_1 layout on a buffer it shares with vendored siblings.
+/// True when the dequantizing GEMM serves the type (see `QuantType::uses_dequantizing_gemm`).
 fn gemm_dq_ty(quant: crate::kernels::cuda::resident::matvec_q::QuantType) -> bool {
-    matches!(
-        quant,
-        QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
-    ) || quant.is_codebook()
+    quant.uses_dequantizing_gemm()
 }
 
 /// The per-launch FIFI_DELTA_TRACE probe, cached: every projection launch would
@@ -2954,7 +2835,6 @@ fn run_chunk_tiered(
             ctx,
             stream,
             weight,
-            dims,
             ids_set,
             x,
             ld,
@@ -3531,7 +3411,6 @@ pub(super) fn run_chunk_routed_timed(
                 ctx,
                 stream,
                 weight,
-                dims,
                 &ids,
                 x,
                 ld,
@@ -4174,7 +4053,6 @@ pub(super) mod phase_timing {
                     ctx,
                     stream,
                     weight,
-                    dims,
                     &ids,
                     x,
                     ld,

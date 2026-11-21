@@ -891,7 +891,9 @@ impl CudaContext {
 }
 
 mod dq;
+mod routed;
 pub(crate) use dq::DqMmidCall;
+pub(crate) use routed::{RoutedX, routed_gemm, routed_quantize};
 
 #[cfg(all(test, feature = "native-cuda"))]
 pub(in crate::kernels::cuda) mod tests;

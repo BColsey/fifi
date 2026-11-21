@@ -4,9 +4,9 @@
 //! the dequantizing GEMM reading slot rows. The outputs are compared with an f64 reference over
 //! the oracle's dequantized weights. Run with `--ignored --test-threads=1`.
 
-use super::prefill::{RoutedX, routed_gemm, routed_quantize};
-use crate::family::exl3::launch::MoeDims;
-use crate::kernels::cuda::prefill::mmq_mmid::{HostIds, MmidIds, MmidIdsOut, MmidShape};
+use crate::kernels::cuda::prefill::mmq_mmid::{
+    HostIds, MmidIds, MmidIdsOut, MmidShape, RoutedX, routed_gemm, routed_quantize,
+};
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
 use crate::kernels::cuda::{
@@ -175,14 +175,6 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         },
     )
     .expect("ids");
-    let dims = MoeDims {
-        rows: M,
-        hidden: HIDDEN,
-        n_expert: E,
-        top_k: TOP_K,
-        inter: INTER,
-        shared_inter: INTER,
-    };
     let x2: Vec<f32> = (0..M * HIDDEN).map(|_| rng.normal() as f32 * 0.5).collect();
     let act: Vec<f32> = (0..slots * INTER)
         .map(|_| rng.normal() as f32 * 0.5)
@@ -224,7 +216,6 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         &ctx,
         &stream,
         &gate,
-        &dims,
         &ids,
         &gate_x,
         ld_gu,
@@ -232,18 +223,8 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         fixup_range,
     )
     .expect("gate on the dequantizing GEMM");
-    routed_gemm(
-        &ctx,
-        &stream,
-        &up,
-        &dims,
-        &ids,
-        &gate_x,
-        ld_gu,
-        gu_up,
-        fixup_range,
-    )
-    .expect("up on the vendored MMQ");
+    routed_gemm(&ctx, &stream, &up, &ids, &gate_x, ld_gu, gu_up, fixup_range)
+        .expect("up on the vendored MMQ");
     let down_x = RoutedX {
         q8: q8act.range(0, q8act.bytes()).expect("q8act"),
         rows: act_buf.range(0, act_buf.bytes()).expect("act"),
@@ -267,7 +248,6 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         &ctx,
         &stream,
         &down,
-        &dims,
         &ids,
         &down_x,
         HIDDEN,

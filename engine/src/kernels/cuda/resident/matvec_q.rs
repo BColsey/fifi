@@ -110,6 +110,13 @@ impl QuantType {
         )
     }
 
+    /// True for the types whose prefill GEMM is the in-house dequantizing GEMM, dense and routed:
+    /// it reads the f32 activation rows directly, so no q8_1 quantize pass feeds the role and it
+    /// imposes no q8_1 layout on a buffer it shares with vendored siblings.
+    pub(crate) fn uses_dequantizing_gemm(self) -> bool {
+        matches!(self, Self::Q5K | Self::Q40 | Self::Q3K) || self.is_codebook()
+    }
+
     pub(crate) fn block_size(self) -> usize {
         match self {
             Self::Q4K
