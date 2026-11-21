@@ -925,7 +925,7 @@ pub(crate) fn start(
     };
     let engine = if owned.cuda_devices == [0] {
         spawn_engine_noted(piece, ready_note, move |stages| {
-            make(stages, owned, rules, plan, guard, announce)
+            make_announced(stages, owned, rules, plan, guard, announce)
         })?
     } else {
         spawn_engine_noted(piece, ready_note, move |stages| {
@@ -1402,7 +1402,7 @@ fn card_fit(
     Ok(Some((variant, variant_plan)))
 }
 
-fn make(
+fn make_announced(
     stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
     rules: QwenRules,
@@ -1410,14 +1410,15 @@ fn make(
     guard: BuildGuard,
     announce: Option<std::sync::mpsc::SyncSender<Announcement<Q36Settings>>>,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
-    let built = make_resolving(stages, settings, rules, plan, guard, announce.as_ref());
+    let built = make(stages, settings, rules, plan, guard, announce.as_ref());
     announce_failure(&built, announce.as_ref());
     built
 }
 
-/// [`make`] after the announcement is wired: reads the card, settles the cache form and context
-/// the start left open, tells `start` what it serves, then loads.
-fn make_resolving(
+/// The engine-thread build: reads the card, settles the cache form and context the start left
+/// open, tells `start` what it serves ([`make_announced`] reports a failure before that), then
+/// loads.
+fn make(
     stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
     rules: QwenRules,
