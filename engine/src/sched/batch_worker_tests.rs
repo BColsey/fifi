@@ -118,6 +118,8 @@ struct WindowFake {
     deny_slot: Option<usize>,
     /// How long the fake lets the engine idle before the pool trims; `None` never trims.
     idle_trim: Option<Duration>,
+    /// The cold prompts that take a whole piece in one idle tick; 1 is the default policy.
+    idle_pieces: usize,
 }
 
 impl WindowFake {
@@ -152,6 +154,7 @@ impl WindowFake {
             created: 1,
             deny_slot: None,
             idle_trim: None,
+            idle_pieces: 8,
         }
     }
 
@@ -203,8 +206,11 @@ impl ExecutorOps for WindowFake {
         self.prompt_share
     }
 
-    fn session_idle_trim(&self) -> Option<Duration> {
-        self.idle_trim
+    fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
+        crate::family::executor::BatchPolicy {
+            idle_pieces: self.idle_pieces,
+            idle_trim: self.idle_trim,
+        }
     }
 
     fn new_session(&mut self) -> Result<Row, EngError> {
@@ -1034,6 +1040,32 @@ fn an_idle_batch_feeds_each_cold_prompt_a_whole_piece() {
     }
     engine.shutdown();
     assert_eq!(lock(&log).windows[0], [vec![0; 3], vec![1; 3]]);
+}
+
+#[test]
+fn an_executor_that_does_not_opt_in_keeps_the_shared_idle_budget() {
+    // The default policy gives two cold prompts one piece between them per tick: each takes two
+    // rows at a time, where the opted-in executor above feeds each a whole piece at once.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.idle_pieces = 1;
+    let (engine, release) = start_with_budget(fake, 1);
+    let (first, first_events) = job(&[0; 3], 2);
+    let (second, second_events) = job(&[1; 3], 2);
+    engine.handle().try_submit(first).unwrap();
+    engine.handle().try_submit(second).unwrap();
+    release.send(()).unwrap();
+    for events in [first_events, second_events] {
+        let result = usage(&collect(events));
+        assert_eq!(
+            result.prefill_pieces.count, 2,
+            "{:?}",
+            result.prefill_pieces
+        );
+        assert_eq!(result.prefill_pieces.max_rows, 2);
+        assert_eq!(result.completion_tokens, 2);
+    }
+    engine.shutdown();
 }
 
 #[test]

@@ -198,9 +198,6 @@ impl<'a, S> Pool<'a, S> {
     }
 }
 
-/// The most whole prefill pieces one tick feeds while no stream decodes.
-const MAX_IDLE_PIECES: usize = 8;
-
 fn register(shared: &Shared, job: &Job) {
     lock(&shared.active).push(ActiveJob {
         cancel: Arc::clone(&job.generation.cancel),
@@ -565,7 +562,8 @@ pub(super) fn work<E: ExecutorOps>(
     max_seqs: usize,
 ) {
     let share = executor.prompt_rows_per_tick();
-    let mut pool = Pool::new(session, &shared.ticks, executor.session_idle_trim());
+    let policy = executor.batch_policy();
+    let mut pool = Pool::new(session, &shared.ticks, policy.idle_trim);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
     // The job that capacity refused while other slots were live, and the number of live slots at
     // the refusal.
@@ -683,12 +681,13 @@ pub(super) fn work<E: ExecutorOps>(
         // slot as exactly one decode row this tick, so decode_rows is the number
         // of ready slots, never a per-slot row count a family could raise.
         let decode_rows = slots.len() - prompt_slots;
-        // With no stream decoding nothing waits on the tick, so each cold prompt takes a whole
-        // piece (one per sequence the batch holds at most, which bounds the wait of a
-        // cancellation): a prompt that arrives alone prefills as fast as the single-sequence
-        // worker, and several cold prompts take turns at the full piece size.
+        // With no stream decoding nothing waits on the tick, so an executor that opts in
+        // (`BatchPolicy::idle_pieces`) has each cold prompt take a whole piece, up to that many
+        // prompts per tick, which bounds the wait of a cancellation: a prompt that arrives alone
+        // prefills as fast as the single-sequence worker, and several cold prompts take turns at
+        // the full piece size. Without the opt-in the cold prompts share the one-piece budget.
         let tick_rows = if decode_rows == 0 {
-            iteration_rows * prompt_slots.clamp(1, MAX_IDLE_PIECES)
+            iteration_rows * prompt_slots.clamp(1, policy.idle_pieces.max(1))
         } else {
             iteration_rows
         };

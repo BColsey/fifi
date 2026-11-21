@@ -10,6 +10,29 @@ use std::sync::atomic::AtomicBool;
 
 type Result<T> = std::result::Result<T, EngError>;
 
+/// What the batch worker does beyond its shared rules, per executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatchPolicy {
+    /// While no stream decodes, a tick feeds each cold prompt a whole planned piece, for up to
+    /// this many cold prompts. 1 keeps the shared budget of one piece per tick for all of them.
+    pub(crate) idle_pieces: usize,
+    /// A pooled session that has idled this long is released, while one session stays when the
+    /// engine is idle. `None` keeps every session for the life of the engine.
+    pub(crate) idle_trim: Option<std::time::Duration>,
+}
+
+impl Default for BatchPolicy {
+    fn default() -> Self {
+        Self {
+            idle_pieces: 1,
+            idle_trim: None,
+        }
+    }
+}
+
+/// The most cold prompts that take a whole piece in one idle tick when an executor opts in.
+pub(crate) const IDLE_PIECES_PER_TICK: usize = 8;
+
 /// How long a batch engine sits with no request before it keeps one session. A chat user pauses
 /// for seconds between turns, so a pool that outlives that spares the next burst its allocations;
 /// a pool that outlives minutes holds the memory of a burst (seven sessions on a Bolt engine is
@@ -86,10 +109,11 @@ pub(crate) trait ExecutorOps {
             "this executor does not support decode windows".into(),
         ))
     }
-    /// How long the batch worker may sit with no request before it releases every pooled session
-    /// but one. `None` keeps every session for the life of the engine.
-    fn session_idle_trim(&self) -> Option<std::time::Duration> {
-        Some(DEFAULT_SESSION_IDLE_TRIM)
+    /// The choices of the batch worker that an executor opts into once it has measured them. The
+    /// default keeps the worker's shared budget and keeps every session for the life of the
+    /// engine.
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::default()
     }
     /// The prompt rows the batch worker feeds per tick, over all cold slots together, while a
     /// stream decodes, beside the decode rows. `None` keeps the worker's rule: the planned piece

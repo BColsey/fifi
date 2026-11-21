@@ -209,6 +209,15 @@ mod device {
             self.max_seqs
         }
 
+        /// Bolt's batching is measured: idle prompts take whole pieces, and a pooled session that
+        /// idles for the default interval is released.
+        fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
+            crate::family::executor::BatchPolicy {
+                idle_pieces: crate::family::executor::IDLE_PIECES_PER_TICK,
+                idle_trim: Some(crate::family::executor::DEFAULT_SESSION_IDLE_TRIM),
+            }
+        }
+
         fn prompt_rows_per_tick(&self) -> Option<usize> {
             (self.max_seqs > 1).then_some(self.prompt_rows)
         }
