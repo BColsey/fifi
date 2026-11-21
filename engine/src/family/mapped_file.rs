@@ -81,6 +81,23 @@ impl MappedFile {
     pub fn open(path: &Path, expected_len: u64) -> Result<MappedFile, MapError> {
         let file = File::open(path).map_err(io_err)?;
         let (len, mtime) = stat(&file)?;
+        Self::map(file, expected_len, len, mtime)
+    }
+
+    /// Maps the original read-only handle after a caller has validated its metadata.
+    pub(crate) fn from_file(
+        file: File,
+        expected_len: u64,
+        expected_mtime: SystemTime,
+    ) -> Result<Self, MapError> {
+        let (len, mtime) = stat(&file)?;
+        if mtime != expected_mtime {
+            return Err(MapError::Changed { what: "mtime" });
+        }
+        Self::map(file, expected_len, len, mtime)
+    }
+
+    fn map(file: File, expected_len: u64, len: u64, mtime: SystemTime) -> Result<Self, MapError> {
         if len == 0 {
             return Err(MapError::Empty);
         }
@@ -97,9 +114,8 @@ impl MappedFile {
         // writable, no MAP_SHARED-writable mapping); the expected length was
         // just confirmed on this handle and the second stat below confirms
         // length and mtime did not move across the map. Residual risk: a
-        // truncation under the live map still SIGBUSes on touch and nothing in
-        // production narrows that window (`check_unchanged` is a test-side
-        // check today); an in-place overwrite by another process raises no
+        // truncation under the live map still SIGBUSes on touch and the metadata checks
+        // cannot close that window; an in-place overwrite by another process raises no
         // fault at all and changes the bytes the CPU tier reads. Model files
         // are immutable by policy, the operator's contract (stated on
         // `TieredOptions`), and that is the argument this block rests on.
@@ -132,8 +148,7 @@ impl MappedFile {
     /// Re-stats the OPEN handle (fstat; a rename-over of the path cannot
     /// matter because the mapping belongs to the inode): `Changed { what:
     /// "length" | "mtime" }` when the file differs from the recorded values,
-    /// else `Ok(())` - the narrowest cheap evidence the bytes did not move. No production path calls
-    /// it yet (the tests do); it narrows a window, it does not close it.
+    /// else `Ok(())` - the narrowest cheap evidence the bytes did not move. It narrows the window for observing a mutation without closing it.
     pub fn check_unchanged(&self) -> Result<(), MapError> {
         let (len, mtime) = stat(&self.file)?;
         if len != self.len {
