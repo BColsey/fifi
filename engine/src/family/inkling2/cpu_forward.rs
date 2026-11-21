@@ -5,15 +5,16 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use super::{
-    Attention, LayerVisit, TextSpec, bad, cpu_attention::VisitState, cpu_weights::Weights,
+    Attention, CPU_CONTEXT_LIMIT, LayerVisit, TextSpec, bad, cpu_attention::VisitState,
+    cpu_weights::Weights,
 };
 use crate::EngError;
 
-const MAX_CPU_CONTEXT: usize = 128;
 const MIX_EPS: f32 = 1e-6;
 
 #[derive(Deserialize)]
 struct CpuConfig {
+    eos_token_id: u32,
     text_config: TextMath,
 }
 
@@ -46,6 +47,7 @@ pub(super) struct CpuForward {
     state: Vec<VisitState>,
     position: usize,
     failed: bool,
+    eos_token_id: u32,
 }
 
 #[derive(Clone)]
@@ -79,26 +81,24 @@ impl Role {
 }
 
 impl CpuForward {
-    fn open(directory: &Path, context: usize) -> Result<Self, EngError> {
+    pub(super) fn open(directory: &Path, context: usize) -> Result<Self, EngError> {
         let config = fs::read(directory.join("config.json"))
             .map_err(|error| bad(format!("read text configuration: {error}")))?;
         let spec = TextSpec::from_config(&config)?;
-        let math = serde_json::from_slice::<CpuConfig>(&config)
-            .map_err(|error| bad(format!("read text forward parameters: {error}")))?
-            .text_config;
-        math.validate(context, &spec)?;
+        let config = CpuConfig::parse(&config, &spec, context)?;
         let visits = spec.visits();
         let state = (0..visits.len()).map(|_| VisitState::default()).collect();
         let weights = Weights::open(directory, &spec)?;
         Ok(Self {
             spec,
-            math,
+            math: config.text_config,
             weights,
             context,
             visits,
             state,
             position: 0,
             failed: false,
+            eos_token_id: config.eos_token_id,
         })
     }
 
@@ -106,7 +106,34 @@ impl CpuForward {
         self.spec.hidden_size as usize
     }
 
-    fn token(&mut self, id: u32, collect_logits: bool) -> Result<Option<Vec<f32>>, EngError> {
+    pub(super) fn vocab_size(&self) -> u32 {
+        self.spec.unpadded_vocab_size as u32
+    }
+
+    pub(super) fn validate_tokenizer(&self, vocab: u32, eos: &[u32]) -> Result<(), EngError> {
+        validate_tokenizer(self.vocab_size(), self.eos_token_id, vocab, eos)
+    }
+
+    pub(super) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(super) fn reset(&mut self) {
+        for slot in &mut self.state {
+            *slot = VisitState::default();
+        }
+        // A failed forward moved the invalidated state out of the sequence.
+        self.state
+            .resize_with(self.visits.len(), VisitState::default);
+        self.position = 0;
+        self.failed = false;
+    }
+
+    pub(super) fn token(
+        &mut self,
+        id: u32,
+        collect_logits: bool,
+    ) -> Result<Option<Vec<f32>>, EngError> {
         if self.failed {
             return Err(bad(
                 "a previous CPU forward failed and invalidated the sequence state",
@@ -374,20 +401,70 @@ impl CpuForward {
     }
 }
 
+pub(crate) fn inspect_cpu_config(
+    bytes: &[u8],
+    spec: &TextSpec,
+    context: u32,
+    tokenizer_dir: &Path,
+) -> Result<(), EngError> {
+    let config = CpuConfig::parse(bytes, spec, context as usize)?;
+    let bundle = crate::tokenizer::inkling2::load(tokenizer_dir)?;
+    validate_tokenizer(
+        spec.unpadded_vocab_size as u32,
+        config.eos_token_id,
+        bundle.vocab_size(),
+        bundle.eos_token_ids(),
+    )
+}
+
+fn validate_tokenizer(
+    model_vocab: u32,
+    model_eos: u32,
+    vocab: u32,
+    eos: &[u32],
+) -> Result<(), EngError> {
+    if model_vocab != vocab || !eos.contains(&model_eos) {
+        return Err(bad(
+            "tokenizer vocabulary or EOS differs from the checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+impl CpuConfig {
+    fn parse(bytes: &[u8], spec: &TextSpec, context: usize) -> Result<Self, EngError> {
+        let config: Self = serde_json::from_slice(bytes)
+            .map_err(|error| bad(format!("read text forward parameters: {error}")))?;
+        config.text_config.validate(context, spec)?;
+        Ok(config)
+    }
+}
+
 impl TextMath {
     fn validate(&self, context: usize, spec: &TextSpec) -> Result<(), EngError> {
         if context == 0
-            || context > MAX_CPU_CONTEXT
+            || context > CPU_CONTEXT_LIMIT as usize
             || context > self.log_scaling_n_floor
             || context > spec.model_max_length as usize
         {
             return Err(bad(format!(
-                "invalid CPU reference context, expected 1..={MAX_CPU_CONTEXT} and at most the log-scale floor"
+                "invalid CPU reference context, expected 1..={CPU_CONTEXT_LIMIT} and at most the log-scale floor"
             )));
         }
-        if self.d_rel == 0
-            || self.rel_extent == 0
-            || self.sconv_kernel_size == 0
+        // The CPU pilot accepts the released Mini attention and convolution sizes.
+        let attention_dims = [
+            spec.num_attention_heads,
+            spec.num_key_value_heads,
+            spec.head_dim,
+            spec.swa_num_attention_heads,
+            spec.swa_num_key_value_heads,
+            spec.swa_head_dim,
+        ];
+        if attention_dims != [24, 8, 128, 24, 8, 128]
+            || spec.hidden_size != 2304
+            || spec.vocab_size != 201_024
+            || spec.unpadded_vocab_size != 200_058
+            || [self.d_rel, self.rel_extent, self.sconv_kernel_size] != [16, 1024, 4]
             || self.q_bias
             || self.o_bias
             || !self.use_gate_bias

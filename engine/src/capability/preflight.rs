@@ -595,29 +595,29 @@ fn inkling2_preflight(
     candidate: &Candidate,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::inkling2::{FAMILY, TextSpec, inspect_checkpoint};
+    use crate::family::inkling2::{self, CPU_CONTEXT_LIMIT, CPU_REFERENCE_ENV, FAMILY, TextSpec};
 
-    let spec = std::fs::read(model_dir.join("config.json"))
+    let enabled = inkling2::cpu_reference_enabled();
+    let context = candidate
+        .context_limit
+        .unwrap_or(if enabled { CPU_CONTEXT_LIMIT } else { 8192 });
+    let config = std::fs::read(model_dir.join("config.json"))
         .map_err(|error| crate::EngError::Checkpoint(format!("read Inkling config.json: {error}")))
-        .and_then(|bytes| TextSpec::from_config(&bytes));
-    match spec {
-        Ok(spec) => {
-            let context = candidate.context_limit.unwrap_or(8192);
+        .and_then(|bytes| TextSpec::from_config(&bytes).map(|spec| (spec, bytes)));
+    match config {
+        Ok((spec, _bytes)) => {
             report_inkling2_plan(&mut checks, &spec, context);
-            match inspect_checkpoint(model_dir, &spec) {
-                Ok(facts) => checks.push(Check::new(
-                    "Inkling checkpoint",
-                    CheckStatus::Pass,
-                    format!(
-                        "{} tensors, {} payload bytes, {} NVFP4 and {} MXFP8 expert layers",
-                        facts.tensors, facts.payload_bytes, facts.nvfp4_layers, facts.mxfp8_layers
-                    ),
-                )),
-                Err(error) => checks.push(Check::new(
-                    "Inkling checkpoint",
-                    CheckStatus::Fail,
-                    super::describe_error(&error),
-                )),
+            report_inkling2_checkpoint(&mut checks, model_dir, &spec);
+            #[cfg(target_pointer_width = "64")]
+            if enabled && !checks.iter().any(|check| check.status == CheckStatus::Fail) {
+                report_inkling2_cpu(
+                    &mut checks,
+                    &spec,
+                    &_bytes,
+                    candidate,
+                    context,
+                    tokenizer_dir,
+                );
             }
         }
         Err(error) => checks.push(Check::new(
@@ -626,27 +626,101 @@ fn inkling2_preflight(
             super::describe_error(&error),
         )),
     }
-    checks.push(Check::new(
-        "generation backend",
-        CheckStatus::Fail,
-        "Inkling 2 Mini checkpoint inspection is staged; generation is pending".to_string(),
-    ));
+
+    let servable = enabled && !checks.iter().any(|check| check.status == CheckStatus::Fail);
+    if !enabled {
+        checks.push(Check::new(
+            "generation backend",
+            CheckStatus::Fail,
+            format!(
+                "Inkling 2 Mini CPU serving requires a 64-bit build with {CPU_REFERENCE_ENV}=1"
+            ),
+        ));
+    }
     PreflightReport {
         model_dir: model_dir.to_path_buf(),
         tokenizer_dir: tokenizer_dir.to_path_buf(),
         family: Some(FAMILY.to_string()),
-        verdict: Verdict::Unsupported,
+        verdict: if servable {
+            Verdict::Experimental
+        } else {
+            Verdict::Unsupported
+        },
         dimensions: Dimensions {
-            compatibility: Compatibility::Unsupported,
-            qualification: Qualification::Unverified,
+            compatibility: if servable {
+                Compatibility::Supported
+            } else {
+                Compatibility::Unsupported
+            },
+            qualification: if servable {
+                Qualification::Experimental
+            } else {
+                Qualification::Unverified
+            },
             resource_fit: ResourceFit::Unknown,
         },
         checks,
         decisions: Vec::new(),
         estimate: None,
-        next_step: "Use the checkpoint and BF16 KV rows above to guide backend implementation."
-            .to_string(),
+        next_step: if servable {
+            "Use the Inkling family in an enginesrv config to try short-context text generation."
+                .into()
+        } else if enabled {
+            "Address the failed Inkling CPU checks above.".into()
+        } else {
+            format!(
+                "Set {CPU_REFERENCE_ENV}=1 to check the experimental short-context CPU backend."
+            )
+        },
     }
+}
+
+fn report_inkling2_checkpoint(
+    checks: &mut Vec<Check>,
+    model_dir: &Path,
+    spec: &crate::family::inkling2::TextSpec,
+) {
+    let (status, detail) = match crate::family::inkling2::inspect_checkpoint(model_dir, spec) {
+        Ok(facts) => (
+            CheckStatus::Pass,
+            format!(
+                "{} tensors, {} payload bytes, {} NVFP4 and {} MXFP8 expert layers",
+                facts.tensors, facts.payload_bytes, facts.nvfp4_layers, facts.mxfp8_layers
+            ),
+        ),
+        Err(error) => (CheckStatus::Fail, super::describe_error(&error)),
+    };
+    checks.push(Check::new("Inkling checkpoint", status, detail));
+}
+
+#[cfg(target_pointer_width = "64")]
+fn report_inkling2_cpu(
+    checks: &mut Vec<Check>,
+    spec: &crate::family::inkling2::TextSpec,
+    bytes: &[u8],
+    candidate: &Candidate,
+    context: u32,
+    tokenizer_dir: &Path,
+) {
+    let (status, detail) = if candidate
+        .kv_dtype
+        .as_deref()
+        .is_some_and(|dtype| dtype != "f32")
+    {
+        (CheckStatus::Fail, "Inkling CPU uses F32 KV".to_string())
+    } else {
+        match crate::family::inkling2::inspect_cpu_config(bytes, spec, context, tokenizer_dir) {
+            Ok(()) => (
+                CheckStatus::Warn,
+                format!(
+                    "experimental CPU text backend, F32 KV, one sequence, at most {} total tokens",
+                    crate::family::inkling2::CPU_CONTEXT_LIMIT
+                ),
+            ),
+            Err(error) => (CheckStatus::Fail, super::describe_error(&error)),
+        }
+    };
+    checks.push(Check::new("generation backend", status, detail));
 }
 
 fn report_inkling2_plan(

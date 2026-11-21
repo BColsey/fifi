@@ -1,12 +1,19 @@
 //! The fixed-loop Inkling 2 Mini text checkpoint and its independent per-visit state.
 
 mod checkpoint;
-#[cfg(all(test, target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 mod cpu_attention;
-#[cfg(all(test, target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 mod cpu_forward;
-#[cfg(all(test, target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 mod cpu_weights;
+#[cfg(target_pointer_width = "64")]
+mod serve;
+
+#[cfg(target_pointer_width = "64")]
+pub(crate) use cpu_forward::inspect_cpu_config;
+#[cfg(target_pointer_width = "64")]
+pub(crate) use serve::start_cpu;
 
 pub(crate) use checkpoint::inspect_checkpoint;
 use serde::Deserialize;
@@ -14,6 +21,13 @@ use serde::Deserialize;
 use crate::{EngError, checkpoint_json::UniqueValue};
 
 pub(crate) const FAMILY: &str = "inkling2_loop";
+pub(crate) const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
+pub(crate) const CPU_CONTEXT_LIMIT: u32 = 128;
+
+pub(crate) fn cpu_reference_enabled() -> bool {
+    cfg!(target_pointer_width = "64")
+        && std::env::var_os(CPU_REFERENCE_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+}
 
 #[derive(Deserialize)]
 struct Config {

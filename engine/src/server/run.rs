@@ -586,13 +586,35 @@ fn start_gemma4(
 }
 
 fn start_inkling2(
-    _config: &EngineConfig,
+    config: &EngineConfig,
     _prefix_reuse: bool,
-    _ready_note: ReadyNote,
+    ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    Err(EngError::BadRequest(
-        "Inkling 2 Mini is staged in this build: use enginesrv check <model_dir> for checkpoint inspection; the generation backend is pending".into(),
-    ))
+    use crate::family::inkling2;
+    if !inkling2::cpu_reference_enabled() {
+        return Err(EngError::BadRequest(format!(
+            "Inkling 2 Mini CPU serving requires a 64-bit build with {}=1",
+            inkling2::CPU_REFERENCE_ENV
+        )));
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let (engine, bundle) =
+            inkling2::start_cpu(&config.model_dir, &config.tokenizer_dir, ready_note)?;
+        Ok(StartedEngine {
+            engine,
+            bundle: Arc::new(bundle),
+            context_limit: inkling2::CPU_CONTEXT_LIMIT,
+            effective: Vec::new(),
+        })
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let _ = (config, ready_note);
+        Err(EngError::BadRequest(
+            "Inkling 2 Mini CPU needs a 64-bit build".into(),
+        ))
+    }
 }
 
 /// The closed registry of families this build starts. Staged backends

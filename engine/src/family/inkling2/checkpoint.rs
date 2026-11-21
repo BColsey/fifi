@@ -26,7 +26,7 @@ pub(crate) fn inspect_checkpoint(
     validate_text(&file, spec, file.tensor_count() as u64)
 }
 
-#[cfg(all(test, target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 pub(super) fn open_checkpoint(
     directory: &Path,
     spec: &TextSpec,
