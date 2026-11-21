@@ -10,6 +10,7 @@
 
 pub(crate) mod bank_tier;
 pub(crate) mod host_tier;
+pub(crate) mod layer_stream;
 // disk_store is host-only and unwired on purpose until the config keys and
 // the restore path exist; drop this allow when they do.
 #[expect(
