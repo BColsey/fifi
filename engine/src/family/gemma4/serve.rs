@@ -101,7 +101,7 @@ mod device {
 
     use super::super::budget;
     use super::super::config::MaxSeqs;
-    use super::super::resident::bolt::{self, Bolt, BoltSeq, CELLS, VOCAB};
+    use super::super::resident::bolt::{self, Bolt, BoltSeq, BoltSnapshot, CELLS, VOCAB};
     use crate::{
         EngError,
         family::{
@@ -130,17 +130,15 @@ mod device {
     pub(crate) struct BoltServe {
         model: Bolt,
         eos: Vec<u32>,
-        /// The cell generation: advances at the attempt of every feed from
-        /// position 0, so entries saved by a prompt that was later replaced can
-        /// never match again. Mirrors the Flash driver's arena generation
-        /// (`flash_next/cuda/driver/chunk.rs`).
-        generation: u64,
-        /// One-tip prefix store (no roots, no periodic points), keyed by the
-        /// cell generation. The snapshot is the model cache position alone: the
-        /// KV8 planes are full-length planes whose cells are read only below
-        /// the position word, so a rewind re-feeds and overwrites exactly the
-        /// cells that the decode past the save point wrote.
-        prefix: PrefixStore<usize, (u64, PrefixIdentity)>,
+        /// One-tip prefix store (no roots, no periodic points). An entry is a copy of the saving
+        /// session's cache cells below its position, held in host memory: a restore writes it
+        /// into any session, so reuse works whatever the number of sessions and whichever
+        /// pooled session serves the next request. Host memory, not a device slab, because the
+        /// planner has already spent the device on sessions: an entry is at most one session's
+        /// cache (952 MiB at 32,768 cells, 30,464 bytes a position) and costs a transfer over
+        /// the bus (about 125 MB for a 4,000-token prefix), where recomputing the prefix costs
+        /// its whole prefill.
+        prefix: PrefixStore<BoltSnapshot, PrefixIdentity>,
         /// The load-time identity half of the prefix path: constant for one loaded Bolt, so
         /// live behaviour is unchanged; a persisted or cross-step store refuses entries another
         /// load wrote. Empty for now: the Bolt loader reads the GGUF header digest at open
@@ -151,10 +149,6 @@ mod device {
         max_seqs: usize,
         /// The prompt rows the worker feeds per tick while sessions share the model.
         prompt_rows: usize,
-        /// False once several sessions share the model: the position-only snapshot would
-        /// rewind to cells that another session's decode no longer guarantees, so the store
-        /// saves and restores nothing.
-        prefix_enabled: bool,
     }
 
     /// The store's explicit one-tip shape (no roots, no periodic points),
@@ -170,25 +164,12 @@ mod device {
         model: &'a mut Bolt,
         seq: &'a BoltSeq,
         pos: &'a mut usize,
-        generation: &'a mut u64,
-    }
-
-    impl Step<'_> {
-        /// The generation advances at the ATTEMPT of a fresh sequence's first
-        /// row, not only on success: a failed batch may still have queued the
-        /// cell writes, and a stale entry must never survive that.
-        fn note_fresh(&mut self) {
-            if *self.pos == 0 {
-                *self.generation += 1;
-            }
-        }
     }
 
     impl TokenStepper for Step<'_> {
         const OPERATION: &'static str = "gemma4_bolt";
 
         fn feed(&mut self, token: u32) -> Result<(), EngError> {
-            self.note_fresh();
             self.model
                 .prefill_batch(self.seq, &[token], *self.pos, false)?;
             *self.pos += 1;
@@ -197,7 +178,6 @@ mod device {
 
         fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
             for chunk in tokens.chunks(Bolt::PREFILL_BATCH) {
-                self.note_fresh();
                 self.model
                     .prefill_batch(self.seq, chunk, *self.pos, false)?;
                 *self.pos += chunk.len();
@@ -206,7 +186,6 @@ mod device {
         }
 
         fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
-            self.note_fresh();
             self.model.decode(self.seq, token, *self.pos)?;
             *self.pos += 1;
             self.model.capped_logits()
@@ -259,7 +238,6 @@ mod device {
                 model: &mut self.model,
                 seq: &st.seq,
                 pos: &mut st.pos,
-                generation: &mut self.generation,
             })
         }
 
@@ -279,7 +257,6 @@ mod device {
                     model: &mut self.model,
                     seq: &st.seq,
                     pos: &mut st.pos,
-                    generation: &mut self.generation,
                 },
                 toks,
                 CELLS,
@@ -301,7 +278,6 @@ mod device {
                     model: &mut self.model,
                     seq: &st.seq,
                     pos: &mut st.pos,
-                    generation: &mut self.generation,
                 },
                 generation,
                 &limits,
@@ -310,51 +286,41 @@ mod device {
 
         fn boundary(&mut self, _st: &mut Self::Session) {}
 
-        /// Saves the cache position of the held prompt under the generation
-        /// that wrote its cells. The session rules (the pending token, the
-        /// strict key match) are `DecodeSession`'s; the model state at the save
-        /// point is the position word alone.
+        /// Saves a copy of the session's cache cells below its position as an entry of the
+        /// store. The session rules (the pending token, the strict key match) are
+        /// `DecodeSession`'s; the model state at the save point is the cells `0..pos`. A host
+        /// that cannot hold the copy refuses with a memory-plan error, which the store treats as
+        /// a denied save.
         fn save_prefix(
             &mut self,
             st: &Self::Session,
             key: &[u32],
             kind: SaveKind,
         ) -> Result<bool, EngError> {
-            if !self.prefix_enabled {
-                return Ok(false);
-            }
-            let path = (self.generation, self.identity.clone());
-            let fed = st.pos;
+            let identity = self.identity.clone();
+            let model = &self.model;
             st.core
-                .save_prefix(&mut self.prefix, key, path, fed, kind, || Ok(st.pos))
+                .save_prefix(&mut self.prefix, key, identity, st.pos, kind, || {
+                    model.snapshot_seq(&st.seq, st.pos)
+                })
         }
 
-        /// Rewinds the cache position to the saved entry of the current
-        /// generation. The KV8 cells at and above it hold the decode that
-        /// followed the save; a re-feed overwrites them, so the restored state
-        /// is exact. A different prompt fed in between advanced the generation,
-        /// so its entry never matches — the stale-entry guard. The tail prefill
-        /// that follows a restore overwrites every cell above the boundary, so
-        /// every stored entry with a longer key is dropped before any row is
-        /// written (`drop_above`, as the Flash executor does).
+        /// Writes the saved entry into the (reset) session and moves its position to the entry's.
+        /// The cells above stay as they are; every read is bounded by the position word and the
+        /// tail prefill that follows overwrites them. Any session can take any entry.
         fn restore_prefix(
             &mut self,
             st: &mut Self::Session,
             prompt: &[u32],
         ) -> Result<usize, EngError> {
-            if !self.prefix_enabled {
-                return Ok(0);
-            }
-            let path = (self.generation, self.identity.clone());
-            let BoltSession { core, pos, .. } = st;
-            let restored = core.restore_prefix(&mut self.prefix, prompt, path, |saved| {
-                *pos = *saved;
+            let identity = self.identity.clone();
+            let model = &self.model;
+            let BoltSession { core, pos, seq } = st;
+            core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
+                model.restore_seq(seq, saved)?;
+                *pos = saved.fed();
                 Ok(())
-            })?;
-            if restored > 0 {
-                self.prefix.drop_above(restored);
-            }
-            Ok(restored)
+            })
         }
     }
 
@@ -375,7 +341,6 @@ mod device {
                     model: &mut self.model,
                     seq,
                     pos,
-                    generation: &mut self.generation,
                 },
                 Limits {
                     eos: &self.eos,
@@ -408,16 +373,12 @@ mod device {
             Ok(())
         }
 
-        /// One token of every session through one step. A session that feeds from position 0
-        /// advances the cell generation at the attempt, as a solo feed does.
+        /// One token of every session through one step.
         fn step_rows(
             &mut self,
             sessions: &mut [&mut BoltSession],
             tokens: &[u32],
         ) -> Result<Vec<Vec<f32>>, EngError> {
-            if sessions.iter().any(|session| session.pos == 0) {
-                self.generation += 1;
-            }
             let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
             let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
             let rows = self.model.decode_rows(&seqs, tokens, &positions)?;
@@ -490,19 +451,17 @@ mod device {
                 model.reserve_window(plan.seqs)?;
                 model.use_decode_graph(false);
                 eprintln!(
-                    "gemma4 bolt: {} sessions share the model, so the position-only prefix snapshot and the decode graph are off",
+                    "gemma4 bolt: {} sessions share the model, so the decode graph is off",
                     plan.seqs
                 );
             }
             let serve = BoltServe {
                 model,
                 eos: eos.clone(),
-                generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
                 max_seqs: plan.seqs,
                 prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
-                prefix_enabled: plan.seqs == 1,
             };
             if plan.seqs > 1 {
                 eprintln!(
@@ -783,117 +742,140 @@ mod device {
             let _ = unsplit;
         }
 
-        /// A one-token prompt feeds nothing in prefill, so its first decode
-        /// writes cell 0 through `logits`: that decode must advance the cell
-        /// generation, or a stale entry would match over the overwritten cell.
-        #[test]
-        #[ignore = "requires the pinned Bolt file and a device"]
-        fn a_one_token_prompt_advances_the_generation_before_its_first_decode() {
-            let mut serve = BoltServe {
-                model: bolt::load(&pinned_bolt(), None).expect("load"),
+        /// A serve with room for three sessions and no tokenizer: the tests drive the executor
+        /// seam and the model directly.
+        fn serve_of(model: Bolt) -> BoltServe {
+            BoltServe {
+                model,
                 eos: vec![0],
-                generation: 0,
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
-                max_seqs: 1,
+                max_seqs: 3,
                 prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
-                prefix_enabled: true,
-            };
-            let mut st = serve.new_session().expect("session");
-            let first: Vec<u32> = (0..64).map(|index| 100 + (index % 977)).collect();
-            let first_ext: Vec<u32> = first.iter().copied().chain(500..512).collect();
-
-            serve.reset(&mut st).expect("reset");
-            serve.prefill(&mut st, &first).expect("prefill first");
-            assert!(serve.save_prefix(&st, &first, SaveKind::Tip).expect("save"));
-
-            // The one-token prompt: prefill holds its only token pending, so
-            // nothing is fed and the position stays 0; the decode step then
-            // writes cell 0.
-            serve.reset(&mut st).expect("reset");
-            serve.prefill(&mut st, &[42]).expect("prefill one token");
-            assert_eq!(st.pos, 0, "the pending token is not fed yet");
-            let mut step = Step {
-                model: &mut serve.model,
-                seq: &st.seq,
-                pos: &mut st.pos,
-                generation: &mut serve.generation,
-            };
-            use crate::family::session::TokenStepper as _;
-            step.logits(42).expect("first decode");
-            assert!(
-                serve.generation >= 2,
-                "the first decode at position 0 must advance the generation"
-            );
-
-            // The stale entry can no longer match the overwritten cell 0.
-            let covered = serve
-                .restore_prefix(&mut st, &first_ext)
-                .expect("stale restore");
-            assert_eq!(covered, 0, "the stale entry must cover nothing");
+            }
         }
 
-        /// The seam refuses a stale entry: after a different prompt's prefill
-        /// advanced the cell generation, restoring onto the first prompt's
-        /// extension covers nothing and leaves the session unchanged; the
-        /// current prompt's own entry still restores and rewinds.
+        fn prompt(len: usize, salt: u32) -> Vec<u32> {
+            (0..len as u32)
+                .map(|index| 100 + salt + (index % 977))
+                .collect()
+        }
+
+        /// The capped logits bits of decoding the pending last token of `session`.
+        fn next_logits(serve: &mut BoltServe, session: &BoltSession, token: u32) -> Vec<u32> {
+            serve
+                .model
+                .decode(&session.seq, token, session.pos)
+                .expect("decode");
+            serve
+                .model
+                .capped_logits()
+                .expect("logits")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+        }
+
+        /// A prefix saved by one session restores into a different, dirty session and the
+        /// continuation matches a cold run bit for bit, with the source session having moved on
+        /// (decoded and reset) since the save.
         #[test]
         #[ignore = "requires the pinned Bolt file and a device"]
-        fn the_seam_refuses_a_stale_entry_and_restores_the_current_one() {
-            let mut serve = BoltServe {
-                model: bolt::load(&pinned_bolt(), None).expect("load"),
-                eos: vec![0],
-                generation: 0,
-                prefix: PrefixStore::with_limits(ONE_TIP),
-                identity: PrefixIdentity::default(),
-                max_seqs: 1,
-                prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
-                prefix_enabled: true,
-            };
-            let mut st = serve.new_session().expect("session");
-            let n = 64;
-            let first: Vec<u32> = (0..n as u32).map(|index| 100 + (index % 977)).collect();
-            let other: Vec<u32> = (0..n as u32).map(|index| 200 + (index % 811)).collect();
-            let first_ext: Vec<u32> = first.iter().copied().chain(500..512).collect();
-            let other_ext: Vec<u32> = other.iter().copied().chain(600..612).collect();
+        fn a_saved_prefix_restores_into_another_session_and_matches_a_cold_run() {
+            let mut serve = serve_of(bolt::load(&pinned_bolt(), None).expect("load"));
+            let mut source = serve.new_session().expect("source");
+            let mut target = serve.new_session().expect("target");
+            let mut cold = serve.new_session().expect("cold");
+            let base = prompt(300, 0);
+            let extended: Vec<u32> = base.iter().copied().chain(prompt(40, 5_000)).collect();
 
-            serve.reset(&mut st).expect("reset");
-            serve.prefill(&mut st, &first).expect("prefill first");
-            assert!(serve.save_prefix(&st, &first, SaveKind::Tip).expect("save"));
-
-            // A different prompt feeds from position 0: the generation
-            // advances and the first prompt's entry can never match again.
-            serve.reset(&mut st).expect("reset");
-            serve.prefill(&mut st, &other).expect("prefill other");
-            let covered = serve
-                .restore_prefix(&mut st, &first_ext)
-                .expect("stale restore");
-            assert_eq!(covered, 0, "the stale entry must cover nothing");
-            assert_eq!(
-                st.core.history(),
-                &other[..],
-                "the session must be unchanged"
+            serve.reset(&mut source).expect("reset");
+            serve.prefill(&mut source, &base).expect("prefill");
+            assert!(
+                serve
+                    .save_prefix(&source, &base, SaveKind::Tip)
+                    .expect("save")
             );
+            // The source moves on: it decodes past the save point and is reset for another job.
+            let mut token = *base.last().expect("prompt");
+            for step in 0..8 {
+                serve
+                    .model
+                    .decode(&source.seq, token, source.pos + step)
+                    .expect("decode");
+                token = 200 + step as u32;
+            }
+            serve.reset(&mut source).expect("reset");
+            serve
+                .prefill(&mut source, &prompt(64, 9_000))
+                .expect("other prompt");
 
-            // The current generation's entry still restores and rewinds.
-            assert!(serve.save_prefix(&st, &other, SaveKind::Tip).expect("save"));
-            serve.reset(&mut st).expect("reset");
+            // The target held other data; the restore covers the whole saved key.
+            serve.reset(&mut target).expect("reset");
+            serve
+                .prefill(&mut target, &prompt(500, 7_000))
+                .expect("dirty");
+            serve.reset(&mut target).expect("reset");
             let covered = serve
-                .restore_prefix(&mut st, &other_ext)
-                .expect("fresh restore");
-            assert_eq!(covered, n, "the current entry must cover the prompt");
+                .restore_prefix(&mut target, &extended)
+                .expect("restore");
+            assert_eq!(covered, base.len(), "the whole saved prompt restores");
             assert_eq!(
-                st.pos,
-                n - 1,
-                "the cache position must rewind to the boundary"
+                target.pos,
+                base.len() - 1,
+                "the cache position is the entry's"
             );
             serve
-                .prefill(&mut st, &other_ext[n..])
+                .prefill(&mut target, &extended[covered..])
                 .expect("tail prefill");
+
+            serve.reset(&mut cold).expect("reset");
+            serve.prefill(&mut cold, &extended).expect("cold prefill");
+            assert_eq!(target.pos, cold.pos);
+            let last = *extended.last().expect("prompt");
+            let restored = next_logits(&mut serve, &target, last);
+            let fresh = next_logits(&mut serve, &cold, last);
             assert_eq!(
-                st.core.history(),
-                &other_ext[..],
-                "the tail must continue the sequence"
+                restored, fresh,
+                "a restored session continues like a cold one"
+            );
+        }
+
+        /// A different prompt saves over the tip, and the old key no longer restores: the store
+        /// holds one entry and answers only for keys the prompt extends.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device"]
+        fn the_store_answers_only_for_a_key_the_prompt_extends() {
+            let mut serve = serve_of(bolt::load(&pinned_bolt(), None).expect("load"));
+            let mut first = serve.new_session().expect("first");
+            let first_key = prompt(64, 0);
+            let other_key = prompt(64, 300);
+            serve.reset(&mut first).expect("reset");
+            serve.prefill(&mut first, &first_key).expect("prefill");
+            assert!(
+                serve
+                    .save_prefix(&first, &first_key, SaveKind::Tip)
+                    .expect("save")
+            );
+            serve.reset(&mut first).expect("reset");
+            serve
+                .prefill(&mut first, &other_key)
+                .expect("prefill other");
+            assert!(
+                serve
+                    .save_prefix(&first, &other_key, SaveKind::Tip)
+                    .expect("save other")
+            );
+
+            let mut second = serve.new_session().expect("second");
+            serve.reset(&mut second).expect("reset");
+            let stale: Vec<u32> = first_key.iter().copied().chain(500..512).collect();
+            assert_eq!(serve.restore_prefix(&mut second, &stale).expect("stale"), 0);
+            assert_eq!(second.pos, 0, "a miss leaves the session as reset");
+            let fresh: Vec<u32> = other_key.iter().copied().chain(600..612).collect();
+            assert_eq!(
+                serve.restore_prefix(&mut second, &fresh).expect("fresh"),
+                other_key.len()
             );
         }
     }

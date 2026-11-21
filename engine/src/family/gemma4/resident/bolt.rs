@@ -225,6 +225,22 @@ pub(crate) struct BoltSeq {
     kv_len: DeviceBuffer,
 }
 
+/// A copy of the cache cells of one sequence below a position, in host memory. The planes of the
+/// 24 physical layers are stored layer by layer, plane by plane (k codes, k scales, v codes,
+/// v scales) and kv head by kv head, each as the cells `0..fed` of that head, so an entry holds
+/// `fed` times the cost of one position. It restores into any sequence.
+pub(crate) struct BoltSnapshot {
+    fed: usize,
+    data: Vec<u8>,
+}
+
+impl BoltSnapshot {
+    /// The positions the snapshot covers.
+    pub(crate) fn fed(&self) -> usize {
+        self.fed
+    }
+}
+
 /// The logits rows of a window: the raw head output and its softcap, one vocabulary row per
 /// sequence. Allocated only for an engine that serves more than one sequence.
 pub(crate) struct WindowBuffers {
@@ -702,6 +718,92 @@ impl Bolt {
             pos: zero(ctx, 4)?,
             kv_len: zero(ctx, 4)?,
         })
+    }
+
+    /// The `(offset, bytes)` ranges of the cells `0..fed` of every plane of one layer's cache, in
+    /// the order a snapshot stores them. Cells are laid out `[kv head][cell][unit]`, so the cells
+    /// of one head are contiguous from the head's base.
+    fn snapshot_ranges(head: usize, fed: usize) -> [[(usize, usize); KV_HEADS]; 4] {
+        let codes = head;
+        let scales = (head / 32) * 2;
+        let plane = |unit: usize| {
+            let mut ranges = [(0, 0); KV_HEADS];
+            for (kv_head, range) in ranges.iter_mut().enumerate() {
+                *range = (kv_head * CELLS * unit, fed * unit);
+            }
+            ranges
+        };
+        [plane(codes), plane(scales), plane(codes), plane(scales)]
+    }
+
+    /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
+    /// later request restores into any sequence, so it holds at most one sequence's cache
+    /// (`CELLS` positions) and is allocated only for the cells it covers; a host that cannot
+    /// hold it refuses with a memory-plan error and nothing is stored.
+    pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
+        if fed > CELLS {
+            return Err(EngError::ContextLimit(
+                "the Bolt snapshot exceeds the context".to_owned(),
+            ));
+        }
+        let mut total = 0usize;
+        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
+            if planes.is_some() {
+                for plane in Self::snapshot_ranges(layer.head, fed) {
+                    total += plane.iter().map(|range| range.1).sum::<usize>();
+                }
+            }
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(total).map_err(|_| {
+            EngError::MemoryPlan(format!(
+                "the host cannot hold a {total} byte prefix snapshot"
+            ))
+        })?;
+        data.resize(total, 0);
+        let mut at = 0;
+        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
+            let Some(kv) = planes else { continue };
+            let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
+            for (buffer, ranges) in buffers
+                .into_iter()
+                .zip(Self::snapshot_ranges(layer.head, fed))
+            {
+                for (offset, bytes) in ranges {
+                    if bytes > 0 {
+                        buffer.read_at(&self.stream, offset, &mut data[at..at + bytes])?;
+                        at += bytes;
+                    }
+                }
+            }
+        }
+        Ok(BoltSnapshot { fed, data })
+    }
+
+    /// Writes a snapshot into `seq`: the cells `0..fed` of every plane. The cells above are left
+    /// as they are, which is safe because the position word bounds every read.
+    pub(crate) fn restore_seq(
+        &self,
+        seq: &BoltSeq,
+        snapshot: &BoltSnapshot,
+    ) -> Result<(), EngError> {
+        let mut at = 0;
+        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
+            let Some(kv) = planes else { continue };
+            let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
+            for (buffer, ranges) in buffers
+                .into_iter()
+                .zip(Self::snapshot_ranges(layer.head, snapshot.fed))
+            {
+                for (offset, bytes) in ranges {
+                    if bytes > 0 {
+                        buffer.write_at(&self.stream, offset, &snapshot.data[at..at + bytes])?;
+                        at += bytes;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Allocates the logits rows that a window of up to `rows` sequences needs, once. A request

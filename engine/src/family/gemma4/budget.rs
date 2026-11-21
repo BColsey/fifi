@@ -62,6 +62,8 @@ pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 
 /// launch of its projections.
 pub(crate) const BOLT_PIECE_ROWS: usize = 8;
 
+const _: () = assert!(BOLT_AUTO_PROMPT_ROWS >= BOLT_PIECE_ROWS);
+
 /// The prompt rows per tick that the engine feeds while several sessions are live, when the entry
 /// does not set `prompt_rows`.
 #[cfg_attr(
@@ -237,6 +239,5 @@ mod tests {
             BOLT_PIECE_ROWS,
             crate::family::gemma4::resident::bolt::Bolt::PREFILL_BATCH
         );
-        assert!(BOLT_AUTO_PROMPT_ROWS >= BOLT_PIECE_ROWS);
     }
 }
