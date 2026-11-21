@@ -10,8 +10,7 @@
  * and dots one window. The CTA is eight warps and persistent: it walks rows with a stride
  * of the whole grid, staging once at the start
  *   - the type's lookup table (if any), copied from the by-value kernel argument to shared
- *     memory with warp-uniform constant-bank loads (a divergent index into the argument
- *     space would serialize across the warp), and
+ *     memory, each thread moving a few 16-byte chunks, and
  *   - the activation windows of every column, re-laid out so one lane reads its window with
  *     two 16-byte shared loads and a 4-byte one without bank conflicts: the 32 int8 quants
  *     at a 48-byte stride and the f32 scale in its own array.
@@ -55,15 +54,15 @@ struct __align__(16) Tab {
     uint32_t w[N];
 };
 
-/* Copies the by-value table to shared memory: every lane of a warp loads the same 16-byte
- * chunk (a uniform constant-bank address), lane 0 stores it. */
+/* Copies the by-value table to shared memory: thread t loads and stores the 16-byte chunks
+ * t, t + 256, ... The loop is fully unrolled (the chunk count is a compile-time constant), so
+ * a thread has all its constant-bank loads in flight before the first store. */
 template <int N>
-__device__ __forceinline__ void stage_table(const Tab<N> &t, uint32_t *sm, int warp, int lane) {
-    for (int c = warp; c < N / 4; c += kWarps) {
-        const uint4 v = *reinterpret_cast<const uint4 *>(&t.w[4 * c]);
-        if (lane == 0) {
-            *reinterpret_cast<uint4 *>(&sm[4 * c]) = v;
-        }
+__device__ __forceinline__ void stage_table(const Tab<N> &t, uint32_t *sm) {
+    const int chunks = N / 4;
+#pragma unroll
+    for (int c = (int)threadIdx.x; c < chunks; c += kThreads) {
+        *reinterpret_cast<uint4 *>(&sm[4 * c]) = *reinterpret_cast<const uint4 *>(&t.w[4 * c]);
     }
 }
 
@@ -198,7 +197,7 @@ __global__ void __launch_bounds__(kThreads)
     const int lane = (int)(threadIdx.x & 31);
     const int nwin = k / 32;
     const int nwp = staged_windows(nwin);
-    stage_table<T::kTabWords>(tab, stab, warp, lane);
+    stage_table<T::kTabWords>(tab, stab);
     if (Staged) {
         for (int c = 0; c < ncols; ++c) {
             stage_x_column(x_q8 + (size_t)c * x_row_bytes, nwin, nwp,
@@ -254,7 +253,7 @@ __global__ void __launch_bounds__(kThreads)
     const int nwin = k / 32;
     const int nwp = staged_windows(nwin);
     const unsigned char *x = x_q8 + (x_per_slot ? (size_t)slot * x_row_bytes : 0);
-    stage_table<T::kTabWords>(tab, stab, warp, lane);
+    stage_table<T::kTabWords>(tab, stab);
     if (Staged) {
         stage_x_column(x, nwin, nwp, sx);
     }
@@ -295,7 +294,7 @@ __global__ void __launch_bounds__(kThreads)
     dequant(const unsigned char *w, float *y, size_t n_windows, Tab<T::kTabWords> tab) {
     extern __shared__ __align__(16) unsigned char smem[];
     uint32_t *stab = reinterpret_cast<uint32_t *>(smem);
-    stage_table<T::kTabWords>(tab, stab, (int)(threadIdx.x >> 5), (int)(threadIdx.x & 31));
+    stage_table<T::kTabWords>(tab, stab);
     __syncthreads();
     for (size_t win = (size_t)blockIdx.x * kThreads + threadIdx.x; win < n_windows;
          win += (size_t)gridDim.x * kThreads) {
