@@ -27,6 +27,16 @@ pub(super) struct FlintCheckpoint {
     profile: Profile,
 }
 
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) struct ExpertPageLayout {
+    stacks: Vec<(
+        crate::family::stored::SlicedWeight,
+        crate::family::stored::StackLayout,
+    )>,
+    pub(super) packed: Vec<crate::kernels::PackedPages>,
+    pub(super) index_offset: usize,
+}
+
 impl FlintCheckpoint {
     pub(super) fn open(root: &Path) -> Result<Self, EngError> {
         // One mount-table read covers the root and every shard (a shard can
@@ -153,26 +163,14 @@ impl FlintCheckpoint {
     /// extents, so this reader stays separate from `weights::expert_store`
     /// until the store's vocabulary grows per-extent addressing.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    pub(super) fn expert_pages(
+    pub(super) fn expert_page_layout(
         &self,
         stem: &str,
-        ids: &[u32],
-        remapped: &Tensor,
-        coalesce_reads: bool,
-    ) -> Result<
-        (
-            crate::kernels::HostPages,
-            Vec<crate::kernels::PackedPages>,
-            crate::kernels::PageRange,
-        ),
-        EngError,
-    > {
-        use crate::family::stored::{
-            RoleRange, StackLayout, read_stack_into, read_stack_runs_into,
-        };
+        count: u32,
+    ) -> Result<ExpertPageLayout, EngError> {
+        use crate::family::stored::{RoleRange, StackLayout};
         use crate::kernels::{HostPages, PackedPages, PageRange};
 
-        let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
         let page = HostPages::page_size();
         let mut end = 0;
         let mut stacks = Vec::with_capacity(3);
@@ -195,6 +193,62 @@ impl FlintCheckpoint {
             end = layout.end;
             stacks.push((weight, layout));
         }
+        let range = |role: &RoleRange| PageRange {
+            offset: role.offset,
+            dtype: role.dtype,
+            shape: role.shape.clone(),
+        };
+        let packed = stacks
+            .iter()
+            .map(|(_, layout)| PackedPages {
+                payload: range(&layout.payload),
+                scales: range(&layout.scales),
+                biases: layout.biases.as_ref().map(range),
+                logical_shape: layout.logical_shape.clone(),
+                quantization: layout.spec,
+            })
+            .collect();
+        Ok(ExpertPageLayout {
+            stacks,
+            packed,
+            index_offset: end,
+        })
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn read_expert_slots(
+        &self,
+        layout: &ExpertPageLayout,
+        slots: &[(u32, usize)],
+        dst: &mut [u8],
+    ) -> Result<(), EngError> {
+        for (weight, stack) in &layout.stacks {
+            crate::family::stored::read_stack_slots_into(&self.weights, weight, slots, dst, stack)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn expert_pages(
+        &self,
+        stem: &str,
+        ids: &[u32],
+        remapped: &Tensor,
+        coalesce_reads: bool,
+    ) -> Result<
+        (
+            crate::kernels::HostPages,
+            Vec<crate::kernels::PackedPages>,
+            crate::kernels::PageRange,
+        ),
+        EngError,
+    > {
+        use crate::family::stored::{read_stack_into, read_stack_runs_into};
+        use crate::kernels::{HostPages, PageRange};
+
+        let count = u32::try_from(ids.len()).map_err(|_| invalid("too many Flint expert IDs"))?;
+        let layout = self.expert_page_layout(stem, count)?;
+        let end = layout.index_offset;
         let local_bytes = remapped
             .host_bytes()
             .ok_or_else(|| invalid("expert IDs need host bytes"))?;
@@ -206,36 +260,21 @@ impl FlintCheckpoint {
             operation: "Flint expert staging",
             message: "fresh expert pages are not writable".into(),
         })?;
-        for (weight, layout) in &stacks {
-            let read_stack = if coalesce_reads {
-                read_stack_runs_into
-            } else {
-                read_stack_into
-            };
+        let read_stack = if coalesce_reads {
+            read_stack_runs_into
+        } else {
+            read_stack_into
+        };
+        for (weight, layout) in &layout.stacks {
             read_stack(&self.weights, weight, ids, dst, layout)?;
         }
         dst[end..id_end].copy_from_slice(local_bytes);
-        let range = |role: &RoleRange| PageRange {
-            offset: role.offset,
-            dtype: role.dtype,
-            shape: role.shape.clone(),
-        };
-        let packed = stacks
-            .into_iter()
-            .map(|(_, layout)| PackedPages {
-                payload: range(&layout.payload),
-                scales: range(&layout.scales),
-                biases: layout.biases.as_ref().map(range),
-                logical_shape: layout.logical_shape,
-                quantization: layout.spec,
-            })
-            .collect();
         let local = PageRange {
             offset: end,
             dtype: remapped.dtype(),
             shape: remapped.shape().to_vec(),
         };
-        Ok((pages, packed, local))
+        Ok((pages, layout.packed, local))
     }
 
     pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<PackedWeight, EngError> {
