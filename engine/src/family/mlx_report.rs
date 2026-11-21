@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::plan_decision::{PlanAlternative, PlanDecision, PlanFixity};
+use super::plan_decision::PlanDecision;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+use super::plan_decision::{PlanAlternative, PlanFixity};
 
 #[cfg(any(
     test,
