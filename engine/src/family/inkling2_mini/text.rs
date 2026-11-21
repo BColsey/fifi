@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a complete Unsloth UD-IQ2_XXS GGUF at INKLING_GGUF_REFERENCE"]
+    #[ignore = "requires a complete Unsloth IQ2_XXS GGUF at INKLING_GGUF_REFERENCE"]
     fn fork_gguf_reference_first_token_matches_oracle() {
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
         let mut decoder = Decoder::open_gguf_reference(Path::new(&file), 128).unwrap();

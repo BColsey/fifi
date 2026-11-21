@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires complete Unsloth UD-IQ2_XXS fork weights at INKLING_GGUF_REFERENCE and Apple Metal"]
+    #[ignore = "requires complete Unsloth IQ2_XXS fork weights at INKLING_GGUF_REFERENCE and Apple Metal"]
     fn packed_gguf_matvec_matches_released_expert_blocks() {
         let _lock = crate::native_test_lock();
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
@@ -817,7 +817,7 @@ mod tests {
 
     #[cfg(feature = "native-fault-qualification")]
     #[test]
-    #[ignore = "requires a complete Unsloth UD-IQ2_XXS GGUF at INKLING_GGUF_REFERENCE and Apple Metal"]
+    #[ignore = "requires a complete Unsloth IQ2_XXS GGUF at INKLING_GGUF_REFERENCE and Apple Metal"]
     fn batched_gguf_visit_matches_sequential_packed_bits_and_counts() {
         let _lock = crate::native_test_lock();
         let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");

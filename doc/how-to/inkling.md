@@ -29,7 +29,7 @@ The GGUF inspector recognizes the mainline `inkling2_loop` and repository-root `
 The GGUF adapters advance prompt tokens serially and can group expert projections within each visit. The safetensors worker can group multiple prompt tokens per visit.
 
 ```sh
-target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
+target/release/enginesrv serve --model /path/to/Inkling-2-Mini-IQ2_XXS.gguf \
   --tokenizer-dir ~/models/inkling2-mini --context 192 --listen 127.0.0.1:18795
 ```
 
@@ -38,8 +38,8 @@ Native MLX builds on Apple Silicon use up to four attention projection workers f
 | Artifact | Inspect | Load and generate | HTTP |
 | --- | --- | --- | --- |
 | Publisher NVFP4/MXFP8 safetensors | Yes | Real checkpoint, Metal experts | Raw, chat, and multi-turn WebGUI |
-| Mainline `inkling2_loop` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
-| Repository-root `inkling2` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
+| Mainline `inkling2_loop` GGUF | Yes | Real IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
+| Repository-root `inkling2` GGUF | Yes | Real IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
 
 At `71aa350c`, `enginesrv check` and `serve --print-config` selected the native Inkling family for both real GGUF files and the publisher safetensors under the 6 GiB ceiling. Both GGUF artifacts returned the reference three-token continuation with temperature zero in the earlier `8a6c6347` HTTP runs. The vision projector's `clip` metadata and the DSpark drafter's `dflash` metadata were inspected in draft PR #97. Both optional paths remain at metadata-only qualification.
 
@@ -83,7 +83,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:18795/v1/completion
 
 The verified response has a `choices[0].text` value of `" Paris.\n\n"`, a `length` finish reason, five prompt tokens, and three completion tokens.
 
-The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its inclusion in completion usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp UD-IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
+The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its inclusion in completion usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
 
 ## Mac qualification TODO
 
@@ -425,7 +425,7 @@ process-attributed disk counter to check physical SSD reads.
 `FIFI_INKLING_GGUF_PACKED_DOT=1` selects direct Q6_K and Q8_0 row dots
 for mapped GGUF weights. The packed rows preserve the FP32 accumulation
 order. The buffered reference and mapped path produced bitwise-equal
-logits on both complete UD-IQ2_XXS GGUF layouts.
+logits on both complete IQ2_XXS GGUF layouts.
 
 `FIFI_INKLING_GGUF_Q8_ACTIVATIONS=1` quantizes inputs to mapped Q8_0
 projections in 32-value groups using the shared CPU quantizer. This
@@ -433,7 +433,7 @@ experiment requires AArch64 dot-product support. Both settings are
 default-off.
 
 At `db08682e`, the M4 mini served a five-token prompt with four output
-tokens using the mainline UD-IQ2_XXS GGUF, a 192-token context, and the
+tokens using the mainline IQ2_XXS GGUF, a 192-token context, and the
 6 GiB working-set cap. With packed rows selected in both arms, the warm
 repeat reached a first token in 3.61 s with FP32 activations and 2.09 s
 with Q8 activations. Decode rose from 0.98 to 1.37 tok/s. The two runs

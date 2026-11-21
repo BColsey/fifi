@@ -13,7 +13,7 @@ from urllib.parse import urlencode, urlsplit
 RAW_PATH = "/v1/completions"
 CHAT_PATH = "/v1/chat/completions"
 RAW_PROMPT = "The capital of France is"
-# Common three-token prefix in native and llama.cpp UD-IQ2_XXS reference text,
+# Common three-token prefix in native and llama.cpp IQ2_XXS reference text,
 # encoded with the publisher's pinned tokenizer.
 RAW_PREFIX = " Paris.\n\n"
 RAW_PREFIX_IDS = [152717, 13, 68014]
