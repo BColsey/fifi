@@ -133,6 +133,7 @@ pub(super) struct Experts {
     projections: ProjectionStats,
     stats: MlxExpertCacheStats,
     timing: Option<ExpertTimings>,
+    trace_routes: bool,
 }
 
 impl Experts {
@@ -163,6 +164,8 @@ impl Experts {
             projections: ProjectionStats::default(),
             stats: MlxExpertCacheStats::default(),
             timing: timing::enabled().then(ExpertTimings::default),
+            trace_routes: std::env::var_os("FIFI_INKLING_ROUTE_TRACE")
+                .is_some_and(|value| value == "1"),
         })
     }
 
@@ -242,8 +245,9 @@ impl Experts {
     ) -> Result<Vec<bf16>, EngError> {
         let source = Arc::clone(&self.source);
         self.stats.visits += 1;
-        let misses = self.stats.misses;
-        let output = if self.batched_enabled && self.can_batch(layer) {
+        let before = self.stats;
+        let grouped = self.batched_enabled && self.can_batch(layer);
+        let output = if grouped {
             let output = self.row_batched(layer, input, selected, routes)?;
             self.batched_visits += 1;
             output
@@ -256,8 +260,48 @@ impl Experts {
                 |name, expert, height, input| self.project(name, expert, height, input),
             )?
         };
-        self.stats.fully_cached_visits += u64::from(misses == self.stats.misses);
+        self.stats.fully_cached_visits += u64::from(before.misses == self.stats.misses);
+        if self.trace_routes {
+            self.trace_visit(layer, selected, grouped, before);
+        }
         Ok(output)
+    }
+
+    fn trace_visit(
+        &self,
+        layer: usize,
+        selected: &[usize],
+        grouped: bool,
+        before: MlxExpertCacheStats,
+    ) {
+        let plane_bytes = ["ffn_gate_up_exps", "ffn_down_exps"].map(|name| {
+            let tensor = self
+                .source
+                .header()
+                .tensor(&format!("blk.{layer}.{name}.weight"))
+                .expect("completed visit uses a validated expert tensor");
+            let resident = if self.packed_enabled && packed_format(tensor.ggml_type()) {
+                tensor.byte_len() / tensor.dims()[2]
+            } else {
+                tensor.dims()[0] * tensor.dims()[1] * 4
+            };
+            [tensor.byte_len() / tensor.dims()[2], resident]
+        });
+        eprintln!(
+            "inkling_gguf_route {}",
+            serde_json::json!({
+                "visit": self.stats.visits,
+                "layer": layer,
+                "selected": selected,
+                "grouped": grouped,
+                "plane_bytes": plane_bytes,
+                "resident_capacity_bytes": self.resident.limit,
+                "ram_capacity_bytes": self.packed.limit,
+                "read_bytes": self.stats.read_bytes - before.read_bytes,
+                "misses": self.stats.misses - before.misses,
+                "evictions": self.stats.evictions - before.evictions,
+            })
+        );
     }
 
     fn can_batch(&self, layer: usize) -> bool {
