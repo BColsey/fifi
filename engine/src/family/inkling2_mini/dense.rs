@@ -393,7 +393,7 @@ impl SafetensorDense {
 }
 
 pub(super) fn attention_cpu_workers() -> usize {
-    if std::env::var_os(ATTN_WORKERS_ENV).is_some_and(|value| value == "4") {
+    if std::env::var_os(ATTN_WORKERS_ENV).map_or(super::factory::NATIVE_MLX, |value| value == "4") {
         bf16_worker_limit()
     } else {
         1

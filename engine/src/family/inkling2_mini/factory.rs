@@ -1,4 +1,4 @@
-//! Explicit startup gate for the single-sequence Inkling text worker.
+//! Startup and platform checks for the single-sequence Inkling text worker.
 
 use super::{UNPADDED_VOCAB, state_plan};
 use crate::{
@@ -8,39 +8,39 @@ use crate::{
 };
 use std::{ffi::OsStr, path::Path};
 
-const OPT_IN: &str = "FIFI_INKLING2_MINI_MLX";
-const GGUF_OPT_IN: &str = "FIFI_INKLING2_MINI_GGUF_MLX";
+const ENABLE_MLX: &str = "FIFI_INKLING2_MINI_MLX";
+const ENABLE_GGUF_MLX: &str = "FIFI_INKLING2_MINI_GGUF_MLX";
+pub(super) const NATIVE_MLX: bool = cfg!(all(
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+));
 
 pub(crate) fn check_gguf_backend() -> Result<(), EngError> {
     check_backend()?;
-    if std::env::var_os(GGUF_OPT_IN).as_deref() != Some(OsStr::new("1")) {
-        return Err(EngError::BadRequest(format!(
-            "Inkling 2 Mini experimental GGUF text serving requires {GGUF_OPT_IN}=1"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn check_backend() -> Result<(), EngError> {
-    check_backend_with(
-        cfg!(all(
-            feature = "native-mlx",
-            target_os = "macos",
-            target_arch = "aarch64"
-        )),
-        std::env::var_os(OPT_IN).as_deref(),
+    check_enabled(
+        ENABLE_GGUF_MLX,
+        std::env::var_os(ENABLE_GGUF_MLX).as_deref(),
     )
 }
 
-fn check_backend_with(native: bool, opt_in: Option<&OsStr>) -> Result<(), EngError> {
+pub(crate) fn check_backend() -> Result<(), EngError> {
+    check_backend_with(NATIVE_MLX, std::env::var_os(ENABLE_MLX).as_deref())
+}
+
+fn check_backend_with(native: bool, setting: Option<&OsStr>) -> Result<(), EngError> {
     if !native {
         return Err(EngError::BadRequest(
             "Inkling 2 Mini requires --features native-mlx on Apple Silicon".into(),
         ));
     }
-    if opt_in != Some(OsStr::new("1")) {
+    check_enabled(ENABLE_MLX, setting)
+}
+
+fn check_enabled(name: &str, setting: Option<&OsStr>) -> Result<(), EngError> {
+    if setting.is_some_and(|value| value != "1") {
         return Err(EngError::BadRequest(format!(
-            "Inkling 2 Mini experimental text serving requires {OPT_IN}=1"
+            "Inkling 2 Mini text serving is disabled by {name}; unset it or set {name}=1"
         )));
     }
     Ok(())
@@ -449,11 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn serving_requires_native_mlx_and_explicit_opt_in() {
+    fn serving_defaults_to_native_mlx_and_honors_disabling_overrides() {
+        assert!(check_backend_with(false, None).is_err());
         assert!(check_backend_with(false, Some(OsStr::new("1"))).is_err());
-        assert!(check_backend_with(true, None).is_err());
+        assert!(check_backend_with(true, None).is_ok());
         assert!(check_backend_with(true, Some(OsStr::new("0"))).is_err());
         assert!(check_backend_with(true, Some(OsStr::new("1"))).is_ok());
+        assert!(check_enabled(ENABLE_GGUF_MLX, None).is_ok());
+        assert!(check_enabled(ENABLE_GGUF_MLX, Some(OsStr::new("0"))).is_err());
     }
 
     #[test]

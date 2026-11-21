@@ -210,7 +210,7 @@ impl Decoder {
     }
 
     fn open_gguf(path: &Path, context: u32, native: bool) -> Result<Self, EngError> {
-        let map_dense = std::env::var_os(gguf::DENSE_MAPPING_ENV).is_some_and(|value| value == "1");
+        let map_dense = gguf::dense_mapping_enabled(native);
         Self::open_gguf_with_dense_mapping(
             path,
             context,
@@ -237,7 +237,7 @@ impl Decoder {
             gguf::projection_scratch_bytes(attention_workers)
         };
         let charges = super::base_charges(0, scratch, &state);
-        let headroom = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)?
+        let headroom = super::device_budget(true, super::GGUF_SMALL_WORKING_SET, &charges)?
             .map_or(Ok(0), |device| {
                 super::working_set_remaining(device, &charges)
             })?;

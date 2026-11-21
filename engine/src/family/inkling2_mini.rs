@@ -49,6 +49,16 @@ const PREFILL_WORKSPACE_PER_ROW: usize = 1 << 20;
 const PREFILL_ROWS_ENV: &str = "FIFI_INKLING_PREFILL_ROWS";
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 const FILE_CACHE_ONLY_ENV: &str = "FIFI_INKLING_FILE_CACHE_ONLY";
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+const SAFETENSORS_SMALL_WORKING_SET: u64 = 5 << 30;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+const GGUF_SMALL_WORKING_SET: u64 = 6 << 30;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn file_cache_only() -> bool {
@@ -1109,18 +1119,54 @@ fn working_set_remaining(
     device.remaining("Inkling 2 Mini", &charges)
 }
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn small_device_default(
+    device: crate::family::mlx_budget::DeviceBudget,
+    preferred: u64,
+    charges: &[(&'static str, u64)],
+) -> crate::family::mlx_budget::DeviceBudget {
+    if device.bytes() > 16 << 30 {
+        return device;
+    }
+    // Limit disposable retention on small Macs while still admitting every
+    // context whose resident charges fit the hardware's working set.
+    let required = charges.iter().fold(
+        crate::family::mlx_budget::PRESSURE_MARGIN,
+        |total, &(_, bytes)| total.saturating_add(bytes),
+    );
+    device.with_default_ceiling(preferred.max(required))
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn device_budget(
+    auto_default: bool,
+    preferred: u64,
+    charges: &[(&'static str, u64)],
+) -> Result<Option<crate::family::mlx_budget::DeviceBudget>, EngError> {
+    use crate::family::mlx_budget::{DeviceBudget, auto_budget_is_explicit};
+
+    let budget = DeviceBudget::detect_with_default(auto_default)?;
+    if auto_budget_is_explicit() {
+        return Ok(budget);
+    }
+    Ok(budget.map(|device| small_device_default(device, preferred, charges)))
+}
+
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
-    let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? else {
+    let source = InklingExpertSource::open(dir)?;
+    let staging = source.one_token_staging_bytes(mac_stage_page_size())?;
+    let state = state_plan(context)?;
+    let charges = base_charges(source.projected_resident_bytes(), staging, &state);
+    let Some(device) = device_budget(true, SAFETENSORS_SMALL_WORKING_SET, &charges)? else {
         eprintln!(
             "Inkling 2 Mini: automatic Metal budget disabled; base allocations unchecked; expert_prefill_headroom_bytes=0"
         );
         return Ok(0);
     };
-    let source = InklingExpertSource::open(dir)?;
-    let staging = source.one_token_staging_bytes(mac_stage_page_size())?;
-    let state = state_plan(context)?;
-    let charges = base_charges(source.projected_resident_bytes(), staging, &state);
     let remaining = working_set_remaining(device, &charges)?;
     eprintln!("Inkling 2 Mini: {device} {charges:?} expert_prefill_headroom_bytes={remaining}");
     usize::try_from(remaining).map_err(|_| staging_overflow())
@@ -1139,10 +1185,11 @@ fn mlx_budget_row(
         charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
     );
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    let (chosen, fit) = if let Some(device) =
-        crate::family::mlx_budget::DeviceBudget::detect_with_default(
-            factory::check_backend().is_ok(),
-        )? {
+    let (chosen, fit) = if let Some(device) = device_budget(
+        factory::check_backend().is_ok(),
+        SAFETENSORS_SMALL_WORKING_SET,
+        &charges,
+    )? {
         match working_set_remaining(device, &charges) {
             Ok(remaining) => {
                 let remaining = usize::try_from(remaining).map_err(|_| staging_overflow())?;
@@ -1198,6 +1245,39 @@ fn mlx_budget_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_mac_defaults_bound_retention_without_refusing_fitting_contexts() {
+        use crate::family::mlx_budget::DeviceBudget;
+
+        let mini = DeviceBudget::new(12 << 30).unwrap();
+        let large = DeviceBudget::new(24 << 30).unwrap();
+        let short = [("base", 3 << 30)];
+        let long = [("base", 7 << 30)];
+        let model = small_device_default(mini, SAFETENSORS_SMALL_WORKING_SET, &short);
+        assert_eq!(model.bytes(), 5 << 30);
+        assert_eq!(working_set_remaining(model, &short).unwrap(), 1 << 30);
+        assert_eq!(
+            small_device_default(mini, GGUF_SMALL_WORKING_SET, &short).bytes(),
+            6 << 30
+        );
+        assert_eq!(
+            small_device_default(large, GGUF_SMALL_WORKING_SET, &short),
+            large
+        );
+        let expanded = small_device_default(mini, SAFETENSORS_SMALL_WORKING_SET, &long);
+        assert_eq!(working_set_remaining(expanded, &long).unwrap(), 0);
+        assert!(working_set_remaining(expanded, &[("base", 8 << 30)]).is_err());
+        assert_eq!(
+            small_device_default(
+                mini.with_default_ceiling(7 << 30),
+                SAFETENSORS_SMALL_WORKING_SET,
+                &short
+            )
+            .bytes(),
+            7 << 30
+        );
+    }
 
     #[test]
     fn each_core_pass_has_private_state_and_shared_weight_indices() {

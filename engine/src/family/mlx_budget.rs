@@ -5,6 +5,8 @@ use std::{ffi::OsStr, fmt};
 use crate::{EngError, family::device_budget::DeviceReserve};
 
 const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+const AUTO_BUDGET: &str = "FIFI_MLX_AUTO_BUDGET";
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
 #[cfg(any(
@@ -93,6 +95,18 @@ impl DeviceBudget {
         self.recommended.min(self.ceiling.unwrap_or(u64::MAX))
     }
 
+    /// A family may supply a smaller default while keeping explicit ceilings.
+    #[cfg(any(
+        test,
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn with_default_ceiling(self, bytes: u64) -> Self {
+        Self {
+            ceiling: self.ceiling.or(Some(bytes)),
+            ..self
+        }
+    }
+
     /// A configured upper bound can make the working set smaller.
     pub(crate) fn prefill(self, configured: Option<u64>) -> u64 {
         self.bytes().min(configured.unwrap_or(u64::MAX))
@@ -159,8 +173,13 @@ pub(crate) fn enabled() -> bool {
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled_with_default(auto_default: bool) -> bool {
-    std::env::var_os("FIFI_MLX_AUTO_BUDGET").map_or(auto_default, |value| value == "1")
+    std::env::var_os(AUTO_BUDGET).map_or(auto_default, |value| value == "1")
         || std::env::var_os(CEILING_MIB).is_some()
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn auto_budget_is_explicit() -> bool {
+    std::env::var_os(AUTO_BUDGET).is_some()
 }
 
 #[cfg(test)]

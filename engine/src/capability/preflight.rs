@@ -781,7 +781,7 @@ fn inkling2_text_report(
         ),
         _ => (
             Verdict::Experimental,
-            "The opt-in text worker is available for end-to-end qualification.",
+            "The Apple Silicon text worker is available for this checkpoint.",
         ),
     };
     PreflightReport {

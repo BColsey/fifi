@@ -14,14 +14,13 @@ From the engine directory, build the native MLX server and start it with a short
 
 ```sh
 cargo build --release --locked --features native-mlx --bin enginesrv
-FIFI_INKLING2_MINI_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
-  target/release/enginesrv serve --model ~/models/inkling2-mini \
+target/release/enginesrv serve --model ~/models/inkling2-mini \
   --context 128 --listen 127.0.0.1:18795
 ```
 
 Use the model name from `GET /v1/models`. The worker supports one active sequence and processes prompt tokens in order. It keeps 48 independent sets of KV and convolution history for the 24 physical layers. The CPU evaluates dense projections and attention. Metal evaluates the eight selected experts at each visit. The planner reserves space for dense weights, sequence state and staging, then uses the remaining budget for expert weights. On a cache miss, fifi reads the selected expert ranges from the checkpoint. The operating system can serve those reads from its file cache.
 
-`FIFI_MLX_WORKING_SET_MIB` sets an optional upper bound on the Metal working-set budget. For example, set it to `5120` to reproduce the 5 GiB budget on the 16 GiB M4 mini. `GET /v1/recent-requests` reports the measured prompt and generation timings.
+With a Metal recommendation of at most 16 GiB, Inkling defaults to a 5 GiB working set for safetensors and 6 GiB for GGUF. Longer contexts can raise that default to cover required allocations within Metal's recommendation. Larger working sets use Metal's recommendation. Set `FIFI_MLX_WORKING_SET_MIB` to override the ceiling, or `FIFI_MLX_AUTO_BUDGET=1` to use Metal's full recommendation. `GET /v1/recent-requests` reports the measured prompt and generation timings.
 
 For chat requests, disabling thinking sets the publisher's reasoning effort to 0.0. Inkling can still emit reasoning, so a short output limit can be reached before the first answer token. The server returns reasoning and answer text in their respective fields. [Publisher guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md#thinking-effort-set-it-everywhere)
 
@@ -30,13 +29,11 @@ The GGUF inspector recognizes the mainline `inkling2_loop` and repository-root `
 The GGUF adapters advance prompt tokens serially and can group expert projections within each visit. The safetensors worker can group multiple prompt tokens per visit.
 
 ```sh
-FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
-  FIFI_MLX_WORKING_SET_MIB=6144 FIFI_INKLING_GGUF_PACKED_MLX=1 \
-  FIFI_INKLING_GGUF_MMAP_DENSE=1 FIFI_INKLING_ATTN_CPU_WORKERS=4 \
-  FIFI_INKLING_GGUF_BATCH_EXPERTS=1 FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1 \
-  target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
+target/release/enginesrv serve --model /path/to/Inkling-2-Mini-UD-IQ2_XXS.gguf \
   --tokenizer-dir ~/models/inkling2-mini --context 192 --listen 127.0.0.1:18795
 ```
+
+Native MLX builds on Apple Silicon use up to four attention projection workers for both formats. GGUF also uses mapped dense weights, direct packed Metal kernels where supported, grouped expert projections, and single-copy expert retention where all projections support direct packed kernels. Set `FIFI_INKLING_ATTN_CPU_WORKERS=1` to use one worker, or set the corresponding `FIFI_INKLING_GGUF_*` setting to `0` for a comparison. `FIFI_INKLING2_MINI_MLX=0` disables the native family. `FIFI_INKLING2_MINI_GGUF_MLX=0` disables GGUF serving.
 
 | Artifact | Inspect | Load and generate | HTTP |
 | --- | --- | --- | --- |
@@ -316,7 +313,7 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 
 ### Cache and placement experiments
 
-`FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS=1` uses the full already-admitted expert budget for packed Metal buffers when every stored expert projection has a direct packed kernel. Set it alongside `FIFI_INKLING_GGUF_PACKED_MLX=1`. The application retains one copy of each cached packed projection. The phase trace reports the two tier capacities and retained payload bytes. Use the same ceiling with and without the flag when comparing it.
+`FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS` defaults to enabled alongside `FIFI_INKLING_GGUF_PACKED_MLX`. It uses the full already-admitted expert budget for packed Metal buffers when every stored expert projection has a direct packed kernel. The application retains one copy of each cached packed projection. The phase trace reports the two tier capacities and retained payload bytes. Use the same ceiling with and without the flag when comparing it.
 
 `FIFI_MLX_ADAPT_EXPERT_CACHE=1` applies to the publisher safetensors host cache. The decoder halves its admitted expert retention limit after a macOS warning and clears retained experts after a critical event. It checks the event before staging a visit or when resetting the decoder. The reduced cap lasts until server restart. KV and staging allocations stay within the original plan. The SDK smoke check registered and reused the observer. At `e9f74c2b`, observer-enabled and control servers at 5 GiB returned identical 12-token completions on the first and repeated requests. Both engine logs showed zero pressure-triggered cache trims. Event-driven trimming and its I/O impact remain unmeasured on real workloads. [Apple Dispatch memory-pressure documentation](https://developer.apple.com/documentation/Dispatch/DISPATCH_SOURCE_TYPE_MEMORYPRESSURE)
 
@@ -405,6 +402,6 @@ For the sustained 5 GiB storage comparison, set `FIFI_INKLING_MMAP_DENSE` and `F
 
 ## Integration status
 
-The tested native code is `e9f74c2b` on integration base `ee830759`. Later commits on `task/inkling2-mini-pr` record qualification evidence and launch instructions. Native selection and the performance settings are opt-in. Integration and publication of the native adapters, optimization commits, and benchmark results are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
+The benchmark measurements used `e9f74c2b` on integration base `ee830759` with the measured settings selected explicitly. The newer local defaults enable native selection, CPU attention workers, and the qualified GGUF settings. Safetensors mapped storage and multi-row prefill remain explicit settings because their physical I/O gains varied by workload. Integration and publication are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
 
 The release build passed the focused Inkling tests, the 12 HTTP cases, and the two-turn WebGUI check. Both GGUF layouts passed normal CLI serving and streamed chat. All seven safetensors timing cases passed the final idle-host audit. Portable all-target Clippy and native library Clippy passed. The broader native all-target Clippy run recorded the existing Qwen3.6 `chunks_exact_to_as_chunks` lint in `resident/prefill/step.rs`.

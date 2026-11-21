@@ -657,19 +657,26 @@ pub(super) fn projection_scratch_bytes(attention_workers: usize) -> u64 {
 }
 
 pub(super) fn packed_mlx_enabled() -> bool {
-    std::env::var_os("FIFI_INKLING_GGUF_PACKED_MLX").is_some_and(|value| value == "1")
+    std::env::var_os("FIFI_INKLING_GGUF_PACKED_MLX")
+        .map_or(super::factory::NATIVE_MLX, |value| value == "1")
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn dense_mapping_enabled(native: bool) -> bool {
+    std::env::var_os(DENSE_MAPPING_ENV).map_or(native, |value| value == "1")
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn single_copy_experts_enabled() -> bool {
     packed_mlx_enabled()
         && std::env::var_os("FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS")
-            .is_some_and(|value| value == "1")
+            .is_none_or(|value| value == "1")
 }
 
 pub(super) fn batched_experts_enabled() -> bool {
     packed_mlx_enabled()
-        && std::env::var_os("FIFI_INKLING_GGUF_BATCH_EXPERTS").is_some_and(|value| value == "1")
+        && std::env::var_os("FIFI_INKLING_GGUF_BATCH_EXPERTS")
+            .map_or(super::factory::NATIVE_MLX, |value| value == "1")
 }
 
 // NVFP4 has the largest block byte/element ratio among the six packed formats.
@@ -722,15 +729,14 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
         charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
     );
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    let (chosen, budget_fit) = if let Some(device) =
-        crate::family::mlx_budget::DeviceBudget::detect_with_default(
-            super::factory::check_gguf_backend().is_ok(),
-        )? {
+    let (chosen, budget_fit) = if let Some(device) = super::device_budget(
+        super::factory::check_gguf_backend().is_ok(),
+        super::GGUF_SMALL_WORKING_SET,
+        &charges,
+    )? {
         match super::working_set_remaining(device, &charges) {
             Ok(headroom) => {
-                let chosen = if std::env::var_os(DENSE_MAPPING_ENV)
-                    .is_some_and(|value| value == "1")
-                {
+                let chosen = if dense_mapping_enabled(true) {
                     format!(
                         "{plan}, up to {headroom} B shared by mapped packed dense projections and expert cache under {device}; exact dense reservation is selected at load; MLX allocator pool is process-wide and outside these logical cache capacities"
                     )
