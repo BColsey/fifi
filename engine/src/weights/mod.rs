@@ -51,6 +51,7 @@ pub use gguf::{
 };
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
+    widen_to_f32_bytes,
 };
 pub use gguf_experts::{
     ExpertSlice, ExpertSlices, ExpertTensorNames, GgufExpertIndex, LocatorError,

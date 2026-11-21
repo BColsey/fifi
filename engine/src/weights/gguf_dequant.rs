@@ -539,6 +539,15 @@ pub fn dequantize(ty: GgufType, src: &[u8]) -> Result<Vec<f32>, EngError> {
     Ok(out)
 }
 
+/// The F32 bytes (little endian) of a tensor stored as `ty`: how a small F16 or BF16 vector
+/// reaches a device buffer that every kernel reads as F32.
+pub fn widen_to_f32_bytes(ty: GgufType, src: &[u8]) -> Result<Vec<u8>, EngError> {
+    Ok(dequantize(ty, src)?
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +749,22 @@ mod tests {
             let want = if bits & 0x8000 != 0 { -mag } else { mag };
             assert_eq!(f64::from(v).to_bits(), want.to_bits(), "{bits:#06x}");
         }
+    }
+
+    #[test]
+    fn half_precision_values_widen_to_little_endian_f32_bytes() {
+        let f16 = [0x00, 0x3c, 0x00, 0xc0]; // 1.0 and -2.0
+        let widened = widen_to_f32_bytes(GgufType::F16, &f16).expect("f16");
+        assert_eq!(
+            widened,
+            [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()
+        );
+        let bf16 = [0x80, 0x3f, 0x00, 0xc0]; // 1.0 and -2.0
+        let widened = widen_to_f32_bytes(GgufType::Bf16, &bf16).expect("bf16");
+        assert_eq!(
+            widened,
+            [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()
+        );
+        assert!(widen_to_f32_bytes(GgufType::F16, &[0u8; 3]).is_err());
     }
 }

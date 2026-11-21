@@ -298,7 +298,20 @@ pub struct GgufTensor {
     shard: usize,
 }
 
+/// The largest tensor, in stored bytes, that the loaders widen to F32 when a file keeps it as F16
+/// or BF16.
+pub const SMALL_VECTOR_BYTES: u64 = 1 << 20;
+
 impl GgufTensor {
+    /// Whether the tensor is a norm, bias or gate vector that a file stores in half precision:
+    /// one dimension, F16 or BF16, under [`SMALL_VECTOR_BYTES`]. Every loader reads such a tensor
+    /// as F32 values; the large matrices are not vectors of this kind.
+    pub fn is_small_half_vector(&self) -> bool {
+        self.dims.len() == 1
+            && matches!(self.ggml_type, GgufType::F16 | GgufType::Bf16)
+            && self.byte_len < SMALL_VECTOR_BYTES
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

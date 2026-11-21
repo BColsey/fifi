@@ -725,6 +725,16 @@ impl CudaProjector {
                 | GgufType::Q40),
                 layout,
             ) => self.upload_quant(weights, tensor, name, ty, layout),
+            (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {
+                let (ty, bytes) = weights.read_tensor(name)?;
+                Ok(CudaWeight::Raw {
+                    name: name.to_owned(),
+                    ty: GgufType::F32,
+                    buffer: self
+                        .context
+                        .upload(&crate::weights::widen_to_f32_bytes(ty, &bytes)?)?,
+                })
+            }
             (ty @ (GgufType::F32 | GgufType::F16), _) => {
                 let (_, bytes) = weights.read_tensor(name)?;
                 Ok(CudaWeight::Raw {
@@ -1616,6 +1626,19 @@ fn upload(
             | GgufType::Q40),
             layout,
         ) => upload_quant(knobs, weights, tensor, ty, layout, slice, mapped),
+        (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {
+            let (ty, bytes) = weights.read_tensor(name)?;
+            let bytes = crate::weights::widen_to_f32_bytes(ty, &bytes)?;
+            let bytes = match slice {
+                Some(slice) => plan::assemble_slice(&bytes, slice)?,
+                None => bytes,
+            };
+            Ok(CudaWeight::Raw {
+                name: name.to_owned(),
+                ty: GgufType::F32,
+                buffer: knobs.context.upload(&bytes)?,
+            })
+        }
         (ty @ (GgufType::F32 | GgufType::F16), _) => {
             let (_, bytes) = weights.read_tensor(name)?;
             let bytes = match slice {

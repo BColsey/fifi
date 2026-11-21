@@ -666,3 +666,37 @@ fn an_extra_block_without_the_next_token_key_is_still_refused() {
         "{message}"
     );
 }
+
+#[test]
+fn a_small_norm_or_gate_vector_stored_in_half_precision_opens_and_a_half_matrix_does_not() {
+    let spec = TWO_LAYER_SPEC;
+    let kvs = metadata("qwen35moe", spec_counts(&spec));
+    let hidden = u64::from(spec.hidden);
+    for half in [GgufType::F16, GgufType::Bf16] {
+        let mut tensors = file_tensors(&spec);
+        replace(&mut tensors, "output_norm.weight", half, vec![hidden]);
+        replace(
+            &mut tensors,
+            "blk.1.ffn_gate_inp_shexp.weight",
+            half,
+            vec![hidden],
+        );
+        let model = open(&kvs, &tensors, &spec)
+            .unwrap_or_else(|error| panic!("{}: {error:?}", half.name()));
+        assert!(
+            model
+                .plan()
+                .tensors()
+                .any(|(name, path)| name == "output_norm.weight" && path == TensorPath::DeviceF32)
+        );
+    }
+    // The vector rule leaves a half-precision matrix to the refusal of its role.
+    let mut tensors = file_tensors(&spec);
+    replace(
+        &mut tensors,
+        "blk.1.attn_k.weight",
+        GgufType::Bf16,
+        vec![512, 256],
+    );
+    assert!(rejection(open(&kvs, &tensors, &spec)).contains("blk.1.attn_k.weight has type BF16"));
+}

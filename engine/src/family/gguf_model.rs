@@ -243,7 +243,9 @@ fn match_tensors<'a>(
 fn classify(expected: &ExpectedTensor, tensor: &GgufTensor) -> Result<PlannedTensor, EngError> {
     let ty = tensor.ggml_type();
     let allowed = expected.allowed_types();
-    if !allowed.contains(&ty) {
+    // A norm, bias or gate vector that the file keeps in half precision is widened at load.
+    let widened = expected.path() == TensorPath::DeviceF32 && tensor.is_small_half_vector();
+    if !allowed.contains(&ty) && !widened {
         let names = allowed
             .iter()
             .map(|allowed| allowed.name())
