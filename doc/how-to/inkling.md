@@ -56,7 +56,7 @@ python3 -B engine/tests/tools/check_inkling_serving.py \
   --report /path/to/scratch/inkling-serving-evidence.json
 ```
 
-The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its exclusion from usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp UD-IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
+The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its inclusion in completion usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp UD-IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
 
 ## Mac qualification TODO
 
@@ -64,7 +64,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 
 | Priority | Work | Evidence and remaining checks |
 | --- | --- | --- |
-| 1 | Verify native text serving | On `f45062d7`, raw HTTP and the WebGUI produced “Paris.” The browser used the model picker and received a completed SSE stream. Its follow-up supplied all three history messages and hit the 68-token output cap before visible answer text. Repeat with a larger output allowance and run the full serving suite. |
+| 1 | Verify native text serving | On `f45062d7`, raw HTTP and the WebGUI produced “Paris.” The browser used the model picker and received a completed SSE stream. On `4138d0df`, the follow-up supplied all three messages and displayed “France” with a 144-token output allowance. Both streams ended at EOS. The 68-token control reached its limit before visible answer text. Complete the HTTP contract suite, including disconnect recovery. |
 | 2 | Qualify bounded prefill | `c651c820` adds opt-in visit-major prefill. Two-row prefill was bitwise equal to serial for all 200,058 logits at each of six prompt positions and a follow-up. On a repeated 62-token prompt producing eight identical tokens at 5 GiB, time to first token rose from 36.39 s to 44.44 s, and process-attributed reads rose from 19.92 GB to 33.30 GB. Verify the later union-aware implementation at the same ceiling. |
 | 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced every cache miss under byte-weighted LRU. Frequency-based replay increased logical payload reads by 3.7%. Compare file-backed dense weights and OS-only retention on matching hardware requests. |
 | 4 | Measure placement | Measure CPU projections, output head, routing, attention, demand reads, staging, Metal submission and synchronized readback. Verify numerical parity before changing placement. |
