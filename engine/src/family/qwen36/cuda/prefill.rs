@@ -1657,7 +1657,10 @@ impl ChunkRun<'_, '_> {
 /// rows directly, so no q8_1 quantize pass feeds the role and it imposes no q8_1
 /// layout on a buffer it shares with vendored siblings.
 fn gemm_dq_ty(quant: crate::kernels::cuda::resident::matvec_q::QuantType) -> bool {
-    matches!(quant, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
+    matches!(
+        quant,
+        QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
+    ) || quant.is_codebook_dense()
 }
 
 /// The per-launch FIFI_DELTA_TRACE probe, cached: every projection launch would

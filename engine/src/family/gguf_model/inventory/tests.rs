@@ -443,6 +443,17 @@ fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
                         GgufType::Q40,
                         GgufType::Q6K,
                         GgufType::Q80,
+                        GgufType::Iq4Nl,
+                        GgufType::Iq4Xs,
+                        GgufType::Iq2Xxs,
+                        GgufType::Iq2Xs,
+                        GgufType::Iq2S,
+                        GgufType::Iq3Xxs,
+                        GgufType::Iq3S,
+                        GgufType::Iq1S,
+                        GgufType::Iq1M,
+                        GgufType::Q20,
+                        GgufType::Q2K,
                     ],
                 };
                 assert_eq!(tensor.allowed_types(), want, "tensor {}", tensor.name);

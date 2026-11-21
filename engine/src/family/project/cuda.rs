@@ -722,7 +722,18 @@ impl CudaProjector {
                 | GgufType::Q80
                 | GgufType::Q50
                 | GgufType::Q5K
-                | GgufType::Q40),
+                | GgufType::Q40
+                | GgufType::Iq4Nl
+                | GgufType::Iq4Xs
+                | GgufType::Iq2Xxs
+                | GgufType::Iq2Xs
+                | GgufType::Iq2S
+                | GgufType::Iq3Xxs
+                | GgufType::Iq3S
+                | GgufType::Iq1S
+                | GgufType::Iq1M
+                | GgufType::Q20
+                | GgufType::Q2K),
                 layout,
             ) => self.upload_quant(weights, tensor, name, ty, layout),
             (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {
@@ -1624,7 +1635,18 @@ fn upload(
             | GgufType::Q80
             | GgufType::Q50
             | GgufType::Q5K
-            | GgufType::Q40),
+            | GgufType::Q40
+            | GgufType::Iq4Nl
+            | GgufType::Iq4Xs
+            | GgufType::Iq2Xxs
+            | GgufType::Iq2Xs
+            | GgufType::Iq2S
+            | GgufType::Iq3Xxs
+            | GgufType::Iq3S
+            | GgufType::Iq1S
+            | GgufType::Iq1M
+            | GgufType::Q20
+            | GgufType::Q2K),
             layout,
         ) => upload_quant(knobs, weights, tensor, ty, layout, slice, mapped),
         (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {

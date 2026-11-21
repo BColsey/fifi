@@ -283,7 +283,7 @@ fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0"
+        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
 }
 
@@ -339,6 +339,25 @@ fn a_q5_k_tensor_opens_the_dense_projection_on_the_native_path() {
 }
 
 #[test]
+fn a_codebook_dense_projection_opens() {
+    let spec = TWO_LAYER_SPEC;
+    for ty in [
+        GgufType::Iq4Nl,
+        GgufType::Iq2S,
+        GgufType::Iq3Xxs,
+        GgufType::Q2K,
+        GgufType::Iq1S,
+    ] {
+        let kvs = metadata("qwen35moe", spec_counts(&spec));
+        let mut tensors = file_tensors(&spec);
+        replace(&mut tensors, "blk.1.attn_k.weight", ty, vec![512, 256]);
+        let model = open(&kvs, &tensors, &spec)
+            .unwrap_or_else(|error| panic!("{ty:?} dense projection must open: {error:?}"));
+        assert_eq!(model.plan.tensors().count(), tensors.len(), "{ty:?}");
+    }
+}
+
+#[test]
 fn a_q3_k_tensor_fails_the_open_naming_the_tensor_and_type() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
@@ -352,7 +371,7 @@ fn a_q3_k_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type Q3_K, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0"
+        "gguf model: tensor blk.1.attn_k.weight has type Q3_K, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
 }
 

@@ -84,15 +84,28 @@ const DELTA_ROLES: [Role; 9] = [
 // The vendored projector tiles Q4_K, Q6_K and Q8_0; F16 is allowed nowhere: a tiled
 // tensor in it has no tile kernel, and every other tensor is uploaded as raw F32.
 // The in-house dequant types ride the dense projections only (gemm_dq prefill arm
-// plus the resident matvec decode arm): Q5_K and Q4_0 serve both, so they open.
+// plus the resident matvec decode arm): Q5_K and Q4_0 serve both, so they open, and so do
+// the codebook types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
+// Q2_0) and Q2_K, whose decoders are shared by the decode matvec and the GEMM.
 // Q3_K is held back until its chunk, expert and embedding wiring is qualified;
 // routed experts and the embedding gather stay on the vendored path.
-const DENSE_TILED_TYPES: [GgufType; 5] = [
+const DENSE_TILED_TYPES: [GgufType; 16] = [
     GgufType::Q4K,
     GgufType::Q5K,
     GgufType::Q40,
     GgufType::Q6K,
     GgufType::Q80,
+    GgufType::Iq4Nl,
+    GgufType::Iq4Xs,
+    GgufType::Iq2Xxs,
+    GgufType::Iq2Xs,
+    GgufType::Iq2S,
+    GgufType::Iq3Xxs,
+    GgufType::Iq3S,
+    GgufType::Iq1S,
+    GgufType::Iq1M,
+    GgufType::Q20,
+    GgufType::Q2K,
 ];
 const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
 /// Routed experts run the vendored MMVQ path only: the in-house dequant types have no
