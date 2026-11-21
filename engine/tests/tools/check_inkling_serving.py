@@ -216,7 +216,7 @@ def run_suite(server, args, report):
     require(not trace["truncated"] and not trace["alignment_error"], "incomplete sampler trace")
     compare(ids.count(EOS_ID), 1, "EOS count")
     compare(ids[-1:], [EOS_ID], "terminal sampled token")
-    compare(len(ids), result["usage"]["completion_tokens"] + 1, "EOS excluded from usage")
+    compare(len(ids), result["usage"]["completion_tokens"], "usage includes the sampled EOS")
     compare(request("chat_stream", CHAT_PATH, chat, True), result, "chat stream parity")
 
     limited_chat = chat_body(messages, 3)
