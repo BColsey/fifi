@@ -135,7 +135,7 @@ impl SwiGlu {
         experts: &[u32],
         remapped: &Tensor,
         coalesce_reads: bool,
-    ) -> Result<(Self, ExecutionTensor, crate::kernels::HostPages)> {
+    ) -> Result<(Self, ExecutionTensor, HostPages)> {
         let (pages, packed, local) =
             source.expert_pages(stem, experts, remapped, coalesce_reads)?;
         let (weights, ids) = Self::import_expert_pages(k, &pages, &packed, local)?;
