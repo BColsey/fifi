@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-//! Persistent worker threads for the EXL3 CPU expert kernels.
+//! Persistent CPU worker threads for independent compute chunks.
 //!
 //! WHAT: [`Exl3Pool::run`] executes `chunks` independent calls of one closure, `f(0)` to
 //! `f(chunks - 1)`, across the calling thread and `threads - 1` persistent workers, and returns
@@ -163,6 +163,25 @@ pub struct Exl3Pool {
 impl Exl3Pool {
     /// `threads` counts the calling thread, so `threads - 1` workers are spawned.
     pub fn new(threads: usize, wait: WaitPolicy) -> Result<Self, EngError> {
+        Self::start(threads, wait, "exl3-cpu", "EXL3 CPU pool", None)
+    }
+
+    pub(crate) fn with_worker_stack(
+        threads: usize,
+        wait: WaitPolicy,
+        name: &str,
+        stack_bytes: usize,
+    ) -> Result<Self, EngError> {
+        Self::start(threads, wait, name, name, Some(stack_bytes))
+    }
+
+    fn start(
+        threads: usize,
+        wait: WaitPolicy,
+        worker_name: &str,
+        error_label: &str,
+        stack_bytes: Option<usize>,
+    ) -> Result<Self, EngError> {
         let threads = threads.max(1);
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot {
@@ -183,14 +202,16 @@ impl Exl3Pool {
         };
         for index in 1..threads {
             let worker_shared = Arc::clone(&shared);
-            let spawned = std::thread::Builder::new()
-                .name(format!("exl3-cpu-{index}"))
-                .spawn(move || worker_main(worker_shared));
+            let mut builder = std::thread::Builder::new().name(format!("{worker_name}-{index}"));
+            if let Some(bytes) = stack_bytes {
+                builder = builder.stack_size(bytes);
+            }
+            let spawned = builder.spawn(move || worker_main(worker_shared));
             match spawned {
                 Ok(handle) => pool.workers.push(handle),
                 Err(error) => {
                     return Err(EngError::MemoryPlan(format!(
-                        "EXL3 CPU pool: spawn worker {index}: {error}"
+                        "{error_label}: spawn worker {index}: {error}"
                     )));
                 }
             }
@@ -242,7 +263,7 @@ impl Exl3Pool {
         }
         assert!(
             !job.panicked.load(Ordering::Relaxed),
-            "an EXL3 CPU kernel chunk panicked"
+            "a CPU pool chunk panicked"
         );
     }
 }
