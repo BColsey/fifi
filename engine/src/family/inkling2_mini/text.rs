@@ -262,6 +262,10 @@ impl Decoder {
         })
     }
 
+    pub(super) fn dense_io_snapshot(&self) -> super::timing::DenseIoStats {
+        self.dense.io_snapshot()
+    }
+
     pub fn expert_cache_stats(&self) -> MlxExpertCacheStats {
         match &self.experts {
             Experts::Mlx { cache, .. } => cache.stats(),
@@ -741,6 +745,7 @@ mod tests {
             order.sort_unstable_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
             order
         };
+        assert!(scores.iter().all(|x| x.is_finite()));
         let ranked_scores = top(scores);
         let ranked_reference = top(&reference);
         let [mut dot, mut a2, mut b2, mut delta2, mut max_abs] = [0.0_f64; 5];
@@ -757,12 +762,17 @@ mod tests {
             .iter()
             .filter(|id| ranked_reference.contains(id))
             .count();
+        let cosine = dot / (a2 * b2).sqrt();
+        let rmse = (delta2 / scores.len() as f64).sqrt();
         eprintln!(
-            "Inkling GGUF reference logits top10={ranked_scores:?} oracle_top10={ranked_reference:?} overlap={overlap} cosine={} rmse={} max_abs={max_abs}",
-            dot / (a2 * b2).sqrt(),
-            (delta2 / scores.len() as f64).sqrt(),
+            "Inkling GGUF reference logits top10={ranked_scores:?} oracle_top10={ranked_reference:?} overlap={overlap} cosine={cosine} rmse={rmse} max_abs={max_abs}"
         );
         assert_eq!(ranked_scores[0], ranked_reference[0]);
+        assert!(overlap >= 9, "top-ten logit overlap {overlap}");
+        assert!(
+            cosine >= 0.999,
+            "full-vector logit cosine similarity {cosine}"
+        );
     }
 
     #[test]

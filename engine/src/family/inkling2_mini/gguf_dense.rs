@@ -204,6 +204,11 @@ impl Dense {
         self.mapping.is_some()
     }
 
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn io_snapshot(&self) -> super::timing::DenseIoStats {
+        self.source.dense_io_snapshot()
+    }
+
     pub(super) fn shape(&self, name: &str) -> Result<&[usize], EngError> {
         Ok(&self.entry(name)?.shape)
     }
@@ -215,7 +220,7 @@ impl Dense {
             .header()
             .tensor(&entry.name)
             .expect("validated tensor");
-        let values = self.source.values(tensor)?;
+        let values = self.source.values(tensor, true)?;
         match entry.transform {
             Transform::None => Ok(values),
             transform => {
@@ -253,7 +258,7 @@ impl Dense {
                 .source
                 .project_mapped(&entry.name, rows, input, mapping, entry.mapped_len);
         }
-        self.source.project(&entry.name, 0, rows, input)
+        self.source.project(&entry.name, 0, rows, input, true)
     }
 
     pub(super) fn loop_query(&self, layer: usize, stream: usize) -> Result<Vec<f32>, EngError> {

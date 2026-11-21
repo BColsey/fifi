@@ -241,7 +241,9 @@ fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
         .ok();
 }
 
-fn load_sampling_defaults(config: &EngineConfig) -> Result<(LoadedDefaults, std::path::PathBuf), EngError> {
+fn load_sampling_defaults(
+    config: &EngineConfig,
+) -> Result<(LoadedDefaults, std::path::PathBuf), EngError> {
     let directory = if config.family == inkling2_mini::FAMILY {
         // The publisher pin includes generation_config.json in the tokenizer bundle.
         storage_guard::require_local(&config.tokenizer_dir, "Inkling tokenizer")?;
