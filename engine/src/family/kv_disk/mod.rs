@@ -44,7 +44,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::JoinHandle,
@@ -396,9 +396,8 @@ pub(crate) struct KvDisk {
     /// One read ring per reader thread.
     rings: Vec<ODirectRing>,
     next_id: u64,
-    /// Bytes and milliseconds of the saves that completed, for the write rate.
-    done_bytes: AtomicU64,
-    done_ms: AtomicU64,
+    /// Bytes and milliseconds of the most recent saves that completed, for the write rate.
+    recent_saves: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
     // Held for the lifetime of the cache: the advisory lock names this process the owner.
     _lock: std::fs::File,
 }
@@ -654,8 +653,7 @@ impl KvDisk {
                 writer: Some(writer),
                 rings,
                 next_id: 0,
-                done_bytes: AtomicU64::new(0),
-                done_ms: AtomicU64::new(0),
+                recent_saves: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 _lock: lock,
             },
             report,
@@ -909,21 +907,36 @@ impl KvDisk {
         let events: Vec<WriteEvent> = self.events.try_iter().collect();
         for event in &events {
             if let WriteEvent::Done { bytes, ms, .. } = event {
-                self.done_bytes.fetch_add(*bytes, Ordering::Relaxed);
-                self.done_ms
-                    .fetch_add(ms.round().max(1.0) as u64, Ordering::Relaxed);
+                self.record_save(*bytes, ms.round().max(1.0) as u64);
             }
         }
         events
     }
 
-    /// The measured write rate in bytes per second, from the saves that completed: their bytes
-    /// over the time from their start to their report, syncs and publication included. `None`
-    /// until 16 MiB have completed. Aborted saves do not count.
+    /// Notes a completed save of `bytes` that took `ms` from its start to its report.
+    fn record_save(&self, bytes: u64, ms: u64) {
+        let mut recent = self
+            .recent_saves
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        recent.push_back((bytes, ms));
+        while recent.len() > RECENT_SAVES {
+            recent.pop_front();
+        }
+    }
+
+    /// The write rate in bytes per second that a stop plans with, from the most recent saves that
+    /// completed (bytes over the time from their start to their report, syncs and publication
+    /// included; aborted saves do not count). The lower of the rate over the last
+    /// `RECENT_SAVES` saves and the rate of the newest save, so a disk that has just slowed down
+    /// is believed at once and one that has just sped up is not; never below `WRITE_RATE_FLOOR`.
+    /// `None` until 16 MiB have completed, which is when the assumed rate applies.
     pub(crate) fn write_rate(&self) -> Option<f64> {
-        let bytes = self.done_bytes.load(Ordering::Relaxed);
-        let ms = self.done_ms.load(Ordering::Relaxed);
-        (bytes >= 16 << 20 && ms > 0).then(|| bytes as f64 / (ms as f64 / 1e3))
+        let recent = self
+            .recent_saves
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        rate_of_recent_saves(recent.iter())
     }
 
     /// Whether no save is in flight.
@@ -1420,13 +1433,38 @@ pub(crate) fn spill_candidates(entries: usize, retained: usize) -> usize {
         .min(entries)
 }
 
+/// How many of the newest completed saves the write rate is read from.
+const RECENT_SAVES: usize = 4;
+
+/// The lowest write rate a stop plans with, in bytes per second.
+pub(crate) const WRITE_RATE_FLOOR: f64 = 1e6;
+
+/// The write rate from `saves` (bytes, milliseconds; oldest first): see `KvDisk::write_rate`.
+pub(crate) fn rate_of_recent_saves<'a>(
+    saves: impl IntoIterator<Item = &'a (u64, u64)>,
+) -> Option<f64> {
+    let saves: Vec<&(u64, u64)> = saves.into_iter().collect();
+    let bytes: u64 = saves.iter().map(|save| save.0).sum();
+    let ms: u64 = saves.iter().map(|save| save.1).sum();
+    if bytes < 16 << 20 || ms == 0 {
+        return None;
+    }
+    let over_all = bytes as f64 / (ms as f64 / 1e3);
+    let newest = saves.last().filter(|save| save.1 > 0 && save.0 >= 1 << 20);
+    let rate = newest.map_or(over_all, |&&(bytes, ms)| {
+        over_all.min(bytes as f64 / (ms as f64 / 1e3))
+    });
+    Some(rate.max(WRITE_RATE_FLOOR))
+}
+
 /// The write rate assumed before one is measured, in bytes per second: a busy shared disk,
 /// measured at 25 to 40 MB/s for a verified write during a build.
 pub(crate) const ASSUMED_WRITE_RATE: f64 = 20e6;
 
 /// How long a graceful stop waits for `remaining` bytes of tip saves: the time they need at the
-/// measured write rate (or the assumed one) three times over, which covers the copy out of
-/// memory and the syncs the busy-time rate leaves out, and 10 s more, between 15 s and 300 s.
+/// write rate of the most recent saves (or the assumed one before any) three times over, which
+/// covers the copy out of memory and the syncs the busy-time rate leaves out, and 10 s more,
+/// between 15 s and 300 s.
 pub(crate) fn drain_bound(remaining: u64, rate: Option<f64>) -> Duration {
     let rate = rate
         .filter(|rate| rate.is_finite() && *rate > 0.0)

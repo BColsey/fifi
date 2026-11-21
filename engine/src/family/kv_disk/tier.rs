@@ -339,7 +339,7 @@ impl DiskTier {
 
     /// The disk half of a graceful stop: `tips` are the entries only in memory, newest first.
     /// Waiting spills that are tips stay (behind them), anything else is dropped. Pumps the
-    /// writer until it is done, the bound from `bound_of(remaining bytes, measured rate)` passes
+    /// writer until it is done, the bound from `bound_of(remaining bytes, recent write rate)` passes
     /// or `hurry` is set.
     pub(crate) fn drain(
         &mut self,
@@ -398,7 +398,7 @@ impl DiskTier {
             bound.as_secs_f64(),
             rate.map_or_else(
                 || format!("an assumed {:.0} MB/s", ASSUMED_WRITE_RATE / 1e6),
-                |rate| format!("the measured {:.0} MB/s", rate / 1e6)
+                |rate| format!("{:.1} MB/s, the rate of its last saves", rate / 1e6)
             )
         );
         let began = Instant::now();

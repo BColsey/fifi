@@ -735,6 +735,31 @@ fn the_drain_bound_follows_the_remaining_bytes_and_the_write_rate() {
 }
 
 #[test]
+fn the_write_rate_follows_the_recent_saves_and_the_slower_of_two_readings() {
+    const MIB: u64 = 1 << 20;
+    // Nothing to read from before 16 MiB have completed: the assumed rate applies.
+    assert_eq!(rate_of_recent_saves(&[]), None);
+    assert_eq!(rate_of_recent_saves(&[(8 * MIB, 100)]), None);
+    // 100 MiB in one second.
+    let fast = (100 * MIB, 1_000);
+    let rate = rate_of_recent_saves(&[fast]).unwrap();
+    assert!((rate - 104_857_600.0).abs() < 1.0, "{rate}");
+    // A disk that slowed after fast saves: the newest save's rate rules, not the average.
+    let slow = (10 * MIB, 10_000);
+    let rate = rate_of_recent_saves(&[fast, fast, slow]).unwrap();
+    assert!((rate - 1_048_576.0).abs() < 1.0, "{rate}");
+    // A disk that sped up after slow saves: the average of the recent saves rules.
+    let rate = rate_of_recent_saves(&[slow, slow, fast]).unwrap();
+    let average = (120 * MIB) as f64 / 21.0;
+    assert!((rate - average).abs() < 1.0, "{rate} {average}");
+    // Never below the floor.
+    let crawl = (20 * MIB, 100_000_000);
+    assert_eq!(rate_of_recent_saves(&[crawl]), Some(WRITE_RATE_FLOOR));
+    // The bound planned from a slow measured rate is the capped wait.
+    assert_eq!(drain_bound(900_000_000, Some(1.1e6)).as_secs(), 300);
+}
+
+#[test]
 fn the_writer_reports_a_measured_rate_after_a_save() {
     let dir = tempfile::tempdir().unwrap();
     let (mut cache, _) = KvDisk::open(&dir.path().join("c"), 1 << 30, &load("w")).unwrap();
