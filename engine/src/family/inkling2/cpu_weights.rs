@@ -1,4 +1,7 @@
-//! Read-only weight access for the Inkling short-context CPU reference.
+//! Read-only weight access for the Inkling short-context reference.
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+use super::cuda_projection::{CudaProjection, DenseUpload};
 
 use std::{ops::Range, path::Path};
 
@@ -17,6 +20,34 @@ pub(super) struct Weights {
     metadata: ShardReader,
     mapping: MappedFile,
     isa: Isa,
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    cuda: Option<CudaProjection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertPacking {
+    Nvfp4,
+    Mxfp8,
+}
+
+impl ExpertPacking {
+    pub(super) fn lengths(self, [rows, cols]: [usize; 2]) -> Option<[usize; 2]> {
+        let elements = rows.checked_mul(cols)?;
+        let (group, stride) = match self {
+            Self::Nvfp4 => (16, 2),
+            Self::Mxfp8 => (32, 1),
+        };
+        (rows > 0 && cols > 0 && cols.is_multiple_of(group))
+            .then_some([elements / stride, elements / group])
+    }
+}
+
+pub(super) struct ExpertMatrix<'a> {
+    pub(super) codes: &'a [u8],
+    pub(super) scales: &'a [u8],
+    pub(super) packing: ExpertPacking,
+    pub(super) shape: [usize; 2],
+    pub(super) outer: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -59,7 +90,48 @@ impl Weights {
             metadata,
             mapping,
             isa: Isa::detect(),
+            #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+            cuda: None,
         })
+    }
+
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn enable_cuda(&mut self, spec: &TextSpec) -> Result<(), EngError> {
+        self.cuda = Some(CudaProjection::load(self, spec)?);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn dense_uploads(&self, spec: &TextSpec) -> Result<Vec<DenseUpload<'_>>, EngError> {
+        let mut uploads = Vec::new();
+        for (name, tensor) in self.metadata.tensors() {
+            let [rows, cols] = tensor.shape() else {
+                continue;
+            };
+            if tensor.dtype() != "BF16"
+                || !name.starts_with("model.llm.")
+                || !(name.ends_with("weight") || name.ends_with(".weight_proj"))
+                || name == "model.llm.embed.weight"
+            {
+                continue;
+            }
+            let rows = if name == "model.llm.unembed.weight" {
+                spec.unpadded_vocab_size
+            } else {
+                *rows
+            };
+            let shape = [rows as usize, *cols as usize];
+            let length = shape[0]
+                .checked_mul(shape[1])
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| bad(format!("dense byte count overflows for {name}")))?;
+            let codes = self
+                .bytes(name)?
+                .get(..length)
+                .ok_or_else(|| bad(format!("dense projection escapes the tensor {name}")))?;
+            uploads.push(DenseUpload { name, codes, shape });
+        }
+        Ok(uploads)
     }
 
     fn bytes(&self, name: &str) -> Result<&[u8], EngError> {
@@ -120,6 +192,12 @@ impl Weights {
                 "{name} projection dimensions disagree with its input or output"
             )));
         }
+        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        if let Some(cuda) = &self.cuda
+            && data.width == 2
+        {
+            return cuda.project(name, [rows, x.len()], x);
+        }
         let bytes_per_row = data.width * x.len();
         Ok(data
             .bytes
@@ -149,23 +227,88 @@ impl Weights {
         input: &Activation,
         x: &[f32],
     ) -> Result<Vec<f32>, EngError> {
+        let weights = self.expert_matrix(name, expert)?;
+        if x.len() != weights.shape[1] {
+            return Err(bad(format!("invalid packed expert input for {name}")));
+        }
+        if weights.outer == 0.0 {
+            return Ok(vec![0.0; weights.shape[0]]);
+        }
+        #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+        if let Some(cuda) = &self.cuda {
+            return cuda.expert(&weights, x);
+        }
+        match weights.packing {
+            ExpertPacking::Nvfp4 => {
+                let [rows, cols] = weights.shape;
+                let mut output = vec![0.0; rows];
+                Nvfp4Matrix::new(weights.codes, weights.scales, weights.outer, rows, cols)
+                    .and_then(|matrix| matrix.matvec_activation(self.isa, input, &mut output))
+                    .map_err(|error| bad(format!("{name}: {error}")))?;
+                Ok(output)
+            }
+            ExpertPacking::Mxfp8 => weights
+                .codes
+                .chunks_exact(x.len())
+                .zip(weights.scales.chunks_exact(x.len() / 32))
+                .map(|(row, scales)| mxfp8_dot(row, scales, x))
+                .collect(),
+        }
+    }
+
+    pub(super) fn expert_matrix(
+        &self,
+        name: &str,
+        expert: usize,
+    ) -> Result<ExpertMatrix<'_>, EngError> {
         let tensor = self
             .metadata
             .tensor(name)
             .ok_or_else(|| bad(format!("missing {name}")))?;
-        let [experts, rows, cols] = tensor.shape() else {
+        let [experts, rows, stored_cols] = tensor.shape() else {
             return Err(bad(format!("{name} must have expert, row and column axes")));
         };
         if expert >= *experts as usize {
             return Err(bad(format!("expert {expert} escapes {name}")));
         }
-        let rows = *rows as usize;
-        let cols = *cols as usize;
-        match tensor.dtype() {
-            "U8" => self.nvfp4_expert(name, expert, input, rows, cols),
-            "F8_E4M3" => self.mxfp8_expert(name, expert, x, rows, cols),
-            _ => Err(bad(format!("unsupported expert precision for {name}"))),
+        let (packing, cols, outer) = match tensor.dtype() {
+            "U8" => (
+                ExpertPacking::Nvfp4,
+                stored_cols
+                    .checked_mul(2)
+                    .ok_or_else(|| bad("packed width overflows"))?,
+                self.outer_scale(name, expert)?,
+            ),
+            "F8_E4M3" => (ExpertPacking::Mxfp8, *stored_cols, 1.0),
+            _ => return Err(bad(format!("unsupported expert precision for {name}"))),
+        };
+        let shape = [*rows as usize, cols as usize];
+        let [code_bytes, scale_bytes] = packing
+            .lengths(shape)
+            .ok_or_else(|| bad(format!("invalid packed expert geometry for {name}")))?;
+        Ok(ExpertMatrix {
+            codes: self.expert_slice(name, expert, code_bytes)?,
+            scales: self.expert_slice(&format!("{name}_scale"), expert, scale_bytes)?,
+            packing,
+            shape,
+            outer,
+        })
+    }
+
+    fn outer_scale(&self, name: &str, expert: usize) -> Result<f32, EngError> {
+        let amax = self.row(&format!("{name}_amax"), expert, 1)?[0];
+        let divisor = self.vec(&format!("{name}_outer_scale_denominator"), 1)?[0];
+        let scale = amax / divisor;
+        if !amax.is_finite()
+            || amax < 0.0
+            || !divisor.is_finite()
+            || divisor <= 0.0
+            || !scale.is_finite()
+            || (scale == 0.0 && amax != 0.0)
+        {
+            return Err(bad(format!("invalid NVFP4 outer scale for {name}")));
         }
+        Ok(scale)
     }
 
     fn expert_slice(&self, name: &str, expert: usize, len: usize) -> Result<&[u8], EngError> {
@@ -178,51 +321,6 @@ impl Weights {
         self.bytes(name)?
             .get(start..end)
             .ok_or_else(|| bad(format!("expert {expert} escapes {name}")))
-    }
-
-    fn nvfp4_expert(
-        &self,
-        name: &str,
-        expert: usize,
-        input: &Activation,
-        rows: usize,
-        packed_cols: usize,
-    ) -> Result<Vec<f32>, EngError> {
-        let packed = self.expert_slice(name, expert, rows * packed_cols)?;
-        let scales = self.expert_slice(&format!("{name}_scale"), expert, rows * packed_cols / 8)?;
-        let amax = self.row(&format!("{name}_amax"), expert, 1)?[0];
-        let divisor = self.vec(&format!("{name}_outer_scale_denominator"), 1)?[0];
-        if !amax.is_finite() || amax < 0.0 || !divisor.is_finite() || divisor <= 0.0 {
-            return Err(bad(format!("invalid NVFP4 outer scale for {name}")));
-        }
-        let mut y = vec![0.0; rows];
-        if amax == 0.0 {
-            return Ok(y);
-        }
-        Nvfp4Matrix::new(packed, scales, amax / divisor, rows, packed_cols * 2)
-            .and_then(|matrix| matrix.matvec_activation(self.isa, input, &mut y))
-            .map_err(|error| bad(format!("{name}: {error}")))?;
-        Ok(y)
-    }
-
-    fn mxfp8_expert(
-        &self,
-        name: &str,
-        expert: usize,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-    ) -> Result<Vec<f32>, EngError> {
-        if cols != x.len() || !cols.is_multiple_of(32) {
-            return Err(bad(format!("invalid MXFP8 input for {name}")));
-        }
-        let packed = self.expert_slice(name, expert, rows * cols)?;
-        let scales = self.expert_slice(&format!("{name}_scale"), expert, rows * cols / 32)?;
-        packed
-            .chunks_exact(cols)
-            .zip(scales.chunks_exact(cols / 32))
-            .map(|(row, scales)| mxfp8_dot(row, scales, x))
-            .collect()
     }
 }
 

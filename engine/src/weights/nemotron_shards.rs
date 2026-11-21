@@ -108,6 +108,18 @@ impl NemotronShardReader {
         self.tensors.get(name)
     }
 
+    #[cfg(all(
+        test,
+        feature = "native-cuda",
+        target_os = "linux",
+        target_pointer_width = "64"
+    ))]
+    pub(crate) fn tensors(&self) -> impl Iterator<Item = (&str, &NemotronShardTensor)> {
+        self.tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+    }
+
     pub(crate) fn tensor_count(&self) -> usize {
         self.tensors.len()
     }

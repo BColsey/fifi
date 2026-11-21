@@ -550,6 +550,23 @@ unsafe extern "C" {
         workspace: *const WorkspaceRaw,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[cfg(test)]
+    #[link_name = "inference_cuda_mxfp8_gemv_ws"]
+    #[allow(clippy::too_many_arguments, reason = "mirrors native/f8_gemv.h")]
+    fn mxfp8_gemv_ws_raw(
+        codes: *const c_void,
+        codes_bytes: usize,
+        scales: *const c_void,
+        scales_bytes: usize,
+        rows: usize,
+        columns: usize,
+        x: *const f32,
+        x_bytes: usize,
+        y: *mut f32,
+        y_bytes: usize,
+        workspace: *const WorkspaceRaw,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_nvfp4_gemv_ws"]
     #[allow(clippy::too_many_arguments, reason = "mirrors native/nvfp4_gemv.h")]
     fn nvfp4_gemv_ws_raw(
@@ -1540,6 +1557,54 @@ pub(super) fn f8_gemv(
             codes.ptr.as_ptr(),
             codes.bytes,
             weight_scale,
+            shape[0],
+            shape[1],
+            x.as_ptr(),
+            need.x,
+            y.as_mut_ptr(),
+            need.y,
+            &workspace,
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// MXFP8 uses the same workspace as E4M3 F8 and one E8M0 byte per 32 columns.
+#[cfg(test)]
+pub(super) fn mxfp8_gemv(
+    codes: &RawDevice,
+    scales: &RawDevice,
+    shape: [usize; 2],
+    work: Work<'_>,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), DeviceFailure> {
+    let (codes_bytes, need) = f8_matvec_bytes(shape).ok_or_else(invalid_argument)?;
+    if codes.bytes != codes_bytes
+        || !shape[1].is_multiple_of(32)
+        || scales.bytes != codes_bytes / 32
+        || x.len() != shape[1]
+        || y.len() != shape[0]
+        || !x.iter().all(|value| value.is_finite())
+        || codes.ptr == scales.ptr
+        || codes.ptr == work.device.ptr
+        || scales.ptr == work.device.ptr
+    {
+        return Err(invalid_argument());
+    }
+
+    let workspace = workspace_raw(&work, need).ok_or_else(invalid_argument)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the checked extents and distinct device allocations bound both weight
+    // regions. workspace_raw validates the aligned, disjoint scratch regions, and
+    // the synchronous call borrows x and y for exactly their checked extents.
+    let status = unsafe {
+        mxfp8_gemv_ws_raw(
+            codes.ptr.as_ptr(),
+            codes.bytes,
+            scales.ptr.as_ptr(),
+            scales.bytes,
             shape[0],
             shape[1],
             x.as_ptr(),

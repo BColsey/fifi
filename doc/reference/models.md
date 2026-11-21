@@ -7,7 +7,7 @@
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | opt-in | Not validated end to end; A `native-cuda` Linux build serves it on the card unless `flash_next.cuda_decode` is false. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
-| `inkling2_loop` | Inkling 2 Mini | staged | staged | `enginesrv check` validates the [published ModelOpt checkpoint](https://huggingface.co/thinkingmachines/Inkling-2-Mini) and estimates BF16 KV storage for the fixed loop. Generation is pending. |
+| `inkling2_loop` | Inkling 2 Mini | CPU pilot | projection tests | Native ModelOpt safetensors and tokenizer files from the [pinned release](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7). |
 | `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
@@ -18,6 +18,12 @@ On CUDA, any `.gguf` conversion of Qwen3.6-35B-A3B in `model_dir` serves (the la
 For CUDA GGUF, `qwen36.gguf_sha256` binds startup to an expected full-file digest, including an alternate checkpoint admitted by that switch.
 See [content pinning](configuration.md#gguf-content-pinning-cuda).
 A content pin does not qualify another quantization or checkpoint for quality.
+
+## Inkling 2 Mini
+
+On a 64-bit build, set `FIFI_INKLING_CPU_REFERENCE=1` and choose family `inkling2_loop` in the `enginesrv` configuration. Use the pinned release directory for `model_dir` and `tokenizer_dir`. The CPU pilot supports raw completions and plain-text chat, with one active sequence and at most 128 tokens including the prompt.
+
+`enginesrv check` inspects the safetensors inventory and reports the BF16 KV storage plan for the fixed loop. With the CPU pilot enabled it also checks the pinned tokenizer and the short-context settings used for serving. The pilot uses F32 KV.
 
 ## Tokenizer files
 
@@ -33,6 +39,7 @@ For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4b
 | GGUF with F16, Q4_K, Q5_0, Q6_K and Q8_0 tensors | Qwen3.6 on CUDA |
 | EXL3 | Qwen3.6 and Flint on CUDA |
 | NVFP4 safetensors | Nemotron 3.5 Super |
+| Mixed NVFP4 and MXFP8 safetensors | Inkling 2 Mini |
 
 ## Context limits
 

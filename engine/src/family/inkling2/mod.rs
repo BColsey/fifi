@@ -7,6 +7,13 @@ mod cpu_attention;
 mod cpu_forward;
 #[cfg(target_pointer_width = "64")]
 mod cpu_weights;
+#[cfg(all(
+    test,
+    feature = "native-cuda",
+    target_os = "linux",
+    target_pointer_width = "64"
+))]
+mod cuda_projection;
 #[cfg(target_pointer_width = "64")]
 mod serve;
 

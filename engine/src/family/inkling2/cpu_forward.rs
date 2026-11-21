@@ -585,6 +585,18 @@ fn depth_mix_can_exclude_the_first_core_boundary() {
 #[test]
 #[ignore = "requires the native Inkling 2 Mini safetensors checkpoint"]
 fn native_cpu_logits() {
+    logits_probe(|_| ());
+}
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+#[test]
+#[ignore = "requires a leased CUDA device and the native Mini checkpoint"]
+fn native_cuda_logits() {
+    logits_probe(|model| model.weights.enable_cuda(&model.spec).unwrap());
+}
+
+#[cfg(test)]
+fn logits_probe(prepare: impl FnOnce(&mut CpuForward)) {
     use std::{
         env,
         io::{BufWriter, Write},
@@ -601,6 +613,7 @@ fn native_cpu_logits() {
         .collect::<Vec<_>>();
     let last_only = env::var_os("FIFI_INKLING_LAST_LOGITS_ONLY").is_some();
     let mut model = CpuForward::open(Path::new(&directory), tokens.len()).unwrap();
+    prepare(&mut model);
     let mut output = BufWriter::new(fs::File::create(output).unwrap());
     let last_index = tokens.len() - 1;
     for (index, token) in tokens.into_iter().enumerate() {

@@ -1049,6 +1049,60 @@ impl CudaContext {
         Ok(y)
     }
 
+    /// Projects through E4M3FN codes with an E8M0 exponent for each block of 32.
+    #[cfg(test)]
+    pub(crate) fn mxfp8_matvec(
+        &self,
+        codes: &DeviceBuffer,
+        scales: &DeviceBuffer,
+        shape: [usize; 2],
+        x: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        self.ensure_usable()?;
+        let codes_raw = self.owned(codes)?;
+        let scales_raw = self.owned(scales)?;
+        let invalid = || {
+            EngError::BadRequest(
+                "cuda MXFP8 matvec: expected packed codes, block scales, and finite activations"
+                    .into(),
+            )
+        };
+        let (codes_bytes, need) = native::f8_matvec_bytes(shape).ok_or_else(invalid)?;
+        if !shape[1].is_multiple_of(32)
+            || codes.bytes() != codes_bytes
+            || scales.bytes() != codes_bytes / 32
+            || x.len() != shape[1]
+            || !x.iter().all(|value| value.is_finite())
+        {
+            return Err(invalid());
+        }
+        let mut y = host_floats(shape[0])?;
+        let _dispatch = self.enter()?;
+        let mut workspace = self
+            .workspace
+            .try_borrow_mut()
+            .map_err(|_| workspace_in_use())?;
+        self.reserve_workspace(&mut workspace, need)?;
+        self.ensure_usable()?;
+        let device = self.owned(&workspace.buffer)?;
+        native::mxfp8_gemv(
+            codes_raw,
+            scales_raw,
+            shape,
+            workspace.work(device),
+            x,
+            &mut y,
+        )
+        .map_err(|failure| {
+            if failure.status == native::STATUS_INVALID_ARGUMENT {
+                invalid()
+            } else {
+                device_error(failure)
+            }
+        })?;
+        Ok(y)
+    }
+
     /// Projects one finite host row and returns the lowest index holding the
     /// largest logit, with its value. The device reduces the row, so the host
     /// receives 8 bytes instead of the whole vocabulary.
