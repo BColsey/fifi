@@ -691,7 +691,10 @@ impl ExecutorOps for FlashExecutor {
         let decoder = &mut self.decoder;
         let FlashSession { state, core } = st;
         core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
-            decoder.restore(state, snapshot)
+            decoder.restore(state, snapshot)?;
+            #[cfg(feature = "native-fault-qualification")]
+            super::stream_timing::record_prefix_restore(snapshot.pos(), snapshot.charged_bytes());
+            Ok(())
         })
     }
 }

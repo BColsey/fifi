@@ -78,6 +78,9 @@ fn run(
     let mut ple_ring = None;
     let mut layers = Vec::with_capacity(old.len());
     let mut records = Vec::new();
+    #[cfg(feature = "native-fault-qualification")]
+    let mut routes = (mode == StepMode::Logits && super::stream_timing::capture_decode_routes())
+        .then(|| Vec::<Vec<u32>>::with_capacity(weights.layers.len()));
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
         if index == shape.ple_layer {
             let out = ple::block(
@@ -133,6 +136,10 @@ fn run(
             &mut decoder.slots,
             &read.mixed,
         )?;
+        #[cfg(feature = "native-fault-qualification")]
+        if let Some(routes) = &mut routes {
+            routes.push(selection.0.iter().map(|&(expert, _)| expert).collect());
+        }
         // Tests only: the S3 route recorder keeps the host selection of each layer.
         #[cfg(test)]
         if let Some(trace) = decoder.route_trace.as_mut() {
@@ -222,6 +229,10 @@ fn run(
         None => None,
     };
     state.commit(layers, ple_ring, start.history, permit)?;
+    #[cfg(feature = "native-fault-qualification")]
+    if let Some(routes) = routes {
+        super::stream_timing::record_decode_routes(pos, &routes);
+    }
     Ok(StepResult {
         token: token_out,
         logits: logits_out,
