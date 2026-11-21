@@ -2907,7 +2907,10 @@ impl<'a> QwenResidentStep<'a> {
             let bytes = f32_bytes(sampler_vocab)?;
             let out = &mut self.logits_bytes[..bytes];
             row.buffer().read_at(&self.stream, row.offset(), out)?;
-            Ok(self.logits_values())
+            // The padded head rows beyond the sampler vocabulary are not candidates.
+            let mut values = self.logits_values();
+            values.truncate(sampler_vocab);
+            Ok(values)
         })
     }
 
