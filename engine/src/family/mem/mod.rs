@@ -16,6 +16,9 @@
 // The host facts exist on every target: `/proc` and the cgroup tree on Linux, the unified memory
 // of `unified` on a Mac.
 mod host;
+pub(crate) mod layer_rung;
+#[cfg(test)]
+mod layer_rung_real_tests;
 mod unified;
 
 // The Mac half of the facts: unified-memory fractions, Metal's working set and the expert bytes
