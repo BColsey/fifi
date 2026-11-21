@@ -420,9 +420,35 @@ phase. The last counts the packed or expanded weights staged for Metal,
 including weights served from the retained RAM tier. Use the benchmark's
 process-attributed disk counter to check physical SSD reads.
 
+### Packed GGUF attention projections
+
+`FIFI_INKLING_GGUF_PACKED_DOT=1` selects direct Q6_K and Q8_0 row dots
+for mapped GGUF weights. The packed rows preserve the FP32 accumulation
+order. The buffered reference and mapped path produced bitwise-equal
+logits on both complete UD-IQ2_XXS GGUF layouts.
+
+`FIFI_INKLING_GGUF_Q8_ACTIVATIONS=1` quantizes inputs to mapped Q8_0
+projections in 32-value groups using the shared CPU quantizer. This
+experiment requires AArch64 dot-product support. Both settings are
+default-off.
+
+At `db08682e`, the M4 mini served a five-token prompt with four output
+tokens using the mainline UD-IQ2_XXS GGUF, a 192-token context, and the
+6 GiB working-set cap. With packed rows selected in both arms, the warm
+repeat reached a first token in 3.61 s with FP32 activations and 2.09 s
+with Q8 activations. Decode rose from 0.98 to 1.37 tok/s. The two runs
+returned identical text and recorded zero logical expert bytes, physical
+SSD bytes, and swap-outs on the repeats. Both arms passed the idle-host
+audit.
+
+A separate comparison at five matched token positions measured mean
+KLD of 0.00107 nats against FP32 activations on the same GGUF. Four of the
+five positions retained the same top token. Quality and throughput over
+longer prompts are pending.
+
 ## Integration status
 
-The benchmark measurements used `e9f74c2b` on integration base `ee830759` with the measured settings selected explicitly. The newer local defaults enable native selection, CPU attention workers, and the qualified GGUF settings. Safetensors mapped storage and multi-row prefill remain explicit settings because their physical I/O gains varied by workload. Integration and publication are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
+The initial benchmark measurements used `e9f74c2b` on integration base `ee830759` with the measured settings selected explicitly. The newer defaults enable native selection, CPU attention workers, and the qualified GGUF settings. Safetensors mapped storage and multi-row prefill remain explicit settings because their physical I/O gains varied by workload. Integration is pending review. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
 
 On `b2b51d94`, normal CLI serving with no performance overrides returned the same two greedy 12-token responses as the qualified build on all three artifacts. The M4 mini admitted 5 GiB for safetensors and 6 GiB for GGUF with zero swap-outs during the requests. Repeat decode measured 1.68 tok/s for safetensors, 0.98 tok/s for the GGUF fork, and 0.97 tok/s for mainline GGUF. The runs used an uncontrolled OS page cache. Preflight also verified the explicit ceiling override, backend disable settings, and a fitting longer context with cache retention reduced to zero.
 
