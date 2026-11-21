@@ -15,6 +15,7 @@ use crate::{
     weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
 };
 
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) const DENSE_MAPPING_ENV: &str = "FIFI_INKLING_GGUF_MMAP_DENSE";
 const ROWS_PER_READ: usize = 256;
 pub(super) const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
