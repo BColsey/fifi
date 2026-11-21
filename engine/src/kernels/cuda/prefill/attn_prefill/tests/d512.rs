@@ -663,3 +663,508 @@ fn d512_report_ms() {
         println!("{line}");
     }
 }
+
+// ---- structured values: a lost or repeated key changes the output visibly ------------------
+
+/// The scale of every structured plane: a power of two, exact in f16, bf16 and f32.
+const STRUCT_SCALE: f32 = 0.0625;
+
+/// The V code at (position, kv head, dim): a small integer that differs for every position,
+/// head and dimension pattern, so any key a call drops, repeats or reads from the wrong row
+/// moves the mean of its row.
+fn v_code(pos: usize, head: usize, dim: usize, signed: bool) -> i32 {
+    let c = ((pos * 7 + dim * 3 + head * 11) % 31) as i32;
+    if signed { c - 15 } else { c }
+}
+
+fn v_value(pos: usize, head: usize, dim: usize, signed: bool) -> f64 {
+    f64::from(STRUCT_SCALE) * f64::from(v_code(pos, head, dim, signed))
+}
+
+/// The device planes of a structured cache: K codes all 3, V codes by `v_code` of the position
+/// each row holds (`None`: bytes no row may read), power-of-two scales in `dtype`.
+struct StructPlanes {
+    codes: [DeviceBuffer; 2],
+    scales: [DeviceBuffer; 2],
+    layout: AttnKvLayout,
+    cells: usize,
+    origin: usize,
+}
+
+fn scalar_bytes(dtype: Dtype) -> Vec<u8> {
+    match dtype {
+        Dtype::F16 => f16_bits(STRUCT_SCALE).to_le_bytes().to_vec(),
+        Dtype::Bf16 => ((STRUCT_SCALE.to_bits() >> 16) as u16)
+            .to_le_bytes()
+            .to_vec(),
+        _ => STRUCT_SCALE.to_le_bytes().to_vec(),
+    }
+}
+
+fn struct_planes(
+    ctx: &CudaContext,
+    cells: usize,
+    position_of_row: &dyn Fn(usize) -> Option<usize>,
+    signed: bool,
+    dtype: Dtype,
+    origin: usize,
+) -> StructPlanes {
+    let width = scalar_bytes(dtype).len();
+    let layout = AttnKvLayout {
+        storage: AttnKvStorage::Q8Affine {
+            group_size: 32,
+            signed,
+        },
+        payload_strides: AttnStrides {
+            time_stride_bytes: WIDE,
+            head_stride_bytes: cells * WIDE,
+        },
+        scales: Some(AttnScalarLayout {
+            dtype,
+            strides: AttnStrides {
+                time_stride_bytes: GROUPS * width,
+                head_stride_bytes: cells * GROUPS * width,
+            },
+            group_stride_bytes: width,
+        }),
+        bias: None,
+    };
+    let mut k = vec![0u8; origin];
+    let mut v = vec![0u8; origin];
+    for head in 0..KV_HEADS {
+        for row in 0..cells {
+            for dim in 0..WIDE {
+                k.push(3);
+                v.push(match position_of_row(row) {
+                    Some(pos) => v_code(pos, head, dim, signed) as i8 as u8,
+                    None => 0x55,
+                });
+            }
+        }
+    }
+    let scale = scalar_bytes(dtype);
+    let scales: Vec<u8> = (0..KV_HEADS * cells * GROUPS)
+        .flat_map(|_| scale.iter().copied())
+        .collect();
+    let pad = |mut bytes: Vec<u8>| {
+        bytes.resize(bytes.len() + 64, 0);
+        bytes
+    };
+    StructPlanes {
+        codes: [
+            testkit::upload_bytes(ctx, &pad(k)),
+            testkit::upload_bytes(ctx, &pad(v)),
+        ],
+        scales: [
+            testkit::upload_bytes(ctx, &scales),
+            testkit::upload_bytes(ctx, &scales),
+        ],
+        layout,
+        cells,
+        origin,
+    }
+}
+
+impl StructPlanes {
+    fn views(&self) -> Result<[AttnKvView<'_>; 2], EngError> {
+        let extents = self.layout.extents(self.cells, KV_HEADS, WIDE)?;
+        let view = |p: usize| -> Result<AttnKvView<'_>, EngError> {
+            Ok(AttnKvView {
+                layout: self.layout,
+                payload: self.codes[p].range(self.origin, extents.payload_bytes)?,
+                scales: Some(self.scales[p].range(0, extents.scale_bytes.unwrap_or(0))?),
+                bias: None,
+            })
+        };
+        Ok([view(0)?, view(1)?])
+    }
+
+    fn call<'b>(
+        &'b self,
+        shape: AttnPrefillShape,
+        split: CpfAttnSplit,
+        span: CpfAttnSpan,
+        io: &'b Io,
+    ) -> Result<AttnPrefillCall<'b>, EngError> {
+        let views = self.views()?;
+        Ok(AttnPrefillCall {
+            storage: self.layout.storage,
+            shape,
+            span,
+            split,
+            q_tile: CPF_ATTN_Q_TILE,
+            scale: 1.0,
+            q: io.q.range(0, io.out_bytes)?,
+            proj: None,
+            k_cache: views[0].payload,
+            v_cache: views[1].payload,
+            kv_views: Some(views),
+            part: io.part.range(0, io.part_bytes)?,
+            out: io.out.range(0, io.out_bytes)?,
+            status: Some(io.status.range(0, 4)?),
+            sinks: None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StructCase {
+    p0: usize,
+    m: usize,
+    window: usize,
+    ring: usize,
+    signed: bool,
+    dtype: Dtype,
+    /// `Some(cut)`: the keys below `cut` and from `cut` on are staged as two segments.
+    cut: Option<usize>,
+}
+
+impl StructCase {
+    fn new(p0: usize, m: usize) -> Self {
+        Self {
+            p0,
+            m,
+            window: 0,
+            ring: 0,
+            signed: true,
+            dtype: Dtype::F16,
+            cut: None,
+        }
+    }
+}
+
+/// The rows a ring cache of `ring` rows holds after a chunk at `p0`: the newest position of
+/// the union of the chunk's windows in each row.
+fn ring_position(row: usize, ring: usize, p0: usize, m: usize, window: usize) -> Option<usize> {
+    let last = p0 + m - 1;
+    let low = (p0 + 1).saturating_sub(window);
+    let pos = last.checked_sub((last + ring - row % ring) % ring)?;
+    (pos >= low && pos % ring == row).then_some(pos)
+}
+
+/// Runs one structured case with q = 0, so every score is 0 and the output of a row is the exact
+/// mean of the V rows it sees: returns the output, the status word and the split used.
+fn run_structured(case: StructCase) -> Result<(Vec<f32>, i32, CpfAttnSplit), EngError> {
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let end = case.p0 + case.m;
+    let span = CpfAttnSpan {
+        window: case.window as i64,
+        ring: case.ring as i64,
+    };
+    let q = vec![0f32; case.m * HEADS * WIDE];
+    let (status, out, split) = if let Some(cut) = case.cut {
+        let low = struct_planes(&ctx, cut, &|row| Some(row), case.signed, case.dtype, 0);
+        let high = struct_planes(
+            &ctx,
+            end - cut,
+            &|row| Some(cut + row),
+            case.signed,
+            case.dtype,
+            0,
+        );
+        let split = CpfAttnSplit {
+            max_splits: 2,
+            min_keys: 256,
+        };
+        let shape_low = shape(case.m, cut, case.p0);
+        let shape_high = shape(case.m, end - cut, case.p0);
+        let io = io(&ctx, &shape_low, split, &q)?;
+        for (planes, shape, origin, rows, index) in [
+            (&low, shape_low, 0, cut, 0),
+            (&high, shape_high, cut, end - cut, 1),
+        ] {
+            ctx.attn_prefill_part(
+                &stream,
+                planes.call(shape, split, span, &io)?,
+                AttnPrefillSegment {
+                    key_origin: origin,
+                    key_rows: rows,
+                    part_index: index,
+                },
+            )?;
+        }
+        ctx.attn_prefill_combine(&stream, low.call(shape_low, split, span, &io)?)?;
+        stream.synchronize()?;
+        read_struct(&ctx, &io, split)
+    } else {
+        let rows = if case.ring > 0 { case.ring } else { end };
+        let planes = if case.ring > 0 {
+            struct_planes(
+                &ctx,
+                rows,
+                &|row| ring_position(row, case.ring, case.p0, case.m, case.window),
+                case.signed,
+                case.dtype,
+                0,
+            )
+        } else {
+            struct_planes(&ctx, rows, &|row| Some(row), case.signed, case.dtype, 0)
+        };
+        let shape = shape(case.m, rows, case.p0);
+        let split = plan(&shape, case.window)?;
+        let io = io(&ctx, &shape, split, &q)?;
+        ctx.attn_prefill(&stream, planes.call(shape, split, span, &io)?)?;
+        stream.synchronize()?;
+        read_struct(&ctx, &io, split)
+    };
+    Ok((out, status, split))
+}
+
+fn read_struct(ctx: &CudaContext, io: &Io, split: CpfAttnSplit) -> (i32, Vec<f32>, CpfAttnSplit) {
+    let status = i32::from_le_bytes(
+        testkit::read_bytes(ctx, &io.status, 4)[..4]
+            .try_into()
+            .expect("the status word"),
+    );
+    (
+        status,
+        testkit::floats(&testkit::read_bytes(ctx, &io.out, io.out_bytes)),
+        split,
+    )
+}
+
+/// Worst per-row error of a structured run, as a fraction of the row's own output magnitude.
+/// `floor` drops the keys below that position from the reference: 0 for the real one, above 0
+/// to show that the bound notices a run that lost its first keys.
+fn structured_error(case: StructCase, out: &[f32], floor: usize) -> f64 {
+    let end = case.p0 + case.m;
+    // Prefix sums over absolute positions, per kv head and dimension.
+    let mut prefix = vec![vec![0f64; (end + 1) * WIDE]; KV_HEADS];
+    for (head, sums) in prefix.iter_mut().enumerate() {
+        for pos in 0..end {
+            for dim in 0..WIDE {
+                sums[(pos + 1) * WIDE + dim] =
+                    sums[pos * WIDE + dim] + v_value(pos, head, dim, case.signed);
+            }
+        }
+    }
+    let mut worst = 0f64;
+    for t in 0..case.m {
+        let pos = case.p0 + t;
+        let low = if case.window > 0 {
+            (pos + 1).saturating_sub(case.window)
+        } else {
+            0
+        }
+        .max(floor)
+        .min(pos);
+        let count = (pos + 1 - low) as f64;
+        for h in 0..HEADS {
+            let head = h / (HEADS / KV_HEADS);
+            let want: Vec<f64> = (0..WIDE)
+                .map(|d| {
+                    (prefix[head][(pos + 1) * WIDE + d] - prefix[head][low * WIDE + d]) / count
+                })
+                .collect();
+            let magnitude = want.iter().fold(1e-3f64, |a, v| a.max(v.abs()));
+            let base = (t * HEADS + h) * WIDE;
+            let error = (0..WIDE)
+                .map(|d| (f64::from(out[base + d]) - want[d]).abs())
+                .fold(0.0, f64::max);
+            worst = worst.max(error / magnitude);
+        }
+    }
+    worst
+}
+
+/// With q = 0 the kernel's arithmetic is exact (equal weights, V exact in f16, sums exact in
+/// f32), so the bound is about ten times the largest error of the first measurement (5.8e-8),
+/// relative to the row's own magnitude: a key or a tile dropped, repeated or read from the wrong
+/// row moves a row by far more.
+const STRUCTURED_BOUND: f64 = 1e-6;
+
+#[test]
+fn d512_structured_values_expose_a_lost_repeated_or_misplaced_key() {
+    if !testkit::device_present("d512_structured_values") {
+        return;
+    }
+    let mut cases = vec![
+        StructCase::new(0, 1),
+        StructCase::new(0, 5),
+        // kv_len 4,127 is not a multiple of 16 and 37 rows are not a multiple of 8.
+        StructCase::new(4_090, 37),
+        StructCase::new(1_000, 256),
+        StructCase {
+            window: 512,
+            ..StructCase::new(2_000, 100)
+        },
+        // Unsigned codes and the other scale dtypes.
+        StructCase {
+            signed: false,
+            dtype: Dtype::Bf16,
+            ..StructCase::new(700, 33)
+        },
+        StructCase {
+            signed: true,
+            dtype: Dtype::F32,
+            ..StructCase::new(700, 33)
+        },
+        StructCase {
+            signed: false,
+            dtype: Dtype::F32,
+            ..StructCase::new(517, 9)
+        },
+        // A ring cache: 1,024 rows, window 512, the union of the chunk's windows staged.
+        StructCase {
+            window: 512,
+            ring: 1_024,
+            ..StructCase::new(4_090, 37)
+        },
+        // The part and combine entries over two segments.
+        StructCase {
+            cut: Some(2_000),
+            ..StructCase::new(2_990, 37)
+        },
+        StructCase {
+            cut: Some(33),
+            signed: false,
+            dtype: Dtype::Bf16,
+            ..StructCase::new(90, 40)
+        },
+    ];
+    cases.push(StructCase::new(300, 64));
+    let (mut split_cases, mut tail_cases) = (0, 0);
+    for case in cases {
+        let (out, status, split) = run_structured(case).expect("the device phase");
+        assert_eq!(status, 0, "status at p0 {} m {}", case.p0, case.m);
+        assert!(out.iter().all(|v| v.is_finite()));
+        let error = structured_error(case, &out, 0);
+        println!(
+            "D512 structured p0 {} m {} window {} ring {} signed {} {:?} cut {:?} splits {}: worst row error {error:.3e}",
+            case.p0,
+            case.m,
+            case.window,
+            case.ring,
+            case.signed,
+            case.dtype,
+            case.cut,
+            split.max_splits
+        );
+        assert!(
+            error <= STRUCTURED_BOUND,
+            "p0 {} m {} window {} ring {} cut {:?}: {error:e}",
+            case.p0,
+            case.m,
+            case.window,
+            case.ring,
+            case.cut
+        );
+        if case.p0 == 4_090 && case.cut.is_none() && case.ring == 0 {
+            // The bound has teeth: a reference that lacks the first 16 keys (one lost tile) is
+            // far outside it.
+            let lost = structured_error(case, &out, 16);
+            assert!(
+                lost > 100.0 * STRUCTURED_BOUND,
+                "a lost tile moves a row by only {lost:e}"
+            );
+        }
+        split_cases += usize::from(split.max_splits > 1 && case.cut.is_none());
+        tail_cases += usize::from((case.p0 + case.m) % 16 != 0 && case.m % 8 != 0);
+    }
+    assert!(
+        split_cases >= 3,
+        "cases with more than one split: {split_cases}"
+    );
+    assert!(
+        tail_cases >= 3,
+        "cases with a partial last tile and chunk: {tail_cases}"
+    );
+}
+
+/// Refusals the structured planes reach: a mixed F16 V plane, a V plane with 64-value groups, a
+/// payload base off the 16-byte grid. Every refused call leaves the status word and the
+/// buffers it names as they were.
+#[test]
+fn d512_refuses_mixed_wide_group_and_misaligned_planes_with_status_untouched() {
+    if !testkit::device_present("d512_refuses_mixed_wide_group_and_misaligned_planes") {
+        return;
+    }
+    let (m, p0) = (8usize, 56usize);
+    let phase = || -> Result<Vec<String>, EngError> {
+        let ctx = CudaContext::new()?;
+        let stream = ctx.stream()?;
+        let cells = p0 + m;
+        let good = struct_planes(&ctx, cells, &|row| Some(row), true, Dtype::F16, 0);
+        let shifted = struct_planes(&ctx, cells, &|row| Some(row), true, Dtype::F16, 8);
+        let f16_rows = testkit::upload_filled(&ctx, 0, KV_HEADS * cells * WIDE * 2 + 64);
+        let base = shape(m, cells, p0);
+        let split = plan(&base, 0)?;
+        let io = io(&ctx, &base, split, &vec![0f32; m * HEADS * WIDE])?;
+        let snapshot = |ctx: &CudaContext| {
+            [
+                testkit::read_bytes(ctx, &io.part, io.part_bytes),
+                testkit::read_bytes(ctx, &io.out, io.out_bytes),
+                testkit::read_bytes(ctx, &io.status, 4),
+            ]
+        };
+        let before = snapshot(&ctx);
+        let mut failures = Vec::new();
+        let mut refused = |label: &str, result: Result<(), EngError>| {
+            if !matches!(result, Err(EngError::BadRequest(_))) {
+                failures.push(format!("{label}: {result:?}"));
+            }
+        };
+        // The mixed profile: K Q8, V F16.
+        let mut bad = good.call(base, split, CpfAttnSpan::FULL, &io)?;
+        if let Some(views) = bad.kv_views.as_mut() {
+            views[1] = AttnKvView {
+                layout: AttnKvLayout {
+                    storage: AttnKvStorage::F16,
+                    payload_strides: AttnStrides {
+                        time_stride_bytes: WIDE * 2,
+                        head_stride_bytes: cells * WIDE * 2,
+                    },
+                    scales: None,
+                    bias: None,
+                },
+                payload: f16_rows.range(0, KV_HEADS * cells * WIDE * 2)?,
+                scales: None,
+                bias: None,
+            };
+            bad.v_cache = views[1].payload;
+        }
+        refused("mixed f16 V plane", ctx.attn_prefill(&stream, bad));
+        // A V plane with 64-value groups beside a K plane with 32.
+        let mut bad = good.call(base, split, CpfAttnSpan::FULL, &io)?;
+        if let Some(views) = bad.kv_views.as_mut() {
+            views[1].layout.storage = AttnKvStorage::Q8Affine {
+                group_size: 64,
+                signed: true,
+            };
+        }
+        refused(
+            "V plane with 64-value groups",
+            ctx.attn_prefill(&stream, bad),
+        );
+        // A payload base at byte 8 of its buffer.
+        refused(
+            "payload base off the 16-byte grid",
+            ctx.attn_prefill(&stream, shifted.call(base, split, CpfAttnSpan::FULL, &io)?),
+        );
+        stream.synchronize()?;
+        if before != snapshot(&ctx) {
+            failures.push("a refused call changed the part, out or status bytes".to_owned());
+        }
+        // The same planes still run, with a zero status word.
+        ctx.attn_prefill(&stream, good.call(base, split, CpfAttnSpan::FULL, &io)?)?;
+        stream.synchronize()?;
+        if snapshot(&ctx)[2] != 0i32.to_le_bytes() {
+            failures.push("a good call set the status word".to_owned());
+        }
+        Ok(failures)
+    };
+    let failures = phase().expect("the device phase");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The device gate: the card the tests run on provides what the wide kernel needs.
+#[test]
+fn d512_device_gate_admits_the_test_card() {
+    if !testkit::device_present("d512_device_gate_admits_the_test_card") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    ctx.check_wide_device()
+        .expect("sm_80 PTX and an 80 KB opt-in on the test card");
+}
