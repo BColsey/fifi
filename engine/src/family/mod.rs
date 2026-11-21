@@ -56,6 +56,11 @@ pub(crate) mod kv_format;
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 pub(crate) mod mlx_budget;
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) mod mlx_kv;
 pub(crate) mod mlx_report;
 
 pub mod layer_weights;

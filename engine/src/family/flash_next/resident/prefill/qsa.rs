@@ -9,8 +9,8 @@
 //! Dense batches stop at the dense limit. Sparse batches use the decode selector on each row's
 //! causal prefix while sharing the layer's projections and cache append.
 
-use super::super::ops::{Ctx, dim};
-use super::super::qsa::{Kv, MAX_POSITIONS, attend_sparse_rows, check_cache};
+use super::super::ops::Ctx;
+use super::super::qsa::{CacheAppend, Kv, MAX_POSITIONS, attend_sparse_rows, check_cache};
 use super::super::state::LayerState;
 use super::super::weights::RQsa;
 use crate::family::flash_next::qsa::QsaShape;
@@ -88,10 +88,6 @@ fn overflow() -> EngError {
     EngError::BadRequest("resident qsa dimension overflows".into())
 }
 
-fn mismatch() -> EngError {
-    EngError::BadRequest("resident qsa cache does not match its shape".into())
-}
-
 /// Checks, before any native call, that the cache holds `pos` positions and that the last row of a
 /// chunk of `rows` rows still selects every indexer block, so dense attention equals the host
 /// rule. The last row sees `pos + rows` positions. The rule of `qsa::check_dense` is monotone in
@@ -140,17 +136,17 @@ pub(in super::super) fn dense_rows(shape: &QsaShape, pos: u32) -> Result<u32, En
 }
 
 /// Runs one QSA batch of `x` `[T, H]` at position `pos`. It builds a lazy graph only: no
-/// readback and no evaluate. `state` is never changed; on error nothing is returned.
+/// readback and no evaluate. The old cache is consumed.
 pub(super) fn chunk(
     ctx: &mut Ctx<'_>,
     shape: &QsaShape,
     w: &RQsa,
-    state: &LayerState,
+    state: LayerState,
     pos: u32,
     x: &ExecutionTensor,
     batch: QsaBatch,
 ) -> Result<QsaChunk, EngError> {
-    let LayerState::Qsa { k, v, ik, len } = state else {
+    let LayerState::Qsa { len, .. } = state else {
         return Err(EngError::BadRequest(
             "qsa chunk needs a QSA layer state".into(),
         ));
@@ -163,33 +159,14 @@ pub(super) fn chunk(
     if rows == 0 {
         return Err(EngError::BadRequest("qsa chunk needs a row".into()));
     }
-    check_batch(shape, *len, pos, rows, batch)?;
+    check_batch(shape, len, pos, rows, batch)?;
     let d = shape.dims();
+    let cache = CacheAppend::new(state, &d, pos)?;
     let (heads, kv_heads, width) = (d.heads_q, d.heads_kv, d.head_dim);
-    let cached = dim(*len)?;
-    let cache = match (k, v, ik) {
-        (None, None, None) if *len == 0 => None,
-        (Some(k), Some(v), Some(ik)) if *len > 0 => {
-            let kv_shape = [1, kv_heads, cached, width];
-            let ik_shape = [cached, d.idx_dim];
-            if k.shape() != kv_shape.as_slice()
-                || v.shape() != kv_shape.as_slice()
-                || ik.shape() != ik_shape.as_slice()
-            {
-                return Err(mismatch());
-            }
-            Some((k, v, ik))
-        }
-        _ => return Err(mismatch()),
-    };
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
     let idx_start = d.idx_heads.checked_mul(d.idx_dim).ok_or_else(overflow)?;
     let idx_stop = idx_start.checked_add(d.idx_dim).ok_or_else(overflow)?;
     let q_width = heads.checked_mul(width).ok_or_else(overflow)?;
-    let next_len = usize::try_from(rows)
-        .ok()
-        .and_then(|rows| len.checked_add(rows))
-        .ok_or_else(overflow)?;
     let rope = RopeSpec {
         dims: d.rotary_dim,
         base: d.theta,
@@ -224,14 +201,7 @@ pub(super) fn chunk(
     let ip = ctx.kernels.qmm(x, &w.idx)?;
     let ik_new = ctx.kernels.slice(&ip, &[0, idx_start], &[rows, idx_stop])?;
     // 5. Append on the time axis, or start the cache.
-    let (k_all, v_all, ik_all) = match cache {
-        None => (k_new, v_new, ik_new),
-        Some((k, v, ik)) => (
-            ctx.kernels.concatenate(&[k, &k_new], 2)?,
-            ctx.kernels.concatenate(&[v, &v_new], 2)?,
-            ctx.kernels.concatenate(&[ik, &ik_new], 0)?,
-        ),
-    };
+    let ([k_all, v_all, ik_all], state) = cache.append(ctx, [k_new, v_new, ik_new])?;
     // 6. Each row attends to its own prefix in the grown cache.
     let att = match batch {
         QsaBatch::Dense => {
@@ -255,15 +225,7 @@ pub(super) fn chunk(
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
     let o = ctx.kernels.reshape(&o, &[rows, q_width])?;
     let out = ctx.kernels.qmm(&o, &w.o)?;
-    Ok(QsaChunk {
-        out,
-        state: LayerState::Qsa {
-            k: Some(k_all),
-            v: Some(v_all),
-            ik: Some(ik_all),
-            len: next_len,
-        },
-    })
+    Ok(QsaChunk { out, state })
 }
 
 #[cfg(test)]
@@ -332,7 +294,7 @@ mod tests {
             &mut ctx,
             &rig.shape,
             qsa_weights(&rig.weights),
-            state,
+            state.share(),
             pos,
             &x,
         )
@@ -370,7 +332,7 @@ mod tests {
             &mut ctx,
             &rig.shape,
             qsa_weights(&rig.weights),
-            state,
+            state.share(),
             pos,
             &x,
             batch,

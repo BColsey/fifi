@@ -2,7 +2,7 @@
 
 use super::ops::{Bytes, dim, short_import, zeros};
 use super::prefill::qsa::{QsaBatch, check_batch};
-use super::qsa::check_cache;
+use super::qsa::{capacity, check_cache};
 use super::weights::{RAttn, ResidentWeights};
 use crate::{
     EngError,
@@ -48,6 +48,18 @@ pub(super) fn chunk_growth_bytes(weights: &ResidentWeights, rows: u32) -> Result
         .ok_or_else(|| EngError::MemoryPlan("qsa chunk growth bytes overflow u64".into()))
 }
 
+/// Charge newly allocated rows, including spare capacity, before taking state.
+pub(super) fn qsa_append_growth(
+    weights: &ResidentWeights,
+    pos: u32,
+    rows: u32,
+) -> Result<u64, EngError> {
+    let end = pos
+        .checked_add(rows)
+        .ok_or_else(|| EngError::ContextLimit("position overflows u32".into()))?;
+    chunk_growth_bytes(weights, capacity(end) - capacity(pos))
+}
+
 /// Bytes of the QSA tensors in `layers`, summed from the tensors' own sizes.
 fn qsa_bytes(layers: &[LayerState]) -> Result<u64, EngError> {
     let mut total = Bytes::default();
@@ -68,7 +80,8 @@ pub(super) enum LayerState {
         rec: ExecutionTensor,
         ring: ExecutionTensor,
     },
-    /// QSA keys `[1, KVH, T, D]`, values, and raw indexer keys `[T, ID]`. `None` while `len` is 0.
+    /// QSA keys `[1, KVH, cap, D]`, values, and raw indexer keys `[cap, ID]`.
+    /// Only rows below `len` are visible. The planes are absent at length zero.
     Qsa {
         k: Option<ExecutionTensor>,
         v: Option<ExecutionTensor>,
@@ -79,7 +92,7 @@ pub(super) enum LayerState {
 
 impl LayerState {
     /// Returns a layer state that shares every array with `self`. It copies no array.
-    fn share(&self) -> Self {
+    pub(super) fn share(&self) -> Self {
         match self {
             Self::Delta { rec, ring } => Self::Delta {
                 rec: rec.share(),
@@ -108,8 +121,8 @@ fn fixed_bytes(layers: &[LayerState], ple_ring: &ExecutionTensor) -> Result<u64,
     Ok(total.total())
 }
 
-/// A committed `ResidentState` held by shared handles. Its arrays are immutable: a step builds new
-/// arrays and never writes into an existing one. One growth permit charges all its bytes to the
+/// A committed `ResidentState` held by shared handles. Its arrays are immutable while shared.
+/// One growth permit charges all allocated bytes to the
 /// session budget and releases them when the snapshot drops.
 pub(super) struct ResidentSnapshot {
     layers: Vec<LayerState>,
@@ -332,7 +345,9 @@ impl ResidentState {
                 "session charge {charged} bytes differs from stored QSA bytes {stored}"
             )));
         }
-        self.permits.push(permit);
+        if permit.retained_bytes() > 0 {
+            self.permits.push(permit);
+        }
         self.layers = layers;
         self.ple_ring = ple_ring;
         self.history = history;
@@ -760,6 +775,65 @@ mod snapshot_tests {
     /// Bytes of the fixture state that do not grow: DeltaNet `rec` 2 * 32 * 32 * 4 = 8,192,
     /// the convolution ring 128 * 3 * 4 = 1,536, and the PLE ring 128 * 9 * 4 = 4,608.
     const FIXED_BYTES: u64 = 14_336;
+
+    #[test]
+    #[ignore = "run with FIFI_FLASH_NEXT_MLX_CAPACITY_KV=1 on an admitted Mac GPU"]
+    fn capacity_qsa_charges_growth_and_protects_restored_prefixes() {
+        let _serial = crate::native_test_lock();
+        assert_eq!(super::capacity(1), 256, "the capacity-backed arm must run");
+        let (ckpt, flash) = load();
+        let initial = 256 * QSA_PER_TOKEN;
+        let mut decoder = decoder_with_cap(&ckpt, &flash, 2 * initial + FIXED_BYTES);
+        decoder.open_prefill(128).unwrap();
+        decoder.sparse_prefill_bytes = 8 << 20;
+        let mut state = decoder.zero_state().unwrap();
+        let ids: Vec<u32> = (0..261).map(|pos| pos % 7 + 1).collect();
+        for piece in ids[..252].chunks(128) {
+            decoder
+                .prefill(&mut state, piece, StepMode::Prompt)
+                .unwrap();
+        }
+        assert_eq!(decoder.session_used(), initial);
+        let snapshot = decoder.snapshot(&state).unwrap();
+        let snapshot_values = read(&mut decoder, arrays(&snapshot.layers, &snapshot.ple_ring));
+        assert_eq!(snapshot.charged_bytes(), initial + FIXED_BYTES);
+        decoder.reset(&mut state).unwrap();
+        decoder.restore(&mut state, &snapshot).unwrap();
+        decoder
+            .step(&mut state, ids[252], StepMode::Prompt)
+            .unwrap();
+        assert_eq!(state.pos(), 253);
+        assert_eq!(decoder.session_used(), 2 * initial + FIXED_BYTES);
+        assert_eq!(
+            read(&mut decoder, arrays(&snapshot.layers, &snapshot.ple_ring)),
+            snapshot_values
+        );
+
+        let resumed = &ids[253..];
+        let denied = decoder.prefill(&mut state, resumed, StepMode::Record);
+        assert!(matches!(denied, Err(EngError::MemoryPlan(_))));
+        assert_eq!(state.pos(), 253);
+        assert!(!state.is_poisoned());
+        assert_eq!(decoder.session_used(), 2 * initial + FIXED_BYTES);
+        drop(snapshot);
+        let grown = decoder
+            .prefill(&mut state, resumed, StepMode::Record)
+            .unwrap();
+        assert_eq!(state.pos(), 261);
+        assert_eq!(decoder.session_used(), 2 * initial);
+        decoder.reset(&mut state).unwrap();
+        assert_eq!(decoder.session_used(), 0);
+        prefill(&mut decoder, &mut state, &ids[..260]);
+        let stepped = decoder
+            .step(&mut state, ids[260], StepMode::Record)
+            .unwrap();
+        assert_eq!(stepped.token, grown.token);
+        super::super::prefill::assert_parity(
+            &grown.logits.unwrap(),
+            &stepped.logits.unwrap(),
+            "QSA growth after restoring",
+        );
+    }
 
     fn load() -> (StreamedCheckpoint, FlashWeights) {
         let ckpt = fixtures::checkpoint();

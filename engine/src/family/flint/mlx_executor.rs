@@ -764,6 +764,7 @@ pub(super) struct FlintEnv {
     pub(super) t1_flash: bool,
     pub(super) async_chain: bool,
     pub(super) coalesce_residual: bool,
+    pub(super) compact_kv: bool,
 }
 
 /// The numeric-path fingerprint a stored Flint prefix binds: the context
@@ -795,6 +796,7 @@ impl FlintPath {
                 t1_flash: mlx::t1_flash_flagged(),
                 async_chain: super::mlx_forward::async_chain_flagged(),
                 coalesce_residual: super::mlx_forward::coalesce_residual_flagged(),
+                compact_kv: super::mlx_state::compact_kv_flagged(),
             },
         )
     }

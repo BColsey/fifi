@@ -319,7 +319,7 @@ fn block_attention(
             ))
         }
         (RAttn::Qsa(w), cache @ LayerState::Qsa { .. }) => {
-            let s = qsa::step(ctx, &shape.qsa, w, &cache, pos, &x)?;
+            let s = qsa::step(ctx, &shape.qsa, w, cache, pos, &x)?;
             let out = values(ctx.kernels, &s.out)?;
             Ok((out, s.state))
         }
