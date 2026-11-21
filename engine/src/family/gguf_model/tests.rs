@@ -698,5 +698,9 @@ fn a_small_norm_or_gate_vector_stored_in_half_precision_opens_and_a_half_matrix_
         GgufType::Bf16,
         vec![512, 256],
     );
-    assert!(rejection(open(&kvs, &tensors, &spec)).contains("blk.1.attn_k.weight has type BF16"));
+    let message = rejection(open(&kvs, &tensors, &spec));
+    assert!(
+        message.contains("blk.1.attn_k.weight") && message.contains("BF16"),
+        "{message}"
+    );
 }
