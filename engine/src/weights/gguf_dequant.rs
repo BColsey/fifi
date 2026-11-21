@@ -725,12 +725,12 @@ mod tests {
             "3178868383e701c4d00fccb83ad4d003f426a422ee71a404486432c2e6e525ea"
         );
         let mut m1 = stream_blocks(0x53, 16, 56);
-        for i in 0..16 {
+        for (i, scale) in M.iter().enumerate() {
             for w in 0..4 {
                 let at = 56 * i + 48 + 2 * w;
                 let low = u16::from_le_bytes([m1[at], m1[at + 1]]) & 0x0fff;
                 m1[at..at + 2]
-                    .copy_from_slice(&(low | (((M[i] >> (4 * w)) & 0xf) << 12)).to_le_bytes());
+                    .copy_from_slice(&(low | (((scale >> (4 * w)) & 0xf) << 12)).to_le_bytes());
             }
         }
         assert_eq!(
