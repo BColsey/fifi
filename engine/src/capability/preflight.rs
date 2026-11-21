@@ -252,19 +252,11 @@ fn evaluate(
         .family
         .as_deref()
         .is_none_or(|family| family == inkling2_mini::FAMILY)
-        && !inspection
-            .config_model_types
-            .iter()
-            .any(|kind| kind == inkling2_mini::MODEL_TYPE && inspection.safetensors_files > 0)
-        && inspection
-            .gguf_files
-            .iter()
-            .any(|file| file.inkling2_loop.is_some())
+        && !inspection.has_inkling_safetensors()
+        && inspection.inkling_ggufs().next().is_some()
     {
-        for file in &inspection.gguf_files {
-            let Some(geometry) = &file.inkling2_loop else {
-                continue;
-            };
+        for file in inspection.inkling_ggufs() {
+            let geometry = file.inkling2_loop.as_ref().expect("Inkling GGUF geometry");
             let (status, detail) = match geometry {
                 Ok(g) => (
                     CheckStatus::Pass,
@@ -306,13 +298,49 @@ fn evaluate(
                 ));
             }
         }
-        return inkling2_mini_report(
+        if inspection.inkling_ggufs().count() > 1 {
+            let error = inspection.inkling_gguf().unwrap_err();
+            checks.push(Check::new(
+                "Inkling 2 Mini GGUF model",
+                CheckStatus::Fail,
+                error.describe(),
+            ));
+        }
+        for sidecar in &inspection.gguf_files {
+            if matches!(sidecar.architecture.as_deref(), Some("clip" | "dflash")) {
+                checks.push(Check::new(
+                    "Inkling 2 Mini GGUF sidecar",
+                    CheckStatus::Info,
+                    format!("{} is outside text execution", sidecar.file),
+                ));
+            }
+        }
+        let plan = if candidate.kv_dtype.as_deref().is_some_and(|kv| kv != "bf16") {
+            Err(crate::EngError::BadRequest(
+                "Inkling 2 Mini GGUF text requires BF16 KV".into(),
+            ))
+        } else if candidate.prefill_rows.is_some_and(|rows| rows != 1) {
+            Err(crate::EngError::BadRequest(
+                "Inkling 2 Mini GGUF prefill uses one token per forward pass".into(),
+            ))
+        } else {
+            inkling2_mini::gguf::preflight_plan(candidate.context_limit)
+        };
+        let backend = if facts.backends.mlx {
+            inkling2_mini::factory::check_gguf_backend()
+        } else {
+            Err(crate::EngError::BadRequest(
+                "Inkling 2 Mini GGUF requires --features native-mlx on Apple Silicon".into(),
+            ))
+        };
+        return inkling2_text_report(
             model_dir,
             tokenizer_dir,
             checks,
-            Vec::new(),
-            "Inkling 2 Mini GGUF serving is unsupported",
-            "Use the GGUF header inventory to validate the checkpoint layout.",
+            plan,
+            backend,
+            "Inkling 2 Mini GGUF text plan",
+            "experimental Apple Silicon GGUF expert projections on Metal with pinned publisher tokenizer sidecar",
         );
     }
     if candidate.family.as_deref() == Some(inkling2_mini::FAMILY)
@@ -755,31 +783,48 @@ fn inkling2_mini_preflight(
     } else {
         inkling2_mini::inspect(model_dir, candidate.context_limit, candidate.prefill_rows)
     };
-    let (decisions, fit) = match plan {
-        Ok(plan) => {
-            checks.push(Check::new(
-                "Inkling 2 Mini expert layout",
-                CheckStatus::Pass,
-                "fixed-loop config, shard inventory and mixed expert layout verified from headers"
-                    .into(),
-            ));
-            (plan.decisions, plan.budget_fit)
-        }
-        Err(error) => {
-            checks.push(Check::new(
-                "Inkling 2 Mini expert layout",
-                CheckStatus::Fail,
-                super::describe_error(&error),
-            ));
-            (Vec::new(), None)
-        }
-    };
+    let plan = plan.inspect(|_| {
+        checks.push(Check::new(
+            "Inkling 2 Mini expert layout",
+            CheckStatus::Pass,
+            "fixed-loop config, shard inventory and mixed expert layout verified from headers"
+                .into(),
+        ));
+    });
     let backend = if facts.backends.mlx {
         inkling2_mini::factory::check_backend()
     } else {
         Err(crate::EngError::BadRequest(
             "Inkling 2 Mini requires --features native-mlx on Apple Silicon".into(),
         ))
+    };
+    inkling2_text_report(
+        model_dir,
+        tokenizer_dir,
+        checks,
+        plan,
+        backend,
+        "Inkling 2 Mini expert layout",
+        "experimental Apple Silicon safetensors text, one sequence with bounded prompt prefill and single-token decode",
+    )
+}
+
+fn inkling2_text_report(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    mut checks: Vec<Check>,
+    plan: Result<crate::family::inkling2_mini::HeaderPlan, crate::EngError>,
+    backend: Result<(), crate::EngError>,
+    plan_check: &str,
+    execution: &str,
+) -> PreflightReport {
+    use crate::family::inkling2_mini;
+    let (decisions, fit) = match plan {
+        Ok(plan) => (plan.decisions, plan.budget_fit),
+        Err(error) => {
+            checks.push(Check::new(plan_check, CheckStatus::Fail, error.describe()));
+            (Vec::new(), None)
+        }
     };
     if let Err(error) = backend {
         return inkling2_mini_report(
@@ -805,8 +850,7 @@ fn inkling2_mini_preflight(
     checks.push(Check::new(
         "text execution",
         CheckStatus::Info,
-        "experimental Apple Silicon safetensors text, one sequence with bounded prompt prefill and single-token decode"
-            .into(),
+        execution.to_string(),
     ));
     let compatibility = if any_failed(&checks) {
         Compatibility::Unsupported
@@ -2868,7 +2912,7 @@ mod tests {
             );
             assert_eq!(
                 check_named(&report, "text execution").detail,
-                "Inkling 2 Mini GGUF serving is unsupported"
+                "Inkling 2 Mini GGUF requires --features native-mlx on Apple Silicon"
             );
             assert!(
                 !report

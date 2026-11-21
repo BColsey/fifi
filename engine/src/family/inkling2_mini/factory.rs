@@ -9,6 +9,17 @@ use crate::{
 use std::{ffi::OsStr, path::Path};
 
 const OPT_IN: &str = "FIFI_INKLING2_MINI_MLX";
+const GGUF_OPT_IN: &str = "FIFI_INKLING2_MINI_GGUF_MLX";
+
+pub(crate) fn check_gguf_backend() -> Result<(), EngError> {
+    check_backend()?;
+    if std::env::var_os(GGUF_OPT_IN).as_deref() != Some(OsStr::new("1")) {
+        return Err(EngError::BadRequest(format!(
+            "Inkling 2 Mini experimental GGUF text serving requires {GGUF_OPT_IN}=1"
+        )));
+    }
+    Ok(())
+}
 
 pub(crate) fn check_backend() -> Result<(), EngError> {
     check_backend_with(
@@ -116,12 +127,24 @@ fn launch(
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle, u32), EngError> {
     let load_start = executor::Phase::start_if_enabled();
+    let root = model_dir.to_owned();
+    let inspection = crate::capability::inspect::inspect(model_dir, tokenizer_dir)?;
+    let gguf = inspection.inkling_gguf()?.map(|file| root.join(&file.file));
+    if let Some(path) = &gguf {
+        check_gguf_backend()?;
+        eprintln!(
+            "Inkling 2 Mini: experimental GGUF expert projections on Metal, model={}",
+            path.display()
+        );
+    }
     let bundle = load_tokenizer(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
-    let root = model_dir.to_owned();
     eprintln!("Inkling 2 Mini: experimental single-sequence text serving, context_limit={context}");
     let engine = crate::sched::worker::spawn_engine_noted(1, ready_note, move |_| {
-        let decoder = super::text::Decoder::open(&root, context)?;
+        let decoder = match gguf {
+            Some(path) => super::text::Decoder::open_gguf_native(&path, context)?,
+            None => super::text::Decoder::open(&root, context)?,
+        };
         if let Some(start) = load_start {
             start.report("load", decoder.expert_cache_stats());
         }

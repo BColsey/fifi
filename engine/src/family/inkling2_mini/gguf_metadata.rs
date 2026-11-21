@@ -30,7 +30,7 @@ impl Layout {
         }
     }
 
-    fn architecture(self) -> &'static str {
+    pub(super) fn architecture(self) -> &'static str {
         match self {
             Self::Mainline => MODEL_TYPE,
             Self::Fork => "inkling2",

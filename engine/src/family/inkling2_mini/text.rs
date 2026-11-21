@@ -208,7 +208,7 @@ impl Decoder {
         }
         let state = super::state_plan(context)?;
         let scratch = if native {
-            gguf_mlx::scratch_bytes()
+            gguf::native_scratch_bytes()
         } else {
             gguf::projection_scratch_bytes()
         };
@@ -608,6 +608,9 @@ mod tests {
             .advance_rows(&[371, 151451, 149879, 151194])
             .unwrap();
         let scores = decoder.step(149884).unwrap();
+        if let Some(path) = std::env::var_os("INKLING_GGUF_LOGITS_REFERENCE") {
+            check_reference_logits(&scores, Path::new(&path));
+        }
         let top = scores
             .iter()
             .enumerate()
@@ -621,6 +624,49 @@ mod tests {
             top.0, 152717,
             "first greedy token for The capital of France is"
         );
+    }
+
+    fn check_reference_logits(scores: &[f32], path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), scores.len() * 4);
+        let reference: Vec<_> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| f32::from_le_bytes(word))
+            .collect();
+        assert!(reference.iter().all(|x| x.is_finite()));
+        let top = |values: &[f32]| {
+            let mut order: Vec<_> = (0..values.len()).collect();
+            order.select_nth_unstable_by(10, |&a, &b| {
+                values[b].total_cmp(&values[a]).then(a.cmp(&b))
+            });
+            order.truncate(10);
+            order.sort_unstable_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+            order
+        };
+        let ranked_scores = top(scores);
+        let ranked_reference = top(&reference);
+        let [mut dot, mut a2, mut b2, mut delta2, mut max_abs] = [0.0_f64; 5];
+        for (&a, &b) in scores.iter().zip(&reference) {
+            let (a, b) = (f64::from(a), f64::from(b));
+            let error = (a - b).abs();
+            dot += a * b;
+            a2 += a * a;
+            b2 += b * b;
+            delta2 += error * error;
+            max_abs = max_abs.max(error);
+        }
+        let overlap = ranked_scores
+            .iter()
+            .filter(|id| ranked_reference.contains(id))
+            .count();
+        eprintln!(
+            "Inkling GGUF reference logits top10={ranked_scores:?} oracle_top10={ranked_reference:?} overlap={overlap} cosine={} rmse={} max_abs={max_abs}",
+            dot / (a2 * b2).sqrt(),
+            (delta2 / scores.len() as f64).sqrt(),
+        );
+        assert_eq!(ranked_scores[0], ranked_reference[0]);
     }
 
     #[test]

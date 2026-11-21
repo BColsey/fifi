@@ -10,10 +10,11 @@ use super::{
 };
 use crate::{
     EngError,
-    weights::{GgufHeader, GgufTensor, GgufType},
+    weights::{GgufHeader, GgufTensor, GgufType, MetaValue},
 };
 
 const ROWS_PER_READ: usize = 256;
+const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
 const PADDED_VOCAB: u64 = 201_024;
 const RELATIVE_FEATURES: u64 = 16;
 const RELATIVE_EXTENT: u64 = 1024;
@@ -193,6 +194,46 @@ pub(crate) fn validate_tensors(header: &GgufHeader) -> Result<(), EngError> {
             if layout == Layout::Mainline {
                 layer("loop_msg_query.weight", &[hidden, 4], Kind::F32)?;
             }
+        }
+    }
+    // The shared text graph fixes these inference constants. Reject a header
+    // that advertises different inference semantics for the same tensor shapes.
+    let arch = layout.architecture();
+    for (key, expected) in [
+        ("vocab_size", MetaValue::U32(PADDED_VOCAB as u32)),
+        (
+            "vocab_size_unpadded",
+            MetaValue::U32(super::UNPADDED_VOCAB as u32),
+        ),
+        (
+            "attention.relative_length",
+            MetaValue::U32(RELATIVE_FEATURES as u32),
+        ),
+        (
+            "attention.relative_extent",
+            MetaValue::U32(RELATIVE_EXTENT as u32),
+        ),
+        ("attention.layer_norm_rms_epsilon", MetaValue::F32(1e-6)),
+        (
+            "attention.qk_clip",
+            MetaValue::F32(2.0 * (HEAD_DIM as f32).sqrt()),
+        ),
+        ("attention.relative_clip", MetaValue::F32(8.0)),
+        ("attention.log_scale_floor", MetaValue::U32(8192)),
+        ("attention.log_scale_alpha", MetaValue::F32(0.1)),
+        ("shortconv.l_cache", MetaValue::U32(CONV_TAPS as u32)),
+        ("expert_weights_scale", MetaValue::F32(super::ROUTE_SCALE)),
+        ("activation.situ_beta", MetaValue::F32(super::GATE_CAP)),
+        ("activation.situ_linear_beta", MetaValue::F32(super::UP_CAP)),
+        ("attn_res.block_size", MetaValue::U32(6)),
+        ("final_logit_softcapping", MetaValue::F32(30.0)),
+        ("rope.dimension_count", MetaValue::U32(0)),
+    ] {
+        let key = format!("{arch}.{key}");
+        if header.meta(&key) != Some(&expected) {
+            return Err(checkpoint_error(format!(
+                "GGUF metadata {key} must be {expected:?}"
+            )));
         }
     }
     Ok(())
@@ -392,11 +433,63 @@ impl Weights {
     }
 }
 
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn projection_scratch_bytes() -> u64 {
     // Largest possible FP32 row (the controller input) times the chunk, plus
     // one output logits row and conservatively sized attention and MoE temporaries.
     (ROWS_PER_READ * 2 * HIDDEN * 4 + PADDED_VOCAB as usize * 4 + 256 * HIDDEN * 4) as u64
+}
+
+pub(super) fn native_scratch_bytes() -> u64 {
+    // Packed plane, converted F32 plane, Metal import and allocator workspace.
+    projection_scratch_bytes() + 4 * LARGEST_PLANE_F32_BYTES as u64
+}
+
+pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, EngError> {
+    use crate::family::plan_decision::{PlanDecision, PlanFixity};
+
+    let context = context.unwrap_or(super::DEFAULT_CONTEXT);
+    let state = super::state_plan(context)?;
+    let staging = native_scratch_bytes();
+    let charges = super::base_charges(0, staging, &state);
+    let plan = format!(
+        "{} B for one GGUF expert plane, BF16 state at {context} tokens and decoder scratch",
+        charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
+    );
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    let (chosen, budget_fit) = if let Some(device) =
+        crate::family::mlx_budget::DeviceBudget::detect_with_default(
+            super::factory::check_gguf_backend().is_ok(),
+        )? {
+        match super::working_set_remaining(device, &charges) {
+            Ok(headroom) => {
+                let ram = headroom / 4;
+                (
+                    format!(
+                        "{plan}, {ram} B for packed RAM and {} B for expanded Metal expert planes, under {device}",
+                        headroom - ram
+                    ),
+                    Some(true),
+                )
+            }
+            Err(error) => (format!("{plan}, {}", error.describe()), Some(false)),
+        }
+    } else {
+        (format!("{plan}, automatic Metal budget disabled"), None)
+    };
+    #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
+    let (chosen, budget_fit) = (
+        format!("{plan}, Metal budget unavailable in this build"),
+        None,
+    );
+    Ok(super::HeaderPlan {
+        decisions: vec![PlanDecision {
+            name: "Apple Silicon GGUF working set".into(),
+            chosen,
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Load,
+        }],
+        budget_fit,
+    })
 }
 
 fn matrix(tensor: &GgufTensor) -> Result<(usize, usize, GgufType, usize), EngError> {

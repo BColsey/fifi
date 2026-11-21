@@ -281,7 +281,6 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
     };
     let inkling2_loop =
         matches!(architecture.as_deref(), Some("inkling2_loop" | "inkling2")).then(|| {
-<<<<<<< HEAD
             // main reads the header through shared_header, which keeps no reader; the
             // geometry inspection needs positioned reads, so it opens its own.
             let mut reader = match std::fs::File::open(path) {
@@ -293,18 +292,12 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
                     ))));
                 }
             };
-=======
->>>>>>> c6fea7197 (feat(inkling): resolve both GGUF text layouts and decode IQ1_S expert blocks)
             crate::family::inkling2_mini::gguf_metadata::inspect(&header, &mut reader)
                 .map_err(|error| super::describe_error(&error))
         });
     if path
         .extension()
-<<<<<<< HEAD
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf_file"))
-=======
-        .is_some_and(|extension| extension == "gguf_file")
->>>>>>> c6fea7197 (feat(inkling): resolve both GGUF text layouts and decode IQ1_S expert blocks)
         && architecture.as_deref() != Some("inkling2_loop")
     {
         return Err(checkpoint(
