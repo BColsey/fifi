@@ -7,7 +7,8 @@ use crate::{
     EngError,
     expert_tier::{
         ExpertId, ExpertPayload, ExpertPayloadSource, GpuExpertStore, GpuLayerPlan, Placement,
-        Residency, VRAM_HEADROOM_BYTES, auto_fit_gpu_layers, place_gpu_layers,
+        Residency, VRAM_HEADROOM_BYTES, auto_fit_gpu_layers, expert_cache_reserve,
+        place_gpu_layers,
     },
     family::mapped_file::MappedFile,
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
@@ -39,6 +40,11 @@ pub(super) enum Weight<'a> {
 pub(super) struct ResidentExperts {
     placement: Residency,
     banks: BTreeMap<u32, [Option<Bank>; 2]>,
+}
+
+pub(super) struct PackedBudget {
+    pub(super) total: u64,
+    pub(super) cache: Option<u64>,
 }
 
 impl ResidentExperts {
@@ -92,23 +98,34 @@ impl ResidentExperts {
         experts: u32,
         layers: Vec<ExpertLayer<'_>>,
         file: &MappedFile,
-        budget: u64,
+        budget: PackedBudget,
     ) -> Result<Self, EngError> {
         let mut residency = Self {
             placement: Residency::default(),
             banks: BTreeMap::new(),
         };
-        let mut remaining = budget;
+        let reserve = if budget.cache != Some(0) {
+            let capacity = (ctx.memory_info()?.free as u64)
+                .saturating_sub(VRAM_HEADROOM_BYTES)
+                .min(budget.total);
+            expert_cache_reserve(layers.iter().map(layer_bytes).sum(), capacity, budget.cache)
+        } else {
+            0
+        };
+        if reserve > 0 {
+            eprintln!("Inkling GGUF reserved {reserve} expert bytes for adaptive caching");
+        }
+        let mut remaining = budget.total.saturating_sub(reserve);
         for layer in layers {
             let bytes = layer_bytes(&layer);
             let free = ctx.memory_info()?.free as u64;
-            if bytes > remaining || auto_fit_gpu_layers(free, 0, bytes, 1) == 0 {
+            if bytes > remaining || auto_fit_gpu_layers(free, reserve, bytes, 1) == 0 {
                 continue;
             }
             let [gate, down] = layer.parts;
             let w13 = ctx.allocate(gate.bytes.len())?;
             let w2 = ctx.allocate(down.bytes.len())?;
-            if (ctx.memory_info()?.free as u64) < VRAM_HEADROOM_BYTES {
+            if (ctx.memory_info()?.free as u64) < VRAM_HEADROOM_BYTES + reserve {
                 continue;
             }
             ctx.upload_at(&w13, 0, gate.bytes)?;

@@ -41,6 +41,8 @@ For VRAM → RAM → SSD expert placement, set `FIFI_INKLING_CUDA_RAM_EXPERT_MIB
 
 Set `FIFI_INKLING_CUDA_CACHE_EXPERTS=1` to retain frequently routed expert pairs in the remaining VRAM allowance. The shared adaptive policy ranks observed routes per layer. A promotion copies an expert directly from its existing CUDA staging bank. Later hits execute both projections from the cached original bytes. The cache respects the total expert budget and the shared device headroom. With `FIFI_INKLING_CUDA_PROFILE=1`, the server reports hits and avoided host-to-device bytes by layer.
 
+With packed GGUF and adaptive caching enabled, FiFi reserves three quarters of the admitted expert budget for adaptive slots when the full expert weights exceed the budget. The shared device headroom still applies. Set `FIFI_INKLING_CUDA_EXPERT_CACHE_RESERVE_MIB` to choose a fixed quota, or set it to zero to place whole layers first.
+
 Set `"prefix_reuse": true` in the server configuration to reuse saved chat prefixes. Inkling uses the shared scheduler and prefix store with one pinned root and two evictable entries. Each snapshot retains the independent KV and short-convolution state of every visit. KV rows are shared with snapshots while they are in use.
 
 Set `FIFI_INKLING_CUDA_PREFILL_ROWS` from 2 to 16 to group prompt tokens on the GGUF CUDA backend with shared expert streaming. Each attention and convolution state advances in token order. The CUDA staging banks upload each missing expert once per layer visit and prompt chunk. `FIFI_INKLING_CUDA_PROFILE=1` records expert uploads in the shared request log. A value of 1 uses single-token prefill and is the default.

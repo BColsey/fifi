@@ -104,18 +104,21 @@ fn expert_stacks(weights: &Weights, layer: usize) -> Result<[ExpertStack<'_>; 2]
 }
 
 pub(super) fn expert_residency_budget() -> Result<u64, EngError> {
-    let Some(value) = std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB") else {
-        return Ok(0);
-    };
-    value
-        .to_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|mib| mib.checked_mul(1024 * 1024))
-        .ok_or_else(|| {
-            EngError::BadRequest(
-                "FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB must be a nonnegative MiB count".into(),
-            )
+    Ok(expert_mib_budget("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB")?.unwrap_or(0))
+}
+
+pub(super) fn expert_mib_budget(name: &str) -> Result<Option<u64>, EngError> {
+    std::env::var_os(name)
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|mib| mib.checked_mul(1024 * 1024))
+                .ok_or_else(|| {
+                    EngError::BadRequest(format!("{name} must be a nonnegative MiB count"))
+                })
         })
+        .transpose()
 }
 
 struct Plan<'a> {

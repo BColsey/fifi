@@ -41,6 +41,8 @@ mod stream_nvfp4;
 
 pub use cpu::{CpuExpertKernel, CpuTier, ExpertPick, map_read_only};
 pub use overlap::{Overlap, run_overlapped};
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) use plan::expert_cache_reserve;
 pub use plan::{
     ExpertPayload, ExpertPayloadSource, ExpertPayloadView, GpuExpertStore, GpuLayerPlan,
     VRAM_HEADROOM_BYTES, auto_fit_gpu_layers, place_gpu_layers,

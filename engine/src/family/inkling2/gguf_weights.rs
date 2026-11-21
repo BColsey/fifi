@@ -18,7 +18,7 @@ use crate::{
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::cuda_projection::{
-    DenseUpload, expert_layer_order, expert_residency_budget,
+    DenseUpload, expert_layer_order, expert_mib_budget, expert_residency_budget,
     gguf::{ExpertLayer, ExpertStack, ExpertView, GgufCuda, GgufDenseUpload, can_repack},
 };
 
@@ -579,6 +579,11 @@ impl GgufTextWeights {
                 expert_residency_budget()?
             };
         let direct = std::env::var("FIFI_INKLING_CUDA_DIRECT_RESIDENT").as_deref() == Ok("1");
+        let cache_reserve = if packed && reuse {
+            expert_mib_budget("FIFI_INKLING_CUDA_EXPERT_CACHE_RESERVE_MIB")?
+        } else {
+            Some(0)
+        };
         let layers = self.expert_layers(spec, budget, direct, packed)?;
         let stream = packed
             || tiered
@@ -593,6 +598,7 @@ impl GgufTextWeights {
                 packed,
                 stream,
                 budget,
+                cache_reserve,
             },
         )?;
         if reuse {
@@ -643,7 +649,7 @@ impl GgufTextWeights {
             } else {
                 gate.kind == GgufType::Nvfp4 && down.kind == GgufType::Nvfp4
             };
-            if !supported || bytes > remaining {
+            if !supported || (!packed && bytes > remaining) {
                 continue;
             }
             if !packed && !direct && (!can_repack(gate_bytes) || !can_repack(down_bytes)) {

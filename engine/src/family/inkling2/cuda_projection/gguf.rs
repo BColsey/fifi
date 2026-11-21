@@ -20,8 +20,8 @@ mod cache;
 mod residency;
 pub(in crate::family::inkling2) mod streaming;
 
-use residency::ResidentExperts;
 pub(in crate::family::inkling2) use residency::{ExpertLayer, ExpertStack};
+use residency::{PackedBudget, ResidentExperts};
 
 pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
@@ -48,6 +48,7 @@ pub(in crate::family::inkling2) struct Options {
     pub packed: bool,
     pub stream: bool,
     pub budget: u64,
+    pub cache_reserve: Option<u64>,
 }
 
 struct ResidentMoe {
@@ -80,6 +81,7 @@ impl GgufCuda {
             packed,
             stream,
             budget,
+            cache_reserve,
         }: Options,
     ) -> Result<Self, EngError> {
         let hidden = spec.hidden_size as usize;
@@ -156,7 +158,16 @@ impl GgufCuda {
             .transpose()?;
         let experts = spec.n_routed_experts as u32;
         let resident = if packed {
-            ResidentExperts::load_packed(&context, experts, layers, file, budget)?
+            ResidentExperts::load_packed(
+                &context,
+                experts,
+                layers,
+                file,
+                PackedBudget {
+                    total: budget,
+                    cache: cache_reserve,
+                },
+            )?
         } else {
             ResidentExperts::load_nvfp4(&context, experts, layers, file, direct)?
         };
