@@ -28,8 +28,12 @@
 //! | `context_length` | `max_position_embeddings` |
 //! | token embedding row count | `vocab_size` |
 //!
-//! Fields the GGUF does not carry take the value the EXL3 path gives them: `norm_topk_prob`
-//! is absent from the config of this model (top-k weights are renormalised), and
+//! `expert_weights_norm`, when the file carries it, must be true (the executor renormalises
+//! the top-k weights) and `expert_weights_scale`, when present, must be 0 or 1 (no scaling);
+//! a file that says otherwise is refused by key. The real file carries neither key, so the
+//! renormalisation stays on, as `norm_topk_prob` absent does in the EXL3 config.
+//!
+//! Fields the GGUF does not carry take the value the EXL3 path gives them:
 //! `split_ngram_parts` has no counterpart (the GGUF holds the n-gram table as one tensor).
 //! `rope.dimension_sections` is read and checked but not used: the model decodes text only, where the
 //! interleaved multi-axis rotary reduces to the plain rotary the step applies.
@@ -262,6 +266,20 @@ impl GgufConfig {
                 return Err(refuse(
                     "attention.compress_ratios and full_attention_interval disagree on which layers attend",
                 ));
+            }
+        }
+
+        if let Some(MetaValue::Bool(false)) = header.meta(&Meta::key("expert_weights_norm")) {
+            return Err(refuse(
+                "metadata key qwen4exp.expert_weights_norm is false, but the executor renormalises the top-k expert weights",
+            ));
+        }
+        if meta.present("expert_weights_scale") {
+            let scale = meta.float("expert_weights_scale")?;
+            if scale != 0.0 && scale != 1.0 {
+                return Err(refuse(format!(
+                    "metadata key qwen4exp.expert_weights_scale is {scale}, but the executor applies no expert weight scale"
+                )));
             }
         }
 

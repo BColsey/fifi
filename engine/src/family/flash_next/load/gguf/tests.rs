@@ -543,7 +543,7 @@ fn real_file_host_forward_of_the_first_layers() {
     assert_eq!(again.layer_out[0], run.layer_out[0]);
 }
 
-/// The whole model on the host: a plain-text prompt and the five most likely next tokens.
+/// The whole model on the host: a plain-text prompt and the five most likely next tokens, of which the first must be Paris.
 /// Needs FIFI_FLASH_GGUF, FIFI_FLASH_EXL3 (for `tokenizer.json`) and FIFI_FLASH_FULL=1; it
 /// decodes every layer of every token at CPU speed (minutes).
 #[test]
@@ -581,8 +581,87 @@ fn real_file_host_forward_continues_a_sentence() {
         })
         .collect();
     eprintln!("top five after {prompt:?}: {top:?}");
+    assert_eq!(top[0].0.trim(), "Paris", "top five: {top:?}");
+}
+
+#[test]
+fn an_unrelated_gguf_that_does_not_open_leaves_the_exl3_start_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A partial download of another model: the magic and nothing else.
+    std::fs::write(
+        dir.path().join("other-model-Q4_K_M.gguf"),
+        b"GGUF\x03\0\0\0",
+    )
+    .expect("write");
+    assert!(GgufModel::open(dir.path()).expect("not an error").is_none());
+    // A truncated set whose first shard is not ours either.
+    std::fs::write(dir.path().join("part-00002-of-00003.gguf"), b"GGUF").expect("write");
+    assert!(GgufModel::open(dir.path()).expect("not an error").is_none());
+}
+
+#[test]
+fn a_truncated_file_that_names_the_architecture_is_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("Qwen3.8-Flash-Next-Q3.gguf"),
+        b"GGUF\x03\0\0\0",
+    )
+    .expect("write");
+    let error = GgufModel::open(dir.path()).expect_err("the model is there and unusable");
+    assert!(error.describe().contains("gguf"), "{}", error.describe());
+    // The same by the first bytes: the architecture key leads the metadata.
+    let other = tempfile::tempdir().expect("tempdir");
+    let mut head = b"GGUF\x03\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0".to_vec();
+    head.extend_from_slice(
+        b"\x14\0\0\0\0\0\0\0general.architecture\x08\0\0\0\x08\0\0\0\0\0\0\0qwen4exp",
+    );
+    std::fs::write(other.path().join("model.gguf"), head).expect("write");
+    assert!(GgufModel::open(other.path()).is_err());
+}
+
+#[test]
+fn a_set_with_a_truncated_shard_is_an_error_named_for_the_set() {
+    let written = write_flash(&Spec {
+        shards: 3,
+        ..Spec::default()
+    });
+    let last = written.dir.path().join("flash-00003-of-00003.gguf");
+    let len = std::fs::metadata(&last).expect("stat").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&last)
+        .expect("open")
+        .set_len(len / 2)
+        .expect("truncate");
+    let error = GgufModel::open(written.dir.path()).expect_err("an unusable set");
     assert!(
-        top.iter().any(|(text, _)| text.trim() == "Paris"),
-        "Paris is not among the top five: {top:?}"
+        error.describe().contains("extends beyond"),
+        "{}",
+        error.describe()
+    );
+}
+
+#[test]
+fn a_file_that_says_the_expert_weights_are_not_normalised_is_refused_by_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("m.gguf");
+    let mut kvs = flash_kvs();
+    let mut flag = super::testkit::string("qwen4exp.expert_weights_norm");
+    flag.extend_from_slice(&7u32.to_le_bytes());
+    flag.push(0);
+    kvs.push(flag);
+    let embed = super::testkit::TensorSpec {
+        name: "token_embd.weight".into(),
+        dims: vec![2560, 248_320],
+        ty: GgufType::Q6K,
+        payload: None,
+    };
+    write_gguf(&path, &kvs, &[embed]);
+    let weights = crate::weights::GgufWeights::open_any_type(&path, super::testkit::LIMITS, None)
+        .expect("open");
+    let error = GgufConfig::read(&weights).expect_err("refused").describe();
+    assert!(
+        error.contains("qwen4exp.expert_weights_norm is false"),
+        "{error}"
     );
 }

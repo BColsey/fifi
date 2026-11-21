@@ -14,8 +14,13 @@
 //! experts in video memory, in pinned host memory, or reads them from the files on a miss,
 //! whichever the host memory allows.
 
-// Staged: the Flash-Next CUDA start is the first caller.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the n-gram reader and the per-tensor map entries have no caller outside the tests until the executor reads GGUF weights"
+    )
+)]
 
 pub(super) mod config;
 #[cfg(test)]
@@ -60,19 +65,26 @@ impl GgufModel {
     /// Opens the Flash-Next GGUF at `model` (a `.gguf` file, one shard of a split set, or a
     /// directory). `Ok(None)` when the path holds no GGUF of this architecture, so the EXL3
     /// loader can take it; a directory with several GGUF files opens the largest one of the
-    /// architecture. A GGUF of this architecture that cannot be used is an error naming why.
+    /// architecture. A GGUF file that cannot be opened is skipped with a log line naming it,
+    /// unless its file name or the start of its header says `qwen4exp` (or it is a shard of a
+    /// set whose first shard does): that one is an error naming why, because the model is
+    /// there and unusable. A partial download of another model beside an EXL3 pack therefore
+    /// leaves the pack's start alone.
     pub(in crate::family::flash_next) fn open(model: &Path) -> Result<Option<Self>, EngError> {
         let Ok((_, files)) = gguf_select::candidates(model) else {
             return Ok(None);
         };
-        let mut first_error = None;
         for file in files {
             let weights = match GgufWeights::open_any_type(&file.path, LIMITS, None) {
                 Ok(weights) => weights,
-                // A file of another model in the directory is not this loader's to judge;
-                // its error is reported only when no file of this architecture turns up.
+                Err(error) if names_this_architecture(&file.path) => return Err(error),
+                // A file of another model is not this loader's to judge.
                 Err(error) => {
-                    first_error.get_or_insert(error);
+                    eprintln!(
+                        "flash-next gguf: skipping {}, which does not open: {}",
+                        file.path.display(),
+                        error.describe()
+                    );
                     continue;
                 }
             };
@@ -90,7 +102,7 @@ impl GgufModel {
                 map,
             }));
         }
-        first_error.map_or(Ok(None), Err)
+        Ok(None)
     }
 
     /// The path of shard 1 (the file itself outside a split set).
@@ -189,6 +201,35 @@ impl GgufModel {
             types.join(", ")
         )
     }
+}
+
+/// Whether the file name or the first bytes of the file at `path` name this architecture. The
+/// architecture is the first metadata entry of every file the converters write. A shard
+/// after the first has only split keys, so it answers through shard 1.
+fn names_this_architecture(path: &Path) -> bool {
+    use std::io::Read;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.contains(ARCHITECTURE) || name.contains("flash-next") {
+        return true;
+    }
+    if let Some(shard) = crate::weights::shard_name_of(path)
+        && shard.number != 1
+    {
+        return names_this_architecture(&shard.sibling(path, 1));
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 4096];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    head[..read]
+        .windows(ARCHITECTURE.len())
+        .any(|window| window == ARCHITECTURE.as_bytes())
 }
 
 #[cfg(test)]
