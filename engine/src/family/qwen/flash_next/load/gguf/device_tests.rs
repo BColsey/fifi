@@ -65,3 +65,41 @@ fn the_device_logits_follow_the_host_forward_on_the_small_model() {
     eprintln!("worst max abs difference {worst} on logits up to {scale}");
     assert!(worst < 0.05 * scale.max(1.0), "{worst} against {scale}");
 }
+
+fn time_run<S: TokenStepper>(driver: &mut S) -> f64 {
+    driver.reset().expect("reset");
+    let start = std::time::Instant::now();
+    for at in 0..48u32 {
+        let logits = driver.logits(5 + at * 7 % 400).expect("logits");
+        assert!(logits.iter().all(|v| v.is_finite()));
+    }
+    start.elapsed().as_secs_f64() * 1e3 / 48.0
+}
+
+/// Decode time per token on the small model, which picks ten experts per layer: the median of
+/// five runs of 48 tokens after one warm-up run. It prints the figure; the check is that every
+/// run completes and the logits stay finite.
+#[test]
+fn the_decode_time_per_token_on_the_small_model() {
+    let small = write_small(7);
+    let model: &'static GgufModel = Box::leak(Box::new(
+        GgufModel::open(&small.first)
+            .expect("open")
+            .expect("a qwen4exp model"),
+    ));
+    let projector: &'static CudaProjector =
+        Box::leak(Box::new(CudaProjector::new().expect("the card")));
+    let ctx = projector.context();
+    let stream: &'static DeviceStream = Box::leak(Box::new(ctx.stream().expect("stream")));
+    let weights = Box::leak(Box::new(
+        gguf_trunk(model, ctx, true, 8 << 20).expect("the trunk uploads"),
+    ));
+    let mut driver = gguf_driver(model, ctx, stream, weights, 128, 2).expect("the driver");
+    time_run(&mut driver);
+    let mut times: Vec<f64> = (0..5).map(|_| time_run(&mut driver)).collect();
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "decode ms per token on the small model: median {:.3}, runs {times:.3?}",
+        times[2]
+    );
+}
