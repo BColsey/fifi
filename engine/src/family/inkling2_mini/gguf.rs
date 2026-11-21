@@ -555,6 +555,12 @@ pub(super) fn packed_mlx_enabled() -> bool {
     std::env::var_os("FIFI_INKLING_GGUF_PACKED_MLX").is_some_and(|value| value == "1")
 }
 
+pub(super) fn single_copy_experts_enabled() -> bool {
+    packed_mlx_enabled()
+        && std::env::var_os("FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS")
+            .is_some_and(|value| value == "1")
+}
+
 pub(super) fn native_scratch_bytes() -> u64 {
     // Reserve the existing general plane workspace, plus four resident U32
     // codebooks and a second copy to cover their host upload in packed mode.
@@ -591,6 +597,10 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
                 {
                     format!(
                         "{plan}, up to {headroom} B shared by mapped packed dense projections and expert cache under {device}; exact dense reservation is selected at load; MLX allocator pool is process-wide and outside these logical cache capacities"
+                    )
+                } else if single_copy_experts_enabled() {
+                    format!(
+                        "{plan}, up to {headroom} B of Metal expert retention under {device}; one retained copy when the checkpoint's expert tensors all have direct packed kernels; MLX allocator pool is process-wide and outside this logical capacity"
                     )
                 } else {
                     let ram = headroom / 4;
