@@ -22,7 +22,7 @@ use crate::family::gemma4;
 use crate::family::inkling2_mini;
 use crate::family::nemotron35::factory as nemotron_factory;
 use crate::family::qwen36::factory as q36_factory;
-use crate::family::sampler::SamplingDefaults;
+use crate::family::sampler::{LoadedDefaults, SamplingDefaults};
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
 use crate::tokenizer::TokenizerBundle;
@@ -241,6 +241,18 @@ fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
         .ok();
 }
 
+fn load_sampling_defaults(config: &EngineConfig) -> Result<LoadedDefaults, EngError> {
+    if config.family == inkling2_mini::FAMILY {
+        // The publisher pin includes generation_config.json in the tokenizer bundle.
+        storage_guard::require_local(&config.tokenizer_dir, "Inkling tokenizer")?;
+        SamplingDefaults::from_model_dir(&config.tokenizer_dir)
+    } else {
+        // A model path may name one `.gguf` file; side files sit beside it.
+        let directory = crate::family::gguf_select::directory_of(&config.model_dir);
+        SamplingDefaults::from_model_dir(&directory)
+    }
+}
+
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the
 /// `prefix_reuse` flag of the configuration file to the chat handler and to the Q36 engine
 /// start, whose session-cap rule reads it (`family::qwen36::settings::check_prefix_reuse_cap`),
@@ -295,9 +307,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
                 describe(&error)
             ))
         })?;
-        // A model path may name one `.gguf` file; its side files sit beside it.
-        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
+        let loaded = load_sampling_defaults(config).map_err(|error| {
             StartupError(format!(
                 "engine {} failed to start: {}",
                 config.id,
@@ -883,6 +893,35 @@ mod tests {
             nemotron: None,
             flint: None,
         }
+    }
+
+    #[test]
+    fn inkling_sampling_defaults_follow_the_pinned_tokenizer_directory() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("generation_config.json"),
+            r#"{"temperature":0.25}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tokenizer.path().join("generation_config.json"),
+            r#"{"temperature":1.0}"#,
+        )
+        .unwrap();
+        let mut config = engine_config("inkling", None);
+        config.model_dir = model.path().to_owned();
+        config.tokenizer_dir = tokenizer.path().to_owned();
+        config.family = crate::family::inkling2_mini::FAMILY.into();
+        let load = |config| {
+            super::load_sampling_defaults(config)
+                .unwrap()
+                .values
+                .temperature
+        };
+        assert_eq!(load(&config), 1.0);
+        config.family = "fake".into();
+        assert_eq!(load(&config), 0.25);
     }
 
     /// A tokenizer dir carrying the PINNED qwen template, so an entry's

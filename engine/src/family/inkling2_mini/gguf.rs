@@ -14,7 +14,7 @@ use crate::{
 };
 
 const ROWS_PER_READ: usize = 256;
-const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
+pub(super) const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
 const PADDED_VOCAB: u64 = 201_024;
 const RELATIVE_FEATURES: u64 = 16;
 const RELATIVE_EXTENT: u64 = 1024;
@@ -465,7 +465,7 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
                 let ram = headroom / 4;
                 (
                     format!(
-                        "{plan}, {ram} B for packed RAM and {} B for expanded Metal expert planes, under {device}",
+                        "{plan}, {ram} B for packed RAM and {} B for expanded Metal expert planes under {device}; MLX allocator pool is process-wide and outside these logical cache capacities",
                         headroom - ram
                     ),
                     Some(true),
@@ -474,7 +474,12 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
             Err(error) => (format!("{plan}, {}", error.describe()), Some(false)),
         }
     } else {
-        (format!("{plan}, automatic Metal budget disabled"), None)
+        (
+            format!(
+                "{plan}, automatic Metal budget disabled; base allocations unchecked and expert caches disabled"
+            ),
+            None,
+        )
     };
     #[cfg(not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")))]
     let (chosen, budget_fit) = (
