@@ -408,7 +408,9 @@ fn check_tensor(
     check_types: bool,
 ) -> Result<(), EngError> {
     let ty = tensor.ggml_type();
-    if check_types && !SUPPORTED_TYPES.contains(&ty) {
+    // A BF16 norm or gate vector is widened to F32 at load, so it is a supported tensor.
+    let widened = ty == GgufType::Bf16 && tensor.is_small_half_vector();
+    if check_types && !SUPPORTED_TYPES.contains(&ty) && !widened {
         return Err(checkpoint(format!(
             "tensor {} has unsupported type {}",
             tensor.name(),
