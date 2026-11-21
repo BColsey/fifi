@@ -121,6 +121,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gguf_wmma_launch"]
+    fn gguf_wmma_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 /// The geometry of one launch: `m` activation rows of `cols` values at stride `ld_x`, a weight
@@ -170,6 +176,32 @@ pub(in crate::kernels::cuda) fn typed_gemv_need(
     if !inside {
         return None;
     }
+    projection_need(dims, dtype)
+}
+
+pub(in crate::kernels::cuda) fn typed_wmma_need(
+    dims: GemvDims,
+    dtype: DenseDtype,
+) -> Option<DenseGemvBytes> {
+    use GgufType::{Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Q20};
+    let quant = matches!(
+        dtype,
+        DenseDtype::GgufNvfp4 | DenseDtype::PackedGguf(Iq1S | Iq1M | Iq2Xxs | Iq2Xs | Iq2S | Q20)
+    );
+    let geometries = [dims.m, dims.rows, dims.cols, dims.ld_x, dims.ld_y];
+    if !quant
+        || geometries
+            .into_iter()
+            .any(|n| n == 0 || c_int::try_from(n).is_err())
+        || dims.ld_x < dims.cols
+        || dims.ld_y < dims.rows
+    {
+        return None;
+    }
+    projection_need(dims, dtype)
+}
+
+fn projection_need(dims: GemvDims, dtype: DenseDtype) -> Option<DenseGemvBytes> {
     let strided = |last: usize, stride: usize, tail: usize| {
         (last - 1)
             .checked_mul(stride)?
@@ -198,8 +230,7 @@ fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
 }
 
 /// The result is apart from both inputs; the inputs may share bytes.
-fn check(call: &DenseGemvRaw<'_>) -> Result<DenseGemvBytes, DeviceFailure> {
-    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+fn check(call: &DenseGemvRaw<'_>, need: DenseGemvBytes) -> Result<(), DeviceFailure> {
     let sized = fits(&call.w, need.w, call.dtype.weight_alignment())
         && fits(&call.x, need.x, FLOAT)
         && fits(&call.y, need.y, FLOAT);
@@ -208,7 +239,7 @@ fn check(call: &DenseGemvRaw<'_>) -> Result<DenseGemvBytes, DeviceFailure> {
     if !(sized && apart) {
         return Err(invalid_argument());
     }
-    Ok(need)
+    Ok(())
 }
 
 /// Queues the kernel on `stream`: `y[t * ld_y + r] = sum_c w[r][c] * x[t * ld_x + c]`.
@@ -216,7 +247,28 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     stream: &RawStream,
     call: DenseGemvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
-    check(&call)?;
+    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    projection_launch(stream, call, need, dense_gemv_raw)
+}
+
+pub(in crate::kernels::cuda) fn gguf_wmma_launch(
+    stream: &RawStream,
+    call: DenseGemvRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let need = typed_wmma_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    projection_launch(stream, call, need, gguf_wmma_raw)
+}
+
+type ProjectionEntry =
+    unsafe extern "C" fn(*const DenseGemvArgsRaw, *mut c_void, *mut c_int) -> c_int;
+
+fn projection_launch(
+    stream: &RawStream,
+    call: DenseGemvRaw<'_>,
+    need: DenseGemvBytes,
+    entry: ProjectionEntry,
+) -> Result<(), DeviceFailure> {
+    check(&call, need)?;
     let dims = call.dims;
     let as_int = |v: usize| c_int::try_from(v).map_err(|_| invalid_argument());
     let args = DenseGemvArgsRaw {
@@ -236,7 +288,7 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     // `w` and `x`; the entry checks the addresses again. The allocations outlive the queued work
     // (`inference_cuda_free` synchronizes first). `args` is a live local that the entry reads only
     // during the call, `stream` is live, and `stage` is a writable c_int.
-    let status = unsafe { dense_gemv_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe { entry(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 
@@ -263,6 +315,20 @@ mod tests {
         assert_eq!(need.y, (2 * 21_728 + 48) * 4);
         let single = gemv_need(dims(1, 48, 2560, 2560, 48)).unwrap();
         assert_eq!((single.x, single.y), (2560 * 4, 48 * 4));
+    }
+
+    #[test]
+    fn wmma_admits_wider_batches_and_checks_packed_geometry() {
+        let m = GEMV_MAX_M + 1;
+        let q2 = DenseDtype::PackedGguf(GgufType::Q20);
+        let allowed = typed_wmma_need(dims(m, 7, 128, 135, 11), q2).unwrap();
+        assert_eq!(allowed.w, 7 * 2 * 18);
+        assert_eq!(allowed.x, ((m - 1) * 135 + 128) * 4);
+        assert_eq!(allowed.y, ((m - 1) * 11 + 7) * 4);
+        assert!(typed_wmma_need(dims(32, 7, 129, 135, 11), q2).is_none());
+        assert!(typed_wmma_need(dims(32, 7, 128, 127, 11), q2).is_none());
+        assert!(typed_wmma_need(dims(32, 7, 128, 135, 11), DenseDtype::F32).is_none());
+        assert!(typed_wmma_need(dims(i32::MAX as usize + 1, 7, 128, 135, 11), q2).is_none());
     }
 
     #[test]

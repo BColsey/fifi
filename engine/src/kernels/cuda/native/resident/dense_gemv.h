@@ -44,6 +44,14 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
+/* Tiled FP16-operand FP32-accumulating GEMM with the same external F32 activation
+ * and output layouts. This opt-in entry uses Tensor Cores and accepts the
+ * original packed blocks of IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, NVFP4 and Q2_0.
+ * Columns must be a multiple of their block size. Weight and input half rounding
+ * can change the output from the F32 matvec. No global weight staging. */
+int inference_cuda_gguf_wmma_launch(const inference_cuda_dense_gemv_args *args, void *stream,
+                                     int *out_stage);
+
 /* Contiguous GGUF expert stacks. Rank order is the order of picks. Scratch holds
  * count * (3 * middle + hidden) f32 values. The launch queues the two indexed
  * projections, clipped gate activation and weighted sum on one stream. */

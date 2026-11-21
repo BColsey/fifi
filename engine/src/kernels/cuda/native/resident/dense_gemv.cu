@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cmath>
 #include <stddef.h>
@@ -241,13 +242,11 @@ size_t weight_row_bytes(int dtype, int cols) {
     }
 }
 
-bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
-    if (stream == NULL || a.w == NULL || a.x == NULL || a.y == NULL) return false;
-    if (a.m < 1 || a.m > kMaxM || a.rows < 1 || a.rows > kMaxRows || a.cols < 1 ||
-        a.cols > kMaxCols) {
+bool valid_operands(const inference_cuda_dense_gemv_args &a, void *stream) {
+    if (!stream || !a.w || !a.x || !a.y ||
+        a.m < 1 || a.rows < 1 || a.cols < 1 || a.ld_x < a.cols || a.ld_y < a.rows) {
         return false;
     }
-    if (a.ld_x < a.cols || a.ld_x > kMaxLd || a.ld_y < a.rows || a.ld_y > kMaxLd) return false;
     const size_t weight_alignment = a.weight_dtype == kDtypeF32 ? 4 : 2;
     if (!aligned(a.w, weight_alignment) || !aligned(a.x, 4) || !aligned(a.y, 4)) return false;
     const size_t m = (size_t)a.m;
@@ -257,6 +256,134 @@ bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
     const Span in = {a.x, ((m - 1) * a.ld_x + a.cols) * 4};
     const Span out = {a.y, ((m - 1) * a.ld_y + a.rows) * 4};
     return apart(out, in) && apart(out, weights);
+}
+
+bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
+    return a.m <= kMaxM && a.rows <= kMaxRows && a.cols <= kMaxCols &&
+           a.ld_x <= kMaxLd && a.ld_y <= kMaxLd && valid_operands(a, stream);
+}
+
+constexpr int kWmmaTile = 32;
+constexpr int kWmmaStride = kWmmaTile + 8;
+constexpr int kWmmaThreads = 128;
+
+// Native GGUF blocks are decoded once per tile and rounded to F16. External
+// tensor scales remain the caller's responsibility, as in the F32 matvec.
+template <int Type, int Block, int Bytes>
+__device__ __forceinline__ __half wmma_weight(const uint8_t *row, int col) {
+    const uint8_t *block = row + size_t(col / Block) * Bytes;
+    const int i = col % Block;
+    if constexpr (Type == 40) {
+        const int group = i / 16;
+        const unsigned pair = block[4 + 8 * group + i % 8];
+        return __float2half_rn(gguf_fp4((pair >> (4 * ((i / 8) % 2))) & 15) *
+                                 gguf_scale(block[group]));
+    } else {
+        return __float2half_rn(fifi_gguf::decode<Type>(block, i));
+    }
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+using WmmaAccumulator = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>;
+
+template <int Type, int Block, int Bytes>
+__device__ void accumulate_packed_tile(inference_cuda_dense_gemv_args a,
+                                       size_t token, size_t output, int warp,
+                                       __half *x_tile, __half *w_tile, WmmaAccumulator &accum) {
+    using namespace nvcuda::wmma;
+    const auto *x = static_cast<const float *>(a.x);
+    const auto *w = static_cast<const uint8_t *>(a.w);
+    const size_t row_bytes = size_t(a.cols / Block) * Bytes;
+    fill_fragment(accum, 0.0f);
+    for (int base = 0; base < a.cols; base += kWmmaTile) {
+        for (int i = threadIdx.x; i < kWmmaTile * kWmmaTile; i += kWmmaThreads) {
+            const int row = i / kWmmaTile;
+            const int col = base + i % kWmmaTile;
+            const int at = row * kWmmaStride + i % kWmmaTile;
+            x_tile[at] = token + row < size_t(a.m) ?
+                __float2half_rn(x[(token + row) * a.ld_x + col]) : __float2half_rn(0.0f);
+            w_tile[at] = output + row < size_t(a.rows) ?
+                wmma_weight<Type, Block, Bytes>(w + (output + row) * row_bytes, col) :
+                __float2half_rn(0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int step = 0; step < kWmmaTile; step += 16) {
+            fragment<matrix_a, 16, 16, 16, __half, row_major> left;
+            fragment<matrix_b, 16, 16, 16, __half, col_major> right;
+            load_matrix_sync(left, x_tile + (warp / 2) * 16 * kWmmaStride + step, kWmmaStride);
+            load_matrix_sync(right, w_tile + (warp % 2) * 16 * kWmmaStride + step, kWmmaStride);
+            mma_sync(accum, left, right, accum);
+        }
+        __syncthreads();
+    }
+}
+#endif
+
+template <int Type, int Block, int Bytes>
+__global__ void gguf_wmma_kernel(inference_cuda_dense_gemv_args a) {
+    const size_t output = size_t(blockIdx.x) * kWmmaTile;
+    auto *y = static_cast<float *>(a.y);
+#if __CUDA_ARCH__ >= 700
+    __shared__ __align__(32) __half x_tile[kWmmaTile * kWmmaStride];
+    __shared__ __align__(32) __half w_tile[kWmmaTile * kWmmaStride];
+    __shared__ __align__(32) float results[kWmmaTile * kWmmaTile];
+    const int warp = threadIdx.x / 32;
+#endif
+    // Grid Y is hardware-limited. Return rows in the original order even if
+    // one CTA must process multiple token tiles.
+    for (size_t token = size_t(blockIdx.y) * kWmmaTile; token < size_t(a.m);
+         token += size_t(gridDim.y) * kWmmaTile) {
+#if __CUDA_ARCH__ >= 700
+        WmmaAccumulator accum;
+        accumulate_packed_tile<Type, Block, Bytes>(a, token, output, warp, x_tile, w_tile, accum);
+        nvcuda::wmma::store_matrix_sync(
+            results + (warp / 2) * 16 * kWmmaTile + (warp % 2) * 16, accum,
+            kWmmaTile, nvcuda::wmma::mem_row_major);
+        __syncthreads();
+#endif
+        for (int i = threadIdx.x; i < kWmmaTile * kWmmaTile; i += kWmmaThreads) {
+            const size_t t = token + i / kWmmaTile;
+            const size_t r = output + i % kWmmaTile;
+            if (t < size_t(a.m) && r < size_t(a.rows)) {
+#if __CUDA_ARCH__ >= 700
+                y[t * a.ld_y + r] = results[i];
+#else
+                // This path requires Tensor Cores. An unsupported raw launch
+                // must not leave stale results in the output.
+                y[t * a.ld_y + r] = __int_as_float(0x7fc00000);
+#endif
+            }
+        }
+        __syncthreads();
+    }
+}
+
+int launch_wmma(inference_cuda_dense_gemv_args a, void *stream, int *out_stage) {
+    const int kind = a.weight_dtype == kDtypeGgufNvfp4 ? 40 :
+        a.weight_dtype - fifi_gguf::kDtypeBase;
+    const unsigned token_tiles = (a.m - 1) / kWmmaTile + 1;
+    const dim3 grid((a.rows - 1) / kWmmaTile + 1, token_tiles < 65535 ? token_tiles : 65535);
+    const auto cuda_stream = (cudaStream_t)stream;
+    switch (kind) {
+#define WMMA_CASE(id, block, bytes) case id: \
+        gguf_wmma_kernel<id, block, bytes><<<grid, kWmmaThreads, 0, cuda_stream>>>(a); \
+        break;
+        WMMA_CASE(16, 256, 66)
+        WMMA_CASE(17, 256, 74)
+        WMMA_CASE(19, 256, 50)
+        WMMA_CASE(22, 256, 82)
+        WMMA_CASE(29, 256, 56)
+        WMMA_CASE(40, 64, 36)
+        WMMA_CASE(42, 64, 18)
+#undef WMMA_CASE
+    default:
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    report_stage(out_stage, failure.stage);
+    return (int)failure.err;
 }
 
 template <typename W>
@@ -446,6 +573,19 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gguf_wmma_launch(const inference_cuda_dense_gemv_args *args,
+                                                void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!args || !valid_operands(*args, stream) || args->cols % kWmmaTile) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return launch_wmma(*args, stream, out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }

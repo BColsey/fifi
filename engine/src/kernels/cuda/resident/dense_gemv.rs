@@ -14,7 +14,7 @@ use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, DenseGemvBytes};
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
-    dense_gemv_launch, typed_gemv_need,
+    dense_gemv_launch, gguf_wmma_launch, typed_gemv_need, typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -116,8 +116,44 @@ impl CudaContext {
         })
     }
 
+    /// Projects a batch with packed weights and F32 buffers. Operand tiles round to F16
+    /// before Tensor Core products with F32 accumulation. Select it explicitly where that
+    /// precision has been qualified. The original dense GEMV remains the exact fallback.
+    #[allow(
+        dead_code,
+        reason = "staged pending full-model quality and dispatch qualification"
+    )]
+    pub(crate) fn gguf_wmma_gemm(
+        &self,
+        stream: &DeviceStream,
+        call: DenseGemvCall<'_>,
+    ) -> Result<(), EngError> {
+        self.check_launch_stream(stream)?;
+        let need = typed_wmma_need(call.shape.dims(), call.dtype).ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "GGUF Tensor Core projection cannot use {:?} at {:?}",
+                call.dtype, call.shape
+            ))
+        })?;
+        let raw = self.plan_dense_projection(&call, need)?;
+        if self.mmq_device_facts()?.cc < 700 {
+            return Err(EngError::BadRequest(
+                "GGUF Tensor Core projection needs SM70 or later".into(),
+            ));
+        }
+        self.launch_on(stream, move |stream_raw| gguf_wmma_launch(stream_raw, raw))
+    }
+
     fn plan_dense_gemv<'b>(&self, call: &DenseGemvCall<'b>) -> Result<DenseGemvRaw<'b>, EngError> {
         let need = dense_gemv_bytes(call.shape, call.dtype)?;
+        self.plan_dense_projection(call, need)
+    }
+
+    fn plan_dense_projection<'b>(
+        &self,
+        call: &DenseGemvCall<'b>,
+        need: DenseGemvBytes,
+    ) -> Result<DenseGemvRaw<'b>, EngError> {
         require_fit("w", &call.w, need.w, call.dtype.weight_alignment())?;
         require_fit("x", &call.x, need.x, 4)?;
         require_fit("y", &call.y, need.y, 4)?;
