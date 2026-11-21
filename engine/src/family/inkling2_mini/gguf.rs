@@ -324,6 +324,23 @@ impl Weights {
         selected: &[usize],
         routes: &[f32],
     ) -> Result<Vec<half::bf16>, EngError> {
+        self.moe_row_with(
+            layer,
+            input,
+            selected,
+            routes,
+            |name, plane, rows, input| self.project(name, plane, 0..rows, input),
+        )
+    }
+
+    pub(super) fn moe_row_with(
+        &self,
+        layer: usize,
+        input: &[f32],
+        selected: &[usize],
+        routes: &[f32],
+        mut project: impl FnMut(&str, usize, usize, &[f32]) -> Result<Vec<f32>, EngError>,
+    ) -> Result<Vec<half::bf16>, EngError> {
         use super::{GATE_CAP, TOP_K, UP_CAP};
         if layer >= LAYERS || selected.len() != TOP_K || routes.len() != TOP_K {
             return Err(EngError::BadRequest(
@@ -348,7 +365,7 @@ impl Weights {
                     "Inkling GGUF expert ID out of range".into(),
                 ));
             }
-            let fused = self.project(&gate, expert, 0..2 * INTERMEDIATE, input)?;
+            let fused = project(&gate, expert, 2 * INTERMEDIATE, input)?;
             let (gate_values, up_values) = fused.split_at(INTERMEDIATE);
             let s = gate_scale[expert];
             let activated: Vec<_> = gate_values
@@ -362,7 +379,7 @@ impl Weights {
                         * (u / UP_CAP).tanh()
                 })
                 .collect();
-            let projected = self.project(&down, expert, 0..HIDDEN, &activated)?;
+            let projected = project(&down, expert, HIDDEN, &activated)?;
             let s = route * down_scale[expert];
             for (out, value) in merged.iter_mut().zip(projected) {
                 *out += value * s;
@@ -396,4 +413,33 @@ fn matrix(tensor: &GgufTensor) -> Result<(usize, usize, GgufType, usize), EngErr
         dtype,
         (width / dtype.block_elems() * dtype.block_bytes()) as usize,
     ))
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) struct ExpertPlane {
+    pub(super) width: usize,
+    pub(super) height: usize,
+    pub(super) dtype: GgufType,
+    pub(super) bytes: Vec<u8>,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl Weights {
+    pub(super) fn read_expert(&self, name: &str, expert: usize) -> Result<ExpertPlane, EngError> {
+        let tensor = self.tensor(name)?;
+        let (width, height, dtype, row_bytes) = matrix(tensor)?;
+        if tensor.dims().get(2).copied() != Some(EXPERTS as u64) || expert >= EXPERTS {
+            return Err(EngError::BadRequest(format!(
+                "invalid expert {expert} for Inkling GGUF tensor {name}"
+            )));
+        }
+        let mut bytes = self.buffer(name, height * row_bytes)?;
+        self.read_range(name, (expert * bytes.len()) as u64, &mut bytes)?;
+        Ok(ExpertPlane {
+            width,
+            height,
+            dtype,
+            bytes,
+        })
+    }
 }
