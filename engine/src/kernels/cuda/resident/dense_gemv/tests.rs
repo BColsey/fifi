@@ -92,7 +92,9 @@ fn narrow(dtype: DenseDtype, values: &[f32]) -> Vec<u16> {
         .map(|&v| match dtype {
             DenseDtype::F16 => half::f16::from_f32(v).to_bits(),
             DenseDtype::Bf16 => half::bf16::from_f32(v).to_bits(),
-            DenseDtype::GgufNvfp4 => unreachable!("half-precision fixture"),
+            DenseDtype::GgufNvfp4 | DenseDtype::PackedGguf(_) => {
+                unreachable!("half-precision fixture")
+            }
         })
         .collect()
 }
@@ -103,7 +105,9 @@ fn widen(dtype: DenseDtype, codes: &[u16]) -> Vec<f64> {
         .map(|&c| match dtype {
             DenseDtype::F16 => half::f16::from_bits(c).to_f64(),
             DenseDtype::Bf16 => half::bf16::from_bits(c).to_f64(),
-            DenseDtype::GgufNvfp4 => unreachable!("half-precision fixture"),
+            DenseDtype::GgufNvfp4 | DenseDtype::PackedGguf(_) => {
+                unreachable!("half-precision fixture")
+            }
         })
         .collect()
 }
@@ -492,4 +496,120 @@ fn gguf_nvfp4_projects_original_blocks_and_checks_their_extents() {
         })
         .collect();
     assert_eq!(got, expected);
+}
+
+fn test_packed_blocks(kind: crate::weights::GgufType, count: usize) -> Vec<u8> {
+    use crate::weights::GgufType::*;
+    let mut rng = Rng::new(0xAB_54_30_17);
+    let mut bytes = vec![0; count * kind.block_bytes() as usize];
+    for (i, block) in bytes
+        .chunks_exact_mut(kind.block_bytes() as usize)
+        .enumerate()
+    {
+        for byte in block.iter_mut() {
+            *byte = (256.0 * rng.unit()) as u8;
+        }
+        let d = half::f16::from_f32((i % 7 + 1) as f32 / 256.0).to_bits();
+        let offset = match kind {
+            Q2K => 80,
+            Q3K => 108,
+            Q6K => 208,
+            Mxfp4 => {
+                block[0] = 121 + (i % 7) as u8;
+                continue;
+            }
+            Iq1M => {
+                for (j, byte) in block[49..56].iter_mut().step_by(2).enumerate() {
+                    *byte = (*byte & 15) | (((d >> (4 * j)) & 15) as u8) << 4;
+                }
+                continue;
+            }
+            _ => 0,
+        };
+        block[offset..offset + 2].copy_from_slice(&d.to_le_bytes());
+        if matches!(kind, Q2K | Q4K | Q5K) {
+            block[offset + 2..offset + 4].copy_from_slice(&(d + 13).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+#[test]
+fn original_packed_gguf_gemv_matches_cpu_for_every_supported_format() {
+    use crate::weights::{GgufType, dequantize_into};
+
+    if !testkit::device_present("original_packed_gguf_gemv_matches_cpu_for_every_supported_format")
+    {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = DenseGemvShape {
+        m: 3,
+        rows: 13,
+        cols: 512,
+        ld_x: 517,
+        ld_y: 16,
+    };
+    let mut rng = Rng::new(0xAB_54_30_19);
+    let input = draw(&mut rng, (shape.m - 1) * shape.ld_x + shape.cols, 1.0);
+    let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+    let y_bytes = ((shape.m - 1) * shape.ld_y + shape.rows) * 4;
+
+    let mut covered = 0;
+    for id in 0..=42 {
+        let Ok(kind) = GgufType::from_id(id) else {
+            continue;
+        };
+        let Some(dtype @ DenseDtype::PackedGguf(_)) = DenseDtype::from_gguf(kind) else {
+            continue;
+        };
+        covered += 1;
+        let values = shape.rows * shape.cols;
+        let blocks = test_packed_blocks(kind, values / kind.block_elems() as usize);
+        let mut decoded = vec![0.0; values];
+        dequantize_into(kind, &blocks, &mut decoded).unwrap();
+        let w = Padded::new(&rig.ctx, &blocks, 2);
+        let y = Padded::new(&rig.ctx, &sentinel(y_bytes), 0);
+        rig.ctx
+            .dense_gemv(
+                &rig.stream,
+                DenseGemvCall {
+                    shape,
+                    dtype,
+                    w: w.all(),
+                    x: x.all(),
+                    y: y.all(),
+                },
+            )
+            .unwrap();
+        rig.stream.synchronize().unwrap();
+        assert_eq!(w.read(&rig.ctx, "packed weight"), blocks);
+        let bytes = y.read(&rig.ctx, "GGUF packed output");
+        let result = testkit::floats(&bytes);
+        for t in 0..shape.m {
+            let x = &input[t * shape.ld_x..][..shape.cols];
+            for (row, weights) in decoded.chunks_exact(shape.cols).enumerate() {
+                let (want, magnitude) =
+                    x.iter().zip(weights).fold((0.0, 0.0), |(s, a), (&x, &w)| {
+                        let term = f64::from(x) * f64::from(w);
+                        (s + term, a + term.abs())
+                    });
+                let got = f64::from(result[t * shape.ld_y + row]);
+                let depth = (shape.cols / 32 + 6) as f64;
+                let tolerance = SLACK * U * depth * magnitude;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{} token {t} row {row}: got {got}, expected {want} ± {tolerance}",
+                    kind.name()
+                );
+            }
+            if t + 1 < shape.m {
+                for padding in shape.rows..shape.ld_y {
+                    assert_eq!(result[t * shape.ld_y + padding].to_bits(), SENT_BITS);
+                }
+            }
+        }
+        println!("packed GGUF {} against CPU", kind.name());
+    }
+    assert_eq!(covered, 19);
 }

@@ -1,6 +1,4 @@
-// The dense half-precision matvec of the Flash-Next step (see resident/dense_gemv.h for the
-// contract). One warp per weight row; the activation row is staged in shared memory once per
-// block and shared by its eight warps.
+// Dense matvec for half-precision or packed GGUF weights (see resident/dense_gemv.h).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -11,6 +9,7 @@
 #include "abi.h"
 #include "device.h"
 #include "resident/dense_gemv.h"
+#include "resident/gguf_gemv.cuh"
 
 namespace {
 
@@ -110,11 +109,44 @@ __global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a) {
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
+template <int Type, int Block, int Bytes>
+__global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a) {
+    extern __shared__ float staged[];
+    const auto *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
+    for (int col = threadIdx.x; col < a.cols; col += blockDim.x) staged[col] = x[col];
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row >= a.rows) return;
+    const int blocks = a.cols / Block;
+    const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row) * blocks * Bytes;
+    float sum = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto *weights = w + block * Bytes;
+#pragma unroll
+        for (int col = lane; col < Block; col += 32) {
+            sum = fmaf(fifi_gguf::decode<Type>(weights, col), staged[block * Block + col], sum);
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
+}
+
+size_t weight_row_bytes(int dtype, int cols) {
+    switch (dtype) {
+    case kDtypeF16:
+    case kDtypeBf16:
+        return size_t(cols) * 2;
+    case kDtypeGgufNvfp4:
+        return cols % 64 == 0 ? size_t(cols / 64) * 36 : 0;
+    default:
+        return fifi_gguf::row_bytes(dtype, cols);
+    }
+}
+
 bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
     if (stream == NULL || a.w == NULL || a.x == NULL || a.y == NULL) return false;
-    const bool gguf = a.weight_dtype == kDtypeGgufNvfp4;
-    if (!gguf && a.weight_dtype != kDtypeF16 && a.weight_dtype != kDtypeBf16) return false;
-    if (gguf && a.cols % 64 != 0) return false;
     if (a.m < 1 || a.m > kMaxM || a.rows < 1 || a.rows > kMaxRows || a.cols < 1 ||
         a.cols > kMaxCols) {
         return false;
@@ -122,7 +154,8 @@ bool valid(const inference_cuda_dense_gemv_args &a, void *stream) {
     if (a.ld_x < a.cols || a.ld_x > kMaxLd || a.ld_y < a.rows || a.ld_y > kMaxLd) return false;
     if (!aligned(a.w, 2) || !aligned(a.x, 4) || !aligned(a.y, 4)) return false;
     const size_t m = (size_t)a.m;
-    const size_t row_bytes = gguf ? size_t(a.cols / 64) * 36 : size_t(a.cols) * 2;
+    const size_t row_bytes = weight_row_bytes(a.weight_dtype, a.cols);
+    if (row_bytes == 0) return false;
     const Span weights = {a.w, size_t(a.rows) * row_bytes};
     const Span in = {a.x, ((m - 1) * a.ld_x + a.cols) * 4};
     const Span out = {a.y, ((m - 1) * a.ld_y + a.rows) * 4};
@@ -144,6 +177,21 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
 }
 
+void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
+                   Failure &failure) {
+    const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
+    const size_t shared = size_t(a.cols) * sizeof(float);
+    switch (a.weight_dtype - fifi_gguf::kDtypeBase) {
+#define LAUNCH(id, block, bytes) \
+    case id: \
+        gguf_packed_gemv<id, block, bytes><<<grid, kWarps * 32, shared, stream>>>(a); \
+        break;
+        FIFI_GGUF_GEMV_TYPES(LAUNCH)
+#undef LAUNCH
+    }
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args,
@@ -158,6 +206,8 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         } else if (args->weight_dtype == kDtypeF16) {
             launch<__half>(*args, (cudaStream_t)stream, failure);
+        } else if (args->weight_dtype >= fifi_gguf::kDtypeBase) {
+            launch_packed(*args, (cudaStream_t)stream, failure);
         } else {
             launch<__nv_bfloat16>(*args, (cudaStream_t)stream, failure);
         }

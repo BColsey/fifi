@@ -1,5 +1,5 @@
 //! Raw FFI to `inference_cuda_dense_gemv_launch` of `native/resident/dense_gemv.cu` (declared in
-//! `native/resident/dense_gemv.h`): the shared dense half-precision matvec.
+//! `native/resident/dense_gemv.h`): shared dense matvec for half-precision and packed GGUF weights.
 //! Child of `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
@@ -17,6 +17,8 @@
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 
+use crate::weights::GgufType;
+
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
 /// Limits of `dense_gemv.h`.
@@ -27,6 +29,7 @@ pub(in crate::kernels::cuda) const GEMV_MAX_LD: usize = 1 << 20;
 
 const FLOAT: usize = 4;
 const HALF: usize = 2;
+const GGUF_DTYPE_BASE: c_int = 256;
 
 /// Element type of the weight matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +37,36 @@ pub(crate) enum DenseDtype {
     F16,
     Bf16,
     GgufNvfp4,
+    PackedGguf(GgufType),
 }
 
 impl DenseDtype {
+    pub(crate) fn from_gguf(kind: GgufType) -> Option<Self> {
+        use GgufType::*;
+        match kind {
+            F16 => Some(Self::F16),
+            Bf16 => Some(Self::Bf16),
+            Nvfp4 => Some(Self::GgufNvfp4),
+            Q40 | Q50 | Q80 | Q20 | Q2K | Q3K | Q4K | Q5K | Q6K | Iq1S | Iq1M | Iq2Xxs | Iq2Xs
+            | Iq2S | Iq3Xxs | Iq3S | Iq4Nl | Iq4Xs | Mxfp4 => Some(Self::PackedGguf(kind)),
+            _ => None,
+        }
+    }
+
+    fn gguf_kind(self) -> Option<GgufType> {
+        match self {
+            Self::GgufNvfp4 => Some(GgufType::Nvfp4),
+            Self::PackedGguf(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
     fn code(self) -> c_int {
         match self {
             Self::F16 => 0,
             Self::Bf16 => 1,
             Self::GgufNvfp4 => 2,
+            Self::PackedGguf(kind) => GGUF_DTYPE_BASE + kind.id() as c_int,
         }
     }
 }
@@ -134,14 +159,18 @@ pub(in crate::kernels::cuda) fn typed_gemv_need(
             .checked_add(tail)?
             .checked_mul(FLOAT)
     };
-    Some(DenseGemvBytes {
-        w: match dtype {
-            DenseDtype::GgufNvfp4 if dims.cols.is_multiple_of(64) => {
-                dims.rows.checked_mul(dims.cols / 64)?.checked_mul(36)?
+    let row_bytes = match dtype.gguf_kind() {
+        Some(kind) => {
+            let block = kind.block_elems() as usize;
+            if DenseDtype::from_gguf(kind) != Some(dtype) || !dims.cols.is_multiple_of(block) {
+                return None;
             }
-            DenseDtype::GgufNvfp4 => return None,
-            _ => dims.rows.checked_mul(dims.cols)?.checked_mul(HALF)?,
-        },
+            (dims.cols / block).checked_mul(kind.block_bytes() as usize)?
+        }
+        None => dims.cols.checked_mul(HALF)?,
+    };
+    Some(DenseGemvBytes {
+        w: dims.rows.checked_mul(row_bytes)?,
         x: strided(dims.m, dims.ld_x, dims.cols)?,
         y: strided(dims.m, dims.ld_y, dims.rows)?,
     })

@@ -1,4 +1,4 @@
-//! Shared matrix-vector projection for F16, BF16 and original GGUF NVFP4 weights.
+//! Shared matrix-vector projection for F16, BF16 and original packed GGUF weights.
 //! Activations and results stay in device buffers between launches.
 //!
 //! [`CudaContext::dense_gemv`] queues one kernel on a [`DeviceStream`] and returns. It allocates
