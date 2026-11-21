@@ -137,6 +137,11 @@ struct WindowFake {
     fits: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Whether evicting prefix entries can free a session's memory (the trait's default is yes).
     eviction_frees: bool,
+    /// Background work (a disk write-behind) the fake reports as pending until this many steps
+    /// ran; how many ran, how many ran while a stream was live, and whether it was drained.
+    background_want: usize,
+    background_steps: Arc<std::sync::atomic::AtomicUsize>,
+    background_drained: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WindowFake {
@@ -180,6 +185,9 @@ impl WindowFake {
             default_policy: false,
             fits: None,
             eviction_frees: true,
+            background_want: 0,
+            background_steps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            background_drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -239,6 +247,19 @@ impl ExecutorOps for WindowFake {
 
     fn eviction_frees_session_memory(&self) -> bool {
         self.eviction_frees
+    }
+
+    fn background_pending(&self) -> bool {
+        self.background_steps.load(Ordering::SeqCst) < self.background_want
+    }
+
+    fn background_step(&mut self) {
+        self.background_steps.fetch_add(1, Ordering::SeqCst);
+        self.note("background_step");
+    }
+
+    fn background_drain(&mut self) {
+        self.background_drained.store(true, Ordering::SeqCst);
     }
 
     fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
@@ -3150,4 +3171,86 @@ fn the_default_batch_policy_is_the_shared_budget_and_no_trim() {
     assert_eq!(fake.batch_policy(), policy);
     assert!(fake.can_admit_session());
     assert!(fake.eviction_frees_session_memory());
+}
+
+#[test]
+fn an_idle_batching_engine_advances_background_work_and_drains_it_at_shutdown() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.background_want = 3;
+    let (steps, drained) = (
+        Arc::clone(&fake.background_steps),
+        Arc::clone(&fake.background_drained),
+    );
+    let (engine, release) = start(fake);
+    release.send(()).expect("load");
+    wait(|| steps.load(Ordering::SeqCst) == 3);
+    assert!(!drained.load(Ordering::SeqCst), "no drain before shutdown");
+    // A job still runs between steps.
+    let (request, events) = job(&[0], 2);
+    engine.handle().try_submit(request).expect("submit");
+    assert!(matches!(
+        collect(events).last(),
+        Some(JobEvent::Finished(_))
+    ));
+    let report = engine.shutdown();
+    assert_ne!(report.state, EngineState::NativeFailed);
+    assert!(
+        drained.load(Ordering::SeqCst),
+        "a batching engine drains its background work at shutdown"
+    );
+}
+
+#[test]
+fn a_batching_engine_steps_background_work_between_ticks_while_streams_decode() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.background_want = usize::MAX;
+    fake.script_tokens = 40;
+    let (engine, release) = start(fake);
+    let (request, events) = job(&[0], 30);
+    engine.handle().try_submit(request).expect("submit");
+    release.send(()).expect("load");
+    assert!(matches!(
+        collect(events).last(),
+        Some(JobEvent::Finished(_))
+    ));
+    engine.shutdown();
+    let calls = lock(&log).calls.clone();
+    let first = calls
+        .iter()
+        .position(|call| call == "window")
+        .expect("a window");
+    let last = calls
+        .iter()
+        .rposition(|call| call == "window")
+        .expect("a window");
+    assert!(
+        calls[first..last]
+            .iter()
+            .any(|call| call == "background_step"),
+        "no background step ran between two windows of the stream: {calls:?}"
+    );
+}
+
+#[test]
+fn a_natively_failed_batching_engine_does_not_drain_background_work() {
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.failure = Some(Failure::Native);
+    fake.background_want = 0;
+    let drained = Arc::clone(&fake.background_drained);
+    let (engine, release) = start(fake);
+    let (request, events) = job(&[0], 2);
+    engine.handle().try_submit(request).expect("submit");
+    release.send(()).expect("load");
+    assert!(matches!(
+        collect(events).as_slice(),
+        [JobEvent::Error(EngError::Backend { .. })]
+    ));
+    assert_eq!(engine.shutdown().state, EngineState::NativeFailed);
+    assert!(
+        !drained.load(Ordering::SeqCst),
+        "a failed engine's device state is not read at shutdown"
+    );
 }

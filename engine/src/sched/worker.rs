@@ -713,11 +713,20 @@ fn work<E, F>(
         shared.set_state(next);
         *current = None;
     }
-    executor.background_drain();
+    finish_background(&mut executor, shared);
     if shared.state() != EngineState::NativeFailed {
         shared.set_state(EngineState::Stopped);
     }
     drain(jobs, cancel_unstarted);
+}
+
+/// Ends the executor's background work (a disk flush) at a stop, unless the engine failed
+/// natively: its device state cannot be trusted to be read, and a flush would hang or write a
+/// damaged entry.
+fn finish_background<E: ExecutorOps>(executor: &mut E, shared: &Shared) {
+    if shared.state() != EngineState::NativeFailed {
+        executor.background_drain();
+    }
 }
 
 /// How long an idle engine waits for a job before it advances its background work.

@@ -643,6 +643,29 @@ pub(super) fn work<E: ExecutorOps>(
     iteration_rows: usize,
     max_seqs: usize,
 ) {
+    work_loop(
+        executor,
+        session,
+        jobs,
+        shared,
+        prefill_chunk,
+        iteration_rows,
+        max_seqs,
+    );
+    // Every way out of the loop passes here, so the background work (a disk flush of the saved
+    // prefixes) ends the same way as in the single-session worker.
+    super::finish_background(executor, shared);
+}
+
+fn work_loop<E: ExecutorOps>(
+    executor: &mut E,
+    session: E::Session,
+    jobs: &Receiver<Message>,
+    shared: &Shared,
+    prefill_chunk: usize,
+    iteration_rows: usize,
+    max_seqs: usize,
+) {
     let share = executor.prompt_rows_per_tick();
     let policy = executor.batch_policy();
     let mut pool = Pool::new(session, &shared.ticks, policy.idle_trim);
@@ -660,6 +683,11 @@ pub(super) fn work<E: ExecutorOps>(
         // Pooled sessions that have idled for the trim interval go, even while other streams
         // run; an idle engine keeps one.
         pool.trim(Instant::now(), usize::from(slots.is_empty()));
+        // Background work (a disk write-behind) advances by one bounded step per tick while
+        // streams run; with none running the idle wait below drives it.
+        if !slots.is_empty() && executor.background_pending() {
+            executor.background_step();
+        }
         // A waiting job whose client has gone is cancelled now, not at its next retry.
         if let Some(held) =
             waiting.take_if(|held| held.job.generation.cancel.load(Ordering::SeqCst))
@@ -696,10 +724,22 @@ pub(super) fn work<E: ExecutorOps>(
                 None => {
                     let message = if slots.is_empty() {
                         shared.set_state(EngineState::Ready);
-                        match pool.idle_trim {
-                            Some(trim) => match jobs.recv_timeout(trim) {
+                        // An executor with background work (a disk write-behind) wakes between
+                        // jobs to advance it, as in the single-session worker.
+                        let background = executor.background_pending();
+                        let wait = match (pool.idle_trim, background) {
+                            (Some(trim), true) => Some(trim.min(super::BACKGROUND_POLL)),
+                            (Some(trim), false) => Some(trim),
+                            (None, true) => Some(super::BACKGROUND_POLL),
+                            (None, false) => None,
+                        };
+                        match wait {
+                            Some(wait) => match jobs.recv_timeout(wait) {
                                 Ok(message) => Some(message),
                                 Err(RecvTimeoutError::Timeout) => {
+                                    if background {
+                                        executor.background_step();
+                                    }
                                     pool.trim(Instant::now(), 1);
                                     continue;
                                 }
