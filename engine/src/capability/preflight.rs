@@ -362,6 +362,13 @@ fn evaluate(
         sensenova_checks(model_dir, tokenizer_dir, candidate, &mut checks);
         return shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks);
     }
+    if family_name == Some(crate::family::raon::raon1::serve::FAMILY) && !facts.backends.cuda {
+        checks.push(Check::new(
+            "backend",
+            CheckStatus::Fail,
+            "this family serves on CUDA only and this build has no CUDA backend".to_string(),
+        ));
+    }
     if family_name == Some(crate::family::gemma::gemma4::FAMILY)
         && let Err(error) =
             crate::family::gemma::gemma4::serve::check_backend(model_dir, &facts.backends)

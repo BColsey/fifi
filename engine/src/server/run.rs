@@ -566,15 +566,23 @@ fn check_family_backend(config: &EngineConfig) -> Result<(), EngError> {
 }
 
 /// The sampling defaults that the weights file of a family carries in its header, with the file
-/// they came from. `None` for a family whose defaults live in `generation_config.json`.
+/// they came from. A Raon-1 entry reads its file; any other GGUF directory without a
+/// `generation_config.json` reads the first GGUF that carries a vocabulary. `None` when there is
+/// no such file.
 fn header_defaults(
     config: &EngineConfig,
 ) -> Result<Option<(std::path::PathBuf, SamplingDefaults)>, EngError> {
-    if config.family != raon1::serve::FAMILY {
-        return Ok(None);
-    }
-    let files = crate::family::gguf_select::of_architecture(&config.model_dir, RAON1_ARCHITECTURE)?;
-    let file = files[0].path.clone();
+    let file = if config.family == raon1::serve::FAMILY {
+        crate::family::gguf_select::of_architecture(&config.model_dir, RAON1_ARCHITECTURE)?[0]
+            .path
+            .clone()
+    } else {
+        let directory = crate::family::gguf_select::directory_of(&config.model_dir);
+        match crate::tokenizer::gguf::vocabulary_gguf(&directory)? {
+            Some(file) => file,
+            None => return Ok(None),
+        }
+    };
     let values = SamplingDefaults::from_gguf(&file)?;
     Ok(Some((file, values)))
 }

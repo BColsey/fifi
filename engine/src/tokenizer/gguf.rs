@@ -546,6 +546,43 @@ fn has_vocabulary(path: &Path) -> bool {
         )
 }
 
+/// The first GGUF file of `dir`, by name, whose header carries a vocabulary and a chat template:
+/// the file a start builds its tokenizer from when no `tokenizer.json` sits beside the weights.
+/// A draft model's file without a template is skipped; later shards of a split model hold no
+/// tokenizer keys and are never first. `None` when no file qualifies.
+pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, EngError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    files.sort();
+    for file in files {
+        // A file that is not a readable GGUF is not a candidate; the start reports its own.
+        let Ok(header) = crate::weights::shared_header(&file, HEADER_CAP_BYTES) else {
+            continue;
+        };
+        if matches!(header.meta("tokenizer.ggml.tokens"), Some(MetaValue::Array(_)))
+            && matches!(
+                header.meta("tokenizer.chat_template"),
+                Some(MetaValue::String(_))
+            )
+        {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads the whole data range of one metadata array.
 fn array_bytes(file: &File, name: &str, array: &ArrayMeta) -> Result<Vec<u8>, EngError> {
     let len = usize::try_from(array.byte_range.end - array.byte_range.start)
