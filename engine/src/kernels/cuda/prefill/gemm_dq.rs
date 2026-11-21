@@ -225,6 +225,15 @@ impl CudaContext {
                     "{quant:?} rides the vendored MMQ pair, not the in-house dequantizing GEMM"
                 )))
             }
+            QuantType::Iq4Nl
+            | QuantType::Iq2S
+            | QuantType::Iq3Xxs
+            | QuantType::Iq2Xxs
+            | QuantType::Q20
+            | QuantType::Iq2Xs
+            | QuantType::Iq3S => Err(EngError::BadRequest(format!(
+                "{quant:?} has no prefill GEMM yet; only the decode matvec serves it"
+            ))),
         }
     }
     pub(crate) fn gemm_dq_q5k(

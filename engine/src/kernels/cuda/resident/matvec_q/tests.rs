@@ -161,6 +161,14 @@ pub(in crate::kernels::cuda) mod reference {
                 crate::weights::dequantize(crate::weights::GgufType::Iq4Xs, block)
                     .expect("iq4_xs dequant")[i],
             ),
+            // The codebook types are tested in resident/matvec_gguf.rs against the oracle.
+            QuantType::Iq4Nl
+            | QuantType::Iq2S
+            | QuantType::Iq3Xxs
+            | QuantType::Iq2Xxs
+            | QuantType::Q20
+            | QuantType::Iq2Xs
+            | QuantType::Iq3S => unreachable!("the codebook types have their own tests"),
         }
     }
 

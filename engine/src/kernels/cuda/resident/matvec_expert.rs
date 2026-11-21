@@ -19,6 +19,11 @@
 //! ([`ROWS_MULTIPLE`]); `n_used` is in `1..=8` and at most `n_expert`; `y_slot_stride >= rows`;
 //! every range holds the bytes the call uses and is 4-byte aligned; `y` overlaps none of
 //! `w_stack`, `x_q8`, `ids`. A refused call changes nothing.
+//!
+//! The IQ and Q2_0 types ([`QuantType::is_codebook_expert`]) run the in-house codebook
+//! kernel (`native/resident/matvec_gguf.cu`) instead of the vendored one: same layout and ids
+//! contract, but `rows` is any positive count and `n_used` is in `1..=32` (Flash-Next routes
+//! ten experts per token).
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -26,6 +31,9 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::matvec_expert::{
     ExpertMatvecRaw, matvec_expert_launch,
+};
+use crate::kernels::cuda::native::resident::matvec_gguf::{
+    ExpertGgufRaw, MAX_USED, matvec_gguf_expert_launch,
 };
 use crate::kernels::cuda::resident::matvec_q::{QuantType, ROWS_MULTIPLE};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
@@ -103,8 +111,89 @@ impl CudaContext {
         call: ExpertMatvecCall<'_>,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
+        if call.ty.is_codebook_expert() {
+            let raw = self.plan_matvec_expert_codebook(&call)?;
+            let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan");
+            return self.launch_on(stream, |stream_raw| {
+                matvec_gguf_expert_launch(stream_raw, &raw, row_bytes)
+            });
+        }
         let raw = self.plan_matvec_expert(&call)?;
         self.launch_on(stream, |stream_raw| matvec_expert_launch(stream_raw, &raw))
+    }
+
+    fn plan_matvec_expert_codebook<'b>(
+        &self,
+        call: &ExpertMatvecCall<'b>,
+    ) -> Result<ExpertGgufRaw<'b>, EngError> {
+        let (w_raw, ids_raw, x_raw, y_raw) = (
+            self.raw_range(&call.w_stack)?,
+            self.raw_range(&call.ids)?,
+            self.raw_range(&call.x_q8)?,
+            self.raw_range(&call.y)?,
+        );
+        if !call.k.is_multiple_of(call.ty.block_size()) || call.k == 0 {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA expert matvec needs k as a multiple of {}, got {}",
+                call.ty.block_size(),
+                call.k
+            )));
+        }
+        if call.rows == 0 || call.n_expert == 0 {
+            return Err(EngError::BadRequest(
+                "the CUDA expert matvec needs rows and experts above zero".to_owned(),
+            ));
+        }
+        if call.n_used < 1 || call.n_used > MAX_USED || call.n_used > call.n_expert {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA expert launch takes 1 to {} used slots, got {}",
+                call.n_expert.min(MAX_USED),
+                call.n_used
+            )));
+        }
+        if call.y_slot_stride < call.rows {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA expert y stride {} is below the {} rows of a slot",
+                call.y_slot_stride, call.rows
+            )));
+        }
+        let need = expert_needs(&call.shape())
+            .ok_or_else(|| EngError::BadRequest("the CUDA expert size overflows".to_owned()))?;
+        require_fit("w_stack", &call.w_stack, need.w_stack, 4)?;
+        require_fit("ids", &call.ids, need.ids, 4)?;
+        require_fit("x_q8", &call.x_q8, need.x_q8, 4)?;
+        require_fit("y", &call.y, need.y, 4)?;
+        let written = Claim::of("y", &call.y, need.y);
+        require_apart(&written, &Claim::of("w_stack", &call.w_stack, need.w_stack))?;
+        require_apart(&written, &Claim::of("ids", &call.ids, need.ids))?;
+        require_apart(&written, &Claim::of("x_q8", &call.x_q8, need.x_q8))?;
+        if let Some(gate) = &call.glu_gate {
+            if call.x_per_slot {
+                return Err(EngError::BadRequest(
+                    "the CUDA expert GLU fusion takes the shared-x view only".to_owned(),
+                ));
+            }
+            require_fit("glu_gate", gate, need.w_stack, 4)?;
+            require_apart(&written, &Claim::of("glu_gate", gate, need.w_stack))?;
+        }
+        Ok(ExpertGgufRaw {
+            ty: call.ty,
+            w_stack: w_raw,
+            ids: ids_raw,
+            x_q8: x_raw,
+            x_per_slot: call.x_per_slot,
+            y: y_raw,
+            y_slot_stride: call.y_slot_stride,
+            k: call.k,
+            rows: call.rows,
+            n_expert: call.n_expert,
+            n_used: call.n_used,
+            glu_gate: call
+                .glu_gate
+                .as_ref()
+                .map(|g| self.raw_range(g))
+                .transpose()?,
+        })
     }
 
     fn plan_matvec_expert<'b>(
@@ -124,13 +213,13 @@ impl CudaContext {
                 call.k
             )));
         }
-        // The expert matvec runs the vendored MMVQ only; the in-house types (Q5_K,
-        // Q4_0, Q3_K, IQ4_XS) wait for an in-house expert kernel, so every type without a
-        // vendored arm is refused here rather than reaching the discriminant.
-        if matches!(
-            call.ty,
-            QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
-        ) {
+        // This plan serves the vendored MMVQ only; the in-house codebook types are planned by
+        // `plan_matvec_expert_codebook`, and Q5_K, Q4_0 and Q3_K still wait for an in-house
+        // expert kernel, so every type without a vendored arm is refused here rather than
+        // reaching the discriminant.
+        if matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
+            || call.ty.is_codebook_expert()
+        {
             return Err(EngError::BadRequest(format!(
                 "the CUDA expert matvec does not take {:?} yet",
                 call.ty

@@ -19,6 +19,7 @@ use crate::kernels::cuda::context::{
 };
 #[cfg(test)]
 use crate::kernels::cuda::native;
+use crate::kernels::cuda::native::resident::matvec_gguf::{MatvecGgufRaw, matvec_gguf_launch};
 use crate::kernels::cuda::native::resident::matvec_iq4xs::matvec_iq4xs_launch;
 use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launch};
 use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
@@ -36,7 +37,10 @@ use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 /// memory. `Q5K`/`Q3K`/`Iq4Xs` are the in-house Q5_K/Q3_K/IQ4_XS kernels
 /// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`,
 /// `native/resident/matvec_iq4xs.cu`): they never enter the
-/// vendored switch and carry no `ggml_type`.
+/// vendored switch and carry no `ggml_type`. `Iq4Nl`, `Iq2S`, `Iq3Xxs`, `Iq2Xxs`, `Q20`,
+/// `Iq2Xs` and `Iq3S` are served by the in-house codebook matvec
+/// (`native/resident/matvec_gguf.cu`), dense and expert; `Iq4Xs` is served by it for the
+/// expert matvec as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantType {
     Q4K,
@@ -47,6 +51,13 @@ pub(crate) enum QuantType {
     Q40,
     Q3K,
     Iq4Xs,
+    Iq4Nl,
+    Iq2S,
+    Iq3Xxs,
+    Iq2Xxs,
+    Q20,
+    Iq2Xs,
+    Iq3S,
 }
 
 impl QuantType {
@@ -60,23 +71,66 @@ impl QuantType {
             Self::Q50 => 6,
             Self::Q6K => 14,
             Self::Q80 => 8,
-            Self::Q5K | Self::Q40 | Self::Q3K | Self::Iq4Xs => {
+            Self::Q5K
+            | Self::Q40
+            | Self::Q3K
+            | Self::Iq4Xs
+            | Self::Iq4Nl
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq2Xxs
+            | Self::Q20
+            | Self::Iq2Xs
+            | Self::Iq3S => {
                 unreachable!("the in-house kernels never enter the vendored switch")
             }
         }
     }
 
+    /// True for the types the in-house codebook matvec (`matvec_gguf.cu`) serves in the
+    /// dense matvec: every IQ type and Q2_0 here except IQ4_XS, which keeps its own dense
+    /// kernel and reaches the codebook matvec only through the expert launch.
+    pub(crate) fn is_codebook_dense(self) -> bool {
+        matches!(
+            self,
+            Self::Iq4Nl
+                | Self::Iq2S
+                | Self::Iq3Xxs
+                | Self::Iq2Xxs
+                | Self::Q20
+                | Self::Iq2Xs
+                | Self::Iq3S
+        )
+    }
+
+    /// True for the types the in-house codebook expert matvec serves.
+    pub(crate) fn is_codebook_expert(self) -> bool {
+        self.is_codebook_dense() || self == Self::Iq4Xs
+    }
+
     pub(crate) fn block_size(self) -> usize {
         match self {
-            Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K | Self::Iq4Xs => 256,
-            Self::Q50 | Self::Q80 | Self::Q40 => 32,
+            Self::Q4K
+            | Self::Q6K
+            | Self::Q5K
+            | Self::Q3K
+            | Self::Iq4Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq3S => 256,
+            Self::Q20 => 64,
+            Self::Q50 | Self::Q80 | Self::Q40 | Self::Iq4Nl => 32,
         }
     }
 
     /// Bytes per block: Q4_K 144, Q5_0 22, Q6_K 210, Q8_0 34 (ggml-common.h static_asserts);
-    /// Q5_K 176 (d + dmin + 12 scale bytes + 32 qh bytes + 128 qs bytes); Q4_0 18 (f16 scale
-    /// + 16 code bytes); Q3_K 110 (32 hmask + 64 qs + 12 packed 6-bit scales + f16 d);
-    ///   IQ4_XS 136 (f16 d + u16 scales_h + scales_l[4] + 128 qs).
+    /// Q5_K 176 (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs bytes); Q4_0 18 (f16 scale and
+    /// 16 code bytes); Q3_K 110 (32 hmask, 64 qs, 12 packed 6-bit scales, f16 d);
+    /// IQ4_XS 136 (f16 d, u16 scales_h, scales_l[4], 128 qs); IQ4_NL 18 and Q2_0 18 (f16 d and
+    /// 16 code bytes); IQ2_XXS 66, IQ2_XS 74, IQ2_S 82, IQ3_XXS 98, IQ3_S 110 (the block
+    /// layouts of `weights/gguf.rs`, the CPU oracle's sizes).
     pub(crate) fn block_bytes(self) -> usize {
         match self {
             Self::Q4K => 144,
@@ -87,6 +141,12 @@ impl QuantType {
             Self::Q40 => 18,
             Self::Q3K => 110,
             Self::Iq4Xs => 136,
+            Self::Iq4Nl | Self::Q20 => 18,
+            Self::Iq2Xxs => 66,
+            Self::Iq2Xs => 74,
+            Self::Iq2S => 82,
+            Self::Iq3Xxs => 98,
+            Self::Iq3S => 110,
         }
     }
 
@@ -252,6 +312,21 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
+            // The in-house codebook matvec: its own ABI, native blocks, whole rows, the
+            // type's lookup table passed to the kernel by value.
+            ty if ty.is_codebook_dense() => matvec_gguf_launch(
+                stream_raw,
+                &MatvecGgufRaw {
+                    ty,
+                    w: raw.w,
+                    x_q8: raw.x_q8,
+                    y: raw.y,
+                    k: raw.k,
+                    rows: raw.rows,
+                    ncols: raw.ncols,
+                },
+                row_bytes,
+            ),
             // The in-house Q8_0 kernel under the column-invariant contract: its own ABI,
             // native 34-byte blocks, whole rows, lane arithmetics independent of ncols.
             // Without the contract the vendored launcher keeps serving Q8_0, so served
@@ -293,7 +368,8 @@ impl CudaContext {
             || (!(matches!(
                 call.ty,
                 QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
-            ) || (call.ty == QuantType::Q80 && invariant))
+            ) || call.ty.is_codebook_dense()
+                || (call.ty == QuantType::Q80 && invariant))
                 && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {
             return Err(EngError::BadRequest(format!(

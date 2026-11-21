@@ -147,6 +147,13 @@ fn gguf_of(quant: QuantType) -> GgufType {
         QuantType::Q40 => GgufType::Q40,
         QuantType::Q3K => GgufType::Q3K,
         QuantType::Iq4Xs => GgufType::Iq4Xs,
+        QuantType::Iq4Nl => GgufType::Iq4Nl,
+        QuantType::Iq2S => GgufType::Iq2S,
+        QuantType::Iq3Xxs => GgufType::Iq3Xxs,
+        QuantType::Iq2Xxs => GgufType::Iq2Xxs,
+        QuantType::Q20 => GgufType::Q20,
+        QuantType::Iq2Xs => GgufType::Iq2Xs,
+        QuantType::Iq3S => GgufType::Iq3S,
     }
 }
 
