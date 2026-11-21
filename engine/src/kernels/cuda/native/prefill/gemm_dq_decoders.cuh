@@ -23,6 +23,7 @@
  * pinned to weights/gguf_tables.rs KVALUES_IQ4NL by the matvec host pin test, and
  * native/constant_bank_guard.rs keeps new __constant__ tables out of the tree. */
 #include "iq4_nl_values.cuh"
+#include "resident/gguf_decode.cuh"
 
 namespace gemm_dq {
 
@@ -63,12 +64,14 @@ struct Q5kDecoder {
     static const int kQK = 256;
     static const int kBlockBytes = 176;
     static const int kChunkBlocks = 1;
+    static const int kTabWords = 4;
 
     __device__ static int chunk_block_off(int c) { return c >> 2; }
 
     /* c is the raw 64-value chunk index along k (0..k/64); the slice inside this block is
      * c mod 4, because four chunks share one 256-value block. */
-    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv) {
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv,
+                                             const uint32_t *) {
         c &= 3;
         const float d = half_at(block);
         const float dmin = half_at(block + 2);
@@ -102,13 +105,15 @@ struct Q40Decoder {
     static const int kQK = 32;
     static const int kBlockBytes = 18;
     static const int kChunkBlocks = 2;
+    static const int kTabWords = 4;
 
     __device__ static int chunk_block_off(int c) { return 2 * c; }
 
     /* A block's 32 values, in GGUF order: value j (0..16) is the LOW nibble of
      * qs[j], value j + 16 the HIGH nibble (the layout weights/gguf_dequant.rs
      * q4_0 decodes and the ggml reference pins). */
-    __device__ static void decode_chunk(const unsigned char *chunk, int c, __half *dst, const float *iq4nl_kv) {
+    __device__ static void decode_chunk(const unsigned char *chunk, int c, __half *dst, const float *iq4nl_kv,
+                                             const uint32_t *) {
         (void)c;
         for (int b = 0; b < 2; ++b) {
             const unsigned char *blk = chunk + 18 * b;
@@ -134,6 +139,7 @@ struct Q3kDecoder {
     static const int kQK = 256;
     static const int kBlockBytes = 110;
     static const int kChunkBlocks = 1;
+    static const int kTabWords = 4;
 
     __device__ static int chunk_block_off(int c) { return c >> 2; }
 
@@ -154,7 +160,8 @@ struct Q3kDecoder {
      * 32 values (qs shift 2*j, hmask bit 4*half + j: one mask byte carries
      * all eight lanes of both halves), groups of 16 at qs+16 and hm+16; a
      * CLEAR hmask bit subtracts 4. */
-    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv) {
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv,
+                                             const uint32_t *) {
         c &= 3;
         const float d = half_at(block + 108);
         const unsigned char *hm = block;
@@ -188,10 +195,12 @@ struct Iq4xsDecoder {
     static const int kQK = 256;
     static const int kBlockBytes = 136;
     static const int kChunkBlocks = 1;
+    static const int kTabWords = 4;
 
     __device__ static int chunk_block_off(int c) { return c >> 2; }
 
-    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv) {
+    __device__ static void decode_chunk(const unsigned char *block, int c, __half *dst, const float *iq4nl_kv,
+                                             const uint32_t *) {
         c &= 3;
         const float d = half_at(block);
         unsigned short scales_h_raw;
@@ -209,6 +218,45 @@ struct Iq4xsDecoder {
             const unsigned char q = qs[16 * ib + (j & 15)];
             const int nib = j < 16 ? (q & 0x0f) : (q >> 4);
             dst[s] = __float2half(dl * iq4nl_kv[nib]);
+        }
+    }
+};
+
+/* The window decoders of the in-house codebook matvec (resident/gguf_decode.cuh) as GEMM
+ * decoders: a 64-value chunk is two 32-value windows. For the 256-value blocks (and Q2_0's
+ * 64-value block) the chunk is a slice of one block and windows 2 * (c mod (windows / 2)) and
+ * the next; IQ4_NL's 32-value blocks put two whole blocks in a chunk. The lookup table of the
+ * type is the shared-memory copy the kernel stages from its by-value argument. */
+template <class T>
+struct WindowDecoder {
+    static const int kQK = 32 * T::kWinPerBlock;
+    static const int kBlockBytes = T::kBlockBytes;
+    static const int kChunkBlocks = T::kWinPerBlock >= 2 ? 1 : 2;
+    static const int kTabWords = T::kTabWords;
+
+    __device__ static int chunk_block_off(int c) {
+        return T::kWinPerBlock >= 2 ? c / (T::kWinPerBlock / 2) : 2 * c;
+    }
+
+    __device__ static void write_window(const gguf::Win &wn, __half *dst) {
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            dst[j] = __float2half(gguf::window_value<T>(wn, j));
+        }
+    }
+
+    __device__ static void decode_chunk(const unsigned char *chunk, int c, __half *dst,
+                                        const float *, const uint32_t *tab) {
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            gguf::Win wn;
+            if constexpr (T::kWinPerBlock >= 2) {
+                const int first = 2 * (c % (T::kWinPerBlock / 2));
+                T::decode(T::load(chunk, first + h), tab, wn);
+            } else {
+                T::decode(T::load(chunk + h * T::kBlockBytes, 0), tab, wn);
+            }
+            write_window(wn, dst + 32 * h);
         }
     }
 };

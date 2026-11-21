@@ -29,6 +29,8 @@
 #include "abi.h"
 #include "device.h"
 #include "prefill/gemm_dq.h"
+#include <string.h>
+
 #include "prefill/gemm_dq_decoders.cuh"
 
 namespace {
@@ -107,12 +109,15 @@ template <class D>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
                    int w_blocks, int x_col_stride, int y_col_stride, int x_f32,
-                   iq4nl_table iq4nl) {
+                   iq4nl_table iq4nl, gguf::Tab<D::kTabWords> tab) {
     extern __shared__ __align__(16) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
     __half *a = smem;                  /* the decoded weight tile */
     __half *b = smem + kBM * kAStride; /* the activation tile */
     unsigned char *stage =
         reinterpret_cast<unsigned char *>(smem + kBM * kAStride + kBK * kBStride);
+    /* The type's lookup table (a 4-word dummy for the K-quant decoders), after the raw blocks. */
+    uint32_t *stab = reinterpret_cast<uint32_t *>(stage + stage_bytes_of<D>);
+    gguf::stage_table<D::kTabWords, kThreads>(tab, stab);
     const int tile_m = blockIdx.x * kBM;
     const int tile_n = blockIdx.y * kBN;
     const int tx = threadIdx.x;      /* 0..255 */
@@ -131,7 +136,7 @@ __global__ void __launch_bounds__(kThreads, 2)
         __syncthreads();
         if (tx < kBM) {
             D::decode_chunk(stage + (size_t)tx * D::kChunkBlocks * D::kBlockBytes, c,
-                            a + tx * kAStride, iq4nl.v);
+                            a + tx * kAStride, iq4nl.v, stab);
         } else {
             /* Activation tile: the remaining 192 threads load 4096 halves, row-major by k,
              * written at the padded stride. */
@@ -181,7 +186,8 @@ __global__ void __launch_bounds__(kThreads, 2)
 }
 
 template <class D>
-int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage) {
+int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage,
+           const void *table = NULL, size_t table_bytes = 0) {
     const int k = args->k;
     const int rows = args->rows;
     const int ncols = args->ncols;
@@ -216,17 +222,27 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
-    const size_t smem =
-        (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) + (size_t)stage_bytes_of<D>;
+    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) +
+                        (size_t)stage_bytes_of<D> + 4 * (size_t)D::kTabWords;
+    gguf::Tab<D::kTabWords> tab;
+    memset(&tab, 0, sizeof(tab));
+    if (table_bytes > sizeof(tab) || (table_bytes != 0 && table == NULL)) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    if (table_bytes != 0) {
+        memcpy(&tab, table, table_bytes);
+    }
     // The IQ4_NL table rides a kernel argument, never a per-TU __constant__
     // array: the at-load constant bank of this multi-cubin .so aliases those
     // by position (2026-11-18, 3090). The tree-wide guard that keeps new
     // initialized __constant__ tables out is native/constant_bank_guard.rs.
     gemm_dq_kernel<D><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
-        w_blocks, x_col_stride, y_col_stride, x_f32, make_iq4nl_table());
+        w_blocks, x_col_stride, y_col_stride, x_f32, make_iq4nl_table(), tab);
     Failure failure;
-    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    const cudaError_t err = cudaGetLastError();
+    gguf::note_argument_failure(err, sizeof(tab));
+    failure.record(err, INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
     return (int)failure.err;
 }
@@ -288,6 +304,41 @@ extern "C" int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_ar
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         return launch<gemm_dq::Q40Decoder>(args, stream, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+/* The codebook types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, Q2_0): the window
+ * decoders of the decode matvec behind the same GEMM. The host passes the table words of
+ * weights/gguf_tables.rs (the exact byte count of the type, none for Q2_0); they ride the
+ * launch by value. */
+extern "C" int inference_cuda_gemm_dq_codebook_launch(const inference_cuda_gemm_dq_args *args,
+                                                      int type, const void *table,
+                                                      size_t table_bytes, void *stream,
+                                                      int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
+            args->y == NULL || !aligned(args->w, 2) || !aligned(args->x, 2) ||
+            !aligned(args->y, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        using namespace gguf;
+        using namespace gemm_dq;
+        switch (type) {
+        case kIq2Xxs: return table_bytes == 4 * Iq2Xxs::kTabWords ? launch<WindowDecoder<Iq2Xxs>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq2Xs: return table_bytes == 4 * Iq2Xs::kTabWords ? launch<WindowDecoder<Iq2Xs>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq2S: return table_bytes == 4 * Iq2S::kTabWords ? launch<WindowDecoder<Iq2S>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq3Xxs: return table_bytes == 4 * Iq3Xxs::kTabWords ? launch<WindowDecoder<Iq3Xxs>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq3S: return table_bytes == 4 * Iq3S::kTabWords ? launch<WindowDecoder<Iq3S>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq4Nl: return table_bytes == 4 * Iq4Nl::kTabWords ? launch<WindowDecoder<Iq4Nl>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kQ2K: return table_bytes == 0 ? launch<WindowDecoder<Q2K>>(args, stream, out_stage) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq1S: return table_bytes == 4 * Iq1S::kTabWords ? launch<WindowDecoder<Iq1S>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kIq1M: return table_bytes == 4 * Iq1M::kTabWords ? launch<WindowDecoder<Iq1M>>(args, stream, out_stage, table, table_bytes) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        case kQ2_0: return table_bytes == 0 ? launch<WindowDecoder<Q2_0>>(args, stream, out_stage) : INFERENCE_CUDA_INVALID_ARGUMENT;
+        default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }

@@ -314,6 +314,9 @@ fn gguf_of(ty: QuantType) -> GgufType {
         QuantType::Q20 => GgufType::Q20,
         QuantType::Iq2Xs => GgufType::Iq2Xs,
         QuantType::Iq3S => GgufType::Iq3S,
+        QuantType::Q2K => GgufType::Q2K,
+        QuantType::Iq1S => GgufType::Iq1S,
+        QuantType::Iq1M => GgufType::Iq1M,
     }
 }
 
@@ -520,7 +523,10 @@ fn mmq_type_of(ty: QuantType) -> MmqType {
         | QuantType::Iq2Xxs
         | QuantType::Q20
         | QuantType::Iq2Xs
-        | QuantType::Iq3S => unreachable!("the codebook types have no mmq type"),
+        | QuantType::Iq3S
+        | QuantType::Q2K
+        | QuantType::Iq1S
+        | QuantType::Iq1M => unreachable!("the codebook types have no mmq type"),
     }
 }
 

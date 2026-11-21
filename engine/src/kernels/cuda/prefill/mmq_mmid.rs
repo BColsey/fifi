@@ -218,7 +218,10 @@ pub(crate) fn mmq_type_of(quant: QuantType) -> Result<MmqType, EngError> {
         | QuantType::Iq2Xxs
         | QuantType::Q20
         | QuantType::Iq2Xs
-        | QuantType::Iq3S => Err(rule("type", "the codebook types have no mmq case")),
+        | QuantType::Iq3S
+        | QuantType::Q2K
+        | QuantType::Iq1S
+        | QuantType::Iq1M => Err(rule("type", "the codebook types have no mmq case")),
     }
 }
 

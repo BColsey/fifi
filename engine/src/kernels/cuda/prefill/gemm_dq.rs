@@ -15,8 +15,9 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gemm_dq::{
-    GemmDqIq4xsRaw, GemmDqLayout, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw, gemm_dq_iq4xs_launch,
-    gemm_dq_q3k_launch, gemm_dq_q5k_launch, gemm_dq_q40_launch,
+    GemmDqCodebookRaw, GemmDqIq4xsRaw, GemmDqLayout, GemmDqQ3kRaw, GemmDqQ5kRaw, GemmDqQ40Raw,
+    gemm_dq_codebook_launch, gemm_dq_iq4xs_launch, gemm_dq_q3k_launch, gemm_dq_q5k_launch,
+    gemm_dq_q40_launch,
 };
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 
@@ -225,17 +226,105 @@ impl CudaContext {
                     "{quant:?} rides the vendored MMQ pair, not the in-house dequantizing GEMM"
                 )))
             }
+            ty if ty.is_codebook_dense() => self.gemm_dq_codebook(
+                stream,
+                ty,
+                GemmDqTypedCall {
+                    w,
+                    x,
+                    y,
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride,
+                    y_col_stride,
+                    x_f32,
+                },
+            ),
             QuantType::Iq4Nl
             | QuantType::Iq2S
             | QuantType::Iq3Xxs
             | QuantType::Iq2Xxs
             | QuantType::Q20
             | QuantType::Iq2Xs
-            | QuantType::Iq3S => Err(EngError::BadRequest(format!(
-                "{quant:?} has no prefill GEMM yet; only the decode matvec serves it"
-            ))),
+            | QuantType::Iq3S
+            | QuantType::Q2K
+            | QuantType::Iq1S
+            | QuantType::Iq1M => unreachable!("covered by is_codebook_dense"),
         }
     }
+
+    /// The dequantizing GEMM over the codebook types: the decode matvec's window decoders
+    /// behind the same tile kernel. Checks mirror the per-type entries: `k` a positive
+    /// multiple of the block size and of 64, rows and columns above zero, exact byte counts,
+    /// 2-byte `w`/`x` and 4-byte `y` alignment, `y` apart from `w` and `x`.
+    pub(crate) fn gemm_dq_codebook(
+        &self,
+        stream: &DeviceStream,
+        ty: QuantType,
+        call: GemmDqTypedCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let (w_raw, x_raw, y_raw) = (
+            self.raw_range(&call.w)?,
+            self.raw_range(&call.x)?,
+            self.raw_range(&call.y)?,
+        );
+        let unit = ty.block_size().max(64);
+        if !ty.is_codebook_dense() || call.k == 0 || !call.k.is_multiple_of(unit) {
+            return Err(EngError::BadRequest(format!(
+                "the {ty:?} dequantizing GEMM needs k as a positive multiple of {unit}, got {}",
+                call.k
+            )));
+        }
+        if call.rows == 0 || call.ncols == 0 {
+            return Err(EngError::BadRequest(format!(
+                "the {ty:?} dequantizing GEMM needs rows and columns above zero"
+            )));
+        }
+        let need_w = ty.weight_bytes(call.rows, call.k).ok_or_else(|| {
+            EngError::BadRequest(format!("the {ty:?} GEMM weight size overflows"))
+        })?;
+        let (need_x, need_y) = gemm_dq_layout_spans(
+            call.k,
+            call.rows,
+            call.ncols,
+            call.x_col_stride,
+            call.y_col_stride,
+            call.x_f32,
+        )
+        .ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "the {ty:?} GEMM size overflows for the layout strides"
+            ))
+        })?;
+        require_fit("w", &call.w, need_w, 2)?;
+        require_fit("x", &call.x, need_x, if call.x_f32 { 4 } else { 2 })?;
+        require_fit("y", &call.y, need_y, 4)?;
+        let written = Claim::of("y", &call.y, need_y);
+        require_apart(&written, &Claim::of("w", &call.w, need_w))?;
+        require_apart(&written, &Claim::of("x", &call.x, need_x))?;
+        self.launch_on(stream, |stream_raw| {
+            gemm_dq_codebook_launch(
+                stream_raw,
+                &GemmDqCodebookRaw {
+                    ty,
+                    w: w_raw,
+                    x: x_raw,
+                    y: y_raw,
+                    k: call.k,
+                    rows: call.rows,
+                    ncols: call.ncols,
+                    layout: GemmDqLayout {
+                        x_col_stride: call.x_col_stride,
+                        y_col_stride: call.y_col_stride,
+                        x_f32: call.x_f32,
+                    },
+                },
+            )
+        })
+    }
+
     pub(crate) fn gemm_dq_q5k(
         &self,
         stream: &DeviceStream,

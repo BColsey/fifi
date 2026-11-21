@@ -21,13 +21,16 @@ use super::matvec_q::tests::{assert_bad_request, bench, nan_filled};
 use super::matvec_q::{MatvecCall, QuantType};
 use super::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::EngError;
-use crate::kernels::cuda::native::resident::matvec_gguf::dequant_gguf_launch;
+use crate::kernels::cuda::native::resident::matvec_gguf::{
+    MatvecGgufRaw, dequant_gguf_launch, matvec_gguf_launch,
+};
+use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::testkit;
-use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 use crate::weights::{GgufType, dequantize};
 
 /// The types of the dense and expert matvec, with the oracle's type of each.
-const DENSE_TYPES: [(QuantType, GgufType); 7] = [
+const DENSE_TYPES: [(QuantType, GgufType); 10] = [
     (QuantType::Iq4Nl, GgufType::Iq4Nl),
     (QuantType::Iq2S, GgufType::Iq2S),
     (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
@@ -35,10 +38,13 @@ const DENSE_TYPES: [(QuantType, GgufType); 7] = [
     (QuantType::Q20, GgufType::Q20),
     (QuantType::Iq2Xs, GgufType::Iq2Xs),
     (QuantType::Iq3S, GgufType::Iq3S),
+    (QuantType::Q2K, GgufType::Q2K),
+    (QuantType::Iq1S, GgufType::Iq1S),
+    (QuantType::Iq1M, GgufType::Iq1M),
 ];
 
 /// IQ4_XS joins the list for the expert matvec (its dense kernel is a different file).
-const EXPERT_TYPES: [(QuantType, GgufType); 8] = [
+const EXPERT_TYPES: [(QuantType, GgufType); 11] = [
     (QuantType::Iq4Nl, GgufType::Iq4Nl),
     (QuantType::Iq2S, GgufType::Iq2S),
     (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
@@ -47,6 +53,9 @@ const EXPERT_TYPES: [(QuantType, GgufType); 8] = [
     (QuantType::Iq2Xs, GgufType::Iq2Xs),
     (QuantType::Iq3S, GgufType::Iq3S),
     (QuantType::Iq4Xs, GgufType::Iq4Xs),
+    (QuantType::Q2K, GgufType::Q2K),
+    (QuantType::Iq1S, GgufType::Iq1S),
+    (QuantType::Iq1M, GgufType::Iq1M),
 ];
 
 /// The Flash-Next routed-expert shapes (config.json: hidden 2560, moe_intermediate 640, 512
@@ -132,8 +141,29 @@ fn quant_types_match_the_oracle_block_geometry() {
 // Test data and the CPU reference.
 // ---------------------------------------------------------------------------------------------
 
-/// `count` blocks of random bytes with a finite f16 scale `d` in `[d_lo, d_hi]` at offset 0
-/// (every type here keeps `d` first).
+/// Writes the f16 scale `d_bits` into a block: at offset 0 for most types; Q2_K keeps `d` at 80
+/// and `dmin` (set to the same bits) at 82; IQ1_M has no field, its four scale words carry the
+/// bits in their top nibbles.
+fn set_scales(ty: QuantType, block: &mut [u8], d_bits: u16) {
+    match ty {
+        QuantType::Q2K => {
+            block[80..82].copy_from_slice(&d_bits.to_le_bytes());
+            block[82..84].copy_from_slice(&d_bits.to_le_bytes());
+        }
+        QuantType::Iq1M => {
+            for w in 0..4 {
+                let at = 48 + 2 * w;
+                let low = u16::from_le_bytes([block[at], block[at + 1]]) & 0x0fff;
+                let top = (d_bits >> (4 * w)) & 0xf;
+                block[at..at + 2].copy_from_slice(&(low | (top << 12)).to_le_bytes());
+            }
+        }
+        _ => block[0..2].copy_from_slice(&d_bits.to_le_bytes()),
+    }
+}
+
+/// `count` blocks of random bytes with a finite f16 scale `d` in `[d_lo, d_hi]` (see
+/// [`set_scales`] for where each type keeps it).
 fn random_blocks(
     ty: QuantType,
     count: usize,
@@ -148,7 +178,7 @@ fn random_blocks(
     }
     for block in bytes.chunks_mut(ty.block_bytes()) {
         let d = d_lo + rng.unit() * (d_hi - d_lo);
-        block[0..2].copy_from_slice(&testkit::f64_to_f16_bits(d).to_le_bytes());
+        set_scales(ty, block, testkit::f64_to_f16_bits(d));
     }
     bytes
 }
@@ -185,8 +215,15 @@ fn dot_ref(w: &[f32], x: &[f64]) -> (f64, f64) {
 }
 
 /// The tolerance factor of the module doc for rows of `k` values.
-fn tolerance_factor(k: usize) -> f64 {
-    (4.0 * (k / 32).div_ceil(32) as f64 + 8.0) * 2f64.powi(-24)
+fn tolerance_factor(ty: QuantType, k: usize) -> f64 {
+    // The shifted (IQ1) and offset (Q2_K) forms add the activation-sum terms: about four more
+    // roundings per window.
+    let per_window = if matches!(ty, QuantType::Q2K | QuantType::Iq1S | QuantType::Iq1M) {
+        8.0
+    } else {
+        4.0
+    };
+    (per_window * (k / 32).div_ceil(32) as f64 + 12.0) * 2f64.powi(-24)
 }
 
 struct Quantized {
@@ -246,6 +283,40 @@ fn ids_buffer(ctx: &CudaContext, ids: &[i32]) -> DeviceBuffer {
 }
 
 impl CudaContext {
+    /// Test support: one dense launch of the codebook kernel on any type it serves, including
+    /// IQ4_XS, whose dense matvec otherwise rides its own kernel.
+    fn matvec_gguf_direct(
+        &self,
+        stream: &DeviceStream,
+        ty: QuantType,
+        w: DeviceRange<'_>,
+        x: DeviceRange<'_>,
+        y: DeviceRange<'_>,
+        (k, rows): (usize, usize),
+    ) -> Result<(), EngError> {
+        let (w_raw, x_raw, y_raw) = (
+            self.raw_range(&w)?,
+            self.raw_range(&x)?,
+            self.raw_range(&y)?,
+        );
+        let row_bytes = q8_1_bytes(k, 1).expect("size");
+        self.launch_on(stream, |raw| {
+            matvec_gguf_launch(
+                raw,
+                &MatvecGgufRaw {
+                    ty,
+                    w: w_raw,
+                    x_q8: x_raw,
+                    y: y_raw,
+                    k,
+                    rows,
+                    ncols: 1,
+                },
+                row_bytes,
+            )
+        })
+    }
+
     /// Test support: decodes `n_blocks` blocks of `ty` on the device.
     fn dequant_gguf(
         &self,
@@ -277,7 +348,7 @@ fn edge_blocks(ty: QuantType, rng: &mut testkit::Rng) -> Vec<u8> {
     let mut out = Vec::new();
     let mut push = |body: &dyn Fn(usize) -> u8, d_bits: u16| {
         let mut block: Vec<u8> = (0..bb).map(body).collect();
-        block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+        set_scales(ty, &mut block, d_bits);
         out.extend_from_slice(&block);
     };
     for d_bits in [0x3c00u16, 0x0000, 0x8000, 0x0001, 0x7bff, 0xbc00] {
@@ -293,7 +364,7 @@ fn edge_blocks(ty: QuantType, rng: &mut testkit::Rng) -> Vec<u8> {
     for d_bits in [0x0000u16, 0x8000, 0x0001, 0x7bff, 0xfbff] {
         for _ in 0..8 {
             let mut block: Vec<u8> = (0..bb).map(|_| (rng.next_u64() >> 24) as u8).collect();
-            block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+            set_scales(ty, &mut block, d_bits);
             out.extend_from_slice(&block);
         }
     }
@@ -402,7 +473,7 @@ fn check_dense(
         let x = q8_row(&run.x.host[col * run.x.row_bytes..], k);
         for row in 0..rows {
             let (dot, abs) = dot_ref(&weights[row * k..(row + 1) * k], &x);
-            let tolerance = tolerance_factor(k) * abs;
+            let tolerance = tolerance_factor(ty, k) * abs;
             let error = (f64::from(run.got[col * rows + row]) - dot).abs();
             let ratio = if tolerance > 0.0 {
                 error / tolerance
@@ -531,7 +602,7 @@ fn gguf_dense_matvec_catches_one_flipped_field() {
     // index fields sit in different bytes per type; every byte of a block below is read by the
     // window whose lane covers it, and the first window reads the offsets listed.
     type Fields<'a> = &'a [(&'a str, usize, u8)];
-    let fields: [(QuantType, Fields); 7] = [
+    let fields: [(QuantType, Fields); 10] = [
         (QuantType::Iq4Nl, &[("d", 0, 1), ("codes", 2, 1)]),
         (
             QuantType::Iq2S,
@@ -573,6 +644,36 @@ fn gguf_dense_matvec_catches_one_flipped_field() {
                 ("high bit", 66, 1),
                 ("sign", 74, 1),
                 ("scale", 106, 1),
+            ],
+        ),
+        (
+            QuantType::Q2K,
+            &[
+                ("scale", 0, 1),
+                ("minimum", 0, 0x10),
+                ("codes", 16, 1),
+                ("d", 80, 1),
+                ("dmin", 82, 1),
+            ],
+        ),
+        (
+            QuantType::Iq1S,
+            &[
+                ("d", 0, 1),
+                ("grid index", 2, 1),
+                ("high index bit", 34, 1),
+                ("scale", 35, 0x10),
+                ("shift sign", 35, 0x80),
+            ],
+        ),
+        (
+            QuantType::Iq1M,
+            &[
+                ("grid index", 0, 1),
+                ("high index bit", 32, 1),
+                ("shift sign", 32, 8),
+                ("scale", 48, 1),
+                ("d nibble", 49, 0x10),
             ],
         ),
     ];
@@ -717,11 +818,11 @@ fn run_expert(ctx: &CudaContext, stream: &DeviceStream, case: &ExpertCase, seed:
         for (row, &got_row) in out.iter().enumerate() {
             let w_row = base + row * k;
             let (dot, abs) = dot_ref(&up_w[w_row..w_row + k], &xrow);
-            let mut tolerance = tolerance_factor(k) * abs;
+            let mut tolerance = tolerance_factor(ty, k) * abs;
             let mut want = dot;
             if glu {
                 let (gdot, gabs) = dot_ref(&gate_w[w_row..w_row + k], &xrow);
-                let gtol = tolerance_factor(k) * gabs;
+                let gtol = tolerance_factor(ty, k) * gabs;
                 // y = up * silu(gate): the up error scales by |silu(gate)|, the gate error by
                 // |up| times the largest slope of silu (1.1), plus a few roundings of the
                 // product, the exponential and the division.
@@ -1123,6 +1224,168 @@ fn gguf_matvec_inside_a_capture_equals_eager() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Prefill: the dequantizing GEMM over the codebook types.
+// ---------------------------------------------------------------------------------------------
+
+/// `values` as little-endian f16 bytes, and the f16-rounded values back as f64.
+fn f16_rows(values: &[f32]) -> (Vec<u8>, Vec<f64>) {
+    let bits: Vec<u16> = values.iter().map(|&v| testkit::f16_bits(v)).collect();
+    let bytes = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let back = bits
+        .iter()
+        .map(|&b| f64::from(testkit::f16_to_f32(b)))
+        .collect();
+    (bytes, back)
+}
+
+/// The prefill GEMM against an f64 reference over the oracle's dequantized weights rounded to
+/// f16 (the decoders write f16 tiles) and f16 activations. The kernel accumulates k products
+/// in f32 in one fixed order per output, so the bound is `k * 2^-24 * sum(|w * x|)`.
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_prefill_gemm_matches_the_cpu_reference() {
+    if !testkit::device_present("gguf_prefill_gemm_matches_the_cpu_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    for (ty, gt) in DENSE_TYPES {
+        let mut worst = 0.0f64;
+        let shapes: Vec<(usize, usize, usize)> = [
+            (256usize, 64usize, 3usize),
+            (2560, 70, 65),
+            (640, 130, 9),
+            (768, 17, 130),
+            (64, 5, 1),
+        ]
+        .into_iter()
+        .filter(|&(k, _, _)| block_ok(ty, k) && k.is_multiple_of(64))
+        .collect();
+        for (i, &(k, rows, ncols)) in shapes.iter().enumerate() {
+            let mut rng = testkit::Rng::new(0x6e_0000 + gt.id() as u64 * 100 + i as u64);
+            let w_bytes = random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01);
+            let w = testkit::upload_bytes(&ctx, &w_bytes);
+            let x: Vec<f32> = (0..ncols * k)
+                .map(|_| (rng.normal() as f32) * 0.5)
+                .collect();
+            let (x_bytes, x_back) = f16_rows(&x);
+            let x_dev = testkit::upload_bytes(&ctx, &x_bytes);
+            let y_bytes = rows * ncols * 4;
+            let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+            ctx.gemm_dq(
+                &stream,
+                ty,
+                GemmDqTypedCall {
+                    w: w.range(0, w_bytes.len()).expect("w"),
+                    x: x_dev.range(0, x_bytes.len()).expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride: k,
+                    y_col_stride: rows,
+                    x_f32: false,
+                },
+            )
+            .expect("gemm");
+            stream.synchronize().expect("drain");
+            let got = read_f32(&ctx, &y, rows * ncols);
+            let weights: Vec<f64> = dequantize(gt, &w_bytes)
+                .expect("oracle dequant")
+                .iter()
+                .map(|&v| f64::from(testkit::f16_to_f32(testkit::f16_bits(v))))
+                .collect();
+            for col in 0..ncols {
+                for row in 0..rows {
+                    let (mut dot, mut abs) = (0.0f64, 0.0f64);
+                    for j in 0..k {
+                        let term = weights[row * k + j] * x_back[col * k + j];
+                        dot += term;
+                        abs += term.abs();
+                    }
+                    let tolerance = k as f64 * 2f64.powi(-24) * abs;
+                    let error = (f64::from(got[col * rows + row]) - dot).abs();
+                    worst = worst.max(if tolerance > 0.0 {
+                        error / tolerance
+                    } else {
+                        error
+                    });
+                    assert!(
+                        error <= tolerance,
+                        "{ty:?} k {k} rows {rows} ncols {ncols} col {col} row {row}: error \
+                         {error:e} over tolerance {tolerance:e}"
+                    );
+                }
+            }
+        }
+        println!(
+            "prefill gemm {ty:?}: {} shapes, max error over tolerance {worst:.4}",
+            shapes.len()
+        );
+    }
+}
+
+/// The prefill GEMM throughput of every dense type at one prefill-sized shape, beside the Q5_K
+/// arm of the same kernel as the reference point (its decoder is the longest-serving one).
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn gguf_prefill_gemm_report_tflops() {
+    if !testkit::device_present("gguf_prefill_gemm_report_tflops") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (k, rows, ncols) = (2048usize, 2048usize, 2048usize);
+    let iters = if cfg!(debug_assertions) { 2 } else { 20 };
+    let mut rng = testkit::Rng::new(0x7f_0001);
+    let x: Vec<f32> = (0..ncols * k)
+        .map(|_| (rng.normal() as f32) * 0.5)
+        .collect();
+    let (x_bytes, _) = f16_rows(&x);
+    let x_dev = testkit::upload_bytes(&ctx, &x_bytes);
+    let y_bytes = rows * ncols * 4;
+    let y = testkit::upload_filled(&ctx, 0, y_bytes);
+    println!("type     k     rows  ncols   ms/launch  TFLOP/s (2*k*rows*ncols)");
+    let mut types: Vec<QuantType> = vec![QuantType::Q5K];
+    types.extend(DENSE_TYPES.iter().map(|&(ty, _)| ty));
+    types.push(QuantType::Iq4Xs);
+    for ty in types {
+        let w_bytes = if ty == QuantType::Q5K {
+            super::matvec_q::tests::reference::build_weight(ty, rows, k, &mut rng)
+        } else {
+            random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01)
+        };
+        let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let launch = || {
+            ctx.gemm_dq(
+                &stream,
+                ty,
+                GemmDqTypedCall {
+                    w: w.range(0, w_bytes.len()).expect("w"),
+                    x: x_dev.range(0, x_bytes.len()).expect("x"),
+                    y: y.range(0, y_bytes).expect("y"),
+                    k,
+                    rows,
+                    ncols,
+                    x_col_stride: k,
+                    y_col_stride: rows,
+                    x_f32: false,
+                },
+            )
+            .expect("gemm");
+        };
+        let us = bench(&ctx, &stream, iters, &launch);
+        let flops = 2.0 * k as f64 * rows as f64 * ncols as f64;
+        println!(
+            "{:8} {k:5} {rows:5} {ncols:5} {:10.3} {:8.2}",
+            format!("{ty:?}"),
+            us / 1000.0,
+            flops / (f64::from(us) * 1e-6) / 1e12
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // (d) Speed: the Flash-Next expert shapes.
 // ---------------------------------------------------------------------------------------------
 
@@ -1199,12 +1462,18 @@ fn gguf_codebook_matvec_report_gbps() {
             let y_bytes = FN_USED * rows * 4;
             let y = nan_filled(&ctx, y_bytes);
             // The down projection reads one activation row per slot.
-            for (launch_name, per_slot) in [
+            // IQ4_XS has its own dense kernel (`matvec_iq4xs.cu`): "dense" times that one, and
+            // "dense-new" times the codebook kernel on the same bytes.
+            let mut launches = vec![
                 ("expert", name == "down"),
                 ("2x5", name == "down"),
                 ("dense", false),
-            ] {
-                let (n_used, bytes_read) = if launch_name == "dense" {
+            ];
+            if ty == QuantType::Iq4Xs {
+                launches.push(("dense-new", false));
+            }
+            for (launch_name, per_slot) in launches {
+                let (n_used, bytes_read) = if launch_name.starts_with("dense") {
                     (1, expert_bytes)
                 } else {
                     (FN_USED, expert_bytes * FN_USED)
@@ -1266,7 +1535,17 @@ fn gguf_codebook_matvec_report_gbps() {
                             },
                         )
                         .expect("expert");
-                    } else if ty != QuantType::Iq4Xs {
+                    } else if launch_name == "dense-new" {
+                        ctx.matvec_gguf_direct(
+                            &stream,
+                            ty,
+                            stack.range(0, expert_bytes).expect("w"),
+                            x.buffer.range(0, x.row_bytes).expect("x"),
+                            y.range(0, rows * 4).expect("y"),
+                            (k, rows),
+                        )
+                        .expect("dense new");
+                    } else {
                         ctx.matvec_q(
                             &stream,
                             MatvecCall {
@@ -1282,9 +1561,6 @@ fn gguf_codebook_matvec_report_gbps() {
                         .expect("dense");
                     }
                 };
-                if launch_name == "dense" && ty == QuantType::Iq4Xs {
-                    continue;
-                }
                 let warm_us = bench(&ctx, &stream, warm_iters, &|| run(&id_sets[0]));
                 let mut cold = Vec::new();
                 for set in 0..cold_iters {

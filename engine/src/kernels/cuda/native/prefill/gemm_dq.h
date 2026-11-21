@@ -45,6 +45,15 @@ int inference_cuda_gemm_dq_q5k_launch(const inference_cuda_gemm_dq_args *args, v
 int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args, void *stream,
                                       int *out_stage);
 
+/* The same launch for the codebook types (GGUF ids 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS,
+ * 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 42 Q2_0): k must be a multiple of the type's block size and
+ * of 64, w is 2-byte aligned. table points at the type's lookup table words
+ * (weights/gguf_tables.rs) and table_bytes is their exact byte count (0 for Q2_0); they are
+ * copied into the launch arguments before the call returns. */
+int inference_cuda_gemm_dq_codebook_launch(const inference_cuda_gemm_dq_args *args, int type,
+                                           const void *table, size_t table_bytes, void *stream,
+                                           int *out_stage);
+
 /* The same launch with the Q3_K decoder: k must be a multiple of 256, w holds
  * rows * k/256 * 110 bytes, x and y as above. */
 int inference_cuda_gemm_dq_q3k_launch(const inference_cuda_gemm_dq_args *args, void *stream,

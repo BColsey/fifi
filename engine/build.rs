@@ -579,6 +579,24 @@ impl CudaToolkit {
              set CUDA_PATH or NVCC to a CUDA 12 toolkit",
             release.unwrap_or("unknown")
         );
+        // The codebook matvec and GEMM pass their lookup tables (up to 16 KiB) as by-value kernel
+        // arguments. The 4 KiB argument limit became 32764 bytes in CUDA 12.1, on Volta and newer.
+        let minor = release
+            .and_then(|rest| rest.split('.').nth(1))
+            .and_then(|digits| {
+                digits
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            });
+        assert!(
+            minor.is_some_and(|minor| minor >= 1),
+            "native-cuda requires CUDA 12.1 or newer (kernel arguments up to 32764 bytes carry the \
+             quantization lookup tables); `{nvcc}` reports release {}",
+            release.unwrap_or("unknown")
+        );
     }
 
     /// Links the static CUDA runtime from this toolkit.
@@ -644,6 +662,14 @@ fn cuda_archs() -> Vec<String> {
             assert!(
                 !arch.is_empty() && arch.bytes().all(|byte| byte.is_ascii_digit()),
                 "INFERENCE_CUDA_ARCHS entry {arch:?} must be a decimal SM number such as 86"
+            );
+            // Kernel arguments above 4 KiB (the codebook lookup tables) exist on Volta (sm_70)
+            // and newer with CUDA 12.1.
+            let sm = arch.parse::<u32>().expect("checked as digits above");
+            assert!(
+                sm >= 70,
+                "INFERENCE_CUDA_ARCHS entry {arch} is below sm_70: the codebook matvec passes its \
+                 lookup tables as kernel arguments of up to 16 KiB, which need Volta or newer"
             );
             arch.to_owned()
         })

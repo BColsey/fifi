@@ -24,7 +24,9 @@ use std::mem::offset_of;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
-use crate::weights::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
+use crate::weights::{
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL,
+};
 
 const _: () = assert!(
     cfg!(target_endian = "little"),
@@ -117,7 +119,10 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a C entry's flat argument list: type, two buffers, count, table pointer and size, stream, stage"
+    )]
     #[link_name = "inference_cuda_dequant_gguf_launch"]
     fn dequant_gguf_launch_raw(
         ty: c_int,
@@ -149,6 +154,9 @@ pub(in crate::kernels::cuda) fn gguf_type_id(ty: QuantType) -> Option<c_int> {
         QuantType::Iq2S => 22,
         QuantType::Iq4Xs => 23,
         QuantType::Q20 => 42,
+        QuantType::Q2K => 10,
+        QuantType::Iq1S => 19,
+        QuantType::Iq1M => 29,
         _ => return None,
     })
 }
@@ -162,6 +170,7 @@ pub(in crate::kernels::cuda) fn table_of(ty: QuantType) -> &'static [u8] {
         QuantType::Iq2S => bytes_of(&IQ2S_GRID),
         QuantType::Iq3Xxs => bytes_of(&IQ3XXS_GRID),
         QuantType::Iq3S => bytes_of(&IQ3S_GRID),
+        QuantType::Iq1S | QuantType::Iq1M => bytes_of(&IQ1S_GRID),
         QuantType::Iq4Nl | QuantType::Iq4Xs => bytes_of(&KVALUES_IQ4NL),
         _ => &[],
     }

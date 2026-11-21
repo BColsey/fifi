@@ -266,7 +266,10 @@ fn mmq_type_of(ty: QuantType) -> Result<MmqType, EngError> {
         | QuantType::Iq2Xxs
         | QuantType::Q20
         | QuantType::Iq2Xs
-        | QuantType::Iq3S => Err(rule("type", "the codebook types have no dense case")),
+        | QuantType::Iq3S
+        | QuantType::Q2K
+        | QuantType::Iq1S
+        | QuantType::Iq1M => Err(rule("type", "the codebook types have no dense case")),
     }
 }
 

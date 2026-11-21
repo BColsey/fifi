@@ -16,6 +16,8 @@ use std::ffi::{c_int, c_void};
 use std::mem::offset_of;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
+use crate::kernels::cuda::native::resident::matvec_gguf::{gguf_type_id, table_of};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 /// Mirror of `inference_cuda_gemm_dq_args` (`gemm_dq.h`), field for field.
 /// The layout is pinned as well by the `static_assert` of the header.
@@ -65,6 +67,15 @@ unsafe extern "C" {
     #[link_name = "inference_cuda_gemm_dq_iq4xs_launch"]
     fn gemm_dq_iq4xs_launch_raw(
         args: *const GemmDqArgsRepr,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gemm_dq_codebook_launch"]
+    fn gemm_dq_codebook_launch_raw(
+        args: *const GemmDqArgsRepr,
+        ty: c_int,
+        table: *const c_void,
+        table_bytes: usize,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -405,5 +416,66 @@ pub(in crate::kernels::cuda) fn gemm_dq_q40_launch(
         &call.layout,
     )?;
     let status = unsafe { gemm_dq_q40_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The codebook-type dequantizing GEMM call: `w` native blocks of `ty` (`rows * k / block *
+/// block_bytes` bytes), `x` and `y` as in the other types.
+pub(in crate::kernels::cuda) struct GemmDqCodebookRaw<'a> {
+    pub(in crate::kernels::cuda) ty: QuantType,
+    pub(in crate::kernels::cuda) w: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) ncols: usize,
+    pub(in crate::kernels::cuda) layout: GemmDqLayout,
+}
+
+pub(in crate::kernels::cuda) fn gemm_dq_codebook_launch(
+    stream: &RawStream,
+    call: &GemmDqCodebookRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let id = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
+    if !call.ty.is_codebook_dense() {
+        return Err(invalid_argument());
+    }
+    check_gemm_dq(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+        &GemmDqGeom {
+            qk: call.ty.block_size(),
+            block_bytes: call.ty.block_bytes(),
+            w_align: 2,
+        },
+    )?;
+    let table = table_of(call.ty);
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gemm_dq_q5k_launch`, with the geometry of the type (2-byte weight
+    // alignment). `table` is a `'static` slice the adapter copies before it returns.
+    let args = gemm_dq_args(
+        &call.w,
+        &call.x,
+        &call.y,
+        call.k,
+        call.rows,
+        call.ncols,
+        &call.layout,
+    )?;
+    let status = unsafe {
+        gemm_dq_codebook_launch_raw(
+            &args,
+            id,
+            table.as_ptr().cast::<c_void>(),
+            table.len(),
+            stream.as_ptr(),
+            &mut stage,
+        )
+    };
     checked(status, stage)
 }

@@ -6,7 +6,17 @@
  *
  *     dequantized weight j  =  (j < 16 ? s0 : s1) * (float)int8_j
  *
- * is the exact f32 value of weights/gguf_dequant.rs (the CPU oracle). The matvec multiplies
+ * is the exact f32 value of weights/gguf_dequant.rs (the CPU oracle) for the types whose
+ * weights are a scale times an integer. Two types add a term, flagged per type at compile
+ * time: kHasAdd (IQ1_S, IQ1_M: the grid value is shifted before scaling, one shift a[g] per
+ * group of eight) and kHasMin (Q2_K: a per-16 minimum m0, m1 is subtracted after scaling),
+ * so that in general
+ *
+ *     weight j  =  (s_h * ((float)int8_j + a_g)) - m_h        (h = j / 16, g = j / 8)
+ *
+ * with a = 0 and m = 0 where the flag is off. The dot product then adds
+ * s_h * a_g * (sum of the activation quants of group g) and subtracts m_h * (sum of the
+ * activation quants of half h). The matvec multiplies
  * the int8 weights against the int8 activation quants with __dp4a and applies the scales in
  * f32; the device dequant test applies them to the int8 weights directly.
  *
@@ -39,19 +49,70 @@
 #define INFERENCE_CUDA_RESIDENT_GGUF_DECODE_CUH
 
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <stdio.h>
 
 #include <stdint.h>
 #include <string.h>
 
 namespace gguf {
 
+/* A failed launch of a kernel that carries a lookup table by value: when the driver stack
+ * rejects the argument size (older than CUDA 12.1, or before Volta, the limit is 4 KiB) the
+ * runtime reports an invalid value or configuration; say what the argument was. */
+static inline void note_argument_failure(cudaError_t err, size_t argument_bytes) {
+    if (err == cudaErrorInvalidValue || err == cudaErrorInvalidConfiguration) {
+        fprintf(stderr,
+                "codebook kernel launch refused (%s): the lookup table rides a %zu-byte kernel "
+                "argument, which needs a CUDA 12.1 or newer driver stack on Volta or newer\n",
+                cudaGetErrorString(err), argument_bytes);
+    }
+}
+
 struct Win {
     int w[8];
     float s0;
     float s1;
+    float a[4]; /* kHasAdd types: the shift of each group of eight */
+    float m0;   /* kHasMin types: the minima of weights 0..15 and 16..31 */
+    float m1;
 };
 
-/* GGUF type ids (ggml_type values) the in-house matvec serves. */
+/* The exact f32 weight j of a decoded window, in the oracle's operation order. */
+template <class T>
+__device__ __forceinline__ float window_value(const Win &wn, int j) {
+    const int v = (int)(signed char)((wn.w[j >> 2] >> (8 * (j & 3))) & 0xFF);
+    float x = (float)v;
+    if constexpr (T::kHasAdd) {
+        x = __fadd_rn(x, wn.a[j >> 3]);
+    }
+    x = __fmul_rn(j < 16 ? wn.s0 : wn.s1, x);
+    if constexpr (T::kHasMin) {
+        x = __fsub_rn(x, j < 16 ? wn.m0 : wn.m1);
+    }
+    return x;
+}
+
+/* The lookup table of a type as a by-value kernel argument (see the file comment). */
+template <int N>
+struct __align__(16) Tab {
+    uint32_t w[N];
+};
+
+/* Copies the by-value table to shared memory: thread t loads and stores the 16-byte chunks
+ * t, t + Threads, ... The loop is fully unrolled (the chunk count is a compile-time
+ * constant), so a thread has all its constant-bank loads in flight before the first store. */
+template <int N, int Threads>
+__device__ __forceinline__ void stage_table(const Tab<N> &t, uint32_t *sm) {
+    const int chunks = N / 4;
+#pragma unroll
+    for (int c = (int)threadIdx.x; c < chunks; c += Threads) {
+        *reinterpret_cast<uint4 *>(&sm[4 * c]) = *reinterpret_cast<const uint4 *>(&t.w[4 * c]);
+    }
+}
+
+/* The GGUF tensor type ids the in-house matvec serves. */
 enum {
     kIq2Xxs = 16,
     kIq2Xs = 17,
@@ -61,6 +122,9 @@ enum {
     kIq2S = 22,
     kIq4Xs = 23,
     kQ2_0 = 42,
+    kQ2K = 10,
+    kIq1S = 19,
+    kIq1M = 29,
 };
 
 __device__ __forceinline__ unsigned rd16(const unsigned char *p) {
@@ -140,6 +204,8 @@ struct Iq4Nl {
     static constexpr int kWinPerBlock = 1;
     static constexpr int kTabWords = 4;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned q[4];
         float d;
@@ -167,6 +233,8 @@ struct Iq4Xs {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 4;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned q[4];
         unsigned scale;
@@ -200,6 +268,8 @@ struct Q2_0 {
     static constexpr int kWinPerBlock = 2;
     static constexpr int kTabWords = 4;
     static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned q[4];
         float d;
@@ -243,6 +313,8 @@ struct Iq2Xxs {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 512;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned a0, a1;
         float d;
@@ -277,6 +349,8 @@ struct Iq2Xs {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 1024;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned v0, v1;
         unsigned scale;
@@ -312,6 +386,8 @@ struct Iq2S {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 2048;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned qs, signs;
         unsigned qh, scale;
@@ -349,6 +425,8 @@ struct Iq3Xxs {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 256;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned q0, q1;
         unsigned a;
@@ -384,6 +462,8 @@ struct Iq3S {
     static constexpr int kWinPerBlock = 8;
     static constexpr int kTabWords = 512;
     static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
     struct Raw {
         unsigned q0, q1;
         unsigned qh, signs;
@@ -413,6 +493,137 @@ struct Iq3S {
         const float db = __fmul_rn(r.d, (float)(1 + 2 * (int)r.scale));
         o.s0 = db;
         o.s1 = db;
+    }
+};
+
+/* Q2_K: 84-byte super-block: 16 scale bytes (low nibble scales a group of 16, high nibble is
+ * its minimum), 64 code bytes of 2-bit codes, f16 d at +80, f16 dmin at +82. Window wi
+ * (0..7) is value range [32 wi, 32 wi + 32): its codes are bit pair 2 * (wi % 4) of the 32
+ * bytes qs[32 * (wi / 4) ..), and its two groups use scale bytes 2 wi and 2 wi + 1. The
+ * weight is d * (scale & 15) * code - dmin * (scale >> 4). */
+struct Q2K {
+    static constexpr int kBlockBytes = 84;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = true;
+    struct Raw {
+        unsigned q[8];
+        unsigned sc0, sc1;
+        unsigned shift;
+        float d, dmin;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int wi) {
+        Raw r;
+        r.d = rd_half(blk + 80);
+        r.dmin = rd_half(blk + 82);
+        r.sc0 = blk[2 * wi];
+        r.sc1 = blk[2 * wi + 1];
+        r.shift = 2 * (wi & 3);
+        const unsigned char *qs = blk + 16 + 32 * (wi >> 2);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            r.q[i] = *reinterpret_cast<const unsigned *>(qs + 4 * i);
+        }
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o.w[i] = (int)((r.q[i] >> r.shift) & 0x03030303u);
+        }
+        o.s0 = __fmul_rn(r.d, (float)(r.sc0 & 0x0Fu));
+        o.s1 = __fmul_rn(r.d, (float)(r.sc1 & 0x0Fu));
+        o.m0 = __fmul_rn(r.dmin, (float)(r.sc0 >> 4));
+        o.m1 = __fmul_rn(r.dmin, (float)(r.sc1 >> 4));
+    }
+};
+
+/* The IQ1 shift of the grid values: weight = scale * (grid + delta), delta = +-0.125. */
+#define GGUF_IQ1_DELTA 0.125f
+
+/* IQ1_S: 50-byte super-block: f16 d, 32 grid index bytes, eight u16 qh words. Window ib
+ * reads four index bytes and qh word ib: bits 3l..3l+2 are the high index bits of group l,
+ * bits 12..14 the scale (2 * s + 1) and bit 15 the sign of the shift. Each grid entry is
+ * eight signed bytes in {-1, 0, 1}, which are exactly the int8 weights. */
+struct Iq1S {
+    static constexpr int kBlockBytes = 50;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4096;
+    static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = true;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned qs, qh;
+        float d;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int wi) {
+        Raw r;
+        r.d = rd_half(blk);
+        r.qs = rd32(blk + 2 + 4 * wi);
+        r.qh = rd16(blk + 34 + 2 * wi);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *tab, Win &o) {
+        const uint2 *grid = reinterpret_cast<const uint2 *>(tab);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = grid[((r.qs >> (8 * l)) & 0xFFu) | (((r.qh >> (3 * l)) & 7u) << 8)];
+            o.w[2 * l] = (int)g.x;
+            o.w[2 * l + 1] = (int)g.y;
+        }
+        const float dl = __fmul_rn(r.d, (float)(2 * (int)((r.qh >> 12) & 7u) + 1));
+        const float delta = (r.qh & 0x8000u) ? -GGUF_IQ1_DELTA : GGUF_IQ1_DELTA;
+        o.s0 = dl;
+        o.s1 = dl;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            o.a[g] = delta;
+        }
+    }
+};
+
+/* IQ1_M: 56-byte super-block: 32 grid index bytes, 16 qh bytes (two per window: the low three
+ * bits of each nibble are the high index bits of one group, bit 3 the sign of its shift), four
+ * u16 scale words at +48. The f16 d has no field: the top nibbles of the four words, in order,
+ * are its bits 0..3, 4..7, 8..11, 12..15. Word ib / 2 carries the 3-bit scales (2 * s + 1) of
+ * window ib at shifts 6 * (ib % 2) (groups 0 and 1) and 6 * (ib % 2) + 3 (groups 2 and 3). */
+struct Iq1M {
+    static constexpr int kBlockBytes = 56;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4096;
+    static constexpr int kHostTabWords = kTabWords;
+    static constexpr bool kHasAdd = true;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned qs, qh;
+        unsigned word, dbits, shift;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int wi) {
+        Raw r;
+        r.qs = rd32(blk + 4 * wi);
+        r.qh = rd16(blk + 32 + 2 * wi);
+        const unsigned w0 = rd16(blk + 48), w1 = rd16(blk + 50), w2 = rd16(blk + 52),
+                       w3 = rd16(blk + 54);
+        r.dbits = (w0 >> 12) | ((w1 >> 8) & 0x00F0u) | ((w2 >> 4) & 0x0F00u) | (w3 & 0xF000u);
+        r.word = wi < 4 ? (wi < 2 ? w0 : w1) : (wi < 6 ? w2 : w3);
+        r.shift = 6 * (wi & 1);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *tab, Win &o) {
+        const uint2 *grid = reinterpret_cast<const uint2 *>(tab);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const unsigned nib = (r.qh >> (4 * (l & 1) + 8 * (l >> 1))) & 0x0Fu;
+            const uint2 g = grid[((r.qs >> (8 * l)) & 0xFFu) | ((nib & 7u) << 8)];
+            o.w[2 * l] = (int)g.x;
+            o.w[2 * l + 1] = (int)g.y;
+            o.a[l] = (nib & 8u) ? -GGUF_IQ1_DELTA : GGUF_IQ1_DELTA;
+        }
+        const float d = __half2float(__ushort_as_half((unsigned short)r.dbits));
+        o.s0 = __fmul_rn(d, (float)(2 * (int)((r.word >> r.shift) & 7u) + 1));
+        o.s1 = __fmul_rn(d, (float)(2 * (int)((r.word >> (r.shift + 3)) & 7u) + 1));
     }
 };
 

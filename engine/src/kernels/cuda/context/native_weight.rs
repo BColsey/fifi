@@ -379,6 +379,9 @@ fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {
         GgufType::Q20 => QuantType::Q20,
         GgufType::Iq2Xs => QuantType::Iq2Xs,
         GgufType::Iq3S => QuantType::Iq3S,
+        GgufType::Q2K => QuantType::Q2K,
+        GgufType::Iq1S => QuantType::Iq1S,
+        GgufType::Iq1M => QuantType::Iq1M,
         other => {
             return Err(EngError::Checkpoint(format!(
                 "tensor {} has type {other:?}, which the CUDA native weights do not take",

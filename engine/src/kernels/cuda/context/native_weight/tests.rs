@@ -42,6 +42,16 @@ fn checked_native_takes_the_matvec_types_and_refuses_the_rest() {
         (GgufType::Q40, QuantType::Q40),
         (GgufType::Q3K, QuantType::Q3K),
         (GgufType::Iq4Xs, QuantType::Iq4Xs),
+        (GgufType::Iq4Nl, QuantType::Iq4Nl),
+        (GgufType::Iq2S, QuantType::Iq2S),
+        (GgufType::Iq3Xxs, QuantType::Iq3Xxs),
+        (GgufType::Iq2Xxs, QuantType::Iq2Xxs),
+        (GgufType::Q20, QuantType::Q20),
+        (GgufType::Iq2Xs, QuantType::Iq2Xs),
+        (GgufType::Iq3S, QuantType::Iq3S),
+        (GgufType::Q2K, QuantType::Q2K),
+        (GgufType::Iq1S, QuantType::Iq1S),
+        (GgufType::Iq1M, QuantType::Iq1M),
     ] {
         let tensor = QuantTensor {
             name: "w",
@@ -55,7 +65,7 @@ fn checked_native_takes_the_matvec_types_and_refuses_the_rest() {
             "{ty:?}"
         );
     }
-    for ty in [GgufType::F32, GgufType::Q2K] {
+    for ty in [GgufType::F32, GgufType::Q41] {
         let text = error_text(checked_native(QuantTensor {
             name: "embd",
             ty,

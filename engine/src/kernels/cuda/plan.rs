@@ -96,6 +96,9 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
         GgufType::Iq3Xxs => Some((256, 98)),
         GgufType::Iq3S => Some((256, 110)),
         GgufType::Iq4Xs => Some((256, 136)),
+        GgufType::Q2K => Some((256, 84)),
+        GgufType::Iq1S => Some((256, 50)),
+        GgufType::Iq1M => Some((256, 56)),
         _ => None,
     }
 }
@@ -534,6 +537,9 @@ mod tests {
             (GgufType::Iq3Xxs, 256, 98),
             (GgufType::Iq3S, 256, 110),
             (GgufType::Iq4Xs, 256, 136),
+            (GgufType::Q2K, 256, 84),
+            (GgufType::Iq1S, 256, 50),
+            (GgufType::Iq1M, 256, 56),
         ] {
             assert_eq!(
                 (values, bytes),
@@ -703,7 +709,7 @@ mod tests {
         // Q80 blocks are 32 wide: the same 192 cut is legal there.
         assert!(plan_slice("w", GgufType::Q80, &dims, 0..192, 0..2048).is_ok());
         // A type with no native block, and an over-rank tensor, refuse.
-        assert!(plan_slice("w", GgufType::Q2K, &dims, 0..512, 0..2048).is_err());
+        assert!(plan_slice("w", GgufType::Q41, &dims, 0..512, 0..2048).is_err());
         assert!(plan_slice("w", GgufType::F32, &[4, 4, 4, 4], 0..4, 0..4).is_err());
     }
 

@@ -168,7 +168,10 @@ pub(in crate::kernels::cuda) mod reference {
             | QuantType::Iq2Xxs
             | QuantType::Q20
             | QuantType::Iq2Xs
-            | QuantType::Iq3S => unreachable!("the codebook types have their own tests"),
+            | QuantType::Iq3S
+            | QuantType::Q2K
+            | QuantType::Iq1S
+            | QuantType::Iq1M => unreachable!("the codebook types have their own tests"),
         }
     }
 

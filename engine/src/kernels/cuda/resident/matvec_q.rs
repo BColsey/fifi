@@ -58,6 +58,9 @@ pub(crate) enum QuantType {
     Q20,
     Iq2Xs,
     Iq3S,
+    Q2K,
+    Iq1S,
+    Iq1M,
 }
 
 impl QuantType {
@@ -81,7 +84,10 @@ impl QuantType {
             | Self::Iq2Xxs
             | Self::Q20
             | Self::Iq2Xs
-            | Self::Iq3S => {
+            | Self::Iq3S
+            | Self::Q2K
+            | Self::Iq1S
+            | Self::Iq1M => {
                 unreachable!("the in-house kernels never enter the vendored switch")
             }
         }
@@ -100,6 +106,9 @@ impl QuantType {
                 | Self::Q20
                 | Self::Iq2Xs
                 | Self::Iq3S
+                | Self::Q2K
+                | Self::Iq1S
+                | Self::Iq1M
         )
     }
 
@@ -119,7 +128,10 @@ impl QuantType {
             | Self::Iq3Xxs
             | Self::Iq2Xxs
             | Self::Iq2Xs
-            | Self::Iq3S => 256,
+            | Self::Iq3S
+            | Self::Q2K
+            | Self::Iq1S
+            | Self::Iq1M => 256,
             Self::Q20 => 64,
             Self::Q50 | Self::Q80 | Self::Q40 | Self::Iq4Nl => 32,
         }
@@ -129,7 +141,7 @@ impl QuantType {
     /// Q5_K 176 (d, dmin, 12 scale bytes, 32 qh bytes, 128 qs bytes); Q4_0 18 (f16 scale and
     /// 16 code bytes); Q3_K 110 (32 hmask, 64 qs, 12 packed 6-bit scales, f16 d);
     /// IQ4_XS 136 (f16 d, u16 scales_h, scales_l[4], 128 qs); IQ4_NL 18 and Q2_0 18 (f16 d and
-    /// 16 code bytes); IQ2_XXS 66, IQ2_XS 74, IQ2_S 82, IQ3_XXS 98, IQ3_S 110 (the block
+    /// 16 code bytes); IQ2_XXS 66, IQ2_XS 74, IQ2_S 82, IQ3_XXS 98, IQ3_S 110, Q2_K 84, IQ1_S 50, IQ1_M 56 (the block
     /// layouts of `weights/gguf.rs`, the CPU oracle's sizes).
     pub(crate) fn block_bytes(self) -> usize {
         match self {
@@ -147,6 +159,9 @@ impl QuantType {
             Self::Iq2S => 82,
             Self::Iq3Xxs => 98,
             Self::Iq3S => 110,
+            Self::Q2K => 84,
+            Self::Iq1S => 50,
+            Self::Iq1M => 56,
         }
     }
 

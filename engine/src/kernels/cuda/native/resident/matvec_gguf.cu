@@ -49,23 +49,6 @@ const int kMaxCols = 8;
 const int kMaxUsed = 32;
 const int kCtasPerSm = 4;
 
-template <int N>
-struct __align__(16) Tab {
-    uint32_t w[N];
-};
-
-/* Copies the by-value table to shared memory: thread t loads and stores the 16-byte chunks
- * t, t + 256, ... The loop is fully unrolled (the chunk count is a compile-time constant), so
- * a thread has all its constant-bank loads in flight before the first store. */
-template <int N>
-__device__ __forceinline__ void stage_table(const Tab<N> &t, uint32_t *sm) {
-    const int chunks = N / 4;
-#pragma unroll
-    for (int c = (int)threadIdx.x; c < chunks; c += kThreads) {
-        *reinterpret_cast<uint4 *>(&sm[4 * c]) = *reinterpret_cast<const uint4 *>(&t.w[4 * c]);
-    }
-}
-
 /* Shared bytes of one staged activation column of nwin windows (nwin rounded up to 4 so every
  * array stays 16-byte aligned). */
 __host__ __device__ inline int staged_windows(int nwin) { return (nwin + 3) & ~3; }
@@ -143,7 +126,24 @@ __device__ __forceinline__ void accumulate(const typename T::Raw &raw, int win,
                 s0 = __dp4a(wn.w[i], q[i], s0);
                 s1 = __dp4a(wn.w[4 + i], q[4 + i], s1);
             }
-            const float t = fmaf(wn.s0, (float)s0, __fmul_rn(wn.s1, (float)s1));
+            float t = fmaf(wn.s0, (float)s0, __fmul_rn(wn.s1, (float)s1));
+            if constexpr (T::kHasAdd || T::kHasMin) {
+                /* The shifted and offset forms: sums of the activation quants per group of
+                 * eight (a dp4a against ones), then s_h * a_g * sum_g and m_h * sum_h. */
+                int xs[4];
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    xs[g] = __dp4a(0x01010101, q[2 * g + 1], __dp4a(0x01010101, q[2 * g], 0));
+                }
+                if constexpr (T::kHasAdd) {
+                    const float h0 = fmaf(wn.a[0], (float)xs[0], __fmul_rn(wn.a[1], (float)xs[1]));
+                    const float h1 = fmaf(wn.a[2], (float)xs[2], __fmul_rn(wn.a[3], (float)xs[3]));
+                    t = fmaf(wn.s0, h0, fmaf(wn.s1, h1, t));
+                }
+                if constexpr (T::kHasMin) {
+                    t -= fmaf(wn.m0, (float)(xs[0] + xs[1]), __fmul_rn(wn.m1, (float)(xs[2] + xs[3])));
+                }
+            }
             acc[c] = fmaf(d, t, acc[c]);
         }
     }
@@ -197,7 +197,7 @@ __global__ void __launch_bounds__(kThreads)
     const int lane = (int)(threadIdx.x & 31);
     const int nwin = k / 32;
     const int nwp = staged_windows(nwin);
-    stage_table<T::kTabWords>(tab, stab);
+    stage_table<T::kTabWords, kThreads>(tab, stab);
     if (Staged) {
         for (int c = 0; c < ncols; ++c) {
             stage_x_column(x_q8 + (size_t)c * x_row_bytes, nwin, nwp,
@@ -253,7 +253,7 @@ __global__ void __launch_bounds__(kThreads)
     const int nwin = k / 32;
     const int nwp = staged_windows(nwin);
     const unsigned char *x = x_q8 + (x_per_slot ? (size_t)slot * x_row_bytes : 0);
-    stage_table<T::kTabWords>(tab, stab);
+    stage_table<T::kTabWords, kThreads>(tab, stab);
     if (Staged) {
         stage_x_column(x, nwin, nwp, sx);
     }
@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(kThreads)
     dequant(const unsigned char *w, float *y, size_t n_windows, Tab<T::kTabWords> tab) {
     extern __shared__ __align__(16) unsigned char smem[];
     uint32_t *stab = reinterpret_cast<uint32_t *>(smem);
-    stage_table<T::kTabWords>(tab, stab);
+    stage_table<T::kTabWords, kThreads>(tab, stab);
     __syncthreads();
     for (size_t win = (size_t)blockIdx.x * kThreads + threadIdx.x; win < n_windows;
          win += (size_t)gridDim.x * kThreads) {
@@ -304,8 +304,7 @@ __global__ void __launch_bounds__(kThreads)
         T::decode(raw, stab, wn);
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
-            const int v = (int)(signed char)((wn.w[j >> 2] >> (8 * (j & 3))) & 0xFF);
-            y[win * 32 + j] = __fmul_rn(j < 16 ? wn.s0 : wn.s1, (float)v);
+            y[win * 32 + j] = window_value<T>(wn, j);
         }
     }
 }
@@ -369,13 +368,18 @@ int with_type(int type, F &&f) {
     case kIq2S: return f(TypeTag<Iq2S>());
     case kIq4Xs: return f(TypeTag<Iq4Xs>());
     case kQ2_0: return f(TypeTag<Q2_0>());
+    case kQ2K: return f(TypeTag<Q2K>());
+    case kIq1S: return f(TypeTag<Iq1S>());
+    case kIq1M: return f(TypeTag<Iq1M>());
     default: return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
 }
 
-int finish_launch(int *out_stage) {
+int finish_launch(int *out_stage, size_t argument_bytes) {
     Failure failure;
-    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    const cudaError_t err = cudaGetLastError();
+    note_argument_failure(err, argument_bytes);
+    failure.record(err, INFERENCE_CUDA_STAGE_LAUNCH);
     report_stage(out_stage, failure.stage);
     return (int)failure.err;
 }
@@ -434,7 +438,7 @@ extern "C" int inference_cuda_matvec_gguf_launch(const inference_cuda_matvec_ggu
                 matvec_dense<T, false><<<blocks, kThreads, smem, (cudaStream_t)stream>>>(
                     w, x, args->y, k, rows, ncols, x_row_bytes, tab);
             }
-            return finish_launch(out_stage);
+            return finish_launch(out_stage, sizeof(tab));
         });
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
@@ -507,7 +511,7 @@ extern "C" int inference_cuda_matvec_gguf_expert_launch(
                     w, ids, x, args->y, gate, k, rows, n_expert, per_slot, args->y_slot_stride,
                     x_row_bytes, tab);
             }
-            return finish_launch(out_stage);
+            return finish_launch(out_stage, sizeof(tab));
         });
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
@@ -535,7 +539,7 @@ extern "C" int inference_cuda_dequant_gguf_launch(int type, const void *w, float
             const int blocks = (int)(blocks_needed < 1024 ? blocks_needed : 1024);
             dequant<T><<<blocks, kThreads, 4 * (size_t)T::kTabWords, (cudaStream_t)stream>>>(
                 (const unsigned char *)w, y, n_windows, tab);
-            return finish_launch(out_stage);
+            return finish_launch(out_stage, sizeof(tab));
         });
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
