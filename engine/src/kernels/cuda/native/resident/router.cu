@@ -252,10 +252,13 @@ __device__ inline bool before(float pa, int ia, float pb, int ib) {
 }
 
 // Per is the experts a lane holds: n_expert <= Per * 32.
-template <bool Sigmoid, int Per>
+/* With Biased, experts are ranked by score + bias[e] while the weights stay the unbiased scores
+ * (a selection bias that shifts which experts win without changing how they are weighted); the
+ * instantiation without it is the original kernel. */
+template <bool Sigmoid, int Per, bool Biased>
 __global__ void __launch_bounds__(32)
 router_select_k(const float *logits, int *ids, float *weights, float *shared_gate, int *status,
-                int n_expert, int top_k, int logit_stride) {
+                int n_expert, int top_k, int logit_stride, const float *bias) {
     const int t = blockIdx.x, lane = threadIdx.x;
     const float *lg = logits + (size_t)t * logit_stride;
     float p[Per];
@@ -283,15 +286,33 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
         // Normalizing all scores here can create extra ties through F32 rounding.
         p[k] = (k * 32 + lane) < n_expert ? (Sigmoid ? p[k] : p[k] / z) : -1.f;
     }
+    float rk_store[Biased ? Per : 1];
+    if constexpr (Biased) {
+#pragma unroll
+        for (int k = 0; k < Per; ++k) {
+            const int e = k * 32 + lane;
+            rk_store[k] = e < n_expert ? p[k] + bias[e] : -INFINITY;
+        }
+    }
+    // The ranking values: the scores themselves, or the biased scores.
+    auto rk = [&](int k) -> float & {
+        if constexpr (Biased) {
+            return rk_store[k];
+        } else {
+            return p[k];
+        }
+    };
+    const float rank_floor = Biased ? -INFINITY : -2.f;
+    const float removed = Biased ? -INFINITY : -1.f;
     float my_p = 0.f, sum = 0.f;
     int my_i = -1;
     for (int r = 0; r < top_k; ++r) {
-        float bp = -2.f;
+        float bp = rank_floor;
         int bi = 0x7fffffff;
 #pragma unroll
         for (int k = 0; k < Per; ++k) {
-            if (before(p[k], k * 32 + lane, bp, bi)) {
-                bp = p[k];
+            if (before(rk(k), k * 32 + lane, bp, bi)) {
+                bp = rk(k);
                 bi = k * 32 + lane;
             }
         }
@@ -304,15 +325,25 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
                 bi = oi;
             }
         }
-        sum += bp;  // rank order, sequential: the order of route_experts
+        float weight = bp;
+        if constexpr (Biased) {
+            // The winner's own lane holds its unbiased score; the others add zero.
+            weight = 0.f;
+#pragma unroll
+            for (int k = 0; k < Per; ++k) {
+                if (bi == k * 32 + lane) weight = p[k];
+            }
+            weight = warp_sum_r(weight);
+        }
+        sum += weight;  // rank order, sequential: the order of route_experts
         if (lane == r) {
-            my_p = bp;
+            my_p = weight;
             my_i = bi;
         }
 #pragma unroll
         for (int k = 0; k < Per; ++k) {
             if (bi == k * 32 + lane) {
-                p[k] = -1.f;  // the owner removes the winner
+                rk(k) = removed;  // the owner removes the winner
             }
         }
     }
@@ -341,19 +372,31 @@ struct SelectArgs {
     float *shared_gate;
     int *status;
     int m, n_expert, top_k, logit_stride;
+    const float *bias;  /* NULL: rank by the scores themselves */
 };
 
 /* Launches router_select_k with 8 experts per lane up to 256 experts, else 16. */
 template <bool Sigmoid>
 void launch_select(const SelectArgs &k, cudaStream_t s) {
-    if (k.n_expert <= kNarrowExperts) {
-        router_select_k<Sigmoid, kNarrowExperts / 32><<<k.m, 32, 0, s>>>(
+    const bool narrow = k.n_expert <= kNarrowExperts;
+    if (k.bias == NULL) {
+        if (narrow) {
+            router_select_k<Sigmoid, kNarrowExperts / 32, false><<<k.m, 32, 0, s>>>(
+                k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
+                k.logit_stride, NULL);
+        } else {
+            router_select_k<Sigmoid, kRouterMaxExperts / 32, false><<<k.m, 32, 0, s>>>(
+                k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
+                k.logit_stride, NULL);
+        }
+    } else if (narrow) {
+        router_select_k<Sigmoid, kNarrowExperts / 32, true><<<k.m, 32, 0, s>>>(
             k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
-            k.logit_stride);
+            k.logit_stride, k.bias);
     } else {
-        router_select_k<Sigmoid, kRouterMaxExperts / 32><<<k.m, 32, 0, s>>>(
+        router_select_k<Sigmoid, kRouterMaxExperts / 32, true><<<k.m, 32, 0, s>>>(
             k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
-            k.logit_stride);
+            k.logit_stride, k.bias);
     }
 }
 
@@ -419,6 +462,10 @@ bool valid_split_select(const inference_cuda_router_sigmoid_args *a) {
            split_span(a->ids, a->ids_bytes, picks, 4) &&
            split_span(a->weights, a->weights_bytes, picks, 4) &&
            split_span(a->status, a->status_bytes, 4, 4) &&
+           (a->bias == NULL || (split_span(a->bias, a->bias_bytes, size_t(a->n_expert) * 4, 4) &&
+                                split_apart(a->ids, picks, a->bias, size_t(a->n_expert) * 4) &&
+                                split_apart(a->weights, picks, a->bias, size_t(a->n_expert) * 4) &&
+                                split_apart(a->status, 4, a->bias, size_t(a->n_expert) * 4))) &&
            split_apart(a->ids, picks, a->logits, logits) &&
            split_apart(a->weights, picks, a->logits, logits) &&
            split_apart(a->status, 4, a->logits, logits) &&
@@ -455,7 +502,7 @@ extern "C" int inference_cuda_router_launch(const inference_cuda_router_args *a,
         if (failure.ok()) {
             const SelectArgs k{(const float *)a->logits, (int *)a->ids, (float *)a->weights,
                                (float *)a->shared_gate, (int *)a->status, a->m, a->n_expert,
-                               a->top_k, a->n_expert + 1};
+                               a->top_k, a->n_expert + 1, NULL};
             launch_select<false>(k, s);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
@@ -516,7 +563,7 @@ extern "C" int inference_cuda_router_sigmoid_select_launch(const inference_cuda_
         if (!stream || !valid_split_select(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         const SelectArgs k{a->logits, a->ids,      a->weights, NULL,
                            a->status, a->m,        a->n_expert, a->top_k,
-                           a->n_expert};
+                           a->n_expert, a->bias};
         launch_select<true>(k, (cudaStream_t)stream);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);

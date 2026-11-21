@@ -2,7 +2,7 @@
  * Launch entry of block_ops: the row operations of a hybrid decoder block that are not
  * shared with another resident kernel yet (the convolution is `gdn_conv`, the norm is `add_rmsnorm_q8`, the stream-mixing apply is `hyper_mix_apply`): the four-stream mixed residual with its stream-mixing matrix, a
  * delta-rule scan with a decay per key channel, absorbed latent attention over one shared
- * key/value head, the SiTU activation with its q8_1 quantize, and a biased sigmoid router.
+ * key/value head, the SiTU activation with its q8_1 quantize.
  * Launch-only: nothing here allocates, copies or synchronizes. Every operation works on
  * `n` token rows at once, so decode (n = 1) and prefill chunks share the entry.
  *
@@ -57,9 +57,6 @@ extern "C" {
  * 13 GATED_QUANT p0 x f32 [rows][w]; p1 gate f32 [rows][w] (optional); p2 q8_1 rows (W,
  *             optional); p3 y f32 [rows][w] (W, optional; one of p2 and p3 is present).
  *             i0 rows; i1 w.
- * 14 MOE_ROUTE p0 x f32 [n][h]; p1 gate_w f32 [e][h]; p2 bias f32 [e]; p3 ids i32 [n][k]
- *             (W); p4 weights f32 [n][k] (W). i0 n; i1 h; i2 e (<= 256); i3 k (<= 8);
- *             i4 normalize. f0 smallest weight sum.
  * 15 FILL     p0 f32 [i0] (W). i0 count. f0 value.
  */
 enum {
@@ -73,7 +70,6 @@ enum {
     INFERENCE_CUDA_BLOCK_OP_MLA_PROJECT = 11,
     INFERENCE_CUDA_BLOCK_OP_SITU_QUANT = 12,
     INFERENCE_CUDA_BLOCK_OP_GATED_QUANT = 13,
-    INFERENCE_CUDA_BLOCK_OP_MOE_ROUTE = 14,
     INFERENCE_CUDA_BLOCK_OP_FILL = 15
 };
 

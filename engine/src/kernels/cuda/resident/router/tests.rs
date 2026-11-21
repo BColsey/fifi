@@ -698,6 +698,7 @@ fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngEr
                     ids: whole_range(&ids)?,
                     weights: whole_range(&weights)?,
                     status: whole_range(&status)?,
+                    bias: None,
                 },
             )?;
             stream.synchronize()?;

@@ -442,86 +442,6 @@ __global__ void __launch_bounds__(128) mla_project_kernel(const float *mix, cons
     }
 }
 
-/* ---- biased sigmoid router ---------------------------------------------------------- */
-
-/* One block per token, one thread per expert slot (up to 256). The routed experts are the
- * top `k` of sigmoid(logit) + bias, ties to the lower index; the weights are the unbiased
- * sigmoids, divided by their sum (clamped below) when `normalize` is set. */
-__global__ void __launch_bounds__(256) moe_route_kernel(const float *x, const float *gate_w,
-                                                        const float *bias, int *ids,
-                                                        float *weights, int h, int e, int k,
-                                                        int normalize, float min_sum) {
-    extern __shared__ float xs[];  /* [h] */
-    __shared__ float probs[256];
-    __shared__ float sel[256];
-    __shared__ float red_v[8];
-    __shared__ int red_i[8];
-    __shared__ int pick[8];
-    __shared__ float pick_p[8];
-    const int t = blockIdx.x;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    for (int i = threadIdx.x; i < h; i += blockDim.x) xs[i] = x[(size_t)t * h + i];
-    __syncthreads();
-    for (int ex = warp; ex < e; ex += warps) {
-        const float *wr = gate_w + (size_t)ex * h;
-        float acc = 0.0f;
-        for (int i = lane * 4; i < h; i += 128) {
-            const float4 wv = *reinterpret_cast<const float4 *>(wr + i);
-            acc += wv.x * xs[i] + wv.y * xs[i + 1] + wv.z * xs[i + 2] + wv.w * xs[i + 3];
-        }
-        acc = warp_sum(acc);
-        if (lane == 0) {
-            const float p = sigmoid_f(acc);
-            probs[ex] = p;
-            sel[ex] = p + bias[ex];
-        }
-    }
-    __syncthreads();
-    for (int round = 0; round < k; ++round) {
-        float best = -INFINITY;
-        int best_i = 0x7fffffff;
-        if (threadIdx.x < e) {
-            best = sel[threadIdx.x];
-            best_i = threadIdx.x;
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
-            if (ov > best || (ov == best && oi < best_i)) {
-                best = ov;
-                best_i = oi;
-            }
-        }
-        if (lane == 0) {
-            red_v[warp] = best;
-            red_i[warp] = best_i;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float bv = red_v[0];
-            int bi = red_i[0];
-            for (int wi = 1; wi < warps; ++wi)
-                if (red_v[wi] > bv || (red_v[wi] == bv && red_i[wi] < bi)) {
-                    bv = red_v[wi];
-                    bi = red_i[wi];
-                }
-            pick[round] = bi;
-            pick_p[round] = probs[bi];
-            sel[bi] = -INFINITY;
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int r = 0; r < k; ++r) sum += pick_p[r];
-        sum = fmaxf(sum, min_sum);
-        for (int r = 0; r < k; ++r) {
-            ids[(size_t)t * k + r] = pick[r];
-            weights[(size_t)t * k + r] = normalize ? pick_p[r] / sum : pick_p[r];
-        }
-    }
-}
-
 /* ---- entry ------------------------------------------------------------------------- */
 
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
@@ -762,22 +682,6 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             gated_quant_kernel<<<(unsigned)rows, 256, 0, s>>>(
                 (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
                 (int)w);
-            return launch_status(out_stage);
-        }
-        case INFERENCE_CUDA_BLOCK_OP_MOE_ROUTE: {
-            const long long n = i[0], h = i[1], e = i[2], k = i[3];
-            if (n < 1 || n > 65536 || h < 128 || h > 8192 || h % 128 != 0 || e < 1 || e > 256 ||
-                k < 1 || k > 8 || k > e || (i[4] != 0 && i[4] != 1))
-                return INFERENCE_CUDA_INVALID_ARGUMENT;
-            slots.use(0, n * h * 4, false);
-            slots.use(1, e * h * 4, false);
-            slots.use(2, e * 4, false);
-            slots.use(3, n * k * 4, true);
-            slots.use(4, n * k * 4, true);
-            if (!slots.valid() || !aligned(p[1], 16)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-            moe_route_kernel<<<(unsigned)n, 256, (size_t)h * 4, s>>>(
-                (const float *)p[0], (const float *)p[1], (const float *)p[2], (int *)p[3],
-                (float *)p[4], (int)h, (int)e, (int)k, (int)i[4], f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_FILL: {

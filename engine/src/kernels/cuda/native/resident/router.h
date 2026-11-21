@@ -67,6 +67,10 @@ typedef struct inference_cuda_router_sigmoid_args {
     int m;
     int n_expert;
     int top_k;
+    /* Optional selection bias, f32 [n_expert]: experts are ranked by score + bias while the
+     * weights stay the unbiased scores. NULL ranks by the scores. */
+    const float *bias;
+    size_t bias_bytes;
 } inference_cuda_router_sigmoid_args;
 
 int inference_cuda_router_logits_launch(const inference_cuda_router_logits_args *args,

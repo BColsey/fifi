@@ -627,34 +627,38 @@ fn the_latent_attention_matches_the_host_with_split_keys() {
 }
 
 #[test]
-fn the_biased_router_matches_the_host() {
-    let Some(r) = rig("block_ops moe_route") else {
+fn the_shared_sigmoid_select_ranks_by_score_plus_bias_and_weights_the_scores() {
+    let Some(r) = rig("router sigmoid select with a bias") else {
         return;
     };
-    let (h, e, k) = (256usize, 16usize, 4usize);
+    use crate::kernels::cuda::resident::router::{RouterShape, RouterSigmoidCall};
+    let (e, k) = (16usize, 4usize);
     for n in [1usize, 7] {
-        let x = data(61 + n as u64, n * h, 1.0);
-        let w = data(62, e * h, 0.2);
-        let bias = data(63, e, 0.3);
-        let (xb, wb, bb) = (r.up(&x), r.up(&w), r.up(&bias));
+        let logits = data(61 + n as u64, n * e, 2.0);
+        let bias = data(63, e, 0.5);
+        let (lb, bb) = (r.up(&logits), r.up(&bias));
         let ids = r.zero_bytes(n * k * 4);
         let weights = r.zeros(n * k);
-        r.run(
-            BlockOp::moe_route(
-                n,
-                h,
-                e,
-                k,
-                true,
-                6.1035156e-5,
-                whole(&xb),
-                whole(&wb),
-                whole(&bb),
-                whole(&ids),
-                whole(&weights),
+        let status = r.zero_bytes(4);
+        r.ctx
+            .router_sigmoid_select_rows(
+                &r.stream,
+                RouterSigmoidCall {
+                    shape: RouterShape {
+                        m: n,
+                        hidden: 256,
+                        n_expert: e,
+                        top_k: k,
+                    },
+                    logits: whole(&lb),
+                    ids: whole(&ids),
+                    weights: whole(&weights),
+                    status: whole(&status),
+                    bias: Some(whole(&bb)),
+                },
             )
-            .expect("op"),
-        );
+            .expect("select");
+        r.stream.synchronize().expect("drain");
         let got_ids: Vec<i32> = testkit::read_bytes(&r.ctx, &ids, n * k * 4)
             .as_chunks::<4>()
             .0
@@ -663,9 +667,7 @@ fn the_biased_router_matches_the_host() {
             .collect();
         let got_w = r.read(&weights, n * k);
         for t in 0..n {
-            let probs: Vec<f32> = (0..e)
-                .map(|ex| sigmoid((0..h).map(|i| w[ex * h + i] * x[t * h + i]).sum()))
-                .collect();
+            let probs: Vec<f32> = (0..e).map(|ex| sigmoid(logits[t * e + ex])).collect();
             let mut order: Vec<usize> = (0..e).collect();
             order.sort_by(|&a, &b| {
                 (probs[b] + bias[b])
@@ -673,15 +675,45 @@ fn the_biased_router_matches_the_host() {
                     .then(a.cmp(&b))
             });
             let picked = &order[..k];
-            let total: f32 = picked
-                .iter()
-                .map(|&i| probs[i])
-                .sum::<f32>()
-                .max(6.1035156e-5);
+            let total: f32 = picked.iter().map(|&i| probs[i]).sum();
             for (slot, &ex) in picked.iter().enumerate() {
                 assert_eq!(got_ids[t * k + slot], ex as i32, "token {t} slot {slot}");
                 assert!((got_w[t * k + slot] - probs[ex] / total).abs() < 1e-5);
             }
+        }
+        // Without a bias the same call ranks by the scores.
+        r.ctx
+            .router_sigmoid_select_rows(
+                &r.stream,
+                RouterSigmoidCall {
+                    shape: RouterShape {
+                        m: n,
+                        hidden: 256,
+                        n_expert: e,
+                        top_k: k,
+                    },
+                    logits: whole(&lb),
+                    ids: whole(&ids),
+                    weights: whole(&weights),
+                    status: whole(&status),
+                    bias: None,
+                },
+            )
+            .expect("select without bias");
+        r.stream.synchronize().expect("drain");
+        let plain: Vec<i32> = testkit::read_bytes(&r.ctx, &ids, n * k * 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        for t in 0..n {
+            let mut order: Vec<usize> = (0..e).collect();
+            order.sort_by(|&a, &b| logits[t * e + b].total_cmp(&logits[t * e + a]).then(a.cmp(&b)));
+            assert_eq!(
+                &plain[t * k..(t + 1) * k],
+                &order[..k].iter().map(|&i| i as i32).collect::<Vec<_>>()[..]
+            );
         }
     }
 }

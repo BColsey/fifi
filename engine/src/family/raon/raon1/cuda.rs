@@ -40,6 +40,9 @@ use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::{MatvecCall, QuantType};
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
+use crate::kernels::cuda::resident::router::{
+    RouterLogitsCall, RouterShape, RouterSigmoidCall,
+};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, NativeWeight};
 use crate::weights::dequantize;
 
@@ -285,6 +288,8 @@ struct Scratch {
     logits: DeviceBuffer,
     mla_gated: DeviceBuffer,
     act_ffn: DeviceBuffer,
+    logits_route: DeviceBuffer,
+    route_status: DeviceBuffer,
     mmq_q8: DeviceBuffer,
     mmq_q8_routed: DeviceBuffer,
     fixup: DeviceBuffer,
@@ -334,6 +339,7 @@ impl Scratch {
             + f(c * DENSE_INTER)
             + mmq_q8_bytes(DENSE_INTER, c).expect("mmq q8 size") as u64
             + fixup
+            + f(c * EXPERTS)
             + mmq_q8_bytes(HIDDEN, c * USED).expect("mmq q8 size") as u64
             + f(c * USED) * 4
     }
@@ -384,6 +390,12 @@ impl Raon1Device {
         let model = open_raon_1_mini_preview(path, None)?;
         let spec = model.spec();
         let hy = hyper(&model, spec)?;
+        if !hy.weights_norm {
+            return Err(EngError::Checkpoint(
+                "raon1: the shared router normalizes the selected weights; expert_weights_norm is false in this file"
+                    .into(),
+            ));
+        }
         let vocab = spec.vocab as usize;
         let ctx = CudaContext::with_admission(&served_admission())?;
         let stream = ctx.stream()?;
@@ -1195,19 +1207,32 @@ impl Raon1Device {
 
     fn moe_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.run(BlockOp::moe_route(
-            n,
-            HIDDEN,
-            EXPERTS,
-            USED,
-            self.hy.weights_norm,
-            6.103_515_6e-5,
-            sc.cur.range(0, n * HIDDEN * 4)?,
-            self.raw(&names.gate_inp)?,
-            self.raw(&names.exp_bias)?,
-            sc.ids.range(0, n * USED * 4)?,
-            sc.weights.range(0, n * USED * 4)?,
-        )?)?;
+        let shape = RouterShape {
+            m: n,
+            hidden: HIDDEN,
+            n_expert: EXPERTS,
+            top_k: USED,
+        };
+        self.ctx.router_logits_rows(
+            &self.stream,
+            RouterLogitsCall {
+                shape,
+                x: sc.cur.range(0, n * HIDDEN * 4)?,
+                w: self.raw(&names.gate_inp)?,
+                logits: sc.logits_route.range(0, n * EXPERTS * 4)?,
+            },
+        )?;
+        self.ctx.router_sigmoid_select_rows(
+            &self.stream,
+            RouterSigmoidCall {
+                shape,
+                logits: sc.logits_route.range(0, n * EXPERTS * 4)?,
+                ids: sc.ids.range(0, n * USED * 4)?,
+                weights: sc.weights.range(0, n * USED * 4)?,
+                status: Self::whole(&sc.route_status)?,
+                bias: Some(self.raw(&names.exp_bias)?),
+            },
+        )?;
         if self.trace.borrow().is_some() {
             let mut bytes = vec![0u8; n * USED * 4];
             sc.ids.read_at(&self.stream, 0, &mut bytes)?;
@@ -1391,6 +1416,8 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         mla_gated: f(c * WIDTH)?,
         act_ffn: f(c * DENSE_INTER)?,
         mmq_q8: ctx.allocate(mmq_q8_bytes(DENSE_INTER, c)?)?,
+        logits_route: f(c * EXPERTS)?,
+        route_status: ctx.upload(&[0u8; 4])?,
         mmq_q8_routed: ctx.allocate(mmq_q8_bytes(HIDDEN, c * USED)?)?,
         fixup: ctx.allocate(ctx.mmq_fixup_bytes()?)?,
         ids_g: f(c * USED)?,

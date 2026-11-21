@@ -671,6 +671,7 @@ fn route_reusing(
             ids: frame.range(ids)?,
             weights: frame.range(gates)?,
             status: frame.flag()?,
+            bias: None,
         },
     )?;
     if device_picks {

@@ -288,31 +288,6 @@ impl<'b> BlockOp<'b> {
         outs.attach(op, rows, w)
     }
 
-    /// Sigmoid router with a selection bias: the top `k` experts and their weights.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn moe_route(
-        n: usize,
-        h: usize,
-        experts: usize,
-        k: usize,
-        normalize: bool,
-        min_sum: f32,
-        x: DeviceRange<'b>,
-        gate_w: DeviceRange<'b>,
-        bias: DeviceRange<'b>,
-        ids: DeviceRange<'b>,
-        weights: DeviceRange<'b>,
-    ) -> Result<Self, EngError> {
-        Ok(
-            Self::new(14, &[n, h, experts, k, usize::from(normalize)], &[min_sum])?
-                .read(0, x, bytes(&[n, h, 4])?)
-                .read(1, gate_w, bytes(&[experts, h, 4])?)
-                .read(2, bias, bytes(&[experts, 4])?)
-                .write(3, ids, bytes(&[n, k, 4])?)
-                .write(4, weights, bytes(&[n, k, 4])?),
-        )
-    }
-
     /// Fills `count` f32 values.
     pub(crate) fn fill(count: usize, value: f32, out: DeviceRange<'b>) -> Result<Self, EngError> {
         Ok(Self::new(15, &[count], &[value])?.write(0, out, bytes(&[count, 4])?))

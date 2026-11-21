@@ -278,7 +278,8 @@ pub(crate) struct RouterLogitsCall<'a> {
     pub(crate) logits: DeviceRange<'a>,
 }
 
-/// Sigmoid top-k with selected-only F32 normalization. No shared gate or bias.
+/// Sigmoid top-k with selected-only F32 normalization. No shared gate. With a `bias`, experts
+/// are ranked by score plus bias while the weights stay the unbiased scores.
 /// Logits must already have passed the caller's shared BF16 publication.
 pub(crate) struct RouterSigmoidCall<'a> {
     pub(crate) shape: RouterShape,
@@ -286,6 +287,8 @@ pub(crate) struct RouterSigmoidCall<'a> {
     pub(crate) ids: DeviceRange<'a>,
     pub(crate) weights: DeviceRange<'a>,
     pub(crate) status: DeviceRange<'a>,
+    /// f32 `[n_expert]`, or `None` to rank by the scores themselves.
+    pub(crate) bias: Option<DeviceRange<'a>>,
 }
 
 fn split_plan(shape: RouterShape) -> Result<(Bytes, RouterInts), EngError> {
@@ -361,20 +364,23 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let (need, ints) = split_plan(call.shape)?;
-        check_split_regions(
-            self,
-            &[
-                ("logits", &call.logits, need.logits, 4, false),
-                ("ids", &call.ids, need.picks, 4, true),
-                ("weights", &call.weights, need.picks, 4, true),
-                ("status", &call.status, 4, 4, true),
-            ],
-        )?;
+        let bias_bytes = call.shape.n_expert.checked_mul(4).ok_or_else(overflow)?;
+        let mut regions = vec![
+            ("logits", &call.logits, need.logits, 4, false),
+            ("ids", &call.ids, need.picks, 4, true),
+            ("weights", &call.weights, need.picks, 4, true),
+            ("status", &call.status, 4, 4, true),
+        ];
+        if let Some(bias) = &call.bias {
+            regions.push(("bias", bias, bias_bytes, 4, false));
+        }
+        check_split_regions(self, &regions)?;
         let io = RouterSigmoidRaw {
             logits: self.raw_range(&call.logits)?,
             ids: self.raw_range(&call.ids)?,
             weights: self.raw_range(&call.weights)?,
             status: self.raw_range(&call.status)?,
+            bias: call.bias.as_ref().map(|b| self.raw_range(b)).transpose()?,
             ints,
         };
         self.launch_on(stream, move |raw| router_sigmoid_launch(raw, io))
