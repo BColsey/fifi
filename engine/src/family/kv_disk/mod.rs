@@ -505,6 +505,13 @@ fn lock_dir(dir: &Path) -> Result<std::fs::File, String> {
 /// writes and then fail every verified read, filling the quota with entries that never restore,
 /// so the cache stays off there. The rate is what a graceful stop plans its first wait from,
 /// before any entry has been written.
+/// The probe needs `O_DIRECT`, which only Linux and Android have: elsewhere the cache stays off.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn probe_direct_io(_dir: &Path) -> Result<f64, String> {
+    Err("direct I/O is not available on this platform, which the verified reads need".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn probe_direct_io(dir: &Path) -> Result<f64, String> {
     use rustix::fs::OFlags;
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -1796,5 +1803,6 @@ pub(crate) fn plan(
     }
 }
 
-#[cfg(test)]
+/// The tests open files for direct I/O, which only Linux and Android have.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests;
