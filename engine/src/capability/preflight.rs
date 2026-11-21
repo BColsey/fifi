@@ -616,14 +616,14 @@ fn inkling2_preflight(
                 Err(error) => checks.push(Check::new(
                     "Inkling checkpoint",
                     CheckStatus::Fail,
-                    error.to_string(),
+                    super::describe_error(&error),
                 )),
             }
         }
         Err(error) => checks.push(Check::new(
             "Inkling config",
             CheckStatus::Fail,
-            error.to_string(),
+            super::describe_error(&error),
         )),
     }
     checks.push(Check::new(
@@ -664,7 +664,7 @@ fn report_inkling2_plan(
                 plan.windowed_bytes, plan.all_full_bytes
             ),
         )),
-        Err(error) => checks.push(Check::new("Inkling text plan", CheckStatus::Fail, error.to_string())),
+        Err(error) => checks.push(Check::new("Inkling text plan", CheckStatus::Fail, super::describe_error(&error))),
     }
 }
 
