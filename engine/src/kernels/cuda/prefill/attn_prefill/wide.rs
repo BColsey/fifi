@@ -131,10 +131,9 @@ impl WideGate {
     }
 }
 
-/// Whether a start with no override takes the wide path. It is held off until the quality arm
-/// passes in every stratum; `FIFI_WIDE_PREFILL=1` starts
-/// it on, `0` or `off` refuses the path altogether.
-pub(crate) const WIDE_PREFILL_DEFAULT_ON: bool = false;
+/// Whether a start with no override takes the wide path. `FIFI_WIDE_PREFILL=0` or `off`
+/// refuses the path, and a card that fails the gate falls back to row attention.
+pub(crate) const WIDE_PREFILL_DEFAULT_ON: bool = true;
 
 /// The override text: `Some(false)` for `0` and `off`, `Some(true)` for `1` and `on`, `None` when
 /// unset; anything else is an error, so a typo does not silently change the path.
