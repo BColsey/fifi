@@ -10,12 +10,14 @@ mod completions;
 pub(crate) mod config;
 #[cfg(test)]
 mod contract;
+mod engines;
 mod error;
 mod fake;
 #[cfg(test)]
 mod family_registry_tests;
 #[cfg(test)]
 mod flint_tests;
+mod hf;
 mod messages;
 mod model_serve;
 mod pieces;

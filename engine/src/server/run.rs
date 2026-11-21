@@ -250,7 +250,7 @@ fn apply_replay_overrides(
 /// what is true at the moment it polls: a stage only after the engine
 /// announced it, ready only after the state is `Ready`. Exits by itself
 /// once every engine has settled.
-fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
+pub(crate) fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
     let watched: Vec<(String, crate::sched::worker::EngineHandle)> = entries
         .iter()
         .map(|entry| (entry.id.clone(), entry.handle.clone()))
@@ -322,113 +322,128 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
     let mut engines = Vec::new();
     let mut entries = Vec::new();
     for config in &file.engines {
-        check_staged_family(&config.family).map_err(|error| {
-            StartupError(format!(
-                "engine {} failed to start: {}",
-                config.id,
-                describe(&error)
-            ))
-        })?;
-        // The registry lookup sits next to the staged check and before any
-        // file read: an unstartable family fails fast without touching the
-        // model directory.
-        let starter = family_starter(&config.family).ok_or_else(|| {
-            StartupError(format!(
-                "engine {} failed to start: family {} has no starter in this build",
-                config.id, config.family
-            ))
-        })?;
-        // Weights must be local; refuse before the first read of the directory.
-        storage_guard::require_local(&config.model_dir, "model weights").map_err(|error| {
-            StartupError(format!(
-                "engine {} failed to start: {}",
-                config.id,
-                describe(&error)
-            ))
-        })?;
-        // A model path may name one `.gguf` file; its side files sit beside it.
-        let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-        let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
-            StartupError(format!(
-                "engine {} failed to start: {}",
-                config.id,
-                describe(&error)
-            ))
-        })?;
-        // Resolve the flag once, before anything consumes it: Flint's env
-        // opt-in is checked first (it only reads the engine's own options),
-        // then the family-aware decision covers the ready note, the starter
-        // (whose Q36 session-cap rule reads the flag) and the entry.
-        let flint_opt_in = config.family == flint::FAMILY
-            && flint::prefix_reuse_entry_enabled(
-                config
-                    .flint
-                    .as_ref()
-                    .map(|options| options.kv_profile.as_str()),
-            );
-        let prefix_reuse = entry_prefix_reuse(config, file.prefix_reuse, flint_opt_in);
-        // The block prefix-match state is process-wide (the env parse) but only
-        // matters for engines whose store can cut a rolling Block entry. The
-        // engine thread fires this note with the BUILT executor's own
-        // capability - cuts and spacing both - when the engine becomes
-        // ready, so the line reports the real store - never a factory flag
-        // or the process-wide parse - and a wrong default or a stray
-        // rollback stays visible before the engine serves its first request.
-        let ready_note: ReadyNote = if cfg!(test) {
-            None
-        } else {
-            block_match_note(
-                &config.id,
-                prefix_reuse,
-                // A broken stderr pipe must not turn a Ready engine into a
-                // failed one over a log line.
-                |line| {
-                    let _ = writeln!(std::io::stderr().lock(), "{line}");
-                },
-            )
-        };
-        let StartedEngine {
-            engine,
-            mut bundle,
-            context_limit,
-            effective,
-        } = starter(config, prefix_reuse, ready_note).map_err(|error| {
-            StartupError(format!(
-                "engine {} failed to start: {}",
-                config.id,
-                describe(&error)
-            ))
-        })?;
-        // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
-        // the template already wins over anything set here.
-        apply_replay_overrides(&config.id, &mut bundle, config)?;
-        let generation = model_directory.join("generation_config.json");
-        // The label comes from the loader result, not from a second `exists` call, so the file
-        // cannot change between the read and the log line.
-        eprintln!(
-            "{}",
-            defaults_line(&config.id, &generation, &loaded.values, loaded.from_file)
-        );
-        if config.family == flint::FAMILY {
-            eprintln!(
-                "flint prefix reuse: {}",
-                if prefix_reuse { "on" } else { "off" }
-            );
-        }
-        entries.push(EngineEntry {
-            id: config.id.clone(),
-            model: config.model_name(),
-            handle: engine.handle(),
-            bundle,
-            context_limit,
-            prefix_reuse,
-            warm: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            defaults: loaded.values,
-            effective,
-        });
+        let (engine, entry) = start_one(config, file.prefix_reuse)?;
+        entries.push(entry);
         engines.push(engine);
     }
     Ok((engines, entries))
+}
+
+/// Starts one configured engine: the exact body of the boot loop,
+/// lifted so the runtime add route (`POST /v1/engines`) starts
+/// engines through the same checks and notes as boot — one loader,
+/// one evidence trail. `file_prefix_reuse` is the configuration
+/// file's flag, the one input the loop body took from the document.
+pub(crate) fn start_one(
+    config: &crate::server::config::EngineConfig,
+    file_prefix_reuse: Option<bool>,
+) -> Result<(Engine, EngineEntry), StartupError> {
+    check_staged_family(&config.family).map_err(|error| {
+        StartupError(format!(
+            "engine {} failed to start: {}",
+            config.id,
+            describe(&error)
+        ))
+    })?;
+    // The registry lookup sits next to the staged check and before any
+    // file read: an unstartable family fails fast without touching the
+    // model directory.
+    let starter = family_starter(&config.family).ok_or_else(|| {
+        StartupError(format!(
+            "engine {} failed to start: family {} has no starter in this build",
+            config.id, config.family
+        ))
+    })?;
+    // Weights must be local; refuse before the first read of the directory.
+    storage_guard::require_local(&config.model_dir, "model weights").map_err(|error| {
+        StartupError(format!(
+            "engine {} failed to start: {}",
+            config.id,
+            describe(&error)
+        ))
+    })?;
+    // A model path may name one `.gguf` file; its side files sit beside it.
+    let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
+    let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
+        StartupError(format!(
+            "engine {} failed to start: {}",
+            config.id,
+            describe(&error)
+        ))
+    })?;
+    // Resolve the flag once, before anything consumes it: Flint's env
+    // opt-in is checked first (it only reads the engine's own options),
+    // then the family-aware decision covers the ready note, the starter
+    // (whose Q36 session-cap rule reads the flag) and the entry.
+    let flint_opt_in = config.family == flint::FAMILY
+        && flint::prefix_reuse_entry_enabled(
+            config
+                .flint
+                .as_ref()
+                .map(|options| options.kv_profile.as_str()),
+        );
+    let prefix_reuse = entry_prefix_reuse(config, file_prefix_reuse, flint_opt_in);
+    // The block prefix-match state is process-wide (the env parse) but only
+    // matters for engines whose store can cut a rolling Block entry. The
+    // engine thread fires this note with the BUILT executor's own
+    // capability - cuts and spacing both - when the engine becomes
+    // ready, so the line reports the real store - never a factory flag
+    // or the process-wide parse - and a wrong default or a stray
+    // rollback stays visible before the engine serves its first request.
+    let ready_note: ReadyNote = if cfg!(test) {
+        None
+    } else {
+        block_match_note(
+            &config.id,
+            prefix_reuse,
+            // A broken stderr pipe must not turn a Ready engine into a
+            // failed one over a log line.
+            |line| {
+                let _ = writeln!(std::io::stderr().lock(), "{line}");
+            },
+        )
+    };
+    let StartedEngine {
+        engine,
+        mut bundle,
+        context_limit,
+        effective,
+    } = starter(config, prefix_reuse, ready_note).map_err(|error| {
+        StartupError(format!(
+            "engine {} failed to start: {}",
+            config.id,
+            describe(&error)
+        ))
+    })?;
+    // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
+    // the template already wins over anything set here.
+    apply_replay_overrides(&config.id, &mut bundle, config)?;
+    let generation = model_directory.join("generation_config.json");
+    // The label comes from the loader result, not from a second `exists` call, so the file
+    // cannot change between the read and the log line.
+    eprintln!(
+        "{}",
+        defaults_line(&config.id, &generation, &loaded.values, loaded.from_file)
+    );
+    if config.family == flint::FAMILY {
+        eprintln!(
+            "flint prefix reuse: {}",
+            if prefix_reuse { "on" } else { "off" }
+        );
+    }
+    let entry = EngineEntry {
+        id: config.id.clone(),
+        model: config.model_name(),
+        handle: engine.handle(),
+        bundle,
+        context_limit,
+        prefix_reuse,
+        warm: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        defaults: loaded.values,
+        effective,
+        model_dir: config.model_dir.clone(),
+    };
+    Ok((engine, entry))
 }
 
 /// The start line of one engine: the effective sampling defaults and the file they came from.

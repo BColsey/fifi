@@ -70,9 +70,11 @@ mod tests {
     }
 
     /// The (path, method) pairs router.rs registers, scanned from every
-    /// `.route("<path>", <method>(...))` call: whitespace and line breaks
-    /// inside the call are tolerated, and comment lines are dropped so a
-    /// documented route is never scanned.
+    /// `.route("<path>", <method>(...))` call — including chained methods
+    /// like `get(a).post(b)`, which axum requires for a path answering
+    /// more than one method. Whitespace and line breaks inside the call
+    /// are tolerated, and comment lines are dropped so a documented route
+    /// is never scanned.
     fn served_routes(source: &str) -> Vec<(String, String)> {
         let code: String = source
             .lines()
@@ -100,6 +102,27 @@ mod tests {
                 .unwrap_or(after_comma.len());
             served.push((path, after_comma[..method_len].to_string()));
             rest = &after_comma[method_len..];
+            // A chained method follows as `).post(`; this file's route
+            // arguments are path-qualified identifiers, so the first `)`
+            // after each argument closes that method's call.
+            let mut chain = rest.trim_start();
+            while chain.starts_with('(')
+                && let Some(close) = chain.find(')')
+            {
+                chain = chain[close + 1..].trim_start();
+                if !chain.starts_with('.') {
+                    break;
+                }
+                chain = &chain[1..];
+                let name_len = chain
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(chain.len());
+                let method = &chain[..name_len];
+                if matches!(method, "get" | "post" | "delete" | "put" | "patch" | "head") {
+                    served.push((after_path[..path_end].to_string(), method.to_string()));
+                }
+                chain = &chain[name_len..];
+            }
         }
         served
     }

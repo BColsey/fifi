@@ -16,7 +16,7 @@ use crate::sched::worker::{EngineHandle, EngineState, RetryClass};
 use crate::tokenizer::TokenizerBundle;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The quiet time after which a stream sends a keep-alive comment (the server design).
@@ -53,11 +53,24 @@ pub(crate) struct EngineEntry {
     /// engine actually started with — never a second resolution). Empty
     /// for families whose per-key origins are not composed yet.
     pub(crate) effective: Vec<crate::capability::effective::EffectiveSetting>,
+    /// The directory the weights loaded from. `GET /v1/engines` shows
+    /// it so the GUI can match a served engine to a cache snapshot.
+    pub(crate) model_dir: std::path::PathBuf,
 }
 
 pub(crate) struct AppState {
     api_key: Vec<u8>,
-    engines: Vec<EngineEntry>,
+    /// The engines this process serves, as one immutable snapshot:
+    /// a runtime add or removal swaps the whole list, so a reader
+    /// either sees the old set or the new one, never a half swap.
+    engines: RwLock<Arc<[Arc<EngineEntry>]>>,
+    /// Engines added through the runtime API, by id. The API may
+    /// remove only what it added; boot engines live and die with the
+    /// process, because their `Engine` owners sit on `run`'s stack.
+    owned: Mutex<HashMap<String, crate::sched::worker::Engine>>,
+    /// The hub bridge: search, cache listing, download jobs. Shared
+    /// state is all locks and atomics, so handlers clone the Arc.
+    hf: Arc<super::hf::HfHub>,
     started: u64,
     requests: AtomicU64,
     keep_alive: Duration,
@@ -107,12 +120,23 @@ pub(crate) fn unix_seconds() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// Why `remove_engine` refused: the id names an engine the boot
+/// configuration owns (removable only by restart), or no engine at
+/// all.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoveRefused {
+    BootEngine,
+    Unknown,
+}
+
 impl AppState {
     /// The caller has checked that the key is not empty.
     pub(crate) fn new(api_key: &str, engines: Vec<EngineEntry>) -> Self {
         Self {
             api_key: api_key.as_bytes().to_vec(),
-            engines,
+            engines: RwLock::new(engines.into_iter().map(Arc::new).collect()),
+            owned: Mutex::new(HashMap::new()),
+            hf: Arc::new(super::hf::HfHub::from_env()),
             started: unix_seconds(),
             requests: AtomicU64::new(0),
             keep_alive: KEEP_ALIVE,
@@ -216,7 +240,7 @@ impl AppState {
         session: Option<&str>,
         engine: Option<&str>,
         model: Option<&str>,
-    ) -> Result<&EngineEntry, ServerError> {
+    ) -> Result<Arc<EngineEntry>, ServerError> {
         if let Some(id) = session {
             return self.resolve_session(id, engine, model);
         }
@@ -227,19 +251,20 @@ impl AppState {
         &self,
         engine: Option<&str>,
         model: Option<&str>,
-    ) -> Result<&EngineEntry, ServerError> {
+    ) -> Result<Arc<EngineEntry>, ServerError> {
+        let engines = self.engines();
         if let Some(id) = engine {
-            return self
-                .engines
+            return engines
                 .iter()
                 .find(|entry| entry.id == id)
+                .cloned()
                 .ok_or_else(|| ServerError::NotFound(format!("engine {id} does not exist")));
         }
         if let Some(name) = model {
-            return self
-                .engines
+            return engines
                 .iter()
                 .find(|entry| entry.model == name)
+                .cloned()
                 .ok_or_else(|| ServerError::NotFound(format!("model {name} does not exist")));
         }
         Err(ServerError::Eng(EngError::BadRequest(
@@ -257,7 +282,7 @@ impl AppState {
         id: &str,
         engine: Option<&str>,
         model: Option<&str>,
-    ) -> Result<&EngineEntry, ServerError> {
+    ) -> Result<Arc<EngineEntry>, ServerError> {
         let bound = {
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             sessions.get_mut(id).map(|(engine_id, used)| {
@@ -267,9 +292,10 @@ impl AppState {
         };
         if let Some(engine_id) = bound {
             let entry = self
-                .engines
+                .engines()
                 .iter()
                 .find(|entry| entry.id == engine_id)
+                .cloned()
                 .ok_or_else(|| ServerError::NotFound(format!("session {id} does not exist")))?;
             if let Some(wanted) = engine
                 && wanted != entry.id
@@ -304,7 +330,7 @@ impl AppState {
             sessions.remove(&oldest);
         }
         sessions.insert(id.to_string(), (entry.id.clone(), now_ms()));
-        // The entry borrows self.engines; the registry holds only its id.
+        // The entry is its own Arc snapshot; the registry holds only its id.
         Ok(entry)
     }
 
@@ -338,7 +364,7 @@ impl AppState {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.engines
+        self.engines()
             .iter()
             .any(|entry| matches!(entry.handle.state(), EngineState::Ready | EngineState::Busy))
     }
@@ -346,11 +372,11 @@ impl AppState {
     /// The message of the `not_ready` answer: the state of every engine. It never shows the text
     /// of a failure, because the route is public. `new_failures` supplies that text for the log.
     pub(crate) fn not_ready_message(&self) -> String {
-        if self.engines.is_empty() {
+        let engines = self.engines();
+        if engines.is_empty() {
             return "no engine is configured".to_string();
         }
-        let parts: Vec<String> = self
-            .engines
+        let parts: Vec<String> = engines
             .iter()
             .map(|entry| format!("{} is {}", entry.id, state_name(entry.handle.state())))
             .collect();
@@ -359,7 +385,7 @@ impl AppState {
 
     fn new_failures(&self) -> Vec<String> {
         let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
-        self.engines
+        self.engines()
             .iter()
             .filter_map(|entry| {
                 let cause = entry.handle.failure()?;
@@ -379,13 +405,103 @@ impl AppState {
     /// Every engine entry once, in configuration order. For status
     /// surfaces that need fields the models list does not carry,
     /// such as the context limit.
-    pub(crate) fn entries(&self) -> Vec<&EngineEntry> {
-        self.engines.iter().collect()
+    pub(crate) fn entries(&self) -> Vec<Arc<EngineEntry>> {
+        self.engines().iter().cloned().collect()
+    }
+
+    /// The engine list as one immutable snapshot.
+    pub(crate) fn engines(&self) -> Arc<[Arc<EngineEntry>]> {
+        Arc::clone(&self.engines.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The hub bridge.
+    pub(crate) fn hf(&self) -> &Arc<super::hf::HfHub> {
+        &self.hf
+    }
+
+    /// True when `id` names a served engine.
+    pub(crate) fn engine_exists(&self, id: &str) -> bool {
+        self.engines().iter().any(|entry| entry.id == id)
+    }
+
+    /// True when the runtime API — not the boot configuration —
+    /// owns this engine id, and can therefore remove it.
+    pub(crate) fn owns_engine(&self, id: &str) -> bool {
+        self.owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
+    }
+
+    /// Registers one engine started at runtime. The `Engine` keeps
+    /// the worker thread; only what the `owned` registry holds can
+    /// later be removed through the API.
+    pub(crate) fn add_engine(
+        &self,
+        entry: EngineEntry,
+        engine: crate::sched::worker::Engine,
+    ) -> Arc<EngineEntry> {
+        let shared = Arc::new(entry);
+        self.owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shared.id.clone(), engine);
+        let mut engines = self.engines.write().unwrap_or_else(PoisonError::into_inner);
+        let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
+        list.push(Arc::clone(&shared));
+        *engines = list.into();
+        shared
+    }
+
+    /// Removes one runtime-added engine: the id leaves the list
+    /// first (new requests 404 instead of submitting to a stopping
+    /// engine), then its session bindings drop so they rebind, then
+    /// the worker thread stops and joins. `Engine::shutdown` cancels
+    /// the running and every queued job.
+    pub(crate) fn remove_engine(
+        &self,
+        id: &str,
+    ) -> Result<(Arc<EngineEntry>, crate::sched::worker::ShutdownReport), RemoveRefused> {
+        let engine = {
+            let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+            owned.remove(id)
+        };
+        let Some(engine) = engine else {
+            return Err(if self.engine_exists(id) {
+                RemoveRefused::BootEngine
+            } else {
+                RemoveRefused::Unknown
+            });
+        };
+        let removed = {
+            let engines = self.engines();
+            engines.iter().find(|entry| entry.id == id).cloned()
+        };
+        {
+            let mut engines = self.engines.write().unwrap_or_else(PoisonError::into_inner);
+            let list: Vec<Arc<EngineEntry>> = engines
+                .iter()
+                .filter(|entry| entry.id != id)
+                .cloned()
+                .collect();
+            *engines = list.into();
+        }
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (engine_id, _)| engine_id != id);
+        let report = engine.shutdown();
+        match removed {
+            Some(entry) => Ok((entry, report)),
+            // The engine was owned but never listed; the honest answer
+            // is the same 404 an unknown id gets.
+            None => Err(RemoveRefused::Unknown),
+        }
     }
 
     pub(crate) fn models(&self) -> ModelList {
         let mut models: Vec<Model> = Vec::new();
-        for entry in &self.engines {
+        for entry in self.engines().iter() {
             let info = EngineInfo {
                 id: entry.id.clone(),
                 model: entry.model.clone(),
@@ -509,6 +625,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_added_engines_round_trip() {
+        let (state, _boot) = two_engines();
+        let added = testkit::engine(Vec::new());
+        testkit::wait_for_state(&added.handle(), EngineState::Ready);
+        let shared = state.add_engine(testkit::entry("late", "model-c", &added, 8_192), added);
+        assert_eq!(shared.id, "late");
+        assert!(state.engine_exists("late"));
+        assert!(state.owns_engine("late"));
+        assert!(!state.owns_engine("e1"), "boot engines stay unowned");
+
+        let (removed, report) = state.remove_engine("late").expect("remove");
+        assert_eq!(removed.id, "late");
+        assert!(report.failure.is_none(), "clean shutdown");
+        assert!(!state.engine_exists("late"));
+        assert!(!state.owns_engine("late"));
+    }
+
+    #[test]
+    fn only_runtime_added_engines_are_removable() {
+        let (state, _boot) = two_engines();
+        assert!(matches!(
+            state.remove_engine("e1"),
+            Err(super::RemoveRefused::BootEngine)
+        ));
+        assert!(matches!(
+            state.remove_engine("nope"),
+            Err(super::RemoveRefused::Unknown)
+        ));
+        assert!(
+            state.engine_exists("e1"),
+            "the refused removal left the engine listed"
+        );
+    }
+
+    #[test]
     fn a_session_binds_on_first_use_and_sticks_to_its_engine() {
         let (state, _engines) = two_engines();
         let first = state
@@ -560,14 +711,14 @@ mod tests {
     #[test]
     fn the_state_is_ready_only_while_an_engine_can_take_a_job() {
         let (state, _engines) = two_engines();
-        for entry in &state.engines {
+        for entry in state.engines().iter() {
             testkit::wait_for_state(&entry.handle, EngineState::Ready);
         }
         assert!(state.is_ready());
         let broken = testkit::failing_engine();
         let entries = vec![testkit::entry("e1", "model-a", &broken, 4_096)];
         let down = AppState::new(testkit::API_KEY, entries);
-        testkit::wait_for_state(&down.engines[0].handle, EngineState::Error);
+        testkit::wait_for_state(&down.engines()[0].handle, EngineState::Error);
         assert!(!down.is_ready());
         let empty = AppState::new(testkit::API_KEY, Vec::new());
         assert!(!empty.is_ready());
@@ -582,7 +733,7 @@ mod tests {
             testkit::entry("e2", "model-b", &waiting, 4_096),
         ];
         let state = AppState::new(testkit::API_KEY, entries);
-        testkit::wait_for_state(&state.engines[0].handle, EngineState::Error);
+        testkit::wait_for_state(&state.engines()[0].handle, EngineState::Error);
         let message = state.not_ready_message();
         assert!(message.starts_with("no engine is ready: "), "{message}");
         assert!(message.contains("e1 is error"), "{message}");
@@ -600,7 +751,7 @@ mod tests {
             testkit::entry("e2", "model-b", &waiting, 4_096),
         ];
         let state = AppState::new(testkit::API_KEY, entries);
-        testkit::wait_for_state(&state.engines[0].handle, EngineState::Error);
+        testkit::wait_for_state(&state.engines()[0].handle, EngineState::Error);
         let first = state.new_failures();
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(first[0].starts_with("engine e1 failed: "), "{first:?}");

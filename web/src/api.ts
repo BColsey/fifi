@@ -537,3 +537,147 @@ export async function chatStream(
   if (streamError !== null) throw streamError;
   return done ? "done" : "closed";
 }
+
+/** Shared body for the mutating routes of the models view. */
+async function sendJson<T>(
+  method: string, path: string, body?: unknown, signal?: AbortSignal
+): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method,
+      signal,
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
+    throw new ApiError("Server unreachable.", "network", 0);
+  }
+  if (!res.ok) throw await toApiError(res);
+  return (await res.json()) as T;
+}
+
+export interface EngineSummary {
+  id: string;
+  model: string;
+  model_dir: string;
+  state: EngineState;
+  load_stage?: string;
+  context_limit: number;
+  runtime_added: boolean;
+}
+
+export interface EngineList {
+  engines: EngineSummary[];
+}
+
+export interface AddEngineRequest {
+  model_dir: string;
+  id?: string;
+  family?: string;
+  context_limit?: number;
+  kv_dtype?: string;
+  tokenizer_dir?: string;
+}
+
+export interface HubSearchRow {
+  id: string;
+  likes: number;
+  downloads: number;
+  last_modified?: string | null;
+  pipeline_tag?: string | null;
+  gated: boolean;
+}
+
+export interface HubCacheRef {
+  name: string;
+  commit: string;
+}
+
+export interface HubCacheSnapshot {
+  commit: string;
+  path: string;
+  gguf: string[];
+  families: string[];
+}
+
+export interface HubCacheModel {
+  repo: string;
+  bytes: number;
+  refs: HubCacheRef[];
+  snapshots: HubCacheSnapshot[];
+}
+
+export interface HubCache {
+  hub_dir: string;
+  models: HubCacheModel[];
+}
+
+export type HubDownloadState =
+  "resolving" | "downloading" | "done" | "failed" | "cancelled";
+
+export interface HubDownloadJob {
+  id: number;
+  repo: string;
+  revision: string;
+  state: HubDownloadState;
+  commit?: string;
+  files_total?: number;
+  files_done?: number;
+  bytes?: number;
+  bytes_total?: number;
+  current_file?: string;
+  error?: string;
+}
+
+export function listEngines(signal?: AbortSignal): Promise<EngineList> {
+  return getJson<EngineList>("/v1/engines", true, signal);
+}
+
+export function searchHubModels(
+  q: string,
+  opts: { gguf?: boolean; exl3?: boolean; limit?: number },
+  signal?: AbortSignal
+): Promise<{ results: HubSearchRow[] }> {
+  const params = new URLSearchParams({ q });
+  if (opts.gguf === true) params.set("gguf", "true");
+  if (opts.exl3 === true) params.set("exl3", "true");
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  return getJson<{ results: HubSearchRow[] }>(`/v1/hf/search?${params}`, true, signal);
+}
+
+export function listHubCache(signal?: AbortSignal): Promise<HubCache> {
+  return getJson<HubCache>("/v1/hf/cache", true, signal);
+}
+
+export function listHubDownloads(
+  signal?: AbortSignal
+): Promise<{ downloads: HubDownloadJob[] }> {
+  return getJson<{ downloads: HubDownloadJob[] }>("/v1/hf/downloads", true, signal);
+}
+
+export function startHubDownload(
+  repo: string, revision?: string
+): Promise<{ id: number; repo: string; revision: string }> {
+  return sendJson("POST", "/v1/hf/downloads",
+    revision === undefined ? { repo } : { repo, revision });
+}
+
+export function cancelHubDownload(
+  id: number
+): Promise<{ id: number; cancelling: boolean }> {
+  return sendJson("DELETE", `/v1/hf/downloads/${id}`);
+}
+
+export function addEngine(
+  body: AddEngineRequest
+): Promise<{ id: string; model: string; model_dir: string; state: string }> {
+  return sendJson("POST", "/v1/engines", body);
+}
+
+export function removeEngine(
+  id: string
+): Promise<{ id: string; model: string; state: string; shutdown_failure?: string }> {
+  return sendJson("DELETE", `/v1/engines/${encodeURIComponent(id)}`);
+}

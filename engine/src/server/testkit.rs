@@ -196,6 +196,7 @@ fn entry_with(
         prefix_reuse: false,
         defaults,
         effective,
+        model_dir: std::path::PathBuf::new(),
     }
 }
 

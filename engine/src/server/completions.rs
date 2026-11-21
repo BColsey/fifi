@@ -168,7 +168,7 @@ async fn submit(state: &AppState, input: CompletionInput) -> Result<Submitted, S
         endpoint: "/v1/completions",
         session: input.session.clone(),
     };
-    admit(state, entry, admission)
+    admit(state, &entry, admission)
 }
 
 #[cfg(test)]

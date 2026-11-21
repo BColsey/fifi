@@ -62,10 +62,10 @@ fn encode_source(object: &Map<String, Value>) -> Result<Source, ServerError> {
 }
 
 /// The engine that `x-session`, `x-engine`, or `model` selects.
-fn entry_of<'a>(
-    state: &'a AppState,
+fn entry_of(
+    state: &AppState,
     object: &Map<String, Value>,
-) -> Result<&'a EngineEntry, ServerError> {
+) -> Result<std::sync::Arc<EngineEntry>, ServerError> {
     let session = optional_string(object, "x-session", "")?;
     let engine = optional_string(object, "x-engine", "")?;
     let model = optional_string(object, "model", "")?;
@@ -117,7 +117,7 @@ pub(crate) async fn encode(
         Source::Chat(chat) => bundle.encode_prompt(&chat.messages, &chat.tools, chat.thinking),
     })
     .await?;
-    log_served(&state, entry, ids.len(), "/v1/token/encode");
+    log_served(&state, &entry, ids.len(), "/v1/token/encode");
     Ok(Json(json!({"tokens": ids, "length": ids.len()})))
 }
 
@@ -168,7 +168,7 @@ pub(crate) async fn decode(
     }
     let count = ids.len();
     let text = blocking(move || bundle.tokenizer().decode(&ids)).await?;
-    log_served(&state, entry, count, "/v1/token/decode");
+    log_served(&state, &entry, count, "/v1/token/decode");
     Ok(Json(json!({"text": text})))
 }
 
@@ -184,7 +184,7 @@ pub(crate) async fn apply_template(
     let bundle = Arc::clone(&entry.bundle);
     let prompt =
         blocking(move || bundle.render_prompt(&chat.messages, &chat.tools, chat.thinking)).await?;
-    log_served(&state, entry, 0, "/v1/apply-template");
+    log_served(&state, &entry, 0, "/v1/apply-template");
     Ok(Json(json!({"prompt": prompt})))
 }
 

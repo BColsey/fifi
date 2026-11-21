@@ -26,7 +26,7 @@ use crate::server::config::{Config, EngineConfig, StartupError};
 /// The families `--model` can identify and start. One row per
 /// detectable family; extending to Flint is a row here plus its
 /// loader's own checks staying the authority.
-const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
+pub(crate) const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
     (
         crate::family::qwen36::factory::FAMILY,
         crate::family::QWEN3_6_35B_A3B.model_types,
@@ -171,8 +171,31 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 /// in-memory `Config` for the existing serve path. Prints the chosen
 /// configuration and any qualification acknowledgement before the
 /// engines start.
+/// A `--model` argument that names an existing path is that path;
+/// anything else shaped like `org/repo` resolves to the hub cache
+/// snapshot of its `main` ref, and anything else is left for
+/// discovery to reject in its own words.
+fn resolve_model_dir(args: &ModelServeArgs) -> ModelServeArgs {
+    let text = args.model_dir.to_string_lossy();
+    if !args.model_dir.exists()
+        && let Some(snapshot) = super::hf::cached_main_snapshot(&text)
+    {
+        eprintln!(
+            "model: {text} resolved to the hub cache at {}",
+            snapshot.display()
+        );
+        let mut resolved = args.clone();
+        resolved.model_dir = snapshot;
+        return resolved;
+    }
+    args.clone()
+}
+
 pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError> {
-    let discovered = discover(args)?;
+    // An `org/repo` id names a hub-cache download (the GUI's model
+    // page, or `hf download`); a literal existing path always wins.
+    let args = resolve_model_dir(args);
+    let discovered = discover(&args)?;
 
     // The preflight of a serving process: every check that needs no
     // device. CUDA facts stay deliberately unavailable (the module
@@ -227,7 +250,7 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
         args.model_dir.display()
     );
 
-    Ok(config_from(&discovered, args))
+    Ok(config_from(&discovered, &args))
 }
 
 /// Assemble the in-memory `Config` — the document a `--config` file

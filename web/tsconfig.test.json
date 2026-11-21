@@ -25,6 +25,8 @@
     "src/internals.test.ts",
     "src/markdown.ts",
     "src/markdown.test.ts",
+    "src/models.ts",
+    "src/models.test.ts",
     "src/notices.ts",
     "src/notices.test.ts",
     "src/panel.ts",

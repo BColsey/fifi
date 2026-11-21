@@ -1798,6 +1798,61 @@ components:
                     gate:
                       type: number
                       description: The layer's shared router gate value.
+    EngineSummary:
+      type: object
+      required:
+        [id, model, model_dir, state, load_stage, context_limit,
+         runtime_added]
+      description: >-
+        One engine of the runtime API: the fields the GUI's model
+        page needs, including the directory the weights came from.
+      properties:
+        id:
+          type: string
+        model:
+          type: string
+        model_dir:
+          type: string
+        state:
+          type: string
+          description: The engine state name, as /v1/system reports it.
+        load_stage:
+          type: string
+        context_limit:
+          type: integer
+        runtime_added:
+          type: boolean
+          description: >-
+            True when the runtime API (not the boot configuration)
+            owns this engine, so DELETE /v1/engines/{id} can stop it.
+    HfDownloadJob:
+      type: object
+      required: [id, repo, revision, state]
+      description: One hub download job's live status.
+      properties:
+        id:
+          type: integer
+        repo:
+          type: string
+        revision:
+          type: string
+        state:
+          type: string
+          enum: [resolving, downloading, done, failed, cancelled]
+        commit:
+          type: string
+        files_total:
+          type: integer
+        files_done:
+          type: integer
+        bytes:
+          type: integer
+        bytes_total:
+          type: integer
+        current_file:
+          type: string
+        error:
+          type: string
 paths:
   /health:
     get:
@@ -2388,6 +2443,379 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RouteTracePacket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/engines:
+    get:
+      operationId: listEngines
+      summary: List engines (server extension)
+      description: >-
+        Every engine of the process with the fields the GUI's model
+        page needs; boot-configured and runtime-added engines are
+        distinguished by runtime_added.
+      responses:
+        "200":
+          description: The engines.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [engines]
+                properties:
+                  engines:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EngineSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: addEngine
+      summary: Start one engine at runtime (server extension)
+      description: >-
+        Server extension. Boots one engine in the running process
+        through the exact CLI boot path, so a model the GUI
+        downloaded to the hub cache is served without a restart.
+        model_dir accepts a local model directory or org/repo,
+        resolved to the hub cache the way serve --model does. The
+        load is asynchronous; the state surfaces report progress.
+        Only engines this route added can be removed by
+        DELETE /v1/engines/{id}.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_dir]
+              properties:
+                model_dir:
+                  type: string
+                id:
+                  type: string
+                family:
+                  type: string
+                context_limit:
+                  type: integer
+                kv_dtype:
+                  type: string
+                tokenizer_dir:
+                  type: string
+      responses:
+        "201":
+          description: The engine was registered and is loading.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, model, model_dir, state]
+                properties:
+                  id:
+                    type: string
+                  model:
+                    type: string
+                  model_dir:
+                    type: string
+                  state:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/engines/{id}:
+    delete:
+      operationId: removeEngine
+      summary: Stop one runtime-added engine (server extension)
+      description: >-
+        Stops one engine the runtime API added. In-flight and queued
+        jobs on it are cancelled; sessions bound to it rebind on
+        their next request. Boot-configured engines are refused.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The engine stopped.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, model, state]
+                properties:
+                  id:
+                    type: string
+                  model:
+                    type: string
+                  state:
+                    type: string
+                    enum: [stopped]
+                  shutdown_failure:
+                    type: string
+                    description: >-
+                      Set when the worker reported a shutdown failure.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/hf/search:
+    get:
+      operationId: searchHubModels
+      summary: Search the Hugging Face hub (server extension)
+      description: >-
+        Server extension. Proxies the hub's model list search for
+        the GUI's model page. The gguf and exl3 filters are the
+        hub's own tags, passed through unchanged.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: gguf
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: exl3
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 50
+      responses:
+        "200":
+          description: The hub's answer rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, likes, downloads, gated]
+                      properties:
+                        id:
+                          type: string
+                        likes:
+                          type: integer
+                        downloads:
+                          type: integer
+                        last_modified:
+                          type: string
+                          nullable: true
+                        pipeline_tag:
+                          type: string
+                          nullable: true
+                        gated:
+                          type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/hf/cache:
+    get:
+      operationId: listHubCache
+      summary: The local hub cache (server extension)
+      description: >-
+        Server extension. The models-- directories of the hub cache
+        this engine reads, with refs, sizes, and the snapshots this
+        build could serve.
+      responses:
+        "200":
+          description: The cache listing.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hub_dir, models]
+                properties:
+                  hub_dir:
+                    type: string
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      required: [repo, bytes, refs, snapshots]
+                      properties:
+                        repo:
+                          type: string
+                        bytes:
+                          type: integer
+                          description: Total size of the repo's blobs.
+                        refs:
+                          type: array
+                          items:
+                            type: object
+                            required: [name, commit]
+                            properties:
+                              name:
+                                type: string
+                              commit:
+                                type: string
+                        snapshots:
+                          type: array
+                          items:
+                            type: object
+                            required: [commit, path, gguf, families]
+                            properties:
+                              commit:
+                                type: string
+                              path:
+                                type: string
+                              gguf:
+                                type: array
+                                items:
+                                  type: string
+                              families:
+                                type: array
+                                items:
+                                  type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/hf/tree:
+    get:
+      operationId: hubTree
+      summary: One hub revision's file list (server extension)
+      description: >-
+        Server extension. The commit and the files of one repo
+        revision, with sizes, for the GUI's download preview.
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: revision
+          in: query
+          schema:
+            type: string
+            default: main
+      responses:
+        "200":
+          description: The revision's files.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [repo, revision, commit, total_bytes, files]
+                properties:
+                  repo:
+                    type: string
+                  revision:
+                    type: string
+                  commit:
+                    type: string
+                  total_bytes:
+                    type: integer
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      required: [path, size]
+                      properties:
+                        path:
+                          type: string
+                        size:
+                          type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/hf/downloads:
+    get:
+      operationId: listHubDownloads
+      summary: Hub download job statuses (server extension)
+      responses:
+        "200":
+          description: Every job's live status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [downloads]
+                properties:
+                  downloads:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HfDownloadJob"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: startHubDownload
+      summary: Start a hub download job (server extension)
+      description: >-
+        Server extension. Downloads one repo revision into the
+        standard hub cache layout (blobs, snapshot symlinks, refs)
+        that serve --model org/repo reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo]
+              properties:
+                repo:
+                  type: string
+                revision:
+                  type: string
+                  default: main
+      responses:
+        "202":
+          description: The job was registered; poll GET /v1/hf/downloads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, repo, revision]
+                properties:
+                  id:
+                    type: integer
+                  repo:
+                    type: string
+                  revision:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/hf/downloads/{id}:
+    delete:
+      operationId: cancelHubDownload
+      summary: Cancel a hub download job (server extension)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The job was asked to stop.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, cancelling]
+                properties:
+                  id:
+                    type: integer
+                  cancelling:
+                    type: boolean
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

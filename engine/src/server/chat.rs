@@ -187,7 +187,7 @@ pub(crate) async fn submit(
         endpoint,
         session: input_session,
     };
-    admit(state, entry, admission)
+    admit(state, &entry, admission)
 }
 
 /// How a reply reads the generated text.

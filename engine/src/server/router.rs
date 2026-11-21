@@ -27,7 +27,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -45,6 +45,19 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/v1/token/encode", post(encode))
         .route("/v1/token/decode", post(decode))
         .route("/v1/apply-template", post(apply_template))
+        .route(
+            "/v1/engines",
+            get(super::engines::list).post(super::engines::add),
+        )
+        .route("/v1/engines/{id}", delete(super::engines::remove))
+        .route("/v1/hf/search", get(super::hf::search))
+        .route("/v1/hf/cache", get(super::hf::cache))
+        .route("/v1/hf/tree", get(super::hf::tree))
+        .route(
+            "/v1/hf/downloads",
+            get(super::hf::downloads).post(super::hf::start_download),
+        )
+        .route("/v1/hf/downloads/{id}", delete(super::hf::cancel_download))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let messages_routes = Router::new()
         .route("/v1/messages", post(messages))
@@ -775,7 +788,7 @@ mod tests {
     async fn a_route_that_the_server_does_not_ship_returns_a_json_404() {
         let (state, _engine) = one_engine_state();
         let app = router(state);
-        for uri in ["/v1/engines", "/v1/sessions", "/metrics", "/nowhere"] {
+        for uri in ["/v1/sessions", "/metrics", "/nowhere"] {
             let (status, _headers, body) =
                 testkit::send(&app, testkit::get(uri, Some(testkit::API_KEY))).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
@@ -838,6 +851,92 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("engine e1 failed: "), "{lines:?}");
         assert!(lines[0].contains("fixture load failure"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn engines_list_distinguishes_runtime_added_engines() {
+        let (state, _engine) = one_engine_state();
+        let late = testkit::engine(Vec::new());
+        state.add_engine(testkit::entry("late", "model-b", &late, 1_024), late);
+        let (status, _headers, body) = testkit::send(
+            &router(state),
+            testkit::get("/v1/engines", Some(testkit::API_KEY)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = testkit::json_of(&body);
+        let engines = body["engines"].as_array().expect("engines array");
+        let find = |id: &str| {
+            engines
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .unwrap_or_else(|| panic!("engine {id} missing"))
+        };
+        assert_eq!(find("e1")["runtime_added"], false);
+        assert_eq!(find("late")["runtime_added"], true);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_boot_engine_is_refused_but_known() {
+        let (state, _engine) = one_engine_state();
+        let request = testkit::request("DELETE", "/v1/engines/e1", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = testkit::json_of(&body);
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("started by the configuration")
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_engine_is_404() {
+        let (state, _engine) = one_engine_state();
+        let request = testkit::request("DELETE", "/v1/engines/nope", Some(testkit::API_KEY));
+        let (status, _headers, _body) = testkit::send(&router(state), request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn post_engines(body: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/engines")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", testkit::API_KEY),
+            )
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn adding_an_engine_requires_a_model_dir() {
+        let (state, _engine) = one_engine_state();
+        let (status, _headers, body) =
+            testkit::send(&router(state), post_engines(r#"{"model_dir":"  "}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = testkit::json_of(&body);
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert_eq!(body["error"]["message"], "model_dir is required");
+    }
+
+    #[tokio::test]
+    async fn adding_an_engine_from_a_missing_directory_carries_the_cli_error() {
+        let (state, _engine) = one_engine_state();
+        let (status, _headers, body) = testkit::send(
+            &router(state),
+            post_engines(r#"{"model_dir":"no-such-dir-anywhere/models"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = testkit::json_of(&body);
+        assert_eq!(body["error"]["code"], "bad_request");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains("no-such-dir-anywhere"), "{message}");
     }
 }
 
