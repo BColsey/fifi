@@ -6,9 +6,10 @@ use std::{collections::VecDeque, rc::Rc, sync::Arc};
 use half::bf16;
 
 use super::{
-    LAYERS,
+    HIDDEN, INTERMEDIATE, LAYERS, TOP_K,
     gguf::{
-        ExpertPlane, LARGEST_PLANE_F32_BYTES, Weights, packed_mlx_enabled,
+        ExpertPlane, GGUF_BATCH_RETIRE_BYTES, LARGEST_PLANE_F32_BYTES, Weights,
+        batched_experts_enabled, finish_expert_visit, packed_mlx_enabled,
         single_copy_experts_enabled,
     },
     mlx::MlxExpertCacheStats,
@@ -97,6 +98,8 @@ pub(super) struct ExpertTimings {
     metal_input_import_ns: u128,
     metal_dispatch_ns: u128,
     metal_readback_ns: u128,
+    metal_readback_calls: u64,
+    metal_activation_import_calls: u64,
 }
 
 pub(super) struct Experts {
@@ -105,6 +108,8 @@ pub(super) struct Experts {
     packed: Cache<ExpertPlane>,
     resident: Cache<Projection>,
     packed_enabled: bool,
+    batched_enabled: bool,
+    batched_visits: u64,
     codes: Vec<(GgufType, ExecutionTensor)>,
     projections: ProjectionStats,
     stats: MlxExpertCacheStats,
@@ -120,13 +125,21 @@ impl Experts {
         let mut metal = MlxKernels::try_new()?;
         // Bound deferred retirements on this adapter. The allocator pool is
         // shared by the process, so changing its limit would affect other engines.
-        metal.set_retire_cap(LARGEST_PLANE_F32_BYTES as u64)?;
+        let batched_enabled = batched_experts_enabled();
+        let retire_cap = if batched_enabled {
+            GGUF_BATCH_RETIRE_BYTES
+        } else {
+            LARGEST_PLANE_F32_BYTES as u64
+        };
+        metal.set_retire_cap(retire_cap)?;
         Ok(Self {
             source,
             metal,
             packed: Cache::new(ram),
             resident: Cache::new(headroom - ram),
             packed_enabled: packed_mlx_enabled(),
+            batched_enabled,
+            batched_visits: 0,
             codes: Vec::new(),
             projections: ProjectionStats::default(),
             stats: MlxExpertCacheStats::default(),
@@ -152,6 +165,8 @@ impl Experts {
             serde_json::json!({
                 "phase": phase,
                 "packed_enabled": self.packed_enabled,
+                "batched_enabled": self.batched_enabled,
+                "batched_visits": std::mem::take(&mut self.batched_visits),
                 "retained_ram_capacity_bytes": self.packed.limit,
                 "retained_metal_capacity_bytes": self.resident.limit,
                 "projections": std::mem::take(&mut self.projections),
@@ -208,15 +223,104 @@ impl Experts {
         let source = Arc::clone(&self.source);
         self.stats.visits += 1;
         let misses = self.stats.misses;
-        let output = source.moe_row_with(
-            layer,
-            input,
-            selected,
-            routes,
-            |name, expert, height, input| self.project(name, expert, height, input),
-        )?;
+        let output = if self.batched_enabled && self.can_batch(layer) {
+            let output = self.row_batched(layer, input, selected, routes)?;
+            self.batched_visits += 1;
+            output
+        } else {
+            source.moe_row_with(
+                layer,
+                input,
+                selected,
+                routes,
+                |name, expert, height, input| self.project(name, expert, height, input),
+            )?
+        };
         self.stats.fully_cached_visits += u64::from(misses == self.stats.misses);
         Ok(output)
+    }
+
+    fn can_batch(&self, layer: usize) -> bool {
+        layer_has_packed_kernels(&self.source, layer)
+    }
+
+    fn row_batched(
+        &mut self,
+        layer: usize,
+        input: &[f32],
+        selected: &[usize],
+        routes: &[f32],
+    ) -> Result<Vec<bf16>, EngError> {
+        let visit = self.source.expert_visit(layer, selected, routes)?;
+        let gate = self.project_group(&visit.gate, selected, 2 * INTERMEDIATE, &[input])?;
+        let activated: Vec<_> = selected
+            .iter()
+            .zip(gate.as_chunks::<{ 2 * INTERMEDIATE }>().0)
+            .map(|(&expert, fused)| visit.activate(expert, fused))
+            .collect();
+        drop(gate);
+        let activations: Vec<_> = activated.iter().map(Vec::as_slice).collect();
+        let down = self.project_group(&visit.down, selected, HIDDEN, &activations)?;
+        let mut merged = vec![0.; HIDDEN];
+        for ((&expert, &route), projected) in selected
+            .iter()
+            .zip(routes)
+            .zip(down.as_chunks::<HIDDEN>().0)
+        {
+            visit.accumulate(&mut merged, expert, route, projected);
+        }
+        finish_expert_visit(merged)
+    }
+
+    fn project_group(
+        &mut self,
+        name: &str,
+        selected: &[usize],
+        height: usize,
+        inputs: &[&[f32]],
+    ) -> Result<Vec<f32>, EngError> {
+        // Stage every plane before dispatch so a cache miss cannot split a
+        // pending projection group with the synchronous weight import.
+        let width = inputs[0].len();
+        let weights = selected
+            .iter()
+            .map(|&expert| self.weight(name, expert, height, width))
+            .collect::<Result<Vec<_>, _>>()?;
+        let host_inputs = inputs
+            .iter()
+            .map(|input| host_activation(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let activation = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_input_import_ns),
+            || {
+                if host_inputs.len() == 1 {
+                    Ok(vec![self.metal.import_tensor(&host_inputs[0])?])
+                } else {
+                    let inputs: Vec<_> = host_inputs.iter().collect();
+                    self.metal.import_many(&inputs)
+                }
+            },
+        )?;
+        if let Some(timing) = &mut self.timing {
+            timing.metal_activation_import_calls += 1;
+        }
+        let outputs = weights
+            .iter()
+            .enumerate()
+            .map(|(slot, weight)| {
+                let index = if activation.len() == 1 { 0 } else { slot };
+                self.dispatch(weight, &activation[index])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut concatenate_ns = 0;
+        let result = measure(self.timing.is_some().then_some(&mut concatenate_ns), || {
+            let rows: Vec<_> = outputs.iter().collect();
+            self.metal.concatenate(&rows, 0)
+        })?;
+        if let Some(timing) = &mut self.timing {
+            timing.metal_dispatch_ns += concatenate_ns;
+        }
+        self.read_output(&result, TOP_K, height)
     }
 
     fn project(
@@ -226,6 +330,25 @@ impl Experts {
         height: usize,
         input: &[f32],
     ) -> Result<Vec<f32>, EngError> {
+        let weight = self.weight(name, expert, height, input.len())?;
+        let activation = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_input_import_ns),
+            || self.metal.import_tensor(&host_activation(input)?),
+        )?;
+        if let Some(timing) = &mut self.timing {
+            timing.metal_activation_import_calls += 1;
+        }
+        let projected = self.dispatch(&weight, &activation)?;
+        self.read_output(&projected, 1, height)
+    }
+
+    fn weight(
+        &mut self,
+        name: &str,
+        expert: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Rc<Projection>, EngError> {
         let weight = if let Some(weight) = self.resident.get(name, expert) {
             self.stats.hits += 1;
             weight
@@ -250,7 +373,7 @@ impl Experts {
                 }
                 plane
             };
-            if plane.width != input.len() || plane.height != height {
+            if plane.width != width || plane.height != height {
                 return Err(super::checkpoint_error(
                     "GGUF Metal expert projection shape mismatch",
                 ));
@@ -270,21 +393,18 @@ impl Experts {
             self.stats.cached_bytes = self.packed.bytes + self.resident.bytes;
             weight
         };
-        let activation = measure(
-            self.timing.as_mut().map(|t| &mut t.metal_input_import_ns),
-            || {
-                let activation = Tensor::try_from_host(
-                    Dtype::F32,
-                    vec![1, input.len() as u32],
-                    input.iter().flat_map(|value| value.to_le_bytes()).collect(),
-                )?;
-                self.metal.import_tensor(&activation)
-            },
-        )?;
-        let projected = measure(
+        Ok(weight)
+    }
+
+    fn dispatch(
+        &mut self,
+        weight: &Projection,
+        activation: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        measure(
             self.timing.as_mut().map(|t| &mut t.metal_dispatch_ns),
             || {
-                let output = match weight.as_ref() {
+                let output = match weight {
                     Projection::Packed(payload, format) => {
                         let codes = self
                             .codes
@@ -299,14 +419,14 @@ impl Experts {
                             GgufType::Nvfp4 => &mut self.projections.nvfp4,
                             _ => unreachable!("packed formats were validated when staged"),
                         };
-                        let result =
-                            self.metal
-                                .inkling_gguf_matvec(&activation, payload, codes, *format)?;
+                        let result = self
+                            .metal
+                            .inkling_gguf_matvec(activation, payload, codes, *format)?;
                         *count += 1;
                         result
                     }
                     Projection::Expanded(expanded) => {
-                        let result = self.metal.mm(&activation, expanded)?;
+                        let result = self.metal.mm(activation, expanded)?;
                         if self.packed_enabled {
                             self.projections.expanded_metal_transpose += 1;
                         } else {
@@ -317,12 +437,23 @@ impl Experts {
                 };
                 Ok::<_, EngError>(output)
             },
-        )?;
+        )
+    }
+
+    fn read_output(
+        &mut self,
+        projected: &ExecutionTensor,
+        rows: usize,
+        height: usize,
+    ) -> Result<Vec<f32>, EngError> {
         let host = measure(
             self.timing.as_mut().map(|t| &mut t.metal_readback_ns),
-            || self.metal.readback(&projected),
+            || self.metal.readback(projected),
         )?;
-        if host.shape() != [1, height as u32] || host.dtype() != Dtype::F32 {
+        if let Some(timing) = &mut self.timing {
+            timing.metal_readback_calls += 1;
+        }
+        if host.shape() != [rows as u32, height as u32] || host.dtype() != Dtype::F32 {
             return Err(super::checkpoint_error(
                 "GGUF Metal expert output shape mismatch",
             ));
@@ -342,20 +473,26 @@ impl Experts {
 /// Expanded formats can still benefit from keeping a smaller packed host
 /// copy. Fully packed checkpoints retain the same bytes in the Metal buffer.
 fn all_experts_have_packed_kernels(source: &Weights) -> bool {
-    (0..LAYERS).all(|layer| {
-        ["ffn_gate_up_exps", "ffn_down_exps"]
-            .into_iter()
-            .all(|projection| {
-                source
-                    .header()
-                    .tensor(&format!("blk.{layer}.{projection}.weight"))
-                    .is_some_and(|tensor| {
-                        let format = tensor.ggml_type();
-                        inkling_codebook_words(format).is_some()
-                            || matches!(format, GgufType::Q20 | GgufType::Nvfp4)
-                    })
-            })
-    })
+    (0..LAYERS).all(|layer| layer_has_packed_kernels(source, layer))
+}
+
+fn layer_has_packed_kernels(source: &Weights, layer: usize) -> bool {
+    ["ffn_gate_up_exps", "ffn_down_exps"]
+        .into_iter()
+        .all(|name| {
+            source
+                .header()
+                .tensor(&format!("blk.{layer}.{name}.weight"))
+                .is_some_and(|tensor| packed_format(tensor.ggml_type()))
+        })
+}
+
+fn host_activation(input: &[f32]) -> Result<Tensor, EngError> {
+    Tensor::try_from_host(
+        Dtype::F32,
+        vec![1, input.len() as u32],
+        input.iter().flat_map(|value| value.to_le_bytes()).collect(),
+    )
 }
 
 fn packed_format(format: GgufType) -> bool {
@@ -493,6 +630,156 @@ mod tests {
                     "{name} row {row}: {actual} != {want}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "native-fault-qualification")]
+    #[test]
+    #[ignore = "requires a complete Unsloth UD-IQ2_XXS GGUF at INKLING_GGUF_REFERENCE and Apple Metal"]
+    fn batched_gguf_visit_matches_sequential_packed_bits_and_counts() {
+        let _lock = crate::native_test_lock();
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let source = Arc::new(Weights::open(std::path::Path::new(&file)).unwrap());
+        let x: Vec<_> = (0..HIDDEN)
+            .map(|i| ((i % 17) as f32 - 8.) * 0.0625)
+            .collect();
+        let experts = [17, 1, 21, 0, 43, 5, 87, 127];
+        let routes = [0.8125, 0.9375, 1., 1.25, 0.875, 0.6875, 1.125, 1.3125];
+        let pairs = [
+            (0, GgufType::Iq1S, GgufType::Q20),
+            (5, GgufType::Iq2Xxs, GgufType::Nvfp4),
+            (7, GgufType::Iq2Xxs, GgufType::Q20),
+            (9, GgufType::Iq2Xs, GgufType::Nvfp4),
+            (10, GgufType::Iq2Xs, GgufType::Q20),
+            (16, GgufType::Iq2S, GgufType::Q20),
+            (19, GgufType::Iq2S, GgufType::Nvfp4),
+        ];
+        let run = |batched, headroom| {
+            let mut runtime = Experts::open(Arc::clone(&source), headroom).unwrap();
+            runtime.packed_enabled = true;
+            runtime.batched_enabled = batched;
+            runtime.timing = Some(ExpertTimings::default());
+            let retire_cap = if batched {
+                GGUF_BATCH_RETIRE_BYTES
+            } else {
+                LARGEST_PLANE_F32_BYTES as u64
+            };
+            runtime.metal.set_retire_cap(retire_cap).unwrap();
+            let mut values = Vec::new();
+            for (layer, gate, down) in pairs {
+                let plan = source.expert_visit(layer, &experts, &routes).unwrap();
+                for (name, dtype) in [(&plan.gate, gate), (&plan.down, down)] {
+                    assert_eq!(source.header().tensor(name).unwrap().ggml_type(), dtype);
+                }
+                assert!(runtime.can_batch(layer));
+                for repeated in [false, true] {
+                    let case = match (headroom, repeated) {
+                        (0, _) => "zero_retention",
+                        (n, _) if n == 8 << 20 => "eviction",
+                        (_, false) => "cold",
+                        (_, true) => "warm",
+                    };
+                    let before = runtime.stats();
+                    let sync_before = runtime.metal.qualification_sync_count();
+                    let flush_before = runtime.metal.qualification_retire_stats().0;
+                    runtime.metal.qualification_reset_retire_peak();
+                    let result = runtime.row(layer, &x, &experts, &routes).unwrap();
+                    let syncs = runtime.metal.qualification_sync_count() - sync_before;
+                    let (flush_total, retire_peak) = runtime.metal.qualification_retire_stats();
+                    let flushes = flush_total - flush_before;
+                    let after = runtime.stats();
+                    let timing = runtime.take_component_timings().unwrap();
+                    let calls = if batched { 2 } else { 16 };
+                    assert_eq!(timing.metal_activation_import_calls, calls);
+                    assert_eq!(timing.metal_readback_calls, calls);
+                    assert_eq!(
+                        std::mem::take(&mut runtime.batched_visits),
+                        u64::from(batched)
+                    );
+                    let weight_or_table_imports = if case == "warm" {
+                        0
+                    } else {
+                        2 * TOP_K as u64 + 2
+                    };
+                    // A strided readback may take one extra sync. The shim counts
+                    // retire-cap flushes too, so subtract those for the call bound.
+                    let minimum = 2 * calls + flushes;
+                    let maximum = minimum + calls + weight_or_table_imports;
+                    assert!(
+                        (minimum..=maximum).contains(&syncs),
+                        "layer={layer} batched={batched} case={case} syncs={syncs} expected={minimum}..={maximum}"
+                    );
+                    assert!(retire_peak <= retire_cap + LARGEST_PLANE_F32_BYTES as u64);
+                    if case == "warm" {
+                        assert_eq!(after.read_ranges, before.read_ranges);
+                        assert_eq!(after.evictions, before.evictions);
+                        assert_eq!(flushes, 0);
+                    }
+                    if case == "cold" {
+                        assert!(after.read_ranges > before.read_ranges);
+                    }
+                    if case == "eviction" {
+                        assert!(
+                            after.evictions > before.evictions,
+                            "eviction case must evict an entry"
+                        );
+                    }
+                    if case == "zero_retention" {
+                        assert_eq!(after.cached_bytes, 0);
+                    }
+                    eprintln!(
+                        "gguf batch visit layer={layer} batched={batched} case={case} syncs={syncs} retire_flushes={flushes} retire_peak_bytes={retire_peak} evictions={}",
+                        after.evictions - before.evictions
+                    );
+                    values.extend(result.into_iter().map(bf16::to_bits));
+                }
+                if layer == 0 && batched && headroom == 64 << 20 {
+                    // Both phases of one warm visit also compare projection
+                    // values directly, before BF16 narrowing can mask changes.
+                    let gates = runtime
+                        .project_group(&plan.gate, &experts, 2 * INTERMEDIATE, &[&x])
+                        .unwrap();
+                    let mut activations = Vec::new();
+                    for (&expert, fused) in experts
+                        .iter()
+                        .zip(gates.as_chunks::<{ 2 * INTERMEDIATE }>().0)
+                    {
+                        let sequential = runtime
+                            .project(&plan.gate, expert, 2 * INTERMEDIATE, &x)
+                            .unwrap();
+                        assert!(
+                            fused
+                                .iter()
+                                .zip(sequential)
+                                .all(|(&a, b)| a.to_bits() == b.to_bits())
+                        );
+                        activations.push(plan.activate(expert, fused));
+                    }
+                    let inputs: Vec<_> = activations.iter().map(Vec::as_slice).collect();
+                    let downs = runtime
+                        .project_group(&plan.down, &experts, HIDDEN, &inputs)
+                        .unwrap();
+                    for ((&expert, activation), down) in experts
+                        .iter()
+                        .zip(inputs)
+                        .zip(downs.as_chunks::<HIDDEN>().0)
+                    {
+                        let sequential = runtime
+                            .project(&plan.down, expert, HIDDEN, activation)
+                            .unwrap();
+                        assert!(
+                            down.iter()
+                                .zip(sequential)
+                                .all(|(&a, b)| a.to_bits() == b.to_bits())
+                        );
+                    }
+                    let _ = runtime.take_component_timings();
+                }
+            }
+            values
+        };
+        for headroom in [0, 8 << 20, 64 << 20] {
+            assert_eq!(run(false, headroom), run(true, headroom));
         }
     }
 

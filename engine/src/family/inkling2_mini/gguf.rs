@@ -468,8 +468,28 @@ impl Weights {
         routes: &[f32],
         mut project: impl FnMut(&str, usize, usize, &[f32]) -> Result<Vec<f32>, EngError>,
     ) -> Result<Vec<half::bf16>, EngError> {
-        use super::{GATE_CAP, TOP_K, UP_CAP};
-        if layer >= LAYERS || selected.len() != TOP_K || routes.len() != TOP_K {
+        let plan = self.expert_visit(layer, selected, routes)?;
+        let mut merged = vec![0.; HIDDEN];
+        for (&expert, &route) in selected.iter().zip(routes) {
+            let fused = project(&plan.gate, expert, 2 * INTERMEDIATE, input)?;
+            let activated = plan.activate(expert, &fused);
+            let projected = project(&plan.down, expert, HIDDEN, &activated)?;
+            plan.accumulate(&mut merged, expert, route, &projected);
+        }
+        finish_expert_visit(merged)
+    }
+
+    pub(super) fn expert_visit(
+        &self,
+        layer: usize,
+        selected: &[usize],
+        routes: &[f32],
+    ) -> Result<ExpertVisit, EngError> {
+        if layer >= LAYERS
+            || selected.len() != super::TOP_K
+            || routes.len() != super::TOP_K
+            || selected.iter().any(|&expert| expert >= EXPERTS)
+        {
             return Err(EngError::BadRequest(
                 "bad Inkling GGUF expert selection".into(),
             ));
@@ -484,40 +504,57 @@ impl Weights {
         };
         let gate_scale = scale(&gate)?;
         let down_scale = scale(&down)?;
-        let gate = format!("{gate}.weight");
-        let down = format!("{down}.weight");
-        let mut merged = vec![0.; HIDDEN];
-        for (&expert, &route) in selected.iter().zip(routes) {
-            if expert >= EXPERTS {
-                return Err(EngError::BadRequest(
-                    "Inkling GGUF expert ID out of range".into(),
-                ));
-            }
-            let fused = project(&gate, expert, 2 * INTERMEDIATE, input)?;
-            let (gate_values, up_values) = fused.split_at(INTERMEDIATE);
-            let s = gate_scale[expert];
-            let activated: Vec<_> = gate_values
-                .iter()
-                .zip(up_values)
-                .map(|(&g, &u)| {
-                    let g = g * s;
-                    let u = u * s;
-                    GATE_CAP * (g / GATE_CAP).tanh() / (1. + (-g).exp())
-                        * UP_CAP
-                        * (u / UP_CAP).tanh()
-                })
-                .collect();
-            let projected = project(&down, expert, HIDDEN, &activated)?;
-            let s = route * down_scale[expert];
-            for (out, value) in merged.iter_mut().zip(projected) {
-                *out += value * s;
-            }
-        }
-        if merged.iter().any(|v| !v.is_finite()) {
-            return Err(checkpoint_error("nonfinite Inkling GGUF expert output"));
-        }
-        Ok(merged.into_iter().map(half::bf16::from_f32).collect())
+        Ok(ExpertVisit {
+            gate: format!("{gate}.weight"),
+            down: format!("{down}.weight"),
+            gate_scale,
+            down_scale,
+        })
     }
+}
+
+pub(super) struct ExpertVisit {
+    pub(super) gate: String,
+    pub(super) down: String,
+    gate_scale: Vec<f32>,
+    down_scale: Vec<f32>,
+}
+
+impl ExpertVisit {
+    pub(super) fn activate(&self, expert: usize, fused: &[f32]) -> Vec<f32> {
+        use super::{GATE_CAP, UP_CAP};
+        let (gate_values, up_values) = fused.split_at(INTERMEDIATE);
+        let s = self.gate_scale[expert];
+        gate_values
+            .iter()
+            .zip(up_values)
+            .map(|(&g, &u)| {
+                let g = g * s;
+                let u = u * s;
+                GATE_CAP * (g / GATE_CAP).tanh() / (1. + (-g).exp()) * UP_CAP * (u / UP_CAP).tanh()
+            })
+            .collect()
+    }
+
+    pub(super) fn accumulate(
+        &self,
+        merged: &mut [f32],
+        expert: usize,
+        route: f32,
+        projected: &[f32],
+    ) {
+        let s = route * self.down_scale[expert];
+        for (out, &value) in merged.iter_mut().zip(projected) {
+            *out += value * s;
+        }
+    }
+}
+
+pub(super) fn finish_expert_visit(merged: Vec<f32>) -> Result<Vec<half::bf16>, EngError> {
+    if merged.iter().any(|v| !v.is_finite()) {
+        return Err(checkpoint_error("nonfinite Inkling GGUF expert output"));
+    }
+    Ok(merged.into_iter().map(half::bf16::from_f32).collect())
 }
 
 fn project_packed_rows(
@@ -563,6 +600,23 @@ pub(super) fn single_copy_experts_enabled() -> bool {
             .is_some_and(|value| value == "1")
 }
 
+pub(super) fn batched_experts_enabled() -> bool {
+    packed_mlx_enabled()
+        && std::env::var_os("FIFI_INKLING_GGUF_BATCH_EXPERTS").is_some_and(|value| value == "1")
+}
+
+// NVFP4 has the largest block byte/element ratio among the six packed formats.
+// A visit holds a single group's input references at dispatch. Hold one more
+// group in the ledger for released projections pending the next sync.
+const MAX_PACKED_GROUP_BYTES: u64 = (2 * HIDDEN * INTERMEDIATE / 64 * 36 * super::TOP_K) as u64;
+// Fused/activation/down rows, inputs, projection results, concatenate output,
+// and host readback/decoded rows fit within eight widest F32 groups.
+const GROUP_ROW_WORKSPACE_BYTES: u64 = (8 * super::TOP_K * 2 * INTERMEDIATE * 4) as u64;
+const GGUF_BATCH_EXPERT_BYTES: u64 = 2 * MAX_PACKED_GROUP_BYTES + GROUP_ROW_WORKSPACE_BYTES;
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) const GGUF_BATCH_RETIRE_BYTES: u64 =
+    LARGEST_PLANE_F32_BYTES as u64 + MAX_PACKED_GROUP_BYTES + GROUP_ROW_WORKSPACE_BYTES;
+
 pub(super) fn native_scratch_bytes() -> u64 {
     // Reserve the existing general plane workspace, plus four resident U32
     // codebooks and a second copy to cover their host upload in packed mode.
@@ -571,6 +625,11 @@ pub(super) fn native_scratch_bytes() -> u64 {
         + 4 * LARGEST_PLANE_F32_BYTES as u64
         + if packed_mlx_enabled() {
             2 * CODEBOOK_BYTES
+        } else {
+            0
+        }
+        + if batched_experts_enabled() {
+            GGUF_BATCH_EXPERT_BYTES
         } else {
             0
         }
@@ -583,8 +642,15 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
     let state = super::state_plan(context)?;
     let staging = native_scratch_bytes();
     let charges = super::base_charges(0, staging, &state);
+    let expert_workspace = if batched_experts_enabled() {
+        format!(
+            "batched GGUF projection workspace including {GGUF_BATCH_EXPERT_BYTES} B for grouped and deferred buffers"
+        )
+    } else {
+        "one GGUF expert plane".to_string()
+    };
     let plan = format!(
-        "{} B for one GGUF expert plane, BF16 state at {context} tokens and decoder scratch",
+        "{} B for {expert_workspace}, BF16 state at {context} tokens and decoder scratch",
         charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
     );
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
