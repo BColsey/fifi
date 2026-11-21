@@ -189,9 +189,11 @@ pub(super) fn plan_prefill(
         settings.prefill_reserve
     };
     let reserve = if device.is_some() {
+        // Saved prefixes are not part of the reserve: they live in what the planned piece
+        // leaves (`limit_prefix_to_plan`), so reuse never shrinks the piece.
         reserve.max(executor.device_prefill_reserve(
             settings.cache_limit,
-            settings.prefix_reuse,
+            false,
             settings.session_cap,
         )?)
     } else {
@@ -206,6 +208,9 @@ pub(super) fn plan_prefill(
                 ("session_reserve_bytes", reserve),
             ],
         )?;
+    }
+    if device.is_some() && settings.prefix_reuse {
+        executor.limit_prefix_to_plan(&plan)?;
     }
     if settings.max_seqs > 1 && plan.chunk.is_none() {
         return Err(EngError::MemoryPlan(

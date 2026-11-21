@@ -175,6 +175,12 @@ pub(crate) struct Q36Executor {
     /// The chunk size of the batched prefill, set only by `apply_chunk`. `None` means one-token steps.
     chunk: Option<u32>,
     mlx_plan: Option<MlxExecutionPlan>,
+    /// The bytes the saved prefixes may hold beyond the live session under a device budget: what
+    /// remains after the weights, the session reserve and the planned prefill piece. A save that
+    /// would pass it evicts older entries and, when none is left, is refused, so a saved prefix
+    /// never takes the memory of the prefill piece. `None` (no device budget) leaves the store
+    /// to the session cap alone.
+    prefix_room: Option<u64>,
     /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
     /// `Miss` until a restore takes an entry, and a reset clears it again, so the report of a job
     /// without a boundary is a miss.
@@ -935,7 +941,7 @@ impl Q36Executor {
         admit(&shape, &rules)?;
         let plan = placement
             .map(|(device, settings, _)| {
-                let retained = (settings.prefix_reuse || rules.max_seqs > 1).then_some(rules.session_cap);
+                let retained = (rules.max_seqs > 1).then_some(rules.session_cap);
                 let context = usize::try_from(rules.context_limit)
                     .map_err(|_| EngError::MemoryPlan("context exceeds platform size".into()))?;
                 let reserve = device_reserve(
@@ -1061,6 +1067,7 @@ impl Q36Executor {
             fixed_state_bytes,
             chunk: None,
             mlx_plan: None,
+            prefix_room: None,
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
             prefix_shadow: None,
@@ -1183,13 +1190,7 @@ impl Q36Executor {
             let cost = self.prefill_cost()?;
             if self.decoder.weights.streams_experts() {
                 crate::family::prefill::mlx::admitted_chunk(max_rows, terms.remaining(), |rows| {
-                    let staged = self
-                        .decoder
-                        .weights
-                        .expert_stage_bytes(self.decoder.ckpt, rows)?;
-                    cost.workspace(rows)?.checked_add(staged).ok_or_else(|| {
-                        EngError::MemoryPlan("Qwen MLX prefill plus expert stage overflows".into())
-                    })
+                    self.chunk_charge(&cost, rows)
                 })?
             } else {
                 admitted_chunk(&cost, terms.remaining(), max_rows)?
@@ -1199,6 +1200,39 @@ impl Q36Executor {
         };
         self.apply_chunk(chunk)?;
         Ok(PrefillPlan { chunk, terms })
+    }
+
+    /// The bytes one prefill piece of `rows` rows needs on this placement: its workspace plus the
+    /// expert pages it stages when the experts stream from disk.
+    fn chunk_charge(&self, cost: &ChunkCost, rows: u32) -> Result<u64> {
+        let staged = self
+            .decoder
+            .weights
+            .expert_stage_bytes(self.decoder.ckpt, rows)?;
+        cost.workspace(rows)?.checked_add(staged).ok_or_else(|| {
+            EngError::MemoryPlan("Qwen MLX prefill plus expert stage overflows".into())
+        })
+    }
+
+    /// Limits the saved prefixes to what the plan leaves after the prefill piece it admitted:
+    /// the remaining bytes minus the piece's charge. Call it after `plan_prefill`, with that
+    /// plan, on a start under a device budget.
+    pub(in crate::family::qwen36) fn limit_prefix_to_plan(
+        &mut self,
+        plan: &PrefillPlan,
+    ) -> Result<()> {
+        let piece = match plan.chunk {
+            Some(rows) => self.chunk_charge(&self.prefill_cost()?, rows)?,
+            None => 0,
+        };
+        self.prefix_room = Some(plan.terms.remaining().saturating_sub(piece));
+        Ok(())
+    }
+
+    /// The bytes the saved prefixes may hold under a device budget, when a plan set them.
+    #[cfg(test)]
+    pub(crate) fn prefix_room(&self) -> Option<u64> {
+        self.prefix_room
     }
 
     /// The numeric path that `feed_rows` takes now. A chunk size of one is a one-token step.
@@ -1614,9 +1648,23 @@ impl ExecutorOps for Q36Executor {
     fn save_prefix(&mut self, st: &Q36Session, key: &[u32], kind: SaveKind) -> Result<bool> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
+        let room = self.prefix_room;
         let fed = fed_positions(&st.state);
         st.core
             .save_prefix(&mut self.prefix, key, path, fed, kind, || {
+                if let Some(room) = room {
+                    // The session budget holds the live permits and one permit per stored entry,
+                    // so what exceeds the live state is what the store holds.
+                    let held = decoder
+                        .budget
+                        .used()
+                        .saturating_sub(st.state.charged_bytes().unwrap_or(0));
+                    if held.saturating_add(decoder.snapshot_bytes(&st.state)?) > room {
+                        return Err(EngError::MemoryPlan(
+                            "a saved prefix would take memory the prefill piece needs".into(),
+                        ));
+                    }
+                }
                 decoder.snapshot(&st.state)
             })
     }
@@ -5067,6 +5115,40 @@ mod tests {
         executor
             .save_prefix(session, &PREFIX_PROMPT[..KEY], SaveKind::Tip)
             .unwrap()
+    }
+
+    /// Under a device budget a saved prefix lives in what the planned piece leaves: a room that
+    /// holds one entry keeps the save, a room of zero refuses it without an error, and the plan
+    /// itself does not depend on the room (the same chunk with and without the limit).
+    #[test]
+    fn a_saved_prefix_is_limited_to_the_room_the_prefill_piece_leaves() {
+        let _serial = crate::native_test_lock();
+        let (mut executor, mut session) = build(prefix_rules());
+        let plan = executor
+            .plan_prefill(held(&executor) + (1 << 30), 0, 256)
+            .unwrap();
+        let chunk = executor.prefill_chunk();
+        executor.limit_prefix_to_plan(&plan).unwrap();
+        let room = executor.prefix_room().unwrap();
+        assert!(
+            room > 0 && room < plan.terms.remaining(),
+            "the piece took {room}"
+        );
+        assert!(
+            save_key(&mut executor, &mut session),
+            "the room held the entry"
+        );
+        assert_eq!(executor.prefill_chunk(), chunk, "the piece did not change");
+        let (mut executor, mut session) = build(prefix_rules());
+        let plan = executor
+            .plan_prefill(held(&executor) + (1 << 30), 0, 256)
+            .unwrap();
+        executor.limit_prefix_to_plan(&plan).unwrap();
+        executor.prefix_room = Some(0);
+        assert!(
+            !save_key(&mut executor, &mut session),
+            "no room refuses the save"
+        );
     }
 
     fn max_gap(a: &[f32], b: &[f32]) -> f32 {
