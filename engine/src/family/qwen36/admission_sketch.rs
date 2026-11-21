@@ -78,6 +78,24 @@ pub(crate) fn admission_demand(
     }
 }
 
+/// The KV bytes one position costs on the CUDA arm: the fp16 control cache for `f32` (half the
+/// F32 figure of the spec, two bytes per value) and the int8 form with fp16 group scales for
+/// `q8`. These are `KvPool::bytes_per_token` of the two `KvMode`s, 20,480 and 10,880 for
+/// `QWEN3_6_35B_A3B`; the loader pins both in its start tests.
+pub(crate) fn cuda_kv_per_position(
+    spec: &crate::family::spec::FamilySpec,
+    kv: crate::family::qwen36::settings::KvDtype,
+) -> Result<u64, crate::EngError> {
+    use crate::family::qwen36::settings::{Activation, KvDtype, cache_growth_per_position};
+
+    match kv {
+        KvDtype::Q8 => cache_growth_per_position(spec, KvDtype::Q8, Activation::Bf16),
+        KvDtype::F32 | KvDtype::Bf16 => {
+            cache_growth_per_position(spec, KvDtype::F32, Activation::Bf16).map(|bytes| bytes / 2)
+        }
+    }
+}
+
 /// The CUDA admission demand as a function of the candidate context, on
 /// the paper math above. The per-position cache rate and the fixed state
 /// come back beside the closure because every caller needs the figures as
@@ -100,10 +118,50 @@ pub(crate) fn cuda_demand_model(
     ),
     crate::EngError,
 > {
-    use crate::family::admission_sketch::kv8_staging_bytes;
-    use crate::family::qwen36::settings::{KvDtype, cache_growth_per_position, delta_state_bytes};
+    let per_position =
+        crate::family::qwen36::settings::cache_growth_per_position(spec, kv, activation)?;
+    demand_model(spec, kv, per_position)
+}
 
-    let per_position = cache_growth_per_position(spec, kv, activation)?;
+/// [`cuda_demand_model`] with the exact CUDA cache rate ([`cuda_kv_per_position`]): what the card
+/// start charges for the cache form it would build.
+#[allow(
+    clippy::type_complexity,
+    reason = "the builder hands back the figures and the closure together; an impl-Trait closure has no nameable type to factor out"
+)]
+pub(crate) fn card_demand_model(
+    spec: &crate::family::spec::FamilySpec,
+    kv: crate::family::qwen36::settings::KvDtype,
+) -> Result<
+    (
+        u64,
+        u64,
+        impl Fn(u32) -> Result<AdmissionSketch, crate::EngError> + use<'_>,
+    ),
+    crate::EngError,
+> {
+    demand_model(spec, kv, cuda_kv_per_position(spec, kv)?)
+}
+
+#[allow(
+    clippy::type_complexity,
+    reason = "the builder hands back the figures and the closure together; an impl-Trait closure has no nameable type to factor out"
+)]
+fn demand_model(
+    spec: &crate::family::spec::FamilySpec,
+    kv: crate::family::qwen36::settings::KvDtype,
+    per_position: u64,
+) -> Result<
+    (
+        u64,
+        u64,
+        impl Fn(u32) -> Result<AdmissionSketch, crate::EngError> + use<'_>,
+    ),
+    crate::EngError,
+> {
+    use crate::family::admission_sketch::kv8_staging_bytes;
+    use crate::family::qwen36::settings::{KvDtype, delta_state_bytes};
+
     let state_bytes = delta_state_bytes(spec)?;
     // Staged KV8 rows and the device-tip prefix copy are the two runtime
     // charges the closed-form figures above do not carry; only the Q8 cache
@@ -136,6 +194,23 @@ pub(crate) fn cuda_demand_model(
     Ok((per_position, state_bytes, demand_at))
 }
 
+/// Whether `context` leaves at least the uncertainty band of slack against the measured budget.
+fn admits_cuda(
+    free: u64,
+    weights: u64,
+    cuda_demand_at: &dyn Fn(u32) -> Result<AdmissionSketch, crate::EngError>,
+    context: u32,
+) -> bool {
+    let Ok(demand) = cuda_demand_at(context) else {
+        return false;
+    };
+    let Ok(charges) = demand.total_after_weights() else {
+        return false;
+    };
+    i128::from(free) - i128::from(weights) - i128::from(charges)
+        >= i128::from(ADMISSION_UNCERTAINTY_BAND_BYTES)
+}
+
 /// The largest context (a multiple of 1024, capped at the requested context)
 /// whose paper demand leaves at least the uncertainty band of slack against
 /// the measured budget. `None` when not even a minimal context fits — the
@@ -146,17 +221,73 @@ pub(crate) fn largest_fitting_cuda(
     cuda_demand_at: &dyn Fn(u32) -> Result<AdmissionSketch, crate::EngError>,
     requested: u32,
 ) -> Option<u32> {
-    let band = i128::from(ADMISSION_UNCERTAINTY_BAND_BYTES);
-    let fits = |context: u32| -> bool {
-        let Ok(demand) = cuda_demand_at(context) else {
-            return false;
-        };
-        let Ok(charges) = demand.total_after_weights() else {
-            return false;
-        };
-        i128::from(free) - i128::from(weights) - i128::from(charges) >= band
-    };
+    let fits = |context: u32| admits_cuda(free, weights, cuda_demand_at, context);
     crate::family::admission_sketch::largest_fitting_context(requested, &fits)
+}
+
+/// The model's maximum context in positions: the ceiling of a card-chosen context.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) const MODEL_MAX_CONTEXT: u32 =
+    crate::family::qwen36::settings::MLX_DEFAULT_CONTEXT_LIMIT;
+
+/// A card-chosen start: the cache form and the context it serves.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) type CudaFit =
+    crate::family::card_fit::CardFit<crate::family::qwen36::settings::KvDtype>;
+
+/// The context up to which the fp16 cache is kept over the int8 cache: the owner's 128K prompt
+/// tier. The fp16 cache is the exact control and prefills faster; the int8 cache holds almost
+/// twice the positions, so it is chosen only when fp16 cannot reach this context.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) const FP16_SUFFICIENT_CONTEXT: u32 = 131_072;
+
+/// The cache form and context a card carries, from the free bytes before the weights are
+/// uploaded and the weight bytes the load pins. `kv` and `context` name what the config fixed;
+/// an absent one is chosen by the shared card-fit rule (`family::card_fit`), fed with this
+/// family's charges: the cache at the candidate context, the DeltaNet state, the staged int8
+/// rows and the admission margins. fp16 is preferred; the ceiling is the named context, else
+/// [`MODEL_MAX_CONTEXT`].
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn choose_cuda_fit(
+    spec: &crate::family::spec::FamilySpec,
+    free: u64,
+    weights: u64,
+    kv: Option<crate::family::qwen36::settings::KvDtype>,
+    context: Option<u32>,
+) -> Result<Option<CudaFit>, crate::EngError> {
+    use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
+    use crate::family::qwen36::settings::KvDtype;
+
+    let (_, _, fp16_demand) = card_demand_model(spec, KvDtype::F32)?;
+    let (_, _, int8_demand) = card_demand_model(spec, KvDtype::Q8)?;
+    let fp16 = |context: u32| fp16_demand(context).ok()?.total_after_weights().ok();
+    let int8 = |context: u32| int8_demand(context).ok()?.total_after_weights().ok();
+    let candidates = [
+        CacheForm {
+            form: KvDtype::F32,
+            charge: &fp16,
+        },
+        CacheForm {
+            form: KvDtype::Q8,
+            charge: &int8,
+        },
+    ];
+    let named: Vec<CacheForm<'_, KvDtype>> = candidates
+        .into_iter()
+        .filter(|candidate| kv.is_none_or(|fixed| fixed == candidate.form))
+        .collect();
+    Ok(plan_card_fit(
+        CardBytes {
+            free,
+            weights,
+            band: ADMISSION_UNCERTAINTY_BAND_BYTES,
+        },
+        &named,
+        ContextLimits {
+            ceiling: context.unwrap_or(MODEL_MAX_CONTEXT),
+            sufficient: FP16_SUFFICIENT_CONTEXT,
+        },
+    ))
 }
 
 /// The configured context's verdict against the measured budget, and the
@@ -316,6 +447,103 @@ mod tests {
             admission_demand(u64::MAX, 1, 0, 0)
                 .total_after_weights()
                 .is_err()
+        );
+    }
+
+    use crate::family::QWEN3_6_35B_A3B;
+    use crate::family::qwen36::settings::KvDtype;
+
+    #[test]
+    fn the_cuda_cache_rates_are_the_two_kv_pool_layouts() {
+        // KvPool::bytes_per_token of Fp16 and Int8G32, pinned in the start tests.
+        assert_eq!(
+            cuda_kv_per_position(&QWEN3_6_35B_A3B, KvDtype::F32).unwrap(),
+            20_480
+        );
+        assert_eq!(
+            cuda_kv_per_position(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap(),
+            10_880
+        );
+    }
+
+    /// The free bytes at which exactly `context` positions of `kv` fit beside `weights`.
+    fn free_for(kv: KvDtype, weights: u64, context: u32) -> u64 {
+        let (_, _, demand_at) = card_demand_model(&QWEN3_6_35B_A3B, kv).unwrap();
+        weights
+            + demand_at(context).unwrap().total_after_weights().unwrap()
+            + ADMISSION_UNCERTAINTY_BAND_BYTES
+    }
+
+    const WEIGHTS: u64 = 20_408_576_512;
+
+    #[test]
+    fn a_roomy_card_keeps_fp16_at_the_model_maximum() {
+        let free = free_for(KvDtype::F32, WEIGHTS, MODEL_MAX_CONTEXT);
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None).unwrap();
+        assert_eq!(
+            fit,
+            Some(CudaFit {
+                form: KvDtype::F32,
+                context: MODEL_MAX_CONTEXT
+            })
+        );
+    }
+
+    #[test]
+    fn fp16_is_kept_where_it_reaches_the_sufficient_context() {
+        let free = free_for(KvDtype::F32, WEIGHTS, 150_528);
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None)
+            .unwrap()
+            .expect("fits");
+        assert_eq!(fit.form, KvDtype::F32);
+        assert_eq!(fit.context, 150_528);
+    }
+
+    #[test]
+    fn int8_is_chosen_where_fp16_falls_short_of_the_sufficient_context() {
+        let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None)
+            .unwrap()
+            .expect("fits");
+        assert_eq!(fit.form, KvDtype::Q8);
+        assert!(fit.context > 150_000, "{}", fit.context);
+        // The chosen context is the largest one that fits: one step more does not.
+        let (_, _, demand_at) = card_demand_model(&QWEN3_6_35B_A3B, KvDtype::Q8).unwrap();
+        assert!(admits_cuda(free, WEIGHTS, &demand_at, fit.context));
+        assert!(
+            fit.context == MODEL_MAX_CONTEXT
+                || !admits_cuda(free, WEIGHTS, &demand_at, fit.context + 1024)
+        );
+    }
+
+    #[test]
+    fn a_named_cache_form_or_context_is_taken_as_given() {
+        let free = free_for(KvDtype::F32, WEIGHTS, 100_352);
+        // The form is fixed: only that form is weighed, whatever the other would reach.
+        let fixed = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, Some(KvDtype::F32), None)
+            .unwrap()
+            .expect("fits");
+        assert_eq!((fixed.form, fixed.context), (KvDtype::F32, 100_352));
+        // The context is fixed and fp16 holds it: fp16 serves exactly that context.
+        let named = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(65_536))
+            .unwrap()
+            .expect("fits");
+        assert_eq!((named.form, named.context), (KvDtype::F32, 65_536));
+        // The context is fixed, fp16 cannot hold it and int8 can: int8 serves it.
+        let wide = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, Some(180_224))
+            .unwrap()
+            .expect("fits");
+        assert_eq!((wide.form, wide.context), (KvDtype::Q8, 180_224));
+    }
+
+    #[test]
+    fn a_card_that_carries_nothing_answers_none() {
+        let free = free_for(KvDtype::Q8, WEIGHTS, 1024) - 1;
+        let fit = choose_cuda_fit(&QWEN3_6_35B_A3B, free, WEIGHTS, None, None).unwrap();
+        assert_eq!(fit, None);
+        assert_eq!(
+            choose_cuda_fit(&QWEN3_6_35B_A3B, WEIGHTS - 1, WEIGHTS, None, None).unwrap(),
+            None
         );
     }
 }

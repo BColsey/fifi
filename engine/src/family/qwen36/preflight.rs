@@ -11,7 +11,7 @@ use crate::capability::Probe;
 use crate::family::admission_sketch::BandVerdict;
 use crate::family::plan_decision::{PlanAlternative, PlanDecision, PlanFixity};
 use crate::family::plan_rows::{RowsFit, RowsRequest};
-use crate::family::qwen36::admission_sketch::{cuda_demand_model, cuda_verdict_and_proposal};
+use crate::family::qwen36::admission_sketch::{card_demand_model, cuda_verdict_and_proposal};
 use crate::family::qwen36::settings::{
     Backend, KvDtype, Q36Env, Q36Options, Q36Settings, kv_dtype_name,
 };
@@ -75,8 +75,7 @@ pub(crate) fn rows_from_walk(
     disk_bytes: u64,
     free_bytes: &Probe<u64>,
 ) -> Result<(Vec<PlanDecision>, RowsFit), EngError> {
-    let (per_position, _state_bytes, demand_at) =
-        cuda_demand_model(&settings.spec, settings.kv, settings.activation)?;
+    let (per_position, _state_bytes, demand_at) = card_demand_model(&settings.spec, settings.kv)?;
 
     // One gate and one search, shared with the capability estimate: the
     // entry never re-implements the rule, it calls the same function with

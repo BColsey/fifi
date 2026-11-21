@@ -1684,8 +1684,16 @@ fn estimate_q36(
 
     // The one CUDA demand model: the same builder the family's preflight
     // rows call, so the estimate and the rows cannot drift apart.
-    let (per_position, state_bytes, cuda_demand_at) =
-        sketch::cuda_demand_model(spec, settings.kv, settings.activation)?;
+    // The card start charges the cache form it builds (fp16 for `f32`), not the MLX figure.
+    let (per_position, state_bytes, cuda_demand_at): (u64, u64, Box<dyn Fn(u32) -> _>) =
+        if backend == Backend::Cuda {
+            let (per_position, state, demand) = sketch::card_demand_model(spec, settings.kv)?;
+            (per_position, state, Box::new(demand))
+        } else {
+            let (per_position, state, demand) =
+                sketch::cuda_demand_model(spec, settings.kv, settings.activation)?;
+            (per_position, state, Box::new(demand))
+        };
     let kv_bytes = per_position
         .checked_mul(u64::from(settings.context_limit))
         .ok_or_else(|| {
@@ -2644,15 +2652,15 @@ mod tests {
             &facts,
         )
         .expect("estimate");
-        // The CUDA default cache is the F32 control: 40,960 B/position,
-        // and the DeltaNet state of the real spec is 65,863,680 bytes —
-        // the same figures the settings admission charges by.
-        assert_eq!(est.kv_bytes_per_position, 40_960);
+        // The CUDA default cache is the fp16 control: 20,480 B/position (the F32
+        // form of the spec, stored in two bytes), and the DeltaNet state of the
+        // real spec is 65,863,680 bytes — the figures the card start charges by.
+        assert_eq!(est.kv_bytes_per_position, 20_480);
         assert_eq!(est.fixed_state_bytes, 65_863_680);
         assert_eq!(est.context_limit, 32_768);
         assert_eq!(
             est.total_bytes,
-            20_000_000_000 + 40_960 * 32_768 + 65_863_680
+            20_000_000_000 + 20_480 * 32_768 + 65_863_680
         );
         // 24 GiB free against the full runtime charge model is a confident
         // fit for the 32K F32 default — the case the 850-permille share rule

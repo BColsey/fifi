@@ -1,4 +1,6 @@
 pub(crate) mod admission_sketch;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod card_fit;
 mod config;
 #[allow(
     dead_code,
