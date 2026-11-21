@@ -3,7 +3,10 @@
 use super::{super::weights::FlintCheckpoint, *};
 use crate::family::prefill::mlx::{local_expert_ids, sorted_expert_ids, submit_shared_expert};
 use crate::kernels::HostPages;
-use std::ops::Range;
+use std::{
+    ops::{ControlFlow, Range},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const EXPERTS: usize = 256;
 const TOP_K: u32 = 6;
@@ -41,7 +44,8 @@ impl Model {
         state: &mut State,
         tokens: &[u32],
         plan: PairPlan,
-    ) -> Result<()> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ControlFlow<()>> {
         let Some((first, second)) = tokens.split_at_checked(plan.split) else {
             return Err(EngError::BadRequest(
                 "Flint prefill pair split is outside the input".into(),
@@ -63,24 +67,32 @@ impl Model {
         let timing = super::super::mlx_expert_timing::ForwardTiming::begin(&self.kernels, 0);
         // Once writes begin, an execution failure requires the normal session reset.
         state.valid = false;
-        let _stage_peak = self.forward_pair(state, [first, second], rows, plan.staging)?;
-        state.pos = rows.iter().sum();
-        state.valid = true;
+        let (_stage_peak, forward) =
+            self.forward_pair(state, [first, second], rows, plan.staging, cancel)?;
+        if forward.is_continue() {
+            state.pos = rows.iter().sum();
+            state.valid = true;
+        }
         #[cfg(feature = "native-fault-qualification")]
         if let Some(timing) = timing {
             timing.finish_group(
                 &self.kernels,
-                state.pos,
+                rows.iter().sum(),
                 state.full_capacity,
                 Some(super::super::mlx_expert_timing::PairTiming {
                     piece_rows: rows,
                     stage_slots: plan.staging.slots(),
                     peak_experts: _stage_peak.experts,
                     peak_mapped_bytes: _stage_peak.mapped_bytes,
+                    completed_layers: match forward {
+                        ControlFlow::Break(layers) => layers,
+                        ControlFlow::Continue(()) => self.layers.len(),
+                    },
+                    cancelled: forward.is_break(),
                 }),
             );
         }
-        Ok(())
+        Ok(forward.map_break(|_| ()))
     }
 
     fn forward_pair(
@@ -89,7 +101,8 @@ impl Model {
         tokens: [&[u32]; 2],
         rows: [u32; 2],
         strategy: PairStaging,
-    ) -> Result<StagePeak> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(StagePeak, ControlFlow<usize>)> {
         let k = &mut self.kernels;
         state.ensure_full_capacity(k, rows.iter().sum())?;
         let [first, second] = tokens;
@@ -103,6 +116,10 @@ impl Model {
         let mut second_health = Vec::new();
         let mut stage_peak = StagePeak::default();
         for (index, (layer, plane)) in self.layers.iter().zip(&mut state.planes).enumerate() {
+            // The prior routed stage has evaluated both outputs and retired its pages.
+            if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                return Ok((stage_peak, ControlFlow::Break(index)));
+            }
             let plan = ChunkCachePlan::new(index, 0, rows[0], state.full_capacity)?;
             let first_input = FfnInput::prepare(k, layer, &first, plane, &plan)?;
             let plan = ChunkCachePlan::new(index, rows[0], rows[1], state.full_capacity)?;
@@ -144,7 +161,12 @@ impl Model {
         k.evaluate(&[&first, &second])?;
         mlx_route::read_step(k, None, &first_health)?;
         mlx_route::read_step(k, None, &second_health)?;
-        Ok(stage_peak)
+        let forward = if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            ControlFlow::Break(self.layers.len())
+        } else {
+            ControlFlow::Continue(())
+        };
+        Ok((stage_peak, forward))
     }
 }
 

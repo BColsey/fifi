@@ -82,6 +82,12 @@ impl GenerationState {
     }
 }
 
+pub(crate) enum PrefillPairOutcome {
+    Declined,
+    Completed,
+    Cancelled,
+}
+
 /// The calls the engine worker makes on an executor, in the worker's call order. `check_prompt`
 /// comes first: the worker asks it at the start of every job, before it resets a session or
 /// feeds a token, so a prompt that cannot fit is refused before any engine work.
@@ -160,15 +166,16 @@ pub(crate) trait ExecutorOps {
     }
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
-    /// Tries to consume a fresh prompt as two pieces in one call. Returning false
-    /// leaves the session untouched so the worker can feed the pieces separately.
+    /// Tries to consume a fresh prompt as two pieces in one call. A declined
+    /// pair leaves the session untouched. A cancelled pair requires a reset.
     fn try_prefill_pair(
         &mut self,
         _st: &mut Self::Session,
         _tokens: &[u32],
         _first_piece: usize,
-    ) -> Result<bool> {
-        Ok(false)
+        _cancel: &AtomicBool,
+    ) -> Result<PrefillPairOutcome> {
+        Ok(PrefillPairOutcome::Declined)
     }
     /// Commits one batch of tokens, or reports `Cancelled`.
     fn decode(

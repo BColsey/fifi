@@ -11,7 +11,7 @@ use crate::sched::job::{PrefixHit, PrefixReport};
 use crate::{
     EngError,
     family::{
-        executor::{ExecutorOps, GenerationState},
+        executor::{ExecutorOps, GenerationState, PrefillPairOutcome},
         mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         session::{
             DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper, check_prompt,
@@ -22,6 +22,7 @@ use crate::{
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 type Result<T> = std::result::Result<T, EngError>;
@@ -47,6 +48,7 @@ pub(super) struct FlintExecutor {
     /// priced by the route it will run.
     flash_prefill: bool,
     prefill_pair: PrefillPairPolicy,
+    cancel_prefill_pair: bool,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -96,16 +98,11 @@ impl FlintSession {
 pub(super) struct Step<'a> {
     model: &'a mut Model,
     state: &'a mut State,
-    pair: Option<PairPlan>,
 }
 
 impl<'a> Step<'a> {
     fn new(model: &'a mut Model, state: &'a mut State) -> Self {
-        Self {
-            model,
-            state,
-            pair: None,
-        }
+        Self { model, state }
     }
 }
 
@@ -117,9 +114,6 @@ impl TokenStepper for Step<'_> {
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
-        if let Some(plan) = self.pair {
-            return self.model.prefill_pair(self.state, tokens, plan);
-        }
         self.model
             .prefill_rows(self.state, tokens, false)
             .map(|_| ())
@@ -251,6 +245,8 @@ impl FlintExecutor {
                 request_prefill,
                 flash_prefill,
                 prefill_pair,
+                cancel_prefill_pair: std::env::var_os("FIFI_FLINT_MLX_CANCEL_PREFILL_PAIR")
+                    .is_some_and(|value| value == "1"),
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -780,15 +776,16 @@ impl ExecutorOps for FlintExecutor {
         st: &mut FlintSession,
         tokens: &[u32],
         first_piece: usize,
-    ) -> Result<bool> {
+        cancel: &AtomicBool,
+    ) -> Result<PrefillPairOutcome> {
         if !st.prefill_pair || !st.core.history().is_empty() || st.state.pos != 0 {
-            return Ok(false);
+            return Ok(PrefillPairOutcome::Declined);
         }
         let (Some(piece), Some(memory)) = (st.request_prefill_piece, &self.mlx_plan.memory) else {
-            return Ok(false);
+            return Ok(PrefillPairOutcome::Declined);
         };
         if first_piece != piece.get() {
-            return Ok(false);
+            return Ok(PrefillPairOutcome::Declined);
         }
         let Some(plan) = admitted_pair_plan(
             tokens.len(),
@@ -797,20 +794,21 @@ impl ExecutorOps for FlintExecutor {
             self.model.streamed_expert_bytes,
             self.prefill_pair,
         ) else {
-            return Ok(false);
+            return Ok(PrefillPairOutcome::Declined);
         };
         // DecodeSession leaves the last token pending. The split preserves
         // the boundary just before the first piece's former pending token.
-        st.core.prefill(
-            &mut Step {
-                model: &mut self.model,
-                state: &mut st.state,
-                pair: Some(plan),
-            },
-            tokens,
-            context_limit() as usize,
-        )?;
-        Ok(true)
+        let cancel = self.cancel_prefill_pair.then_some(cancel);
+        let forward = st
+            .core
+            .prefill_with(tokens, context_limit() as usize, |rows| {
+                self.model.prefill_pair(&mut st.state, rows, plan, cancel)
+            })?;
+        if forward.is_break() {
+            Ok(PrefillPairOutcome::Cancelled)
+        } else {
+            Ok(PrefillPairOutcome::Completed)
+        }
     }
 
     fn decode(
