@@ -214,9 +214,8 @@ fn empty_input_gives_empty_output() {
 #[test]
 fn unsupported_type_is_an_error() {
     let mut dst = vec![0f32; 32];
-    // Q4_0 left this list when the dequant plan wired it (scalar decode
-    // and the CUDA projector); only types plan() still refuses belong here.
-    for ty in [GgufType::Q2K, GgufType::Iq1S] {
+    // Only types plan() still refuses belong here (Q4_1 and Q5_1 have no decoder).
+    for ty in [GgufType::Q41, GgufType::Q51] {
         let src = vec![0u8; ty.block_bytes() as usize];
         assert!(matches!(
             dequantize_into(ty, &src, &mut dst),

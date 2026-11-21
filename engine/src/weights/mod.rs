@@ -22,7 +22,7 @@ pub(crate) use gguf_tables::KSIGNS_IQ2XS;
 /// of the IQ4_NL header (kernels/cuda/resident/matvec_q/tests.rs).
 #[cfg(feature = "native-cuda")]
 pub(crate) use gguf_tables::{
-    IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL,
 };
 mod gguf_identity;
 mod gguf_weights;

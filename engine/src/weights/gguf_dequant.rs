@@ -19,8 +19,8 @@
 
 use super::gguf::GgufType;
 use super::gguf_tables::{
-    IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
-    KVALUES_IQ4NL,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use crate::EngError;
 
@@ -360,6 +360,84 @@ fn iq4_xs(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// The IQ1 grid shift: every group of eight is `scale * (grid + delta)` with `delta` plus or
+/// minus this value.
+const IQ1_DELTA: f32 = 0.125;
+
+/// Q2_K: 84 bytes, 16 scale bytes (the low nibble scales the group, the high nibble is its
+/// minimum), 64 code bytes of 2-bit codes, then the f16 `d` at +80 and f16 `dmin` at +82.
+/// Value `i` (0..256): `half = i / 128`, `j = (i % 128) / 32`, `l = i % 32`; its code is bit
+/// pair `2 * j` of `qs[32 * half + l]`, its group is `scales[8 * half + 2 * j + l / 16]`, and
+/// the value is `d * (scale & 15) * code - dmin * (scale >> 4)` (the product rounded before
+/// the subtraction).
+fn q2_k(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 80);
+    let dmin = rd_f16(b, 82);
+    for (i, out) in y.iter_mut().enumerate() {
+        let (half, j, l) = (i / 128, (i % 128) / 32, i % 32);
+        let sc = b[8 * half + 2 * j + l / 16];
+        let code = (b[16 + 32 * half + l] >> (2 * j)) & 3;
+        let dl = d * f32::from(sc & 0x0f);
+        let ml = dmin * f32::from(sc >> 4);
+        *out = dl * f32::from(code) - ml;
+    }
+}
+
+/// IQ1_S: 50 bytes, f16 `d`, 32 low grid-index bytes, and eight u16 `qh` words, one per
+/// 32-value sub-block. Sub-block `ib` has four groups of eight; group `l` takes grid index
+/// `qs[4 * ib + l] | ((qh >> 3l) & 7) << 8`; bits 12..15 of `qh` are the 3-bit scale (the
+/// scale is `2 * s + 1`) and the sign of the shift (bit 15 set gives `-delta`).
+fn iq1_s(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    for ib in 0..8 {
+        let qh = rd_u16(b, 34 + 2 * ib);
+        let dl = d * (2 * u32::from((qh >> 12) & 7) + 1) as f32;
+        let delta = if qh & 0x8000 != 0 {
+            -IQ1_DELTA
+        } else {
+            IQ1_DELTA
+        };
+        for l in 0..4 {
+            let idx = usize::from(b[2 + 4 * ib + l]) | (usize::from((qh >> (3 * l)) & 7) << 8);
+            let grid = IQ1S_GRID[idx].to_le_bytes();
+            for j in 0..8 {
+                y[32 * ib + 8 * l + j] = dl * (f32::from(grid[j] as i8) + delta);
+            }
+        }
+    }
+}
+
+/// IQ1_M: 56 bytes (no scale field up front), 32 low grid-index bytes, 16 `qh` bytes (two per sub-block: the low three
+/// bits of each nibble are the high index bits of one group, bit 3 of the nibble the sign of
+/// its shift) and four u16 scale words at +48. The f16 super scale has no field of its own:
+/// the top four bits of the four scale words, in order, are its bits 0..3, 4..7, 8..11 and
+/// 12..15. Each word holds four 3-bit sub-block scales (`2 * s + 1`) in its low 12 bits:
+/// sub-block `ib` reads word `ib / 2`, shifts `6 * (ib % 2)` (groups 0 and 1) and
+/// `6 * (ib % 2) + 3` (groups 2 and 3).
+fn iq1_m(b: &[u8], y: &mut [f32]) {
+    let sc: [u16; 4] = std::array::from_fn(|i| rd_u16(b, 48 + 2 * i));
+    let d_bits =
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    let d = f16_to_f32(d_bits);
+    for ib in 0..8 {
+        let word = sc[ib / 2];
+        let dl = [
+            d * (2 * u32::from((word >> (6 * (ib % 2))) & 7) + 1) as f32,
+            d * (2 * u32::from((word >> (6 * (ib % 2) + 3)) & 7) + 1) as f32,
+        ];
+        for l in 0..4 {
+            let qh = b[32 + 2 * ib + l / 2];
+            let nib = (qh >> (4 * (l % 2))) & 0x0f;
+            let idx = usize::from(b[4 * ib + l]) | (usize::from(nib & 7) << 8);
+            let delta = if nib & 8 != 0 { -IQ1_DELTA } else { IQ1_DELTA };
+            let grid = IQ1S_GRID[idx].to_le_bytes();
+            for j in 0..8 {
+                y[32 * ib + 8 * l + j] = dl[l / 2] * (f32::from(grid[j] as i8) + delta);
+            }
+        }
+    }
+}
+
 fn nvfp4(b: &[u8], y: &mut [f32]) {
     // The GGUF integer-value convention makes code 8 positive zero.
     const VALUES: [f32; 16] = [
@@ -387,6 +465,9 @@ type Decoder = fn(&[u8], &mut [f32]);
 fn plan(ty: GgufType, src_len: usize) -> Result<(Decoder, usize, usize, usize), EngError> {
     let decode: Decoder = match ty {
         GgufType::Q20 => q2_0,
+        GgufType::Q2K => q2_k,
+        GgufType::Iq1S => iq1_s,
+        GgufType::Iq1M => iq1_m,
         GgufType::Q40 => q4_0,
         GgufType::Q3K => q3_k,
         GgufType::Q4K => q4_k,
@@ -563,6 +644,99 @@ mod tests {
         assert_eq!(f16_to_f32(0x8000).to_bits(), 0x8000_0000);
         assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
         assert_eq!(f16_to_f32(0x7d55).to_bits(), 0x7fea_a000);
+    }
+
+    /// Deterministic bytes: successive little-endian words of a splitmix64 stream.
+    fn stream_blocks(seed: u64, count: usize, size: usize) -> Vec<u8> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut out = Vec::with_capacity(count * size);
+        for _ in 0..count {
+            let mut block = Vec::new();
+            while block.len() < size {
+                block.extend_from_slice(&next().to_le_bytes());
+            }
+            out.extend_from_slice(&block[..size]);
+        }
+        out
+    }
+
+    fn hash_of(values: &[f32]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for v in values {
+            hasher.update(v.to_le_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Known answers from an independent implementation (the numpy decoders of gguf-py at
+    /// llama.cpp acecd5603): sixteen deterministic blocks per type, the f16 scale fields set
+    /// to fixed finite values, the SHA-256 of the f32 output bytes. The expected hashes were
+    /// computed once outside this tree.
+    #[test]
+    fn q2_k_iq1_s_and_iq1_m_match_an_independent_decoder() {
+        const D: [u16; 16] = [
+            8780, 8911, 9042, 9173, 9260, 9326, 9391, 9457, 9522, 9588, 9653, 9719, 9785, 9850,
+            9916, 9981,
+        ];
+        const DMIN: [u16; 16] = [
+            7324, 7507, 7691, 7874, 8058, 8217, 8308, 8400, 8492, 8584, 8675, 8767, 8859, 8951,
+            9042, 9134,
+        ];
+        const S: [u16; 16] = [
+            9503, 9699, 9896, 10093, 10265, 10363, 10461, 10559, 10658, 10756, 10854, 10953, 11051,
+            11149, 11248, 11305,
+        ];
+        const M: [u16; 16] = [
+            9134, 9306, 9437, 9568, 9699, 9830, 9961, 10093, 10224, 10297, 10363, 10428, 10494,
+            10559, 10625, 10691,
+        ];
+        let decode = |ty: GgufType, bytes: &[u8]| {
+            let mut out = vec![0f32; 16 * 256];
+            dequantize_into(ty, bytes, &mut out).expect("decode");
+            hash_of(&out)
+        };
+        let mut q2 = stream_blocks(0x51, 16, 84);
+        for i in 0..16 {
+            q2[84 * i + 80..84 * i + 82].copy_from_slice(&D[i].to_le_bytes());
+            q2[84 * i + 82..84 * i + 84].copy_from_slice(&DMIN[i].to_le_bytes());
+        }
+        assert_eq!(
+            decode(GgufType::Q2K, &q2),
+            "b1937a6ae9400306a226356b0bbcca003e44c7091c0fda167bcbf2e0e634257c"
+        );
+        let mut s1 = stream_blocks(0x52, 16, 50);
+        for i in 0..16 {
+            s1[50 * i..50 * i + 2].copy_from_slice(&S[i].to_le_bytes());
+        }
+        assert_eq!(
+            decode(GgufType::Iq1S, &s1),
+            "3178868383e701c4d00fccb83ad4d003f426a422ee71a404486432c2e6e525ea"
+        );
+        let mut m1 = stream_blocks(0x53, 16, 56);
+        for i in 0..16 {
+            for w in 0..4 {
+                let at = 56 * i + 48 + 2 * w;
+                let low = u16::from_le_bytes([m1[at], m1[at + 1]]) & 0x0fff;
+                m1[at..at + 2]
+                    .copy_from_slice(&(low | (((M[i] >> (4 * w)) & 0xf) << 12)).to_le_bytes());
+            }
+        }
+        assert_eq!(
+            decode(GgufType::Iq1M, &m1),
+            "a38596b6ee24b3d93deeab98360033868cde817d6ed9d011aed8bf7b3d0f83b3"
+        );
     }
 
     #[test]
