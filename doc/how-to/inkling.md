@@ -36,8 +36,8 @@ FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
 | Artifact | Inspect | Load and generate | HTTP |
 | --- | --- | --- | --- |
 | Publisher NVFP4/MXFP8 safetensors | Yes | Real checkpoint, Metal experts | Raw, chat, and multi-turn WebGUI |
-| Mainline `inkling2_loop` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
-| Repository-root `inkling2` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
+| Mainline `inkling2_loop` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
+| Repository-root `inkling2` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Explicit file-path raw completions and streamed chat verified at `71aa350c` |
 
 At `71aa350c`, `enginesrv check` and `serve --print-config` selected the native Inkling family for both real GGUF files and the publisher safetensors under the 6 GiB ceiling. Both GGUF artifacts returned the reference three-token continuation with temperature zero in the earlier `8a6c6347` HTTP runs. The table covers text. Vision and DSpark have separate qualification.
 
@@ -94,7 +94,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | 3 | Reduce attributed disk reads | The five-prompt-token, twelve-output-token repeated 5 GiB control on `f45062d7` reproduced 1.65 decode tok/s, 9.604 GB of logical expert reads and 6.551 GB of process-attributed disk reads. A 1,536-visit trace reproduced all 3,909 cache misses under byte-weighted LRU. All 4,388 repeated expert selections within the same token’s core passes hit the cache. Across tokens, 3,991 of 6,632 repeated selections hit. Layers 23 and 22 accounted for the most logical reads. Adjacent expert coalescing saved 312 read ranges on the first request and 282 on its repeat, measured against a one-range-per-expert-tensor replay with identical payload bytes. Frequency-based replay increased logical payload reads by 3.7%. The balanced 5 GiB repeat below reproduced a smaller physical I/O reduction. The longer prompt reproduced lower disk reads with higher first-request latency. The first sustained comparison overlapped an iOS CI job. Repeat it in reverse order when the host is idle. Keep mapped storage opt-in. |
 | 4 | Measure placement | On the safetensors short repeat, 11 decode steps spent 1.68 s in CPU attention, 3.90 s in expert staging including 2.80 s of demand reads, and 1.11 s in synchronized Metal readback. Real-weight one-row QKV tests favored four CPU workers over the widened Metal path. Measure the end-to-end worker change and record the complete GGUF breakdown. |
 | 5 | Verify scaling | The 1 GiB safetensors server was rejected at admission with a 128-token context. At the verified 192-token context, preflight also rejected all three artifacts with a 1 GiB ceiling. The safetensors plan required 3,471,813,632 bytes, and each GGUF plan required 1,206,322,432 bytes. The planner correctly applied the 5 GiB, 6 GiB and automatic ceilings on the mini. Recheck latency and swap once the competing iOS CI build has cleared. The larger-device planner checks use simulated budgets. |
-| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, and both full checkpoints selected the reference token. The fork matched all ten leading external-reference IDs. Complete the explicit-file chat and measure grouped expert projections. |
+| 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, and both full checkpoints selected the reference token. The fork matched all ten leading external-reference IDs. Both explicit file paths passed repeated raw completions and streamed chat at `71aa350c`. Measure the opt-in grouped projections and CPU workers. |
 
 The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
 
@@ -168,6 +168,17 @@ Both variants used the same real IQ2_XXS checkpoints, mapped dense projections, 
 
 Both selected token 152717. The fork logit vector had cosine similarity 0.999973 to the pinned Unsloth llama.cpp reference and matched the ordered top ten. The six-format test logged 3,840 packed projections and zero expanded expert projections on each layout. CPU attention projection took the largest measured share. Metal readback includes evaluating the submitted expert work.
 
+### GGUF serving at 6 GiB
+
+Under the ordinary explicit-file launch with `71aa350c`, both layouts returned `" Paris.\n\n"` twice. The streamed chat then displayed “Paris,” returned separate reasoning, and ended at EOS with `[DONE]`. The chat requests used 24 input tokens, a 192-token context, and the same settings.
+
+| Layout | Raw repeat TTFT | Raw repeat decode | Chat TTFT | Chat decode | Chat wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Unsloth fork | 7.16 s | 0.57 tok/s | 38.43 s | 0.55 tok/s | 139.26 s |
+| Mainline | 6.96 s | 0.58 tok/s | 42.34 s | 0.53 tok/s | 145.64 s |
+
+Both chats used 56 completion tokens including EOS. CPU attention projections took 72.87 s on the fork and 73.79 s on mainline across prefill and decode. Metal expert readback took 30.03 s and 30.69 s. Each three-token raw repeat recorded 8,192 process-attributed disk bytes and zero swap-out pages. The OS page cache was uncontrolled.
+
 The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefill tok/s and 13.74 decode tok/s on the fork with 12 output tokens and full Metal offload. Its effective context was 256 tokens and it did not use fifi's 6 GiB budget. Those are reference-runtime observations.
 
 ### Cache experiments awaiting device qualification
@@ -178,7 +189,7 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 
 `FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. Compare this flag with the same single-copy cache setting and inspect actual synchronization counts and complete model logits before using it for timing.
 
-`FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. Verify full logits and measure CPU time, disk bytes, and request latency at the same ceiling.
+`FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. The `e9f74c2b` preflight verified this charge and the independent grouped-expert charge on both real files. With both optimizations enabled, each GGUF preflight required 1,263,707,392 bytes and rejected a 1 GiB ceiling. Verify full logits and measure CPU time, disk bytes, and request latency at the same ceiling.
 
 ### Speculative read replay
 
