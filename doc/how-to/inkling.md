@@ -64,7 +64,7 @@ Use a dedicated server on loopback with the original checkpoint and the verified
 }
 ```
 
-Launch it with the native opt-in and budget from above, using `enginesrv --config /path/to/config.json`. To exercise the WebGUI, set `web_dir` at the top level to the built WebGUI directory. Open the loopback address in a browser, select Inkling in the model picker, and send “Name the capital of France. Answer in one word.” For a follow-up, send “Which country is that city in? Answer in one word.” The measured browser run displayed “Paris” and “France” using a 192-token context and a 144-token output limit. Run the suite from the repository root once the model is ready. Python 3.9 or later is sufficient.
+Launch it with `enginesrv --config /path/to/config.json`. To exercise the WebGUI, set `web_dir` at the top level to the built WebGUI directory. Open the loopback address in a browser, select Inkling in the model picker, and send “Name the capital of France. Answer in one word.” For a follow-up, send “Which country is that city in? Answer in one word.” The measured browser run displayed “Paris” and “France” using a 192-token context and a 144-token output limit. Run the suite from the repository root once the model is ready. Python 3.9 or later is sufficient.
 
 ```sh
 python3 -B engine/tests/tools/check_inkling_serving.py \
@@ -98,7 +98,7 @@ Use the 16 GiB M4 Mac mini for hardware results. The publisher safetensors revis
 | 5 | Verify scaling | At a 192-token context, preflight rejected all three artifacts with a 1 GiB ceiling. The safetensors plan required 3,471,813,632 bytes, and each GGUF plan required 1,206,322,432 bytes. The mini applied the 5 GiB, 6 GiB and automatic ceilings on both `8a6c6347` and `e9f74c2b` in the idle-host runs below. On both builds, automatic sizing incurred swap-outs on the first request and hit every expert on the repeat. The larger-device planner unit test uses simulated 24, 48 and 96 GiB working sets. |
 | 6 | Qualify each GGUF layout | `6df5ccc4` adds mainline and fork tensor adapters and a CPU reference path. At `4138d0df`, both complete IQ2_XXS artifacts selected token 152717 through the GPU decoder. The fork’s 200,058-logit vector had cosine similarity 0.999983 to the pinned Unsloth runtime and matched its top-ten set. Both layouts passed repeated raw HTTP at `8a6c6347`. The fork’s full-logit comparison at that revision matched all ten leading reference IDs with cosine similarity 0.999974. At `71aa350c`, all six Metal formats matched their CPU block references, both full checkpoints selected the reference token, and the fork matched all ten leading external-reference IDs. Both explicit file paths passed repeated raw completions and streamed chat at `71aa350c`. At `e9f74c2b`, each serving layout passed the matched single-copy, grouped projection and CPU worker trials below. Both also passed repeated raw completions and streamed chat with all three flags enabled. |
 
-The comparison controls are opt-in. `FIFI_INKLING_PREFILL_ROWS=1` selects serial prefill. Larger values request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
+The safetensors prefill width defaults to one row. Larger values of `FIFI_INKLING_PREFILL_ROWS` request up to 16 rows subject to admission. `FIFI_INKLING_EXPERT_TIMING=1` emits per-request cache totals and load, prefill and decode records. The prefill record includes computing logits for the final prompt token. With either expert timing or `FIFI_INKLING_COMPONENT_TIMING=1`, the phase log includes logical dense positional reads and logical mapped spans. Compare physical I/O using the separate process-attributed disk byte counter. `FIFI_INKLING_ROUTE_TRACE=1` emits each visit’s physical layer, selected and missing experts, cache capacity and read time. Use a separate trace run when measuring throughput.
 
 The release parity fixture runs seven positions on the full mixed-format checkpoint. It compares all 200,058 logits at every position, including a short final window and a follow-up decode. It checks that the grouped path actually visits experts fewer times. The focused tests separately check local and full attention boundaries, independent convolution streams, and a separate state slot for each of the 48 scheduled visits across all three core passes.
 
@@ -383,7 +383,8 @@ The measured 5 GiB route trace spent 9.13 s in demand reads across 1,536 visits.
 Run the driver from the repository root with the release server binary and a new output directory.
 
 ```sh
-FIFI_INKLING_PREFILL_ROWS=1 python3 -B engine/tests/tools/bench_inkling.py \
+FIFI_INKLING_PREFILL_ROWS=1 FIFI_INKLING_ATTN_CPU_WORKERS=1 \
+  python3 -B engine/tests/tools/bench_inkling.py \
   --server engine/target/release/enginesrv --model ~/models/inkling2-mini \
   --output-dir /path/to/scratch/inkling-5g --ceiling-mib 5120 --max-tokens 12
 ```
@@ -403,5 +404,7 @@ For the sustained 5 GiB storage comparison, set `FIFI_INKLING_MMAP_DENSE` and `F
 ## Integration status
 
 The benchmark measurements used `e9f74c2b` on integration base `ee830759` with the measured settings selected explicitly. The newer local defaults enable native selection, CPU attention workers, and the qualified GGUF settings. Safetensors mapped storage and multi-row prefill remain explicit settings because their physical I/O gains varied by workload. Integration and publication are pending under the repository synchronization hold. The published draft remains open at `e2a3f054`. [Draft PR #97](https://github.com/zbrdc/fifi/pull/97)
+
+On `b2b51d94`, normal CLI serving with no performance overrides returned the same two greedy 12-token responses as the qualified build on all three artifacts. The M4 mini admitted 5 GiB for safetensors and 6 GiB for GGUF with zero swap-outs during the requests. Repeat decode measured 1.68 tok/s for safetensors, 0.98 tok/s for the GGUF fork, and 0.97 tok/s for mainline GGUF. The runs used an uncontrolled OS page cache. Preflight also verified the explicit ceiling override, backend disable settings, and a fitting longer context with cache retention reduced to zero.
 
 The release build passed the focused Inkling tests, the 12 HTTP cases, and the two-turn WebGUI check. Both GGUF layouts passed normal CLI serving and streamed chat. All seven safetensors timing cases passed the final idle-host audit. Portable all-target Clippy and native library Clippy passed. The broader native all-target Clippy run recorded the existing Qwen3.6 `chunks_exact_to_as_chunks` lint in `resident/prefill/step.rs`.
