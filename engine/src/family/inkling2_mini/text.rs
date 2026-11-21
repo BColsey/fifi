@@ -348,6 +348,38 @@ impl Decoder {
             }
             return Ok(out);
         };
+        let first = cache.routed_group_len(layer, &routes, 0)?;
+        if first == routes.rows() {
+            return Self::mlx_moe_group(cache, metal, layer, inputs, &routes);
+        }
+        let mut out = Vec::with_capacity(inputs.len() * HIDDEN);
+        let mut start = 0;
+        let mut count = first;
+        loop {
+            let end = start + count;
+            let group = routes.select_rows(start..end);
+            out.extend(Self::mlx_moe_group(
+                cache,
+                metal,
+                layer,
+                &inputs[start..end],
+                &group,
+            )?);
+            if end == routes.rows() {
+                return Ok(out);
+            }
+            start = end;
+            count = cache.routed_group_len(layer, &routes, start)?;
+        }
+    }
+
+    fn mlx_moe_group(
+        cache: &mut MlxExpertCache,
+        metal: &mut MlxKernels,
+        layer: usize,
+        inputs: &[Row],
+        routes: &InklingRoutes,
+    ) -> Result<Vec<bf16>, EngError> {
         let shape = vec![inputs.len() as u32, HIDDEN as u32];
         let host = Tensor::try_from_host(
             Dtype::F32,
@@ -358,7 +390,7 @@ impl Decoder {
                 .flat_map(|x| x.to_le_bytes())
                 .collect(),
         )?;
-        let host = cache.forward_quantized_readback(metal, layer, &routes, &host)?;
+        let host = cache.forward_quantized_readback(metal, layer, routes, &host)?;
         if host.dtype() != Dtype::F32 || host.shape() != shape.as_slice() {
             return Err(invalid());
         }
@@ -721,10 +753,11 @@ mod tests {
                 "logit differed at sequence position {index}"
             );
             assert_eq!(decoder.position(), index + 1);
-            assert_eq!(
-                decoder.expert_cache_stats().visits - before,
-                (index.div_ceil(decoder.prefill_rows()) + 1) as u64 * visits_per_window,
-            );
+            let observed = decoder.expert_cache_stats().visits - before;
+            let min_visits =
+                (index.div_ceil(decoder.prefill_rows()) + 1) as u64 * visits_per_window;
+            let max_visits = (index + 1) as u64 * visits_per_window;
+            assert!((min_visits..=max_visits).contains(&observed));
         }
     }
 
