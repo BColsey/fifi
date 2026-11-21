@@ -468,6 +468,12 @@ fn admit<E: ExecutorOps>(
 ) -> Result<Slot<E::Session>, (EngError, Box<Job>)> {
     match build_slot(executor, pool, job, prefill_chunk) {
         Ok(slot) => Ok(slot),
+        Err((EngError::MemoryPlan(message), job_back))
+            if !executor.eviction_frees_session_memory() =>
+        {
+            // The sessions and the prefix entries do not share memory: the denial stands.
+            Err((EngError::MemoryPlan(message), job_back))
+        }
         Err((EngError::MemoryPlan(message), job_back)) => {
             // The eviction restart for admission itself, incrementally: `new_session`
             // charges fixed state and the restore charges its entry before any prefill
@@ -664,10 +670,20 @@ pub(super) fn work<E: ExecutorOps>(
             // A job that capacity refused waits at the head of the line, ahead of the queue. It
             // asks again when a slot has freed since its refusal and once a second otherwise.
             let (job, ticket, fresh) = match waiting.take() {
-                Some(held) if slots.len() < held.live || Instant::now() >= held.retry_at => {
+                // A slot has freed since the refusal: its session is in the pool, or its memory is back.
+                Some(held) if slots.len() < held.live => (held.job, held.ticket, false),
+                // The timed retry asks the executor first: an allocation that cannot fit would
+                // stall the live streams for nothing.
+                Some(held)
+                    if Instant::now() >= held.retry_at
+                        && (!pool.free.is_empty() || executor.can_admit_session()) =>
+                {
                     (held.job, held.ticket, false)
                 }
-                Some(held) => {
+                Some(mut held) => {
+                    if Instant::now() >= held.retry_at {
+                        held.retry_at = Instant::now() + WAIT_RETRY;
+                    }
                     waiting = Some(held);
                     break;
                 }

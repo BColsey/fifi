@@ -226,6 +226,29 @@ mod device {
             }
         }
 
+        /// Whether the device has room for one more session's planes and the headroom. A probe
+        /// that cannot read the device says yes, and the allocation decides.
+        fn can_admit_session(&self) -> bool {
+            let Some(cost) = budget::bolt_seq_cost() else {
+                return true;
+            };
+            let per_session = cost
+                .per_position
+                .saturating_mul(CELLS as u64)
+                .saturating_add(cost.fixed)
+                .saturating_add(budget::BOLT_HEADROOM_BYTES);
+            self.model
+                .ctx
+                .memory_info()
+                .map_or(true, |info| info.free as u64 >= per_session)
+        }
+
+        /// The entries live in host memory and the sessions on the device: dropping an entry does
+        /// not make room for a session.
+        fn eviction_frees_session_memory(&self) -> bool {
+            false
+        }
+
         fn prompt_rows_per_tick(&self) -> Option<usize> {
             (self.max_seqs > 1).then_some(self.prompt_rows)
         }

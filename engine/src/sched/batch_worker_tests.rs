@@ -126,6 +126,10 @@ struct WindowFake {
     idle_pieces: usize,
     /// Answers the trait's default policy instead of the opted-in one.
     default_policy: bool,
+    /// What `can_admit_session` answers while a test holds the device full; `None` says yes.
+    fits: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether evicting prefix entries can free a session's memory (the trait's default is yes).
+    eviction_frees: bool,
 }
 
 impl WindowFake {
@@ -165,6 +169,8 @@ impl WindowFake {
             idle_trim: Some(Duration::from_secs(3600)),
             idle_pieces: 8,
             default_policy: false,
+            fits: None,
+            eviction_frees: true,
         }
     }
 
@@ -216,6 +222,16 @@ impl ExecutorOps for WindowFake {
         self.prompt_share
     }
 
+    fn can_admit_session(&self) -> bool {
+        self.fits
+            .as_ref()
+            .is_none_or(|fits| fits.load(Ordering::SeqCst))
+    }
+
+    fn eviction_frees_session_memory(&self) -> bool {
+        self.eviction_frees
+    }
+
     fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
         if self.default_policy {
             return crate::family::executor::BatchPolicy::default();
@@ -233,6 +249,7 @@ impl ExecutorOps for WindowFake {
             None => self.session_cap,
         };
         if cap.is_some_and(|cap| self.created >= cap) {
+            self.note("new_session_refused");
             return Err(EngError::MemoryPlan(
                 "the device holds no more sessions".into(),
             ));
@@ -2736,11 +2753,37 @@ fn waiting_engine(
     (engine, long_events, waiter_events, cancel)
 }
 
+/// Whether a job has not yet ended, from the events it has sent so far. It reads without
+/// waiting and consumes the events it reads, never the terminal one.
+fn still_running(handle: &mut JobHandle) -> bool {
+    loop {
+        match handle.events.try_recv() {
+            Ok(JobEvent::Finished(_) | JobEvent::Error(_)) => return false,
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
+        }
+    }
+}
+
+/// Waits until the fake has refused a session to the waiting job: from then on the job is out of
+/// the channel and waiting.
+fn wait_until_refused(log: &Log) {
+    wait(|| {
+        lock(log)
+            .calls
+            .iter()
+            .any(|call| call == "new_session_refused")
+    });
+}
+
 #[test]
 fn a_waiting_job_counts_as_queued_and_gets_one_started_event() {
     let log = Log::default();
     let (engine, long_events, waiter_events, _cancel) = waiting_engine(&log);
-    wait(|| engine.handle().queued() == 1);
+    // Queued is also 1 while the job still sits in the channel: wait until it has been taken
+    // out, refused and made to wait, and only then ask.
+    wait_until_refused(&log);
     assert_eq!(
         engine.handle().queued(),
         1,
@@ -2898,4 +2941,86 @@ fn an_executor_that_does_not_opt_into_the_trim_keeps_one_session_after_a_burst()
     assert_eq!(usage(&collect(again_events)).completion_tokens, 2);
     assert_eq!(snapshot(&engine).sessions_created, 3);
     engine.shutdown();
+}
+
+#[test]
+fn a_retry_that_cannot_fit_does_not_allocate_and_one_that_can_does() {
+    // While the device is full, the one-second retries skip the allocation: only the first
+    // attempt, which found the refusal, called new_session. When room returns the job is admitted
+    // at the next retry with the stream still running.
+    let log = Log::default();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let fits = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut fake = WindowFake::new(&log);
+    fake.max = 2;
+    fake.live_cap = Some(Arc::clone(&live));
+    fake.fits = Some(Arc::clone(&fits));
+    // No prefix entry to evict, so the first refusal is a single allocation attempt.
+    fake.evictions = 0;
+    fake.window_delay = Some(Duration::from_millis(5));
+    let (engine, release) = start(fake);
+    let (long, mut long_events) = job(&[0], 1_000);
+    let (waiter, waiter_events) = job(&[1], 3);
+    engine.handle().try_submit(long).expect("long");
+    engine.handle().try_submit(waiter).expect("waiter");
+    release.send(()).expect("load");
+    wait_until_refused(&log);
+    std::thread::sleep(Duration::from_millis(2_300));
+    let asked = lock(&log)
+        .calls
+        .iter()
+        .filter(|call| *call == "new_session")
+        .count();
+    assert_eq!(
+        asked, 1,
+        "two retry intervals passed without another allocation"
+    );
+    live.store(2, Ordering::SeqCst);
+    fits.store(true, Ordering::SeqCst);
+    assert_eq!(usage(&collect(waiter_events)).completion_tokens, 3);
+    assert!(still_running(&mut long_events));
+    collect(long_events);
+    engine.shutdown();
+}
+
+#[test]
+fn an_executor_whose_prefix_entries_do_not_share_session_memory_is_not_made_to_evict() {
+    // A lone job after a failed window finds the pool empty and the device full. With entries that
+    // share the session budget the worker evicts before it reports the denial; with host-memory
+    // entries it does not, and they stay.
+    let evictions = |frees: bool| {
+        let log = Log::default();
+        let mut fake = WindowFake::new(&log);
+        fake.max = 2;
+        fake.session_cap = Some(2);
+        fake.failure = Some(Failure::Local);
+        fake.eviction_frees = frees;
+        let (engine, release) = start(fake);
+        let (first, first_events) = job(&[0], 3);
+        let (second, second_events) = job(&[1], 3);
+        engine.handle().try_submit(first).expect("first");
+        engine.handle().try_submit(second).expect("second");
+        release.send(()).expect("load");
+        collect(first_events);
+        collect(second_events);
+        let (alone, alone_events) = job(&[2], 3);
+        engine.handle().try_submit(alone).expect("alone");
+        assert!(matches!(
+            collect(alone_events).last(),
+            Some(JobEvent::Error(EngError::MemoryPlan(_)))
+        ));
+        let evicted = lock(&log)
+            .calls
+            .iter()
+            .filter(|call| *call == "evict")
+            .count();
+        engine.shutdown();
+        evicted
+    };
+    assert!(evictions(true) > 0, "the default evicts before it refuses");
+    assert_eq!(
+        evictions(false),
+        0,
+        "host-memory entries are not evicted for a device shortage"
+    );
 }

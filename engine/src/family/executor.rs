@@ -109,6 +109,20 @@ pub(crate) trait ExecutorOps {
             "this executor does not support decode windows".into(),
         ))
     }
+    /// Whether a new session can be allocated now. The batch worker asks before a timed retry of a
+    /// job that the executor refused for lack of memory, so a retry that cannot fit does not pay an
+    /// allocation, a zero fill and a stream drain while other streams decode. The default says yes.
+    fn can_admit_session(&self) -> bool {
+        true
+    }
+    /// Whether evicting prefix entries can free the memory a new session needs. Executors whose
+    /// entries share the session budget (Qwen3.6) say yes, and the worker evicts one entry at a
+    /// time before it reports a denial. An executor whose entries live in host memory while its
+    /// sessions live on the device says no: a device shortage is not cured by dropping them, and
+    /// they stay.
+    fn eviction_frees_session_memory(&self) -> bool {
+        true
+    }
     /// The choices of the batch worker that an executor opts into once it has measured them. The
     /// default keeps the worker's shared budget and keeps every session for the life of the
     /// engine.
