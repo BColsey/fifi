@@ -43,6 +43,9 @@ pub(super) struct FlintExecutor {
     mlx_plan: MlxExecutionPlan,
     request_sized_kv: bool,
     request_prefill: bool,
+    /// Whether the startup route is the float-flash prefill kernel, so a request-sized piece is
+    /// priced by the route it will run.
+    flash_prefill: bool,
     prefill_pair: PrefillPairPolicy,
     eos: Vec<u32>,
     pub(super) vocab: usize,
@@ -192,11 +195,12 @@ impl FlintExecutor {
         let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
             std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
         ));
-        let (prefill_piece, memory) = if let Some((device, charges, _)) = reserve {
-            let (piece, memory) = device_prefill_piece(device, &model, max_rows, &charges)?;
-            (piece, Some(memory))
+        let (prefill_piece, memory, flash_prefill) = if let Some((device, charges, _)) = reserve {
+            let (piece, memory, flash_prefill) =
+                device_prefill_piece(device, &model, max_rows, &charges)?;
+            (piece, Some(memory), flash_prefill)
         } else {
-            (max_rows, None)
+            (max_rows, None, false)
         };
         let (placement, placement_reason) = if model.streamed_expert_bytes != 0 {
             ("disk_experts", "full expert banks exceed the device budget")
@@ -243,6 +247,7 @@ impl FlintExecutor {
                 mlx_plan,
                 request_sized_kv,
                 request_prefill,
+                flash_prefill,
                 prefill_pair,
                 eos,
                 vocab,
@@ -475,7 +480,7 @@ fn device_prefill_piece(
     model: &Model,
     max_rows: usize,
     session: &[(&'static str, u64)],
-) -> Result<(usize, MlxPrefillMemory)> {
+) -> Result<(usize, MlxPrefillMemory, bool)> {
     // Model::open_for_budget has imported its resident arrays. The allocator
     // count includes those arrays; the prefill reserve separately prices the
     // whole session including the fixed-size rings.
@@ -526,6 +531,7 @@ fn device_prefill_piece(
             base_charges: charges.into_iter().collect(),
             workspace: [("expert_staging_bytes", staging)].into(),
         },
+        flash_prefill,
     ))
 }
 
@@ -674,6 +680,21 @@ fn request_span_admits_a_wider_piece_at_the_same_budget() {
         fitting_prefill_piece(1024, 2041, just_fits - 1, expert, false).unwrap(),
         512
     );
+    // The flash route's workspace does not depend on the prompt span, so the request-sized
+    // piece equals the startup piece on the same budget, and the piece changes at the edge of
+    // the flash charge.
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, remaining, expert, true).unwrap(),
+        fitting_prefill_piece(1024, 32768, remaining, expert, true).unwrap(),
+        "flash workspace is independent of prompt span"
+    );
+    let flash_edge = FLASH_PREFILL_BASE_BYTES
+        + FLASH_PREFILL_ROW_BYTES * 512
+        + expert_staging_bytes(expert, 512);
+    assert_eq!(
+        fitting_prefill_piece(1024, 2041, flash_edge, expert, true).unwrap(),
+        512
+    );
 }
 
 impl ExecutorOps for FlintExecutor {
@@ -717,7 +738,7 @@ impl ExecutorOps for FlintExecutor {
                     prompt_rows as u32,
                     memory.remaining_bytes,
                     self.model.streamed_expert_bytes,
-                    false,
+                    self.flash_prefill,
                 )?);
             }
             st.request_prefill_piece = NonZeroUsize::new(rows);
