@@ -23,6 +23,7 @@ const EXPERTS: usize = 128;
 const TOP_K: usize = 8;
 const HIDDEN: usize = 2304;
 const INTERMEDIATE: usize = 1152;
+const QUERY_HEADS: usize = 24;
 const KV_HEADS: u64 = 8;
 const HEAD_DIM: u64 = 128;
 const WINDOW: u32 = 1024;
@@ -47,6 +48,9 @@ struct TextConfig {
     num_attention_heads: usize,
     num_key_value_heads: u64,
     head_dim: u64,
+    swa_num_attention_heads: usize,
+    swa_num_key_value_heads: u64,
+    swa_head_dim: u64,
     vocab_size: usize,
     unpadded_vocab_size: usize,
     model_max_length: u32,
@@ -107,9 +111,12 @@ fn validate_config(bytes: &[u8]) -> Result<(), EngError> {
     if text.num_hidden_layers != LAYERS
         || text.hidden_size != HIDDEN
         || text.intermediate_size != INTERMEDIATE
-        || text.num_attention_heads != 24
+        || text.num_attention_heads != QUERY_HEADS
         || text.num_key_value_heads != KV_HEADS
         || text.head_dim != HEAD_DIM
+        || text.swa_num_attention_heads != QUERY_HEADS
+        || text.swa_num_key_value_heads != KV_HEADS
+        || text.swa_head_dim != HEAD_DIM
         || text.vocab_size != 201_024
         || text.unpadded_vocab_size != 200_058
         || text.model_max_length != MAX_CONTEXT

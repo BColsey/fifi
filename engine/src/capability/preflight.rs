@@ -603,15 +603,16 @@ fn inkling2_mini_preflight(
     let decisions = match plan {
         Ok(rows) => {
             checks.push(Check::new(
-                "Inkling 2 Mini checkpoint",
+                "Inkling 2 Mini expert layout",
                 CheckStatus::Pass,
-                "fixed loop and mixed expert storage verified from headers".into(),
+                "fixed-loop config, shard inventory and mixed expert layout verified from headers"
+                    .into(),
             ));
             rows
         }
         Err(error) => {
             checks.push(Check::new(
-                "Inkling 2 Mini checkpoint",
+                "Inkling 2 Mini expert layout",
                 CheckStatus::Fail,
                 super::describe_error(&error),
             ));
