@@ -10,12 +10,13 @@ use crate::{
     EngError,
     family::{
         device_budget::KvPlan,
+        flash_next::host_plan::{HostFrame, NGRAM_STAGING_BYTES_PER_ROW},
         flash_next::moe::{
             slot_bank::SlotBankLayout,
             tier_plan::{TierInputs, TierPlan, TierShape, position_bytes},
         },
         mem::HostFacts,
-        tier_budget::{HostBudget, VramBudget},
+        tier_budget::VramBudget,
         tiered_classify::classify_reference,
     },
 };
@@ -57,13 +58,7 @@ fn plan_with_slots(slots: usize) -> TierPlan {
             positions: 1,
             bytes_per_position: 1,
         },
-        host: HostBudget {
-            total: 256 * GIB,
-            non_reclaimable: 0,
-            engine_heap: 0,
-            staging: 0,
-            margin: 0,
-        },
+        host: HostFrame::with_default_terms(HostMemory::from_pair(256 * GIB, 256 * GIB)),
         ring_backing_bytes: 0,
     })
     .unwrap()
@@ -93,10 +88,7 @@ fn gib(bytes: u64) -> f64 {
 }
 
 fn host(available: u64) -> HostMemory {
-    HostMemory {
-        total: HOST_TOTAL,
-        available,
-    }
+    HostMemory::from_pair(HOST_TOTAL, available)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -146,19 +138,13 @@ fn the_geometry_takes_the_plan_and_refuses_another_record_size() {
 fn the_os_floor_is_a_tenth_of_the_ram_with_an_8_gib_minimum() {
     // `HostMemory` carries figures its caller probed (the admission snapshot); the
     // meminfo parsing itself lives in `family::mem` and is tested there.
-    let memory = HostMemory {
-        total: HOST_TOTAL,
-        available: 50_000_000 * 1024,
-    };
+    let memory = HostMemory::from_pair(HOST_TOTAL, 50_000_000 * 1024);
     assert_eq!(
         memory.os_floor(),
         8 * GIB,
         "a tenth of 62 GiB is under the 8 GiB floor"
     );
-    let big = HostMemory {
-        total: 200 * GIB,
-        available: 100 * GIB,
-    };
+    let big = HostMemory::from_pair(200 * GIB, 100 * GIB);
     assert_eq!(big.os_floor(), 20 * GIB);
 }
 
@@ -259,10 +245,7 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
         )
         .unwrap()
     };
-    let memory_of = |admission: &HostFacts| HostMemory {
-        total: 64 * GIB,
-        available: admission.budget(),
-    };
+    let memory_of = |admission: &HostFacts| HostMemory::from_pair(64 * GIB, admission.budget());
 
     // Uncapped the inclusive store plans and its bytes pass the guard on the same snapshot.
     let uncapped = admission(None);
@@ -302,8 +285,8 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
         message(HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms).unwrap_err());
     assert!(error.contains("42949672960"), "{error}");
 
-    // The same snapshot through the tier plan: non-reclaimable is the total minus the budget,
-    // never the bare meminfo figure.
+    // The same snapshot through the tier plan: the frame carries the cgroup budget the guard
+    // admits against, never the bare meminfo figure.
     let inputs = TierInputs::measured(
         shape(),
         (0, 0),
@@ -312,10 +295,11 @@ fn a_cgroup_capped_budget_takes_the_exclusive_store_and_names_the_cap_when_both_
             bytes_per_position: 1,
         },
         0,
-        capped.host_memory(),
+        HostFrame::new(HostMemory::of(&capped), terms),
         0,
     );
-    assert_eq!(inputs.host.non_reclaimable, 64 * GIB - 50 * GIB);
+    assert_eq!(inputs.host.memory.available, 50 * GIB);
+    assert_eq!(inputs.host.terms, terms);
 }
 
 /// The terms with the 8 GiB page-cache floor the plan used before the n-gram reads were measured, to
@@ -1242,10 +1226,7 @@ mod device_tests {
         let plan = HostPinPlan::new(
             &geometry,
             HostMode::Exclusive,
-            &HostMemory {
-                total: 62 * (1 << 30),
-                available: 55 * (1 << 30),
-            },
+            &HostMemory::from_pair(62 * (1 << 30), 55 * (1 << 30)),
             &HostTerms::DEFAULT,
         )
         .expect("the host plan");
@@ -1637,4 +1618,145 @@ fn the_mode_override_forces_or_refuses_and_never_falls_back() {
             "{bad}: {text}"
         );
     }
+}
+
+/// One frame: where the context choice (`TierPlan`) answers a host, the start's own host plan
+/// (`HostPinPlan`) and the host guard (`HostFacts::admit_for`), over the same facts and the same
+/// terms, answer it too, with the same tier. Before the two read one frame, the context choice
+/// charged the memory in use plus 2 + 1 + 1 GiB and the start charged the OS floor plus
+/// 3 + 2 GiB, so a host between the two figures was planned and then refused.
+#[test]
+fn the_tier_plan_ok_implies_the_host_pin_plan_and_the_guard_ok_across_hosts_and_caps() {
+    use crate::family::expert_bank::bank_tier::rung_ring_placeholder_bytes;
+    let record = EXPERT_BYTES as usize;
+    let ring = rung_ring_placeholder_bytes(record);
+    let kv_position = position_bytes(12, 2, 256, 2, (128, 4)).unwrap();
+    let mut checked = 0;
+    let mut tiers = std::collections::BTreeSet::new();
+    let mut broken = Vec::new();
+    for total_gib in [16u64, 32, 62, 64, 128] {
+        for in_use_gib in [2u64, 8, 16] {
+            for cap in [
+                None,
+                Some(6u64),
+                Some(8),
+                Some(12),
+                Some(16),
+                Some(24),
+                Some(32),
+                Some(40),
+                Some(48),
+                Some(56),
+            ] {
+                let meminfo = format!(
+                    "MemTotal: {} kB\nMemAvailable: {} kB\n",
+                    total_gib * (1 << 20),
+                    total_gib.saturating_sub(in_use_gib) * (1 << 20)
+                );
+                let host =
+                    HostFacts::from_meminfo("test", &meminfo, cap.map(|cap| cap * GIB)).unwrap();
+                for positions in [4096u64, 32_768, 131_072, 262_144] {
+                    for ring in [0, ring] {
+                        let frame = HostFrame::with_default_terms(HostMemory::of(&host));
+                        let inputs = TierInputs::measured(
+                            shape(),
+                            (TRUNK_BYTES, STATE_BYTES),
+                            KvPlan {
+                                positions,
+                                bytes_per_position: kv_position,
+                            },
+                            23_416 * MIB,
+                            frame,
+                            ring,
+                        );
+                        let Ok(plan) = TierPlan::new(&inputs) else {
+                            continue;
+                        };
+                        checked += 1;
+                        tiers.insert(format!("{:?}", plan.store_tier()));
+                        let slots = plan.slots_per_layer();
+                        let geometry = BankGeometry::new(48, 512, 10, slots, record).unwrap();
+                        let memory = HostMemory::of(&host);
+                        let terms = HostTerms::DEFAULT;
+                        let outcome =
+                            HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring)
+                                .and_then(|tier| {
+                                    let host_plan = match tier {
+                                        TierChoice::Inclusive => HostPinPlan::new(
+                                            &geometry,
+                                            HostMode::Inclusive,
+                                            &memory,
+                                            &terms,
+                                        ),
+                                        TierChoice::Disk => {
+                                            HostPinPlan::new_disk(&geometry, &memory, &terms, ring)
+                                        }
+                                        _ => HostPinPlan::new(
+                                            &geometry,
+                                            HostMode::Exclusive,
+                                            &memory,
+                                            &terms,
+                                        ),
+                                    }?;
+                                    host.admit_for(host_plan.process_bytes, "the test")?;
+                                    Ok(tier)
+                                });
+                        if outcome.as_ref().ok() != Some(&plan.store_tier()) {
+                            broken.push((total_gib, in_use_gib, cap, positions, ring, slots));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 200, "{checked}");
+    assert!(tiers.len() >= 3, "{tiers:?}");
+    assert!(
+        broken.is_empty(),
+        "{} of {checked} admitted plans differ between the context choice and the start: {broken:?}",
+        broken.len()
+    );
+}
+
+/// The capped default start that was refused: under `MemoryMax=8G` on the 62 GiB host the
+/// context choice and the start take the disk tier (ring and process terms inside the cgroup), and
+/// the guard admits the same bytes. The OS floor is not charged inside a cgroup that already
+/// fences the process off.
+#[test]
+fn a_default_start_under_a_cgroup_cap_plans_the_disk_tier_and_the_guard_admits_it() {
+    use crate::family::expert_bank::bank_tier::rung_ring_placeholder_bytes;
+    let record = EXPERT_BYTES as usize;
+    let ring = rung_ring_placeholder_bytes(record);
+    let meminfo = format!(
+        "MemTotal: {} kB\nMemAvailable: {} kB\n",
+        HOST_TOTAL / 1024,
+        (HOST_TOTAL - 12 * GIB) / 1024
+    );
+    let host = HostFacts::from_meminfo("test", &meminfo, Some(8 * GIB)).unwrap();
+    let kv_position = position_bytes(12, 2, 256, 2, (128, 4)).unwrap();
+    let inputs = TierInputs::measured(
+        shape(),
+        (TRUNK_BYTES, STATE_BYTES),
+        KvPlan {
+            positions: 4096,
+            bytes_per_position: kv_position,
+        },
+        23_416 * MIB,
+        HostFrame::with_default_terms(HostMemory::of(&host)),
+        ring,
+    );
+    let plan = TierPlan::new(&inputs).expect("the context choice admits the 8 GiB cap");
+    assert_eq!(plan.store_tier(), TierChoice::Disk);
+    let geometry = BankGeometry::new(48, 512, 10, plan.slots_per_layer(), record).unwrap();
+    let memory = HostMemory::of(&host);
+    let tier =
+        HostPinPlan::choose_store_tier(&geometry, &memory, &HostTerms::DEFAULT, ring).unwrap();
+    assert_eq!(tier, TierChoice::Disk);
+    let host_plan = HostPinPlan::new_disk(&geometry, &memory, &HostTerms::DEFAULT, ring).unwrap();
+    host.admit_for(host_plan.process_bytes, "the capped start")
+        .expect("the guard admits the bytes the plan charged");
+    assert_eq!(
+        host_plan.os_floor, 0,
+        "the cgroup binds, so no OS floor is kept inside it"
+    );
 }

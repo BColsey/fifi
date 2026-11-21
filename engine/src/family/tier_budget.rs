@@ -1,11 +1,11 @@
 //! The admission arithmetic of the tiered offload.
 //!
-//! WHAT: two pure planners that decide, in bytes, how the machine is split at
+//! WHAT: a pure planner that decides, in bytes, how the card is split at
 //! load. [`plan_vram`] gives the KV cache of the configured context VRAM first
 //! and the per-layer expert bank the rest, spilling KV positions to the host
-//! only when they do not fit or when the minimum bank needs the room;
-//! [`plan_host`] gives the host RAM to the OS page cache of the experts minus a
-//! host KV overflow taken from that cache one-for-one. WHY (REV4 c.4, north
+//! only when they do not fit or when the minimum bank needs the room. The host
+//! side is planned from the shared host facts (`family::mem`) by each
+//! family's host plan. WHY (REV4 c.4, north
 //! star = coding agents with long context): a 6 GiB card cannot hold the
 //! model's experts, so the split must be settled before the first token, and a
 //! context that cannot fit is refused with a typed error that names the budget
@@ -169,79 +169,6 @@ pub fn plan_vram(
     })
 }
 
-/// What the host has and what is already spoken for before the page cache (the
-/// caller measures these at load; none of them is guessed here). All fields are
-/// bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostBudget {
-    pub total: u64,
-    /// RAM held by the OS, the loader and other processes; never returned.
-    pub non_reclaimable: u64,
-    /// The engine's own heap: activations, CPU jobs, bookkeeping.
-    pub engine_heap: u64,
-    /// Staging buffers for expert transfers to the GPU.
-    pub staging: u64,
-    /// Safety margin kept free so the plan does not ride the OOM line.
-    pub margin: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostPlan {
-    /// Bytes left for the OS page cache of the experts.
-    pub page_cache: u64,
-    pub cached_experts: u64,
-    /// The host KV bytes echoed back; each was taken from `page_cache`
-    /// one-for-one (REV4 c.4).
-    pub host_kv: u64,
-}
-
-/// WHY: the OS page cache is what makes the CPU tier fast, so it owns the
-/// residual host RAM — but every host KV byte is taken from it one-for-one
-/// (REV4 c.4), which this plan makes explicit instead of accidental.
-pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<HostPlan, BudgetError> {
-    if expert_bytes == 0 {
-        return Err(bad_input("budget: expert bytes must be nonzero"));
-    }
-    // The floor alone can exceed the total (a container smaller than the
-    // host's non-reclaimable memory). The general refusal below would
-    // print `needed 0 > available 0`, so this case names itself.
-    if h.total < h.non_reclaimable {
-        return Err(BudgetError::Overcommitted {
-            what: "host RAM: the non-reclaimable floor alone exceeds the total",
-            needed: 0,
-            available: 0,
-        });
-    }
-    let spent = h
-        .non_reclaimable
-        .checked_add(h.engine_heap)
-        .and_then(|sum| sum.checked_add(h.staging))
-        .and_then(|sum| sum.checked_add(h.margin))
-        .and_then(|sum| sum.checked_add(host_kv))
-        .ok_or_else(|| bad_input("budget: host commitments overflow u64"))?;
-    let page_cache = h
-        .total
-        .checked_sub(spent)
-        .ok_or(BudgetError::Overcommitted {
-            what: "engine heap + staging + margin + host KV against host RAM after the non-reclaimable floor",
-            // The pair nets the OS floor out of both sides so the printed
-            // `needed > available` matches the check above: the check compares
-            // `spent > total`, and subtracting the same non_reclaimable from
-            // each keeps the inequality equivalent (spent >= non_reclaimable
-            // by construction).
-            needed: spent.saturating_sub(h.non_reclaimable),
-            // `non_reclaimable` already folds the cgroup clamp in, so this is
-            // the clamped figure after the OS floor — not the raw MemTotal,
-            // which made a capped container read as if the cap were ignored.
-            available: h.total.saturating_sub(h.non_reclaimable),
-        })?;
-    Ok(HostPlan {
-        page_cache,
-        cached_experts: page_cache / expert_bytes,
-        host_kv,
-    })
-}
-
 fn bad_input(what: &str) -> BudgetError {
     BudgetError::BadInput(String::from(what))
 }
@@ -251,9 +178,7 @@ mod tests {
     //! The 35B-A3B-shape numbers live here and only here; production code
     //! takes every number as an input. GiB = 2^30 bytes throughout.
 
-    use super::{
-        BudgetError, ExpertSize, HostBudget, KvPlan, VramBudget, bad_input, plan_host, plan_vram,
-    };
+    use super::{BudgetError, ExpertSize, KvPlan, VramBudget, bad_input, plan_vram};
     /// One GiB (2^30 bytes); 8-bit KV bytes of one position (10 attention
     /// layers x 1,088 bytes); one quantized expert; the MoE layer count; and the
     /// VRAM one slot per layer costs (`EXPERT_BYTES * LAYERS`).
@@ -303,17 +228,6 @@ mod tests {
         geom(EXPERT_BYTES, LAYERS)
     }
 
-    /// The host RAM fixture: 14.76 GiB total with the fixed commitments.
-    fn host() -> HostBudget {
-        HostBudget {
-            total: 15_847_931_904,
-            non_reclaimable: 2 * GIB,
-            engine_heap: GIB,
-            staging: 214_748_365,
-            margin: GIB / 2,
-        }
-    }
-
     #[test]
     fn the_32k_8bit_kv_leaves_about_39_slots_per_layer() {
         let plan = plan_vram(&vram(3 * GIB / 4), &kv(32_768), &experts(), 0, 0).unwrap();
@@ -343,33 +257,6 @@ mod tests {
             (262_144, 0)
         );
         assert!((1..=6).contains(&plan.bank_slots_per_layer), "{plan:?}");
-    }
-
-    #[test]
-    fn an_overcommitted_refusal_names_the_clamped_budget_not_the_raw_total() {
-        // A capped container: the raw total stays the host's, but the budget the
-        // plan can spend is what remains after the cgroup-clamped floor.
-        let mut capped = host();
-        capped.non_reclaimable = capped.total - 4 * GIB;
-        match plan_host(&capped, 5 * GIB, EXPERT_BYTES).expect_err("overcommitted") {
-            BudgetError::Overcommitted {
-                needed, available, ..
-            } => {
-                assert_eq!(
-                    available,
-                    4 * GIB,
-                    "the refusal must name the clamped budget"
-                );
-                // `needed` is pinned exactly: heap + staging + margin + host KV,
-                // the floor netted out so the pair matches the check.
-                assert_eq!(
-                    needed,
-                    capped.engine_heap + capped.staging + capped.margin + 5 * GIB
-                );
-                assert!(needed > available);
-            }
-            other => panic!("wrong error: {other:?}"),
-        }
     }
 
     #[test]
@@ -488,95 +375,6 @@ mod tests {
                 needed, available, ..
             }) => {
                 assert_eq!((needed, available), (41 * SLOT_COST, 2 * GIB));
-            }
-            other => panic!("expected Overcommitted, got {other:?}"),
-        }
-        let host_over = HostBudget {
-            total: max,
-            non_reclaimable: max / 2 + 1,
-            engine_heap: max / 2 + 1,
-            staging: 0,
-            margin: 0,
-        };
-        assert!(matches!(
-            plan_host(&host_over, 0, EXPERT_BYTES),
-            Err(BudgetError::BadInput(_))
-        ));
-        assert_eq!(
-            plan_host(&host(), 0, 0),
-            Err(bad_input("budget: expert bytes must be nonzero"))
-        );
-    }
-
-    #[test]
-    fn host_cache_loses_a_gib_per_host_kv_gib() {
-        let base = plan_host(&host(), 0, EXPERT_BYTES).unwrap();
-        // About 11.06 GiB of page cache before any host KV.
-        assert!(
-            (11 * GIB..11 * GIB + GIB / 8).contains(&base.page_cache),
-            "{}",
-            base.page_cache
-        );
-        assert_eq!(base.host_kv, 0);
-        for extra in 0..=4u64 {
-            let plan = plan_host(&host(), extra * GIB, EXPERT_BYTES).unwrap();
-            assert_eq!(plan.host_kv, extra * GIB);
-            assert_eq!(plan.page_cache, base.page_cache - extra * GIB);
-        }
-        let lost = base.cached_experts
-            - plan_host(&host(), GIB, EXPERT_BYTES)
-                .unwrap()
-                .cached_experts;
-        assert!((606..=607).contains(&lost), "{lost}"); // about 607 experts per GiB
-    }
-
-    #[test]
-    fn host_plan_refuses_a_kv_larger_than_the_cache() {
-        let budget = host();
-        let cache = plan_host(&budget, 0, EXPERT_BYTES).unwrap().page_cache;
-        match plan_host(&budget, cache + 1, EXPERT_BYTES) {
-            Err(BudgetError::Overcommitted {
-                what,
-                needed,
-                available,
-            }) => {
-                assert!(what.contains("host"), "{what}");
-                assert_eq!(available, budget.total - budget.non_reclaimable);
-                // `needed` is pinned exactly: the commitments the plan adds,
-                // with the floor netted out.
-                assert_eq!(
-                    needed,
-                    budget.engine_heap + budget.staging + budget.margin + cache + 1
-                );
-                assert!(needed > available);
-            }
-            other => panic!("expected Overcommitted, got {other:?}"),
-        }
-        let edge = plan_host(&budget, cache, EXPERT_BYTES).unwrap();
-        assert_eq!(
-            (edge.page_cache, edge.cached_experts, edge.host_kv),
-            (0, 0, cache)
-        );
-    }
-
-    #[test]
-    fn a_floor_larger_than_the_total_names_itself() {
-        // A container smaller than the host's non-reclaimable memory: the
-        // general refusal would print `needed 0 > available 0`, so the case
-        // carries its own label instead of a puzzle.
-        let mut floored = host();
-        floored.engine_heap = 0;
-        floored.staging = 0;
-        floored.margin = 0;
-        floored.non_reclaimable = floored.total + 1;
-        match plan_host(&floored, 0, EXPERT_BYTES) {
-            Err(BudgetError::Overcommitted {
-                what,
-                needed,
-                available,
-            }) => {
-                assert!(what.contains("floor"), "{what}");
-                assert_eq!((needed, available), (0, 0));
             }
             other => panic!("expected Overcommitted, got {other:?}"),
         }

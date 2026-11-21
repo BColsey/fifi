@@ -7,6 +7,7 @@ mod artifact;
 mod cuda;
 mod deltanet;
 pub(crate) mod factory;
+mod host_plan;
 mod hyper;
 mod load;
 

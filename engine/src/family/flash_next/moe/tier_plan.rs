@@ -12,7 +12,7 @@
 //! (`docs/plans/flash-next-cuda.md`, memory budget).
 //!
 //! Reused unchanged from the Qwen3.6 tiered offload, which takes every number as an input:
-//! `budget::plan_vram` (K/V first, bank the remainder, uniform slots), `budget::plan_host`,
+//! `budget::plan_vram` (K/V first, bank the remainder, uniform slots),
 //! `StaticProfile` (hottest experts per layer, ties to the lowest id) and `classify_reference`
 //! (the oracle of `tiered_classify`). New here: the Flash-Next sizes, the cap of the slot count at the
 //! expert count, the cold-expert host check, the placement map and the slot table. The expert
@@ -20,26 +20,23 @@
 //! bytes of EXL3 trellis and scales, and the bank itself (with the filler-expert rule for a missed
 //! pick) is the CUDA step's job.
 //!
-//! The host check compares the cold experts with the page-cache share of the host budget
-//! (`plan_host`); the page cache of the n-gram table's random reads competes for the same RAM and
-//! is not budgeted yet.
+//! The host check is the start's own: the store tier is chosen by the host plan's ladder over the
+//! same host frame (`host_plan`), so the context choice and the start read the host one way.
 //!
 //! Pure host arithmetic: no device, no clock, no I/O.
 
 // Staged: the Flash-Next CUDA step is the first caller.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::family::expert_bank::bank_tier::{TierBudget as LadderBudget, TierChoice, choose_tier};
+use crate::family::expert_bank::{BankGeometry, HostMode, bank_tier::TierChoice};
+use crate::family::flash_next::host_plan::{HostFrame, HostPinPlan};
 use crate::{
     EngError,
     expert_tier::{ExpertId, Placement, Residency},
     family::{
         device_budget::KvPlan,
         qwen36::tiered::{PolicyMode, TieredConfig, policy::StaticProfile},
-        tier_budget::{
-            BudgetError, ExpertSize, HostBudget, HostPlan, VramBudget, VramPlan, plan_host,
-            plan_vram,
-        },
+        tier_budget::{BudgetError, ExpertSize, VramBudget, VramPlan, plan_vram},
         tiered_classify::{Classified, LengthMismatch, classify_reference},
     },
 };
@@ -145,7 +142,9 @@ pub(in crate::family::flash_next) struct TierInputs {
     pub(in crate::family::flash_next) vram: VramBudget,
     /// Context positions and the K/V plus indexer bytes of one.
     pub(in crate::family::flash_next) kv: KvPlan,
-    pub(in crate::family::flash_next) host: HostBudget,
+    /// The host side: the machine and the process terms, the same frame the start's host plan
+    /// is built from.
+    pub(in crate::family::flash_next) host: HostFrame,
     /// The staging ring's backing bytes the disk tier would charge (the same
     /// infallible placeholder the start's two-phase choice charges first:
     /// the pooled depth's records in flight, from the one shared constant
@@ -164,16 +163,16 @@ impl TierInputs {
     /// kernel arena and the CUDA context, and the admission margin, the minimum spare and the
     /// uncertainty band as the margin (`desktop_reserve` of `VramBudget`, whose error text still says
     /// "desktop reserve"), plus the ledger's 64 MiB chunked-attention part charge, which stands in for
-    /// Flash-Next's own engine state until the step's arena plan supplies the real term. The host keeps the larger of
-    /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
-    /// heap, 1 GiB of staging and a 1 GiB margin. The caller adds the live shared-prefill scratch
+    /// Flash-Next's own engine state until the step's arena plan supplies the real term. The host
+    /// side is answered by the host plan's own arithmetic over `host` (see [`TierPlan::new`]).
+    /// The caller adds the live shared-prefill scratch
     /// through `with_prefill_arena` before selecting the expert slots; the legacy path adds zero.
     pub(in crate::family::flash_next) fn measured(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
         kv: KvPlan,
         free_vram: u64,
-        (mem_total, mem_available): (u64, u64),
+        host: HostFrame,
         ring_backing_bytes: u64,
     ) -> Self {
         use crate::family::admission_sketch::{
@@ -184,7 +183,6 @@ impl TierInputs {
         /// Qwen3.6's measured value (2026-11-03 qualification, n=1), borrowed
         /// until Flash-Next measures its own floor: unqualified for Flash-Next.
         const RUNTIME_OVERHEAD_FLOOR_BYTES: u64 = 384 << 20;
-        const GIB: u64 = 1 << 30;
         Self {
             shape,
             vram: VramBudget {
@@ -198,13 +196,7 @@ impl TierInputs {
             },
             kv,
             ring_backing_bytes,
-            host: HostBudget {
-                total: mem_total,
-                non_reclaimable: mem_total.saturating_sub(mem_available).max(8 * GIB),
-                engine_heap: 2 * GIB,
-                staging: GIB,
-                margin: GIB,
-            },
+            host,
         }
     }
 
@@ -233,6 +225,7 @@ impl TierInputs {
         kv: KvPlan,
         ring_backing_bytes: u64,
     ) -> Self {
+        use crate::family::flash_next::host_plan::HostMemory;
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
         Self {
@@ -246,13 +239,7 @@ impl TierInputs {
             },
             kv,
             ring_backing_bytes,
-            host: HostBudget {
-                total: 62 * GIB,
-                non_reclaimable: 8 * GIB,
-                engine_heap: 2 * GIB,
-                staging: GIB,
-                margin: GIB,
-            },
+            host: HostFrame::with_default_terms(HostMemory::from_pair(62 * GIB, 62 * GIB)),
         }
     }
 }
@@ -263,16 +250,12 @@ pub(in crate::family::flash_next) struct TierPlan {
     shape: TierShape,
     slots_per_layer: usize,
     vram: VramPlan,
-    host: HostPlan,
     cold_bytes: u64,
-    /// The store tier the one ladder answered in this frame: the pinned cold
-    /// store while it fits (the spare-place policy is the loader's, not the
-    /// context budget's), else the disk tier the ring serves through. The
-    /// loader's bank build answers the same ladder from the same admission
-    /// pair, so above about 14.2 GB the two agree on the tier for one cgroup
-    /// cap; between about 4 and 14.2 GB this budget can answer Disk where
-    /// the start's own admission still reads the older frame and refuses —
-    /// one budget, two admissions, until the start moves to this frame.
+    /// Host RAM left for the page cache once the process, the store and the OS floor are charged.
+    host_spare: u64,
+    /// The store tier the start's own ladder answers over the same host frame: the pinned
+    /// store while it fits (the spare-place policy is the loader's, not the context budget's),
+    /// else the disk tier the ring serves through.
     store_tier: TierChoice,
 }
 
@@ -288,6 +271,11 @@ impl TierPlan {
     /// Refuses, with the budget that lost, a context whose K/V leaves fewer than `top_k` slots per
     /// layer, a K/V that does not fit the card (it never spills to the host), and a split whose
     /// cold experts exceed the host's page-locked budget.
+    ///
+    /// The host side is the start's own: the store tier is chosen by the same ladder
+    /// (`HostPinPlan::choose_store_tier`) over the same frame (`inputs.host`: the machine, the OS
+    /// floor, the process terms), at the slots the card leaves, so a context this plan admits is
+    /// a host plan the start admits.
     pub(in crate::family::flash_next) fn new(inputs: &TierInputs) -> Result<Self, EngError> {
         let shape = inputs.shape;
         if shape.top_k == 0 || shape.top_k > shape.experts {
@@ -304,76 +292,64 @@ impl TierPlan {
             plan_vram(&inputs.vram, &inputs.kv, &size, shape.top_k, 0).map_err(budget_error)?;
         let slots_per_layer = vram.bank_slots_per_layer.min(shape.experts);
         let cold_bytes = (shape.experts - slots_per_layer) as u64 * shape.slot_cost();
-        let host = plan_host(&inputs.host, 0, shape.expert_bytes).map_err(budget_error)?;
-        let store_tier = if cold_bytes > host.page_cache {
-            if inputs.ring_backing_bytes == 0 {
-                return Err(refuse(format!(
-                    "{} experts outside the {slots_per_layer} slots of each layer need {cold_bytes} \
-                     pinned host bytes, the host budget allows {}",
-                    shape.experts - slots_per_layer,
-                    host.page_cache
-                )));
-            }
-            // The one rule the loader's bank build consults, in this frame: the
-            // fixed terms are already out of the page cache, so the ladder's
-            // overhead is zero and its exclusive rung at zero spare places is
-            // exactly the pinned need that just missed — no pinning tier can
-            // answer, so only the disk arm can serve, and its floor refusal
-            // carries the figures.
-            match choose_tier(&LadderBudget {
-                record_bytes: shape.expert_bytes,
-                layers: shape.layers,
-                experts: shape.experts,
-                slots: slots_per_layer,
-                max_spare_places: 0,
-                min_spare_places: 0,
-                overhead_bytes: 0,
-                cache_floor: 0,
-                ring_bytes: inputs.ring_backing_bytes,
-                available: host.page_cache,
-                card: None,
-            }) {
-                Ok(TierChoice::Disk) => TierChoice::Disk,
-                // The pinned store missed, so no pinning rung can fit below
-                // it. If the ladder answers one anyway the arithmetic is
-                // inconsistent — refuse with the figures instead of panicking
-                // in a start.
-                Ok(answer) => {
-                    return Err(refuse(format!(
-                        "the ladder answered {answer:?} below the exclusive store that just \
-                         missed: {} experts outside the {slots_per_layer} slots of each layer \
-                         need {cold_bytes} pinned host bytes, the host budget allows {}",
-                        shape.experts - slots_per_layer,
-                        host.page_cache
-                    )));
-                }
-                Err(refused) => {
-                    return Err(refuse(format!(
-                        "{} experts outside the {slots_per_layer} slots of each layer need {cold_bytes} \
-                         pinned host bytes, the host budget allows {}, and the disk tier cannot \
-                         carry the ring either: {}",
-                        shape.experts - slots_per_layer,
-                        host.page_cache,
-                        refused.describe()
-                    )));
-                }
-            }
-        } else if cold_bytes == 0 {
-            TierChoice::Inclusive
-        } else {
-            TierChoice::Exclusive { spare_places: 0 }
+        let record_bytes = usize::try_from(shape.expert_bytes)
+            .map_err(|_| refuse("the expert record does not fit usize".into()))?;
+        // The host arithmetic never reads `top_k`, so the bank's own slot minimum (one filler
+        // slot beyond the picks) is the loader's to enforce, not this plan's.
+        let geometry = BankGeometry {
+            layers: shape.layers,
+            experts: shape.experts,
+            top_k: shape.top_k,
+            slots: slots_per_layer,
+            record_bytes,
         };
-        let cold_bytes = if matches!(store_tier, TierChoice::Disk) {
-            0
-        } else {
-            cold_bytes
+        let HostFrame { memory, terms } = inputs.host;
+        let ring = inputs.ring_backing_bytes;
+        let outside = shape.experts - slots_per_layer;
+        let missed = |why: String| {
+            refuse(format!(
+                "{outside} experts outside the {slots_per_layer} slots of each layer need \
+                 {cold_bytes} pinned host bytes, the host budget of {} bytes cannot carry them \
+                 beside the process and the OS floor: {why}",
+                memory.available
+            ))
+        };
+        let tier = HostPinPlan::choose_store_tier(&geometry, &memory, &terms, ring)
+            .map_err(|refused| missed(refused.describe()))?;
+        let (store_tier, host_spare, cold_bytes) = match tier {
+            TierChoice::Disk if ring == 0 => {
+                // No ring is offered on this path: the pinned-store refusal stands.
+                let pinned = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms);
+                return Err(missed(match pinned {
+                    Err(refused) => refused.describe(),
+                    Ok(_) => "the ladder offered the disk tier without a ring".into(),
+                }));
+            }
+            TierChoice::Disk => {
+                let plan = HostPinPlan::new_disk(&geometry, &memory, &terms, ring)?;
+                (TierChoice::Disk, plan.page_cache_left, 0)
+            }
+            TierChoice::Inclusive => {
+                let plan = HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &terms)?;
+                (tier, plan.page_cache_left, cold_bytes)
+            }
+            TierChoice::Exclusive { .. } => {
+                let plan = HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &terms)?;
+                (tier, plan.page_cache_left, cold_bytes)
+            }
+            TierChoice::CardTiered { .. } => {
+                return Err(refuse(
+                    "the host ladder answered a card tier to a plan that passed no card figures"
+                        .into(),
+                ));
+            }
         };
         Ok(Self {
             shape,
             slots_per_layer,
             vram,
-            host,
             cold_bytes,
+            host_spare,
             store_tier,
         })
     }
@@ -395,7 +371,7 @@ impl TierPlan {
 
     /// Host bytes still free for the page-locked experts after the plan.
     pub(in crate::family::flash_next) fn host_spare_bytes(&self) -> u64 {
-        self.host.page_cache - self.cold_bytes
+        self.host_spare
     }
 
     /// The store tier the one ladder answered for this plan (the disk tier

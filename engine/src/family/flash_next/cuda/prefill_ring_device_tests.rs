@@ -50,10 +50,7 @@ fn the_ring_streams_every_non_resident_expert_in_layer_order() {
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
-        &HostMemory {
-            total: 62 << 30,
-            available: 55 << 30,
-        },
+        &HostMemory::from_pair(62 << 30, 55 << 30),
         &HostTerms::DEFAULT,
     )
     .expect("the host plan");
@@ -133,10 +130,7 @@ fn freeing_out_of_order_is_refused() {
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
-        &HostMemory {
-            total: 62 << 30,
-            available: 55 << 30,
-        },
+        &HostMemory::from_pair(62 << 30, 55 << 30),
         &HostTerms::DEFAULT,
     )
     .expect("the host plan");
@@ -164,10 +158,7 @@ fn selected_ring_copies_unique_misses_and_preserves_reads_across_wrap() {
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
-        &HostMemory {
-            total: 62 << 30,
-            available: 55 << 30,
-        },
+        &HostMemory::from_pair(62 << 30, 55 << 30),
         &HostTerms::DEFAULT,
     )
     .unwrap();
@@ -236,10 +227,7 @@ fn lookahead_reuses_predictions_and_fills_misses_after_slot_conflicts() {
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
-        &HostMemory {
-            total: 62 << 30,
-            available: 55 << 30,
-        },
+        &HostMemory::from_pair(62 << 30, 55 << 30),
         &HostTerms::DEFAULT,
     )
     .unwrap();

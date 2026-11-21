@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::family::expert_bank::bank_tier::{TierChoice, rung_ring_placeholder_bytes};
+use crate::family::flash_next::host_plan::{HostFrame, HostMemory};
 use crate::family::flash_next::moe::tier_plan::TierShape;
+use crate::family::mem::HostFacts;
 
 const MIB: u64 = 1 << 20;
 const EXPERT_BYTES: u64 = 1_881_600;
@@ -160,22 +162,27 @@ fn a_capped_host_serves_the_requested_context_through_the_disk_tier() {
         positions: 1,
         bytes_per_position: 1,
     };
+    // The host facts under a fresh MemoryMax cgroup: MemTotal and MemAvailable read the whole
+    // machine, the cgroup holds `cap`. The cgroup fences the process off from the host, so the
+    // OS floor is not charged inside it: the budget is the cap, always below the 27.5 GB pinned
+    // need and always above the disk tier's fixed terms (heap, margin, staging and the ring's
+    // placeholder, 5.1 GiB) once the ring reads the pack in place.
+    let capped = |cap: u64| {
+        let host = HostFacts::from_meminfo(
+            "test",
+            "MemTotal: 65011712 kB\nMemAvailable: 62914560 kB\n",
+            Some(cap),
+        )
+        .unwrap();
+        HostFrame::with_default_terms(HostMemory::of(&host))
+    };
     for cap_gib in [20u64, 16, 12, 8, 6] {
-        // The admission snapshot under a fresh MemoryMax cgroup of `cap` on
-        // through the constructor the start uses: MemTotal
-        // still reads the whole machine while MemAvailable reads the cap, so
-        // the non-reclaimable floor nets the rest of the host out and the
-        // page cache holds `cap - 4 GiB` — always below the 27.5 GB pinned
-        // need, always above the disk tier's fixed terms once the ring reads
-        // the pack in place. The start's two-phase choice charges the same
-        // placeholder first: two records in flight, always inside the
-        // smallest cap's page cache.
         let inputs = TierInputs::measured(
             shape,
             (TRUNK_BYTES, STATE_BYTES),
             placeholder,
             24 * GIB,
-            (62 * GIB, cap_gib * GIB - 40 * MIB),
+            capped(cap_gib * GIB - 40 * MIB),
             rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
         );
         let budget = ContextBudget::new(inputs, FLASH_NEXT);
@@ -191,24 +198,20 @@ fn a_capped_host_serves_the_requested_context_through_the_disk_tier() {
         assert_eq!(served.plan.store_tier(), TierChoice::Disk);
     }
 
-    // A host whose page cache cannot hold the fixed terms beside the floor
-    // refuses at the heap term, naming it: the non-reclaimable floor alone
-    // nets 60 of the 62 GiB out and the heap, staging and margin cannot fit
-    // beside them.
+    // A cgroup that cannot hold the fixed terms (heap, margin, staging and the ring) refuses at
+    // the ladder's floor, naming the figures: the disk tier's own minimum.
     let inputs = TierInputs::measured(
         shape,
         (TRUNK_BYTES, STATE_BYTES),
         placeholder,
         24 * GIB,
-        (62 * GIB, 2 * GIB - 40 * MIB),
+        capped(2 * GIB - 40 * MIB),
         rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
     );
     let budget = ContextBudget::new(inputs, FLASH_NEXT);
     let text = message(budget.resolve(4096, KvFormat::F16, 11).unwrap_err());
-    assert!(
-        text.contains("engine heap + staging + margin + host KV against host RAM"),
-        "{text}"
-    );
+    assert!(text.contains("cannot carry the minimum tier"), "{text}");
+    assert!(text.contains("fixed overhead"), "{text}");
 }
 
 /// The boundary at the exclusive fit: one byte of page cache below the
@@ -232,7 +235,7 @@ fn the_disk_tier_boundary_sits_at_the_exclusive_fit() {
             (TRUNK_BYTES, STATE_BYTES),
             placeholder,
             24 * GIB,
-            (62 * GIB, available),
+            HostFrame::with_default_terms(HostMemory::from_pair(62 * GIB, available)),
             rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
         );
         ContextBudget::new(inputs, FLASH_NEXT)
@@ -244,7 +247,7 @@ fn the_disk_tier_boundary_sits_at_the_exclusive_fit() {
     while exclusive_side - disk_side > 1 {
         let mid = disk_side + (exclusive_side - disk_side) / 2;
         match resolve_tier(mid) {
-            Ok(TierChoice::Exclusive { .. }) => exclusive_side = mid,
+            Ok(TierChoice::Exclusive { .. } | TierChoice::Inclusive) => exclusive_side = mid,
             _ => disk_side = mid,
         }
     }
@@ -260,7 +263,7 @@ fn the_disk_tier_boundary_sits_at_the_exclusive_fit() {
         (TRUNK_BYTES, STATE_BYTES),
         placeholder,
         24 * GIB,
-        (62 * GIB, exclusive_side),
+        HostFrame::with_default_terms(HostMemory::from_pair(62 * GIB, exclusive_side)),
         rung_ring_placeholder_bytes(EXPERT_BYTES as usize),
     );
     assert_eq!(

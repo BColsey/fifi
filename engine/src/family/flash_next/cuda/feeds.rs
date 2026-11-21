@@ -62,8 +62,8 @@ pub(in crate::family) mod device;
 pub(in crate::family) const DEFAULT_THREADS: usize = 32;
 const MAX_THREADS: usize = 128;
 
-/// Page cache the n-gram table needs reserved in the host budget (`HostBudget::page_cache` of
-/// `tier_plan`): none. Measured on the real file (`doc/flash-next-ngram-latency.md`), a decode
+/// Page cache the n-gram table needs reserved in the host budget (`HostPinPlan::page_cache_left`):
+/// none. Measured on the real file (`doc/flash-next-ngram-latency.md`), a decode
 /// token with all 16 rows cold costs 160-200 us p50 and 238-323 us p99 through [`RowReader`] on 32
 /// threads (three runs, 400 tokens each, machine under load), about 1% of a token, and the reads can
 /// start before layer 0; a prefill chunk reads one chunk ahead of its

@@ -17,6 +17,7 @@ use super::{
     GgufModel,
     tensors::{Place, Role},
 };
+use crate::family::flash_next::host_plan::{HostFrame, HostMemory};
 use crate::{
     EngError,
     family::{
@@ -53,8 +54,7 @@ pub(in crate::family::flash_next) struct GgufSizes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family::flash_next) struct Card {
     pub(in crate::family::flash_next) free_vram: u64,
-    pub(in crate::family::flash_next) host_total: u64,
-    pub(in crate::family::flash_next) host_available: u64,
+    pub(in crate::family::flash_next) host: HostMemory,
     /// Video memory set aside for the prefill ring before the bank sizes itself.
     pub(in crate::family::flash_next) ring_budget: u64,
 }
@@ -128,7 +128,7 @@ impl GgufModel {
                 bytes_per_position: 1,
             },
             card.free_vram.saturating_sub(card.ring_budget),
-            (card.host_total, card.host_available),
+            HostFrame::with_default_terms(card.host),
             rung_ring_placeholder_bytes(
                 usize::try_from(sizes.record_bytes_max)
                     .map_err(|_| refuse("the largest expert record overflows usize"))?,

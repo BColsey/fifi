@@ -69,8 +69,6 @@ pub(crate) mod recipe;
 pub(crate) mod slot_request;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) mod step_dims;
-// Pure host bookkeeping, compiled wherever it has a caller: every Linux
-// build (the admission fits need the cgroup-aware probe) and the test build.
 pub(crate) mod host_memory;
 pub mod keys;
 #[allow(
@@ -86,7 +84,9 @@ pub mod keys;
 )]
 pub(crate) mod kv_disk;
 pub(crate) mod kv_format;
-#[cfg(any(test, target_os = "linux"))]
+// The memory facts and the numbers every host plan shares. The host reader inside is compiled
+// where it has a caller: every Linux build (the admission fits need the cgroup-aware probe)
+// and the test build.
 pub(crate) mod mem;
 #[cfg(any(
     test,

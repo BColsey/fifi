@@ -10,19 +10,21 @@
 //! keeps out of every plan, and [`HOST_MARGIN_BYTES`] is the slack a plan that pins a store keeps
 //! beyond it. A family supplies the byte costs of its own objects, never a floor or a margin.
 
-// The facts are read by the CUDA-build starts and the host plans' tests; the plain host build
-// compiles them without a reader.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the CUDA-build starts read the facts")
-)]
+// The facts are read by the CUDA-build starts; the host build compiles them without a reader.
+#![allow(dead_code, reason = "the CUDA-build starts read the facts")]
 
+// The host reader parses `/proc`, so it exists where a Linux host does (and in the test build);
+// the numbers below are plain arithmetic and exist everywhere.
+#[cfg(any(test, target_os = "linux"))]
 mod host;
 
+#[cfg(any(test, target_os = "linux"))]
+#[allow(unused_imports, reason = "the name a caller matches a provenance on")]
 pub(crate) use host::{HostFacts, Provenance};
 
 use std::path::{Path, PathBuf};
 
+#[cfg(any(test, target_os = "linux"))]
 use crate::EngError;
 
 /// One gibibyte.
@@ -73,6 +75,7 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 }
 
 /// The facts of one start. Read once, then lent to every stage.
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Facts {
     pub(crate) host: HostFacts,
@@ -80,6 +83,7 @@ pub(crate) struct Facts {
     pub(crate) disks: Vec<DiskFacts>,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl Facts {
     /// The facts with the host read from the machine and no card or disk yet.
     pub(crate) fn read(label: &'static str, root_label: &'static str) -> Result<Self, EngError> {
@@ -150,7 +154,11 @@ mod tests {
         let facts = Facts::with_host(host).with_card(20 * GIB, 24 * GIB);
         assert_eq!(facts.host.os_floor(), os_floor_of(facts.host.total()));
         assert_eq!(facts.host.budget(), 20 * GIB, "the cgroup clamps the host");
-        assert_eq!(facts.host.spare(), 12 * GIB);
+        assert_eq!(
+            facts.host.spare(),
+            20 * GIB,
+            "the cgroup binds, so no floor inside it"
+        );
         assert_eq!(
             facts.card,
             Some(CardFacts {
@@ -171,7 +179,13 @@ mod tests {
             .with_disk(&missing);
         let there = facts.disk_free(dir.path()).expect("the directory exists");
         assert!(there > 0);
-        assert_eq!(facts.disk_free(&missing), Some(there));
+        // The two reads are two moments of one filesystem: equal up to what other writers do
+        // between them.
+        let through_ancestor = facts.disk_free(&missing).expect("the ancestor exists");
+        assert!(
+            there.abs_diff(through_ancestor) < GIB,
+            "{there} {through_ancestor}"
+        );
         assert_eq!(facts.disk_free(Path::new("/never/added")), None);
     }
 

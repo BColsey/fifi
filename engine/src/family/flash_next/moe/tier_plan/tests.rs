@@ -4,6 +4,7 @@
 //! the classifier oracle at ten picks.
 
 use super::*;
+use crate::family::flash_next::host_plan::{HostMemory, HostTerms};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -125,10 +126,16 @@ fn the_plan_accounts_for_every_byte() {
         24 * GIB
     );
     assert!(plan.vram_left() < plan.shape().slot_cost());
-    assert_eq!(
-        plan.host_spare_bytes(),
-        (62 - 8 - 2 - 1 - 1) * GIB - plan.cold_bytes()
-    );
+    // 62 GiB hold the whole 24,576-record store beside the process terms and the 8 GiB floor,
+    // so the one ladder takes the inclusive tier and the spare is what that plan leaves.
+    assert_eq!(plan.store_tier(), TierChoice::Inclusive);
+    let terms = HostTerms::DEFAULT;
+    let process = 24_576 * EXPERT_BYTES
+        + 2 * (EXPERT_BYTES + terms.stream_slot_metadata)
+        + terms.ngram_staging_bytes().unwrap()
+        + terms.engine_heap
+        + terms.margin;
+    assert_eq!(plan.host_spare_bytes(), 62 * GIB - 8 * GIB - process);
 }
 
 #[test]
@@ -163,13 +170,15 @@ fn a_context_that_does_not_fit_is_refused_by_name() {
 #[test]
 fn cold_experts_that_exceed_the_pinned_host_budget_are_refused() {
     let mut tight = inputs(262_144, 2);
-    tight.host.total = 40 * GIB;
+    tight.host = HostFrame::with_default_terms(HostMemory::from_pair(40 * GIB, 40 * GIB));
     let text = message(TierPlan::new(&tight).unwrap_err());
     assert!(text.contains("pinned host bytes"), "{text}");
+    // A host below the process terms and the OS floor cannot carry any tier.
     let mut gone = inputs(262_144, 2);
-    gone.host.total = 8 * GIB;
+    gone.host = HostFrame::with_default_terms(HostMemory::from_pair(8 * GIB, 8 * GIB));
     let text = message(TierPlan::new(&gone).unwrap_err());
-    assert!(text.contains("Overcommitted"), "{text}");
+    assert!(text.contains("pinned host bytes"), "{text}");
+    assert!(text.contains("cannot carry"), "{text}");
     let mut wide = inputs(1_024, 2);
     wide.shape.top_k = 513;
     assert!(TierPlan::new(&wide).is_err());
@@ -321,7 +330,7 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
             (TRUNK_BYTES, STATE_BYTES),
             kv,
             free,
-            (62 * GIB, available),
+            HostFrame::with_default_terms(HostMemory::from_pair(62 * GIB, available)),
             0,
         )
     };
@@ -342,13 +351,13 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
     assert_eq!(ten_more.slots_per_layer(), slots + 10);
     let ten_fewer = TierPlan::new(&measured(free - 10 * slot, 54 * GIB)).unwrap();
     assert_eq!(ten_fewer.slots_per_layer(), slots - 10);
-    // A busy host: 32 GiB in use leaves 26 GiB of page cache for 31 GiB of cold experts.
+    // A busy host: 32 GiB in use leaves 30 GiB, which cannot pin the 31 GiB of cold experts.
     let text = TierPlan::new(&measured(free, 30 * GIB))
         .unwrap_err()
         .describe();
     assert!(text.contains("pinned host bytes"), "{text}");
-    // A quiet host keeps the 8 GiB OS floor.
-    assert_eq!(measured(free, 62 * GIB).host.non_reclaimable, 8 * GIB);
+    // A quiet host keeps the 8 GiB OS floor back, the one floor of the host guard.
+    assert_eq!(measured(free, 62 * GIB).host.memory.os_floor(), 8 * GIB);
 }
 
 /// c0 goldens (P4): `TierInputs::measured` as a literal struct. The part
@@ -366,7 +375,7 @@ fn tier_inputs_measured_golden_struct() {
         (7 * GIB, 512 * MIB),
         kv,
         22 * GIB,
-        (64 * GIB, 6 * GIB),
+        HostFrame::with_default_terms(HostMemory::from_pair(64 * GIB, 6 * GIB)),
         0,
     );
     assert_eq!(inputs.vram.usable, 22 * GIB);
@@ -376,12 +385,10 @@ fn tier_inputs_measured_golden_struct() {
     assert_eq!(inputs.vram.desktop_reserve, (256 + 64 + 128) * MIB);
     assert_eq!(inputs.kv.positions, 131_072);
     assert_eq!(inputs.kv.bytes_per_position, 4096);
-    assert_eq!(inputs.host.total, 64 * GIB);
-    assert_eq!(inputs.host.non_reclaimable, 58 * GIB);
-    assert_eq!(inputs.host.engine_heap, 2 * GIB);
-    assert_eq!(inputs.host.staging, GIB);
-    assert_eq!(inputs.host.margin, GIB);
-    // The host floor: available memory cannot push non-reclaimable under 8 GiB.
-    let clamped = TierInputs::measured(shape(), (0, 0), kv, 0, (64 * GIB, 60 * GIB), 0);
-    assert_eq!(clamped.host.non_reclaimable, 8 * GIB);
+    // The host frame is the host plan's: the machine, the OS floor of `family::mem` and the
+    // default terms (heap, margin, staging) the start charges.
+    assert_eq!(inputs.host.memory.total, 64 * GIB);
+    assert_eq!(inputs.host.memory.available, 6 * GIB);
+    assert_eq!(inputs.host.memory.os_floor(), 8 * GIB);
+    assert_eq!(inputs.host.terms, HostTerms::DEFAULT);
 }

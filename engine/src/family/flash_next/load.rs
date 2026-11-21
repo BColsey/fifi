@@ -920,6 +920,7 @@ pub(crate) fn preflight_rows(
     EngError,
 > {
     use crate::capability::Probe;
+    use crate::family::flash_next::host_plan::{HostFrame, HostMemory};
     use crate::family::flash_next::moe::tier_plan::{TierInputs, TierShape};
     use crate::family::plan_rows::RowsFit;
     // The fields this family reads; the request's shape is shared.
@@ -975,7 +976,12 @@ pub(crate) fn preflight_rows(
         }
     };
     let host = match (&facts.host.mem_total_bytes, &facts.host.mem_available_bytes) {
-        (Probe::Measured(total), Probe::Measured(available)) => (*total, *available),
+        (Probe::Measured(total), Probe::Measured(available)) => {
+            facts.host.mem_floor_bytes.map_or_else(
+                || HostMemory::from_pair(*total, *available),
+                |floor| HostMemory::with_floor(*total, *available, floor),
+            )
+        }
         _ => {
             return Ok((
                 Vec::new(),
@@ -999,8 +1005,7 @@ pub(crate) fn preflight_rows(
     if let Some(model) = gguf::GgufModel::open(dir)? {
         let plan = model.load_plan(gguf::plan::Card {
             free_vram,
-            host_total: host.0,
-            host_available: host.1,
+            host,
             ring_budget,
         })?;
         let min_slots = model.config().top_k() + 1;
@@ -1034,7 +1039,7 @@ pub(crate) fn preflight_rows(
             bytes_per_position: 1,
         },
         free_vram.saturating_sub(ring_budget),
-        host,
+        HostFrame::with_default_terms(host),
         // No ring source on this path: the pinned-store refusal stands.
         0,
     );
@@ -1339,6 +1344,7 @@ mod tests {
             host: HostFacts {
                 mem_total_bytes: Probe::Measured(64u64 << 30),
                 mem_available_bytes: Probe::Measured(32u64 << 30),
+                mem_floor_bytes: None,
                 cpu_threads: 8,
             },
         }

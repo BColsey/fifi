@@ -54,6 +54,11 @@ pub struct CudaFacts {
 pub struct HostFacts {
     pub mem_total_bytes: Probe<u64>,
     pub mem_available_bytes: Probe<u64>,
+    /// The bytes of the budget a host plan keeps back (the OS floor, less inside a binding
+    /// cgroup): read from the same host facts as the pair, so a report plans the host the way
+    /// a start does. Not part of the report; `None` plans with the whole OS floor.
+    #[serde(skip)]
+    pub(crate) mem_floor_bytes: Option<u64>,
     pub cpu_threads: usize,
 }
 
@@ -150,27 +155,35 @@ fn probe_cuda() -> CudaFacts {
 /// `cgroup budget unknown` line, so nothing that worked inside a container
 /// goes dark.
 pub(crate) fn probe_host() -> HostFacts {
-    let (total, available) = read_meminfo().map_or_else(
+    let (total, available, floor) = read_meminfo().map_or_else(
         |reason| {
             (
                 Probe::Unavailable(reason.clone()),
                 Probe::Unavailable(reason),
+                None,
             )
         },
-        |(total, available)| (Probe::Measured(total), Probe::Measured(available)),
+        |(total, available, floor)| {
+            (
+                Probe::Measured(total),
+                Probe::Measured(available),
+                Some(floor),
+            )
+        },
     );
     HostFacts {
         mem_total_bytes: total,
         mem_available_bytes: available,
+        mem_floor_bytes: floor,
         cpu_threads: std::thread::available_parallelism().map_or(1, usize::from),
     }
 }
 
-fn read_meminfo() -> Result<(u64, u64), String> {
+fn read_meminfo() -> Result<(u64, u64, u64), String> {
     #[cfg(target_os = "linux")]
     {
         crate::family::mem::HostFacts::read("Hardware facts", "the host")
-            .map(|host| host.host_memory())
+            .map(|host| (host.total(), host.budget(), host.kept_back()))
             .map_err(|error| format!("the host memory probe refused: {error:?}"))
     }
     #[cfg(not(target_os = "linux"))]

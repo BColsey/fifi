@@ -150,9 +150,23 @@ impl HostFacts {
         super::os_floor_of(self.mem_total)
     }
 
-    /// The budget above the OS floor: what a plan may spend on the process and its stores.
+    /// What a plan may spend on the process and its stores: `MemAvailable` above the OS floor,
+    /// and no more than the enclosing cgroup has left.
+    ///
+    /// The floor guards the rest of the host (the OS, other processes) from this one. A cgroup
+    /// limit already fences this process off from the host, so it is spent whole and the floor is
+    /// not charged inside it: a start under `MemoryMax=12G` plans against 12 GiB, not 4.
     pub(crate) fn spare(&self) -> u64 {
-        self.budget().saturating_sub(self.os_floor())
+        let above_floor = self.mem_available.saturating_sub(self.os_floor());
+        self.cgroup_remaining
+            .map_or(above_floor, |remaining| remaining.min(above_floor))
+    }
+
+    /// The bytes of the budget a plan keeps back: the budget less what [`HostFacts::spare`]
+    /// allows spending. The whole OS floor while the host is the binding limit, less while a
+    /// cgroup is.
+    pub(crate) fn kept_back(&self) -> u64 {
+        self.budget() - self.spare()
     }
 
     /// `MemTotal` paired with [`HostFacts::budget`], for host plans that carry
@@ -183,13 +197,14 @@ impl HostFacts {
     )]
     pub(crate) fn admit_for(&self, required: u64, what: &str) -> Result<(), EngError> {
         let available = self.budget();
-        if required
-            .checked_add(self.os_floor())
-            .is_none_or(|needed| needed > available)
+        let kept_back = self.kept_back();
+        if self.spare() == 0
+            || required
+                .checked_add(kept_back)
+                .is_none_or(|needed| needed > available)
         {
             return Err(EngError::MemoryPlan(format!(
-                "{what} needs {required} bytes plus {} bytes for the OS floor. Available host/cgroup budget: {available} bytes.",
-                self.os_floor()
+                "{what} needs {required} bytes plus {kept_back} bytes for the OS floor. Available host/cgroup budget: {available} bytes."
             )));
         }
         Ok(())
@@ -888,8 +903,10 @@ mod tests {
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(6u64 << 30));
         assert_eq!(budget.os_floor(), 8u64 << 30);
-        // 6 GiB left in the cgroup, 8 GiB floor: nothing is admitted.
-        assert!(budget.admit(LABEL, 1).is_err());
+        // 6 GiB left in the cgroup: the cgroup is the binding limit, the OS floor is not charged
+        // inside it, and the whole 6 GiB is spendable.
+        assert!(budget.admit(LABEL, 6u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (6u64 << 30) + 1).is_err());
         let (_root, _proc, directory, proc_dir) = namespace_root("max\n", "memory\n");
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, None);
@@ -1038,8 +1055,8 @@ mod tests {
             remaining,
         )
         .unwrap();
-        assert!(budget.admit(LABEL, 4u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (4u64 << 30) + 1).is_err());
+        assert!(budget.admit(LABEL, 12u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (12u64 << 30) + 1).is_err());
     }
 
     #[test]
@@ -1072,10 +1089,28 @@ mod tests {
         .unwrap();
         assert_eq!(host_smaller.budget(), 8 << 30);
 
-        // One budget for plan and guard: the last byte the guard admits is the accessor's
-        // figure minus the OS floor (8 GiB of the 64 GiB host).
-        assert!(cgroup_smaller.admit(LABEL, 4u64 << 30).is_ok());
-        assert!(cgroup_smaller.admit(LABEL, (4u64 << 30) + 1).is_err());
+        // One budget for plan and guard: the last byte the guard admits is `spare`. With the
+        // cgroup binding (12 GiB left of 24 GiB available) that is the whole cgroup remainder;
+        // with the host binding it is the available figure minus the 8 GiB OS floor of the
+        // 64 GiB host.
+        assert_eq!(cgroup_smaller.spare(), 12 << 30);
+        assert!(cgroup_smaller.admit(LABEL, 12u64 << 30).is_ok());
+        assert!(cgroup_smaller.admit(LABEL, (12u64 << 30) + 1).is_err());
+        assert_eq!(unlimited.spare(), 16 << 30);
+        assert_eq!(unlimited.kept_back(), 8 << 30);
+        assert_eq!(
+            host_smaller.spare(),
+            0,
+            "the floor is above what the host has"
+        );
+        // A cgroup roomier than the host above its floor does not raise the spare.
+        let roomy = HostFacts::from_meminfo(
+            LABEL,
+            "MemTotal: 67108864 kB\nMemAvailable: 25165824 kB\n",
+            Some(20 << 30),
+        )
+        .unwrap();
+        assert_eq!(roomy.spare(), 16 << 30);
     }
 
     #[test]
@@ -1153,8 +1188,8 @@ mod tests {
         let budget = HostFacts::from_meminfo(LABEL, text, Some(floor + 1)).unwrap();
         assert_eq!(budget.os_floor(), floor);
         assert_eq!(budget.cgroup_remaining, Some(floor + 1));
-        assert!(budget.admit(LABEL, 1).is_ok());
-        assert!(budget.admit(LABEL, 2).is_err());
+        assert!(budget.admit(LABEL, floor + 1).is_ok());
+        assert!(budget.admit(LABEL, floor + 2).is_err());
         assert!(
             HostFacts::from_meminfo(LABEL, text, Some(0))
                 .unwrap()
@@ -1223,15 +1258,24 @@ mod tests {
         assert!(
             HostFacts {
                 mem_available: exact.mem_available - 1,
-                ..exact
+                ..exact.clone()
             }
             .admit(LABEL, required)
             .is_err()
         );
         assert!(
             HostFacts {
-                cgroup_remaining: Some(required + floor - 1),
-                ..exact
+                cgroup_remaining: Some(required),
+                ..exact.clone()
+            }
+            .admit(LABEL, required)
+            .is_ok(),
+            "a cgroup that holds the payload is not asked to hold the OS floor as well"
+        );
+        assert!(
+            HostFacts {
+                cgroup_remaining: Some(required - 1),
+                ..exact.clone()
             }
             .admit(LABEL, required)
             .is_err()
@@ -1239,7 +1283,7 @@ mod tests {
         assert!(
             HostFacts {
                 cgroup_remaining: None,
-                ..exact
+                ..exact.clone()
             }
             .admit(LABEL, required)
             .is_ok(),
@@ -1265,8 +1309,8 @@ mod tests {
         std::fs::write(group.join("memory.current"), "1073741824\n").unwrap();
         let budget = HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).unwrap();
         assert_eq!(budget.cgroup_remaining, Some(15u64 << 30));
-        assert!(budget.admit(LABEL, 7u64 << 30).is_ok());
-        assert!(budget.admit(LABEL, (7u64 << 30) + 1).is_err());
+        assert!(budget.admit(LABEL, 15u64 << 30).is_ok());
+        assert!(budget.admit(LABEL, (15u64 << 30) + 1).is_err());
         std::fs::remove_file(group.join("memory.current")).unwrap();
         assert!(HostFacts::verified_in(LABEL, ROOT_LABEL, &proc_dir, &directory, 42).is_err());
         // The one read does not fail closed: the same unverifiable tree reads as the bare

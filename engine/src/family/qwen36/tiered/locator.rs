@@ -210,7 +210,7 @@ pub(crate) mod tests {
     use super::{ExpertLocator, ExpertTensorNames, LocatorError};
     use crate::family::qwen36::tiered::cpu_pool::{CpuPool, MappedRegion};
     use crate::family::qwen36::tiered::{PolicyMode, TieredConfig};
-    use crate::family::tier_budget::{ExpertSize, HostBudget, plan_host};
+    use crate::family::tier_budget::ExpertSize;
     use crate::kernels::expert_cpu::{
         ExpertScratch, ExpertShape, ExpertSlices, Q4K_BLOCK_BYTES, Q4K_BLOCK_VALUES, expert_forward,
     };
@@ -686,16 +686,6 @@ pub(crate) mod tests {
         cfg.check().unwrap();
         let size = ExpertSize::from_config(&cfg, locator.expert_bytes());
         assert_eq!((size.bytes, size.layers), (3 * per, 3));
-        // The host planner floors the cache to whole experts of that size.
-        let host = HostBudget {
-            total: 1 << 20,
-            non_reclaimable: 0,
-            engine_heap: 0,
-            staging: 0,
-            margin: 1,
-        };
-        let plan = plan_host(&host, 0, size.bytes).unwrap();
-        assert_eq!(plan.cached_experts, ((1 << 20) - 1) / (3 * per));
     }
 
     #[test]

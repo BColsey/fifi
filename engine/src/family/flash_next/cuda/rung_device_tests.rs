@@ -61,10 +61,7 @@ fn compare_disk_and_exclusive(selective: Option<bool>) {
     let row: Vec<i32> = vec![0, 1, -1];
     let rows: Vec<&[i32]> = vec![row.as_slice(); synthetic::LAYERS];
     let counts = vec![vec![0u64; synthetic::EXPERTS]; synthetic::LAYERS];
-    let memory = HostMemory {
-        total: 62 << 30,
-        available: 55 << 30,
-    };
+    let memory = HostMemory::from_pair(62 << 30, 55 << 30);
     let terms = HostTerms::DEFAULT;
     let disk_policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     let disk_state = ExpertBankState::with_policy(geometry, HostMode::Disk, disk_policy).unwrap();

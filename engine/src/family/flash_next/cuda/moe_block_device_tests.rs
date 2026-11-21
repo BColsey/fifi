@@ -259,10 +259,7 @@ fn build_bank(
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
-        &HostMemory {
-            total: 62 << 30,
-            available: 55 << 30,
-        },
+        &HostMemory::from_pair(62 << 30, 55 << 30),
         &HostTerms::DEFAULT,
     )
     .expect("the host plan");

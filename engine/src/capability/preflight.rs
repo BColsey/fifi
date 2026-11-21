@@ -2261,6 +2261,7 @@ mod tests {
             host: HostFacts {
                 mem_total_bytes: Probe::Unavailable("test".into()),
                 mem_available_bytes: Probe::Unavailable("test".into()),
+                mem_floor_bytes: None,
                 cpu_threads: 1,
             },
         }

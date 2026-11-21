@@ -65,6 +65,7 @@ use crate::{
         exl3_pack::layer_name,
         flash_next::{
             artifact::{pack_identity, tokenizer_pin},
+            host_plan::HostFrame,
             load::{
                 model_shape,
                 pack_files::{FlashPackFiles, NGRAM_FILE},
@@ -646,7 +647,7 @@ fn build_driver_resolving(
     let facts =
         Facts::read("Flash-Next expert bank", "Flash-Next")?.with_card(free_vram, vram_total);
     let host_admission = &facts.host;
-    let (mem_total, mem_available) = host_admission.host_memory();
+    let mem_available = host_admission.budget();
     let rows = wanted.prefill_rows as usize;
     let bulk_reader = ngram_bulk()? && rows > 1;
     let switches = crate::family::flash_next::settings::CacheSwitches::from_env()?;
@@ -683,6 +684,52 @@ fn build_driver_resolving(
     // arena serves chunked prefill only; `prefill_rows = 1` is the per-token driver and keeps
     // the pre-switch charge of zero. The arena grows with the context, so the plan is built per
     // context.
+    // The host side is admitted before anything is uploaded: the pinned store of the bank, the
+    // engine heap and margin of `HostTerms`, including any host F32 PLE projections.
+    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
+    let ple_bytes = if ple_shape.is_none() {
+        ple_width * model.ple.embed() as u64 * 4
+    } else {
+        0
+    };
+    let prefetch_backing = if disk_prefetch_horizon.is_some() {
+        bank_source::RungSource::backing_bytes(&checkpoint, artifact, 1)?
+    } else {
+        0
+    };
+    // One raw slot, the worker's aligned read window, and the packed records in
+    // the current upload and the pending layers. Include the transient pack workspace.
+    let prefetch_bytes = disk_prefetch_horizon.map_or(0, |horizon| {
+        let records = (horizon + 1) * super::disk_prefetch::CANDIDATES + 2;
+        2 * prefetch_backing as u64 + records as u64 * record_bytes as u64
+    });
+    let victim_budget = switches.victim_cache_bytes;
+    let victim_layout = (victim_budget > 0)
+        .then(|| {
+            super::victim_cache::VictimLayout::new(victim_budget, model.moe.top_k(), record_bytes)
+        })
+        .transpose()?;
+    let selective_victims = switches.selective_victims;
+    let recent_bytes = if selective_victims {
+        super::victim_cache::RecentPicks::bytes(layers, model.moe.experts())
+    } else {
+        0
+    };
+    let victim_bytes = victim_layout
+        .as_ref()
+        .map_or(0, |layout| layout.bytes() as u64);
+    let engine_heap = (HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes)
+        .checked_add(victim_bytes)
+        .and_then(|bytes| bytes.checked_add(recent_bytes))
+        .ok_or_else(|| {
+            EngError::MemoryPlan("Flash-Next victim cache host budget overflows".into())
+        })?;
+    let terms = HostTerms {
+        engine_heap,
+        ..HostTerms::DEFAULT
+    };
+    let memory = HostMemory::of(host_admission);
+    let host_frame = HostFrame::new(memory, terms);
     let geometry_for_arena = FlashGeometry::new(&model, &kinds)?;
     let plan_for = |context: u32| -> Result<FlashLoadPlan, EngError> {
         let prefill_arena_bytes = if rows > 1 {
@@ -698,7 +745,7 @@ fn build_driver_resolving(
                 bytes_per_position: 1,
             },
             free_vram.saturating_sub(ring_budget),
-            (mem_total, mem_available),
+            host_frame,
             // The same infallible placeholder the two-phase choice below charges
             // first: the pooled depth's records in flight, from the one shared
             // constant. The real figure is read only when the tier already points
@@ -778,50 +825,6 @@ fn build_driver_resolving(
         )));
     }
 
-    // The host side is admitted before anything is uploaded: the pinned store of the bank, the
-    // engine heap and margin of `HostTerms`, including any host F32 PLE projections.
-    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
-    let ple_bytes = if ple_shape.is_none() {
-        ple_width * model.ple.embed() as u64 * 4
-    } else {
-        0
-    };
-    let prefetch_backing = if disk_prefetch_horizon.is_some() {
-        bank_source::RungSource::backing_bytes(&checkpoint, artifact, 1)?
-    } else {
-        0
-    };
-    // One raw slot, the worker's aligned read window, and the packed records in
-    // the current upload and the pending layers. Include the transient pack workspace.
-    let prefetch_bytes = disk_prefetch_horizon.map_or(0, |horizon| {
-        let records = (horizon + 1) * super::disk_prefetch::CANDIDATES + 2;
-        2 * prefetch_backing as u64 + records as u64 * record_bytes as u64
-    });
-    let victim_budget = switches.victim_cache_bytes;
-    let victim_layout = (victim_budget > 0)
-        .then(|| {
-            super::victim_cache::VictimLayout::new(victim_budget, model.moe.top_k(), record_bytes)
-        })
-        .transpose()?;
-    let selective_victims = switches.selective_victims;
-    let recent_bytes = if selective_victims {
-        super::victim_cache::RecentPicks::bytes(layers, model.moe.experts())
-    } else {
-        0
-    };
-    let victim_bytes = victim_layout
-        .as_ref()
-        .map_or(0, |layout| layout.bytes() as u64);
-    let engine_heap = (HostTerms::DEFAULT.engine_heap + ple_bytes + prefetch_bytes)
-        .checked_add(victim_bytes)
-        .and_then(|bytes| bytes.checked_add(recent_bytes))
-        .ok_or_else(|| {
-            EngError::MemoryPlan("Flash-Next victim cache host budget overflows".into())
-        })?;
-    let terms = HostTerms {
-        engine_heap,
-        ..HostTerms::DEFAULT
-    };
     let geometry = BankGeometry::new(
         layers,
         model.moe.experts(),
@@ -835,10 +838,6 @@ fn build_driver_resolving(
     // rung; below ring + overhead + cache floor the refusal stays, the honest minimum tier).
     // `FIFI_FLASH_NEXT_BANK_MODE` forces a tier (`inclusive`, `exclusive` or `disk`);
     // anything else is refused, never a silent fallback.
-    let memory = HostMemory {
-        total: mem_total,
-        available: mem_available,
-    };
     // The rung's pooled read depth (RUNG_RING_SLOTS, in the shared tier
     // module): one worker per slot, one RECORD per job. The span bench's
     // step cells issue two records per layer, so it cannot separate depth 4
@@ -1525,10 +1524,7 @@ mod tests {
     fn the_disk_rung_refuses_below_its_own_floor_with_the_plans_counts() {
         let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
         let terms = HostTerms::DEFAULT;
-        let memory = HostMemory {
-            total: 1 << 30,
-            available: 1,
-        };
+        let memory = HostMemory::from_pair(1 << 30, 1);
         let ring = 4096u64;
         let scratch = 2 * (8 + terms.stream_slot_metadata);
         let staging = terms.ngram_staging_bytes().expect("the staging bytes");
@@ -1548,10 +1544,7 @@ mod tests {
             )
         );
         // The page-cache refusal: the floor fits, one byte of the cache floor does not.
-        let memory = HostMemory {
-            total: 1 << 30,
-            available: needed + (4u64 << 30) - 1,
-        };
+        let memory = HostMemory::from_pair(1 << 30, needed + (4u64 << 30) - 1);
         let terms = HostTerms {
             ngram_cache_min: 4u64 << 30,
             ..HostTerms::DEFAULT

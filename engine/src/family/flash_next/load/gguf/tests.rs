@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::flash_next::host_plan::HostMemory,
     family::flash_next::load::{Dims, tests::CONFIG},
     weights::GgufType,
 };
@@ -369,8 +370,7 @@ fn the_n_gram_rows_come_from_the_ends_of_the_28_gb_table() {
 fn card(free: u64, total: u64, available: u64) -> Card {
     Card {
         free_vram: free,
-        host_total: total,
-        host_available: available,
+        host: HostMemory::from_pair(total, available),
         ring_budget: 0,
     }
 }
@@ -389,7 +389,7 @@ fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
     for (available, label) in [
         (40 * GIB, "40 GiB free"),
         (20 * GIB, "20 GiB free"),
-        (12 * GIB, "12 GiB free"),
+        (16 * GIB, "16 GiB free"),
     ] {
         let plan = model
             .load_plan(card(22 * GIB + GIB / 2, 62 * GIB, available))
@@ -417,12 +417,13 @@ fn a_host_that_cannot_pin_the_cold_experts_plans_the_disk_tier() {
             .and_then(|plan| plan.at_context(4096, kv, 11))
             .map(|load| load.context.plan.store_tier())
     };
-    // A host with room for the whole store pins it; the same card with 12 GiB free reads from disk.
+    // A host with room for the whole store pins it; the same card with 16 GiB free (the 8 GiB OS
+    // floor and the process terms leave no room for a pinned store) reads from disk.
     assert!(matches!(
         tier(200 * GIB),
         Ok(TierChoice::Inclusive | TierChoice::Exclusive { .. })
     ));
-    assert!(matches!(tier(12 * GIB), Ok(TierChoice::Disk)));
+    assert!(matches!(tier(16 * GIB), Ok(TierChoice::Disk)));
 }
 
 #[test]
