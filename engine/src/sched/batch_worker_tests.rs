@@ -124,6 +124,8 @@ struct WindowFake {
     idle_trim: Option<Duration>,
     /// The cold prompts that take a whole piece in one idle tick; 1 is the default policy.
     idle_pieces: usize,
+    /// Answers the trait's default policy instead of the opted-in one.
+    default_policy: bool,
 }
 
 impl WindowFake {
@@ -159,8 +161,10 @@ impl WindowFake {
             live_cap: None,
             window_delay: None,
             deny_slot: None,
-            idle_trim: None,
+            // The fake stands for an executor that has opted in: an hour is never reached.
+            idle_trim: Some(Duration::from_secs(3600)),
             idle_pieces: 8,
+            default_policy: false,
         }
     }
 
@@ -213,6 +217,9 @@ impl ExecutorOps for WindowFake {
     }
 
     fn batch_policy(&self) -> crate::family::executor::BatchPolicy {
+        if self.default_policy {
+            return crate::family::executor::BatchPolicy::default();
+        }
         crate::family::executor::BatchPolicy {
             idle_pieces: self.idle_pieces,
             idle_trim: self.idle_trim,
@@ -2858,5 +2865,37 @@ fn a_session_whose_setup_failed_is_not_pooled_again() {
     assert_eq!(usage(&collect(second_events)).completion_tokens, 2);
     // The seed that failed its reset is gone: the second job got a session of its own.
     assert_eq!(snapshot(&engine).sessions_created, 1);
+    engine.shutdown();
+}
+
+#[test]
+fn an_executor_that_does_not_opt_into_the_trim_keeps_one_session_after_a_burst() {
+    // Four jobs at once need four sessions (the seed and three more). Their sessions come back as
+    // the jobs finish: the executor keeps one and the other three are released at once.
+    let log = Log::default();
+    let mut fake = WindowFake::new(&log);
+    fake.max = 4;
+    fake.default_policy = true;
+    let (engine, release) = start(fake);
+    let mut all = Vec::new();
+    for index in 0..4u32 {
+        let (next, events) = job(&[index], 4);
+        engine.handle().try_submit(next).expect("submit");
+        all.push(events);
+    }
+    release.send(()).expect("load");
+    for events in all {
+        collect(events);
+    }
+    wait(|| snapshot(&engine).sessions_dropped == 3);
+    let counts = snapshot(&engine);
+    assert_eq!(counts.sessions_created, 3, "{counts:?}");
+    let held = 1 + counts.sessions_created - counts.sessions_dropped - counts.sessions_trimmed;
+    assert_eq!(held, 1, "{counts:?}");
+    // The kept session serves the next job without an allocation.
+    let (again, again_events) = job(&[0], 2);
+    engine.handle().try_submit(again).expect("again");
+    assert_eq!(usage(&collect(again_events)).completion_tokens, 2);
+    assert_eq!(snapshot(&engine).sessions_created, 3);
     engine.shutdown();
 }

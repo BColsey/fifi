@@ -82,6 +82,8 @@ pub(super) struct TickCounters {
     sessions_reused: AtomicU64,
     /// Sessions released because the engine sat idle.
     sessions_trimmed: AtomicU64,
+    /// Finished sessions released at once because the executor keeps only one.
+    sessions_dropped: AtomicU64,
 }
 
 /// A copy of the counters at one moment.
@@ -97,6 +99,7 @@ pub(super) struct TickSnapshot {
     pub(super) sessions_created: u64,
     pub(super) sessions_reused: u64,
     pub(super) sessions_trimmed: u64,
+    pub(super) sessions_dropped: u64,
 }
 
 impl TickCounters {
@@ -113,6 +116,7 @@ impl TickCounters {
             sessions_created: read(&self.sessions_created),
             sessions_reused: read(&self.sessions_reused),
             sessions_trimmed: read(&self.sessions_trimmed),
+            sessions_dropped: read(&self.sessions_dropped),
         }
     }
 
@@ -196,7 +200,15 @@ impl<'a, S> Pool<'a, S> {
         Some(pooled.session)
     }
 
+    /// Takes a finished session back. An executor that has not opted into the trim keeps one
+    /// session and releases every finished session beyond it at once, as the worker did before
+    /// it pooled sessions: a burst does not leave its sessions allocated for the life of the
+    /// engine.
     fn give(&mut self, session: S) {
+        if self.idle_trim.is_none() && !self.free.is_empty() {
+            TickCounters::add(&self.counters.sessions_dropped, 1);
+            return;
+        }
         self.give_at(session, Instant::now());
     }
 
