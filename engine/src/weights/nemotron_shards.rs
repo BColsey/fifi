@@ -108,6 +108,14 @@ impl NemotronShardReader {
         self.tensors.get(name)
     }
 
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub(crate) fn payload_len(&self) -> u64 {
+        self.file_len - self.data_start
+    }
+
     /// Length of the shard file; `open` proved the header-declared data section ends exactly here.
     pub fn file_len(&self) -> u64 {
         self.file_len

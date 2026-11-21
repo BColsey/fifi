@@ -231,6 +231,9 @@ fn evaluate(
 
     let family = identify_family(inspection, candidate, &mut checks);
     let family_name = family.as_deref();
+    if family_name == Some(crate::family::inkling2::FAMILY) {
+        return inkling2_preflight(model_dir, tokenizer_dir, candidate, checks);
+    }
     if family_name == Some(crate::family::qwen36::factory::FAMILY) {
         // `None` when this binary has no GPU backend at all;
         // `backend_of_build`'s fallback arm must not masquerade as one.
@@ -536,6 +539,18 @@ fn identify_family(
         ));
         return None;
     }
+    if inspection
+        .config_model_types
+        .iter()
+        .any(|model| model == crate::family::inkling2::FAMILY)
+    {
+        checks.push(Check::new(
+            "family",
+            CheckStatus::Pass,
+            "config.json model_type matches inkling2_loop".to_string(),
+        ));
+        return Some(crate::family::inkling2::FAMILY.to_string());
+    }
     // Inference, deliberately narrow: only a `config.json` model_type that
     // a family's spec itself accepts. Anything else asks the user to name
     // the family rather than guessing at GB-scale consequences.
@@ -572,6 +587,85 @@ fn any_failed(checks: &[Check]) -> bool {
 
 fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
+}
+
+fn inkling2_preflight(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    candidate: &Candidate,
+    mut checks: Vec<Check>,
+) -> PreflightReport {
+    use crate::family::inkling2::{FAMILY, TextSpec, inspect_checkpoint};
+
+    let spec = std::fs::read(model_dir.join("config.json"))
+        .map_err(|error| crate::EngError::Checkpoint(format!("read Inkling config.json: {error}")))
+        .and_then(|bytes| TextSpec::from_config(&bytes));
+    match spec {
+        Ok(spec) => {
+            let context = candidate.context_limit.unwrap_or(8192);
+            report_inkling2_plan(&mut checks, &spec, context);
+            match inspect_checkpoint(model_dir, &spec) {
+                Ok(facts) => checks.push(Check::new(
+                    "Inkling checkpoint",
+                    CheckStatus::Pass,
+                    format!(
+                        "{} tensors, {} payload bytes, {} NVFP4 and {} MXFP8 expert layers",
+                        facts.tensors, facts.payload_bytes, facts.nvfp4_layers, facts.mxfp8_layers
+                    ),
+                )),
+                Err(error) => checks.push(Check::new(
+                    "Inkling checkpoint",
+                    CheckStatus::Fail,
+                    error.to_string(),
+                )),
+            }
+        }
+        Err(error) => checks.push(Check::new(
+            "Inkling config",
+            CheckStatus::Fail,
+            error.to_string(),
+        )),
+    }
+    checks.push(Check::new(
+        "generation backend",
+        CheckStatus::Fail,
+        "Inkling 2 Mini checkpoint inspection is staged; generation is pending".to_string(),
+    ));
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family: Some(FAMILY.to_string()),
+        verdict: Verdict::Unsupported,
+        dimensions: Dimensions {
+            compatibility: Compatibility::Unsupported,
+            qualification: Qualification::Unverified,
+            resource_fit: ResourceFit::Unknown,
+        },
+        checks,
+        decisions: Vec::new(),
+        estimate: None,
+        next_step: "Use the checkpoint and BF16 KV rows above to guide backend implementation."
+            .to_string(),
+    }
+}
+
+fn report_inkling2_plan(
+    checks: &mut Vec<Check>,
+    spec: &crate::family::inkling2::TextSpec,
+    context: u32,
+) {
+    match spec.kv_plan(context) {
+        Ok(plan) => checks.push(Check::new(
+            "Inkling text plan",
+            CheckStatus::Pass,
+            format!(
+                "{} stored layers, {} local and {} global layer visits; BF16 KV at {} tokens is {} bytes with local windows or {} bytes with full caches",
+                spec.stored_layers(), plan.local_visits, plan.global_visits, plan.context,
+                plan.windowed_bytes, plan.all_full_bytes
+            ),
+        )),
+        Err(error) => checks.push(Check::new("Inkling text plan", CheckStatus::Fail, error.to_string())),
+    }
 }
 
 fn shallow_preflight(

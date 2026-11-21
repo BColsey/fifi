@@ -585,6 +585,16 @@ fn start_gemma4(
     )))
 }
 
+fn start_inkling2(
+    _config: &EngineConfig,
+    _prefix_reuse: bool,
+    _ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    Err(EngError::BadRequest(
+        "Inkling 2 Mini is staged in this build: use enginesrv check <model_dir> for checkpoint inspection; the generation backend is pending".into(),
+    ))
+}
+
 /// The closed registry of families this build starts. Staged backends
 /// refuse inside their starter before model or tokenizer reads; the
 /// config gate owns the unknown-family rejection text.
@@ -598,6 +608,7 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (q36_factory::DENSE_FAMILY, start_q36, true),
     (nemotron_factory::FAMILY, start_nemotron, false),
     (gemma4::FAMILY, start_gemma4, false),
+    (crate::family::inkling2::FAMILY, start_inkling2, false),
     (fake::FAMILY, start_fake, false),
 ];
 
