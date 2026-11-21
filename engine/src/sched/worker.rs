@@ -445,7 +445,7 @@ impl Stages<'_> {
 /// thread boundary. `prefill_chunk` is the largest prompt slice passed to
 /// one `prefill` call when the executor does not plan its own piece. An
 /// executor's initial `prefill_piece()` sets the maximum after `make`; the
-/// hint is refreshed between pieces without exceeding that maximum.
+/// hint is refreshed between pieces within that maximum and any request-specific limit.
 #[cfg(test)]
 pub(crate) fn spawn_engine<E, F>(prefill_chunk: usize, make: F) -> Result<Engine, EngError>
 where
@@ -1143,6 +1143,7 @@ fn start<E: ExecutorOps>(
         generation.remaining_tokens(),
         plan.boundary.is_some(),
     )?;
+    let prefill_chunk = request_prefill_chunk(executor, session, prefill_chunk);
     let cancel = &generation.cancel;
     let restored = match plan.boundary {
         Some(_) => executor.restore_prefix(session, plan.tokens)?,
@@ -1181,6 +1182,16 @@ fn start<E: ExecutorOps>(
     let tail = span(plan.tokens, next, plan.tokens.len())?;
     prefill_chunks(executor, session, tail, prefill_chunk, cancel, pieces)?;
     Ok(restored)
+}
+
+fn request_prefill_chunk<E: ExecutorOps>(
+    executor: &E,
+    session: &E::Session,
+    startup_chunk: usize,
+) -> usize {
+    executor
+        .request_prefill_piece(session)
+        .map_or(startup_chunk, |rows| rows.get().min(startup_chunk))
 }
 
 fn span(tokens: &[u32], from: usize, to: usize) -> Result<&[u32], EngError> {
@@ -1389,6 +1400,7 @@ mod tests {
         /// The piece that `prefill_piece` reports.
         piece: Option<usize>,
         piece_after_prefill: Option<usize>,
+        request_piece: Option<std::num::NonZeroUsize>,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
         /// The admit-path bank reports the spy answers: the `before` sample until the first
@@ -1424,6 +1436,7 @@ mod tests {
                 fail_restore: None,
                 piece: None,
                 piece_after_prefill: None,
+                request_piece: None,
                 context_limit: None,
                 bank_reports: None,
             }
@@ -1457,6 +1470,10 @@ mod tests {
             } else {
                 self.piece
             }
+        }
+
+        fn request_prefill_piece(&self, _st: &Self::Session) -> Option<std::num::NonZeroUsize> {
+            self.request_piece
         }
 
         fn prefix_limits(&self) -> StoreLimits {
@@ -2194,6 +2211,31 @@ mod tests {
             ])
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn request_prefill_piece_is_used_within_the_startup_ceiling() {
+        for (limit, expected) in [
+            (4, &["prefill:4", "prefill:4", "prefill:2"][..]),
+            (16, &["prefill:8", "prefill:2"][..]),
+        ] {
+            let log = new_log();
+            let mut spy = Spy::new(vec![vec![EOS]], &log);
+            spy.piece = Some(8);
+            spy.request_piece = std::num::NonZeroUsize::new(limit);
+            let engine = start_spy(1, spy);
+            let (job, handle) = job(&[1; 10]);
+            engine.handle().try_submit(job).expect("submit");
+            collect(handle);
+            assert_eq!(
+                calls(&log)
+                    .into_iter()
+                    .filter(|call| call.starts_with("prefill:"))
+                    .collect::<Vec<_>>(),
+                strings(expected)
+            );
+            engine.shutdown();
+        }
     }
 
     #[test]

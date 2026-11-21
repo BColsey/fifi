@@ -51,6 +51,13 @@ pub(crate) fn request_sized_kv_enabled(setting: Option<&std::ffi::OsStr>) -> boo
         && crate::family::mlx_budget::enabled()
 }
 
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn request_prefill_enabled(setting: Option<&std::ffi::OsStr>) -> bool {
+    setting.is_some_and(|value| value == "1")
+        && crate::family::mlx_budget::enabled()
+        && !super::mlx_forward::prefill_chain_flagged()
+}
+
 /// MLX freed-buffer cache limit selection (the OnceLock reader lives in
 /// `mlx_model`, which is Mac-gated; see the rollback documentation there).
 #[cfg(any(
