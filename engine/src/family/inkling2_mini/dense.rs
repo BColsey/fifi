@@ -30,14 +30,16 @@ impl DenseWeights {
     }
 
     pub fn from_gguf(source: Arc<gguf::Weights>) -> Result<Self, EngError> {
-        Self::from_gguf_with_mapping(source, 0).map(|(dense, _)| dense)
+        Self::from_gguf_with_mapping(source, 0, 1).map(|(dense, _)| dense)
     }
 
     pub(super) fn from_gguf_with_mapping(
         source: Arc<gguf::Weights>,
         mapping_budget: u64,
+        attention_workers: usize,
     ) -> Result<(Self, u64), EngError> {
-        let (dense, mapped_bytes) = gguf_dense::Dense::new(source, mapping_budget)?;
+        let (dense, mapped_bytes) =
+            gguf_dense::Dense::new(source, mapping_budget, attention_workers)?;
         Ok((Self(Backend::Gguf(dense)), mapped_bytes))
     }
 
@@ -193,11 +195,7 @@ impl SafetensorDense {
         } else {
             DenseShard::Buffered(shard)
         };
-        let attention_workers = if std::env::var_os(ATTN_WORKERS_ENV).is_some_and(|v| v == "4") {
-            bf16_worker_limit()
-        } else {
-            1
-        };
+        let attention_workers = attention_cpu_workers();
         Ok(Self {
             shard,
             len,
@@ -391,6 +389,14 @@ impl SafetensorDense {
         }
         check_len()?;
         Ok(bytes.into_boxed_slice())
+    }
+}
+
+pub(super) fn attention_cpu_workers() -> usize {
+    if std::env::var_os(ATTN_WORKERS_ENV).is_some_and(|value| value == "4") {
+        bf16_worker_limit()
+    } else {
+        1
     }
 }
 

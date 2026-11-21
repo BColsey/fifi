@@ -18,6 +18,8 @@ use crate::{
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) const DENSE_MAPPING_ENV: &str = "FIFI_INKLING_GGUF_MMAP_DENSE";
 const ROWS_PER_READ: usize = 256;
+const ATTENTION_WORKER_STACK_BYTES: usize = 256 << 10;
+const MAX_ATTENTION_PROJECTION_DIM: usize = QUERY_HEADS * HEAD_DIM as usize;
 pub(super) const LARGEST_PLANE_F32_BYTES: usize = 2 * HIDDEN * INTERMEDIATE * 4;
 const PADDED_VOCAB: u64 = 201_024;
 const RELATIVE_FEATURES: u64 = 16;
@@ -366,6 +368,18 @@ impl Weights {
         input: &[f32],
         dense: bool,
     ) -> Result<Vec<f32>, EngError> {
+        self.project_with_workers(name, plane, rows, input, dense, 1)
+    }
+
+    pub(super) fn project_with_workers(
+        &self,
+        name: &str,
+        plane: usize,
+        rows: Range<usize>,
+        input: &[f32],
+        dense: bool,
+        workers: usize,
+    ) -> Result<Vec<f32>, EngError> {
         let tensor = self.tensor(name)?;
         let (width, height, dtype, row_bytes) = matrix(tensor)?;
         let planes = tensor.dims().get(2).copied().unwrap_or(1) as usize;
@@ -374,24 +388,26 @@ impl Weights {
                 "projection exceeds Inkling GGUF tensor {name}"
             )));
         }
-        let mut bytes = self.buffer(name, rows.len().min(ROWS_PER_READ) * row_bytes)?;
-        let mut result = Vec::with_capacity(rows.len());
-        let mut values = vec![0.; width];
-        for start in (rows.start..rows.end).step_by(ROWS_PER_READ) {
-            let count = ROWS_PER_READ.min(rows.end - start);
-            let bytes = &mut bytes[..count * row_bytes];
-            self.read_range_classified(
-                name,
-                ((plane * height + start) * row_bytes) as u64,
-                bytes,
-                dense,
-            )?;
-            for row in bytes.chunks_exact(row_bytes) {
-                crate::weights::dequantize_into(dtype, row, &mut values)?;
-                result.push(values.iter().zip(input).map(|(w, x)| w * x).sum());
+        project_row_groups(rows, workers, |rows| {
+            let mut bytes = self.buffer(name, rows.len().min(ROWS_PER_READ) * row_bytes)?;
+            let mut result = Vec::with_capacity(rows.len());
+            let mut values = vec![0.; width];
+            for start in (rows.start..rows.end).step_by(ROWS_PER_READ) {
+                let count = ROWS_PER_READ.min(rows.end - start);
+                let bytes = &mut bytes[..count * row_bytes];
+                self.read_range_classified(
+                    name,
+                    ((plane * height + start) * row_bytes) as u64,
+                    bytes,
+                    dense,
+                )?;
+                for row in bytes.chunks_exact(row_bytes) {
+                    crate::weights::dequantize_into(dtype, row, &mut values)?;
+                    result.push(values.iter().zip(input).map(|(w, x)| w * x).sum());
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
     pub(super) fn project_mapped(
@@ -401,6 +417,7 @@ impl Weights {
         input: &[f32],
         mapping: &MappedFile,
         admitted_bytes: u64,
+        workers: usize,
     ) -> Result<Vec<f32>, EngError> {
         let tensor = self.tensor(name)?;
         let (width, height, dtype, row_bytes) = matrix(tensor)?;
@@ -426,7 +443,14 @@ impl Weights {
         let bytes = mapping.as_ref().get(start..stop).ok_or_else(|| {
             checkpoint_error(format!("mapped GGUF tensor {name} is out of bounds"))
         })?;
-        let result = project_packed_rows(dtype, row_bytes, bytes, input)?;
+        let result = project_row_groups(0..rows.len(), workers, |range| {
+            project_packed_rows(
+                dtype,
+                row_bytes,
+                &bytes[range.start * row_bytes..range.end * row_bytes],
+                input,
+            )
+        })?;
         if let Some(io) = &self.dense_io {
             io.mapped_access(bytes.len());
         }
@@ -557,6 +581,37 @@ pub(super) fn finish_expert_visit(merged: Vec<f32>) -> Result<Vec<half::bf16>, E
     Ok(merged.into_iter().map(half::bf16::from_f32).collect())
 }
 
+fn project_row_groups(
+    rows: Range<usize>,
+    workers: usize,
+    project: impl Fn(Range<usize>) -> Result<Vec<f32>, EngError> + Sync,
+) -> Result<Vec<f32>, EngError> {
+    if workers <= 1 || rows.len() <= 1 {
+        return project(rows);
+    }
+    let rows_per_worker = rows.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for start in rows.clone().step_by(rows_per_worker) {
+            let end = (start + rows_per_worker).min(rows.end);
+            let project = &project;
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(ATTENTION_WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || project(start..end))
+                    .map_err(|error| {
+                        EngError::MemoryPlan(format!("Inkling attention worker: {error}"))
+                    })?,
+            );
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for handle in handles {
+            out.extend(handle.join().expect("Inkling attention worker panicked")?);
+        }
+        Ok(out)
+    })
+}
+
 fn project_packed_rows(
     dtype: GgufType,
     row_bytes: usize,
@@ -583,10 +638,22 @@ fn project_packed_rows(
     Ok(result)
 }
 
-pub(super) fn projection_scratch_bytes() -> u64 {
-    // Largest possible FP32 row (the controller input) times the chunk, plus
-    // one output logits row and conservatively sized attention and MoE temporaries.
-    (ROWS_PER_READ * 2 * HIDDEN * 4 + PADDED_VOCAB as usize * 4 + 256 * HIDDEN * 4) as u64
+pub(super) fn projection_scratch_bytes(attention_workers: usize) -> u64 {
+    // Serial scratch includes the largest FP32 controller chunk and logits row.
+    let serial_buffer = ROWS_PER_READ * 2 * HIDDEN * 4;
+    let base = serial_buffer + PADDED_VOCAB as usize * 4 + 256 * HIDDEN * 4;
+    if attention_workers == 1 {
+        return base as u64;
+    }
+    // Each worker can hold one 256-row packed chunk with up to a 3072-wide
+    // F32 row, one decoded row, and a fixed stack. Joining also holds one
+    // extra full attention output. Only one projection runs at a time.
+    let worker_buffer = ROWS_PER_READ * MAX_ATTENTION_PROJECTION_DIM * 4;
+    let buffers = serial_buffer.max(attention_workers * worker_buffer);
+    let extra = attention_workers
+        * (ATTENTION_WORKER_STACK_BYTES + MAX_ATTENTION_PROJECTION_DIM * 4)
+        + MAX_ATTENTION_PROJECTION_DIM * 4;
+    (base - serial_buffer + buffers + extra) as u64
 }
 
 pub(super) fn packed_mlx_enabled() -> bool {
@@ -617,11 +684,11 @@ const GGUF_BATCH_EXPERT_BYTES: u64 = 2 * MAX_PACKED_GROUP_BYTES + GROUP_ROW_WORK
 pub(super) const GGUF_BATCH_RETIRE_BYTES: u64 =
     LARGEST_PLANE_F32_BYTES as u64 + MAX_PACKED_GROUP_BYTES + GROUP_ROW_WORKSPACE_BYTES;
 
-pub(super) fn native_scratch_bytes() -> u64 {
+pub(super) fn native_scratch_bytes(attention_workers: usize) -> u64 {
     // Reserve the existing general plane workspace, plus four resident U32
     // codebooks and a second copy to cover their host upload in packed mode.
     const CODEBOOK_BYTES: u64 = (2048 + 2 * (256 + 512 + 1024)) * 4;
-    projection_scratch_bytes()
+    projection_scratch_bytes(attention_workers)
         + 4 * LARGEST_PLANE_F32_BYTES as u64
         + if packed_mlx_enabled() {
             2 * CODEBOOK_BYTES
@@ -640,7 +707,8 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
 
     let context = context.unwrap_or(super::DEFAULT_CONTEXT);
     let state = super::state_plan(context)?;
-    let staging = native_scratch_bytes();
+    let attention_workers = super::dense::attention_cpu_workers();
+    let staging = native_scratch_bytes(attention_workers);
     let charges = super::base_charges(0, staging, &state);
     let expert_workspace = if batched_experts_enabled() {
         format!(
@@ -650,7 +718,7 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
         "one GGUF expert plane".to_string()
     };
     let plan = format!(
-        "{} B for {expert_workspace}, BF16 state at {context} tokens and decoder scratch",
+        "{} B for {expert_workspace}, BF16 state at {context} tokens and decoder scratch ({attention_workers} CPU attention workers)",
         charges.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
     );
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -755,6 +823,52 @@ mod mapped_projection_tests {
     use super::*;
 
     #[test]
+    fn gguf_attention_worker_admission_covers_pread_buffers_and_stacks() {
+        assert_eq!(projection_scratch_bytes(1), 7_881_984);
+        assert_eq!(
+            projection_scratch_bytes(4) - projection_scratch_bytes(1),
+            8_974_336
+        );
+        assert!(projection_scratch_bytes(2) < projection_scratch_bytes(4));
+    }
+
+    #[test]
+    fn parallel_quantized_attention_preserves_uneven_q6_k_and_q8_0_rows() {
+        let input: Vec<_> = (0..256).map(|i| (i % 11) as f32 / 16. - 0.25).collect();
+        for (dtype, row_bytes) in [(GgufType::Q6K, 210), (GgufType::Q80, 272)] {
+            let mut weights = vec![0; row_bytes * 11];
+            for (index, row) in weights.chunks_exact_mut(row_bytes).enumerate() {
+                row.fill((index * 7 + 1) as u8);
+                let scale = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+                if dtype == GgufType::Q6K {
+                    row[208..210].copy_from_slice(&scale);
+                } else {
+                    for block in row.chunks_exact_mut(34) {
+                        block[..2].copy_from_slice(&scale);
+                    }
+                }
+            }
+            let run = |workers| {
+                project_row_groups(0..11, workers, |range| {
+                    project_packed_rows(
+                        dtype,
+                        row_bytes,
+                        &weights[range.start * row_bytes..range.end * row_bytes],
+                        &input,
+                    )
+                })
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+            };
+            let serial = run(1);
+            assert_ne!(serial[0], serial[10]);
+            assert_eq!(serial, run(4));
+        }
+    }
+
+    #[test]
     fn mapped_projection_matches_buffered_gates_and_bounds_the_selected_rows() {
         use std::io::Write;
 
@@ -792,12 +906,12 @@ mod mapped_projection_tests {
         let input = [0.5, 0.25, -0.75];
         let before = weights.project(name, 0, 0..257, &input, true).unwrap();
         let after = weights
-            .project_mapped(name, 0..1, &input, &mapping, 12)
+            .project_mapped(name, 0..1, &input, &mapping, 12, 1)
             .unwrap();
         assert_eq!(before[0].to_bits(), after[0].to_bits());
         assert!(
             weights
-                .project_mapped(name, 1..2, &input, &mapping, 12)
+                .project_mapped(name, 1..2, &input, &mapping, 12, 1)
                 .is_err()
         );
         // Expert callers use the same read helpers without charging dense bytes.
@@ -812,10 +926,25 @@ mod mapped_projection_tests {
         assert_eq!(io.snapshot().file_bytes, 2 * 257 * 12 + 12);
         assert_eq!(io.snapshot().mapped_accesses, 1);
         assert_eq!(io.snapshot().mapped_span_bytes, 12);
+        let before_io = io.snapshot();
+        let parallel = weights
+            .project_with_workers(name, 0, 0..257, &input, true, 4)
+            .unwrap();
+        let mapped = weights
+            .project_mapped(name, 0..257, &input, &mapping, 257 * 12, 4)
+            .unwrap();
+        let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        assert_eq!(bits(before.clone()), bits(parallel));
+        assert_eq!(bits(before), bits(mapped));
+        let delta = io.snapshot().since(before_io);
+        assert_eq!(delta.file_bytes, 257 * 12);
+        assert_eq!(delta.file_ranges, 4);
+        assert_eq!(delta.mapped_span_bytes, 257 * 12);
+        assert_eq!(delta.mapped_accesses, 1);
         artifact.as_file().set_len(0).unwrap();
         assert!(
             weights
-                .project_mapped(name, 0..1, &input, &mapping, 12)
+                .project_mapped(name, 0..1, &input, &mapping, 12, 1)
                 .is_err()
         );
     }

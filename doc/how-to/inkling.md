@@ -178,6 +178,8 @@ The pinned Unsloth llama.cpp reference `b12588-mix-c0c3de8` reported 4.50 prefil
 
 `FIFI_INKLING_GGUF_BATCH_EXPERTS=1` groups eight gate/up projections and eight down projections on layers with two direct packed kernels. It issues one readback per group and retains the same CPU activation and output accumulation order. The shared planner reserves 48,365,568 additional bytes for the live and deferred groups. Compare this flag with the same single-copy cache setting and inspect actual synchronization counts and complete model logits before using it for timing.
 
+`FIFI_INKLING_ATTN_CPU_WORKERS=4` also enables up to four workers for GGUF Q, K, V, and attention output projections. They handle contiguous output rows while preserving each row’s dequantization and accumulation order. Four workers add 8,974,336 bytes to the shared scratch reservation, including bounded positional-read buffers and worker stacks. Verify full logits and measure CPU time, disk bytes, and request latency at the same ceiling.
+
 ### Speculative read replay
 
 The measured 5 GiB route trace spent 9.13 s in demand reads across 1,536 visits. Two historical predictors used the previous token’s route at the same visit or the latest route for the same physical layer. Both would issue zero speculative reads under a one- or two-visit lookahead because all their predicted experts were already cached when they would have issued. At a simulated 1 GiB expert cache, the better two-visit predictor by byte precision would read 16.63 GB ahead, including 11.08 GB unused at its target visit. This replay models logical payloads. The runtime retains demand-only scheduling.
