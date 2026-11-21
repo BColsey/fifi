@@ -50,6 +50,33 @@ const _: () = assert!(
         && offset_of!(GemmDqArgsRepr, x_f32) == 44
 );
 
+/// Mirror of `inference_cuda_gemm_dq_mmid_args` (`gemm_dq.h`), field for field.
+#[repr(C)]
+struct GemmDqMmidArgsRepr {
+    w: *const c_void,
+    x: *const f32,
+    y: *mut f32,
+    ids_dst: *const c_int,
+    expert_bounds: *const c_int,
+    expert_stride: u64,
+    k: c_int,
+    rows: c_int,
+    n_experts: c_int,
+    total_cols: c_int,
+    x_div: c_int,
+    x_row_stride: c_int,
+    y_row_stride: c_int,
+    pad: c_int,
+}
+
+const _: () = assert!(
+    size_of::<GemmDqMmidArgsRepr>() == 80
+        && offset_of!(GemmDqMmidArgsRepr, ids_dst) == 24
+        && offset_of!(GemmDqMmidArgsRepr, expert_stride) == 40
+        && offset_of!(GemmDqMmidArgsRepr, k) == 48
+        && offset_of!(GemmDqMmidArgsRepr, y_row_stride) == 72
+);
+
 unsafe extern "C" {
     #[link_name = "inference_cuda_gemm_dq_q5k_launch"]
     fn gemm_dq_q5k_launch_raw(
@@ -63,16 +90,18 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
-    #[allow(dead_code)] // Staged until a model caller is qualified.
-    #[link_name = "inference_cuda_gemm_dq_iq4xs_launch"]
-    fn gemm_dq_iq4xs_launch_raw(
-        args: *const GemmDqArgsRepr,
-        stream: *mut c_void,
-        out_stage: *mut c_int,
-    ) -> c_int;
     #[link_name = "inference_cuda_gemm_dq_codebook_launch"]
     fn gemm_dq_codebook_launch_raw(
         args: *const GemmDqArgsRepr,
+        ty: c_int,
+        table: *const c_void,
+        table_bytes: usize,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gemm_dq_mmid_launch"]
+    fn gemm_dq_mmid_launch_raw(
+        args: *const GemmDqMmidArgsRepr,
         ty: c_int,
         table: *const c_void,
         table_bytes: usize,
@@ -323,55 +352,6 @@ pub(in crate::kernels::cuda) fn gemm_dq_q3k_launch(
     checked(status, stage)
 }
 
-/// The IQ4_XS dequantizing GEMM call: `w` native super-blocks (`rows * k / 256 * 136`
-/// bytes), `x` the f16 activation row-major by `k` (`k * ncols` values), `y` the f32
-/// output row-major by `rows` (`rows * ncols` values).
-#[allow(dead_code)] // Staged until a model caller is qualified.
-pub(in crate::kernels::cuda) struct GemmDqIq4xsRaw<'a> {
-    pub(in crate::kernels::cuda) w: RawRange<'a>,
-    pub(in crate::kernels::cuda) x: RawRange<'a>,
-    pub(in crate::kernels::cuda) y: RawRange<'a>,
-    pub(in crate::kernels::cuda) k: usize,
-    pub(in crate::kernels::cuda) rows: usize,
-    pub(in crate::kernels::cuda) ncols: usize,
-    pub(in crate::kernels::cuda) layout: GemmDqLayout,
-}
-
-#[allow(dead_code)] // Staged until a model caller is qualified.
-pub(in crate::kernels::cuda) fn gemm_dq_iq4xs_launch(
-    stream: &RawStream,
-    call: &GemmDqIq4xsRaw<'_>,
-) -> Result<(), DeviceFailure> {
-    check_gemm_dq(
-        &call.w,
-        &call.x,
-        &call.y,
-        call.k,
-        call.rows,
-        call.ncols,
-        &call.layout,
-        &GemmDqGeom {
-            qk: 256,
-            block_bytes: 136,
-            w_align: 2,
-        },
-    )?;
-    let mut stage = STAGE_NONE;
-    // SAFETY: as `gemm_dq_q5k_launch`, with the IQ4_XS geometry (136-byte super-blocks,
-    // 2-byte weight alignment).
-    let args = gemm_dq_args(
-        &call.w,
-        &call.x,
-        &call.y,
-        call.k,
-        call.rows,
-        call.ncols,
-        &call.layout,
-    )?;
-    let status = unsafe { gemm_dq_iq4xs_launch_raw(&args, stream.as_ptr(), &mut stage) };
-    checked(status, stage)
-}
-
 /// The Q4_0 dequantizing GEMM call: `w` native blocks (`rows * k / 32 * 18` bytes), `x` the
 /// f16 activation row-major by `k` (`k * ncols` values), `y` the f32 output row-major by
 /// `rows` (`rows * ncols` values).
@@ -437,7 +417,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_codebook_launch(
     call: &GemmDqCodebookRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let id = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
-    if !call.ty.is_codebook_dense() {
+    if !call.ty.is_codebook() {
         return Err(invalid_argument());
     }
     check_gemm_dq(
@@ -469,6 +449,174 @@ pub(in crate::kernels::cuda) fn gemm_dq_codebook_launch(
     )?;
     let status = unsafe {
         gemm_dq_codebook_launch_raw(
+            &args,
+            id,
+            table.as_ptr().cast::<c_void>(),
+            table.len(),
+            stream.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The grouped dequantizing GEMM call: `w` holds `n_experts` stacked weights `expert_stride`
+/// bytes apart (each `rows` rows of `k` values of `ty`), `x` f32 rows of `x_row_stride`
+/// floats (`x_rows` of them), `y` f32 slot rows of `y_row_stride` floats (`total_cols` of
+/// them), `ids_dst` the `total_cols` token slots in compact-column order and `expert_bounds`
+/// the `n_experts + 1` column bounds of the experts. Slot `s` reads x row `s / x_div` and
+/// writes y row `s`.
+pub(in crate::kernels::cuda) struct GemmDqMmidRaw<'a> {
+    pub(in crate::kernels::cuda) ty: QuantType,
+    pub(in crate::kernels::cuda) w: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) y: RawRange<'a>,
+    pub(in crate::kernels::cuda) ids_dst: RawRange<'a>,
+    pub(in crate::kernels::cuda) expert_bounds: RawRange<'a>,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) rows: usize,
+    pub(in crate::kernels::cuda) n_experts: usize,
+    pub(in crate::kernels::cuda) total_cols: usize,
+    pub(in crate::kernels::cuda) x_div: usize,
+    pub(in crate::kernels::cuda) x_row_stride: usize,
+    pub(in crate::kernels::cuda) y_row_stride: usize,
+    pub(in crate::kernels::cuda) expert_stride: usize,
+}
+
+/// The GGUF type id the grouped entry switches on: the three K-quant and Q4_0 decoders and
+/// every type of the window decoders.
+fn grouped_type_id(ty: QuantType) -> Option<c_int> {
+    match ty {
+        QuantType::Q40 => Some(2),
+        QuantType::Q3K => Some(11),
+        QuantType::Q5K => Some(13),
+        other => gguf_type_id(other),
+    }
+}
+
+/// The types the grouped dequantizing GEMM serves.
+pub(in crate::kernels::cuda) fn gemm_dq_mmid_type(ty: QuantType) -> bool {
+    matches!(
+        ty,
+        QuantType::Q40 | QuantType::Q3K | QuantType::Q5K | QuantType::Iq4Xs
+    ) || ty.is_codebook()
+}
+
+pub(in crate::kernels::cuda) fn gemm_dq_mmid_launch(
+    stream: &RawStream,
+    call: &GemmDqMmidRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let ty = call.ty;
+    let id = grouped_type_id(ty).ok_or_else(invalid_argument)?;
+    if !gemm_dq_mmid_type(ty) {
+        return Err(invalid_argument());
+    }
+    let (qk, block_bytes) = (ty.block_size(), ty.block_bytes());
+    let w_align = if ty == QuantType::Q5K { 16 } else { 2 };
+    let row_bytes = (call.k / qk).checked_mul(block_bytes);
+    let need_w = row_bytes
+        .and_then(|row| row.checked_mul(call.rows))
+        .and_then(|expert| {
+            call.n_experts
+                .checked_sub(1)?
+                .checked_mul(call.expert_stride)?
+                .checked_add(expert)
+        });
+    let x_rows = call.total_cols.div_ceil(call.x_div.max(1));
+    let need_x = x_rows
+        .checked_sub(1)
+        .and_then(|head| head.checked_mul(call.x_row_stride))
+        .and_then(|head| head.checked_add(call.k))
+        .and_then(|n| n.checked_mul(4));
+    let need_y = call
+        .total_cols
+        .checked_sub(1)
+        .and_then(|head| head.checked_mul(call.y_row_stride))
+        .and_then(|head| head.checked_add(call.rows))
+        .and_then(|n| n.checked_mul(4));
+    let need_ids = call.total_cols.checked_mul(4);
+    let need_bounds = call.n_experts.checked_add(1).and_then(|n| n.checked_mul(4));
+    let (Some(need_w), Some(need_x), Some(need_y), Some(need_ids), Some(need_bounds)) =
+        (need_w, need_x, need_y, need_ids, need_bounds)
+    else {
+        return Err(invalid_argument());
+    };
+    let ints_fit = [
+        call.k,
+        call.rows,
+        call.n_experts,
+        call.total_cols,
+        call.x_div,
+        call.x_row_stride,
+        call.y_row_stride,
+    ]
+    .iter()
+    .all(|&v| c_int::try_from(v).is_ok())
+        && call
+            .total_cols
+            .checked_mul(call.x_row_stride.max(call.y_row_stride))
+            .is_some_and(|n| n <= i32::MAX as usize);
+    let y_span = Span::of(&call.y, need_y);
+    let apart = [
+        Span::of(&call.w, need_w),
+        Span::of(&call.x, need_x),
+        Span::of(&call.ids_dst, need_ids),
+        Span::of(&call.expert_bounds, need_bounds),
+    ]
+    .iter()
+    .all(|other| y_span.apart(other));
+    if !ints_fit
+        || !apart
+        || !call.w.offset().is_multiple_of(w_align)
+        || !call.expert_stride.is_multiple_of(w_align)
+        || !call.x.offset().is_multiple_of(4)
+        || !call.y.offset().is_multiple_of(4)
+        || !call.ids_dst.offset().is_multiple_of(4)
+        || !call.expert_bounds.offset().is_multiple_of(4)
+        || call.w.bytes() < need_w
+        || call.x.bytes() < need_x
+        || call.y.bytes() < need_y
+        || call.ids_dst.bytes() < need_ids
+        || call.expert_bounds.bytes() < need_bounds
+        || call.expert_stride < row_bytes.unwrap_or(0).saturating_mul(call.rows)
+        || call.k == 0
+        || call.rows == 0
+        || call.n_experts == 0
+        || call.total_cols == 0
+        || call.x_div == 0
+        || call.x_row_stride < call.k
+        || call.y_row_stride < call.rows
+        || !call.k.is_multiple_of(qk)
+        || !call.k.is_multiple_of(64)
+    {
+        return Err(invalid_argument());
+    }
+    let table = table_of(ty);
+    let mut stage = STAGE_NONE;
+    let int = |v: usize| c_int::try_from(v).map_err(|_| invalid_argument());
+    let args = GemmDqMmidArgsRepr {
+        w: call.w.address().cast_const(),
+        x: call.x.address().cast_const().cast::<f32>(),
+        y: call.y.address().cast::<f32>(),
+        ids_dst: call.ids_dst.address().cast_const().cast::<c_int>(),
+        expert_bounds: call.expert_bounds.address().cast_const().cast::<c_int>(),
+        expert_stride: call.expert_stride as u64,
+        k: int(call.k)?,
+        rows: int(call.rows)?,
+        n_experts: int(call.n_experts)?,
+        total_cols: int(call.total_cols)?,
+        x_div: int(call.x_div)?,
+        x_row_stride: int(call.x_row_stride)?,
+        y_row_stride: int(call.y_row_stride)?,
+        pad: 0,
+    };
+    // SAFETY: the checks above proved every range inside its live allocation, large enough for
+    // the call, aligned, and `y`, the only range the kernel writes, disjoint from the others.
+    // The id values are the kernel's to trust: they come from an `MmidIds`, whose constructors
+    // prove them. `table` is a `'static` slice the adapter copies before it returns, `stream`
+    // is live for the call.
+    let status = unsafe {
+        gemm_dq_mmid_launch_raw(
             &args,
             id,
             table.as_ptr().cast::<c_void>(),

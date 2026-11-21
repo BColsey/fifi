@@ -20,7 +20,6 @@ use crate::kernels::cuda::context::{
 #[cfg(test)]
 use crate::kernels::cuda::native;
 use crate::kernels::cuda::native::resident::matvec_gguf::{MatvecGgufRaw, matvec_gguf_launch};
-use crate::kernels::cuda::native::resident::matvec_iq4xs::matvec_iq4xs_launch;
 use crate::kernels::cuda::native::resident::matvec_q::{MatvecRaw, matvec_q_launch};
 use crate::kernels::cuda::native::resident::matvec_q3k::matvec_q3k_launch;
 use crate::kernels::cuda::native::resident::matvec_q5k::matvec_q5k_launch;
@@ -34,13 +33,12 @@ use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
 /// The weight formats the matvec serves. The four `Vendored` discriminants name the trimmed
 /// vendored MMVQ instantiations (Qwen3.6 and Mellum) and are the `ggml_type` values of the shim
 /// `ggml.h` (`GGML_TYPE_Q4_K = 12`, `Q5_0 = 6`, `Q6_K = 14`, `Q8_0 = 8`), not numbers from
-/// memory. `Q5K`/`Q3K`/`Iq4Xs` are the in-house Q5_K/Q3_K/IQ4_XS kernels
-/// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`,
-/// `native/resident/matvec_iq4xs.cu`): they never enter the
-/// vendored switch and carry no `ggml_type`. `Iq4Nl`, `Iq2S`, `Iq3Xxs`, `Iq2Xxs`, `Q20`,
-/// `Iq2Xs` and `Iq3S` are served by the in-house codebook matvec
-/// (`native/resident/matvec_gguf.cu`), dense and expert; `Iq4Xs` is served by it for the
-/// expert matvec as well.
+/// memory. `Q5K`/`Q3K` are the in-house Q5_K/Q3_K kernels
+/// (`native/resident/matvec_q5k.cu`, `native/resident/matvec_q3k.cu`): they never enter the
+/// vendored switch and carry no `ggml_type`. `Iq4Xs`, `Iq4Nl`, `Iq2S`, `Iq3Xxs`, `Iq2Xxs`,
+/// `Q20`, `Iq2Xs`, `Iq3S`, `Q2K`, `Iq1S` and `Iq1M` are served by the in-house codebook
+/// matvec (`native/resident/matvec_gguf.cu`), dense and expert, and by the codebook arms of
+/// the dequantizing GEMM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantType {
     Q4K,
@@ -93,13 +91,13 @@ impl QuantType {
         }
     }
 
-    /// True for the types the in-house codebook matvec (`matvec_gguf.cu`) serves in the
-    /// dense matvec: every IQ type and Q2_0 here except IQ4_XS, which keeps its own dense
-    /// kernel and reaches the codebook matvec only through the expert launch.
-    pub(crate) fn is_codebook_dense(self) -> bool {
+    /// True for the types the in-house codebook kernels (`matvec_gguf.cu` and the codebook arms
+    /// of `gemm_dq.cu`) serve: every IQ type, Q2_0 and Q2_K.
+    pub(crate) fn is_codebook(self) -> bool {
         matches!(
             self,
-            Self::Iq4Nl
+            Self::Iq4Xs
+                | Self::Iq4Nl
                 | Self::Iq2S
                 | Self::Iq3Xxs
                 | Self::Iq2Xxs
@@ -110,11 +108,6 @@ impl QuantType {
                 | Self::Iq1S
                 | Self::Iq1M
         )
-    }
-
-    /// True for the types the in-house codebook expert matvec serves.
-    pub(crate) fn is_codebook_expert(self) -> bool {
-        self.is_codebook_dense() || self == Self::Iq4Xs
     }
 
     pub(crate) fn block_size(self) -> usize {
@@ -314,22 +307,9 @@ impl CudaContext {
                 },
                 row_bytes,
             ),
-            // The in-house IQ4_XS kernel: its own ABI, native 136-byte super-blocks.
-            QuantType::Iq4Xs => matvec_iq4xs_launch(
-                stream_raw,
-                &crate::kernels::cuda::native::resident::matvec_iq4xs::MatvecIq4xsRaw {
-                    w: raw.w,
-                    x_q8: raw.x_q8,
-                    y: raw.y,
-                    k: raw.k,
-                    rows: raw.rows,
-                    ncols: raw.ncols,
-                },
-                row_bytes,
-            ),
             // The in-house codebook matvec: its own ABI, native blocks, whole rows, the
             // type's lookup table passed to the kernel by value.
-            ty if ty.is_codebook_dense() => matvec_gguf_launch(
+            ty if ty.is_codebook() => matvec_gguf_launch(
                 stream_raw,
                 &MatvecGgufRaw {
                     ty,
@@ -380,10 +360,8 @@ impl CudaContext {
             )));
         }
         if call.rows == 0
-            || (!(matches!(
-                call.ty,
-                QuantType::Q5K | QuantType::Q40 | QuantType::Q3K | QuantType::Iq4Xs
-            ) || call.ty.is_codebook_dense()
+            || (!(matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
+                || call.ty.is_codebook()
                 || (call.ty == QuantType::Q80 && invariant))
                 && !call.rows.is_multiple_of(ROWS_MULTIPLE))
         {

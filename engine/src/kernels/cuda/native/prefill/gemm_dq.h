@@ -46,7 +46,7 @@ int inference_cuda_gemm_dq_q40_launch(const inference_cuda_gemm_dq_args *args, v
                                       int *out_stage);
 
 /* The same launch for the codebook types (GGUF ids 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS,
- * 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 42 Q2_0): k must be a multiple of the type's block size and
+ * 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 42 Q2_0, and 10 Q2_K, 19 IQ1_S, 29 IQ1_M): k must be a multiple of the type's block size and
  * of 64, w is 2-byte aligned. table points at the type's lookup table words
  * (weights/gguf_tables.rs) and table_bytes is their exact byte count (0 for Q2_0); they are
  * copied into the launch arguments before the call returns. */
@@ -54,18 +54,48 @@ int inference_cuda_gemm_dq_codebook_launch(const inference_cuda_gemm_dq_args *ar
                                            const void *table, size_t table_bytes, void *stream,
                                            int *out_stage);
 
+/* The grouped (per-expert) launch of the GEMM for the GGUF type `type` (2 Q4_0, 11 Q3_K,
+ * 13 Q5_K, and every type of the codebook entry above plus 23 IQ4_XS and 10 Q2_K, 19 IQ1_S,
+ * 29 IQ1_M). w holds n_experts weights expert_stride bytes apart (16-byte aligned, a multiple
+ * of 16), each rows x k native blocks; x holds f32 token rows of x_row_stride floats; y holds
+ * f32 slot rows of y_row_stride floats. expert_bounds holds n_experts + 1 ints and ids_dst
+ * total_cols ints: compact column j of expert e (expert_bounds[e] <= j < expert_bounds[e + 1])
+ * is token slot ids_dst[j], which reads x row slot / x_div and writes y row slot (columns
+ * 0..rows). table and table_bytes are as for the codebook entry. */
+typedef struct inference_cuda_gemm_dq_mmid_args {
+    const void *w;
+    const float *x;
+    float *y;
+    const int *ids_dst;
+    const int *expert_bounds;
+    unsigned long long expert_stride;
+    int k;
+    int rows;
+    int n_experts;
+    int total_cols; /* m * top_k: every slot of the launch */
+    int x_div;      /* slot / x_div is the activation row: top_k for the gate and up input, 1 for the down input */
+    int x_row_stride;
+    int y_row_stride;
+    int pad;
+} inference_cuda_gemm_dq_mmid_args;
+
+int inference_cuda_gemm_dq_mmid_launch(const inference_cuda_gemm_dq_mmid_args *args, int type,
+                                       const void *table, size_t table_bytes, void *stream,
+                                       int *out_stage);
+
 /* The same launch with the Q3_K decoder: k must be a multiple of 256, w holds
  * rows * k/256 * 110 bytes, x and y as above. */
 int inference_cuda_gemm_dq_q3k_launch(const inference_cuda_gemm_dq_args *args, void *stream,
                                       int *out_stage);
 
-/* The same launch with the IQ4_XS decoder: k must be a multiple of 256, w holds
- * rows * k/256 * 136 bytes, x and y as above. */
-int inference_cuda_gemm_dq_iq4xs_launch(const inference_cuda_gemm_dq_args *args, void *stream,
-                                         int *out_stage);
-
 #ifdef __cplusplus
 }
+static_assert(sizeof(inference_cuda_gemm_dq_mmid_args) == 80 &&
+                  offsetof(inference_cuda_gemm_dq_mmid_args, ids_dst) == 24 &&
+                  offsetof(inference_cuda_gemm_dq_mmid_args, expert_stride) == 40 &&
+                  offsetof(inference_cuda_gemm_dq_mmid_args, k) == 48 &&
+                  offsetof(inference_cuda_gemm_dq_mmid_args, y_row_stride) == 72,
+              "inference_cuda_gemm_dq_mmid_args layout");
 static_assert(sizeof(inference_cuda_gemm_dq_args) == 48 &&
                   offsetof(inference_cuda_gemm_dq_args, w) == 0 &&
                   offsetof(inference_cuda_gemm_dq_args, x) == 8 &&

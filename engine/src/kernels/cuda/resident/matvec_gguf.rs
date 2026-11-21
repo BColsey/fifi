@@ -21,30 +21,14 @@ use super::matvec_q::tests::{assert_bad_request, bench, nan_filled};
 use super::matvec_q::{MatvecCall, QuantType};
 use super::quantize_q8_1::{QuantizeCall, q8_1_bytes};
 use crate::EngError;
-use crate::kernels::cuda::native::resident::matvec_gguf::{
-    MatvecGgufRaw, dequant_gguf_launch, matvec_gguf_launch,
-};
+use crate::kernels::cuda::native::resident::matvec_gguf::dequant_gguf_launch;
 use crate::kernels::cuda::prefill::gemm_dq::GemmDqTypedCall;
 use crate::kernels::cuda::testkit;
-use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
+use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream};
 use crate::weights::{GgufType, dequantize};
 
 /// The types of the dense and expert matvec, with the oracle's type of each.
-const DENSE_TYPES: [(QuantType, GgufType); 10] = [
-    (QuantType::Iq4Nl, GgufType::Iq4Nl),
-    (QuantType::Iq2S, GgufType::Iq2S),
-    (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
-    (QuantType::Iq2Xxs, GgufType::Iq2Xxs),
-    (QuantType::Q20, GgufType::Q20),
-    (QuantType::Iq2Xs, GgufType::Iq2Xs),
-    (QuantType::Iq3S, GgufType::Iq3S),
-    (QuantType::Q2K, GgufType::Q2K),
-    (QuantType::Iq1S, GgufType::Iq1S),
-    (QuantType::Iq1M, GgufType::Iq1M),
-];
-
-/// IQ4_XS joins the list for the expert matvec (its dense kernel is a different file).
-const EXPERT_TYPES: [(QuantType, GgufType); 11] = [
+const DENSE_TYPES: [(QuantType, GgufType); 11] = [
     (QuantType::Iq4Nl, GgufType::Iq4Nl),
     (QuantType::Iq2S, GgufType::Iq2S),
     (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
@@ -126,7 +110,7 @@ fn grid_bytes_are_in_the_range_the_sign_step_needs() {
 /// The block geometry the kernels hard-code equals the oracle's.
 #[test]
 fn quant_types_match_the_oracle_block_geometry() {
-    for (ty, gt) in EXPERT_TYPES {
+    for (ty, gt) in DENSE_TYPES {
         assert_eq!(ty.block_size() as u64, gt.block_elems(), "{ty:?} elements");
         assert_eq!(ty.block_bytes() as u64, gt.block_bytes(), "{ty:?} bytes");
         assert_eq!(
@@ -283,40 +267,6 @@ fn ids_buffer(ctx: &CudaContext, ids: &[i32]) -> DeviceBuffer {
 }
 
 impl CudaContext {
-    /// Test support: one dense launch of the codebook kernel on any type it serves, including
-    /// IQ4_XS, whose dense matvec otherwise rides its own kernel.
-    fn matvec_gguf_direct(
-        &self,
-        stream: &DeviceStream,
-        ty: QuantType,
-        w: DeviceRange<'_>,
-        x: DeviceRange<'_>,
-        y: DeviceRange<'_>,
-        (k, rows): (usize, usize),
-    ) -> Result<(), EngError> {
-        let (w_raw, x_raw, y_raw) = (
-            self.raw_range(&w)?,
-            self.raw_range(&x)?,
-            self.raw_range(&y)?,
-        );
-        let row_bytes = q8_1_bytes(k, 1).expect("size");
-        self.launch_on(stream, |raw| {
-            matvec_gguf_launch(
-                raw,
-                &MatvecGgufRaw {
-                    ty,
-                    w: w_raw,
-                    x_q8: x_raw,
-                    y: y_raw,
-                    k,
-                    rows,
-                    ncols: 1,
-                },
-                row_bytes,
-            )
-        })
-    }
-
     /// Test support: decodes `n_blocks` blocks of `ty` on the device.
     fn dequant_gguf(
         &self,
@@ -379,7 +329,7 @@ fn gguf_device_dequant_is_bit_identical_to_the_cpu_oracle() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    for (ty, gt) in EXPERT_TYPES {
+    for (ty, gt) in DENSE_TYPES {
         let mut rng = testkit::Rng::new(0xD0_0000 + u64::from(gt.id()));
         let mut bytes = random_blocks(ty, 4096, &mut rng, 0.001, 8.0);
         bytes.extend(edge_blocks(ty, &mut rng));
@@ -864,7 +814,7 @@ fn gguf_expert_matvec_matches_the_cpu_reference() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    for (ty, gt) in EXPERT_TYPES {
+    for (ty, gt) in DENSE_TYPES {
         let mut worst = 0.0f64;
         let mut cases = 0usize;
         let mut run = |case: ExpertCase, seed: u64| {
@@ -1348,7 +1298,6 @@ fn gguf_prefill_gemm_report_tflops() {
     println!("type     k     rows  ncols   ms/launch  TFLOP/s (2*k*rows*ncols)");
     let mut types: Vec<QuantType> = vec![QuantType::Q5K];
     types.extend(DENSE_TYPES.iter().map(|&(ty, _)| ty));
-    types.push(QuantType::Iq4Xs);
     for ty in types {
         let w_bytes = if ty == QuantType::Q5K {
             super::matvec_q::tests::reference::build_weight(ty, rows, k, &mut rng)
@@ -1356,23 +1305,19 @@ fn gguf_prefill_gemm_report_tflops() {
             random_blocks(ty, rows * (k / ty.block_size()), &mut rng, 0.0005, 0.01)
         };
         let w = testkit::upload_bytes(&ctx, &w_bytes);
+        let call = GemmDqTypedCall {
+            w: w.range(0, w_bytes.len()).expect("w"),
+            x: x_dev.range(0, x_bytes.len()).expect("x"),
+            y: y.range(0, y_bytes).expect("y"),
+            k,
+            rows,
+            ncols,
+            x_col_stride: k,
+            y_col_stride: rows,
+            x_f32: false,
+        };
         let launch = || {
-            ctx.gemm_dq(
-                &stream,
-                ty,
-                GemmDqTypedCall {
-                    w: w.range(0, w_bytes.len()).expect("w"),
-                    x: x_dev.range(0, x_bytes.len()).expect("x"),
-                    y: y.range(0, y_bytes).expect("y"),
-                    k,
-                    rows,
-                    ncols,
-                    x_col_stride: k,
-                    y_col_stride: rows,
-                    x_f32: false,
-                },
-            )
-            .expect("gemm");
+            ctx.gemm_dq(&stream, ty, call.clone()).expect("gemm");
         };
         let us = bench(&ctx, &stream, iters, &launch);
         let flops = 2.0 * k as f64 * rows as f64 * ncols as f64;
@@ -1382,6 +1327,371 @@ fn gguf_prefill_gemm_report_tflops() {
             us / 1000.0,
             flops / (f64::from(us) * 1e-6) / 1e12
         );
+    }
+}
+
+/// One grouped GEMM case: `n_experts` experts of `rows` rows over `k`, `m` tokens of `top_k`
+/// picks, the routing seeded.
+struct GroupedCase {
+    n_experts: usize,
+    m: usize,
+    top_k: usize,
+    rows: usize,
+    k: usize,
+}
+
+/// The host ids of a routing: token `t` picks `top_k` distinct experts; compact columns are the
+/// slots grouped by expert in slot order. Expert 0 is never picked when `skip_first`, so an
+/// empty expert stands between full ones.
+fn grouped_ids(
+    case: &GroupedCase,
+    rng: &mut testkit::Rng,
+    skip_first: bool,
+) -> (Vec<i32>, Vec<i32>) {
+    let mut groups: Vec<Vec<i32>> = vec![Vec::new(); case.n_experts];
+    for token in 0..case.m {
+        let mut picks: Vec<usize> = Vec::new();
+        while picks.len() < case.top_k {
+            let low = usize::from(skip_first);
+            let e = low + rng.below((case.n_experts - low) as u64) as usize;
+            if !picks.contains(&e) {
+                picks.push(e);
+            }
+        }
+        for (r, e) in picks.into_iter().enumerate() {
+            groups[e].push((token * case.top_k + r) as i32);
+        }
+    }
+    let mut ids_dst = Vec::new();
+    let mut bounds = vec![0i32];
+    for group in &groups {
+        ids_dst.extend_from_slice(group);
+        bounds.push(ids_dst.len() as i32);
+    }
+    (ids_dst, bounds)
+}
+
+/// The grouped dequantizing GEMM against an f64 reference over the oracle's dequantized weights
+/// rounded to f16 and f16-rounded f32 activations, for the gate/up form (token rows) and the
+/// down form (slot rows). Every output cell of every slot is checked; the `ld - rows` pad
+/// floats of each output row must stay untouched.
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
+    use crate::kernels::cuda::prefill::mmq_mmid::{
+        DqMmidCall, HostIds, MmidIds, MmidIdsOut, MmidShape, MmidWeight,
+    };
+    if !testkit::device_present("gguf_grouped_prefill_gemm_matches_the_cpu_reference") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let cases = [
+        // Every expert holds under 64 columns; expert 0 is empty.
+        (
+            GroupedCase {
+                n_experts: 6,
+                m: 37,
+                top_k: 3,
+                rows: 70,
+                k: 512,
+            },
+            true,
+        ),
+        // Experts with 64 to 150 columns: several column tiles, two row tiles.
+        (
+            GroupedCase {
+                n_experts: 3,
+                m: 150,
+                top_k: 2,
+                rows: 130,
+                k: 512,
+            },
+            false,
+        ),
+        // A single expert, one pick: the plain GEMM through the grouped entry.
+        (
+            GroupedCase {
+                n_experts: 1,
+                m: 9,
+                top_k: 1,
+                rows: 64,
+                k: 256,
+            },
+            false,
+        ),
+    ];
+    let mut types: Vec<(QuantType, GgufType)> = DENSE_TYPES.to_vec();
+    types.push((QuantType::Q5K, GgufType::Q5K));
+    for (ty, gt) in types {
+        let mut worst = 0.0f64;
+        for (ci, (case, skip_first)) in cases.iter().enumerate() {
+            let k = case.k;
+            if !block_ok(ty, k) || !k.is_multiple_of(64) {
+                continue;
+            }
+            for per_slot in [false, true] {
+                let mut rng = testkit::Rng::new(0x9a_0000 + gt.id() as u64 * 1000 + ci as u64 * 10);
+                let slots = case.m * case.top_k;
+                let w_bytes = if ty == QuantType::Q5K {
+                    super::matvec_q::tests::reference::build_weight(
+                        ty,
+                        case.n_experts * case.rows,
+                        k,
+                        &mut rng,
+                    )
+                } else {
+                    random_blocks(
+                        ty,
+                        case.n_experts * case.rows * (k / ty.block_size()),
+                        &mut rng,
+                        0.0005,
+                        0.01,
+                    )
+                };
+                let expert_bytes = ty.weight_bytes(case.rows, k).expect("expert size");
+                let w = testkit::upload_bytes(&ctx, &w_bytes);
+                let x_rows = if per_slot { slots } else { case.m };
+                let x_stride = k + 8;
+                let x: Vec<f32> = (0..x_rows * x_stride)
+                    .map(|_| (rng.normal() as f32) * 0.5)
+                    .collect();
+                let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let x_dev = testkit::upload_bytes(&ctx, &x_bytes);
+                let ld = case.rows + 8;
+                let y_bytes = slots * ld * 4;
+                let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
+                let (ids_dst, bounds) = grouped_ids(case, &mut rng, *skip_first);
+                let shape = MmidShape {
+                    n_experts: case.n_experts,
+                    m: case.m,
+                    top_k: case.top_k,
+                };
+                let src1 = testkit::upload_filled(&ctx, 0, slots * 4);
+                let dst = testkit::upload_filled(&ctx, 0, (slots + case.m + 127) * 4);
+                let bnd = testkit::upload_filled(&ctx, 0, (case.n_experts + 1) * 4);
+                let ids = MmidIds::from_host(
+                    &stream,
+                    shape,
+                    HostIds {
+                        ids_dst: &ids_dst,
+                        expert_bounds: &bounds,
+                    },
+                    MmidIdsOut {
+                        ids_src1: src1.range(0, slots * 4).expect("src1"),
+                        ids_dst: dst.range(0, (slots + case.m + 127) * 4).expect("dst"),
+                        expert_bounds: bnd.range(0, (case.n_experts + 1) * 4).expect("bounds"),
+                    },
+                )
+                .expect("ids");
+                ctx.gemm_dq_mmid(
+                    &stream,
+                    DqMmidCall {
+                        shape,
+                        weight: MmidWeight {
+                            base: w.range(0, w_bytes.len()).expect("w"),
+                            quant: ty,
+                            k,
+                            n: case.rows,
+                            stride_bytes: expert_bytes,
+                        },
+                        ids: &ids,
+                        x: x_dev.range(0, x_bytes.len()).expect("x"),
+                        x_row_stride: x_stride,
+                        x_per_slot: per_slot,
+                        y: y.range(0, y_bytes).expect("y"),
+                        ld,
+                    },
+                )
+                .expect("grouped gemm");
+                stream.synchronize().expect("drain");
+                let got = read_f32(&ctx, &y, slots * ld);
+                let weights: Vec<f64> = dequantize(gt, &w_bytes)
+                    .expect("oracle dequant")
+                    .iter()
+                    .map(|&v| f64::from(testkit::f16_to_f32(testkit::f16_bits(v))))
+                    .collect();
+                let mut expert_of = vec![usize::MAX; slots];
+                for e in 0..case.n_experts {
+                    for c in bounds[e] as usize..bounds[e + 1] as usize {
+                        expert_of[ids_dst[c] as usize] = e;
+                    }
+                }
+                for slot in 0..slots {
+                    let e = expert_of[slot];
+                    assert_ne!(e, usize::MAX, "slot {slot} has no expert");
+                    let x_row = if per_slot { slot } else { slot / case.top_k };
+                    let x_ref: Vec<f64> = x[x_row * x_stride..x_row * x_stride + k]
+                        .iter()
+                        .map(|&v| f64::from(testkit::f16_to_f32(testkit::f16_bits(v))))
+                        .collect();
+                    for row in 0..case.rows {
+                        let wrow =
+                            &weights[(e * case.rows + row) * k..(e * case.rows + row + 1) * k];
+                        let (dot, abs) = dot_ref_f64(wrow, &x_ref);
+                        let tolerance = k as f64 * 2f64.powi(-22) * abs;
+                        let error = (f64::from(got[slot * ld + row]) - dot).abs();
+                        worst = worst.max(if tolerance > 0.0 {
+                            error / tolerance
+                        } else {
+                            error
+                        });
+                        assert!(
+                            error <= tolerance,
+                            "{ty:?} case {ci} per_slot {per_slot} slot {slot} expert {e} row {row}: error {error:e} over tolerance {tolerance:e}"
+                        );
+                    }
+                    for pad in case.rows..ld {
+                        assert_eq!(
+                            got[slot * ld + pad].to_bits(),
+                            0xAAAA_AAAA,
+                            "{ty:?} case {ci} slot {slot}: pad float {pad} was written"
+                        );
+                    }
+                }
+            }
+        }
+        println!("grouped gemm {ty:?}: max error over tolerance {worst:.4}");
+    }
+}
+
+/// `sum(w * x)` and `sum(|w * x|)` in f64.
+fn dot_ref_f64(w: &[f64], x: &[f64]) -> (f64, f64) {
+    let (mut dot, mut abs) = (0.0f64, 0.0f64);
+    for (a, b) in w.iter().zip(x) {
+        dot += a * b;
+        abs += (a * b).abs();
+    }
+    (dot, abs)
+}
+
+/// The grouped GEMM over the three expert stacks of one Qwen3.6-shaped MoE layer (256 experts,
+/// top 8, hidden 2048, expert width 512: gate and up `k 2048, n 512`, down `k 512, n 2048`) at
+/// 1,024, 2,048 and 4,096 tokens, uniform random routing: milliseconds per layer, times 40
+/// layers, and the TFLOP/s of the three launches. The Q4_K row of the vendored grouped MMQ at
+/// the same shapes is `mmq_mmid::tests::speed`.
+#[test]
+#[ignore = "bench: exclusive timing slot"]
+fn gguf_grouped_prefill_report_layer_ms() {
+    use crate::kernels::cuda::prefill::mmq_mmid::{
+        DqMmidCall, HostIds, MmidIds, MmidIdsOut, MmidShape, MmidWeight,
+    };
+    if !testkit::device_present("gguf_grouped_prefill_report_layer_ms") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (hidden, inter, n_experts, top_k) = (2048usize, 512usize, 256usize, 8usize);
+    let iters = if cfg!(debug_assertions) { 1 } else { 10 };
+    println!("type    tokens  layer_ms  x40_ms  TFLOP/s (gate + up + down, 2*k*n*slots each)");
+    for ty in [
+        QuantType::Q5K,
+        QuantType::Iq4Nl,
+        QuantType::Iq4Xs,
+        QuantType::Iq3Xxs,
+        QuantType::Iq2S,
+        QuantType::Q2K,
+    ] {
+        let mut rng = testkit::Rng::new(0xb1_0000 + ty.block_bytes() as u64);
+        let stack = |rows: usize, k: usize, rng: &mut testkit::Rng| {
+            let bytes = if ty == QuantType::Q5K {
+                super::matvec_q::tests::reference::build_weight(ty, n_experts * rows, k, rng)
+            } else {
+                random_blocks(
+                    ty,
+                    n_experts * rows * (k / ty.block_size()),
+                    rng,
+                    0.0005,
+                    0.01,
+                )
+            };
+            let buffer = testkit::upload_bytes(&ctx, &bytes);
+            (buffer, bytes.len())
+        };
+        let gate = stack(inter, hidden, &mut rng);
+        let up = stack(inter, hidden, &mut rng);
+        let down = stack(hidden, inter, &mut rng);
+        for m in [1024usize, 2048, 4096] {
+            let case = GroupedCase {
+                n_experts,
+                m,
+                top_k,
+                rows: inter,
+                k: hidden,
+            };
+            let slots = m * top_k;
+            let (ids_dst, bounds) = grouped_ids(&case, &mut rng, false);
+            let shape = MmidShape {
+                n_experts,
+                m,
+                top_k,
+            };
+            let src1 = testkit::upload_filled(&ctx, 0, slots * 4);
+            let dst = testkit::upload_filled(&ctx, 0, (slots + m + 127) * 4);
+            let bnd = testkit::upload_filled(&ctx, 0, (n_experts + 1) * 4);
+            let ids = MmidIds::from_host(
+                &stream,
+                shape,
+                HostIds {
+                    ids_dst: &ids_dst,
+                    expert_bounds: &bounds,
+                },
+                MmidIdsOut {
+                    ids_src1: src1.range(0, slots * 4).expect("src1"),
+                    ids_dst: dst.range(0, (slots + m + 127) * 4).expect("dst"),
+                    expert_bounds: bnd.range(0, (n_experts + 1) * 4).expect("bounds"),
+                },
+            )
+            .expect("ids");
+            let x = testkit::upload_filled(&ctx, 0x3c, m * hidden * 4);
+            let act = testkit::upload_filled(&ctx, 0x3c, slots * inter * 4);
+            let gu = testkit::upload_filled(&ctx, 0, slots * 2 * inter * 4);
+            let dn = testkit::upload_filled(&ctx, 0, slots * hidden * 4);
+            let launch_one = |stack: &(DeviceBuffer, usize),
+                              (k, n): (usize, usize),
+                              x: &DeviceBuffer,
+                              x_per_slot: bool,
+                              y: &DeviceBuffer,
+                              (y_off, ld): (usize, usize)| {
+                ctx.gemm_dq_mmid(
+                    &stream,
+                    DqMmidCall {
+                        shape,
+                        weight: MmidWeight {
+                            base: stack.0.range(0, stack.1).expect("w"),
+                            quant: ty,
+                            k,
+                            n,
+                            stride_bytes: stack.1 / n_experts,
+                        },
+                        ids: &ids,
+                        x: x.range(0, x.bytes()).expect("x"),
+                        x_row_stride: k,
+                        x_per_slot,
+                        y: y.range(y_off * 4, y.bytes() - y_off * 4).expect("y"),
+                        ld,
+                    },
+                )
+                .expect("grouped");
+            };
+            let layer = || {
+                launch_one(&gate, (hidden, inter), &x, false, &gu, (0, 2 * inter));
+                launch_one(&up, (hidden, inter), &x, false, &gu, (inter, 2 * inter));
+                launch_one(&down, (inter, hidden), &act, true, &dn, (0, hidden));
+            };
+            let us = bench(&ctx, &stream, iters, &layer);
+            let flops = 2.0
+                * slots as f64
+                * (2.0 * (hidden * inter) as f64 + (inter * hidden) as f64)
+                * 1.0;
+            println!(
+                "{:7} {m:6} {:9.3} {:7.1} {:8.2}",
+                format!("{ty:?}"),
+                us / 1000.0,
+                40.0 * f64::from(us) / 1000.0,
+                flops / (f64::from(us) * 1e-6) / 1e12
+            );
+        }
     }
 }
 
@@ -1433,7 +1743,7 @@ fn gguf_codebook_matvec_report_gbps() {
         flush_bytes / 1_000_000
     );
     println!("type     shape          launch      warm_us  cold_us  GB/s_warm GB/s_cold  %936");
-    for (ty, _gt) in EXPERT_TYPES {
+    for (ty, _gt) in DENSE_TYPES {
         for (name, (k, rows)) in [("gate/up", FN_GATE_UP), ("down", FN_DOWN)] {
             if !block_ok(ty, k) {
                 continue;
@@ -1462,16 +1772,11 @@ fn gguf_codebook_matvec_report_gbps() {
             let y_bytes = FN_USED * rows * 4;
             let y = nan_filled(&ctx, y_bytes);
             // The down projection reads one activation row per slot.
-            // IQ4_XS has its own dense kernel (`matvec_iq4xs.cu`): "dense" times that one, and
-            // "dense-new" times the codebook kernel on the same bytes.
-            let mut launches = vec![
+            let launches = vec![
                 ("expert", name == "down"),
                 ("2x5", name == "down"),
                 ("dense", false),
             ];
-            if ty == QuantType::Iq4Xs {
-                launches.push(("dense-new", false));
-            }
             for (launch_name, per_slot) in launches {
                 let (n_used, bytes_read) = if launch_name.starts_with("dense") {
                     (1, expert_bytes)
@@ -1535,16 +1840,6 @@ fn gguf_codebook_matvec_report_gbps() {
                             },
                         )
                         .expect("expert");
-                    } else if launch_name == "dense-new" {
-                        ctx.matvec_gguf_direct(
-                            &stream,
-                            ty,
-                            stack.range(0, expert_bytes).expect("w"),
-                            x.buffer.range(0, x.row_bytes).expect("x"),
-                            y.range(0, rows * 4).expect("y"),
-                            (k, rows),
-                        )
-                        .expect("dense new");
                     } else {
                         ctx.matvec_q(
                             &stream,

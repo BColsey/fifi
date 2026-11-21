@@ -840,9 +840,10 @@ fn gemm_dq_iq4xs_probe_crafted() {
             &x.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(),
         );
         let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
-        ctx.gemm_dq_iq4xs(
+        ctx.gemm_dq(
             &stream,
-            GemmDqIq4xsCall {
+            QuantType::Iq4Xs,
+            GemmDqTypedCall {
                 w: w.range(0, w_bytes.len()).expect("w"),
                 x: xb.range(0, k * ncols * 2).expect("x"),
                 y: y.range(0, rows * ncols * 4).expect("y"),
@@ -933,9 +934,10 @@ fn gemm_dq_iq4xs_matches_the_cpu_dequant_matmul() {
         let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
         let xb = testkit::upload_bytes(&ctx, &x_bytes);
         let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
-        ctx.gemm_dq_iq4xs(
+        ctx.gemm_dq(
             &stream,
-            GemmDqIq4xsCall {
+            QuantType::Iq4Xs,
+            GemmDqTypedCall {
                 w: w.range(0, w_bytes.len()).expect("w"),
                 x: xb.range(0, x_bytes.len()).expect("x"),
                 y: y.range(0, rows * ncols * 4).expect("y"),
@@ -1042,9 +1044,10 @@ fn gemm_dq_iq4xs_catches_one_wrong_group_scale() {
     let x_bytes: Vec<u8> = x.iter().flat_map(|b| b.to_le_bytes()).collect();
     let xb = testkit::upload_bytes(&ctx, &x_bytes);
     let y = testkit::upload_filled(&ctx, 0xAA, rows * ncols * 4);
-    ctx.gemm_dq_iq4xs(
+    ctx.gemm_dq(
         &stream,
-        GemmDqIq4xsCall {
+        QuantType::Iq4Xs,
+        GemmDqTypedCall {
             w: w.range(0, w_bad.len()).expect("w"),
             x: xb.range(0, x_bytes.len()).expect("x"),
             y: y.range(0, rows * ncols * 4).expect("y"),

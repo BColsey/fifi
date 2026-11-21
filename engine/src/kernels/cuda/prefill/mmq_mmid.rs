@@ -890,6 +890,9 @@ impl CudaContext {
     }
 }
 
+mod dq;
+pub(crate) use dq::DqMmidCall;
+
 #[cfg(all(test, feature = "native-cuda"))]
 pub(in crate::kernels::cuda) mod tests;
 

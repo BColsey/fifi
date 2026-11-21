@@ -3,7 +3,7 @@
 //! 2-bit GGUF types, and the device dequant the tests compare against the CPU oracle. Child of
 //! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
-//! Safety invariants this module relies on (mirrors `matvec_iq4xs`):
+//! Safety invariants this module relies on (mirrors the other native matvec adapters):
 //! - A device range is proved in bounds by `RawRange::new` before it gets here. This module
 //!   proves, again and on the sizes of the call, that `w` holds `rows` rows of whole native
 //!   blocks, that `x_q8` holds the padded blocks of the activation rows the call reads, that

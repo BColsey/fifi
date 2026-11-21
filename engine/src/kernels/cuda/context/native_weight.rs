@@ -366,7 +366,7 @@ fn checked_native(tensor: QuantTensor<'_>) -> Result<QuantType, EngError> {
         GgufType::Q6K => QuantType::Q6K,
         GgufType::Q80 => QuantType::Q80,
         // The in-house matvecs (native/resident/matvec_q5k.cu, matvec_q40.cu,
-        // matvec_q3k.cu, matvec_iq4xs.cu): native blocks, no ggml_type discriminant.
+        // matvec_q3k.cu): native blocks, no ggml_type discriminant.
         GgufType::Q5K => QuantType::Q5K,
         GgufType::Q40 => QuantType::Q40,
         GgufType::Q3K => QuantType::Q3K,

@@ -20,7 +20,7 @@
 //! every range holds the bytes the call uses and is 4-byte aligned; `y` overlaps none of
 //! `w_stack`, `x_q8`, `ids`. A refused call changes nothing.
 //!
-//! The IQ and Q2_0 types ([`QuantType::is_codebook_expert`]) run the in-house codebook
+//! The IQ and Q2_0 types ([`QuantType::is_codebook`]) run the in-house codebook
 //! kernel (`native/resident/matvec_gguf.cu`) instead of the vendored one: same layout and ids
 //! contract, but `rows` is any positive count and `n_used` is in `1..=32` (Flash-Next routes
 //! ten experts per token).
@@ -111,7 +111,7 @@ impl CudaContext {
         call: ExpertMatvecCall<'_>,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
-        if call.ty.is_codebook_expert() {
+        if call.ty.is_codebook() {
             let raw = self.plan_matvec_expert_codebook(&call)?;
             let row_bytes = q8_1_bytes(call.k, 1).expect("checked in plan");
             return self.launch_on(stream, |stream_raw| {
@@ -218,7 +218,7 @@ impl CudaContext {
         // expert kernel, so every type without a vendored arm is refused here rather than
         // reaching the discriminant.
         if matches!(call.ty, QuantType::Q5K | QuantType::Q40 | QuantType::Q3K)
-            || call.ty.is_codebook_expert()
+            || call.ty.is_codebook()
         {
             return Err(EngError::BadRequest(format!(
                 "the CUDA expert matvec does not take {:?} yet",
