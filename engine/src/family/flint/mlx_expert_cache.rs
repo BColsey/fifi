@@ -22,7 +22,7 @@ type Result<T> = std::result::Result<T, EngError>;
 /// The (expert, slot) pairs a route still has to read.
 type SlotWrites = Vec<(u32, usize)>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Entry {
     expert: u32,
     used: u64,
@@ -35,38 +35,84 @@ pub(super) struct LayerExpertCache {
     tick: u64,
 }
 
-pub(super) fn plan(
-    source: &FlintCheckpoint,
+/// What the cache switch asks for, given the bytes left for it.
+#[derive(Debug, PartialEq, Eq)]
+enum Sizing {
+    /// The switch is absent or 0.
+    Off,
+    /// The requested cache does not fit, and not even the smallest useful one does.
+    Skip(String),
+    /// Slots to allocate inside `usable` bytes; `reduced` when the budget, not the
+    /// setting, set the size.
+    Use {
+        slots: usize,
+        usable: u64,
+        reduced: bool,
+    },
+}
+
+fn minimum_cache_bytes(per_expert: u64, page: u64) -> u64 {
+    per_expert * (ROUTED_LAYERS * ROUTES) as u64 + ROUTED_LAYERS as u64 * page
+}
+
+/// Read the MiB setting and fit it to the bytes available. A value that cannot
+/// hold the smallest useful cache is refused; a budget that cannot hold it
+/// skips the cache; a budget below the setting shrinks the cache to fit.
+fn size_cache(
+    setting: Option<&std::ffi::OsStr>,
+    per_expert: u64,
+    page: u64,
     available: u64,
-) -> Result<(Vec<Option<LayerExpertCache>>, u64)> {
-    let empty = || (0..LAYERS).map(|_| None).collect();
-    let mib = match std::env::var(CACHE_MIB) {
-        Ok(value) => value.parse::<u64>().ok(),
-        Err(std::env::VarError::NotPresent) => Some(0),
-        Err(std::env::VarError::NotUnicode(_)) => None,
-    }
-    .ok_or_else(|| EngError::MemoryPlan(format!("{CACHE_MIB} must be an integer MiB")))?;
+) -> Result<Sizing> {
+    let Some(setting) = setting else {
+        return Ok(Sizing::Off);
+    };
+    let mib = setting
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| EngError::MemoryPlan(format!("{CACHE_MIB} must be an integer MiB")))?;
     if mib == 0 {
-        return Ok((empty(), 0));
+        return Ok(Sizing::Off);
     }
     let cap = mib
         .checked_mul(1 << 20)
         .ok_or_else(|| EngError::MemoryPlan(format!("{CACHE_MIB} overflows bytes")))?;
-    let per_expert = source.bytes_per_routed_expert();
-    // Each Flint expert role is page aligned on Apple Silicon. Reserve an extra
-    // page per layer for its local route IDs, then check the resulting layouts.
-    let index_reserve = (ROUTED_LAYERS * HostPages::page_size()) as u64;
-    let slots = (cap.min(available).saturating_sub(index_reserve) / per_expert)
-        .min((ROUTED_LAYERS * EXPERTS) as u64) as usize;
-    if slots < ROUTED_LAYERS * ROUTES {
+    let minimum = minimum_cache_bytes(per_expert, page);
+    if cap < minimum {
         return Err(EngError::MemoryPlan(format!(
-            "Flint expert cache needs {} bytes for {ROUTES} slots per routed layer, with {} bytes allowed",
-            per_expert * (ROUTED_LAYERS * ROUTES) as u64 + index_reserve,
-            cap.min(available),
+            "Flint expert cache needs {minimum} bytes for {ROUTES} slots per routed layer, with {cap} bytes requested"
         )));
     }
+    let usable = cap.min(available);
+    if usable < minimum {
+        return Ok(Sizing::Skip(format!(
+            "{available} bytes remain after weights, staging and one prefill piece, and the smallest cache needs {minimum}"
+        )));
+    }
+    let index_reserve = ROUTED_LAYERS as u64 * page;
+    let slots = ((usable - index_reserve) / per_expert).min((ROUTED_LAYERS * EXPERTS) as u64);
+    Ok(Sizing::Use {
+        slots: slots as usize,
+        usable,
+        reduced: available < cap,
+    })
+}
 
-    let mut layers = empty();
+/// Log that the switch is set but this start does not use it.
+pub(super) fn note_ignored(reason: &str) {
+    if let Some(value) = std::env::var_os(CACHE_MIB)
+        && !value.is_empty()
+        && value != "0"
+    {
+        eprintln!("flint: {CACHE_MIB} ignored: {reason}");
+    }
+}
+
+fn build_layers(
+    source: &FlintCheckpoint,
+    slots: usize,
+) -> Result<(Vec<Option<LayerExpertCache>>, u64)> {
+    let mut layers: Vec<Option<LayerExpertCache>> = (0..LAYERS).map(|_| None).collect();
     let mut bytes = 0;
     for (index, layer) in layers.iter_mut().enumerate().skip(2) {
         let count = slots / ROUTED_LAYERS + usize::from(index - 2 < slots % ROUTED_LAYERS);
@@ -78,14 +124,75 @@ pub(super) fn plan(
         bytes += cache.pages.len() as u64;
         *layer = Some(cache);
     }
-    if bytes > cap.min(available) {
-        return Err(EngError::MemoryPlan(format!(
-            "Flint expert cache needs {bytes} bytes with {} bytes allowed",
-            cap.min(available)
-        )));
-    }
-    eprintln!("flint: MLX expert cache bytes={bytes} slots={slots}");
     Ok((layers, bytes))
+}
+
+/// Size and allocate the cache inside `available` bytes (what remains of the
+/// device budget after resident weights, one-row staging and one prefill
+/// piece).
+pub(super) fn plan(
+    source: &FlintCheckpoint,
+    available: u64,
+) -> Result<(Vec<Option<LayerExpertCache>>, u64)> {
+    let empty = || (0..LAYERS).map(|_| None).collect();
+    let page = HostPages::page_size() as u64;
+    let setting = std::env::var_os(CACHE_MIB);
+    let (mut slots, usable, mut reduced) = match size_cache(
+        setting.as_deref(),
+        source.bytes_per_routed_expert(),
+        page,
+        available,
+    )? {
+        Sizing::Off => return Ok((empty(), 0)),
+        Sizing::Skip(reason) => {
+            eprintln!("flint: {CACHE_MIB} ignored: {reason}");
+            return Ok((empty(), 0));
+        }
+        Sizing::Use {
+            slots,
+            usable,
+            reduced,
+        } => (slots, usable, reduced),
+    };
+    let minimum_slots = ROUTED_LAYERS * ROUTES;
+    // Each layer's pages are page aligned, so the allocated bytes can exceed
+    // the slot arithmetic; shrink until the allocation fits.
+    loop {
+        let (layers, bytes) = build_layers(source, slots)?;
+        if bytes <= usable {
+            if reduced {
+                eprintln!("flint: {CACHE_MIB} reduced to {slots} slots to fit the device budget");
+            }
+            eprintln!("flint: MLX expert cache bytes={bytes} slots={slots}");
+            return Ok((layers, bytes));
+        }
+        if slots <= minimum_slots {
+            eprintln!(
+                "flint: {CACHE_MIB} ignored: the smallest cache allocates {bytes} bytes, with {usable} bytes available"
+            );
+            return Ok((empty(), 0));
+        }
+        reduced = true;
+        let fitted = (slots as u128 * u128::from(usable) / u128::from(bytes)) as usize;
+        slots = fitted.min(slots - 1).max(minimum_slots);
+    }
+}
+
+/// Publish `next` only after `read` has filled every written slot. A failed
+/// read can overwrite part of a victim, so the written slots are emptied
+/// before the read and stay empty when it fails.
+fn commit_reads(
+    slots: &mut Vec<Option<Entry>>,
+    next: Vec<Option<Entry>>,
+    writes: &[(u32, usize)],
+    read: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    for &(_, slot) in writes {
+        slots[slot] = None;
+    }
+    read()?;
+    *slots = next;
+    Ok(())
 }
 
 fn route_slots(
@@ -147,13 +254,10 @@ impl LayerExpertCache {
         self.tick += 1;
         let mut next = self.slots.clone();
         let (local, writes) = route_slots(&mut next, experts, self.tick)?;
-        // A failed read can overwrite part of a victim. Publish replacements
-        // only after all three projections have been read.
-        for &(_, slot) in &writes {
-            self.slots[slot] = None;
-        }
-        source.read_expert_slots(&self.layout, &writes, dst)?;
-        self.slots = next;
+        let layout = &self.layout;
+        commit_reads(&mut self.slots, next, &writes, || {
+            source.read_expert_slots(layout, &writes, dst)
+        })?;
 
         let offset = self.layout.index_offset;
         for (dst, id) in dst[offset..offset + INDEX_BYTES]
@@ -198,5 +302,99 @@ mod tests {
         let (local, writes) = route_slots(&mut slots, &[17, 11, 12, 13, 14, 15], 3).unwrap();
         assert_eq!(local, [0, 1, 2, 3, 4, 5]);
         assert_eq!(writes, [(17, 0)]);
+    }
+
+    const PER_EXPERT: u64 = 1_769_472;
+    const PAGE: u64 = 16_384;
+
+    fn minimum() -> u64 {
+        minimum_cache_bytes(PER_EXPERT, PAGE)
+    }
+
+    fn os(text: &str) -> Option<&std::ffi::OsStr> {
+        Some(std::ffi::OsStr::new(text))
+    }
+
+    #[test]
+    fn the_cache_is_off_when_the_switch_is_absent_or_zero() {
+        assert_eq!(
+            size_cache(None, PER_EXPERT, PAGE, u64::MAX).unwrap(),
+            Sizing::Off
+        );
+        assert_eq!(
+            size_cache(os("0"), PER_EXPERT, PAGE, u64::MAX).unwrap(),
+            Sizing::Off
+        );
+    }
+
+    #[test]
+    fn an_invalid_or_too_small_setting_is_refused() {
+        for bad in ["", "1.5", "-1", "many"] {
+            assert!(
+                size_cache(os(bad), PER_EXPERT, PAGE, u64::MAX).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(size_cache(os("1"), PER_EXPERT, PAGE, u64::MAX).is_err());
+        assert!(size_cache(os("18446744073709551615"), PER_EXPERT, PAGE, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_budget_below_the_setting_shrinks_the_cache_and_one_below_the_minimum_skips_it() {
+        let wanted = size_cache(os("4096"), PER_EXPERT, PAGE, 8 << 30).unwrap();
+        let Sizing::Use {
+            slots,
+            usable,
+            reduced,
+        } = wanted
+        else {
+            panic!("{wanted:?}")
+        };
+        assert!(!reduced);
+        assert_eq!(usable, 4 << 30);
+        let less = size_cache(os("4096"), PER_EXPERT, PAGE, 1 << 30).unwrap();
+        let Sizing::Use {
+            slots: fewer,
+            usable,
+            reduced,
+        } = less
+        else {
+            panic!("{less:?}")
+        };
+        assert!(reduced && fewer < slots && usable == 1 << 30);
+        assert!(fewer >= ROUTED_LAYERS * ROUTES);
+        assert!(matches!(
+            size_cache(os("4096"), PER_EXPERT, PAGE, minimum() - 1).unwrap(),
+            Sizing::Skip(_)
+        ));
+        assert!(matches!(
+            size_cache(os("4096"), PER_EXPERT, PAGE, minimum()).unwrap(),
+            Sizing::Use { reduced: true, .. }
+        ));
+    }
+
+    fn entry(expert: u32) -> Option<Entry> {
+        Some(Entry { expert, used: 1 })
+    }
+
+    #[test]
+    fn a_failed_read_leaves_the_written_slots_empty() {
+        let mut slots = vec![entry(1), entry(2), entry(3)];
+        let mut next = slots.clone();
+        next[1] = entry(9);
+        let failed = commit_reads(&mut slots, next, &[(9, 1)], || {
+            Err(EngError::BadRequest("read failed".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(slots, [entry(1), None, entry(3)]);
+    }
+
+    #[test]
+    fn a_complete_read_publishes_the_new_slots() {
+        let mut slots = vec![entry(1), entry(2), entry(3)];
+        let mut next = slots.clone();
+        next[1] = entry(9);
+        commit_reads(&mut slots, next.clone(), &[(9, 1)], || Ok(())).unwrap();
+        assert_eq!(slots, next);
     }
 }

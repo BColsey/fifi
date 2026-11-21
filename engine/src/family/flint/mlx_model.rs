@@ -352,11 +352,23 @@ impl Model {
         };
         let disk = streamed_expert_bytes != 0;
         let (caches, cached_expert_bytes) = if let Some(budget) = available.filter(|_| disk) {
-            let cache_budget = budget
+            // The cache gets what remains after resident weights, one-row
+            // staging and the prefill piece the ladder would pick without it.
+            let remaining = budget
                 .saturating_sub(source.mlx_weight_bytes(true))
                 .saturating_sub(expert_staging_bytes(streamed_expert_bytes, 1));
-            mlx_expert_cache::plan(&source, cache_budget)?
+            let prefill = super::mlx_executor::planned_prefill_reserve(
+                ceiling,
+                remaining,
+                streamed_expert_bytes,
+            );
+            mlx_expert_cache::plan(&source, remaining.saturating_sub(prefill))?
         } else {
+            mlx_expert_cache::note_ignored(if available.is_some() {
+                "the weights fit the device budget"
+            } else {
+                "device sizing is off"
+            });
             ((0..super::config::LAYERS).map(|_| None).collect(), 0)
         };
         if disk {
