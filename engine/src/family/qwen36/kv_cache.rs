@@ -87,6 +87,14 @@ impl Capture {
     }
 }
 
+/// The version of the numeric recipe that produces the state an entry holds: the kernels, their
+/// precision and the order of their arithmetic. It enters the namespace of every entry, so a
+/// change of it makes the old entries unreachable instead of restoring state the current kernels
+/// would not have produced. Bump it with any change that can alter a prefill's output bits
+/// (a kernel rewrite, a different accumulation order, a new KV storage format, a new
+/// quantisation of the cached state). Changes that leave the output bits alone need no bump.
+pub(crate) const NUMERIC_RECIPE_VERSION: u32 = 1;
+
 /// What a cache entry was built under. Two loads that differ in any field never share an entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoadIdentity {
@@ -122,7 +130,10 @@ impl LoadIdentity {
             backend_id: "cuda.single-card".to_owned(),
             snapshot_schema: "qwen36.compact-state.v1".to_owned(),
             payload_abi: "delta-f32.kv-compact.v1".to_owned(),
-            numeric_recipe_digest: digest("numeric", &self.numeric_path),
+            numeric_recipe_digest: digest(
+                "numeric",
+                &format!("recipe-v{NUMERIC_RECIPE_VERSION}; {}", self.numeric_path),
+            ),
             position_policy_digest: digest("position", "absolute-rope-from-zero"),
             render_mode: "chat".to_owned(),
             kv_layout_digest: digest("kv-layout", &self.layout),
@@ -226,6 +237,8 @@ struct Record {
 }
 
 struct State {
+    /// Jobs the engine thread cancelled; the writer drops each when it next looks.
+    aborted: HashSet<u64>,
     records: Vec<Record>,
     clock: u64,
     /// Bytes promised to saves in flight.
@@ -358,7 +371,24 @@ pub(crate) struct KvDisk {
     _lock: std::fs::File,
 }
 
-fn aligned_leak(bytes: usize) -> &'static mut [u8] {
+/// Sector-aligned read buffers handed back by closed caches. The ring takes `'static` memory, so
+/// a buffer is allocated once and reused by every later open instead of leaking a new one.
+static SPARE_BUFFERS: Mutex<Vec<&'static mut [u8]>> = Mutex::new(Vec::new());
+
+/// A sector-aligned buffer of `bytes`: a spare of that size, else a fresh allocation.
+fn aligned_buffer(bytes: usize) -> &'static mut [u8] {
+    let spare = {
+        let mut spares = SPARE_BUFFERS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        spares
+            .iter()
+            .position(|buffer| buffer.len() == bytes)
+            .map(|at| spares.swap_remove(at))
+    };
+    if let Some(buffer) = spare {
+        return buffer;
+    }
     let slop = SECTOR as usize;
     let backing = Box::leak(vec![0u8; bytes + slop].into_boxed_slice());
     let base = backing.as_ptr() as usize;
@@ -405,6 +435,55 @@ fn lock_dir(dir: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// Writes one sector to a scratch file in `dir` with `O_DIRECT` and reads it back the same way. A
+/// directory whose filesystem refuses direct I/O (some tmpfs, overlay and encrypted home
+/// directories) could take writes and then fail every verified read, filling the quota with
+/// entries that never restore, so the cache stays off there.
+fn probe_direct_io(dir: &Path) -> Result<(), String> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let sector = SECTOR as usize;
+    let path = dir.join(format!(".direct-probe-{}", std::process::id()));
+    let outcome = (|| -> Result<(), String> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(OFlags::DIRECT.bits() as i32);
+        let file = options
+            .open(&path)
+            .map_err(|e| io_err("opening a direct-I/O file", e))?;
+        // An O_DIRECT buffer must be sector-aligned.
+        let mut backing = vec![0u8; 2 * sector];
+        let skip = (sector - backing.as_ptr() as usize % sector) % sector;
+        let (first, rest) = backing[skip..].split_at_mut(sector);
+        let _ = rest;
+        for (at, byte) in first.iter_mut().enumerate() {
+            *byte = (at % 251) as u8;
+        }
+        file.write_all_at(first, 0)
+            .map_err(|e| io_err("a direct-I/O write", e))?;
+        let expected = first.to_vec();
+        first.fill(0);
+        file.read_exact_at(first, 0)
+            .map_err(|e| io_err("a direct-I/O read", e))?;
+        if first != expected.as_slice() {
+            return Err("a direct-I/O read returned other bytes than were written".into());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&path);
+    outcome.map_err(|reason| {
+        format!(
+            "{} does not support direct I/O ({reason}), which the verified reads need",
+            dir.display()
+        )
+    })
+}
+
 impl KvDisk {
     /// Opens (or creates) the cache under `dir` for this load. Entries of other loads stay and
     /// age out by use order; entries that fail to parse or lack an object are removed.
@@ -421,6 +500,7 @@ impl KvDisk {
         let lock = lock_dir(dir)?;
         let dir =
             std::fs::canonicalize(dir).map_err(|e| io_err("resolving the cache directory", e))?;
+        probe_direct_io(&dir)?;
         let root = DiskRoot::open_or_create(&dir, credential_scope(), billing_engine())
             .map_err(|e| format!("opening the cache root: {e}"))?;
         let identity = load.record();
@@ -499,6 +579,7 @@ impl KvDisk {
         }
         let clock = records.len() as u64;
         let state = State {
+            aborted: HashSet::new(),
             records,
             clock,
             reserved: 0,
@@ -528,7 +609,7 @@ impl KvDisk {
                 ODirectRing::new(
                     NonZeroUsize::MIN,
                     NonZeroU64::new((CHUNK_BYTES as u64) + SECTOR).expect("a nonzero span"),
-                    aligned_leak(CHUNK_BYTES + SECTOR as usize),
+                    aligned_buffer(CHUNK_BYTES + SECTOR as usize),
                 )
                 .map_err(|e| format!("the read ring: {e}"))?,
             );
@@ -783,7 +864,11 @@ impl KvDisk {
     }
 
     /// Cancels a save: staged bytes are discarded and its reservation is released.
+    ///
+    /// The cancel is recorded in the shared state, which the writer reads, so a full command queue
+    /// cannot lose it; the command only wakes a writer that is waiting.
     pub(crate) fn abort(&self, job: &WriteJob) {
+        self.shared.lock().aborted.insert(job.id);
         let _ = self.commands.try_send(Command::Abort { id: job.id });
     }
 
@@ -834,6 +919,13 @@ impl Drop for KvDisk {
         let _ = self.commands.send(Command::Stop);
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
+        }
+        // The rings' memory goes back to the pool for the next open.
+        let mut spares = SPARE_BUFFERS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for ring in std::mem::take(&mut self.rings) {
+            spares.extend(ring.into_memory());
         }
     }
 }
@@ -918,6 +1010,15 @@ struct Current {
 fn writer_loop(shared: &Shared, commands: &Receiver<Command>, events: &Sender<WriteEvent>) {
     let mut current: Option<Current> = None;
     while let Ok(command) = commands.recv() {
+        // A cancel recorded in the shared state takes effect before the next command, even when
+        // its own command found the queue full.
+        if current.as_ref().is_some_and(|job| {
+            let mut state = shared.lock();
+            state.aborted.remove(&job.id)
+        }) && let Some(old) = current.take()
+        {
+            release(shared, old);
+        }
         match command {
             Command::Stop => break,
             Command::Begin { id, spec, need } => {
@@ -967,6 +1068,7 @@ fn writer_loop(shared: &Shared, commands: &Receiver<Command>, events: &Sender<Wr
 /// Drops a job's reservation and any objects it installed that no entry names.
 fn release(shared: &Shared, job: Current) {
     let mut state = shared.lock();
+    state.aborted.remove(&job.id);
     state.reserved = state.reserved.saturating_sub(job.need);
     for dep in &job.installed {
         let named = state
@@ -1360,7 +1462,8 @@ pub(crate) enum Plan {
 }
 
 /// Decides whether the tier runs and where, from the config member, the environment and the
-/// build's default. The environment wins over the config. A malformed environment value is an
+/// build's default. The environment wins over the config, except that `kv_cache.enabled: false`
+/// is not undone by `Q36_KV_CACHE_DIR` alone (only `Q36_KV_CACHE=1` does that). A malformed environment value is an
 /// error (a typo must not silently turn the cache off or point it elsewhere).
 pub(crate) fn plan(
     config: Option<&crate::family::qwen36::settings::KvCacheSettings>,
@@ -1398,10 +1501,14 @@ pub(crate) fn plan(
     let config_dir = config.and_then(|c| c.dir.clone());
     let (wanted, origin) = if switch == Some(false) {
         return Ok(Plan::Off(format!("{SWITCH_ENV} is off")));
-    } else if switch == Some(true) || env_dir.is_some() {
+    } else if switch == Some(true) {
         (true, "environment")
     } else if config_enabled == Some(false) {
+        // An explicit off in the config wins over a directory named in the environment; only
+        // `Q36_KV_CACHE=1` overrides it.
         return Ok(Plan::Off("kv_cache.enabled is false".into()));
+    } else if env_dir.is_some() {
+        (true, "environment")
     } else if config_enabled == Some(true) || config_dir.is_some() {
         (true, "config")
     } else if default_on {

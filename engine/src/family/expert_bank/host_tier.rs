@@ -204,6 +204,11 @@ impl std::fmt::Debug for ODirectRing {
 }
 
 impl ODirectRing {
+    /// Gives the slots' memory back to a caller that pools it. A slot on loan is not returned.
+    pub(crate) fn into_memory(self) -> Vec<&'static mut [u8]> {
+        self.slots_mem.into_iter().flatten().collect()
+    }
+
     /// Wraps `mem` — pinned by the caller — as `slots` slots of exactly
     /// `slot_span` bytes. `slot_span` must cover the worst-case record plus
     /// the worst-case staging spans the pack reader will issue (the reader

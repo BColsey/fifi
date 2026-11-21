@@ -11,6 +11,57 @@ fn load(weights: &str) -> LoadIdentity {
     }
 }
 
+#[test]
+fn the_numeric_recipe_version_and_every_digest_enter_the_namespace() {
+    let base = load("w").record().namespace();
+    assert_eq!(load("w").record().namespace(), base);
+    assert_ne!(load("w2").record().namespace(), base);
+    let mut other = load("w");
+    other.numeric_path = "steps-int8".into();
+    assert_ne!(other.record().namespace(), base);
+    // A bump of the version (simulated by the text it adds to the numeric path) changes it too.
+    let recipe = format!("recipe-v{NUMERIC_RECIPE_VERSION}; steps-fp16");
+    let bumped = format!("recipe-v{}; steps-fp16", NUMERIC_RECIPE_VERSION + 1);
+    let digest = |text: &str| H64::from_digest(sha256(&[b"numeric", text.as_bytes()]));
+    assert_ne!(digest(&recipe), digest(&bumped));
+    assert_eq!(load("w").record().numeric_recipe_digest, digest(&recipe));
+}
+
+#[test]
+fn a_directory_that_serves_direct_io_opens_and_a_missing_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    match probe_direct_io(dir.path()) {
+        Ok(()) => {}
+        Err(reason) => {
+            eprintln!("direct I/O refused on the test directory ({reason}); the probe test skips");
+            return;
+        }
+    }
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "the probe leaves no file"
+    );
+    let error = probe_direct_io(&dir.path().join("absent")).unwrap_err();
+    assert!(error.contains("does not support direct I/O"), "{error}");
+}
+
+#[test]
+fn a_cancel_survives_a_full_command_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut cache, _) = KvDisk::open(&dir.path().join("c"), 2 << 30, &load("w")).unwrap();
+    let spec = WriteSpec {
+        tokens: tokens(2_049, 1),
+        capture: Capture::Tip,
+        object_bytes: vec![1 << 20, 1 << 20],
+    };
+    let job = cache.begin_write(spec).unwrap();
+    // The queue is not what carries the cancel: the shared state records it.
+    cache.abort(&job);
+    assert!(cache.wait_idle(Duration::from_secs(10)));
+    assert!(cache.shared.lock().aborted.is_empty());
+    assert_eq!(cache.entry_count(), 0);
+}
+
 fn tokens(len: usize, seed: u32) -> Vec<u32> {
     (0..len as u32)
         .map(|i| i.wrapping_mul(31).wrapping_add(seed))
@@ -522,6 +573,23 @@ fn the_plan_follows_the_environment_then_the_config_then_the_build_default() {
         true,
         free
     )));
+    // enabled=false is not undone by a directory in the environment; only the switch undoes it.
+    assert!(off(plan(
+        Some(&disabled),
+        &env(Some("/e"), None, None),
+        true,
+        free
+    )));
+    let Plan::On { origin, .. } = plan(
+        Some(&disabled),
+        &env(Some("/e"), None, Some("1")),
+        true,
+        free,
+    )
+    .unwrap() else {
+        panic!("on")
+    };
+    assert_eq!(origin, "environment");
     // enabled=true with no directory takes the default location.
     let enabled = KvCacheSettings {
         enabled: Some(true),
