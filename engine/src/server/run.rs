@@ -587,7 +587,7 @@ fn start_gemma4(
 
 fn start_inkling2(
     config: &EngineConfig,
-    _prefix_reuse: bool,
+    prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
     use crate::family::inkling2;
@@ -595,22 +595,27 @@ fn start_inkling2(
         .ok_or_else(|| EngError::BadRequest(inkling2::enable_text_backend()))?;
     #[cfg(target_pointer_width = "64")]
     {
+        let context_limit = inkling2::text_context()?;
         let (engine, bundle) = inkling2::start_engine(
             backend,
             &config.model_dir,
             &config.tokenizer_dir,
+            inkling2::TextSettings {
+                context: context_limit,
+                prefix_reuse,
+            },
             ready_note,
         )?;
         Ok(StartedEngine {
             engine,
             bundle: Arc::new(bundle),
-            context_limit: inkling2::TEXT_CONTEXT_LIMIT,
+            context_limit,
             effective: Vec::new(),
         })
     }
     #[cfg(not(target_pointer_width = "64"))]
     {
-        let _ = (backend, config, ready_note);
+        let _ = (backend, config, ready_note, prefix_reuse);
         Err(EngError::BadRequest(
             "Inkling text serving requires a 64-bit build".into(),
         ))

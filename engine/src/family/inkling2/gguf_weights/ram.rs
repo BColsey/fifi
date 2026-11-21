@@ -150,6 +150,7 @@ impl RamExperts {
         spec: &TextSpec,
         eps: f32,
         limit: u64,
+        host_reserve: u64,
     ) -> Result<Option<Self>, EngError> {
         if limit == 0 {
             return Ok(None);
@@ -161,7 +162,7 @@ impl RamExperts {
                 return Ok(None);
             }
         };
-        let cap = limit.min(admission.cache_capacity());
+        let cap = limit.min(admission.cache_capacity().saturating_sub(host_reserve));
         let experts = spec.n_routed_experts as usize;
         let hidden = spec.hidden_size as usize;
         let k = spec.num_experts_per_tok as usize;

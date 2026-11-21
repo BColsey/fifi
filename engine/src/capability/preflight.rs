@@ -607,14 +607,22 @@ fn inkling2_preflight(
     candidate: &Candidate,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
-    use crate::family::inkling2::{self, FAMILY, TEXT_CONTEXT_LIMIT, TextBackend, TextSpec};
+    use crate::family::inkling2::{self, DEFAULT_TEXT_CONTEXT, FAMILY, TextBackend, TextSpec};
 
     let selection = TextBackend::from_env();
     let backend = selection.as_ref().ok().copied().flatten();
-    let context = candidate.context_limit.unwrap_or(if backend.is_some() {
-        TEXT_CONTEXT_LIMIT
-    } else {
-        8192
+    let context = candidate.context_limit.unwrap_or_else(|| {
+        if backend.is_none() {
+            return 8192;
+        }
+        inkling2::text_context().unwrap_or_else(|error| {
+            checks.push(Check::new(
+                "Inkling context",
+                CheckStatus::Fail,
+                super::describe_error(&error),
+            ));
+            DEFAULT_TEXT_CONTEXT
+        })
     });
     #[cfg(target_pointer_width = "64")]
     let gguf = inkling2::gguf_path(model_dir);
@@ -637,6 +645,7 @@ fn inkling2_preflight(
                     checks.push(inkling2_backend_check(
                         backend,
                         candidate.kv_dtype.as_deref(),
+                        context,
                         || inkling2::inspect_gguf_config(&plan, context, tokenizer_dir),
                     ));
                 }
@@ -664,6 +673,7 @@ fn inkling2_preflight(
                         checks.push(inkling2_backend_check(
                             backend,
                             candidate.kv_dtype.as_deref(),
+                            context,
                             || inkling2::inspect_cpu_config(&_bytes, &spec, context, tokenizer_dir),
                         ));
                     }
@@ -717,8 +727,7 @@ fn inkling2_preflight(
         decisions: Vec::new(),
         estimate: None,
         next_step: if servable {
-            "Use the Inkling family in an enginesrv config to try short-context text generation."
-                .into()
+            "Use the Inkling family in an enginesrv config to try text generation.".into()
         } else {
             "Address the failed Inkling checks above.".into()
         },
@@ -747,6 +756,7 @@ fn report_inkling2_checkpoint(
 fn inkling2_backend_check(
     backend: crate::family::inkling2::TextBackend,
     kv_dtype: Option<&str>,
+    context: u32,
     validate: impl FnOnce() -> Result<(), crate::EngError>,
 ) -> Check {
     let (status, detail) = if kv_dtype.is_some_and(|dtype| dtype != "f32") {
@@ -761,7 +771,7 @@ fn inkling2_backend_check(
                 format!(
                     "experimental {} text backend, host F32 KV, one sequence, at most {} total tokens",
                     backend.name(),
-                    crate::family::inkling2::TEXT_CONTEXT_LIMIT
+                    context
                 ),
             ),
             Err(error) => (CheckStatus::Fail, super::describe_error(&error)),

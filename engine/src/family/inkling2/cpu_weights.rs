@@ -97,10 +97,15 @@ impl Weights {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    pub(super) fn enable_cuda(&mut self, spec: &TextSpec, eps: f32) -> Result<(), EngError> {
+    pub(super) fn enable_cuda(
+        &mut self,
+        spec: &TextSpec,
+        eps: f32,
+        host_reserve: u64,
+    ) -> Result<(), EngError> {
         match self {
             Self::Native(w) => w.enable_cuda(spec),
-            Self::Gguf(w) => w.enable_cuda(spec, eps),
+            Self::Gguf(w) => w.enable_cuda(spec, eps, host_reserve),
         }
     }
 

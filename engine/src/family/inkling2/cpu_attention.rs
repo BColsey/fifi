@@ -1,12 +1,12 @@
 //! Per-visit state and streaming attention for the native Inkling CPU check.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use super::Attention;
 use super::cpu_forward::{CpuForward, dot, rms_norm, sigmoid};
 use crate::EngError;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CausalConv(VecDeque<Vec<f32>>);
 
 impl CausalConv {
@@ -46,10 +46,11 @@ struct DynamicTaps {
     head_width: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct VisitState {
-    keys: VecDeque<Vec<f32>>,
-    values: VecDeque<Vec<f32>>,
+    // KV rows are immutable after append, so prefix snapshots share their storage.
+    keys: VecDeque<Arc<Vec<f32>>>,
+    values: VecDeque<Arc<Vec<f32>>>,
     k_conv: CausalConv,
     v_conv: CausalConv,
     attn_conv: CausalConv,
@@ -285,8 +286,8 @@ impl CpuForward {
 
 impl VisitState {
     fn push(&mut self, key: Vec<f32>, value: Vec<f32>, length: usize) {
-        self.keys.push_front(key);
-        self.values.push_front(value);
+        self.keys.push_front(Arc::new(key));
+        self.values.push_front(Arc::new(value));
         self.keys.truncate(length);
         self.values.truncate(length);
     }

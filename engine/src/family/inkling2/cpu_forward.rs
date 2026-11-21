@@ -5,7 +5,7 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use super::{
-    Attention, LayerVisit, TEXT_CONTEXT_LIMIT, TextSpec, bad,
+    Attention, LayerVisit, TextSpec, bad,
     cpu_attention::VisitState,
     cpu_weights::{NativeWeights, Weights},
     gguf_weights::{GgufPlan, Metadata, gguf_path},
@@ -56,6 +56,11 @@ pub(super) struct CpuForward {
     position: usize,
     failed: bool,
     eos_token_id: u32,
+}
+
+pub(super) struct PrefixState {
+    position: usize,
+    visits: Vec<VisitState>,
 }
 
 #[derive(Clone)]
@@ -123,8 +128,9 @@ impl CpuForward {
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    pub(super) fn enable_cuda(&mut self) -> Result<(), EngError> {
-        self.weights.enable_cuda(&self.spec, self.math.rms_norm_eps)
+    pub(super) fn enable_cuda(&mut self, host_reserve: u64) -> Result<(), EngError> {
+        self.weights
+            .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve)
     }
 
     pub(super) fn vocab_size(&self) -> u32 {
@@ -133,6 +139,27 @@ impl CpuForward {
 
     pub(super) fn validate_tokenizer(&self, vocab: u32, eos: &[u32]) -> Result<(), EngError> {
         validate_tokenizer(self.vocab_size(), self.eos_token_id, vocab, eos)
+    }
+
+    /// Conservative RAM accounting for F32 KV, row ownership and four causal convolutions.
+    pub(super) fn host_state_bytes(&self) -> Result<u64, EngError> {
+        let payload = self.spec.kv_plan(self.context as u32)?.windowed_bytes * 2;
+        let row_overhead = payload / 64;
+        let convolution_and_deques = self.visits.len() as u64 * 256 * 1024;
+        Ok(payload + row_overhead + convolution_and_deques)
+    }
+
+    pub(super) fn snapshot(&self) -> PrefixState {
+        PrefixState {
+            position: self.position,
+            visits: self.state.clone(),
+        }
+    }
+
+    pub(super) fn restore(&mut self, saved: &PrefixState) {
+        self.state.clone_from(&saved.visits);
+        self.position = saved.position;
+        self.failed = false;
     }
 
     pub(super) fn position(&self) -> usize {
@@ -161,9 +188,7 @@ impl CpuForward {
             ));
         }
         if self.position >= self.context || u64::from(id) >= self.spec.unpadded_vocab_size {
-            return Err(bad(
-                "token or sequence is outside the short-context CPU limits",
-            ));
+            return Err(bad("token or sequence is outside the Inkling text limits"));
         }
 
         self.failed = true;
@@ -548,13 +573,10 @@ impl CpuConfig {
 
 impl TextMath {
     fn validate(&self, context: usize, spec: &TextSpec) -> Result<(), EngError> {
-        if context == 0
-            || context > TEXT_CONTEXT_LIMIT as usize
-            || context > self.log_scaling_n_floor
-            || context > spec.model_max_length as usize
-        {
+        let max = self.log_scaling_n_floor.min(spec.model_max_length as usize);
+        if !(1..=max).contains(&context) {
             return Err(bad(format!(
-                "invalid CPU reference context, expected 1..={TEXT_CONTEXT_LIMIT} and at most the log-scale floor"
+                "Inkling text context must be in 1..={max} with the current attention implementation"
             )));
         }
         // The CPU pilot accepts the released Mini attention and convolution sizes.
@@ -698,7 +720,7 @@ fn native_cpu_logits() {
 #[test]
 #[ignore = "requires a leased CUDA device and the native Mini checkpoint"]
 fn native_cuda_logits() {
-    logits_probe(|model| model.enable_cuda().unwrap());
+    logits_probe(|model| model.enable_cuda(0).unwrap());
 }
 
 #[cfg(test)]

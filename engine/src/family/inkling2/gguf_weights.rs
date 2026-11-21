@@ -531,7 +531,12 @@ pub(super) struct GgufTextWeights {
 
 impl GgufTextWeights {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-    pub(super) fn enable_cuda(&mut self, spec: &TextSpec, eps: f32) -> Result<(), EngError> {
+    pub(super) fn enable_cuda(
+        &mut self,
+        spec: &TextSpec,
+        eps: f32,
+        host_reserve: u64,
+    ) -> Result<(), EngError> {
         let mut uploads = Vec::new();
         for (name, tensor) in &self.tensors {
             if tensor.kind != GgufType::Bf16
@@ -575,7 +580,8 @@ impl GgufTextWeights {
                 .collect();
             cuda.enable_cache(layout, spec, budget)?;
         }
-        self.ram = ram::RamExperts::plan(self, &cuda, spec, eps, ram_limit.unwrap_or(0))?;
+        self.ram =
+            ram::RamExperts::plan(self, &cuda, spec, eps, ram_limit.unwrap_or(0), host_reserve)?;
         self.cuda = Some(cuda);
         Ok(())
     }

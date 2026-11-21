@@ -23,7 +23,7 @@ pub(crate) use cpu_forward::{inspect_cpu_config, inspect_gguf_config};
 #[cfg(target_pointer_width = "64")]
 pub(crate) use gguf_weights::{GgufPlan, gguf_path};
 #[cfg(target_pointer_width = "64")]
-pub(crate) use serve::start_engine;
+pub(crate) use serve::{TextSettings, start_engine};
 
 pub(crate) use checkpoint::inspect_checkpoint;
 use serde::Deserialize;
@@ -33,7 +33,18 @@ use crate::{EngError, checkpoint_json::UniqueValue};
 pub(crate) const FAMILY: &str = "inkling2_loop";
 const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
 const CUDA_REFERENCE_ENV: &str = "FIFI_INKLING_CUDA_REFERENCE";
-pub(crate) const TEXT_CONTEXT_LIMIT: u32 = 128;
+pub(crate) const DEFAULT_TEXT_CONTEXT: u32 = 128;
+
+pub(crate) fn text_context() -> Result<u32, EngError> {
+    const NAME: &str = "FIFI_INKLING_CONTEXT_TOKENS";
+    let Some(raw) = std::env::var_os(NAME) else {
+        return Ok(DEFAULT_TEXT_CONTEXT);
+    };
+    raw.to_str()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| bad(format!("{NAME} must be a positive token count")))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextBackend {
