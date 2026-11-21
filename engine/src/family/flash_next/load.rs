@@ -22,6 +22,8 @@ use crate::{
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) mod exl3_pack;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family::flash_next) mod gguf;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) mod pack_files;
 
 const MODEL: &str = "language_model.model.";
@@ -93,6 +95,7 @@ pub(super) fn resident_packed_payload(key: &str, kinds: &[bool], ple_layer: usiz
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct Dims {
     hidden: u32,
     eps: f32,
@@ -918,8 +921,7 @@ pub(crate) fn preflight_rows(
 > {
     use crate::capability::Probe;
     use crate::family::flash_next::moe::tier_plan::{TierInputs, TierShape};
-    use crate::family::plan_decision::{PlanAlternative, PlanFixity};
-    use crate::family::plan_rows::{PlanRows, RowsFit};
+    use crate::family::plan_rows::RowsFit;
     // The fields this family reads; the request's shape is shared.
     let dir = request.model_dir;
     let context = request.context;
@@ -983,6 +985,29 @@ pub(crate) fn preflight_rows(
         }
     };
 
+    let ring_budget = super::settings::ring_budget_bytes(
+        std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
+            .ok()
+            .as_deref(),
+    )?;
+    let requested = u64::from(settings.context);
+    let kv = settings.kv_format.format();
+    let note = "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them";
+
+    // A GGUF checkpoint plans from its own tensor table. The disk tier is offered there, so
+    // a host that cannot pin the cold experts still plans.
+    if let Some(model) = gguf::GgufModel::open(dir)? {
+        let plan = model.load_plan(gguf::plan::Card {
+            free_vram,
+            host_total: host.0,
+            host_available: host.1,
+            ring_budget,
+        })?;
+        let min_slots = model.config().top_k() + 1;
+        let note = "the rows plan the GGUF files as stored: the experts and the n-gram table stay in the files and are read in place; the expert row is before the prefill arena the load carves out, and the rows do not run the load-time admission";
+        return context_rows(&plan, requested, kv, min_slots, settings.context, note);
+    }
+
     // The loader's own open: the storage guard judges the directory, every
     // shard, the metadata files and the n-gram table before anything is
     // read, refusing a network-backed path by name.
@@ -1000,11 +1025,6 @@ pub(crate) fn preflight_rows(
         model.moe.experts(),
         model.moe.top_k(),
         report.expert_bytes,
-    )?;
-    let ring_budget = super::settings::ring_budget_bytes(
-        std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
-            .ok()
-            .as_deref(),
     )?;
     let card = TierInputs::measured(
         tier_shape,
@@ -1024,10 +1044,31 @@ pub(crate) fn preflight_rows(
         ngram_bytes,
         card,
     )?;
-    let requested = u64::from(settings.context);
-    let kv = settings.kv_format.format();
     let min_slots = model.moe.top_k() + 1;
-    let note = "the rows assume cuda_decode: true and a manifest in the config; the expert row is before the prefill arena the load carves out; the rows do not run the bank-mode switch spelling, the pack-record and geometry constructions, the PLE-vector and n-gram reads, the live-host pin admission, the tokenizer vocabulary pin, an expert_stats profile parse, or the device-time bank and kernel registration — load-time admission re-runs all of them";
+    context_rows(&plan, requested, kv, min_slots, settings.context, note)
+}
+
+/// The decision rows of `plan` at `requested` positions, or, when the plan refuses that
+/// context, the rows of the largest context it admits with the refusal's context kept as the
+/// configured truth.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn context_rows(
+    plan: &crate::family::flash_next::moe::load_plan::FlashLoadPlan,
+    requested: u64,
+    kv: crate::family::flash_next::moe::context_budget::KvFormat,
+    min_slots: usize,
+    requested_context: u32,
+    note: &str,
+) -> Result<
+    (
+        Vec<crate::family::plan_decision::PlanDecision>,
+        String,
+        crate::family::plan_rows::RowsFit,
+    ),
+    EngError,
+> {
+    use crate::family::plan_decision::{PlanAlternative, PlanFixity};
+    use crate::family::plan_rows::{PlanRows, RowsFit};
     match plan.at_context(requested, kv, min_slots) {
         Ok(load) => Ok((load.plan_rows(), note.to_string(), RowsFit::Fits)),
         Err(refusal) => {
@@ -1035,7 +1076,7 @@ pub(crate) fn preflight_rows(
             // largest fitting context as a proposal, never applied; every
             // size row is the largest fitting plan's own, and the
             // alternative says so.
-            let Some(largest) = largest_fitting_context(&plan, requested, kv, min_slots) else {
+            let Some(largest) = largest_fitting_context(plan, requested, kv, min_slots) else {
                 return Err(refusal);
             };
             let largest = u32::try_from(largest).map_err(|_| {
@@ -1070,7 +1111,7 @@ pub(crate) fn preflight_rows(
                 rows,
                 note.to_string(),
                 RowsFit::Constrained {
-                    requested: settings.context,
+                    requested: requested_context,
                     largest,
                 },
             ))

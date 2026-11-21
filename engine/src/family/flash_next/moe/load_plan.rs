@@ -27,7 +27,7 @@ use crate::{
     EngError,
     family::device_budget::KvPlan,
     family::exl3_pack::PackReport,
-    family::flash_next::{deltanet::DeltaState, load::model_shape},
+    family::flash_next::{deltanet::DeltaState, load::model_shape, step::ModelShape},
     family::plan_decision::{PlanDecision, PlanFixity},
     family::plan_rows::PlanRows,
 };
@@ -79,6 +79,25 @@ impl FlashLoadPlan {
             .ok_or_else(|| {
                 refuse("the experts and the embedding exceed the pack's device bytes".into())
             })?;
+        Self::from_sizes(
+            &model,
+            &kinds,
+            (shape, trunk_bytes, embedding_bytes),
+            ngram_bytes,
+            card,
+        )
+    }
+
+    /// The plan from sizes the caller measured: the expert shape, the device bytes of the trunk
+    /// and the host bytes of the embedding. [`Self::new`] takes them from a pack walk; a
+    /// checkpoint in another format (a GGUF) supplies its own.
+    pub(in crate::family::flash_next) fn from_sizes(
+        model: &ModelShape,
+        kinds: &[bool],
+        (shape, trunk_bytes, embedding_bytes): (TierShape, u64, u64),
+        ngram_bytes: u64,
+        card: TierInputs,
+    ) -> Result<Self, EngError> {
         let cached_layers = kinds.iter().filter(|&&attention| attention).count() as u64;
         let delta_layers = kinds.len() as u64 - cached_layers;
         let delta_state_bytes = delta_layers
