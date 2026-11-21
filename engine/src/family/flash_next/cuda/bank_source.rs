@@ -550,7 +550,7 @@ impl DecodeMisses {
         let step_word = if steps == 1 { "step" } else { "steps" };
         Some(format!(
             "disk rung decode: {steps} {step_word}, misses per layer min {} / median {} / max {}, \
-             per step min {} / median {} / max {}, pool depth {pool_depth}, exact records {total_records}",
+             per step min {} / median {} / max {}, pool depth {pool_depth}, miss records {total_records}",
             layer_stats.min,
             layer_stats.median,
             layer_stats.max,

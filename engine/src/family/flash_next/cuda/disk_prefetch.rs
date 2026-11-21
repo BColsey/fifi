@@ -34,6 +34,7 @@ struct Counters {
     joined: u64,
     join_fallback: u64,
     join_wait_ns: u64,
+    last_error: Option<String>,
 }
 
 struct ActiveRead {
@@ -90,7 +91,10 @@ impl DiskPrefetch {
                                 plan.ready.push((expert, bytes));
                             }
                         }
-                        Err(_) => state.counters.failed += 1,
+                        Err(error) => {
+                            state.counters.failed += 1;
+                            state.counters.last_error = Some(error.describe());
+                        }
                     }
                 }
             })
@@ -244,7 +248,7 @@ impl DiskPrefetch {
         let state = self.shared.state.lock().expect("disk prefetch state");
         let stats = &state.counters;
         format!(
-            "disk prefetch cumulative: issued {} failed {} ready hits {} late {} demand {} active {} joined {} join fallback {} join wait ns {}",
+            "disk prefetch cumulative: issued {} failed {} ready hits {} late {} demand {} active {} joined {} join fallback {} join wait ns {}{}",
             stats.issued,
             stats.failed,
             stats.ready_hits,
@@ -253,7 +257,11 @@ impl DiskPrefetch {
             usize::from(state.active.is_some()),
             stats.joined,
             stats.join_fallback,
-            stats.join_wait_ns
+            stats.join_wait_ns,
+            stats
+                .last_error
+                .as_ref()
+                .map_or(String::new(), |error| format!(" last error: {error}"))
         )
     }
 }
@@ -508,5 +516,45 @@ mod tests {
                 .contains("late 1 demand 1 active 1 joined 0 join fallback 1")
         );
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_inflight_read_falls_back_to_the_exact_reader_and_keeps_its_error() {
+        let (entered, started) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let prefetch = DiskPrefetch::spawn(2, true, move |_, id| {
+            entered.send(id).unwrap();
+            proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+            Err(EngError::BadRequest(format!("record {id} unreadable")))
+        })
+        .unwrap();
+        prefetch.submit(target(), [3, 4].into_iter());
+        assert_eq!(started.recv_timeout(Duration::from_secs(3)).unwrap(), 3);
+        let mut calls = Vec::new();
+        let result = prefetch
+            .read_demand(target(), &[3], |ids| {
+                calls.push(ids.to_vec());
+                if ids.is_empty() {
+                    // Let the adopted read fail and drop its hand-off before the wait.
+                    release.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while prefetch.shared.state.lock().unwrap().active.is_some() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                }
+                Ok(ids.iter().map(|_| vec![30]).collect())
+            })
+            .unwrap();
+        assert_eq!(result, [vec![30]]);
+        assert_eq!(calls, [vec![], vec![3]]);
+        let report = prefetch.report();
+        assert!(
+            report.contains("late 1 demand 1 active 0 joined 0 join fallback 1"),
+            "{report}"
+        );
+        assert!(report.contains("failed 1"), "{report}");
+        assert!(report.contains("last error: "), "{report}");
+        assert!(report.contains("record 3 unreadable"), "{report}");
     }
 }
