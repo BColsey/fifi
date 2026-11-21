@@ -581,7 +581,7 @@ mod device {
         // ready.
         let (announce, resolved) = std::sync::mpsc::sync_channel::<Announcement<usize>>(1);
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
-            let loaded = bolt::load_choosing(&files, None, &|cells| {
+            let loaded = bolt::load_choosing(&files, None, seqs, &|cells| {
                 let _ = announce.try_send(Ok(cells));
             });
             announce_failure(&loaded, Some(&announce));

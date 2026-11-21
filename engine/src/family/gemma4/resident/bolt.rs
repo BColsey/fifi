@@ -432,13 +432,16 @@ pub(crate) fn bolt_demand(
     })
 }
 
-/// The KV cells per physical layer a card carries beside `weights_bytes`: the largest count up to
-/// the model maximum whose cache, scratch and headroom fit `free` (the shared card-fit rule, one
-/// cache form). `None` when not even the smallest count fits.
+/// The KV cells per physical layer a card carries beside `weights_bytes` while `sessions`
+/// sessions each hold that many: the largest count up to the model maximum whose first session's
+/// cache, the shared scratch, the headroom and the cache and fixed bytes of every further session
+/// fit `free` (the shared card-fit rule, one cache form). `None` when not even the smallest count
+/// fits.
 pub(crate) fn plan_cells(
     free: u64,
     weights_bytes: u64,
     attn_split_armed: bool,
+    sessions: usize,
 ) -> Result<Option<usize>, EngError> {
     use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
 
@@ -446,11 +449,16 @@ pub(crate) fn plan_cells(
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
     let scratch = scratch_bytes(attn_split_armed)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
+    let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
     let charge = |cells: u32| {
-        u64::from(cells)
-            .checked_mul(per_position)?
+        let cache = u64::from(cells).checked_mul(per_position)?;
+        let further = cache
+            .checked_add(super::super::budget::BOLT_SEQ_FIXED_BYTES)?
+            .checked_mul(extra)?;
+        cache
             .checked_add(scratch)?
-            .checked_add(super::super::budget::BOLT_HEADROOM_BYTES)
+            .checked_add(super::super::budget::BOLT_HEADROOM_BYTES)?
+            .checked_add(further)
     };
     let ceiling = u32::try_from(MAX_CELLS)
         .map_err(|_| EngError::MemoryPlan("the Bolt model maximum exceeds u32".into()))?;
@@ -472,10 +480,33 @@ pub(crate) fn plan_cells(
     .map(|fit| fit.context as usize))
 }
 
-/// The cells a load of `weights_bytes` serves: the planned count, or the figure a refusal is
-/// worded for when the card carries none.
-fn cells_for(free: u64, weights_bytes: u64, split: bool) -> Result<usize, EngError> {
-    Ok(plan_cells(free, weights_bytes, split)?.unwrap_or(FALLBACK_CELLS))
+/// The sessions a start plans its cells for: the count the config names, else the most the
+/// planner would ever fund (one when the decode graph is asked for, which serves one session).
+fn planned_sessions(seqs: super::super::config::MaxSeqs) -> Result<usize, EngError> {
+    use super::super::config::MaxSeqs;
+    Ok(match seqs {
+        MaxSeqs::Count(count) => count,
+        MaxSeqs::Auto if decode_graph_wanted()? => 1,
+        MaxSeqs::Auto => Bolt::PREFILL_BATCH,
+    })
+}
+
+/// The cells a load of `weights_bytes` serves: concurrency first, then context. The cache is
+/// widened beyond [`FALLBACK_CELLS`] only as far as the planned `sessions` all still fit; a card
+/// that cannot fund them even at [`FALLBACK_CELLS`] serves that many cells (or what one session
+/// carries, when less), so the session planner finds at least the count the fixed size gave.
+/// When the card carries no count, the figure a refusal is worded for.
+fn cells_for(
+    free: u64,
+    weights_bytes: u64,
+    split: bool,
+    sessions: usize,
+) -> Result<usize, EngError> {
+    let Some(one) = plan_cells(free, weights_bytes, split, 1)? else {
+        return Ok(FALLBACK_CELLS);
+    };
+    let all = plan_cells(free, weights_bytes, split, sessions)?.unwrap_or(0);
+    Ok(all.max(one.min(FALLBACK_CELLS)))
 }
 
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
@@ -488,6 +519,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
             bytes,
         }],
         header_sha256,
+        super::super::config::MaxSeqs::Count(1),
         &|_| {},
     )
 }
@@ -498,8 +530,10 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
 pub(crate) fn load_choosing(
     files: &[crate::family::gguf_select::GgufFile],
     header_sha256: Option<&str>,
+    seqs: super::super::config::MaxSeqs,
     planned: &dyn Fn(usize),
 ) -> Result<Bolt, EngError> {
+    let sessions = planned_sessions(seqs)?;
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
     let stream = ctx.stream()?;
     // Admit the device budget before allocating: weights + KV cache + scratch
@@ -509,7 +543,7 @@ pub(crate) fn load_choosing(
     let free = ctx.memory_info()?.free as u64;
     let split = attn_split_wanted()?;
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        cells_for(free, file.bytes, split)
+        cells_for(free, file.bytes, split, sessions)
             .and_then(|cells| bolt_demand(file.bytes, split, cells))
             .and_then(|demand| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
@@ -525,7 +559,7 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let cells = cells_for(free, choice.chosen.bytes, split)?;
+    let cells = cells_for(free, choice.chosen.bytes, split, sessions)?;
     let demand = bolt_demand(choice.chosen.bytes, split, cells)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
@@ -2198,14 +2232,17 @@ mod tests {
         };
         // A 3090-sized card holds the model maximum.
         assert_eq!(
-            plan_cells(22_000_000_000, weights, true).expect("plan"),
+            plan_cells(22_000_000_000, weights, true, 1).expect("plan"),
             Some(MAX_CELLS)
         );
         // A card that carries 40,960 cells and not one step more gets exactly those.
         let free = free_for(40_960);
-        assert_eq!(plan_cells(free, weights, true).expect("plan"), Some(40_960));
         assert_eq!(
-            plan_cells(free - 1, weights, true).expect("plan"),
+            plan_cells(free, weights, true, 1).expect("plan"),
+            Some(40_960)
+        );
+        assert_eq!(
+            plan_cells(free - 1, weights, true, 1).expect("plan"),
             Some(39_936)
         );
         // The count the plan returns passes the shared admission, and a card short of the
@@ -2213,10 +2250,66 @@ mod tests {
         let demand = bolt_demand(weights, true, 40_960).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
         assert_eq!(
-            plan_cells(free_for(1024) - 1, weights, true).expect("plan"),
+            plan_cells(free_for(1024) - 1, weights, true, 1).expect("plan"),
             None
         );
         assert_eq!(MAX_CELLS, 65_536);
+    }
+
+    /// The sessions the planner funds once `cells` are resident beside the weights.
+    fn funded_sessions(free: u64, weights: u64, cells: usize) -> usize {
+        use crate::family::seq_plan::{SeqInputs, plan_seqs};
+        let demand = bolt_demand(weights, true, cells).expect("demand");
+        let after_first = free.saturating_sub(demand.tensors + demand.kv_cache + demand.work);
+        let plan = plan_seqs(
+            SeqInputs {
+                free: after_first,
+                headroom: crate::family::gemma4::budget::BOLT_HEADROOM_BYTES,
+                cost: crate::family::gemma4::budget::bolt_seq_cost().expect("cost"),
+                context: cells as u64,
+                row_cap: Bolt::PREFILL_BATCH,
+                ceiling: Bolt::PREFILL_BATCH,
+            },
+            None,
+        )
+        .expect("plan");
+        plan.seqs
+    }
+
+    #[test]
+    fn widening_the_cache_never_costs_a_session_the_fixed_size_funded() {
+        let weights = 7_946_927_552u64;
+        let target = Bolt::PREFILL_BATCH;
+        for free in (9u64..=24)
+            .map(|gib| gib << 30)
+            .chain([23_448_322_048, 23_566_221_312])
+        {
+            let cells = cells_for(free, weights, true, target).expect("cells");
+            let old = funded_sessions(free, weights, FALLBACK_CELLS);
+            let now = funded_sessions(free, weights, cells);
+            assert!(
+                cells
+                    >= FALLBACK_CELLS.min(plan_cells(free, weights, true, 1).unwrap().unwrap_or(0)),
+                "{free}: {cells} cells"
+            );
+            assert!(
+                now >= old,
+                "{free}: {now} sessions at {cells} cells, {old} at the fixed size"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_is_widened_only_as_far_as_every_planned_session_fits() {
+        let weights = 7_946_927_552u64;
+        let free = 23_448_322_048u64;
+        let cells = cells_for(free, weights, true, Bolt::PREFILL_BATCH).expect("cells");
+        assert!(cells > FALLBACK_CELLS && cells < MAX_CELLS, "{cells}");
+        assert_eq!(funded_sessions(free, weights, cells), Bolt::PREFILL_BATCH);
+        // The model maximum alone would have cost a session on this card.
+        assert!(funded_sessions(free, weights, MAX_CELLS) < Bolt::PREFILL_BATCH);
+        // One planned session (the decode graph) takes the whole model maximum.
+        assert_eq!(cells_for(free, weights, true, 1).expect("cells"), MAX_CELLS);
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
