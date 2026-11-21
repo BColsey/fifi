@@ -692,6 +692,7 @@ fn ffn(
                     source,
                     stem,
                     cache,
+                    staging,
                 } => stage_disk_experts(
                     k,
                     source,
@@ -699,7 +700,7 @@ fn ffn(
                     x,
                     &route.ids,
                     Some(shared),
-                    expert_pipeline_flagged(),
+                    *staging,
                     cache.as_deref(),
                 )?,
             };
@@ -730,7 +731,12 @@ pub(super) fn disk_experts(
     ids: &BoundedIndices,
     pipeline: bool,
 ) -> Result<ExecutionTensor> {
-    stage_disk_experts(k, source, stem, x, ids, None, pipeline, None).map(|(rows, _)| rows)
+    let staging = crate::family::prefill::mlx::StagingReads {
+        read_runs: false,
+        overlap: pipeline,
+        positioned: false,
+    };
+    stage_disk_experts(k, source, stem, x, ids, None, staging, None).map(|(rows, _)| rows)
 }
 
 #[allow(clippy::too_many_arguments)] // the staging inputs of one layer, passed once by each caller
@@ -741,9 +747,10 @@ fn stage_disk_experts(
     x: &ExecutionTensor,
     ids: &BoundedIndices,
     shared: Option<&SwiGlu>,
-    pipeline: bool,
+    staging: crate::family::prefill::mlx::StagingReads,
     cache: Option<&std::cell::RefCell<LayerExpertCache>>,
 ) -> Result<(ExecutionTensor, Option<ExecutionTensor>)> {
+    let pipeline = expert_pipeline_flagged(staging);
     let cache = cache.filter(|_| x.shape()[0] == 1);
     let host = k.readback(ids.ids())?;
     // The router results are available now. The shared expert only needs
@@ -773,7 +780,7 @@ fn stage_disk_experts(
         .collect();
     let local = Tensor::try_from_host(Dtype::U32, host.shape().to_vec(), remapped)?;
     let (stack, local, _pages) = if pipeline {
-        let coalesce_reads = expert_read_runs().coalesce(x.shape()[0]);
+        let coalesce_reads = expert_read_runs(staging).coalesce(x.shape()[0]);
         let (stack, local, pages) =
             SwiGlu::load_expert_pages(k, source, stem, &experts, &local, coalesce_reads)?;
         (stack, local, Some(pages))

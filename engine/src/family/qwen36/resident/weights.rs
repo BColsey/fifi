@@ -17,7 +17,7 @@ use crate::{
     EngError,
     family::{
         mlx_budget::DeviceBudget,
-        prefill::mlx::{local_expert_ids, prefill_expert_read_runs, sorted_expert_ids},
+        prefill::mlx::{StagingReads, local_expert_ids, sorted_expert_ids},
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
@@ -305,6 +305,8 @@ pub(super) struct ExpertPages {
 pub(super) struct ExpertSlices {
     stacks: [SlicedWeight; 3],
     f32_scales: bool,
+    /// The staging reads of this engine, set once its placement is known.
+    staging: StagingReads,
 }
 
 impl ExpertPages {
@@ -479,7 +481,11 @@ impl RMoe {
             shared_up: front.shared_up,
             shared_down: front.shared_down,
             shared_scalar_t: front.shared_scalar_t,
-            experts: Experts::Disk(Box::new(ExpertSlices { stacks, f32_scales })),
+            experts: Experts::Disk(Box::new(ExpertSlices {
+                stacks,
+                f32_scales,
+                staging: StagingReads::of_placement(false, false),
+            })),
         }
     }
 
@@ -492,6 +498,11 @@ impl RMoe {
 
     pub(super) fn streams_experts(&self) -> bool {
         self.disk().is_some()
+    }
+
+    /// Whether this engine submits the shared expert before it reads the routed experts.
+    pub(super) fn overlaps_expert_reads(&self) -> bool {
+        self.disk().is_some_and(|slices| slices.staging.overlap)
     }
 
     pub(super) fn stage_selection(
@@ -508,7 +519,7 @@ impl RMoe {
             ckpt.ok_or_else(|| EngError::Checkpoint("missing Qwen expert checkpoint".into()))?;
         let experts = sorted_expert_ids(selected);
         let local = local_expert_ids(selected, &experts)?;
-        let coalesce = rows > 1 && prefill_expert_read_runs();
+        let coalesce = rows > 1 && slices.staging.read_runs;
         Ok(Some((
             slices.stage(kernels, ckpt, &experts, coalesce)?,
             local,
@@ -676,7 +687,16 @@ impl ResidentWeights {
             consts,
             kv: crate::family::qwen36::settings::KvDtype::F32,
         };
-        if weights.choose_expert_placement(ckpt, device_plan)? {
+        let resident = weights.choose_expert_placement(ckpt, device_plan)?;
+        let staging = StagingReads::of_placement(!resident, device_plan.is_some());
+        for layer in &mut weights.layers {
+            if let RFeedForward::Moe(moe) = &mut layer.feed_forward
+                && let Experts::Disk(slices) = &mut moe.experts
+            {
+                slices.staging = staging;
+            }
+        }
+        if resident {
             let count = dim(weights.shape.moe.experts)?;
             let ids: Vec<u32> = (0..count).collect();
             for layer in &mut weights.layers {
@@ -749,9 +769,6 @@ impl ResidentWeights {
                 "Qwen MLX disk-backed experts serve one sequence: set max_seqs to 1, or raise FIFI_MLX_WORKING_SET_MIB until every expert page fits resident"
                     .into(),
             ));
-        }
-        if !resident {
-            crate::family::prefill::mlx::mark_experts_streaming();
         }
         eprintln!(
             "qwen: MLX weight placement={} base_weights_bytes={base} full_expert_page_bytes={} decode_expert_stage_bytes={decode_stage} expert_budget_bytes={available}",

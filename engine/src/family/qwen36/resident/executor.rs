@@ -782,8 +782,8 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("{name}: {error}"))
 }
 
-fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
-    StreamedCheckpoint::open_local(dir, 64 << 20)
+fn open_checkpoint(dir: &Path, positioned: bool) -> Result<StreamedCheckpoint> {
+    StreamedCheckpoint::open_local(dir, 64 << 20, positioned)
 }
 
 /// The cache bytes that one position adds over all attention layers, in the cache form `kv` with
@@ -965,10 +965,10 @@ impl Q36Executor {
                 })
             })
             .transpose()?;
-        if plan.is_some() {
-            crate::family::prefill::mlx::mark_experts_may_stream();
-        }
-        let ckpt = open_checkpoint(artifact)?;
+        let positioned =
+            crate::family::prefill::mlx::StagingReads::of_placement(false, plan.is_some())
+                .positioned;
+        let ckpt = open_checkpoint(artifact, positioned)?;
         let disk_experts = placement.is_some_and(|(_, _, disk_experts)| disk_experts);
         if let Some(plan) = plan {
             plan.device
@@ -3113,7 +3113,7 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), bytes).unwrap();
         }
-        let ckpt = Box::leak(Box::new(open_checkpoint(dir.path()).unwrap()));
+        let ckpt = Box::leak(Box::new(open_checkpoint(dir.path(), false).unwrap()));
         let prompt = cycle(10);
         for activation in [Activation::F32, Activation::Bf16] {
             // Read both the exact page footprint and the tensors charged to
@@ -3286,7 +3286,7 @@ mod tests {
             std::fs::write(dir.path().join(name), bytes).unwrap();
         }
         let ckpt: &'static StreamedCheckpoint =
-            Box::leak(Box::new(open_checkpoint(dir.path()).unwrap()));
+            Box::leak(Box::new(open_checkpoint(dir.path(), false).unwrap()));
         std::mem::forget(dir);
         let mut kernels = MlxKernels::try_new().unwrap();
         let weights = ResidentWeights::import_with(
@@ -3325,6 +3325,34 @@ mod tests {
                 max_seqs: 1,
             }),
         )
+    }
+
+    /// The staging reads belong to the engine, not to the process: an engine that streams its
+    /// experts carries them on; an engine built after it, with every expert resident, carries
+    /// none (a process-wide flag set by the first would have turned them on for the second).
+    /// A process holds one MLX context, so the engines are built one after the other.
+    #[test]
+    fn each_engine_carries_the_staging_reads_of_its_own_placement() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, base, stage, full) = file_backed(Activation::F32);
+        let overlaps = |executor: &Q36Executor| {
+            executor
+                .decoder
+                .weights
+                .layers
+                .iter()
+                .find_map(|layer| layer.as_moe().ok())
+                .unwrap()
+                .overlaps_expert_reads()
+        };
+        let (disk, _) = place_experts(ckpt, chunk_rules(), base + stage).unwrap();
+        assert!(disk.decoder.weights.streams_experts() && overlaps(&disk));
+        drop(disk);
+        let (resident, _) = place_experts(ckpt, chunk_rules(), base + full).unwrap();
+        assert!(!resident.decoder.weights.streams_experts() && !overlaps(&resident));
+        drop(resident);
+        let (disk_again, _) = place_experts(ckpt, chunk_rules(), base + stage).unwrap();
+        assert!(overlaps(&disk_again));
     }
 
     /// The pre-import packed-payload floor is a lower bound of what an import keeps: for each
@@ -3442,7 +3470,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            let ckpt = open_checkpoint(dir.path()).unwrap();
+            let ckpt = open_checkpoint(dir.path(), false).unwrap();
             let floor =
                 packed_payload_floor(&ckpt, resident_packed_payload(spec, disk_experts)).unwrap();
             let open = |bytes| {

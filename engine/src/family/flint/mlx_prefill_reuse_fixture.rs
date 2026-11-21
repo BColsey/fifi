@@ -192,7 +192,15 @@ fn two_piece_prefill_reuse_preserves_layer_output() -> Result<()> {
     k.set_cache_limit(0)?;
 
     for index in [35, 37] {
-        let layer = Layer::load(&mut k, &checkpoint, index, true, None)?;
+        let layer = Layer::load(
+            &mut k,
+            &checkpoint,
+            index,
+            Some(crate::family::prefill::mlx::StagingReads::of_placement(
+                true, true,
+            )),
+            None,
+        )?;
         let Ffn::Moe {
             routed: Routed::Disk { stem, .. },
             shared,

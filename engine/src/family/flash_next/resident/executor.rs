@@ -246,8 +246,8 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("{name}: {error}"))
 }
 
-fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
-    StreamedCheckpoint::open_local(dir, 64 << 20)
+fn open_checkpoint(dir: &Path, positioned: bool) -> Result<StreamedCheckpoint> {
+    StreamedCheckpoint::open_local(dir, 64 << 20, positioned)
 }
 
 fn session_reserve(
@@ -313,7 +313,10 @@ impl FlashExecutor {
                 Ok::<_, EngError>((device, shape.ple_layer, kinds, reserve))
             })
             .transpose()?;
-        let ckpt = open_checkpoint(artifact)?;
+        let positioned =
+            crate::family::prefill::mlx::StagingReads::of_placement(true, device.is_some())
+                .positioned;
+        let ckpt = open_checkpoint(artifact, positioned)?;
         if let Some((device, ple_layer, kinds, reserve)) = preflight {
             device.check_packed_payload_floor(
                 "Flash-Next MLX pre-import",
@@ -754,7 +757,7 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors.index.json"), index).unwrap();
         std::fs::write(dir.path().join("m.safetensors"), shard).unwrap();
         let (shape, kinds) = model_shape(&fixtures::config()).unwrap();
-        let ckpt = open_checkpoint(dir.path()).unwrap();
+        let ckpt = open_checkpoint(dir.path(), false).unwrap();
         let floor = packed_payload_floor(&ckpt, |key| {
             resident_packed_payload(key, &kinds, shape.ple_layer)
         })
@@ -2711,7 +2714,7 @@ mod tests {
         let config = std::fs::read(artifact.join("config.json")).unwrap();
         // The device chain: `Generate` steps on a decoder that drops before the executor loads.
         let device: Vec<u32> = {
-            let ckpt = open_checkpoint(&artifact).unwrap();
+            let ckpt = open_checkpoint(&artifact, false).unwrap();
             let flash = FlashWeights::load(&ckpt, &config).unwrap();
             let mut kernels = MlxKernels::try_new().unwrap();
             kernels.set_cache_limit(cache_limit).unwrap();

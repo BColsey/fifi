@@ -7,23 +7,22 @@ use super::{
 };
 use crate::{
     EngError,
-    family::prefill::mlx::{overlap_expert_reads, prefill_expert_read_runs},
+    family::prefill::mlx::StagingReads,
     kernels::{HostPages, MlxKernels, PackedPages, PageRange, ResidentPackedWeight},
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
 use std::{cell::RefCell, path::Path, rc::Rc, sync::OnceLock};
 
-/// The expert pipeline: an explicit `FIFI_FLINT_MLX_EXPERT_PIPELINE` decides (`1` on, anything
-/// else off); unset, it follows the shared staging switches, which are on whenever the start
-/// streams its experts from disk. The variable is read once; the automatic part is read each
-/// time, because the placement is not known until the weights load.
-pub(super) fn expert_pipeline_flagged() -> bool {
+/// The expert pipeline of an engine with these staging reads: an explicit
+/// `FIFI_FLINT_MLX_EXPERT_PIPELINE` decides (`1` on, anything else off); unset, it follows the
+/// engine's own staging reads, which are on whenever the engine streams its experts from disk.
+pub(super) fn expert_pipeline_flagged(staging: StagingReads) -> bool {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
             std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").map(|value| value == "1")
         })
-        .unwrap_or_else(|| overlap_expert_reads() || prefill_expert_read_runs())
+        .unwrap_or(staging.overlap || staging.read_runs)
 }
 
 #[derive(Clone, Copy)]
@@ -55,9 +54,9 @@ impl ExpertReadRuns {
     }
 }
 
-/// The expert read runs: an explicit `FIFI_FLINT_MLX_EXPERT_READ_RUNS` decides; unset, they
-/// follow the shared switch, which is on whenever the start streams its experts from disk.
-pub(super) fn expert_read_runs() -> ExpertReadRuns {
+/// The expert read runs of an engine with these staging reads: an explicit
+/// `FIFI_FLINT_MLX_EXPERT_READ_RUNS` decides; unset, they follow the engine's own staging reads.
+pub(super) fn expert_read_runs(staging: StagingReads) -> ExpertReadRuns {
     static OVERRIDE: OnceLock<Option<ExpertReadRuns>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
@@ -65,12 +64,10 @@ pub(super) fn expert_read_runs() -> ExpertReadRuns {
                 .ok()
                 .map(|value| ExpertReadRuns::from_env(Some(&value)))
         })
-        .unwrap_or_else(|| {
-            if prefill_expert_read_runs() {
-                ExpertReadRuns::Prefill
-            } else {
-                ExpertReadRuns::Off
-            }
+        .unwrap_or(if staging.read_runs {
+            ExpertReadRuns::Prefill
+        } else {
+            ExpertReadRuns::Off
         })
 }
 
@@ -205,6 +202,8 @@ pub(super) enum Routed {
         source: Rc<FlintCheckpoint>,
         stem: String,
         cache: Option<Box<RefCell<LayerExpertCache>>>,
+        /// The staging reads of this engine.
+        staging: StagingReads,
     },
 }
 
@@ -235,7 +234,7 @@ impl Layer {
         k: &mut MlxKernels,
         source: &Rc<FlintCheckpoint>,
         index: usize,
-        disk: bool,
+        staging: Option<StagingReads>,
         cache: Option<LayerExpertCache>,
     ) -> Result<Self> {
         let stem = format!("model.layers.{index}");
@@ -247,11 +246,12 @@ impl Layer {
             k.evaluate(&[&router])?;
             Ffn::Moe {
                 router,
-                routed: if disk {
+                routed: if let Some(staging) = staging {
                     Routed::Disk {
                         source: Rc::clone(source),
                         stem: format!("{stem}.mlp.switch_mlp"),
                         cache: cache.map(|cache| Box::new(RefCell::new(cache))),
+                        staging,
                     }
                 } else {
                     Routed::Resident(SwiGlu::load(k, source, &format!("{stem}.mlp.switch_mlp"))?)
@@ -317,6 +317,8 @@ pub(super) struct Model {
     pub(super) source: Rc<FlintCheckpoint>,
     pub(super) streamed_expert_bytes: u64,
     pub(super) cached_expert_bytes: u64,
+    /// The staging reads of this engine: on once its experts stream from disk.
+    pub(super) staging: StagingReads,
     pub(super) kernels: MlxKernels,
 }
 
@@ -360,18 +362,13 @@ impl Model {
         } else {
             eprintln!("flint: MLX prefill piece size {ceiling} rows");
         }
-        if available.is_some() {
-            crate::family::prefill::mlx::mark_experts_may_stream();
-        }
         let source = Rc::new(FlintCheckpoint::open(root)?);
         let streamed_expert_bytes = match available {
             Some(bytes) => plan_weight_placement(&source, bytes)?,
             None => 0,
         };
         let disk = streamed_expert_bytes != 0;
-        if disk {
-            crate::family::prefill::mlx::mark_experts_streaming();
-        }
+        let staging = StagingReads::of_placement(disk, available.is_some());
         let (caches, cached_expert_bytes) = if let Some(budget) = available.filter(|_| disk) {
             // The cache gets what remains after resident weights, one-row
             // staging and the prefill piece the ladder would pick without it.
@@ -394,7 +391,7 @@ impl Model {
         };
         #[cfg(feature = "native-fault-qualification")]
         if let Some(description) = source.expert_record_description() {
-            if !disk || !expert_pipeline_flagged() || cached_expert_bytes != 0 {
+            if !disk || !expert_pipeline_flagged(staging) || cached_expert_bytes != 0 {
                 return Err(EngError::BadRequest(
                     "Flint expert records need disk-backed experts, the shared-page pipeline and expert caching off".into(),
                 ));
@@ -402,12 +399,12 @@ impl Model {
             eprintln!("flint: MLX expert records {description}");
         }
         if disk {
-            let pipeline = expert_pipeline_flagged();
+            let pipeline = expert_pipeline_flagged(staging);
             eprintln!(
                 "flint: MLX expert pipeline {}, contiguous reads {}",
                 if pipeline { "on" } else { "off" },
                 if pipeline {
-                    expert_read_runs().label()
+                    expert_read_runs(staging).label()
                 } else {
                     "off"
                 },
@@ -428,7 +425,13 @@ impl Model {
         kernels.set_cache_limit(cache_limit_bytes())?;
         let mut layers = Vec::with_capacity(super::config::LAYERS);
         for (index, cache) in caches.into_iter().enumerate() {
-            layers.push(Layer::load(&mut kernels, &source, index, disk, cache)?);
+            layers.push(Layer::load(
+                &mut kernels,
+                &source,
+                index,
+                disk.then_some(staging),
+                cache,
+            )?);
         }
         let norm = plain(&mut kernels, &source, "model.norm.weight")?;
         let head = packed(&mut kernels, &source, "lm_head")?;
@@ -439,6 +442,7 @@ impl Model {
             source,
             streamed_expert_bytes,
             cached_expert_bytes,
+            staging,
             kernels,
         })
     }

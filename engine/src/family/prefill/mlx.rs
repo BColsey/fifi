@@ -23,80 +23,78 @@ pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [
 pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 pub(crate) const RETIRE_CAP_BASE: u64 = 64 << 20;
 
-/// Set when a start places its routed experts on disk: the staging reads then run the grouped,
-/// overlapped path that the A/B measured as the faster one for every family.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-static EXPERTS_STREAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Set when a device budget is active, so the experts may stream and the shard files open for
-/// positioned reads.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-static EXPERTS_MAY_STREAM: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Records that this start streams its routed experts from disk.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn mark_experts_streaming() {
-    EXPERTS_STREAM.store(true, std::sync::atomic::Ordering::Relaxed);
+/// The staging reads of one engine: whether it groups adjacent expert reads, overlaps the shared
+/// expert with them, and reads shard ranges at explicit offsets. They are part of the engine's
+/// placement, not of the process: two engines in one process, one streaming its experts and one
+/// holding them resident, each carry their own value.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagingReads {
+    pub(crate) read_runs: bool,
+    pub(crate) overlap: bool,
+    pub(crate) positioned: bool,
 }
 
-/// Records that this start runs under a device budget, before its shard files open.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn mark_experts_may_stream() {
-    EXPERTS_MAY_STREAM.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// A staging switch: the variable decides when it is set (only `on` turns it on), and the
-/// start's own placement decides when it is not.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-fn staging_switch(
-    variable: &str,
-    on: &str,
-    cell: &std::sync::OnceLock<Option<bool>>,
-    automatic: &std::sync::atomic::AtomicBool,
-) -> bool {
-    cell.get_or_init(|| std::env::var_os(variable).map(|value| value == on))
-        .unwrap_or_else(|| automatic.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Group only adjacent, exactly routed expert slices for multi-row stages. Automatic whenever
-/// the experts stream from disk; `FIFI_MLX_EXPERT_READ_RUNS` overrides (`prefill` on, any other
-/// value off).
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn prefill_expert_read_runs() -> bool {
-    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    staging_switch(
-        "FIFI_MLX_EXPERT_READ_RUNS",
-        "prefill",
-        &OVERRIDE,
-        &EXPERTS_STREAM,
-    )
-}
-
-/// Submit the shared expert to Metal before the CPU reads the routed experts. Automatic
-/// whenever the experts stream from disk; `FIFI_MLX_OVERLAP_EXPERT_READS` overrides (`1` on, any
+/// What the three variables say, when they are set: `FIFI_MLX_EXPERT_READ_RUNS` (`prefill` on, any
+/// other value off), `FIFI_MLX_OVERLAP_EXPERT_READS` and `FIFI_MLX_POSITIONED_READS` (`1` on, any
 /// other value off).
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn overlap_expert_reads() -> bool {
-    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    staging_switch(
-        "FIFI_MLX_OVERLAP_EXPERT_READS",
-        "1",
-        &OVERRIDE,
-        &EXPERTS_STREAM,
-    )
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StagingOverrides {
+    pub(crate) read_runs: Option<bool>,
+    pub(crate) overlap: Option<bool>,
+    pub(crate) positioned: Option<bool>,
 }
 
-/// Read shard ranges at explicit offsets. Automatic under a device budget (where the experts may
-/// stream); `FIFI_MLX_POSITIONED_READS` overrides (`1` on, any other value off).
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn positioned_expert_reads() -> bool {
-    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    staging_switch(
-        "FIFI_MLX_POSITIONED_READS",
-        "1",
-        &OVERRIDE,
-        &EXPERTS_MAY_STREAM,
-    )
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+impl StagingOverrides {
+    /// The variables of this process, read once.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn from_env() -> Self {
+        static CELL: std::sync::OnceLock<StagingOverrides> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let flag = |name: &str, on: &str| std::env::var_os(name).map(|value| value == on);
+            Self {
+                read_runs: flag("FIFI_MLX_EXPERT_READ_RUNS", "prefill"),
+                overlap: flag("FIFI_MLX_OVERLAP_EXPERT_READS", "1"),
+                positioned: flag("FIFI_MLX_POSITIONED_READS", "1"),
+            }
+        })
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+impl StagingReads {
+    /// The reads of an engine whose experts `streams` from disk, under a device budget when
+    /// `budgeted`: grouped reads and the overlap follow the streaming (the A/B measured them as
+    /// the faster path whenever experts come from disk), positioned reads follow the budget (the
+    /// experts may stream and the shard files open before the placement is known). A variable that
+    /// is set decides its read.
+    pub(crate) fn resolve(streams: bool, budgeted: bool, overrides: StagingOverrides) -> Self {
+        Self {
+            read_runs: overrides.read_runs.unwrap_or(streams),
+            overlap: overrides.overlap.unwrap_or(streams),
+            positioned: overrides.positioned.unwrap_or(budgeted),
+        }
+    }
+
+    /// The reads of the variables of this process for an engine with this placement.
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn of_placement(streams: bool, budgeted: bool) -> Self {
+        Self::resolve(streams, budgeted, StagingOverrides::from_env())
+    }
 }
 
 /// Queue one independent GPU result while the worker reads the exact expert IDs.
@@ -185,4 +183,58 @@ pub(crate) fn admitted_chunk(
         .into_iter()
         .filter(|&rows| rows > 1 && rows <= max_rows);
     largest_fitting_chunk(sizes, remaining, workspace)
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn the_reads_follow_each_engines_own_placement() {
+        let none = StagingOverrides::default();
+        let streaming = StagingReads::resolve(true, true, none);
+        let resident = StagingReads::resolve(false, false, none);
+        assert_eq!(
+            streaming,
+            StagingReads {
+                read_runs: true,
+                overlap: true,
+                positioned: true
+            }
+        );
+        assert_eq!(
+            resident,
+            StagingReads {
+                read_runs: false,
+                overlap: false,
+                positioned: false
+            }
+        );
+        // A budgeted engine whose experts all fit still opens its shards for positioned reads.
+        let fits = StagingReads::resolve(false, true, none);
+        assert!(fits.positioned && !fits.overlap && !fits.read_runs);
+    }
+
+    #[test]
+    fn a_set_variable_decides_its_read_for_every_placement() {
+        let off = StagingOverrides {
+            read_runs: Some(false),
+            overlap: Some(false),
+            positioned: Some(false),
+        };
+        assert_eq!(
+            StagingReads::resolve(true, true, off),
+            StagingReads {
+                read_runs: false,
+                overlap: false,
+                positioned: false
+            }
+        );
+        let on = StagingOverrides {
+            overlap: Some(true),
+            ..StagingOverrides::default()
+        };
+        assert!(StagingReads::resolve(false, false, on).overlap);
+        assert!(!StagingReads::resolve(false, false, on).read_runs);
+    }
 }

@@ -186,11 +186,13 @@ impl StreamedWeights {
         file: std::fs::File,
         byte_len: u64,
         max_header_bytes: u64,
+        positioned: bool,
     ) -> Result<Self, EngError> {
         #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-        if crate::family::prefill::mlx::positioned_expert_reads() {
+        if positioned {
             return Self::open_positioned(file, byte_len, max_header_bytes);
         }
+        let _ = positioned;
         Self::open(Box::new(file), byte_len, max_header_bytes)
     }
 
@@ -581,15 +583,17 @@ impl StreamedCheckpoint {
             parse_weight_map(index)?,
             shards,
             max_header_bytes,
-            StreamedWeights::open_file,
+            |file, bytes, max| StreamedWeights::open_file(file, bytes, max, false),
         )
     }
 
-    /// Opens the local indexed shards for the resident MLX model loaders.
+    /// Opens the local indexed shards for the resident MLX model loaders. `positioned` opens each
+    /// shard for reads at explicit offsets (the staging reads of an engine under a device budget).
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn open_local(
         dir: &std::path::Path,
         max_header_bytes: u64,
+        positioned: bool,
     ) -> Result<Self, EngError> {
         let guard = crate::storage_guard::LocalGuard::new()?;
         guard.check(dir, "model weights")?;
@@ -612,7 +616,7 @@ impl StreamedCheckpoint {
             weight_map,
             shards,
             max_header_bytes,
-            StreamedWeights::open_file,
+            move |file, bytes, max| StreamedWeights::open_file(file, bytes, max, positioned),
         )
     }
 

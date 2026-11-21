@@ -31,7 +31,7 @@ use crate::{
     EngError,
     family::{
         math::expect_len,
-        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
+        prefill::mlx::submit_shared_expert,
         qwen36::host::HostShape,
         route::{Routed, route_experts},
         spec::Router,
@@ -148,7 +148,7 @@ pub(super) fn chunk_with_checkpoint(
     let plan = pair_plan(&routed, m.top_k, m.experts)?;
     require_sorted_experts(&plan.experts)?;
     let pairs = dim(plan.experts.len())?;
-    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+    let queued_shared = if w.overlaps_expert_reads() {
         let output = shared_rows(ctx, w, x)?;
         Some(submit_shared_expert(ctx.kernels, output)?)
     } else {

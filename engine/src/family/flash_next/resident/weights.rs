@@ -285,6 +285,8 @@ pub(super) struct RMoe {
     pub(super) gate: SlicedWeight,
     pub(super) up: SlicedWeight,
     pub(super) down: SlicedWeight,
+    /// The staging reads of this engine: its experts always stream from the local shards.
+    pub(super) staging: crate::family::prefill::mlx::StagingReads,
 }
 
 impl RMoe {
@@ -313,6 +315,7 @@ impl RMoe {
             gate: sliced(w.gate)?,
             up: sliced(w.up)?,
             down: sliced(w.down)?,
+            staging: crate::family::prefill::mlx::StagingReads::of_placement(true, false),
         })
     }
     fn bytes(&self, total: &mut Bytes) -> Result<(), EngError> {

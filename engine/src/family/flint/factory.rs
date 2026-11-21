@@ -109,7 +109,12 @@ pub(crate) fn switch_conditions() -> SwitchConditions {
         device_sizing: crate::family::mlx_budget::enabled(),
         chained_prefill: super::mlx_forward::prefill_chain_flagged(),
         compact_kv: super::mlx_state::compact_kv_flagged(),
-        pipeline: super::mlx_model::expert_pipeline_flagged(),
+        pipeline: super::mlx_model::expert_pipeline_flagged(
+            crate::family::prefill::mlx::StagingReads::of_placement(
+                true,
+                crate::family::mlx_budget::enabled(),
+            ),
+        ),
     }
 }
 

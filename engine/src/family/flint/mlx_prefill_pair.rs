@@ -109,7 +109,13 @@ impl Model {
             let second_input = FfnInput::prepare(k, layer, &second, plane, &plan)?;
             if let Ffn::Moe {
                 router,
-                routed: Routed::Disk { source, stem, .. },
+                routed:
+                    Routed::Disk {
+                        source,
+                        stem,
+                        staging,
+                        ..
+                    },
                 shared,
             } = &layer.ffn
             {
@@ -118,7 +124,7 @@ impl Model {
                 let mut loader = StageLoader {
                     source,
                     stem,
-                    coalesce: expert_read_runs().coalesce(rows[0] + rows[1]),
+                    coalesce: expert_read_runs(*staging).coalesce(rows[0] + rows[1]),
                     peak: &mut stage_peak,
                 };
                 [first, second] = shared_stage(

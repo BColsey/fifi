@@ -20,9 +20,7 @@ use super::super::{
     weights::RMoe,
 };
 use super::pool::{PrefillPool, WavePages};
-use crate::family::prefill::mlx::{
-    overlap_expert_reads, prefill_expert_read_runs, submit_shared_expert,
-};
+use crate::family::prefill::mlx::submit_shared_expert;
 use crate::{
     EngError,
     kernels::{BinaryOp, ReduceOp, UnaryOp},
@@ -118,7 +116,7 @@ fn routed_rows(
     };
     let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(plan.waves.len());
     let mut inverse: Option<ExecutionTensor> = None;
-    let coalesce = tokens > 1 && prefill_expert_read_runs();
+    let coalesce = tokens > 1 && w.staging.read_runs;
     for (index, wave) in plan.waves.iter().enumerate() {
         let last = index + 1 == plan.waves.len();
         let wanted = last.then_some(plan.inverse.as_slice());
@@ -180,7 +178,7 @@ pub(super) fn step_chunk(
     let route = chunk_route(ctx, shape, w, x)?;
     pool.release_lent(); // the router readback evaluated every earlier layer
     let plan = split_waves(&route, pool.set_experts())?;
-    let queued_shared = if overlap_expert_reads() {
+    let queued_shared = if w.staging.overlap {
         let output = shared_rows(ctx, w, x)?;
         Some(submit_shared_expert(ctx.kernels, output)?)
     } else {

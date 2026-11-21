@@ -228,7 +228,7 @@ impl FlintExecutor {
             );
         let prefill_pair = if request_prefill
             && model.streamed_expert_bytes != 0
-            && super::mlx_model::expert_pipeline_flagged()
+            && super::mlx_model::expert_pipeline_flagged(model.staging)
         {
             prefill_pair_policy(std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR").as_deref())
         } else {

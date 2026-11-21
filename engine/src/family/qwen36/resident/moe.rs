@@ -24,11 +24,8 @@ use super::weights::{ExpertPages, RDense, RMoe};
 use crate::{
     EngError,
     family::{
-        math::expect_len,
-        prefill::mlx::{overlap_expert_reads, submit_shared_expert},
-        qwen36::host::HostShape,
-        route::route_experts,
-        spec::Router,
+        math::expect_len, prefill::mlx::submit_shared_expert, qwen36::host::HostShape,
+        route::route_experts, spec::Router,
     },
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
     tensor::{Dtype, ExecutionTensor, Tensor},
@@ -126,7 +123,7 @@ pub(super) fn step_with_checkpoint(
     // the block so the eager and compiled paths share one contract over the raw residual stream.
     let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
     let (routed, host) = route_row(ctx, shape, w, &normed)?;
-    let queued_shared = if w.streams_experts() && overlap_expert_reads() {
+    let queued_shared = if w.overlaps_expert_reads() {
         let output = shared(ctx, w, &normed)?;
         Some(submit_shared_expert(ctx.kernels, output)?)
     } else {
