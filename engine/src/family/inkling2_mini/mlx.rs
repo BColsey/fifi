@@ -259,6 +259,27 @@ impl MlxRoutedExpertStage {
         kernels: &mut MlxKernels,
         input: &ExecutionTensor,
     ) -> Result<ExecutionTensor, EngError> {
+        self.forward_impl(kernels, input, None)
+    }
+
+    /// Applies the layer's activation quantizer at both expert projections.
+    /// The Metal kernels reconstruct F32 values for the packed-weight gather.
+    /// Routing still uses the unquantized input supplied to the router.
+    pub fn forward_quantized(
+        &self,
+        kernels: &mut MlxKernels,
+        input: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        let mode = self.experts.gate_up.weight.quantization().mode;
+        self.forward_impl(kernels, input, Some(mode))
+    }
+
+    fn forward_impl(
+        &self,
+        kernels: &mut MlxKernels,
+        input: &ExecutionTensor,
+        quantization: Option<QuantizationMode>,
+    ) -> Result<ExecutionTensor, EngError> {
         let width = HIDDEN as u32;
         if input.dtype() != Dtype::F32 || input.shape() != [self.rows, width] {
             return Err(EngError::BadRequest(
@@ -266,14 +287,18 @@ impl MlxRoutedExpertStage {
                     .into(),
             ));
         }
+        let input = match quantization {
+            Some(mode) => kernels.inkling_quantized_rows(input, mode)?,
+            None => input.share(),
+        };
         let input = if self.rows == 1 {
-            input.share()
+            input
         } else {
-            kernels.repeat(input, TOP_K as u32, 0)?
+            kernels.repeat(&input, TOP_K as u32, 0)?
         };
         let input = kernels.reshape(&input, &[input.shape()[0], 1, width])?;
         let gate_up = self.experts.project_gate_up(kernels, &input, &self.ids)?;
-        let activation = kernels.inkling_activation(&gate_up, &self.weights)?;
+        let activation = kernels.inkling_activation(&gate_up, &self.weights, quantization)?;
         let down = self.experts.project_down(kernels, &activation, &self.ids)?;
         kernels.inkling_merge(&down, self.rows, TOP_K as u32)
     }
@@ -458,6 +483,77 @@ mod tests {
     use crate::kernels::PackedWeight;
 
     #[test]
+    fn inkling_quantizers_match_scale_and_midpoint_cases() {
+        let _lock = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let check = |kernels: &mut MlxKernels, mode, input: &[f32], expected: &[f32]| {
+            let host = Tensor::try_from_host(
+                Dtype::F32,
+                vec![1, input.len() as u32],
+                input.iter().copied().flat_map(f32::to_le_bytes).collect(),
+            )
+            .unwrap();
+            let resident = kernels.import_tensor(&host).unwrap();
+            let output = kernels.inkling_quantized_rows(&resident, mode).unwrap();
+            let output = kernels.readback(&output).unwrap();
+            assert_eq!(output.shape(), host.shape());
+            let (words, tail) = output.host_bytes().unwrap().as_chunks::<4>();
+            assert!(tail.is_empty() && words.len() == expected.len());
+            for (col, (&word, &value)) in words.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    f32::from_le_bytes(word).to_bits(),
+                    value.to_bits(),
+                    "{mode:?} col {col}"
+                );
+            }
+        };
+        check(
+            &mut kernels,
+            QuantizationMode::Nvfp4,
+            &[
+                6., 5., 3.5, 2.5, 1.75, 1.25, 0.75, 0.25, -6., -5., -3.5, -2.5, -1.75, -1.25,
+                -0.75, -0.25, 1.125, 0.875, -0.34375, 0.25, -0.8125, 0.375, -0.25, 0.1875, 1.125,
+                0.875, -0.34375, 0.25, -0.8125, 0.375, -0.25, 0.1875,
+            ],
+            &[
+                6., 4.5, 3., 2.25, 1.5, 1.5, 0.75, 0., -6., -4.5, -3., -2.25, -1.5, -1.5, -0.75,
+                -0.0, 1.125, 0.75, -0.375, 0.28125, -0.75, 0.375, -0.28125, 0.1875, 1.125, 0.75,
+                -0.375, 0.28125, -0.75, 0.375, -0.28125, 0.1875,
+            ],
+        );
+        check(
+            &mut kernels,
+            QuantizationMode::Nvfp4,
+            &[
+                6., 0.25, -0.75, 1.25, -1.75, 2.5, -3.5, 5., 1., 1., 1., 1., 1., 1., 1., 1.,
+            ],
+            &[
+                6., 0., -1., 1., -2., 2., -4., 4., 1., 1., 1., 1., 1., 1., 1., 1.,
+            ],
+        );
+        check(
+            &mut kernels,
+            QuantizationMode::Nvfp4,
+            &[-0.0; 16],
+            &[-0.0; 16],
+        );
+        let mut input = [0.0; 64];
+        input[..10].copy_from_slice(&[448., -448., 432., 416., 400., 384., 368., 352., 0., -0.0]);
+        input[32..38].copy_from_slice(&[448., -450., 4.375, 4.125, -4.375, -4.125]);
+        let mut expected = [0.0; 64];
+        expected[..10]
+            .copy_from_slice(&[448., -448., 448., 416., 384., 384., 384., 352., 0., -0.0]);
+        expected[32..38].copy_from_slice(&[448., -448., 4.5, 4., -4.5, -4.]);
+        check(&mut kernels, QuantizationMode::Mxfp8, &input, &expected);
+        check(
+            &mut kernels,
+            QuantizationMode::Mxfp8,
+            &[-0.0; 32],
+            &[-0.0; 32],
+        );
+    }
+
+    #[test]
     fn router_transposes_bf16_columns_for_f32_matmul() {
         let _lock = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
@@ -519,7 +615,9 @@ mod tests {
         let route_weights = [0.25, 1.75];
         let gate_up = import(&mut kernels, vec![2, 1, 4], &raw);
         let weights = import(&mut kernels, vec![2], &route_weights);
-        let output = kernels.inkling_activation(&gate_up, &weights).unwrap();
+        let output = kernels
+            .inkling_activation(&gate_up, &weights, None)
+            .unwrap();
         assert_eq!(output.shape(), [2, 1, 2]);
         let expected: Vec<_> = raw
             .chunks_exact(2)
