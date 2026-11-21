@@ -230,13 +230,15 @@ pub(in crate::family::flash_next) mod device {
                     "Flash-Next prefill store: the sub-block exceeds the bank's slots".into(),
                 ));
             }
+            let mut admitted = 0;
             if plan.admits() {
                 // Earlier sub-blocks can still read the slots this admit will overwrite.
                 let copies = drain_before_admit(
                     || stream.synchronize(),
                     || self.adapter.admit_planned(self.ctx, self.layer, &plan),
                 )?;
-                if copies.as_ref().is_some_and(|pass| !pass.ops.is_empty()) {
+                admitted = copies.as_ref().map_or(0, |pass| pass.ops.len());
+                if admitted != 0 {
                     let bytes: Vec<u8> = self
                         .adapter
                         .slot_row(self.layer)?
@@ -249,6 +251,9 @@ pub(in crate::family::flash_next) mod device {
                         .write_at(stream, destination.offset(), &bytes)?;
                 }
             }
+            self.adapter
+                .bank
+                .trace_prefill_group(self.layer, picks, admitted);
             let row = self.adapter.slot_row(self.layer)?;
             picks
                 .iter()

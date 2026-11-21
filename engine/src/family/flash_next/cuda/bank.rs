@@ -673,6 +673,7 @@ pub(super) mod device {
         disk_prefetch: Option<DiskPrefetch>,
         victim_cache: Option<VictimCache>,
         refill_timing: Option<Cell<[RefillTiming; 2]>>,
+        trace_prefill_routes: bool,
         stream: DeviceStream,
         /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
         /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
@@ -767,6 +768,7 @@ pub(super) mod device {
                 disk_prefetch: None,
                 victim_cache: None,
                 refill_timing: None,
+                trace_prefill_routes: false,
                 stream,
                 admit_passes: AtomicU64::new(0),
                 admit_misses: AtomicU64::new(0),
@@ -1078,6 +1080,40 @@ pub(super) mod device {
         pub(in crate::family::flash_next::cuda) fn enable_refill_timing(&mut self) {
             if self.source.is_some() {
                 self.refill_timing = Some(Cell::default());
+            }
+        }
+
+        pub(in crate::family::flash_next::cuda) fn enable_prefill_route_trace(&mut self) {
+            self.trace_prefill_routes = self.source.is_some();
+        }
+
+        pub(in crate::family::flash_next::cuda) fn trace_prefill_chunk(
+            &self,
+            layer: usize,
+            rows: usize,
+        ) {
+            if self.trace_prefill_routes
+                && let Some(resident) = self.state.experts_by_recency(layer)
+            {
+                let record = serde_json::json!({
+                    "layer": layer,
+                    "rows": rows,
+                    "top_k": self.state.geometry().top_k,
+                    "resident_lru_first": resident,
+                });
+                eprintln!("flash-next disk prefill chunk: {record}");
+            }
+        }
+
+        pub(in crate::family::flash_next::cuda) fn trace_prefill_group(
+            &self,
+            layer: usize,
+            picks: &[usize],
+            misses: usize,
+        ) {
+            if self.trace_prefill_routes {
+                let record = serde_json::json!({"layer": layer, "picks": picks, "misses": misses});
+                eprintln!("flash-next disk prefill group: {record}");
             }
         }
 

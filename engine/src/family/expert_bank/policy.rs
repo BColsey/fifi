@@ -189,6 +189,18 @@ pub(crate) struct ReplaceOnMissLru {
 }
 
 impl ReplaceOnMissLru {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in crate::family) fn experts_by_recency(&self, layer: usize) -> Option<Vec<u16>> {
+        let layer = self.layers.get(layer)?;
+        Some(
+            layer
+                .recency
+                .iter()
+                .map(|&slot| layer.resident[usize::from(slot)])
+                .collect(),
+        )
+    }
+
     /// Starts from a filled bank: `rows[layer][expert]` is the slot of the expert or -1, with exactly
     /// `slots` experts held (`TierPlan::hot_set`'s table). The least popular holder (by `counts`,
     /// ties to the higher id) is the first victim.

@@ -1141,6 +1141,7 @@ mod device {
             // in a feed window. Reopening prefill or preparing the final logits row drains
             // the prior window's ring copies before bank admits can run.
             let ring_funded = self.ring.is_some();
+            self.bank.trace_prefill_chunk(layer, dims.rows);
             let mut store = LayerStore {
                 adapter: PrefillAdapter::new(&mut self.bank),
                 ctx: launch.ctx,

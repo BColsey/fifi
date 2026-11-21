@@ -361,6 +361,14 @@ pub(crate) struct ExpertBankState<P: SlotPolicy> {
     stats: BankStats,
     poisoned: bool,
 }
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+impl ExpertBankState<ReplaceOnMissLru> {
+    pub(in crate::family) fn experts_by_recency(&self, layer: usize) -> Option<Vec<u16>> {
+        self.policy.experts_by_recency(layer)
+    }
+}
+
 impl<P: SlotPolicy> ExpertBankState<P> {
     /// A bank around any policy that starts filled (every slot holds an expert).
     pub(crate) fn with_policy(

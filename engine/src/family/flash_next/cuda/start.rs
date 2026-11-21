@@ -629,6 +629,8 @@ fn build_driver_resolving(
     super::driver::chunk::prof::check_switch_spelling()?;
     let refill_timing =
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_DISK_PROFILE")?;
+    let prefill_route_trace =
+        super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_PREFILL_ROUTE_TRACE")?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -1096,6 +1098,9 @@ fn build_driver_resolving(
     )?;
     if refill_timing {
         bank.enable_refill_timing();
+    }
+    if prefill_route_trace {
+        bank.enable_prefill_route_trace();
     }
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
