@@ -22,7 +22,7 @@ On Apple Silicon, saved prefixes share `session_cap_bytes` with the live session
 
 On NVIDIA CUDA, the newest saved prefix stays on the GPU until a later request overwrites it, so restoring it needs no copy from host memory.
 Up to eight saved prefixes are also kept in pinned host memory; see [How fifi plans memory](memory.md#on-nvidia-cuda).
-With the disk cache (see the [configuration reference](../reference/configuration.md#prefix-cache-on-disk-cuda)), Qwen3.6 on CUDA also keeps saved prefixes in a directory, but only when pinned memory is not enough: entries about to be evicted are written in the background, and a graceful stop writes the tips that exist only in memory. A prompt that pinned memory cannot serve is looked up there before it is processed again, so a restart or an eviction from pinned memory costs one verified read of the saved state instead of the whole prompt.
+With the disk cache (see the [configuration reference](../reference/configuration.md#prefix-cache-on-disk-cuda)), Qwen3.6 on CUDA also keeps saved prefixes in a directory, but only when pinned memory is not enough: entries about to be evicted are written in the background, and a graceful stop writes the tips that exist only in memory. A prompt that pinned memory cannot serve is looked up there before it is processed again, so a restart or an eviction from pinned memory costs one verified read of the saved state instead of the whole prompt. The files hold the conversations' exact tokens and model state, so the cache is a privacy decision: it can be turned off, and it serves GGUF loads only.
 
 ## Which engines support it
 
