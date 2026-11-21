@@ -115,6 +115,7 @@ fn call_text(call: &ToolCall, grammar: ToolGrammar) -> String {
     let mut text = match grammar {
         ToolGrammar::Qwen => format!("<tool_call>\n<function={}>\n", call.name),
         ToolGrammar::Flint => format!("<tool_call>{}", call.name),
+        ToolGrammar::Inkling => unreachable!("Inkling text requests cannot construct tool calls"),
     };
     if let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(&call.arguments) {
         for (key, value) in arguments {
@@ -129,12 +130,14 @@ fn call_text(call: &ToolCall, grammar: ToolGrammar) -> String {
                 ToolGrammar::Flint => text.push_str(&format!(
                     "<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"
                 )),
+                ToolGrammar::Inkling => unreachable!(),
             }
         }
     }
     text.push_str(match grammar {
         ToolGrammar::Qwen => "</function>\n</tool_call>",
         ToolGrammar::Flint => "</tool_call>",
+        ToolGrammar::Inkling => unreachable!(),
     });
     text
 }

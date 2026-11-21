@@ -5,6 +5,7 @@
 use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
 use crate::family::gemma4::FAMILY as GEMMA4_FAMILY;
+use crate::family::inkling2_mini::FAMILY as INKLING_FAMILY;
 use crate::family::{
     nemotron35::factory::{FAMILY as NEMOTRON_FAMILY, NemotronOptions},
     qwen36::{
@@ -29,7 +30,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 7] = [
+pub(crate) const FAMILIES: [&str; 8] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -37,6 +38,7 @@ pub(crate) const FAMILIES: [&str; 7] = [
     FLINT_FAMILY,
     NEMOTRON_FAMILY,
     GEMMA4_FAMILY,
+    INKLING_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
@@ -82,8 +84,7 @@ pub(crate) struct EngineConfig {
     pub(crate) tokenizer_dir: PathBuf,
     pub(crate) family: String,
     pub(crate) model: Option<String>,
-    /// The context limit of the `fake` family. A real family reports its own limit when it
-    /// starts, and the file does not set it.
+    /// Context limit for the fake and Inkling 2 Mini families.
     pub(crate) context_limit: Option<u32>,
     pub(crate) fake: Option<FakeOptions>,
     pub(crate) flash_next: Option<FlashOptions>,
@@ -186,12 +187,26 @@ impl Config {
                     )));
                 }
             }
-            if engine.family != FAKE_FAMILY
-                && (engine.context_limit.is_some() || engine.fake.is_some())
+            if engine.fake.is_some() && engine.family != FAKE_FAMILY {
+                return Err(StartupError(format!(
+                    "engines[{index}] sets fake, which only the {FAKE_FAMILY} family takes"
+                )));
+            }
+            if engine.context_limit.is_some()
+                && !matches!(engine.family.as_str(), FAKE_FAMILY | INKLING_FAMILY)
             {
                 return Err(StartupError(format!(
-                    "engines[{index}] sets context_limit or fake, which only the {FAKE_FAMILY} family takes"
+                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY} family and the {INKLING_FAMILY} family take"
                 )));
+            }
+            if engine.family == INKLING_FAMILY {
+                crate::family::inkling2_mini::factory::context_limit(engine.context_limit)
+                    .map_err(|error| {
+                        StartupError(format!(
+                            "engines[{index}].context_limit: {}",
+                            error.describe()
+                        ))
+                    })?;
             }
             if engine.family != FLASH_FAMILY && engine.flash_next.is_some() {
                 return Err(StartupError(format!(

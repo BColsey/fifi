@@ -36,8 +36,9 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FIFI_MLX_AUTO_BUDGET` | off | Set to `1` to size Qwen3.6, Qwen3.8 dense, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. Flint streams selected routed experts from its local checkpoint when its full resident weights exceed the budget. |
+| `FIFI_MLX_AUTO_BUDGET` | on for opt-in Inkling, off elsewhere | Set to `1` to size Qwen3.6, Qwen3.8 dense, Flash-Next or Flint prefill from Metal's recommended working set at startup. Applies to one MLX model per server and respects configured chunk ceilings. Flint streams selected routed experts from its local checkpoint when its full resident weights exceed the budget. Inkling uses the working set to admit text state and size retained expert pages. `0` disables automatic sizing unless an explicit ceiling is set. |
 | `FIFI_MLX_WORKING_SET_MIB` | unset | A positive integer ceiling for the planned Metal working set, in MiB. Setting it activates automatic sizing and retains Metal's recommendation as an upper bound. Applies to one MLX model per server. |
+| `FIFI_INKLING2_MINI_MLX` | off | Set to `1` for experimental [Inkling 2 Mini text serving](../how-to/inkling.md) on Apple Silicon. |
 | `FIFI_MLX_REUSE_IDENTITY_RESHAPE` | off | Set to `1` to share a validated native resident tensor when the requested reshape matches its current dimensions. |
 
 ## Qwen3.6 on Apple Silicon

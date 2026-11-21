@@ -31,7 +31,12 @@ impl DeviceBudget {
 
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn detect() -> Result<Option<Self>, EngError> {
-        if enabled() {
+        Self::detect_with_default(false)
+    }
+
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn detect_with_default(auto_default: bool) -> Result<Option<Self>, EngError> {
+        if enabled_with_default(auto_default) {
             let ceiling = std::env::var_os(CEILING_MIB);
             let ceiling = ceiling.as_deref().map(parse_ceiling).transpose()?;
             let device = Self::new(crate::kernels::MlxKernels::recommended_working_set_bytes())?;
@@ -106,7 +111,12 @@ fn parse_ceiling(value: &OsStr) -> Result<u64, EngError> {
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enabled() -> bool {
-    std::env::var_os("FIFI_MLX_AUTO_BUDGET").is_some_and(|value| value == "1")
+    enabled_with_default(false)
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn enabled_with_default(auto_default: bool) -> bool {
+    std::env::var_os("FIFI_MLX_AUTO_BUDGET").map_or(auto_default, |value| value == "1")
         || std::env::var_os(CEILING_MIB).is_some()
 }
 

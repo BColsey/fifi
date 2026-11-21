@@ -234,6 +234,10 @@ fn evaluate(
         .family
         .as_deref()
         .is_none_or(|family| family == inkling2_mini::FAMILY)
+        && !inspection
+            .config_model_types
+            .iter()
+            .any(|kind| kind == inkling2_mini::MODEL_TYPE && inspection.safetensors_files > 0)
         && inspection
             .gguf_files
             .iter()
@@ -286,7 +290,7 @@ fn evaluate(
                 .iter()
                 .any(|kind| kind == inkling2_mini::MODEL_TYPE))
     {
-        return inkling2_mini_preflight(model_dir, tokenizer_dir, candidate, checks);
+        return inkling2_mini_preflight(model_dir, tokenizer_dir, candidate, facts, checks);
     }
 
     let family = identify_family(inspection, candidate, &mut checks);
@@ -634,30 +638,35 @@ fn any_warned(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == CheckStatus::Warn)
 }
 
-/// Inkling's header plan is available before a serving backend is wired up.
+/// Inkling's header plan is available independently of the serving opt-in.
 fn inkling2_mini_preflight(
     model_dir: &Path,
     tokenizer_dir: &Path,
     candidate: &Candidate,
+    facts: &HardwareFacts,
     mut checks: Vec<Check>,
 ) -> PreflightReport {
     use crate::family::inkling2_mini;
     let plan = if candidate.kv_dtype.as_deref().is_some_and(|kv| kv != "bf16") {
         Err(crate::EngError::BadRequest(
-            "Inkling 2 Mini currently prices BF16 KV".into(),
+            "Inkling 2 Mini text requires BF16 KV".into(),
+        ))
+    } else if candidate.prefill_rows.is_some_and(|rows| rows != 1) {
+        Err(crate::EngError::BadRequest(
+            "Inkling 2 Mini text prefill uses one token per forward pass".into(),
         ))
     } else {
         inkling2_mini::inspect(model_dir, candidate.context_limit)
     };
-    let decisions = match plan {
-        Ok(rows) => {
+    let (decisions, fit) = match plan {
+        Ok(plan) => {
             checks.push(Check::new(
                 "Inkling 2 Mini expert layout",
                 CheckStatus::Pass,
                 "fixed-loop config, shard inventory and mixed expert layout verified from headers"
                     .into(),
             ));
-            rows
+            (plan.decisions, plan.budget_fit)
         }
         Err(error) => {
             checks.push(Check::new(
@@ -665,17 +674,81 @@ fn inkling2_mini_preflight(
                 CheckStatus::Fail,
                 super::describe_error(&error),
             ));
-            Vec::new()
+            (Vec::new(), None)
         }
     };
-    inkling2_mini_report(
-        model_dir,
-        tokenizer_dir,
+    let backend = if facts.backends.mlx {
+        inkling2_mini::factory::check_backend()
+    } else {
+        Err(crate::EngError::BadRequest(
+            "Inkling 2 Mini requires --features native-mlx on Apple Silicon".into(),
+        ))
+    };
+    if let Err(error) = backend {
+        return inkling2_mini_report(
+            model_dir,
+            tokenizer_dir,
+            checks,
+            decisions,
+            &error.describe(),
+            "Use the header plan to size an experimental single-sequence text worker.",
+        );
+    }
+
+    if !any_failed(&checks) {
+        let (status, detail) = match inkling2_mini::factory::load_tokenizer(tokenizer_dir) {
+            Ok(_) => (
+                CheckStatus::Pass,
+                "Inkling tokenizer and template loaded".into(),
+            ),
+            Err(error) => (CheckStatus::Fail, error.describe()),
+        };
+        checks.push(Check::new("Inkling 2 Mini tokenizer", status, detail));
+    }
+    checks.push(Check::new(
+        "text execution",
+        CheckStatus::Info,
+        "experimental Apple Silicon safetensors text, one sequence and one token per forward pass"
+            .into(),
+    ));
+    let compatibility = if any_failed(&checks) {
+        Compatibility::Unsupported
+    } else {
+        Compatibility::Supported
+    };
+    let (verdict, next_step) = match (compatibility, fit) {
+        (Compatibility::Unsupported, _) => (
+            Verdict::Unsupported,
+            "Fix the failed checks before trying the Inkling text worker.",
+        ),
+        (_, Some(false)) => (
+            Verdict::ResourceConstrained,
+            "Reduce the requested context or raise the configured working-set ceiling within Metal's limit.",
+        ),
+        _ => (
+            Verdict::Experimental,
+            "The opt-in text worker is available for end-to-end qualification.",
+        ),
+    };
+    PreflightReport {
+        model_dir: model_dir.to_path_buf(),
+        tokenizer_dir: tokenizer_dir.to_path_buf(),
+        family: Some(inkling2_mini::FAMILY.into()),
+        verdict,
+        dimensions: Dimensions {
+            compatibility,
+            qualification: Qualification::Experimental,
+            resource_fit: match fit {
+                Some(true) => ResourceFit::Fits,
+                Some(false) => ResourceFit::DoesNotFit,
+                None => ResourceFit::Unknown,
+            },
+        },
         checks,
         decisions,
-        "Inkling 2 Mini text execution is pending",
-        "Use the header plan to size the text executor and qualify it against the reference model.",
-    )
+        estimate: None,
+        next_step: next_step.into(),
+    }
 }
 
 fn inkling2_mini_report(

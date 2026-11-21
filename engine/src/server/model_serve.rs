@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use crate::capability::probe::{CompiledBackends, HardwareFacts};
 use crate::capability::{Probe, describe_error, inspect, preflight};
+use crate::family::inkling2_mini;
 use crate::server::config::{Config, EngineConfig, StartupError};
 
 /// The families `--model` can identify and start. One row per
@@ -35,6 +36,7 @@ const DETECTABLE_FAMILIES: &[(&str, &[&str])] = &[
         crate::family::qwen36::factory::DENSE_FAMILY,
         crate::family::QWEN3_8_27B_DENSE.model_types,
     ),
+    (inkling2_mini::FAMILY, &[inkling2_mini::MODEL_TYPE]),
 ];
 
 /// The listen address of a simplified startup, matching the shipped
@@ -116,7 +118,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -149,7 +151,15 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     }
 
     let family = select_family(args, &inspection)?;
-    let weight_format = select_weight_format(has_gguf, has_safetensors);
+    let weight_format = if family == inkling2_mini::FAMILY {
+        if has_safetensors {
+            "safetensors"
+        } else {
+            "gguf"
+        }
+    } else {
+        select_weight_format(has_gguf, has_safetensors)
+    };
 
     let options = crate::family::qwen36::settings::Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
@@ -233,6 +243,7 @@ pub(crate) fn build_config(args: &ModelServeArgs) -> Result<Config, StartupError
 /// Assemble the in-memory `Config` — the document a `--config` file
 /// would carry, headed for the identical serve path.
 fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
+    let inkling = discovered.family == inkling2_mini::FAMILY;
     Config {
         listen: args
             .listen
@@ -243,17 +254,17 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         sample_trace: false,
         web_dir: None,
         engines: vec![EngineConfig {
-            id: "q36".to_string(),
+            id: if inkling { "inkling" } else { "q36" }.into(),
             model_dir: args.model_dir.clone(),
             tokenizer_dir: discovered.tokenizer_dir.clone(),
             family: discovered.family.clone(),
             model: None,
-            context_limit: None,
+            context_limit: if inkling { args.context_limit } else { None },
             think_replay: None,
             notice_toolwrap: None,
             fake: None,
             flash_next: None,
-            qwen36: Some(discovered.options.clone()),
+            qwen36: (!inkling).then(|| discovered.options.clone()),
             nemotron: None,
             flint: None,
         }],
@@ -278,17 +289,22 @@ pub(crate) fn config_json(config: &Config) -> String {
             q36.insert("kv_dtype".into(), json!(value));
         }
     }
+    let mut entry = json!({
+        "id": engine.id,
+        "family": engine.family,
+        "model_dir": engine.model_dir.display().to_string(),
+        "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
+    });
+    if engine.qwen36.is_some() {
+        entry["qwen36"] = json!(q36);
+    } else if let Some(context_limit) = engine.context_limit {
+        entry["context_limit"] = json!(context_limit);
+    }
     let document = json!({
         "listen": config.listen,
         "api_key_env": config.api_key_env,
         "prefix_reuse": config.prefix_reuse,
-        "engines": [{
-            "id": engine.id,
-            "family": engine.family,
-            "model_dir": engine.model_dir.display().to_string(),
-            "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
-            "qwen36": q36,
-        }],
+        "engines": [entry],
     });
     serde_json::to_string_pretty(&document).expect("the built config is valid JSON")
 }

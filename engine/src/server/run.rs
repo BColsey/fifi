@@ -19,6 +19,7 @@ use crate::EngError;
 use crate::family::flash_next::factory;
 use crate::family::flint;
 use crate::family::gemma4;
+use crate::family::inkling2_mini;
 use crate::family::nemotron35::factory as nemotron_factory;
 use crate::family::qwen36::factory as q36_factory;
 use crate::family::sampler::SamplingDefaults;
@@ -247,22 +248,23 @@ fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
 /// whether that file supplied them (the start line quotes both).
 fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), StartupError> {
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-    if crate::family::mlx_budget::enabled()
-        && file
-            .engines
-            .iter()
-            .filter(|entry| {
-                FAMILY_STARTERS
-                    .iter()
-                    .any(|&(family, _, metal)| metal && family == entry.family)
-            })
-            .count()
-            > 1
+    if crate::family::mlx_budget::enabled_with_default(file.engines.iter().any(|entry| {
+        entry.family == inkling2_mini::FAMILY && inkling2_mini::factory::check_backend().is_ok()
+    })) && file
+        .engines
+        .iter()
+        .filter(|entry| {
+            FAMILY_STARTERS
+                .iter()
+                .any(|&(family, _, metal)| metal && family == entry.family)
+        })
+        .count()
+        > 1
     {
         return Err(StartupError(
-            "FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB requires one MLX model per \
-             server; either variable alone activates automatic sizing, and Metal reports one \
-             shared working set"
+            "Automatic MLX sizing requires one MLX model per server. Metal reports one shared \
+             working set. FIFI_MLX_AUTO_BUDGET=1 or FIFI_MLX_WORKING_SET_MIB activates automatic \
+             sizing, and the opt-in Inkling backend uses it by default."
                 .into(),
         ));
     }
@@ -408,6 +410,9 @@ fn check_staged_family(family: &str) -> Result<(), EngError> {
     if family == flint::FAMILY {
         flint::factory::check_backend()?;
     }
+    if family == inkling2_mini::FAMILY {
+        inkling2_mini::factory::check_backend()?;
+    }
     Ok(())
 }
 
@@ -455,6 +460,25 @@ fn start_flint(
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
         effective,
+    })
+}
+
+fn start_inkling(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let (engine, bundle, context_limit) = inkling2_mini::factory::start_engine(
+        &config.model_dir,
+        &config.tokenizer_dir,
+        config.context_limit,
+        ready_note,
+    )?;
+    Ok(StartedEngine {
+        engine,
+        bundle: Arc::new(bundle),
+        context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -593,6 +617,7 @@ fn start_gemma4(
 // set it counts can never drift from this dispatch table.
 const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (flint::FAMILY, start_flint, true),
+    (inkling2_mini::FAMILY, start_inkling, true),
     (factory::FAMILY, start_flash, true),
     (q36_factory::FAMILY, start_q36, true),
     (q36_factory::DENSE_FAMILY, start_q36, true),
@@ -609,7 +634,8 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
 /// load) because its snapshots are not qualified yet.
 fn entry_prefix_reuse(engine: &EngineConfig, file_flag: Option<bool>, flint_opt_in: bool) -> bool {
     let flag = file_flag.unwrap_or_else(|| default_prefix_reuse(engine));
-    flag && (engine.family != flint::FAMILY || flint_opt_in)
+    flag && engine.family != inkling2_mini::FAMILY
+        && (engine.family != flint::FAMILY || flint_opt_in)
 }
 
 /// The unset-key default: on only where reuse is qualified - the Flash-Next
