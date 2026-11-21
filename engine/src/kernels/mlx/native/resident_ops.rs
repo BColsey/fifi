@@ -20,11 +20,11 @@ use super::{
     handles::{Array, Resident, native_byte_len, native_dtype},
 };
 #[cfg(test)]
-use crate::kernels::{QuantizationMode, QuantizationSpec};
+use crate::kernels::QuantizationSpec;
 use crate::{
     EngError,
     kernels::{
-        BinaryOp, ReduceOp, RopeSpec, UnaryOp,
+        BinaryOp, QuantizationMode, ReduceOp, RopeSpec, UnaryOp,
         elementwise::{self, AxisRule, ElementwiseInputs, ElementwiseLayout, output_bytes},
         gated_delta,
         rope::{self, RopeLayout, RopeOperands, RopeStep},
@@ -66,6 +66,9 @@ pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal
 const INKLING_ACTIVATION_SOURCE: &str =
     concat!(include_str!("inkling_activation.body.metal"), "\0");
 const INKLING_MERGE_SOURCE: &str = concat!(include_str!("inkling_merge.body.metal"), "\0");
+const INKLING_HEADER: &str = concat!(include_str!("inkling_experts.header.metal"), "\0");
+const INKLING_NVFP4_SOURCE: &str = concat!(include_str!("inkling_nvfp4.body.metal"), "\0");
+const INKLING_MXFP8_SOURCE: &str = concat!(include_str!("inkling_mxfp8.body.metal"), "\0");
 
 pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.metal"), "\0");
 
@@ -2785,6 +2788,7 @@ impl Context {
         &mut self,
         gate_up: &ExecutionTensor,
         weights: &ExecutionTensor,
+        quantization: Option<QuantizationMode>,
     ) -> Result<ExecutionTensor, EngError> {
         let label = "Inkling capped activation";
         let &[rows, 1, combined] = gate_up.shape() else {
@@ -2797,7 +2801,27 @@ impl Context {
                 "Inkling gate/up and route weight shapes disagree",
             ));
         }
-        self.inkling_expert_kernel(label, gate_up, Some(weights), rows, combined / 2, 1)
+        self.inkling_expert_kernel(
+            label,
+            gate_up,
+            Some(weights),
+            [rows, combined / 2, 1],
+            quantization,
+        )
+    }
+
+    pub(in crate::kernels::mlx) fn inkling_quantized_rows(
+        &mut self,
+        input: &ExecutionTensor,
+        mode: QuantizationMode,
+    ) -> Result<ExecutionTensor, EngError> {
+        let label = "Inkling input quantization";
+        let &[rows, width] = input.shape() else {
+            return Err(bad_request(
+                "Inkling quantization input must have shape [tokens, hidden]",
+            ));
+        };
+        self.inkling_expert_kernel(label, input, None, [rows, width, 1], Some(mode))
     }
 
     pub(in crate::kernels::mlx) fn inkling_merge(
@@ -2815,7 +2839,7 @@ impl Context {
         if picks == 0 || rows.checked_mul(picks) != Some(routes) {
             return Err(bad_request("Inkling down output and route count disagree"));
         }
-        self.inkling_expert_kernel(label, down, None, rows, width, picks)
+        self.inkling_expert_kernel(label, down, None, [rows, width, picks], None)
     }
 
     fn inkling_expert_kernel(
@@ -2823,14 +2847,36 @@ impl Context {
         label: &'static str,
         projected: &ExecutionTensor,
         weights: Option<&ExecutionTensor>,
-        rows: u32,
-        width: u32,
-        picks: u32,
+        [rows, width, picks]: [u32; 3],
+        quantization: Option<QuantizationMode>,
     ) -> Result<ExecutionTensor, EngError> {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;
         let state = self.state.as_mut().unwrap();
         check_f32_operand(label, state, projected)?;
+        let (code, group, source) = match quantization {
+            Some(QuantizationMode::Nvfp4) => (1, 16, INKLING_NVFP4_SOURCE),
+            Some(QuantizationMode::Mxfp8) => (2, 32, INKLING_MXFP8_SOURCE),
+            Some(_) => {
+                return Err(bad_request(
+                    "Inkling activation format must be NVFP4 or MXFP8",
+                ));
+            }
+            None if weights.is_some() => (0, 1, INKLING_ACTIVATION_SOURCE),
+            None => (0, 1, INKLING_MERGE_SOURCE),
+        };
+        if width == 0 || !width.is_multiple_of(group) {
+            return Err(bad_request(
+                "Inkling activation width must contain complete quantization groups",
+            ));
+        }
+        if quantization == Some(QuantizationMode::Nvfp4)
+            && (u64::from(width) + 4) * 4 > state.max_threadgroup_memory
+        {
+            return Err(bad_request(
+                "Inkling NVFP4 row exceeds Metal threadgroup memory",
+            ));
+        }
         let projected_elements = projected.byte_len() / Dtype::F32.byte_width();
         if projected_elements > u64::from(u32::MAX) {
             return Err(bad_request(
@@ -2840,17 +2886,13 @@ impl Context {
         let items = rows
             .checked_mul(width)
             .ok_or_else(|| bad_request("Inkling expert grid overflows"))?;
-        let dims = native_ints(label, &[rows, width, items, picks])?;
-        let (shape, weight_array, source) = match weights {
+        let dims = native_ints(label, &[rows, width, items, picks, code])?;
+        let (shape, weight_array) = match weights {
             Some(weights) => {
                 check_f32_operand(label, state, weights)?;
-                (
-                    vec![rows, 1, width],
-                    weights.storage.native_array(),
-                    INKLING_ACTIVATION_SOURCE,
-                )
+                (vec![rows, 1, width], weights.storage.native_array())
             }
-            None => (vec![rows, width], ffi::NULL_ARRAY, INKLING_MERGE_SOURCE),
+            None => (vec![rows, width], ffi::NULL_ARRAY),
         };
         let layout = shape::dequantize(label, &shape)?;
         clear_message();
@@ -2862,6 +2904,7 @@ impl Context {
                 weight_array,
                 dims.as_ptr(),
                 source.as_ptr().cast(),
+                INKLING_HEADER.as_ptr().cast(),
                 stream,
             )
         })?;

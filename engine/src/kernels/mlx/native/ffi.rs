@@ -619,6 +619,7 @@ unsafe extern "C" {
         route_weights: mlx_array,
         dims: *const i32,
         source: *const c_char,
+        header: *const c_char,
         stream: mlx_stream,
     ) -> i32;
     /// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection and

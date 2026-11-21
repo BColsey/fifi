@@ -1,9 +1,4 @@
 const uint index = thread_position_in_grid.x;
 if (index >= uint(n_items)) return;
-const float gate = float(bfloat16_t(projected[2 * index]));
-const float up = float(bfloat16_t(projected[2 * index + 1]));
-const float capped_gate = 4.0f * metal::tanh(gate * 0.25f);
-const float capped_up = 25.0f * metal::tanh(up / 25.0f);
-const float sigmoid = 1.0f / (1.0f + metal::exp(-gate));
-const float weight = route_weights[index / WIDTH];
-result[index] = float(bfloat16_t(((capped_gate * sigmoid) * capped_up) * weight));
+result[index] = inkling_capped_value(
+    projected[2 * index], projected[2 * index + 1], route_weights[index / WIDTH]);

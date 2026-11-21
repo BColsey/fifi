@@ -2158,8 +2158,18 @@ impl MlxKernels {
         &mut self,
         gate_up: &ExecutionTensor,
         weights: &ExecutionTensor,
+        quantization: Option<QuantizationMode>,
     ) -> Result<ExecutionTensor, EngError> {
-        self.context.inkling_activation(gate_up, weights)
+        self.context
+            .inkling_activation(gate_up, weights, quantization)
+    }
+
+    pub(crate) fn inkling_quantized_rows(
+        &mut self,
+        input: &ExecutionTensor,
+        mode: QuantizationMode,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.inkling_quantized_rows(input, mode)
     }
 
     pub(crate) fn inkling_merge(
