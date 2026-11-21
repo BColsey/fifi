@@ -62,6 +62,8 @@ pub struct Raon1Spec {
     pub time_step_rank: u64,
     pub conv_kernel: u64,
     pub experts: u64,
+    /// Routed experts used per token (`expert_used_count`).
+    pub experts_used: u64,
     pub moe_inter: u64,
     pub dense_inter: u64,
     /// Raon-mHC residual streams (`hyper_connection.count`).
@@ -88,6 +90,7 @@ pub const RAON_1_MINI_PREVIEW: Raon1Spec = Raon1Spec {
     time_step_rank: 128,
     conv_kernel: 4,
     experts: 128,
+    experts_used: 6,
     moe_inter: 1088,
     dense_inter: 12_032,
     streams: 4,
@@ -502,7 +505,7 @@ fn check_metadata(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> 
         ("raon1.ssm.conv_kernel", spec.conv_kernel),
         ("raon1.ssm.time_step_rank", spec.time_step_rank),
         ("raon1.expert_count", spec.experts),
-        ("raon1.expert_used_count", 6),
+        ("raon1.expert_used_count", spec.experts_used),
         ("raon1.expert_shared_count", 1),
         ("raon1.expert_feed_forward_length", spec.moe_inter),
         ("raon1.feed_forward_length", spec.dense_inter),

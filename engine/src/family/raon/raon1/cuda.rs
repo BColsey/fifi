@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use super::reference::{Hyper, hyper};
-use super::{Raon1Model, Raon1Spec, RaonKind, open_raon_1_mini_preview};
+use super::{RAON_1_MINI_PREVIEW, Raon1Model, Raon1Spec, RaonKind, open_raon_1_mini_preview};
 use crate::EngError;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
@@ -44,27 +44,36 @@ use crate::weights::dequantize;
 /// Token rows per chunk: the scratch is sized for this many.
 pub(crate) const CHUNK: usize = 256;
 
-const HIDDEN: usize = 2560;
-const STREAMS: usize = 4;
-const HEADS: usize = 40;
-const HEAD_DIM: usize = 128;
+// The geometry of the checkpoint this device path serves, read from its spec (the opener pins
+// the same fields against the GGUF header). The kernels of `block_ops` fix the head width, the
+// latent rank and the rope width; `geometry_check` refuses a spec outside them by name.
+const SPEC: Raon1Spec = RAON_1_MINI_PREVIEW;
+const HIDDEN: usize = SPEC.hidden as usize;
+const STREAMS: usize = SPEC.streams as usize;
+const HEADS: usize = SPEC.heads as usize;
+const HEAD_DIM: usize = SPEC.head_dim as usize;
 const WIDTH: usize = HEADS * HEAD_DIM;
-const RANK: usize = 512;
-const ROPE: usize = 64;
+const RANK: usize = SPEC.kv_latent as usize;
+const ROPE: usize = (SPEC.kv_a_width - SPEC.kv_latent) as usize;
 const MLA_ROW: usize = RANK + ROPE;
-const Q_NOPE: usize = 128;
+const Q_NOPE: usize = SPEC.k_head as usize;
 const Q_ROW: usize = Q_NOPE + ROPE;
-const Q_LORA: usize = 576;
-const EXPERTS: usize = 128;
-const USED: usize = 6;
-const MOE_INTER: usize = 1088;
-const DENSE_INTER: usize = 12_032;
-const TIME_RANK: usize = 128;
-const CONV_TAPS: usize = 3;
+const Q_LORA: usize = SPEC.q_lora as usize;
+const EXPERTS: usize = SPEC.experts as usize;
+const USED: usize = SPEC.experts_used as usize;
+const MOE_INTER: usize = SPEC.moe_inter as usize;
+const DENSE_INTER: usize = SPEC.dense_inter as usize;
+const TIME_RANK: usize = SPEC.time_step_rank as usize;
+const CONV_TAPS: usize = SPEC.conv_kernel as usize - 1;
+// The row operations fix these widths: a spec outside them does not build.
+const _: () = assert!(
+    HEAD_DIM == 128 && RANK == 512 && ROPE == 64 && Q_NOPE == 128 && STREAMS == 4 && HEADS % 8 == 0
+);
+
 /// Rows per thread of the multi-row convolution kernel; shorter chunks use the one-row kernel.
 const CONV_ROWS_PER_THREAD: usize = 16;
 /// Bytes of KV cache per position: seven attention layers of 576 f16 values.
-const KV_BYTES_PER_POSITION: u64 = 7 * MLA_ROW as u64 * 2;
+const KV_BYTES_PER_POSITION: u64 = SPEC.mla_layers.len() as u64 * MLA_ROW as u64 * 2;
 /// Device bytes kept free beside the weights, the scratch and the cache.
 const HEADROOM: u64 = 768 << 20;
 /// Smallest context a start accepts.

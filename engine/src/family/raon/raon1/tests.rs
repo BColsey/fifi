@@ -31,6 +31,7 @@ fn tiny_spec() -> Raon1Spec {
         time_step_rank: 208,
         conv_kernel: 9,
         experts: 6,
+        experts_used: 6,
         moe_inter: 352,
         dense_inter: 1024,
         streams: 4,
