@@ -737,12 +737,24 @@ mod tests {
         let path = std::env::var_os("FIFI_TEST_INKLING_CHECKPOINT")
             .expect("set FIFI_TEST_INKLING_CHECKPOINT to the native checkpoint directory");
         let _lock = crate::native_test_lock();
+        let width = std::env::var("FIFI_INKLING_PREFILL_ROWS").unwrap_or_else(|_| "2".into());
+        let requested: usize = width.parse().unwrap();
+        assert!((2..=16).contains(&requested));
         let mut decoder =
-            Decoder::open_with_prefill_rows(Path::new(&path), 32, Some(OsStr::new("2"))).unwrap();
-        assert_eq!(decoder.prefill_rows(), 2, "test needs two admitted rows");
-        let tokens = [42, 1147, 2034, 11, 150, 2582, 27];
-        // The first six tokens form the prompt. The last token checks the state carried
-        // into the next decode. Every prefix ends in a solo logits step, as serving does.
+            Decoder::open_with_prefill_rows(Path::new(&path), 32, Some(OsStr::new(&width)))
+                .unwrap();
+        assert_eq!(
+            decoder.prefill_rows(),
+            requested,
+            "requested test width must fit"
+        );
+        let tokens: Vec<_> = [42, 1147, 2034, 11, 150, 2582, 27]
+            .into_iter()
+            .cycle()
+            .take((requested + 3).max(7))
+            .collect();
+        // Include a full window, an uneven tail and one follow-up decode. Each
+        // prefix ends in a solo logits step just as it does in serving.
         let before = decoder.expert_cache_stats().visits;
         let reference: Vec<_> = tokens
             .iter()
@@ -754,6 +766,7 @@ mod tests {
             tokens.len() as u64 * visits_per_window,
         );
 
+        let mut batched = false;
         for (index, expected) in reference.iter().enumerate() {
             decoder.reset();
             let before = decoder.expert_cache_stats().visits;
@@ -776,7 +789,12 @@ mod tests {
                 (index.div_ceil(decoder.prefill_rows()) + 1) as u64 * visits_per_window;
             let max_visits = (index + 1) as u64 * visits_per_window;
             assert!((min_visits..=max_visits).contains(&observed));
+            batched |= observed < max_visits;
         }
+        assert!(
+            batched,
+            "checkpoint parity must exercise a multi-row expert visit"
+        );
     }
 
     #[test]
