@@ -105,6 +105,10 @@ unsafe extern "C" {
     /// The OS page size in bytes, or 0 when the query fails.
     #[link_name = "inference_page_size"]
     pub(super) fn inference_page_size() -> usize;
+    #[link_name = "inference_mlx_start_memory_pressure"]
+    pub(super) fn mlx_start_memory_pressure() -> i32;
+    #[link_name = "inference_mlx_memory_pressure"]
+    pub(super) fn mlx_memory_pressure() -> u32;
     #[link_name = "inference_mlx_process_io"]
     pub(super) fn mlx_process_io(read_bytes: *mut u64, peak_bytes: *mut u64) -> i32;
     #[cfg(test)]
