@@ -2642,6 +2642,57 @@ mod tests {
         }
     }
 
+    /// The cells the default start picks serve every session the planner then funds, each up to
+    /// the last cell.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn the_default_cells_serve_every_planned_session_to_the_last_cell() {
+        use crate::family::seq_plan::{SeqInputs, plan_seqs};
+        let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
+        let bytes = std::fs::metadata(&path).expect("model file").len();
+        let mut model = load_choosing(
+            &[crate::family::gguf_select::GgufFile { path, bytes }],
+            None,
+            crate::family::gemma4::config::MaxSeqs::Auto,
+            &|_| {},
+        )
+        .expect("load");
+        let cells = model.cells();
+        let first = model.new_seq().expect("first session");
+        let free = u64::try_from(model.ctx.memory_info().expect("memory").free).unwrap_or(u64::MAX);
+        let plan = plan_seqs(
+            SeqInputs {
+                free,
+                headroom: crate::family::gemma4::budget::BOLT_HEADROOM_BYTES,
+                cost: crate::family::gemma4::budget::bolt_seq_cost().expect("cost"),
+                context: cells as u64,
+                row_cap: Bolt::PREFILL_BATCH,
+                ceiling: Bolt::PREFILL_BATCH,
+            },
+            None,
+        )
+        .expect("session plan");
+        eprintln!(
+            "default cells {cells}, planned sessions {} ({})",
+            plan.seqs,
+            plan.describe()
+        );
+        assert!(cells >= FALLBACK_CELLS, "{cells}");
+        let mut seqs = vec![first];
+        for _ in 1..plan.seqs {
+            seqs.push(model.new_seq().expect("a planned session"));
+        }
+        model.reserve_window(plan.seqs).expect("the window rows");
+        let refs: Vec<&BoltSeq> = seqs.iter().collect();
+        let tokens = vec![2u32; plan.seqs];
+        let positions = vec![cells - 1; plan.seqs];
+        let rows = model
+            .decode_rows(&refs, &tokens, &positions)
+            .expect("every session decodes at the last cell");
+        assert_eq!(rows.len(), plan.seqs);
+        assert!(rows.iter().all(|row| row.len() == VOCAB));
+    }
+
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
     #[test]
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
