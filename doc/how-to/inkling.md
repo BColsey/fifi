@@ -39,7 +39,7 @@ FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
 | Mainline `inkling2_loop` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
 | Repository-root `inkling2` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
 
-Both GGUF artifacts returned the reference three-token continuation with temperature zero under the 6 GiB ceiling. The table covers text. Vision and DSpark have separate qualification.
+At `71aa350c`, `enginesrv check` accepted both real GGUF files and the publisher safetensors under the 6 GiB ceiling. Both GGUF artifacts returned the reference three-token continuation with temperature zero in the earlier `8a6c6347` HTTP runs. The table covers text. Vision and DSpark have separate qualification.
 
 ## Check the serving contract
 
