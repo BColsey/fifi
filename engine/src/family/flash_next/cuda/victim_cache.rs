@@ -117,16 +117,24 @@ impl VictimIndex {
         Some(self.entries.remove(index)?.1)
     }
 
-    pub(super) fn insert(&mut self, key: Key) -> usize {
-        let slot = self.take(key).unwrap_or_else(|| {
-            if self.entries.len() == self.capacity {
+    /// The slot a victim record is saved in. Fails when every spare slot is loaned to a hit
+    /// upload, which only a step with more distinct misses than the layout's reserve can do.
+    pub(super) fn insert(&mut self, key: Key) -> Result<usize, EngError> {
+        let slot = match self.take(key) {
+            Some(slot) => slot,
+            None if self.entries.len() == self.capacity => {
                 self.entries.pop_front().expect("nonempty victim cache").1
-            } else {
-                self.free.pop().expect("spare slots cover hit uploads")
             }
-        });
+            None => self.free.pop().ok_or_else(|| {
+                EngError::BadRequest(
+                    "the Flash-Next victim cache has no spare slot: a decode step carried more \
+                     distinct misses than the cache reserves for hit uploads"
+                        .into(),
+                )
+            })?,
+        };
         self.entries.push_back((key, slot));
-        slot
+        Ok(slot)
     }
 
     pub(super) fn release(&mut self, slot: usize) {
@@ -170,21 +178,41 @@ mod tests {
         assert_eq!(layout.bytes(), 4096);
         assert_eq!(layout.resident_records(), 2);
         let mut cache = VictimIndex::new(&layout);
-        let first = cache.insert(key(0, 4));
-        let second = cache.insert(key(1, 4));
+        let first = cache.insert(key(0, 4)).unwrap();
+        let second = cache.insert(key(1, 4)).unwrap();
         assert_eq!(cache.take(key(0, 4)), Some(first));
         assert_eq!(cache.take(key(1, 4)), Some(second));
-        let third = cache.insert(key(0, 8));
-        let fourth = cache.insert(key(1, 8));
+        let third = cache.insert(key(0, 8)).unwrap();
+        let fourth = cache.insert(key(1, 8)).unwrap();
         assert!(![first, second].contains(&third));
         assert!(![first, second, third].contains(&fourth));
         cache.release(first);
         cache.release(second);
         assert_eq!(cache.take(key(0, 4)), None);
-        assert_eq!(cache.insert(key(2, 4)), third, "evict the oldest victim");
+        assert_eq!(
+            cache.insert(key(2, 4)).unwrap(),
+            third,
+            "evict the oldest victim"
+        );
         assert_eq!(cache.take(key(1, 8)), Some(fourth));
         cache.clear();
         assert_eq!(cache.take(key(2, 4)), None);
-        assert_eq!(cache.insert(key(0, 4)), first);
+        assert_eq!(cache.insert(key(0, 4)).unwrap(), first);
+    }
+
+    #[test]
+    fn more_hit_loans_than_the_reserve_is_an_error_not_a_panic() {
+        let layout = VictimLayout::new(4096, 1, 1024).unwrap();
+        let mut cache = VictimIndex::new(&layout);
+        for expert in 0..3 {
+            cache.insert(key(0, expert)).unwrap();
+        }
+        // Two hits are loaned out and the reserve is one slot: entries 1 and 2 of 4 slots.
+        assert!(cache.take(key(0, 0)).is_some());
+        assert!(cache.take(key(0, 1)).is_some());
+        cache.insert(key(1, 0)).unwrap();
+        cache.insert(key(1, 1)).unwrap();
+        let error = cache.insert(key(1, 2)).unwrap_err().describe();
+        assert!(error.contains("no spare slot"), "{error}");
     }
 }

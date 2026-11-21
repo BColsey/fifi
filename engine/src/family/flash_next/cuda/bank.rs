@@ -1251,7 +1251,7 @@ pub(super) mod device {
                 {
                     continue;
                 }
-                let cached = cache.index.insert(key);
+                let cached = cache.index.insert(key)?;
                 ctx.copy_to_pinned(
                     &self.stream,
                     bank.range(slot * record, record)?,
