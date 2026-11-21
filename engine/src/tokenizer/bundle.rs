@@ -36,6 +36,15 @@ pub struct PromptBoundaries {
     pub root: Option<usize>,
 }
 
+/// The bytes of the four tokenizer files. `generation_config_json` is optional: the
+/// end-of-sequence ids then come from `tokenizer_config_json` alone.
+pub struct TokenizerParts {
+    pub tokenizer_json: Vec<u8>,
+    pub tokenizer_config_json: Vec<u8>,
+    pub chat_template: Vec<u8>,
+    pub generation_config_json: Option<Vec<u8>>,
+}
+
 pub struct TokenizerBundle {
     identity: TokenizerIdentity,
     tokenizer: Tokenizer,
@@ -423,37 +432,63 @@ impl TokenizerBundle {
             pin.generation_config_json,
             &mut notes,
         )?;
-        let generation = match &generation_bytes {
+        if generation_bytes.is_none() {
+            notes.push(
+                "tokenizer: generation_config.json is missing; the end-of-sequence ids come \
+                 from tokenizer_config.json alone"
+                    .to_string(),
+            );
+        }
+        Self::from_parts(
+            TokenizerParts {
+                tokenizer_json: tokenizer_bytes,
+                tokenizer_config_json: config_bytes,
+                chat_template: template_bytes,
+                generation_config_json: generation_bytes,
+            },
+            Some(pin.vocab_size),
+            notes,
+        )
+    }
+
+    /// Builds the bundle from the four files' bytes, wherever they came from: a directory
+    /// (`load`) or a model file that carries its own tokenizer. `pinned_vocab` is the vocabulary
+    /// size a pin names; a different observed size adds a note. `notes` are the warning lines
+    /// the caller collected; they print with the bundle's own and stay readable through
+    /// `load_notes`.
+    pub fn from_parts(
+        parts: TokenizerParts,
+        pinned_vocab: Option<u32>,
+        mut notes: Vec<String>,
+    ) -> Result<Self, EngError> {
+        let config = parse_json(&parts.tokenizer_config_json, "tokenizer_config.json")?;
+        let generation = match &parts.generation_config_json {
             Some(bytes) => parse_json(bytes, "generation_config.json")?,
-            None => {
-                notes.push(
-                    "tokenizer: generation_config.json is missing; the end-of-sequence ids come \
-                     from tokenizer_config.json alone"
-                        .to_string(),
-                );
-                serde_json::Value::Object(serde_json::Map::new())
-            }
+            None => serde_json::Value::Object(serde_json::Map::new()),
         };
-        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)?;
+        let tokenizer = Tokenizer::from_bytes(&parts.tokenizer_json)?;
         let vocab_size = tokenizer.vocab_size();
-        if vocab_size != pin.vocab_size {
+        if let Some(pinned) = pinned_vocab
+            && vocab_size != pinned
+        {
             notes.push(format!(
-                "tokenizer: vocab size {vocab_size} differs from the pinned {}; serving the \
-                 observed vocabulary, which the engine checks against the model's own head size",
-                pin.vocab_size
+                "tokenizer: vocab size {vocab_size} differs from the pinned {pinned}; serving the \
+                 observed vocabulary, which the engine checks against the model's own head size"
             ));
         }
         let eos_token_ids = eos_lookup(&config, &generation, &tokenizer)?;
-        let template = parse_template(&template_bytes)?;
+        let template = parse_template(&parts.chat_template)?;
         for note in &notes {
             eprintln!("{note}");
         }
         Ok(Self {
             identity: TokenizerIdentity {
-                tokenizer_json: digest(&tokenizer_bytes),
-                tokenizer_config_json: digest(&config_bytes),
-                chat_template_jinja: digest(&template_bytes),
-                generation_config_json: digest(generation_bytes.as_deref().unwrap_or(&[])),
+                tokenizer_json: digest(&parts.tokenizer_json),
+                tokenizer_config_json: digest(&parts.tokenizer_config_json),
+                chat_template_jinja: digest(&parts.chat_template),
+                generation_config_json: digest(
+                    parts.generation_config_json.as_deref().unwrap_or(&[]),
+                ),
             },
             tokenizer,
             eos_token_ids,

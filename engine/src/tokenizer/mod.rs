@@ -4,6 +4,7 @@ mod bundle;
 mod decode;
 mod encode;
 pub mod gemma;
+pub(crate) mod gguf;
 pub mod nemotron;
 mod output;
 mod pyjson;
@@ -13,7 +14,8 @@ mod template;
 pub mod toolcall;
 
 pub use bundle::{
-    PromptBoundaries, TokenizerBundle, TokenizerIdentity, TokenizerPin, WarmTurnCache,
+    PromptBoundaries, TokenizerBundle, TokenizerIdentity, TokenizerParts, TokenizerPin,
+    WarmTurnCache,
 };
 pub use decode::IncrementalDecoder;
 pub use encode::Tokenizer;
