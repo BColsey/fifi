@@ -103,12 +103,6 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
     }
 }
 
-/// True for the quantized types a native upload can place: the one table every loader checks
-/// against, so a type gains a loader arm by gaining a block geometry above.
-pub(crate) const fn is_native_type(ty: GgufType) -> bool {
-    native_block(ty).is_some()
-}
-
 /// Device bytes of the tensor `name` after a native upload: the file's own
 /// blocks, row-major, exactly the source bytes. Q4_K, Q5_0, Q6_K, Q8_0, Q5_K and Q4_0. There is no
 /// 8-row rule and no tile-column rule: any row count from one up loads, and `dims[0]` must be
@@ -362,6 +356,25 @@ pub(crate) fn admit(demand: &Demand, free: u64) -> Result<u64, EngError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan's block table and the format layer's list of natively served types are one set,
+    /// with the geometry of the format.
+    #[test]
+    fn the_native_block_table_matches_the_types_the_format_layer_lists() {
+        for id in 0..=64 {
+            let Ok(ty) = GgufType::from_id(id) else {
+                continue;
+            };
+            assert_eq!(native_block(ty).is_some(), ty.has_native_kernel(), "{ty:?}");
+            if let Some((values, bytes)) = native_block(ty) {
+                assert_eq!(
+                    (values, bytes),
+                    (ty.block_elems(), ty.block_bytes()),
+                    "{ty:?}"
+                );
+            }
+        }
+    }
 
     const DEMAND: Demand = Demand {
         tensors: 600,

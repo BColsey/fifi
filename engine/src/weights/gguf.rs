@@ -191,6 +191,32 @@ impl GgufType {
         }
     }
 
+    /// True for the quantized types the native CUDA kernels read as stored blocks (decode matvec,
+    /// expert matvec and dequantizing or vendored prefill GEMM). The one list every loader and
+    /// planner checks; `kernels::cuda::plan` pins its block geometry to it.
+    pub const fn has_native_kernel(self) -> bool {
+        matches!(
+            self,
+            Self::Q4K
+                | Self::Q6K
+                | Self::Q80
+                | Self::Q50
+                | Self::Q5K
+                | Self::Q40
+                | Self::Iq4Nl
+                | Self::Q20
+                | Self::Iq2Xxs
+                | Self::Iq2Xs
+                | Self::Iq2S
+                | Self::Iq3Xxs
+                | Self::Iq3S
+                | Self::Iq4Xs
+                | Self::Q2K
+                | Self::Iq1S
+                | Self::Iq1M
+        )
+    }
+
     /// Weights per block. A row length must be a multiple of this value.
     pub fn block_elems(self) -> u64 {
         match self {
