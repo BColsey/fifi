@@ -948,7 +948,15 @@ impl Q36Executor {
                     retained,
                 )?
                 .max(settings.prefill_reserve);
-                device.remaining("Qwen MLX pre-import", &[("session_reserve_bytes", reserve)])?;
+                device
+                    .remaining("Qwen MLX pre-import", &[("session_reserve_bytes", reserve)])
+                    .map_err(|error| {
+                        with_fit_hint(
+                            error,
+                            spec.feed_forward.is_none(),
+                            placement_disk(placement),
+                        )
+                    })?;
                 Ok::<_, EngError>(ExpertDevicePlan {
                     device,
                     reserve,
@@ -959,18 +967,14 @@ impl Q36Executor {
         let ckpt = open_checkpoint(artifact)?;
         let disk_experts = placement.is_some_and(|(_, _, disk_experts)| disk_experts);
         if let Some(plan) = plan {
-            use crate::family::keys::{KeyClass, KeyRole, classify};
-            plan.device.check_packed_payload_floor(
-                "Qwen MLX pre-import",
-                &ckpt,
-                plan.reserve,
-                |key| match classify(key, spec) {
-                    Ok((KeyClass::EmbedTokens, _)) => false,
-                    Ok((KeyClass::ExpertStack { .. }, KeyRole::Packed)) => !disk_experts,
-                    Ok((_, KeyRole::Packed)) => true,
-                    _ => false,
-                },
-            )?;
+            plan.device
+                .check_packed_payload_floor(
+                    "Qwen MLX pre-import",
+                    &ckpt,
+                    plan.reserve,
+                    resident_packed_payload(spec, disk_experts),
+                )
+                .map_err(|error| with_fit_hint(error, spec.feed_forward.is_none(), disk_experts))?;
         }
         let host = HostWeights::load(&ckpt, spec, &config)?;
         let mut kernels = MlxKernels::try_new()?;
@@ -1276,6 +1280,37 @@ impl Q36Executor {
     fn force_chunk(&mut self, chunk: Option<u32>) {
         self.apply_chunk(chunk).unwrap();
     }
+}
+
+/// The checkpoint keys whose packed payload stays in memory for a placement: every packed
+/// weight except the embedding table, and except the routed expert stacks when they stream.
+fn resident_packed_payload(spec: &FamilySpec, disk_experts: bool) -> impl Fn(&str) -> bool + '_ {
+    use crate::family::keys::{KeyClass, KeyRole, classify};
+    move |key| match classify(key, spec) {
+        Ok((KeyClass::EmbedTokens, _)) => false,
+        Ok((KeyClass::ExpertStack { .. }, KeyRole::Packed)) => !disk_experts,
+        Ok((_, KeyRole::Packed)) => true,
+        _ => false,
+    }
+}
+
+fn placement_disk(placement: Option<(DeviceBudget, &Q36Settings, bool)>) -> bool {
+    placement.is_some_and(|(_, _, disk_experts)| disk_experts)
+}
+
+/// Appends what would make an early memory refusal fit: streaming the routed experts when the
+/// model has them and they are resident, and a smaller context or sequence count, which the
+/// session reserve depends on.
+fn with_fit_hint(error: EngError, has_experts: bool, disk_experts: bool) -> EngError {
+    let EngError::MemoryPlan(message) = error else {
+        return error;
+    };
+    let mut options = Vec::new();
+    if has_experts && !disk_experts {
+        options.push("set FIFI_Q36_MLX_DISK_EXPERTS=1 to read the routed experts from disk");
+    }
+    options.push("lower context_limit or max_seqs, which the session reserve depends on");
+    EngError::MemoryPlan(format!("{message}; to fit: {}", options.join("; or ")))
 }
 
 fn device_reserve(
@@ -3133,6 +3168,55 @@ mod tests {
         }
     }
 
+    /// Proposes the oracle chain with only its first `right` tokens of each window correct, so a
+    /// window accepts some drafts and then rejects. `partial` counts the windows that did both.
+    struct Partial {
+        want: Vec<u32>,
+        right: usize,
+        skip: usize,
+        proposed: usize,
+        partial: usize,
+    }
+
+    impl Drafter for Partial {
+        fn propose(
+            &mut self,
+            history: &[u32],
+            room: usize,
+        ) -> std::result::Result<Proposal, crate::EngError> {
+            let start = history.len().saturating_sub(self.skip).min(self.want.len());
+            let take = room.min(self.want.len() - start);
+            let tokens: Vec<u32> = self.want[start..start + take]
+                .iter()
+                .enumerate()
+                .map(|(i, &token)| {
+                    if i < self.right {
+                        token
+                    } else {
+                        (token + 1) % VOCAB as u32
+                    }
+                })
+                .collect();
+            self.proposed = tokens.len();
+            Ok(Proposal {
+                tokens,
+                scores: Vec::new(),
+            })
+        }
+
+        fn observe(
+            &mut self,
+            _window: &crate::family::speculate::window::Window,
+            accepted: &crate::family::speculate::accept::Accepted,
+        ) -> std::result::Result<(), crate::EngError> {
+            let drafts = accepted.drafts_accepted();
+            if drafts > 0 && drafts < self.proposed {
+                self.partial += 1;
+            }
+            Ok(())
+        }
+    }
+
     /// The tiny GQA fixture as files, with the byte sizes that place its routed experts: the
     /// base weights, one token's expert stage, and every expert page.
     fn file_backed(activation: Activation) -> (&'static StreamedCheckpoint, u64, u64, u64) {
@@ -3188,6 +3272,126 @@ mod tests {
                 max_seqs: 1,
             }),
         )
+    }
+
+    /// The pre-import packed-payload floor is a lower bound of what an import keeps: for each
+    /// placement the floor read from the headers is at most the bytes of the imported weights.
+    #[test]
+    fn the_preimport_floor_never_exceeds_the_imported_weights() {
+        use crate::family::mlx_budget::packed_payload_floor;
+        let _serial = crate::native_test_lock();
+        for activation in [Activation::F32, Activation::Bf16] {
+            let (ckpt, base, stage, full) = file_backed(activation);
+            let rules = || Q36Rules {
+                activation,
+                ..chunk_rules()
+            };
+            let resident_floor =
+                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, false)).unwrap();
+            let disk_floor =
+                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, true)).unwrap();
+            let (resident, _) = place_experts(ckpt, rules(), base + full).unwrap();
+            let (disk, _) = place_experts(ckpt, rules(), base + stage).unwrap();
+            assert!(!resident.decoder.weights.streams_experts());
+            assert!(disk.decoder.weights.streams_experts());
+            let (imported, imported_disk) = (
+                resident.decoder.weights.byte_len().unwrap(),
+                disk.decoder.weights.byte_len().unwrap(),
+            );
+            assert!(0 < disk_floor && disk_floor < resident_floor);
+            assert!(resident_floor <= imported, "{resident_floor} > {imported}");
+            assert!(
+                disk_floor <= imported_disk,
+                "{disk_floor} > {imported_disk}"
+            );
+        }
+        let dense_ckpt: &'static StreamedCheckpoint =
+            Box::leak(Box::new(tiny::checkpoint(&tiny::TINY_DENSE)));
+        let dense_floor = packed_payload_floor(
+            dense_ckpt,
+            resident_packed_payload(&tiny::TINY_DENSE, false),
+        )
+        .unwrap();
+        let host = HostWeights::load(
+            dense_ckpt,
+            &tiny::TINY_DENSE,
+            &tiny::config(&tiny::TINY_DENSE),
+        )
+        .unwrap();
+        let (dense, _) = Q36Executor::from_parts(
+            MlxKernels::try_new().unwrap(),
+            dense_ckpt,
+            host,
+            chunk_rules(),
+        )
+        .unwrap();
+        let imported = dense.decoder.weights.byte_len().unwrap();
+        assert!(0 < dense_floor && dense_floor <= imported);
+    }
+
+    /// An early refusal names what would make the start fit: streaming the routed experts when
+    /// the model has them and they are resident, and a smaller context or sequence count.
+    #[test]
+    fn the_early_refusal_names_what_would_make_it_fit() {
+        let full = |error| match error {
+            EngError::MemoryPlan(message) => message,
+            other => panic!("{other:?}"),
+        };
+        let moe_resident = full(with_fit_hint(
+            EngError::MemoryPlan("over".into()),
+            true,
+            false,
+        ));
+        assert!(moe_resident.starts_with("over; to fit: "));
+        assert!(moe_resident.contains("FIFI_Q36_MLX_DISK_EXPERTS=1"));
+        assert!(moe_resident.contains("context_limit") && moe_resident.contains("max_seqs"));
+        for (experts, disk) in [(true, true), (false, false)] {
+            let text = full(with_fit_hint(
+                EngError::MemoryPlan("over".into()),
+                experts,
+                disk,
+            ));
+            assert!(
+                !text.contains("FIFI_Q36_MLX_DISK_EXPERTS"),
+                "{experts} {disk}"
+            );
+            assert!(text.contains("context_limit"));
+        }
+        let other = with_fit_hint(EngError::BadRequest("x".into()), true, false);
+        assert!(matches!(other, EngError::BadRequest(_)));
+    }
+
+    /// The refusal of a real start carries the hint.
+    #[test]
+    fn a_start_that_does_not_fit_says_how_to_make_it_fit() {
+        use crate::family::qwen36::fixtures::checkpoint_files;
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (index, shard) = checkpoint_files(tiny::entries(&TINY_GQA));
+        for (name, bytes) in [
+            ("config.json", tiny::config(&TINY_GQA)),
+            ("model.safetensors.index.json", index),
+            ("m.safetensors", shard),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let mut settings = serving(Q36Options::default());
+        settings.artifact = dir.path().to_path_buf();
+        settings.spec = TINY_GQA;
+        settings.prefill_reserve = 0;
+        let refused = Q36Executor::open_for_device(
+            &settings,
+            Q36Rules {
+                session_cap: 16 << 20,
+                ..chunk_rules()
+            },
+            DeviceBudget::new(1).unwrap(),
+            false,
+        );
+        assert!(matches!(refused, Err(EngError::MemoryPlan(m))
+            if m.contains("Qwen MLX pre-import")
+            && m.contains("FIFI_Q36_MLX_DISK_EXPERTS=1")
+            && m.contains("context_limit")));
     }
 
     /// With the resident decoder forced to host routing, the disk-staged logits are compared with
@@ -3293,6 +3497,39 @@ mod tests {
                 );
                 assert!(speculator.drafter.windows > 0, "the window path must run");
             }
+            // Some drafts accepted, then one rejected: the window commits the accepted rows
+            // and rolls the rest back.
+            let (mut executor, mut session) = place_experts(ckpt, limits(), base + stage).unwrap();
+            executor.prefill(&mut session, &prompt).unwrap();
+            let mut job = seeded_generation(count);
+            let mut speculator = Speculator::new(
+                Partial {
+                    want: plain.clone(),
+                    right: 2,
+                    skip: prompt.len(),
+                    proposed: 0,
+                    partial: 0,
+                },
+                4,
+            );
+            let mut batches = Vec::new();
+            for _ in 0..100 {
+                let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+                let done = batch.finish.is_some();
+                batches.push(batch);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(
+                tokens_of(&batches),
+                plain,
+                "compile {compile}, partial acceptance"
+            );
+            assert!(
+                speculator.drafter.partial > 0,
+                "a window must accept some drafts and then reject one"
+            );
         }
     }
 
@@ -3324,6 +3561,15 @@ mod tests {
             result,
             Err(EngError::MemoryPlan(message))
                 if message.contains("max_seqs") && message.contains("FIFI_MLX_WORKING_SET_MIB")
+        ));
+        // One byte short of a single token's stage names the context limit as well.
+        let short = place_experts(ckpt, chunk_rules(), base + stage - 1);
+        assert!(matches!(
+            short,
+            Err(EngError::MemoryPlan(message))
+                if message.contains("stage one token")
+                && message.contains("context_limit")
+                && message.contains("FIFI_MLX_WORKING_SET_MIB")
         ));
     }
 

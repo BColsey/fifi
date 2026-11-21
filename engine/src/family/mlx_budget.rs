@@ -69,15 +69,9 @@ impl DeviceBudget {
         reserve: u64,
         is_resident: impl Fn(&str) -> bool,
     ) -> Result<(), EngError> {
-        let weights = ckpt
-            .names()
-            .filter(|key| key.ends_with(".weight") && is_resident(key))
-            .try_fold(0u64, |total, key| {
-                total.checked_add(ckpt.stored_byte_len(key)?)
-            })
-            .ok_or_else(|| {
-                EngError::MemoryPlan(format!("{family} packed payload bytes overflow"))
-            })?;
+        let weights = packed_payload_floor(ckpt, is_resident).ok_or_else(|| {
+            EngError::MemoryPlan(format!("{family} packed payload bytes overflow"))
+        })?;
         self.remaining(
             family,
             &[
@@ -154,6 +148,20 @@ pub(crate) fn configured_ceiling() -> Result<Option<u64>, EngError> {
         .as_deref()
         .map(parse_ceiling)
         .transpose()
+}
+
+/// The packed `.weight` payload bytes that `is_resident` keeps in memory, read from the
+/// checkpoint headers alone; `None` on overflow.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn packed_payload_floor(
+    ckpt: &crate::weights::StreamedCheckpoint,
+    is_resident: impl Fn(&str) -> bool,
+) -> Option<u64> {
+    ckpt.names()
+        .filter(|key| key.ends_with(".weight") && is_resident(key))
+        .try_fold(0u64, |total, key| {
+            total.checked_add(ckpt.stored_byte_len(key)?)
+        })
 }
 
 #[cfg(test)]

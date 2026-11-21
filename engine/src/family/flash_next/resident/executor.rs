@@ -740,6 +740,37 @@ mod tests {
         let (_executor, _session) = build(4 << 30).unwrap();
     }
 
+    /// The pre-import estimates are bounds of the real load: the packed-payload floor read from
+    /// the headers is at most the bytes of the imported weights, and the full-context session
+    /// state that the pre-import reserve prices equals the zero state plus the growth of every
+    /// context position, which is what `configure_prefill` charges.
+    #[test]
+    fn the_preimport_estimates_match_the_imported_fixture() {
+        use crate::family::mlx_budget::packed_payload_floor;
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (index, shard) = fixtures::checkpoint_files(Embedding::Flat);
+        std::fs::write(dir.path().join("config.json"), fixtures::config()).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index).unwrap();
+        std::fs::write(dir.path().join("m.safetensors"), shard).unwrap();
+        let (shape, kinds) = model_shape(&fixtures::config()).unwrap();
+        let ckpt = open_checkpoint(dir.path()).unwrap();
+        let floor = packed_payload_floor(&ckpt, |key| {
+            resident_packed_payload(key, &kinds, shape.ple_layer)
+        })
+        .unwrap();
+        let (executor, session) =
+            FlashExecutor::open(dir.path(), 1024, rules(vec![], VOCAB)).unwrap();
+        let imported = executor.decoder.weights.byte_len().unwrap();
+        assert!(0 < floor && floor <= imported, "{floor} > {imported}");
+        let priced =
+            super::super::state::state_bytes_at_context(&shape, &kinds, MAX_POSITIONS).unwrap();
+        let charged = session.state.byte_len().unwrap()
+            + super::super::state::chunk_growth_bytes(&executor.decoder.weights, MAX_POSITIONS)
+                .unwrap();
+        assert_eq!(priced, charged);
+    }
+
     /// The tokens that a `Record` chain draws from `sampler`: a path that shares no code with the
     /// executor's `Logits` step. The decoder and its state drop before the caller builds an executor.
     fn oracle(prompt: &[u32], count: usize, sampler: &mut Sampler, limit: usize) -> Vec<u32> {
