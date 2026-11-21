@@ -908,7 +908,7 @@ impl Q36Executor {
         rules: Q36Rules,
         spec: &FamilySpec,
     ) -> Result<(Self, Q36Session)> {
-        Self::open_with_placement(artifact, cache_limit, rules, spec, None)
+        Self::open_with_placement(artifact, cache_limit, rules, spec, None, false)
     }
 
     pub(crate) fn open_for_device(
@@ -924,6 +924,9 @@ impl Q36Executor {
             rules,
             &settings.spec,
             Some((device, settings, disk_experts, force_stream)),
+            settings.spec.feed_forward.is_some()
+                && std::env::var_os("FIFI_Q36_MLX_DISK_DENSE_FFN")
+                    .is_some_and(|value| value == "1"),
         )
     }
 
@@ -933,6 +936,7 @@ impl Q36Executor {
         rules: Q36Rules,
         spec: &FamilySpec,
         placement: Option<(DeviceBudget, &Q36Settings, bool, bool)>,
+        stage_dense_ffn: bool,
     ) -> Result<(Self, Q36Session)> {
         let config = std::fs::read(artifact.join("config.json"))
             .map_err(|error| io_error("config.json", &error))?;
@@ -978,7 +982,7 @@ impl Q36Executor {
                     "Qwen MLX pre-import",
                     &ckpt,
                     plan.reserve,
-                    resident_packed_payload(spec, disk_experts),
+                    resident_packed_payload(spec, disk_experts, stage_dense_ffn),
                 )
                 .map_err(|error| {
                     with_fit_hint(
@@ -988,11 +992,34 @@ impl Q36Executor {
                     )
                 })?;
         }
-        let host = HostWeights::load(&ckpt, spec, &config)?;
+        let host = HostWeights::load_with_dense_staging(&ckpt, spec, &config, stage_dense_ffn)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.set_cache_limit(cache_limit)?;
         let ckpt = Box::leak(Box::new(ckpt));
-        Self::from_parts_with_placement(kernels, ckpt, host, rules, plan.filter(|_| disk_experts))
+        let (executor, session) = Self::from_parts_with_placement(
+            kernels,
+            ckpt,
+            host,
+            rules,
+            plan.filter(|_| disk_experts),
+        )?;
+        if let Some(plan) = plan.filter(|_| stage_dense_ffn) {
+            plan.device.remaining(
+                "Qwen dense FFN staging",
+                &[
+                    (
+                        "resident_weights_bytes",
+                        executor.decoder.weights.byte_len()?,
+                    ),
+                    ("session_reserve_bytes", plan.reserve),
+                    (
+                        "dense_ffn_stage_bytes",
+                        executor.decoder.weights.dense_stage_bytes()?,
+                    ),
+                ],
+            )?;
+        }
+        Ok((executor, session))
     }
 
     /// Builds the executor from loaded parts. The rules are checked again before the import, so a
@@ -1190,9 +1217,22 @@ impl Q36Executor {
         // not know still plans no chunk.
         let chunk = if chunked_prefill_allowed(self.decoder.weights.consts.act) {
             let cost = self.prefill_cost()?;
-            if self.decoder.weights.streams_experts() {
+            let dense_stage = self.decoder.weights.dense_stage_bytes()?;
+            if self.decoder.weights.streams_experts() || dense_stage != 0 {
+                if dense_stage > terms.remaining() {
+                    return Err(EngError::MemoryPlan(format!(
+                        "Qwen dense FFN staging needs {dense_stage} bytes with {} left after resident weights and session reserve",
+                        terms.remaining(),
+                    )));
+                }
                 crate::family::prefill::mlx::admitted_chunk(max_rows, terms.remaining(), |rows| {
-                    self.chunk_charge(&cost, rows)
+                    self.chunk_charge(&cost, rows)?
+                        .checked_add(dense_stage)
+                        .ok_or_else(|| {
+                            EngError::MemoryPlan(
+                                "Qwen MLX prefill plus weight stage overflows".into(),
+                            )
+                        })
                 })?
             } else {
                 admitted_chunk(&cost, terms.remaining(), max_rows)?
@@ -1253,7 +1293,13 @@ impl Q36Executor {
         device: Option<DeviceBudget>,
     ) -> Result<()> {
         use crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS;
-        let (placement, placement_reason) = if self.decoder.weights.streams_experts() {
+        let dense_stage = self.decoder.weights.dense_stage_bytes()?;
+        let (placement, placement_reason) = if dense_stage != 0 {
+            (
+                "disk_dense_ffn",
+                "dense feed-forward weights stage one layer at a time",
+            )
+        } else if self.decoder.weights.streams_experts() {
             ("disk_experts", "full expert banks exceed the device budget")
         } else {
             ("resident", "model weights are imported at startup")
@@ -1267,6 +1313,9 @@ impl Q36Executor {
                 let mut workspace = std::collections::BTreeMap::new();
                 if staged != 0 {
                     workspace.insert("expert_staging_bytes", staged);
+                }
+                if dense_stage != 0 {
+                    workspace.insert("dense_ffn_stage_bytes", dense_stage);
                 }
                 Ok::<_, EngError>(MlxPrefillMemory {
                     prefill_budget_bytes: plan.terms.budget,
@@ -1324,11 +1373,16 @@ impl Q36Executor {
 
 /// The checkpoint keys whose packed payload stays in memory for a placement: every packed
 /// weight except the embedding table, and except the routed expert stacks when they stream.
-fn resident_packed_payload(spec: &FamilySpec, disk_experts: bool) -> impl Fn(&str) -> bool + '_ {
+fn resident_packed_payload(
+    spec: &FamilySpec,
+    disk_experts: bool,
+    stage_dense_ffn: bool,
+) -> impl Fn(&str) -> bool + '_ {
     use crate::family::keys::{KeyClass, KeyRole, classify};
     move |key| match classify(key, spec) {
         Ok((KeyClass::EmbedTokens, _)) => false,
         Ok((KeyClass::ExpertStack { .. }, KeyRole::Packed)) => !disk_experts,
+        Ok((KeyClass::DenseMlp { .. }, KeyRole::Packed)) => !stage_dense_ffn,
         Ok((_, KeyRole::Packed)) => true,
         _ => false,
     }
@@ -3101,6 +3155,143 @@ mod tests {
     }
 
     #[test]
+    fn capped_dense_qwen_stages_one_file_backed_ffn_at_a_time() {
+        use crate::family::qwen36::fixtures::checkpoint_files;
+        let _serial = crate::native_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let spec = &FamilySpec {
+            head_dim: 64,
+            ..tiny::TINY_DENSE
+        };
+        let config = tiny::config(spec);
+        let entries = tiny::entries(spec);
+        #[cfg(feature = "native-fault-qualification")]
+        let ffn_file_bytes: u64 = entries
+            .iter()
+            .filter(|(key, _, _, _)| key.contains(".layers.0.mlp."))
+            .map(|(_, _, _, payload)| payload.len() as u64)
+            .sum();
+        let (index, shard) = checkpoint_files(entries);
+        for (file, content) in [
+            ("config.json", config.clone()),
+            ("model.safetensors.index.json", index),
+            ("m.safetensors", shard),
+        ] {
+            std::fs::write(dir.path().join(file), content).unwrap();
+        }
+        let mut settings = serving(Q36Options::default());
+        settings.spec = *spec;
+        settings.artifact = dir.path().to_path_buf();
+        settings.cache_limit = 0;
+        settings.prefill_reserve = 0;
+        let shape = shape_of(&config, spec).unwrap();
+        for (activation, kv_dtype) in [
+            (Activation::F32, KvDtype::F32),
+            (Activation::Bf16, KvDtype::F32),
+            (Activation::Bf16, KvDtype::Bf16),
+            (Activation::Bf16, KvDtype::Q8),
+        ] {
+            let rules = || Q36Rules {
+                activation,
+                kv_dtype,
+                session_cap: 16 << 20,
+                ..chunk_rules()
+            };
+            let reserve = device_reserve(
+                &shape,
+                activation,
+                rules().kv_dtype,
+                rules().context_limit as usize,
+                0,
+                None,
+            )
+            .unwrap();
+            let open = |bytes, staged| {
+                Q36Executor::open_with_placement(
+                    &settings.artifact,
+                    0,
+                    rules(),
+                    spec,
+                    Some((DeviceBudget::new(bytes).unwrap(), &settings, false, false)),
+                    staged,
+                )
+            };
+            let (probe, probe_session) = open(4 << 30, true).unwrap();
+            let resident_bytes = probe.decoder.weights.byte_len().unwrap();
+            let stage_bytes = probe.decoder.weights.dense_stage_bytes().unwrap();
+            assert!(stage_bytes > 0);
+            assert!(!probe.decoder.weights.streams_experts());
+            drop((probe_session, probe));
+            let minimum = resident_bytes + reserve + stage_bytes;
+            assert!(
+                matches!(open(minimum - 1, true), Err(EngError::MemoryPlan(message))
+                if message.contains("dense_ffn_stage_bytes"))
+            );
+            let (mut streamed, mut streamed_session) = open(minimum, true).unwrap();
+            let (mut resident, mut resident_session) = open(4 << 30, false).unwrap();
+            assert_eq!(resident.decoder.weights.dense_stage_bytes().unwrap(), 0);
+            assert!(resident.decoder.weights.byte_len().unwrap() > resident_bytes);
+            assert_eq!(
+                streamed.plan_prefill(minimum, reserve, 4).unwrap().chunk,
+                None
+            );
+            let workspace = streamed.prefill_cost().unwrap().workspace(4).unwrap();
+            assert_eq!(
+                streamed
+                    .plan_prefill(minimum + workspace - 1, reserve, 4)
+                    .unwrap()
+                    .chunk,
+                None
+            );
+            let plan = streamed
+                .plan_prefill(minimum + workspace, reserve, 4)
+                .unwrap();
+            assert_eq!(plan.chunk, Some(4));
+            streamed
+                .record_mlx_plan(4, Some(plan), Some(DeviceBudget::new(4 << 30).unwrap()))
+                .unwrap();
+            let plan = streamed.mlx_execution_plan().unwrap();
+            assert_eq!(plan.decisions[0].chosen, "disk_dense_ffn");
+            assert_eq!(
+                plan.memory.as_ref().unwrap().workspace["dense_ffn_stage_bytes"],
+                stage_bytes
+            );
+            resident.force_chunk(Some(4));
+            let prompt = cycle(10);
+            let reference = run_job(&mut resident, &mut resident_session, &prompt, 4);
+            #[cfg(feature = "native-fault-qualification")]
+            let (before, copies) = (
+                crate::family::stored::qualification_expert_reads(),
+                streamed.decoder.kernels.qualification_page_copies(),
+            );
+            let staged = run_job(&mut streamed, &mut streamed_session, &prompt, 4);
+            assert_eq!(
+                (staged.pending, staged.history, staged.pos),
+                (reference.pending, reference.history, reference.pos)
+            );
+            assert_eq!(staged.rows.len(), reference.rows.len());
+            for (actual, expected) in staged.rows.iter().zip(&reference.rows) {
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            #[cfg(feature = "native-fault-qualification")]
+            {
+                let after = crate::family::stored::qualification_expert_reads();
+                let reads = after.slice_reads - before.slice_reads;
+                let bytes = after.read_bytes - before.read_bytes;
+                assert!(reads >= 9 && reads % 9 == 0);
+                assert_eq!(bytes, (reads / 9) * ffn_file_bytes);
+                assert_eq!(streamed.decoder.kernels.qualification_page_copies(), copies);
+                println!(
+                    "{activation:?}/{kv_dtype:?} resident_bytes={resident_bytes} stage_bytes={stage_bytes} logical_ffn_bytes={bytes} ffn_slice_reads={reads}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn capped_qwen_streams_selected_experts_from_a_file_backed_checkpoint() {
         use super::super::ops::Bytes;
         use super::super::weights::ResidentWeights;
@@ -3374,9 +3565,11 @@ mod tests {
                 ..chunk_rules()
             };
             let resident_floor =
-                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, false)).unwrap();
+                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, false, false))
+                    .unwrap();
             let disk_floor =
-                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, true)).unwrap();
+                packed_payload_floor(ckpt, resident_packed_payload(&TINY_GQA, true, false))
+                    .unwrap();
             let (resident, _) = place_experts(ckpt, rules(), base + full).unwrap();
             let (disk, _) = place_experts(ckpt, rules(), base + stage).unwrap();
             assert!(!resident.decoder.weights.streams_experts());
@@ -3396,7 +3589,7 @@ mod tests {
             Box::leak(Box::new(tiny::checkpoint(&tiny::TINY_DENSE)));
         let dense_floor = packed_payload_floor(
             dense_ckpt,
-            resident_packed_payload(&tiny::TINY_DENSE, false),
+            resident_packed_payload(&tiny::TINY_DENSE, false, false),
         )
         .unwrap();
         let host = HostWeights::load(
@@ -3478,7 +3671,8 @@ mod tests {
             .unwrap();
             let ckpt = open_checkpoint(dir.path(), false).unwrap();
             let floor =
-                packed_payload_floor(&ckpt, resident_packed_payload(spec, disk_experts)).unwrap();
+                packed_payload_floor(&ckpt, resident_packed_payload(spec, disk_experts, false))
+                    .unwrap();
             let open = |bytes| {
                 Q36Executor::open_for_device(
                     &settings,

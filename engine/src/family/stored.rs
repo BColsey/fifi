@@ -272,6 +272,24 @@ pub(crate) fn sliced(
     })
 }
 
+/// Describe a rank-two packed matrix as contiguous single-row slices.
+pub(crate) fn sliced_matrix(
+    ckpt: &StreamedCheckpoint,
+    stem: &str,
+    spec: QuantizationSpec,
+    rows: u32,
+    cols: u32,
+) -> Result<SlicedWeight, EngError> {
+    let weight = sliced(ckpt, stem, spec, 1, cols)?;
+    if weight.slices != rows {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {stem}.weight has {} rows, expected {rows}",
+            weight.slices
+        )));
+    }
+    Ok(weight)
+}
+
 /// Reads one role of slice `index`, keeping a single row as rank 2.
 fn read_role(
     ckpt: &StreamedCheckpoint,
@@ -394,6 +412,21 @@ pub(crate) struct StackLayout {
 }
 
 impl StackLayout {
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn matrix(
+        ckpt: &StreamedCheckpoint,
+        weight: &SlicedWeight,
+        base: usize,
+        page: usize,
+    ) -> Result<Self, EngError> {
+        if weight.slice_rows != 1 {
+            return Err(EngError::Checkpoint(
+                "dense staging needs a packed matrix".into(),
+            ));
+        }
+        Self::new(ckpt, weight, weight.slices, base, page)
+    }
+
     /// The publisher stores expert payloads as U8. A page import can view the
     /// same byte ranges as U32 words without a repacking copy.
     #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -665,6 +698,40 @@ pub(crate) fn read_stack_runs_into(
     layout: &StackLayout,
 ) -> Result<(), EngError> {
     read_stack_to_pages::<true>(ckpt, weight, indices, dst, layout)
+}
+
+/// Read each role of a whole packed matrix once into its aligned destination.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn read_matrix_into(
+    ckpt: &StreamedCheckpoint,
+    weight: &SlicedWeight,
+    dst: &mut [u8],
+    layout: &StackLayout,
+) -> Result<(), EngError> {
+    if weight.slice_rows != 1 || layout.count != weight.slices || layout.end > dst.len() {
+        return Err(EngError::BadRequest(format!(
+            "invalid matrix staging for {}",
+            weight.stem
+        )));
+    }
+    for (role, range) in layout.roles() {
+        let target = range
+            .slice_len
+            .checked_mul(layout.count as usize)
+            .and_then(|len| range.offset.checked_add(len))
+            .and_then(|end| dst.get_mut(range.offset..end))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "matrix staging range for {}.{role} overflows",
+                    weight.stem
+                ))
+            })?;
+        let key = format!("{}.{role}", weight.stem);
+        counted_read(target.len(), || {
+            ckpt.read_slice_run_into(&key, 0, layout.count, target)
+        })?;
+    }
+    Ok(())
 }
 
 fn read_stack_to_pages<const COALESCE: bool>(

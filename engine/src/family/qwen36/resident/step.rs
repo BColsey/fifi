@@ -160,6 +160,9 @@ pub(super) fn run(
             (RFeedForward::Dense(w), _) => {
                 moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
             }
+            (RFeedForward::StagedDense(stage), _) => {
+                stage.evaluate(&mut ctx, ckpt, shape, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => {
                 let (out, (selection, probs)) = moe::step_with_checkpoint(
                     &mut ctx,
@@ -201,7 +204,7 @@ pub(super) fn run(
     let head_routing = if weights
         .layers
         .iter()
-        .all(|layer| matches!(&layer.feed_forward, RFeedForward::Dense(_)))
+        .all(|layer| layer.feed_forward.is_dense())
     {
         Routing::Host
     } else {

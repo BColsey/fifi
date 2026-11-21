@@ -251,6 +251,11 @@ pub(crate) fn q36_effective(
                     Origin::Default
                 },
             ));
+        } else {
+            rows.push(mlx_switch(
+                "mlx_disk_dense_ffn",
+                "FIFI_Q36_MLX_DISK_DENSE_FFN",
+            ));
         }
     }
     rows
