@@ -569,7 +569,7 @@ mod expert_counters {
 
 /// Runs one slice read of `bytes` bytes and, in qualification builds, counts it with its wall time.
 #[cfg(feature = "native-fault-qualification")]
-fn counted_read<T>(bytes: usize, read: impl FnOnce() -> T) -> T {
+pub(crate) fn counted_read<T>(bytes: usize, read: impl FnOnce() -> T) -> T {
     use expert_counters::{READ_BYTES, READ_NS, SLICE_READS, add, ns};
     let started = std::time::Instant::now();
     let out = read();

@@ -2,6 +2,7 @@
 
 use std::{sync::OnceLock, time::Instant};
 
+use super::weights::records::{LayerReads, layer_reads};
 use crate::{
     family::stored::{ExpertReadStats, qualification_expert_reads},
     kernels::MlxKernels,
@@ -21,6 +22,7 @@ pub(super) struct ForwardTiming {
     stats: ExpertReadStats,
     page_copies: u64,
     position: u32,
+    layer: LayerReads,
 }
 
 impl ForwardTiming {
@@ -30,12 +32,14 @@ impl ForwardTiming {
             stats: qualification_expert_reads(),
             page_copies: k.qualification_page_copies(),
             position,
+            layer: layer_reads(),
         })
     }
 
     pub(super) fn finish(self, k: &MlxKernels, rows: u32) {
         let forward_ns = self.started.elapsed().as_nanos() as u64;
         let end = qualification_expert_reads();
+        let layer = layer_reads();
         eprintln!(
             "{EVENT} {}",
             serde_json::json!({
@@ -48,6 +52,9 @@ impl ForwardTiming {
                 "page_imports": end.page_imports - self.stats.page_imports,
                 "import_ns": end.import_ns - self.stats.import_ns,
                 "page_copies": k.qualification_page_copies() - self.page_copies,
+                "layer24_read_ns": layer.read_ns - self.layer.read_ns,
+                "layer24_stages": layer.stages - self.layer.stages,
+                "layer24_record_stages": layer.record_stages - self.layer.record_stages,
             })
         );
     }

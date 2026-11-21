@@ -132,6 +132,39 @@ impl Read for AtOffset<'_> {
     }
 }
 
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn read_all_vectored(
+    reader: &mut dyn Read,
+    mut remaining: &mut [std::io::IoSliceMut<'_>],
+) -> std::io::Result<()> {
+    use std::io::{ErrorKind, IoSliceMut};
+    while !remaining.is_empty() {
+        match reader.read_vectored(remaining) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => IoSliceMut::advance_slices(&mut remaining, n),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+pub(crate) fn read_all_vectored_at(
+    file: &File,
+    offset: u64,
+    dst: &mut [IoSliceMut<'_>],
+) -> std::io::Result<()> {
+    read_all_vectored(&mut AtOffset { file, offset }, dst)
+}
+
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn positioned_reads() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -314,7 +347,6 @@ impl StreamedWeights {
         first: u32,
         dst: &mut [std::io::IoSliceMut<'_>],
     ) -> Result<(), EngError> {
-        use std::io::{ErrorKind, IoSliceMut};
         let count =
             u32::try_from(dst.len()).map_err(|_| read_failure(key, "too many destinations"))?;
         let bytes = dst
@@ -327,18 +359,7 @@ impl StreamedWeights {
             )));
         }
         let start = self.slice_run_start(key, first, count, bytes)?;
-        self.read_range_with(key, start, bytes, |reader| {
-            let mut remaining = dst;
-            while !remaining.is_empty() {
-                match reader.read_vectored(remaining) {
-                    Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
-                    Ok(n) => IoSliceMut::advance_slices(&mut remaining, n),
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        })
+        self.read_range_with(key, start, bytes, |reader| read_all_vectored(reader, dst))
     }
 
     /// The entry, data offset, and byte length of leading slice `index` of `key`.

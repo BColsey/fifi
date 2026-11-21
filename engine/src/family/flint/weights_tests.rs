@@ -92,7 +92,19 @@ fn tiny(logical: Vec<u32>, bits: u8) -> (FlintCheckpoint, Vec<u8>) {
     profile
         .packed
         .insert("model.embed_tokens".into(), (logical, bits));
-    (FlintCheckpoint { weights, profile }, payload)
+    (
+        FlintCheckpoint {
+            weights,
+            profile,
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            records: None,
+        },
+        payload,
+    )
 }
 
 #[test]
@@ -345,7 +357,16 @@ fn disk_experts_match_resident_grouped_predictions() {
         HEADER_LIMIT,
     )
     .unwrap();
-    let checkpoint = FlintCheckpoint { profile, weights };
+    let checkpoint = FlintCheckpoint {
+        profile,
+        weights,
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        records: None,
+    };
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();
     k.allow_bf16(true);
@@ -622,7 +643,16 @@ fn expert_page_staging_matches_the_packed_experts_path() {
         HEADER_LIMIT,
     )
     .unwrap();
-    let checkpoint = FlintCheckpoint { profile, weights };
+    let checkpoint = FlintCheckpoint {
+        profile,
+        weights,
+        #[cfg(all(
+            feature = "native-fault-qualification",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ))]
+        records: None,
+    };
     let page = crate::kernels::HostPages::page_size();
     let refused = crate::family::stored::StackLayout::for_byte_payload(
         &checkpoint.weights,
@@ -768,7 +798,16 @@ fn packed_api_rejects_incomplete_words_and_wrong_storage() {
         .unwrap();
         let mut profile = Profile::default();
         profile.packed.insert("x".into(), (vec![2, 64], 4));
-        let checkpoint = FlintCheckpoint { weights, profile };
+        let checkpoint = FlintCheckpoint {
+            weights,
+            profile,
+            #[cfg(all(
+                feature = "native-fault-qualification",
+                target_os = "macos",
+                target_arch = "aarch64"
+            ))]
+            records: None,
+        };
         let error = checkpoint.packed("x").unwrap_err();
         assert!(
             matches!(error, EngError::Checkpoint(message) if message.contains("payload") || message.contains("words"))
@@ -816,6 +855,71 @@ fn open_rejects_malformed_ranges_duplicate_members_and_truncated_files() {
     }
     std::fs::write(&path, [0u8; 4]).unwrap();
     assert!(FlintCheckpoint::open(root.path()).is_err());
+}
+
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+#[test]
+fn flint_records_fill_exact_expert_slots_and_check_source_identity() {
+    use std::os::unix::fs::FileExt;
+
+    let root = sparse_checkpoint(|_| {});
+    let source = FlintCheckpoint::open(root.path()).unwrap();
+    let layout = source.expert_page_layout(records::STEM, 6).unwrap();
+    let roles: Vec<_> = layout
+        .stacks
+        .iter()
+        .flat_map(|(_, stack)| {
+            [
+                &stack.payload,
+                &stack.scales,
+                stack.biases.as_ref().unwrap(),
+            ]
+        })
+        .collect();
+    let sizes: Vec<_> = roles.iter().map(|role| role.slice_len).collect();
+    let width: usize = sizes.iter().sum();
+    let header = serde_json::to_vec(&json!({
+        "format": "fifi-flint-expert-records-v1", "layer": 24, "shards": [], "role_bytes": sizes
+    }))
+    .unwrap();
+    let path = root.path().join("sidecar.records");
+    let mut file = File::create(&path).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(&header).unwrap();
+    let start = 8 + header.len() as u64;
+    let file_len = start + 256 * width as u64;
+    file.set_len(file_len).unwrap();
+    let ids = [0, 4, 30, 88, 100, 255];
+    let mut expected = vec![0xEF; layout.index_offset];
+    for (rank, &id) in ids.iter().enumerate() {
+        let mut offset = start + u64::from(id) * width as u64;
+        for (index, role) in roles.iter().enumerate() {
+            let marker = 1 + (rank * roles.len() + index) as u8;
+            let slot = role.offset + rank * role.slice_len;
+            expected[slot..slot + role.slice_len].fill(marker);
+            file.write_all_at(&expected[slot..slot + role.slice_len], offset)
+                .unwrap();
+            offset += role.slice_len as u64;
+        }
+    }
+    let mut got = vec![0xEF; layout.index_offset];
+    records::ExpertRecords::open(&path, &[])
+        .unwrap()
+        .read(&layout, &ids, &mut got)
+        .unwrap();
+    assert!(
+        got == expected,
+        "record reads must preserve the selected ranges and all padding"
+    );
+    let unrelated = records::ShardStamp::from(&file.metadata().unwrap());
+    assert!(records::ExpertRecords::open(&path, &[unrelated]).is_err());
+    file.set_len(file_len - 1).unwrap();
+    assert!(records::ExpertRecords::open(&path, &[]).is_err());
 }
 
 #[test]
