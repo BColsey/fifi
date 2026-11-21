@@ -4612,6 +4612,119 @@ mod tests {
         );
     }
 
+    /// The model side as a forced reference whose prompt path feeds each segment between the
+    /// given split positions as its own `feed_rows` call, as the worker does when it saves a
+    /// prefix at a message boundary. Every call chunks from its own start.
+    struct SplitModel<'a> {
+        step: Q36Step<'a>,
+        splits: Vec<usize>,
+    }
+
+    impl crate::family::token_forcing::score::ForcedModel for SplitModel<'_> {
+        fn reset(&mut self) -> Result<()> {
+            self.step.reset()
+        }
+
+        fn prefill_logits(&mut self, context: &[u32]) -> Result<Vec<f32>> {
+            let (&last, rows) = context.split_last().unwrap();
+            let mut from = 0;
+            for &cut in self
+                .splits
+                .iter()
+                .filter(|&&cut| cut > 0 && cut < rows.len())
+            {
+                self.step.feed_rows(&rows[from..cut])?;
+                from = cut;
+            }
+            if from < rows.len() {
+                self.step.feed_rows(&rows[from..])?;
+            }
+            self.step.logits(last)
+        }
+
+        fn step_logits(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.step.logits(token)
+        }
+    }
+
+    /// Teacher-forced scores of text under three prompt piece plans, for the quality arm of the
+    /// prefix-reuse default: no split (no boundary marked), one split seven tokens before the
+    /// prompt end (a cold turn that saves its tip) and two splits (a turn restored from the tip
+    /// of the turn before, then saving its own). Environment: `Q36_CKPT_DIR`, `Q36_QUAL_DOCS`
+    /// (a directory of text files), `Q36_QUAL_OUT` (the JSON lines file), `Q36_QUAL_LENS`
+    /// (comma separated prompt lengths), `Q36_QUAL_GEN` (scored tokens), `Q36_CACHE_LIMIT`,
+    /// `Q36_ACTIVATION`, `Q36_KV_DTYPE`.
+    #[test]
+    #[ignore = "needs the Q36 checkpoint and a text directory on the Mac"]
+    fn prompt_piece_plans_score_the_same_text_for_the_quality_gate() {
+        use crate::family::token_forcing::score::score_sequence;
+        let _serial = crate::native_test_lock();
+        let ckpt_dir = env_path("Q36_CKPT_DIR");
+        let docs = env_path("Q36_QUAL_DOCS");
+        let out = env_path("Q36_QUAL_OUT");
+        let lens: Vec<usize> = std::env::var("Q36_QUAL_LENS")
+            .unwrap()
+            .split(',')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        let generated: usize = std::env::var("Q36_QUAL_GEN").unwrap().parse().unwrap();
+        let cache_limit: u64 = std::env::var("Q36_CACHE_LIMIT").unwrap().parse().unwrap();
+        let tokenizer =
+            Tokenizer::from_bytes(&std::fs::read(ckpt_dir.join("tokenizer.json")).unwrap())
+                .unwrap();
+        let rules = Q36Rules {
+            prefix_store: StoreLimits::default(),
+            eos: vec![],
+            sampler_vocab: 248_320,
+            context_limit: 8192,
+            session_cap: 1 << 30,
+            max_seqs: 1,
+            activation: activation_from_env(),
+            kv_dtype: kv_dtype_from_env(),
+            compile: false,
+            compile_program_limit: Default::default(),
+        };
+        let (mut executor, mut session) = Q36Executor::open(&ckpt_dir, cache_limit, rules).unwrap();
+        executor.chunk = Some(256);
+        let mut files: Vec<_> = std::fs::read_dir(&docs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        let mut lines = String::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let ids = tokenizer.encode(text.as_str()).unwrap();
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            for &len in &lens {
+                if ids.len() < len + generated {
+                    continue;
+                }
+                let (prompt, scored) = (&ids[..len], &ids[len..len + generated]);
+                for (plan, splits) in [
+                    ("none", vec![]),
+                    ("cold", vec![len - 7]),
+                    ("warm", vec![len - 107, len - 7]),
+                ] {
+                    let Q36Session { state, .. } = &mut session;
+                    let (step, _) = executor.split(state);
+                    let mut model = SplitModel { step, splits };
+                    let records = score_sequence(&mut model, prompt, scored, 248_320).unwrap();
+                    for record in records {
+                        lines.push_str(&format!(
+                            "{{\"doc\":\"{name}\",\"len\":{len},\"plan\":\"{plan}\",\"pos\":{},\"nll\":{},\"hit\":{}}}\n",
+                            record.position,
+                            -record.logprob,
+                            record.argmax == record.generated
+                        ));
+                    }
+                }
+                eprintln!("scored {name} at {len}");
+            }
+        }
+        std::fs::write(&out, lines).unwrap();
+    }
+
     fn env_u64(name: &str, default: Option<u64>) -> u64 {
         std::env::var(name).map_or_else(
             |_| default.unwrap_or_else(|| panic!("set {name}")),
