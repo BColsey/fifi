@@ -9,6 +9,8 @@ use super::{
     gguf_metadata::{self, Layout},
     is_local, read_exact_at,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::kernels::expert_cpu_q8g::{Q8DotProduct, Q8gRow, quantize_q8g};
 use crate::{
     EngError,
     family::mapped_file::MappedFile,
@@ -252,6 +254,8 @@ pub struct Weights {
     modified: Option<SystemTime>,
     dense_io: Option<DenseIo>,
     packed_dot: bool,
+    #[cfg(target_arch = "aarch64")]
+    q8_activations: Option<Q8DotProduct>,
 }
 
 impl Weights {
@@ -270,6 +274,11 @@ impl Weights {
             dense_io: DenseIo::start_if_enabled(),
             packed_dot: std::env::var_os("FIFI_INKLING_GGUF_PACKED_DOT")
                 .is_some_and(|value| value == "1"),
+            #[cfg(target_arch = "aarch64")]
+            q8_activations: std::env::var_os("FIFI_INKLING_GGUF_Q8_ACTIVATIONS")
+                .is_some_and(|value| value == "1")
+                .then(Q8DotProduct::detect)
+                .flatten(),
         })
     }
 
@@ -282,6 +291,10 @@ impl Weights {
             .map_err(checkpoint_error)?;
         if self.packed_dot {
             eprintln!("Inkling 2 Mini GGUF: packed_attention_dot=on");
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.q8_activations.is_some() {
+            eprintln!("Inkling 2 Mini GGUF: q8_attention_activations=on");
         }
         Ok(mapping)
     }
@@ -451,14 +464,26 @@ impl Weights {
         let bytes = mapping.as_ref().get(start..stop).ok_or_else(|| {
             checkpoint_error(format!("mapped GGUF tensor {name} is out of bounds"))
         })?;
+        #[cfg(target_arch = "aarch64")]
+        let quantized = self
+            .q8_activations
+            .filter(|_| dtype == GgufType::Q80)
+            .and_then(|kernel| {
+                // One activation row is shared by all output rows and workers.
+                let mut row = Q8gRow::zeros(input.len()).ok()?;
+                quantize_q8g(input, &mut row).ok()?;
+                Some((kernel, row))
+            });
         let result = project_row_groups(0..rows.len(), workers, |range| {
-            project_packed_rows(
-                dtype,
-                row_bytes,
-                &bytes[range.start * row_bytes..range.end * row_bytes],
-                input,
-                self.packed_dot,
-            )
+            let bytes = &bytes[range.start * row_bytes..range.end * row_bytes];
+            #[cfg(target_arch = "aarch64")]
+            if let Some((kernel, activation)) = &quantized {
+                return Ok(bytes
+                    .chunks_exact(row_bytes)
+                    .map(|row| kernel.row(row, activation))
+                    .collect());
+            }
+            project_packed_rows(dtype, row_bytes, bytes, input, self.packed_dot)
         })?;
         if let Some(io) = &self.dense_io {
             io.mapped_access(bytes.len());
@@ -945,6 +970,8 @@ mod mapped_projection_tests {
             modified: meta.modified().ok(),
             dense_io: Some(DenseIo::default()),
             packed_dot: true,
+            #[cfg(target_arch = "aarch64")]
+            q8_activations: None,
         };
         let mapping = weights.map_projection_source().unwrap();
         let input = [0.5, 0.25, -0.75];

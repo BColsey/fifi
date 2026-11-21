@@ -1007,6 +1007,11 @@ mod tests {
                 1usize,
             ),
             ("expert_cpu_q8g.rs", include_str!("expert_cpu_q8g.rs"), 0),
+            (
+                "expert_cpu_q8g/aarch64.rs",
+                include_str!("expert_cpu_q8g/aarch64.rs"),
+                2,
+            ),
             ("expert_cpu_q8k.rs", include_str!("expert_cpu_q8k.rs"), 0),
             ("expert_cpu.rs", include_str!("expert_cpu.rs"), 0),
             (

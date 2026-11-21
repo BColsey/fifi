@@ -33,6 +33,11 @@ use super::expert_cpu::{
 };
 use super::expert_cpu_q8k::DotBackend;
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use aarch64::Q8DotProduct;
+
 /// Activations per quantization group: one Q4_K sub-block.
 pub(crate) const GROUP: usize = 32;
 pub(crate) const GROUPS_PER_BLOCK: usize = Q4K_BLOCK_VALUES / GROUP;
