@@ -179,13 +179,8 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
 
 /// The `general.architecture` string of one GGUF file, read from its header alone.
 fn architecture_of(path: &Path) -> Result<Option<String>, EngError> {
-    use crate::weights::{GgufHeader, MetaValue};
-    let unreadable = |error: std::io::Error| {
-        EngError::Checkpoint(format!("model file {}: {error}", path.display()))
-    };
-    let file = std::fs::File::open(path).map_err(unreadable)?;
-    let len = file.metadata().map_err(unreadable)?.len();
-    let header = GgufHeader::parse(&mut std::io::BufReader::new(file), len, 256 << 20)?;
+    use crate::weights::{MetaValue, shared_header};
+    let header = shared_header(path, 256 << 20)?;
     Ok(match header.meta("general.architecture") {
         Some(MetaValue::String(architecture)) => Some(architecture.clone()),
         _ => None,

@@ -130,14 +130,9 @@ impl SamplingDefaults {
     /// `general.sampling.top_k` and `general.sampling.top_p`. An absent key keeps the contract
     /// default of that key; a value outside the contract bounds is an error that names the key.
     pub(crate) fn from_gguf(path: &Path) -> Result<Self, EngError> {
-        use crate::weights::{GgufHeader, MetaValue};
+        use crate::weights::{MetaValue, shared_header};
         let bad = |message: String| EngError::Checkpoint(format!("{}: {message}", path.display()));
-        let file = fs::File::open(path).map_err(|error| bad(error.to_string()))?;
-        let len = file
-            .metadata()
-            .map_err(|error| bad(error.to_string()))?
-            .len();
-        let header = GgufHeader::parse(&mut std::io::BufReader::new(file), len, 256 << 20)?;
+        let header = shared_header(path, 256 << 20)?;
         let number = |key: &str, fallback: f64, low: f64, high: f64| -> Result<f64, EngError> {
             let value = match header.meta(key) {
                 None => return Ok(fallback),

@@ -68,6 +68,7 @@ pub use gguf::{
     ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SMALL_VECTOR_BYTES, SplitInfo,
     check_split_set, hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
 };
+pub(crate) use gguf::shared_header;
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
     widen_to_f32_bytes,
