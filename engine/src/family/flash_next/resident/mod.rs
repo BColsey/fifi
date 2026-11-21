@@ -36,6 +36,12 @@ mod slots;
 mod state;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod step;
+#[cfg(all(
+    feature = "native-fault-qualification",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod stream_timing;
 #[cfg(test)]
 mod trace;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

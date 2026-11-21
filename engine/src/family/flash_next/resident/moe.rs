@@ -117,11 +117,15 @@ fn import_in_pages(
             *word = value.to_le_bytes();
         }
     }
+    #[cfg(feature = "native-fault-qualification")]
+    let import_started = std::time::Instant::now();
     let imported = ctx.kernels.import_packed_pages(
         slots.pages(set)?,
         &layout.packed(),
         std::slice::from_ref(&layout.gates),
     )?;
+    #[cfg(feature = "native-fault-qualification")]
+    crate::family::stored::record_page_import(import_started.elapsed());
     slots.lend(set);
     Ok(imported)
 }

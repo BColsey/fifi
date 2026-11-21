@@ -6,21 +6,13 @@ use super::{decoder::StepMode, weights::ExpertPages, weights::ResidentWeights};
 use crate::{EngError, kernels::MlxKernels};
 
 #[cfg(feature = "native-fault-qualification")]
-use crate::{family::stored::ExpertReadStats, kernels::mlx::QualificationTiming};
+use crate::family::mlx_stream_stats::StreamSnapshot;
 
 pub(super) struct ForwardTiming {
     #[cfg(feature = "native-fault-qualification")]
-    started: Instant,
+    counters: StreamSnapshot,
     #[cfg(feature = "native-fault-qualification")]
     position: u32,
-    #[cfg(feature = "native-fault-qualification")]
-    reads: ExpertReadStats,
-    #[cfg(feature = "native-fault-qualification")]
-    native: QualificationTiming,
-    #[cfg(feature = "native-fault-qualification")]
-    page_copies: u64,
-    #[cfg(feature = "native-fault-qualification")]
-    syncs: u64,
     host_route_ns: u64,
     stages: u32,
     stage_fill_ns: u64,
@@ -42,12 +34,8 @@ impl ForwardTiming {
                 std::env::var_os("FIFI_Q36_MLX_STREAM_TIMING").is_some_and(|value| value == "1")
             });
             (enabled && weights.streams_experts()).then(|| Self {
-                started: Instant::now(),
+                counters: StreamSnapshot::begin(k),
                 position,
-                reads: crate::family::stored::qualification_expert_reads(),
-                native: k.qualification_timing(),
-                page_copies: k.qualification_page_copies(),
-                syncs: k.qualification_sync_count(),
                 host_route_ns: 0,
                 stages: 0,
                 stage_fill_ns: 0,
@@ -97,37 +85,17 @@ impl ForwardTiming {
     pub(super) fn finish(self, k: &MlxKernels, rows: u32, mode: StepMode) {
         #[cfg(feature = "native-fault-qualification")]
         {
-            let forward_ns = ns(self.started);
-            let reads = crate::family::stored::qualification_expert_reads();
-            let native = k.qualification_timing();
-            eprintln!(
-                "qwen36_stream_timing {}",
-                serde_json::json!({
-                    "position": self.position,
-                    "rows": rows,
-                    "mode": format!("{mode:?}"),
-                    "forward_ns": forward_ns,
-                    "slice_reads": reads.slice_reads - self.reads.slice_reads,
-                    "read_bytes": reads.read_bytes - self.reads.read_bytes,
-                    "read_ns": reads.read_ns - self.reads.read_ns,
-                    "page_imports": reads.page_imports - self.reads.page_imports,
-                    "page_import_ns": reads.import_ns - self.reads.import_ns,
-                    "page_copies": k.qualification_page_copies() - self.page_copies,
-                    "metal_syncs": k.qualification_sync_count() - self.syncs,
-                    "native_import_calls": native.import_calls - self.native.import_calls,
-                    "native_import_ns": native.import_ns - self.native.import_ns,
-                    "native_readback_calls": native.readback_calls - self.native.readback_calls,
-                    "native_readback_ns": native.readback_ns - self.native.readback_ns,
-                    "native_evaluate_calls": native.evaluate_calls - self.native.evaluate_calls,
-                    "native_evaluate_ns": native.evaluate_ns - self.native.evaluate_ns,
-                    "host_route_ns": self.host_route_ns,
-                    "stages": self.stages,
-                    "stage_fill_ns": self.stage_fill_ns,
-                    "stage_lifetime_ns": self.stage_lifetime_ns,
-                    "peak_stage_bytes": self.peak_stage_bytes,
-                    "peak_stage_experts": self.peak_stage_experts,
-                })
-            );
+            let mut row = self.counters.finish(k);
+            row["position"] = self.position.into();
+            row["rows"] = rows.into();
+            row["mode"] = format!("{mode:?}").into();
+            row["host_route_ns"] = self.host_route_ns.into();
+            row["stages"] = self.stages.into();
+            row["stage_fill_ns"] = self.stage_fill_ns.into();
+            row["stage_lifetime_ns"] = self.stage_lifetime_ns.into();
+            row["peak_stage_bytes"] = self.peak_stage_bytes.into();
+            row["peak_stage_experts"] = self.peak_stage_experts.into();
+            eprintln!("qwen36_stream_timing {row}");
         }
         #[cfg(not(feature = "native-fault-qualification"))]
         let _ = (k, rows, mode);

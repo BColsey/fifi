@@ -42,9 +42,15 @@ pub(super) fn step(
     state.check_step(&decoder.weights)?;
     let growth = qsa_append_growth(&decoder.weights, state.pos(), 1)?;
     let permit = decoder.budget.acquire_growth(growth)?;
+    #[cfg(feature = "native-fault-qualification")]
+    let timing = super::stream_timing::begin(&decoder.kernels, state.pos());
     let old = state.begin();
     let result = run(decoder, state, old, permit, token, mode);
     decoder.slots.release_lent();
+    #[cfg(feature = "native-fault-qualification")]
+    if let (Ok(_), Some(timing)) = (&result, timing) {
+        timing.finish(&decoder.kernels, 1, mode, "step");
+    }
     result
 }
 
