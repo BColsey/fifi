@@ -115,6 +115,49 @@ impl SamplingDefaults {
     }
 }
 
+impl SamplingDefaults {
+    /// Reads the defaults a GGUF file carries in its own header: `general.sampling.temp`,
+    /// `general.sampling.top_k` and `general.sampling.top_p`. An absent key keeps the contract
+    /// default of that key; a value outside the contract bounds is an error that names the key.
+    pub(crate) fn from_gguf(path: &Path) -> Result<Self, EngError> {
+        use crate::weights::{MetaValue, shared_header};
+        let bad = |message: String| EngError::Checkpoint(format!("{}: {message}", path.display()));
+        let header = shared_header(path, 256 << 20)?;
+        let number = |key: &str, fallback: f64, low: f64, high: f64| -> Result<f64, EngError> {
+            let value = match header.meta(key) {
+                None => return Ok(fallback),
+                Some(MetaValue::F32(value)) => f64::from(*value),
+                Some(MetaValue::F64(value)) => *value,
+                Some(_) => return Err(bad(format!("{key} must be a number"))),
+            };
+            if (low..=high).contains(&value) {
+                Ok(value)
+            } else {
+                Err(bad(format!(
+                    "{key} must be between {low} and {high}, found {value}"
+                )))
+            }
+        };
+        let top_k = match header.meta("general.sampling.top_k") {
+            None => 0,
+            Some(MetaValue::U32(value)) => *value,
+            Some(MetaValue::I32(value)) => u32::try_from(*value)
+                .map_err(|_| bad("general.sampling.top_k must not be negative".to_string()))?,
+            Some(_) => return Err(bad("general.sampling.top_k must be an integer".to_string())),
+        };
+        Ok(Self {
+            temperature: number(
+                "general.sampling.temp",
+                DEFAULT_TEMPERATURE,
+                0.0,
+                MAX_TEMPERATURE,
+            )?,
+            top_p: number("general.sampling.top_p", DEFAULT_TOP_P, 0.0, 1.0)?,
+            top_k,
+        })
+    }
+}
+
 /// Reads at most `MAX_FILE_BYTES + 1` bytes of the file, so a longer file cannot inflate memory
 /// or reach the parser. A file over the cap is an error that names the path and the cap.
 fn read_capped(path: &Path) -> Result<Vec<u8>, EngError> {
@@ -1370,6 +1413,32 @@ mod tests {
     };
     use crate::EngError;
     use std::cmp::Ordering;
+
+    #[test]
+    fn a_gguf_header_supplies_the_sampling_defaults_and_an_absent_key_keeps_the_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.gguf");
+        std::fs::write(
+            &path,
+            crate::tokenizer::gguf::tests::tiny_gguf("qwen35moe", "gpt2", "raon"),
+        )
+        .expect("write");
+        let values = SamplingDefaults::from_gguf(&path).expect("defaults");
+        assert_eq!(values.top_k, 20);
+        assert!((values.temperature - 0.8).abs() < 1e-6, "{values:?}");
+        assert!((values.top_p - 0.95).abs() < 1e-6, "{values:?}");
+        let bare = dir.path().join("bare.gguf");
+        let mut file = b"GGUF".to_vec();
+        file.extend_from_slice(&3u32.to_le_bytes());
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.resize(32, 0);
+        std::fs::write(&bare, file).expect("write");
+        assert_eq!(
+            SamplingDefaults::from_gguf(&bare).expect("defaults"),
+            SamplingDefaults::CONTRACT
+        );
+    }
 
     fn params(temperature: f64, top_p: f64, top_k: u32) -> SamplingParams {
         SamplingParams::new(temperature, top_p, top_k).expect("valid params")

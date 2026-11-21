@@ -1,6 +1,6 @@
 //! What is in a model directory, read without loading any weights.
 //!
-//! GGUF facts come from `GgufHeader::parse`, which stops at the end of
+//! GGUF facts come from the shared `GgufHeader` parse, which stops at the end of
 //! the tensor table and never reads payloads; safetensors directories are
 //! inventoried by file size only (the loaders stay the authority on shard
 //! contents). A directory that cannot be inventoried at all is an error;
@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::EngError;
-use crate::weights::{GgufHeader, MetaValue};
+use crate::weights::MetaValue;
 
 /// Header cap for a scanned GGUF file. The real Qwen3.6 header (metadata
 /// plus tensor table) is well under this; the cap exists so a hostile or
@@ -170,11 +170,7 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
 }
 
 fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path)
-            .map_err(|error| checkpoint(format!("cannot open {}: {error}", path.display())))?,
-    );
-    let header = GgufHeader::parse(&mut reader, file_bytes, GGUF_HEADER_CAP_BYTES)?;
+    let header = crate::weights::shared_header(path, GGUF_HEADER_CAP_BYTES)?;
     let architecture = match header.meta("general.architecture") {
         Some(MetaValue::String(value)) => Some(value.clone()),
         _ => None,

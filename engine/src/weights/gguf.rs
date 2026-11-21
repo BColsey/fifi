@@ -1022,3 +1022,57 @@ pub fn verify_sha256<R: Read + ?Sized>(
     }
     Ok(())
 }
+
+/// Files below this size are parsed on every call: a header cache is for model files, and a small
+/// file may be rewritten under the same size and modification time.
+const SHARED_HEADER_MIN_FILE_BYTES: u64 = 1 << 20;
+
+/// Parsed headers kept at once.
+const SHARED_HEADER_ENTRIES: usize = 4;
+
+type SharedHeaderEntry = (
+    std::path::PathBuf,
+    u64,
+    std::time::SystemTime,
+    std::sync::Arc<GgufHeader>,
+);
+
+/// The parsed header of the GGUF at `path`, shared by every reader in the process. A start reads
+/// the architecture, the sampling defaults, the tokenizer and the capability facts from one header
+/// instead of parsing it again for each. An entry is keyed by path, length and modification time;
+/// `max_header_bytes` bounds a parse that is not served from the cache.
+pub(crate) fn shared_header(
+    path: &std::path::Path,
+    max_header_bytes: u64,
+) -> Result<std::sync::Arc<GgufHeader>, EngError> {
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Vec<SharedHeaderEntry>> = Mutex::new(Vec::new());
+    let unreadable = |error: std::io::Error| {
+        EngError::Checkpoint(format!("model file {}: {error}", path.display()))
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    let (len, modified) = (meta.len(), meta.modified().map_err(unreadable)?);
+    let cacheable = len >= SHARED_HEADER_MIN_FILE_BYTES;
+    if cacheable
+        && let Ok(cache) = CACHE.lock()
+        && let Some((_, _, _, header)) = cache
+            .iter()
+            .find(|(p, l, m, _)| p == path && *l == len && *m == modified)
+    {
+        return Ok(Arc::clone(header));
+    }
+    let header = Arc::new(GgufHeader::parse(
+        &mut std::io::BufReader::new(file),
+        len,
+        max_header_bytes,
+    )?);
+    if cacheable && let Ok(mut cache) = CACHE.lock() {
+        cache.retain(|(p, _, _, _)| p != path);
+        if cache.len() >= SHARED_HEADER_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push((path.to_path_buf(), len, modified, Arc::clone(&header)));
+    }
+    Ok(header)
+}

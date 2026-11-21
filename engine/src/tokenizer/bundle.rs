@@ -385,6 +385,13 @@ impl TokenizerBundle {
     /// executors compare the vocabulary with the model's own head size and refuse a larger one.
     /// `tokenizer.json` and `tokenizer_config.json` are required.
     pub fn load(dir: &Path, pin: &TokenizerPin) -> Result<Self, EngError> {
+        // A directory of GGUF weights with no tokenizer.json starts from the vocabulary in the
+        // GGUF header. The pin names files that are not there, so it does not apply.
+        if !dir.join("tokenizer.json").is_file()
+            && let Some(file) = super::gguf::vocabulary_gguf(dir)?
+        {
+            return super::gguf::bundle_from_gguf(&file);
+        }
         let mut notes = Vec::new();
         let tokenizer_bytes = require(
             "tokenizer.json",

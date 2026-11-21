@@ -43,6 +43,7 @@ pub use acquire::{
 pub(crate) mod acquire_read {
     pub(crate) use super::acquire::{reset, set, snapshot};
 }
+pub(crate) use gguf::shared_header;
 pub use gguf::{
     ArrayMeta, GgufHeader, GgufTensor, GgufType, MetaValue, SplitInfo, check_split_set,
     hash_sampled_edges, sha256_hex, sha256_stream, verify_sha256,
