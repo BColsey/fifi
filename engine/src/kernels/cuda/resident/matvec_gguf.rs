@@ -1347,10 +1347,13 @@ fn grouped_ids(
     case: &GroupedCase,
     rng: &mut testkit::Rng,
     skip_first: bool,
+    heavy: Option<usize>,
 ) -> (Vec<i32>, Vec<i32>) {
     let mut groups: Vec<Vec<i32>> = vec![Vec::new(); case.n_experts];
     for token in 0..case.m {
-        let mut picks: Vec<usize> = Vec::new();
+        // A heavy expert is picked by every token, so it holds `m` columns while most experts
+        // hold few or none.
+        let mut picks: Vec<usize> = heavy.into_iter().collect();
         while picks.len() < case.top_k {
             let low = usize::from(skip_first);
             let e = low + rng.below((case.n_experts - low) as u64) as usize;
@@ -1409,6 +1412,18 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
             },
             false,
         ),
+        // 70 experts (three per lane of the tile finder), one picked by every token (150
+        // columns), most picked by a few tokens or none.
+        (
+            GroupedCase {
+                n_experts: 70,
+                m: 150,
+                top_k: 2,
+                rows: 70,
+                k: 256,
+            },
+            false,
+        ),
         // A single expert, one pick: the plain GEMM through the grouped entry.
         (
             GroupedCase {
@@ -1461,7 +1476,8 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
                 let ld = case.rows + 8;
                 let y_bytes = slots * ld * 4;
                 let y = testkit::upload_filled(&ctx, 0xAA, y_bytes);
-                let (ids_dst, bounds) = grouped_ids(case, &mut rng, *skip_first);
+                let heavy = (case.n_experts >= 64).then_some(5);
+                let (ids_dst, bounds) = grouped_ids(case, &mut rng, *skip_first, heavy);
                 let shape = MmidShape {
                     n_experts: case.n_experts,
                     m: case.m,
@@ -1620,7 +1636,7 @@ fn gguf_grouped_prefill_report_layer_ms() {
                 k: hidden,
             };
             let slots = m * top_k;
-            let (ids_dst, bounds) = grouped_ids(&case, &mut rng, false);
+            let (ids_dst, bounds) = grouped_ids(&case, &mut rng, false, None);
             let shape = MmidShape {
                 n_experts,
                 m,

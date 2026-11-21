@@ -185,6 +185,8 @@ mod resources_tests;
 #[cfg(test)]
 mod rollback_window_device_tests;
 #[cfg(test)]
+mod routed_device_tests;
+#[cfg(test)]
 mod router_tests;
 use crate::family::decode_step::{readback, run_report, verdict};
 #[cfg(test)]

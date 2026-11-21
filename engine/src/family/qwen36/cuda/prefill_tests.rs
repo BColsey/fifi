@@ -460,6 +460,20 @@ fn q8_layouts_refuse_a_mixed_buffer() {
     );
 }
 
+/// A routed stack on the dequantizing GEMM reads the f32 rows, so the stage declares them: `Act`
+/// must stay live through the down launch (the arena otherwise places `Down` over it), and `X2`
+/// through the gate and up launches.
+#[test]
+fn the_routed_stages_declare_the_f32_rows_the_dequantizing_gemm_reads() {
+    use super::prefill_plan::ChunkSlot;
+    let (down_reads, _) = super::prefill::moe_stage_slots(MoeStage::Down);
+    assert!(down_reads.contains(&ChunkSlot::Act), "{down_reads:?}");
+    for stage in [MoeStage::Gate, MoeStage::Up] {
+        let (reads, _) = super::prefill::moe_stage_slots(stage);
+        assert!(reads.contains(&ChunkSlot::X2), "{stage:?} {reads:?}");
+    }
+}
+
 /// The up-half sub-view follows `dims.inter`, never a literal column.
 #[test]
 fn routed_up_view_follows_the_moe_inter() {

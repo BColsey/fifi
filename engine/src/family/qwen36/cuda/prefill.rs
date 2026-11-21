@@ -567,14 +567,27 @@ pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'stati
             ],
         ),
         MoeStage::Scatter => (&[ChunkSlot::X2, ChunkSlot::IdsSrc1], &[ChunkSlot::Q8S]),
+        // A routed stack on the dequantizing GEMM reads the f32 rows (`X2`, `Act`) where a
+        // vendored one reads the q8_1 pack, so the slots either may read are declared: the
+        // arena planner must not let `Down` reuse `Act` before the down launch ran.
         MoeStage::Gate | MoeStage::Up => (
-            &[ChunkSlot::Q8S, ChunkSlot::IdsDst, ChunkSlot::ExpertBounds],
+            &[
+                ChunkSlot::Q8S,
+                ChunkSlot::X2,
+                ChunkSlot::IdsDst,
+                ChunkSlot::ExpertBounds,
+            ],
             &[ChunkSlot::Gu, ChunkSlot::Fixup],
         ),
         MoeStage::Swiglu => (&[ChunkSlot::Gu], &[ChunkSlot::Act]),
         MoeStage::GatherQuant => (&[ChunkSlot::Act, ChunkSlot::IdsDst], &[ChunkSlot::Q8Act]),
         MoeStage::Down => (
-            &[ChunkSlot::Q8Act, ChunkSlot::IdsDst, ChunkSlot::ExpertBounds],
+            &[
+                ChunkSlot::Q8Act,
+                ChunkSlot::Act,
+                ChunkSlot::IdsDst,
+                ChunkSlot::ExpertBounds,
+            ],
             &[ChunkSlot::Down, ChunkSlot::Fixup],
         ),
         MoeStage::Combine => (
