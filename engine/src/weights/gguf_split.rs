@@ -70,6 +70,39 @@ pub(crate) fn shard_name_of(path: &Path) -> Option<ShardName> {
     ShardName::parse(path.file_name()?.to_str()?)
 }
 
+/// Writes a two-shard set of tensor-less files (`<stem>-00001-of-00002.gguf` and `-00002-`)
+/// into `dir` and returns shard 1's path, for tests of readers that must refuse a split set.
+#[cfg(test)]
+pub(crate) fn write_two_shard_set(dir: &Path, stem: &str) -> PathBuf {
+    let string = |text: &str| {
+        let mut out = (text.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(text.as_bytes());
+        out
+    };
+    let kv = |key: &str, value: u16| {
+        let mut out = string(key);
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+        out
+    };
+    let mut first = PathBuf::new();
+    for number in 1..=2u16 {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend(kv("split.no", number - 1));
+        bytes.extend(kv("split.count", 2));
+        bytes.extend(kv("split.tensors.count", 0));
+        let path = dir.join(format!("{stem}-{number:05}-of-00002.gguf"));
+        std::fs::write(&path, bytes).expect("write shard");
+        if number == 1 {
+            first = path;
+        }
+    }
+    first
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

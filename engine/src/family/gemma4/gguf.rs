@@ -85,6 +85,7 @@ pub(crate) fn open_humanizer_weights(
     header_sha256: Option<&str>,
 ) -> Result<GgufWeights, EngError> {
     let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+    weights.require_single_file("the Gemma 4 engine")?;
     let header = weights.header();
     check_architecture(header)?;
     check_int_scalars(header, &HUMANIZER_INT_SCALARS)?;
@@ -503,6 +504,7 @@ pub(crate) fn open_bolt_weights(
     header_sha256: Option<&str>,
 ) -> Result<(GgufWeights, BoltSpelling), EngError> {
     let weights = GgufWeights::open(path, BOLT_LIMITS, header_sha256)?;
+    weights.require_single_file("the Bolt engine")?;
     let header = weights.header();
     check_architecture(header)?;
     check_int_scalars(header, &BOLT_INT_SCALARS)?;
@@ -737,6 +739,24 @@ fn check_bolt_layer_pattern(kv: &[i32], pattern: &[u8]) -> Result<(), EngError> 
 mod tests {
     use super::*;
     use crate::family::spec::NEMOTRON_BOLT_E4B;
+
+    #[test]
+    fn the_gemma_and_bolt_openers_refuse_a_split_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = crate::weights::write_two_shard_set(dir.path(), "gemma");
+        for error in [
+            open_humanizer_weights(&first, None).expect_err("a split set is refused"),
+            open_bolt_weights(&first, None)
+                .map(|_| ())
+                .expect_err("a split set is refused"),
+        ] {
+            assert!(
+                error.describe().contains("does not take a split GGUF set"),
+                "{}",
+                error.describe()
+            );
+        }
+    }
 
     /// The reader's geometry constants are the descriptor's, not a second
     /// source of truth: a descriptor change fails here until the reader agrees.

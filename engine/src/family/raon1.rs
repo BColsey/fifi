@@ -451,6 +451,7 @@ fn open_with_spec(
     spec: Raon1Spec,
 ) -> Result<Raon1Model, EngError> {
     let weights = GgufWeights::open(path, LIMITS, header_sha256)?;
+    weights.require_single_file("the Raon engine")?;
     check_metadata(weights.header(), spec)?;
     check_tensors(weights.header(), spec)?;
     Ok(Raon1Model {

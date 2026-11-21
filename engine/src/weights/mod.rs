@@ -44,6 +44,8 @@ pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
 };
 pub(crate) use gguf_split::shard_name_of;
+#[cfg(test)]
+pub(crate) use gguf_split::write_two_shard_set;
 pub(crate) use gguf_weights::{GgufLimits, GgufWeights};
 pub use indexed::IndexedWeights;
 pub use shard::{HeaderEntry, ShardHeader};

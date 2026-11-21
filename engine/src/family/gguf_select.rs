@@ -334,4 +334,18 @@ mod tests {
             "{none}"
         );
     }
+
+    #[test]
+    fn the_raon_opener_refuses_a_split_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = crate::weights::write_two_shard_set(dir.path(), "raon");
+        let error = crate::family::raon1::open_raon_1_mini_preview(&first, None)
+            .map(|_| ())
+            .expect_err("a split set is refused");
+        assert!(
+            error.describe().contains("does not take a split GGUF set"),
+            "{}",
+            error.describe()
+        );
+    }
 }
