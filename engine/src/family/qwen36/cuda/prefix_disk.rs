@@ -7,25 +7,26 @@
 //! verified in full, stored as an ordinary entry, and restored through the existing pinned path,
 //! so the disk tier adds no second restore code. Every failure here is a logged miss.
 use super::super::{
-    prefix::{CudaPrefillPath, CudaSavedPrefix, HOST_HEADROOM, entry_bytes},
+    prefix::{CudaPrefillPath, CudaSavedPrefix, entry_bytes},
     prefix_shape::entry_slab,
-    state::{LAYOUT_TAG, pinned::PinnedSnapshot},
+    state::{
+        LAYOUT_TAG, ResidentState,
+        pinned::{PinnedLanding, PrefixPinPool},
+    },
+    state_layout::StateLayout,
 };
 use super::QwenResidentStep;
 use crate::{
     EngError,
     family::{
         kv_disk::{
-            Capture, DiskTier, FamilyContract, Held, Hit, KvDisk, LoadIdentity, MIN_POSITIONS,
-            PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, Resolved, SlotBytes,
-            Stored, drain_bound, host_memory_is_short, hurry_flag, restore_report,
-            retry_while_removed, spill_candidates, spill_picks, start_line, stop_picks,
+            DiskTier, FamilyContract, HostFamily, HostStoreDisk, LoadIdentity, PUMP_EMIT_BYTES,
+            PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Resolved, SlabLayout, SlotBytes, SnapshotView,
+            restore_tier,
         },
-        mem::HostFacts,
-        session::SaveKind,
+        session::PrefixIdentity,
     },
-    kernels::cuda::PinnedBuf,
-    sched::job::{PrefixSource, PrefixTier},
+    kernels::cuda::{DeviceStream, PinnedBuf},
 };
 use std::{
     cell::RefCell,
@@ -45,8 +46,6 @@ const CONTRACT: FamilyContract = FamilyContract {
     render_mode: "chat",
 };
 
-/// Lookups one restore may spend on entries that turn out damaged.
-const PROMOTE_ATTEMPTS: usize = 3;
 /// The least time between two logged background failures.
 const BACKGROUND_ERROR_GAP: Duration = Duration::from_secs(30);
 impl SlotBytes for RefCell<PinnedBuf> {
@@ -55,43 +54,78 @@ impl SlotBytes for RefCell<PinnedBuf> {
     }
 }
 
-/// A stored pinned entry as a spill: `None` for a pageable entry or one too short to repay a read.
-fn held_of(
-    layout: &super::super::state_layout::StateLayout,
-    key: &[u32],
-    kind: SaveKind,
-    saved: &CudaSavedPrefix,
-    reason: Reason,
-) -> Option<Held> {
-    let CudaSavedPrefix::Pinned { state, .. } = saved else {
-        return None;
-    };
-    let positions = state.tokens();
-    if positions < MIN_POSITIONS {
-        return None;
-    }
-    let shape = entry_slab(layout, positions).ok()?;
-    Some(Held {
-        reason,
-        slot: state.hold(),
-        key: key.to_vec(),
-        capture: capture_of(kind),
-        positions,
-        bytes: shape.object_bytes().iter().sum(),
-    })
+/// The Qwen3.6 engine as the host-store adapter sees it: its entries are pinned slots of the
+/// prefix pool, and a disk read lands in a free slot.
+struct QwenFamily<'a> {
+    layout: StateLayout,
+    /// The pool a disk read takes a slot from; absent when only the saves are in play.
+    pool: Option<&'a mut PrefixPinPool>,
+    stream: &'a DeviceStream,
+    state: &'a ResidentState,
 }
 
-fn capture_of(kind: SaveKind) -> Capture {
-    match kind {
-        SaveKind::Tip => Capture::Tip,
-        SaveKind::Root | SaveKind::Periodic | SaveKind::Block => Capture::Periodic,
-    }
-}
+impl HostFamily for QwenFamily<'_> {
+    type Snapshot = CudaSavedPrefix;
+    type Path = (CudaPrefillPath, PrefixIdentity);
+    type Landing = PinnedLanding;
 
-fn kind_of(capture: Capture) -> SaveKind {
-    match capture {
-        Capture::Tip => SaveKind::Tip,
-        Capture::Periodic => SaveKind::Periodic,
+    /// A pinned entry offers its slot; a pageable one stays in memory only.
+    fn view(&self, saved: &CudaSavedPrefix) -> Option<SnapshotView> {
+        let CudaSavedPrefix::Pinned { state, .. } = saved else {
+            return None;
+        };
+        let positions = state.tokens();
+        let shape = entry_slab(&self.layout, positions).ok()?;
+        Some(SnapshotView {
+            positions,
+            bytes: shape.object_bytes().iter().sum(),
+            slot: state.hold(),
+        })
+    }
+
+    fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
+        if positions >= self.layout.kv.capacity {
+            return Err(EngError::ContextLimit(format!(
+                "a kv disk entry of {positions} positions does not fit the {} position context",
+                self.layout.kv.capacity
+            )));
+        }
+        entry_slab(&self.layout, positions)
+    }
+
+    fn begin_landing(
+        &mut self,
+        tier: &mut DiskTier,
+        positions: usize,
+        _layout: &SlabLayout,
+    ) -> Result<PinnedLanding, EngError> {
+        let pool = self
+            .pool
+            .as_deref_mut()
+            .ok_or_else(|| EngError::MemoryPlan("no pinned prefix pool".into()))?;
+        // The spills that hold slots give them up to a restore.
+        tier.drop_spills_for_slots(pool.free_slots(), "a restore");
+        pool.begin_landing(self.stream, self.state, positions)
+    }
+
+    fn place(&self, landing: &mut PinnedLanding, slab: usize, part: &[u8]) -> Result<(), EngError> {
+        landing.write(slab, part)
+    }
+
+    fn finish_landing(
+        &mut self,
+        landing: PinnedLanding,
+        positions: usize,
+    ) -> Result<CudaSavedPrefix, EngError> {
+        let pool = self
+            .pool
+            .as_deref_mut()
+            .ok_or_else(|| EngError::MemoryPlan("no pinned prefix pool".into()))?;
+        let state = pool.finish_landing(landing)?;
+        Ok(CudaSavedPrefix::Pinned {
+            state,
+            payload_bytes: entry_bytes(&self.layout, positions).unwrap_or(0),
+        })
     }
 }
 
@@ -146,38 +180,17 @@ impl QwenResidentStep<'_> {
             .prefix_pins
             .as_ref()
             .map_or(1, |pool| pool.retained_entries());
-        match KvDisk::open(&resolved.dir, resolved.quota_bytes, &self.load_identity()) {
-            Ok((cache, report)) => {
-                eprintln!(
-                    "{}",
-                    start_line(TIER_LABEL, resolved, origin, &report, retained)
-                );
-                self.disk = Some(DiskTier::new(TIER_LABEL, cache, retained));
-            }
-            Err(error) => {
-                eprintln!(
-                    "q36 cuda: kv disk tier off: {} cannot be used: {error}",
-                    resolved.dir.display()
-                );
-            }
-        }
+        self.disk = HostStoreDisk::open(
+            TIER_LABEL,
+            resolved,
+            origin,
+            &self.load_identity(),
+            retained,
+        );
     }
 
     pub(crate) fn disk_tier_enabled(&self) -> bool {
         self.disk.is_some()
-    }
-
-    /// Whether the host's memory is short: what the start plan read to size the pinned pool (the
-    /// cgroup-clamped available budget) is under the headroom the plan keeps plus one more entry.
-    fn host_memory_short(&self) -> bool {
-        let entry = self
-            .prefix_pins
-            .as_ref()
-            .map_or(0, |pool| pool.bytes() / (pool.retained_entries() + 1));
-        let available = HostFacts::read("Qwen36 kv disk", "Qwen36")
-            .ok()
-            .map(|admission| admission.budget());
-        host_memory_is_short(available, HOST_HEADROOM as u64, entry as u64)
     }
 
     /// After a save publishes: when the store holds as many entries as the watermark and the
@@ -188,35 +201,15 @@ impl QwenResidentStep<'_> {
         if !self.prefix_identity.is_persistable() {
             return;
         }
-        let stored = self.prefix.entries_len() + self.prefix.roots_len();
-        let want = match self.disk.as_ref() {
-            Some(tier) => spill_candidates(stored, tier.retained),
-            None => return,
-        };
-        if want == 0 || !self.host_memory_short() {
-            return;
-        }
-        let Some(tier) = self.disk.as_mut() else {
-            return;
-        };
         let layout = *self.state.layout();
-        let entries: Vec<_> = self.prefix.entries_lru().collect();
-        let view: Vec<Stored<'_>> = entries
-            .iter()
-            .map(|&(key, kind, _)| Stored {
-                key,
-                tip: kind == SaveKind::Tip,
-            })
-            .collect();
-        let offers: Vec<Held> = spill_picks(&view, want)
-            .into_iter()
-            .filter_map(|at| {
-                let (key, kind, saved) = entries[at];
-                held_of(&layout, key, kind, saved, Reason::Watermark)
-            })
-            .collect();
-        for offer in offers {
-            tier.enqueue(offer);
+        if let Some(disk) = self.disk.as_mut() {
+            let family = QwenFamily {
+                layout,
+                pool: None,
+                stream: &self.stream,
+                state: &self.state,
+            };
+            disk.spill_after_save(&family, &self.prefix);
         }
     }
 
@@ -227,8 +220,8 @@ impl QwenResidentStep<'_> {
             return;
         };
         let free = pool.free_slots();
-        if let Some(tier) = self.disk.as_mut() {
-            tier.drop_spills_for_slots(free, "a save");
+        if let Some(disk) = self.disk.as_mut() {
+            disk.tier.drop_spills_for_slots(free, "a save");
         }
     }
 
@@ -261,186 +254,68 @@ impl QwenResidentStep<'_> {
 
     /// Whether the disk tier has work the engine thread should advance while idle.
     pub(crate) fn disk_pending(&self) -> bool {
-        self.disk.as_ref().is_some_and(DiskTier::pending)
+        self.disk.as_ref().is_some_and(HostStoreDisk::pending)
     }
 
     /// Copies up to `budget` bytes of pending saves to the writer and logs what finished.
     fn pump_disk(&mut self, budget: usize) {
         let layout = *self.state.layout();
-        if let Some(tier) = self.disk.as_mut() {
-            tier.pump(&|positions| entry_slab(&layout, positions), budget);
+        if let Some(disk) = self.disk.as_mut() {
+            let family = QwenFamily {
+                layout,
+                pool: None,
+                stream: &self.stream,
+                state: &self.state,
+            };
+            disk.pump_with(&family, budget);
         }
     }
 
     /// A graceful stop: writes the tips that exist only in memory, newest first, so a restart
-    /// restores them. What is not a tip (a periodic or block entry waiting, or being copied) is
-    /// left out. The wait is bounded by the bytes the tips still have to move and the measured
-    /// write rate, and ends at once on the process's second stop signal; one line says the bound
-    /// and one says how it ended.
+    /// restores them, within the bound the tier derives from their bytes and the write rate; a
+    /// second stop signal ends the wait at once.
     pub(crate) fn drain_disk(&mut self) {
-        if self.disk.is_none() {
+        if !self.prefix_identity.is_persistable() {
             return;
         }
-        // The live tips in memory, newest first.
         let layout = *self.state.layout();
-        let mut tips: Vec<Held> = Vec::new();
-        if self.prefix_identity.is_persistable() {
-            let entries: Vec<_> = self.prefix.entries_lru().collect();
-            let view: Vec<Stored<'_>> = entries
-                .iter()
-                .map(|&(key, kind, _)| Stored {
-                    key,
-                    tip: kind == SaveKind::Tip,
-                })
-                .collect();
-            tips = stop_picks(&view)
-                .into_iter()
-                .filter_map(|at| {
-                    let (key, kind, saved) = entries[at];
-                    held_of(&layout, key, kind, saved, Reason::Stop)
-                })
-                .collect();
+        if let Some(disk) = self.disk.as_mut() {
+            let family = QwenFamily {
+                layout,
+                pool: None,
+                stream: &self.stream,
+                state: &self.state,
+            };
+            disk.drain(&family, &self.prefix);
         }
-        let left_in_memory = self.prefix.entries_len().saturating_sub(tips.len());
-        let Some(tier) = self.disk.as_mut() else {
-            return;
-        };
-        tier.drain(
-            tips,
-            left_in_memory,
-            &|positions| entry_slab(&layout, positions),
-            hurry_flag(),
-            &drain_bound,
-        );
     }
 
     /// Before a restore: when the disk holds a longer stored prefix of `prompt` than pinned
     /// memory does, reads it (verified in full) into a free pinned slot and stores it as an
     /// ordinary entry, so the restore that follows finds it. A miss changes nothing.
     pub(crate) fn promote_from_disk(&mut self, prompt: &[u32]) {
-        let Some(tier) = self.disk.as_mut() else {
-            return;
-        };
-        tier.hit = None;
-        // An entry that fails its integrity check is removed, so the next lookup names the
-        // next longest stored prefix: a damaged tip falls back to its block cut, not to a
-        // cold prefill.
-        retry_while_removed(PROMOTE_ATTEMPTS, || self.promote_once(prompt));
-    }
-
-    /// One lookup and read. Returns true when the entry failed its integrity check and was
-    /// removed, so another candidate may serve the prompt.
-    fn promote_once(&mut self, prompt: &[u32]) -> bool {
-        let Some(tier) = self.disk.as_mut() else {
-            return false;
-        };
         let path = (
             CudaPrefillPath::Steps(self.state.layout().kv.mode),
             self.prefix_identity.clone(),
         );
-        let Some(candidate) = tier.cache.lookup(prompt) else {
-            return false;
-        };
-        if self
-            .prefix
-            .longest_candidate_len(prompt, &path)
-            .is_some_and(|len| len >= candidate.key_len)
-        {
-            return false;
-        }
-        let began = Instant::now();
-        let positions = candidate.key_len - 1;
         let layout = *self.state.layout();
-        if positions >= layout.kv.capacity {
-            eprintln!(
-                "q36 cuda: kv disk entry of {positions} positions does not fit the {} position context",
-                layout.kv.capacity
-            );
-            return false;
+        if let Some(disk) = self.disk.as_mut() {
+            let mut family = QwenFamily {
+                layout,
+                pool: self.prefix_pins.as_mut(),
+                stream: &self.stream,
+                state: &self.state,
+            };
+            disk.promote(&mut family, &mut self.prefix, &path, prompt);
         }
-        let shape = match entry_slab(&layout, positions) {
-            Ok(shape) => shape,
-            Err(error) => {
-                eprintln!("q36 cuda: kv disk restore skipped: {error:?}");
-                return false;
-            }
-        };
-        let Some(pool) = self.prefix_pins.as_mut() else {
-            return false;
-        };
-        tier.drop_spills_for_slots(pool.free_slots(), "a restore");
-        let landing = match pool.begin_landing(&self.stream, &self.state, positions) {
-            Ok(landing) => landing,
-            Err(error) => {
-                tier.counters.missed += 1;
-                eprintln!("q36 cuda: kv disk restore skipped: no free pinned slot ({error:?})");
-                return false;
-            }
-        };
-        let stats = match tier.read_into(&candidate, prompt, &shape, &mut |slab, part| {
-            landing.write(slab, part)
-        }) {
-            Ok(stats) => stats,
-            Err(removed) => return removed,
-        };
-        let snapshot: PinnedSnapshot = match pool.finish_landing(landing) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tier.counters.missed += 1;
-                eprintln!("q36 cuda: kv disk restore dropped: {error:?}");
-                return false;
-            }
-        };
-        let Some(&pending) = prompt[..candidate.key_len].last() else {
-            return false;
-        };
-        let charge = entry_bytes(&layout, positions).unwrap_or(0);
-        let stored = self.prefix.save_loaded(
-            &prompt[..candidate.key_len],
-            pending,
-            path,
-            kind_of(candidate.capture),
-            CudaSavedPrefix::Pinned {
-                state: snapshot,
-                payload_bytes: charge,
-            },
-        );
-        match stored {
-            Ok(true) => {
-                tier.counters.restored += 1;
-                tier.hit = Some(Hit {
-                    key_len: candidate.key_len,
-                    bytes: stats.bytes,
-                    ms: stats.ms,
-                });
-                eprintln!(
-                    "q36 cuda: kv disk read {} positions, {} B, {:.1} ms (verified), {:.1} ms with the lookup",
-                    positions,
-                    stats.bytes,
-                    stats.ms,
-                    began.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            Ok(false) => {
-                tier.counters.missed += 1;
-                eprintln!(
-                    "q36 cuda: kv disk entry read but the store refused it; the prompt is prefilled"
-                );
-            }
-            Err(error) => {
-                tier.counters.missed += 1;
-                eprintln!("q36 cuda: kv disk entry could not be stored: {error:?}");
-            }
-        }
-        false
     }
 
     /// The tier facts of the restore that just covered `covered` tokens. A restore served from
     /// pinned memory names its source; one that promoted a disk entry names the disk and what
     /// the read cost.
-    pub(super) fn restore_tier(&mut self, covered: usize) -> PrefixTier {
+    pub(super) fn restore_tier(&mut self, covered: usize) -> crate::sched::job::PrefixTier {
         let source = self.restore_source.take();
-        restore_report(self.disk.as_mut(), covered, source, PrefixSource::Pinned)
+        restore_tier(self.disk.as_mut(), covered, source)
     }
 }
 

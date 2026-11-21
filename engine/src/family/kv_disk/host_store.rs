@@ -25,21 +25,73 @@ const HOST_RESERVE: u64 = 1 << 30;
 /// Lookups one restore may spend on entries that turn out damaged.
 const PROMOTE_ATTEMPTS: usize = 3;
 
+/// What the disk tier sees of one stored snapshot: the positions it covers, the host bytes it
+/// holds and a reader of them.
+pub(crate) struct SnapshotView {
+    pub(crate) positions: usize,
+    pub(crate) bytes: u64,
+    /// A second owner of the snapshot's bytes, to copy out of while the store still holds it.
+    pub(crate) slot: Rc<dyn SlotBytes>,
+}
+
 /// What a family tells the tier about its host snapshots.
 pub(crate) trait HostFamily {
     type Snapshot;
     type Path: PartialEq + Clone;
+    /// Where the bytes of a disk read land before they become a snapshot.
+    type Landing;
 
-    /// The positions a snapshot covers.
-    fn positions(&self, snapshot: &Self::Snapshot) -> usize;
-    /// The host bytes a snapshot holds.
-    fn host_bytes(&self, snapshot: &Self::Snapshot) -> u64;
-    /// A second owner of the snapshot's bytes, to copy out of while the store still holds it.
-    fn slot(&self, snapshot: &Self::Snapshot) -> Rc<dyn SlotBytes>;
+    /// What the disk may take of a snapshot, or `None` for one that cannot be written (an entry
+    /// that is not kept in host memory).
+    fn view(&self, snapshot: &Self::Snapshot) -> Option<SnapshotView>;
     /// The layout of an entry of `positions`, or why this load cannot hold one that long.
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError>;
-    /// A snapshot of `positions` from the bytes of a verified read, laid out as `layout` says.
-    fn rebuild(&self, positions: usize, slab: Vec<u8>) -> Result<Self::Snapshot, EngError>;
+    /// Makes room for a snapshot of `positions` laid out as `layout`: a free slot, or host memory.
+    /// `tier` lets a family give up the spills that hold the slots it needs.
+    fn begin_landing(
+        &mut self,
+        tier: &mut DiskTier,
+        positions: usize,
+        layout: &SlabLayout,
+    ) -> Result<Self::Landing, EngError>;
+    /// Puts `part`, which belongs at `slab` of the entry's slab, into the landing.
+    fn place(&self, landing: &mut Self::Landing, slab: usize, part: &[u8]) -> Result<(), EngError>;
+    /// The snapshot a filled landing becomes.
+    fn finish_landing(
+        &mut self,
+        landing: Self::Landing,
+        positions: usize,
+    ) -> Result<Self::Snapshot, EngError>;
+}
+
+/// A landing in a vector of host memory, for a family whose snapshot is one: the budget is
+/// checked against the host's available memory and the allocation is fallible.
+pub(crate) fn vec_landing(label: &str, layout: &SlabLayout) -> Result<Vec<u8>, EngError> {
+    let total = slab_bytes(layout);
+    let available = crate::family::mem::HostFacts::read("a kv disk restore", "a kv disk restore")
+        .ok()
+        .map(|host| host.budget());
+    if available.is_some_and(|available| total as u64 > available) {
+        return Err(EngError::MemoryPlan(format!(
+            "{label}: the host budget cannot hold {total} B"
+        )));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(total).map_err(|_| {
+        EngError::MemoryPlan(format!("{label}: {total} B do not fit in host memory"))
+    })?;
+    data.resize(total, 0u8);
+    Ok(data)
+}
+
+/// Copies `part` to `slab` of a vector landing.
+pub(crate) fn place_in_vec(data: &mut [u8], slab: usize, part: &[u8]) -> Result<(), EngError> {
+    let end = slab
+        .checked_add(part.len())
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| EngError::BadRequest("kv disk: a part past the snapshot".into()))?;
+    data[slab..end].copy_from_slice(part);
+    Ok(())
 }
 
 pub(crate) type Store<F> = PrefixStore<<F as HostFamily>::Snapshot, <F as HostFamily>::Path>;
@@ -67,17 +119,17 @@ pub(crate) fn held_of<F: HostFamily>(
     snapshot: &F::Snapshot,
     reason: Reason,
 ) -> Option<Held> {
-    let positions = family.positions(snapshot);
-    if positions < MIN_POSITIONS || key.len() != positions + 1 {
+    let view = family.view(snapshot)?;
+    if view.positions < MIN_POSITIONS || key.len() != view.positions + 1 {
         return None;
     }
     Some(Held {
         reason,
-        slot: family.slot(snapshot),
+        slot: view.slot,
         key: key.to_vec(),
         capture: capture_of(kind),
-        positions,
-        bytes: family.host_bytes(snapshot),
+        positions: view.positions,
+        bytes: view.bytes,
     })
 }
 
@@ -141,8 +193,14 @@ impl HostStoreDisk {
     /// Copies a bounded part of the pending saves to the writer: a few MiB per call, which a
     /// batching worker makes between ticks and an idle one every 2 ms.
     pub(crate) fn pump<F: HostFamily>(&mut self, family: &F) {
+        self.pump_with(family, PUMP_EMIT_BYTES);
+    }
+
+    /// [`Self::pump`] with the bytes to copy this call given by the caller: a decode token takes
+    /// a few MiB, a prefill piece or an idle poll many.
+    pub(crate) fn pump_with<F: HostFamily>(&mut self, family: &F, budget: usize) {
         self.tier
-            .pump(&|positions| family.layout(positions), PUMP_EMIT_BYTES);
+            .pump(&|positions| family.layout(positions), budget);
     }
 
     /// After a save: when the store holds as many entries as the watermark and `short` says the
@@ -185,7 +243,8 @@ impl HostStoreDisk {
     pub(crate) fn largest<F: HostFamily>(family: &F, store: &Store<F>) -> u64 {
         store
             .snapshots()
-            .map(|snapshot| family.host_bytes(snapshot))
+            .filter_map(|snapshot| family.view(snapshot))
+            .map(|view| view.bytes)
             .max()
             .unwrap_or(0)
     }
@@ -234,7 +293,7 @@ impl HostStoreDisk {
     /// entry, so the restore that follows finds it. A miss changes nothing.
     pub(crate) fn promote<F: HostFamily>(
         &mut self,
-        family: &F,
+        family: &mut F,
         store: &mut Store<F>,
         path: &F::Path,
         prompt: &[u32],
@@ -249,7 +308,7 @@ impl HostStoreDisk {
     /// removed, so another candidate may serve the prompt.
     fn promote_once<F: HostFamily>(
         &mut self,
-        family: &F,
+        family: &mut F,
         store: &mut Store<F>,
         path: &F::Path,
         prompt: &[u32],
@@ -274,34 +333,21 @@ impl HostStoreDisk {
                 return false;
             }
         };
-        let total = slab_bytes(&shape);
-        let available = crate::family::mem::HostFacts::read(label, label)
-            .ok()
-            .map(|host| host.budget());
-        if available.is_some_and(|available| total as u64 > available) {
-            tier.counters.missed += 1;
-            eprintln!("{label}: kv disk restore skipped: the host budget cannot hold {total} B");
-            return false;
-        }
-        let mut data = Vec::new();
-        if data.try_reserve_exact(total).is_err() {
-            tier.counters.missed += 1;
-            eprintln!("{label}: kv disk restore skipped: {total} B do not fit in host memory");
-            return false;
-        }
-        data.resize(total, 0u8);
+        let mut landing = match family.begin_landing(tier, positions, &shape) {
+            Ok(landing) => landing,
+            Err(error) => {
+                tier.counters.missed += 1;
+                eprintln!("{label}: kv disk restore skipped: {error:?}");
+                return false;
+            }
+        };
         let stats = match tier.read_into(&candidate, prompt, &shape, &mut |slab, part| {
-            let end = slab
-                .checked_add(part.len())
-                .filter(|end| *end <= data.len())
-                .ok_or_else(|| EngError::BadRequest("kv disk: a part past the snapshot".into()))?;
-            data[slab..end].copy_from_slice(part);
-            Ok(())
+            family.place(&mut landing, slab, part)
         }) {
             Ok(stats) => stats,
             Err(removed) => return removed,
         };
-        let snapshot = match family.rebuild(positions, data) {
+        let snapshot = match family.finish_landing(landing, positions) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tier.counters.missed += 1;
@@ -350,11 +396,15 @@ impl HostStoreDisk {
 }
 
 /// The tier facts of the restore that just covered `covered` tokens.
-pub(crate) fn restore_tier(disk: Option<&mut HostStoreDisk>, covered: usize) -> PrefixTier {
+pub(crate) fn restore_tier(
+    disk: Option<&mut HostStoreDisk>,
+    covered: usize,
+    source: Option<PrefixSource>,
+) -> PrefixTier {
     restore_report(
         disk.map(|disk| &mut disk.tier),
         covered,
-        None,
+        source,
         PrefixSource::Pinned,
     )
 }

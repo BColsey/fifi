@@ -8,10 +8,10 @@ use super::resident::bolt::BoltSnapshot;
 use crate::{
     EngError,
     family::kv_disk::{
-        FamilyContract, HostFamily, LoadIdentity, ObjectRole, Run, SlabLayout, SlotBytes,
+        DiskTier, FamilyContract, HostFamily, LoadIdentity, ObjectRole, Run, SlabLayout,
+        SnapshotView, place_in_vec, vec_landing,
     },
 };
-use std::rc::Rc;
 
 /// What the shared tier calls this engine in its log lines.
 pub(super) const TIER_LABEL: &str = "gemma4 bolt";
@@ -58,17 +58,14 @@ pub(super) struct BoltFamily<'a> {
 impl HostFamily for BoltFamily<'_> {
     type Snapshot = BoltSnapshot;
     type Path = crate::family::session::PrefixIdentity;
+    type Landing = Vec<u8>;
 
-    fn positions(&self, snapshot: &BoltSnapshot) -> usize {
-        snapshot.fed()
-    }
-
-    fn host_bytes(&self, snapshot: &BoltSnapshot) -> u64 {
-        snapshot.bytes() as u64
-    }
-
-    fn slot(&self, snapshot: &BoltSnapshot) -> Rc<dyn SlotBytes> {
-        snapshot.hold()
+    fn view(&self, snapshot: &BoltSnapshot) -> Option<SnapshotView> {
+        Some(SnapshotView {
+            positions: snapshot.fed(),
+            bytes: snapshot.bytes() as u64,
+            slot: snapshot.hold(),
+        })
     }
 
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
@@ -81,8 +78,25 @@ impl HostFamily for BoltFamily<'_> {
         Ok(entry_slab(&(self.layer_bytes)(positions)))
     }
 
-    fn rebuild(&self, positions: usize, slab: Vec<u8>) -> Result<BoltSnapshot, EngError> {
-        Ok(BoltSnapshot::from_parts(positions, slab))
+    fn begin_landing(
+        &mut self,
+        _tier: &mut DiskTier,
+        _positions: usize,
+        layout: &SlabLayout,
+    ) -> Result<Vec<u8>, EngError> {
+        vec_landing(TIER_LABEL, layout)
+    }
+
+    fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
+        place_in_vec(landing, slab, part)
+    }
+
+    fn finish_landing(
+        &mut self,
+        landing: Vec<u8>,
+        positions: usize,
+    ) -> Result<BoltSnapshot, EngError> {
+        Ok(BoltSnapshot::from_parts(positions, landing))
     }
 }
 

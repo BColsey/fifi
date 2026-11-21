@@ -373,11 +373,11 @@ mod device {
             // The host store missed or holds a shorter prefix: the disk may hold a longer one.
             if let Some(disk) = self.disk.as_mut() {
                 let layer_bytes = |cells| model.snapshot_layer_bytes(cells);
-                let family = BoltFamily {
+                let mut family = BoltFamily {
                     layer_bytes: &layer_bytes,
                     context_cells: model.cells(),
                 };
-                disk.promote(&family, &mut self.prefix, &identity, prompt);
+                disk.promote(&mut family, &mut self.prefix, &identity, prompt);
             }
             let BoltSession { core, pos, seq } = st;
             let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
@@ -389,7 +389,7 @@ mod device {
             self.prefix_hit = self.prefix.restored_kind().into();
             self.prefix_uncached = self.prefix.uncached_shared(prompt, covered);
             self.prefix_shadow = self.prefix.shadow_report();
-            self.prefix_tier = kv_cache::restore_tier(self.disk.as_mut(), covered);
+            self.prefix_tier = kv_cache::restore_tier(self.disk.as_mut(), covered, None);
             Ok(covered)
         }
 

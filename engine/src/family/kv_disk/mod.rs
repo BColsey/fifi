@@ -25,7 +25,9 @@ mod slab;
 mod tier;
 
 pub(crate) use config::{KV_CACHE_DEFAULT_ON, KvCacheOptions, KvCacheSettings};
-pub(crate) use host_store::{HostFamily, HostStoreDisk, restore_tier};
+pub(crate) use host_store::{
+    HostFamily, HostStoreDisk, SnapshotView, place_in_vec, restore_tier, vec_landing,
+};
 pub(crate) use slab::{ObjectRole, Put, Run, SlabLayout};
 pub(crate) use tier::{
     DiskTier, Held, Hit, PUMP_EMIT_BYTES, PUMP_IDLE_BYTES, PUMP_PREFILL_BYTES, Reason, SlotBytes,

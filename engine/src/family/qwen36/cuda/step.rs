@@ -532,7 +532,7 @@ pub(crate) struct QwenResidentStep<'a> {
     prefix_identity: PrefixIdentity,
     prefix_pins: Option<super::state::pinned::PrefixPinPool>,
     /// The disk tier behind the pinned entries, when the cache directory opened.
-    disk: Option<crate::family::kv_disk::DiskTier>,
+    disk: Option<crate::family::kv_disk::HostStoreDisk>,
     /// When the last background failure was logged (see `note_background_error`).
     background_error_at: Option<std::time::Instant>,
     /// The tier of the last restore from memory, taken when its report is built.

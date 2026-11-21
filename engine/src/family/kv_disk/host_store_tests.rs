@@ -24,15 +24,14 @@ impl Fake {
 impl HostFamily for Fake {
     type Snapshot = Snap;
     type Path = u8;
+    type Landing = Vec<u8>;
 
-    fn positions(&self, snapshot: &Snap) -> usize {
-        snapshot.positions
-    }
-    fn host_bytes(&self, snapshot: &Snap) -> u64 {
-        snapshot.data.len() as u64
-    }
-    fn slot(&self, snapshot: &Snap) -> Rc<dyn SlotBytes> {
-        Rc::clone(&snapshot.data) as Rc<dyn SlotBytes>
+    fn view(&self, snapshot: &Snap) -> Option<SnapshotView> {
+        Some(SnapshotView {
+            positions: snapshot.positions,
+            bytes: snapshot.data.len() as u64,
+            slot: Rc::clone(&snapshot.data) as Rc<dyn SlotBytes>,
+        })
     }
     fn layout(&self, positions: usize) -> Result<SlabLayout, EngError> {
         if positions > 4_000 {
@@ -55,10 +54,21 @@ impl HostFamily for Fake {
             ],
         })
     }
-    fn rebuild(&self, positions: usize, slab: Vec<u8>) -> Result<Snap, EngError> {
+    fn begin_landing(
+        &mut self,
+        _tier: &mut DiskTier,
+        _positions: usize,
+        layout: &SlabLayout,
+    ) -> Result<Vec<u8>, EngError> {
+        vec_landing("fake", layout)
+    }
+    fn place(&self, landing: &mut Vec<u8>, slab: usize, part: &[u8]) -> Result<(), EngError> {
+        place_in_vec(landing, slab, part)
+    }
+    fn finish_landing(&mut self, landing: Vec<u8>, positions: usize) -> Result<Snap, EngError> {
         Ok(Snap {
             positions,
-            data: Rc::new(slab),
+            data: Rc::new(landing),
         })
     }
 }
@@ -185,7 +195,7 @@ fn a_restart_restores_what_a_stop_wrote_byte_for_byte() {
     let mut store = store(2);
     let mut prompt = written.0.clone();
     prompt.extend(key(50, 9));
-    disk.promote(&Fake, &mut store, &0u8, &prompt);
+    disk.promote(&mut Fake, &mut store, &0u8, &prompt);
     assert_eq!(disk.tier.counters.restored, 1);
     let restored = store.snapshots().next().expect("the entry is in the store");
     assert_eq!(restored.positions, 1_500);
@@ -193,11 +203,11 @@ fn a_restart_restores_what_a_stop_wrote_byte_for_byte() {
         *restored.data, *written.1.data,
         "the bytes are the ones saved"
     );
-    let tier = restore_tier(Some(&mut disk), written.0.len());
+    let tier = restore_tier(Some(&mut disk), written.0.len(), None);
     assert_eq!(tier.source, PrefixSource::Disk);
     assert_eq!(tier.disk_bytes, Fake::bytes_of(1_500) as u64);
     // A prompt the store already covers is not read again.
-    disk.promote(&Fake, &mut store, &0u8, &prompt);
+    disk.promote(&mut Fake, &mut store, &0u8, &prompt);
     assert_eq!(disk.tier.counters.restored, 1);
 }
 
@@ -228,7 +238,7 @@ fn a_damaged_entry_is_a_miss_that_leaves_the_store_empty() {
     let mut store = store(2);
     let mut prompt = tip.clone();
     prompt.extend(key(50, 9));
-    disk.promote(&Fake, &mut store, &0u8, &prompt);
+    disk.promote(&mut Fake, &mut store, &0u8, &prompt);
     assert_eq!(disk.tier.counters.restored, 0);
     assert!(store.snapshots().next().is_none());
     assert_eq!(
@@ -250,7 +260,7 @@ fn a_prompt_the_load_cannot_hold_is_a_logged_miss() {
     let mut prompt = tip;
     prompt.extend(key(10, 1));
     let mut other = store_empty();
-    disk.promote(&Fake, &mut other, &0u8, &prompt);
+    disk.promote(&mut Fake, &mut other, &0u8, &prompt);
     assert_eq!(disk.tier.counters.restored, 0);
 }
 
