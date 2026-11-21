@@ -39,11 +39,11 @@ FIFI_INKLING2_MINI_MLX=1 FIFI_INKLING2_MINI_GGUF_MLX=1 FIFI_MLX_AUTO_BUDGET=1 \
 | Mainline `inkling2_loop` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
 | Repository-root `inkling2` GGUF | Yes | Real UD-IQ2_XXS, Metal experts | Raw completion verified at `8a6c6347` |
 
-At `71aa350c`, `enginesrv check` accepted both real GGUF files and the publisher safetensors under the 6 GiB ceiling. Both GGUF artifacts returned the reference three-token continuation with temperature zero in the earlier `8a6c6347` HTTP runs. The table covers text. Vision and DSpark have separate qualification.
+At `71aa350c`, `enginesrv check` and `serve --print-config` selected the native Inkling family for both real GGUF files and the publisher safetensors under the 6 GiB ceiling. Both GGUF artifacts returned the reference three-token continuation with temperature zero in the earlier `8a6c6347` HTTP runs. The table covers text. Vision and DSpark have separate qualification.
 
 ## Check the serving contract
 
-Use a dedicated server on loopback with the original checkpoint and a context of at least 128 tokens. Start it with a JSON config of this form, substituting the absolute model path.
+Use a dedicated server on loopback with the original checkpoint and the verified 192-token context. Start it with a JSON config of this form, substituting the absolute model path.
 
 ```json
 {
@@ -57,7 +57,7 @@ Use a dedicated server on loopback with the original checkpoint and a context of
     "model": "inkling",
     "model_dir": "/path/to/inkling2-mini",
     "tokenizer_dir": "/path/to/inkling2-mini",
-    "context_limit": 128
+    "context_limit": 192
   }]
 }
 ```
@@ -69,6 +69,17 @@ python3 -B engine/tests/tools/check_inkling_serving.py \
   --base-url http://127.0.0.1:18795 --model inkling \
   --report /path/to/scratch/inkling-serving-evidence.json
 ```
+
+To verify raw text generation on the running server, send the same greedy three-token request used by the suite.
+
+```sh
+curl --fail-with-body --silent --show-error http://127.0.0.1:18795/v1/completions \
+  -H "Authorization: Bearer ${ENGINESRV_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"inkling","prompt":"The capital of France is","max_tokens":3,"temperature":0}'
+```
+
+The verified response has a `choices[0].text` value of `" Paris.\n\n"`, a `length` finish reason, five prompt tokens, and three completion tokens.
 
 The report preserves JSON responses and stream events, including reasoning. The test checks raw and chat output caps, streaming parity, the sampled EOS ID and its inclusion in completion usage, explicit multi-turn history, repeatability across requests, and reset after an observed client disconnect. The raw reference check re-encodes the first three matching tokens of the llama.cpp UD-IQ2_XXS and native outputs using the pinned tokenizer. The server exposes sampled token IDs on the chat route.
 
