@@ -2642,3 +2642,36 @@ fn a_cancelled_cold_prompt_is_not_fed_after_its_cancel() {
     assert_eq!(fed, 2, "only the first prompt's two pieces were fed");
     engine.shutdown();
 }
+
+#[test]
+fn the_pool_releases_sessions_by_their_own_idle_age() {
+    let counters = super::TickCounters::default();
+    let interval = Duration::from_millis(100);
+    let now = Instant::now();
+    let mut pool = super::Pool::new(0u32, &counters, Some(interval));
+    // Three more sessions went idle at different times; the seed went idle just now.
+    pool.give_at(1, now - Duration::from_millis(300));
+    pool.give_at(2, now - Duration::from_millis(150));
+    pool.give_at(3, now - Duration::from_millis(10));
+    // With a live slot the sessions idle past the interval go, whatever the pool then holds.
+    pool.trim(now, 0);
+    let mut left: Vec<u32> = pool.free.iter().map(|pooled| pooled.session).collect();
+    left.sort_unstable();
+    assert_eq!(
+        left,
+        vec![0, 3],
+        "the seed, which has just been built, and the session idle for 10 ms stay"
+    );
+    assert_eq!(counters.snapshot().sessions_trimmed, 2);
+    // An idle engine keeps one session even when every one has idled past the interval.
+    let mut pool = super::Pool::new(0u32, &counters, Some(interval));
+    pool.give_at(1, now - Duration::from_millis(300));
+    pool.give_at(2, now - Duration::from_millis(200));
+    pool.trim(now + Duration::from_secs(1), 1);
+    assert_eq!(pool.free.len(), 1);
+    // A pool without an interval never releases.
+    let mut pool = super::Pool::new(0u32, &counters, None);
+    pool.give_at(1, now - Duration::from_secs(60));
+    pool.trim(now, 0);
+    assert_eq!(pool.free.len(), 2);
+}

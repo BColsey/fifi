@@ -160,41 +160,81 @@ impl Drop for TickTimer<'_> {
 
 /// The sessions that no slot holds. Each is reset by `setup_slot` when a job takes it. A session
 /// that has served a job is `used`: the seed the executor built at start is not, so taking it is
-/// not counted as a reuse.
+/// not counted as a reuse. Each carries the time it went idle, so the pool can release the
+/// sessions that have idled longest.
 struct Pool<'a, S> {
-    free: Vec<(S, bool)>,
+    free: Vec<PooledSession<S>>,
     counters: &'a TickCounters,
-    /// How long the engine may sit with no request before the pool keeps one session.
+    /// How long a pooled session may idle before it is released; `None` keeps every session.
     idle_trim: Option<Duration>,
+}
+
+struct PooledSession<S> {
+    session: S,
+    used: bool,
+    idle_since: Instant,
 }
 
 impl<'a, S> Pool<'a, S> {
     fn new(first: S, counters: &'a TickCounters, idle_trim: Option<Duration>) -> Self {
         Self {
-            free: vec![(first, false)],
+            free: vec![PooledSession {
+                session: first,
+                used: false,
+                idle_since: Instant::now(),
+            }],
             counters,
             idle_trim,
         }
     }
 
     fn take(&mut self) -> Option<S> {
-        let (session, used) = self.free.pop()?;
-        if used {
+        let pooled = self.free.pop()?;
+        if pooled.used {
             TickCounters::add(&self.counters.sessions_reused, 1);
         }
-        Some(session)
+        Some(pooled.session)
     }
 
     fn give(&mut self, session: S) {
-        self.free.push((session, true));
+        self.give_at(session, Instant::now());
     }
 
-    /// Releases every pooled session but one, which keeps a lone client's next request from
-    /// paying an allocation.
-    fn trim_to_one(&mut self) {
-        let extra = self.free.len().saturating_sub(1);
-        self.free.truncate(1);
-        TickCounters::add(&self.counters.sessions_trimmed, extra as u64);
+    fn give_at(&mut self, session: S, idle_since: Instant) {
+        self.free.push(PooledSession {
+            session,
+            used: true,
+            idle_since,
+        });
+    }
+
+    /// Releases the pooled sessions that have idled for the trim interval, longest idle first,
+    /// until `keep` pooled sessions would remain at most: an idle engine keeps one for its next
+    /// request, an engine with a live slot keeps none that has idled that long. A session that
+    /// has idled less than the interval stays.
+    fn trim(&mut self, now: Instant, keep: usize) {
+        let Some(interval) = self.idle_trim else {
+            return;
+        };
+        let mut released = 0u64;
+        while self.free.len() > keep {
+            let oldest = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, pooled)| pooled.idle_since)
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index)
+                    if now.saturating_duration_since(self.free[index].idle_since) >= interval =>
+                {
+                    self.free.swap_remove(index);
+                    released += 1;
+                }
+                _ => break,
+            }
+        }
+        TickCounters::add(&self.counters.sessions_trimmed, released);
     }
 }
 
@@ -577,6 +617,9 @@ pub(super) fn work<E: ExecutorOps>(
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
+        // Pooled sessions that have idled for the trim interval go, even while other streams
+        // run; an idle engine keeps one.
+        pool.trim(Instant::now(), usize::from(slots.is_empty()));
         // Bound queue polling as well as live sessions. A stream of cancelled submissions
         // must not starve the jobs already decoding.
         for _ in 0..QUEUE_CAPACITY {
@@ -598,7 +641,7 @@ pub(super) fn work<E: ExecutorOps>(
                             Some(trim) => match jobs.recv_timeout(trim) {
                                 Ok(message) => Some(message),
                                 Err(RecvTimeoutError::Timeout) => {
-                                    pool.trim_to_one();
+                                    pool.trim(Instant::now(), 1);
                                     continue;
                                 }
                                 Err(RecvTimeoutError::Disconnected) => None,
