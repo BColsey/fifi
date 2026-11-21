@@ -912,7 +912,7 @@ mod tests {
         config.model_dir = model.path().to_owned();
         config.tokenizer_dir = tokenizer.path().to_owned();
         config.family = crate::family::inkling2_mini::FAMILY.into();
-        let load = |config| {
+        let load = |config: &EngineConfig| {
             super::load_sampling_defaults(config)
                 .unwrap()
                 .0
