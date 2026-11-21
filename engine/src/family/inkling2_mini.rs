@@ -1,6 +1,6 @@
 //! Checkpoint geometry and text memory plan for the fixed-loop Inkling 2 Mini release.
 
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{collections::BTreeMap, fs::File, ops::Range, path::Path};
 
 use safetensors::{Dtype, tensor::TensorInfo};
 use serde::Deserialize;
@@ -178,14 +178,54 @@ struct WeightPlan {
     vision: u64,
     expert_storage: [u64; LAYERS],
     routed_per_layer: [u64; LAYERS],
+    coalesced_reads: [usize; LAYERS],
+    scattered_reads: [usize; LAYERS],
 }
 
 fn tensor_bytes(tensor: &TensorInfo) -> u64 {
     (tensor.data_offsets.1 - tensor.data_offsets.0) as u64
 }
 
-fn expert_stage(entries: &BTreeMap<String, TensorInfo>, layer: usize) -> Result<u64, EngError> {
-    let mut bytes = 0;
+enum ExpertRegion {
+    Slices { start: u64, stride: u64 },
+    Shared(Range<u64>),
+}
+
+/// Sort by the physical expert slot and merge only adjacent selected slots.
+fn expert_read_runs(
+    regions: &[ExpertRegion],
+    experts: &[usize],
+) -> Result<Vec<Range<u64>>, EngError> {
+    if experts.is_empty() || experts.iter().any(|&expert| expert >= EXPERTS) {
+        return Err(EngError::BadRequest(
+            "Inkling expert selection is empty or out of range".into(),
+        ));
+    }
+    let mut sorted = experts.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut ranges = Vec::new();
+    for region in regions {
+        match region {
+            ExpertRegion::Slices { start, stride } => {
+                for run in sorted.chunk_by(|&left, &right| left + 1 == right) {
+                    let first = run[0] as u64;
+                    let end = first + run.len() as u64;
+                    ranges.push((start + first * stride)..(start + end * stride));
+                }
+            }
+            ExpertRegion::Shared(range) => ranges.push(range.clone()),
+        }
+    }
+    Ok(ranges)
+}
+
+fn expert_regions(
+    entries: &BTreeMap<String, TensorInfo>,
+    data_start: u64,
+    layer: usize,
+) -> Result<Vec<ExpertRegion>, EngError> {
+    let mut regions = Vec::new();
     let nvfp4 = layer < 20;
     let group = if nvfp4 { 16 } else { 32 };
     // w13 packs gate and up rows together. w2 projects to the hidden dimension.
@@ -204,12 +244,17 @@ fn expert_stage(entries: &BTreeMap<String, TensorInfo>, layer: usize) -> Result<
                     "unexpected storage layout for {key}"
                 )));
             }
+            let start = data_start + info.data_offsets.0 as u64;
             let stored = tensor_bytes(info);
-            bytes += if per_expert {
-                stored / EXPERTS as u64 * TOP_K as u64
+            let region = if per_expert {
+                ExpertRegion::Slices {
+                    start,
+                    stride: stored / EXPERTS as u64,
+                }
             } else {
-                stored
+                ExpertRegion::Shared(start..start + stored)
             };
+            regions.push(region);
             Ok(())
         };
         if nvfp4 {
@@ -227,11 +272,12 @@ fn expert_stage(entries: &BTreeMap<String, TensorInfo>, layer: usize) -> Result<
             get("_scale", Dtype::U8, &[EXPERTS, rows, cols / group], true)?;
         }
     }
-    Ok(bytes)
+    Ok(regions)
 }
 
 fn weight_plan(
     index: &WeightIndex,
+    data_start: u64,
     entries: BTreeMap<String, TensorInfo>,
 ) -> Result<WeightPlan, EngError> {
     if index.weight_map.len() != entries.len()
@@ -271,8 +317,15 @@ fn weight_plan(
     if expert_tensors != 20 * 8 + 4 * 4 {
         return Err(checkpoint_error("unexpected number of expert tensors"));
     }
-    for (layer, bytes) in plan.routed_per_layer.iter_mut().enumerate() {
-        *bytes = expert_stage(&entries, layer)?;
+    let adjacent: [usize; TOP_K] = std::array::from_fn(|i| i);
+    let spread: [usize; TOP_K] = std::array::from_fn(|i| 2 * i);
+    for layer in 0..LAYERS {
+        let regions = expert_regions(&entries, data_start, layer)?;
+        let grouped = expert_read_runs(&regions, &adjacent)?;
+        let scattered = expert_read_runs(&regions, &spread)?;
+        plan.routed_per_layer[layer] = grouped.iter().map(|range| range.end - range.start).sum();
+        plan.coalesced_reads[layer] = grouped.len();
+        plan.scattered_reads[layer] = scattered.len();
     }
     Ok(plan)
 }
@@ -327,8 +380,8 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
     let index = parse_json(&std::fs::read(index_path).map_err(checkpoint_error)?)?;
     let mut shard = File::open(shard_path).map_err(checkpoint_error)?;
     let len = shard.metadata().map_err(checkpoint_error)?.len();
-    let (_, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT)?;
-    let weights = weight_plan(&index, entries.into_iter().collect())?;
+    let (data_start, entries) = read_stored_header(&mut shard, len, HEADER_LIMIT)?;
+    let weights = weight_plan(&index, data_start, entries.into_iter().collect())?;
     let context = context.unwrap_or(MAX_CONTEXT);
     let state = state_plan(context)?;
     let routed_peak = weights
@@ -384,6 +437,17 @@ pub(crate) fn inspect(dir: &Path, context: Option<u32>) -> Result<Vec<PlanDecisi
                 state.kv, state.full, state.local, state.convolution
             ),
             PlanFixity::Start,
+        ),
+        row(
+            "exact expert read ranges",
+            format!(
+                "adjacent versus scattered top-8 IDs need {} vs {} ranges for NVFP4 and {} vs {} for MXFP8",
+                weights.coalesced_reads[0],
+                weights.scattered_reads[0],
+                weights.coalesced_reads[20],
+                weights.scattered_reads[20],
+            ),
+            PlanFixity::Load,
         ),
         row(
             "loop-core residency",
@@ -459,10 +523,28 @@ mod tests {
             add(20, "", Dtype::F8_E4M3, vec![EXPERTS, rows, cols], 1);
             add(20, "_scale", Dtype::U8, vec![EXPERTS, rows, cols / 32], 1);
         }
-        assert_eq!(expert_stage(&nv, 0).unwrap(), 35_831_880);
-        assert_eq!(expert_stage(&mx, 20).unwrap(), 65_691_648);
-        assert!(expert_stage(&mx, 0).is_err());
+        let adjacent = [7, 6, 5, 4, 3, 2, 1, 0, 0];
+        let scattered = [0, 2, 4, 6, 8, 10, 12, 127];
+        for (table, layer, bytes, grouped, individual) in
+            [(&nv, 0, 35_831_880, 8, 50), (&mx, 20, 65_691_648, 4, 32)]
+        {
+            let regions = expert_regions(table, 1024, layer).unwrap();
+            for (ids, count) in [
+                (adjacent.as_slice(), grouped),
+                (scattered.as_slice(), individual),
+            ] {
+                let runs = expert_read_runs(&regions, ids).unwrap();
+                assert_eq!(runs.len(), count);
+                assert_eq!(
+                    runs.iter().map(|run| run.end - run.start).sum::<u64>(),
+                    bytes
+                );
+                assert!(runs.iter().all(|run| run.start >= 1024));
+            }
+            assert!(expert_read_runs(&regions, &[128]).is_err());
+        }
+        assert!(expert_regions(&mx, 0, 0).is_err());
         nv.remove("model.llm.layers.0.mlp.experts.w2_weight_amax");
-        assert!(expert_stage(&nv, 0).is_err());
+        assert!(expert_regions(&nv, 0, 0).is_err());
     }
 }
