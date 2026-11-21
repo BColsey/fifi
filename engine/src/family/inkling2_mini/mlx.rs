@@ -1,7 +1,8 @@
 //! Import one selected expert set from bounded host pages and project in its stored format.
 
 use super::{
-    HIDDEN, InklingExpertPlan, InklingExpertProjection, InklingExpertSource, InklingRoutes, TOP_K,
+    EXPERTS, HIDDEN, InklingExpertPlan, InklingExpertProjection, InklingExpertSource,
+    InklingRoutes, TOP_K,
 };
 use crate::{
     EngError,
@@ -9,8 +10,118 @@ use crate::{
         BoundedIndices, HostPages, MlxKernels, PackedPages, PageRange, QuantizationMode,
         QuantizationSpec, ResidentPackedWeight,
     },
-    tensor::{Dtype, ExecutionTensor},
+    tensor::{Dtype, ExecutionTensor, Tensor},
 };
+
+const MAX_ROUTED_ROWS: usize = u32::MAX as usize / HIDDEN / TOP_K;
+
+/// One resident router bound to the packed experts of its physical layer.
+pub struct MlxRouter<'a> {
+    source: &'a InklingExpertSource,
+    layer: usize,
+    weight: ExecutionTensor,
+    bias: [f32; EXPERTS],
+}
+
+impl<'a> MlxRouter<'a> {
+    /// Reads the checkpoint's BF16 gate matrix and F32 selection bias once.
+    /// Widen and transpose at load so successive visits reuse the F32 matrix.
+    pub fn load(
+        kernels: &mut MlxKernels,
+        source: &'a InklingExpertSource,
+        layer: usize,
+    ) -> Result<Self, EngError> {
+        kernels.check_ready()?;
+        let stored = source.read_router(layer)?;
+        let weight = kernels.import_tensor(&router_matrix(&stored.weight)?)?;
+        Ok(Self {
+            source,
+            layer,
+            weight,
+            bias: stored.bias,
+        })
+    }
+
+    /// Projects normalized F32 [tokens, hidden] inputs to unbiased F32 logits.
+    pub fn logits(
+        &self,
+        kernels: &mut MlxKernels,
+        input: &ExecutionTensor,
+    ) -> Result<ExecutionTensor, EngError> {
+        let &[rows, width] = input.shape() else {
+            return Err(bad_router_input());
+        };
+        if input.dtype() != Dtype::F32
+            || width != HIDDEN as u32
+            || !(1..=MAX_ROUTED_ROWS).contains(&(rows as usize))
+        {
+            return Err(bad_router_input());
+        }
+        kernels.mm(input, &self.weight)
+    }
+
+    /// Reads back only the F32 logits. Bias affects expert selection separately
+    /// from the unbiased route weights.
+    pub fn select(
+        &self,
+        kernels: &mut MlxKernels,
+        input: &ExecutionTensor,
+    ) -> Result<InklingRoutes, EngError> {
+        let projected = self.logits(kernels, input)?;
+        let logits = kernels.readback(&projected)?;
+        let bytes = logits.host_bytes().ok_or_else(|| EngError::Backend {
+            operation: "Inkling router",
+            message: "logits readback returned no host bytes".into(),
+        })?;
+        let (rows, trailing) = bytes.as_chunks::<{ EXPERTS * 4 }>();
+        if !trailing.is_empty() || rows.len() != input.shape()[0] as usize {
+            return Err(EngError::Backend {
+                operation: "Inkling router",
+                message: "logits readback has the wrong size".into(),
+            });
+        }
+        let rows = rows.iter().map(|row| {
+            let words = row.as_chunks::<4>().0;
+            std::array::from_fn(|expert| f32::from_le_bytes(words[expert]))
+        });
+        InklingRoutes::from_rows(rows, &self.bias)
+    }
+
+    /// Prices the selected expert stage on the same checkpoint and weight layer.
+    pub fn plan<'plan>(
+        &'plan self,
+        routes: &'plan InklingRoutes,
+    ) -> Result<MlxRoutedExpertPlan<'plan>, EngError> {
+        MlxRoutedExpertPlan::new(self.source, self.layer, routes)
+    }
+}
+
+fn bad_router_input() -> EngError {
+    EngError::BadRequest(
+        "Inkling router requires a nonempty F32 [tokens, hidden] batch within Metal limits".into(),
+    )
+}
+
+fn router_matrix(stored: &[u8]) -> Result<Tensor, EngError> {
+    if stored.len() != EXPERTS * HIDDEN * 2 {
+        return Err(EngError::Checkpoint(
+            "Inkling BF16 router payload has the wrong size".into(),
+        ));
+    }
+    let mut transposed = vec![0; HIDDEN * EXPERTS * 4];
+    for (expert, row) in stored.chunks_exact(HIDDEN * 2).enumerate() {
+        for (feature, &word) in row.as_chunks::<2>().0.iter().enumerate() {
+            if u16::from_le_bytes(word) & 0x7f80 == 0x7f80 {
+                return Err(EngError::Checkpoint(
+                    "Inkling BF16 router weights must be finite".into(),
+                ));
+            }
+            let offset = (feature * EXPERTS + expert) * 4;
+            transposed[offset + 2..offset + 4].copy_from_slice(&word);
+        }
+    }
+    Tensor::try_from_host(Dtype::F32, vec![HIDDEN as u32, EXPERTS as u32], transposed)
+}
 
 /// The selected experts for both projections of one physical layer.
 pub struct MlxExpertStage {
@@ -37,7 +148,7 @@ impl<'a> MlxRoutedExpertPlan<'a> {
         let count = routes.expert_ids().len();
         // Both packed projections have HIDDEN output values per route.
         // Reject batches above the Metal kernel's element-index limit before I/O.
-        if count == 0 || count > u32::MAX as usize / HIDDEN {
+        if !(1..=MAX_ROUTED_ROWS).contains(&routes.rows()) {
             return Err(EngError::BadRequest(
                 "Inkling Metal staging requires a nonempty batch within native index limits".into(),
             ));
@@ -344,7 +455,39 @@ fn normalize_multipliers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kernels::PackedWeight, tensor::Tensor};
+    use crate::kernels::PackedWeight;
+
+    #[test]
+    fn router_transposes_bf16_columns_for_f32_matmul() {
+        let _lock = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let mut stored = vec![0; HIDDEN * EXPERTS * 2];
+        for (expert, feature, weight) in [(0, 9, 1.5_f32), (127, 9, -2.0)] {
+            let offset = (expert * HIDDEN + feature) * 2;
+            stored[offset..offset + 2]
+                .copy_from_slice(&((weight.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let weight = kernels
+            .import_tensor(&router_matrix(&stored).unwrap())
+            .unwrap();
+        let mut input = vec![0; HIDDEN * 4];
+        input[9 * 4..10 * 4].copy_from_slice(&3.0_f32.to_le_bytes());
+        let input = Tensor::try_from_host(Dtype::F32, vec![1, HIDDEN as u32], input).unwrap();
+        let input = kernels.import_tensor(&input).unwrap();
+        let logits = kernels.mm(&input, &weight).unwrap();
+        let logits = kernels.readback(&logits).unwrap();
+        assert_eq!(logits.shape(), [1, EXPERTS as u32]);
+        let words = logits.host_bytes().unwrap().as_chunks::<4>().0;
+        assert_eq!(f32::from_le_bytes(words[0]), 4.5);
+        assert_eq!(f32::from_le_bytes(words[127]), -6.0);
+        assert!(
+            words[1..127]
+                .iter()
+                .all(|&word| f32::from_le_bytes(word) == 0.0)
+        );
+        stored[..2].copy_from_slice(&0x7fc0_u16.to_le_bytes());
+        assert!(router_matrix(&stored).is_err());
+    }
 
     #[test]
     fn routed_activation_and_merge_round_at_the_bf16_boundaries() {
