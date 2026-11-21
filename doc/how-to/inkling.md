@@ -408,7 +408,8 @@ when comparing throughput.
 `FIFI_INKLING_GGUF_SEGMENTED_LRU=1` selects the experimental cache policy
 for GGUF checkpoints using single-copy packed Metal experts. Hits can
 promote planes into a protected queue within 90% of the same Metal
-budget. New admissions compete for the rest of the cache. Compare against
+budget. Sustained misses without a protected hit let a changed working
+set reclaim the oldest protected entries. Compare against
 the same checkpoint and working-set budget with the variable unset.
 
 For GGUF, the same timing output reports `gguf_file_read_bytes`,
