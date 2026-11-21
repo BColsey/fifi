@@ -57,10 +57,12 @@ struct GdnScanSeqArgsRaw {
     head_dim: c_int,
     eps: f32,
     form: c_int,
+    decay: *const c_void,
+    norm_eps: f32,
 }
 
 const _: () = assert!(
-    size_of::<GdnScanSeqArgsRaw>() == 120
+    size_of::<GdnScanSeqArgsRaw>() == 136
         && offset_of!(GdnScanSeqArgsRaw, conv) == 0
         && offset_of!(GdnScanSeqArgsRaw, state) == 40
         && offset_of!(GdnScanSeqArgsRaw, status) == 56
@@ -74,13 +76,17 @@ const _: () = assert!(
         && offset_of!(GdnScanSeqArgsRaw, head_dim) == 104
         && offset_of!(GdnScanSeqArgsRaw, eps) == 108
         && offset_of!(GdnScanSeqArgsRaw, form) == 112
+        && offset_of!(GdnScanSeqArgsRaw, decay) == 120
+        && offset_of!(GdnScanSeqArgsRaw, norm_eps) == 128
 );
 
 /// The `INFERENCE_CUDA_GDN_FORM_*` bits of `gdn_scan_seq.h`.
 pub(in crate::kernels::cuda) const FORM_GROUPED_HEADS: c_int = 1;
 pub(in crate::kernels::cuda) const FORM_ADD_EPS_L2: c_int = 2;
 pub(in crate::kernels::cuda) const FORM_SIGMOID_GATE: c_int = 4;
-const FORM_ALL: c_int = FORM_GROUPED_HEADS | FORM_ADD_EPS_L2 | FORM_SIGMOID_GATE;
+pub(in crate::kernels::cuda) const FORM_CHANNEL_DECAY: c_int = 8;
+const FORM_ALL: c_int =
+    FORM_GROUPED_HEADS | FORM_ADD_EPS_L2 | FORM_SIGMOID_GATE | FORM_CHANNEL_DECAY;
 
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_scan_seq_launch"]
@@ -161,6 +167,13 @@ pub(in crate::kernels::cuda) struct GdnScanSeqInts {
     pub(in crate::kernels::cuda) head_dim: c_int,
 }
 
+/// The input of the `FORM_CHANNEL_DECAY` form: f32 `[m][n_v_heads][128]` decay rows and the eps
+/// of the gated output RMSNorm (the q/k L2 norms keep the call's `eps`).
+pub(in crate::kernels::cuda) struct DecayRows<'a> {
+    pub(in crate::kernels::cuda) rows: RawRange<'a>,
+    pub(in crate::kernels::cuda) norm_eps: f32,
+}
+
 /// What one scan launch reads and writes: `conv` the conv output rows, `proj` the projection
 /// rows (z, beta, alpha), the per-head weights, the in-place `state`, the `o_out` rows
 /// (written pre-norm by the scan kernel, rewritten in place by the out-gate kernel), the
@@ -168,8 +181,11 @@ pub(in crate::kernels::cuda) struct GdnScanSeqInts {
 pub(in crate::kernels::cuda) struct GdnScanSeqRaw<'a> {
     pub(in crate::kernels::cuda) conv: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
-    pub(in crate::kernels::cuda) a: RawRange<'a>,
-    pub(in crate::kernels::cuda) dt_bias: RawRange<'a>,
+    /// The per-head gates, `Some` exactly when the form has no `FORM_CHANNEL_DECAY` bit.
+    pub(in crate::kernels::cuda) a: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) dt_bias: Option<RawRange<'a>>,
+    /// The decay rows, `Some` exactly when the form has the bit.
+    pub(in crate::kernels::cuda) decay: Option<DecayRows<'a>>,
     pub(in crate::kernels::cuda) norm_w: RawRange<'a>,
     pub(in crate::kernels::cuda) state: RawRange<'a>,
     pub(in crate::kernels::cuda) o_out: RawRange<'a>,
@@ -183,6 +199,7 @@ struct Needs {
     conv: usize,
     proj: usize,
     head_vec: usize,
+    decay: usize,
     norm_w: usize,
     state: usize,
     o_out: usize,
@@ -225,6 +242,7 @@ fn needs(ints: &GdnScanSeqInts) -> Result<Needs, DeviceFailure> {
         conv: product(&[m, conv_cols, 4])?,
         proj,
         head_vec: product(&[nv, 4])?,
+        decay: product(&[m, nv, head_dim, 4])?,
         norm_w: product(&[head_dim, 4])?,
         state: product(&[nv, head_dim, head_dim, 4])?,
         o_out: product(&[m, nv, head_dim, 4])?,
@@ -233,31 +251,41 @@ fn needs(ints: &GdnScanSeqInts) -> Result<Needs, DeviceFailure> {
 
 fn check_scan(io: &GdnScanSeqRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints)?;
-    let ranges = [
+    let channel = io.form & FORM_CHANNEL_DECAY != 0;
+    // The per-head gates are read exactly when the form has no decay rows, the decay rows
+    // exactly when it has.
+    if channel != io.decay.is_some() || channel == (io.a.is_some() || io.dt_bias.is_some()) {
+        return Err(invalid_argument());
+    }
+    let mut reads = vec![
         (&io.conv, need.conv),
         (&io.proj, need.proj),
-        (&io.a, need.head_vec),
-        (&io.dt_bias, need.head_vec),
         (&io.norm_w, need.norm_w),
-        (&io.state, need.state),
-        (&io.o_out, need.o_out),
     ];
-    let fitted = ranges
-        .iter()
-        .all(|(range, bytes)| range.bytes() >= *bytes && range.offset().is_multiple_of(4))
+    for (range, bytes) in [(&io.a, need.head_vec), (&io.dt_bias, need.head_vec)] {
+        if let Some(range) = range {
+            reads.push((range, bytes));
+        }
+    }
+    if let Some(decay) = &io.decay {
+        reads.push((&decay.rows, need.decay));
+    }
+    let fits = |range: &RawRange<'_>, bytes: usize| {
+        range.bytes() >= bytes && range.offset().is_multiple_of(4)
+    };
+    let fitted = reads.iter().all(|(range, bytes)| fits(range, *bytes))
+        && fits(&io.state, need.state)
+        && fits(&io.o_out, need.o_out)
         && io
             .status
             .as_ref()
             .is_none_or(|s| s.bytes() >= 4 && s.offset().is_multiple_of(4));
     let state = Span::of(&io.state, need.state);
     let out = Span::of(&io.o_out, need.o_out);
-    let reads = [
-        Span::of(&io.conv, need.conv),
-        Span::of(&io.proj, need.proj),
-        Span::of(&io.a, need.head_vec),
-        Span::of(&io.dt_bias, need.head_vec),
-        Span::of(&io.norm_w, need.norm_w),
-    ];
+    let reads: Vec<Span> = reads
+        .iter()
+        .map(|(range, bytes)| Span::of(range, *bytes))
+        .collect();
     let apart = state.apart(&out)
         && reads
             .iter()
@@ -278,8 +306,14 @@ fn c_args(io: &GdnScanSeqRaw<'_>) -> GdnScanSeqArgsRaw {
     GdnScanSeqArgsRaw {
         conv: io.conv.address().cast_const(),
         proj: io.proj.address().cast_const(),
-        a: io.a.address().cast_const(),
-        dt_bias: io.dt_bias.address().cast_const(),
+        a: io
+            .a
+            .as_ref()
+            .map_or(std::ptr::null(), |r| r.address().cast_const()),
+        dt_bias: io
+            .dt_bias
+            .as_ref()
+            .map_or(std::ptr::null(), |r| r.address().cast_const()),
         norm_w: io.norm_w.address().cast_const(),
         state: io.state.address(),
         o_out: io.o_out.address(),
@@ -300,6 +334,11 @@ fn c_args(io: &GdnScanSeqRaw<'_>) -> GdnScanSeqArgsRaw {
         head_dim: io.ints.head_dim,
         eps: io.eps,
         form: io.form,
+        decay: io
+            .decay
+            .as_ref()
+            .map_or(std::ptr::null(), |d| d.rows.address().cast_const()),
+        norm_eps: io.decay.as_ref().map_or(0.0, |d| d.norm_eps),
     }
 }
 
@@ -334,7 +373,7 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_launch(
     block_cols: usize,
 ) -> Result<(), DeviceFailure> {
     check_scan(&io)?;
-    if !GDN_SCAN_BLOCK_COLS.contains(&block_cols) {
+    if !GDN_SCAN_BLOCK_COLS.contains(&block_cols) || io.form & FORM_CHANNEL_DECAY != 0 {
         return Err(invalid_argument());
     }
     let args = c_args(&io);
@@ -359,6 +398,9 @@ pub(in crate::kernels::cuda) fn gdn_scan_chunk_launch(
     io: GdnScanSeqRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     check_scan(&io)?;
+    if io.form & FORM_CHANNEL_DECAY != 0 {
+        return Err(invalid_argument());
+    }
     let args = c_args(&io);
     let mut stage = STAGE_NONE;
     // SAFETY: as `gdn_scan_seq_launch`: `check_scan` proved every range inside its live

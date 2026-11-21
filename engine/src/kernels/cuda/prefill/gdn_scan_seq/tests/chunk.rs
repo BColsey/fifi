@@ -529,8 +529,9 @@ fn gdn_scan_chunk_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
         let io = GdnScanSeqRaw {
             conv: rig.ctx.raw_range(&conv.range(0, need.conv)?)?,
             proj: rig.ctx.raw_range(&proj.range(0, need.proj)?)?,
-            a: rig.ctx.raw_range(&a.range(0, need.a)?)?,
-            dt_bias: rig.ctx.raw_range(&dt.range(0, need.dt_bias)?)?,
+            a: Some(rig.ctx.raw_range(&a.range(0, need.a)?)?),
+            dt_bias: Some(rig.ctx.raw_range(&dt.range(0, need.dt_bias)?)?),
+            decay: None,
             norm_w: rig.ctx.raw_range(&nw.range(0, need.norm_w)?)?,
             state: rig.ctx.raw_range(&state.range(0, need.state)?)?,
             o_out: rig.ctx.raw_range(&o_out.range(0, need.o_out)?)?,

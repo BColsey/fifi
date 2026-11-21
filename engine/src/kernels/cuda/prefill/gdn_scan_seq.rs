@@ -42,8 +42,9 @@ use crate::kernels::cuda::gdn_mutants::{
     CHUNK_MIN_ONE, SCAN_ACCEPTS_FOUR, SCAN_MIN_ONE, SCAN_NO_TRIM, mutated,
 };
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
-    FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
-    GdnScanSeqRaw, gdn_scan_chunk_launch, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
+    DecayRows, FORM_ADD_EPS_L2, FORM_CHANNEL_DECAY, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE,
+    GDN_SCAN_BLOCK_COLS, GdnScanSeqInts, GdnScanSeqRaw, gdn_scan_chunk_launch,
+    gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
 };
 
 /// The kernel-side geometry of one chunk: the conv channel count
@@ -229,6 +230,27 @@ pub(crate) struct GdnScanSeqCall<'b> {
     pub(crate) conv: DeviceRange<'b>,
     pub(crate) proj: DeviceRange<'b>,
     pub(crate) weights: ScanWeights<'b>,
+    pub(crate) state: DeviceRange<'b>,
+    pub(crate) o_out: DeviceRange<'b>,
+    pub(crate) status: Option<DeviceRange<'b>>,
+}
+
+/// One scan call of the decay-row form: the same scan as [`GdnScanSeqCall`] for a model whose
+/// decay is one value per key channel and token, computed by the caller into `decay`, f32
+/// `[m][n_v_heads][128]`, instead of the per-head gate of `a` and `dt_bias` (which this call
+/// does not take). The shape's `alpha_off` is not read; set it to `beta_off`. Only the
+/// default sequential kernel serves this form, so neither the cols nor the chunk switch
+/// applies.
+pub(crate) struct GdnChannelScanCall<'b> {
+    pub(crate) shape: ScanShape,
+    /// The eps of the q/k L2 norms: exactly [`GDN_SCAN_EPS`].
+    pub(crate) eps: f32,
+    /// The eps of the gated output RMSNorm, in `(0, 1]`.
+    pub(crate) norm_eps: f32,
+    pub(crate) conv: DeviceRange<'b>,
+    pub(crate) proj: DeviceRange<'b>,
+    pub(crate) decay: DeviceRange<'b>,
+    pub(crate) norm_w: DeviceRange<'b>,
     pub(crate) state: DeviceRange<'b>,
     pub(crate) o_out: DeviceRange<'b>,
     pub(crate) status: Option<DeviceRange<'b>>,
@@ -632,8 +654,9 @@ impl CudaContext {
         let io = GdnScanSeqRaw {
             conv,
             proj,
-            a,
-            dt_bias,
+            a: Some(a),
+            dt_bias: Some(dt_bias),
+            decay: None,
             norm_w,
             state,
             o_out,
@@ -698,8 +721,9 @@ impl CudaContext {
         let io = GdnScanSeqRaw {
             conv,
             proj,
-            a,
-            dt_bias,
+            a: Some(a),
+            dt_bias: Some(dt_bias),
+            decay: None,
             norm_w,
             state,
             o_out,
@@ -716,6 +740,81 @@ impl CudaContext {
             Some(cols) => gdn_scan_seq_cols_launch(raw, io, cols),
             None => gdn_scan_seq_launch(raw, io),
         })
+    }
+
+    /// Queues the sequential scan of the decay-row form on `stream`: the scan kernel with the
+    /// caller's per-channel decay, then the gated output RMSNorm in place, under the rules of
+    /// `form`. The checks, the refusals and the written ranges are those of
+    /// [`Self::gdn_scan_seq_cols`] with `None`, plus the `decay` range.
+    pub(crate) fn gdn_scan_seq_channel_decay(
+        &self,
+        stream: &DeviceStream,
+        call: GdnChannelScanCall<'_>,
+        form: GdnForm,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        check_shape(&call.shape, call.eps)?;
+        if !(call.norm_eps > 0.0 && call.norm_eps <= 1.0) {
+            return Err(rule(
+                "norm_eps",
+                &format!("norm_eps is {:e}, not in (0, 1]", call.norm_eps),
+            ));
+        }
+        let ints = scan_ints(&call.shape)?;
+        let need = scan_bytes(call.shape)?;
+        let decay_bytes = product(&[call.shape.m, call.shape.n_v_heads, GDN_SCAN_HEAD_DIM, 4])?;
+        require_fit("conv", &call.conv, need.conv, 4)?;
+        require_fit("proj", &call.proj, need.proj, 4)?;
+        require_fit("decay", &call.decay, decay_bytes, 4)?;
+        require_fit("norm_w", &call.norm_w, need.norm_w, 4)?;
+        require_fit("state", &call.state, need.state, 4)?;
+        require_fit("o_out", &call.o_out, need.o_out, 4)?;
+        if let Some(status) = &call.status {
+            require_fit("status", status, 4, 4)?;
+        }
+        let state = Claim::of("state", &call.state, need.state);
+        let out = Claim::of("o_out", &call.o_out, need.o_out);
+        let reads = [
+            Claim::of("conv", &call.conv, need.conv),
+            Claim::of("proj", &call.proj, need.proj),
+            Claim::of("decay", &call.decay, decay_bytes),
+            Claim::of("norm_w", &call.norm_w, need.norm_w),
+        ];
+        require_apart(&state, &out)?;
+        for read in &reads {
+            require_apart(&state, read)?;
+            require_apart(&out, read)?;
+        }
+        if let Some(status) = &call.status {
+            let word = Claim::of("status", status, 4);
+            require_apart(&word, &state)?;
+            require_apart(&word, &out)?;
+            for read in &reads {
+                require_apart(&word, read)?;
+            }
+        }
+        let io = GdnScanSeqRaw {
+            conv: self.raw_range(&call.conv)?,
+            proj: self.raw_range(&call.proj)?,
+            a: None,
+            dt_bias: None,
+            decay: Some(DecayRows {
+                rows: self.raw_range(&call.decay)?,
+                norm_eps: call.norm_eps,
+            }),
+            norm_w: self.raw_range(&call.norm_w)?,
+            state: self.raw_range(&call.state)?,
+            o_out: self.raw_range(&call.o_out)?,
+            status: call
+                .status
+                .as_ref()
+                .map(|r| self.raw_range(r))
+                .transpose()?,
+            ints,
+            eps: call.eps,
+            form: form.bits() | FORM_CHANNEL_DECAY,
+        };
+        self.launch_on(stream, move |raw| gdn_scan_seq_launch(raw, io))
     }
 }
 

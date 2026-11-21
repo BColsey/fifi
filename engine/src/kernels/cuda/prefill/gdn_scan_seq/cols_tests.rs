@@ -727,8 +727,9 @@ mod mutants {
             let io = GdnScanSeqRaw {
                 conv: ctx.raw_range(&conv.range(0, need.conv).unwrap()).unwrap(),
                 proj: ctx.raw_range(&proj.range(0, need.proj).unwrap()).unwrap(),
-                a: ctx.raw_range(&a.range(0, need.a).unwrap()).unwrap(),
-                dt_bias: ctx.raw_range(&dt.range(0, need.dt_bias).unwrap()).unwrap(),
+                a: Some(ctx.raw_range(&a.range(0, need.a).unwrap()).unwrap()),
+                dt_bias: Some(ctx.raw_range(&dt.range(0, need.dt_bias).unwrap()).unwrap()),
+                decay: None,
                 norm_w: ctx.raw_range(&nw.range(0, need.norm_w).unwrap()).unwrap(),
                 state: ctx.raw_range(&state.range(0, need.state).unwrap()).unwrap(),
                 o_out: ctx.raw_range(&o_out.range(0, need.o_out).unwrap()).unwrap(),

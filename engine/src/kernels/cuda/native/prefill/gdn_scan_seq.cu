@@ -59,6 +59,8 @@ static_assert(D / kGroupLanes == 4 * 4, "16 state entries per lane: s[4][4]");
 
 struct ScanArgs {
     const float *conv, *proj, *a, *dt_bias, *norm_w;
+    const float *decay;  // the CHANNEL_DECAY rows, [m][n_v_heads][D]; NULL for every other form
+    float out_eps;       // the eps of the gated output RMSNorm: eps, or norm_eps with CHANNEL_DECAY
     float *state, *o_out;
     int *status;
     int m, p0, ctx_tokens, conv_ld, ld, z_off, beta_off, alpha_off, n_k_heads, n_v_heads;
@@ -80,6 +82,12 @@ bool apart(const Span &a, const Span &b) {
     return pa + a.bytes <= pb || pb + b.bytes <= pa;
 }
 
+/* The decay-row form exists only on the default scan kernel; the narrow-block and chunk entries
+ * refuse it. */
+bool has_decay_rows(const inference_cuda_gdn_scan_seq_args &a) {
+    return (a.form & INFERENCE_CUDA_GDN_FORM_CHANNEL_DECAY) != 0;
+}
+
 /* The p0 bound the wrapper, this entry and the kernels all check, the sum in 64 bits. */
 bool bounds_ok(const inference_cuda_gdn_scan_seq_args &a) {
     return a.p0 >= 0 && (long long)a.p0 + a.m <= a.ctx_tokens;
@@ -88,14 +96,19 @@ bool bounds_ok(const inference_cuda_gdn_scan_seq_args &a) {
 /* Mirrors the Rust wrapper term by term; a term added here needs a row there. The Rust side
  * refuses everything this refuses, so a C refusal means a wrapper defect. */
 bool valid(const inference_cuda_gdn_scan_seq_args &a, void *stream) {
-    if (a.conv == NULL || a.proj == NULL || a.a == NULL || a.dt_bias == NULL ||
-        a.norm_w == NULL || a.state == NULL || a.o_out == NULL || stream == NULL) {
+    const bool channel = (a.form & INFERENCE_CUDA_GDN_FORM_CHANNEL_DECAY) != 0;
+    // The per-head gates are read exactly when the form has no decay rows, and the decay rows
+    // exactly when it has (a and dt_bias are ignored by the decay-row form).
+    if (a.conv == NULL || a.proj == NULL || (!channel && (a.a == NULL || a.dt_bias == NULL)) ||
+        (a.decay != NULL) != channel || a.norm_w == NULL || a.state == NULL ||
+        a.o_out == NULL || stream == NULL) {
         return false;
     }
     if (a.m < 1 || a.m > kMaxM || a.head_dim != D || a.n_k_heads < 1 ||
         a.n_k_heads > kMaxKHeads || a.n_v_heads < 1 || a.n_v_heads > kMaxVHeads ||
         a.n_v_heads % a.n_k_heads != 0 || a.eps != kEps ||
-        (a.form & ~INFERENCE_CUDA_GDN_FORM_ALL) != 0) {
+        (a.form & ~INFERENCE_CUDA_GDN_FORM_ALL) != 0 ||
+        (channel && !(a.norm_eps > 0.0f && a.norm_eps <= 1.0f))) {
         return false;
     }
     const long conv_cols = (2L * a.n_k_heads + a.n_v_heads) * D;
@@ -110,8 +123,9 @@ bool valid(const inference_cuda_gdn_scan_seq_args &a, void *stream) {
         return false;
     }
     if (!aligned(a.conv, 4) || !aligned(a.proj, 4) || !aligned(a.a, 4) ||
-        !aligned(a.dt_bias, 4) || !aligned(a.norm_w, 4) || !aligned(a.state, 4) ||
-        !aligned(a.o_out, 4) || (a.status != NULL && !aligned(a.status, 4))) {
+        !aligned(a.dt_bias, 4) || !aligned(a.decay, 4) || !aligned(a.norm_w, 4) ||
+        !aligned(a.state, 4) || !aligned(a.o_out, 4) ||
+        (a.status != NULL && !aligned(a.status, 4))) {
         return false;
     }
     const size_t m = (size_t)a.m, nv = (size_t)a.n_v_heads, f = sizeof(float);
@@ -120,8 +134,9 @@ bool valid(const inference_cuda_gdn_scan_seq_args &a, void *stream) {
     const Span state = {a.state, nv * D * D * f}, out = {a.o_out, m * nv * D * f};
     const Span reads[] = {{a.conv, m * (size_t)conv_cols * f},
                           {a.proj, ((m - 1) * (size_t)a.ld + proj_cols) * f},
-                          {a.a, nv * f},
-                          {a.dt_bias, nv * f},
+                          {a.a, channel ? 0 : nv * f},
+                          {a.dt_bias, channel ? 0 : nv * f},
+                          {a.decay, channel ? m * nv * D * f : 0},
                           {a.norm_w, (size_t)D * f}};
     if (!apart(state, out)) {
         return false;
@@ -170,6 +185,8 @@ ScanArgs to_args(const inference_cuda_gdn_scan_seq_args *a) {
     k.a = (const float *)a->a;
     k.dt_bias = (const float *)a->dt_bias;
     k.norm_w = (const float *)a->norm_w;
+    k.decay = (const float *)a->decay;
+    k.out_eps = (a->form & INFERENCE_CUDA_GDN_FORM_CHANNEL_DECAY) ? a->norm_eps : a->eps;
     k.state = (float *)a->state;
     k.o_out = (float *)a->o_out;
     k.status = a->status;
@@ -265,7 +282,7 @@ __device__ __forceinline__ float out_gate(float z) {
 // the two 128-term dots differs from a one-warp-per-column scan's (four accumulators, a
 // pairwise combine and a 3-level tree over the 8 lanes of a column, against one accumulator
 // and a 5-level tree over 32 lanes); the rounding depth is 9 in both.
-template <bool kGrouped, bool kAddEps>
+template <bool kGrouped, bool kAddEps, bool kChannelDecay>
 __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a) {
     // qk_s is float4 so the type itself guarantees the 16-byte alignment of S's LDS.128
     // loads; P1's scalar stores go through the float view qk_f (element (j, plane, e) at
@@ -273,6 +290,9 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
     __shared__ float4 qk_s[kTile][2][D / 4];
     __shared__ float v_s[kTile][kBlockCols];
     __shared__ float2 g_s[kTile];
+    // The per-channel decay rows of the tile (CHANNEL_DECAY only): float4 index 8 * k + g of a
+    // slot holds the decay of rows 32k + 4g..+3, the layout of the k-hat loads below.
+    __shared__ float4 dec_s[kChannelDecay ? kTile : 1][kChannelDecay ? D / 4 : 1];
     float *const qk_f = reinterpret_cast<float *>(qk_s);
     const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
     const int lane = threadIdx.x, w = threadIdx.y;
@@ -297,7 +317,7 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
         }
         return;
     }
-    const float a_h = a.a[h], dt_h = a.dt_bias[h];
+    const float a_h = kChannelDecay ? 0.f : a.a[h], dt_h = kChannelDecay ? 0.f : a.dt_bias[h];
     float s[4][4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -350,8 +370,15 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
         float alpha_l = 0.f, beta_l = 0.f;
         if (w == 1 && lane < len) {
             const float *p = a.proj + (size_t)(t0 + lane) * a.ld;
-            alpha_l = p[a.alpha_off + h];
+            if constexpr (!kChannelDecay) alpha_l = p[a.alpha_off + h];
             beta_l = p[a.beta_off + h];
+        }
+        if constexpr (kChannelDecay) {
+            // The decay rows of the tile, one coalesced run of D floats per slot.
+            float *const dec_f = reinterpret_cast<float *>(dec_s);
+            for (int e = w * kLanes + lane; e < len * D; e += kLanes * kWarps) {
+                dec_f[e] = a.decay[((size_t)(t0 + e / D) * a.n_v_heads + h) * D + e % D];
+            }
         }
         // P's reductions and shared stores.
         if (live_w) {
@@ -391,7 +418,7 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
             // Gates from the projection row, in kernel; a is ssm_a as stored (no second
             // exp). The header's expressions verbatim, with a[h] and dt_bias[h] read once
             // before the tile loop.
-            g_s[lane] = make_float2(expf(softplus_e(alpha_l + dt_h) * a_h),
+            g_s[lane] = make_float2(kChannelDecay ? 1.f : expf(softplus_e(alpha_l + dt_h) * a_h),
                                     1.f / (1.f + expf(-beta_l)));
         }
         if (live_w) v_s[w][lane] = v_w;
@@ -423,9 +450,16 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
             float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
+                if constexpr (kChannelDecay) {
+                    const float4 df = dec_s[j][8 * k + g];
+                    s[k][0] *= df.x;
+                    s[k][1] *= df.y;
+                    s[k][2] *= df.z;
+                    s[k][3] *= df.w;
+                }
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
-                    s[k][c] *= gb.x;
+                    if constexpr (!kChannelDecay) s[k][c] *= gb.x;
                     acc[c] += s[k][c] * khat[k][c];
                 }
             }
@@ -443,7 +477,7 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
             const float o = group_sum((oacc[0] + oacc[1]) + (oacc[2] + oacc[3]));
             if (g == 0) a.o_out[((size_t)(t0 + j) * a.n_v_heads + h) * D + col] = o;
         }
-        __syncthreads();  // the next tile's P overwrites qk_s, g_s and v_s
+        __syncthreads();  // the next tile's P overwrites qk_s, g_s, v_s and dec_s
     }
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -631,7 +665,7 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
     float *row = a.o_out + ((size_t)t * a.n_v_heads + h) * D;
     const float *p = a.proj + (size_t)t * a.ld;
     const float o = row[j];
-    const float rstd = rsqrtf(block_sum(o * o) / D + a.eps);
+    const float rstd = rsqrtf(block_sum(o * o) / D + a.out_eps);
     row[j] = o * rstd * a.norm_w[j] * out_gate<kSigmoid>(p[a.z_off + h * D + j]);
 }
 
@@ -1212,9 +1246,15 @@ void launch_scan_kernel(const ScanArgs &k, int cols, void *stream) {
     case 16: launch_cols<4, kGrouped, kAddEps>(k, stream); break;
     case 32: launch_cols<8, kGrouped, kAddEps>(k, stream); break;
     default:
-        gdn_scan_seq_k<kGrouped, kAddEps>
-            <<<dim3(k.n_v_heads, 1, D / kBlockCols), dim3(kLanes, kWarps, 1), 0,
-               (cudaStream_t)stream>>>(k);
+        if (k.decay != NULL) {
+            gdn_scan_seq_k<kGrouped, kAddEps, true>
+                <<<dim3(k.n_v_heads, 1, D / kBlockCols), dim3(kLanes, kWarps, 1), 0,
+                   (cudaStream_t)stream>>>(k);
+        } else {
+            gdn_scan_seq_k<kGrouped, kAddEps, false>
+                <<<dim3(k.n_v_heads, 1, D / kBlockCols), dim3(kLanes, kWarps, 1), 0,
+                   (cudaStream_t)stream>>>(k);
+        }
     }
 }
 
@@ -1295,7 +1335,7 @@ extern "C" int inference_cuda_gdn_scan_chunk_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || !valid(*args, stream)) {
+        if (args == NULL || !valid(*args, stream) || has_decay_rows(*args)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         const ScanArgs k = to_args(args);
@@ -1328,7 +1368,7 @@ extern "C" int inference_cuda_gdn_scan_seq_cols_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage, int block_cols) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || !valid(*args, stream) ||
+        if (args == NULL || !valid(*args, stream) || has_decay_rows(*args) ||
             (block_cols != 8 && block_cols != 16 && block_cols != 32)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
@@ -1372,7 +1412,7 @@ extern "C" int inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || !valid_sans_bounds(*args, stream)) {
+        if (args == NULL || !valid_sans_bounds(*args, stream) || has_decay_rows(*args)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         ScanArgs k = to_args(args);
@@ -1398,7 +1438,7 @@ extern "C" int inference_cuda_gdn_scan_seq_cols_bad_bounds_launch(
     const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage, int block_cols) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        if (args == NULL || !valid_sans_bounds(*args, stream) ||
+        if (args == NULL || !valid_sans_bounds(*args, stream) || has_decay_rows(*args) ||
             (block_cols != 8 && block_cols != 16 && block_cols != 32)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }

@@ -11,8 +11,17 @@
  *                  instead of the ggml rsqrt(fmax(sum(x^2), eps^2)); the q scale rsqrt(D)
  *                  stays;
  *   SIGMOID_GATE   the output gate is sigmoid(z) = 1 / (1 + expf(-z)) instead of silu(z).
- * Qwen3.8 Flash-Next uses all three. Each form is its own template instance, so the form-0
- * kernels are the same code as before the bits existed.
+ *   CHANNEL_DECAY  step 3 does not compute the decay: it is read from `decay`, one value per
+ *                  key channel (f32 [m][n_v_heads][128], channel i of head h of token t at
+ *                  decay[(t * n_v_heads + h) * 128 + i]), and step 4 scales row i of the
+ *                  state by decay[i] instead of by one value per head. The beta gate is
+ *                  unchanged; `a`, `dt_bias` and the alpha logits are not read (a and dt_bias
+ *                  may be NULL). The q/k L2 norms keep `eps`; the gated output RMSNorm of step 5
+ *                  takes `norm_eps`. Only the default entry takes this bit: the narrow-block entry
+ *                  and the chunk entry refuse it. The form is for a model whose decay is a
+ *                  vector, so its caller computes that vector.
+ * Qwen3.8 Flash-Next uses the first three. Each form is its own template instance, so the
+ * form-0 kernels are the same code as before the bits existed.
  *   1. qv/kv: the head's D values of the conv row t (layout q | k | v of gdn_delta.h);
  *      vv: the head's D values of the v plane.
  *   2. q/k L2 norms in the GGML form (norm.cu:273), NOT the decode rsqrt(sum + eps):
@@ -71,7 +80,8 @@ extern "C" {
 #define INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS 1
 #define INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2 2
 #define INFERENCE_CUDA_GDN_FORM_SIGMOID_GATE 4
-#define INFERENCE_CUDA_GDN_FORM_ALL 7
+#define INFERENCE_CUDA_GDN_FORM_CHANNEL_DECAY 8
+#define INFERENCE_CUDA_GDN_FORM_ALL 15
 
 typedef struct inference_cuda_gdn_scan_seq_args {
     const void *conv;
@@ -95,6 +105,9 @@ typedef struct inference_cuda_gdn_scan_seq_args {
     int head_dim;    /* 128 */
     float eps;       /* exactly 1e-6f */
     int form;        /* INFERENCE_CUDA_GDN_FORM_* bits; 0 is the Qwen3.6 GGUF form */
+    const void *decay; /* CHANNEL_DECAY: f32 [m][n_v_heads][128], 4-byte aligned; otherwise NULL */
+    float norm_eps;  /* CHANNEL_DECAY: the eps of the gated output RMSNorm, in (0, 1]; every other
+                        form uses `eps` there and ignores this field */
 } inference_cuda_gdn_scan_seq_args;
 
 int inference_cuda_gdn_scan_seq_launch(const inference_cuda_gdn_scan_seq_args *args,
@@ -140,7 +153,7 @@ int inference_cuda_gdn_scan_chunk_fault_bad_bounds_launch(
 #endif
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
+static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 136 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, conv) == 0 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, state) == 40 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, status) == 56 &&
@@ -153,10 +166,12 @@ static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, n_k_heads) == 96 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, head_dim) == 104 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108 &&
-                  offsetof(inference_cuda_gdn_scan_seq_args, form) == 112,
+                  offsetof(inference_cuda_gdn_scan_seq_args, form) == 112 &&
+                  offsetof(inference_cuda_gdn_scan_seq_args, decay) == 120 &&
+                  offsetof(inference_cuda_gdn_scan_seq_args, norm_eps) == 128,
               "inference_cuda_gdn_scan_seq_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
+_Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 136 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, conv) == 0 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, state) == 40 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, status) == 56 &&
@@ -169,7 +184,9 @@ _Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, n_k_heads) == 96 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, head_dim) == 104 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108 &&
-                   offsetof(inference_cuda_gdn_scan_seq_args, form) == 112,
+                   offsetof(inference_cuda_gdn_scan_seq_args, form) == 112 &&
+                   offsetof(inference_cuda_gdn_scan_seq_args, decay) == 120 &&
+                   offsetof(inference_cuda_gdn_scan_seq_args, norm_eps) == 128,
                "inference_cuda_gdn_scan_seq_args layout");
 #endif
 
