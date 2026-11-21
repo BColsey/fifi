@@ -1199,15 +1199,55 @@ fn gguf_codebook_matvec_report_gbps() {
             let y_bytes = FN_USED * rows * 4;
             let y = nan_filled(&ctx, y_bytes);
             // The down projection reads one activation row per slot.
-            for (launch_name, per_slot) in [("expert", name == "down"), ("dense", false)] {
-                let (n_used, bytes_read) = if launch_name == "expert" {
-                    (FN_USED, expert_bytes * FN_USED)
-                } else {
+            for (launch_name, per_slot) in [
+                ("expert", name == "down"),
+                ("2x5", name == "down"),
+                ("dense", false),
+            ] {
+                let (n_used, bytes_read) = if launch_name == "dense" {
                     (1, expert_bytes)
+                } else {
+                    (FN_USED, expert_bytes * FN_USED)
                 };
                 let x_rows = if per_slot { FN_USED } else { 1 };
                 let run = |ids: &DeviceBuffer| {
-                    if launch_name == "expert" {
+                    if launch_name == "2x5" {
+                        // The same ten slots as two launches of five: the second launch reads
+                        // ids 5..10 and writes slots 5..10 (a second view of the same ranges).
+                        let half = FN_USED / 2;
+                        for part in 0..2 {
+                            ctx.matvec_expert(
+                                &stream,
+                                ExpertMatvecCall {
+                                    ty,
+                                    w_stack: stack
+                                        .range(0, n_expert * expert_bytes)
+                                        .expect("stack"),
+                                    ids: ids.range(part * half * 4, half * 4).expect("ids"),
+                                    x_q8: x
+                                        .buffer
+                                        .range(
+                                            if per_slot {
+                                                part * half * x.row_bytes
+                                            } else {
+                                                0
+                                            },
+                                            x.row_bytes * if per_slot { half } else { 1 },
+                                        )
+                                        .expect("x"),
+                                    x_per_slot: per_slot,
+                                    y: y.range(part * half * rows * 4, half * rows * 4).expect("y"),
+                                    y_slot_stride: rows,
+                                    k,
+                                    rows,
+                                    n_expert,
+                                    n_used: half,
+                                    glu_gate: None,
+                                },
+                            )
+                            .expect("expert half");
+                        }
+                    } else if launch_name == "expert" {
                         ctx.matvec_expert(
                             &stream,
                             ExpertMatvecCall {
