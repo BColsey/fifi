@@ -314,7 +314,9 @@ fn common_rows(g: &MixerGeometry, m: usize, nsm: usize, card: bool) -> Result<Ve
         // its routed and shared inputs must remain disjoint from that output.
         // The single-device path combines into Hidden and keeps its shorter lifetime.
         (S::Delta, hidden, DOut, if card { Combine } else { NormF }),
-        (S::X2, hidden, NormF, Scatter),
+        // X2 stays live through the routed gate and up launches: a stack on the dequantizing
+        // GEMM reads these f32 rows directly (the mmq protocol lets it die after the scatter).
+        (S::X2, hidden, NormF, GateUp),
         (S::XfF, xf, NormF, NormF),
         (
             S::Fixup,
@@ -404,7 +406,9 @@ fn moe_rows_with(
         ),
         (S::Q8S, q8_1_bytes(h, routed)?, Scatter, GateUp),
         (S::Gu, word_bytes(&[routed, 2 * e.inter])?, GateUp, Swiglu),
-        (S::Act, word_bytes(&[routed, e.inter])?, Swiglu, QuantAct),
+        // Act stays live through the down launch: a stack on the dequantizing GEMM reads these f32
+        // slot rows directly, so `Down` must not share its arena span.
+        (S::Act, word_bytes(&[routed, e.inter])?, Swiglu, Down),
         (S::Q8Act, q8_1_bytes(e.inter, routed)?, QuantAct, Down),
         (S::Down, word_bytes(&[routed, h])?, Down, Combine),
     ])
