@@ -32,6 +32,7 @@ use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
 use crate::kernels::cuda::resident::block_ops::{
     BlockOp, MLA_GROUP, MlaShape, RdaInputs, RowOutputs,
 };
+use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
@@ -596,6 +597,34 @@ impl Raon1Device {
         buffer.range(0, buffer.bytes())
     }
 
+    /// RMS norm of `n` rows of `d` values scaled by `weight`: the f32 rows into `y` and the
+    /// q8_1 rows into `q8_out`, through the shared fused norm and quantize kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_rows(
+        &self,
+        n: usize,
+        d: usize,
+        eps: f32,
+        x: &DeviceBuffer,
+        weight: DeviceRange<'_>,
+        y: &DeviceBuffer,
+        q8_out: &DeviceBuffer,
+    ) -> Result<(), EngError> {
+        self.ctx.add_rmsnorm_q8(
+            &self.stream,
+            AddNormQ8Call {
+                n: d,
+                eps,
+                h: x.range(0, n * d * 4)?,
+                delta: None,
+                weight,
+                norm_out: y.range(0, n * d * 4)?,
+                q8: q8_out.range(0, q8(d, n))?,
+                rows: n,
+            },
+        )
+    }
+
     /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
     /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched GEMM.
     fn mv(&self, name: &str, x: Rows<'_>, y: &DeviceBuffer, n: usize) -> Result<(), EngError> {
@@ -772,16 +801,7 @@ impl Raon1Device {
             sc.post.range(0, n * STREAMS * 4)?,
             sc.comb.range(0, n * 16 * 4)?,
         )?)?;
-        self.run(BlockOp::rms_rows(
-            n,
-            HIDDEN,
-            HIDDEN,
-            self.hy.norm_eps,
-            sc.branch.range(0, n * HIDDEN * 4)?,
-            self.raw(norm)?,
-            Some(sc.cur.range(0, n * HIDDEN * 4)?),
-            Some(sc.q8_cur.range(0, q8(HIDDEN, n))?),
-        )?)
+        self.norm_rows(n, HIDDEN, self.hy.norm_eps, &sc.branch, self.raw(norm)?, &sc.cur, &sc.q8_cur)
     }
 
     /// The stream update of one half: `out = comb * resid + post * proj`.
@@ -899,16 +919,16 @@ impl Raon1Device {
         let sc = &self.sc;
         let mla = names.ordinal;
         self.mv(&names.attn_q_a, sc.cur_rows(), &sc.qa, n)?;
-        self.run(BlockOp::rms_rows(
+        // The f32 rows go to `proj`, which the mixer has not written yet; only the q8_1 rows are read.
+        self.norm_rows(
             n,
             Q_LORA,
-            Q_LORA,
             self.hy.latent_eps,
-            sc.qa.range(0, n * Q_LORA * 4)?,
+            &sc.qa,
             self.raw(&names.attn_q_a_norm)?,
-            None,
-            Some(sc.q8_qa.range(0, q8(Q_LORA, n))?),
-        )?)?;
+            &sc.proj,
+            &sc.q8_qa,
+        )?;
         self.mv(&names.attn_q_b, Rows::q8(&sc.q8_qa), &sc.qb, n)?;
         self.mv(&names.attn_kv_a, sc.cur_rows(), &sc.kv, n)?;
         let layer_cache = self.cells * MLA_ROW * 2;
@@ -1292,16 +1312,15 @@ impl Raon1Device {
             sc.resid_a.range(0, (row + 1) * STREAMS * HIDDEN * 4)?,
             sc.head.range(0, HIDDEN * 4)?,
         )?)?;
-        self.run(BlockOp::rms_rows(
+        self.norm_rows(
             1,
             HIDDEN,
-            HIDDEN,
             self.hy.norm_eps,
-            sc.head.range(0, HIDDEN * 4)?,
+            &sc.head,
             self.raw("output_norm.weight")?,
-            None,
-            Some(sc.q8_head.range(0, q8(HIDDEN, 1))?),
-        )?)?;
+            &sc.cur,
+            &sc.q8_head,
+        )?;
         self.mv("output.weight", Rows::q8(&sc.q8_head), &sc.logits, 1)?;
         let mut bytes = vec![0u8; self.vocab * 4];
         sc.logits.read_at(&self.stream, 0, &mut bytes)?;

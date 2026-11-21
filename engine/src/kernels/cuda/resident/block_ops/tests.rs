@@ -106,43 +106,46 @@ fn fill_writes_the_value() {
     assert!(r.read(&buffer, 37).iter().all(|&v| v == 2.5));
 }
 
+/// The fused norm and quantize kernel at the widths Raon needs (576 is off the old 256 grid).
 #[test]
-fn rms_rows_matches_the_host_for_wide_strides_and_ragged_rows() {
-    let Some(r) = rig("block_ops rms_rows") else {
+fn the_shared_norm_takes_a_width_on_the_32_grid_at_ragged_rows() {
+    let Some(r) = rig("add_rmsnorm_q8 width 576") else {
         return;
     };
-    for (n, d, ld) in [(1usize, 576usize, 576usize), (7, 576, 608), (3, 2560, 2560)] {
-        let x = data(11 + n as u64, n * ld, 1.0);
+    for (n, d) in [(1usize, 576usize), (7, 576), (3, 2560), (2, 32)] {
+        let x = data(11 + n as u64, n * d, 1.0);
         let w = data(5, d, 1.0);
         let (xb, wb) = (r.up(&x), r.up(&w));
         let y = r.zeros(n * d);
         let q8 = r.zero_bytes(q8_1_bytes(d, n).expect("q8"));
-        r.run(
-            BlockOp::rms_rows(
-                n,
-                d,
-                ld,
-                1e-5,
-                whole(&xb),
-                whole(&wb),
-                Some(whole(&y)),
-                Some(whole(&q8)),
+        r.ctx
+            .add_rmsnorm_q8(
+                &r.stream,
+                crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call {
+                    n: d,
+                    eps: 1e-5,
+                    h: whole(&xb),
+                    delta: None,
+                    weight: whole(&wb),
+                    norm_out: whole(&y),
+                    q8: whole(&q8),
+                    rows: n,
+                },
             )
-            .expect("op"),
-        );
+            .expect("norm");
+        r.stream.synchronize().expect("drain");
         let mut want = Vec::new();
         for t in 0..n {
-            let row = &x[t * ld..t * ld + d];
+            let row = &x[t * d..(t + 1) * d];
             let scale = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / d as f32 + 1e-5).sqrt();
             want.extend(row.iter().zip(&w).map(|(v, w)| v * scale * w));
         }
-        let got = r.read(&y, n * d);
-        assert_close("rms f32", &got, &want, 1e-5);
+        assert_close("norm f32", &r.read(&y, n * d), &want, 1e-5);
         let codes = dequant_q8(&testkit::read_bytes(&r.ctx, &q8, q8.bytes()), n, d);
         let tol = q8_tolerance(&want);
         assert!(
             codes.iter().zip(&want).all(|(a, b)| (a - b).abs() <= tol),
-            "rms q8 rows differ beyond one code step"
+            "norm q8 rows differ beyond one code step"
         );
     }
 }

@@ -25,7 +25,7 @@ extern "C" {
  * against a host reference. The row is padded to MATRIX_ROW_PADDING (512) values: the tail
  * blocks past n are written as zeros (d = 0, q = 0, s = 0), q8 holds pad(n, 512)/32 blocks of
  * 36 bytes. One kernel, one block of 256 threads. h, delta, w, norm_out: f32 [n]; q8:
- * block_q8_1 [pad(n, 512)/32]. n is a multiple of 256 in 256..32768, eps finite and > 0.
+ * block_q8_1 [pad(n, 512)/32]. n is a multiple of 32 (one q8_1 block) in 32..32768, eps finite and > 0.
  * h (4-byte aligned), norm_out (16-byte aligned, like add_norm_pack's) and q8 (4-byte) are
  * written and must overlap no other range; delta (4) and w (4) are read and may share bytes
  * with each other only. stream must not be NULL. Returns INFERENCE_CUDA_INVALID_ARGUMENT
@@ -36,7 +36,7 @@ typedef struct inference_cuda_add_rmsnorm_q8_args {
     const void *w;      /* f32 [n], the RMSNorm weight shared by every row */
     void *norm_out;     /* f32 [n * rows] out, 16-byte aligned: byte-identical to add_norm_pack's */
     void *q8;           /* block_q8_1 out: rows * pad(n, 512)/32 * 36 bytes */
-    int n;              /* multiple of 256, 256..32768 */
+    int n;              /* multiple of 32, 32..32768 */
     float eps;          /* finite, > 0 */
     int rows;           /* row count, 1..262144; one block per row */
     int h_stride;       /* f32 elements between rows of h: 0 = n, else >= n; delta, norm_out and q8 stay dense */

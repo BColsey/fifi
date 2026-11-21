@@ -113,7 +113,7 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
         const int n = args->n;
         const int64_t rows = args->rows;
         if (args->h == NULL || args->w == NULL || args->norm_out == NULL || args->q8 == NULL ||
-            n < 256 || n > kMaxWidth || n % 256 != 0 || !std::isfinite(args->eps) ||
+            n < 32 || n > kMaxWidth || n % 32 != 0 || !std::isfinite(args->eps) ||
             args->eps <= 0.0f || rows < 1 || rows > kMaxRows || !aligned(args->h, 4) ||
             (args->delta != NULL && !aligned(args->delta, 4)) || !aligned(args->w, 4) ||
             !aligned(args->norm_out, 16) || !aligned(args->q8, 4) || args->h_stride < 0 ||

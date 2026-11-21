@@ -109,8 +109,8 @@ fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
             .delta
             .as_ref()
             .is_some_and(|delta| !fits(delta, all_rows, 4))
-        || !(256..=32_768).contains(&n)
-        || !n.is_multiple_of(256)
+        || !(32..=32_768).contains(&n)
+        || !n.is_multiple_of(32)
         || !call.eps.is_finite()
         || call.eps <= 0.0
         || !(1..=262_144).contains(&rows)
@@ -236,7 +236,7 @@ mod tests {
             ("NULL q8", |a| a.q8 = 0),
             ("NULL stream", |a| a.stream = 0),
             ("n below one unit", |a| a.n = 128),
-            ("n off the 256 grid", |a| a.n = 2048 + 64),
+            ("n off the 32 grid", |a| a.n = 2048 + 16),
             ("n above the width bound", |a| a.n = 32_768 + 256),
             ("eps zero", |a| a.eps = 0.0),
             ("eps negative", |a| a.eps = -1e-6),
@@ -357,7 +357,7 @@ mod tests {
             ("n zero", |l| l.n = 0),
             ("n below one unit", |l| resized(l, 128)),
             ("n above the width bound", |l| resized(l, 32_768 + 256)),
-            ("n off the 256 grid", |l| resized(l, N + 128)),
+            ("n off the 32 grid", |l| resized(l, N + 16)),
             ("q8 over h", |l| l.q8.0 = 4_096),
             ("h over delta", |l| l.h.0 = 3 * ROW_N + 512),
             ("norm_out over w", |l| l.norm_out.0 = 6 * ROW_N + 512),

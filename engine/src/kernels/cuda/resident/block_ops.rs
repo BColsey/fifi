@@ -125,35 +125,6 @@ impl<'b> BlockOp<'b> {
             .write(4, out, bytes(&[n, width, 4])?))
     }
 
-    /// RMS norm of `n` rows of `d` values (read at stride `ld_x`), scaled by `weight`, into an
-    /// f32 range, a q8_1 range, or both.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn rms_rows(
-        n: usize,
-        d: usize,
-        ld_x: usize,
-        eps: f32,
-        x: DeviceRange<'b>,
-        weight: DeviceRange<'b>,
-        y: Option<DeviceRange<'b>>,
-        q8: Option<DeviceRange<'b>>,
-    ) -> Result<Self, EngError> {
-        let mut op = Self::new(3, &[n, d, ld_x], &[eps])?
-            .read(
-                0,
-                x,
-                bytes(&[n.saturating_sub(1), ld_x, 4])?.saturating_add(d * 4),
-            )
-            .read(1, weight, bytes(&[d, 4])?);
-        if let Some(y) = y {
-            op = op.write(2, y, bytes(&[n, d, 4])?);
-        }
-        if let Some(q8) = q8 {
-            op = op.write(3, q8, q8_rows(d, n)?);
-        }
-        Ok(op)
-    }
-
     /// The mean of the four streams of token row `row`.
     pub(crate) fn hc_mean(
         row: usize,

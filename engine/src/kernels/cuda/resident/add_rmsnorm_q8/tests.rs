@@ -749,11 +749,11 @@ fn add_rmsnorm_q8_rejects_unsound_calls_before_launching() {
         _ctx: other_ctx,
     };
     let cases: [(&str, &str, Spec); 18] = [
-        ("n below one unit", "takes n in", Spec { n: 128, ..VALID }),
+        ("n below one unit", "takes n in", Spec { n: 16, ..VALID }),
         (
-            "n off the 256 grid",
-            "needs n as a multiple of 256",
-            Spec { n: 2368, ..VALID },
+            "n off the 32 grid",
+            "needs n as a multiple of 32",
+            Spec { n: 2370, ..VALID },
         ),
         (
             "n above the width bound",

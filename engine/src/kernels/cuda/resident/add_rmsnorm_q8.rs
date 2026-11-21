@@ -15,7 +15,7 @@
 //! bit-checkable against a host reference.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
-//! usable; `n` is a multiple of 256 in `256..=32768` (the bounds of today's `add_norm_pack`); `eps`
+//! usable; `n` is a multiple of 32 (one q8_1 block) in `32..=32768`; `eps`
 //! is finite and above 0; `h`, `delta`, `weight` and `norm_out` hold `n` floats and `q8` holds
 //! [`q8_1_bytes`]`(n, 1)` bytes, with `norm_out` 16-byte aligned and the rest 4; the written
 //! ranges (`h`, `norm_out`, `q8`) overlap no other range of the call (`delta` and `weight` may
@@ -28,8 +28,8 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::native::resident::add_rmsnorm_q8::{AddNormQ8Raw, add_rmsnorm_q8_launch};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
-/// The vendored kernel's unit, as `add_norm_pack`.
-pub(crate) const NORM_WIDTH_UNIT: usize = 256;
+/// The unit of the row width: one q8_1 block of 32 values.
+pub(crate) const NORM_WIDTH_UNIT: usize = 32;
 /// The vendored `kern::kMaxK`.
 pub(crate) const MAX_WIDTH: usize = 32_768;
 
@@ -76,7 +76,7 @@ impl CudaContext {
     /// `q8` and (when `delta` is given) `h` in place.
     ///
     /// Returns `BadRequest` for a stream or buffer of another adapter, for `n` that is not a
-    /// multiple of 256 in `256..=32768`, for `eps` not finite and above 0, for a range that is
+    /// multiple of 32 in `32..=32768`, for `eps` not finite and above 0, for a range that is
     /// short or misaligned, and for a written range that overlaps another range of the call.
     pub(crate) fn add_rmsnorm_q8(
         &self,

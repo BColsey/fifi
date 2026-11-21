@@ -197,31 +197,7 @@ __global__ void hc_mean_kernel(const float *resid, float *out, int row, int h) {
     out[k] = acc / (float)kHcStreams;
 }
 
-/* ---- norm and quantize ------------------------------------------------------------- */
-
-__global__ void __launch_bounds__(256) rms_rows_kernel(const float *x, const float *w, float *y,
-                                                       unsigned char *q8, int d, int ld_x,
-                                                       float eps) {
-    extern __shared__ float row[];
-    __shared__ float scratch[32];
-    const int t = blockIdx.x;
-    const float *xr = x + (size_t)t * ld_x;
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < d; i += blockDim.x) ss += xr[i] * xr[i];
-    ss = block_sum(ss, scratch);
-    const float scale = 1.0f / sqrtf(ss / (float)d + eps);
-    for (int i = threadIdx.x; i < d; i += blockDim.x) {
-        const float v = xr[i] * scale * w[i];
-        row[i] = v;
-        if (y != NULL) y[(size_t)t * d + i] = v;
-    }
-    if (q8 == NULL) return;
-    __syncthreads();
-    unsigned char *qrow = q8 + (size_t)t * q8_row_bytes(d);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    for (int b = warp; b < d / 32; b += warps) store_q8_1_block(reinterpret_cast<block_q8_1 *>(qrow + (size_t)b * kQ8Block), row[b * 32 + lane]);
-    zero_q8_tail(qrow, d);
-}
+/* ---- quantize -------------------------------------------------------------------------- */
 
 __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const float *g,
                                                           unsigned char *q8, float *y, int w) {
@@ -665,21 +641,6 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
             hc_apply_kernel<<<dim3((unsigned)n, (unsigned)((h + 255) / 256)), 256, 0, s>>>(
                 (const float *)p[0], (const float *)p[1], (const float *)p[2], (const float *)p[3],
                 (float *)p[4], (int)h);
-            return launch_status(out_stage);
-        }
-        case INFERENCE_CUDA_BLOCK_OP_RMS_ROWS: {
-            const long long n = i[0], d = i[1], ld = i[2];
-            if (n < 1 || n > 65536 || d < 32 || d > 8192 || d % 32 != 0 || ld < d)
-                return INFERENCE_CUDA_INVALID_ARGUMENT;
-            slots.use(0, ((n - 1) * ld + d) * 4, false);
-            slots.use(1, d * 4, false);
-            slots.maybe(2, n * d * 4, true);
-            slots.maybe(3, n * (long long)q8_row_bytes(d), true);
-            if (!slots.valid() || (p[2] == NULL && p[3] == NULL))
-                return INFERENCE_CUDA_INVALID_ARGUMENT;
-            rms_rows_kernel<<<(unsigned)n, 256, (size_t)d * 4, s>>>(
-                (const float *)p[0], (const float *)p[1], (float *)p[2], (unsigned char *)p[3],
-                (int)d, (int)ld, f[0]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_HC_MEAN: {
