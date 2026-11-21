@@ -184,7 +184,7 @@ impl Experts {
         let ram = if single_copy { 0 } else { headroom / 4 };
         let mut resident = Cache::new(headroom - ram);
         if single_copy
-            && std::env::var_os("FIFI_INKLING_GGUF_SEGMENTED_LRU").is_some_and(|value| value == "1")
+            && std::env::var_os("FIFI_INKLING_GGUF_SEGMENTED_LRU").is_none_or(|value| value == "1")
         {
             // A second access promotes a plane. New admissions and demotions
             // share the remaining space. Both queues use the same Metal budget.
