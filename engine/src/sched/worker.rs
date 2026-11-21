@@ -1225,6 +1225,16 @@ fn prefill_chunks<E: ExecutorOps>(
             ));
         }
         let (piece, rest) = remaining.split_at(rows.min(remaining.len()));
+        if pieces.count == 0
+            && piece.len() >= 3
+            && (2..=rows).contains(&rest.len())
+            && !cancel.load(Ordering::SeqCst)
+            && executor.try_prefill_pair(session, remaining, piece.len())?
+        {
+            pieces.count = 2;
+            pieces.max_rows = u32::try_from(piece.len()).unwrap_or(u32::MAX);
+            return Ok(true);
+        }
         // The executor's prefill error passes through unchanged: this is shared scheduler
         // code, and a piece-index prefix would reach HTTP 400 clients of every family on
         // default-off paths. The piece shape is recorded in the request log instead.
@@ -1401,6 +1411,7 @@ mod tests {
         piece: Option<usize>,
         piece_after_prefill: Option<usize>,
         request_piece: Option<std::num::NonZeroUsize>,
+        prefill_pair: bool,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
         /// The admit-path bank reports the spy answers: the `before` sample until the first
@@ -1437,6 +1448,7 @@ mod tests {
                 piece: None,
                 piece_after_prefill: None,
                 request_piece: None,
+                prefill_pair: false,
                 context_limit: None,
                 bank_reports: None,
             }
@@ -1542,6 +1554,20 @@ mod tests {
                 flag.store(true, Ordering::SeqCst);
             }
             Ok(())
+        }
+
+        fn try_prefill_pair(
+            &mut self,
+            st: &mut Self::Session,
+            tokens: &[u32],
+            first_piece: usize,
+        ) -> Result<bool, EngError> {
+            if !self.prefill_pair {
+                return Ok(false);
+            }
+            self.note(format!("pair:{first_piece}+{}", tokens.len() - first_piece));
+            self.inner.prefill(st, tokens)?;
+            Ok(true)
         }
 
         fn decode(
@@ -2235,6 +2261,37 @@ mod tests {
                 strings(expected)
             );
             engine.shutdown();
+        }
+    }
+
+    #[test]
+    fn paired_prefill_reports_two_pieces_and_preserves_the_fallback() {
+        use crate::sched::job::PrefillPieces;
+
+        for (accept, calls_expected) in [
+            (true, &["pair:4+2"][..]),
+            (false, &["prefill:4", "prefill:2"][..]),
+        ] {
+            let log = new_log();
+            let mut spy = Spy::new(vec![], &log);
+            spy.prefill_pair = accept;
+            let mut session = <Spy as ExecutorOps>::Session::default();
+            let mut pieces = PrefillPieces::default();
+            let tokens = [1, 2, 3, 4, 5, 6];
+            assert!(
+                super::prefill_chunks(
+                    &mut spy,
+                    &mut session,
+                    &tokens,
+                    4,
+                    &AtomicBool::new(false),
+                    &mut pieces,
+                )
+                .unwrap()
+            );
+            assert_eq!(calls(&log), strings(calls_expected));
+            assert_eq!(spy.history(&session), tokens);
+            assert_eq!((pieces.count, pieces.max_rows), (2, 4));
         }
     }
 

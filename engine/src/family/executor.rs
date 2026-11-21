@@ -160,6 +160,16 @@ pub(crate) trait ExecutorOps {
     }
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
+    /// Tries to consume a fresh prompt as two pieces in one call. Returning false
+    /// leaves the session untouched so the worker can feed the pieces separately.
+    fn try_prefill_pair(
+        &mut self,
+        _st: &mut Self::Session,
+        _tokens: &[u32],
+        _first_piece: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// Commits one batch of tokens, or reports `Cancelled`.
     fn decode(
         &mut self,

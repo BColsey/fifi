@@ -42,6 +42,7 @@ pub(super) struct FlintExecutor {
     mlx_plan: MlxExecutionPlan,
     request_sized_kv: bool,
     request_prefill: bool,
+    prefill_pair: bool,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -68,6 +69,7 @@ pub(super) struct FlintSession {
     state: State,
     core: DecodeSession,
     request_prefill_piece: Option<NonZeroUsize>,
+    prefill_pair: bool,
 }
 
 impl FlintSession {
@@ -90,6 +92,17 @@ impl FlintSession {
 pub(super) struct Step<'a> {
     model: &'a mut Model,
     state: &'a mut State,
+    pair_split: Option<usize>,
+}
+
+impl<'a> Step<'a> {
+    fn new(model: &'a mut Model, state: &'a mut State) -> Self {
+        Self {
+            model,
+            state,
+            pair_split: None,
+        }
+    }
 }
 
 impl TokenStepper for Step<'_> {
@@ -100,6 +113,9 @@ impl TokenStepper for Step<'_> {
     }
 
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        if let Some(split) = self.pair_split {
+            return self.model.prefill_pair(self.state, tokens, split);
+        }
         self.model
             .prefill_rows(self.state, tokens, false)
             .map(|_| ())
@@ -129,10 +145,7 @@ impl FlintExecutor {
     /// state, for identity gates that must feed rows and read logits back.
     #[cfg(test)]
     pub(super) fn stepper<'a>(&'a mut self, st: &'a mut FlintSession) -> Step<'a> {
-        Step {
-            model: &mut self.model,
-            state: &mut st.state,
-        }
+        Step::new(&mut self.model, &mut st.state)
     }
 
     pub(super) fn open(
@@ -206,6 +219,12 @@ impl FlintExecutor {
             && super::factory::request_prefill_enabled(
                 std::env::var_os("FIFI_FLINT_MLX_REQUEST_PREFILL").as_deref(),
             );
+        let prefill_pair = request_prefill
+            && super::factory::prefill_pair_enabled(
+                std::env::var_os("FIFI_FLINT_MLX_PREFILL_PAIR").as_deref(),
+            )
+            && model.streamed_expert_bytes != 0
+            && super::mlx_model::expert_pipeline_flagged();
         let mlx_plan = MlxExecutionPlan::new(
             placement,
             placement_reason,
@@ -221,6 +240,7 @@ impl FlintExecutor {
                 mlx_plan,
                 request_sized_kv,
                 request_prefill,
+                prefill_pair,
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -236,6 +256,7 @@ impl FlintExecutor {
                 state: State::new(),
                 core: DecodeSession::default(),
                 request_prefill_piece: None,
+                prefill_pair: false,
             },
         ))
     }
@@ -341,6 +362,40 @@ pub(super) fn planned_prefill_reserve(
     FLASH_PREFILL_BASE_BYTES
         + FLASH_PREFILL_ROW_BYTES * u64::from(rows)
         + expert_staging_bytes(streamed_expert_bytes, rows)
+}
+
+fn pair_workspace(first: u32, second: u32, per_expert: u64) -> u64 {
+    let (first, second) = (u64::from(first), u64::from(second));
+    let total = first + second;
+    // Price both attention workspaces, one maximally populated stage, and
+    // the hidden, projection and routed-pair buffers across both pieces.
+    let scores = 3 * 32 * 4 * (first * first + second * total);
+    scores + expert_staging_bytes(per_expert, 1024) + 32 * total * 2048 * 2
+}
+
+fn admitted_pair_split(
+    prompt_rows: usize,
+    first_piece: usize,
+    remaining_bytes: u64,
+    per_expert: u64,
+) -> Option<usize> {
+    let second = prompt_rows.checked_sub(first_piece)?;
+    if !(3..=1024).contains(&first_piece) || !(2..=first_piece).contains(&second) {
+        return None;
+    }
+    let split = first_piece - 1;
+    (pair_workspace(split as u32, second as u32, per_expert) <= remaining_bytes).then_some(split)
+}
+
+#[test]
+fn prefill_pair_admission_accounts_for_both_pieces_before_mutation() {
+    let expert = 1_769_472;
+    let budget = pair_workspace(1023, 1017, expert);
+    assert_eq!(admitted_pair_split(2041, 1024, budget, expert), Some(1023));
+    assert_eq!(admitted_pair_split(2041, 1024, budget - 1, expert), None);
+    assert_eq!(admitted_pair_split(2049, 1024, u64::MAX, expert), None);
+    assert_eq!(admitted_pair_split(1025, 1024, u64::MAX, expert), None);
+    assert_eq!(admitted_pair_split(2, 1024, u64::MAX, expert), None);
 }
 
 fn device_session_charges(retention_cap: u64) -> Result<[(&'static str, u64); 5]> {
@@ -592,10 +647,9 @@ impl ExecutorOps for FlintExecutor {
         self.prefix_hit = PrefixHit::Miss;
         self.prefix_uncached_shared = 0;
         st.request_prefill_piece = None;
-        st.core.reset(&mut Step {
-            model: &mut self.model,
-            state: &mut st.state,
-        })
+        st.prefill_pair = false;
+        st.core
+            .reset(&mut Step::new(&mut self.model, &mut st.state))
     }
 
     fn reset_for_request(
@@ -606,6 +660,7 @@ impl ExecutorOps for FlintExecutor {
         has_prefix_boundary: bool,
     ) -> Result<()> {
         self.reset(st)?;
+        st.prefill_pair = self.prefill_pair && !has_prefix_boundary;
         if self.request_prefill {
             let mut rows = self.prefill_piece;
             // Prefix snapshots keep their established chunk tiling.
@@ -634,13 +689,47 @@ impl ExecutorOps for FlintExecutor {
 
     fn prefill(&mut self, st: &mut FlintSession, tokens: &[u32]) -> Result<()> {
         st.core.prefill(
-            &mut Step {
-                model: &mut self.model,
-                state: &mut st.state,
-            },
+            &mut Step::new(&mut self.model, &mut st.state),
             tokens,
             context_limit() as usize,
         )
+    }
+
+    fn try_prefill_pair(
+        &mut self,
+        st: &mut FlintSession,
+        tokens: &[u32],
+        first_piece: usize,
+    ) -> Result<bool> {
+        if !st.prefill_pair || !st.core.history().is_empty() || st.state.pos != 0 {
+            return Ok(false);
+        }
+        let (Some(piece), Some(memory)) = (st.request_prefill_piece, &self.mlx_plan.memory) else {
+            return Ok(false);
+        };
+        if first_piece != piece.get() {
+            return Ok(false);
+        }
+        let Some(split) = admitted_pair_split(
+            tokens.len(),
+            first_piece,
+            memory.remaining_bytes,
+            self.model.streamed_expert_bytes,
+        ) else {
+            return Ok(false);
+        };
+        // DecodeSession leaves the last token pending. The split preserves
+        // the boundary just before the first piece's former pending token.
+        st.core.prefill(
+            &mut Step {
+                model: &mut self.model,
+                state: &mut st.state,
+                pair_split: Some(split),
+            },
+            tokens,
+            context_limit() as usize,
+        )?;
+        Ok(true)
     }
 
     fn decode(
@@ -654,10 +743,7 @@ impl ExecutorOps for FlintExecutor {
             context_limit: context_limit() as usize,
         };
         st.core.decode(
-            &mut Step {
-                model: &mut self.model,
-                state: &mut st.state,
-            },
+            &mut Step::new(&mut self.model, &mut st.state),
             generation,
             &limits,
         )
