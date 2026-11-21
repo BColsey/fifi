@@ -1,4 +1,4 @@
-//! `enginesrv serve --model <dir>`: the simplified startup.
+//! `enginesrv serve --model <path>`: the simplified startup.
 //!
 //! A front end, not a second loader. Discovery reads the directory the
 //! way `capability::inspect` already does; the chosen settings go into
@@ -112,13 +112,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
     }
     if parsed.model_dir.as_os_str().is_empty() {
         return Err(StartupError(format!(
-            "serve --model: --model <dir> is required\n{USAGE}"
+            "serve --model: --model <path> is required\n{USAGE}"
         )));
     }
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve --model <path> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -137,7 +137,7 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
+        .unwrap_or_else(|| crate::family::gguf_select::directory_of(&args.model_dir));
     let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
@@ -322,6 +322,10 @@ fn select_family(
             detectable_names()
         )));
     }
+    // The explicitly chosen file is authoritative even in a mixed model directory.
+    if args.model_dir.is_file() && inspection.inkling_ggufs().next().is_some() {
+        return Ok(inkling2_mini::FAMILY.into());
+    }
     let mut matches: Vec<&str> = DETECTABLE_FAMILIES
         .iter()
         .filter(|(_, types)| {
@@ -434,21 +438,22 @@ mod tests {
         bytes
     }
 
+    fn gguf_arch(arch: &str) -> Vec<u8> {
+        let mut bytes = minimal_gguf();
+        bytes.truncate(24);
+        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend((key.len() as u64).to_le_bytes());
+        bytes.extend(key);
+        bytes.extend(8u32.to_le_bytes());
+        bytes.extend((arch.len() as u64).to_le_bytes());
+        bytes.extend(arch.as_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes
+    }
+
     #[test]
     fn discover_inkling_gguf_text_with_optional_sidecars() {
-        fn gguf_arch(arch: &str) -> Vec<u8> {
-            let mut bytes = minimal_gguf();
-            bytes.truncate(24);
-            bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
-            let key = b"general.architecture";
-            bytes.extend((key.len() as u64).to_le_bytes());
-            bytes.extend(key);
-            bytes.extend(8u32.to_le_bytes());
-            bytes.extend((arch.len() as u64).to_le_bytes());
-            bytes.extend(arch.as_bytes());
-            bytes.resize(bytes.len().next_multiple_of(32), 0);
-            bytes
-        }
         let model = tempfile::tempdir().unwrap();
         let tokenizer = tempfile::tempdir().unwrap();
         for (filename, arch) in [
@@ -467,6 +472,56 @@ mod tests {
         assert_eq!(found.family, "inkling2_mini");
         assert_eq!(found.weight_format, "gguf");
         assert_eq!(found.tokenizer_dir, tokenizer.path());
+    }
+
+    #[test]
+    fn explicit_inkling_gguf_selects_one_file_and_resolves_the_tokenizer() {
+        let model = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let fork = model.path().join("fork.gguf");
+        let mainline = model.path().join("mainline.gguf_file");
+        std::fs::write(&fork, gguf_arch("inkling2")).unwrap();
+        std::fs::write(&mainline, gguf_arch("inkling2_loop")).unwrap();
+        std::fs::write(model.path().join("malformed-draft.gguf"), b"GGUF-broken").unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"qwen3_5_moe"}"#,
+        )
+        .unwrap();
+        std::fs::write(model.path().join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(external.path().join("chat_template.jinja"), b"template").unwrap();
+
+        for (path, tokenizer_dir, expected_dir, basename, present) in [
+            (&fork, None, model.path(), "fork.gguf", "tokenizer.json"),
+            (
+                &mainline,
+                Some(external.path().to_owned()),
+                external.path(),
+                "mainline.gguf_file",
+                "chat_template.jinja",
+            ),
+        ] {
+            let found = discover(&ModelServeArgs {
+                model_dir: path.clone(),
+                tokenizer_dir,
+                ..ModelServeArgs::default()
+            })
+            .unwrap();
+            assert_eq!(found.family, "inkling2_mini");
+            assert_eq!(found.weight_format, "gguf");
+            assert_eq!(found.tokenizer_dir, expected_dir);
+
+            let report = crate::capability::inspect::inspect(path, &found.tokenizer_dir).unwrap();
+            assert_eq!(report.model_dir, *path);
+            assert_eq!(report.files.len(), 1);
+            assert_eq!(report.gguf_files.len(), 1);
+            assert_eq!(report.gguf_files[0].file, basename);
+            assert!(report.gguf_errors.is_empty(), "{:?}", report.gguf_errors);
+            assert_eq!(report.tokenizer_present, [present]);
+        }
+        let directory = crate::capability::inspect::inspect(model.path(), model.path()).unwrap();
+        assert_eq!(directory.inkling_ggufs().count(), 2);
+        assert_eq!(directory.gguf_errors.len(), 1);
     }
 
     fn copy_tokenizer(dir: &Path) {

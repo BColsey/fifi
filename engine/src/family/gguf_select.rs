@@ -42,9 +42,14 @@ fn is_gguf(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
 }
 
-/// The directory of a model path: the path itself, or the parent of a path to a `.gguf` file.
+/// The directory for a model's side files, including explicit Inkling `.gguf_file` paths.
 pub(crate) fn directory_of(model: &Path) -> PathBuf {
-    if model.is_file() && is_gguf(model) {
+    if model.is_file()
+        && (is_gguf(model)
+            || model
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf_file")))
+    {
         match model.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => return parent.to_path_buf(),
             _ => return PathBuf::from("."),

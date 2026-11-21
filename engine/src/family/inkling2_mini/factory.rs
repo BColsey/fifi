@@ -129,7 +129,13 @@ fn launch(
     let load_start = executor::Phase::start_if_enabled();
     let root = model_dir.to_owned();
     let inspection = crate::capability::inspect::inspect(model_dir, tokenizer_dir)?;
-    let gguf = inspection.inkling_gguf()?.map(|file| root.join(&file.file));
+    let gguf = inspection.inkling_gguf()?.map(|file| {
+        if model_dir.is_file() {
+            root.clone()
+        } else {
+            root.join(&file.file)
+        }
+    });
     if let Some(path) = &gguf {
         check_gguf_backend()?;
         eprintln!(

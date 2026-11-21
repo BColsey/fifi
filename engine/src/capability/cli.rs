@@ -17,13 +17,13 @@ use super::{
 pub const USAGE: &str = "\
 usage:
   enginesrv --config <path>            serve (same as `serve --config <path>`)
-  enginesrv serve --model <dir>        simplified startup: discover the model,
+  enginesrv serve --model <path>        simplified startup: discover the model,
                     preflight it, and serve the qualified defaults
                     ([--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--listen <addr>]
                     [--print-config])
   enginesrv doctor [--config <path>] [--json] [--bundle <file>]
-  enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
+  enginesrv check <model_path> [--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--json]
   enginesrv config validate <path>
   enginesrv config effective <path> [--json]
@@ -38,7 +38,7 @@ doctor  Report what this build can serve on this machine: compiled
         a manifest of what was collected and a readable summary).
         Home paths become ~, no secrets or prompts are collected, and
         an existing file is never overwritten. Attach it to an issue.
-check   Preflight one model directory: compatibility verdict, the
+check   Preflight one model directory or GGUF file: compatibility verdict, the
         checks behind it, and a memory estimate against the probed
         free memory. Exit 0 when servable, 1 otherwise.
 config validate
@@ -186,7 +186,7 @@ fn parse_check(rest: &[String]) -> Result<Action, String> {
             candidate,
             json,
         }),
-        None => Err("usage: enginesrv check <model_dir> [options]".to_string()),
+        None => Err("usage: enginesrv check <model_path> [options]".to_string()),
     }
 }
 
@@ -249,7 +249,8 @@ pub fn run(action: &Action) -> Result<(), String> {
             candidate,
             json,
         } => {
-            let tokenizer = tokenizer_dir.as_deref().unwrap_or(model_dir.as_path());
+            let default_tokenizer = crate::family::gguf_select::directory_of(model_dir);
+            let tokenizer = tokenizer_dir.as_deref().unwrap_or(&default_tokenizer);
             let facts = super::probe::probe();
             let report = super::preflight::preflight(model_dir, tokenizer, candidate, &facts)
                 .map_err(|error| super::describe_error(&error))?;

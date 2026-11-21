@@ -97,6 +97,12 @@ impl ModelInspection {
                 "select one Inkling 2 Mini text GGUF per model directory".into(),
             ));
         }
+        if selected.is_none() && self.model_dir.is_file() {
+            return Err(checkpoint(format!(
+                "{} is not an Inkling 2 Mini text GGUF",
+                self.model_dir.display()
+            )));
+        }
         if let Some(file) = selected {
             if let Some(Err(error)) = &file.inkling2_loop {
                 return Err(checkpoint(error.clone()));
@@ -121,41 +127,65 @@ fn checkpoint(message: String) -> EngError {
     EngError::Checkpoint(format!("model inspection: {message}"))
 }
 
-/// Inspect `model_dir`; tokenizer presence is read from `tokenizer_dir`
-/// (pass the same path twice for the usual one-directory layout).
+/// Inspect a model directory or one explicitly selected GGUF file.
+/// Pass the same path twice to use co-located tokenizer files.
 pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
     crate::storage_guard::require_local(model_dir, "model weights")?;
-    if !model_dir.is_dir() {
-        return Err(checkpoint(format!(
-            "{} is not a directory",
-            model_dir.display()
-        )));
-    }
+    let root = crate::family::gguf_select::directory_of(model_dir);
+    let explicit = root.as_path() != model_dir;
     let mut files = Vec::new();
-    let entries = std::fs::read_dir(model_dir)
-        .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
-        let metadata = entry.metadata().map_err(|error| {
-            checkpoint(format!("cannot stat {}: {error}", entry.path().display()))
-        })?;
-        if metadata.is_file() {
-            files.push(FileFact {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                bytes: metadata.len(),
-            });
+    if explicit {
+        let metadata = std::fs::metadata(model_dir)
+            .map_err(|error| checkpoint(format!("cannot stat {}: {error}", model_dir.display())))?;
+        let name = model_dir
+            .file_name()
+            .ok_or_else(|| checkpoint(format!("{} has no file name", model_dir.display())))?
+            .to_string_lossy()
+            .into_owned();
+        files.push(FileFact {
+            name,
+            bytes: metadata.len(),
+        });
+    } else {
+        if !model_dir.is_dir() {
+            return Err(checkpoint(format!(
+                "{} is not a directory",
+                model_dir.display()
+            )));
         }
+        let entries = std::fs::read_dir(model_dir)
+            .map_err(|error| checkpoint(format!("cannot list {}: {error}", model_dir.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                checkpoint(format!("cannot list {}: {error}", model_dir.display()))
+            })?;
+            let metadata = entry.metadata().map_err(|error| {
+                checkpoint(format!("cannot stat {}: {error}", entry.path().display()))
+            })?;
+            if metadata.is_file() {
+                files.push(FileFact {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    bytes: metadata.len(),
+                });
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    files.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut gguf_files = Vec::new();
     let mut gguf_errors = Vec::new();
     let mut safetensors_files = 0usize;
     let mut safetensors_bytes = 0u64;
     for file in &files {
-        if file.name.ends_with(".gguf") || file.name.ends_with(".gguf_file") {
-            match gguf_fact(&model_dir.join(&file.name), file.bytes) {
+        if explicit || file.name.ends_with(".gguf") || file.name.ends_with(".gguf_file") {
+            let sibling;
+            let path = if explicit {
+                model_dir
+            } else {
+                sibling = root.join(&file.name);
+                &sibling
+            };
+            match gguf_fact(path, file.bytes) {
                 Ok(mut fact) => {
                     fact.file.clone_from(&file.name);
                     gguf_files.push(fact);
@@ -170,7 +200,7 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
         }
     }
 
-    let config_path = model_dir.join("config.json");
+    let config_path = root.join("config.json");
     let has_config_json = config_path.is_file();
     let config_model_types = if has_config_json {
         read_model_types(&config_path).unwrap_or_default()
@@ -178,6 +208,11 @@ pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection
         Vec::new()
     };
 
+    let tokenizer_dir = if explicit && tokenizer_dir == model_dir {
+        &root
+    } else {
+        tokenizer_dir
+    };
     let mut tokenizer_present = Vec::new();
     let mut tokenizer_missing = Vec::new();
     for name in TOKENIZER_FILES {
@@ -219,7 +254,7 @@ fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
         });
     if path
         .extension()
-        .is_some_and(|extension| extension == "gguf_file")
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf_file"))
         && architecture.as_deref() != Some("inkling2_loop")
     {
         return Err(checkpoint(
