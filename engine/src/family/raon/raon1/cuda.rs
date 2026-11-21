@@ -1026,6 +1026,7 @@ impl Raon1Device {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expert_mv(
         &self,
         name: &str,

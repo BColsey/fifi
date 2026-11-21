@@ -5,13 +5,6 @@
 //! are trusted device indices (the guarded ids builder writes them), so only their capacity
 //! is checked here.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

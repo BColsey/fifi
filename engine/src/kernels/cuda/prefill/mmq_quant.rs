@@ -19,13 +19,6 @@
 //! SwiGLU `act` layout, one row per compact column); a smaller source is refused by the fit
 //! rule, and a `src_rows` field would be the extension if a caller ever needs a wider
 //! source.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
 
 use std::ffi::c_int;
 

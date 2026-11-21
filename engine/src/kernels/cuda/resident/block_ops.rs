@@ -257,6 +257,7 @@ impl<'b> BlockOp<'b> {
 
     /// Partial softmax attention of `n` query rows over the cache, one partial per
     /// `(token, head group, split)`; `splits * keys_per_split` must cover `pos0 + n` keys.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mla_attn(
         shape: MlaShape,
         pos0: usize,
