@@ -426,30 +426,40 @@ fn engine_input(
 }
 
 /// The `config effective` rows for one entry, or the resolution
-/// refusal. Reads only the allowlisted `Q36_CACHE_LIMIT`, exactly as
-/// that command does; the API key is never read here.
+/// refusal. Consults the same family environment settings as the CLI.
 fn effective_rows(
     engine: &crate::server::config::EngineConfig,
     env: &crate::family::qwen36::settings::Q36Env,
 ) -> Result<Vec<Value>, String> {
     use crate::family::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
     use crate::family::qwen36::settings::Q36Settings;
-    if engine.family == crate::family::flint::FAMILY {
-        let default_options = crate::family::flint::settings::FlintOptions::cuda_default();
-        let options = engine.flint.as_ref().unwrap_or(&default_options);
-        return Ok(super::effective::flint_effective(
-            options,
-            &crate::family::flint::budget::FlintEnv::capture(),
+    let rows = if engine.family == crate::family::flint::FAMILY {
+        Some(super::effective::flint_effective_for_build(
+            engine.flint.as_ref(),
             None,
-        )
-        .iter()
-        .map(|row| json!({"key": row.key, "value": row.value, "origin": row.origin.name()}))
-        .collect());
+        ))
+    } else if engine.family == crate::family::flash_next::factory::FAMILY
+        && super::probe::CompiledBackends::of_this_build().mlx
+    {
+        Some(super::effective::flash_mlx_config_effective(
+            &engine.model_dir,
+            &engine.tokenizer_dir,
+            engine.flash_next.as_ref(),
+        ))
+    } else {
+        None
+    };
+    if let Some(rows) = rows {
+        return Ok(rows
+            .map_err(|error| super::describe_error(&error))?
+            .iter()
+            .map(|row| json!({"key": row.key, "value": row.value, "origin": row.origin.name()}))
+            .collect());
     }
     if engine.family != FAMILY && engine.family != DENSE_FAMILY {
         return Ok(vec![json!({
             "unavailable":
-                "per-key origins are composed for the Qwen3.6 families only so far",
+                "per-key origins are unavailable on this backend",
         })]);
     }
     let backend = backend_of_build();

@@ -50,7 +50,7 @@ pub(super) fn context_limit_with(setting: Option<&str>) -> u32 {
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
 ))]
-pub(super) fn cache_limit_with(setting: Option<&str>) -> u64 {
+pub(crate) fn cache_limit_with(setting: Option<&str>) -> u64 {
     match setting.map(str::trim) {
         None => 64 * 1024 * 1024,
         Some("67108864") => 64 * 1024 * 1024,
@@ -67,7 +67,7 @@ pub(super) fn cache_limit_with(setting: Option<&str>) -> u64 {
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
-pub(super) fn os_setting(value: Option<&std::ffi::OsStr>) -> Option<&str> {
+pub(crate) fn os_setting(value: Option<&std::ffi::OsStr>) -> Option<&str> {
     value.map(|v| v.to_str().unwrap_or(""))
 }
 
@@ -75,7 +75,7 @@ pub(super) fn os_setting(value: Option<&std::ffi::OsStr>) -> Option<&str> {
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
-pub(super) fn prefill_chunk_rows(setting: Option<&str>) -> usize {
+pub(crate) fn prefill_chunk_rows(setting: Option<&str>) -> usize {
     // Chunk 1024 is the default: against 512 it measured +9.31% pp4096 and
     // KL <= 1.3e-4 (log-sum-exp) with equal top-1, at +0.14 GiB peak.
     // Rollback = FIFI_FLINT_MLX_BATCH_PREFILL=512. An explicitly SET but
@@ -125,6 +125,16 @@ pub(crate) fn start_engine(
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn check_mlx_options(options: Option<&FlintOptions>) -> Result<(), EngError> {
+    if options.is_some() {
+        return Err(EngError::BadRequest(
+            "flint options select the CUDA pilot, not MLX".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn launch(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -133,11 +143,7 @@ fn launch(
 ) -> Result<StartedEngine, EngError> {
     use crate::sched::worker::spawn_engine_noted;
 
-    if options.is_some() {
-        return Err(EngError::BadRequest(
-            "flint options select the CUDA pilot, not MLX".into(),
-        ));
-    }
+    check_mlx_options(options)?;
     let bundle = load_tokenizer(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
     let vocab = bundle.vocab_size() as usize;

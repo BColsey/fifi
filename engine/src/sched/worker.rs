@@ -29,12 +29,13 @@ use super::job::{
 };
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::mlx_report::LoadedMlxExecution;
 use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 
@@ -142,6 +143,7 @@ struct Shared {
     /// phases the family's own start code actually performs — no
     /// percentages, no invented sequence.
     load_stage: Mutex<Option<&'static str>>,
+    mlx_execution: OnceLock<LoadedMlxExecution>,
     /// Set by `shutdown`. The worker cancels every job that it has not finished.
     stop: AtomicBool,
     /// The cancel flag of the running job, so `shutdown` can cancel it.
@@ -167,6 +169,7 @@ impl Shared {
             state: AtomicU8::new(EngineState::Loading as u8),
             failure: Mutex::new(None),
             load_stage: Mutex::new(None),
+            mlx_execution: OnceLock::new(),
             stop: AtomicBool::new(false),
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
@@ -284,6 +287,10 @@ impl EngineHandle {
 
     pub(crate) fn failure(&self) -> Option<String> {
         self.shared.failure()
+    }
+
+    pub(crate) fn mlx_execution(&self) -> Option<&LoadedMlxExecution> {
+        self.shared.mlx_execution.get()
     }
 
     /// The structured failure, for authenticated operator surfaces.
@@ -612,6 +619,12 @@ fn work<E, F>(
     shared
         .no_prefix_store
         .store(limits.roots == 0 && limits.entries == 0, Ordering::SeqCst);
+    if let Some(plan) = executor.mlx_execution_plan() {
+        let _ = shared.mlx_execution.set(LoadedMlxExecution {
+            plan: plan.clone(),
+            worker_piece_rows: prefill_chunk,
+        });
+    }
     shared.set_state(EngineState::Ready);
     shared.clear_load_stage();
     // The engine reports its own prefix capability to the one-shot note: the

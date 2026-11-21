@@ -107,6 +107,10 @@ pub(crate) trait ExecutorOps {
     fn prefill_piece(&self) -> Option<usize> {
         None
     }
+    /// An optional report from startup after the executor has applied its plan.
+    fn mlx_execution_plan(&self) -> Option<&super::mlx_report::MlxExecutionPlan> {
+        None
+    }
     /// The limits of this executor's prefix store: how many pinned roots and how many LRU entries
     /// it holds. The worker asks once per job and plans its save points with the answer: it emits a
     /// root point only when `roots > 0`, so a job with a root boundary behaves like a job without

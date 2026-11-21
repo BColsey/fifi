@@ -78,6 +78,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         session::{DecodeSession, Limits, PrefixSlot, SaveKind, TokenStepper, check_prompt},
     },
     kernels::{HostPages, MlxKernels},
@@ -130,6 +131,7 @@ pub(crate) struct FlashExecutor {
     context_limit: usize,
     /// The chunk size of the batched prefill, set by `plan_prefill`. `None` means one-token steps.
     chunk: Option<u32>,
+    mlx_plan: Option<MlxExecutionPlan>,
     /// The chunk size that the open prefill page sets serve, or 0 when none are open.
     open_tokens: u32,
     /// Tests only: what the chunk path did, shared so that an engine thread test can read it.
@@ -316,6 +318,7 @@ impl FlashExecutor {
             rules,
             context_limit,
             chunk: None,
+            mlx_plan: None,
             open_tokens: 0,
             #[cfg(test)]
             log: std::sync::Arc::default(),
@@ -377,11 +380,26 @@ impl FlashExecutor {
         prefix_reuse: bool,
         device: Option<crate::family::mlx_budget::DeviceBudget>,
     ) -> Result<Option<String>> {
-        use crate::family::mlx_budget::PRESSURE_MARGIN;
+        use crate::family::{
+            mlx_budget::{DeviceBudget, PRESSURE_MARGIN},
+            prefill::mlx::MIN_PREFILL_CHUNK_ROWS,
+        };
+        let cap = settings.prefill_chunk;
+        let report = |selected_rows, reason, memory| {
+            MlxExecutionPlan::new(
+                "disk_experts",
+                "routed experts are staged from local shards",
+                cap as usize,
+                selected_rows,
+                reason,
+                memory,
+            )
+        };
         let budget = device
             .map(|device| device.prefill(settings.prefill_budget))
             .or(settings.prefill_budget);
         let Some(budget) = budget else {
+            self.mlx_plan = Some(report(1, PrefillReason::NoBudget, None));
             return Ok(None);
         };
         let overflow =
@@ -413,18 +431,33 @@ impl FlashExecutor {
             .and_then(|n| n.checked_add(PRESSURE_MARGIN))
             .ok_or_else(overflow)?;
         // This executor streams local shards and has no S3 cache.
-        let cap = settings.prefill_chunk;
         let plan = self.plan_prefill(budget, 0, reserve, cap)?;
+        let charges = [
+            ("weights_bytes", plan.terms.weights),
+            ("decode_pool_bytes", plan.terms.decode_pool),
+            ("session_reserve_bytes", reserve),
+        ];
         if let Some(device) = device {
-            device.remaining(
-                "Flash-Next MLX",
-                &[
-                    ("weights_bytes", plan.terms.weights),
-                    ("decode_pool_bytes", plan.terms.decode_pool),
-                    ("session_reserve_bytes", reserve),
-                ],
-            )?;
+            device.remaining("Flash-Next MLX", &charges)?;
         }
+        let reason = if plan.chunk.is_some() {
+            PrefillReason::Admitted
+        } else if cap < MIN_PREFILL_CHUNK_ROWS {
+            PrefillReason::RowCeiling
+        } else {
+            PrefillReason::Workspace
+        };
+        self.mlx_plan = Some(report(
+            plan.chunk.unwrap_or(1) as usize,
+            reason,
+            Some(MlxPrefillMemory {
+                prefill_budget_bytes: budget,
+                remaining_bytes: plan.terms.remaining(),
+                base_charges: charges.into(),
+                device: device.map(DeviceBudget::ceiling_report),
+                workspace: [("sparse_workspace_bytes", self.decoder.sparse_prefill_bytes)].into(),
+            }),
+        ));
         let path = match plan.chunk {
             Some(rows) => format!("chunk of {rows} rows"),
             None if cap < crate::family::prefill::mlx::MIN_PREFILL_CHUNK_ROWS => {
@@ -517,6 +550,10 @@ impl FlashExecutor {
 
 impl ExecutorOps for FlashExecutor {
     type Session = FlashSession;
+
+    fn mlx_execution_plan(&self) -> Option<&MlxExecutionPlan> {
+        self.mlx_plan.as_ref()
+    }
 
     /// Refuses a prompt that cannot fit before any state changes: a prompt of `context_limit()`
     /// tokens or more fails with `ContextLimit`, the Flash-Next rule that `prefill` enforces
@@ -2394,6 +2431,14 @@ mod tests {
             if let EngineNote::Failed(why) = rx.recv().unwrap() {
                 panic!("Flash-Next startup failed: {why}");
             }
+            let handle = started.engine.handle();
+            let report = handle.mlx_execution().unwrap();
+            let batched = budget == Some(2 << 30)
+                || (budget.is_none() && crate::family::mlx_budget::enabled());
+            assert_eq!(report.plan.prefill_rows, if batched { 4 } else { 1 });
+            assert_eq!(report.worker_piece_rows, 4);
+            assert_eq!(report.plan.decisions[0].chosen, "disk_experts");
+            assert_eq!(report.plan.memory.is_some(), budget.is_some() || batched);
             let before = counter.qualification_sync_count();
             let (job, mut response) = Job::new(cycle(13), seeded_generation(4)).unwrap();
             started.engine.handle().try_submit(job).unwrap();

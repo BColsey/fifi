@@ -11,6 +11,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        mlx_report::{MlxExecutionPlan, MlxPrefillMemory, PrefillReason},
         session::{
             DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper, check_prompt,
         },
@@ -35,6 +36,7 @@ pub(super) struct FlintExecutor {
     prefix: PrefixStore<PrefixSnapshot, FlintPath>,
     model: Model,
     prefill_piece: usize,
+    mlx_plan: MlxExecutionPlan,
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
@@ -170,15 +172,39 @@ impl FlintExecutor {
         let max_rows = super::factory::prefill_chunk_rows(super::factory::os_setting(
             std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").as_deref(),
         ));
-        let prefill_piece = if let Some((device, charges, _)) = reserve {
-            device_prefill_piece(device, &model, max_rows, &charges)?
+        let (prefill_piece, memory) = if let Some((device, charges, _)) = reserve {
+            let (piece, memory) = device_prefill_piece(device, &model, max_rows, &charges)?;
+            (piece, Some(memory))
         } else {
-            max_rows
+            (max_rows, None)
         };
+        let (placement, placement_reason) = if model.streamed_expert_bytes != 0 {
+            ("disk_experts", "full expert banks exceed the device budget")
+        } else {
+            ("resident", "routed expert banks are imported at startup")
+        };
+        let reason = if max_rows == 1 {
+            PrefillReason::RowCeiling
+        } else if memory.is_none() {
+            PrefillReason::Configured
+        } else if prefill_piece == 1 {
+            PrefillReason::Workspace
+        } else {
+            PrefillReason::Admitted
+        };
+        let mlx_plan = MlxExecutionPlan::new(
+            placement,
+            placement_reason,
+            max_rows,
+            prefill_piece,
+            reason,
+            memory,
+        );
         Ok((
             Self {
                 model,
                 prefill_piece,
+                mlx_plan,
                 eos,
                 vocab,
                 root: root.to_path_buf(),
@@ -331,7 +357,7 @@ fn device_prefill_piece(
     model: &Model,
     max_rows: usize,
     session: &[(&'static str, u64)],
-) -> Result<usize> {
+) -> Result<(usize, MlxPrefillMemory)> {
     // Model::open_for_budget has imported its resident arrays. The allocator
     // count includes those arrays; the prefill reserve separately prices the
     // whole session including the fixed-size rings.
@@ -368,11 +394,21 @@ fn device_prefill_piece(
         .map(|(name, bytes)| format!("{name}={bytes}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let staging = expert_staging_bytes(per_expert, rows as u32);
     eprintln!(
         "flint: MLX device budget selects {rows} prefill rows (ceiling {max_rows}); {device} {terms} expert_staging_bytes={} remaining_bytes={remaining}",
-        expert_staging_bytes(per_expert, rows as u32),
+        staging,
     );
-    Ok(rows)
+    Ok((
+        rows,
+        MlxPrefillMemory {
+            prefill_budget_bytes: device.bytes(),
+            remaining_bytes: remaining,
+            device: Some(device.ceiling_report()),
+            base_charges: charges.into_iter().collect(),
+            workspace: [("expert_staging_bytes", staging)].into(),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -556,6 +592,10 @@ impl ExecutorOps for FlintExecutor {
 
     fn prefill_piece(&self) -> Option<usize> {
         Some(self.prefill_piece)
+    }
+
+    fn mlx_execution_plan(&self) -> Option<&MlxExecutionPlan> {
+        Some(&self.mlx_plan)
     }
 
     fn prefix_limits(&self) -> StoreLimits {
