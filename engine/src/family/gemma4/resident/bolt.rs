@@ -3044,8 +3044,9 @@ mod tests {
 
     /// The widths, 1 to 8, in which a prompt of `len` tokens is cut for the scoring test: a fixed
     /// pseudo-random sequence, so lone rows and every alignment of a chunk end occur and both
-    /// paths of one document see the same cut.
-    fn score_widths(len: usize, seed: u64) -> Vec<usize> {
+    /// paths of one document see the same cut. With `lone_heavy`, half of the pieces are a lone
+    /// row, which gives the lone-row positions a stratum of their own to judge.
+    fn score_widths(len: usize, seed: u64, lone_heavy: bool) -> Vec<usize> {
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         let mut widths = Vec::new();
         let mut left = len;
@@ -3053,16 +3054,24 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            let width = (1 + (state >> 33) as usize % Bolt::PREFILL_BATCH).min(left);
-            widths.push(width);
-            left -= width;
+            let pick = (state >> 33) as usize;
+            let width = if lone_heavy && state >> 63 == 0 {
+                1
+            } else if lone_heavy {
+                2 + pick % (Bolt::PREFILL_BATCH - 1)
+            } else {
+                1 + pick % Bolt::PREFILL_BATCH
+            };
+            widths.push(width.min(left));
+            left -= width.min(left);
         }
         widths
     }
 
     /// True-token scores of the wide prefill attention against the row attention on real text.
-    /// Each document is cut into pieces of 1 to 8 tokens (`score_widths`); every third piece ends
-    /// with logits, and its last position records the negative log-likelihood of the next true
+    /// Each document is cut into pieces of 1 to 8 tokens (`score_widths`; `BOLT_SCORE_CUT=lone-heavy`
+    /// makes half of them lone rows and scores every lone row); every third piece ends with
+    /// logits, and its last position records the negative log-likelihood of the next true
     /// token and the arg-max under both paths. The text comes from `BOLT_SCORE_TOKENS`, one
     /// document per line as space-separated token ids; the records are written to
     /// `BOLT_SCORE_OUT` as tab-separated rows (document, position, true token, nll under the row
@@ -3094,13 +3103,14 @@ mod tests {
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .map_or(0, |(i, _)| i)
         };
+        let lone_heavy = std::env::var("BOLT_SCORE_CUT").is_ok_and(|cut| cut == "lone-heavy");
         let mut report = String::new();
         for (doc, line) in docs.lines().enumerate() {
             let tokens: Vec<u32> = line
                 .split_whitespace()
                 .map(|t| t.parse().expect("a token id"))
                 .collect();
-            let widths = score_widths(tokens.len(), doc as u64 + 1);
+            let widths = score_widths(tokens.len(), doc as u64 + 1, lone_heavy);
             // Scored positions: the last token of every third piece, whose next token is known.
             let mut rows: Vec<(usize, usize, [Vec<f32>; 2])> = Vec::new();
             for (pass, wide) in [false, true].into_iter().enumerate() {
@@ -3108,7 +3118,8 @@ mod tests {
                 let mut pos = 0;
                 for (index, &width) in widths.iter().enumerate() {
                     let batch = &tokens[pos..pos + width];
-                    let scored = index % 3 == 2 && pos + width < tokens.len();
+                    let scored = (index % 3 == 2 || (lone_heavy && width == 1))
+                        && pos + width < tokens.len();
                     model
                         .prefill_batch(&seq, batch, pos, scored)
                         .expect("batch");
