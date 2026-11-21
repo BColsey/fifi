@@ -7,7 +7,10 @@ use crate::{EngError, family::device_budget::DeviceReserve};
 const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
 
 /// Family reserves leave this much room for memory outside their tensor estimates.
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 pub(crate) const PRESSURE_MARGIN: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,10 +1,12 @@
 //! Single-sequence native text decoding for the released fixed-loop checkpoint.
 use super::{
     CORE_START, EXPERTS, HIDDEN, InklingExpertSource, InklingRoutes, LayerVisit, MAX_CONTEXT,
+    PREFILL_ROWS_ENV,
     attention::InklingAttentionState,
     dense::DenseWeights,
     gguf, gguf_mlx, is_local,
     mlx::{MlxExpertCache, MlxExpertCacheStats},
+    requested_prefill_rows,
     sconv::{InklingConvState, InklingConvStream, InklingConvTaps},
     timing::{self, measure},
     visits,
@@ -18,15 +20,6 @@ use half::bf16;
 use std::{ffi::OsStr, path::Path, sync::Arc};
 
 const VOCAB: usize = 200_058;
-const MAX_PREFILL_ROWS: usize = 16;
-
-fn requested_prefill_rows(setting: Option<&OsStr>, context: u32) -> usize {
-    setting
-        .and_then(OsStr::to_str)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, MAX_PREFILL_ROWS.min(context as usize))
-}
 type Row = Vec<f32>;
 
 fn invalid() -> EngError {
@@ -161,7 +154,7 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn open(dir: &Path, context: u32) -> Result<Self, EngError> {
-        let requested = std::env::var_os("FIFI_INKLING_PREFILL_ROWS");
+        let requested = std::env::var_os(PREFILL_ROWS_ENV);
         Self::open_with_prefill_rows(dir, context, requested.as_deref())
     }
 
@@ -179,11 +172,10 @@ impl Decoder {
         let mut experts = MlxExpertCache::new(&metal, source, bytes);
         let requested = requested_prefill_rows(requested, context);
         let prefill_rows = experts.configure_prefill(requested)?;
-        if requested > 1 {
-            eprintln!(
-                "Inkling 2 Mini: prefill_rows={prefill_rows} requested_prefill_rows={requested}"
-            );
-        }
+        eprintln!(
+            "Inkling 2 Mini: prefill_rows={prefill_rows} requested_prefill_rows={requested} expert_cache_capacity_bytes={}",
+            experts.capacity_bytes()
+        );
         Ok(Self {
             dense: DenseWeights::open(dir)?,
             experts: Experts::Mlx {
@@ -640,7 +632,7 @@ mod tests {
         assert_eq!(rows("invalid", 4096), 1);
         assert_eq!(rows("4", 4096), 4);
         assert_eq!(rows("4", 2), 2);
-        assert_eq!(rows("100", 4096), MAX_PREFILL_ROWS);
+        assert_eq!(rows("100", 4096), super::super::MAX_PREFILL_ROWS);
     }
 
     #[test]

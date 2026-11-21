@@ -522,33 +522,31 @@ impl MlxExpertCache {
     /// Use the working-set headroom already available to the expert cache.
     /// The single-token arena was charged by the base plan.
     pub(super) fn configure_prefill(&mut self, requested: usize) -> Result<usize, EngError> {
-        if requested <= 1 || self.max_bytes == 0 {
-            return Ok(1);
-        }
-        let page_size = HostPages::page_size();
-        let solo_bytes = peak_prefill_staging(&self.source, 1, page_size)?;
-        for rows in (2..=requested.min(MAX_ROUTED_ROWS)).rev() {
-            let stage_bytes = peak_prefill_staging(&self.source, rows, page_size)?;
-            // Cover row-private residuals, readback and the repeated input and
-            // expert projection/activation intermediates. Charge all window rows.
-            let row_workspace = rows * PREFILL_WORKSPACE_PER_ROW;
-            let extra = (stage_bytes - solo_bytes) + row_workspace;
-            if extra > self.max_bytes {
-                continue;
-            }
-            match HostPages::try_new(stage_bytes) {
+        let mut staging = None;
+        let (rows, extra) = self.source.reserve_prefill_window(
+            requested.min(MAX_ROUTED_ROWS),
+            HostPages::page_size(),
+            self.max_bytes,
+            |stage_bytes| match HostPages::try_new(stage_bytes) {
                 Ok(pages) => {
-                    self.staging = Some(pages);
-                    self.staging_rows = rows;
-                    self.max_bytes -= extra;
-                    self.stats.staging_allocations += 1;
-                    return Ok(rows);
+                    staging = Some(pages);
+                    Ok(true)
                 }
-                Err(EngError::MemoryPlan(_)) => continue,
-                Err(error) => return Err(error),
-            }
+                Err(EngError::MemoryPlan(_)) => Ok(false),
+                Err(error) => Err(error),
+            },
+        )?;
+        if let Some(pages) = staging {
+            self.staging = Some(pages);
+            self.staging_rows = rows;
+            self.max_bytes -= extra;
+            self.stats.staging_allocations += 1;
         }
-        Ok(1)
+        Ok(rows)
+    }
+
+    pub(super) fn capacity_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     pub(super) fn take_component_timings(&mut self) -> Option<ExpertTimings> {
@@ -617,11 +615,9 @@ impl MlxExpertCache {
                         .as_mut()
                         .map(|t| &mut t.staging_arena_allocation_ns),
                     || {
-                        let bytes = peak_prefill_staging(
-                            &self.source,
-                            self.staging_rows,
-                            HostPages::page_size(),
-                        )?;
+                        let bytes = self
+                            .source
+                            .prefill_staging_bytes(self.staging_rows, HostPages::page_size())?;
                         HostPages::try_new(bytes)
                     },
                 )?;
@@ -822,25 +818,6 @@ impl MlxExpertCache {
         });
         Ok(())
     }
-}
-
-const PREFILL_WORKSPACE_PER_ROW: usize = 1 << 20;
-
-fn peak_prefill_staging(
-    source: &InklingExpertSource,
-    rows: usize,
-    page_size: usize,
-) -> Result<usize, EngError> {
-    let routes = rows * TOP_K;
-    let experts: [usize; EXPERTS] = std::array::from_fn(|id| id);
-    (0..source.layers.len()).try_fold(0, |peak, layer| {
-        let plan = source.plan(layer, &experts[..routes.min(EXPERTS)], page_size)?;
-        let [_, _, end] = super::route_page_offsets(plan.staging_bytes(), routes, page_size)?;
-        let bytes = end
-            .checked_next_multiple_of(page_size)
-            .ok_or_else(super::staging_overflow)?;
-        Ok(peak.max(bytes))
-    })
 }
 
 fn expert_ranges(plan: &InklingExpertPlan<'_>, slot: usize) -> impl Iterator<Item = Range<usize>> {
@@ -1135,9 +1112,9 @@ mod tests {
             .unwrap()
         };
         let input = make_input(&[1.0, -0.5]);
-        let single = peak_prefill_staging(&source, 1, page).unwrap();
-        let double = peak_prefill_staging(&source, 2, page).unwrap();
-        let charge = double - single + 2 * PREFILL_WORKSPACE_PER_ROW;
+        let single = source.prefill_staging_bytes(1, page).unwrap();
+        let double = source.prefill_staging_bytes(2, page).unwrap();
+        let charge = double - single + 2 * super::super::PREFILL_WORKSPACE_PER_ROW;
         let mut fallback = MlxExpertCache::new(&kernels, Arc::clone(&source), charge - 1);
         assert_eq!(fallback.configure_prefill(2).unwrap(), 1);
         assert!(fallback.staging.is_none());

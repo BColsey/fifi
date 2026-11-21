@@ -665,12 +665,8 @@ fn inkling2_mini_preflight(
         Err(crate::EngError::BadRequest(
             "Inkling 2 Mini text requires BF16 KV".into(),
         ))
-    } else if candidate.prefill_rows.is_some_and(|rows| rows != 1) {
-        Err(crate::EngError::BadRequest(
-            "Inkling 2 Mini text prefill uses one token per forward pass".into(),
-        ))
     } else {
-        inkling2_mini::inspect(model_dir, candidate.context_limit)
+        inkling2_mini::inspect(model_dir, candidate.context_limit, candidate.prefill_rows)
     };
     let (decisions, fit) = match plan {
         Ok(plan) => {
@@ -722,7 +718,7 @@ fn inkling2_mini_preflight(
     checks.push(Check::new(
         "text execution",
         CheckStatus::Info,
-        "experimental Apple Silicon safetensors text, one sequence and one token per forward pass"
+        "experimental Apple Silicon safetensors text, one sequence with bounded prompt prefill and single-token decode"
             .into(),
     ));
     let compatibility = if any_failed(&checks) {
