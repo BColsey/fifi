@@ -4908,7 +4908,7 @@ mod tests {
                 let mut rows_of =
                     |plan: &str, splits: Vec<usize>, forced: &[u32]| -> Vec<Vec<f32>> {
                         use crate::family::token_forcing::score::ForcedModel;
-                        let mut rows_from = |model: &mut dyn ForcedModel| {
+                        let rows_from = |model: &mut dyn ForcedModel| {
                             model.reset().unwrap();
                             let mut rows = vec![model.prefill_logits(prompt).unwrap()];
                             for step in 0..steps - 1 {
@@ -4937,10 +4937,14 @@ mod tests {
                 let base = rows_of("none", vec![], &[]);
                 let greedy: Vec<u32> = base.iter().map(|row| argmax(row).0 as u32).collect();
                 let base_logs: Vec<Vec<f64>> = base.iter().map(|row| log_softmax(row)).collect();
+                // The split at the last multiple of the piece size before the tail: both segments
+                // chunk exactly as the unsplit prompt does, so only the split itself differs.
+                let aligned = (len - 7) / 256 * 256;
                 for (plan, splits) in [
                     ("cold", vec![len - 7]),
                     ("warm", vec![len - 107, len - 7]),
                     ("restore", vec![]),
+                    ("aligned", vec![aligned]),
                 ] {
                     let rows = rows_of(plan, splits, &greedy);
                     for (step, (row, base_row)) in rows.iter().zip(&base).enumerate() {
