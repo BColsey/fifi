@@ -172,8 +172,14 @@ impl Decoder {
         let mut experts = MlxExpertCache::new(&metal, source, bytes);
         let requested = requested_prefill_rows(requested, context);
         let prefill_rows = experts.configure_prefill(requested)?;
+        let cache_policy = if super::file_cache_only() {
+            experts.disable_retention();
+            "file_cache_only"
+        } else {
+            "packed_host_lru"
+        };
         eprintln!(
-            "Inkling 2 Mini: prefill_rows={prefill_rows} requested_prefill_rows={requested} expert_cache_capacity_bytes={}",
+            "Inkling 2 Mini: prefill_rows={prefill_rows} requested_prefill_rows={requested} expert_cache_policy={cache_policy} expert_cache_capacity_bytes={}",
             experts.capacity_bytes()
         );
         Ok(Self {

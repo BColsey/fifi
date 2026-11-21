@@ -47,6 +47,13 @@ const MAX_PREFILL_ROWS: usize = 16;
 ))]
 const PREFILL_WORKSPACE_PER_ROW: usize = 1 << 20;
 const PREFILL_ROWS_ENV: &str = "FIFI_INKLING_PREFILL_ROWS";
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+const FILE_CACHE_ONLY_ENV: &str = "FIFI_INKLING_FILE_CACHE_ONLY";
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn file_cache_only() -> bool {
+    std::env::var_os(FILE_CACHE_ONLY_ENV).as_deref() == Some(OsStr::new("1"))
+}
 const ROUTE_SCALE: f32 = 8.0;
 const GATE_CAP: f32 = 4.0;
 const UP_CAP: f32 = 25.0;
@@ -1101,7 +1108,7 @@ fn working_set_remaining(
 fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
     let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? else {
         eprintln!(
-            "Inkling 2 Mini: automatic Metal budget disabled; base allocations unchecked; expert_cache_budget_bytes=0"
+            "Inkling 2 Mini: automatic Metal budget disabled; base allocations unchecked; expert_prefill_headroom_bytes=0"
         );
         return Ok(0);
     };
@@ -1110,7 +1117,7 @@ fn cache_budget(dir: &Path, context: u32) -> Result<usize, EngError> {
     let state = state_plan(context)?;
     let charges = base_charges(source.projected_resident_bytes(), staging, &state);
     let remaining = working_set_remaining(device, &charges)?;
-    eprintln!("Inkling 2 Mini: {device} {charges:?} expert_cache_budget_bytes={remaining}");
+    eprintln!("Inkling 2 Mini: {device} {charges:?} expert_prefill_headroom_bytes={remaining}");
     usize::try_from(remaining).map_err(|_| staging_overflow())
 }
 
@@ -1140,10 +1147,14 @@ fn mlx_budget_row(
                     extra_bytes,
                     split_visits,
                 } = source.reserve_prefill_window(requested, page_size, remaining, |_| Ok(true))?;
-                let cache = remaining - extra_bytes;
+                let (cache, policy) = if file_cache_only() {
+                    (0, "file_cache_only")
+                } else {
+                    (remaining - extra_bytes, "packed_host_lru")
+                };
                 (
                     format!(
-                        "{plan}; {device}; up to {rows} prefill rows by budget, with {extra_bytes} B extra stage/workspace, a {stage_bytes} B staging arena and {cache} B optional expert cache; route-dependent split={split_visits}; arena allocation may lower the width"
+                        "{plan}; {device}; up to {rows} prefill rows by budget, with {extra_bytes} B extra stage/workspace, a {stage_bytes} B staging arena and {cache} B packed expert retention ({policy}); route-dependent split={split_visits}; arena allocation may lower the width"
                     ),
                     Some(true),
                 )
