@@ -9,6 +9,7 @@
 //! tested: the kv8 mode/NULL consistency guard of the C entry (the wrapper has no KV8 ranges
 //! yet, so only C can reach it).
 
+mod d512;
 mod q8;
 mod segmented;
 mod shared_rows;

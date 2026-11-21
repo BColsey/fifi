@@ -674,6 +674,8 @@ __device__ inline float f16_value(const inference_cuda_attn_kv_view &v, int row,
     return __half2float(*((const __half *)((const char *)v.payload + payload)));
 }
 
+#include "prefill/attn_prefill_d512.cuh"
+
 // A launch covers every query row; decode only visible keys, without an F16 cache copy.
 // VIsF16 is the mixed profile ("q8k"): K dequantizes as q8 while V reads f16
 // payload at its own strides; the branch folds at compile time.
@@ -850,6 +852,20 @@ bool f16_view(const inference_cuda_attn_kv_view &v, const inference_cuda_attn_pr
            read_span(v.payload, (size_t)a->head_dim * 2, counts, strides);
 }
 
+/* What the head_dim 512 kernel reads: both planes q8 with 32-value groups and no bias, four
+ * query heads per kv head, and payload rows the 16-byte loads can address. */
+bool d512_views(const inference_cuda_attn_kv_pair &views, const inference_cuda_attn_prefill_args &a) {
+    if (a.n_head != kD512Group * a.n_kv_head || a.kv_mode != INFERENCE_CUDA_PREFILL_KV_VIEW)
+        return false;
+    for (const inference_cuda_attn_kv_view *v : {&views.k, &views.v}) {
+        if (v->storage != INFERENCE_CUDA_ATTN_STORAGE_Q8_AFFINE || v->group_size != 32 ||
+            v->bias != NULL || !aligned_to(v->payload, 16) ||
+            v->payload_time_stride_bytes % 16 != 0 || v->payload_head_stride_bytes % 16 != 0)
+            return false;
+    }
+    return true;
+}
+
 /* The wrapper mirrors every rule here, so the native entry cannot return INVALID_ARGUMENT
  * (which would latch the backend); a C caller gets the same refusal before any launch. */
 bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
@@ -880,7 +896,8 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
                       a->min_keys >= kTile && a->min_keys % kTile == 0 &&
                       a->min_keys <= kMaxMinKeys;
     const bool scale_ok = a->scale > 0.f && a->scale < 1e30f && isfinite(a->scale);
-    if (!(a->head_dim == 64 || a->head_dim == 128 || a->head_dim == 256) ||
+    if (!(a->head_dim == 64 || a->head_dim == 128 || a->head_dim == 256 ||
+          (a->head_dim == kD512 && tagged)) ||
         !heads || !gate_ok || !ring_ok || !bounds || !plan || !scale_ok ||
         (segmented && (a->window != 0 || a->ring != 0)) || a->m < 1 ||
         a->m > kMaxGridY || a->cache_rows < 1 || a->cache_rows > kMaxRows)
@@ -894,6 +911,7 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
     if (!(a->n_head <= kMaxGridY && floats > 0 && floats <= (64u << 20) / sizeof(float) &&
           a->k_cache == views.k.payload && a->v_cache == views.v.payload))
         return false;
+    if (a->head_dim == kD512 && !d512_views(views, *a)) return false;
     /* Uniform q8: both planes q8 with matching group geometry. Mixed ("q8k"):
      * K q8, V f16. */
     if (q8_view(views.v, *a))
@@ -1349,8 +1367,37 @@ Failure enqueue_q8(const Args &k, inference_cuda_attn_kv_pair views, void *strea
     return failure;
 }
 
+/* The head_dim 512 q8 path: attn_prefill_part_q8_d512_k over grid (q_tiles, n_kv_head, splits)
+ * with 80 KB of dynamic shared memory (opted in once per process), then the shared combine. */
+static Failure enqueue_q8_d512(const Args &k, inference_cuda_attn_kv_pair views, void *stream) {
+    Failure failure;
+    static const cudaError_t arm_error = []() -> cudaError_t {
+        return cudaFuncSetAttribute(attn_prefill_part_q8_d512_k,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kD512SmemBytes);
+    }();
+    if (arm_error != cudaSuccess) {
+        failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);
+        if (cudaPeekAtLastError() == arm_error)
+            (void)cudaGetLastError();  // consume the duplicate of the reported arm failure
+        return failure;
+    }
+    if (k.mode != 2) {
+        const int q_tiles = (k.m + kQTile - 1) / kQTile;
+        attn_prefill_part_q8_d512_k<<<dim3(q_tiles, k.n_kv_head, k.mode == 1 ? 1 : k.max_splits),
+                                      kD512Threads, kD512SmemBytes, (cudaStream_t)stream>>>(k, views);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    }
+    if (failure.ok() && k.mode != 1) {
+        attn_prefill_combine_k<kD512, 0><<<dim3(k.n_head, k.m), kD512, 0, (cudaStream_t)stream>>>(k);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    }
+    return failure;
+}
+
 Failure enqueue(const Args &k, void *stream, const inference_cuda_attn_kv_pair *views) {
     if (views != NULL) {
+        if (k.head_dim == kD512) return enqueue_q8_d512(k, *views, stream);
         if (k.head_dim == 64) return enqueue_q8<64>(k, *views, stream);
         if (k.head_dim == 128) return enqueue_q8<128>(k, *views, stream);
         return enqueue_q8<256>(k, *views, stream);
@@ -1370,7 +1417,7 @@ Failure enqueue(const Args &k, void *stream, const inference_cuda_attn_kv_pair *
 extern "C" size_t inference_cuda_attn_prefill_part_floats(int m, int n_kv_head, int head_dim,
                                                           int max_splits, int group) {
     if (m < 1 || m > kMaxGridY || n_kv_head < 1 || n_kv_head > 64 ||
-        (head_dim != 64 && head_dim != 128 && head_dim != 256) || group < 1 ||
+        (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != kD512) || group < 1 ||
         max_splits < 1 || max_splits > kMaxSplits)
         return 0;
     size_t floats = (size_t)((m + kQTile - 1) / kQTile);

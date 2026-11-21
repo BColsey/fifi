@@ -68,7 +68,9 @@
  * never read (the loader zero-fills past the range).
  *
  * Legacy F16: head_dim 128/256 and GQA 1/8. Tagged Q8 affine: D64/128/256 and any positive integral
- * GQA within the 64MiB partial budget; F32 Q and accumulators, independent F16/BF16/F32 scalar
+ * GQA within the 64MiB partial budget; D512 (sm_80+, attn_prefill_d512.cuh) takes exactly GQA 4,
+ * both planes Q8 with 32-value groups, no bias and 16-byte aligned payload rows and heads, and
+ * uses 80 KB of dynamic shared memory (one 512-thread block per SM); F32 Q and accumulators, independent F16/BF16/F32 scalar
  * planes, optional bias, no temporary F16 cache. Q8 reads only keys visible to each row;
  * signed/G32/F16-scale/no-bias is Q8_0-equivalent separated planes, not the raw interleaved GGUF
  * block layout. In both paths, every geometry value stays a run-time argument and a value the entry
@@ -145,7 +147,7 @@ typedef struct inference_cuda_attn_prefill_args {
     int m;       /* tokens, 1..65535 */
     int n_head;      /* legacy GQA1/8; Q8: positive integral multiple of n_kv_head */
     int n_kv_head;
-    int head_dim;     /* legacy 128/256; Q8 64/128/256 */
+    int head_dim;     /* legacy 128/256; Q8 64/128/256, and 512 for GQA 4 */
     int cache_rows;   /* 1..2^30 - 1 physical rows; Full linear: p0 + m <= cache_rows;
                       * ring/segmented: p0 + m <= 2^30 - 1 */
     int max_splits;   /* 1..128 */

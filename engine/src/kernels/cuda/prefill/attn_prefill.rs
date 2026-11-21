@@ -73,6 +73,12 @@ pub(crate) const CPF_ATTN_BLOCKS_PER_SM: usize = 1;
 /// bytes never exceed it (the plan reduces its splits to fit).
 pub(crate) const CPF_ATTN_PART_CAP: usize = 64 * 1024 * 1024;
 
+/// The head size of the wide kernel: Q8 affine planes only, four query heads per kv head,
+/// 32-value groups, no bias plane, payload rows addressable in 16-byte units.
+pub(crate) const CPF_ATTN_WIDE_HEAD_DIM: usize = 512;
+/// Query heads per kv head the wide kernel packs into one 32-row tile.
+const WIDE_GROUP: usize = 4;
+
 /// The geometry of one prefill attention call: a chunk of `m` rows, `n_head` query heads over
 /// `n_kv_head` kv heads, and the head dimension. Every value is a run-time argument; the
 /// sizing is generic in all of them.
@@ -605,7 +611,9 @@ fn check_storage(storage: AttnKvStorage, dim: usize) -> Result<(), EngError> {
             "invalid KV payload extent or affine group size",
         ));
     }
-    if matches!(storage, AttnKvStorage::Q8Affine { .. }) && [64, 128, 256].contains(&dim) {
+    if matches!(storage, AttnKvStorage::Q8Affine { .. })
+        && [64, 128, 256, CPF_ATTN_WIDE_HEAD_DIM].contains(&dim)
+    {
         return Ok(());
     }
     Err(rule(
@@ -725,7 +733,9 @@ fn check_shape_mode(
         ));
     }
     let q8 = matches!(storage, AttnKvStorage::Q8Affine { .. });
-    if ![64, 128, HEAD_DIM].contains(&shape.head_dim) || (!q8 && shape.head_dim == 64) {
+    if ![64, 128, HEAD_DIM, CPF_ATTN_WIDE_HEAD_DIM].contains(&shape.head_dim)
+        || (!q8 && (shape.head_dim == 64 || shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM))
+    {
         return Err(rule(
             "head_dim",
             &format!("head_dim {} is unsupported for {storage:?}", shape.head_dim),
@@ -1005,6 +1015,9 @@ fn check_kv_views(
         view.layout.storage == call.storage
             || (plane == 1 && matches!(view.layout.storage, AttnKvStorage::F16))
     };
+    if call.shape.head_dim == CPF_ATTN_WIDE_HEAD_DIM {
+        check_wide(call, views)?;
+    }
     let mut writes = vec![
         Claim::of("out", &call.out, need.out),
         Claim::of("part", &call.part, need.part),
@@ -1032,6 +1045,43 @@ fn check_kv_views(
             ],
             &writes,
         )?;
+    }
+    Ok(())
+}
+
+/// The rules of the head_dim 512 kernel on top of the shared view checks: both planes Q8
+/// affine with 32-value groups and no bias, four query heads per kv head, and payload rows
+/// and heads the kernel's 16-byte loads can address.
+fn check_wide(call: &AttnPrefillCall<'_>, views: &[AttnKvView<'_>; 2]) -> Result<(), EngError> {
+    let shape = &call.shape;
+    if shape.n_head != WIDE_GROUP * shape.n_kv_head {
+        return Err(rule(
+            "group",
+            &format!(
+                "head_dim {CPF_ATTN_WIDE_HEAD_DIM} takes {WIDE_GROUP} query heads per kv head, \
+                 got {} over {}",
+                shape.n_head, shape.n_kv_head
+            ),
+        ));
+    }
+    for view in views {
+        let strides = view.layout.payload_strides;
+        let ok = matches!(
+            view.layout.storage,
+            AttnKvStorage::Q8Affine { group_size: 32, .. }
+        ) && view.layout.bias.is_none()
+            && view.payload.offset().is_multiple_of(16)
+            && strides.time_stride_bytes.is_multiple_of(16)
+            && strides.head_stride_bytes.is_multiple_of(16);
+        if !ok {
+            return Err(rule(
+                "storage",
+                &format!(
+                    "head_dim {CPF_ATTN_WIDE_HEAD_DIM} needs Q8 affine planes with 32-value \
+                     groups, no bias and 16-byte aligned payload rows"
+                ),
+            ));
+        }
     }
     Ok(())
 }
