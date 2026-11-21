@@ -2,6 +2,7 @@
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
+use super::timing::{self, measure};
 use super::{
     EXPERTS, HIDDEN, InklingExpertPlan, InklingExpertProjection, InklingExpertSource,
     InklingRoutes, LAYERS, TOP_K,
@@ -468,6 +469,17 @@ pub struct MlxExpertCacheStats {
     pub cached_bytes: usize,
 }
 
+#[derive(Default, serde::Serialize)]
+pub(super) struct ExpertTimings {
+    metal_input_import_ns: u128,
+    staging_arena_allocation_ns: u128,
+    staging_ns: u128,
+    demand_read_ns: u128,
+    metal_dispatch_ns: u128,
+    metal_readback_ns: u128,
+    metal_fallback_sync_ns: u128,
+}
+
 /// Byte-bounded LRU of packed checkpoint payloads indexed by physical layer and expert.
 /// On each visit, a single Metal staging arena receives cached slabs and coalesced
 /// missing reads in compact order. The budget covers retained raw expert payloads.
@@ -480,6 +492,7 @@ pub struct MlxExpertCache {
     staging: Option<HostPages>,
     staging_rows: usize,
     trace_routes: bool,
+    timing: Option<ExpertTimings>,
     stats: MlxExpertCacheStats,
 }
 
@@ -501,6 +514,7 @@ impl MlxExpertCache {
             staging_rows: 1,
             trace_routes: std::env::var_os("FIFI_INKLING_ROUTE_TRACE").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
+            timing: timing::enabled().then(ExpertTimings::default),
             stats: MlxExpertCacheStats::default(),
         }
     }
@@ -535,6 +549,10 @@ impl MlxExpertCache {
             }
         }
         Ok(1)
+    }
+
+    pub(super) fn take_component_timings(&mut self) -> Option<ExpertTimings> {
+        self.timing.as_mut().map(std::mem::take)
     }
 
     pub fn stats(&self) -> MlxExpertCacheStats {
@@ -587,20 +605,36 @@ impl MlxExpertCache {
                 "Inkling cache must belong to the active Metal owner".into(),
             ));
         }
-        let input = kernels.import_tensor(input)?;
+        let input = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_input_import_ns),
+            || kernels.import_tensor(input),
+        )?;
         let mut pages = match self.staging.take() {
             Some(pages) => pages,
             None => {
-                let bytes =
-                    peak_prefill_staging(&self.source, self.staging_rows, HostPages::page_size())?;
-                let pages = HostPages::try_new(bytes)?;
+                let pages = measure(
+                    self.timing
+                        .as_mut()
+                        .map(|t| &mut t.staging_arena_allocation_ns),
+                    || {
+                        let bytes = peak_prefill_staging(
+                            &self.source,
+                            self.staging_rows,
+                            HostPages::page_size(),
+                        )?;
+                        HostPages::try_new(bytes)
+                    },
+                )?;
                 self.stats.staging_allocations += 1;
                 pages
             }
         };
         if pages.in_use() {
             self.stats.staging_fallback_syncs += 1;
-            kernels.evaluate(&[&input])?;
+            measure(
+                self.timing.as_mut().map(|t| &mut t.metal_fallback_sync_ns),
+                || kernels.evaluate(&[&input]),
+            )?;
             if pages.in_use() {
                 return Err(EngError::Backend {
                     operation: "Inkling expert staging",
@@ -610,7 +644,10 @@ impl MlxExpertCache {
             }
         }
         let output = self.forward_impl(kernels, layer, routes, &input, true, Some(&mut pages))?;
-        let result = kernels.readback(&output)?;
+        let result = measure(
+            self.timing.as_mut().map(|t| &mut t.metal_readback_ns),
+            || kernels.readback(&output),
+        )?;
         drop(output);
         pages.release();
         self.staging = Some(pages);
@@ -632,6 +669,7 @@ impl MlxExpertCache {
                 "Inkling cache and input must belong to the active Metal owner".into(),
             ));
         }
+        let staging_start = self.timing.is_some().then(std::time::Instant::now);
         let page_size = HostPages::page_size();
         RoutePages::validate(routes, page_size)?;
         validate_routed_input(input, routes.rows() as u32)?;
@@ -673,7 +711,9 @@ impl MlxExpertCache {
             let plan = plan.expert_plan();
             let read_start = self.trace_routes.then(std::time::Instant::now);
             if plan.read_count() > 0 {
-                plan.read_into(bytes)?;
+                measure(self.timing.as_mut().map(|t| &mut t.demand_read_ns), || {
+                    plan.read_into(bytes)
+                })?;
                 self.stats.read_bytes += plan.read_bytes() as u64;
                 self.stats.read_ranges += plan.read_count() as u64;
             }
@@ -735,10 +775,19 @@ impl MlxExpertCache {
                 self.retain_expert(layer, expert, plan, slot, bytes)?;
             }
             Ok(())
-        })?;
-        stage
-            .experts
-            .forward_routed(kernels, input, &stage.routing, quantized)
+        });
+        if let Some((timing, start)) = self.timing.as_mut().zip(staging_start) {
+            timing.staging_ns += start.elapsed().as_nanos();
+        }
+        let stage = stage?;
+        measure(
+            self.timing.as_mut().map(|t| &mut t.metal_dispatch_ns),
+            || {
+                stage
+                    .experts
+                    .forward_routed(kernels, input, &stage.routing, quantized)
+            },
+        )
     }
 
     fn retain_expert(

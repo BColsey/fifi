@@ -155,7 +155,7 @@ mod executor {
         tokenizer::DecodeBatch,
     };
 
-    use super::super::{UNPADDED_VOCAB, mlx::MlxExpertCacheStats, text::Decoder};
+    use super::super::{UNPADDED_VOCAB, mlx::MlxExpertCacheStats, text::Decoder, timing};
 
     pub(super) struct Phase {
         started: std::time::Instant,
@@ -173,9 +173,12 @@ mod executor {
         }
 
         pub(super) fn start_if_enabled() -> Option<Self> {
-            (std::env::var_os("FIFI_INKLING_EXPERT_TIMING").as_deref()
-                == Some(std::ffi::OsStr::new("1")))
-            .then(|| Self::new(MlxExpertCacheStats::default()))
+            Self::enabled().then(|| Self::new(MlxExpertCacheStats::default()))
+        }
+
+        fn enabled() -> bool {
+            timing::enabled()
+                || std::env::var_os("FIFI_INKLING_EXPERT_TIMING").is_some_and(|value| value == "1")
         }
 
         pub(super) fn report(&self, phase: &str, end: MlxExpertCacheStats) {
@@ -212,8 +215,7 @@ mod executor {
                 stepper: Stepper { decoder, fed: 0 },
                 eos,
                 context,
-                trace_cache: std::env::var_os("FIFI_INKLING_EXPERT_TIMING")
-                    .is_some_and(|value| value == "1"),
+                trace_cache: Phase::enabled(),
                 trace_start: None,
                 phase: None,
                 first_sample: false,
@@ -226,14 +228,13 @@ mod executor {
             };
             let end = self.stepper.decoder.expert_cache_stats();
             if let Some(phase) = self.phase.take() {
-                phase.report(
-                    if self.first_sample {
-                        "decode"
-                    } else {
-                        "prefill"
-                    },
-                    end,
-                );
+                let name = if self.first_sample {
+                    "decode"
+                } else {
+                    "prefill"
+                };
+                phase.report(name, end);
+                self.stepper.decoder.report_component_timings(name);
             }
             eprintln!(
                 "inkling_expert_timing {}",
@@ -339,10 +340,11 @@ mod executor {
             // sampler call. Charge this feed and its output head to prefill.
             if !self.first_sample && self.phase.is_some() && self.stepper.fed > fed {
                 let end = self.stepper.decoder.expert_cache_stats();
-                let next = Phase::new(end);
-                if let Some(phase) = self.phase.replace(next) {
+                if let Some(phase) = self.phase.take() {
                     phase.report("prefill", end);
+                    self.stepper.decoder.report_component_timings("prefill");
                 }
+                self.phase = Some(Phase::new(end));
                 self.first_sample = true;
             }
             match &result {

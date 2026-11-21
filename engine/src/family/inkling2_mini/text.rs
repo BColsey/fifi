@@ -6,6 +6,7 @@ use super::{
     gguf, is_local,
     mlx::{MlxExpertCache, MlxExpertCacheStats},
     sconv::{InklingConvState, InklingConvStream, InklingConvTaps},
+    timing::{self, measure},
     visits,
 };
 use crate::{
@@ -85,16 +86,20 @@ fn blend(
     prefix: &str,
     dest: &[f32],
     msg: &[f32],
+    projection_ns: Option<&mut u128>,
 ) -> Result<Row, EngError> {
     let mut pair = Vec::with_capacity(2 * HIDDEN);
     for row in [dest, msg] {
         let inv = inv_rms(row);
         pair.extend(row.iter().map(|v| rounded(v * inv)));
     }
-    let mut hidden = dense.matvec(&format!("{prefix}.down_weight"), &pair)?;
-    hidden.iter_mut().for_each(|x| *x = rounded(*x));
-    let gain = dense.matvec(&format!("{prefix}.gain_weight"), &hidden)?;
-    let forget = dense.matvec(&format!("{prefix}.forget_weight"), &hidden)?;
+    let (gain, forget) = measure(projection_ns, || {
+        let mut hidden = dense.matvec(&format!("{prefix}.down_weight"), &pair)?;
+        hidden.iter_mut().for_each(|x| *x = rounded(*x));
+        let gain = dense.matvec(&format!("{prefix}.gain_weight"), &hidden)?;
+        let forget = dense.matvec(&format!("{prefix}.forget_weight"), &hidden)?;
+        Ok::<_, EngError>((gain, forget))
+    })?;
     if gain.len() != HIDDEN || forget.len() != HIDDEN {
         return Err(invalid());
     }
@@ -131,6 +136,16 @@ enum Experts {
     GgufReference(Arc<gguf::Weights>),
 }
 
+#[derive(Default, serde::Serialize)]
+struct CpuTimings {
+    embedding_ns: u128,
+    attention_ns: u128,
+    attention_projections_ns: u128,
+    controller_projections_ns: u128,
+    router_ns: u128,
+    head_projection_ns: u128,
+}
+
 pub struct Decoder {
     dense: DenseWeights,
     experts: Experts,
@@ -140,6 +155,7 @@ pub struct Decoder {
     context: u32,
     failed: bool,
     prefill_rows: usize,
+    timing: Option<CpuTimings>,
 }
 
 impl Decoder {
@@ -179,6 +195,7 @@ impl Decoder {
             context,
             failed: false,
             prefill_rows,
+            timing: timing::enabled().then(CpuTimings::default),
         })
     }
     /// Opens the portable GGUF projections in the common text graph for parity checks.
@@ -203,6 +220,7 @@ impl Decoder {
             context,
             failed: false,
             prefill_rows: 1,
+            timing: None,
         })
     }
 
@@ -210,6 +228,19 @@ impl Decoder {
         match &self.experts {
             Experts::Mlx { cache, .. } => cache.stats(),
             Experts::GgufReference(_) => MlxExpertCacheStats::default(),
+        }
+    }
+
+    pub(super) fn report_component_timings(&mut self, phase: &str) {
+        if let (Some(cpu), Experts::Mlx { cache, .. }) = (&mut self.timing, &mut self.experts) {
+            eprintln!(
+                "inkling_components {}",
+                serde_json::json!({
+                    "phase": phase,
+                    "cpu": std::mem::take(cpu),
+                    "experts": cache.take_component_timings(),
+                })
+            );
         }
     }
 
@@ -271,21 +302,20 @@ impl Decoder {
     }
 
     fn moe(&mut self, layer: usize, prefix: &str, inputs: &[Row]) -> Result<Vec<bf16>, EngError> {
-        let gate = format!("{prefix}.mlp.gate.weight");
-        let mut logits = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let row: [f32; EXPERTS] = self
-                .dense
-                .matvec(&gate, input)?
-                .try_into()
-                .map_err(|_| invalid())?;
-            logits.push(row);
-        }
-        let bias = self.dense.vector(&format!("{prefix}.mlp.gate.bias"))?;
-        let routes = InklingRoutes::from_logits(
-            &logits,
-            bias.as_slice().try_into().map_err(|_| invalid())?,
-        )?;
+        let routes = measure(self.timing.as_mut().map(|t| &mut t.router_ns), || {
+            let gate = format!("{prefix}.mlp.gate.weight");
+            let mut logits = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let row: [f32; EXPERTS] = self
+                    .dense
+                    .matvec(&gate, input)?
+                    .try_into()
+                    .map_err(|_| invalid())?;
+                logits.push(row);
+            }
+            let bias = self.dense.vector(&format!("{prefix}.mlp.gate.bias"))?;
+            InklingRoutes::from_logits(&logits, bias.as_slice().try_into().map_err(|_| invalid())?)
+        })?;
         let Experts::Mlx { metal, cache } = &mut self.experts else {
             let Experts::GgufReference(source) = &self.experts else {
                 unreachable!()
@@ -328,7 +358,9 @@ impl Decoder {
         let embed_norm = self.dense.vector("model.llm.embed_norm.weight")?;
         let mut rows = Vec::with_capacity(tokens.len());
         for &token in tokens {
-            let embedded = self.dense.row("model.llm.embed.weight", token as usize)?;
+            let embedded = measure(self.timing.as_mut().map(|t| &mut t.embedding_ns), || {
+                self.dense.row("model.llm.embed.weight", token as usize)
+            })?;
             rows.push(PrefillRow {
                 blocks: vec![normalize(&embedded, &embed_norm)?],
                 prelude: Vec::new(),
@@ -432,17 +464,26 @@ impl Decoder {
             );
         }
         let tau = 1. + 0.1 * (((position + 1) as f32 / 8192.).max(1.)).ln();
-        let attn = self.attention.step(
-            &self.dense,
-            &mut self.conv,
-            visit.state_slot,
-            (
-                &inputs[0],
-                inputs.get(1).unwrap_or(&inputs[0]),
-                inputs.get(2).unwrap_or(&inputs[0]),
-            ),
-            tau,
-        )?;
+        let inputs = (
+            inputs[0].as_slice(),
+            inputs.get(1).unwrap_or(&inputs[0]).as_slice(),
+            inputs.get(2).unwrap_or(&inputs[0]).as_slice(),
+        );
+        let attn = match &mut self.timing {
+            Some(timing) => measure(Some(&mut timing.attention_ns), || {
+                self.attention.step_timed(
+                    &self.dense,
+                    &mut self.conv,
+                    visit.state_slot,
+                    inputs,
+                    tau,
+                    Some(&mut timing.attention_projections_ns),
+                )
+            }),
+            None => self
+                .attention
+                .step(&self.dense, &mut self.conv, visit.state_slot, inputs, tau),
+        }?;
         let a = conv(
             &mut self.dense,
             &mut self.conv,
@@ -477,9 +518,13 @@ impl Decoder {
             &self.dense.vector("model.llm.attn_res.output_query")?,
         )?;
         let result = normalize(&mixed, &self.dense.vector("model.llm.norm.weight")?)?;
-        let mut scores = self
-            .dense
-            .matvec_rows("model.llm.unembed.weight", &result, 0..VOCAB)?;
+        let mut scores = measure(
+            self.timing.as_mut().map(|t| &mut t.head_projection_ns),
+            || {
+                self.dense
+                    .matvec_rows("model.llm.unembed.weight", &result, 0..VOCAB)
+            },
+        )?;
         scores.iter_mut().for_each(|v| *v = 30. * (*v / 30.).tanh());
         if scores.len() != VOCAB || !scores.iter().all(|v| v.is_finite()) {
             return Err(invalid());
@@ -511,6 +556,9 @@ impl Decoder {
             &format!("{prefix}.controllers.{stream}"),
             dest,
             &mix(bank, &q)?,
+            self.timing
+                .as_mut()
+                .map(|t| &mut t.controller_projections_ns),
         )
     }
 }

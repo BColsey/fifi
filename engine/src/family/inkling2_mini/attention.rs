@@ -9,6 +9,7 @@ use super::{
     dense::DenseWeights,
     is_local,
     sconv::{InklingConvState, InklingConvStream, InklingConvTaps},
+    timing::measure,
     visits,
 };
 use crate::EngError;
@@ -75,8 +76,21 @@ impl InklingAttentionState {
         weights: &DenseWeights,
         conv: &mut InklingConvState,
         visit: usize,
+        inputs: (&[bf16], &[bf16], &[bf16]),
+        tau: f32,
+    ) -> Result<Vec<bf16>, EngError> {
+        self.step_timed(weights, conv, visit, inputs, tau, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn step_timed(
+        &mut self,
+        weights: &DenseWeights,
+        conv: &mut InklingConvState,
+        visit: usize,
         (query, key, value): (&[bf16], &[bf16], &[bf16]),
         tau: f32,
+        mut projection_ns: Option<&mut u128>,
     ) -> Result<Vec<bf16>, EngError> {
         let schedule = visits();
         let layer = schedule
@@ -97,10 +111,12 @@ impl InklingAttentionState {
         }
         let tau = if local { 1.0 } else { tau };
         let prefix = format!("model.llm.layers.{layer}.attn.");
-        let project = |name: &str, input: &[f32], rows: usize| {
-            let name = format!("{prefix}{name}");
-            check_shape(weights, &name, &[rows, input.len()])?;
-            weights.matvec(&name, input).map(|row| narrow(&row))
+        let mut project = |name: &str, input: &[f32], rows: usize| {
+            measure(projection_ns.as_deref_mut(), || {
+                let name = format!("{prefix}{name}");
+                check_shape(weights, &name, &[rows, input.len()])?;
+                weights.matvec(&name, input).map(|row| narrow(&row))
+            })
         };
         let weight = |name: &str, shape: &[usize]| {
             let name = format!("{prefix}{name}");
