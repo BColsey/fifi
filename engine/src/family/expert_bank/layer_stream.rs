@@ -420,6 +420,27 @@ pub(crate) trait ExpertTransport {
     fn release(&mut self, slot: usize) -> Result<(), EngError>;
 }
 
+impl<T: ExpertTransport + ?Sized> ExpertTransport for &mut T {
+    type Ticket = T::Ticket;
+
+    fn begin(
+        &mut self,
+        layer: usize,
+        set: &UploadSet,
+        slot: usize,
+    ) -> Result<Self::Ticket, EngError> {
+        (**self).begin(layer, set, slot)
+    }
+
+    fn wait(&mut self, ticket: Self::Ticket) -> Result<TransferReport, EngError> {
+        (**self).wait(ticket)
+    }
+
+    fn release(&mut self, slot: usize) -> Result<(), EngError> {
+        (**self).release(slot)
+    }
+}
+
 /// What the recipe knows about one layer's picks, after its router ran for a piece.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Picks {

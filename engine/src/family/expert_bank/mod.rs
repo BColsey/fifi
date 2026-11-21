@@ -11,6 +11,10 @@
 pub(crate) mod bank_tier;
 pub(crate) mod host_tier;
 pub(crate) mod layer_stream;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) mod layer_stream_card;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod layer_stream_card_tests;
 // disk_store is host-only and unwired on purpose until the config keys and
 // the restore path exist; drop this allow when they do.
 #[expect(
