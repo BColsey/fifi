@@ -130,7 +130,24 @@ impl TokenDevice for GgufDevice {
         if range.is_empty() {
             return Ok(());
         }
-        let GgufRun { step, moe, .. } = self.owner.step_mut();
+        let GgufRun {
+            step,
+            moe,
+            stream_width,
+            ..
+        } = self.owner.step_mut();
+        #[cfg(test)]
+        if layer_trace::on() {
+            // One layer a call, the residual stream read after each: the comparison with the
+            // host's per-layer output.
+            for layer in range {
+                step.run_layers(layer..layer + 1, pos, 1, moe)?;
+                let stream = step.read_f32(step.slot(Slot::Stream)?, *stream_width)?;
+                layer_trace::push(stream);
+            }
+            return Ok(());
+        }
+        let _ = stream_width;
         step.run_layers(range, pos, 1, moe)
     }
 
@@ -174,5 +191,38 @@ impl StateIo for GgufDevice {
 
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
         self.owner.step_mut().step.write_fixed_state(parts)
+    }
+}
+
+/// The residual stream after each layer of the tokens a test runs, for the device-against-host
+/// comparison of one layer at a time.
+#[cfg(test)]
+pub(in crate::family::qwen::flash_next) mod layer_trace {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static TRACE: RefCell<Option<Vec<Vec<f32>>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording; the next layers each push their stream.
+    pub(in crate::family::qwen::flash_next) fn start() {
+        TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(super) fn on() -> bool {
+        TRACE.with(|trace| trace.borrow().is_some())
+    }
+
+    pub(super) fn push(stream: Vec<f32>) {
+        TRACE.with(|trace| {
+            if let Some(rows) = trace.borrow_mut().as_mut() {
+                rows.push(stream);
+            }
+        });
+    }
+
+    /// Takes what was recorded since [`start`] and records again from empty.
+    pub(in crate::family::qwen::flash_next) fn take() -> Vec<Vec<f32>> {
+        TRACE.with(|trace| trace.borrow_mut().replace(Vec::new()).unwrap_or_default())
     }
 }

@@ -414,6 +414,12 @@ pub(super) fn select_positions(
     let take = blocks.min(dims.budget as usize / ratio);
     let mut order: Vec<usize> = (0..blocks).collect();
     order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
+    #[cfg(test)]
+    if take > 0 && take < blocks {
+        let last = score[order[take - 1]];
+        let next = score[order[take]];
+        margins::push(pos, (last - next) / last.abs().max(f64::MIN_POSITIVE));
+    }
     let mut selected = Vec::new();
     for &block in order.iter().take(take) {
         for r in 0..ratio {
@@ -422,6 +428,27 @@ pub(super) fn select_positions(
     }
     selected.extend(tail..visible);
     Ok(selected)
+}
+
+/// The relative gap between the last block kept and the first dropped, at each selection that
+/// drops blocks, so a test can tell a selection that the activation rounding of another
+/// implementation may flip from one it cannot.
+#[cfg(test)]
+pub(super) mod margins {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<(u32, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(in crate::family::qwen::flash_next) fn push(pos: u32, gap: f64) {
+        LOG.with(|log| log.borrow_mut().push((pos, gap)));
+    }
+
+    /// The `(position, gap)` pairs recorded since the last take.
+    pub(in crate::family::qwen::flash_next) fn take() -> Vec<(u32, f64)> {
+        LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
 }
 
 #[cfg(test)]

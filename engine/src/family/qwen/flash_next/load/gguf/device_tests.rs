@@ -39,22 +39,64 @@ fn argmax(values: &[f32]) -> usize {
         .expect("nonempty")
 }
 
-#[test]
-#[ignore = "needs a GPU (about 2 GiB)"]
-fn the_device_logits_follow_the_host_forward_on_the_small_model() {
-    let small = write_small(7);
+/// How far the device logits sit from the host's over a token sequence.
+struct Agreement {
+    /// The largest absolute difference at any position.
+    worst: f32,
+    /// The largest ratio of a position's difference to its bound.
+    worst_ratio: f32,
+    /// Positions whose top-1 matched, and positions whose host margin was too small to ask.
+    matched: usize,
+    undecided: usize,
+    /// Positions where a selection was close enough to flip: the run stops at the first.
+    flippable: usize,
+    /// Positions whose difference was held to the bound.
+    compared: usize,
+}
+
+/// The activation rounding step of the device, as a fraction of a block's largest value: a q8_1
+/// block stores 8-bit integers at scale `amax / 127`, so a value is off by at most half a step.
+const Q8_HALF_STEP: f32 = 0.5 / 127.0;
+
+/// The bound on a logit's difference at a position whose host logits reach `scale`. Every
+/// quantized projection (about twelve a layer and the head) adds an independent relative error of
+/// at most half a q8_1 step; independent errors add in quadrature, and the logit row is a
+/// linear read-out of values of the size of `scale`.
+fn bound(layers: usize, scale: f32) -> f32 {
+    Q8_HALF_STEP * ((12 * layers + 1) as f32).sqrt() * scale
+}
+
+/// Runs `tokens` through the device and the host forward over the small model of `layers`
+/// layers and compares every position: each difference stays under [`bound`], and where the
+/// host's top-1 leads the second by more than twice the bound the device picks the same id.
+fn agreement(small: &Small, layers: usize, tokens: &[u32]) -> Agreement {
     let model: &'static GgufModel = Box::leak(Box::new(
         GgufModel::open(&small.first)
             .expect("open")
             .expect("a qwen4exp model"),
     ));
-    let mut driver = driver_of(&small, 64);
-
-    let tokens = [5u32, 9, 200, 17, 33, 481];
-    let reference = host::HostModel::load(model, 4).expect("host layers");
-    let want = host::run(model, &reference, &tokens, 2).expect("host forward");
-    let mut worst = 0f32;
-    let mut scale = 0f32;
+    let mut driver = driver_of(small, tokens.len() + 8);
+    let reference = host::HostModel::load(model, layers).expect("host layers");
+    crate::family::qwen::flash_next::qsa::margins::take();
+    let want = host::run(model, &reference, tokens, 2).expect("host forward");
+    // A selection whose last kept block leads the first dropped one by less than twice the
+    // bound's relative error can flip under the device's activation rounding; a flip changes
+    // the attended positions, so the position is not a test of the arithmetic.
+    let flip_gap = 2.0 * f64::from(bound(layers, 1.0));
+    let mut sensitive = std::collections::BTreeSet::new();
+    for (pos, gap) in crate::family::qwen::flash_next::qsa::margins::take() {
+        if gap < flip_gap {
+            sensitive.insert(pos as usize);
+        }
+    }
+    let mut out = Agreement {
+        worst: 0.0,
+        worst_ratio: 0.0,
+        matched: 0,
+        undecided: 0,
+        flippable: 0,
+        compared: 0,
+    };
     for (at, &token) in tokens.iter().enumerate() {
         let got = driver.logits(token).expect("device logits");
         assert_eq!(got.len(), want.logits[at].len());
@@ -64,17 +106,74 @@ fn the_device_logits_follow_the_host_forward_on_the_small_model() {
             .zip(&want.logits[at])
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        worst = worst.max(diff);
-        scale = scale.max(want.logits[at].iter().fold(0f32, |m, v| m.max(v.abs())));
-        eprintln!(
-            "position {at}: device top-1 {}, host top-1 {}, max abs difference {diff}",
-            argmax(&got),
-            argmax(&want.logits[at])
+        let scale = host_row.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let limit = bound(layers, scale);
+        if sensitive.contains(&at) {
+            eprintln!(
+                "position {at}: a selection within the flip gap, difference {diff} not asserted"
+            );
+            out.flippable += 1;
+            // Past a flip the recurrent state differs, so no later position tests the arithmetic.
+            break;
+        }
+        out.compared += 1;
+        assert!(
+            diff <= limit,
+            "position {at}: difference {diff} over the bound {limit} (scale {scale})"
         );
         assert_eq!(argmax(&got), argmax(&want.logits[at]), "position {at}");
     }
-    eprintln!("worst max abs difference {worst} on logits up to {scale}");
-    assert!(worst < 0.05 * scale.max(1.0), "{worst} against {scale}");
+    eprintln!(
+        "{} positions, {layers} layers: worst difference {}, worst ratio to the bound {:.3}, top-1 matched {}, undecided {}, compared {}, flippable {}",
+        tokens.len(),
+        out.worst,
+        out.worst_ratio,
+        out.matched,
+        out.undecided,
+        out.compared,
+        out.flippable
+    );
+    out
+}
+
+fn sequence(len: usize) -> Vec<u32> {
+    (0..len as u32).map(|i| (i * 37 + 11) % 512).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn the_device_logits_follow_the_host_forward_on_the_small_model() {
+    let small = write_small(7);
+    let got = agreement(&small, 4, &[5, 9, 200, 17, 33, 481]);
+    assert!(got.matched >= 2, "{} of 6 positions decided", got.matched);
+}
+
+/// A prompt past the indexer's budget (4 positions, the block ratio of the model) over two QSA
+/// layers: from the eighth token on the selection drops blocks. The run is held to the bound up
+/// to the first selection that the device's rounding may flip.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn the_device_follows_the_host_when_the_indexer_drops_positions() {
+    let small = write_small_with(7, 8, 4);
+    let got = agreement(&small, 8, &sequence(48));
+    // Dropping starts at position 7: the positions before the first flippable selection hold
+    // at least ten of them.
+    assert!(got.compared >= 17, "{} positions compared", got.compared);
+}
+
+/// More than a thousand positions deep, over two QSA layers whose indexer keeps every block
+/// (a budget past the depth), so no selection can flip and every position is held to the bound.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn the_device_follows_the_host_a_thousand_positions_deep() {
+    let small = write_small_with(7, 8, 2048);
+    let got = agreement(&small, 8, &sequence(1030));
+    assert_eq!(got.compared, 1030, "every position is compared");
+    assert!(
+        got.matched >= 400,
+        "{} of 1030 positions decided",
+        got.matched
+    );
 }
 
 fn time_run<S: TokenStepper>(driver: &mut S) -> f64 {
@@ -242,4 +341,38 @@ fn stopping_the_engine_gives_back_its_card_memory() {
         "the stopped engine kept {} MiB",
         (before - after) >> 20
     );
+}
+
+/// Where the first difference sits: the residual stream after every layer, device against host,
+/// at the positions around the first one where the indexer drops blocks.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn which_layer_first_differs_when_the_indexer_drops_positions() {
+    let small = write_small_with(7, 8, 4);
+    let model: &'static GgufModel = Box::leak(Box::new(
+        GgufModel::open(&small.first)
+            .expect("open")
+            .expect("a qwen4exp model"),
+    ));
+    let tokens = sequence(27);
+    let mut driver = driver_of(&small, tokens.len() + 8);
+    let reference = host::HostModel::load(model, 8).expect("host layers");
+    let want = host::run(model, &reference, &tokens, 2).expect("host forward");
+    crate::family::qwen::flash_next::cuda::gguf_device::layer_trace::start();
+    for (at, &token) in tokens.iter().enumerate() {
+        driver.logits(token).expect("device logits");
+        let streams = crate::family::qwen::flash_next::cuda::gguf_device::layer_trace::take();
+        let mut line = format!("position {at}:");
+        for (layer, got) in streams.iter().enumerate() {
+            let host_stream = &want.layer_out[at][layer];
+            let scale = host_stream.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = got
+                .iter()
+                .zip(host_stream)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            line.push_str(&format!(" L{layer} {:.4}", diff / scale.max(1e-6)));
+        }
+        eprintln!("{line}");
+    }
 }
