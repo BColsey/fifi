@@ -23,6 +23,7 @@ mod routes;
 pub mod sconv;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod text;
+mod timing;
 pub use routes::InklingRoutes;
 
 pub(crate) const FAMILY: &str = "inkling2_mini";
