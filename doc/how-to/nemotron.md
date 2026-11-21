@@ -103,6 +103,22 @@ python3 scripts/mac_cache_study/nemotron35_cpu_profile.py \
   "$NEM35_PROFILE_RUNNER" "$NEM35_LAYER1_DIR" "$SCRATCH/proc-io" "$SCRATCH/nemotron35-profile"
 ```
 
+### Compare the NEON NVFP4 kernel
+
+`FIFI_NEM35_CPU_NEON=1` selects a vector dot product for the mapped CPU expert pool on Apple Silicon. It decodes the E2M1 nibbles with a NEON table lookup and accumulates F32 products in four lanes. The existing scalar path remains the default. The numerical suite checks short and production-width matrices, multi-row batches, refusal cases, and reproducibility across thread counts.
+
+The paired run on the same layer 1 shard alternated scalar and NEON with each thread count, using 31 timed calls in each of 12 arms. The Flash-Next transfer was paused for this measurement. The table compares paired medians within this run.
+
+| Threads | Scalar p50 | NEON p50 | Scalar p90 | NEON p90 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 36.19 ms | 10.87 ms | 37.35 ms | 11.82 ms |
+| 4 | 10.47 ms | 3.56 ms | 11.10 ms | 3.89 ms |
+| 6 | 8.60 ms | 3.10 ms | 8.89 ms | 3.45 ms |
+
+At four threads the paired median was 2.94 times faster. All four- and six-thread arms recorded zero SSD reads and zero page-ins. The first one-thread scalar process attributed 28.2 MB of reads across setup and its calls, and the remaining one-thread processes recorded zero. This step measures the CPU expert layer. Full-model quality and a default selection remain open. [Per-arm measurements](../../scripts/benchmarks/mac-m4-nemotron35-neon-ab.csv)
+
+Repeat the same profiler command with `--compare-neon` and a fresh output directory.
+
 ## See also
 
 - [`nemotron` options](../reference/configuration.md#nemotron)
