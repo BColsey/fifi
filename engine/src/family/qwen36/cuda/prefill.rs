@@ -35,6 +35,7 @@ use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swi
 use crate::family::project::cuda::WeightLayout;
 use crate::family::spec::AttentionKind;
 use crate::family::state_words::Word;
+pub(super) use crate::kernels::cuda::prefill::mmq_mmid::Q8Cursor;
 use crate::{
     EngError,
     family::gguf_model::Role,
@@ -53,8 +54,8 @@ use crate::{
             mmq_dense::{MmqDenseCall, MmqDenseInputCall},
             mmq_facts::MmqFacts,
             mmq_mmid::{
-                IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedX, mmq_type_of, routed_gemm,
-                routed_quantize,
+                IdsGuardCall, MmidIds, MmidIdsOut, MmidShape, RoutedQuant, RoutedX, mmq_type_of,
+                routed_gemm,
             },
             mmq_size::{NCOLS_LIMIT, fixup_floats_max},
             swiglu_rows::SwigluRowsCall,
@@ -499,16 +500,31 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
             &[ChunkSlot::Hidden, ChunkSlot::XfA, ChunkSlot::X],
         ),
         Stage::QuantA => (&[ChunkSlot::X], &[ChunkSlot::Q8X]),
-        Stage::DeltaProj => (&[ChunkSlot::Q8X], &[ChunkSlot::ProjD, ChunkSlot::Fixup]),
+        // A projection on the dequantizing GEMM reads the f32 rows (`X`, `OOut`, `AttnOut`) where a
+        // vendored one reads the q8_1 pack, so a slot a stage may read through either is declared:
+        // the arena planner never lets another slot reuse it before the stage ran.
+        Stage::DeltaProj => (
+            &[ChunkSlot::Q8X, ChunkSlot::X],
+            &[ChunkSlot::ProjD, ChunkSlot::Fixup],
+        ),
         Stage::Conv => (&[ChunkSlot::ProjD], &[ChunkSlot::ConvOut]),
         Stage::Scan => (&[ChunkSlot::ConvOut, ChunkSlot::ProjD], &[ChunkSlot::OOut]),
         Stage::QuantDOut => (&[ChunkSlot::OOut], &[ChunkSlot::Q8OD]),
-        Stage::SsmOut => (&[ChunkSlot::Q8OD], &[ChunkSlot::Delta, ChunkSlot::Fixup]),
-        Stage::AttnProj => (&[ChunkSlot::Q8X], &[ChunkSlot::ProjA, ChunkSlot::Fixup]),
+        Stage::SsmOut => (
+            &[ChunkSlot::Q8OD, ChunkSlot::OOut],
+            &[ChunkSlot::Delta, ChunkSlot::Fixup],
+        ),
+        Stage::AttnProj => (
+            &[ChunkSlot::Q8X, ChunkSlot::X],
+            &[ChunkSlot::ProjA, ChunkSlot::Fixup],
+        ),
         Stage::Prep => (&[ChunkSlot::ProjA], &[ChunkSlot::Q]),
         Stage::Flash => (&[ChunkSlot::Q, ChunkSlot::ProjA], &[ChunkSlot::AttnOut]),
         Stage::QuantAOut => (&[ChunkSlot::AttnOut], &[ChunkSlot::Q8OA]),
-        Stage::AttnOut => (&[ChunkSlot::Q8OA], &[ChunkSlot::Delta, ChunkSlot::Fixup]),
+        Stage::AttnOut => (
+            &[ChunkSlot::Q8OA, ChunkSlot::AttnOut],
+            &[ChunkSlot::Delta, ChunkSlot::Fixup],
+        ),
         Stage::NormF => (
             &[ChunkSlot::Hidden, ChunkSlot::Delta],
             &[ChunkSlot::Hidden, ChunkSlot::XfF, ChunkSlot::X2],
@@ -551,12 +567,16 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
 pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'static [ChunkSlot]) {
     match stage {
         MoeStage::SharedQuant => (&[ChunkSlot::X2], &[ChunkSlot::Q8X2]),
-        MoeStage::SharedGate | MoeStage::SharedUp => {
-            (&[ChunkSlot::Q8X2], &[ChunkSlot::GuSh, ChunkSlot::Fixup])
-        }
+        MoeStage::SharedGate | MoeStage::SharedUp => (
+            &[ChunkSlot::Q8X2, ChunkSlot::X2],
+            &[ChunkSlot::GuSh, ChunkSlot::Fixup],
+        ),
         MoeStage::SharedSwiglu => (&[ChunkSlot::GuSh], &[ChunkSlot::ActSh]),
         MoeStage::SharedDownQuant => (&[ChunkSlot::ActSh], &[ChunkSlot::Q8Ash]),
-        MoeStage::SharedDown => (&[ChunkSlot::Q8Ash], &[ChunkSlot::ShOut, ChunkSlot::Fixup]),
+        MoeStage::SharedDown => (
+            &[ChunkSlot::Q8Ash, ChunkSlot::ActSh],
+            &[ChunkSlot::ShOut, ChunkSlot::Fixup],
+        ),
         MoeStage::Ids => (
             &[ChunkSlot::TopkId],
             &[
@@ -601,50 +621,6 @@ pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'stati
             &[ChunkSlot::Hidden],
         ),
     }
-}
-
-/// The q8 layout rule: one q8 buffer is read by several GEMMs, and a GEMM of the other scale layout
-/// reads wrong values, not a fault. Refuses `prefill chunk: q8 layout` for a group whose members
-/// differ in [`Q8_1Layout`]; the group's first member is the `mmq_dense_input` representative of
-/// the buffer.
-pub(super) fn check_q8_layouts(groups: &[(ChunkSlot, &[QuantType])]) -> Result<(), EngError> {
-    for (slot, group) in groups {
-        let mut first = None;
-        for quant in *group {
-            if gemm_dq_ty(*quant) {
-                // The dequantizing GEMM reads the f32 rows: no q8_1 layout.
-                continue;
-            }
-            let layout = mmq_type_of(*quant)
-                .map_err(|_| {
-                    EngError::BadRequest(format!(
-                        "prefill chunk: q8 layout: {slot:?} holds a non-mmq type"
-                    ))
-                })?
-                .q8_1_layout();
-            match first {
-                None => first = Some(layout),
-                Some(seen) if seen != layout => {
-                    return Err(EngError::BadRequest(format!(
-                        "prefill chunk: q8 layout: {slot:?} is quantized once but read at mixed layouts"
-                    )));
-                }
-                _ => {}
-            }
-        }
-        if group.is_empty() {
-            return Err(EngError::BadRequest(format!(
-                "prefill chunk: q8 layout: {slot:?} holds no projection"
-            )));
-        }
-        if first.is_none() {
-            // Every member reads its f32 rows through the dequantizing GEMM, so
-            // the shared buffer carries no q8_1 pass at all; later groups still
-            // carry their own layout constraint.
-            continue;
-        }
-    }
-    Ok(())
 }
 
 /// The `(offset, length)` of the up half's sub-view of a `Gu` slot of `gu_bytes` bytes
@@ -973,35 +949,6 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
                 )));
             }
         }
-        let of = |entries: &[(Role, Option<QuantType>)]| {
-            entries
-                .iter()
-                .filter_map(|(_, quant)| *quant)
-                .collect::<Vec<_>>()
-        };
-        let dense_of = || {
-            facts
-                .dense
-                .iter()
-                .filter(|(role, quant)| {
-                    quant.is_some() && !matches!(role, Role::SsmOut | Role::AttnOutput)
-                })
-                .filter_map(|(_, quant)| *quant)
-                .collect::<Vec<_>>()
-        };
-        let routed_stacks = || {
-            facts
-                .stacks
-                .iter()
-                .filter(|stack| stack.role != Role::FfnDownExps)
-                .filter_map(|stack| stack.quant)
-                .collect::<Vec<_>>()
-        };
-        check_q8_layouts(&[
-            (ChunkSlot::Q8X, &dense_of()),
-            (ChunkSlot::Q8X2, &of(&facts.shared[..2])),
-            (ChunkSlot::Q8S, &routed_stacks()),
-        ])?;
     }
     Ok(())
 }
@@ -1577,6 +1524,8 @@ pub(super) struct LayerCtx<'a, 'w> {
     pub(super) layer: usize,
     pub(super) kind: AttentionKind,
     pub(super) status: DeviceRange<'a>,
+    /// The q8_1 layout the layer's shared `Q8X` buffer holds.
+    pub(super) q8x: Q8Cursor,
 }
 
 #[derive(Clone, Copy)]
@@ -1771,7 +1720,6 @@ pub(super) fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(
 
 /// Stage 2, `QuantA`: one quantize on the group representative role of the kind.
 pub(super) fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
-    let launch = ctx.launch;
     // The vendored members share one q8_1 buffer; the representative is the first
     // of them, so a gemm_dq member (which reads the f32 rows) never quantizes.
     let members: &[Role] = match ctx.kind {
@@ -1793,17 +1741,29 @@ pub(super) fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<
         // dequantizing GEMM: the shared q8_1 buffer stays unquantized.
         return Ok(());
     };
-    run.dense_input(
-        launch,
-        MmqDenseInputCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            weight: ctx.weights.native(rep)?,
-            m: run.rows.m(),
-            row_stride: run.model.geometry.hidden,
-            x: run.v(ChunkSlot::X)?,
-            y: run.v(ChunkSlot::Q8X)?,
-        },
-    )
+    quantize_q8x(run, ctx, ctx.weights.native(rep)?)
+}
+
+/// Quantizes the layer's shared `Q8X` buffer for the q8_1 layout of `weight`, unless it holds
+/// that layout already.
+fn quantize_q8x(
+    run: &ChunkRun<'_, '_>,
+    ctx: &LayerCtx<'_, '_>,
+    weight: &NativeWeight,
+) -> Result<(), EngError> {
+    ctx.q8x.ensure(weight.quant(), || {
+        run.dense_input(
+            ctx.launch,
+            MmqDenseInputCall {
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                weight,
+                m: run.rows.m(),
+                row_stride: run.model.geometry.hidden,
+                x: run.v(ChunkSlot::X)?,
+                y: run.v(ChunkSlot::Q8X)?,
+            },
+        )
+    })
 }
 
 /// Stage 3d, the four DeltaNet in-projections. With the fusion flag on (the same
@@ -1874,6 +1834,7 @@ pub(super) fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resu
             col_off,
             m,
         )? {
+            quantize_q8x(run, ctx, weight)?;
             let call = MmqDenseCall {
                 weight,
                 w_seg,
@@ -2021,6 +1982,7 @@ pub(super) fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
             col_off,
             m,
         )? {
+            quantize_q8x(run, ctx, weight)?;
             run.dense(
                 launch,
                 MmqDenseCall {
@@ -2810,24 +2772,13 @@ fn run_chunk_tiered(
     };
     let gate = native_stack(&weights.gate)?;
     let up = native_stack(&weights.up)?;
-    routed_quantize(
-        ctx,
-        stream,
-        &ids.combined,
-        &[gate, up],
-        false,
-        crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-        hidden,
-        io.x2,
-        d.get(ChunkSlot::Q8S)?,
-    )?;
     mark(Stage::MoeScatter)?;
     let gu = d.get(ChunkSlot::Gu)?;
     let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
     let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
     let launch_mmid = |weight: &NativeWeight,
                        ids_set: &MmidIds<'_>,
-                       x: &RoutedX<'_>,
+                       x: &RoutedX<'_, '_>,
                        ld: usize,
                        dst: DeviceRange<'_>|
      -> Result<(), EngError> {
@@ -2847,6 +2798,12 @@ fn run_chunk_tiered(
         rows: io.x2,
         row_stride: hidden,
         per_slot: false,
+        quant: RoutedQuant {
+            ids: &ids.combined,
+            gather: false,
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            cursor: Q8Cursor::default(),
+        },
     };
     launch_mmid(gate, &ids.bank, &q8s, 2 * dims.inter, gu)?;
     launch_mmid(up, &ids.bank, &q8s, 2 * dims.inter, up_dst)?;
@@ -2871,6 +2828,12 @@ fn run_chunk_tiered(
         rows: d.get(ChunkSlot::Act)?,
         row_stride: dims.inter,
         per_slot: true,
+        quant: RoutedQuant {
+            ids: &ids.combined,
+            gather: true,
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+            cursor: Q8Cursor::default(),
+        },
     };
     if tiered_trace() {
         eprintln!(
@@ -2879,17 +2842,6 @@ fn run_chunk_tiered(
             ids.combined.shape().ne_get_rows()
         );
     }
-    routed_quantize(
-        ctx,
-        stream,
-        &ids.combined,
-        &[down],
-        true,
-        crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-        dims.inter,
-        d.get(ChunkSlot::Act)?,
-        d.get(ChunkSlot::Q8Act)?,
-    )?;
     mark(Stage::MoeGather)?;
     launch_mmid(
         down,
@@ -3256,21 +3208,9 @@ pub(super) fn run_chunk_shared(
         native_dense(&mw.shared_up)?,
         native_dense(&mw.shared_down)?,
     );
-    if let Some(&quant_rep) = [gate_w, up_w].iter().find(|w| !gemm_dq_ty(w.quant())) {
-        // The vendored halves share one q8_1 buffer; a gemm_dq half reads the
-        // f32 rows and imposes nothing on it.
-        ctx.mmq_dense_input(
-            stream,
-            MmqDenseInputCall {
-                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-                weight: quant_rep,
-                m,
-                row_stride: dims.hidden,
-                x: io.x2,
-                y: d.get(ChunkSlot::Q8X2)?,
-            },
-        )?;
-    }
+    // The vendored halves share one q8_1 buffer, built for the layout of the half that reads it;
+    // a gemm_dq half reads the f32 rows and imposes nothing on it.
+    let q8x2 = Q8Cursor::default();
     let cols = shared_cols(dims);
     for (weight, (_, col_off)) in [(gate_w, cols[0]), (up_w, cols[1])] {
         if !dense_gemm_dq(
@@ -3285,6 +3225,19 @@ pub(super) fn run_chunk_shared(
             col_off,
             m,
         )? {
+            q8x2.ensure(weight.quant(), || {
+                ctx.mmq_dense_input(
+                    stream,
+                    MmqDenseInputCall {
+                        packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                        weight,
+                        m,
+                        row_stride: dims.hidden,
+                        x: io.x2,
+                        y: d.get(ChunkSlot::Q8X2)?,
+                    },
+                )
+            })?;
             ctx.mmq_dense(
                 stream,
                 MmqDenseCall {
@@ -3387,46 +3340,44 @@ pub(super) fn run_chunk_routed_timed(
     // 12, the scatter quantize of the gate/up input, for the stacks that read q8_1.
     let gate = native_stack(&mw.gate)?;
     let up = native_stack(&mw.up)?;
-    routed_quantize(
-        ctx,
-        stream,
-        &ids,
-        &[gate, up],
-        false,
-        crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-        dims.hidden,
-        io.x2,
-        d.get(ChunkSlot::Q8S)?,
-    )?;
     // 13a and 13b, the gate and up launches; the up half through the derived sub-view.
     let gu = d.get(ChunkSlot::Gu)?;
     let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
     let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
-    let mut launch_mmid =
-        |index: usize, weight: &NativeWeight, x: &RoutedX<'_>, ld: usize, dst: DeviceRange<'_>| {
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.start(index, weight, stream)?;
-            }
-            routed_gemm(
-                ctx,
-                stream,
-                weight,
-                &ids,
-                x,
-                ld,
-                dst,
-                d.get(ChunkSlot::Fixup)?,
-            )?;
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.finish(index, stream)?;
-            }
-            Ok::<(), EngError>(())
-        };
+    let mut launch_mmid = |index: usize,
+                           weight: &NativeWeight,
+                           x: &RoutedX<'_, '_>,
+                           ld: usize,
+                           dst: DeviceRange<'_>| {
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.start(index, weight, stream)?;
+        }
+        routed_gemm(
+            ctx,
+            stream,
+            weight,
+            &ids,
+            x,
+            ld,
+            dst,
+            d.get(ChunkSlot::Fixup)?,
+        )?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.finish(index, stream)?;
+        }
+        Ok::<(), EngError>(())
+    };
     let q8s = RoutedX {
         q8: d.get(ChunkSlot::Q8S)?,
         rows: io.x2,
         row_stride: dims.hidden,
         per_slot: false,
+        quant: RoutedQuant {
+            ids: &ids,
+            gather: false,
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            cursor: Q8Cursor::default(),
+        },
     };
     launch_mmid(0, gate, &q8s, 2 * dims.inter, gu)?;
     launch_mmid(1, up, &q8s, 2 * dims.inter, up_dst)?;
@@ -3443,22 +3394,17 @@ pub(super) fn run_chunk_routed_timed(
         },
     )?;
     let down = native_stack(&mw.down)?;
-    routed_quantize(
-        ctx,
-        stream,
-        &ids,
-        &[down],
-        true,
-        crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-        dims.inter,
-        d.get(ChunkSlot::Act)?,
-        d.get(ChunkSlot::Q8Act)?,
-    )?;
     let q8act = RoutedX {
         q8: d.get(ChunkSlot::Q8Act)?,
         rows: d.get(ChunkSlot::Act)?,
         row_stride: dims.inter,
         per_slot: true,
+        quant: RoutedQuant {
+            ids: &ids,
+            gather: true,
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            cursor: Q8Cursor::default(),
+        },
     };
     launch_mmid(2, down, &q8act, dims.hidden, d.get(ChunkSlot::Down)?)
 }
@@ -3629,6 +3575,7 @@ pub(super) fn run_chunk_layer(
         layer,
         kind: slot.kind,
         status,
+        q8x: Q8Cursor::default(),
     };
     // An EXL3 chunk reads the F32 rows in place: it has no quantize stages.
     let exl3 = run.model.weights.is_exl3();
@@ -3935,6 +3882,7 @@ pub(super) mod phase_timing {
             layer,
             kind: slot.kind,
             status,
+            q8x: Q8Cursor::default(),
         };
         for stage in layer_stages(slot.kind)? {
             match stage {
@@ -4032,23 +3980,12 @@ pub(super) mod phase_timing {
         )?;
         let gate = native_stack(&mw.gate)?;
         let up = native_stack(&mw.up)?;
-        routed_quantize(
-            ctx,
-            stream,
-            &ids,
-            &[gate, up],
-            false,
-            crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            dims.hidden,
-            io.x2,
-            d.get(ChunkSlot::Q8S)?,
-        )?;
         marks.mark(stream, "moe_prep")?;
         let gu = d.get(ChunkSlot::Gu)?;
         let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
         let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
         let launch_mmid =
-            |weight: &NativeWeight, x: &RoutedX<'_>, ld: usize, dst: DeviceRange<'_>| {
+            |weight: &NativeWeight, x: &RoutedX<'_, '_>, ld: usize, dst: DeviceRange<'_>| {
                 routed_gemm(
                     ctx,
                     stream,
@@ -4065,6 +4002,12 @@ pub(super) mod phase_timing {
             rows: io.x2,
             row_stride: dims.hidden,
             per_slot: false,
+            quant: RoutedQuant {
+                ids: &ids,
+                gather: false,
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                cursor: Q8Cursor::default(),
+            },
         };
         launch_mmid(gate, &q8s, 2 * dims.inter, gu)?;
         launch_mmid(up, &q8s, 2 * dims.inter, up_dst)?;
@@ -4079,22 +4022,17 @@ pub(super) mod phase_timing {
         )?;
         marks.mark(stream, "moe_swiglu")?;
         let down = native_stack(&mw.down)?;
-        routed_quantize(
-            ctx,
-            stream,
-            &ids,
-            &[down],
-            true,
-            crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
-            dims.inter,
-            d.get(ChunkSlot::Act)?,
-            d.get(ChunkSlot::Q8Act)?,
-        )?;
         let q8act = RoutedX {
             q8: d.get(ChunkSlot::Q8Act)?,
             rows: d.get(ChunkSlot::Act)?,
             row_stride: dims.inter,
             per_slot: true,
+            quant: RoutedQuant {
+                ids: &ids,
+                gather: true,
+                packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+                cursor: Q8Cursor::default(),
+            },
         };
         launch_mmid(down, &q8act, dims.hidden, d.get(ChunkSlot::Down)?)?;
         marks.mark(stream, "moe_down")

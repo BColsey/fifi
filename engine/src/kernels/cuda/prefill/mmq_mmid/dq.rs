@@ -20,7 +20,7 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 ///
 /// - `weight`: the expert stack, `weight.n` rows of `weight.k` values per expert, experts
 ///   `weight.stride_bytes` apart; its type is one [`gemm_dq_mmid_type`] accepts.
-/// - `x`: f32 rows of `x_row_stride >= k` floats, 4-byte aligned, read only. With `x_per_slot`
+/// - `x`: f32 rows of `x_row_stride >= k` floats (a multiple of 4), 16-byte aligned, read only. With `x_per_slot`
 ///   false they are the token rows (slot `s` reads row `s / top_k`: the gate and up input);
 ///   with it true row `s` itself (the down input, in token-slot order).
 /// - `y`: f32 slot rows of `ld >= n` floats, `(m * top_k - 1) * ld + n` floats, 4-byte aligned:
@@ -34,6 +34,9 @@ pub(crate) struct DqMmidCall<'b, 'i> {
     pub(crate) x_per_slot: bool,
     pub(crate) y: DeviceRange<'b>,
     pub(crate) ld: usize,
+    /// The column tile of the launch: 0 chooses from the expected columns per expert, else 64
+    /// or 128.
+    pub(crate) col_tile: usize,
 }
 
 impl CudaContext {
@@ -117,7 +120,16 @@ impl CudaContext {
             .ok_or_else(|| rule("size", "the output size overflows"))?;
         let w_align = if ty == QuantType::Q5K { 16 } else { 2 };
         require_fit("w", &weight.base, need_w, w_align)?;
-        require_fit("x", &call.x, need_x, 4)?;
+        require_fit("x", &call.x, need_x, 16)?;
+        if !call.x_row_stride.is_multiple_of(4) || !matches!(call.col_tile, 0 | 64 | 128) {
+            return Err(rule(
+                "stride",
+                &format!(
+                    "x row stride {} is not a multiple of 4 or column tile {} is not 0, 64 or 128",
+                    call.x_row_stride, call.col_tile
+                ),
+            ));
+        }
         require_fit("y", &call.y, need_y, 4)?;
         let written = Claim::of("y", &call.y, need_y);
         require_apart(&written, &Claim::of("w", &weight.base, need_w))?;
@@ -145,6 +157,7 @@ impl CudaContext {
             x_row_stride: call.x_row_stride,
             y_row_stride: call.ld,
             expert_stride: weight.stride_bytes,
+            col_tile: call.col_tile,
         };
         self.launch_on(stream, move |s| gemm_dq_mmid_launch(s, &raw))
     }

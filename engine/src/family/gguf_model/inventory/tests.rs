@@ -431,46 +431,16 @@ fn tiled_roles_allow_only_the_native_types_and_f32_roles_only_f32() {
     for tensor in inventory.tensors() {
         match tensor.path() {
             TensorPath::DeviceTiled => {
-                // The embedding gather stays on the vendored kernels; routed experts add the
-                // codebook types; dense projections add those and the other dequant types.
-                let want: &[GgufType] = match tensor.role {
-                    Role::TokenEmbd => &[GgufType::Q4K, GgufType::Q6K, GgufType::Q80],
-                    Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps => &[
-                        GgufType::Q4K,
-                        GgufType::Q6K,
-                        GgufType::Q80,
-                        GgufType::Iq4Nl,
-                        GgufType::Iq4Xs,
-                        GgufType::Iq2Xxs,
-                        GgufType::Iq2Xs,
-                        GgufType::Iq2S,
-                        GgufType::Iq3Xxs,
-                        GgufType::Iq3S,
-                        GgufType::Iq1S,
-                        GgufType::Iq1M,
-                        GgufType::Q20,
-                        GgufType::Q2K,
-                    ],
-                    _ => &[
-                        GgufType::Q4K,
-                        GgufType::Q5K,
-                        GgufType::Q40,
-                        GgufType::Q6K,
-                        GgufType::Q80,
-                        GgufType::Iq4Nl,
-                        GgufType::Iq4Xs,
-                        GgufType::Iq2Xxs,
-                        GgufType::Iq2Xs,
-                        GgufType::Iq2S,
-                        GgufType::Iq3Xxs,
-                        GgufType::Iq3S,
-                        GgufType::Iq1S,
-                        GgufType::Iq1M,
-                        GgufType::Q20,
-                        GgufType::Q2K,
-                    ],
-                };
-                assert_eq!(tensor.allowed_types(), want, "tensor {}", tensor.name);
+                // Every quantized role takes exactly the types the native kernels read.
+                let want: Vec<GgufType> = (0..64)
+                    .filter_map(|id| GgufType::from_id(id).ok())
+                    .filter(|ty| ty.has_native_kernel())
+                    .collect();
+                let mut got = tensor.allowed_types().to_vec();
+                got.sort_by_key(|ty| ty.id());
+                let mut want = want;
+                want.sort_by_key(|ty| ty.id());
+                assert_eq!(got, want, "tensor {}", tensor.name);
             }
             TensorPath::DeviceF32 => assert_eq!(
                 tensor.allowed_types(),

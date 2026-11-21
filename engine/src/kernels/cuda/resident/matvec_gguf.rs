@@ -42,6 +42,49 @@ const DENSE_TYPES: [(QuantType, GgufType); 11] = [
     (QuantType::Iq1M, GgufType::Iq1M),
 ];
 
+/// Every type the window decoders serve: the codebook types, then the K-quants, Q4_0, Q5_0 and
+/// Q8_0, whose dense decode and prefill ride their own kernels but whose expert matvec and
+/// embedding gather are the window kernel.
+const WINDOW_TYPES: [(QuantType, GgufType); 18] = [
+    (QuantType::Iq4Nl, GgufType::Iq4Nl),
+    (QuantType::Iq2S, GgufType::Iq2S),
+    (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
+    (QuantType::Iq2Xxs, GgufType::Iq2Xxs),
+    (QuantType::Q20, GgufType::Q20),
+    (QuantType::Iq2Xs, GgufType::Iq2Xs),
+    (QuantType::Iq3S, GgufType::Iq3S),
+    (QuantType::Iq4Xs, GgufType::Iq4Xs),
+    (QuantType::Q2K, GgufType::Q2K),
+    (QuantType::Iq1S, GgufType::Iq1S),
+    (QuantType::Iq1M, GgufType::Iq1M),
+    (QuantType::Q40, GgufType::Q40),
+    (QuantType::Q50, GgufType::Q50),
+    (QuantType::Q80, GgufType::Q80),
+    (QuantType::Q3K, GgufType::Q3K),
+    (QuantType::Q4K, GgufType::Q4K),
+    (QuantType::Q5K, GgufType::Q5K),
+    (QuantType::Q6K, GgufType::Q6K),
+];
+
+/// The types whose routed-expert matvec is the window kernel: the dense list and the three
+/// types without a vendored expert arm that have a dense kernel of their own.
+const EXPERT_TYPES: [(QuantType, GgufType); 14] = [
+    (QuantType::Iq4Nl, GgufType::Iq4Nl),
+    (QuantType::Iq2S, GgufType::Iq2S),
+    (QuantType::Iq3Xxs, GgufType::Iq3Xxs),
+    (QuantType::Iq2Xxs, GgufType::Iq2Xxs),
+    (QuantType::Q20, GgufType::Q20),
+    (QuantType::Iq2Xs, GgufType::Iq2Xs),
+    (QuantType::Iq3S, GgufType::Iq3S),
+    (QuantType::Iq4Xs, GgufType::Iq4Xs),
+    (QuantType::Q2K, GgufType::Q2K),
+    (QuantType::Iq1S, GgufType::Iq1S),
+    (QuantType::Iq1M, GgufType::Iq1M),
+    (QuantType::Q40, GgufType::Q40),
+    (QuantType::Q3K, GgufType::Q3K),
+    (QuantType::Q5K, GgufType::Q5K),
+];
+
 /// The Flash-Next routed-expert shapes (config.json: hidden 2560, moe_intermediate 640, 512
 /// experts, 10 used): gate and up are `k = 2560, rows = 640`, down is `k = 640, rows = 2560`.
 /// The down shape is off the 256-value block grid, which is why the 32- and 64-value block types
@@ -110,7 +153,7 @@ fn grid_bytes_are_in_the_range_the_sign_step_needs() {
 /// The block geometry the kernels hard-code equals the oracle's.
 #[test]
 fn quant_types_match_the_oracle_block_geometry() {
-    for (ty, gt) in DENSE_TYPES {
+    for (ty, gt) in WINDOW_TYPES {
         assert_eq!(ty.block_size() as u64, gt.block_elems(), "{ty:?} elements");
         assert_eq!(ty.block_bytes() as u64, gt.block_bytes(), "{ty:?} bytes");
         assert_eq!(
@@ -142,6 +185,12 @@ fn set_scales(ty: QuantType, block: &mut [u8], d_bits: u16) {
                 block[at..at + 2].copy_from_slice(&(low | (top << 12)).to_le_bytes());
             }
         }
+        QuantType::Q4K | QuantType::Q5K => {
+            block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+            block[2..4].copy_from_slice(&d_bits.to_le_bytes());
+        }
+        QuantType::Q6K => block[208..210].copy_from_slice(&d_bits.to_le_bytes()),
+        QuantType::Q3K => block[108..110].copy_from_slice(&d_bits.to_le_bytes()),
         _ => block[0..2].copy_from_slice(&d_bits.to_le_bytes()),
     }
 }
@@ -202,7 +251,10 @@ fn dot_ref(w: &[f32], x: &[f64]) -> (f64, f64) {
 fn tolerance_factor(ty: QuantType, k: usize) -> f64 {
     // The shifted (IQ1) and offset (Q2_K) forms add the activation-sum terms: about four more
     // roundings per window.
-    let per_window = if matches!(ty, QuantType::Q2K | QuantType::Iq1S | QuantType::Iq1M) {
+    let per_window = if matches!(
+        ty,
+        QuantType::Q2K | QuantType::Iq1S | QuantType::Iq1M | QuantType::Q4K | QuantType::Q5K
+    ) {
         8.0
     } else {
         4.0
@@ -329,7 +381,7 @@ fn gguf_device_dequant_is_bit_identical_to_the_cpu_oracle() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    for (ty, gt) in DENSE_TYPES {
+    for (ty, gt) in WINDOW_TYPES {
         let mut rng = testkit::Rng::new(0xD0_0000 + u64::from(gt.id()));
         let mut bytes = random_blocks(ty, 4096, &mut rng, 0.001, 8.0);
         bytes.extend(edge_blocks(ty, &mut rng));
@@ -814,7 +866,7 @@ fn gguf_expert_matvec_matches_the_cpu_reference() {
     }
     let ctx = CudaContext::new().expect("context");
     let stream = ctx.stream().expect("stream");
-    for (ty, gt) in DENSE_TYPES {
+    for (ty, gt) in EXPERT_TYPES {
         let mut worst = 0.0f64;
         let mut cases = 0usize;
         let mut run = |case: ExpertCase, seed: u64| {
@@ -1436,7 +1488,7 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
             false,
         ),
     ];
-    let mut types: Vec<(QuantType, GgufType)> = DENSE_TYPES.to_vec();
+    let mut types: Vec<(QuantType, GgufType)> = EXPERT_TYPES.to_vec();
     types.push((QuantType::Q5K, GgufType::Q5K));
     for (ty, gt) in types {
         let mut worst = 0.0f64;
@@ -1445,7 +1497,13 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
             if !block_ok(ty, k) || !k.is_multiple_of(64) {
                 continue;
             }
-            for per_slot in [false, true] {
+            for (per_slot, col_tile) in [
+                (false, 64),
+                (true, 64),
+                (false, 128),
+                (true, 128),
+                (false, 0),
+            ] {
                 let mut rng = testkit::Rng::new(0x9a_0000 + gt.id() as u64 * 1000 + ci as u64 * 10);
                 let slots = case.m * case.top_k;
                 let w_bytes = if ty == QuantType::Q5K {
@@ -1517,6 +1575,7 @@ fn gguf_grouped_prefill_gemm_matches_the_cpu_reference() {
                         x_per_slot: per_slot,
                         y: y.range(0, y_bytes).expect("y"),
                         ld,
+                        col_tile,
                     },
                 )
                 .expect("grouped gemm");
@@ -1599,7 +1658,9 @@ fn gguf_grouped_prefill_report_layer_ms() {
     let stream = ctx.stream().expect("stream");
     let (hidden, inter, n_experts, top_k) = (2048usize, 512usize, 256usize, 8usize);
     let iters = if cfg!(debug_assertions) { 1 } else { 10 };
-    println!("type    tokens  layer_ms  x40_ms  TFLOP/s (gate + up + down, 2*k*n*slots each)");
+    println!(
+        "type    tokens  tile (0 = automatic)  layer_ms  x40_ms  TFLOP/s (gate + up + down, 2*k*n*slots each)"
+    );
     for ty in [
         QuantType::Q5K,
         QuantType::Iq4Nl,
@@ -1668,7 +1729,8 @@ fn gguf_grouped_prefill_report_layer_ms() {
                               x: &DeviceBuffer,
                               x_per_slot: bool,
                               y: &DeviceBuffer,
-                              (y_off, ld): (usize, usize)| {
+                              (y_off, ld): (usize, usize),
+                              col_tile: usize| {
                 ctx.gemm_dq_mmid(
                     &stream,
                     DqMmidCall {
@@ -1686,29 +1748,248 @@ fn gguf_grouped_prefill_report_layer_ms() {
                         x_per_slot,
                         y: y.range(y_off * 4, y.bytes() - y_off * 4).expect("y"),
                         ld,
+                        col_tile,
                     },
                 )
                 .expect("grouped");
             };
-            let layer = || {
-                launch_one(&gate, (hidden, inter), &x, false, &gu, (0, 2 * inter));
-                launch_one(&up, (hidden, inter), &x, false, &gu, (inter, 2 * inter));
-                launch_one(&down, (inter, hidden), &act, true, &dn, (0, hidden));
-            };
-            let us = bench(&ctx, &stream, iters, &layer);
-            let flops = 2.0
-                * slots as f64
-                * (2.0 * (hidden * inter) as f64 + (inter * hidden) as f64)
-                * 1.0;
-            println!(
-                "{:7} {m:6} {:9.3} {:7.1} {:8.2}",
-                format!("{ty:?}"),
-                us / 1000.0,
-                40.0 * f64::from(us) / 1000.0,
-                flops / (f64::from(us) * 1e-6) / 1e12
-            );
+            for tile in [64usize, 128, 0] {
+                let layer = || {
+                    launch_one(&gate, (hidden, inter), &x, false, &gu, (0, 2 * inter), tile);
+                    launch_one(
+                        &up,
+                        (hidden, inter),
+                        &x,
+                        false,
+                        &gu,
+                        (inter, 2 * inter),
+                        tile,
+                    );
+                    launch_one(&down, (inter, hidden), &act, true, &dn, (0, hidden), tile);
+                };
+                let us = bench(&ctx, &stream, iters, &layer);
+                let flops = 2.0 * slots as f64 * 3.0 * (hidden * inter) as f64;
+                println!(
+                    "{:7} {m:6} tile {tile:3} {:9.3} {:7.1} {:8.2}",
+                    format!("{ty:?}"),
+                    us / 1000.0,
+                    40.0 * f64::from(us) / 1000.0,
+                    flops / (f64::from(us) * 1e-6) / 1e12
+                );
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The embedding row gather over the window decoders.
+// ---------------------------------------------------------------------------------------------
+
+/// The native gather of every window type against the CPU decoder, bit for bit, including the
+/// first and last row, repeated ids and the two invalid ids (a row of NaN and the status bit).
+#[test]
+#[ignore = "device: needs the card"]
+fn gguf_embedding_gather_is_bit_identical_to_the_cpu_oracle() {
+    use crate::kernels::cuda::resident::embed::{EmbedNativeCall, embed_x_bytes};
+    use crate::kernels::cuda::{CHUNK_LIMIT, QuantTensor};
+    if !testkit::device_present("gguf_embedding_gather_is_bit_identical_to_the_cpu_oracle") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let (n_rows, k) = (40usize, 512usize);
+    for (ty, gt) in WINDOW_TYPES {
+        let mut rng = testkit::Rng::new(0xE0_0000 + u64::from(gt.id()));
+        let bytes = random_blocks(ty, n_rows * (k / ty.block_size()), &mut rng, 0.001, 8.0);
+        let weight = ctx
+            .upload_native(
+                QuantTensor {
+                    name: "embed table",
+                    ty: gt,
+                    n_rows,
+                    k,
+                    source_len: bytes.len(),
+                },
+                CHUNK_LIMIT,
+                &mut |at, buf| {
+                    buf.copy_from_slice(&bytes[at..at + buf.len()]);
+                    Ok(())
+                },
+            )
+            .expect("upload the native table");
+        let row_bytes = ty.weight_bytes(1, k).expect("row bytes");
+        let want_row = |id: usize| {
+            dequantize(gt, &bytes[id * row_bytes..(id + 1) * row_bytes]).expect("oracle row")
+        };
+        for ids in [vec![0i32, 7, 39, 17, 3, 39, 0], vec![5, -1, 40, 6]] {
+            let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            let ids_buf = testkit::upload_bytes(&ctx, &ids_bytes);
+            let status = testkit::upload_filled(&ctx, 0, 4);
+            let x_bytes = embed_x_bytes(ids.len(), k).expect("size");
+            let x = testkit::upload_filled(&ctx, 0xAA, x_bytes);
+            ctx.embed_native(
+                &stream,
+                EmbedNativeCall {
+                    weight: &weight,
+                    ids: ids_buf.range(0, ids_bytes.len()).expect("ids"),
+                    x: x.range(0, x_bytes).expect("x"),
+                    status: status.range(0, 4).expect("status"),
+                    m: ids.len(),
+                },
+            )
+            .expect("gather");
+            stream.synchronize().expect("drain");
+            let got = read_f32(&ctx, &x, ids.len() * k);
+            let flag = i32::from_le_bytes(
+                testkit::read_bytes(&ctx, &status, 4)[..4]
+                    .try_into()
+                    .expect("word"),
+            );
+            let invalid = ids.iter().any(|&id| id < 0 || id as usize >= n_rows);
+            assert_eq!(flag != 0, invalid, "{ty:?} status {flag}");
+            for (t, &id) in ids.iter().enumerate() {
+                let row = &got[t * k..(t + 1) * k];
+                if id < 0 || id as usize >= n_rows {
+                    assert!(row.iter().all(|v| v.is_nan()), "{ty:?} id {id}: not NaN");
+                } else {
+                    let want = want_row(id as usize);
+                    let wrong = (0..k)
+                        .filter(|&j| row[j].to_bits() != want[j].to_bits())
+                        .count();
+                    assert_eq!(wrong, 0, "{ty:?} id {id}: {wrong} values differ");
+                }
+            }
+        }
+        println!("embedding gather {ty:?}: bit-identical to the oracle");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real blocks: the first rows of every native-type tensor of a published GGUF set.
+// ---------------------------------------------------------------------------------------------
+
+/// A published dynamic-quant GGUF set kept on the host: the device dequant of the first rows of
+/// one tensor of every native type, and the embedding gather over the first rows of the token
+/// table, equal the CPU decoder bit for bit on the blocks as the file stores them. The test is
+/// skipped without `FIFI_TEST_GGUF_SET`.
+#[test]
+#[ignore = "device: needs the card and a local model set"]
+fn gguf_real_set_blocks_decode_like_the_cpu_decoder() {
+    use crate::kernels::cuda::resident::embed::{EmbedNativeCall, embed_x_bytes};
+    use crate::kernels::cuda::{CHUNK_LIMIT, QuantTensor};
+    use crate::weights::{GgufLimits, GgufWeights};
+    if !testkit::device_present("gguf_real_set_blocks_decode_like_the_cpu_decoder") {
+        return;
+    }
+    // The first shard of the set, named by FIFI_TEST_GGUF_SET (the test skips without it).
+    let Some(first) = std::env::var_os("FIFI_TEST_GGUF_SET") else {
+        println!("skipped: FIFI_TEST_GGUF_SET names no set");
+        return;
+    };
+    let path = std::path::Path::new(&first);
+    assert!(path.exists(), "FIFI_TEST_GGUF_SET names a missing file");
+    let weights = GgufWeights::open_any_type(
+        path,
+        GgufLimits {
+            max_header_bytes: 256 << 20,
+            max_tensor_bytes: 1 << 40,
+        },
+        None,
+    )
+    .expect("open the set");
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut seen: Vec<GgufType> = Vec::new();
+    for tensor in weights.header().tensors() {
+        let gt = tensor.ggml_type();
+        let Some((ty, _)) = WINDOW_TYPES.iter().find(|(_, g)| *g == gt).copied() else {
+            continue;
+        };
+        let dims = tensor.dims();
+        let k = dims[0] as usize;
+        let total_rows = tensor.element_count() as usize / k;
+        let is_embed = tensor.name() == "token_embd.weight";
+        if !is_embed && seen.contains(&gt) {
+            continue;
+        }
+        if !is_embed {
+            seen.push(gt);
+        }
+        let rows = total_rows.min(if is_embed { 1024 } else { 64 });
+        let row_bytes = ty.weight_bytes(1, k).expect("row bytes");
+        let mut bytes = vec![0u8; rows * row_bytes];
+        weights
+            .read_range(tensor.name(), 0, &mut bytes)
+            .expect("read the first rows");
+        let want = dequantize(gt, &bytes).expect("oracle");
+        let n_blocks = bytes.len() / ty.block_bytes();
+        let w = testkit::upload_bytes(&ctx, &bytes);
+        let y = testkit::upload_filled(&ctx, 0xAA, want.len() * 4);
+        ctx.dequant_gguf(&stream, ty, &w, &y, n_blocks)
+            .expect("device dequant");
+        stream.synchronize().expect("drain");
+        let got = read_f32(&ctx, &y, want.len());
+        let wrong = (0..want.len())
+            .filter(|&i| got[i].to_bits() != want[i].to_bits())
+            .count();
+        assert_eq!(
+            wrong,
+            0,
+            "{} ({gt:?}): {wrong} values differ",
+            tensor.name()
+        );
+        println!(
+            "real blocks {} {gt:?}: {rows} rows of {k}, {} values bit-identical to the CPU decoder",
+            tensor.name(),
+            want.len()
+        );
+        if is_embed {
+            let weight = ctx
+                .upload_native(
+                    QuantTensor {
+                        name: "embed rows",
+                        ty: gt,
+                        n_rows: rows,
+                        k,
+                        source_len: bytes.len(),
+                    },
+                    CHUNK_LIMIT,
+                    &mut |at, buf| {
+                        buf.copy_from_slice(&bytes[at..at + buf.len()]);
+                        Ok(())
+                    },
+                )
+                .expect("upload the embedding rows");
+            let ids = [0i32, 1, 17, rows as i32 - 1];
+            let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            let ids_buf = testkit::upload_bytes(&ctx, &ids_bytes);
+            let status = testkit::upload_filled(&ctx, 0, 4);
+            let x_bytes = embed_x_bytes(ids.len(), k).expect("size");
+            let x = testkit::upload_filled(&ctx, 0xAA, x_bytes);
+            ctx.embed_native(
+                &stream,
+                EmbedNativeCall {
+                    weight: &weight,
+                    ids: ids_buf.range(0, 16).expect("ids"),
+                    x: x.range(0, x_bytes).expect("x"),
+                    status: status.range(0, 4).expect("status"),
+                    m: ids.len(),
+                },
+            )
+            .expect("gather");
+            stream.synchronize().expect("drain");
+            let rows_got = read_f32(&ctx, &x, ids.len() * k);
+            for (t, &id) in ids.iter().enumerate() {
+                let id = id as usize;
+                let exact = (0..k)
+                    .filter(|&j| rows_got[t * k + j].to_bits() != want[id * k + j].to_bits())
+                    .count();
+                assert_eq!(exact, 0, "embedding row {id} of {gt:?}");
+            }
+            println!("real token table {gt:?}: the gather of four rows equals the CPU decoder");
+        }
+    }
+    println!("real set: types checked {seen:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1759,7 +2040,7 @@ fn gguf_codebook_matvec_report_gbps() {
         flush_bytes / 1_000_000
     );
     println!("type     shape          launch      warm_us  cold_us  GB/s_warm GB/s_cold  %936");
-    for (ty, _gt) in DENSE_TYPES {
+    for (ty, _gt) in EXPERT_TYPES {
         for (name, (k, rows)) in [("gate/up", FN_GATE_UP), ("down", FN_DOWN)] {
             if !block_ok(ty, k) {
                 continue;

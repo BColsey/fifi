@@ -4,7 +4,7 @@
 use super::{
     common_tests,
     prefill::{
-        ALL_SLOTS, ChunkRows, EMBED_PHASE, EMBED_SLOTS, MoeStage, Stage, check_q8_layouts,
+        ALL_SLOTS, ChunkRows, EMBED_PHASE, EMBED_SLOTS, MoeStage, Q8Cursor, Stage,
         check_view_layout, check_view_list, kv8_segment_query_rows, kv8_use_segments, layer_stages,
         moe_stage_phase, moe_stage_slots, resident_moe_stages, routed_up_view, slot_position,
         stage_phase, stage_slots,
@@ -424,9 +424,10 @@ fn prefill_stages_touch_only_live_slots() {
     }
 }
 
-/// The layout map and the mixed-buffer refusal.
+/// The layout map, and the cursor of a shared q8_1 buffer: a role of the layout the buffer holds
+/// reads it as it is, a role of the other layout quantizes it again first.
 #[test]
-fn q8_layouts_refuse_a_mixed_buffer() {
+fn a_shared_q8_buffer_is_requantized_when_the_layout_changes() {
     for (quant, want) in [
         (QuantType::Q80, Q8_1Layout::D4),
         (QuantType::Q50, Q8_1Layout::D4),
@@ -439,25 +440,34 @@ fn q8_layouts_refuse_a_mixed_buffer() {
             "{quant:?}"
         );
     }
-    use super::prefill_plan::ChunkSlot;
-    let q8x = ChunkSlot::Q8X;
-    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q80; 4])]).is_ok());
-    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q80, QuantType::Q6K])]).is_ok());
-    let error = check_q8_layouts(&[(q8x, &[QuantType::Q80, QuantType::Q4K])]).expect_err("refused");
-    assert!(
-        matches!(&error, EngError::BadRequest(text) if text.contains("prefill chunk: q8 layout")),
-        "{error:?} does not refuse the mixed buffer"
+    let cursor = Q8Cursor::default();
+    let runs = std::cell::Cell::new(0);
+    let role = |quant: QuantType| {
+        cursor
+            .ensure(quant, || {
+                runs.set(runs.get() + 1);
+                Ok(())
+            })
+            .expect("ensure")
+    };
+    role(QuantType::Q80);
+    role(QuantType::Q6K);
+    assert_eq!(runs.get(), 1, "D4 then D4 quantizes once");
+    role(QuantType::Q4K);
+    assert_eq!(runs.get(), 2, "the Ds4 role quantizes the buffer again");
+    role(QuantType::Q4K);
+    assert_eq!(runs.get(), 2);
+    role(QuantType::Q50);
+    assert_eq!(runs.get(), 3, "back to D4");
+    cursor.note(QuantType::Q4K);
+    role(QuantType::Q4K);
+    assert_eq!(
+        runs.get(),
+        3,
+        "a buffer noted as Ds4 is not quantized again"
     );
-    assert!(check_q8_layouts(&[(ChunkSlot::Q8S, &[QuantType::Q4K, QuantType::Q4K])]).is_ok());
-    // A gemm_dq member imposes no q8_1 layout, even against a vendored sibling,
-    // and a group that is entirely gemm_dq never quantizes the buffer at all.
-    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q80, QuantType::Q5K])]).is_ok());
-    assert!(check_q8_layouts(&[(q8x, &[QuantType::Q5K, QuantType::Q40])]).is_ok());
-    let error = check_q8_layouts(&[(q8x, &[])]).expect_err("refused");
-    assert!(
-        matches!(&error, EngError::BadRequest(text) if text.contains("holds no projection")),
-        "{error:?} does not refuse the empty group"
-    );
+    // A type the mmq pair does not read has no layout: the buffer is untouched and the call errs.
+    assert!(cursor.ensure(QuantType::Q5K, || Ok(())).is_err());
 }
 
 /// A routed stack on the dequantizing GEMM reads the f32 rows, so the stage declares them: `Act`

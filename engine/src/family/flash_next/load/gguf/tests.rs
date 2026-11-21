@@ -324,12 +324,12 @@ fn the_refusal_names_each_type_without_a_kernel_and_the_types_that_have_one() {
 #[test]
 fn a_native_matrix_is_not_a_gap_anywhere_and_q4_1_is_one() {
     use super::tensors::has_decode_kernel;
-    // Q3_K has a dense kernel but its loaders are held back, so it is not in the native list.
-    assert!(!has_decode_kernel(Place::Device, GgufType::Q3K));
+    assert!(has_decode_kernel(Place::Device, GgufType::Q3K));
+    assert!(has_decode_kernel(Place::Experts, GgufType::Q3K));
     assert!(has_decode_kernel(Place::Experts, GgufType::Q4K));
     assert!(has_decode_kernel(Place::Experts, GgufType::Iq3Xxs));
     assert!(!has_decode_kernel(Place::Experts, GgufType::Q41));
-    assert_eq!(GgufType::native_types().len(), 17);
+    assert_eq!(GgufType::native_types().len(), 18);
 }
 
 #[test]
@@ -337,7 +337,7 @@ fn a_file_of_supported_types_has_no_gaps() {
     let all = |_: Place, _: GgufType| true;
     let (_written, model) = open(&Spec::default());
     assert!(model.map().kernel_gaps(all).is_empty());
-    assert_eq!(GgufType::native_types().len(), 17);
+    assert_eq!(GgufType::native_types().len(), 18);
 }
 
 #[test]

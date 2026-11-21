@@ -38,13 +38,22 @@
 namespace {
 
 const int kBM = 64;
-const int kBN = 64;
 const int kBK = 64;
 const int kThreads = 256; /* eight warps */
 /* Row strides of the shared tiles in halves: a multiple of 8 (the fragment loads need 16-byte
  * rows) that is not a multiple of 64, so the rows of a fragment fall on different banks. */
 const int kAStride = kBK + 8;
-const int kBStride = kBN + 8;
+/* The activation tile is stored column-major (a column of the output is a contiguous run of k
+ * values), so that a thread loads four consecutive k of one activation row as one float4 and
+ * stores them as one 8-byte word; kBTStride is its column stride in halves. */
+const int kBTStride = kBK + 8;
+
+/* Shared bytes of the weight and activation tiles; the output tile of the epilogue reuses them. */
+__host__ __device__ constexpr int tile_region_bytes(int bn) {
+    const int tiles = kBM * kAStride * 2 + bn * kBTStride * 2;
+    const int out = kBM * bn * 4;
+    return tiles > out ? tiles : out;
+}
 
 /* Wide staging of one tile's raw chunk bytes (kChunkBytes per row, the kChunkBlocks blocks
  * the chunk decodes): threads stride the (row, 16-byte piece) space in address order, so
@@ -94,6 +103,13 @@ constexpr int stage_bytes_of = kBM * D::kChunkBlocks * D::kBlockBytes;
 
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
 
+/* An activation as f16, saturated at the largest finite half: an f32 beyond 65504 would
+ * otherwise become infinity and turn every output of its column into infinity or NaN. NaN stays
+ * NaN. */
+__device__ __forceinline__ __half to_half_saturated(float v) {
+    return __float2half(v > 65504.0f ? 65504.0f : (v < -65504.0f ? -65504.0f : v));
+}
+
 bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
     return (uintptr_t)a + a_bytes <= (uintptr_t)b || (uintptr_t)b + b_bytes <= (uintptr_t)a;
 }
@@ -110,18 +126,18 @@ struct GroupedArgs {
     int x_div;
 };
 
-/* Tile `tile` of the grouped launch: tiles are numbered expert after expert, ceil(n_e / kBN)
+/* Tile `tile` of the grouped launch: tiles are numbered expert after expert, ceil(n_e / bn)
  * for expert e. One warp finds the expert and the tile inside it (out[0] = -1 when `tile` is
  * past the last): each lane totals the tiles of its own run of experts, a shuffle scan gives
  * the run starts, and the lane whose run holds `tile` walks it. */
-__device__ void find_tile(const int *bounds, int n_experts, int tile, int *out) {
+__device__ void find_tile(const int *bounds, int n_experts, int bn, int tile, int *out) {
     const int lane = (int)threadIdx.x;
     const int per = (n_experts + 31) / 32;
     const int e0 = min(lane * per, n_experts);
     const int e1 = min(e0 + per, n_experts);
     int count = 0;
     for (int e = e0; e < e1; ++e) {
-        count += (bounds[e + 1] - bounds[e] + kBN - 1) / kBN;
+        count += (bounds[e + 1] - bounds[e] + bn - 1) / bn;
     }
     int inclusive = count;
     for (int off = 1; off < 32; off <<= 1) {
@@ -141,7 +157,7 @@ __device__ void find_tile(const int *bounds, int n_experts, int tile, int *out) 
     if (lane == __ffs(owner) - 1) {
         int t = tile - exclusive;
         for (int e = e0; e < e1; ++e) {
-            const int tiles = (bounds[e + 1] - bounds[e] + kBN - 1) / kBN;
+            const int tiles = (bounds[e + 1] - bounds[e] + bn - 1) / bn;
             if (t < tiles) {
                 out[0] = e;
                 out[1] = t;
@@ -152,31 +168,32 @@ __device__ void find_tile(const int *bounds, int n_experts, int tile, int *out) 
     }
 }
 
-/* One 64 x 64 output tile of y = W . x. Dense: tile (blockIdx.x, blockIdx.y) of the rows x
- * ncols product. Grouped: blockIdx.x is the row tile and blockIdx.y a tile number of the
- * grouped launch (find_tile); the weights are that expert's, the columns its compact columns,
- * and the activation and output rows are addressed through the token slots (GroupedArgs). */
-template <class D, bool kGrouped>
+/* One 64 x BN output tile of y = W . x (BN 64, or 128 for the grouped launch). Dense: tile
+ * (blockIdx.x, blockIdx.y) of the rows x ncols product. Grouped: blockIdx.x is the row tile and
+ * blockIdx.y a tile number of the grouped launch (find_tile); the weights are that expert's, the
+ * columns its compact columns, and the activation and output rows are addressed through the
+ * token slots (GroupedArgs). A wider tile decodes each weight tile once for twice the columns. */
+template <class D, bool kGrouped, int BN>
 __global__ void __launch_bounds__(kThreads, 2)
     gemm_dq_kernel(const unsigned char *w, const __half *x, float *y, int k, int rows, int ncols,
                    int w_blocks, int x_col_stride, int y_col_stride, int x_f32,
                    gguf::Tab<D::kTabWords> tab, GroupedArgs grouped) {
-    extern __shared__ __align__(128) __half smem[]; /* A [kBM][kAStride] then B [kBK][kBStride] then raw blocks */
+    constexpr int kFrags = BN / 32; /* 16-column fragments per warp */
+    extern __shared__ __align__(128) __half smem[]; /* A [kBM][kAStride], B [BN][kBTStride], raw blocks, table */
     __half *a = smem;                  /* the decoded weight tile */
-    __half *b = smem + kBM * kAStride; /* the activation tile */
-    unsigned char *stage =
-        reinterpret_cast<unsigned char *>(smem + kBM * kAStride + kBK * kBStride);
+    __half *b = smem + kBM * kAStride; /* the activation tile, column-major */
+    unsigned char *stage = reinterpret_cast<unsigned char *>(smem) + tile_region_bytes(BN);
     /* The type's lookup table (a 4-word dummy for the K-quant decoders), after the raw blocks. */
     uint32_t *stab = reinterpret_cast<uint32_t *>(stage + stage_bytes_of<D>);
     gguf::stage_table<D::kTabWords, kThreads>(tab, stab);
     const int tile_m = blockIdx.x * kBM;
-    int tile_n = blockIdx.y * kBN;
-    __shared__ int s_xoff[kGrouped ? kBN : 1]; /* grouped: per tile column, its activation row offset or -1 */
-    __shared__ int s_yoff[kGrouped ? kBN : 1]; /* grouped: its output row offset */
+    int tile_n = blockIdx.y * BN;
+    __shared__ int s_xoff[kGrouped ? BN : 1]; /* grouped: per tile column, its activation row offset or -1 */
+    __shared__ int s_yoff[kGrouped ? BN : 1]; /* grouped: its output row offset */
     __shared__ int s_tile[2];
     if constexpr (kGrouped) {
         if (threadIdx.x < 32) {
-            find_tile(grouped.bounds, grouped.n_experts, (int)blockIdx.y, s_tile);
+            find_tile(grouped.bounds, grouped.n_experts, BN, (int)blockIdx.y, s_tile);
         }
         __syncthreads();
         const int expert = s_tile[0];
@@ -185,17 +202,17 @@ __global__ void __launch_bounds__(kThreads, 2)
         }
         const int lo = grouped.bounds[expert];
         const int count = grouped.bounds[expert + 1] - lo;
-        tile_n = s_tile[1] * kBN;
+        tile_n = s_tile[1] * BN;
         w += (size_t)expert * grouped.expert_stride;
-        if (threadIdx.x < kBN) {
-            const int j = tile_n + (int)threadIdx.x;
+        for (int col = (int)threadIdx.x; col < BN; col += kThreads) {
+            const int j = tile_n + col;
             if (j < count) {
                 const int slot = grouped.ids_dst[lo + j];
-                s_xoff[threadIdx.x] = (slot / grouped.x_div) * x_col_stride;
-                s_yoff[threadIdx.x] = slot * y_col_stride;
+                s_xoff[col] = (slot / grouped.x_div) * x_col_stride;
+                s_yoff[col] = slot * y_col_stride;
             } else {
-                s_xoff[threadIdx.x] = -1;
-                s_yoff[threadIdx.x] = 0;
+                s_xoff[col] = -1;
+                s_yoff[col] = 0;
             }
         }
         ncols = count;
@@ -203,19 +220,55 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int tx = threadIdx.x;      /* 0..255 */
     const int warp = tx / 32;
     const int warp_r = warp % 4;     /* rows 16 * warp_r .. +16 of the tile */
-    const int warp_c = warp / 4;     /* columns 32 * warp_c .. +32 of the tile */
+    const int warp_c = warp / 4;     /* columns BN / 2 * warp_c .. +BN / 2 of the tile */
 
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[2];
-    nvcuda::wmma::fill_fragment(acc[0], 0.0f);
-    nvcuda::wmma::fill_fragment(acc[1], 0.0f);
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[kFrags];
+    #pragma unroll
+    for (int f = 0; f < kFrags; ++f) {
+        nvcuda::wmma::fill_fragment(acc[f], 0.0f);
+    }
     const int chunks = k / 64;
     for (int c = 0; c < chunks; ++c) {
         __syncthreads();
-        /* Weight tile: the chunk's raw blocks first move into shared memory as one
-         * warp-cooperative sweep, then one thread per tile row decodes its row's 64-value
-         * chunk slice from shared into the f16 tile. */
+        /* Both loads of the step run in one phase, by every thread: the raw weight blocks of the
+         * chunk move into shared memory as one warp-cooperative sweep, and the activation tile
+         * is converted from f32 to f16 (saturated) four k at a time. */
         stage_blocks<D::kBlockBytes, D::kChunkBlocks * D::kBlockBytes>(
             w, tile_m, rows, w_blocks, c, D::chunk_block_off(c), stage);
+        if constexpr (kGrouped) {
+            /* One float4 per thread step: 16 consecutive threads read the 256 contiguous bytes
+             * of one activation row, and the four halves land in one 8-byte shared word. */
+            for (int q = tx; q < BN * (kBK / 4); q += kThreads) {
+                const int col = q / (kBK / 4);
+                const int kq = q % (kBK / 4);
+                const int xoff = s_xoff[col];
+                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (xoff >= 0) {
+                    v = *reinterpret_cast<const float4 *>(reinterpret_cast<const float *>(x) +
+                                                          (size_t)xoff + c * 64 + 4 * kq);
+                }
+                const __half2 lo = __halves2half2(to_half_saturated(v.x), to_half_saturated(v.y));
+                const __half2 hi = __halves2half2(to_half_saturated(v.z), to_half_saturated(v.w));
+                uint2 packed;
+                packed.x = *reinterpret_cast<const unsigned *>(&lo);
+                packed.y = *reinterpret_cast<const unsigned *>(&hi);
+                *reinterpret_cast<uint2 *>(b + col * kBTStride + 4 * kq) = packed;
+            }
+        } else {
+            for (int idx = tx; idx < kBK * BN; idx += kThreads) {
+                const int r = idx / BN;
+                const int col_in = idx % BN;
+                const int col = tile_n + col_in;
+                const int row_k = c * 64 + r;
+                const size_t x_at = x_col_stride ? (size_t)col * x_col_stride + row_k
+                                                : (size_t)row_k * ncols + col;
+                b[col_in * kBTStride + r] =
+                    (row_k < k && col < ncols)
+                        ? (x_f32 ? to_half_saturated(reinterpret_cast<const float *>(x)[x_at])
+                                 : x[x_at])
+                        : __float2half(0.0f);
+            }
+        }
         __syncthreads();
         constexpr int kDecodeThreads = kBM * D::kParts;
         if (tx < kDecodeThreads) {
@@ -224,29 +277,6 @@ __global__ void __launch_bounds__(kThreads, 2)
             const int row = tx % kBM;
             D::decode_chunk(stage + (size_t)row * D::kChunkBlocks * D::kBlockBytes, c,
                             a + row * kAStride, stab, tx / kBM);
-        } else {
-            /* Activation tile: the remaining threads load 4096 halves, row-major by k,
-             * written at the padded stride. */
-            for (int idx = tx - kDecodeThreads; idx < kBK * kBN; idx += kThreads - kDecodeThreads) {
-                const int r = idx / kBN;
-                const int col = tile_n + idx % kBN;
-                const int row_k = c * 64 + r;
-                if constexpr (kGrouped) {
-                    const int xoff = s_xoff[idx % kBN];
-                    b[r * kBStride + idx % kBN] =
-                        (row_k < k && xoff >= 0)
-                            ? __float2half(reinterpret_cast<const float *>(x)[(size_t)xoff + row_k])
-                            : __float2half(0.0f);
-                } else {
-                    const size_t x_at = x_col_stride ? (size_t)col * x_col_stride + row_k
-                                                    : (size_t)row_k * ncols + col;
-                    b[r * kBStride + idx % kBN] =
-                        (row_k < k && col < ncols)
-                            ? (x_f32 ? __float2half(reinterpret_cast<const float *>(x)[x_at])
-                                     : x[x_at])
-                            : __float2half(0.0f);
-                }
-            }
         }
         __syncthreads();
         #pragma unroll
@@ -256,12 +286,12 @@ __global__ void __launch_bounds__(kThreads, 2)
                 fa;
             nvcuda::wmma::load_matrix_sync(fa, a + warp_r * 16 * kAStride + kk * 16, kAStride);
             #pragma unroll
-            for (int f = 0; f < 2; ++f) {
+            for (int f = 0; f < kFrags; ++f) {
                 nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half,
-                                       nvcuda::wmma::row_major>
+                                       nvcuda::wmma::col_major>
                     fb;
                 nvcuda::wmma::load_matrix_sync(
-                    fb, b + kk * 16 * kBStride + warp_c * 32 + f * 16, kBStride);
+                    fb, b + (warp_c * (BN / 2) + f * 16) * kBTStride + kk * 16, kBTStride);
                 nvcuda::wmma::mma_sync(acc[f], fa, fb, acc[f]);
             }
         }
@@ -271,15 +301,15 @@ __global__ void __launch_bounds__(kThreads, 2)
      * consecutive rows of one column. */
     __syncthreads();
     float *tile_out = reinterpret_cast<float *>(smem);
-    static_assert(kBM * kBN * sizeof(float) <= (kBM * kAStride + kBK * kBStride) * sizeof(__half),
+    static_assert(kBM * BN * sizeof(float) <= tile_region_bytes(BN),
                   "the output tile reuses the A and B tiles");
     #pragma unroll
-    for (int f = 0; f < 2; ++f) {
-        nvcuda::wmma::store_matrix_sync(tile_out + (warp_c * 32 + f * 16) * kBM + warp_r * 16,
+    for (int f = 0; f < kFrags; ++f) {
+        nvcuda::wmma::store_matrix_sync(tile_out + (warp_c * (BN / 2) + f * 16) * kBM + warp_r * 16,
                                         acc[f], kBM, nvcuda::wmma::mem_col_major);
     }
     __syncthreads();
-    for (int idx = tx; idx < kBM * kBN; idx += kThreads) {
+    for (int idx = tx; idx < kBM * BN; idx += kThreads) {
         const int col_in = idx / kBM;
         const int row = tile_m + idx % kBM;
         if (row >= rows) {
@@ -335,9 +365,9 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
         !apart(args->y, y_elems * sizeof(float), args->x, x_elems * x_unit)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
-    const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + kBN - 1) / kBN));
-    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) +
-                        (size_t)stage_bytes_of<D> + 4 * (size_t)D::kTabWords;
+    const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)((ncols + 63) / 64));
+    const size_t smem = (size_t)tile_region_bytes(64) + (size_t)stage_bytes_of<D> +
+                        4 * (size_t)D::kTabWords;
     gguf::Tab<D::kTabWords> tab;
     memset(&tab, 0, sizeof(tab));
     if (table_bytes > sizeof(tab) || (table_bytes != 0 && table == NULL)) {
@@ -348,7 +378,7 @@ int launch(const inference_cuda_gemm_dq_args *args, void *stream, int *out_stage
     }
     // The lookup table rides a kernel argument, never a per-TU __constant__ array (see
     // native/constant_bank_guard.rs).
-    gemm_dq_kernel<D, false><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
+    gemm_dq_kernel<D, false, 64><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
         (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, ncols,
         w_blocks, x_col_stride, y_col_stride, x_f32, tab, GroupedArgs{});
     Failure failure;
@@ -390,9 +420,41 @@ int with_decoder(int type, F &&f) {
     }
 }
 
+/* Launches the grouped kernel at column tile BN. The tables of the larger types push a 128-wide
+ * tile past the default 48 KiB of dynamic shared memory, so the limit is raised once per
+ * instantiation. */
+template <class D, int BN>
+int launch_grouped_tile(const inference_cuda_gemm_dq_mmid_args *args,
+                        const gguf::Tab<D::kTabWords> &tab, const GroupedArgs &grouped,
+                        void *stream) {
+    const long long tiles = ((long long)args->total_cols + BN - 1) / BN + args->n_experts;
+    if (tiles > 65535) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    const size_t smem = (size_t)tile_region_bytes(BN) + (size_t)stage_bytes_of<D> +
+                        4 * (size_t)D::kTabWords;
+    static bool raised = false;
+    if (!raised && smem > 48 * 1024) {
+        const cudaError_t e = cudaFuncSetAttribute(gemm_dq_kernel<D, true, BN>,
+                                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   (int)smem);
+        if (e != cudaSuccess) {
+            return (int)e;
+        }
+        raised = true;
+    }
+    const dim3 grid((unsigned)((args->rows + kBM - 1) / kBM), (unsigned)tiles);
+    gemm_dq_kernel<D, true, BN><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
+        (const unsigned char *)args->w, (const __half *)args->x, args->y, args->k, args->rows, 0,
+        args->k / D::kQK, args->x_row_stride, args->y_row_stride, 1, tab, grouped);
+    return 0;
+}
+
 /* The grouped launch of decoder D: one block per (row tile, tile of the grouped columns). The
- * tile count is bounded by ceil(total_cols / kBN) + n_experts (every expert adds at most one
- * partial tile); blocks past the real count return at once. */
+ * tile count is bounded by ceil(total_cols / BN) + n_experts (every expert adds at most one
+ * partial tile); blocks past the real count return at once. The column tile is the caller's
+ * (64 or 128) or, left at 0, chosen from the expected columns of an expert: 128 once an expert
+ * holds at least 96 on average, so a wide tile is mostly full. */
 template <class D>
 int launch_grouped(const inference_cuda_gemm_dq_mmid_args *args, const void *table,
                    size_t table_bytes, void *stream, int *out_stage) {
@@ -400,15 +462,12 @@ int launch_grouped(const inference_cuda_gemm_dq_mmid_args *args, const void *tab
     const int rows = args->rows;
     if (k <= 0 || k % D::kQK != 0 || k % 64 != 0 || rows < 1 || args->n_experts < 1 ||
         args->total_cols < 1 || args->x_div < 1 || args->x_row_stride < k ||
-        args->y_row_stride < rows) {
+        args->y_row_stride < rows || args->x_row_stride % 4 != 0 ||
+        (args->col_tile != 0 && args->col_tile != 64 && args->col_tile != 128)) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     if ((long long)args->total_cols * args->y_row_stride > INT_MAX ||
         (long long)args->total_cols * args->x_row_stride > INT_MAX) {
-        return INFERENCE_CUDA_INVALID_ARGUMENT;
-    }
-    const long long tiles = ((long long)args->total_cols + kBN - 1) / kBN + args->n_experts;
-    if (tiles > 65535) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     if (table_bytes != 4 * (size_t)D::kHostTabWords || (table_bytes != 0 && table == NULL)) {
@@ -425,12 +484,15 @@ int launch_grouped(const inference_cuda_gemm_dq_mmid_args *args, const void *tab
     grouped.expert_stride = (size_t)args->expert_stride;
     grouped.n_experts = args->n_experts;
     grouped.x_div = args->x_div;
-    const dim3 grid((unsigned)((rows + kBM - 1) / kBM), (unsigned)tiles);
-    const size_t smem = (size_t)(kBM * kAStride + kBK * kBStride) * sizeof(__half) +
-                        (size_t)stage_bytes_of<D> + 4 * (size_t)D::kTabWords;
-    gemm_dq_kernel<D, true><<<grid, kThreads, smem, (cudaStream_t)stream>>>(
-        (const unsigned char *)args->w, (const __half *)args->x, args->y, k, rows, 0,
-        k / D::kQK, args->x_row_stride, args->y_row_stride, 1, tab, grouped);
+    int col_tile = args->col_tile;
+    if (col_tile == 0) {
+        col_tile = args->total_cols >= 96 * args->n_experts ? 128 : 64;
+    }
+    const int status = col_tile == 128 ? launch_grouped_tile<D, 128>(args, tab, grouped, stream)
+                                       : launch_grouped_tile<D, 64>(args, tab, grouped, stream);
+    if (status != 0) {
+        return status;
+    }
     Failure failure;
     const cudaError_t err = cudaGetLastError();
     gguf::note_argument_failure(err, sizeof(tab));
@@ -527,7 +589,7 @@ extern "C" int inference_cuda_gemm_dq_mmid_launch(const inference_cuda_gemm_dq_m
         const size_t w_align = type == gguf::kQ5K ? 16 : 2;
         if (args == NULL || stream == NULL || args->w == NULL || args->x == NULL ||
             args->y == NULL || args->ids_dst == NULL || args->expert_bounds == NULL ||
-            !aligned(args->w, w_align) || !aligned(args->x, 4) || !aligned(args->y, 4) ||
+            !aligned(args->w, w_align) || !aligned(args->x, 16) || !aligned(args->y, 4) ||
             !aligned(args->ids_dst, 4) || !aligned(args->expert_bounds, 4) ||
             args->expert_stride % w_align != 0) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;

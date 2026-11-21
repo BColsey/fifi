@@ -97,6 +97,28 @@ const _: () = assert!(
         && offset_of!(ExpertArgsRepr, glu_gate) == 64
 );
 
+/// Mirror of `inference_cuda_embed_gguf_args` (`matvec_gguf.h`), field for field.
+#[repr(C)]
+struct EmbedArgsRepr {
+    blocks: *const c_void,
+    ids: *const c_int,
+    x: *mut f32,
+    status: *mut c_int,
+    ty: c_int,
+    m: c_int,
+    n_rows: c_int,
+    k: c_int,
+}
+
+const _: () = assert!(
+    size_of::<EmbedArgsRepr>() == 48
+        && offset_of!(EmbedArgsRepr, ids) == 8
+        && offset_of!(EmbedArgsRepr, x) == 16
+        && offset_of!(EmbedArgsRepr, status) == 24
+        && offset_of!(EmbedArgsRepr, ty) == 32
+        && offset_of!(EmbedArgsRepr, k) == 44
+);
+
 unsafe extern "C" {
     #[link_name = "inference_cuda_matvec_gguf_launch"]
     fn matvec_gguf_launch_raw(
@@ -114,6 +136,15 @@ unsafe extern "C" {
         table: *const c_void,
         table_bytes: usize,
         x_row_bytes: usize,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "inference_cuda_embed_gguf_launch"]
+    fn embed_gguf_launch_raw(
+        args: *const EmbedArgsRepr,
+        table: *const c_void,
+        table_bytes: usize,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -153,7 +184,13 @@ pub(in crate::kernels::cuda) fn gguf_type_id(ty: QuantType) -> Option<c_int> {
         QuantType::Q2K => 10,
         QuantType::Iq1S => 19,
         QuantType::Iq1M => 29,
-        _ => return None,
+        QuantType::Q40 => 2,
+        QuantType::Q50 => 6,
+        QuantType::Q80 => 8,
+        QuantType::Q3K => 11,
+        QuantType::Q4K => 12,
+        QuantType::Q5K => 13,
+        QuantType::Q6K => 14,
     })
 }
 
@@ -439,6 +476,91 @@ pub(in crate::kernels::cuda) fn dequant_gguf_launch(
             w.address().cast_const(),
             y.address().cast::<f32>(),
             n_blocks,
+            table.as_ptr().cast::<c_void>(),
+            table.len(),
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The embedding gather call: row `ids[t]` of `blocks` (the native table of `n_rows` rows of `k`
+/// values of `ty`) into f32 row `t` of `x`, `status` the step status word.
+pub(in crate::kernels::cuda) struct EmbedGgufRaw<'a> {
+    pub(in crate::kernels::cuda) ty: QuantType,
+    pub(in crate::kernels::cuda) blocks: RawRange<'a>,
+    pub(in crate::kernels::cuda) ids: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) status: RawRange<'a>,
+    pub(in crate::kernels::cuda) m: usize,
+    pub(in crate::kernels::cuda) n_rows: usize,
+    pub(in crate::kernels::cuda) k: usize,
+}
+
+pub(in crate::kernels::cuda) fn embed_gguf_launch(
+    stream: &RawStream,
+    call: &EmbedGgufRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let ty = gguf_type_id(call.ty).ok_or_else(invalid_argument)?;
+    let need_blocks = call
+        .ty
+        .weight_bytes(call.n_rows, call.k)
+        .ok_or_else(invalid_argument)?;
+    let need_ids = call.m.checked_mul(4).ok_or_else(invalid_argument)?;
+    let need_x = call
+        .m
+        .checked_mul(call.k)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(invalid_argument)?;
+    let x_span = Span::of(&call.x, need_x);
+    let status_span = Span::of(&call.status, 4);
+    let apart = x_span.apart(&Span::of(&call.blocks, need_blocks))
+        && x_span.apart(&Span::of(&call.ids, need_ids))
+        && x_span.apart(&status_span)
+        && status_span.apart(&Span::of(&call.ids, need_ids))
+        && status_span.apart(&Span::of(&call.blocks, need_blocks));
+    let ints_fit = [call.m, call.n_rows, call.k]
+        .iter()
+        .all(|&v| c_int::try_from(v).is_ok());
+    if !ints_fit
+        || !apart
+        || !(1..=4096).contains(&call.m)
+        || !(1..=(1usize << 28)).contains(&call.n_rows)
+        || call.k < 32
+        || call.k > 32768
+        || !call.k.is_multiple_of(call.ty.block_size())
+        || !call.blocks.offset.is_multiple_of(2)
+        || !aligned4(&call.ids)
+        || !call.x.offset.is_multiple_of(16)
+        || !aligned4(&call.status)
+        || call.blocks.bytes < need_blocks
+        || call.ids.bytes < need_ids
+        || call.x.bytes < need_x
+        || call.status.bytes < 4
+    {
+        return Err(invalid_argument());
+    }
+    let table = table_of(call.ty);
+    let mut stage = STAGE_NONE;
+    let args = EmbedArgsRepr {
+        blocks: call.blocks.address().cast_const(),
+        ids: call.ids.address().cast_const().cast::<c_int>(),
+        x: call.x.address().cast::<f32>(),
+        status: call.status.address().cast::<c_int>(),
+        ty,
+        m: c_int::try_from(call.m).map_err(|_| invalid_argument())?,
+        n_rows: c_int::try_from(call.n_rows).map_err(|_| invalid_argument())?,
+        k: c_int::try_from(call.k).map_err(|_| invalid_argument())?,
+    };
+    // SAFETY: the checks above proved every range inside its live allocation, large enough for
+    // the call and aligned, and `x`, the range the kernel writes besides the status word,
+    // disjoint from every range it reads; the status word is written only by the kernel's
+    // integer atomic. `table` is a `'static` slice the adapter copies before returning;
+    // `stream` is live for the call.
+    let status = unsafe {
+        embed_gguf_launch_raw(
+            &args,
             table.as_ptr().cast::<c_void>(),
             table.len(),
             stream.0.as_ptr(),

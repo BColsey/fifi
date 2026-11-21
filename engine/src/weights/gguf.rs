@@ -203,6 +203,7 @@ impl GgufType {
                 | Self::Q50
                 | Self::Q5K
                 | Self::Q40
+                | Self::Q3K
                 | Self::Iq4Nl
                 | Self::Q20
                 | Self::Iq2Xxs

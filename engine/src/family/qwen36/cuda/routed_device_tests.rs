@@ -5,7 +5,7 @@
 //! the oracle's dequantized weights. Run with `--ignored --test-threads=1`.
 
 use crate::kernels::cuda::prefill::mmq_mmid::{
-    HostIds, MmidIds, MmidIdsOut, MmidShape, RoutedX, routed_gemm, routed_quantize,
+    HostIds, MmidIds, MmidIdsOut, MmidShape, Q8Cursor, RoutedQuant, RoutedX, routed_gemm,
 };
 use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
 use crate::kernels::cuda::prefill::mmq_size::{fixup_floats_max, q8_1_bytes};
@@ -89,10 +89,8 @@ fn read_f32(stream: &DeviceStream, buffer: &DeviceBuffer, n: usize) -> Vec<f32> 
     let mut bytes = vec![0u8; n * 4];
     buffer.read_at(stream, 0, &mut bytes).expect("read back");
     bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
 
@@ -123,7 +121,7 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         return;
     };
     let stream = ctx.stream().expect("stream");
-    let mut rng = Rng(0x0051_07ed_2545_f491);
+    let mut rng = Rng(0x5107_ed_2545_f491);
     let (gate_ty, up_ty, down_ty) = (GgufType::Iq3Xxs, GgufType::Q4K, GgufType::Iq4Xs);
     let gate_bytes = blocks(gate_ty, E * INTER, HIDDEN, &mut rng);
     let up_bytes = blocks(up_ty, E * INTER, HIDDEN, &mut rng);
@@ -197,21 +195,13 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         rows: x2_buf.range(0, x2_buf.bytes()).expect("x2"),
         row_stride: HIDDEN,
         per_slot: false,
+        quant: RoutedQuant {
+            ids: &ids,
+            gather: false,
+            packing: MmqPacking::CpuReference,
+            cursor: Q8Cursor::default(),
+        },
     };
-    // The scatter quantize runs for the stage because the up stack is vendored; the gate stack
-    // on the dequantizing GEMM ignores it.
-    routed_quantize(
-        &ctx,
-        &stream,
-        &ids,
-        &[&gate, &up],
-        false,
-        MmqPacking::CpuReference,
-        HIDDEN,
-        gate_x.rows,
-        gate_x.q8,
-    )
-    .expect("scatter quantize");
     routed_gemm(
         &ctx,
         &stream,
@@ -230,20 +220,13 @@ fn a_routed_stage_mixes_the_dequantizing_gemm_and_the_vendored_mmq() {
         rows: act_buf.range(0, act_buf.bytes()).expect("act"),
         row_stride: INTER,
         per_slot: true,
+        quant: RoutedQuant {
+            ids: &ids,
+            gather: true,
+            packing: MmqPacking::CpuReference,
+            cursor: Q8Cursor::default(),
+        },
     };
-    // The down stack is on the dequantizing GEMM: no gather quantize runs and no q8_1 is read.
-    routed_quantize(
-        &ctx,
-        &stream,
-        &ids,
-        &[&down],
-        true,
-        MmqPacking::CpuReference,
-        INTER,
-        down_x.rows,
-        down_x.q8,
-    )
-    .expect("gather quantize is a no-op for a dequantizing stack");
     routed_gemm(
         &ctx,
         &stream,

@@ -83,18 +83,18 @@ const DELTA_ROLES: [Role; 9] = [
 ];
 // The vendored projector tiles Q4_K, Q6_K and Q8_0; F16 is allowed nowhere: a tiled
 // tensor in it has no tile kernel, and every other tensor is uploaded as raw F32.
-// The in-house dequant types ride the dense projections only (gemm_dq prefill arm
-// plus the resident matvec decode arm): Q5_K and Q4_0 serve both, so they open, and so do
-// the codebook types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
-// Q2_0) and Q2_K, whose decoders are shared by the decode matvec and the GEMM.
-// Q3_K is held back until its chunk, expert and embedding wiring is qualified;
-// the embedding gather stays on the vendored path.
-const DENSE_TILED_TYPES: [GgufType; 16] = [
+// Every quantized role (dense projections, routed experts, the embedding) takes every type the
+// native kernels read (`GgufType::has_native_kernel`): the decode matvec, the expert matvec,
+// the prefill GEMMs and the embedding gather all dispatch on the type, so no role has a list of
+// its own. The order is the order the refusal text names them in.
+const NATIVE_TYPES: [GgufType; 18] = [
     GgufType::Q4K,
     GgufType::Q5K,
     GgufType::Q40,
     GgufType::Q6K,
     GgufType::Q80,
+    GgufType::Q50,
+    GgufType::Q3K,
     GgufType::Iq4Nl,
     GgufType::Iq4Xs,
     GgufType::Iq2Xxs,
@@ -108,29 +108,6 @@ const DENSE_TILED_TYPES: [GgufType; 16] = [
     GgufType::Q2K,
 ];
 const RAW_TYPES: [GgufType; 1] = [GgufType::F32];
-/// Routed experts: the vendored MMVQ and MMQ types, and the codebook types (IQ4_NL, IQ4_XS,
-/// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0) and Q2_K, whose decode expert
-/// matvec and grouped dequantizing GEMM are the in-house kernels. Any other type is refused at
-/// the open, naming the tensor.
-const EXPERT_TYPES: [GgufType; 14] = [
-    GgufType::Q4K,
-    GgufType::Q6K,
-    GgufType::Q80,
-    GgufType::Iq4Nl,
-    GgufType::Iq4Xs,
-    GgufType::Iq2Xxs,
-    GgufType::Iq2Xs,
-    GgufType::Iq2S,
-    GgufType::Iq3Xxs,
-    GgufType::Iq3S,
-    GgufType::Iq1S,
-    GgufType::Iq1M,
-    GgufType::Q20,
-    GgufType::Q2K,
-];
-/// The native embedding gather reads the vendored blocks only.
-const EMBD_TYPES: [GgufType; 3] = [GgufType::Q4K, GgufType::Q6K, GgufType::Q80];
-
 impl Role {
     /// The GGUF name of the tensor of this role: `blk.N.` and the suffix for a layer's role, the
     /// whole name for a global one.
@@ -199,15 +176,9 @@ impl Role {
     }
 
     fn allowed_types(self) -> &'static [GgufType] {
-        match self {
-            // Routed experts: the vendored expert kernels and the in-house codebook kernels.
-            Role::FfnGateExps | Role::FfnUpExps | Role::FfnDownExps => &EXPERT_TYPES,
-            // The embedding gather decodes Q4_K blocks natively.
-            Role::TokenEmbd => &EMBD_TYPES,
-            _ => match self.path() {
-                TensorPath::DeviceTiled => &DENSE_TILED_TYPES,
-                TensorPath::DeviceF32 => &RAW_TYPES,
-            },
+        match self.path() {
+            TensorPath::DeviceTiled => &NATIVE_TYPES,
+            TensorPath::DeviceF32 => &RAW_TYPES,
         }
     }
 

@@ -32,7 +32,7 @@ use super::mixer_weights::MixerWeights;
 use super::moe::MoeLayerWeights;
 use super::multi::fold_ring_status;
 use super::prefix::{CudaPrefillPath, stored_prefix_report};
-use super::resources::{GlobalNames, MoeSpecs, check_native_embed, moe_layer_weights, raw_buffer};
+use super::resources::{GlobalNames, MoeSpecs, moe_layer_weights, raw_buffer};
 use super::run_report::prefix_lookup;
 use super::state::export::ExportedState;
 use super::state::{ResidentState, StepField};
@@ -231,7 +231,6 @@ impl CardSession {
                 k: dims.shape.hidden,
             },
         )?;
-        check_native_embed(&names.embed, weight.quant())?;
         let embed = weight;
         let kv_runs = (0..cards)
             .map(|card| shard.kv_rows(card))

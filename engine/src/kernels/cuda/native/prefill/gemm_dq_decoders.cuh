@@ -194,6 +194,10 @@ struct WindowDecoder {
     static const int kTabWords = T::kTabWords;
     static const int kHostTabWords = T::kHostTabWords;
     static const int kParts = 2;
+    /* The raw chunk is staged in 16-byte words only when its size is a multiple of 16, which
+     * needs a 16-byte aligned weight; the window types stage bytes and need two. */
+    static_assert(((T::kWinPerBlock >= 2 ? 1 : 2) * T::kBlockBytes) % 16 != 0,
+                  "a window type whose chunk is a multiple of 16 bytes would need 16-byte alignment");
 
     __device__ static int chunk_block_off(int c) {
         return T::kWinPerBlock >= 2 ? c / (T::kWinPerBlock / 2) : 2 * c;

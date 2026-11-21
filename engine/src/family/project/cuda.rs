@@ -716,26 +716,9 @@ impl CudaProjector {
     ) -> Result<CudaWeight, EngError> {
         let name = tensor.name();
         match (tensor.ggml_type(), layout) {
-            (
-                ty @ (GgufType::Q4K
-                | GgufType::Q6K
-                | GgufType::Q80
-                | GgufType::Q50
-                | GgufType::Q5K
-                | GgufType::Q40
-                | GgufType::Iq4Nl
-                | GgufType::Iq4Xs
-                | GgufType::Iq2Xxs
-                | GgufType::Iq2Xs
-                | GgufType::Iq2S
-                | GgufType::Iq3Xxs
-                | GgufType::Iq3S
-                | GgufType::Iq1S
-                | GgufType::Iq1M
-                | GgufType::Q20
-                | GgufType::Q2K),
-                layout,
-            ) => self.upload_quant(weights, tensor, name, ty, layout),
+            (ty, layout) if ty.has_native_kernel() => {
+                self.upload_quant(weights, tensor, name, ty, layout)
+            }
             (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {
                 let (ty, bytes) = weights.read_tensor(name)?;
                 Ok(CudaWeight::Raw {
@@ -1629,26 +1612,9 @@ fn upload(
 ) -> Result<CudaWeight, EngError> {
     let name = tensor.name();
     match (tensor.ggml_type(), layout) {
-        (
-            ty @ (GgufType::Q4K
-            | GgufType::Q6K
-            | GgufType::Q80
-            | GgufType::Q50
-            | GgufType::Q5K
-            | GgufType::Q40
-            | GgufType::Iq4Nl
-            | GgufType::Iq4Xs
-            | GgufType::Iq2Xxs
-            | GgufType::Iq2Xs
-            | GgufType::Iq2S
-            | GgufType::Iq3Xxs
-            | GgufType::Iq3S
-            | GgufType::Iq1S
-            | GgufType::Iq1M
-            | GgufType::Q20
-            | GgufType::Q2K),
-            layout,
-        ) => upload_quant(knobs, weights, tensor, ty, layout, slice, mapped),
+        (ty, layout) if ty.has_native_kernel() => {
+            upload_quant(knobs, weights, tensor, ty, layout, slice, mapped)
+        }
         (GgufType::F16 | GgufType::Bf16, _) if tensor.is_small_half_vector() => {
             let (ty, bytes) = weights.read_tensor(name)?;
             let bytes = crate::weights::widen_to_f32_bytes(ty, &bytes)?;

@@ -117,6 +117,12 @@ impl QuantType {
         matches!(self, Self::Q5K | Self::Q40 | Self::Q3K) || self.is_codebook()
     }
 
+    /// True for the types whose routed-expert matvec is the in-house window kernel
+    /// (`matvec_gguf.cu`): every type without a vendored MMVQ arm.
+    pub(crate) fn expert_uses_window(self) -> bool {
+        !matches!(self, Self::Q4K | Self::Q50 | Self::Q6K | Self::Q80)
+    }
+
     pub(crate) fn block_size(self) -> usize {
         match self {
             Self::Q4K

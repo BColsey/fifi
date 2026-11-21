@@ -45,9 +45,9 @@ use super::{
     moe::MoeLayerWeights,
     prefill::ChunkRows,
     prefill::{
-        ChunkBufs, ChunkModel, ChunkRun, ChunkViews, ChunkWeights, LayerCtx, LayerMoe, Stage,
-        attn_flash, attn_out, attn_prep, attn_proj, chunk_attn_geometry, chunk_embed, chunk_route,
-        combine_chunk_moe, delta_conv, delta_proj, delta_scan, kv8_segment_query_rows,
+        ChunkBufs, ChunkModel, ChunkRun, ChunkViews, ChunkWeights, LayerCtx, LayerMoe, Q8Cursor,
+        Stage, attn_flash, attn_out, attn_prep, attn_proj, chunk_attn_geometry, chunk_embed,
+        chunk_route, combine_chunk_moe, delta_conv, delta_proj, delta_scan, kv8_segment_query_rows,
         kv8_use_segments, layer_stages, norm_a, norm_f, quant_a, quant_a_out, quant_d_out,
         run_chunk_routed, run_chunk_routed_timed, run_chunk_shared, ssm_out,
     },
@@ -936,6 +936,7 @@ where
         layer,
         kind,
         status: status[card],
+        q8x: Q8Cursor::default(),
     })
 }
 

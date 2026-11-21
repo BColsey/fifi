@@ -28,10 +28,10 @@ use super::gguf_split::shard_name_of;
 use crate::EngError;
 
 /// Tensor types the CUDA path loads: F32 and F16 hold norms and small tables, every quantized
-/// type with a native kernel (`GgufType::has_native_kernel`) holds matrices, and Q3_K is read here
-/// although the native plan refuses it. Which role takes which type is the model open's rule.
+/// type with a native kernel (`GgufType::has_native_kernel`) holds matrices. Which role takes
+/// which type is the model open's rule.
 fn supported_type(ty: GgufType) -> bool {
-    matches!(ty, GgufType::F32 | GgufType::F16 | GgufType::Q3K) || ty.has_native_kernel()
+    matches!(ty, GgufType::F32 | GgufType::F16) || ty.has_native_kernel()
 }
 
 /// Size limits checked before anything large is allocated.

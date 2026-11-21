@@ -1512,15 +1512,12 @@ fn the_default_layout_is_tiled() {
 
 #[test]
 fn a_native_load_refuses_an_unsupported_type_naming_the_tensor() {
-    // The GGUF reader takes every in-house type (`supported_type`), so a file can carry
-    // a type the native plan refuses: Q3_K is held back until its chunk, expert and
-    // embedding wiring is qualified, so the model open keeps it out and the plan
-    // refuses it. The plan function that
-    // `planned` calls is therefore checked directly for the refusal and its text.
-    let text = error_text(plan::native_device_bytes("odd", GgufType::Q3K, &[256, 8]));
+    // A type without a native kernel (Q4_1) is refused by the plan with the tensor named. The
+    // plan function that `planned` calls is checked directly for the refusal and its text.
+    let text = error_text(plan::native_device_bytes("odd", GgufType::Q41, &[256, 8]));
     assert!(
         text.starts_with("Checkpoint")
-            && text.contains("tensor odd has type Q3K, which the CUDA native weights do not take"),
+            && text.contains("tensor odd has type Q41, which the CUDA native weights do not take"),
         "{text}"
     );
     let mut rng = Rng(SEED);
@@ -2232,37 +2229,6 @@ fn a_native_load_skips_the_scale_scans_that_stop_the_tiled_load() {
     // The backend still loads and runs after both loads.
     let fixture = Fixture::new(GgufType::Q4K, q4k_blocks(&mut rng, N_ROWS * BLOCKS_PER_ROW));
     assert_loads_and_runs_after(&mut projector, &fixture, "tiled after the native load");
-}
-
-#[test]
-fn a_q3k_tensor_opens_but_the_native_plan_refuses_it_before_any_device_call() {
-    const NAME: &str = "a_q3k_tensor_opens_but_the_native_plan_refuses_it_before_any_device_call";
-    if !device_present(NAME) {
-        return;
-    }
-    // The reader takes Q3_K (`supported_type`); the model open keeps it out (its
-    // chunk, expert and embedding wiring is not qualified), and the native plan
-    // refuses it the same way, naming the tensor, with the device untouched.
-    let dir = tempfile::tempdir().expect("create the fixture directory");
-    let path = dir.path().join("q3.gguf");
-    let payload = vec![0u8; N_ROWS * BLOCKS_PER_ROW * 110];
-    let entries = [weight_entry("q3", GgufType::Q3K, (N_ROWS, K), payload)];
-    std::fs::write(&path, gguf_bytes(&entries)).expect("write the GGUF fixture");
-    let mut projector = CudaProjector::new().expect("create the CUDA projector");
-    let before = projector.live_bytes();
-    let weights = GgufWeights::open(&path, LIMITS, None).expect("the reader takes Q3_K");
-    assert_error(
-        planned(&weights, "q3", WeightLayout::Native).map(|(_, bytes)| bytes),
-        "Checkpoint",
-        "tensor q3 has type Q3K",
-    );
-    assert_eq!(
-        projector.live_bytes(),
-        before,
-        "the plan touched the device"
-    );
-    let fixture = big_and_small_fixture();
-    assert_loads_and_runs_after(&mut projector, &fixture, "q4k after a refused q3_k");
 }
 
 /// Q8_0 blocks whose every `d` is `d_bits` and whose quant 0 is `q`, the rest
@@ -3313,7 +3279,7 @@ fn measure_q8_0_scale_scan_time() {
 fn trim_fixture() -> Vec<Entry> {
     vec![
         weight_entry("blk.0.q4k", GgufType::Q4K, (8, 256), filled(8 * 144, 1)),
-        weight_entry("blk.0.q3k", GgufType::Q3K, (2, 256), filled(2 * 110, 2)),
+        weight_entry("blk.0.q41", GgufType::Q41, (2, 256), filled(2 * 8 * 20, 2)),
         weight_entry("blk.0.q6k", GgufType::Q6K, (8, 256), filled(8 * 210, 4)),
         weight_entry("blk.0.f32", GgufType::F32, (2, 4), filled(32, 3)),
     ]
@@ -3347,14 +3313,14 @@ fn assert_payloads(weights: &GgufWeights, kept: &[&Entry]) {
 }
 
 #[test]
-fn trimmed_copy_drops_the_q3k_tensor_and_keeps_the_rest_byte_for_byte() {
+fn trimmed_copy_drops_the_q4_1_tensor_and_keeps_the_rest_byte_for_byte() {
     let dir = tempfile::tempdir().expect("create the trim directory");
     let source = dir.path().join("source.gguf");
     let entries = trim_fixture();
     std::fs::write(&source, gguf_bytes(&entries)).expect("write the source fixture");
     assert!(
-        GgufWeights::open(&source, MEASURE_LIMITS, None).is_ok(),
-        "the reader takes every supported type, including the Q3_K tensor"
+        GgufWeights::open_any_type(&source, MEASURE_LIMITS, None).is_ok(),
+        "the reader of any type takes the Q4_1 tensor"
     );
     let dest = dir.path().join("trimmed.gguf");
     let trim = write_trimmed(&source, &dest, u64::MAX);
@@ -3363,7 +3329,7 @@ fn trimmed_copy_drops_the_q3k_tensor_and_keeps_the_rest_byte_for_byte() {
         (3, 1, 0)
     );
     let weights = GgufWeights::open(&dest, MEASURE_LIMITS, None).expect("open the trimmed fixture");
-    let kept: Vec<&Entry> = entries.iter().filter(|e| e.ty != GgufType::Q3K).collect();
+    let kept: Vec<&Entry> = entries.iter().filter(|e| e.ty != GgufType::Q41).collect();
     assert_payloads(&weights, &kept);
 }
 

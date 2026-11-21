@@ -58,7 +58,7 @@ int inference_cuda_gemm_dq_codebook_launch(const inference_cuda_gemm_dq_args *ar
  * 13 Q5_K, and every type of the codebook entry above plus 23 IQ4_XS and 10 Q2_K, 19 IQ1_S,
  * 29 IQ1_M). w holds n_experts weights expert_stride bytes apart (16-byte aligned, a multiple
  * of 16), each rows x k native blocks; x holds f32 token rows of x_row_stride floats; y holds
- * f32 slot rows of y_row_stride floats. expert_bounds holds n_experts + 1 ints and ids_dst
+ * f32 slot rows of y_row_stride floats (x 16-byte aligned, x_row_stride a multiple of 4). expert_bounds holds n_experts + 1 ints and ids_dst
  * total_cols ints: compact column j of expert e (expert_bounds[e] <= j < expert_bounds[e + 1])
  * is token slot ids_dst[j], which reads x row slot / x_div and writes y row slot (columns
  * 0..rows). table and table_bytes are as for the codebook entry. */
@@ -76,7 +76,7 @@ typedef struct inference_cuda_gemm_dq_mmid_args {
     int x_div;      /* slot / x_div is the activation row: top_k for the gate and up input, 1 for the down input */
     int x_row_stride;
     int y_row_stride;
-    int pad;
+    int col_tile;   /* 0 chooses by the expected columns per expert; else 64 or 128 */
 } inference_cuda_gemm_dq_mmid_args;
 
 int inference_cuda_gemm_dq_mmid_launch(const inference_cuda_gemm_dq_mmid_args *args, int type,

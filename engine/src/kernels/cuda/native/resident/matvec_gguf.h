@@ -72,6 +72,30 @@ int inference_cuda_dequant_gguf_launch(int type, const void *w, float *y, size_t
                                        const void *table, size_t table_bytes, void *stream,
                                        int *out_stage);
 
+/* The embedding row gather over the file's native blocks of any type the window decoders serve
+ * (GGUF type ids as above, plus 2 Q4_0, 6 Q5_0, 8 Q8_0, 10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K,
+ * 19 IQ1_S, 29 IQ1_M): x[t][0 .. k) = row ids[t] of the table as f32, bit equal to the host
+ * dequantizer. blocks is the row-major table, n_rows rows of k / block_size blocks, 2-byte
+ * aligned; ids is m device ints read when the kernel runs; x is f32 [m][k], 16-byte aligned;
+ * status is the step status word. An id outside [0, n_rows) writes a row of NaN, reads no
+ * weight and ORs INFERENCE_CUDA_STATUS_INVALID_STEP_STATE into status (one atomicOr, idempotent).
+ * m 1..4096, n_rows 1..2^28, k a multiple of the type's block size up to 32768. table and
+ * table_bytes as for the matvec entries. */
+typedef struct inference_cuda_embed_gguf_args {
+    const void *blocks;
+    const int *ids;
+    float *x;
+    int *status;
+    int type;
+    int m;
+    int n_rows;
+    int k;
+} inference_cuda_embed_gguf_args;
+
+int inference_cuda_embed_gguf_launch(const inference_cuda_embed_gguf_args *args,
+                                     const void *table, size_t table_bytes, void *stream,
+                                     int *out_stage);
+
 #ifdef __cplusplus
 }
 static_assert(sizeof(inference_cuda_matvec_gguf_args) == 40 &&
@@ -83,6 +107,13 @@ static_assert(sizeof(inference_cuda_matvec_gguf_args) == 40 &&
                   offsetof(inference_cuda_matvec_gguf_args, x_q8) == 24 &&
                   offsetof(inference_cuda_matvec_gguf_args, y) == 32,
               "inference_cuda_matvec_gguf_args layout");
+static_assert(sizeof(inference_cuda_embed_gguf_args) == 48 &&
+                  offsetof(inference_cuda_embed_gguf_args, ids) == 8 &&
+                  offsetof(inference_cuda_embed_gguf_args, x) == 16 &&
+                  offsetof(inference_cuda_embed_gguf_args, status) == 24 &&
+                  offsetof(inference_cuda_embed_gguf_args, type) == 32 &&
+                  offsetof(inference_cuda_embed_gguf_args, k) == 44,
+              "inference_cuda_embed_gguf_args layout");
 static_assert(sizeof(inference_cuda_matvec_gguf_expert_args) == 72 &&
                   offsetof(inference_cuda_matvec_gguf_expert_args, type) == 0 &&
                   offsetof(inference_cuda_matvec_gguf_expert_args, k) == 4 &&

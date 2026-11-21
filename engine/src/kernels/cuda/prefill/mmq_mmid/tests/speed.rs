@@ -1,5 +1,5 @@
-//! Speed rows of the grouped launch: UNPAIRED and REPORTED ONLY, never gated. At M = 512, 1,024 and
-//! 2,048 tokens on the 3090 (release profile) they print the three mmid launches of one MoE layer
+//! Speed rows of the grouped launch: UNPAIRED and REPORTED ONLY, never gated. At M = 512, 1,024, 2,048 and 4,096
+//! tokens on the 3090 (release profile) they print the three mmid launches of one MoE layer
 //! (gate, up, down; 256 experts, top 8, uniform random ids; Q4_K; K 2,048 / N 512, K 2,048 / N 512,
 //! K 512 / N 2,048) in milliseconds per layer and times 40 layers, beside two anchors: an earlier
 //! probe (gate 870 us + up 870 us + down 1,117 us = 2.86 ms per layer at T = 1,024, MEASURED) and
@@ -247,7 +247,7 @@ fn mmq_mmid_speed_rows_are_reported_unpaired() {
     }
     let release = !cfg!(debug_assertions);
     let (ms, iters): (&[usize], usize) = if release {
-        (&[512, 1024, 2048], ITERS)
+        (&[512, 1024, 2048, 4096], ITERS)
     } else {
         (&[64], 1)
     };

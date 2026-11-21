@@ -34,6 +34,7 @@
 #include "device.h"
 #include "resident/gguf_decode.cuh"
 #include "resident/matvec_gguf.h"
+#include "resident/step_params.h"  // INFERENCE_CUDA_STATUS_INVALID_STEP_STATE
 
 namespace {
 
@@ -309,6 +310,46 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+/* The embedding row gather: block t gathers row ids[t] of the native table into x[t][0..k), one
+ * window per thread step. An id outside [0, n_rows) writes a row of NaN, reads no weight and ORs
+ * the invalid-step-state bit into the status word from one thread (the contract of embed.h). */
+const int kEmbedThreads = 128;
+
+template <class T>
+__global__ void __launch_bounds__(kEmbedThreads)
+    embed_rows(const unsigned char *w, const int *ids, float *x, int *status, int n_rows, int k,
+               Tab<T::kTabWords> tab) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    uint32_t *stab = reinterpret_cast<uint32_t *>(smem);
+    stage_table<T::kTabWords, kEmbedThreads>(tab, stab);
+    __syncthreads();
+    const int id = ids[blockIdx.x];
+    float *row_out = x + (size_t)blockIdx.x * (size_t)k;
+    if (id < 0 || id >= n_rows) {
+        for (int j = (int)threadIdx.x; j < k; j += kEmbedThreads) {
+            row_out[j] = __int_as_float(0x7fc00000);
+        }
+        if (threadIdx.x == 0) {
+            atomicOr(status, INFERENCE_CUDA_STATUS_INVALID_STEP_STATE);
+        }
+        return;
+    }
+    const size_t row_bytes = (size_t)(k / (32 * T::kWinPerBlock)) * T::kBlockBytes;
+    const unsigned char *row = w + (size_t)id * row_bytes;
+    for (int win = (int)threadIdx.x; win < k / 32; win += kEmbedThreads) {
+        const typename T::Raw raw =
+            T::load(row + (size_t)(win / T::kWinPerBlock) * T::kBlockBytes, win % T::kWinPerBlock);
+        Win wn;
+        T::decode(raw, stab, wn);
+        float4 *out4 = reinterpret_cast<float4 *>(row_out + (size_t)win * 32);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out4[j] = make_float4(window_value<T>(wn, 4 * j), window_value<T>(wn, 4 * j + 1),
+                                  window_value<T>(wn, 4 * j + 2), window_value<T>(wn, 4 * j + 3));
+        }
+    }
+}
+
 bool aligned(const void *p, size_t alignment) { return (uintptr_t)p % alignment == 0; }
 
 bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
@@ -371,6 +412,13 @@ int with_type(int type, F &&f) {
     case kQ2K: return f(TypeTag<Q2K>());
     case kIq1S: return f(TypeTag<Iq1S>());
     case kIq1M: return f(TypeTag<Iq1M>());
+    case kQ4_0: return f(TypeTag<Q4_0>());
+    case kQ5_0: return f(TypeTag<Q5_0>());
+    case kQ8_0: return f(TypeTag<Q8_0>());
+    case kQ3K: return f(TypeTag<Q3K>());
+    case kQ4K: return f(TypeTag<Q4K>());
+    case kQ5K: return f(TypeTag<Q5K>());
+    case kQ6K: return f(TypeTag<Q6K>());
     default: return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
 }
@@ -539,6 +587,38 @@ extern "C" int inference_cuda_dequant_gguf_launch(int type, const void *w, float
             const int blocks = (int)(blocks_needed < 1024 ? blocks_needed : 1024);
             dequant<T><<<blocks, kThreads, 4 * (size_t)T::kTabWords, (cudaStream_t)stream>>>(
                 (const unsigned char *)w, y, n_windows, tab);
+            return finish_launch(out_stage, sizeof(tab));
+        });
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_embed_gguf_launch(const inference_cuda_embed_gguf_args *args,
+                                                const void *table, size_t table_bytes,
+                                                void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || stream == NULL || args->blocks == NULL || args->ids == NULL ||
+            args->x == NULL || args->status == NULL || !aligned(args->blocks, 2) ||
+            !aligned(args->ids, 4) || !aligned(args->x, 16) || !aligned(args->status, 4) ||
+            args->m < 1 || args->m > 4096 || args->n_rows < 1 || args->n_rows > (1 << 28) ||
+            args->k < 32 || args->k > 32768) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        return with_type(args->type, [&](auto tag) -> int {
+            using T = typename decltype(tag)::Type;
+            if (args->k % (32 * T::kWinPerBlock) != 0) {
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+            Tab<T::kTabWords> tab;
+            if (!load_table<T>(&tab, table, table_bytes)) {
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+            embed_rows<T><<<args->m, kEmbedThreads, 4 * (size_t)T::kTabWords,
+                            (cudaStream_t)stream>>>((const unsigned char *)args->blocks, args->ids,
+                                                    args->x, args->status, args->n_rows, args->k,
+                                                    tab);
             return finish_launch(out_stage, sizeof(tab));
         });
     } catch (...) {

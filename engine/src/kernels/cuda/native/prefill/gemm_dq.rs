@@ -66,7 +66,7 @@ struct GemmDqMmidArgsRepr {
     x_div: c_int,
     x_row_stride: c_int,
     y_row_stride: c_int,
-    pad: c_int,
+    col_tile: c_int,
 }
 
 const _: () = assert!(
@@ -481,6 +481,9 @@ pub(in crate::kernels::cuda) struct GemmDqMmidRaw<'a> {
     pub(in crate::kernels::cuda) x_row_stride: usize,
     pub(in crate::kernels::cuda) y_row_stride: usize,
     pub(in crate::kernels::cuda) expert_stride: usize,
+    /// The column tile of the launch: 0 chooses from the expected columns per expert, else 64 or
+    /// 128.
+    pub(in crate::kernels::cuda) col_tile: usize,
 }
 
 /// The GGUF type id the grouped entry switches on: the three K-quant and Q4_0 decoders and
@@ -569,7 +572,9 @@ pub(in crate::kernels::cuda) fn gemm_dq_mmid_launch(
         || !apart
         || !call.w.offset().is_multiple_of(w_align)
         || !call.expert_stride.is_multiple_of(w_align)
-        || !call.x.offset().is_multiple_of(4)
+        || !call.x.offset().is_multiple_of(16)
+        || !call.x_row_stride.is_multiple_of(4)
+        || !matches!(call.col_tile, 0 | 64 | 128)
         || !call.y.offset().is_multiple_of(4)
         || !call.ids_dst.offset().is_multiple_of(4)
         || !call.expert_bounds.offset().is_multiple_of(4)
@@ -608,7 +613,7 @@ pub(in crate::kernels::cuda) fn gemm_dq_mmid_launch(
         x_div: int(call.x_div)?,
         x_row_stride: int(call.x_row_stride)?,
         y_row_stride: int(call.y_row_stride)?,
-        pad: 0,
+        col_tile: int(call.col_tile)?,
     };
     // SAFETY: the checks above proved every range inside its live allocation, large enough for
     // the call, aligned, and `y`, the only range the kernel writes, disjoint from the others.

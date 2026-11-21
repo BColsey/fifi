@@ -680,10 +680,9 @@ mod tests {
             .collect()
     }
 
-    /// Known answers from an independent implementation (the numpy decoders of gguf-py at
-    /// llama.cpp acecd5603): sixteen deterministic blocks per type, the f16 scale fields set
-    /// to fixed finite values, the SHA-256 of the f32 output bytes. The expected hashes were
-    /// computed once outside this tree.
+    /// Known answers from an independent decoder: sixteen deterministic blocks per type, the
+    /// f16 scale fields set to fixed finite values, the SHA-256 of the f32 output bytes. The
+    /// expected hashes were computed once outside this tree.
     #[test]
     fn q2_k_iq1_s_and_iq1_m_match_an_independent_decoder() {
         const D: [u16; 16] = [

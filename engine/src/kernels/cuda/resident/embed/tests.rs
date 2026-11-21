@@ -12,6 +12,7 @@ use super::{
     embed_x_bytes, native_blocks_bytes,
 };
 use crate::EngError;
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::step_params::{
     OFFSET_STATUS, OFFSET_TOKEN_ID, StepParams, StepStatus,
 };
@@ -892,54 +893,6 @@ fn embed_native_is_bit_equal_to_the_tiled_gather() {
     }
 }
 
-#[test]
-fn the_native_gather_takes_only_q4_k_blocks() {
-    const NAME: &str = "the_native_gather_takes_only_q4_k_blocks";
-    if !testkit::device_present(NAME) {
-        return;
-    }
-    let rig = Rig::new();
-    let weight = q8_0_native(&rig.ctx);
-    let k = weight.k();
-    let ids_buf = testkit::upload_bytes(&rig.ctx, &1i32.to_le_bytes());
-    let status = testkit::upload_filled(&rig.ctx, 0x55, 8);
-    let x = rig.x_buffer(1, k);
-    let call = EmbedNativeCall {
-        weight: &weight,
-        ids: ids_buf.range(0, 4).expect("ids"),
-        x: x.range(GUARD_BYTES, 4 * k).expect("x"),
-        status: status.range(4, 4).expect("status"),
-        m: 1,
-    };
-    let error = rig
-        .ctx
-        .embed_native(&rig.stream, call)
-        .expect_err("Q8_0 is refused");
-    let text = format!("{error:?}");
-    assert!(
-        text.contains("BadRequest") && text.contains("takes Q4_K blocks"),
-        "{NAME}: {text}"
-    );
-}
-
-/// A Q8_0 native weight of 8 rows: a type the native gather refuses before any launch
-/// (the twin of `q5_0_weight` above).
-fn q8_0_native(ctx: &CudaContext) -> NativeWeight {
-    let source = vec![0_u8; 8 * 16 * 34];
-    let tensor = QuantTensor {
-        name: "q8_0",
-        ty: GgufType::Q80,
-        n_rows: 8,
-        k: 512,
-        source_len: source.len(),
-    };
-    ctx.upload_native(tensor, CHUNK_LIMIT, &mut |at, buf| {
-        buf.copy_from_slice(&source[at..at + buf.len()]);
-        Ok(())
-    })
-    .expect("upload the Q8_0 native weight")
-}
-
 /// A Q4_K native weight of 8 rows marked as a 4-expert stack: the gather refuses it (an
 /// embedding table is a plain matrix).
 fn native_stack(ctx: &CudaContext) -> NativeWeight {
@@ -964,9 +917,10 @@ fn native_shape_and_blocks_bytes_rules_need_no_device() {
     // `check_native_shape` has no 8-row rule: one row and 12 rows are gather shapes, and
     // the bound is inclusive at 2^28 rows (the tiled twin refuses 12 rows and stops at a
     // multiple of 8).
-    check_native_shape(1, 256).expect("one row");
-    check_native_shape(12, 256).expect("12 rows: no 8-row rule");
-    check_native_shape(1 << 28, 256).expect("the largest table");
+    check_native_shape(QuantType::Q4K, 1, 256).expect("one row");
+    check_native_shape(QuantType::Q4K, 12, 256).expect("12 rows: no 8-row rule");
+    check_native_shape(QuantType::Q4K, 1 << 28, 256).expect("the largest table");
+    check_native_shape(QuantType::Q80, 8, 32).expect("one Q8_0 block per row");
     for (rows, k) in [
         (0, 256),
         ((1 << 28) + 1, 256),
@@ -976,23 +930,23 @@ fn native_shape_and_blocks_bytes_rules_need_no_device() {
         (8, 33_024),
     ] {
         assert_bad_request(
-            check_native_shape(rows, k),
+            check_native_shape(QuantType::Q4K, rows, k),
             &format!("{rows} x {k}"),
             &[&rows.to_string(), &k.to_string()],
         );
     }
     // `native_blocks_bytes`: 144 bytes per 256 values, and the size refuses to overflow.
     assert_eq!(
-        native_blocks_bytes(8, 256).expect("one block per row"),
+        native_blocks_bytes(QuantType::Q4K, 8, 256).expect("one block per row"),
         8 * 144
     );
     assert_eq!(
-        native_blocks_bytes(64, 512).expect("the fixture table"),
+        native_blocks_bytes(QuantType::Q4K, 64, 512).expect("the fixture table"),
         64 * 2 * 144
     );
     assert!(
         matches!(
-            native_blocks_bytes(usize::MAX, 32_768),
+            native_blocks_bytes(QuantType::Q4K, usize::MAX, 32_768),
             Err(EngError::BadRequest(message)) if message.contains("table size overflows")
         ),
         "the largest row count must refuse to overflow"
@@ -1009,7 +963,6 @@ fn embed_native_rejects_bad_calls_before_any_launch() {
     let other_ctx = CudaContext::new().expect("second context");
     let table = Table::new(&rig.ctx, GgufType::Q4K, (64, 512), Scales::Mixed, 0x4c0a);
     let native = native_table(&rig.ctx, table.n_rows, table.k, &table.source);
-    let q8 = q8_0_native(&rig.ctx);
     let stack = native_stack(&rig.ctx);
     let ints: Vec<u8> = (1..=4100_i32).flat_map(i32::to_le_bytes).collect();
     let big = 4 * 4097 * 512 + 64;
@@ -1054,7 +1007,7 @@ fn embed_native_rejects_bad_calls_before_any_launch() {
     let (ids_ok, x_ok, st_ok) = (at(ids, 0, 8), at(x, 0, 4096), at(status, 0, 4));
     let s = &rig.stream;
     type Case<'a> = (&'a str, &'a [&'a str], &'a dyn Fn() -> Result<(), EngError>);
-    let cases: [Case<'_>; 17] = [
+    let cases: [Case<'_>; 16] = [
         ("m 0", &["1 to 4096 tokens", "got 0"], &|| {
             try_call(w, 0, ids_ok, x_ok, st_ok, s)
         }),
@@ -1067,9 +1020,6 @@ fn embed_native_rejects_bad_calls_before_any_launch() {
                 st_ok,
                 s,
             )
-        }),
-        ("Q8_0 weight", &["takes Q4_K blocks", "Q80"], &|| {
-            try_call(&q8, 2, ids_ok, x_ok, st_ok, s)
         }),
         (
             "expert stack weight",

@@ -87,6 +87,7 @@ const fn native_block(ty: GgufType) -> Option<(u64, u64)> {
         GgufType::Q50 => Some((32, 22)),
         GgufType::Q5K => Some((256, 176)),
         GgufType::Q40 => Some((32, 18)),
+        GgufType::Q3K => Some((256, 110)),
         // The in-house codebook matvec types (native/resident/matvec_gguf.cu).
         GgufType::Iq4Nl => Some((32, 18)),
         GgufType::Q20 => Some((64, 18)),
@@ -571,9 +572,13 @@ mod tests {
                 "{ty:?}"
             );
         }
-        assert!(matches!(
+        assert_eq!(
             native_device_bytes("w", GgufType::Q3K, &[256, 8]),
-            Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q3K")
+            Ok(8 * 110)
+        );
+        assert!(matches!(
+            native_device_bytes("w", GgufType::Q41, &[256, 8]),
+            Err(EngError::Checkpoint(message)) if message.contains("tensor w has type Q41")
         ));
         // F32 and F16 count as in the tiled plan: raw copies in both layouts.
         assert_eq!(native_device_bytes("norm", GgufType::F32, &[5]), Ok(20));

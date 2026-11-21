@@ -283,25 +283,25 @@ fn an_f16_tensor_fails_the_open_naming_the_tensor_and_type() {
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
+        "gguf model: tensor blk.1.attn_k.weight has type F16, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
 }
 
 #[test]
-fn a_q5_k_expert_stack_fails_the_open_naming_the_tensor() {
+fn a_q4_1_expert_stack_fails_the_open_naming_the_tensor() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
     replace(
         &mut tensors,
         "blk.1.ffn_gate_exps.weight",
-        GgufType::Q5K,
+        GgufType::Q41,
         vec![512, 256, 8],
     );
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
+        "gguf model: tensor blk.1.ffn_gate_exps.weight has type Q4_1, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
 }
 
@@ -313,6 +313,9 @@ fn a_codebook_expert_stack_opens() {
         GgufType::Iq2S,
         GgufType::Iq3Xxs,
         GgufType::Q2K,
+        GgufType::Q3K,
+        GgufType::Q5K,
+        GgufType::Q40,
     ] {
         let kvs = metadata("qwen35moe", spec_counts(&spec));
         let mut tensors = file_tensors(&spec);
@@ -335,21 +338,16 @@ fn a_codebook_expert_stack_opens() {
 }
 
 #[test]
-fn an_in_house_token_embedding_fails_the_open_naming_the_tensor() {
+fn a_native_type_token_embedding_opens() {
     let spec = TWO_LAYER_SPEC;
-    let kvs = metadata("qwen35moe", spec_counts(&spec));
-    let mut tensors = file_tensors(&spec);
-    replace(
-        &mut tensors,
-        "token_embd.weight",
-        GgufType::Q5K,
-        vec![512, 64],
-    );
-    let message = rejection(open(&kvs, &tensors, &spec));
-    assert_eq!(
-        message,
-        "gguf model: tensor token_embd.weight has type Q5_K, expected one of Q4_K, Q6_K, Q8_0"
-    );
+    for ty in [GgufType::Q5K, GgufType::Q3K, GgufType::Iq4Nl, GgufType::Q40] {
+        let kvs = metadata("qwen35moe", spec_counts(&spec));
+        let mut tensors = file_tensors(&spec);
+        replace(&mut tensors, "token_embd.weight", ty, vec![512, 24]);
+        let model = open(&kvs, &tensors, &spec)
+            .unwrap_or_else(|error| panic!("{ty:?} token embedding must open: {error:?}"));
+        assert_eq!(model.plan.tensors().count(), tensors.len(), "{ty:?}");
+    }
 }
 
 #[test]
@@ -376,6 +374,8 @@ fn a_codebook_dense_projection_opens() {
         GgufType::Iq3Xxs,
         GgufType::Q2K,
         GgufType::Iq1S,
+        GgufType::Q3K,
+        GgufType::Q50,
     ] {
         let kvs = metadata("qwen35moe", spec_counts(&spec));
         let mut tensors = file_tensors(&spec);
@@ -387,20 +387,20 @@ fn a_codebook_dense_projection_opens() {
 }
 
 #[test]
-fn a_q3_k_tensor_fails_the_open_naming_the_tensor_and_type() {
+fn a_q4_1_tensor_fails_the_open_naming_the_tensor_and_type() {
     let spec = TWO_LAYER_SPEC;
     let kvs = metadata("qwen35moe", spec_counts(&spec));
     let mut tensors = file_tensors(&spec);
     replace(
         &mut tensors,
         "blk.1.attn_k.weight",
-        GgufType::Q3K,
+        GgufType::Q41,
         vec![512, 256],
     );
     let message = rejection(open(&kvs, &tensors, &spec));
     assert_eq!(
         message,
-        "gguf model: tensor blk.1.attn_k.weight has type Q3_K, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
+        "gguf model: tensor blk.1.attn_k.weight has type Q4_1, expected one of Q4_K, Q5_K, Q4_0, Q6_K, Q8_0, Q5_0, Q3_K, IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, Q2_0, Q2_K"
     );
 }
 

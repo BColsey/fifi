@@ -19,24 +19,6 @@ fn geometry() -> MixerGeometry {
 }
 
 #[test]
-fn the_native_embed_takes_q4_k_blocks_only() {
-    use super::resources::check_native_embed;
-    use crate::kernels::cuda::resident::matvec_q::QuantType;
-    assert!(check_native_embed("token_embd.weight", QuantType::Q4K).is_ok());
-    for quant in [QuantType::Q6K, QuantType::Q50, QuantType::Q80] {
-        match check_native_embed("token_embd.weight", quant) {
-            Err(EngError::Checkpoint(message)) => {
-                assert!(
-                    message.contains("Q4_K") && message.contains("token_embd.weight"),
-                    "{message}"
-                )
-            }
-            other => panic!("a {quant:?} embedding table must be refused: {other:?}"),
-        }
-    }
-}
-
-#[test]
 fn the_native_projection_columns_are_aligned() {
     let g = geometry();
     let (d, a) = (&g.delta, &g.attn);

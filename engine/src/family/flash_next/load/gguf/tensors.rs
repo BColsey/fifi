@@ -838,17 +838,12 @@ mod cuda_tests {
     /// formats are one set with one geometry.
     #[test]
     fn the_native_type_list_is_the_kernel_formats() {
-        // Q3_K has a dense kernel, but its loader wiring is held back: it is not in the list.
-        let mut from_kernels: Vec<u32> = ALL_KERNELS
-            .into_iter()
-            .filter(|q| *q != QuantType::Q3K)
-            .map(|q| gguf_type(q).id())
-            .collect();
+        let mut from_kernels: Vec<u32> = ALL_KERNELS.map(|q| gguf_type(q).id()).to_vec();
         let mut listed: Vec<u32> = GgufType::native_types().iter().map(|ty| ty.id()).collect();
         from_kernels.sort_unstable();
         listed.sort_unstable();
         assert_eq!(listed, from_kernels);
-        for quant in ALL_KERNELS.into_iter().filter(|q| *q != QuantType::Q3K) {
+        for quant in ALL_KERNELS {
             let ty = gguf_type(quant);
             assert_eq!(ty.block_elems() as usize, quant.block_size(), "{ty:?}");
             assert_eq!(ty.block_bytes() as usize, quant.block_bytes(), "{ty:?}");

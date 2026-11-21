@@ -37,7 +37,6 @@ use crate::{
         resident::{
             attn_decode_q8::{AttnQ8Shape, paged::PagedQ8Scratch},
             matmul_expert::ExpertStack,
-            matvec_q::QuantType,
         },
     },
     weights::GgufType,
@@ -728,15 +727,6 @@ impl GlobalWeight<'_> {
     }
 }
 
-pub(super) fn check_native_embed(name: &str, quant: QuantType) -> Result<(), EngError> {
-    if quant == QuantType::Q4K {
-        return Ok(());
-    }
-    Err(EngError::Checkpoint(format!(
-        "step weights: {name} is {quant:?}, the native embedding gather takes Q4_K blocks"
-    )))
-}
-
 fn exl3_global<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -793,9 +783,6 @@ impl<'w> GlobalWeights<'w> {
             }
         };
         let embed = global(&names.embed, &specs.embed)?;
-        if let GlobalWeight::Native(weight) = embed {
-            check_native_embed(&names.embed, weight.quant())?;
-        }
         Ok(Self {
             embed,
             head: global(&names.head, &specs.head)?,

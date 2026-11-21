@@ -4,6 +4,8 @@
 
 use super::{DqMmidCall, MmidIds, MmidLaunchCall, MmidQuantCall, MmidWeight};
 use crate::EngError;
+use crate::kernels::cuda::prefill::mmq_size::Q8_1Layout;
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, NativeWeight};
 
 /// The `MmidWeight` of one routed stack (stages 13a, 13b, 16): the whole stack buffer, its
@@ -29,15 +31,55 @@ pub(crate) fn routed_weight<'a>(
     })
 }
 
-/// What one routed GEMM of a stage reads: the vendored grouped MMQ reads the q8_1 columns `q8`,
-/// the in-house dequantizing GEMM the f32 `rows` (the token rows of the gate and up input, or
-/// the slot rows of the down input when `per_slot`), so a stage quantizes only for the stacks
-/// that need it.
-pub(crate) struct RoutedX<'a> {
+/// The q8_1 layout a shared quantize buffer holds right now. Vendored GEMMs of one group may
+/// need different layouts (Q8_0 and Q6_K read the D4 form, Q4_K the DS4 form), so a role whose
+/// layout differs quantizes the buffer again before it launches; a role of the layout the buffer
+/// already holds reads it as it is.
+#[derive(Default)]
+pub(crate) struct Q8Cursor(std::cell::Cell<Option<Q8_1Layout>>);
+
+impl Q8Cursor {
+    /// Runs `quantize` unless the buffer already holds the layout of a `quant` weight.
+    pub(crate) fn ensure(
+        &self,
+        quant: QuantType,
+        quantize: impl FnOnce() -> Result<(), EngError>,
+    ) -> Result<(), EngError> {
+        let layout = super::mmq_type_of(quant)?.q8_1_layout();
+        if self.0.get() != Some(layout) {
+            quantize()?;
+            self.0.set(Some(layout));
+        }
+        Ok(())
+    }
+
+    /// Records that the buffer was quantized for a `quant` weight.
+    pub(crate) fn note(&self, quant: QuantType) {
+        if let Ok(ty) = mmq_type_of(quant) {
+            self.0.set(Some(ty.q8_1_layout()));
+        }
+    }
+}
+
+/// How the q8_1 columns of a routed stage are built for a vendored stack: from the f32 rows
+/// through the ids (`gather` for the down input, else the scatter of the gate and up input).
+pub(crate) struct RoutedQuant<'q> {
+    pub(crate) ids: &'q MmidIds<'q>,
+    pub(crate) gather: bool,
+    pub(crate) packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
+    pub(crate) cursor: Q8Cursor,
+}
+
+/// What one routed GEMM of a stage reads: the vendored grouped MMQ reads the q8_1 columns `q8`
+/// (built on demand, at the layout of the stack that reads them), the in-house dequantizing GEMM
+/// the f32 `rows` (the token rows of the gate and up input, or the slot rows of the down input
+/// when `per_slot`), so a stage quantizes only for the stacks that need it.
+pub(crate) struct RoutedX<'a, 'q> {
     pub(crate) q8: DeviceRange<'a>,
     pub(crate) rows: DeviceRange<'a>,
     pub(crate) row_stride: usize,
     pub(crate) per_slot: bool,
+    pub(crate) quant: RoutedQuant<'q>,
 }
 
 /// One routed GEMM of `weight` over `ids`: the dequantizing GEMM for the in-house types, the
@@ -48,7 +90,7 @@ pub(crate) fn routed_gemm(
     stream: &DeviceStream,
     weight: &NativeWeight,
     ids: &MmidIds<'_>,
-    x: &RoutedX<'_>,
+    x: &RoutedX<'_, '_>,
     ld: usize,
     dst: DeviceRange<'_>,
     fixup: DeviceRange<'_>,
@@ -67,9 +109,25 @@ pub(crate) fn routed_gemm(
                 x_per_slot: x.per_slot,
                 y: dst,
                 ld,
+                col_tile: 0,
             },
         )
     } else {
+        x.quant.cursor.ensure(weight.quant(), || {
+            let call = MmidQuantCall {
+                packing: x.quant.packing,
+                quant: weight.quant(),
+                k: weight.k(),
+                row_stride: x.row_stride,
+                x: x.rows,
+                y: x.q8,
+            };
+            if x.quant.gather {
+                ctx.mmq_quantize_gather_ids(stream, x.quant.ids, call)
+            } else {
+                ctx.mmq_quantize_scatter_ids(stream, x.quant.ids, call)
+            }
+        })?;
         ctx.mmq_mmid_launch(
             stream,
             MmidLaunchCall {
@@ -82,38 +140,5 @@ pub(crate) fn routed_gemm(
                 fixup,
             },
         )
-    }
-}
-
-/// The q8_1 quantize feeding the stacks of one stage (`gather` for the down input, else the
-/// scatter of the gate and up input): one quantize at the layout of the first stack that rides
-/// the vendored MMQ, none when every stack rides the dequantizing GEMM.
-#[allow(clippy::too_many_arguments)] // one quantize description: ids, stacks, packing, shape, buffers
-pub(crate) fn routed_quantize(
-    ctx: &CudaContext,
-    stream: &DeviceStream,
-    ids: &MmidIds<'_>,
-    stacks: &[&NativeWeight],
-    gather: bool,
-    packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking,
-    k: usize,
-    x: DeviceRange<'_>,
-    y: DeviceRange<'_>,
-) -> Result<(), EngError> {
-    let Some(vendored) = stacks.iter().find(|w| !w.quant().uses_dequantizing_gemm()) else {
-        return Ok(());
-    };
-    let call = MmidQuantCall {
-        packing,
-        quant: vendored.quant(),
-        k,
-        row_stride: k,
-        x,
-        y,
-    };
-    if gather {
-        ctx.mmq_quantize_gather_ids(stream, ids, call)
-    } else {
-        ctx.mmq_quantize_scatter_ids(stream, ids, call)
     }
 }

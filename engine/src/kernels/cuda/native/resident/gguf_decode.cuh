@@ -123,6 +123,10 @@ enum {
     kIq4Xs = 23,
     kQ2_0 = 42,
     kQ4_0 = 2,
+    kQ5_0 = 6,
+    kQ8_0 = 8,
+    kQ4K = 12,
+    kQ6K = 14,
     kQ3K = 11,
     kQ5K = 13,
     kQ2K = 10,
@@ -627,6 +631,295 @@ struct Iq1M {
         const float d = __half2float(__ushort_as_half((unsigned short)r.dbits));
         o.s0 = __fmul_rn(d, (float)(2 * (int)((r.word >> r.shift) & 7u) + 1));
         o.s1 = __fmul_rn(d, (float)(2 * (int)((r.word >> (r.shift + 3)) & 7u) + 1));
+    }
+};
+
+
+/* Byte j of the result is bit j of the low nibble of nib (0 or 1). */
+__device__ __forceinline__ unsigned bits_to_bytes(unsigned nib) {
+    return (nib * 0x00204081u) & 0x01010101u;
+}
+
+/* Loads the four 32-bit words at p (2-byte aligned). */
+__device__ __forceinline__ void load_words(const unsigned char *p, unsigned *q, int n) {
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        q[i] = rd32(p + 4 * i);
+    }
+}
+
+/* Q4_0: 18-byte block, f16 d then 16 code bytes; weight j (0..15) is the low nibble of byte j
+ * minus 8, weight 16 + j the high nibble. */
+struct Q4_0 {
+    static constexpr int kBlockBytes = 18;
+    static constexpr int kWinPerBlock = 1;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned q[4];
+        float d;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int) {
+        Raw r;
+        r.d = rd_half(blk);
+        load_words(blk + 2, r.q, 4);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            o.w[i] = (int)__vsub4(r.q[i] & 0x0F0F0F0Fu, 0x08080808u);
+            o.w[4 + i] = (int)__vsub4((r.q[i] >> 4) & 0x0F0F0F0Fu, 0x08080808u);
+        }
+        o.s0 = r.d;
+        o.s1 = r.d;
+    }
+};
+
+/* Q5_0: 22-byte block, f16 d, the 32 fifth bits qh, then 16 code bytes laid out like Q4_0;
+ * the weight is (nibble | fifth bit << 4) - 16. */
+struct Q5_0 {
+    static constexpr int kBlockBytes = 22;
+    static constexpr int kWinPerBlock = 1;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned q[4];
+        unsigned qh;
+        float d;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int) {
+        Raw r;
+        r.d = rd_half(blk);
+        r.qh = rd32(blk + 2);
+        load_words(blk + 6, r.q, 4);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned low = (r.q[i] & 0x0F0F0F0Fu) | (bits_to_bytes((r.qh >> (4 * i)) & 0xFu) << 4);
+            const unsigned high = ((r.q[i] >> 4) & 0x0F0F0F0Fu) |
+                                  (bits_to_bytes((r.qh >> (16 + 4 * i)) & 0xFu) << 4);
+            o.w[i] = (int)__vsub4(low, 0x10101010u);
+            o.w[4 + i] = (int)__vsub4(high, 0x10101010u);
+        }
+        o.s0 = r.d;
+        o.s1 = r.d;
+    }
+};
+
+/* Q8_0: 34-byte block, f16 d then 32 int8 weights. */
+struct Q8_0 {
+    static constexpr int kBlockBytes = 34;
+    static constexpr int kWinPerBlock = 1;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned q[8];
+        float d;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int) {
+        Raw r;
+        r.d = rd_half(blk);
+        load_words(blk + 2, r.q, 8);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o.w[i] = (int)r.q[i];
+        }
+        o.s0 = r.d;
+        o.s1 = r.d;
+    }
+};
+
+/* The 6-bit scale and minimum of group g (0..7) of a Q4_K or Q5_K block, packed in 12 bytes. */
+__device__ __forceinline__ void scale_min_k4(const unsigned char *scales, int g, unsigned &sc,
+                                             unsigned &mn) {
+    if (g < 4) {
+        sc = scales[g] & 63u;
+        mn = scales[g + 4] & 63u;
+    } else {
+        sc = (scales[g + 4] & 0x0Fu) | ((unsigned)(scales[g - 4] >> 6) << 4);
+        mn = (scales[g + 4] >> 4) | ((unsigned)(scales[g] >> 6) << 4);
+    }
+}
+
+/* Q4_K: 144-byte super-block: f16 d, f16 dmin, 12 packed scale bytes, 128 code bytes. Window g
+ * (0..7) reads the 32 bytes at 32 * (g / 2) and takes their low nibbles for even g, high for odd;
+ * the weight is d * sc * q - dmin * mn (the product rounded before the subtraction). */
+struct Q4K {
+    static constexpr int kBlockBytes = 144;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = true;
+    struct Raw {
+        unsigned q[8];
+        unsigned shift;
+        float s, m;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int g) {
+        Raw r;
+        const float d = rd_half(blk);
+        const float dmin = rd_half(blk + 2);
+        unsigned sc, mn;
+        scale_min_k4(blk + 4, g, sc, mn);
+        r.s = __fmul_rn(d, (float)sc);
+        r.m = __fmul_rn(dmin, (float)mn);
+        r.shift = 4 * (g & 1);
+        load_words(blk + 16 + 32 * (g >> 1), r.q, 8);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o.w[i] = (int)((r.q[i] >> r.shift) & 0x0F0F0F0Fu);
+        }
+        o.s0 = r.s;
+        o.s1 = r.s;
+        o.m0 = r.m;
+        o.m1 = r.m;
+    }
+};
+
+/* Q5_K: 176-byte super-block: Q4_K's header, then 32 high-bit bytes, then 128 code bytes. The
+ * fifth bit of weight l of window g is bit g of high-bit byte l. */
+struct Q5K {
+    static constexpr int kBlockBytes = 176;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = true;
+    struct Raw {
+        unsigned q[8];
+        unsigned h[8];
+        unsigned shift;
+        unsigned g;
+        float s, m;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int g) {
+        Raw r;
+        const float d = rd_half(blk);
+        const float dmin = rd_half(blk + 2);
+        unsigned sc, mn;
+        scale_min_k4(blk + 4, g, sc, mn);
+        r.s = __fmul_rn(d, (float)sc);
+        r.m = __fmul_rn(dmin, (float)mn);
+        r.shift = 4 * (g & 1);
+        r.g = (unsigned)g;
+        load_words(blk + 16, r.h, 8);
+        load_words(blk + 48 + 32 * (g >> 1), r.q, 8);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o.w[i] = (int)(((r.q[i] >> r.shift) & 0x0F0F0F0Fu) | (((r.h[i] >> r.g) & 0x01010101u) << 4));
+        }
+        o.s0 = r.s;
+        o.s1 = r.s;
+        o.m0 = r.m;
+        o.m1 = r.m;
+    }
+};
+
+/* Q6_K: 210-byte super-block: 128 low-nibble bytes, 64 two-bit bytes, 16 int8 group scales, f16 d
+ * last. Window wi (half = wi / 4, quadrant qd = wi % 4) reads the 32 low bytes at 64 * half +
+ * 32 * (qd % 2) (the low nibble for qd < 2, the high for qd >= 2) and the 32 high bytes at
+ * 128 + 32 * half (bit pair 2 * qd); the weight is (q - 32) * d * scale[8 * half + 2 * qd + g]. */
+struct Q6K {
+    static constexpr int kBlockBytes = 210;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned q[8];
+        unsigned h[8];
+        unsigned low_shift;
+        unsigned high_shift;
+        float s0, s1;
+    };
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int wi) {
+        Raw r;
+        const int half = wi >> 2, qd = wi & 3;
+        const float d = rd_half(blk + 208);
+        r.s0 = __fmul_rn(d, (float)(int)(signed char)blk[192 + 8 * half + 2 * qd]);
+        r.s1 = __fmul_rn(d, (float)(int)(signed char)blk[192 + 8 * half + 2 * qd + 1]);
+        r.low_shift = 4 * (qd >> 1);
+        r.high_shift = 2 * qd;
+        load_words(blk + 64 * half + 32 * (qd & 1), r.q, 8);
+        load_words(blk + 128 + 32 * half, r.h, 8);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const unsigned v = ((r.q[i] >> r.low_shift) & 0x0F0F0F0Fu) |
+                               (((r.h[i] >> r.high_shift) & 0x03030303u) << 4);
+            o.w[i] = (int)__vsub4(v, 0x20202020u);
+        }
+        o.s0 = r.s0;
+        o.s1 = r.s1;
+    }
+};
+
+/* Q3_K: 110-byte super-block: 32 high-bit bytes, 64 two-bit bytes, 12 packed 6-bit group scales,
+ * f16 d last. Window wi (half = wi / 4, j = wi % 4) reads the 32 bytes at 32 + 32 * half (bit
+ * pair 2 * j) and bit wi of the 32 high-bit bytes: a set bit adds 4, and the weight is
+ * (code + 4 * bit - 4) * (d * (scale - 32)) with the two groups 2 * wi and 2 * wi + 1. */
+struct Q3K {
+    static constexpr int kBlockBytes = 110;
+    static constexpr int kWinPerBlock = 8;
+    static constexpr int kTabWords = 4;
+    static constexpr int kHostTabWords = 0;
+    static constexpr bool kHasAdd = false;
+    static constexpr bool kHasMin = false;
+    struct Raw {
+        unsigned q[8];
+        unsigned h[8];
+        unsigned shift;
+        unsigned wi;
+        float s0, s1;
+    };
+    static __device__ __forceinline__ int group_scale(const unsigned char *ks, int s) {
+        const int row = s >> 2, col = s & 3;
+        const unsigned nib = (ks[(col + 4 * row) & 7] >> (4 * (row >> 1))) & 0x0Fu;
+        const unsigned h2 = (ks[8 + col] >> (2 * row)) & 3u;
+        return (int)(nib | (h2 << 4)) - 32;
+    }
+    static __device__ __forceinline__ Raw load(const unsigned char *blk, int wi) {
+        Raw r;
+        const float d = rd_half(blk + 108);
+        r.s0 = __fmul_rn(d, (float)group_scale(blk + 96, 2 * wi));
+        r.s1 = __fmul_rn(d, (float)group_scale(blk + 96, 2 * wi + 1));
+        r.shift = 2 * (wi & 3);
+        r.wi = (unsigned)wi;
+        load_words(blk, r.h, 8);
+        load_words(blk + 32 + 32 * (wi >> 2), r.q, 8);
+        return r;
+    }
+    static __device__ __forceinline__ void decode(const Raw &r, const uint32_t *, Win &o) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const unsigned v = ((r.q[i] >> r.shift) & 0x03030303u) |
+                               (((r.h[i] >> r.wi) & 0x01010101u) << 2);
+            o.w[i] = (int)__vsub4(v, 0x04040404u);
+        }
+        o.s0 = r.s0;
+        o.s1 = r.s1;
     }
 };
 
