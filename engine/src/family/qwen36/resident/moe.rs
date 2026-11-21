@@ -20,6 +20,7 @@
 //! node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
+use super::stream_timing::ForwardTiming;
 use super::weights::{ExpertPages, RDense, RMoe};
 use crate::{
     EngError,
@@ -108,7 +109,7 @@ pub(super) fn step(
     x: &ExecutionTensor,
     post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
-    step_with_checkpoint(ctx, shape, w, x, post_norm, None)
+    step_with_checkpoint(ctx, shape, w, x, post_norm, None, &mut None)
 }
 
 pub(super) fn step_with_checkpoint(
@@ -118,18 +119,25 @@ pub(super) fn step_with_checkpoint(
     x: &ExecutionTensor,
     post_norm: &ExecutionTensor,
     ckpt: Option<&StreamedCheckpoint>,
+    timing: &mut Option<ForwardTiming>,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
     // The folded post-attention norm: the same op the step loop used to run, relocated inside
     // the block so the eager and compiled paths share one contract over the raw residual stream.
     let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
-    let (routed, host) = route_row(ctx, shape, w, &normed)?;
+    let (routed, host) = route_row(ctx, shape, w, &normed, timing.as_mut())?;
     let queued_shared = if w.overlaps_expert_reads() {
         let output = shared(ctx, w, &normed)?;
         Some(submit_shared_expert(ctx.kernels, output)?)
     } else {
         None
     };
+    let stage_started = timing.as_ref().map(|_| std::time::Instant::now());
     let staged = w.stage_selection(ctx.kernels, ckpt, &routed.indices, 1)?;
+    ForwardTiming::stage_ready(
+        timing.as_mut(),
+        stage_started,
+        staged.as_ref().map(|(pages, _)| pages),
+    )?;
     let (pages, indices) = if let Some((pages, local)) = &staged {
         (pages, local)
     } else {
@@ -151,6 +159,7 @@ pub(super) fn step_with_checkpoint(
     // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
     let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     let selection = routed.indices.into_iter().zip(routed.weights).collect();
+    ForwardTiming::stage_end(timing.as_mut(), stage_started);
     Ok((out, (selection, host)))
 }
 
@@ -163,16 +172,19 @@ fn route_row(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+    timing: Option<&mut ForwardTiming>,
 ) -> Result<(crate::family::route::Routed, Vec<f32>), EngError> {
     let m = &shape.moe;
     // Router probabilities softmax(x · router_t) `[1, E]`, read back once.
     let logits = ctx.kernels.mm(x, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     let host = values(ctx.kernels, &probs)?;
-    expect_len(&host, m.experts, "moe router")?;
-    let top_k = u32::try_from(m.top_k)
-        .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
-    let routed = route_experts(&host, &Router::SoftmaxTopK { renorm: m.renorm }, top_k)?;
+    let routed = ForwardTiming::host_route(timing, || {
+        expect_len(&host, m.experts, "moe router")?;
+        let top_k = u32::try_from(m.top_k)
+            .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
+        route_experts(&host, &Router::SoftmaxTopK { renorm: m.renorm }, top_k)
+    })?;
     Ok((routed, host))
 }
 

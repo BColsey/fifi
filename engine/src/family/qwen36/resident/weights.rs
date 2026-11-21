@@ -467,7 +467,11 @@ impl ExpertSlices {
                 quantization: stack.spec,
             })
             .collect();
+        #[cfg(feature = "native-fault-qualification")]
+        let started = std::time::Instant::now();
         let (imported, plain) = kernels.import_packed_pages(&pages, &wrapped, &[])?;
+        #[cfg(feature = "native-fault-qualification")]
+        crate::family::stored::record_page_import(started.elapsed());
         if !plain.is_empty() {
             return Err(short_import());
         }

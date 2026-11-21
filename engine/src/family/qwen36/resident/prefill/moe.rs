@@ -26,6 +26,7 @@
 
 use super::super::chunk_plan::{PairPlan, pair_plan, require_sorted_experts};
 use super::super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
+use super::super::stream_timing::ForwardTiming;
 use super::super::weights::RMoe;
 use crate::{
     EngError,
@@ -105,7 +106,7 @@ pub(super) fn chunk(
     w: &RMoe,
     x: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Vec<Routed>), EngError> {
-    chunk_with_checkpoint(ctx, shape, w, x, None)
+    chunk_with_checkpoint(ctx, shape, w, x, None, &mut None)
 }
 
 pub(super) fn chunk_with_checkpoint(
@@ -114,6 +115,7 @@ pub(super) fn chunk_with_checkpoint(
     w: &RMoe,
     x: &ExecutionTensor,
     ckpt: Option<&StreamedCheckpoint>,
+    timing: &mut Option<ForwardTiming>,
 ) -> Result<(ExecutionTensor, Vec<Routed>), EngError> {
     let m = &shape.moe;
     let hidden = dim(shape.hidden)?;
@@ -131,22 +133,25 @@ pub(super) fn chunk_with_checkpoint(
     let logits = ctx.kernels.mm(x, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     let host = values(ctx.kernels, &probs)?;
-    expect_len(
-        &host,
-        m.experts
-            .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
-            .ok_or_else(|| EngError::BadRequest("moe chunk size overflows".into()))?,
-        "moe chunk router",
-    )?;
-    let top_k = u32::try_from(m.top_k)
-        .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
-    let router = Router::SoftmaxTopK { renorm: m.renorm };
-    let routed = host
-        .chunks_exact(m.experts)
-        .map(|row| route_experts(row, &router, top_k))
-        .collect::<Result<Vec<_>, _>>()?;
-    let plan = pair_plan(&routed, m.top_k, m.experts)?;
-    require_sorted_experts(&plan.experts)?;
+    let (routed, plan, top_k) = ForwardTiming::host_route(timing.as_mut(), || {
+        expect_len(
+            &host,
+            m.experts
+                .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
+                .ok_or_else(|| EngError::BadRequest("moe chunk size overflows".into()))?,
+            "moe chunk router",
+        )?;
+        let top_k = u32::try_from(m.top_k)
+            .map_err(|_| EngError::BadRequest("resident moe top-k exceeds u32".into()))?;
+        let router = Router::SoftmaxTopK { renorm: m.renorm };
+        let routed = host
+            .chunks_exact(m.experts)
+            .map(|row| route_experts(row, &router, top_k))
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = pair_plan(&routed, m.top_k, m.experts)?;
+        require_sorted_experts(&plan.experts)?;
+        Ok::<_, EngError>((routed, plan, top_k))
+    })?;
     let pairs = dim(plan.experts.len())?;
     let queued_shared = if w.overlaps_expert_reads() {
         let output = shared_rows(ctx, w, x)?;
@@ -154,7 +159,13 @@ pub(super) fn chunk_with_checkpoint(
     } else {
         None
     };
+    let stage_started = timing.as_ref().map(|_| std::time::Instant::now());
     let staged = w.stage_selection(ctx.kernels, ckpt, &plan.experts, rows)?;
+    ForwardTiming::stage_ready(
+        timing.as_mut(),
+        stage_started,
+        staged.as_ref().map(|(pages, _)| pages),
+    )?;
     let (pages, local) = if let Some((pages, local)) = &staged {
         (pages, local)
     } else {
@@ -203,6 +214,7 @@ pub(super) fn chunk_with_checkpoint(
     if staged.is_some() {
         ctx.kernels.evaluate(&[&out])?;
     }
+    ForwardTiming::stage_end(timing.as_mut(), stage_started);
     Ok((out, routed))
 }
 
