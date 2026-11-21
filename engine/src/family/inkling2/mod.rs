@@ -34,6 +34,8 @@ pub(crate) const FAMILY: &str = "inkling2_loop";
 const CPU_REFERENCE_ENV: &str = "FIFI_INKLING_CPU_REFERENCE";
 const CUDA_REFERENCE_ENV: &str = "FIFI_INKLING_CUDA_REFERENCE";
 pub(crate) const DEFAULT_TEXT_CONTEXT: u32 = 128;
+#[cfg(target_pointer_width = "64")]
+const MAX_PREFILL_ROWS: usize = 16;
 
 pub(crate) fn text_context() -> Result<u32, EngError> {
     const NAME: &str = "FIFI_INKLING_CONTEXT_TOKENS";

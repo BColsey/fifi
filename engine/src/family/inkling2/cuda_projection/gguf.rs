@@ -12,6 +12,7 @@ use crate::{
         CudaContext, DeviceBuffer, DeviceRange,
         plan::{Demand, admit},
     },
+    sched::job::PrefillBankReport,
     weights::{GgufType, repack_nvfp4_into},
 };
 
@@ -27,6 +28,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     dense: BTreeMap<String, Resident>,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
+    prefill_report: Option<RefCell<PrefillBankReport>>,
     stream_banks: Option<RefCell<crate::expert_tier::CudaStreamBanks>>,
     expert_codes: DeviceBuffer,
     expert_scales: DeviceBuffer,
@@ -112,6 +114,9 @@ impl GgufCuda {
             dense,
             resident,
             cache: RefCell::default(),
+            prefill_report: (stream
+                && std::env::var("FIFI_INKLING_CUDA_PROFILE").as_deref() == Ok("1"))
+            .then(RefCell::default),
             stream_banks,
             expert_codes,
             expert_scales,

@@ -39,6 +39,8 @@ Set `FIFI_INKLING_CUDA_CACHE_EXPERTS=1` to retain frequently routed expert pairs
 
 Set `"prefix_reuse": true` in the server configuration to reuse saved chat prefixes. Inkling uses the shared scheduler and prefix store with one pinned root and two evictable entries. Each snapshot retains the independent KV and short-convolution state of every visit. KV rows are shared with snapshots while they are in use.
 
+Set `FIFI_INKLING_CUDA_PREFILL_ROWS` from 2 to 16 to group prompt tokens on the GGUF CUDA backend with shared expert streaming. Each attention and convolution state advances in token order. The CUDA staging banks upload each missing expert once per layer visit and prompt chunk. `FIFI_INKLING_CUDA_PROFILE=1` records expert uploads in the shared request log. A value of 1 uses single-token prefill and is the default.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

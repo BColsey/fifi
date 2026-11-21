@@ -3,7 +3,7 @@ use super::{GgufTextWeights, Tensor, bad};
 use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
-    family::inkling2::cuda_projection::gguf::streaming::RoutedExperts,
+    family::inkling2::cuda_projection::gguf::streaming::{ExpertRows, PrefillRoute, RoutedExperts},
     kernels::cuda::resident::dense_gemv::DenseDtype,
     weights::GgufType,
 };
@@ -66,6 +66,62 @@ impl ExpertPayloadSource for Source<'_> {
 }
 
 impl GgufTextWeights {
+    fn stream_source(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+    ) -> Result<Option<(Source<'_>, [DenseDtype; 2])>, EngError> {
+        let parts = [self.tensor(names[0])?, self.tensor(names[1])?];
+        let dtype = |(tensor, _): (&Tensor, &[u8])| match tensor.kind {
+            GgufType::Nvfp4 => Some(DenseDtype::GgufNvfp4),
+            GgufType::Bf16 => Some(DenseDtype::Bf16),
+            _ => None,
+        };
+        let [Some(gate), Some(down)] = parts.map(dtype) else {
+            return Ok(None);
+        };
+        let source = Source {
+            layer,
+            parts,
+            scales: [self.scale_bytes(names[0])?, self.scale_bytes(names[1])?],
+        };
+        Ok(Some((source, [gate, down])))
+    }
+
+    pub(in crate::family::inkling2) fn supports_grouped_prefill(&self) -> bool {
+        self.cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.has_stream_banks())
+    }
+
+    pub(in crate::family::inkling2) fn observe_experts(&self, layer: usize, selected: &[usize]) {
+        if let Some(ram) = &self.ram {
+            ram.observe(layer, selected);
+        }
+    }
+
+    pub(in crate::family::inkling2) fn prefill_experts(
+        &self,
+        names: [&str; 2],
+        layer: u32,
+        routes: &[PrefillRoute<'_>],
+        activate: impl Fn(f32, f32) -> f32,
+    ) -> Result<Option<ExpertRows>, EngError> {
+        let Some(cuda) = self.cuda.as_ref().filter(|cuda| cuda.streams_layer(layer)) else {
+            return Ok(None);
+        };
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
+            return Ok(None);
+        };
+        cuda.prefill_experts(&mut source, layer, routes, dtypes, activate)
+    }
+
+    pub(in crate::family::inkling2) fn prefill_bank_report(
+        &self,
+    ) -> Option<crate::sched::job::PrefillBankReport> {
+        self.cuda.as_ref()?.prefill_bank_report()
+    }
+
     pub(in crate::family::inkling2) fn stream_experts(
         &self,
         names: [&str; 2],
@@ -78,22 +134,8 @@ impl GgufTextWeights {
         let Some(cuda) = self.cuda.as_ref().filter(|cuda| cuda.streams_layer(layer)) else {
             return Ok(false);
         };
-        if let Some(ram) = &self.ram {
-            ram.observe(layer as usize, selected);
-        }
-        let parts = [self.tensor(names[0])?, self.tensor(names[1])?];
-        let dtype = |(tensor, _): (&Tensor, &[u8])| match tensor.kind {
-            GgufType::Nvfp4 => Some(DenseDtype::GgufNvfp4),
-            GgufType::Bf16 => Some(DenseDtype::Bf16),
-            _ => None,
-        };
-        let [Some(gate), Some(down)] = parts.map(dtype) else {
+        let Some((mut source, dtypes)) = self.stream_source(names, layer)? else {
             return Ok(false);
-        };
-        let mut source = Source {
-            layer,
-            parts,
-            scales: [self.scale_bytes(names[0])?, self.scale_bytes(names[1])?],
         };
         // The binder limits routed expert count to 128, and route indices come from that layer.
         let ids: Vec<_> = selected
@@ -107,7 +149,7 @@ impl GgufTextWeights {
             &mut source,
             RoutedExperts {
                 ids: &ids,
-                dtypes: [gate, down],
+                dtypes,
                 input,
             },
             activate,

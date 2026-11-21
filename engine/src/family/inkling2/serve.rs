@@ -31,7 +31,8 @@ pub(crate) fn start_engine(
     let vocab_size = bundle.vocab_size();
     let eos = bundle.eos_token_ids().to_vec();
     let model_dir = model_dir.to_path_buf();
-    // Bound the time before the worker can observe cancellation during prefill.
+    let requested_rows = prefill_rows(backend)?;
+    // Leave cancellation and prefix boundaries with the shared worker.
     let engine = spawn_engine_noted(1, ready_note, move |stages| {
         stages.begin("weights");
         let forward = CpuForward::open(&model_dir, settings.context as usize)?;
@@ -45,11 +46,17 @@ pub(crate) fn start_engine(
                 cuda_forward(forward, host_reserve)?
             }
         };
+        let prefill_rows = if supports_grouped_prefill(&forward) {
+            requested_rows
+        } else {
+            1
+        };
         Ok((
             TextExecutor {
                 forward,
                 eos,
                 prefix,
+                prefill_rows,
             },
             DecodeSession::default(),
         ))
@@ -70,11 +77,44 @@ fn cuda_forward(_forward: CpuForward, _host_reserve: u64) -> Result<CpuForward, 
     ))
 }
 
+fn prefill_rows(backend: TextBackend) -> Result<usize, EngError> {
+    const NAME: &str = "FIFI_INKLING_CUDA_PREFILL_ROWS";
+    if backend != TextBackend::Cuda {
+        return Ok(1);
+    }
+    let Some(value) = std::env::var_os(NAME) else {
+        return Ok(1);
+    };
+    value
+        .to_str()
+        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|rows| (1..=super::MAX_PREFILL_ROWS).contains(rows))
+        .ok_or_else(|| super::bad(format!("{NAME} must be in 1..={}", super::MAX_PREFILL_ROWS)))
+}
+
+fn supports_grouped_prefill(forward: &CpuForward) -> bool {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    return forward.supports_grouped_prefill();
+    #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+    {
+        let _ = forward;
+        false
+    }
+}
+
 impl TokenStepper for CpuForward {
     const OPERATION: &'static str = "inkling2_text";
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         self.token(token, false).map(|_| ())
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if tokens.len() > 1 && self.supports_grouped_prefill() {
+            return self.prefill_grouped(tokens);
+        }
+        tokens.iter().try_for_each(|&token| self.feed(token))
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
@@ -132,6 +172,7 @@ struct TextExecutor {
     prefix: PrefixStore<PrefixState, ()>,
     forward: CpuForward,
     eos: Vec<u32>,
+    prefill_rows: usize,
 }
 
 impl ExecutorOps for TextExecutor {
@@ -168,6 +209,18 @@ impl ExecutorOps for TextExecutor {
     }
 
     fn boundary(&mut self, _session: &mut Self::Session) {}
+
+    fn prefill_piece(&self) -> Option<usize> {
+        Some(self.prefill_rows)
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    fn prefill_bank_report(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        match &self.forward.weights {
+            super::cpu_weights::Weights::Gguf(weights) => weights.prefill_bank_report(),
+            _ => None,
+        }
+    }
 
     fn prefix_limits(&self) -> StoreLimits {
         self.prefix.limits()

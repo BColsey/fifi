@@ -1,4 +1,4 @@
-//! Short-context, text-only native CPU reference for Inkling 2 Mini.
+//! Text execution for Inkling 2 Mini, including CUDA-backed projections.
 
 use std::{fs, path::Path};
 
@@ -11,6 +11,9 @@ use super::{
     gguf_weights::{GgufPlan, Metadata, gguf_path},
 };
 use crate::{EngError, expert_tier::ExpertId};
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod prefill;
 
 const MIX_EPS: f32 = 1e-6;
 
@@ -210,15 +213,19 @@ impl CpuForward {
         Ok(logits)
     }
 
-    fn forward(&self, state: &mut [VisitState], id: u32) -> Result<Stream, EngError> {
+    fn embed(&self, id: u32) -> Result<Stream, EngError> {
         let mut input = self
             .weights
             .row("model.llm.embed.weight", id as usize, self.hidden())?;
         self.norm(&mut input, "model.llm.embed_norm.weight")?;
-        let mut stream = Stream {
+        Ok(Stream {
             blocks: Vec::new(),
             current: input,
-        };
+        })
+    }
+
+    fn forward(&self, state: &mut [VisitState], id: u32) -> Result<Stream, EngError> {
+        let mut stream = self.embed(id)?;
         let core = &self.spec.core;
         let width = core.core_end - core.core_start;
 
@@ -287,6 +294,20 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
+        let input = self.mlp_input(visit, &layer, state, stream, bank)?;
+        let mlp = self.moe(physical, &format!("{layer}.mlp"), &input)?;
+        self.finish_layer(&layer, state, stream, mlp)
+    }
+
+    fn mlp_input(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        state: &mut VisitState,
+        stream: &mut Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<Vec<f32>, EngError> {
+        let physical = visit.weight_layer;
         let query = self.weights.vec(
             &format!("model.llm.attn_res.mlp_queries.{physical}"),
             self.hidden(),
@@ -295,8 +316,8 @@ impl CpuForward {
         if let Weights::Gguf(weights) = &self.weights {
             weights.predict_experts(physical, || stream.mix(0, &query));
         }
-        let inputs = self.attention_inputs(visit, &layer, stream, bank)?;
-        let attn = self.attention(&layer, visit.attention, &inputs, state)?;
+        let inputs = self.attention_inputs(visit, layer, stream, bank)?;
+        let attn = self.attention(layer, visit.attention, &inputs, state)?;
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
             stream
                 .blocks
@@ -306,14 +327,19 @@ impl CpuForward {
         }
 
         let mut mlp_input = stream.mix(0, &query);
-        self.control(&mut mlp_input, bank, physical, &layer, Role::Mlp)?;
+        self.control(&mut mlp_input, bank, physical, layer, Role::Mlp)?;
         self.norm(&mut mlp_input, &format!("{layer}.mlp_norm.weight"))?;
-        let mlp = self.moe(physical, &format!("{layer}.mlp"), &mlp_input)?;
-        add(
-            &mut stream.current,
-            &self.mlp_conv(mlp, &layer, state)?,
-            1.0,
-        );
+        Ok(mlp_input)
+    }
+
+    fn finish_layer(
+        &self,
+        layer: &str,
+        state: &mut VisitState,
+        stream: &mut Stream,
+        mlp: Vec<f32>,
+    ) -> Result<(), EngError> {
+        add(&mut stream.current, &self.mlp_conv(mlp, layer, state)?, 1.0);
         Ok(())
     }
 
@@ -415,7 +441,7 @@ impl CpuForward {
         Ok(())
     }
 
-    fn moe(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+    fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
         let experts = self.spec.n_routed_experts as usize;
         let scores = self
             .weights
@@ -430,6 +456,31 @@ impl CpuForward {
             .map(|&id| scores[id])
             .sum::<f32>()
             .max(1.0 / 16384.0);
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Weights::Gguf(weights) = &self.weights {
+            weights.observe_experts(layer, &selected);
+        }
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        let _ = layer;
+        Ok(MoeRoute {
+            selected,
+            scores,
+            total,
+        })
+    }
+
+    fn moe(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+        let route = self.moe_route(layer, prefix, input)?;
+        self.moe_with_route(layer, prefix, input, &route)
+    }
+
+    fn moe_with_route(
+        &self,
+        layer: usize,
+        prefix: &str,
+        input: &[f32],
+        route: &MoeRoute,
+    ) -> Result<Vec<f32>, EngError> {
         let gate_up = format!("{prefix}.experts.w13_weight");
         let down = format!("{prefix}.experts.w2_weight");
         let activation = self.weights.activate(input)?;
@@ -439,21 +490,15 @@ impl CpuForward {
             && weights.stream_experts(
                 [&gate_up, &down],
                 layer as u32,
-                &selected,
+                &route.selected,
                 input,
                 |gate, up| self.math.expert_activation(gate, up),
-                |id, row| {
-                    add(
-                        &mut output,
-                        row,
-                        self.math.route_scale * (scores[id] / total),
-                    )
-                },
+                |id, row| add(&mut output, row, route.weight(id, self.math.route_scale)),
             )?
         {
             return Ok(output);
         }
-        for id in selected {
+        for &id in &route.selected {
             let key = ExpertId {
                 layer: layer as u32,
                 expert: u32::try_from(id).map_err(|_| bad("Inkling expert id overflows"))?,
@@ -474,10 +519,22 @@ impl CpuForward {
             add(
                 &mut output,
                 &contribution,
-                self.math.route_scale * (scores[id] / total),
+                route.weight(id, self.math.route_scale),
             );
         }
         Ok(output)
+    }
+}
+
+struct MoeRoute {
+    selected: Vec<usize>,
+    scores: Vec<f32>,
+    total: f32,
+}
+
+impl MoeRoute {
+    fn weight(&self, expert: usize, scale: f32) -> f32 {
+        scale * (self.scores[expert] / self.total)
     }
 }
 
