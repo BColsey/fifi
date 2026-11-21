@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 half = "=2.7.1"
 memmap2 = "=0.9.11"
-minijinja = { version = "=2.24.0", features = ["json", "preserve_order"] }
+minijinja = { version = "=2.24.0", features = ["json", "preserve_order", "fuel"] }
 safetensors = { version = "=0.8.0", path = "vendor/safetensors", default-features = false, features = ["alloc"] }
 sha2 = "=0.10.9"
 

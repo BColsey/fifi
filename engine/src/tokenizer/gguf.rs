@@ -4,20 +4,34 @@
 //! reads the vocabulary, the merges and the chat template from the header and writes the
 //! `tokenizer.json`, `tokenizer_config.json` and chat template bytes that
 //! [`TokenizerBundle::from_parts`] takes, so the bundle is the one every directory-based family
-//! already gets. Only byte-level BPE vocabularies (`tokenizer.ggml.model` = `gpt2`) with a known
-//! pre-tokenizer name are accepted; any other file is refused by name, never guessed.
+//! already gets. Two vocabulary kinds are read: byte-level BPE (`tokenizer.ggml.model` = `gpt2`)
+//! with a known pre-tokenizer name, and the space-marker BPE with byte fallback of the Gemma 4
+//! family (`gemma4`). Any other file is refused by name, never guessed.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use super::{TokenizerBundle, TokenizerParts};
+use super::template::ChatTemplate;
+use super::{PromptMessage, Role, Thinking, TokenizerBundle, TokenizerParts};
 use crate::EngError;
 use crate::weights::{ArrayMeta, GgufHeader, MetaValue};
 
 /// Header cap for the file scan. The Raon-1 header (vocabulary, merges, tensor table) is about
 /// 12 MB.
 const HEADER_CAP_BYTES: u64 = 256 << 20;
+
+/// The longest chat template a header may carry. Real templates are 10 to 30 KB.
+const TEMPLATE_CAP_BYTES: usize = 256 << 10;
+
+/// The two vocabulary kinds of `tokenizer.ggml.model` that this reader builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Byte-level BPE with a named pre-tokenizer.
+    ByteLevel,
+    /// Spaces become `▁`, the text splits after each one, unknown bytes fall back to byte tokens.
+    SpaceMarker,
+}
 
 /// Token types of the GGUF vocabulary that become added tokens: control (3) and user defined (4).
 const TYPE_CONTROL: i32 = 3;
@@ -37,17 +51,19 @@ const END_MARKERS: [&str; 7] = [
 ];
 
 /// The stop set of a vocabulary with no `generation_config.json`: the eos id first, then the eot
-/// and eom ids when the file carries them, then every control-type token whose text is an end
-/// marker, in id order, without repeats.
+/// and eom ids when the file carries them, then the token the chat template ends an assistant
+/// turn with, then every control-type token whose text is an end marker, in id order, without
+/// repeats.
 fn stop_ids(
     tokens: &[String],
     types: &[i32],
     eos: u32,
     eot: Option<u32>,
     eom: Option<u32>,
+    turn_end: Option<u32>,
 ) -> Vec<u32> {
     let mut ids = vec![eos];
-    for id in eot.into_iter().chain(eom) {
+    for id in eot.into_iter().chain(eom).chain(turn_end) {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -59,6 +75,45 @@ fn stop_ids(
         }
     }
     ids
+}
+
+/// The control or user-defined token that the chat template writes right after an assistant
+/// message: a fine-tune that ends its turns with a marker of its own stops on that marker even
+/// when the header names another eos. `None` when the template does not render the probe or the
+/// text after the message starts with no such token.
+fn template_turn_end(tokens: &[String], types: &[i32], template: &str) -> Option<u32> {
+    const PROBE: &str = "zq7xk";
+    let message = |role, text: &str| PromptMessage {
+        role,
+        content: Some(text.to_owned()),
+        reasoning_content: None,
+        name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+    };
+    let chat = ChatTemplate::probe(template).ok()?;
+    let text = chat
+        .render_without_generation_prompt(
+            &[
+                message(Role::User, "hello"),
+                message(Role::Assistant, PROBE),
+            ],
+            &[],
+            Thinking::Default,
+        )
+        .ok()?;
+    let tail = &text[text.find(PROBE)? + PROBE.len()..];
+    tokens
+        .iter()
+        .zip(types)
+        .enumerate()
+        .filter(|(_, (token, kind))| {
+            (**kind == TYPE_CONTROL || **kind == TYPE_USER_DEFINED)
+                && !token.is_empty()
+                && tail.starts_with(token.as_str())
+        })
+        .max_by_key(|(_, (token, _))| token.len())
+        .map(|(id, _)| id as u32)
 }
 
 fn reject(message: impl Into<String>) -> EngError {
@@ -127,6 +182,7 @@ fn pre_tokenizer(pre: &str) -> Option<PreTokenizer> {
 
 /// What the header of one GGUF file says about its tokenizer.
 pub(crate) struct GgufTokenizer {
+    kind: Kind,
     tokens: Vec<String>,
     types: Vec<i32>,
     merges: Vec<String>,
@@ -139,6 +195,8 @@ pub(crate) struct GgufTokenizer {
     unk_id: Option<u32>,
     eot_id: Option<u32>,
     eom_id: Option<u32>,
+    /// The token the chat template ends an assistant message with, see [`template_turn_end`].
+    turn_end: Option<u32>,
     /// The bytes of a `generation_config.json` beside the weights file, when there is one.
     generation_config: Option<Vec<u8>>,
     add_bos: bool,
@@ -151,18 +209,20 @@ impl GgufTokenizer {
         let file = File::open(path)
             .map_err(|error| reject(format!("cannot open {}: {error}", path.display())))?;
         let header = crate::weights::shared_header(path, HEADER_CAP_BYTES)?;
-        match header.meta("tokenizer.ggml.model") {
-            Some(MetaValue::String(model)) if model == "gpt2" => {}
+        let kind = match header.meta("tokenizer.ggml.model") {
+            Some(MetaValue::String(model)) if model == "gpt2" => Kind::ByteLevel,
+            Some(MetaValue::String(model)) if model == "gemma4" => Kind::SpaceMarker,
             Some(MetaValue::String(model)) => {
                 return Err(reject(format!(
-                    "tokenizer.ggml.model is {model}, only gpt2 (byte-level BPE) is read"
+                    "tokenizer.ggml.model is {model}, only gpt2 (byte-level BPE) and gemma4 are read"
                 )));
             }
             _ => return Err(reject("tokenizer.ggml.model is missing")),
-        }
-        let pre = match header.meta("tokenizer.ggml.pre") {
-            Some(MetaValue::String(pre)) => pre.clone(),
-            _ => return Err(reject("tokenizer.ggml.pre is missing")),
+        };
+        let pre = match (kind, header.meta("tokenizer.ggml.pre")) {
+            (_, Some(MetaValue::String(pre))) => pre.clone(),
+            (Kind::SpaceMarker, _) => String::new(),
+            (Kind::ByteLevel, _) => return Err(reject("tokenizer.ggml.pre is missing")),
         };
         let tokens = string_array(&file, &header, "tokenizer.ggml.tokens")?;
         let merges = string_array(&file, &header, "tokenizer.ggml.merges")?;
@@ -199,14 +259,22 @@ impl GgufTokenizer {
             optional_id("tokenizer.ggml.unknown_token_id"),
         );
         let chat_template = match header.meta("tokenizer.chat_template") {
+            Some(MetaValue::String(template)) if template.len() > TEMPLATE_CAP_BYTES => {
+                return Err(reject(format!(
+                    "tokenizer.chat_template is {} bytes, over the {TEMPLATE_CAP_BYTES} byte cap",
+                    template.len()
+                )));
+            }
             Some(MetaValue::String(template)) => template.clone(),
             _ => return Err(reject("tokenizer.chat_template is missing")),
         };
+        let turn_end = template_turn_end(&tokens, &types, &chat_template);
         let (eot_id, eom_id) = (
             optional_id("tokenizer.ggml.eot_token_id"),
             optional_id("tokenizer.ggml.eom_token_id"),
         );
         Ok(Self {
+            kind,
             tokens,
             types,
             merges,
@@ -218,6 +286,7 @@ impl GgufTokenizer {
             unk_id,
             eot_id,
             eom_id,
+            turn_end,
             generation_config: path
                 .parent()
                 .and_then(|dir| std::fs::read(dir.join("generation_config.json")).ok()),
@@ -237,20 +306,51 @@ impl GgufTokenizer {
             self.eos_id,
             self.eot_id,
             self.eom_id,
+            self.turn_end,
         )
     }
 
     /// The four tokenizer files' bytes. `tokenizer.json` lists the vocabulary in id order, so
     /// the bytes depend on the file's tokenizer keys alone.
     pub(crate) fn parts(&self) -> Result<TokenizerParts, EngError> {
-        let pre = pre_tokenizer(&self.pre).ok_or_else(|| {
-            reject(format!(
-                "tokenizer.ggml.pre {} has no known split pattern (known: raon, qwen2, qwen35, pixtral)",
-                self.pre
-            ))
-        })?;
-        let pattern = pre.pattern;
-        let nfc = self.nfc.unwrap_or(pre.nfc);
+        let tokenizer = match self.kind {
+            Kind::ByteLevel => self.byte_level_json()?,
+            Kind::SpaceMarker => self.space_marker_json()?,
+        };
+        let mut config = serde_json::json!({
+            "eos_token": self.tokens[self.eos_id as usize],
+            "add_bos_token": self.add_bos,
+        });
+        for (key, id) in [
+            ("bos_token", self.bos_id),
+            ("pad_token", self.pad_id),
+            ("unk_token", self.unk_id),
+        ] {
+            if let Some(id) = id {
+                config[key] = serde_json::json!(self.tokens[id as usize]);
+            }
+        }
+        Ok(TokenizerParts {
+            tokenizer_json: serialize(&tokenizer)?,
+            tokenizer_config_json: serialize(&config)?,
+            chat_template: self.chat_template.clone().into_bytes(),
+            generation_config_json: Some(match &self.generation_config {
+                Some(bytes) => bytes.clone(),
+                None => serialize(&serde_json::json!({ "eos_token_id": self.stop_ids() }))?,
+            }),
+        })
+    }
+
+    /// The vocabulary map and the added-token list of the header's tokens.
+    fn vocabulary(
+        &self,
+    ) -> Result<
+        (
+            serde_json::Map<String, serde_json::Value>,
+            Vec<serde_json::Value>,
+        ),
+        EngError,
+    > {
         let mut vocab = serde_json::Map::with_capacity(self.tokens.len());
         let mut added = Vec::new();
         for (id, token) in self.tokens.iter().enumerate() {
@@ -270,13 +370,27 @@ impl GgufTokenizer {
                 }));
             }
         }
+        Ok((vocab, added))
+    }
+
+    /// The `tokenizer.json` of a byte-level BPE vocabulary.
+    fn byte_level_json(&self) -> Result<serde_json::Value, EngError> {
+        let pre = pre_tokenizer(&self.pre).ok_or_else(|| {
+            reject(format!(
+                "tokenizer.ggml.pre {} has no known split pattern (known: raon, qwen2, qwen35, pixtral)",
+                self.pre
+            ))
+        })?;
+        let pattern = pre.pattern;
+        let nfc = self.nfc.unwrap_or(pre.nfc);
+        let (vocab, added) = self.vocabulary()?;
         let byte_level = serde_json::json!({
             "type": "ByteLevel",
             "add_prefix_space": false,
             "trim_offsets": false,
             "use_regex": false,
         });
-        let tokenizer = serde_json::json!({
+        Ok(serde_json::json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
@@ -308,29 +422,51 @@ impl GgufTokenizer {
                 "vocab": vocab,
                 "merges": self.merges,
             },
-        });
-        let mut config = serde_json::json!({
-            "eos_token": self.tokens[self.eos_id as usize],
-            "add_bos_token": self.add_bos,
-        });
-        for (key, id) in [
-            ("bos_token", self.bos_id),
-            ("pad_token", self.pad_id),
-            ("unk_token", self.unk_id),
-        ] {
-            if let Some(id) = id {
-                config[key] = serde_json::json!(self.tokens[id as usize]);
-            }
-        }
-        Ok(TokenizerParts {
-            tokenizer_json: serialize(&tokenizer)?,
-            tokenizer_config_json: serialize(&config)?,
-            chat_template: self.chat_template.clone().into_bytes(),
-            generation_config_json: Some(match &self.generation_config {
-                Some(bytes) => bytes.clone(),
-                None => serialize(&serde_json::json!({ "eos_token_id": self.stop_ids() }))?,
-            }),
-        })
+        }))
+    }
+
+    /// The `tokenizer.json` of a space-marker vocabulary: spaces become `▁`, the text splits
+    /// after each marker, and a byte no token covers falls back to its `<0xNN>` token.
+    fn space_marker_json(&self) -> Result<serde_json::Value, EngError> {
+        let (vocab, added) = self.vocabulary()?;
+        let unk = self
+            .unk_id
+            .map(|id| self.tokens[id as usize].clone())
+            .ok_or_else(|| reject("tokenizer.ggml.unknown_token_id is missing"))?;
+        Ok(serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious",
+                "invert": false,
+            },
+            "post_processor": null,
+            "decoder": {
+                "type": "Sequence",
+                "decoders": [
+                    {"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "},
+                    {"type": "ByteFallback"},
+                    {"type": "Fuse"},
+                ],
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": unk,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": true,
+                "byte_fallback": true,
+                "ignore_merges": false,
+                "vocab": vocab,
+                "merges": self.merges,
+            },
+        }))
     }
 }
 
@@ -530,17 +666,139 @@ pub(crate) mod tests {
             kv("tokenizer.ggml.normalizer.nfc", 7, &[1]),
             kv_string("tokenizer.chat_template", TEMPLATE),
         ];
+        gguf_file(&kvs)
+    }
+
+    /// A GGUF with the given metadata entries and no tensors.
+    pub(crate) fn gguf_file(kvs: &[Vec<u8>]) -> Vec<u8> {
         let mut file = b"GGUF".to_vec();
         file.extend_from_slice(&3u32.to_le_bytes());
         file.extend_from_slice(&0u64.to_le_bytes());
         file.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
-        for kv in &kvs {
+        for kv in kvs {
             file.extend_from_slice(kv);
         }
         while !file.len().is_multiple_of(32) {
             file.push(0);
         }
         file
+    }
+
+    /// The metadata of a small vocabulary file with the given tokens (all one type per entry of
+    /// `types`), merges, template and eos id; `extra` adds more entries.
+    fn vocabulary_kvs(
+        model: &str,
+        tokens: &[&str],
+        types: &[i32],
+        merges: &[&str],
+        template: &str,
+        eos: u32,
+        extra: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        let types: Vec<Vec<u8>> = types.iter().map(|t| t.to_le_bytes().to_vec()).collect();
+        let mut kvs = vec![
+            kv_string("general.architecture", "tiny"),
+            kv_string("tokenizer.ggml.model", model),
+            kv_array("tokenizer.ggml.tokens", 8, &strings(tokens)),
+            kv_array("tokenizer.ggml.token_type", 5, &types),
+            kv_array("tokenizer.ggml.merges", 8, &strings(merges)),
+            kv("tokenizer.ggml.eos_token_id", 4, &eos.to_le_bytes()),
+            kv_string("tokenizer.chat_template", template),
+        ];
+        kvs.extend(extra);
+        kvs
+    }
+
+    fn write_temp(bytes: &[u8]) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "gguf-tokenizer-extra-{:x}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).expect("write the file");
+        path
+    }
+
+    #[test]
+    fn a_space_marker_vocabulary_encodes_with_markers_and_byte_fallback() {
+        let tokens = [
+            "<pad>",
+            "<eos>",
+            "<bos>",
+            "<unk>",
+            "a",
+            "b",
+            "\u{2581}",
+            "\u{2581}b",
+            "<0x7A>",
+        ];
+        let types = [3, 3, 3, 3, 1, 1, 1, 1, 6];
+        let kvs = vocabulary_kvs(
+            "gemma4",
+            &tokens,
+            &types,
+            &["\u{2581} b"],
+            TEMPLATE,
+            1,
+            vec![
+                kv("tokenizer.ggml.unknown_token_id", 4, &3u32.to_le_bytes()),
+                kv("tokenizer.ggml.bos_token_id", 4, &2u32.to_le_bytes()),
+            ],
+        );
+        let path = write_temp(&gguf_file(&kvs));
+        let bundle = bundle_from_gguf(&path).expect("a gemma4 vocabulary builds");
+        assert_eq!(bundle.tokenizer().encode("a b").expect("encode"), [4, 7]);
+        assert_eq!(bundle.tokenizer().encode("z").expect("encode"), [8]);
+        assert_eq!(bundle.tokenizer().decode(&[4, 7]).expect("decode"), "a b");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_fine_tune_that_ends_its_turns_with_its_own_marker_stops_on_it() {
+        // The template ends an assistant message with `<|turn_end|>` while the header's eos is
+        // the end-of-text token: both stop the stream.
+        let template = "{%- for message in messages %}{{- '<|turn_start|>' + message.role + '\n' + message.content + '<|turn_end|>\n' }}{%- endfor %}";
+        let tokens = [
+            "a",
+            "b",
+            "<|endoftext|>",
+            "<|turn_start|>",
+            "<|turn_end|>",
+            "<|unrelated|>",
+        ];
+        let types = [1, 1, 3, 3, 3, 3];
+        let kvs = vocabulary_kvs(
+            "gpt2",
+            &tokens,
+            &types,
+            &[],
+            template,
+            2,
+            vec![kv_string("tokenizer.ggml.pre", "qwen2")],
+        );
+        let path = write_temp(&gguf_file(&kvs));
+        let stops = GgufTokenizer::read(&path).expect("read").stop_ids();
+        assert_eq!(stops, [2, 4]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_template_over_the_size_cap_is_refused_by_name() {
+        let template = format!("{}{{{{ 1 }}}}", " ".repeat(super::TEMPLATE_CAP_BYTES));
+        let kvs = vocabulary_kvs(
+            "gpt2",
+            &["a", "<|im_end|>"],
+            &[1, 3],
+            &[],
+            &template,
+            1,
+            vec![kv_string("tokenizer.ggml.pre", "qwen2")],
+        );
+        let path = write_temp(&gguf_file(&kvs));
+        let error = GgufTokenizer::read(&path).err().expect("refused");
+        assert!(error.describe().contains("byte cap"), "{error:?}");
+        let _ = std::fs::remove_file(path);
     }
 
     fn tiny_file(model: &str, pre: &str) -> PathBuf {
@@ -950,12 +1208,15 @@ pub(crate) mod tests {
         .collect();
         // </s> is a control token; the user-defined and normal tokens never count.
         let types = [1, 3, 3, 4, 3, 3];
-        assert_eq!(super::stop_ids(&tokens, &types, 2, None, None), [2, 1]);
         assert_eq!(
-            super::stop_ids(&tokens, &types, 2, Some(5), Some(5)),
+            super::stop_ids(&tokens, &types, 2, None, None, None),
+            [2, 1]
+        );
+        assert_eq!(
+            super::stop_ids(&tokens, &types, 2, Some(5), Some(5), None),
             [2, 5, 1]
         );
-        assert_eq!(super::stop_ids(&tokens, &[1; 6], 2, None, None), [2]);
+        assert_eq!(super::stop_ids(&tokens, &[1; 6], 2, None, None, None), [2]);
     }
 
     /// For a checkpoint with a `generation_config.json`, the derived stop set equals its
@@ -1035,5 +1296,100 @@ pub(crate) mod tests {
     #[ignore = "needs GGUF_ORACLE_NEMOTRON, the first shard of the Nemotron GGUF"]
     fn the_nemotron_gguf_tokenizer_equals_the_recorded_ids_of_the_independent_tokenizer() {
         check_oracle("nemotron", "GGUF_ORACLE_NEMOTRON", &[2, 11]);
+    }
+
+    /// The edge texts of `testdata/gguf-tokenizer/edge.json` (non-BMP, joined emoji, CJK,
+    /// combining marks, digit runs, CRLF, whitespace runs, special-token text, punctuation,
+    /// right-to-left scripts, case changes, empty and one-character input) against the ids of an
+    /// independent tokenizer; `env` names a GGUF with the pre-tokenizer `kind`.
+    fn check_edges(kind: &str, env: &str) {
+        let path = std::env::var(env).unwrap_or_else(|_| panic!("{env} names the GGUF file"));
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/gguf-tokenizer/edge.json"))
+                .expect("edge data");
+        let bundle = bundle_from_gguf(std::path::Path::new(&path)).expect("bundle");
+        let texts = data["texts"].as_array().expect("texts");
+        let ids = data["ids"][kind]
+            .as_array()
+            .expect("ids of the pre-tokenizer");
+        assert_eq!(texts.len(), ids.len());
+        let mut differing = Vec::new();
+        for (case, want) in texts.iter().zip(ids) {
+            let want: Vec<u32> = want
+                .as_array()
+                .expect("ids")
+                .iter()
+                .map(|id| id.as_u64().expect("id") as u32)
+                .collect();
+            let got = bundle
+                .tokenizer()
+                .encode(case["text"].as_str().expect("text"))
+                .expect("encode");
+            if got != want {
+                differing.push(case["name"].as_str().unwrap_or("?").to_owned());
+            }
+        }
+        assert!(differing.is_empty(), "{kind}: ids differ on {differing:?}");
+    }
+
+    #[test]
+    #[ignore = "needs GGUF_EDGE_QWEN35, a GGUF with the qwen35 pre-tokenizer"]
+    fn the_qwen35_pre_tokenizer_equals_the_recorded_ids_on_the_edge_texts() {
+        check_edges("qwen35", "GGUF_EDGE_QWEN35");
+    }
+
+    #[test]
+    #[ignore = "needs GGUF_EDGE_QWEN2, a GGUF with the qwen2 pre-tokenizer"]
+    fn the_qwen2_pre_tokenizer_equals_the_recorded_ids_on_the_edge_texts() {
+        check_edges("qwen2", "GGUF_EDGE_QWEN2");
+    }
+
+    #[test]
+    #[ignore = "needs GGUF_EDGE_PIXTRAL, a GGUF with the pixtral pre-tokenizer"]
+    fn the_pixtral_pre_tokenizer_equals_the_recorded_ids_on_the_edge_texts() {
+        check_edges("pixtral", "GGUF_EDGE_PIXTRAL");
+    }
+
+    #[test]
+    #[ignore = "needs GGUF_EDGE_RAON, a GGUF with the raon pre-tokenizer"]
+    fn the_raon_pre_tokenizer_equals_the_recorded_ids_on_the_edge_texts() {
+        check_edges("raon", "GGUF_EDGE_RAON");
+    }
+
+    /// A space-marker GGUF (`GGUF_TOKENIZER_FILE`) against the `tokenizer.json` of the same model
+    /// (`GGUF_TOKENIZER_JSON`) over the edge texts and a few ordinary ones.
+    #[test]
+    #[ignore = "needs GGUF_TOKENIZER_FILE and GGUF_TOKENIZER_JSON of a gemma4 model"]
+    fn the_space_marker_gguf_tokenizer_equals_the_tokenizer_json_on_the_edge_texts() {
+        let gguf = std::env::var("GGUF_TOKENIZER_FILE").expect("GGUF_TOKENIZER_FILE");
+        let json = std::env::var("GGUF_TOKENIZER_JSON").expect("GGUF_TOKENIZER_JSON");
+        let bundle = bundle_from_gguf(std::path::Path::new(&gguf)).expect("bundle");
+        let reference =
+            crate::tokenizer::Tokenizer::from_bytes(&std::fs::read(&json).expect("json"))
+                .expect("reference tokenizer");
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/gguf-tokenizer/edge.json"))
+                .expect("edge data");
+        let mut texts: Vec<String> = data["texts"]
+            .as_array()
+            .expect("texts")
+            .iter()
+            .map(|case| case["text"].as_str().expect("text").to_owned())
+            .collect();
+        texts.extend([
+            "Hello, world!".to_owned(),
+            "def f(x):\n    return x ** 2  # square".to_owned(),
+            "  leading and trailing   spaces  ".to_owned(),
+            "<start_of_turn>user\nhi<end_of_turn>".to_owned(),
+        ]);
+        let mut differing = Vec::new();
+        for text in &texts {
+            let got = bundle.tokenizer().encode(text).expect("encode");
+            let want = reference.encode(text).expect("reference encode");
+            if got != want {
+                differing.push(text.chars().take(30).collect::<String>());
+            }
+        }
+        assert!(differing.is_empty(), "ids differ on {differing:?}");
     }
 }

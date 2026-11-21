@@ -29,9 +29,24 @@ pub struct ChatTemplate {
     pub(super) notice_toolwrap: bool,
 }
 
+/// The instructions one render of a chat template may execute. A real template needs a few
+/// thousand per message; the bound ends a template that loops over huge ranges, which a GGUF
+/// header can carry from any publisher.
+const RENDER_FUEL: u64 = 20_000_000;
+
 impl ChatTemplate {
     pub(crate) fn from_str(source: &str) -> Result<Self, EngError> {
+        Self::build(source, true)
+    }
+
+    /// The same template without the load line, for a probe that renders it once.
+    pub(crate) fn probe(source: &str) -> Result<Self, EngError> {
+        Self::build(source, false)
+    }
+
+    fn build(source: &str, announce: bool) -> Result<Self, EngError> {
         let mut env = minijinja::Environment::new();
+        env.set_fuel(Some(RENDER_FUEL));
         // The reference renders with trim_blocks and lstrip_blocks enabled.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -58,7 +73,7 @@ impl ChatTemplate {
             Self::env_allows("ENGINESRV_THINK_REPLAY"),
             Self::env_allows("ENGINESRV_NOTICE_TOOLWRAP"),
         );
-        if (think_replay || replay_env_set) && !cfg!(test) {
+        if announce && (think_replay || replay_env_set) && !cfg!(test) {
             // The one load line an operator needs to confirm a rollback.
             eprintln!(
                 "chat template: think replay {}, notice wrap {}{}",
@@ -508,5 +523,53 @@ mod generation_tag_tests {
     fn a_template_without_the_tags_keeps_its_bytes() {
         let source = include_str!("../../testdata/chat_template.jinja");
         assert_eq!(without_generation_tags(source), source);
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::ChatTemplate;
+    use crate::tokenizer::{PromptMessage, Role, Thinking};
+
+    fn user(text: &str) -> PromptMessage {
+        PromptMessage {
+            role: Role::User,
+            content: Some(text.to_owned()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_template_that_loops_over_huge_ranges_stops_with_an_error_instead_of_running() {
+        let template = ChatTemplate::from_str(
+            "{% for i in range(100000) %}{% for j in range(100000) %}x{% endfor %}{% endfor %}",
+        )
+        .expect("the template parses");
+        let started = std::time::Instant::now();
+        let error = template
+            .render(&[user("hi")], &[], Thinking::Default)
+            .expect_err("the render runs out of fuel");
+        assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+        assert!(
+            error.describe().to_lowercase().contains("fuel"),
+            "{}",
+            error.describe()
+        );
+    }
+
+    #[test]
+    fn a_long_conversation_renders_inside_the_fuel() {
+        let template = ChatTemplate::from_str(
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\n{% endfor %}",
+        )
+        .expect("the template parses");
+        let messages: Vec<PromptMessage> = (0..5000).map(|i| user(&format!("turn {i}"))).collect();
+        let text = template
+            .render(&messages, &[], Thinking::Default)
+            .expect("renders");
+        assert!(text.contains("turn 4999"));
     }
 }
