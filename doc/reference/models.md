@@ -35,6 +35,8 @@ Set `FIFI_INKLING_CUDA_DIRECT_RESIDENT=1` to keep original GGUF NVFP4 blocks in 
 
 For VRAM → RAM → SSD expert placement, set `FIFI_INKLING_CUDA_RAM_EXPERT_MIB=auto` or give a positive MiB budget. This enables shared pinned staging and automatic VRAM placement when no explicit VRAM budget is set. After GPU placement, FiFi warms file-backed expert layers within the process's host-memory allowance. Under a smaller allowance, FiFi uses the Qwen expert predictor before attention and asks Linux to read the predicted experts' two GGUF ranges into the page cache. The actual Inkling router determines which experts execute. The budget limits startup warming and advice per visit. Linux can reclaim or retain file pages as memory pressure changes. Set the RAM budget to zero to use ordinary demand paging.
 
+Set `FIFI_INKLING_CUDA_CACHE_EXPERTS=1` to retain frequently routed expert pairs in the remaining VRAM allowance. The shared adaptive policy ranks observed routes per layer. A promotion copies an expert directly from its existing CUDA staging bank. Later hits execute both projections from the cached original bytes. The cache respects the total expert budget and the shared device headroom. With `FIFI_INKLING_CUDA_PROFILE=1`, the server reports hits and avoided host-to-device bytes by layer.
+
 ## Tokenizer files
 
 Each engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

@@ -27,8 +27,8 @@ pub(super) fn requested_limit() -> Result<Option<u64>, EngError> {
         .ok_or_else(|| bad(format!("{NAME} must be auto or a nonnegative MiB count")))
 }
 
-struct Stack {
-    layer: usize,
+pub(super) struct Stack {
+    pub(super) layer: usize,
     parts: [Range<usize>; 2],
     experts: usize,
 }
@@ -49,7 +49,7 @@ impl Stack {
         self.parts.iter().map(|part| part.len() as u64).sum()
     }
 
-    fn ranges(&self, expert: usize) -> [Range<usize>; 2] {
+    pub(super) fn ranges(&self, expert: usize) -> [Range<usize>; 2] {
         self.parts.each_ref().map(|part| {
             let stride = part.len() / self.experts;
             let start = part.start + expert * stride;
@@ -99,7 +99,7 @@ impl Prediction {
     }
 }
 
-fn cold_stacks(
+pub(super) fn cold_stacks(
     weights: &GgufTextWeights,
     cuda: &GgufCuda,
     spec: &TextSpec,
@@ -216,6 +216,7 @@ impl RamExperts {
         layer: usize,
         hidden: impl FnOnce() -> Vec<f32>,
         mapping: &MappedFile,
+        cached: impl Fn(usize) -> bool,
     ) {
         let Some(target) = self.predictive.get(&layer) else {
             return;
@@ -230,7 +231,7 @@ impl RamExperts {
         let Ok(ids) = route(&scores, &target.bias, target.count) else {
             return;
         };
-        for &expert in &ids {
+        for expert in ids.iter().copied().filter(|&id| !cached(id)) {
             for range in target.stack.ranges(expert) {
                 let len = range.len();
                 match mapping.prefetch(range) {

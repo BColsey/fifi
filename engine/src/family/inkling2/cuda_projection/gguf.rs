@@ -15,6 +15,7 @@ use crate::{
     weights::{GgufType, repack_nvfp4_into},
 };
 
+mod cache;
 mod residency;
 pub(in crate::family::inkling2) mod streaming;
 
@@ -25,6 +26,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
     dense: BTreeMap<String, Resident>,
     resident: ResidentExperts,
+    cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
     stream_banks: Option<RefCell<crate::expert_tier::CudaStreamBanks>>,
     expert_codes: DeviceBuffer,
     expert_scales: DeviceBuffer,
@@ -109,6 +111,7 @@ impl GgufCuda {
             step,
             dense,
             resident,
+            cache: RefCell::default(),
             stream_banks,
             expert_codes,
             expert_scales,

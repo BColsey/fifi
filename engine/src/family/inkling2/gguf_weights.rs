@@ -555,18 +555,26 @@ impl GgufTextWeights {
             });
         }
         let ram_limit = ram::requested_limit()?;
-        let budget = if ram_limit.is_some_and(|limit| limit > 0)
-            && std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB").is_none()
-        {
-            u64::MAX
-        } else {
-            expert_residency_budget()?
-        };
+        let reuse = std::env::var("FIFI_INKLING_CUDA_CACHE_EXPERTS").as_deref() == Ok("1");
+        let tiered = reuse || ram_limit.is_some_and(|limit| limit > 0);
+        let budget =
+            if tiered && std::env::var_os("FIFI_INKLING_CUDA_RESIDENT_EXPERT_MIB").is_none() {
+                u64::MAX
+            } else {
+                expert_residency_budget()?
+            };
         let direct = std::env::var("FIFI_INKLING_CUDA_DIRECT_RESIDENT").as_deref() == Ok("1");
         let layers = self.nvfp4_layers(spec, budget, direct)?;
-        let stream = ram_limit.is_some_and(|limit| limit > 0)
-            || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
-        let cuda = GgufCuda::load(uploads, spec, layers, &self.mapping, direct, stream)?;
+        let stream =
+            tiered || std::env::var("FIFI_INKLING_CUDA_STREAM_EXPERTS").as_deref() == Ok("1");
+        let mut cuda = GgufCuda::load(uploads, spec, layers, &self.mapping, direct, stream)?;
+        if reuse {
+            let layout = ram::cold_stacks(self, &cuda, spec)?
+                .into_iter()
+                .map(|stack| (stack.layer as u32, stack.ranges(0).map(|part| part.len())))
+                .collect();
+            cuda.enable_cache(layout, spec, budget)?;
+        }
         self.ram = ram::RamExperts::plan(self, &cuda, spec, eps, ram_limit.unwrap_or(0))?;
         self.cuda = Some(cuda);
         Ok(())
@@ -575,7 +583,11 @@ impl GgufTextWeights {
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn predict_experts(&self, layer: usize, hidden: impl FnOnce() -> Vec<f32>) {
         if let Some(ram) = &self.ram {
-            ram.predict(layer, hidden, &self.mapping);
+            ram.predict(layer, hidden, &self.mapping, |id| {
+                self.cuda
+                    .as_ref()
+                    .is_some_and(|cuda| cuda.cached(layer, id))
+            });
         }
     }
 

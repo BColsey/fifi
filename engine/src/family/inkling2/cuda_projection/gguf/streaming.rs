@@ -1,10 +1,16 @@
 //! Overlap the upload of the next routed expert with projection on the current bank.
-use super::{GgufCuda, bad};
+use super::{GgufCuda, bad, cache::LayerCache};
 use crate::{
     EngError,
     expert_tier::{CudaBankLease, ExpertId, ExpertPayloadSource, Placement, StreamBankPlan},
-    kernels::cuda::resident::dense_gemv::DenseDtype,
+    kernels::cuda::{DeviceRange, DeviceStream, resident::dense_gemv::DenseDtype},
 };
+
+pub(super) struct Matrix<'a> {
+    pub(super) data: DeviceRange<'a>,
+    pub(super) shape: [usize; 2],
+    pub(super) scale: f32,
+}
 
 pub(in crate::family::inkling2) struct RoutedExperts<'a> {
     pub ids: &'a [ExpertId],
@@ -54,42 +60,81 @@ impl GgufCuda {
         }
         let mut banks = banks.borrow_mut();
         let (first, next) = banks.slots_mut();
+        let mut caches = self.cache.borrow_mut();
+        let mut cache = route.ids.first().and_then(|id| caches.get_mut(&id.layer));
+        if let Some(c) = &mut cache {
+            c.observe(route.ids)?;
+        }
+        let mut hits = 0;
         for pair in route.ids.chunks(2) {
-            let a = first
-                .stage_demand(&self.context, source, &pair[..1])?
-                .ok_or_else(|| bad("missing first GGUF stream bank"))?;
-            let b = next.stage_demand(&self.context, source, &pair[1..])?;
-            let mut consume = |lease, id: ExpertId| -> Result<(), EngError> {
-                let output = self.streamed_pair(lease, id, &route, &activate)?;
-                combine(id.expert as usize, &output);
-                Ok(())
+            let hit = |id: &ExpertId| cache.as_ref().and_then(|c| c.hit(id.expert));
+            let slots = [hit(&pair[0]), pair.get(1).and_then(hit)];
+            let a = if slots[0].is_some() {
+                None
+            } else {
+                first.stage_demand(&self.context, source, &pair[..1])?
             };
-            consume(a, pair[0])?;
-            if let Some(b) = b {
-                consume(b, pair[1])?;
+            let b = if slots[1].is_some() || pair.len() == 1 {
+                None
+            } else {
+                next.stage_demand(&self.context, source, &pair[1..])?
+            };
+            for ((&id, lease), slot) in pair.iter().zip([a, b]).zip(slots) {
+                let output = if let Some(lease) = lease {
+                    self.staged_pair(lease, id, &route, &activate, cache.as_deref_mut())?
+                } else {
+                    let (c, slot) = cache
+                        .as_ref()
+                        .zip(slot)
+                        .ok_or_else(|| bad("missing GGUF expert bank"))?;
+                    hits += 1;
+                    self.project_pair(&route, &activate, None, |i| c.part(slot, i))?
+                };
+                combine(id.expert as usize, &output);
             }
+        }
+        if let (Some(c), Some(id)) = (cache, route.ids.first()) {
+            c.record(id.layer, route.ids.len(), hits);
         }
         Ok(true)
     }
 
-    fn streamed_pair(
+    fn staged_pair(
         &self,
         lease: CudaBankLease<'_>,
         id: ExpertId,
         route: &RoutedExperts<'_>,
         activate: &impl Fn(f32, f32) -> f32,
+        cache: Option<&mut LayerCache>,
+    ) -> Result<Vec<f32>, EngError> {
+        let output = self.project_pair(route, activate, Some(lease.stream()), |index| {
+            let part = lease.part(id, index)?;
+            Ok(Matrix {
+                data: part.data,
+                shape: part.shape.map(|d| d as usize),
+                scale: part.tensor_scale,
+            })
+        })?;
+        match cache {
+            Some(layer) => layer.finish(&self.context, lease, id)?,
+            None => lease.finish()?,
+        }
+        Ok(output)
+    }
+
+    fn project_pair<'a>(
+        &self,
+        route: &RoutedExperts<'_>,
+        activate: &impl Fn(f32, f32) -> f32,
+        stream: Option<&DeviceStream>,
+        matrix: impl Fn(usize) -> Result<Matrix<'a>, EngError>,
     ) -> Result<Vec<f32>, EngError> {
         let project = |part: usize, x: &[f32]| {
-            let view = lease.part(id, part)?;
+            let view = matrix(part)?;
             self.step.project_gguf(
                 &self.context,
-                Some(lease.stream()),
-                (
-                    route.dtypes[part],
-                    view.data,
-                    view.shape.map(|v| v as usize),
-                    view.tensor_scale,
-                ),
+                stream,
+                (route.dtypes[part], view.data, view.shape, view.scale),
                 x,
             )
         };
@@ -97,8 +142,6 @@ impl GgufCuda {
         // The GGUF stores complete gate rows followed by complete up rows.
         let (gate, up) = gates.split_at(gates.len() / 2);
         let mid: Vec<_> = gate.iter().zip(up).map(|(&g, &u)| activate(g, u)).collect();
-        let output = project(1, &mid)?;
-        lease.finish()?;
-        Ok(output)
+        project(1, &mid)
     }
 }
