@@ -32,7 +32,6 @@
 //! Drop order: the captured graph first (it keeps the holds of its capture and covers the state
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
-use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::RefCell;
@@ -45,7 +44,6 @@ use super::{
         run_exl3_moe,
     },
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
-    mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
         ExpertBufs, MoeBuffers, MoeLayerWeights, MoeOp, Packs, StackWeights, run_moe_block_marked,
@@ -105,7 +103,6 @@ use crate::{
             add_rmsnorm_q8::AddNormQ8Call,
             embed::{EmbedCall, EmbedNativeCall},
             embed_bf16::EmbedBf16Call,
-            matvec_q::QuantType,
             sample::{SampleShortlistCall, ShortlistDraw},
             shortlist::{self, ShortlistCall, ShortlistMassCall},
             step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
@@ -474,9 +471,6 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The sampler widths the step wires in (see `rules::StepWidths`): the argmax `n` and the
     /// verdict width, both the sampler vocabulary, never the padded head width.
     widths: StepWidths,
-    /// True when any MMQ weight of the chunk is Q6_K (`any_chunk_weight_q6k` at build): the
-    /// chunk gate then refuses with `Q6KWeight`.
-    chunk_q6k: bool,
     /// The cap of `M_sess`, set by `set_m_sess_cap`; the value is the no-cap default until a
     /// later change wires the config member `qwen36.prefill_chunk` into it.
     m_sess_cap: u32,
@@ -569,7 +563,6 @@ pub(super) struct ChunkFacts {
     pub(super) kv_mode: KvMode,
     pub(super) kv8_chunked_prefill: bool,
     pub(super) tiered: bool,
-    pub(super) mmq_q6k: bool,
     /// The cap of `M_sess` (`qwen36.prefill_chunk` on the CUDA arm). It stays beside the
     /// admitted size: the run report needs both.
     pub(super) m_sess_cap: u32,
@@ -579,9 +572,9 @@ pub(super) struct ChunkFacts {
 }
 
 /// The chunk gate itself, in this order: a Native or EXL3 layout first, then Fp16 KV, then the
-/// tier flag, then the Q6_K scan, then the admitted arena. The first refusal wins, so a session that fails more than
-/// one condition reports the earliest one; `NoArena` is checked after the Q6_K scan, and the accept
-/// verdict carries the ADMITTED size.
+/// tier flag, then the admitted arena. The first refusal wins, so a session that fails more than
+/// one condition reports the earliest one, and the accept verdict carries the ADMITTED size. No
+/// weight type refuses: every native type has a chunk kernel, which the type-table test pins.
 pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     if facts.layout == WeightLayout::Tiled {
         return ChunkVerdict::TiledLayout;
@@ -596,9 +589,6 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     {
         return ChunkVerdict::Tiered;
     }
-    if facts.mmq_q6k {
-        return ChunkVerdict::Q6KWeight;
-    }
     let Some(m_sess) = facts.arena else {
         return ChunkVerdict::NoArena;
     };
@@ -611,54 +601,6 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
         m_sess
     };
     ChunkVerdict::Ready { m_sess }
-}
-
-/// The MoE roles whose weights the chunk's MMQ launches read beside every dense projection of
-/// `MixerGeometry`: the routed expert stacks and the shared expert. The router matrices are raw f32
-/// (not an MMQ input), the embedding is a Q4_K gather and the head runs in the decode step only, so
-/// none of the three is scanned.
-pub(super) const CHUNK_MOE_ROLES: [Role; 6] = [
-    Role::FfnGateExps,
-    Role::FfnUpExps,
-    Role::FfnDownExps,
-    Role::FfnGateShexp,
-    Role::FfnUpShexp,
-    Role::FfnDownShexp,
-];
-
-/// True when any MMQ weight of the chunk is Q6_K: every dense projection of every layer plus the
-/// roles of `CHUNK_MOE_ROLES`. `quant_of` answers the quant type of the loaded Native tensor that
-/// the layer table names; `None` means the tensor was not loaded — legitimate only for the six MoE
-/// roles under a tiered load (the stacks stay in the file, and the `Tiered` verdict refuses such a
-/// session anyway), so an absent dense projection is a `Checkpoint` refusal naming the tensor:
-/// dense projections load in every mode. Tiled loads carry no quant type and the layout refusal
-/// covers them.
-pub(super) fn any_chunk_weight_q6k(
-    table: &LayerTable,
-    geometry: &MixerGeometry,
-    quant_of: impl Fn(&str) -> Option<QuantType>,
-) -> Result<bool, EngError> {
-    for layer in 0..table.len() {
-        let kind = table.slot(layer)?.kind;
-        for spec in geometry.dense_specs(WeightLayout::Native, kind)? {
-            let name = table.name(layer, spec.role)?;
-            match quant_of(name) {
-                Some(QuantType::Q6K) => return Ok(true),
-                Some(_) => {}
-                None => {
-                    return Err(EngError::Checkpoint(format!(
-                        "chunk gate: {name} is not loaded; dense projections load in every mode"
-                    )));
-                }
-            }
-        }
-        for role in CHUNK_MOE_ROLES {
-            if quant_of(table.name(layer, role)?) == Some(QuantType::Q6K) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 /// The capture-preserving routing stage (`Q36_ROUTE_STAGE`, `route_stage`): a staging buffer
@@ -925,15 +867,6 @@ impl<'a> QwenResidentStep<'a> {
             pinned.push(stage.buffer);
         }
         let pins: &'a [&'a DeviceBuffer] = Box::leak(pinned.into_boxed_slice());
-        // The chunk gate's Q6_K scan, beside the other build-time facts: only Native weights carry
-        // a quant type; a Tiled session is refused by its layout before the scan matters. The
-        // lookup answers `None` for a tensor the load left in the file (the tiered stacks), which
-        // the scan takes as not Q6_K.
-        let chunk_q6k = options.layout == WeightLayout::Native
-            && any_chunk_weight_q6k(&res.table, &res.geometry, |name| match weights.get(name) {
-                Some(CudaWeight::Native { weight, .. }) => Some(weight.quant()),
-                _ => None,
-            })?;
         let step = Self {
             pins,
             krow_pins: &[],
@@ -980,7 +913,6 @@ impl<'a> QwenResidentStep<'a> {
             marks: None,
             rules,
             widths,
-            chunk_q6k,
             kv8_chunked_prefill: false,
             window: None,
             #[cfg(test)]
@@ -1167,7 +1099,7 @@ impl<'a> QwenResidentStep<'a> {
 
     /// Admits the session's prefill arena: the two guards first (before the first token, at most
     /// once — `admit_guard`), then the pre-arena verdict — a session whose layout, KV mode, tier
-    /// flag or Q6_K scan refuses the chunk path gets its refusal verdict back with NOTHING
+    /// flag refuses the chunk path gets its refusal verdict back with NOTHING
     /// allocated and no device fact even queried — then the MMQ device facts, the ladder costs and
     /// [`admit_m_sess`] with the REAL state term. An admitted `M` allocates the [`PrefillArena`]
     /// (the whole-arena zero fill runs here, ONCE per session); `None` allocates nothing. Both
@@ -1196,7 +1128,6 @@ impl<'a> QwenResidentStep<'a> {
             self.layout,
             layout.kv.mode,
             self.tiered_mode,
-            self.chunk_q6k,
             self.kv8_chunked_prefill,
         ) {
             if fixed {
@@ -1392,8 +1323,8 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The chunk-gate verdict of this session: whether `feed_rows` may run the chunk path. The
-    /// conditions, in order: the Native layout, `Fp16` KV, a non-tiered session, no Q6_K MMQ weight
-    /// of the chunk, and an ADMITTED prefill arena — until `admit_prefill` admits one, an
+    /// conditions, in order: the Native layout, `Fp16` KV, a non-tiered session, and an ADMITTED
+    /// prefill arena — until `admit_prefill` admits one, an
     /// otherwise-ready session answers `NoArena` and keeps the per-token path. The accept verdict
     /// carries the admitted `M_sess` of the arena, never the raw cap.
     pub(super) fn chunk_ready(&self) -> ChunkVerdict {
@@ -1402,7 +1333,6 @@ impl<'a> QwenResidentStep<'a> {
             kv_mode: self.state.layout().kv.mode,
             kv8_chunked_prefill: self.kv8_chunked_prefill,
             tiered: self.tiered_mode,
-            mmq_q6k: self.chunk_q6k,
             m_sess_cap: self.m_sess_cap,
             arena: self.prefill.as_ref().map(PrefillArena::m_sess),
         })

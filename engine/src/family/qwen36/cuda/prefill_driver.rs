@@ -4,7 +4,7 @@
 //!
 //! The pure pieces are host arithmetic only, no CUDA call: [`AdmitFacts`] and [`admit_m_sess`] feed
 //! the prefill plan's `Admission` the REAL state term, guarded by the planned-against-allocated
-//! equality; [`needs_arena`] is the first four conditions of `chunk_verdict`, the half an
+//! equality; [`needs_arena`] is the first three conditions of `chunk_verdict`, the half an
 //! arena-owning session must pass before any device query; [`zero_spans`] cuts the one reused zero
 //! buffer of the arena fill. The device half is [`PrefillArena`]: `QwenResidentStep::admit_prefill`
 //! allocates and zero-fills it once per session, and the per-chunk protocol (the chunk body of
@@ -484,15 +484,13 @@ pub(super) fn require_fixed_room(
     Ok(())
 }
 
-/// The pre-arena gate accepts a Native or EXL3 layout, `Fp16` or opted-in `Int8G32`, a non-tiered
-/// session, and no Q6_K MMQ weight. These conditions match the first four `chunk_verdict`
-/// checks. A rejected session needs no arena. `admit_prefill` runs this check before
+/// The pre-arena gate accepts a Native or EXL3 layout, `Fp16` or opted-in `Int8G32`, and a
+/// non-tiered session. These conditions match the first three `chunk_verdict` checks. A rejected session needs no arena. `admit_prefill` runs this check before
 /// device queries or arena allocation.
 pub(super) fn needs_arena(
     layout: WeightLayout,
     kv_mode: KvMode,
     tiered: bool,
-    mmq_q6k: bool,
     kv8_chunked_prefill: bool,
 ) -> bool {
     let supported_kv =
@@ -501,7 +499,7 @@ pub(super) fn needs_arena(
         || super::prefill::tiered_chunk_enabled(
             std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
         );
-    layout != WeightLayout::Tiled && supported_kv && chunk_ok && !mmq_q6k
+    layout != WeightLayout::Tiled && supported_kv && chunk_ok
 }
 
 /// The two session-build guards of `admit_prefill` as a pure seam (condition 8a): the

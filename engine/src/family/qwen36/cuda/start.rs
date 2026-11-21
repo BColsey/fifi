@@ -489,7 +489,6 @@ pub(super) fn prefill_start_line(verdict: &ChunkVerdict) -> String {
         ChunkVerdict::TiledLayout => "q36 cuda: prefill per token: tiled layout".to_owned(),
         ChunkVerdict::Kv8 => "q36 cuda: prefill per token: 8-bit cache".to_owned(),
         ChunkVerdict::Tiered => "q36 cuda: prefill per token: tiered mode".to_owned(),
-        ChunkVerdict::Q6KWeight => "q36 cuda: prefill per token: Q6_K weight".to_owned(),
         ChunkVerdict::NoArena => "q36 cuda: prefill per token: no arena".to_owned(),
     }
 }

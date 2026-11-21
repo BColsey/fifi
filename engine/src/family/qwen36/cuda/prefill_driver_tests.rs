@@ -385,16 +385,15 @@ fn zero_spans_cover_the_arena_once() {
     }
 }
 
-/// The gate refuses without an arena AFTER the Q6_K scan, and the accept verdict carries the
-/// ADMITTED size, never the cap.
+/// The gate refuses without an arena, and the accept verdict carries the ADMITTED size, never
+/// the cap.
 #[test]
-fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
+fn the_gate_refuses_without_an_arena() {
     let otherwise_ready = || ChunkFacts {
         layout: WeightLayout::Native,
         kv_mode: KvMode::Fp16,
         kv8_chunked_prefill: false,
         tiered: false,
-        mmq_q6k: false,
         m_sess_cap: 2048,
         arena: None,
     };
@@ -410,14 +409,6 @@ fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
         }),
         ChunkVerdict::Ready { m_sess: 512 },
         "the accept verdict carries the admitted size, never the cap"
-    );
-    assert_eq!(
-        chunk_verdict(&ChunkFacts {
-            mmq_q6k: true,
-            ..otherwise_ready()
-        }),
-        ChunkVerdict::Q6KWeight,
-        "NoArena is checked after the Q6_K scan"
     );
     assert_eq!(
         chunk_verdict(&ChunkFacts {
@@ -439,7 +430,6 @@ fn an_exl3_session_takes_the_chunk_gate_of_a_native_one() {
         kv_mode: KvMode::Fp16,
         kv8_chunked_prefill: false,
         tiered: false,
-        mmq_q6k: false,
         m_sess_cap: 2048,
         arena: None,
     };
@@ -479,49 +469,31 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
         KvMode::Fp16,
         false,
         false,
-        false
     ));
-    assert!(needs_arena(
-        WeightLayout::Exl3,
-        KvMode::Fp16,
-        false,
-        false,
-        false
-    ));
+    assert!(needs_arena(WeightLayout::Exl3, KvMode::Fp16, false, false,));
     assert!(!needs_arena(
         WeightLayout::Tiled,
         KvMode::Fp16,
         false,
         false,
-        false
     ));
     assert!(!needs_arena(
         WeightLayout::Native,
         KvMode::Int8G32,
         false,
         false,
-        false
     ));
     assert!(!needs_arena(
         WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
         false,
-        false
     ));
     assert!(!needs_arena(
         WeightLayout::Native,
         KvMode::Fp16,
         true,
         false,
-        false
-    ));
-    assert!(!needs_arena(
-        WeightLayout::Native,
-        KvMode::Fp16,
-        false,
-        true,
-        false
     ));
 }
 
@@ -531,36 +503,25 @@ fn kv8_opt_in_plans_an_arena_without_bypassing_layout_or_weight_guards() {
         WeightLayout::Native,
         KvMode::Int8G32,
         false,
-        false,
-        true
+        true,
     ));
     assert!(needs_arena(
         WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
-        false,
-        true
+        true,
     ));
     assert!(!needs_arena(
         WeightLayout::Tiled,
         KvMode::Int8G32,
         false,
-        false,
-        true
+        true,
     ));
     assert!(!needs_arena(
         WeightLayout::Native,
         KvMode::Int8G32,
         true,
-        false,
-        true
-    ));
-    assert!(!needs_arena(
-        WeightLayout::Native,
-        KvMode::Int8G32,
-        false,
         true,
-        true
     ));
 }
 
@@ -582,10 +543,6 @@ fn the_start_line_names_the_prefill_path() {
     assert_eq!(
         prefill_start_line(&ChunkVerdict::Tiered),
         "q36 cuda: prefill per token: tiered mode"
-    );
-    assert_eq!(
-        prefill_start_line(&ChunkVerdict::Q6KWeight),
-        "q36 cuda: prefill per token: Q6_K weight"
     );
     assert_eq!(
         prefill_start_line(&ChunkVerdict::NoArena),

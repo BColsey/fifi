@@ -93,7 +93,6 @@ pub(crate) enum ChunkVerdictTag {
     TiledLayout,
     Kv8,
     Tiered,
-    Q6KWeight,
     NoArena,
 }
 
@@ -104,7 +103,6 @@ impl ChunkVerdictTag {
             Self::TiledLayout => "TiledLayout",
             Self::Kv8 => "Kv8",
             Self::Tiered => "Tiered",
-            Self::Q6KWeight => "Q6KWeight",
             Self::NoArena => "NoArena",
         }
     }
@@ -115,7 +113,6 @@ impl ChunkVerdictTag {
             super::ChunkVerdict::TiledLayout => Self::TiledLayout,
             super::ChunkVerdict::Kv8 => Self::Kv8,
             super::ChunkVerdict::Tiered => Self::Tiered,
-            super::ChunkVerdict::Q6KWeight => Self::Q6KWeight,
             super::ChunkVerdict::NoArena => Self::NoArena,
         }
     }

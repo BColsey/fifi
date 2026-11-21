@@ -23,9 +23,6 @@ pub(crate) enum ChunkVerdict {
     /// The session is tiered: `chunk_ready` sends tiered sessions to the per-token loop; no
     /// batched tiered prefill exists yet.
     Tiered,
-    /// An MMQ weight of the chunk is Q6_K: no Q6_K chunk row exists, so the session keeps the
-    /// per-token path.
-    Q6KWeight,
     /// The session admitted no prefill arena (no `M` of the ladder fits the budget, or
     /// `admit_prefill` was not called); the session keeps the per-token path.
     NoArena,

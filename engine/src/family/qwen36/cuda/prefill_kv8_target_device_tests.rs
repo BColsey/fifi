@@ -116,7 +116,6 @@ struct Observed {
     records: Vec<StepRecord>,
     n_prefilled: usize,
     n_fed: usize,
-    chunk_q6k: bool,
     layers: usize,
     delta_layers: usize,
     attn_layers: usize,
@@ -137,11 +136,6 @@ fn read_range(stream: &DeviceStream, range: DeviceRange<'_>) -> Result<Vec<u8>, 
 /// Use the normal admission equality and budget sum, but do not change `needs_arena` or its gate.
 fn private_arena(step: &mut QwenResidentStep<'_>, budget: usize) -> Result<(), EngError> {
     admit_guard(step.started, step.prefill.is_some())?;
-    if step.chunk_q6k {
-        return Err(bad(
-            "the target unexpectedly has a Q6_K chunk weight; retain its refusal",
-        ));
-    }
     let layout = step.state.layout();
     let admission = AdmitFacts {
         budget,
@@ -319,7 +313,6 @@ fn device_phase(ids: &[u32], kernel_class: ChunkKernelClass) -> Result<Observed,
         records: step.prefill_report.steps().to_vec(),
         n_prefilled: step.prefill_report.n_prefilled(),
         n_fed: step.prefill_report.n_fed(),
-        chunk_q6k: step.chunk_q6k,
         layers: res.table.len(),
         delta_layers: step.state.layout().delta.layers,
         attn_layers: step.state.layout().kv.layers,
@@ -479,7 +472,6 @@ fn save_rows(
             "kind": format!("{:?}", record.kind)
         })).collect::<Vec<_>>(),
         "delta_layers": observed.delta_layers, "attention_layers": observed.attn_layers,
-        "chunk_q6k": observed.chunk_q6k,
         "arena_rows": observed.arena_rows, "arena_bytes": observed.arena_bytes,
         "part_bytes": observed.part_bytes, "admission_budget": observed.budget,
         "kv8_length_word_bytes": observed.length_word,
@@ -524,10 +516,6 @@ fn inspect_rows(
     assert_eq!(
         observed.production.capture,
         vec![CaptureOutcome::Eager; ROWS]
-    );
-    assert!(
-        !observed.chunk_q6k,
-        "the actual target must retain its independent Q6_K scan"
     );
     assert_eq!(
         (observed.layers, observed.delta_layers, observed.attn_layers),

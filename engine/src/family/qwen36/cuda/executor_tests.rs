@@ -3,18 +3,16 @@
 //! routing on its one switch, the per-token identity on the shared `DecodeSession` over host
 //! steppers, and the device-only wiring on the merged source (the `start_pins` style).
 
-use super::common_tests;
 use super::dims::KvMode;
 use super::executor::{ChunkPath, chunk_path_of, feed_per_token, piece_of};
-use super::mixer_geometry::MixerGeometry;
 use super::start_pins::{pinned, section_of};
-use super::step::{CHUNK_MOE_ROLES, ChunkFacts, ChunkVerdict, any_chunk_weight_q6k, chunk_verdict};
+use super::step::{ChunkFacts, ChunkVerdict, chunk_verdict};
 use crate::EngError;
-use crate::family::exl3::layer_table::LayerTable;
-use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::session::{DecodeSession, TokenStepper};
+use crate::kernels::cuda::prefill::mmq_mmid::mmq_type_of;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
+use crate::weights::GgufType;
 
 type Result<T> = std::result::Result<T, EngError>;
 
@@ -27,7 +25,6 @@ fn ready() -> ChunkFacts {
         kv_mode: KvMode::Fp16,
         kv8_chunked_prefill: false,
         tiered: false,
-        mmq_q6k: false,
         m_sess_cap: 2048,
         arena: Some(2048),
     }
@@ -69,16 +66,11 @@ fn the_gate_refuses_each_condition_with_its_typed_reason() {
         ..ready()
     };
     assert_eq!(chunk_verdict(&tiered), ChunkVerdict::Tiered);
-    let q6k = ChunkFacts {
-        mmq_q6k: true,
-        ..ready()
-    };
-    assert_eq!(chunk_verdict(&q6k), ChunkVerdict::Q6KWeight);
 }
 
 #[test]
 fn the_gate_reports_the_earliest_refusal() {
-    // The refusal order: Native, then Fp16, then tiered, then the Q6_K scan.
+    // The refusal order: Native, then Fp16, then tiered.
     let tiled_and_kv8 = ChunkFacts {
         layout: WeightLayout::Tiled,
         kv_mode: KvMode::Int8G32,
@@ -91,12 +83,6 @@ fn the_gate_reports_the_earliest_refusal() {
         ..ready()
     };
     assert_eq!(chunk_verdict(&kv8_and_tiered), ChunkVerdict::Kv8);
-    let tiered_and_q6k = ChunkFacts {
-        tiered: true,
-        mmq_q6k: true,
-        ..ready()
-    };
-    assert_eq!(chunk_verdict(&tiered_and_q6k), ChunkVerdict::Tiered);
 }
 
 #[test]
@@ -132,142 +118,21 @@ fn kv8_chunking_is_opt_in_and_keeps_the_other_refusals() {
         }),
         ChunkVerdict::Tiered
     );
-    assert_eq!(
-        chunk_verdict(&ChunkFacts {
-            mmq_q6k: true,
-            ..kv8
-        }),
-        ChunkVerdict::Q6KWeight
-    );
 }
 
+/// The gate has no weight-type refusal because every native type has a chunk kernel: the
+/// vendored grouped MMQ for the four glued types, the dequantizing GEMM for the rest. A type
+/// added to the shared table without either kernel fails here instead of silently taking the
+/// one-token-per-step path.
 #[test]
-fn the_chunk_scan_covers_the_routed_stacks_and_the_shared_expert() {
-    // The MMQ weights of the chunk beside the dense projections: the three routed expert stacks and
-    // the three shared-expert projections. The router (raw f32), the embedding gather and the
-    // decode-only head are not scanned.
-    assert_eq!(
-        CHUNK_MOE_ROLES,
-        [
-            Role::FfnGateExps,
-            Role::FfnUpExps,
-            Role::FfnDownExps,
-            Role::FfnGateShexp,
-            Role::FfnUpShexp,
-            Role::FfnDownShexp,
-        ]
-    );
-}
-
-/// The layer table and mixer geometry of the pinned shape (the host fixtures of
-/// `common_tests`): the scan's own inputs, so its rows run without a device. The
-/// `quant_of` lookup is the only thing a real load provides.
-fn scan_fixtures() -> (LayerTable, MixerGeometry) {
-    let dims = common_tests::dims();
-    let table = LayerTable::new(&dims, &common_tests::inventory()).expect("layer table");
-    let geometry = MixerGeometry::new(&dims).expect("geometry");
-    (table, geometry)
-}
-
-fn role_name(table: &LayerTable, layer: usize, role: Role) -> String {
-    table.name(layer, role).expect("role name").to_string()
-}
-
-#[test]
-fn the_chunk_scan_finds_a_q6_k_dense_projection() {
-    let (table, geometry) = scan_fixtures();
-    let kind = table.slot(0).expect("layer 0").kind;
-    let role = geometry
-        .dense_specs(WeightLayout::Native, kind)
-        .expect("specs")[0]
-        .role;
-    let want = role_name(&table, 0, role);
-    let quant_of = move |name: &str| {
-        if name == want {
-            Some(QuantType::Q6K)
-        } else {
-            Some(QuantType::Q80)
-        }
-    };
-    assert_eq!(
-        any_chunk_weight_q6k(&table, &geometry, quant_of),
-        Ok(true),
-        "a Q6_K dense projection of layer 0 refuses the chunk path"
-    );
-}
-
-#[test]
-fn the_chunk_scan_finds_a_q6_k_expert_stack() {
-    let (table, geometry) = scan_fixtures();
-    let want = role_name(&table, 5, Role::FfnDownExps);
-    let quant_of = move |name: &str| {
-        if name == want {
-            Some(QuantType::Q6K)
-        } else {
-            Some(QuantType::Q4K)
-        }
-    };
-    assert_eq!(
-        any_chunk_weight_q6k(&table, &geometry, quant_of),
-        Ok(true),
-        "a Q6_K routed stack of layer 5 refuses the chunk path"
-    );
-}
-
-#[test]
-fn the_chunk_scan_passes_a_load_whose_only_q6_k_is_the_head() {
-    // The pinned file's only Q6_K tensor is `output.weight` (the head), which never meets the
-    // chunk's MMQs: the scan must not ask for it, so a load whose only Q6_K is the head accepts.
-    let (table, geometry) = scan_fixtures();
-    let quant_of = |name: &str| {
-        if name == "output.weight" {
-            Some(QuantType::Q6K)
-        } else {
-            Some(QuantType::Q80)
-        }
-    };
-    assert_eq!(any_chunk_weight_q6k(&table, &geometry, quant_of), Ok(false));
-}
-
-#[test]
-fn absent_moe_stacks_read_as_not_q6_k_under_a_tiered_load() {
-    // A tiered load leaves the routed stacks in the file: `None` for the six MoE roles
-    // reads as not Q6_K (the `Tiered` verdict refuses such a session anyway), while the
-    // dense projections and the shared expert stay loaded.
-    let (table, geometry) = scan_fixtures();
-    let mut moe_names = Vec::new();
-    for layer in 0..table.len() {
-        for role in CHUNK_MOE_ROLES {
-            moe_names.push(role_name(&table, layer, role));
-        }
-    }
-    let quant_of =
-        move |name: &str| (!moe_names.iter().any(|moe| moe == name)).then_some(QuantType::Q4K);
-    assert_eq!(any_chunk_weight_q6k(&table, &geometry, quant_of), Ok(false));
-}
-
-#[test]
-fn an_absent_dense_projection_is_refused_by_name() {
-    // Dense projections load in every mode, so a missing one is a `Checkpoint` refusal naming the
-    // tensor, never a silent skip that would under-report the gate.
-    let (table, geometry) = scan_fixtures();
-    let kind = table.slot(0).expect("layer 0").kind;
-    let role = geometry
-        .dense_specs(WeightLayout::Native, kind)
-        .expect("specs")[0]
-        .role;
-    let absent = role_name(&table, 0, role);
-    let missing = absent.clone();
-    let quant_of = move |name: &str| (name != missing).then_some(QuantType::Q80);
-    match any_chunk_weight_q6k(&table, &geometry, quant_of) {
-        Err(EngError::Checkpoint(message)) => {
-            assert!(message.contains(&absent), "names the tensor: {message}");
-            assert!(
-                message.contains("dense projections load in every mode"),
-                "states the rule: {message}"
-            );
-        }
-        other => panic!("expected a Checkpoint refusal, got {other:?}"),
+fn every_native_type_has_a_chunk_kernel() {
+    for ty in GgufType::native_types() {
+        let quant = QuantType::from_gguf(ty).expect("a native type has a kernel type");
+        assert!(
+            quant.uses_dequantizing_gemm() || mmq_type_of(quant).is_ok(),
+            "{} has no chunk kernel",
+            ty.name()
+        );
     }
 }
 
@@ -277,7 +142,6 @@ fn the_chunk_path_takes_the_admitted_m_sess() {
         ChunkVerdict::TiledLayout,
         ChunkVerdict::Kv8,
         ChunkVerdict::Tiered,
-        ChunkVerdict::Q6KWeight,
         ChunkVerdict::NoArena,
         ChunkVerdict::Ready { m_sess: 128 },
         ChunkVerdict::Ready { m_sess: 2048 },
@@ -371,7 +235,6 @@ fn feed_rows_feeds_token_for_token_as_the_default_loop_for_every_verdict() {
         ChunkVerdict::TiledLayout,
         ChunkVerdict::Kv8,
         ChunkVerdict::Tiered,
-        ChunkVerdict::Q6KWeight,
         ChunkVerdict::NoArena,
     ];
     let sequences: Vec<Vec<Vec<u32>>> = vec![
@@ -524,15 +387,14 @@ fn feed_rows_routes_through_the_chunk_gate() {
 
 #[test]
 fn the_step_builds_its_chunk_facts_and_the_start_hands_the_cap_over() {
-    // The build-time facts and the serve wiring, pinned the same way: `new` runs the Q6_K
-    // scan, `chunk_ready` reads the stored facts, and `make` opens KV8 only by opt-in
+    // The build-time facts and the serve wiring, pinned the same way: `chunk_ready` reads the stored facts, and `make` opens KV8 only by opt-in
     // before handing over the 512-row cap. The old default remains unchanged.
     let step = include_str!("step.rs");
     let new = pinned(section_of(step, "step.rs", "fn build("));
-    assert!(new.contains("any_chunk_weight_q6k("), "{new}");
+    assert!(!new.contains("q6k"), "{new}");
     let ready = pinned(section_of(step, "step.rs", "fn chunk_ready("));
     assert!(
-        ready.contains("chunk_verdict(&ChunkFacts{") && ready.contains("mmq_q6k"),
+        ready.contains("chunk_verdict(&ChunkFacts{") && !ready.contains("q6k"),
         "{ready}"
     );
     let make = pinned(section_of(include_str!("start.rs"), "start.rs", "fn make("));
@@ -628,7 +490,6 @@ fn the_worker_piece_follows_the_verdict() {
         ChunkVerdict::TiledLayout,
         ChunkVerdict::Kv8,
         ChunkVerdict::Tiered,
-        ChunkVerdict::Q6KWeight,
         ChunkVerdict::NoArena,
     ] {
         assert_eq!(
