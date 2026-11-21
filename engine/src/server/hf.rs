@@ -122,9 +122,50 @@ pub(crate) fn valid_repo_id(repo: &str) -> bool {
     }
 }
 
+/// A revision we accept: one plain segment (`main`, a tag, a
+/// branch, a 40-hex commit). It becomes both a URL segment and a
+/// file name under `refs/`, so slashes and traversal are refused.
+pub(crate) fn valid_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 64
+        && revision != "."
+        && revision != ".."
+        && !revision.contains('/')
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// A hub-supplied file path or commit id that becomes a path under
+/// the cache: one relative path of plain segments. This is the
+/// filesystem half of `valid_repo_id` — the hub (or a configured
+/// mirror) is external input, so absolute paths, backslashes, and
+/// empty or dotted segments are injection attempts, not naming
+/// quirks.
+pub(crate) fn safe_rel_path(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 512
+        && !text.starts_with('/')
+        && !text.contains('\\')
+        && text
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// The cache directory name of one repo, the hub's own encoding.
 pub(crate) fn repo_cache_dir(hub_dir: &Path, repo: &str) -> PathBuf {
     hub_dir.join(format!("models--{}", repo.replace('/', "--")))
+}
+
+/// The symlink target for one snapshot file, relative to the
+/// link's own directory: a file nested `n` directories deep needs
+/// `n + 2` `..` levels to reach the repo root's `blobs/`.
+fn blob_link_target(path: &str, blob: &str) -> PathBuf {
+    let depth = path.matches('/').count();
+    let mut target = PathBuf::from("../".repeat(depth + 2));
+    target.push("blobs");
+    target.push(blob);
+    target
 }
 
 /// The state of one download job. `Downloading` carries the live
@@ -469,6 +510,17 @@ impl HfHub {
                 "{MAX_ACTIVE_JOBS} downloads are already running; wait or cancel one"
             ));
         }
+        if jobs.iter().any(|job| {
+            job.repo == repo
+                && job.revision == revision
+                && job
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_active()
+        }) {
+            return Err(format!("{repo} is already downloading"));
+        }
         // A finished job for the same repo+revision is replaced: a
         // retry after a failure must not show two rows for one pack.
         jobs.retain(|job| {
@@ -493,10 +545,19 @@ impl HfHub {
         drop(jobs);
         let hub = Arc::clone(self);
         let thread_job = Arc::clone(&job);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name(format!("hf-download-{id}"))
-            .spawn(move || hub.run_job(&thread_job))
-            .map_err(|error| format!("cannot start the download thread: {error}"))?;
+            .spawn(move || hub.run_job(&thread_job));
+        if let Err(error) = spawned {
+            // The job never ran: drop it from the registry so its
+            // `Resolving` state cannot hold an active-job slot until
+            // process restart.
+            self.jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|registered| registered.id != id);
+            return Err(format!("cannot start the download thread: {error}"));
+        }
         Ok(job)
     }
 
@@ -536,6 +597,16 @@ impl HfHub {
 
     fn run_job_inner(&self, job: &Job) -> Result<(), String> {
         let (commit, files) = self.tree(&job.repo, &job.revision)?;
+        if !safe_rel_path(&commit) {
+            return Err(format!("hub names an unsafe commit: {commit}"));
+        }
+        if let Some(bad) = files
+            .iter()
+            .map(|(path, _)| path)
+            .find(|path| !path.starts_with(SKIPPED_PREFIX) && !safe_rel_path(path))
+        {
+            return Err(format!("hub names an unsafe file path: {bad}"));
+        }
         let wanted: Vec<&(String, u64)> = files
             .iter()
             .filter(|(path, _)| !path.starts_with(SKIPPED_PREFIX))
@@ -574,7 +645,7 @@ impl HfHub {
                     .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
             }
             let _ = std::fs::remove_file(&link);
-            let relative = Path::new("../../blobs").join(&blob);
+            let relative = blob_link_target(path, &blob);
             #[cfg(unix)]
             std::os::unix::fs::symlink(&relative, &link)
                 .map_err(|error| format!("cannot link {}: {error}", link.display()))?;
@@ -597,7 +668,7 @@ impl HfHub {
             let refs = repo_dir.join("refs");
             std::fs::create_dir_all(&refs)
                 .map_err(|error| format!("cannot create {}: {error}", refs.display()))?;
-            let tmp = refs.join(format!(".{}.tmp", job.revision));
+            let tmp = refs.join(format!(".job{}.tmp", job.id));
             std::fs::write(&tmp, &commit)
                 .and_then(|_| std::fs::rename(&tmp, refs.join(&job.revision)))
                 .map_err(|error| format!("cannot record the ref: {error}"))?;
@@ -1015,6 +1086,12 @@ pub(crate) async fn start_download(
         );
     }
     let revision = body.revision.unwrap_or_else(|| "main".to_string());
+    if !valid_revision(&revision) {
+        return Err(EngError::BadRequest(format!(
+            "{revision} is not a revision (one plain segment: main, a tag, a branch, a commit)"
+        ))
+        .into());
+    }
     let job = state
         .hf()
         .start_download(&body.repo, &revision)
@@ -1109,5 +1186,77 @@ mod tests {
         std::fs::create_dir_all(repo.join("refs")).expect("refs dir");
         std::fs::write(repo.join("refs").join("main"), "missing\n").expect("ref");
         assert_eq!(cached_main_snapshot_in(hub.path(), "org/dangling"), None);
+    }
+
+    #[test]
+    fn revisions_are_one_plain_segment() {
+        for rev in ["main", "v1.0", "refs-pr-1", &"d".repeat(40)] {
+            assert!(valid_revision(rev), "{rev}");
+        }
+        for rev in [
+            "",
+            ".",
+            "..",
+            "refs/pr/1",
+            "../x",
+            "a\nb",
+            "a b",
+            &"x".repeat(65),
+        ] {
+            assert!(!valid_revision(rev), "{rev:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn hub_paths_must_be_relative_and_plain() {
+        for path in ["file.gguf", "gguf/file.gguf", "a/b/c.safetensors"] {
+            assert!(safe_rel_path(path), "{path}");
+        }
+        for path in [
+            "",
+            "/etc/passwd",
+            "../../home/x",
+            "a/../b",
+            "./x",
+            "x/.",
+            "..",
+            "a//b",
+            "a\\b",
+            &"x/".repeat(300),
+        ] {
+            assert!(!safe_rel_path(path), "{path:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn blob_targets_reach_blobs_from_any_depth() {
+        assert_eq!(
+            blob_link_target("m.gguf", "cafe"),
+            Path::new("../../blobs/cafe")
+        );
+        assert_eq!(
+            blob_link_target("gguf/m.gguf", "cafe"),
+            Path::new("../../../blobs/cafe")
+        );
+        assert_eq!(
+            blob_link_target("a/b/c.safetensors", "cafe"),
+            Path::new("../../../../blobs/cafe")
+        );
+    }
+
+    #[test]
+    fn nested_snapshot_links_resolve_to_the_blob() {
+        let hub = tempfile::tempdir().expect("tempdir");
+        let repo = repo_cache_dir(hub.path(), "org/name");
+        let blob = "cafe1234";
+        std::fs::create_dir_all(repo.join("blobs")).expect("blobs dir");
+        std::fs::write(repo.join("blobs").join(blob), "payload").expect("blob");
+        for path in ["model.gguf", "gguf/model.gguf", "a/b/c.safetensors"] {
+            let link = repo.join("snapshots").join("c1").join(path);
+            std::fs::create_dir_all(link.parent().expect("link parent")).expect("dirs");
+            std::os::unix::fs::symlink(blob_link_target(path, blob), &link).expect("link");
+            let hit = std::fs::read(&link).expect("link must resolve to the blob");
+            assert_eq!(hit, b"payload", "{path} must reach the blob");
+        }
     }
 }

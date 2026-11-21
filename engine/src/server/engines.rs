@@ -119,7 +119,7 @@ pub(crate) async fn add(
     .map_err(|error| EngError::BadRequest(format!("engine derivation failed: {error}")))?
     .map_err(|error| EngError::BadRequest(error.to_string()))?;
     let (file_prefix_reuse, mut engine_config) = derivation;
-    engine_config.id = id;
+    engine_config.id = id.clone();
     let started = tokio::task::spawn_blocking(move || {
         crate::server::run::start_one(&engine_config, file_prefix_reuse)
     })
@@ -127,10 +127,15 @@ pub(crate) async fn add(
     .map_err(|error| EngError::BadRequest(format!("engine start failed: {error}")))?
     .map_err(|error| EngError::BadRequest(error.to_string()))?;
     let (engine, entry) = started;
+    let Some(shared) = state.add_engine(entry, engine) else {
+        return Err(EngError::BadRequest(format!(
+            "engine {id} already exists; pass a different id"
+        ))
+        .into());
+    };
     if !cfg!(test) {
-        crate::server::run::spawn_stage_reporter(std::slice::from_ref(&entry));
+        crate::server::run::spawn_stage_reporter(std::slice::from_ref(&shared));
     }
-    let shared = state.add_engine(entry, engine);
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -170,7 +175,11 @@ pub(crate) async fn remove(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    match state.remove_engine(&id) {
+    let id_for_stop = id.clone();
+    let stopped = tokio::task::spawn_blocking(move || state.remove_engine(&id_for_stop))
+        .await
+        .map_err(|error| EngError::BadRequest(format!("engine stop join failed: {error}")))?;
+    match stopped {
         Ok((entry, report)) => Ok(Json(serde_json::json!({
             "id": id,
             "model": entry.model,

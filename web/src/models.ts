@@ -92,6 +92,7 @@ export class ModelsView {
     this.enginesBody = card("Engines").root;
     this.noteBody = document.createElement("div");
     this.noteBody.className = "card";
+    this.noteBody.setAttribute("role", "status");
 
     section.append(
       search.root,
@@ -106,15 +107,24 @@ export class ModelsView {
   private readonly noteBody: HTMLDivElement;
 
   private say(text: string | null): void {
+    if (text === this.note) return;
     this.note = text;
     this.noteBody.replaceChildren();
     if (text !== null) this.noteBody.append(line(text));
   }
 
+  /** A second refresh while one is in flight returns instead of
+   * stacking fetches or letting a slow pass overwrite a fresh one
+   * (MonitorView's N3 rule, applied to this poll too). */
+  private refreshing = false;
+
   async refresh(): Promise<void> {
+    if (this.refreshing) return;
+    this.refreshing = true;
     try {
+      const signal = AbortSignal.timeout(4_000);
       const [engines, cache, downloads] = await Promise.all([
-        listEngines(), listHubCache(), listHubDownloads(),
+        listEngines(signal), listHubCache(signal), listHubDownloads(signal),
       ]);
       this.engines = engines.engines;
       this.enginesError = null;
@@ -123,6 +133,8 @@ export class ModelsView {
       this.downloads = downloads.downloads;
     } catch (err) {
       this.enginesError = this.cacheError = err instanceof Error ? err.message : String(err);
+    } finally {
+      this.refreshing = false;
     }
     this.render();
     this.schedulePoll();
@@ -159,6 +171,15 @@ export class ModelsView {
   }
 
   private async download(repo: string): Promise<void> {
+    const running = this.downloads.some(
+      (job) =>
+        job.repo === repo &&
+        (job.state === "resolving" || job.state === "downloading"),
+    );
+    if (running) {
+      this.say(`${repo} is already downloading.`);
+      return;
+    }
     try {
       await startHubDownload(repo);
       this.say(`Download of ${repo} started.`);
@@ -260,7 +281,7 @@ export class ModelsView {
     this.cacheBody.replaceChildren();
     if (this.cacheError !== null) {
       this.cacheBody.append(line(this.cacheError));
-    } else if (this.cache !== null) {
+    } else if (this.cache !== null && Array.isArray(this.cache.models)) {
       const h3 = document.createElement("h3");
       h3.textContent = "Local hub cache";
       const dir = line(`Cache: ${this.cache.hub_dir}`);
@@ -284,6 +305,13 @@ export class ModelsView {
         );
         this.cacheBody.append(p);
       }
+    } else if (this.cache !== null) {
+      // A scan failure answers 200 with {"error"} and no models
+      // array; without this arm the render above would not run and
+      // the failure would be invisible.
+      this.cacheBody.append(
+        line((this.cache as { error?: string }).error ?? "cache scan failed"),
+      );
     }
 
     this.enginesBody.replaceChildren();

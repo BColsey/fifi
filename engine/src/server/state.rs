@@ -433,24 +433,37 @@ impl AppState {
             .contains_key(id)
     }
 
-    /// Registers one engine started at runtime. The `Engine` keeps
-    /// the worker thread; only what the `owned` registry holds can
-    /// later be removed through the API.
+    /// Registers one runtime-started engine, refusing an id the
+    /// list already carries: the collision check runs under the
+    /// list's write lock, so two concurrent adds cannot both pass
+    /// it and strand an `Engine` (which only `shutdown` joins).
+    /// The list is updated before `owned`, the order `remove_engine`
+    /// reads in reverse, so the two cannot interleave into a listed
+    /// but unremovable engine. On refusal the caller owns the
+    /// `Engine` and must shut it down itself.
     pub(crate) fn add_engine(
         &self,
         entry: EngineEntry,
         engine: crate::sched::worker::Engine,
-    ) -> Arc<EngineEntry> {
+    ) -> Option<Arc<EngineEntry>> {
         let shared = Arc::new(entry);
+        let mut engines = self.engines.write().unwrap_or_else(PoisonError::into_inner);
+        if engines.iter().any(|existing| existing.id == shared.id) {
+            // Refused: shut the engine down here — dropping it
+            // without a join would strand the worker thread.
+            drop(engines);
+            engine.shutdown();
+            return None;
+        }
+        let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
+        list.push(Arc::clone(&shared));
+        *engines = list.into();
+        drop(engines);
         self.owned
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(shared.id.clone(), engine);
-        let mut engines = self.engines.write().unwrap_or_else(PoisonError::into_inner);
-        let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
-        list.push(Arc::clone(&shared));
-        *engines = list.into();
-        shared
+        Some(shared)
     }
 
     /// Removes one runtime-added engine: the id leaves the list
@@ -629,7 +642,9 @@ mod tests {
         let (state, _boot) = two_engines();
         let added = testkit::engine(Vec::new());
         testkit::wait_for_state(&added.handle(), EngineState::Ready);
-        let shared = state.add_engine(testkit::entry("late", "model-c", &added, 8_192), added);
+        let shared = state
+            .add_engine(testkit::entry("late", "model-c", &added, 8_192), added)
+            .expect("add must register");
         assert_eq!(shared.id, "late");
         assert!(state.engine_exists("late"));
         assert!(state.owns_engine("late"));
