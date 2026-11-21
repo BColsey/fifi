@@ -3,13 +3,19 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::shortlist::{
-    self as raw, ShortlistRaw, ShortlistRowsRaw,
+    self as raw, MassRaw, ShortlistRaw, ShortlistRowsRaw,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 pub(crate) const K: usize = raw::K;
 pub(crate) const RESULT_BYTES: usize = raw::RESULT_BYTES;
 pub(crate) const RESULT_OFFSET: usize = raw::RESULT_OFFSET;
 pub(crate) const SCRATCH_BYTES: usize = raw::SCRATCH_BYTES;
+/// Where the [`MASS_PARTS`] f64 partials of [`CudaContext::shortlist_mass`] sit in the scratch.
+pub(crate) const MASS_OFFSET: usize = raw::MASS_OFFSET;
+/// The f64 partials of one mass launch.
+pub(crate) const MASS_PARTS: usize = raw::MASS_PARTS;
+/// Scratch bytes a mass launch needs.
+pub(crate) const MASS_SCRATCH_BYTES: usize = raw::MASS_SCRATCH_BYTES;
 /// Bytes of the partials of one row of a K-row launch (the final record is not part of them).
 pub(crate) const PARTS_BYTES: usize = raw::PARTS_BYTES;
 /// The arguments of one K-row launch: the `m` rows of `logits` (`ld` floats apart) each get the record
@@ -29,6 +35,17 @@ pub(crate) struct ShortlistRowsCall<'a> {
     pub(crate) scratch_stride: usize,
     /// `m * RESULT_BYTES` bytes, 16-byte aligned: record `r` is row `r`'s.
     pub(crate) out: DeviceRange<'a>,
+}
+
+/// The arguments of the softmax-mass launch that follows a single-row shortlist on the same
+/// scratch and stream.
+pub(crate) struct ShortlistMassCall<'a> {
+    pub(crate) logits: DeviceRange<'a>,
+    /// The shortlist scratch extended to [`MASS_SCRATCH_BYTES`].
+    pub(crate) scratch: DeviceRange<'a>,
+    pub(crate) n: usize,
+    /// One over the sampling temperature: finite and positive.
+    pub(crate) inv_temperature: f32,
 }
 
 pub(crate) struct ShortlistCall<'a> {
@@ -68,6 +85,56 @@ impl CudaContext {
                     logits,
                     scratch,
                     n: call.n,
+                },
+            )
+        })
+    }
+}
+impl CudaContext {
+    /// The softmax mass of the row the shortlist just ranked: sum of
+    /// `expf((logit - top) * inv_temperature)` over the whole row, as [`MASS_PARTS`] f64 partials
+    /// at [`MASS_OFFSET`] of the scratch. One kernel on `stream`; no allocation, copy or
+    /// synchronization. The caller orders the read of the partials after this stream work.
+    pub(crate) fn shortlist_mass(
+        &self,
+        stream: &DeviceStream,
+        call: ShortlistMassCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let logits = self.raw_range(&call.logits)?;
+        let scratch = self.raw_range(&call.scratch)?;
+        if !(1..=raw::MAX_LOGITS).contains(&call.n) {
+            return Err(EngError::BadRequest(
+                "device shortlist mass vocabulary must be in 1..=2^30".to_owned(),
+            ));
+        }
+        if !call.inv_temperature.is_finite() || call.inv_temperature <= 0.0 {
+            return Err(EngError::BadRequest(
+                "device shortlist mass needs a finite positive inverse temperature".to_owned(),
+            ));
+        }
+        let bytes = call.n.checked_mul(4).ok_or_else(|| {
+            EngError::BadRequest("device shortlist mass size overflows".to_owned())
+        })?;
+        require_fit("shortlist mass logits", &call.logits, bytes, 4)?;
+        require_fit(
+            "shortlist mass scratch",
+            &call.scratch,
+            MASS_SCRATCH_BYTES,
+            16,
+        )?;
+        require_apart(
+            &Claim::of("shortlist mass scratch", &call.scratch, MASS_SCRATCH_BYTES),
+            &Claim::of("shortlist mass logits", &call.logits, bytes),
+        )?;
+        self.launch_on(stream, move |s| {
+            raw::launch_mass(
+                s,
+                MassRaw {
+                    logits,
+                    scratch,
+                    n: call.n,
+                    inv_temperature: call.inv_temperature,
                 },
             )
         })

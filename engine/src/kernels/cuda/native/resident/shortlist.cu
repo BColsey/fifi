@@ -169,6 +169,48 @@ __global__ void shortlist_final_rows_k(const char *scratch, long long stride, Pa
     }
 }
 
+constexpr int kMassBlocks = INFERENCE_CUDA_SHORTLIST_MASS_PARTS;
+constexpr size_t kMassOffset = INFERENCE_CUDA_SHORTLIST_MASS_OFFSET;
+constexpr size_t kMassScratch = INFERENCE_CUDA_SHORTLIST_MASS_SCRATCH_BYTES;
+
+/* One block's share of the softmax mass: thread t adds the terms index = block * kThreads + t,
+ * stepping by kMassBlocks * kThreads, in f32; the f32 sums are then added in f64, warp by warp and
+ * block by block in a fixed order, so a launch is deterministic. */
+__global__ void shortlist_mass_k(const float *logits, int n, char *scratch, float inv_temperature) {
+    __shared__ double warps[kWarps];
+    const Part *record = reinterpret_cast<const Part *>(scratch + INFERENCE_CUDA_SHORTLIST_RESULT_OFFSET);
+    const float top = record->entries[0].logit;
+    float acc = 0.0f;
+    const size_t stride = size_t(kMassBlocks) * kThreads;
+#pragma unroll 4
+    for (size_t index = size_t(blockIdx.x) * kThreads + threadIdx.x; index < size_t(n); index += stride) {
+        acc += expf((logits[index] - top) * inv_temperature);
+    }
+    double sum = double(acc);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) warps[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double block = 0.0;
+#pragma unroll
+        for (int i = 0; i < kWarps; ++i) block += warps[i];
+        reinterpret_cast<double *>(scratch + kMassOffset)[blockIdx.x] = block;
+    }
+}
+
+bool valid_mass(const inference_cuda_shortlist_mass_args *a, void *stream) {
+    if (!a || !stream || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30) ||
+        !isfinite(a->inv_temperature) || !(a->inv_temperature > 0.0f)) {
+        return false;
+    }
+    const uintptr_t x = uintptr_t(a->logits), s = uintptr_t(a->scratch);
+    if (x % 4 || s % 16) return false;
+    const size_t bytes = size_t(a->n) * 4;
+    return s <= x ? kMassScratch <= x - s : bytes <= s - x;
+}
+
 bool valid(const inference_cuda_shortlist_args *a, void *stream) {
     if (!a || !stream || !a->logits || !a->scratch || a->n < 1 || a->n > (1 << 30)) return false;
     const uintptr_t x = uintptr_t(a->logits), s = uintptr_t(a->scratch);
@@ -233,6 +275,23 @@ extern "C" int inference_cuda_shortlist_rows_launch(const inference_cuda_shortli
                                                              static_cast<Part *>(a->out));
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_shortlist_mass_launch(const inference_cuda_shortlist_mass_args *a,
+                                                    void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!valid_mass(a, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure failure;
+        shortlist_mass_k<<<kMassBlocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const float *>(a->logits), a->n, static_cast<char *>(a->scratch),
+            a->inv_temperature);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return int(failure.err);
     } catch (...) {

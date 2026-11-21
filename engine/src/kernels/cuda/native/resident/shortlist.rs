@@ -10,6 +10,12 @@ pub(in crate::kernels::cuda) const RESULT_BYTES: usize = 176;
 pub(in crate::kernels::cuda) const RESULT_OFFSET: usize = 2816;
 pub(in crate::kernels::cuda) const SCRATCH_BYTES: usize = 2992;
 pub(in crate::kernels::cuda) const MAX_LOGITS: usize = 1 << 30;
+/// Where the eight f64 mass partials of [`launch_mass`] sit in the shortlist scratch.
+pub(in crate::kernels::cuda) const MASS_OFFSET: usize = 2992;
+/// Blocks of the mass launch, one f64 partial each.
+pub(in crate::kernels::cuda) const MASS_PARTS: usize = 8;
+/// Scratch bytes the mass launch needs: the shortlist scratch plus the partials.
+pub(in crate::kernels::cuda) const MASS_SCRATCH_BYTES: usize = 3056;
 /// Most rows of one K-row launch.
 pub(in crate::kernels::cuda) const MAX_ROWS: usize = 16;
 /// Bytes of the partials of one row (16 tiles of one record each): the offset of the final record
@@ -23,6 +29,21 @@ struct Args {
     n: c_int,
 }
 const _: () = assert!(size_of::<Args>() == 24 && offset_of!(Args, n) == 16);
+/// Mirror of `inference_cuda_shortlist_mass_args`.
+#[repr(C)]
+struct MassArgs {
+    logits: *const c_void,
+    scratch: *mut c_void,
+    n: c_int,
+    inv_temperature: f32,
+}
+const _: () = assert!(
+    size_of::<MassArgs>() == 24
+        && offset_of!(MassArgs, n) == 16
+        && offset_of!(MassArgs, inv_temperature) == 20
+);
+const _: () = assert!(MASS_OFFSET + MASS_PARTS * 8 == MASS_SCRATCH_BYTES);
+const _: () = assert!(SCRATCH_BYTES <= MASS_OFFSET);
 /// Mirror of `inference_cuda_shortlist_rows_args`.
 #[repr(C)]
 struct RowsArgs {
@@ -47,6 +68,8 @@ const _: () = assert!(
 unsafe extern "C" {
     #[link_name = "inference_cuda_shortlist_launch"]
     fn launch_raw(args: *const Args, stream: *mut c_void, stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_shortlist_mass_launch"]
+    fn launch_mass_raw(args: *const MassArgs, stream: *mut c_void, stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_shortlist_rows_launch"]
     fn launch_rows_raw(args: *const RowsArgs, stream: *mut c_void, stage: *mut c_int) -> c_int;
 }
@@ -145,5 +168,46 @@ pub(in crate::kernels::cuda) fn launch_rows(
     // reads of `logits`. The live ranges outlive the queued work (native free synchronizes). `args`
     // is a live local that the entry reads only during the call; the stream is live for the call.
     let status = unsafe { launch_rows_raw(&raw const args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// What the mass launch reads and writes: the logits row the shortlist ranked and the scratch that
+/// holds its record and receives the partials.
+pub(in crate::kernels::cuda) struct MassRaw<'a> {
+    pub(in crate::kernels::cuda) logits: RawRange<'a>,
+    pub(in crate::kernels::cuda) scratch: RawRange<'a>,
+    pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) inv_temperature: f32,
+}
+
+/// Queues the softmax mass kernel after a shortlist launch on the same scratch and stream.
+pub(in crate::kernels::cuda) fn launch_mass(
+    stream: &RawStream,
+    io: MassRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let bytes = io.n.checked_mul(4).ok_or_else(invalid_argument)?;
+    if !(1..=MAX_LOGITS).contains(&io.n)
+        || !io.inv_temperature.is_finite()
+        || io.inv_temperature <= 0.0
+        || io.logits.bytes < bytes
+        || !io.logits.offset.is_multiple_of(4)
+        || io.scratch.bytes < MASS_SCRATCH_BYTES
+        || !io.scratch.offset.is_multiple_of(16)
+        || !Span::of(&io.logits, bytes).apart(&Span::of(&io.scratch, MASS_SCRATCH_BYTES))
+    {
+        return Err(invalid_argument());
+    }
+    let args = MassArgs {
+        logits: io.logits.address().cast_const(),
+        scratch: io.scratch.address(),
+        n: io.n as c_int,
+        inv_temperature: io.inv_temperature,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: the checks above proved the logits extent, the scratch extent (the record the kernel
+    // reads and the partials it writes), the alignments and the disjointness of the two spans.
+    // The live ranges and the argument struct outlive this launch-only call; native free drains
+    // the queued work.
+    let status = unsafe { launch_mass_raw(&raw const args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }

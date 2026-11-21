@@ -11,7 +11,10 @@ enum {
     INFERENCE_CUDA_SHORTLIST_PART_BYTES = 176,
     INFERENCE_CUDA_SHORTLIST_RESULT_OFFSET = 2816,
     INFERENCE_CUDA_SHORTLIST_SCRATCH_BYTES = 2992,
-    INFERENCE_CUDA_SHORTLIST_MAX_ROWS = 16
+    INFERENCE_CUDA_SHORTLIST_MAX_ROWS = 16,
+    INFERENCE_CUDA_SHORTLIST_MASS_OFFSET = 2992,
+    INFERENCE_CUDA_SHORTLIST_MASS_PARTS = 8,
+    INFERENCE_CUDA_SHORTLIST_MASS_SCRATCH_BYTES = 3056
 };
 typedef struct inference_cuda_shortlist_candidate {
     float logit;
@@ -34,6 +37,24 @@ typedef struct inference_cuda_shortlist_args {
  * No allocation,copy,synchronizationorstep-statuswrite. Explicitnon-nullstreamrequired. */
 int inference_cuda_shortlist_launch(const inference_cuda_shortlist_args *args,
                                     void *stream, int *out_stage);
+typedef struct inference_cuda_shortlist_mass_args {
+    const void *logits;
+    void *scratch;
+    int n;
+    float inv_temperature;
+} inference_cuda_shortlist_mass_args;
+/* The softmax mass of the row a single-row shortlist launch just ranked, on the same scratch: the
+ * sum over all n values of expf((logit - top) * inv_temperature), where top is the first entry of
+ * the shortlist record at scratch + 2816. Eight blocks each write one f64 partial of their strided
+ * share at scratch + 2992 (8 * 8 bytes); the caller adds the eight in order. Each partial adds f32
+ * terms per thread and f64 across threads, so the total carries a relative error far below 1e-4
+ * (f32 expf and f32 per-thread sums of at most n / 2048 terms); a caller that needs the host's f64
+ * total must treat it as an estimate with that bound. Read only on the logits and the record; no
+ * allocation, copy, synchronization or step-status write; explicit non-null stream. scratch is the
+ * 3056 bytes of the shortlist scratch plus the partials, 16-byte aligned, disjoint from logits.
+ * inv_temperature is finite and positive. */
+int inference_cuda_shortlist_mass_launch(const inference_cuda_shortlist_mass_args *args,
+                                         void *stream, int *out_stage);
 typedef struct inference_cuda_shortlist_rows_args {
     const void *logits;
     void *scratch;
@@ -58,6 +79,9 @@ int inference_cuda_shortlist_rows_launch(const inference_cuda_shortlist_rows_arg
 static_assert(sizeof(inference_cuda_shortlist_candidate)==8,"candidate layout");
 static_assert(sizeof(inference_cuda_shortlist_result)==176 &&
               offsetof(inference_cuda_shortlist_result,non_finite)==160,"result layout");
+static_assert(sizeof(inference_cuda_shortlist_mass_args)==24 &&
+              offsetof(inference_cuda_shortlist_mass_args,n)==16 &&
+              offsetof(inference_cuda_shortlist_mass_args,inv_temperature)==20,"mass argument layout");
 static_assert(sizeof(inference_cuda_shortlist_args)==24 &&
               offsetof(inference_cuda_shortlist_args,n)==16,"argument layout");
 static_assert(sizeof(inference_cuda_shortlist_rows_args)==48 &&
