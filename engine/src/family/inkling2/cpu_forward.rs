@@ -152,8 +152,17 @@ impl CpuForward {
 
         self.failed = true;
         let mut state = std::mem::take(&mut self.state);
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        let profile = self
+            .weights
+            .cuda_projection()
+            .and_then(|cuda| cuda.begin_token().map(|start| (cuda, start)));
         let stream = self.forward(&mut state, id)?;
         let logits = collect_logits.then(|| self.logits(&stream)).transpose()?;
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some((cuda, start)) = profile {
+            cuda.end_token(start, self.position, collect_logits);
+        }
         self.position += 1;
         self.state = state;
         self.failed = false;

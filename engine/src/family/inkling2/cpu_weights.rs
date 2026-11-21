@@ -134,7 +134,12 @@ impl Weights {
         Ok(uploads)
     }
 
-    fn bytes(&self, name: &str) -> Result<&[u8], EngError> {
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn cuda_projection(&self) -> Option<&CudaProjection> {
+        self.cuda.as_ref()
+    }
+
+    pub(super) fn bytes(&self, name: &str) -> Result<&[u8], EngError> {
         self.metadata
             .absolute_range(name)
             .and_then(|range| self.mapping.as_ref().get(range))
@@ -236,7 +241,7 @@ impl Weights {
         }
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if let Some(cuda) = &self.cuda {
-            return cuda.expert(&weights, x);
+            return cuda.expert(name, expert, &weights, x);
         }
         match weights.packing {
             ExpertPacking::Nvfp4 => {
