@@ -523,6 +523,30 @@ pub fn dequantize_into(ty: GgufType, src: &[u8], dst: &mut [f32]) -> Result<(), 
     Ok(())
 }
 
+/// Project the first `rows` of a little-endian F32 GGUF matrix. The ordered
+/// products are accumulated directly from the mapped row without a decoded copy.
+pub(crate) fn project_f32_rows(src: &[u8], x: &[f32], rows: usize) -> Result<Vec<f32>, EngError> {
+    let row_bytes = x
+        .len()
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| bad("F32 row size"))?;
+    if row_bytes == 0 || !src.len().is_multiple_of(row_bytes) || rows > src.len() / row_bytes {
+        return Err(bad("invalid F32 matrix extent"));
+    }
+    Ok(src
+        .chunks_exact(row_bytes)
+        .take(rows)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(x)
+                .map(|(w, &value)| f32::from_le_bytes(*w) * value)
+                .sum()
+        })
+        .collect())
+}
+
 /// Decodes one NVFP4 expert and applies its little-endian F32 tensor scale.
 /// Each source expert has exactly `dst.len()` values. The scale count defines
 /// the expert count. No weight copy is allocated; on numeric error `dst` may
@@ -618,6 +642,31 @@ pub fn dequantize(ty: GgufType, src: &[u8]) -> Result<Vec<f32>, EngError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_f32_projection_matches_the_decoded_rows_bit_for_bit() {
+        use super::*;
+        let x: Vec<_> = (0..23).map(|i| (3.25 - i as f32) / 13.0).collect();
+        let bytes: Vec<_> = (0..5 * x.len())
+            .flat_map(|i| ((i % 19) as f32 / 7.0 - 1.125).to_le_bytes())
+            .collect();
+        let want: Vec<_> = bytes
+            .chunks_exact(x.len() * 4)
+            .take(3)
+            .map(|row| {
+                let decoded = dequantize(GgufType::F32, row).unwrap();
+                x.iter()
+                    .zip(decoded)
+                    .map(|(&a, b)| a * b)
+                    .sum::<f32>()
+                    .to_bits()
+            })
+            .collect();
+        let got = project_f32_rows(&bytes, &x, 3).unwrap();
+        assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
+        assert!(project_f32_rows(&bytes[..bytes.len() - 1], &x, 3).is_err());
+        assert!(project_f32_rows(&bytes, &x, 6).is_err());
+    }
+
     #[test]
     fn iq1_s_matches_the_reference_grid_scales_and_signs() {
         let mut block = std::array::from_fn::<_, 50, _>(|i| (i * 37 + 11) as u8);

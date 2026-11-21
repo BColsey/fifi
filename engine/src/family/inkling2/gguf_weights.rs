@@ -13,7 +13,7 @@ use crate::{
     EngError,
     expert_tier::ExpertId,
     family::mapped_file::MappedFile,
-    weights::{GgufHeader, GgufType, MetaValue, dequantize_into},
+    weights::{GgufHeader, GgufType, MetaValue, dequantize_into, project_f32_rows},
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -835,6 +835,9 @@ fn project_rows(
     x: &[f32],
     rows: usize,
 ) -> Result<Vec<f32>, EngError> {
+    if tensor.kind == GgufType::F32 {
+        return project_f32_rows(bytes, x, rows);
+    }
     let stride = bytes.len() / tensor.rows;
     let mut w = vec![0.0; x.len()];
     bytes
