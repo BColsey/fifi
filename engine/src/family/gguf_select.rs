@@ -177,6 +177,46 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
     Ok((model.to_path_buf(), files))
 }
 
+/// The `general.architecture` string of one GGUF file, read from its header alone.
+fn architecture_of(path: &Path) -> Result<Option<String>, EngError> {
+    use crate::weights::{GgufHeader, MetaValue};
+    let unreadable = |error: std::io::Error| {
+        EngError::Checkpoint(format!("model file {}: {error}", path.display()))
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let len = file.metadata().map_err(unreadable)?.len();
+    let header = GgufHeader::parse(&mut std::io::BufReader::new(file), len, 256 << 20)?;
+    Ok(match header.meta("general.architecture") {
+        Some(MetaValue::String(architecture)) => Some(architecture.clone()),
+        _ => None,
+    })
+}
+
+/// The weights files of `model` (a `.gguf` file or a directory) whose `general.architecture` is
+/// `architecture`, ranked like [`candidates`]. A directory can hold files of other roles beside
+/// the model (a draft model, say); they are skipped. An error names every architecture found when
+/// none matches.
+pub(crate) fn of_architecture(model: &Path, architecture: &str) -> Result<Vec<GgufFile>, EngError> {
+    let (_, files) = candidates(model)?;
+    let mut found = Vec::new();
+    let mut kept = Vec::new();
+    for file in files {
+        match architecture_of(&file.path)? {
+            Some(name) if name == architecture => kept.push(file),
+            Some(name) => found.push(format!("{} is {name}", file.name())),
+            None => found.push(format!("{} has no architecture", file.name())),
+        }
+    }
+    if kept.is_empty() {
+        return Err(EngError::Checkpoint(format!(
+            "no .gguf file of architecture {architecture} in {}: {}",
+            model.display(),
+            found.join(", ")
+        )));
+    }
+    Ok(kept)
+}
+
 /// The chosen file and the log line that names it and the other candidates.
 #[derive(Debug)]
 pub(crate) struct Choice {
@@ -237,7 +277,7 @@ pub(crate) fn choose(
 
 #[cfg(test)]
 mod tests {
-    use super::{GgufFile, candidates, choose};
+    use super::{GgufFile, candidates, choose, of_architecture};
     use std::path::Path;
 
     fn write(dir: &Path, name: &str, bytes: usize) {
@@ -438,6 +478,23 @@ mod tests {
                 path: first,
                 bytes: 600
             }]
+        );
+    }
+
+    #[test]
+    fn files_of_other_architectures_are_skipped_and_a_directory_without_a_match_names_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tiny = |architecture: &str| {
+            crate::tokenizer::gguf::tests::tiny_gguf(architecture, "gpt2", "raon")
+        };
+        std::fs::write(dir.path().join("model.gguf"), tiny("raon1")).expect("write");
+        std::fs::write(dir.path().join("draft.gguf"), tiny("draft")).expect("write");
+        let files = of_architecture(dir.path(), "raon1").expect("one match");
+        assert_eq!(names(&files), ["model.gguf"]);
+        let error = of_architecture(dir.path(), "llama").unwrap_err().describe();
+        assert!(
+            error.contains("model.gguf is raon1") && error.contains("draft.gguf is draft"),
+            "{error}"
         );
     }
 }

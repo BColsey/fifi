@@ -31,7 +31,7 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// The family names that this build recognizes, including staged backends.
-pub(crate) const FAMILIES: [&str; 9] = [
+pub(crate) const FAMILIES: [&str; 10] = [
     FAKE_FAMILY,
     FLASH_FAMILY,
     Q36_FAMILY,
@@ -41,9 +41,15 @@ pub(crate) const FAMILIES: [&str; 9] = [
     GEMMA4_FAMILY,
     INKLING_FAMILY,
     SENSENOVA_FAMILY,
+    RAON1_FAMILY,
 ];
 
 const FAKE_FAMILY: &str = super::fake::FAMILY;
+
+/// The `general.architecture` of the Raon-1 weights file.
+pub(crate) use crate::family::raon::raon1::serve::FAMILY as RAON1_FAMILY;
+
+pub(crate) const RAON1_ARCHITECTURE: &str = "raon1";
 
 /// The families that a GGUF `general.architecture` identifies, so a model path that holds only
 /// the weights file starts with no `config.json` and no `--family`. One line per architecture: a
@@ -52,6 +58,7 @@ const FAKE_FAMILY: &str = super::fake::FAMILY;
 pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
     ("qwen35moe", crate::family::qwen::qwen36::factory::FAMILY),
     ("gemma4", crate::family::gemma::gemma4::FAMILY),
+    (RAON1_ARCHITECTURE, RAON1_FAMILY),
 ];
 
 /// Why a GGUF architecture that is not in [`GGUF_ARCHITECTURE_FAMILIES`] is not served, for the
@@ -62,7 +69,6 @@ pub(crate) fn gguf_architecture_note(architecture: &str) -> Option<&'static str>
             "Flash-Next's loader stops on quantization kernels that do not exist yet (IQ2_S and others)"
         }
         "nemotron_h_moe" => "the Nemotron entry needs an options block: write a --config file",
-        "raon1" => "Raon's CUDA serving is not on main yet",
         SENSENOVA_ARCH => "SenseNova CPU serving is experimental; pass --family sensenova",
         "dflash" => "a draft model for speculative decoding, not a model to serve on its own",
         "clip" => {
@@ -327,10 +333,13 @@ impl Config {
                 )));
             }
             if engine.context_limit.is_some()
-                && !matches!(engine.family.as_str(), FAKE_FAMILY | INKLING_FAMILY)
+                && !matches!(
+                    engine.family.as_str(),
+                    FAKE_FAMILY | INKLING_FAMILY | RAON1_FAMILY
+                )
             {
                 return Err(StartupError(format!(
-                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY} family and the {INKLING_FAMILY} family take"
+                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY}, {INKLING_FAMILY} and {RAON1_FAMILY} families take"
                 )));
             }
             if engine.family == INKLING_FAMILY {
@@ -1139,5 +1148,21 @@ mod tests {
         let text = message(load(&text));
         assert!(text.contains("engines[0]"), "{text}");
         assert!(text.contains("only the gemma4 family"), "{text}");
+    }
+
+    #[test]
+    fn raon1_takes_a_context_limit_and_no_other_family_options() {
+        let raon = VALID.replace(
+            r#""family": "fake""#,
+            r#""family": "raon1", "context_limit": 8192"#,
+        );
+        let config = load(&raon).expect("raon1 with a context limit");
+        assert_eq!(config.engines[0].context_limit, Some(8192));
+        let bare = VALID.replace(r#""family": "fake""#, r#""family": "raon1""#);
+        assert!(load(&bare).is_ok(), "raon1 needs no options");
+        let with_options =
+            VALID.replace(r#""family": "fake""#, r#""family": "raon1", "qwen36": {}"#);
+        let text = message(load(&with_options));
+        assert!(text.contains("only the qwen3_6_35b_a3b family"), "{text}");
     }
 }

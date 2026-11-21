@@ -10,7 +10,7 @@
 
 use std::io::Write as _;
 
-use super::config::{Config, EngineConfig, StartupError, config_path};
+use super::config::{Config, EngineConfig, RAON1_ARCHITECTURE, StartupError, config_path};
 use super::fake;
 use super::router::router;
 use super::state::{AppState, EngineEntry};
@@ -23,6 +23,7 @@ use crate::family::nemotron::nemotron35::factory as nemotron_factory;
 use crate::family::qwen::flash_next::factory;
 use crate::family::qwen::qwen36::factory as q36_factory;
 use crate::family::qwen::sensenova;
+use crate::family::raon::raon1;
 use crate::family::sampler::{LoadedDefaults, SamplingDefaults};
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
 use crate::storage_guard;
@@ -401,9 +402,25 @@ pub(crate) fn start_one(
             describe(&error)
         ))
     })?;
-    // SenseNova and explicitly named GGUF files take no neighboring sampling configuration;
-    // the defaults line still names the directory a config file would live in.
-    let (loaded, defaults_directory) = if config.family == sensenova::FAMILY
+    // A Raon-1 directory has no `generation_config.json`: its sampling defaults come
+    // from the weights file's header, and the start line names that file.
+    let (loaded, defaults_directory) = if let Some((file, values)) = header_defaults(config)
+        .map_err(|error| {
+            StartupError(format!(
+                "engine {} failed to start: {}",
+                config.id,
+                describe(&error)
+            ))
+        })?
+    {
+        (
+            LoadedDefaults {
+                values,
+                from_file: true,
+            },
+            file,
+        )
+    } else if config.family == sensenova::FAMILY
         || crate::family::gguf_select::is_gguf_file(&config.model_dir)
     {
         (
@@ -546,6 +563,20 @@ fn check_family_backend(config: &EngineConfig) -> Result<(), EngError> {
         inkling2_mini::FAMILY => inkling2_mini::factory::check_backend(),
         _ => Ok(()),
     }
+}
+
+/// The sampling defaults that the weights file of a family carries in its header, with the file
+/// they came from. `None` for a family whose defaults live in `generation_config.json`.
+fn header_defaults(
+    config: &EngineConfig,
+) -> Result<Option<(std::path::PathBuf, SamplingDefaults)>, EngError> {
+    if config.family != raon1::serve::FAMILY {
+        return Ok(None);
+    }
+    let files = crate::family::gguf_select::of_architecture(&config.model_dir, RAON1_ARCHITECTURE)?;
+    let file = files[0].path.clone();
+    let values = SamplingDefaults::from_gguf(&file)?;
+    Ok(Some((file, values)))
 }
 
 /// One family's start result: the uniform shape every factory already
@@ -760,6 +791,38 @@ fn start_sensenova(
     })
 }
 
+/// The Raon-1 row. The weights are one GGUF file of architecture `raon1` (a directory may also
+/// hold a draft model, which is skipped); the tokenizer comes from the same file.
+fn start_raon1(
+    config: &EngineConfig,
+    _prefix_reuse: bool,
+    ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    let files = crate::family::gguf_select::of_architecture(&config.model_dir, RAON1_ARCHITECTURE)?;
+    if files.len() > 1 {
+        let others: Vec<String> = files[1..]
+            .iter()
+            .map(|file| file.path.display().to_string())
+            .collect();
+        eprintln!(
+            "engine {}: serving {}, the largest of {} raon1 files; name one file as model_dir to choose another ({})",
+            config.id,
+            files[0].path.display(),
+            files.len(),
+            others.join(", ")
+        );
+    }
+    let file = &files[0].path;
+    let bundle = crate::tokenizer::gguf::bundle_from_gguf(file)?;
+    let started = raon1::serve::start_raon1_engine(file, config.context_limit, bundle, ready_note)?;
+    Ok(StartedEngine {
+        engine: started.engine,
+        bundle: Arc::new(started.bundle),
+        context_limit: started.context_limit,
+        effective: Vec::new(),
+    })
+}
+
 /// Starter dispatch for recognized families, not a list of usable backends.
 /// The config gate owns the unknown-family rejection text.
 // The third column: the starter builds a Metal-resident executor on a
@@ -774,6 +837,7 @@ const FAMILY_STARTERS: &[(&str, Starter, bool)] = &[
     (nemotron_factory::FAMILY, start_nemotron, false),
     (gemma4::FAMILY, start_gemma4, false),
     (sensenova::FAMILY, start_sensenova, false),
+    (raon1::serve::FAMILY, start_raon1, false),
     (fake::FAMILY, start_fake, false),
 ];
 

@@ -163,3 +163,45 @@ fn unknown_family_error_text_is_the_config_gate_text() {
         "the gate text must stay byte-identical"
     );
 }
+
+/// The raon1 row looks for a GGUF of architecture `raon1` in the model directory before it reads
+/// a tokenizer or loads a weight, so a directory holding another model's file reaches the
+/// lookup's own refusal that names the file.
+#[test]
+fn raon1_row_refuses_a_directory_without_a_raon1_gguf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("other.gguf"),
+        crate::tokenizer::gguf::tests::tiny_gguf("llama", "gpt2", "raon"),
+    )
+    .expect("write");
+    let config_path = dir.path().join("enginesrv.json");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{
+            "listen": "127.0.0.1:8100",
+            "api_key_env": "ENGINESRV_KEY",
+            "engines": [
+                {{"id": "e1", "model_dir": "{}", "tokenizer_dir": "t",
+                 "family": "raon1", "context_limit": 4096}}
+            ]
+        }}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+    let config = crate::server::config::Config::from_file(&config_path)
+        .expect("the gate accepts raon1 with a context limit");
+    assert_eq!(config.engines[0].context_limit, Some(4096));
+    let entry = &config.engines[0];
+    let starter = family_starter(&entry.family).expect("raon1 starter");
+    match starter(entry, false, None) {
+        Err(crate::EngError::Checkpoint(message)) => assert!(
+            message.contains("no .gguf file of architecture raon1")
+                && message.contains("other.gguf is llama"),
+            "the refusal must be the architecture lookup's own, got {message}"
+        ),
+        other => panic!("expected the lookup refusal, got Ok: {}", other.is_ok()),
+    }
+}

@@ -729,6 +729,23 @@ fn identify_family(
         ));
         return Some(family.to_string());
     }
+    let by_architecture = inspection.gguf_files.iter().find_map(|fact| {
+        crate::server::config::GGUF_ARCHITECTURE_FAMILIES
+            .iter()
+            .find(|(architecture, _)| fact.architecture.as_deref() == Some(*architecture))
+            .map(|&(architecture, family)| (fact, architecture, family))
+    });
+    if let Some((fact, architecture, family)) = by_architecture {
+        checks.push(Check::new(
+            "family",
+            CheckStatus::Pass,
+            format!(
+                "{} has architecture {architecture}, which is the {family} family",
+                fact.file
+            ),
+        ));
+        return Some(family.to_string());
+    }
     checks.push(Check::new(
         "family",
         CheckStatus::Fail,

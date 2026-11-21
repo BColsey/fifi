@@ -27,7 +27,9 @@ use crate::family::qwen::qwen36::{
     settings::Q36Options,
 };
 use crate::family::qwen::sensenova;
-use crate::server::config::{Config, EngineConfig, StartupError, check_sensenova_tokenizer_path};
+use crate::server::config::{
+    Config, EngineConfig, RAON1_FAMILY, StartupError, check_sensenova_tokenizer_path,
+};
 
 /// Families detected from `config.json` model types. GGUF-only families are
 /// detected separately from their GGUF architecture metadata.
@@ -201,6 +203,11 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     } else {
         select_weight_format(has_gguf, has_safetensors)
     };
+    if family == RAON1_FAMILY && args.kv_dtype.is_some() {
+        return Err(StartupError(format!(
+            "serve --model: --kv is not an option of the {RAON1_FAMILY} family"
+        )));
+    }
 
     let qwen36 = uses_qwen36_options(&family).then(|| Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
@@ -539,7 +546,9 @@ pub(crate) fn bare_config(args: &ModelServeArgs, family: &str) -> Config {
                 .unwrap_or_else(|| args.model_dir.clone()),
             family: family.to_string(),
             model: None,
-            context_limit: None,
+            context_limit: (discovered.family == RAON1_FAMILY)
+                .then_some(args.context_limit)
+                .flatten(),
             think_replay: None,
             notice_toolwrap: None,
             kv_cache: None,
@@ -560,16 +569,20 @@ pub(crate) fn config_json(config: &Config) -> String {
     use serde_json::json;
     let engine = &config.engines[0];
     if !uses_qwen36_options(&engine.family) {
+        let mut entry = json!({
+            "id": engine.id,
+            "family": engine.family,
+            "model_dir": engine.model_dir.display().to_string(),
+            "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
+        });
+        if let Some(limit) = engine.context_limit {
+            entry["context_limit"] = json!(limit);
+        }
         let document = json!({
             "listen": config.listen,
             "api_key_env": config.api_key_env,
             "prefix_reuse": config.prefix_reuse,
-            "engines": [{
-                "id": engine.id,
-                "family": engine.family,
-                "model_dir": engine.model_dir.display().to_string(),
-                "tokenizer_dir": engine.tokenizer_dir.display().to_string(),
-            }],
+            "engines": [entry],
         });
         return serde_json::to_string_pretty(&document).expect("the built config is valid JSON");
     }
@@ -711,7 +724,9 @@ fn select_family(
     inspection: &inspect::ModelInspection,
 ) -> Result<String, StartupError> {
     if let Some(family) = &args.family {
-        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family) || family == sensenova::FAMILY
+        if DETECTABLE_FAMILIES.iter().any(|(name, _)| name == family)
+            || family == sensenova::FAMILY
+            || ARCHITECTURE_FAMILIES.iter().any(|(_, name)| name == family)
         {
             return Ok(family.clone());
         }
@@ -822,6 +837,7 @@ fn detectable_names() -> String {
         .iter()
         .map(|(name, _)| *name)
         .chain(std::iter::once(sensenova::FAMILY))
+        .chain(ARCHITECTURE_FAMILIES.iter().map(|(_, name)| *name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1737,4 +1753,43 @@ mod tests {
         assert!(error.contains("no --model given"), "{error}");
         assert!(error.contains("--model <org/repo>"), "{error}");
     }
+
+    #[test]
+    fn a_gguf_only_directory_is_identified_by_its_architecture() {
+        let dir = directory_of_architecture("raon1");
+        let discovered = discover(&args_for(dir.path())).expect("discovers");
+        assert_eq!(discovered.family, "raon1");
+        assert_eq!(discovered.weight_format, "gguf");
+        let mut args = args_for(dir.path());
+        args.family = Some("raon1".to_string());
+        assert_eq!(discover(&args).expect("discovers").family, "raon1");
+    }
+
+    #[test]
+    fn the_raon_configuration_carries_no_qwen_options_and_prints_as_it_starts() {
+        let dir = directory_of_architecture("raon1");
+        let mut args = args_for(dir.path());
+        args.context_limit = Some(16_384);
+        let discovered = discover(&args).expect("discovers");
+        let config = super::config_from(&discovered, &args);
+        let engine = &config.engines[0];
+        assert_eq!(engine.family, "raon1");
+        assert!(engine.qwen36.is_none());
+        assert_eq!(engine.context_limit, Some(16_384));
+        let printed = super::config_json(&config);
+        let path = dir.path().join("printed.json");
+        std::fs::write(&path, &printed).expect("write");
+        let again = Config::from_file(&path).expect("the printed document is a valid config");
+        assert_eq!(again.engines[0].family, "raon1");
+        assert_eq!(again.engines[0].context_limit, Some(16_384));
+        assert!(!printed.contains("qwen36"), "{printed}");
+    }
+
+    #[test]
+    fn the_kv_flag_is_refused_for_raon() {
+        let dir = directory_of_architecture("raon1");
+        let mut args = args_for(dir.path());
+        args.kv_dtype = Some("q8".to_string());
+        let error = discover(&args).unwrap_err();
+        assert!(error.0.contains("--kv is not an option"), "{}", error.0);    }
 }

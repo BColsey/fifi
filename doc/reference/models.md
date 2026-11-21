@@ -11,6 +11,7 @@
 | `inkling2_mini` | Inkling 2 Mini | experimental, opt-in | no | [Official NVFP4 and MXFP8 safetensors](../how-to/inkling.md) |
 | `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
 | `sensenova` | SenseNova-Loop-9B (text) | CPU only | no | Experimental host path for [SenseNova-Loop-9B GGUF](https://huggingface.co/sensenova/SenseNova-Loop-9B-GGUF). |
+| `raon1` | Raon-1-mini-preview, 28.8B total, 4.3B active | no | in the source tree | `raon-1-mini-preview-Q4_K_M.gguf` from `KRAFTON/Raon-1-mini-preview-gguf`. The tokenizer and chat template are read from the GGUF file, so the directory needs no tokenizer files. |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
@@ -37,7 +38,8 @@ decoding, or context and KV overrides.
 
 ## Tokenizer files
 
-Engines that use external tokenizer files read `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.
+A `raon1` engine reads its tokenizer and chat template from the GGUF file instead.
+Every other engine reads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.
 For the three validated families, startup compares the files with the SHA-256 hashes of the tested release and refuses others.
 For Qwen3.6 CUDA, use the tokenizer files from `mlx-community/Qwen3.6-35B-A3B-4bit` with either the GGUF file or the EXL3 pack. The other validated checkpoints listed above include matching files.
 
