@@ -419,7 +419,7 @@ pub(crate) fn served_admission() -> Admission {
 }
 
 pub(crate) struct CudaProjector {
-    context: CudaContext,
+    context: std::rc::Rc<CudaContext>,
     /// Tile bytes per upload chunk, and the size of a scan chunk.
     chunk_limit: usize,
     /// Whether the device shares memory with the host (a Jetson); it selects
@@ -493,7 +493,7 @@ impl CudaProjector {
     /// Takes one of the two process adapter leases.
     pub(crate) fn new() -> Result<Self, EngError> {
         Ok(Self {
-            context: CudaContext::with_admission(&served_admission())?,
+            context: std::rc::Rc::new(CudaContext::with_admission(&served_admission())?),
             chunk_limit: CHUNK_LIMIT,
             integrated: cuda::device_is_integrated()?,
             oom_retries: Cell::new(0),
@@ -513,7 +513,7 @@ impl CudaProjector {
     )]
     pub(crate) fn on_device(device: usize) -> Result<Self, EngError> {
         Ok(Self {
-            context: CudaContext::with_admission_on(device, &served_admission())?,
+            context: std::rc::Rc::new(CudaContext::with_admission_on(device, &served_admission())?),
             chunk_limit: CHUNK_LIMIT,
             integrated: cuda::device_is_integrated()?,
             oom_retries: Cell::new(0),
@@ -580,6 +580,11 @@ impl CudaProjector {
     /// it and a `&CudaWeights`, so both share one adapter lease.
     pub(crate) fn context(&self) -> &CudaContext {
         &self.context
+    }
+
+    /// The context as a shared handle, for an owner that keeps it alive beside a step.
+    pub(crate) fn shared_context(&self) -> std::rc::Rc<CudaContext> {
+        std::rc::Rc::clone(&self.context)
     }
 
     #[cfg(test)]

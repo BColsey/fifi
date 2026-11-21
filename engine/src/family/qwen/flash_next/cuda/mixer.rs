@@ -93,7 +93,7 @@ impl FlashStep<'_> {
             ("linear_attn.in_proj_a.weight", alpha_off),
         ] {
             self.ctx.router_logits_rows_strided(
-                self.stream,
+                &self.stream,
                 RouterLogitsStridedCall {
                     shape: RouterShape {
                         m,
@@ -124,7 +124,7 @@ impl FlashStep<'_> {
         let conv_out = self.slot(Slot::DeltaConv)?;
         let conv_weights = self.float(&at("linear_attn.conv1d.weight"))?;
         self.ctx.gdn_conv(
-            self.stream,
+            &self.stream,
             ConvCall {
                 shape: conv_shape,
                 proj: row.buffer().range(row.offset(), conv_need.proj)?,
@@ -158,7 +158,7 @@ impl FlashStep<'_> {
             self.float(&at("linear_attn.norm.weight"))?,
         );
         self.ctx.gdn_scan_seq_form(
-            self.stream,
+            &self.stream,
             GdnScanSeqCall {
                 shape,
                 eps: GDN_SCAN_EPS,
@@ -237,7 +237,7 @@ impl FlashStep<'_> {
         let v_cache = self.state_slot(StateSlot::QsaV(layer))?;
         let q = self.slot(Slot::AttnQ)?;
         self.ctx.attn_prep(
-            self.stream,
+            &self.stream,
             AttnPrepCall {
                 shape: AttnPrepShape {
                     m,
@@ -285,7 +285,7 @@ impl FlashStep<'_> {
         let queries = self.slot(Slot::IndexQueries)?;
         let keys = self.state_slot(StateSlot::QsaIndexKeys(layer))?;
         self.ctx.qsa_index(
-            self.stream,
+            &self.stream,
             QsaIndexCall {
                 indexer,
                 m,
@@ -303,7 +303,7 @@ impl FlashStep<'_> {
         )?;
         let scores = self.slot(Slot::Scores)?;
         self.ctx.qsa_score(
-            self.stream,
+            &self.stream,
             QsaScoreCall {
                 indexer,
                 m,
@@ -316,7 +316,7 @@ impl FlashStep<'_> {
         )?;
         let chosen = self.slot(Slot::Chosen)?;
         self.ctx.qsa_select(
-            self.stream,
+            &self.stream,
             QsaSelectCall {
                 indexer,
                 m,
@@ -329,7 +329,7 @@ impl FlashStep<'_> {
         )?;
         let core = self.slot(Slot::AttnCore)?;
         self.ctx.qsa_attn(
-            self.stream,
+            &self.stream,
             QsaAttnCall {
                 shape: QsaAttnShape {
                     m,

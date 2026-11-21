@@ -105,14 +105,14 @@ impl StartSink for CardDevice {
         let range = self.step.params()?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &params.to_bytes())
+            .write_at(&self.step.stream, range.offset(), &params.to_bytes())
     }
 
     fn write_stream(&mut self, stream: &[f32]) -> Result<(), EngError> {
         let range = self.step.slot(Slot::Stream)?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &f32_le_bytes(stream))
+            .write_at(&self.step.stream, range.offset(), &f32_le_bytes(stream))
     }
 
     /// The PLE projections stage their own embedding; the start needs no copy of it.
@@ -279,14 +279,14 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
         let range = self.step.params()?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &params.to_bytes())
+            .write_at(&self.step.stream, range.offset(), &params.to_bytes())
     }
 
     fn write_chunk_stream(&mut self, rows: &[f32]) -> Result<(), EngError> {
         let range = self.step.slot(Slot::Stream)?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &f32_le_bytes(rows))
+            .write_at(&self.step.stream, range.offset(), &f32_le_bytes(rows))
     }
 
     /// The device route stages the chunk's embeddings and queues both projections right away:
@@ -298,7 +298,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
             return Ok(());
         };
         let m = self.m;
-        ple.enqueue_chunk(self.step.ctx, self.step.stream, rows, m)
+        ple.enqueue_chunk(&self.step.ctx, &self.step.stream, rows, m)
     }
 
     fn ple_project_chunk(&mut self) -> Result<Vec<PleKeyValue>, EngError> {
@@ -310,7 +310,7 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
                     .to_string(),
             });
         };
-        ple.collect_chunk(self.step.stream, m)
+        ple.collect_chunk(&self.step.stream, m)
     }
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {

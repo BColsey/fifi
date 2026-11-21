@@ -9,6 +9,7 @@
 //! expert. The routed experts are native stacks held on the card (`trunk::expert_key`).
 
 use super::step::{MoeBlock, refuse};
+use crate::family::engine_owner::Handle;
 use crate::{
     EngError,
     family::{
@@ -32,7 +33,7 @@ use crate::{
 
 /// The block over resident native expert stacks.
 pub(in crate::family::qwen::flash_next) struct GgufMoe<'w> {
-    weights: &'w CudaWeights,
+    weights: Handle<'w, CudaWeights>,
     moe: DeviceBuffer,
     down: DeviceBuffer,
     shared: DeviceBuffer,
@@ -47,25 +48,25 @@ impl<'w> GgufMoe<'w> {
     /// The block for a model of `dims` over the uploaded `weights`.
     pub(in crate::family::qwen::flash_next) fn new(
         ctx: &CudaContext,
-        weights: &'w CudaWeights,
+        weights: impl Into<Handle<'w, CudaWeights>>,
         dims: &MoeDims,
     ) -> Result<Self, EngError> {
         Ok(Self {
-            weights,
+            weights: weights.into(),
             moe: pack(ctx, dims.hidden, 1)?,
             down: pack(ctx, dims.inter, dims.top_k)?,
             shared: pack(ctx, dims.shared_inter, 1)?,
         })
     }
 
-    fn native(&self, key: &str) -> Result<&'w crate::kernels::cuda::NativeWeight, EngError> {
+    fn native(&self, key: &str) -> Result<&crate::kernels::cuda::NativeWeight, EngError> {
         match self.weights.get(key) {
             Some(CudaWeight::Native { weight, .. }) => Ok(weight),
             _ => Err(refuse(format!("{key} is not an uploaded native matrix"))),
         }
     }
 
-    fn raw(&self, key: &str) -> Result<&'w DeviceBuffer, EngError> {
+    fn raw(&self, key: &str) -> Result<&DeviceBuffer, EngError> {
         match self.weights.get(key) {
             Some(CudaWeight::Raw { buffer, .. }) => Ok(buffer),
             _ => Err(refuse(format!("{key} is not an uploaded raw tensor"))),

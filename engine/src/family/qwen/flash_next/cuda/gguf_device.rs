@@ -3,7 +3,7 @@
 //! [`CardDevice`](super::device::CardDevice)'s; this device has no expert bank, so it reports no
 //! bank counters.
 
-use std::ops::Range;
+use std::{ops::Range, rc::Rc};
 
 use super::{
     driver::{DriverShape, StateIo, TokenDevice, TokenDriver},
@@ -17,41 +17,35 @@ use super::{
 use crate::{
     EngError,
     family::{
+        engine_owner::{EngineOwner, Handle},
         exl3_tensors::f32_le_bytes,
         flash_next::load::gguf::{GgufModel, feeds::gguf_feeds, trunk::gguf_trunk},
         project::cuda::{CudaProjector, CudaWeights},
     },
     kernels::cuda::{
-        CudaContext, DeviceStream,
-        prefill::gdn_scan_seq::{GdnForm, GdnGate, GdnKeyHeads, GdnL2},
+        CudaContext, DeviceStream, prefill::gdn_scan_seq::GdnForm,
         resident::step_params::StepParams,
     },
 };
 
-/// The DeltaNet scan of a GGUF: the tiled value-head order the converter wrote, the epsilon-added
-/// L2 norm and sigmoid gate of the Flash-Next layers.
-const GGUF_GDN: GdnForm = GdnForm {
-    key_heads: GdnKeyHeads::Tiled,
-    l2: GdnL2::AddEps,
-    gate: GdnGate::Sigmoid,
-};
-
-/// What the decode step borrows, owned by the device so that dropping the device (and with it
-/// the engine) frees the card. The fields drop in declaration order: the uploaded weights first,
-/// then the stream, the card handle and the model. The step and the MoE block borrow the boxed
-/// values below for as long as the device lives; a box's contents do not move when the box does.
-struct Held {
-    weights: Box<CudaWeights>,
-    stream: Box<DeviceStream>,
-    projector: Box<CudaProjector>,
-    model: Box<GgufModel>,
+/// The decode step and the MoE block it runs: the part of the device that is dropped first.
+struct GgufRun {
+    step: FlashStep<'static>,
+    moe: GgufMoe<'static>,
+    /// `branches * hidden`.
+    stream_width: usize,
+    /// The width of the head's output (the vocabulary).
+    logits_width: usize,
 }
 
+type Owner = EngineOwner<GgufRun, Box<GgufModel>, CudaWeights, DeviceStream, CudaContext>;
+
 /// The token driver of a Flash-Next GGUF over resident experts, for `positions` cached positions:
-/// the decode step, the native MoE block and the host feeds of the file. The driver owns the
-/// card handle, the stream, the uploaded weights and the model; dropping it frees them.
-/// `chunk_limit` is the host bytes one tensor upload reads at a time and `threads` the host PLE
-/// projection's thread count.
+/// the decode step, the native MoE block and the host feeds of the file. The device is an
+/// [`EngineOwner`]: it keeps the card handle, the stream, the uploaded weights and the model, and
+/// the step shares them, so dropping the driver quiesces the stream and frees the card in a fixed
+/// order. `chunk_limit` is the host bytes one tensor upload reads at a time and `threads` the
+/// host PLE projection's thread count.
 pub(in crate::family::qwen::flash_next) fn gguf_driver(
     model: GgufModel,
     projector: CudaProjector,
@@ -60,44 +54,24 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
     threads: usize,
 ) -> Result<TokenDriver<GgufDevice, PackFeeds>, EngError> {
     let model = Box::new(model);
-    let projector = Box::new(projector);
-    let stream = Box::new(projector.context().stream()?);
-    let weights = Box::new(gguf_trunk(&model, projector.context(), true, chunk_limit)?);
-    let held = Held {
-        weights,
-        stream,
-        projector,
-        model,
-    };
-    #[allow(unsafe_code)] // the one lifetime extension of the device; see the SAFETY note
-    // SAFETY: each referent sits in its own box inside `held`, which the device stores after
-    // the step and the MoE block, so it outlives them (fields drop in order); nothing moves out
-    // of a box or mutates it, and the references do not leave the device.
-    let (ctx, stream, weights): (
-        &'static CudaContext,
-        &'static DeviceStream,
-        &'static CudaWeights,
-    ) = unsafe {
-        (
-            &*std::ptr::from_ref(held.projector.context()),
-            &*std::ptr::from_ref::<DeviceStream>(&held.stream),
-            &*std::ptr::from_ref::<CudaWeights>(&held.weights),
-        )
-    };
-    let config = held.model.config();
+    let ctx = projector.shared_context();
+    drop(projector);
+    let stream = Rc::new(ctx.stream()?);
+    let weights = Rc::new(gguf_trunk(&model, &ctx, true, chunk_limit)?);
+    let config = model.config();
     let layers = config.layers();
     let step = FlashStep::from_shape(
-        ctx,
-        stream,
-        weights,
+        Handle::Shared(Rc::clone(&ctx)),
+        Handle::Shared(Rc::clone(&stream)),
+        Handle::Shared(Rc::clone(&weights)),
         (config.model_shape()?, config.kinds().to_vec()),
         positions,
         1,
         0..layers,
     )?
-    .with_gdn_form(GGUF_GDN);
-    let moe = GgufMoe::new(ctx, weights, &step.moe_dims(1))?;
-    let feeds = gguf_feeds(&held.model, threads)?;
+    .with_gdn_form(GdnForm::FLASH_NEXT_GGUF);
+    let moe = GgufMoe::new(&ctx, Handle::Shared(Rc::clone(&weights)), &step.moe_dims(1))?;
+    let feeds = gguf_feeds(&model, threads)?;
     let ple = config.model_shape()?.ple;
     let shape = DriverShape {
         layers,
@@ -109,48 +83,36 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
             ple_embed: ple.embed(),
         },
     };
-    TokenDriver::new(GgufDevice::new(step, moe, held), feeds, shape)
+    let run = GgufRun {
+        stream_width: step.geometry.branches * step.geometry.hidden,
+        logits_width: step.model.vocab,
+        step,
+        moe,
+    };
+    let owner = EngineOwner::new(run, model, weights, stream, ctx);
+    TokenDriver::new(GgufDevice { owner }, feeds, shape)
 }
 
 pub(in crate::family::qwen::flash_next) struct GgufDevice {
-    step: FlashStep<'static>,
-    moe: GgufMoe<'static>,
-    /// `branches * hidden`.
-    stream_width: usize,
-    /// The width of the head's output (the vocabulary).
-    logits_width: usize,
-    /// Last field: the step and the block above borrow it.
-    _held: Held,
-}
-
-impl GgufDevice {
-    fn new(step: FlashStep<'static>, moe: GgufMoe<'static>, held: Held) -> Self {
-        let stream_width = step.geometry.branches * step.geometry.hidden;
-        let logits_width = step.model.vocab;
-        Self {
-            step,
-            moe,
-            stream_width,
-            logits_width,
-            _held: held,
-        }
-    }
+    owner: Owner,
 }
 
 impl StartSink for GgufDevice {
     fn write_step_params(&mut self, token: i32, pos: i32) -> Result<(), EngError> {
         let params = StepParams::new(token, pos)?;
-        let range = self.step.params()?;
+        let step = &self.owner.step().step;
+        let range = step.params()?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &params.to_bytes())
+            .write_at(&step.stream, range.offset(), &params.to_bytes())
     }
 
     fn write_stream(&mut self, stream: &[f32]) -> Result<(), EngError> {
-        let range = self.step.slot(Slot::Stream)?;
+        let step = &self.owner.step().step;
+        let range = step.slot(Slot::Stream)?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &f32_le_bytes(stream))
+            .write_at(&step.stream, range.offset(), &f32_le_bytes(stream))
     }
 
     /// The PLE projections run on the host; the start needs no copy of the embedding.
@@ -161,19 +123,21 @@ impl StartSink for GgufDevice {
 
 impl TokenDevice for GgufDevice {
     fn begin_token(&mut self) -> Result<(), EngError> {
-        self.step.begin_token()
+        self.owner.step().step.begin_token()
     }
 
     fn layers(&mut self, range: Range<usize>, pos: usize) -> Result<(), EngError> {
         if range.is_empty() {
             return Ok(());
         }
-        self.step.run_layers(range, pos, 1, &mut self.moe)
+        let GgufRun { step, moe, .. } = self.owner.step_mut();
+        step.run_layers(range, pos, 1, moe)
     }
 
     fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {
-        self.step
-            .read_f32(self.step.slot(Slot::Stream)?, self.stream_width)
+        let run = self.owner.step();
+        run.step
+            .read_f32(run.step.slot(Slot::Stream)?, run.stream_width)
     }
 
     fn write_stream_back(&mut self, stream: &[f32]) -> Result<(), EngError> {
@@ -181,33 +145,34 @@ impl TokenDevice for GgufDevice {
     }
 
     fn head(&mut self) -> Result<(), EngError> {
-        self.step.head(1)
+        self.owner.step().step.head(1)
     }
 
     fn read_logits(&mut self) -> Result<Vec<f32>, EngError> {
-        self.step
-            .read_f32(self.step.slot(Slot::Logits)?, self.logits_width)
+        let run = self.owner.step();
+        run.step
+            .read_f32(run.step.slot(Slot::Logits)?, run.logits_width)
     }
 
     fn check_health(&mut self) -> Result<(), EngError> {
-        self.step.finish_token()
+        self.owner.step().step.finish_token()
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
-        self.step.reset()
+        self.owner.step().step.reset()
     }
 }
 
 impl StateIo for GgufDevice {
     fn read_fixed_state(&self) -> Result<Vec<(StateSlot, Vec<u8>)>, EngError> {
-        self.step.read_fixed_state()
+        self.owner.step().step.read_fixed_state()
     }
 
     fn fixed_state_bytes(&self) -> u64 {
-        self.step.fixed_state_bytes()
+        self.owner.step().step.fixed_state_bytes()
     }
 
     fn write_fixed_state(&mut self, parts: &[(StateSlot, Vec<u8>)]) -> Result<(), EngError> {
-        self.step.write_fixed_state(parts)
+        self.owner.step_mut().step.write_fixed_state(parts)
     }
 }

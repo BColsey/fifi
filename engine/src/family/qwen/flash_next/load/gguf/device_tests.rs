@@ -202,6 +202,7 @@ fn stopping_the_engine_gives_back_its_card_memory() {
     }
     let probe = CudaProjector::new().expect("the card");
     let before = probe.memory_info().expect("memory").free;
+    let live_before = crate::kernels::cuda::live_device_bytes();
     let (tx, rx) = std::sync::mpsc::channel();
     let started = factory::start_engine(
         dir,
@@ -215,8 +216,21 @@ fn stopping_the_engine_gives_back_its_card_memory() {
         panic!("the start failed: {why}");
     }
     let during = probe.memory_info().expect("memory").free;
+    let live_during = crate::kernels::cuda::live_device_bytes();
     assert!(started.engine.shutdown().failure.is_none());
     let after = probe.memory_info().expect("memory").free;
+    let live_after = crate::kernels::cuda::live_device_bytes();
+    eprintln!(
+        "live device bytes: before {live_before}, running {live_during}, stopped {live_after}"
+    );
+    assert!(
+        live_during > live_before,
+        "the running engine holds buffers"
+    );
+    assert_eq!(
+        live_after, live_before,
+        "the stopped engine freed every buffer"
+    );
     eprintln!(
         "card free MiB: before {}, running {}, stopped {}",
         before >> 20,

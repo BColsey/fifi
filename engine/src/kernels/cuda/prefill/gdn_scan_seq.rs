@@ -177,6 +177,14 @@ impl GdnForm {
         gate: GdnGate::Sigmoid,
     };
 
+    /// Qwen3.8 Flash-Next from a GGUF: the tiled value-head order the converter wrote, with the
+    /// L2 norm and the sigmoid gate of the model.
+    pub(crate) const FLASH_NEXT_GGUF: Self = Self {
+        key_heads: GdnKeyHeads::Tiled,
+        l2: GdnL2::AddEps,
+        gate: GdnGate::Sigmoid,
+    };
+
     fn bits(self) -> c_int {
         let heads = match self.key_heads {
             GdnKeyHeads::Tiled => 0,

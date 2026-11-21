@@ -148,19 +148,19 @@ fn already_built() -> EngError {
 
 /// Takes the one-engine flag; released on drop unless committed (a failure before the first leak
 /// owns nothing on the card).
-pub(in crate::family::qwen::flash_next) struct BuildGuard {
+pub(super) struct BuildGuard {
     committed: bool,
 }
 
 impl BuildGuard {
-    pub(in crate::family::qwen::flash_next) fn acquire() -> Result<Self, EngError> {
+    fn acquire() -> Result<Self, EngError> {
         CUDA_ENGINE_BUILT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| already_built())?;
         Ok(Self { committed: false })
     }
 
-    pub(in crate::family::qwen::flash_next) fn commit(&mut self) {
+    fn commit(&mut self) {
         self.committed = true;
     }
 }
@@ -1239,8 +1239,9 @@ fn build_driver_resolving(
     let device_ple = if let Some(shape) = ple_shape {
         stage("allocating the PLE projection workspace");
         let layer = model.ple_layer;
-        let (key, key_dtype) = step.half(&layer_name(layer, "ple.key_proj.weight"))?;
-        let (value, value_dtype) = step.half(&layer_name(layer, "ple.value_proj.weight"))?;
+        let (key, key_dtype) = step.half_borrowed(&layer_name(layer, "ple.key_proj.weight"))?;
+        let (value, value_dtype) =
+            step.half_borrowed(&layer_name(layer, "ple.value_proj.weight"))?;
         if key_dtype != value_dtype {
             return Err(EngError::Checkpoint(
                 "the PLE projection matrices have different dtypes".into(),

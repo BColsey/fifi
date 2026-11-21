@@ -41,6 +41,7 @@
 // Staged: the executor is the first caller of the whole step.
 #![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
 
+use crate::family::engine_owner::Handle;
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::Cell;
 
@@ -93,14 +94,17 @@ pub(super) fn refuse(detail: String) -> EngError {
 }
 
 /// The pack name of the hyper-connection mixer that feeds `lm_head`.
+/// Activation rows one native matvec launch takes.
+const MATVEC_COLUMNS: usize = 8;
+
 pub(super) const MIXER: &str = "model.language_model.hyper_connection_mixer";
 
 /// The step of one token over a window of layers `first_layer..end_layer` (all 48 for a full
 /// model, a few for a parity window).
 pub(super) struct FlashStep<'a> {
-    pub(super) ctx: &'a CudaContext,
-    pub(super) stream: &'a DeviceStream,
-    pub(super) weights: &'a CudaWeights,
+    pub(super) ctx: Handle<'a, CudaContext>,
+    pub(super) stream: Handle<'a, DeviceStream>,
+    pub(super) weights: Handle<'a, CudaWeights>,
     pub(super) geometry: FlashGeometry,
     pub(super) model: ModelShape,
     pub(super) state_plan: StatePlan,
@@ -130,9 +134,9 @@ impl<'a> FlashStep<'a> {
     /// The step over `layers` of the model in `model_config`, with caches for `positions`
     /// positions. The state is zeroed: a new sequence.
     pub(super) fn new(
-        ctx: &'a CudaContext,
-        stream: &'a DeviceStream,
-        weights: &'a CudaWeights,
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
         model_config: &[u8],
         positions: usize,
         rows: usize,
@@ -159,9 +163,9 @@ impl<'a> FlashStep<'a> {
     /// The step over a model whose shape the caller already has (a GGUF, which carries no
     /// `config.json`): `kinds` is true for the QSA layers.
     pub(in crate::family::qwen::flash_next) fn from_shape(
-        ctx: &'a CudaContext,
-        stream: &'a DeviceStream,
-        weights: &'a CudaWeights,
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
         shape: (ModelShape, Vec<bool>),
         positions: usize,
         rows: usize,
@@ -172,9 +176,9 @@ impl<'a> FlashStep<'a> {
 
     /// The shared-prefill owner, with dense and routed scratch from the shared plan.
     pub(super) fn new_prefill(
-        ctx: &'a CudaContext,
-        stream: &'a DeviceStream,
-        weights: &'a CudaWeights,
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
         model_config: &[u8],
         positions: usize,
         rows: usize,
@@ -197,15 +201,16 @@ impl<'a> FlashStep<'a> {
         reason = "one constructor for the two arena lists"
     )]
     fn build(
-        ctx: &'a CudaContext,
-        stream: &'a DeviceStream,
-        weights: &'a CudaWeights,
+        ctx: impl Into<Handle<'a, CudaContext>>,
+        stream: impl Into<Handle<'a, DeviceStream>>,
+        weights: impl Into<Handle<'a, CudaWeights>>,
         (model, kinds): (ModelShape, Vec<bool>),
         positions: usize,
         rows: usize,
         layers: std::ops::Range<usize>,
         shared_prefill: bool,
     ) -> Result<Self, EngError> {
+        let (ctx, stream, weights) = (ctx.into(), stream.into(), weights.into());
         let geometry = FlashGeometry::new(&model, &kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
             return Err(refuse(format!(
@@ -223,7 +228,7 @@ impl<'a> FlashStep<'a> {
         let state = ctx.arena(&state_plan.arena_tensors())?;
         let tensors = step_plan.arena_tensors();
         let scratch = if shared_prefill {
-            allocate_zeroed(ctx, stream, &tensors, false, ArenaHooks::default())?
+            allocate_zeroed(&ctx, &stream, &tensors, false, ArenaHooks::default())?
         } else {
             ctx.arena(&tensors)?
         };
@@ -240,7 +245,7 @@ impl<'a> FlashStep<'a> {
         .into_iter()
         .max()
         .unwrap_or(0);
-        let q8_bytes = q8_1_bytes(widest, 1)
+        let q8_bytes = q8_1_bytes(widest, MATVEC_COLUMNS)
             .ok_or_else(|| refuse("the activation pack size overflows".into()))?
             .max(64 << 10);
         let xq = ctx.upload(&vec![0u8; q8_bytes])?;
@@ -297,7 +302,7 @@ impl<'a> FlashStep<'a> {
                 let len = zeros.len().min(end - at);
                 self.state
                     .buffer()
-                    .write_at(self.stream, at, &zeros[..len])?;
+                    .write_at(&self.stream, at, &zeros[..len])?;
                 at += len;
             }
         }
@@ -316,7 +321,7 @@ impl<'a> FlashStep<'a> {
         let mut out = vec![0u8; bytes];
         range
             .buffer()
-            .read_at(self.stream, range.offset(), &mut out)?;
+            .read_at(&self.stream, range.offset(), &mut out)?;
         Ok(out)
     }
 
@@ -338,7 +343,7 @@ impl<'a> FlashStep<'a> {
                 bytes.len()
             )));
         }
-        range.buffer().write_at(self.stream, range.offset(), bytes)
+        range.buffer().write_at(&self.stream, range.offset(), bytes)
     }
 
     /// Refuses while the step is poisoned.
@@ -467,18 +472,20 @@ impl<'a> FlashStep<'a> {
     }
 
     /// A tensor kept as stored (F16 or BF16) with its dtype.
-    pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'a>, HyperDtype), EngError> {
-        match self.weights.get(name) {
-            Some(CudaWeight::Raw { ty, buffer, .. }) => {
-                let dtype = match ty {
-                    GgufType::F16 => HyperDtype::F16,
-                    GgufType::Bf16 => HyperDtype::Bf16,
-                    other => return Err(refuse(format!("{name} is stored as {other:?}"))),
-                };
-                Ok((buffer.range(0, buffer.bytes())?, dtype))
-            }
-            _ => Err(refuse(format!("{name} is not an uploaded half tensor"))),
-        }
+    pub(super) fn half(&self, name: &str) -> Result<(DeviceRange<'_>, HyperDtype), EngError> {
+        half_of(&self.weights, name)
+    }
+
+    /// [`Self::half`] for a step that borrows its weights, so the range outlives the step.
+    pub(super) fn half_borrowed(
+        &self,
+        name: &str,
+    ) -> Result<(DeviceRange<'a>, HyperDtype), EngError> {
+        let weights = self
+            .weights
+            .borrowed()
+            .ok_or_else(|| refuse("the step shares its weights, which it cannot lend".into()))?;
+        half_of(weights, name)
     }
 
     pub(super) fn shared_prefill(&self) -> bool {
@@ -527,8 +534,8 @@ impl<'a> FlashStep<'a> {
         let weight = self.exl3(prefix)?;
         if self.shared_prefill() {
             let launch = Launch {
-                ctx: self.ctx,
-                stream: self.stream,
+                ctx: &self.ctx,
+                stream: &self.stream,
             };
             return self
                 .prefill_projector(&launch, m)?
@@ -545,7 +552,7 @@ impl<'a> FlashStep<'a> {
                 rows: m,
                 fused: false,
             };
-            return self.ctx.exl3_linear(self.stream, view.linear_call(&io));
+            return self.ctx.exl3_linear(&self.stream, view.linear_call(&io));
         }
         // The job-table path: the out of many rows is strided (`out_ld` per row), which the
         // contiguous single-row call cannot express.
@@ -562,36 +569,42 @@ impl<'a> FlashStep<'a> {
         out: DeviceRange<'_>,
         m: usize,
     ) -> Result<(), EngError> {
-        if m != 1 {
-            return Err(refuse(format!(
-                "a native projection takes one row, the step has {m}"
-            )));
-        }
         let (k, rows) = (weight.k(), weight.n_rows());
-        let pack =
-            q8_1_bytes(k, 1).ok_or_else(|| refuse("the activation pack overflows".into()))?;
-        let x_q8 = self.xq.range(0, pack)?;
-        self.ctx.quantize_q8_1(
-            self.stream,
-            QuantizeCall {
-                x,
-                y: x_q8,
-                k,
-                ncols: 1,
-            },
-        )?;
-        self.ctx.matvec_q(
-            self.stream,
-            MatvecCall {
-                ty: weight.quant(),
-                w: weight.buffer().range(0, weight.buffer().bytes())?,
-                x_q8,
-                y: out,
-                k,
-                rows,
-                ncols: 1,
-            },
-        )
+        let w = weight.buffer().range(0, weight.buffer().bytes())?;
+        // The matvec takes up to eight activation rows a launch; a longer piece runs in groups.
+        for first in (0..m).step_by(MATVEC_COLUMNS) {
+            let n = MATVEC_COLUMNS.min(m - first);
+            let pack =
+                q8_1_bytes(k, n).ok_or_else(|| refuse("the activation pack overflows".into()))?;
+            let x_q8 = self.xq.range(0, pack)?;
+            let x_rows = x
+                .buffer()
+                .range(x.offset() + first * k * F32, n * k * F32)?;
+            self.ctx.quantize_q8_1(
+                &self.stream,
+                QuantizeCall {
+                    x: x_rows,
+                    y: x_q8,
+                    k,
+                    ncols: n,
+                },
+            )?;
+            self.ctx.matvec_q(
+                &self.stream,
+                MatvecCall {
+                    ty: weight.quant(),
+                    w,
+                    x_q8,
+                    y: out
+                        .buffer()
+                        .range(out.offset() + first * rows * F32, n * rows * F32)?,
+                    k,
+                    rows,
+                    ncols: n,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// A projection stored as two half-precision tensors under `prefix.q` and `prefix.k` (the
@@ -604,13 +617,8 @@ impl<'a> FlashStep<'a> {
         out: DeviceRange<'_>,
         m: usize,
     ) -> Result<(), EngError> {
-        if m != 1 {
-            return Err(refuse(format!(
-                "{prefix} is a dense pair, which takes one row, the step has {m}"
-            )));
-        }
         let cols = self.geometry.hidden;
-        let mut at = 0usize;
+        let mut parts = Vec::with_capacity(2);
         for suffix in ["q", "k"] {
             let name = format!("{prefix}.{suffix}");
             let Some(CudaWeight::Raw { ty, buffer, .. }) = self.weights.get(&name) else {
@@ -623,24 +631,36 @@ impl<'a> FlashStep<'a> {
                 GgufType::Bf16 => DenseDtype::Bf16,
                 other => return Err(refuse(format!("{name} is {other:?}, not a half tensor"))),
             };
-            let rows = buffer.bytes() / 2 / cols;
+            parts.push((buffer, dtype, buffer.bytes() / 2 / cols));
+        }
+        // One row of the output holds the queries then the key: both matvecs write their
+        // columns into rows `total` floats wide.
+        let total: usize = parts.iter().map(|part| part.2).sum();
+        if out.bytes() < m * total * F32 {
+            return Err(refuse(format!(
+                "{prefix} has {total} output columns for {m} rows, the slot holds {} floats",
+                out.bytes() / F32
+            )));
+        }
+        let mut at = 0usize;
+        for (buffer, dtype, rows) in parts {
+            let shape = DenseGemvShape {
+                ld_y: total,
+                ..DenseGemvShape::packed(m, rows, cols)
+            };
             self.ctx.dense_gemv(
-                self.stream,
+                &self.stream,
                 DenseGemvCall {
-                    shape: DenseGemvShape::packed(1, rows, cols),
+                    shape,
                     dtype,
                     w: buffer.range(0, buffer.bytes())?,
                     x,
-                    y: out.buffer().range(out.offset() + at * F32, rows * F32)?,
+                    y: out
+                        .buffer()
+                        .range(out.offset() + at * F32, (m - 1) * total * F32 + rows * F32)?,
                 },
             )?;
             at += rows;
-        }
-        if at * F32 != out.bytes() {
-            return Err(refuse(format!(
-                "{prefix} has {at} output columns, the row slot holds {}",
-                out.bytes() / F32
-            )));
         }
         Ok(())
     }
@@ -661,8 +681,8 @@ impl<'a> FlashStep<'a> {
     ) -> Result<(), EngError> {
         if self.shared_prefill() {
             let launch = Launch {
-                ctx: self.ctx,
-                stream: self.stream,
+                ctx: &self.ctx,
+                stream: &self.stream,
             };
             return self.prefill_projector(&launch, m)?.project(
                 self.exl3(prefix)?,
@@ -708,7 +728,7 @@ impl<'a> FlashStep<'a> {
             out_ld,
             out_col,
         };
-        self.ctx.exl3_jobs(self.stream, members.jobs_call(&io))
+        self.ctx.exl3_jobs(&self.stream, members.jobs_call(&io))
     }
 
     /// The input projections `parts` as one grouped launch: part `(prefix, col, n)` writes the
@@ -786,7 +806,7 @@ impl<'a> FlashStep<'a> {
             .iter()
             .map(|(view, io)| view.linear_call(io))
             .collect();
-        self.ctx.exl3_grouped_step(self.stream, &calls)
+        self.ctx.exl3_grouped_step(&self.stream, &calls)
     }
 
     /// `width` floats of `row` from float column `col`.
@@ -827,7 +847,7 @@ impl<'a> FlashStep<'a> {
             )));
         }
         self.ctx.hyper_read(
-            self.stream,
+            &self.stream,
             HyperReadCall {
                 shape: self.hyper_shape(m),
                 eps: self.model.hyper.eps(),
@@ -857,7 +877,7 @@ impl<'a> FlashStep<'a> {
     /// `Stream += gate * block` for the site's `m` rows.
     pub(super) fn hyper_apply(&self, site: Site, m: usize) -> Result<(), EngError> {
         self.ctx.hyper_apply(
-            self.stream,
+            &self.stream,
             HyperApplyCall {
                 shape: self.hyper_shape(m),
                 x: self.slot(Slot::Stream)?,
@@ -992,8 +1012,8 @@ impl<'a> FlashStep<'a> {
         m: usize,
     ) -> Result<(), EngError> {
         let launch = Launch {
-            ctx: self.ctx,
-            stream: self.stream,
+            ctx: &self.ctx,
+            stream: &self.stream,
         };
         if self.shared_prefill() {
             return moe.run_prefill(
@@ -1077,8 +1097,8 @@ impl<'a> FlashStep<'a> {
         self.check_rows(m)?;
         if self.shared_prefill() {
             let launch = Launch {
-                ctx: self.ctx,
-                stream: self.stream,
+                ctx: &self.ctx,
+                stream: &self.stream,
             };
             return write_dense_jobs(
                 &launch,
@@ -1097,7 +1117,7 @@ impl<'a> FlashStep<'a> {
         let table = self.slot(Slot::Exl3Jobs)?;
         table
             .buffer()
-            .write_at(self.stream, table.offset(), &Exl3Job::table(&[job]))
+            .write_at(&self.stream, table.offset(), &Exl3Job::table(&[job]))
     }
 
     /// Clears the sticky EXL3 flag and the status word: the first launch of a token.
@@ -1106,11 +1126,11 @@ impl<'a> FlashStep<'a> {
         let result = (|| {
             let flag = self.slot(Slot::Exl3Flag)?;
             flag.buffer()
-                .write_at(self.stream, flag.offset(), &[0u8; 4])?;
+                .write_at(&self.stream, flag.offset(), &[0u8; 4])?;
             let status = self.status_word()?;
             status
                 .buffer()
-                .write_at(self.stream, status.offset(), &[0u8; 4])
+                .write_at(&self.stream, status.offset(), &[0u8; 4])
         })();
         self.poison_on(result)
     }
@@ -1216,7 +1236,7 @@ impl<'a> FlashStep<'a> {
         let mut bytes = vec![0u8; values * F32];
         range
             .buffer()
-            .read_at(self.stream, range.offset(), &mut bytes)?;
+            .read_at(&self.stream, range.offset(), &mut bytes)?;
         Ok(bytes
             .as_chunks::<4>()
             .0
@@ -1231,11 +1251,11 @@ impl<'a> FlashStep<'a> {
         let status = self.status_word()?;
         status
             .buffer()
-            .read_at(self.stream, status.offset(), &mut word)?;
+            .read_at(&self.stream, status.offset(), &mut word)?;
         let status = i32::from_le_bytes(word);
         let flag = self.slot(Slot::Exl3Flag)?;
         flag.buffer()
-            .read_at(self.stream, flag.offset(), &mut word)?;
+            .read_at(&self.stream, flag.offset(), &mut word)?;
         Ok((status, u32::from_le_bytes(word)))
     }
 }
@@ -1426,5 +1446,23 @@ impl MoeBlock for SplitMoeAt<'_> {
                 ))
             })?;
         self.inner.run_prefill(projector, row, bufs, dims, perm)
+    }
+}
+
+/// A tensor of `weights` kept as stored (F16 or BF16) with its dtype.
+fn half_of<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+) -> Result<(DeviceRange<'w>, HyperDtype), EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Raw { ty, buffer, .. }) => {
+            let dtype = match ty {
+                GgufType::F16 => HyperDtype::F16,
+                GgufType::Bf16 => HyperDtype::Bf16,
+                other => return Err(refuse(format!("{name} is stored as {other:?}"))),
+            };
+            Ok((buffer.range(0, buffer.bytes())?, dtype))
+        }
+        _ => Err(refuse(format!("{name} is not an uploaded half tensor"))),
     }
 }

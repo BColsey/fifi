@@ -1487,7 +1487,7 @@ fn write_params(step: &FlashStep<'_>, token: i32, pos: i32) {
     let params =
         crate::kernels::cuda::resident::step_params::StepParams::new(token, pos).expect("params");
     words
-        .write_at(step.stream, words_at, &params.to_bytes())
+        .write_at(&step.stream, words_at, &params.to_bytes())
         .expect("params");
 }
 
@@ -1496,7 +1496,7 @@ fn write_stream_row(step: &FlashStep<'_>, values: &[f32]) {
     range
         .buffer()
         .write_at(
-            step.stream,
+            &step.stream,
             range.offset(),
             &values
                 .iter()
