@@ -1,7 +1,7 @@
 //! The serving wrap of the resident Bolt executor.
 //!
-//! One session per engine by default; `max_seqs` above one serves several sessions in one decode
-//! window. The token side is the shared `DecodeSession`
+//! One session serves a request at a time; `max_seqs` above one (the default plans it from free
+//! memory) serves several sessions in one decode window. The token side is the shared `DecodeSession`
 //! (`family::session`): it owns the committed tokens, the pending token and
 //! the finish rules (cancel, length, end of sequence, context limit). The
 //! model side is a `TokenStepper` that feeds prompt rows cache-only and reads
@@ -137,7 +137,7 @@ mod device {
         /// session's cache cells below its position, held in host memory: a restore writes it
         /// into any session, so reuse works whatever the number of sessions and whichever
         /// pooled session serves the next request. Host memory, not a device slab, because the
-        /// planner has already spent the device on sessions: an entry is at most one session's
+        /// device memory belongs to the sessions' planes: an entry is at most one session's
         /// cache (952 MiB at 32,768 cells, 30,464 bytes a position) and costs a transfer over
         /// the bus (about 125 MB for a 4,000-token prefix), where recomputing the prefix costs
         /// its whole prefill.

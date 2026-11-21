@@ -256,7 +256,7 @@ impl<'a, S> Pool<'a, S> {
 const WAIT_RETRY: Duration = Duration::from_secs(1);
 
 /// A job that capacity refused while other slots were live. It keeps its queue ticket, so the
-/// engine still counts it as queued and the queue's bound does not grow by one.
+/// `queued` figure of `/v1/system` still counts it while it waits.
 struct Waiting {
     job: Job,
     ticket: QueueTicket,
