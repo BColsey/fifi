@@ -3,7 +3,7 @@ use super::{
     CORE_START, EXPERTS, HIDDEN, InklingExpertSource, InklingRoutes, LayerVisit, MAX_CONTEXT,
     attention::InklingAttentionState,
     dense::DenseWeights,
-    is_local,
+    gguf, is_local,
     mlx::{MlxExpertCache, MlxExpertCacheStats},
     sconv::{InklingConvState, InklingConvStream, InklingConvTaps},
     visits,
@@ -123,10 +123,17 @@ struct PrefillRow {
     bank: Vec<Row>,
 }
 
+enum Experts {
+    Mlx {
+        metal: MlxKernels,
+        cache: Box<MlxExpertCache>,
+    },
+    GgufReference(Arc<gguf::Weights>),
+}
+
 pub struct Decoder {
     dense: DenseWeights,
-    metal: MlxKernels,
-    experts: MlxExpertCache,
+    experts: Experts,
     conv: InklingConvState,
     attention: InklingAttentionState,
     position: u32,
@@ -162,8 +169,10 @@ impl Decoder {
         }
         Ok(Self {
             dense: DenseWeights::open(dir)?,
-            metal,
-            experts,
+            experts: Experts::Mlx {
+                metal,
+                cache: Box::new(experts),
+            },
             conv: Default::default(),
             attention: Default::default(),
             position: 0,
@@ -172,8 +181,36 @@ impl Decoder {
             prefill_rows,
         })
     }
+    /// Opens the portable GGUF projections in the common text graph for parity checks.
+    /// Uses bounded host reads and a single token row per visit.
+    pub fn open_gguf_reference(path: &Path, context: u32) -> Result<Self, EngError> {
+        if !(1..=MAX_CONTEXT).contains(&context) {
+            return Err(EngError::BadRequest("Invalid Inkling context limit".into()));
+        }
+        let state = super::state_plan(context)?;
+        let charges = super::base_charges(0, gguf::projection_scratch_bytes(), &state);
+        if let Some(device) = crate::family::mlx_budget::DeviceBudget::detect_with_default(true)? {
+            super::working_set_remaining(device, &charges)?;
+        }
+        let source = Arc::new(gguf::Weights::open(path)?);
+        let dense = DenseWeights::from_gguf(Arc::clone(&source))?;
+        Ok(Self {
+            dense,
+            experts: Experts::GgufReference(source),
+            conv: Default::default(),
+            attention: Default::default(),
+            position: 0,
+            context,
+            failed: false,
+            prefill_rows: 1,
+        })
+    }
+
     pub fn expert_cache_stats(&self) -> MlxExpertCacheStats {
-        self.experts.stats()
+        match &self.experts {
+            Experts::Mlx { cache, .. } => cache.stats(),
+            Experts::GgufReference(_) => MlxExpertCacheStats::default(),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -249,6 +286,20 @@ impl Decoder {
             &logits,
             bias.as_slice().try_into().map_err(|_| invalid())?,
         )?;
+        let Experts::Mlx { metal, cache } = &mut self.experts else {
+            let Experts::GgufReference(source) = &self.experts else {
+                unreachable!()
+            };
+            let mut out = Vec::with_capacity(inputs.len() * HIDDEN);
+            for ((input, experts), weights) in inputs
+                .iter()
+                .zip(routes.expert_ids().chunks_exact(super::TOP_K))
+                .zip(routes.weights().chunks_exact(super::TOP_K))
+            {
+                out.extend(source.moe_row(layer, input, experts, weights)?);
+            }
+            return Ok(out);
+        };
         let shape = vec![inputs.len() as u32, HIDDEN as u32];
         let host = Tensor::try_from_host(
             Dtype::F32,
@@ -259,9 +310,7 @@ impl Decoder {
                 .flat_map(|x| x.to_le_bytes())
                 .collect(),
         )?;
-        let host =
-            self.experts
-                .forward_quantized_readback(&mut self.metal, layer, &routes, &host)?;
+        let host = cache.forward_quantized_readback(metal, layer, &routes, &host)?;
         if host.dtype() != Dtype::F32 || host.shape() != shape.as_slice() {
             return Err(invalid());
         }
@@ -449,17 +498,14 @@ impl Decoder {
         if !looped {
             return Ok(dest.to_vec());
         }
-        let (suffix, offset) = match stream {
-            "attn" => ("", 0),
-            "k" => ("_kv", 0),
-            "v" => ("_kv", 1),
-            "mlp" => ("", 1),
+        let stream_index = match stream {
+            "attn" => 0,
+            "k" => 1,
+            "v" => 2,
+            "mlp" => 3,
             _ => return Err(invalid()),
         };
-        let q = self.dense.row(
-            &format!("model.llm.middle_cycle_cross_pass{suffix}_queries"),
-            2 * (layer - CORE_START) + offset,
-        )?;
+        let q = self.dense.loop_query(layer, stream_index)?;
         blend(
             &mut self.dense,
             &format!("{prefix}.controllers.{stream}"),
@@ -472,6 +518,31 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a complete Unsloth UD-IQ2_XXS fork GGUF at INKLING_GGUF_REFERENCE"]
+    fn fork_gguf_reference_first_token_matches_oracle() {
+        let file = std::env::var_os("INKLING_GGUF_REFERENCE").expect("INKLING_GGUF_REFERENCE");
+        let mut decoder = Decoder::open_gguf_reference(Path::new(&file), 128).unwrap();
+        let start = std::time::Instant::now();
+        decoder
+            .advance_rows(&[371, 151451, 149879, 151194])
+            .unwrap();
+        let scores = decoder.step(149884).unwrap();
+        let top = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        eprintln!(
+            "Inkling GGUF reference first token={top:?} elapsed={:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            top.0, 152717,
+            "first greedy token for The capital of France is"
+        );
+    }
 
     #[test]
     fn prefill_window_is_explicit_and_bounded() {
