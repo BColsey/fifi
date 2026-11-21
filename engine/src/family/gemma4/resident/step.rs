@@ -401,28 +401,16 @@ impl Gemma {
         )?;
         // A prompt chunk of two or more rows on a global layer runs the wide prefill attention when
         // the device has it; a lone row, and so every decode step, keeps the decode attention.
-        let wide: Option<&WideAttention> = self
-            .wide_prefill
-            .as_ref()
-            .filter(|wide| m > 1 && layer.global && wide.is_on());
-        if let Some(wide) = wide {
-            wide.attend(
-                ctx,
-                stream,
-                WideCall {
-                    planes: [
-                        &layer.kv.k_codes,
-                        &layer.kv.k_scales,
-                        &layer.kv.v_codes,
-                        &layer.kv.v_scales,
-                    ],
-                    q: sc.q_normed.buf.range(0, m * q_rows * 4)?,
-                    out: sc.ctx_out.buf.range(0, m * q_rows * 4)?,
-                    rows: m,
-                    p0: pos,
-                },
-            )?;
-        } else {
+        let kv = &layer.kv;
+        let call = WideCall::new(
+            [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales],
+            sc.q_normed.buf.range(0, m * q_rows * 4)?,
+            sc.ctx_out.buf.range(0, m * q_rows * 4)?,
+            m,
+            pos,
+        );
+        let take = m > 1 && layer.global;
+        if !WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
             ctx.attn_decode_gemma(
                 stream,
                 AttnDecodeGemmaCall {

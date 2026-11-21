@@ -41,6 +41,7 @@ use super::{
     vector_filled, zero,
 };
 use crate::EngError;
+use crate::family::card_fit::CellFigures;
 use crate::family::gemma4::gguf::ple_rows_from_merged;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceBuffer;
@@ -137,11 +138,9 @@ pub(crate) fn scratch_bytes(attn_split_armed: bool, wide_prefill: bool) -> Optio
         total = total.checked_add(attn_part_bytes() as u64)?;
     }
     // The wide prefill attention's partial buffer, present only when the device gate passed.
-    if wide_prefill {
-        // The partial buffer holds at most 128 splits, so the model maximum bounds it for every
-        // planned cell count.
-        total = total.checked_add(wide_geometry(MAX_CELLS).part_bytes().ok()? as u64)?;
-    }
+    // The wide prefill attention's partial buffer, present only when the device gate passed; the
+    // buffer holds at most 128 splits, so the model maximum bounds it for every planned cell count.
+    total = total.checked_add(wide_geometry(MAX_CELLS).charge(wide_prefill)?)?;
     Some(total)
 }
 
@@ -451,65 +450,18 @@ pub(crate) fn bolt_demand(
     })
 }
 
-/// Device bytes kept free beside the demand when several sessions are planned.
-const SESSION_PLAN_SLACK_BYTES: u64 = 256 << 20;
-
-/// The KV cells per physical layer a card carries beside `weights_bytes` while `sessions`
-/// sessions each hold that many: the largest count up to the model maximum whose first session's
-/// cache, the shared scratch, the headroom and the cache and fixed bytes of every further session
-/// fit `free` (the shared card-fit rule, one cache form). `None` when not even the smallest count
-/// fits.
-pub(crate) fn plan_cells(
-    free: u64,
-    weights_bytes: u64,
-    attn_split_armed: bool,
-    wide_prefill: bool,
-    sessions: usize,
-) -> Result<Option<usize>, EngError> {
-    use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
-
-    let per_position = super::super::budget::bolt_kv_bytes_per_position()
-        .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
-    let scratch = scratch_bytes(attn_split_armed, wide_prefill)
-        .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
-    let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
-    // Allocations of the first session that the admission demand does not list (measured on the
-    // 3090: the sessions planner found 196 MiB less free after the first session than the demand
-    // predicts), kept free so that a planned session count survives them.
-    let unlisted = if extra > 0 {
-        SESSION_PLAN_SLACK_BYTES
-    } else {
-        0
-    };
-    let charge = |cells: u32| {
-        let cache = u64::from(cells).checked_mul(per_position)?;
-        let further = cache
-            .checked_add(super::super::budget::BOLT_SEQ_FIXED_BYTES)?
-            .checked_mul(extra)?;
-        cache
-            .checked_add(scratch)?
-            .checked_add(super::super::budget::BOLT_HEADROOM_BYTES)?
-            .checked_add(unlisted)?
-            .checked_add(further)
-    };
-    let ceiling = u32::try_from(MAX_CELLS)
-        .map_err(|_| EngError::MemoryPlan("the Bolt model maximum exceeds u32".into()))?;
-    Ok(plan_card_fit(
-        CardBytes {
-            free,
-            weights: weights_bytes,
-            band: 0,
-        },
-        &[CacheForm {
-            form: (),
-            charge: &charge,
-        }],
-        ContextLimits {
-            ceiling,
-            sufficient: ceiling,
-        },
+/// The byte figures of Bolt's per-session cell sizing, planned by the shared card-fit rule.
+fn cell_figures(attn_split_armed: bool, wide_prefill: bool) -> Result<CellFigures, EngError> {
+    CellFigures::checked(
+        super::super::budget::bolt_kv_bytes_per_position(),
+        scratch_bytes(attn_split_armed, wide_prefill),
+        (
+            super::super::budget::BOLT_HEADROOM_BYTES,
+            super::super::budget::BOLT_SEQ_FIXED_BYTES,
+        ),
+        (MAX_CELLS, FALLBACK_CELLS),
     )
-    .map(|fit| fit.context as usize))
+    .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
 }
 
 /// The sessions a start plans its cells for: the count the config names, else the most the
@@ -521,25 +473,6 @@ fn planned_sessions(seqs: super::super::config::MaxSeqs) -> Result<usize, EngErr
         MaxSeqs::Auto if decode_graph_wanted()? => 1,
         MaxSeqs::Auto => Bolt::PREFILL_BATCH,
     })
-}
-
-/// The cells a load of `weights_bytes` serves: concurrency first, then context. The cache is
-/// widened beyond [`FALLBACK_CELLS`] only as far as the planned `sessions` all still fit; a card
-/// that cannot fund them even at [`FALLBACK_CELLS`] serves that many cells (or what one session
-/// carries, when less), so the session planner finds at least the count the fixed size gave.
-/// When the card carries no count, the figure a refusal is worded for.
-fn cells_for(
-    free: u64,
-    weights_bytes: u64,
-    split: bool,
-    wide: bool,
-    sessions: usize,
-) -> Result<usize, EngError> {
-    let Some(one) = plan_cells(free, weights_bytes, split, wide, 1)? else {
-        return Ok(FALLBACK_CELLS);
-    };
-    let all = plan_cells(free, weights_bytes, split, wide, sessions)?.unwrap_or(0);
-    Ok(all.max(one.min(FALLBACK_CELLS)))
 }
 
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
@@ -579,10 +512,14 @@ pub(crate) fn load_choosing(
     // override or the default says; the admission charges its buffer when it is built.
     let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
     let wide = wide_load.passed();
+    // The cells a card serves for a file, and the demand of that load.
+    let plan = |bytes: u64| -> Result<(usize, crate::kernels::cuda::plan::Demand), EngError> {
+        let cells = cell_figures(split, wide)?.serve(free, bytes, sessions);
+        Ok((cells, bolt_demand(bytes, split, cells, wide)?))
+    };
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        cells_for(free, file.bytes, split, wide, sessions)
-            .and_then(|cells| bolt_demand(file.bytes, split, cells, wide))
-            .and_then(|demand| crate::kernels::cuda::plan::admit(&demand, free))
+        plan(file.bytes)
+            .and_then(|(_, demand)| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
     })?;
@@ -596,8 +533,7 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let cells = cells_for(free, choice.chosen.bytes, split, wide, sessions)?;
-    let demand = bolt_demand(choice.chosen.bytes, split, cells, wide)?;
+    let (cells, demand) = plan(choice.chosen.bytes)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
     eprintln!(
@@ -1637,10 +1573,6 @@ impl Bolt {
                 min_keys: ATTN_SPLIT_MIN_KEYS,
             }
         });
-        // A prompt chunk of two or more rows on a global layer runs the wide prefill attention when
-        // the device has it and it is on; a lone row, and so every decode step, keeps the decode
-        // attention.
-        let wide = self.wide_prefill.as_ref().filter(|wide| wide.is_on());
         // `count` consecutive rows of `seq` starting at row `row` of the scratch, whose first
         // row sits at cell `first`.
         let group =
@@ -1729,24 +1661,20 @@ impl Bolt {
                     &sc.v_normed,
                     (row + count) * kv_rows * 4,
                 );
-                if layer.global
-                    && count > 1
-                    && let Some(wide) = wide
-                {
-                    return wide.attend(
-                        ctx,
-                        stream,
-                        WideCall {
-                            planes: [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
-                            q: sc
-                                .q_normed
-                                .buf
-                                .range(row * q_rows * 4, count * q_rows * 4)?,
-                            out: sc.ctx_out.buf.range(row * q_rows * 4, count * q_rows * 4)?,
-                            rows: count,
-                            p0: first,
-                        },
-                    );
+                // A prompt chunk of two or more rows on a global layer runs the wide prefill
+                // attention when it is on; a lone row, and so every decode step, keeps the decode
+                // attention.
+                let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
+                let call = WideCall::new(
+                    [&own.k_codes, &own.k_scales, &own.v_codes, &own.v_scales],
+                    sc.q_normed.buf.range(at, bytes)?,
+                    sc.ctx_out.buf.range(at, bytes)?,
+                    count,
+                    first,
+                );
+                let take = layer.global && count > 1;
+                if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
+                    return Ok(());
                 }
                 ctx.attn_decode_gemma(
                     stream,
@@ -2210,6 +2138,26 @@ impl Bolt {
 mod tests {
     use super::*;
 
+    fn plan_cells(
+        free: u64,
+        weights: u64,
+        split: bool,
+        wide: bool,
+        sessions: usize,
+    ) -> Result<Option<usize>, EngError> {
+        Ok(cell_figures(split, wide)?.plan(free, weights, sessions))
+    }
+
+    fn cells_for(
+        free: u64,
+        weights: u64,
+        split: bool,
+        wide: bool,
+        sessions: usize,
+    ) -> Result<usize, EngError> {
+        Ok(cell_figures(split, wide)?.serve(free, weights, sessions))
+    }
+
     #[test]
     fn the_split_default_is_armed_and_zero_disarms() {
         // Unset arms the qualified split; `0`/`off` is the rollback to the
@@ -2342,6 +2290,90 @@ mod tests {
             None
         );
         assert_eq!(MAX_CELLS, 65_536);
+    }
+
+    /// The cell planner as it was written inside Bolt before the shared planner took it over.
+    fn reference_cells(
+        free: u64,
+        weights: u64,
+        split: bool,
+        wide: bool,
+        sessions: usize,
+    ) -> Option<usize> {
+        use crate::family::card_fit::{
+            CacheForm, CardBytes, ContextLimits, SESSION_PLAN_SLACK_BYTES, plan_card_fit,
+        };
+        let per_position = crate::family::gemma4::budget::bolt_kv_bytes_per_position().unwrap();
+        let scratch = scratch_bytes(split, wide).unwrap();
+        let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
+        let unlisted = if extra > 0 {
+            SESSION_PLAN_SLACK_BYTES
+        } else {
+            0
+        };
+        let charge = |cells: u32| {
+            let cache = u64::from(cells).checked_mul(per_position)?;
+            let further = cache
+                .checked_add(crate::family::gemma4::budget::BOLT_SEQ_FIXED_BYTES)?
+                .checked_mul(extra)?;
+            cache
+                .checked_add(scratch)?
+                .checked_add(crate::family::gemma4::budget::BOLT_HEADROOM_BYTES)?
+                .checked_add(unlisted)?
+                .checked_add(further)
+        };
+        let ceiling = u32::try_from(MAX_CELLS).unwrap();
+        plan_card_fit(
+            CardBytes {
+                free,
+                weights,
+                band: 0,
+            },
+            &[CacheForm {
+                form: (),
+                charge: &charge,
+            }],
+            ContextLimits {
+                ceiling,
+                sufficient: ceiling,
+            },
+        )
+        .map(|fit| fit.context as usize)
+    }
+
+    #[test]
+    fn the_shared_planner_gives_the_cells_the_bolt_planner_gave() {
+        let weights = 7_578_800_000u64;
+        let mut seen = 0;
+        for free in (6..=24u64).map(|gib| gib * 1_000_000_000 + 123_456_789) {
+            for sessions in 1..=Bolt::PREFILL_BATCH {
+                for (split, wide) in [(true, false), (true, true), (false, false)] {
+                    let old = reference_cells(free, weights, split, wide, sessions);
+                    let new = cell_figures(split, wide)
+                        .expect("figures")
+                        .plan(free, weights, sessions);
+                    assert_eq!(
+                        new, old,
+                        "free {free} sessions {sessions} split {split} wide {wide}"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        // The default start on a 3090: eight planned sessions, the split armed, the gate passing
+        // or not.
+        for wide in [false, true] {
+            let free = 22_000_000_000u64;
+            let one = reference_cells(free, weights, true, wide, 1);
+            let all = reference_cells(free, weights, true, wide, 8).unwrap_or(0);
+            let old = one.map_or(FALLBACK_CELLS, |one| all.max(one.min(FALLBACK_CELLS)));
+            let now = cell_figures(true, wide)
+                .expect("figures")
+                .serve(free, weights, 8);
+            eprintln!("default start, wide {wide}: served {old} cells before, {now} cells now");
+            assert_eq!(now, old);
+        }
+        assert_eq!(seen, 19 * 8 * 3);
     }
 
     #[test]

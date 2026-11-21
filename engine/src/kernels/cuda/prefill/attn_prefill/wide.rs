@@ -76,6 +76,15 @@ impl WideGeometry {
         })
     }
 
+    /// The admission charge of the partial buffer: its bytes when the device gate passed, else 0.
+    pub(crate) fn charge(self, passed: bool) -> Option<u64> {
+        if passed {
+            self.part_bytes().ok().map(|bytes| bytes as u64)
+        } else {
+            Some(0)
+        }
+    }
+
     /// Bytes of the partial buffer of a call of up to `max_rows` rows over `cells` cells.
     pub(crate) fn part_bytes(self) -> Result<usize, EngError> {
         let split = cpf_attn_wide_split(self.cells)?;
@@ -199,6 +208,24 @@ pub(crate) struct WideCall<'a> {
     pub(crate) p0: usize,
 }
 
+impl<'a> WideCall<'a> {
+    pub(crate) fn new(
+        planes: [&'a DeviceBuffer; 4],
+        q: DeviceRange<'a>,
+        out: DeviceRange<'a>,
+        rows: usize,
+        p0: usize,
+    ) -> Self {
+        Self {
+            planes,
+            q,
+            out,
+            rows,
+            p0,
+        }
+    }
+}
+
 /// What a family's load decided about the wide prefill attention: the gate, the start state and
 /// the line it logged.
 pub(crate) struct WideLoad {
@@ -292,6 +319,30 @@ impl WideAttention {
     /// How many launches this model has queued.
     pub(crate) fn launches(&self) -> u64 {
         self.launches.load(Ordering::Relaxed)
+    }
+
+    /// Runs the attention when `wide` holds one that is on and `take` is true, and says so;
+    /// `false` leaves the family on its own path.
+    pub(crate) fn try_attend(
+        wide: Option<&Self>,
+        take: bool,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        call: WideCall<'_>,
+    ) -> Result<bool, EngError> {
+        match wide.filter(|wide| take && wide.is_on()) {
+            Some(wide) => wide.attend(ctx, stream, call).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// The gate, the start state and the build in one step, for a family whose cells are fixed.
+    pub(crate) fn load(
+        ctx: &CudaContext,
+        family: &str,
+        geometry: WideGeometry,
+    ) -> Result<Option<Self>, EngError> {
+        WideLoad::read(ctx, family, geometry)?.build(ctx, geometry)
     }
 
     fn view<'b>(

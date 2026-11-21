@@ -34,7 +34,7 @@ mod tests;
 mod window_tests;
 
 use crate::EngError;
-use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry, WideLoad};
+use crate::kernels::cuda::prefill::attn_prefill::{WideAttention, WideGeometry};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Shape};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
@@ -305,8 +305,7 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
     // The wide prefill attention is built wherever the device gate passes and starts as the
     // override or the default says.
-    let wide_prefill =
-        WideLoad::read(&ctx, "gemma4 humanizer", wide_geometry())?.build(&ctx, wide_geometry())?;
+    let wide_prefill = WideAttention::load(&ctx, "gemma4 humanizer", wide_geometry())?;
     Ok(Gemma {
         ctx,
         stream,
