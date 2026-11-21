@@ -165,14 +165,6 @@ pub(crate) fn read_all_vectored_at(
     read_all_vectored(&mut AtOffset { file, offset }, dst)
 }
 
-#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-fn positioned_reads() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_MLX_POSITIONED_READS").is_some_and(|value| value == "1")
-    })
-}
-
 impl StreamedWeights {
     pub fn open(
         mut reader: Box<dyn ShardIo + Send>,
@@ -196,7 +188,7 @@ impl StreamedWeights {
         max_header_bytes: u64,
     ) -> Result<Self, EngError> {
         #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-        if positioned_reads() {
+        if crate::family::prefill::mlx::positioned_expert_reads() {
             return Self::open_positioned(file, byte_len, max_header_bytes);
         }
         Self::open(Box::new(file), byte_len, max_header_bytes)

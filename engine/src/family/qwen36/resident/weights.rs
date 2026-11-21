@@ -750,6 +750,9 @@ impl ResidentWeights {
                     .into(),
             ));
         }
+        if !resident {
+            crate::family::prefill::mlx::mark_experts_streaming();
+        }
         eprintln!(
             "qwen: MLX weight placement={} base_weights_bytes={base} full_expert_page_bytes={} decode_expert_stage_bytes={decode_stage} expert_budget_bytes={available}",
             if resident { "resident" } else { "disk-experts" },

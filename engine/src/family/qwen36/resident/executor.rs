@@ -959,6 +959,9 @@ impl Q36Executor {
                 })
             })
             .transpose()?;
+        if plan.is_some() {
+            crate::family::prefill::mlx::mark_experts_may_stream();
+        }
         let ckpt = open_checkpoint(artifact)?;
         let disk_experts = placement.is_some_and(|(_, _, disk_experts)| disk_experts);
         if let Some(plan) = plan {

@@ -23,21 +23,80 @@ pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [
 pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 pub(crate) const RETIRE_CAP_BASE: u64 = 64 << 20;
 
-/// Group only adjacent, exactly routed expert slices for multi-row stages.
+/// Set when a start places its routed experts on disk: the staging reads then run the grouped,
+/// overlapped path that the A/B measured as the faster one for every family.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn prefill_expert_read_runs() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_MLX_EXPERT_READ_RUNS").is_some_and(|value| value == "prefill")
-    })
+static EXPERTS_STREAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set when a device budget is active, so the experts may stream and the shard files open for
+/// positioned reads.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+static EXPERTS_MAY_STREAM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records that this start streams its routed experts from disk.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn mark_experts_streaming() {
+    EXPERTS_STREAM.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Records that this start runs under a device budget, before its shard files open.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn mark_experts_may_stream() {
+    EXPERTS_MAY_STREAM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A staging switch: the variable decides when it is set (only `on` turns it on), and the
+/// start's own placement decides when it is not.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn staging_switch(
+    variable: &str,
+    on: &str,
+    cell: &std::sync::OnceLock<Option<bool>>,
+    automatic: &std::sync::atomic::AtomicBool,
+) -> bool {
+    cell.get_or_init(|| std::env::var_os(variable).map(|value| value == on))
+        .unwrap_or_else(|| automatic.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Group only adjacent, exactly routed expert slices for multi-row stages. Automatic whenever
+/// the experts stream from disk; `FIFI_MLX_EXPERT_READ_RUNS` overrides (`prefill` on, any other
+/// value off).
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prefill_expert_read_runs() -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    staging_switch(
+        "FIFI_MLX_EXPERT_READ_RUNS",
+        "prefill",
+        &OVERRIDE,
+        &EXPERTS_STREAM,
+    )
+}
+
+/// Submit the shared expert to Metal before the CPU reads the routed experts. Automatic
+/// whenever the experts stream from disk; `FIFI_MLX_OVERLAP_EXPERT_READS` overrides (`1` on, any
+/// other value off).
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn overlap_expert_reads() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_MLX_OVERLAP_EXPERT_READS").is_some_and(|value| value == "1")
-    })
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    staging_switch(
+        "FIFI_MLX_OVERLAP_EXPERT_READS",
+        "1",
+        &OVERRIDE,
+        &EXPERTS_STREAM,
+    )
+}
+
+/// Read shard ranges at explicit offsets. Automatic under a device budget (where the experts may
+/// stream); `FIFI_MLX_POSITIONED_READS` overrides (`1` on, any other value off).
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn positioned_expert_reads() -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    staging_switch(
+        "FIFI_MLX_POSITIONED_READS",
+        "1",
+        &OVERRIDE,
+        &EXPERTS_MAY_STREAM,
+    )
 }
 
 /// Queue one independent GPU result while the worker reads the exact expert IDs.

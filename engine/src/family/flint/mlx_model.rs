@@ -13,14 +13,17 @@ use crate::{
 };
 use std::{cell::RefCell, path::Path, rc::Rc, sync::OnceLock};
 
+/// The expert pipeline: an explicit `FIFI_FLINT_MLX_EXPERT_PIPELINE` decides (`1` on, anything
+/// else off); unset, it follows the shared staging switches, which are on whenever the start
+/// streams its experts from disk. The variable is read once; the automatic part is read each
+/// time, because the placement is not known until the weights load.
 pub(super) fn expert_pipeline_flagged() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").map_or_else(
-            || overlap_expert_reads() || prefill_expert_read_runs(),
-            |value| value == "1",
-        )
-    })
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var_os("FIFI_FLINT_MLX_EXPERT_PIPELINE").map(|value| value == "1")
+        })
+        .unwrap_or_else(|| overlap_expert_reads() || prefill_expert_read_runs())
 }
 
 #[derive(Clone, Copy)]
@@ -52,15 +55,23 @@ impl ExpertReadRuns {
     }
 }
 
+/// The expert read runs: an explicit `FIFI_FLINT_MLX_EXPERT_READ_RUNS` decides; unset, they
+/// follow the shared switch, which is on whenever the start streams its experts from disk.
 pub(super) fn expert_read_runs() -> ExpertReadRuns {
-    static MODE: OnceLock<ExpertReadRuns> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS") {
-        Ok(value) => ExpertReadRuns::from_env(Some(&value)),
-        Err(std::env::VarError::NotPresent) if prefill_expert_read_runs() => {
-            ExpertReadRuns::Prefill
-        }
-        Err(_) => ExpertReadRuns::Off,
-    })
+    static OVERRIDE: OnceLock<Option<ExpertReadRuns>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("FIFI_FLINT_MLX_EXPERT_READ_RUNS")
+                .ok()
+                .map(|value| ExpertReadRuns::from_env(Some(&value)))
+        })
+        .unwrap_or_else(|| {
+            if prefill_expert_read_runs() {
+                ExpertReadRuns::Prefill
+            } else {
+                ExpertReadRuns::Off
+            }
+        })
 }
 
 #[cfg(test)]
@@ -349,12 +360,18 @@ impl Model {
         } else {
             eprintln!("flint: MLX prefill piece size {ceiling} rows");
         }
+        if available.is_some() {
+            crate::family::prefill::mlx::mark_experts_may_stream();
+        }
         let source = Rc::new(FlintCheckpoint::open(root)?);
         let streamed_expert_bytes = match available {
             Some(bytes) => plan_weight_placement(&source, bytes)?,
             None => 0,
         };
         let disk = streamed_expert_bytes != 0;
+        if disk {
+            crate::family::prefill::mlx::mark_experts_streaming();
+        }
         let (caches, cached_expert_bytes) = if let Some(budget) = available.filter(|_| disk) {
             // The cache gets what remains after resident weights, one-row
             // staging and the prefill piece the ladder would pick without it.
