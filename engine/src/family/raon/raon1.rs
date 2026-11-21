@@ -410,6 +410,10 @@ impl Raon1Model {
         self.spec
     }
 
+    pub(crate) fn weights(&self) -> &GgufWeights {
+        &self.weights
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -567,8 +571,12 @@ fn check_tensors(header: &GgufHeader, spec: Raon1Spec) -> Result<(), EngError> {
     Ok(())
 }
 
+#[cfg(feature = "native-cuda")]
+pub(crate) mod cuda;
 pub mod reference;
 pub(crate) mod serve;
 
+#[cfg(all(test, feature = "native-cuda"))]
+mod cuda_tests;
 #[cfg(test)]
 mod tests;
