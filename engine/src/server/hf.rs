@@ -561,6 +561,23 @@ impl HfHub {
         Ok(job)
     }
 
+    /// The bytes the other running downloads still have to write:
+    /// space this job must not count as free.
+    fn committed_bytes(&self, except: u64) -> u64 {
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter()
+            .filter(|job| job.id != except)
+            .map(
+                |job| match &*job.state.lock().unwrap_or_else(|e| e.into_inner()) {
+                    JobState::Downloading {
+                        bytes, bytes_total, ..
+                    } => bytes_total.saturating_sub(*bytes),
+                    _ => 0,
+                },
+            )
+            .sum()
+    }
+
     /// Marks a job cancelled. The thread notices at its next chunk
     /// boundary and cleans up its partial blob itself.
     pub(crate) fn cancel(&self, id: u64) -> bool {
@@ -615,6 +632,24 @@ impl HfHub {
         let repo_dir = repo_cache_dir(&self.hub_dir, &job.repo);
         let snapshot_dir = repo_dir.join("snapshots").join(&commit);
         let blobs_dir = repo_dir.join("blobs");
+        // Refuse before the first byte is written: the files this job
+        // still has to fetch (their snapshot link is absent) against
+        // the free space left after the other running downloads take
+        // their remaining bytes.
+        let needed: u64 = wanted
+            .iter()
+            .filter(|(path, _)| snapshot_dir.join(path).symlink_metadata().is_err())
+            .map(|(_, size)| size)
+            .sum();
+        if let Some(free) = free_disk_bytes(&self.hub_dir) {
+            disk_refusal(
+                &job.repo,
+                &self.hub_dir,
+                needed,
+                free,
+                self.committed_bytes(job.id),
+            )?;
+        }
         std::fs::create_dir_all(&snapshot_dir)
             .and_then(|_| std::fs::create_dir_all(&blobs_dir))
             .map_err(|error| format!("cannot create the cache layout: {error}"))?;
@@ -773,6 +808,55 @@ impl HfHub {
             .ok()
             .map(|etag| etag.trim_matches('"').to_string())
     }
+}
+
+/// Space the downloads leave free on the cache volume, so the
+/// machine keeps room for its own logs, caches and swap.
+const DISK_SPARE_BYTES: u64 = 1 << 30;
+
+/// Bytes an unprivileged writer can still allocate on the volume
+/// that holds `path`, read from its nearest existing ancestor (the
+/// cache directory is created by the first download). `None` when
+/// the platform offers no answer; the writes then fail on their own.
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    for candidate in path.ancestors() {
+        match rustix::fs::statvfs(candidate) {
+            Ok(stat) => return Some(stat.f_bavail.saturating_mul(stat.f_frsize)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// The refusal for a download that cannot fit, naming the figures
+/// the hub reported and the disk holds. `committed` is what other
+/// running downloads still have to write. A hub that reported no
+/// sizes (all zero) needs nothing here: the writes report their own
+/// failure.
+fn disk_refusal(
+    repo: &str,
+    hub_dir: &Path,
+    needed: u64,
+    free: u64,
+    committed: u64,
+) -> Result<(), String> {
+    let available = free.saturating_sub(committed);
+    if needed == 0 || needed.saturating_add(DISK_SPARE_BYTES) <= available {
+        return Ok(());
+    }
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    Err(format!(
+        "{repo} needs {:.1} GiB but {} has {:.1} GiB free ({:.1} GiB of that is promised to \
+         other running downloads, and {:.1} GiB is kept spare): nothing was written; free \
+         space or point FIFI_HF_HUB at a larger volume",
+        gib(needed),
+        hub_dir.display(),
+        gib(free),
+        gib(committed),
+        gib(DISK_SPARE_BYTES),
+    ))
 }
 
 fn hub_error(error: ureq::Error) -> String {
@@ -1258,5 +1342,85 @@ mod tests {
             let hit = std::fs::read(&link).expect("link must resolve to the blob");
             assert_eq!(hit, b"payload", "{path} must reach the blob");
         }
+    }
+
+    #[test]
+    fn a_download_that_exceeds_free_disk_is_refused_with_the_figures() {
+        let hub = Path::new("/hub");
+        let gib = 1u64 << 30;
+        assert!(disk_refusal("o/r", hub, 10 * gib, 20 * gib, 0).is_ok());
+        // Fits only without the spare: refused.
+        let refusal = disk_refusal("o/r", hub, 10 * gib, 10 * gib, 0).expect_err("no spare left");
+        assert!(refusal.contains("o/r needs 10.0 GiB"), "{refusal}");
+        assert!(refusal.contains("/hub has 10.0 GiB free"), "{refusal}");
+        assert!(refusal.contains("nothing was written"), "{refusal}");
+        // Space promised to another running download is not free.
+        assert!(disk_refusal("o/r", hub, 10 * gib, 20 * gib, 15 * gib).is_err());
+        // A hub that reported no sizes cannot be judged here.
+        assert!(disk_refusal("o/r", hub, 0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn free_disk_is_read_from_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not").join("created").join("yet");
+        let free = free_disk_bytes(&missing).expect("a statvfs answer");
+        assert!(free > 0);
+    }
+
+    /// A one-thread hub that answers every GET with the canned JSON
+    /// of a repo whose single file reports `size` bytes.
+    fn serve_repo_of_size(size: u64) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = if request.contains("/tree/") {
+                    format!(r#"[{{"type":"file","path":"m.gguf","size":{size}}}]"#)
+                } else {
+                    r#"{"sha":"c0ffee","siblings":[{"rfilename":"m.gguf"}]}"#.to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn an_oversized_download_fails_before_anything_is_written() {
+        let hub_dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = serve_repo_of_size(1 << 60);
+        let hub = Arc::new(HfHub::new(endpoint, hub_dir.path().to_path_buf(), None));
+        let job = hub.start_download("org/huge", "main").expect("job starts");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let state = loop {
+            let state = job.state.lock().expect("state").clone();
+            if !state.is_active() || std::time::Instant::now() > deadline {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        match state {
+            JobState::Failed(cause) => {
+                assert!(cause.contains("org/huge needs"), "{cause}");
+                assert!(cause.contains("nothing was written"), "{cause}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_dir(hub_dir.path()).expect("hub dir").count(),
+            0,
+            "a refused download must leave the cache untouched"
+        );
     }
 }
