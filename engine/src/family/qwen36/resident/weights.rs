@@ -720,12 +720,13 @@ impl ResidentWeights {
         };
         if decode_stage > available {
             return Err(EngError::MemoryPlan(format!(
-                "Qwen MLX needs {decode_stage} bytes to stage one token's experts, with {available} bytes left after base weights and session reserves"
+                "Qwen MLX needs {decode_stage} bytes to stage one token's experts, with {available} bytes left after base weights and session reserves; raise FIFI_MLX_WORKING_SET_MIB or lower context_limit"
             )));
         }
         if !resident && plan.max_seqs > 1 {
             return Err(EngError::MemoryPlan(
-                "Qwen MLX disk-backed experts require max_seqs=1".into(),
+                "Qwen MLX disk-backed experts serve one sequence: set max_seqs to 1, or raise FIFI_MLX_WORKING_SET_MIB until every expert page fits resident"
+                    .into(),
             ));
         }
         eprintln!(

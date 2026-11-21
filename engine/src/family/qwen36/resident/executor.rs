@@ -3071,6 +3071,200 @@ mod tests {
         }
     }
 
+    /// The tiny GQA fixture as files, with the byte sizes that place its routed experts: the
+    /// base weights, one token's expert stage, and every expert page.
+    fn file_backed(activation: Activation) -> (&'static StreamedCheckpoint, u64, u64, u64) {
+        use super::super::ops::Bytes;
+        use super::super::weights::ResidentWeights;
+        use crate::family::qwen36::fixtures::checkpoint_files;
+        let dir = tempfile::tempdir().unwrap();
+        let (index, shard) = checkpoint_files(tiny::entries(&TINY_GQA));
+        for (name, bytes) in [
+            ("config.json", tiny::config(&TINY_GQA)),
+            ("model.safetensors.index.json", index),
+            ("m.safetensors", shard),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let ckpt: &'static StreamedCheckpoint =
+            Box::leak(Box::new(open_checkpoint(dir.path()).unwrap()));
+        std::mem::forget(dir);
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let weights = ResidentWeights::import_with(
+            &mut kernels,
+            ckpt,
+            host(ckpt),
+            activation == Activation::F32,
+            None,
+        )
+        .unwrap();
+        let mut routed = Bytes::default();
+        let mut stage = 0;
+        for layer in &weights.layers {
+            let pages = layer.as_moe().unwrap().expert_pages().unwrap();
+            routed.packed(&pages.gate_up).unwrap();
+            routed.packed(&pages.down).unwrap();
+            stage = stage.max(pages.page_bytes().unwrap());
+        }
+        let base = weights.byte_len().unwrap() - routed.total();
+        (ckpt, base, stage, weights.expert_page_bytes().unwrap())
+    }
+
+    fn place_experts(
+        ckpt: &'static StreamedCheckpoint,
+        rules: Q36Rules,
+        device_bytes: u64,
+    ) -> Result<(Q36Executor, Q36Session)> {
+        Q36Executor::from_parts_with_placement(
+            MlxKernels::try_new().unwrap(),
+            ckpt,
+            host(ckpt),
+            rules,
+            Some(ExpertDevicePlan {
+                device: DeviceBudget::new(device_bytes).unwrap(),
+                reserve: 0,
+                max_seqs: 1,
+            }),
+        )
+    }
+
+    /// With the resident decoder forced to host routing, the disk-staged logits are compared with
+    /// the resident ones bit for bit on the one-token path. The staging reads the same packed
+    /// bytes, so a difference between the two paths in a served request comes from routing and
+    /// compilation, not from the staged weights.
+    #[test]
+    fn staged_experts_give_the_logits_of_a_host_routed_resident_decoder() {
+        let _serial = crate::native_test_lock();
+        let prompt = cycle(10);
+        for activation in [Activation::F32, Activation::Bf16] {
+            let (ckpt, base, stage, full) = file_backed(activation);
+            let rules = || Q36Rules {
+                activation,
+                ..chunk_rules()
+            };
+            let (mut resident, mut resident_session) =
+                place_experts(ckpt, rules(), base + full).unwrap();
+            assert!(!resident.decoder.weights.streams_experts());
+            resident.decoder.routing = super::super::moe::Routing::Host;
+            let (mut disk, mut disk_session) = place_experts(ckpt, rules(), base + stage).unwrap();
+            assert!(disk.decoder.weights.streams_experts());
+            let want = run_job(&mut resident, &mut resident_session, &prompt, 4);
+            let got = run_job(&mut disk, &mut disk_session, &prompt, 4);
+            let mut largest = 0f32;
+            for (actual, reference) in got.rows.iter().zip(&want.rows) {
+                assert_eq!(actual.len(), reference.len());
+                for (a, b) in actual.iter().zip(reference) {
+                    largest = largest.max((a - b).abs());
+                }
+            }
+            println!("{activation:?} largest staged-vs-resident logit difference {largest}");
+            assert_eq!(
+                largest, 0.0,
+                "{activation:?}: staged logits differ from host-routed resident logits"
+            );
+        }
+    }
+
+    /// A window of speculative drafts runs on a decoder with disk-staged experts and gives the
+    /// tokens of the same executor without speculation, whether or not the drafts are right and
+    /// with compiled programs on or off. A concurrent decode window never forms: staged experts
+    /// serve one sequence.
+    #[test]
+    fn speculation_with_staged_experts_gives_the_tokens_of_plain_decoding() {
+        let _serial = crate::native_test_lock();
+        let prompt: Vec<u32> = cycle(6);
+        let count = 8;
+        let (ckpt, base, stage, _) = file_backed(Activation::F32);
+        for compile in [false, true] {
+            let limits = || Q36Rules {
+                context_limit: 32,
+                // Room for the window's snapshot beside the live state.
+                session_cap: 8 * 32 * GROWTH,
+                compile,
+                ..chunk_rules()
+            };
+            let plain = {
+                let (mut executor, mut session) =
+                    place_experts(ckpt, limits(), base + stage).unwrap();
+                assert!(executor.decoder.weights.streams_experts());
+                executor.prefill(&mut session, &prompt).unwrap();
+                let mut job = seeded_generation(count);
+                let mut batches = Vec::new();
+                for _ in 0..100 {
+                    let batch = executor.decode(&mut session, &mut job).unwrap();
+                    let done = batch.finish.is_some();
+                    batches.push(batch);
+                    if done {
+                        break;
+                    }
+                }
+                tokens_of(&batches)
+            };
+            assert_eq!(plain.len(), count as usize);
+            for wrong in [false, true] {
+                let (mut executor, mut session) =
+                    place_experts(ckpt, limits(), base + stage).unwrap();
+                executor.prefill(&mut session, &prompt).unwrap();
+                let mut job = seeded_generation(count);
+                let mut speculator = Speculator::new(
+                    Scripted {
+                        want: plain.clone(),
+                        wrong,
+                        skip: prompt.len(),
+                        windows: 0,
+                    },
+                    1,
+                );
+                let mut batches = Vec::new();
+                for _ in 0..100 {
+                    let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+                    let done = batch.finish.is_some();
+                    batches.push(batch);
+                    if done {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    tokens_of(&batches),
+                    plain,
+                    "compile {compile}, wrong drafts {wrong}"
+                );
+                assert!(speculator.drafter.windows > 0, "the window path must run");
+            }
+        }
+    }
+
+    /// Disk-staged experts serve one sequence: a concurrent window needs resident experts, and
+    /// the refusal names the settings to change.
+    #[test]
+    fn staged_experts_refuse_a_concurrent_window_and_name_the_settings() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, base, stage, _) = file_backed(Activation::F32);
+        let rules = Q36Rules {
+            compile: true,
+            max_seqs: 2,
+            session_cap: 4 << 20,
+            context_limit: 24,
+            ..chunk_rules()
+        };
+        let result = Q36Executor::from_parts_with_placement(
+            MlxKernels::try_new().unwrap(),
+            ckpt,
+            host(ckpt),
+            rules,
+            Some(ExpertDevicePlan {
+                device: DeviceBudget::new(base + stage).unwrap(),
+                reserve: 0,
+                max_seqs: 2,
+            }),
+        );
+        assert!(matches!(
+            result,
+            Err(EngError::MemoryPlan(message))
+                if message.contains("max_seqs") && message.contains("FIFI_MLX_WORKING_SET_MIB")
+        ));
+    }
+
     /// Row 1: 10 tokens, chunks of 4, worker pieces of 5: the calls give the rows 4, then 4 and 1
     /// (the carried pending token leads the second call, and the single row is a step). Row 2: 14
     /// tokens, chunks of 8, worker pieces of 9: the calls give 8, then 5. A chunk equals the steps
