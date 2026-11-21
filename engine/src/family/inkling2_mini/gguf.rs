@@ -555,6 +555,7 @@ pub(super) fn packed_mlx_enabled() -> bool {
     std::env::var_os("FIFI_INKLING_GGUF_PACKED_MLX").is_some_and(|value| value == "1")
 }
 
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn single_copy_experts_enabled() -> bool {
     packed_mlx_enabled()
         && std::env::var_os("FIFI_INKLING_GGUF_SINGLE_COPY_EXPERTS")
@@ -605,7 +606,7 @@ pub(crate) fn preflight_plan(context: Option<u32>) -> Result<super::HeaderPlan, 
                 } else {
                     let ram = headroom / 4;
                     format!(
-                        "{plan}, {ram} B for packed RAM and {} B for expanded Metal expert planes under {device}; MLX allocator pool is process-wide and outside these logical cache capacities",
+                        "{plan}, {ram} B for packed RAM and {} B for Metal expert planes under {device}; MLX allocator pool is process-wide and outside these logical cache capacities",
                         headroom - ram
                     )
                 };
