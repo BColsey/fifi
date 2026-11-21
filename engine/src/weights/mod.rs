@@ -18,6 +18,7 @@ mod gguf_tables;
 /// (kernels/cuda/resident/matvec_q/tests.rs): the CUDA copy must equal these bytes.
 #[cfg(all(test, feature = "native-cuda"))]
 pub(crate) use gguf_tables::KVALUES_IQ4NL;
+mod gguf_identity;
 mod gguf_weights;
 mod header;
 mod indexed;
@@ -49,6 +50,7 @@ pub use gguf::{
 pub use gguf_dequant::{
     dequantize, dequantize_into, dequantize_nvfp4_expert_into, repack_nvfp4_into,
 };
+pub use gguf_identity::{TENSOR_SAMPLE, gguf_identity_digest};
 pub(crate) use gguf_split::shard_name_of;
 #[cfg(test)]
 pub(crate) use gguf_split::write_two_shard_set;
