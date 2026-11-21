@@ -729,6 +729,7 @@ pub(super) fn disk_experts(
     stage_disk_experts(k, source, stem, x, ids, None, pipeline, None).map(|(rows, _)| rows)
 }
 
+#[allow(clippy::too_many_arguments)] // the staging inputs of one layer, passed once by each caller
 fn stage_disk_experts(
     k: &mut MlxKernels,
     source: &super::weights::FlintCheckpoint,

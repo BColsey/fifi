@@ -19,6 +19,8 @@ const EXPERTS: usize = 256;
 const INDEX_BYTES: usize = ROUTES * size_of::<u32>();
 
 type Result<T> = std::result::Result<T, EngError>;
+/// The (expert, slot) pairs a route still has to read.
+type SlotWrites = Vec<(u32, usize)>;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -90,7 +92,7 @@ fn route_slots(
     slots: &mut [Option<Entry>],
     experts: &[u32; ROUTES],
     tick: u64,
-) -> Result<([u32; ROUTES], Vec<(u32, usize)>)> {
+) -> Result<([u32; ROUTES], SlotWrites)> {
     let mut local = [0; ROUTES];
     let mut writes = Vec::with_capacity(ROUTES);
     for (rank, &expert) in experts.iter().enumerate() {
@@ -155,7 +157,9 @@ impl LayerExpertCache {
 
         let offset = self.layout.index_offset;
         for (dst, id) in dst[offset..offset + INDEX_BYTES]
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(local)
         {
             dst.copy_from_slice(&id.to_le_bytes());
