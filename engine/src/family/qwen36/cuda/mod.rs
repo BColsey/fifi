@@ -88,6 +88,8 @@ mod krow_ops;
 mod krow_step_device_tests;
 #[cfg(test)]
 mod kv8_step_device_tests;
+#[cfg(all(test, feature = "native-cuda"))]
+mod kv_quality_run;
 pub(in crate::family) mod layer_table;
 #[cfg(test)]
 mod layer_tests;

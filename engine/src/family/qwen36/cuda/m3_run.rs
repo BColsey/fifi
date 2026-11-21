@@ -46,20 +46,20 @@ use std::path::PathBuf;
 
 /// Proven session constants (prefill_exl3_step_device_tests): the padded
 /// head width is the normalization universe of every arm.
-const HEAD_ROWS: usize = 248_320;
-const SAMPLER_VOCAB: usize = 248_077;
+pub(super) const HEAD_ROWS: usize = 248_320;
+pub(super) const SAMPLER_VOCAB: usize = 248_077;
 /// The tokenizer's true id space: 248,044 model ids + 26 added tokens, no
 /// overlap (verified against the pinned tokenizer.json). Rows at or above
 /// it are padding; their probability mass is the leg-0 padding report.
 const TRUE_VOCAB: usize = 248_070;
 const EOS: [u32; 2] = [248_046, 248_044];
 const CONTEXT_TOKENS: usize = 8_192;
-const CHUNK_ROWS: u32 = 1_024;
+pub(super) const CHUNK_ROWS: u32 = 1_024;
 /// The v5 layout's chunk-context floor: at least four full chunks plus a
 /// partial tail before the first scored position.
 const MIN_PREFILL_IDS: usize = 4 * CHUNK_ROWS as usize + 256;
 
-fn rules() -> QwenRules {
+pub(super) fn rules() -> QwenRules {
     QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS).expect("rules")
 }
 
@@ -67,7 +67,7 @@ fn env(name: &str) -> Result<String, EngError> {
     std::env::var(name).map_err(|_| EngError::BadRequest(format!("m3: {name} is not set")))
 }
 
-fn err(text: &str) -> EngError {
+pub(super) fn err(text: &str) -> EngError {
     EngError::BadRequest(format!("m3: {text}"))
 }
 
@@ -175,7 +175,7 @@ fn options_of(kv: KvMode, layout: WeightLayout) -> StepOptions {
 }
 
 /// UTC wall-clock stamp + seconds since `t0`, for lease-progress lines.
-fn stamp(t0: &std::time::Instant) -> String {
+pub(super) fn stamp(t0: &std::time::Instant) -> String {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
