@@ -3,8 +3,10 @@ use super::{GgufTextWeights, Tensor, bad};
 use crate::{
     EngError,
     expert_tier::{ExpertId, ExpertPayload, ExpertPayloadSource, ExpertPayloadView},
-    family::inkling2::cuda_projection::gguf::streaming::{ExpertRows, PrefillRoute, RoutedExperts},
-    kernels::cuda::resident::dense_gemv::DenseDtype,
+    family::inkling2::cuda_projection::gguf::streaming::{
+        ExpertRows, PrefillRoute, ResidentRoute, RoutedExperts,
+    },
+    kernels::cuda::resident::dense_gemv::{DenseDtype, GgufMoePick},
 };
 
 struct Source<'a> {
@@ -115,6 +117,48 @@ impl GgufTextWeights {
         &self,
     ) -> Option<crate::sched::job::PrefillBankReport> {
         self.cuda.as_ref()?.prefill_bank_report()
+    }
+
+    pub(in crate::family::inkling2) fn resident_experts(
+        &self,
+        names: [&str; 2],
+        route: ResidentRoute<'_>,
+        weight: impl Fn(usize) -> f32,
+    ) -> Result<Option<Vec<f32>>, EngError> {
+        let Some(cuda) = self
+            .cuda
+            .as_ref()
+            .filter(|cuda| cuda.batches_expert_layer(route.layer))
+        else {
+            return Ok(None);
+        };
+        let Some((source, dtypes)) = self.stream_source(names, route.layer)? else {
+            return Ok(None);
+        };
+        if !dtypes.into_iter().all(DenseDtype::is_packed_gguf) {
+            return Ok(None);
+        }
+        let picks = route
+            .ids
+            .iter()
+            .map(|&id| {
+                Ok(GgufMoePick {
+                    expert: u32::try_from(id).map_err(|_| bad("Inkling expert id overflows"))?,
+                    gate_scale: super::expert_scale(source.scales[0], id)?,
+                    down_scale: super::expert_scale(source.scales[1], id)?,
+                    weight: weight(id),
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        // The single-expert path handles zero scales without reading that weight matrix.
+        if picks.is_empty()
+            || picks
+                .iter()
+                .any(|pick| pick.gate_scale == 0.0 || pick.down_scale == 0.0)
+        {
+            return Ok(None);
+        }
+        cuda.resident_experts(route, dtypes, &picks).map(Some)
     }
 
     pub(in crate::family::inkling2) fn stream_experts(

@@ -129,6 +129,14 @@ impl ResidentExperts {
         Ok(residency)
     }
 
+    pub(super) fn original_layer(&self, layer: u32) -> Result<[DeviceRange<'_>; 2], EngError> {
+        let Some([Some(Bank::Original(gate)), Some(Bank::Original(down))]) = self.banks.get(&layer)
+        else {
+            return Err(bad("GGUF resident layer has no original packed stacks"));
+        };
+        Ok([gate.range(0, gate.bytes())?, down.range(0, down.bytes())?])
+    }
+
     pub(super) fn ranges(
         &self,
         id: ExpertId,

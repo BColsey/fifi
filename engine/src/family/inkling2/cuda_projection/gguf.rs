@@ -10,7 +10,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange,
         plan::{Demand, admit},
-        resident::dense_gemv::DenseDtype,
+        resident::dense_gemv::{DenseDtype, GgufMoeCall, GgufMoePick, GgufMoeShape},
     },
     sched::job::PrefillBankReport,
     weights::{GgufType, repack_nvfp4_into},
@@ -27,6 +27,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     step: DenseStep,
     dense: BTreeMap<String, (Resident, DenseDtype)>,
     packed_gguf: bool,
+    moe_scratch: Option<ResidentMoe>,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
     prefill_report: Option<RefCell<PrefillBankReport>>,
@@ -47,6 +48,11 @@ pub(in crate::family::inkling2) struct Options {
     pub packed: bool,
     pub stream: bool,
     pub budget: u64,
+}
+
+struct ResidentMoe {
+    shape: GgufMoeShape,
+    scratch: DeviceBuffer,
 }
 
 struct Packed {
@@ -98,9 +104,22 @@ impl GgufCuda {
         let context = CudaContext::with_admission(&admission)?;
         let stream_plan = stream.then(|| streaming::plan(hidden, ff)).transpose()?;
         let stream_bytes = stream_plan.map_or(0, |p| p.device_bytes());
+        let moe_shape = GgufMoeShape {
+            hidden,
+            middle: ff,
+            experts: spec.n_routed_experts as usize,
+        };
+        let moe_bytes =
+            if packed && std::env::var("FIFI_INKLING_CUDA_BATCH_EXPERTS").as_deref() == Ok("1") {
+                moe_shape
+                    .scratch_bytes(spec.num_experts_per_tok as usize)
+                    .ok_or_else(|| bad("CUDA GGUF expert group exceeds its limits"))?
+            } else {
+                0
+            };
         let demand = Demand {
             tensors,
-            work: (stage[0] + stage[1] + plan.device_bytes) as u64 + stream_bytes,
+            work: (stage[0] + stage[1] + plan.device_bytes + moe_bytes) as u64 + stream_bytes,
             kv_cache: 0,
             headroom: DEVICE_HEADROOM,
         };
@@ -127,6 +146,14 @@ impl GgufCuda {
         let stream_banks = stream_plan
             .map(|plan| crate::expert_tier::CudaStreamBanks::new(&context, plan).map(RefCell::new))
             .transpose()?;
+        let moe_scratch = (moe_bytes > 0)
+            .then(|| {
+                context.allocate(moe_bytes).map(|scratch| ResidentMoe {
+                    shape: moe_shape,
+                    scratch,
+                })
+            })
+            .transpose()?;
         let experts = spec.n_routed_experts as u32;
         let resident = if packed {
             ResidentExperts::load_packed(&context, experts, layers, file, budget)?
@@ -135,7 +162,7 @@ impl GgufCuda {
         };
         eprintln!(
             "Inkling GGUF CUDA projections {}",
-            serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": bf16_bytes, "resident_dense_bytes": tensors, "packed_gguf": packed,
+            serde_json::json!({"resident_projection_count": dense.len(), "resident_bf16_bytes": bf16_bytes, "resident_dense_bytes": tensors, "packed_gguf": packed, "batched_resident_experts": moe_scratch.is_some(),
                 "direct_resident_nvfp4": direct || packed, "cold_stream_device_bytes": stream_bytes, "packed_expert_staging_bytes": stage[0] + stage[1], "dense_stream_arena_bytes": plan.device_bytes,
                 "resident_expert_bytes": resident.bytes(),
                 "resident_expert_layers": resident.placement().full_layers(),
@@ -145,6 +172,7 @@ impl GgufCuda {
             step,
             dense,
             packed_gguf: packed,
+            moe_scratch,
             resident,
             cache: RefCell::default(),
             prefill_report: (stream
@@ -220,6 +248,43 @@ impl GgufCuda {
             }
             _ => None,
         }
+    }
+
+    pub(in crate::family::inkling2) fn batches_expert_layer(&self, layer: u32) -> bool {
+        self.moe_scratch.is_some() && !self.resident.placement().has_cold(layer)
+    }
+
+    pub(in crate::family::inkling2) fn resident_experts(
+        &self,
+        route: streaming::ResidentRoute<'_>,
+        dtypes: [DenseDtype; 2],
+        picks: &[GgufMoePick],
+    ) -> Result<Vec<f32>, EngError> {
+        let moe = self
+            .moe_scratch
+            .as_ref()
+            .ok_or_else(|| bad("no CUDA GGUF expert scratch"))?;
+        if route.input.len() != moe.shape.hidden {
+            return Err(bad("CUDA GGUF expert group input width differs"));
+        }
+        let stacks = self.resident.original_layer(route.layer)?;
+        let scratch = moe.scratch.range(0, moe.scratch.bytes())?;
+        self.step
+            .run_layer(&self.context, route.input, |stream, x, y| {
+                self.context.gguf_moe(
+                    stream,
+                    GgufMoeCall {
+                        shape: moe.shape,
+                        dtypes,
+                        caps: route.caps,
+                        picks,
+                        stacks,
+                        x,
+                        scratch,
+                        y,
+                    },
+                )
+            })
     }
 
     fn resident_packed_expert(

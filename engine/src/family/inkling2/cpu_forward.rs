@@ -483,6 +483,21 @@ impl CpuForward {
     ) -> Result<Vec<f32>, EngError> {
         let gate_up = format!("{prefix}.experts.w13_weight");
         let down = format!("{prefix}.experts.w2_weight");
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Weights::Gguf(weights) = &self.weights
+            && let Some(output) = weights.resident_experts(
+                [&gate_up, &down],
+                super::cuda_projection::gguf::streaming::ResidentRoute {
+                    layer: layer as u32,
+                    ids: &route.selected,
+                    input,
+                    caps: [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
+                },
+                |id| route.weight(id, self.math.route_scale),
+            )?
+        {
+            return Ok(output);
+        }
         let activation = self.weights.activate(input)?;
         let mut output = vec![0.0; self.hidden()];
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]

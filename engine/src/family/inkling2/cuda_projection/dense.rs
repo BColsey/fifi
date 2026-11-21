@@ -178,6 +178,18 @@ impl DenseStep {
         )
     }
 
+    pub(super) fn run_layer(
+        &self,
+        context: &CudaContext,
+        x: &[f32],
+        enqueue: impl FnOnce(&DeviceStream, DeviceRange<'_>, DeviceRange<'_>) -> Result<(), EngError>,
+    ) -> Result<Vec<f32>, EngError> {
+        let output = self.range(Slot::Output, 0, x.len())?;
+        self.run(context, &self.stream, x, output, |input| {
+            enqueue(&self.stream, input, output)
+        })
+    }
+
     fn run(
         &self,
         context: &CudaContext,

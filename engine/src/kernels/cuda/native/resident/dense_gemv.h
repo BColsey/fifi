@@ -21,6 +21,8 @@
 #ifndef INFERENCE_CUDA_RESIDENT_DENSE_GEMV_H
 #define INFERENCE_CUDA_RESIDENT_DENSE_GEMV_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +41,37 @@ typedef struct inference_cuda_dense_gemv_args {
 
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
+
+/* Contiguous GGUF expert stacks. Rank order is the order of picks. Scratch holds
+ * count * (3 * middle + hidden) f32 values. The launch queues the two indexed
+ * projections, clipped gate activation and weighted sum on one stream. */
+enum { INFERENCE_CUDA_GGUF_MOE_MAX_PICKS = 8 };
+typedef struct inference_cuda_gguf_moe_pick {
+    uint32_t expert;
+    float gate_scale;
+    float down_scale;
+    float weight;
+} inference_cuda_gguf_moe_pick;
+
+typedef struct inference_cuda_gguf_moe_args {
+    const void *gate;
+    const void *down;
+    const float *x;
+    float *scratch;
+    float *y;
+    int hidden;
+    int middle;
+    int experts;
+    int count;
+    int gate_dtype;
+    int down_dtype;
+    float gate_cap;
+    float up_cap;
+    inference_cuda_gguf_moe_pick picks[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
+} inference_cuda_gguf_moe_args;
+
+int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args, void *stream,
+                                  int *out_stage);
 
 #ifdef __cplusplus
 }

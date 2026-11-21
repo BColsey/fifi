@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -88,13 +89,26 @@ __device__ float gguf_fp4(unsigned code) {
     return code > 8 ? -v : v;
 }
 
-__global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a) {
+struct SharedWeights {
+    __device__ size_t offset(unsigned) const { return 0; }
+};
+
+struct SelectedWeights {
+    size_t stride;
+    uint32_t ids[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
+
+    __device__ size_t offset(unsigned slot) const { return stride * ids[slot]; }
+};
+
+template <typename Index>
+__global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a, Index index) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
     if (row >= a.rows) return;
     const float *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
     const int blocks = a.cols / 64;
-    const auto *w = static_cast<const unsigned char *>(a.w) + size_t(row) * blocks * 36;
+    const auto *w = static_cast<const uint8_t *>(a.w) + index.offset(blockIdx.y) +
+                    size_t(row) * blocks * 36;
     const int group = lane / 8;
     float sum = 0;
     for (int block = 0; block < blocks; ++block) {
@@ -109,8 +123,8 @@ __global__ void gguf_nvfp4_gemv(inference_cuda_dense_gemv_args a) {
     if (lane == 0) static_cast<float *>(a.y)[size_t(blockIdx.y) * a.ld_y + row] = sum;
 }
 
-template <int Type, int Block, int Bytes>
-__global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a) {
+template <int Type, int Block, int Bytes, typename Index>
+__global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a, Index index) {
     extern __shared__ float staged[];
     const auto *x = static_cast<const float *>(a.x) + size_t(blockIdx.y) * a.ld_x;
     for (int col = threadIdx.x; col < a.cols; col += blockDim.x) staged[col] = x[col];
@@ -120,7 +134,8 @@ __global__ void gguf_packed_gemv(inference_cuda_dense_gemv_args a) {
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
     if (row >= a.rows) return;
     const int blocks = a.cols / Block;
-    const auto *w = static_cast<const uint8_t *>(a.w) + size_t(row) * blocks * Bytes;
+    const auto *w = static_cast<const uint8_t *>(a.w) + index.offset(blockIdx.y) +
+                    size_t(row) * blocks * Bytes;
     float sum = 0.0f;
     for (int block = 0; block < blocks; ++block) {
         const auto *weights = w + block * Bytes;
@@ -177,18 +192,113 @@ void launch(const inference_cuda_dense_gemv_args &a, cudaStream_t s, Failure &fa
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
 }
 
+template <typename Index>
 void launch_packed(const inference_cuda_dense_gemv_args &a, cudaStream_t stream,
-                   Failure &failure) {
+                   Failure &failure, Index index) {
     const dim3 grid((a.rows + kWarps - 1) / kWarps, a.m);
     const size_t shared = size_t(a.cols) * sizeof(float);
+    if (a.weight_dtype == kDtypeGgufNvfp4) {
+        gguf_nvfp4_gemv<Index><<<grid, kWarps * 32, 0, stream>>>(a, index);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        return;
+    }
     switch (a.weight_dtype - fifi_gguf::kDtypeBase) {
 #define LAUNCH(id, block, bytes) \
     case id: \
-        gguf_packed_gemv<id, block, bytes><<<grid, kWarps * 32, shared, stream>>>(a); \
+        gguf_packed_gemv<id, block, bytes, Index><<<grid, kWarps * 32, shared, stream>>>(a, index); \
         break;
         FIFI_GGUF_GEMV_TYPES(LAUNCH)
 #undef LAUNCH
     }
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+}
+
+struct MoeSizes {
+    size_t gate_stride;
+    size_t down_stride;
+};
+
+bool good_scale(float value) { return std::isfinite(value) && value > 0.0f; }
+
+bool valid_moe(const inference_cuda_gguf_moe_args &a, void *stream, MoeSizes &sizes) {
+    if (!stream || !a.gate || !a.down || !a.x || !a.scratch || !a.y) return false;
+    if (a.hidden < 1 || a.hidden > kMaxCols || a.middle < 1 || a.middle > kMaxCols ||
+        a.experts < 1 || a.experts > kMaxRows ||
+        a.count < 1 || a.count > INFERENCE_CUDA_GGUF_MOE_MAX_PICKS ||
+        !good_scale(a.gate_cap) || !good_scale(a.up_cap)) return false;
+    if (a.gate_dtype < kDtypeGgufNvfp4 || a.down_dtype < kDtypeGgufNvfp4) return false;
+    sizes = {2 * size_t(a.middle) * weight_row_bytes(a.gate_dtype, a.hidden),
+             size_t(a.hidden) * weight_row_bytes(a.down_dtype, a.middle)};
+    if (!sizes.gate_stride || !sizes.down_stride ||
+        !aligned(a.gate, 2) || !aligned(a.down, 2) || !aligned(a.x, 4) ||
+        !aligned(a.scratch, 4) || !aligned(a.y, 4)) return false;
+
+    const Span inputs[] = {{a.gate, sizes.gate_stride * a.experts},
+                           {a.down, sizes.down_stride * a.experts},
+                           {a.x, size_t(a.hidden) * sizeof(float)}};
+    const Span scratch = {a.scratch, size_t(a.count) * (3 * a.middle + a.hidden) * sizeof(float)};
+    const Span result = {a.y, size_t(a.hidden) * sizeof(float)};
+    if (!apart(scratch, result)) return false;
+    for (const Span &input : inputs) {
+        if (!apart(input, scratch) || !apart(input, result)) return false;
+    }
+    for (int i = 0; i < a.count; ++i) {
+        const auto pick = a.picks[i];
+        if (pick.expert >= uint32_t(a.experts) || !good_scale(pick.gate_scale) ||
+            !good_scale(pick.down_scale) || !std::isfinite(pick.weight)) return false;
+    }
+    return true;
+}
+
+__global__ void activate_moe(inference_cuda_gguf_moe_args a, float *middle) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= a.middle) return;
+    const size_t offset = size_t(blockIdx.y) * a.middle;
+    const float scale = a.picks[blockIdx.y].gate_scale;
+    const float gate = a.scratch[2 * offset + col] * scale;
+    const float up = a.scratch[2 * offset + a.middle + col] * scale;
+    const float g = a.gate_cap * tanhf(gate / a.gate_cap);
+    const float u = a.up_cap * tanhf(up / a.up_cap);
+    // Report an overflow from the gate projection even if the soft cap would hide it.
+    middle[offset + col] = isfinite(gate) && isfinite(up)
+                               ? g * (1.0f / (1.0f + expf(-gate))) * u
+                               : __int_as_float(0x7fc00000);
+}
+
+__global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= a.hidden) return;
+    float out = 0.0f;
+    for (int slot = 0; slot < a.count; ++slot) {
+        const auto pick = a.picks[slot];
+        const float scaled = __fmul_rn(down[size_t(slot) * a.hidden + col], pick.down_scale);
+        out = __fadd_rn(out, __fmul_rn(pick.weight, scaled));
+    }
+    a.y[col] = out;
+}
+
+void launch_moe(const inference_cuda_gguf_moe_args &a, MoeSizes sizes, cudaStream_t stream,
+                Failure &failure) {
+    float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
+    float *down = middle + size_t(a.count) * a.middle;
+    SelectedWeights index = {sizes.gate_stride, {}};
+    for (int slot = 0; slot < a.count; ++slot) index.ids[slot] = a.picks[slot].expert;
+    launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
+                   0, 2 * a.middle, a.gate_dtype}, stream, failure, index);
+    if (!failure.ok()) return;
+
+    constexpr int threads = 256;
+    const dim3 grid((a.middle + threads - 1) / threads, a.count);
+    activate_moe<<<grid, threads, 0, stream>>>(a, middle);
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    if (!failure.ok()) return;
+
+    index.stride = sizes.down_stride;
+    launch_packed({a.down, middle, down, a.count, a.hidden, a.middle,
+                   a.middle, a.hidden, a.down_dtype}, stream, failure, index);
+    if (!failure.ok()) return;
+
+    sum_moe<<<(a.hidden + threads - 1) / threads, threads, 0, stream>>>(a, down);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
 }
 
@@ -200,17 +310,29 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (args == NULL || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        if (args->weight_dtype == kDtypeGgufNvfp4) {
-            const dim3 grid((args->rows + kWarps - 1) / kWarps, args->m);
-            gguf_nvfp4_gemv<<<grid, kWarps * 32, 0, (cudaStream_t)stream>>>(*args);
-            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
-        } else if (args->weight_dtype == kDtypeF16) {
-            launch<__half>(*args, (cudaStream_t)stream, failure);
-        } else if (args->weight_dtype >= fifi_gguf::kDtypeBase) {
-            launch_packed(*args, (cudaStream_t)stream, failure);
+        const auto cuda_stream = (cudaStream_t)stream;
+        if (args->weight_dtype == kDtypeF16) {
+            launch<__half>(*args, cuda_stream, failure);
+        } else if (args->weight_dtype == kDtypeBf16) {
+            launch<__nv_bfloat16>(*args, cuda_stream, failure);
         } else {
-            launch<__nv_bfloat16>(*args, (cudaStream_t)stream, failure);
+            launch_packed(*args, cuda_stream, failure, SharedWeights{});
         }
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
+                                               void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        MoeSizes sizes;
+        if (!args || !valid_moe(*args, stream, sizes)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure failure;
+        launch_moe(*args, sizes, (cudaStream_t)stream, failure);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

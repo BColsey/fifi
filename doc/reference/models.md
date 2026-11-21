@@ -33,6 +33,8 @@ Both backends map the original packed weights from disk and decode or upload onl
 
 Set `FIFI_INKLING_CUDA_PACKED_GGUF=1` to use CUDA projections with the original GGUF blocks in all ten Unsloth text variants, from UD-IQ1_S and UD-IQ1_M through UD-Q8_K_XL. FiFi selects the projection by each tensor's GGUF type and uses actual packed sizes to place complete expert layers in VRAM. This option enables pinned staging for the remaining experts. Add the RAM and adaptive-cache settings below to warm mapped expert pages and retain frequently selected experts in VRAM.
 
+Set `FIFI_INKLING_CUDA_BATCH_EXPERTS=1` with packed GGUF projection to batch each resident layer's selected experts. The gate/up projection, clipped activation, down projection, and weighted sum run on one CUDA stream. Each resident layer visit reads back one combined activation row.
+
 Set `FIFI_INKLING_CUDA_DIRECT_RESIDENT=1` to keep original GGUF NVFP4 blocks in VRAM and use the direct CUDA kernel for those expert banks.
 
 For VRAM → RAM → SSD expert placement, set `FIFI_INKLING_CUDA_RAM_EXPERT_MIB=auto` or give a positive MiB budget. This enables shared pinned staging and automatic VRAM placement when no explicit VRAM budget is set. After GPU placement, FiFi warms file-backed expert layers within the process's host-memory allowance. Under a smaller allowance, FiFi uses the Qwen expert predictor before attention and asks Linux to read the predicted experts' two GGUF ranges into the page cache. The actual Inkling router determines which experts execute. The budget limits startup warming and advice per visit. Linux can reclaim or retain file pages as memory pressure changes. Set the RAM budget to zero to use ordinary demand paging.

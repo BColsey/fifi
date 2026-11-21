@@ -613,3 +613,141 @@ fn original_packed_gguf_gemv_matches_cpu_for_every_supported_format() {
     }
     assert_eq!(covered, 19);
 }
+
+#[test]
+fn indexed_gguf_experts_match_ordered_cpu_projection() {
+    use super::{GgufMoeCall, GgufMoePick, GgufMoeShape};
+    use crate::weights::{GgufType, dequantize_into};
+
+    if !testkit::device_present("indexed_gguf_experts_match_ordered_cpu_projection") {
+        return;
+    }
+    let rig = Rig::new();
+    let shape = GgufMoeShape {
+        hidden: 64,
+        middle: 64,
+        experts: 4,
+    };
+    let [hidden, middle, experts] = [shape.hidden, shape.middle, shape.experts];
+    let kinds = [GgufType::Q20, GgufType::Nvfp4];
+    let dtypes = kinds.map(|kind| DenseDtype::from_gguf(kind).unwrap());
+    let gate = test_packed_blocks(kinds[0], experts * 2 * middle);
+    let down = (0..experts * hidden)
+        .flat_map(|row| {
+            let scale = 0x16 + (row % 4) as u8;
+            [scale; 4]
+                .into_iter()
+                .chain((0..32).map(move |j| (13 * row + 23 * j) as u8))
+        })
+        .collect::<Vec<_>>();
+    let picks = [
+        GgufMoePick {
+            expert: 3,
+            gate_scale: 0.75,
+            down_scale: 0.5,
+            weight: 0.25,
+        },
+        GgufMoePick {
+            expert: 0,
+            gate_scale: 1.0,
+            down_scale: 2.0,
+            weight: 0.5,
+        },
+        GgufMoePick {
+            expert: 2,
+            gate_scale: 0.25,
+            down_scale: 1.0,
+            weight: 0.125,
+        },
+    ];
+    let caps = [0.75, 1.25];
+    let input = (0..hidden)
+        .map(|i| (i % 7) as f32 / 8.0 - 0.375)
+        .collect::<Vec<_>>();
+
+    let w = [
+        Padded::new(&rig.ctx, &gate, 0),
+        Padded::new(&rig.ctx, &down, 0),
+    ];
+    let x = Padded::new(&rig.ctx, &f32_bytes(&input), 0);
+    let scratch = Padded::new(
+        &rig.ctx,
+        &sentinel(shape.scratch_bytes(picks.len()).unwrap()),
+        0,
+    );
+    let y = Padded::new(&rig.ctx, &sentinel(hidden * 4), 0);
+    let args = || GgufMoeCall {
+        shape,
+        caps,
+        picks: &picks,
+        dtypes,
+        stacks: [w[0].all(), w[1].all()],
+        x: x.all(),
+        scratch: scratch.all(),
+        y: y.all(),
+    };
+    let err = rig
+        .ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                scratch: scratch.range(0, scratch.len - 1),
+                ..args()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngError::BadRequest(_)));
+    let bad_id = [GgufMoePick {
+        expert: experts as u32,
+        ..picks[1]
+    }];
+    let err = rig
+        .ctx
+        .gguf_moe(
+            &rig.stream,
+            GgufMoeCall {
+                picks: &bad_id,
+                ..args()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngError::BadRequest(_)));
+    assert_eq!(y.read(&rig.ctx, "refused y"), sentinel(hidden * 4));
+    rig.ctx.gguf_moe(&rig.stream, args()).unwrap();
+    rig.stream.synchronize().unwrap();
+
+    let mut gu = vec![0.0; 2 * experts * middle * hidden];
+    let mut down_weights = vec![0.0; experts * hidden * middle];
+    dequantize_into(kinds[0], &gate, &mut gu).unwrap();
+    dequantize_into(kinds[1], &down, &mut down_weights).unwrap();
+    let got = testkit::floats(&y.read(&rig.ctx, "mixed GGUF expert result"));
+    let mut expected = vec![0.0; hidden];
+    let dot = |x: &[f32], w: &[f32]| x.iter().zip(w).map(|(x, w)| x * w).sum::<f32>();
+    let clip = |x: f32, cap: f32| cap * (x / cap).tanh();
+    for pick in picks {
+        let start = pick.expert as usize * 2 * middle * hidden;
+        let matrix = &gu[start..][..2 * middle * hidden];
+        let (gate, up) = matrix.split_at(middle * hidden);
+        let mid = gate
+            .chunks_exact(hidden)
+            .zip(up.chunks_exact(hidden))
+            .map(|(g, u)| {
+                let gate = pick.gate_scale * dot(&input, g);
+                let up = pick.gate_scale * dot(&input, u);
+                clip(gate, caps[0]) * (1.0 + (-gate).exp()).recip() * clip(up, caps[1])
+            })
+            .collect::<Vec<_>>();
+        let start = pick.expert as usize * hidden * middle;
+        let d = &down_weights[start..][..hidden * middle];
+        for (out, row) in expected.iter_mut().zip(d.chunks_exact(middle)) {
+            *out += pick.weight * (pick.down_scale * dot(&mid, row));
+        }
+    }
+    for (i, (&got, want)) in got.iter().zip(expected).enumerate() {
+        let error = (got - want).abs();
+        assert!(
+            error <= (want.abs() + 1.0) * 1e-5,
+            "column {i}, value {got}, CPU {want}"
+        );
+    }
+}

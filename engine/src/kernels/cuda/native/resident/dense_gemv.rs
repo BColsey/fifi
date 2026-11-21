@@ -27,6 +27,8 @@ pub(in crate::kernels::cuda) const GEMV_MAX_ROWS: usize = 1 << 20;
 pub(in crate::kernels::cuda) const GEMV_MAX_COLS: usize = 12288;
 pub(in crate::kernels::cuda) const GEMV_MAX_LD: usize = 1 << 20;
 
+pub(in crate::kernels::cuda) mod moe;
+
 const FLOAT: usize = 4;
 const HALF: usize = 2;
 const GGUF_DTYPE_BASE: c_int = 256;
@@ -51,6 +53,10 @@ impl DenseDtype {
             | Iq2S | Iq3Xxs | Iq3S | Iq4Nl | Iq4Xs | Mxfp4 => Some(Self::PackedGguf(kind)),
             _ => None,
         }
+    }
+
+    pub(crate) fn is_packed_gguf(self) -> bool {
+        self.gguf_kind().is_some()
     }
 
     fn gguf_kind(self) -> Option<GgufType> {

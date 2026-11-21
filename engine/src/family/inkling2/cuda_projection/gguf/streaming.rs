@@ -20,6 +20,13 @@ pub(in crate::family::inkling2) struct RoutedExperts<'a> {
     pub input: &'a [f32],
 }
 
+pub(in crate::family::inkling2) struct ResidentRoute<'a> {
+    pub layer: u32,
+    pub ids: &'a [usize],
+    pub input: &'a [f32],
+    pub caps: [f32; 2],
+}
+
 pub(in crate::family::inkling2) struct PrefillRoute<'a> {
     pub ids: &'a [usize],
     pub input: &'a [f32],
