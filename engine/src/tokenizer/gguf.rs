@@ -196,93 +196,6 @@ fn template_tool_response_opener(tokens: &[String], types: &[i32], template: &st
         .map(|(_, id)| id)
 }
 
-fn reject(message: impl Into<String>) -> EngError {
-    EngError::Checkpoint(format!("gguf tokenizer: {}", message.into()))
-}
-
-/// The CJK and kana ranges that the Raon-1 pre-tokenizer keeps apart from other letters.
-const RAON_CJK: &str = "\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}";
-
-/// How a `tokenizer.ggml.pre` name splits text before the byte-level BPE merges.
-struct PreTokenizer {
-    /// The split regex; each match is one pre-token.
-    pattern: String,
-    /// Whether text is NFC-normalized first when the file carries no `normalizer.nfc` key.
-    nfc: bool,
-    /// Whether a pre-token that is a whole vocabulary entry is emitted without merging.
-    ignore_merges: bool,
-}
-
-/// The pre-tokenizer of a `tokenizer.ggml.pre` name, or `None` for a name this reader does not
-/// know. Each pattern describes the splitting rule of its family:
-/// - `qwen2`: contractions, a letter run with at most one leading non-letter, single digits,
-///   punctuation runs with trailing newlines, and whitespace runs that keep one space for the
-///   next word.
-/// - `qwen35`: the same, with combining marks counted as letters, and NFC normalization.
-/// - `pixtral`: words split at case changes (an upper-case run then lower-case letters, or
-///   lower-case letters), single digits, punctuation runs that may end in newlines or a slash,
-///   and whitespace runs; whole vocabulary entries are emitted without merging.
-/// - `raon`: CJK and kana runs apart, space-joined letter groups, digits in groups of three
-///   counted from the right, punctuation runs, and whitespace runs.
-fn pre_tokenizer(pre: &str) -> Option<PreTokenizer> {
-    let (pattern, nfc, ignore_merges) = match pre {
-        "raon" => {
-            let letter = format!("(?:(?:(?![{RAON_CJK}])\\p{{L}})\\p{{M}}*)+");
-            (
-                format!(
-                    " ?[{RAON_CJK}]+| ?{letter}(?: {letter})*|\\p{{N}}{{1,3}}(?=(?:\\p{{N}}{{3}})*(?!\\p{{N}}))| ?[^\\s\\p{{L}}\\p{{N}}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-                ),
-                false,
-                false,
-            )
-        }
-        "qwen2" => (
-            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+".to_owned(),
-            true,
-            false,
-        ),
-        "qwen35" => (
-            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+".to_owned(),
-            true,
-            false,
-        ),
-        "pixtral" => (
-            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+".to_owned(),
-            false,
-            true,
-        ),
-        _ => return None,
-    };
-    Some(PreTokenizer {
-        pattern,
-        nfc,
-        ignore_merges,
-    })
-}
-
-/// What the header of one GGUF file says about its tokenizer.
-pub(crate) struct GgufTokenizer {
-    kind: Kind,
-    tokens: Vec<String>,
-    types: Vec<i32>,
-    merges: Vec<String>,
-    pre: String,
-    /// `normalizer.nfc` when the file states it; otherwise the pre-tokenizer's default.
-    nfc: Option<bool>,
-    eos_id: u32,
-    bos_id: Option<u32>,
-    pad_id: Option<u32>,
-    unk_id: Option<u32>,
-    eot_id: Option<u32>,
-    eom_id: Option<u32>,
-    /// The token the chat template ends an assistant message with, see [`template_turn_end`].
-    turn_end: Option<u32>,
-    /// The token the chat template opens a tool response with, see [`template_tool_response_opener`].
-    tool_response: Option<u32>,
-    /// The line that says a spec's template stands in for a header that carries none.
-    template_note: Option<String>,
-    /// The bytes of a `generation_config.json` beside the weights file, when there is one.
-    generation_config: Option<Vec<u8>>,
             add_bos: matches!(
                 header.meta("tokenizer.ggml.add_bos_token"),
                 Some(MetaValue::Bool(true))
@@ -1619,6 +1532,7 @@ pub(crate) mod tests {
         got.sort_unstable();
         assert_eq!(got, want);
     }
+<<<<<<< HEAD
 
     /// The ids of an independent tokenizer (run on the same GGUF with no BOS token and no escape
     /// processing) over nine texts, kept in `testdata/gguf-tokenizer/oracle.json`; `env` names the GGUF.
@@ -1819,4 +1733,6 @@ pub(crate) mod tests {
         }
         assert!(differing.is_empty(), "ids differ on {differing:?}");
     }
+=======
+>>>>>>> 83dc7e01d (feat(tokenizer): derive the stop ids of a GGUF tokenizer by one rule)
 }
