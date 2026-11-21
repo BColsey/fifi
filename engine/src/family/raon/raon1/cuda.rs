@@ -22,7 +22,16 @@ use crate::EngError;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
-use crate::kernels::cuda::resident::block_ops::{BlockOp, MLA_GROUP, MlaShape, RdaInputs};
+use crate::kernels::cuda::prefill::mmq_dense::{MmqDenseCall, MmqDenseInputCall};
+use crate::kernels::cuda::prefill::mmq_mmid::{
+    IdsGuardCall, MmidIdsOut, MmidLaunchCall, MmidQuantCall, MmidShape, MmidWeight,
+};
+use crate::kernels::cuda::prefill::mmq_quant::MmqPacking;
+use crate::kernels::cuda::prefill::mmq_size::q8_1_bytes as mmq_q8_bytes;
+use crate::kernels::cuda::prefill::mmq_size::{expert_bounds_ints, ids_dst_ints};
+use crate::kernels::cuda::resident::block_ops::{
+    BlockOp, MLA_GROUP, MlaShape, RdaInputs, RowOutputs,
+};
 use crate::kernels::cuda::resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape};
 use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
 use crate::kernels::cuda::resident::matvec_q::MatvecCall;
@@ -33,6 +42,9 @@ use crate::weights::{GgufType, dequantize};
 
 /// Token rows per chunk: the scratch is sized for this many.
 pub(crate) const CHUNK: usize = 256;
+
+/// Upper bound of the stream-k fixup scratch of the batched GEMM, for the memory plan.
+const MMQ_FIXUP_BOUND: usize = 16 << 20;
 
 const HIDDEN: usize = 2560;
 const STREAMS: usize = 4;
@@ -77,6 +89,24 @@ fn q8(width: usize, rows: usize) -> usize {
 
 fn plan_error(message: String) -> EngError {
     EngError::MemoryPlan(format!("raon1: {message}"))
+}
+
+/// The activation rows a projection reads: q8_1 rows for the quantized matvec and, when the
+/// producer wrote them, the f32 rows for the batched GEMM.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    q8: &'a DeviceBuffer,
+    f32: Option<&'a DeviceBuffer>,
+}
+
+impl<'a> Rows<'a> {
+    fn q8(q8: &'a DeviceBuffer) -> Self {
+        Self { q8, f32: None }
+    }
+
+    fn both(q8: &'a DeviceBuffer, f32: &'a DeviceBuffer) -> Self {
+        Self { q8, f32: Some(f32) }
+    }
 }
 
 /// The tensor names of one layer, built once.
@@ -238,9 +268,22 @@ struct Scratch {
     head: DeviceBuffer,
     q8_head: DeviceBuffer,
     logits: DeviceBuffer,
+    mla_gated: DeviceBuffer,
+    act_ffn: DeviceBuffer,
+    mmq_q8: DeviceBuffer,
+    mmq_q8_routed: DeviceBuffer,
+    fixup: DeviceBuffer,
+    ids_g: DeviceBuffer,
+    ids_src1: DeviceBuffer,
+    ids_dst: DeviceBuffer,
+    expert_bounds: DeviceBuffer,
 }
 
 impl Scratch {
+    fn cur_rows(&self) -> Rows<'_> {
+        Rows::both(&self.q8_cur, &self.cur)
+    }
+
     /// The device bytes of the scratch of one chunk.
     fn bytes(vocab: usize) -> u64 {
         let c = CHUNK;
@@ -272,6 +315,12 @@ impl Scratch {
             + f(HIDDEN)
             + q(HIDDEN, 1)
             + f(vocab)
+            + f(c * WIDTH)
+            + f(c * DENSE_INTER)
+            + mmq_q8_bytes(DENSE_INTER, c).expect("mmq q8 size") as u64
+            + MMQ_FIXUP_BOUND as u64
+            + mmq_q8_bytes(HIDDEN, c * USED).expect("mmq q8 size") as u64
+            + f(c * USED) * 4
     }
 }
 
@@ -523,16 +572,41 @@ impl Raon1Device {
         buffer.range(0, buffer.bytes())
     }
 
-    /// `y[t] = W x_q8[t]` for `n` rows, in launches of up to 8 columns.
-    fn mv(
-        &self,
-        name: &str,
-        x_q8: &DeviceBuffer,
-        y: &DeviceBuffer,
-        n: usize,
-    ) -> Result<(), EngError> {
+    /// `y[t] = W x[t]` for `n` rows. Up to 8 rows use the quantized matvec on the q8_1 rows;
+    /// a larger chunk with f32 rows and a row length on the 256 grid uses the batched GEMM.
+    fn mv(&self, name: &str, x: Rows<'_>, y: &DeviceBuffer, n: usize) -> Result<(), EngError> {
         let weight = self.native(name)?;
         let (k, rows) = (weight.k(), weight.n_rows());
+        if n > 8
+            && k.is_multiple_of(256)
+            && let Some(f32_rows) = x.f32
+        {
+            let q8_range = self.sc.mmq_q8.range(0, mmq_q8_bytes(k, n)?)?;
+            self.ctx.mmq_dense_input(
+                &self.stream,
+                MmqDenseInputCall {
+                    packing: MmqPacking::CpuReference,
+                    weight,
+                    m: n,
+                    row_stride: k,
+                    x: f32_rows.range(0, n * k * 4)?,
+                    y: q8_range,
+                },
+            )?;
+            return self.ctx.mmq_dense(
+                &self.stream,
+                MmqDenseCall {
+                    weight,
+                    w_seg: None,
+                    m: n,
+                    q8_1: q8_range,
+                    dst: y.range(0, n * rows * 4)?,
+                    ld: rows,
+                    col_off: 0,
+                    fixup: Self::whole(&self.sc.fixup)?,
+                },
+            );
+        }
         let w = Self::whole(weight.buffer())?;
         let x_stride = q8(k, 1);
         let mut first = 0;
@@ -543,7 +617,7 @@ impl Raon1Device {
                 MatvecCall {
                     ty: weight.quant(),
                     w,
-                    x_q8: x_q8.range(first * x_stride, q8(k, cols))?,
+                    x_q8: x.q8.range(first * x_stride, q8(k, cols))?,
                     y: y.range(first * rows * 4, cols * rows * 4)?,
                     k,
                     rows,
@@ -577,21 +651,25 @@ impl Raon1Device {
         )
     }
 
-    /// Quantizes `n` rows of `width` f32 values (x * sigmoid(gate) when a gate is given).
+    /// Quantizes `n` rows of `width` f32 values (x * sigmoid(gate) when a gate is given) into
+    /// q8_1 rows, and also writes the f32 product when `f32_out` is given.
     fn quantize(
         &self,
         n: usize,
         width: usize,
         x: &DeviceBuffer,
         gate: Option<&DeviceBuffer>,
-        out: &DeviceBuffer,
+        out: Rows<'_>,
     ) -> Result<(), EngError> {
         self.run(BlockOp::gated_quant(
             n,
             width,
             x.range(0, n * width * 4)?,
             gate.map(|g| g.range(0, n * width * 4)).transpose()?,
-            out.range(0, q8(width, n))?,
+            RowOutputs {
+                q8: Some(out.q8.range(0, q8(width, n))?),
+                f32: out.f32.map(|b| b.range(0, n * width * 4)).transpose()?,
+            },
         )?)
     }
 
@@ -716,10 +794,10 @@ impl Raon1Device {
     fn rda_mixer(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         let rda = names.ordinal;
-        self.mv(&names.attn_q, &sc.q8_cur, &sc.proj_q, n)?;
-        self.mv(&names.attn_k, &sc.q8_cur, &sc.proj_k, n)?;
-        self.mv(&names.attn_v, &sc.q8_cur, &sc.proj_v, n)?;
-        self.mv(&names.ssm_g, &sc.q8_cur, &sc.g2, n)?;
+        self.mv(&names.attn_q, sc.cur_rows(), &sc.proj_q, n)?;
+        self.mv(&names.attn_k, sc.cur_rows(), &sc.proj_k, n)?;
+        self.mv(&names.attn_v, sc.cur_rows(), &sc.proj_v, n)?;
+        self.mv(&names.ssm_g, sc.cur_rows(), &sc.g2, n)?;
         self.f16_mv(&names.ssm_f_a, &sc.cur, &sc.fa, n, TIME_RANK, HIDDEN)?;
         self.f16_mv(&names.ssm_f_b, &sc.fa, &sc.g1, n, WIDTH, TIME_RANK)?;
         self.f16_mv(&names.ssm_beta, &sc.cur, &sc.beta, n, HEADS, HIDDEN)?;
@@ -765,14 +843,19 @@ impl Raon1Device {
             self.state.range(rda * state_bytes, state_bytes)?,
             sc.scan_out.range(0, row)?,
         )?)?;
-        self.quantize(n, WIDTH, &sc.scan_out, None, &sc.q8_wide)?;
-        self.mv(&names.attn_output, &sc.q8_wide, &sc.proj, n)
+        self.quantize(n, WIDTH, &sc.scan_out, None, Rows::q8(&sc.q8_wide))?;
+        self.mv(
+            &names.attn_output,
+            Rows::both(&sc.q8_wide, &sc.scan_out),
+            &sc.proj,
+            n,
+        )
     }
 
     fn mla_mixer(&self, names: &LayerNames, n: usize, pos0: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         let mla = names.ordinal;
-        self.mv(&names.attn_q_a, &sc.q8_cur, &sc.qa, n)?;
+        self.mv(&names.attn_q_a, sc.cur_rows(), &sc.qa, n)?;
         self.run(BlockOp::rms_rows(
             n,
             Q_LORA,
@@ -783,8 +866,8 @@ impl Raon1Device {
             None,
             Some(sc.q8_qa.range(0, q8(Q_LORA, n))?),
         )?)?;
-        self.mv(&names.attn_q_b, &sc.q8_qa, &sc.qb, n)?;
-        self.mv(&names.attn_kv_a, &sc.q8_cur, &sc.kv, n)?;
+        self.mv(&names.attn_q_b, Rows::q8(&sc.q8_qa), &sc.qb, n)?;
+        self.mv(&names.attn_kv_a, sc.cur_rows(), &sc.kv, n)?;
         let layer_cache = self.cells * MLA_ROW * 2;
         self.run(BlockOp::mla_kv_prep(
             n,
@@ -849,13 +932,24 @@ impl Raon1Device {
             Self::whole(&factors.wv_b)?,
             sc.mla_out.range(0, n * WIDTH * 4)?,
         )?)?;
-        self.mv(&names.attn_gate, &sc.q8_cur, &sc.g2, n)?;
+        self.mv(&names.attn_gate, sc.cur_rows(), &sc.g2, n)?;
         if self.trace.borrow().is_some() {
             self.snap("mla_out", &sc.mla_out, n * WIDTH)?;
             self.snap("mla_gate", &sc.g2, n * WIDTH)?;
         }
-        self.quantize(n, WIDTH, &sc.mla_out, Some(&sc.g2), &sc.q8_wide)?;
-        self.mv(&names.attn_output, &sc.q8_wide, &sc.proj, n)
+        self.quantize(
+            n,
+            WIDTH,
+            &sc.mla_out,
+            Some(&sc.g2),
+            Rows::both(&sc.q8_wide, &sc.mla_gated),
+        )?;
+        self.mv(
+            &names.attn_output,
+            Rows::both(&sc.q8_wide, &sc.mla_gated),
+            &sc.proj,
+            n,
+        )
     }
 
     fn ffn_half(&self, layer: usize, n: usize) -> Result<(), EngError> {
@@ -884,7 +978,7 @@ impl Raon1Device {
         gate: &DeviceBuffer,
         up: &DeviceRange<'_>,
         ld: usize,
-        out: &DeviceBuffer,
+        out: Rows<'_>,
     ) -> Result<(), EngError> {
         let span = ((rows - 1) * ld + width) * 4;
         self.run(BlockOp::situ_quant(
@@ -892,21 +986,35 @@ impl Raon1Device {
             width,
             ld,
             ld,
-            self.hy.situ_beta,
-            self.hy.situ_linear_beta,
+            (self.hy.situ_beta, self.hy.situ_linear_beta),
             gate.range(0, span)?,
             *up,
-            out.range(0, q8(width, rows))?,
+            RowOutputs {
+                q8: Some(out.q8.range(0, q8(width, rows))?),
+                f32: out.f32.map(|b| b.range(0, rows * width * 4)).transpose()?,
+            },
         )?)
     }
 
     fn dense_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
-        self.mv(&names.ffn_gate, &sc.q8_cur, &sc.ffn_gate, n)?;
-        self.mv(&names.ffn_up, &sc.q8_cur, &sc.ffn_up, n)?;
+        self.mv(&names.ffn_gate, sc.cur_rows(), &sc.ffn_gate, n)?;
+        self.mv(&names.ffn_up, sc.cur_rows(), &sc.ffn_up, n)?;
         let up = sc.ffn_up.range(0, n * DENSE_INTER * 4)?;
-        self.situ(n, DENSE_INTER, &sc.ffn_gate, &up, DENSE_INTER, &sc.q8_ffn)?;
-        self.mv(&names.ffn_down, &sc.q8_ffn, &sc.proj, n)
+        self.situ(
+            n,
+            DENSE_INTER,
+            &sc.ffn_gate,
+            &up,
+            DENSE_INTER,
+            Rows::both(&sc.q8_ffn, &sc.act_ffn),
+        )?;
+        self.mv(
+            &names.ffn_down,
+            Rows::both(&sc.q8_ffn, &sc.act_ffn),
+            &sc.proj,
+            n,
+        )
     }
 
     fn expert_mv(
@@ -940,6 +1048,79 @@ impl Raon1Device {
         )
     }
 
+    /// The gate and up projections of a chunk's routed picks as grouped GEMMs: tokens are
+    /// regrouped by expert, each expert's weights are read once, and the rows land in `gu` at
+    /// the slot rows the per-token launches write.
+    fn grouped_gate_up(
+        &self,
+        names: &LayerNames,
+        n: usize,
+        gu_row: usize,
+        stride: usize,
+    ) -> Result<(), EngError> {
+        let sc = &self.sc;
+        let shape = MmidShape {
+            n_experts: EXPERTS,
+            m: n,
+            top_k: USED,
+        };
+        let ids = self.ctx.mmq_build_ids(
+            &self.stream,
+            IdsGuardCall {
+                shape,
+                ids: sc.ids.range(0, n * USED * 4)?,
+                ids_g: sc.ids_g.range(0, n * USED * 4)?,
+                status: None,
+            },
+            MmidIdsOut {
+                ids_src1: sc.ids_src1.range(0, n * USED * 4)?,
+                ids_dst: sc.ids_dst.range(0, ids_dst_ints(n * USED, n)? * 4)?,
+                expert_bounds: sc
+                    .expert_bounds
+                    .range(0, expert_bounds_ints(EXPERTS)? * 4)?,
+            },
+        )?;
+        let gate = self.native(&names.gate_exps)?;
+        let q8_rows = sc.mmq_q8_routed.range(0, mmq_q8_bytes(HIDDEN, n * USED)?)?;
+        self.ctx.mmq_quantize_scatter_ids(
+            &self.stream,
+            &ids,
+            MmidQuantCall {
+                packing: MmqPacking::CpuReference,
+                quant: gate.quant(),
+                k: HIDDEN,
+                row_stride: HIDDEN,
+                x: sc.cur.range(0, n * HIDDEN * 4)?,
+                y: q8_rows,
+            },
+        )?;
+        for (weight, offset) in [(gate, 0), (self.native(&names.up_exps)?, MOE_INTER * 4)] {
+            let quant = weight.quant();
+            let stride_bytes = quant
+                .weight_bytes(MOE_INTER, HIDDEN)
+                .ok_or_else(|| EngError::BadRequest("raon1: the expert stride overflows".into()))?;
+            self.ctx.mmq_mmid_launch(
+                &self.stream,
+                MmidLaunchCall {
+                    shape,
+                    weight: MmidWeight {
+                        base: Self::whole(weight.buffer())?,
+                        quant,
+                        k: HIDDEN,
+                        n: MOE_INTER,
+                        stride_bytes,
+                    },
+                    ids: &ids,
+                    y: q8_rows,
+                    dst: sc.gu.range(offset, n * gu_row - offset)?,
+                    ld: stride,
+                    fixup: Self::whole(&sc.fixup)?,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn moe_block(&self, names: &LayerNames, n: usize) -> Result<(), EngError> {
         let sc = &self.sc;
         self.run(BlockOp::moe_route(
@@ -956,42 +1137,60 @@ impl Raon1Device {
             sc.weights.range(0, n * USED * 4)?,
         )?)?;
         // The shared expert first: its output is the base the routed picks are summed onto.
-        self.mv(&names.gate_shexp, &sc.q8_cur, &sc.ffn_gate, n)?;
-        self.mv(&names.up_shexp, &sc.q8_cur, &sc.ffn_up, n)?;
+        self.mv(&names.gate_shexp, sc.cur_rows(), &sc.ffn_gate, n)?;
+        self.mv(&names.up_shexp, sc.cur_rows(), &sc.ffn_up, n)?;
         let up = sc.ffn_up.range(0, n * MOE_INTER * 4)?;
-        self.situ(n, MOE_INTER, &sc.ffn_gate, &up, MOE_INTER, &sc.q8_ffn)?;
-        self.mv(&names.down_shexp, &sc.q8_ffn, &sc.shared, n)?;
+        self.situ(
+            n,
+            MOE_INTER,
+            &sc.ffn_gate,
+            &up,
+            MOE_INTER,
+            Rows::q8(&sc.q8_ffn),
+        )?;
+        self.mv(&names.down_shexp, Rows::q8(&sc.q8_ffn), &sc.shared, n)?;
         let gu_row = USED * 2 * MOE_INTER * 4;
         let stride = 2 * MOE_INTER;
-        let gu_span = ((USED - 1) * stride + MOE_INTER) * 4;
-        let x_stride = q8(HIDDEN, 1);
-        for t in 0..n {
-            let ids = sc.ids.range(t * USED * 4, USED * 4)?;
-            let x = sc.q8_cur.range(t * x_stride, x_stride)?;
-            let base = t * gu_row;
-            self.expert_mv(
-                &names.gate_exps,
-                x,
-                false,
-                ids,
-                sc.gu.range(base, gu_span)?,
-                stride,
-                MOE_INTER,
-                HIDDEN,
-            )?;
-            self.expert_mv(
-                &names.up_exps,
-                x,
-                false,
-                ids,
-                sc.gu.range(base + MOE_INTER * 4, gu_span)?,
-                stride,
-                MOE_INTER,
-                HIDDEN,
-            )?;
+        if n > 8 {
+            self.grouped_gate_up(names, n, gu_row, stride)?;
+        } else {
+            let gu_span = ((USED - 1) * stride + MOE_INTER) * 4;
+            let x_stride = q8(HIDDEN, 1);
+            for t in 0..n {
+                let ids = sc.ids.range(t * USED * 4, USED * 4)?;
+                let x = sc.q8_cur.range(t * x_stride, x_stride)?;
+                let base = t * gu_row;
+                self.expert_mv(
+                    &names.gate_exps,
+                    x,
+                    false,
+                    ids,
+                    sc.gu.range(base, gu_span)?,
+                    stride,
+                    MOE_INTER,
+                    HIDDEN,
+                )?;
+                self.expert_mv(
+                    &names.up_exps,
+                    x,
+                    false,
+                    ids,
+                    sc.gu.range(base + MOE_INTER * 4, gu_span)?,
+                    stride,
+                    MOE_INTER,
+                    HIDDEN,
+                )?;
+            }
         }
         let up = sc.gu.range(MOE_INTER * 4, n * gu_row - MOE_INTER * 4)?;
-        self.situ(n * USED, MOE_INTER, &sc.gu, &up, stride, &sc.q8_experts)?;
+        self.situ(
+            n * USED,
+            MOE_INTER,
+            &sc.gu,
+            &up,
+            stride,
+            Rows::q8(&sc.q8_experts),
+        )?;
         let e_stride = q8(MOE_INTER, 1);
         for t in 0..n {
             self.expert_mv(
@@ -1042,7 +1241,7 @@ impl Raon1Device {
             None,
             Some(sc.q8_head.range(0, q8(HIDDEN, 1))?),
         )?)?;
-        self.mv("output.weight", &sc.q8_head, &sc.logits, 1)?;
+        self.mv("output.weight", Rows::q8(&sc.q8_head), &sc.logits, 1)?;
         let mut bytes = vec![0u8; self.vocab * 4];
         sc.logits.read_at(&self.stream, 0, &mut bytes)?;
         Ok(f32_values(&bytes))
@@ -1101,5 +1300,14 @@ fn allocate_scratch(ctx: &CudaContext, vocab: usize) -> Result<Scratch, EngError
         head: f(HIDDEN)?,
         q8_head: q(HIDDEN, 1)?,
         logits: f(vocab)?,
+        mla_gated: f(c * WIDTH)?,
+        act_ffn: f(c * DENSE_INTER)?,
+        mmq_q8: ctx.allocate(mmq_q8_bytes(DENSE_INTER, c)?)?,
+        mmq_q8_routed: ctx.allocate(mmq_q8_bytes(HIDDEN, c * USED)?)?,
+        fixup: ctx.allocate(ctx.mmq_fixup_bytes()?)?,
+        ids_g: f(c * USED)?,
+        ids_src1: f(c * USED)?,
+        ids_dst: f(ids_dst_ints(c * USED, c)?)?,
+        expert_bounds: f(EXPERTS + 1)?,
     })
 }

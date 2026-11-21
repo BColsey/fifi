@@ -308,3 +308,46 @@ fn the_device_top_logits_match_the_fork_on_the_fixture_prompt() {
         );
     }
 }
+
+/// Prefill and decode rates at the prompt lengths of `RAON_BENCH` (comma separated tokens),
+/// on the context the free device memory admits. Prints one line per length.
+#[test]
+fn the_device_reports_prefill_and_decode_rates() {
+    let Some(path) = model_path() else { return };
+    let Ok(lengths) = std::env::var("RAON_BENCH") else {
+        eprintln!("skipped: RAON_BENCH is unset");
+        return;
+    };
+    if !device_present("the_device_reports_prefill_and_decode_rates") {
+        return;
+    }
+    let mut device = Raon1Device::load(&path, None, &mut |cells| {
+        eprintln!("planned context {cells}");
+    })
+    .expect("device load");
+    for length in lengths
+        .split(',')
+        .map(|v| v.trim().parse::<usize>().expect("length"))
+    {
+        let tokens: Vec<u32> = (0..length)
+            .map(|i| 1000 + (i as u32 * 7919) % 200_000)
+            .collect();
+        device.reset().expect("reset");
+        let start = std::time::Instant::now();
+        device.feed(&tokens, 0, HeadRows::Last).expect("prefill");
+        let prefill = start.elapsed().as_secs_f64();
+        let steps = 32;
+        let start = std::time::Instant::now();
+        for step in 0..steps {
+            device
+                .feed(&[1234 + step as u32], length + step, HeadRows::Last)
+                .expect("decode");
+        }
+        let decode = start.elapsed().as_secs_f64();
+        eprintln!(
+            "prompt {length}: prefill {:.1} tok/s ({prefill:.2} s) | decode {:.1} tok/s",
+            length as f64 / prefill,
+            steps as f64 / decode
+        );
+    }
+}

@@ -58,9 +58,11 @@ extern "C" {
  *             i3 splits.
  * 11 MLA_PROJECT p0 mix f32 [n][heads][rank]; p1 wv_b f32 [heads][v][rank]; p2 out f32
  *             [n][heads*v] (W). i0 n; i1 heads; i2 rank; i3 v.
- * 12 SITU_QUANT p0 gate f32 rows at ld_gate; p1 up f32 rows at ld_up; p2 q8_1 rows (W).
+ * 12 SITU_QUANT p0 gate f32 rows at ld_gate; p1 up f32 rows at ld_up; p2 q8_1 rows (W,
+ *             optional); p3 y f32 [rows][w] (W, optional; one of p2 and p3 is present).
  *             i0 rows; i1 w; i2 ld_gate; i3 ld_up. f0 beta; f1 linear beta.
- * 13 GATED_QUANT p0 x f32 [rows][w]; p1 gate f32 [rows][w] (optional); p2 q8_1 rows (W).
+ * 13 GATED_QUANT p0 x f32 [rows][w]; p1 gate f32 [rows][w] (optional); p2 q8_1 rows (W,
+ *             optional); p3 y f32 [rows][w] (W, optional; one of p2 and p3 is present).
  *             i0 rows; i1 w.
  * 14 MOE_ROUTE p0 x f32 [n][h]; p1 gate_w f32 [e][h]; p2 bias f32 [e]; p3 ids i32 [n][k]
  *             (W); p4 weights f32 [n][k] (W). i0 n; i1 h; i2 e (<= 256); i3 k (<= 8);

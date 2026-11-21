@@ -316,43 +316,40 @@ impl<'b> BlockOp<'b> {
             .write(2, out, bytes(&[n, heads, v, 4])?))
     }
 
-    /// The SiTU activation of gate and up rows, quantized to q8_1 rows.
+    /// The SiTU activation of gate and up rows, written as q8_1 rows, f32 rows, or both.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn situ_quant(
         rows: usize,
         w: usize,
         ld_gate: usize,
         ld_up: usize,
-        beta: f32,
-        linear_beta: f32,
+        (beta, linear_beta): (f32, f32),
         gate: DeviceRange<'b>,
         up: DeviceRange<'b>,
-        q8: DeviceRange<'b>,
+        outs: RowOutputs<'b>,
     ) -> Result<Self, EngError> {
         let span = |ld: usize| -> Result<usize, EngError> {
             Ok(bytes(&[rows.saturating_sub(1), ld, 4])?.saturating_add(w * 4))
         };
-        Ok(
-            Self::new(12, &[rows, w, ld_gate, ld_up], &[beta, linear_beta])?
-                .read(0, gate, span(ld_gate)?)
-                .read(1, up, span(ld_up)?)
-                .write(2, q8, q8_rows(w, rows)?),
-        )
+        let op = Self::new(12, &[rows, w, ld_gate, ld_up], &[beta, linear_beta])?
+            .read(0, gate, span(ld_gate)?)
+            .read(1, up, span(ld_up)?);
+        outs.attach(op, rows, w)
     }
 
-    /// `x * sigmoid(gate)` (or `x` alone) quantized to q8_1 rows.
+    /// `x * sigmoid(gate)` (or `x` alone), written as q8_1 rows, f32 rows, or both.
     pub(crate) fn gated_quant(
         rows: usize,
         w: usize,
         x: DeviceRange<'b>,
         gate: Option<DeviceRange<'b>>,
-        q8: DeviceRange<'b>,
+        outs: RowOutputs<'b>,
     ) -> Result<Self, EngError> {
         let mut op = Self::new(13, &[rows, w], &[])?.read(0, x, bytes(&[rows, w, 4])?);
         if let Some(gate) = gate {
             op = op.read(1, gate, bytes(&[rows, w, 4])?);
         }
-        Ok(op.write(2, q8, q8_rows(w, rows)?))
+        outs.attach(op, rows, w)
     }
 
     /// Sigmoid router with a selection bias: the top `k` experts and their weights.
@@ -383,6 +380,30 @@ impl<'b> BlockOp<'b> {
     /// Fills `count` f32 values.
     pub(crate) fn fill(count: usize, value: f32, out: DeviceRange<'b>) -> Result<Self, EngError> {
         Ok(Self::new(15, &[count], &[value])?.write(0, out, bytes(&[count, 4])?))
+    }
+}
+
+/// The outputs of the activation rows: q8_1 rows for the quantized matvec, f32 rows for the
+/// batched GEMM, or both. At least one is present.
+pub(crate) struct RowOutputs<'b> {
+    pub(crate) q8: Option<DeviceRange<'b>>,
+    pub(crate) f32: Option<DeviceRange<'b>>,
+}
+
+impl<'b> RowOutputs<'b> {
+    fn attach(self, mut op: BlockOp<'b>, rows: usize, w: usize) -> Result<BlockOp<'b>, EngError> {
+        if self.q8.is_none() && self.f32.is_none() {
+            return Err(EngError::BadRequest(
+                "a block operation needs a q8_1 or an f32 output".into(),
+            ));
+        }
+        if let Some(q8) = self.q8 {
+            op = op.write(2, q8, q8_rows(w, rows)?);
+        }
+        if let Some(y) = self.f32 {
+            op = op.write(3, y, bytes(&[rows, w, 4])?);
+        }
+        Ok(op)
     }
 }
 

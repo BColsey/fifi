@@ -230,24 +230,26 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float *x, const flo
 }
 
 __global__ void __launch_bounds__(256) gated_quant_kernel(const float *x, const float *g,
-                                                          unsigned char *q8, int w) {
+                                                          unsigned char *q8, float *y, int w) {
     const int t = blockIdx.x;
-    unsigned char *qrow = q8 + (size_t)t * q8_row_bytes(w);
+    unsigned char *qrow = q8 == NULL ? NULL : q8 + (size_t)t * q8_row_bytes(w);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     for (int b = warp; b < w / 32; b += warps) {
         const size_t at = (size_t)t * w + (size_t)b * 32 + lane;
         float v = x[at];
         if (g != NULL) v *= sigmoid_f(g[at]);
-        quant_block(qrow + (size_t)b * kQ8Block, v);
+        if (y != NULL) y[at] = v;
+        if (qrow != NULL) quant_block(qrow + (size_t)b * kQ8Block, v);
     }
-    zero_q8_tail(qrow, w);
+    if (qrow != NULL) zero_q8_tail(qrow, w);
 }
 
 __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, const float *up,
-                                                         unsigned char *q8, int w, int ld_gate,
-                                                         int ld_up, float beta, float lb) {
+                                                         unsigned char *q8, float *y, int w,
+                                                         int ld_gate, int ld_up, float beta,
+                                                         float lb) {
     const int t = blockIdx.x;
-    unsigned char *qrow = q8 + (size_t)t * q8_row_bytes(w);
+    unsigned char *qrow = q8 == NULL ? NULL : q8 + (size_t)t * q8_row_bytes(w);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     for (int b = warp; b < w / 32; b += warps) {
         const int i = b * 32 + lane;
@@ -255,9 +257,10 @@ __global__ void __launch_bounds__(256) situ_quant_kernel(const float *gate, cons
         const float u = up[(size_t)t * ld_up + i];
         const float act = tanhf(g / beta) * beta * sigmoid_f(g);
         const float upq = lb > 0.0f ? tanhf(u / lb) * lb : u;
-        quant_block(qrow + (size_t)b * kQ8Block, act * upq);
+        if (y != NULL) y[(size_t)t * w + i] = act * upq;
+        if (qrow != NULL) quant_block(qrow + (size_t)b * kQ8Block, act * upq);
     }
-    zero_q8_tail(qrow, w);
+    if (qrow != NULL) zero_q8_tail(qrow, w);
 }
 
 __global__ void fill_kernel(float *p, int count, float value) {
@@ -843,11 +846,13 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             slots.use(0, ((rows - 1) * ldg + w) * 4, false);
             slots.use(1, ((rows - 1) * ldu + w) * 4, false);
-            slots.use(2, rows * (long long)q8_row_bytes(w), true);
-            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.maybe(2, rows * (long long)q8_row_bytes(w), true);
+            slots.maybe(3, rows * w * 4, true);
+            if (!slots.valid() || (p[2] == NULL && p[3] == NULL))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
             situ_quant_kernel<<<(unsigned)rows, 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (int)w, (int)ldg,
-                (int)ldu, f[0], f[1]);
+                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                (int)w, (int)ldg, (int)ldu, f[0], f[1]);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_GATED_QUANT: {
@@ -856,10 +861,13 @@ extern "C" int inference_cuda_block_ops_launch(const inference_cuda_block_ops_ar
                 return INFERENCE_CUDA_INVALID_ARGUMENT;
             slots.use(0, rows * w * 4, false);
             slots.maybe(1, rows * w * 4, false);
-            slots.use(2, rows * (long long)q8_row_bytes(w), true);
-            if (!slots.valid()) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            slots.maybe(2, rows * (long long)q8_row_bytes(w), true);
+            slots.maybe(3, rows * w * 4, true);
+            if (!slots.valid() || (p[2] == NULL && p[3] == NULL))
+                return INFERENCE_CUDA_INVALID_ARGUMENT;
             gated_quant_kernel<<<(unsigned)rows, 256, 0, s>>>(
-                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (int)w);
+                (const float *)p[0], (const float *)p[1], (unsigned char *)p[2], (float *)p[3],
+                (int)w);
             return launch_status(out_stage);
         }
         case INFERENCE_CUDA_BLOCK_OP_MOE_ROUTE: {
