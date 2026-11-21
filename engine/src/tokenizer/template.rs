@@ -163,7 +163,7 @@ impl ChatTemplate {
 }
 
 /// Training-oriented chat templates mark the assistant span with `{% generation %}` and
-/// `{% endgeneration %}`, a Hugging Face extension that renders nothing. The tags become an
+/// `{% endgeneration %}`, a tag outside the base template language that renders nothing. The tags become an
 /// always-true `if` block so the dash and whitespace controls of the tag keep their effect.
 fn without_generation_tags(source: &str) -> String {
     let mut out = String::with_capacity(source.len());

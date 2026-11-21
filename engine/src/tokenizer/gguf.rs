@@ -985,8 +985,8 @@ pub(crate) mod tests {
         assert_eq!(got, want);
     }
 
-    /// The ids of an independent tokenizer (`llama-tokenize --no-bos --no-escape` on the same GGUF)
-    /// over nine texts, kept in `testdata/gguf-tokenizer/oracle.json`; `env` names the GGUF.
+    /// The ids of an independent tokenizer (run on the same GGUF with no BOS token and no escape
+    /// processing) over nine texts, kept in `testdata/gguf-tokenizer/oracle.json`; `env` names the GGUF.
     /// Also checks the derived stop ids against the end-marker ids of the checkpoint.
     fn check_oracle(model: &str, env: &str, stop: &[u32]) {
         let path = std::env::var(env).unwrap_or_else(|_| panic!("{env} names the GGUF file"));
