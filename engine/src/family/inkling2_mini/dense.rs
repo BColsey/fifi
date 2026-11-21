@@ -6,6 +6,8 @@ use half::bf16;
 
 const PARALLEL_BF16_ROWS: usize = 100_000;
 const MAX_BF16_WORKERS: usize = 4;
+const ATTN_WORKERS_ENV: &str = "FIFI_INKLING_ATTN_CPU_WORKERS";
+const QKV_WEIGHTS: [&str; 3] = ["wq_du.weight", "wk_dv.weight", "wv_dv.weight"];
 use safetensors::{Dtype, tensor::TensorInfo};
 
 use super::{
@@ -107,6 +109,7 @@ struct SafetensorDense {
     len: u64,
     data_start: u64,
     entries: BTreeMap<String, DenseEntry>,
+    attention_workers: usize,
 }
 
 struct DenseEntry {
@@ -159,11 +162,17 @@ impl SafetensorDense {
         } else {
             DenseShard::Buffered(shard)
         };
+        let attention_workers = if std::env::var_os(ATTN_WORKERS_ENV).is_some_and(|v| v == "4") {
+            bf16_worker_limit()
+        } else {
+            1
+        };
         Ok(Self {
             shard,
             len,
             data_start,
             entries,
+            attention_workers,
         })
     }
 
@@ -234,25 +243,30 @@ impl SafetensorDense {
         let row_size = width * (entry.info.dtype.bitsize() / 8);
         let selected = row_range(&entry.info, rows);
         self.with_bytes(name, entry, selected, true, |resident| {
-            if entry.info.dtype == Dtype::BF16 && resident.len() / row_size >= PARALLEL_BF16_ROWS {
-                let workers = std::thread::available_parallelism()
-                    .map_or(1, |count| count.get().min(MAX_BF16_WORKERS));
-                if workers > 1 {
-                    return parallel_bf16_rows(resident, input, workers);
+            match entry.info.dtype {
+                Dtype::BF16 => {
+                    let workers = if resident.len() / row_size >= PARALLEL_BF16_ROWS {
+                        bf16_worker_limit()
+                    } else if is_attention_qkv(name) {
+                        self.attention_workers
+                    } else {
+                        1
+                    };
+                    bf16_rows(resident, input, workers)
                 }
-            }
-            let project = |row: &[u8]| match entry.info.dtype {
-                Dtype::BF16 => dot_bf16(row, input),
-                Dtype::F32 => row
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(input)
-                    .map(|(&word, &value)| f32::from_le_bytes(word) * value)
-                    .sum(),
+                Dtype::F32 => resident
+                    .chunks_exact(row_size)
+                    .map(|row| {
+                        row.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(input)
+                            .map(|(&word, &value)| f32::from_le_bytes(word) * value)
+                            .sum()
+                    })
+                    .collect(),
                 _ => unreachable!("only BF16 and F32 dense tensors are loaded"),
-            };
-            resident.chunks_exact(row_size).map(project).collect()
+            }
         })
     }
 
@@ -349,6 +363,27 @@ impl SafetensorDense {
     }
 }
 
+fn bf16_worker_limit() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get().min(MAX_BF16_WORKERS))
+}
+
+fn is_attention_qkv(name: &str) -> bool {
+    name.starts_with("model.llm.layers.")
+        && name
+            .rsplit_once(".attn.")
+            .is_some_and(|(_, projection)| QKV_WEIGHTS.contains(&projection))
+}
+
+fn bf16_rows(weights: &[u8], input: &[f32], workers: usize) -> Vec<f32> {
+    if workers == 1 {
+        return weights
+            .chunks_exact(input.len() * 2)
+            .map(|row| dot_bf16(row, input))
+            .collect();
+    }
+    parallel_bf16_rows(weights, input, workers)
+}
+
 // Split the resident BF16 rows without repacking or replicating the output matrix.
 fn parallel_bf16_rows(weights: &[u8], input: &[f32], workers: usize) -> Vec<f32> {
     let row_bytes = input.len() * 2;
@@ -440,6 +475,14 @@ fn dot_bf16(weights: &[u8], input: &[f32]) -> f32 {
     }
 }
 
+#[cfg(all(
+    test,
+    feature = "native-mlx",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+mod projection_bench;
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -468,6 +511,23 @@ mod tests {
     }
 
     #[test]
+    fn only_publisher_attention_qkv_projections_use_the_attention_worker_setting() {
+        for projection in QKV_WEIGHTS {
+            assert!(is_attention_qkv(&format!(
+                "model.llm.layers.5.attn.{projection}"
+            )));
+        }
+        for name in [
+            "model.llm.layers.5.attn.wo_ud.weight",
+            "model.llm.layers.5.mlp.gate.weight",
+            "model.llm.unembed.weight",
+            "blk.5.attn_q.weight",
+        ] {
+            assert!(!is_attention_qkv(name), "{name}");
+        }
+    }
+
+    #[test]
     fn dense_row_reads_and_bf16_projection_keep_packed_weights() {
         let mut shard = tempfile::tempfile().unwrap();
         let first = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
@@ -483,6 +543,7 @@ mod tests {
             shard: DenseShard::Buffered(shard),
             len: 11 + bytes.len() as u64,
             data_start: 11,
+            attention_workers: 1,
             entries: BTreeMap::from([(
                 "matrix".into(),
                 DenseEntry {
@@ -526,6 +587,7 @@ mod tests {
             shard: DenseShard::Mapped(mapped),
             len,
             data_start: 11,
+            attention_workers: 1,
             entries: BTreeMap::from([(
                 "matrix".into(),
                 DenseEntry {
