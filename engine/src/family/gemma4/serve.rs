@@ -102,10 +102,11 @@ mod device {
     use super::super::budget;
     use super::super::config::MaxSeqs;
     use super::super::kv_tier::{self, BoltDisk};
-    use super::super::resident::bolt::{self, Bolt, BoltSeq, BoltSnapshot, CELLS, VOCAB};
+    use super::super::resident::bolt::{self, Bolt, BoltSeq, BoltSnapshot, VOCAB};
     use crate::{
         EngError,
         family::{
+            engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             flash_next::factory::StartedEngine,
             kv_disk::{self as kv_cache, KV_CACHE_DEFAULT_ON, KvCacheSettings},
@@ -237,7 +238,7 @@ mod device {
             };
             let per_session = cost
                 .per_position
-                .saturating_mul(CELLS as u64)
+                .saturating_mul(self.model.cells() as u64)
                 .saturating_add(cost.fixed)
                 .saturating_add(budget::BOLT_HEADROOM_BYTES);
             self.model
@@ -290,7 +291,7 @@ mod device {
         }
 
         fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
-            crate::family::session::check_prompt(prompt_tokens, CELLS)
+            crate::family::session::check_prompt(prompt_tokens, self.model.cells())
         }
 
         /// The store's explicit one-tip shape, so the worker's save-point
@@ -300,6 +301,7 @@ mod device {
         }
 
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
+            let cells = self.model.cells();
             st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
@@ -307,7 +309,7 @@ mod device {
                     pos: &mut st.pos,
                 },
                 toks,
-                CELLS,
+                cells,
             )
         }
 
@@ -319,7 +321,7 @@ mod device {
             let limits = Limits {
                 eos: &self.eos,
                 sampler_vocab: VOCAB,
-                context_limit: CELLS,
+                context_limit: self.model.cells(),
             };
             st.core.decode(
                 &mut Step {
@@ -370,9 +372,13 @@ mod device {
             let model = &self.model;
             // The host store missed or holds a shorter prefix: the disk may hold a longer one.
             if let Some(disk) = self.disk.as_mut() {
-                disk.promote(&mut self.prefix, &identity, prompt, &|cells| {
-                    model.snapshot_layer_bytes(cells)
-                });
+                disk.promote(
+                    &mut self.prefix,
+                    &identity,
+                    prompt,
+                    model.cells(),
+                    &|cells| model.snapshot_layer_bytes(cells),
+                );
             }
             let BoltSession { core, pos, seq } = st;
             let covered = core.restore_prefix(&mut self.prefix, prompt, identity, |saved| {
@@ -457,6 +463,7 @@ mod device {
             session: &'a mut BoltSession,
         ) -> (&'a mut DecodeSession, Step<'a>, Limits<'a>) {
             let BoltSession { core, pos, seq } = session;
+            let cells = self.model.cells();
             (
                 core,
                 Step {
@@ -467,15 +474,16 @@ mod device {
                 Limits {
                     eos: &self.eos,
                     sampler_vocab: VOCAB,
-                    context_limit: CELLS,
+                    context_limit: cells,
                 },
             )
         }
 
         fn check_row(&self, session: &BoltSession, token: u32) -> Result<(), EngError> {
-            if session.pos >= CELLS {
+            let cells = self.model.cells();
+            if session.pos >= cells {
                 return Err(EngError::ContextLimit(format!(
-                    "position {} reaches the {CELLS} cell context",
+                    "position {} reaches the {cells} cell context",
                     session.pos
                 )));
             }
@@ -523,7 +531,7 @@ mod device {
             headroom: budget::BOLT_HEADROOM_BYTES,
             cost: budget::bolt_seq_cost()
                 .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
-            context: CELLS as u64,
+            context: model.cells() as u64,
             row_cap: Bolt::PREFILL_BATCH,
             ceiling: Bolt::PREFILL_BATCH,
         };
@@ -568,8 +576,16 @@ mod device {
                 "the tokenizer vocabulary differs from the checkpoint vocabulary",
             ));
         }
+        // The engine thread plans the KV cells from the free card and announces them before the
+        // weights are uploaded; the server's request bound needs the figure before the engine is
+        // ready.
+        let (announce, resolved) = std::sync::mpsc::sync_channel::<Announcement<usize>>(1);
         let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
-            let mut model = bolt::load_choosing(&files, None)?;
+            let loaded = bolt::load_choosing(&files, None, &|cells| {
+                let _ = announce.try_send(Ok(cells));
+            });
+            announce_failure(&loaded, Some(&announce));
+            let mut model = loaded?;
             let first = model.new_seq()?;
             let ask = budget::session_ask(seqs, model.graph_mode.active());
             if let Some(note) = &ask.note {
@@ -642,10 +658,12 @@ mod device {
                 },
             ))
         })?;
+        let cells = await_announced(&resolved, "Bolt", || engine.handle().failure())?;
         Ok(StartedEngine {
             engine,
             bundle,
-            context_limit: u32::try_from(CELLS).expect("cells fit u32"),
+            context_limit: u32::try_from(cells)
+                .map_err(|_| EngError::MemoryPlan("the Bolt cell count exceeds u32".into()))?,
         })
     }
 

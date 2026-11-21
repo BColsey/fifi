@@ -15,8 +15,8 @@
 //! projection and the logit softcap.
 //!
 //! Limits:
-//! - The cache holds 32,768 cells per physical layer, half the model's 65,536
-//!   maximum positions; widening is a constant change.
+//! - The cache holds the planned number of cells per physical layer (up to the model's 65,536
+//!   maximum positions), chosen from the free card at load.
 //! - Prefill runs bounded batches through the batched step.
 //! - The per-head RMSNorm runs one batched launch across heads.
 //! - Shared layers rotate one scratch k row, because the rope kernel requires
@@ -82,8 +82,13 @@ pub(crate) const GLOBAL_HEAD: usize = NEMOTRON_BOLT_E4B.global_head_dim as usize
 /// Width of one per-layer input and of the gated mixing inside every layer.
 pub(crate) const PLE: usize = 256;
 pub(crate) const FFN: usize = 10_240;
-/// KV cells per physical layer: half the model's 65,536 maximum positions.
-pub(crate) const CELLS: usize = 32_768;
+/// The model's maximum positions: the ceiling of the planned KV cells per physical layer.
+pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
+    Some(dense) => dense.context_limit as usize,
+    None => 0,
+};
+/// The cell count a refusal is worded for when the card carries no planned count.
+const FALLBACK_CELLS: usize = 32_768;
 pub(crate) const LOCAL_WINDOW: usize = NEMOTRON_BOLT_E4B.sliding_window as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 /// The identity and mixing scales applied to the per-layer inputs.
@@ -362,6 +367,8 @@ pub(crate) struct Scratch {
 }
 
 pub(crate) struct Bolt {
+    /// KV cells per physical layer: the planned context of this load.
+    cells: usize,
     /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
     /// FIRST so it drops first: fields drop in declaration order, and the
     /// graph must be destroyed before any buffer whose address it baked (a
@@ -401,14 +408,15 @@ fn embed_scale() -> f32 {
 }
 
 /// The device demand of a Bolt load: the weights file bytes, the KV8 cache of
-/// the physical layers at `CELLS` positions, the prefill scratch, and the
+/// the physical layers at `cells` positions, the prefill scratch, and the
 /// shared headroom reserve. Pure arithmetic, so the admission refusal is
 /// testable on the host without a device.
 pub(crate) fn bolt_demand(
     weights_bytes: u64,
     attn_split_armed: bool,
+    cells: usize,
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
-    let kv = super::super::budget::bolt_kv_plan(CELLS as u64)
+    let kv = super::super::budget::bolt_kv_plan(cells as u64)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
     let kv_bytes = kv
         .positions
@@ -424,6 +432,52 @@ pub(crate) fn bolt_demand(
     })
 }
 
+/// The KV cells per physical layer a card carries beside `weights_bytes`: the largest count up to
+/// the model maximum whose cache, scratch and headroom fit `free` (the shared card-fit rule, one
+/// cache form). `None` when not even the smallest count fits.
+pub(crate) fn plan_cells(
+    free: u64,
+    weights_bytes: u64,
+    attn_split_armed: bool,
+) -> Result<Option<usize>, EngError> {
+    use crate::family::card_fit::{CacheForm, CardBytes, ContextLimits, plan_card_fit};
+
+    let per_position = super::super::budget::bolt_kv_bytes_per_position()
+        .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
+    let scratch = scratch_bytes(attn_split_armed)
+        .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
+    let charge = |cells: u32| {
+        u64::from(cells)
+            .checked_mul(per_position)?
+            .checked_add(scratch)?
+            .checked_add(super::super::budget::BOLT_HEADROOM_BYTES)
+    };
+    let ceiling = u32::try_from(MAX_CELLS)
+        .map_err(|_| EngError::MemoryPlan("the Bolt model maximum exceeds u32".into()))?;
+    Ok(plan_card_fit(
+        CardBytes {
+            free,
+            weights: weights_bytes,
+            band: 0,
+        },
+        &[CacheForm {
+            form: (),
+            charge: &charge,
+        }],
+        ContextLimits {
+            ceiling,
+            sufficient: ceiling,
+        },
+    )
+    .map(|fit| fit.context as usize))
+}
+
+/// The cells a load of `weights_bytes` serves: the planned count, or the figure a refusal is
+/// worded for when the card carries none.
+fn cells_for(free: u64, weights_bytes: u64, split: bool) -> Result<usize, EngError> {
+    Ok(plan_cells(free, weights_bytes, split)?.unwrap_or(FALLBACK_CELLS))
+}
+
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Bolt, EngError> {
     let bytes = std::fs::metadata(path)
         .map_err(|error| EngError::MemoryPlan(format!("the Bolt weights file: {error}")))?
@@ -434,14 +488,17 @@ pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Resul
             bytes,
         }],
         header_sha256,
+        &|_| {},
     )
 }
 
 /// Loads the first of `files` (highest precision first) whose device demand the free memory
-/// admits, and prints which file it chose and why when there was a choice.
+/// admits, and prints which file it chose and why when there was a choice. `planned` is told the
+/// KV cells the load serves as soon as they are known, before any weight is uploaded.
 pub(crate) fn load_choosing(
     files: &[crate::family::gguf_select::GgufFile],
     header_sha256: Option<&str>,
+    planned: &dyn Fn(usize),
 ) -> Result<Bolt, EngError> {
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;
     let stream = ctx.stream()?;
@@ -452,7 +509,8 @@ pub(crate) fn load_choosing(
     let free = ctx.memory_info()?.free as u64;
     let split = attn_split_wanted()?;
     let choice = crate::family::gguf_select::choose(files, &|file| {
-        bolt_demand(file.bytes, split)
+        cells_for(free, file.bytes, split)
+            .and_then(|cells| bolt_demand(file.bytes, split, cells))
             .and_then(|demand| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
@@ -467,8 +525,15 @@ pub(crate) fn load_choosing(
             .map_err(|error| EngError::Checkpoint(format!("prefix identity: {error}")))?,
     )
     .to_string();
-    let demand = bolt_demand(choice.chosen.bytes, split)?;
+    let cells = cells_for(free, choice.chosen.bytes, split)?;
+    let demand = bolt_demand(choice.chosen.bytes, split, cells)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
+    planned(cells);
+    eprintln!(
+        "bolt cuda: {cells} KV cells per layer chosen from the card ({free} bytes free, {} bytes \
+         of weights; the model maximum is {MAX_CELLS})",
+        choice.chosen.bytes
+    );
     let mut layers = Vec::with_capacity(LAYERS);
     // The canonical spelling's merged per_layer_token_embd is read once and
     // sliced per layer below; the legacy spelling reads each layer's own
@@ -692,6 +757,7 @@ pub(crate) fn load_choosing(
     let logits = vector_filled(&ctx, VOCAB, 0.0)?;
     let logits_capped = vector_filled(&ctx, VOCAB, 0.0)?;
     Ok(Bolt {
+        cells,
         ctx,
         stream,
         layers,
@@ -715,8 +781,13 @@ pub(crate) fn load_choosing(
 impl Bolt {
     pub(crate) const PREFILL_BATCH: usize = 8;
 
+    /// The KV cells per physical layer this load serves.
+    pub(crate) fn cells(&self) -> usize {
+        self.cells
+    }
+
     /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical
-    /// layers at `CELLS` positions and its two position words. The planes are read only below
+    /// layers at `cells` positions and its two position words. The planes are read only below
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
         // One zero chunk on the device, copied down every plane: the planes are cleared at
@@ -733,6 +804,7 @@ impl Bolt {
 
     fn build_seq(&self, zeros: &DeviceBuffer) -> Result<BoltSeq, EngError> {
         let ctx = &self.ctx;
+        let cells = self.cells;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
             let mut at = 0;
@@ -748,15 +820,15 @@ impl Bolt {
             let head = layer.head;
             kv.push(if layer.physical() {
                 Some(Kv {
-                    k_codes: plane(KV_HEADS * CELLS * head)?,
-                    k_scales: plane(KV_HEADS * CELLS * (head / 32) * 2)?,
-                    v_codes: plane(KV_HEADS * CELLS * head)?,
-                    v_scales: plane(KV_HEADS * CELLS * (head / 32) * 2)?,
+                    k_codes: plane(KV_HEADS * cells * head)?,
+                    k_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
+                    v_codes: plane(KV_HEADS * cells * head)?,
+                    v_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
                     shape: Kv8Shape {
                         rows: 1,
                         n_kv_head: KV_HEADS,
                         head_dim: head,
-                        cells: CELLS,
+                        cells,
                         code_scale: Kv8CodeScale::UnroundedF32,
                     },
                 })
@@ -775,13 +847,13 @@ impl Bolt {
     /// The `(offset, bytes)` ranges of the cells `0..fed` of every plane of one layer's cache, in
     /// the order a snapshot stores them. Cells are laid out `[kv head][cell][unit]`, so the cells
     /// of one head are contiguous from the head's base.
-    fn snapshot_ranges(head: usize, fed: usize) -> [[(usize, usize); KV_HEADS]; 4] {
+    fn snapshot_ranges(head: usize, fed: usize, cells: usize) -> [[(usize, usize); KV_HEADS]; 4] {
         let codes = head;
         let scales = (head / 32) * 2;
         let plane = |unit: usize| {
             let mut ranges = [(0, 0); KV_HEADS];
             for (kv_head, range) in ranges.iter_mut().enumerate() {
-                *range = (kv_head * CELLS * unit, fed * unit);
+                *range = (kv_head * cells * unit, fed * unit);
             }
             ranges
         };
@@ -795,7 +867,7 @@ impl Bolt {
             .iter()
             .filter(|layer| layer.physical())
             .map(|layer| {
-                Self::snapshot_ranges(layer.head, fed)
+                Self::snapshot_ranges(layer.head, fed, self.cells)
                     .iter()
                     .map(|plane| plane.iter().map(|range| range.1).sum::<usize>())
                     .sum()
@@ -805,11 +877,11 @@ impl Bolt {
 
     /// Copies the cells `0..fed` of every plane of `seq` into host memory. The copy is what a
     /// later request restores into any sequence, so it holds at most one sequence's cache
-    /// (`CELLS` positions) and is allocated only for the cells it covers; a host whose available
+    /// (`cells` positions) and is allocated only for the cells it covers; a host whose available
     /// memory (less the OS floor) cannot hold it refuses with a memory-plan error and nothing
     /// is stored.
     pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
-        if fed > CELLS {
+        if fed > self.cells {
             return Err(EngError::ContextLimit(
                 "the Bolt snapshot exceeds the context".to_owned(),
             ));
@@ -817,7 +889,7 @@ impl Bolt {
         let mut total = 0usize;
         for (layer, planes) in self.layers.iter().zip(&seq.kv) {
             if planes.is_some() {
-                for plane in Self::snapshot_ranges(layer.head, fed) {
+                for plane in Self::snapshot_ranges(layer.head, fed, self.cells) {
                     total += plane.iter().map(|range| range.1).sum::<usize>();
                 }
             }
@@ -845,7 +917,7 @@ impl Bolt {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
             for (buffer, ranges) in buffers
                 .into_iter()
-                .zip(Self::snapshot_ranges(layer.head, fed))
+                .zip(Self::snapshot_ranges(layer.head, fed, self.cells))
             {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
@@ -869,9 +941,10 @@ impl Bolt {
         for (layer, planes) in self.layers.iter().zip(&seq.kv) {
             let Some(kv) = planes else { continue };
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
-            for (buffer, ranges) in buffers
-                .into_iter()
-                .zip(Self::snapshot_ranges(layer.head, snapshot.fed))
+            for (buffer, ranges) in
+                buffers
+                    .into_iter()
+                    .zip(Self::snapshot_ranges(layer.head, snapshot.fed, self.cells))
             {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
@@ -933,7 +1006,7 @@ impl Bolt {
                 "the Bolt window buffers are not reserved for this many rows".to_owned(),
             ));
         }
-        if positions.iter().any(|&pos| pos >= CELLS) {
+        if positions.iter().any(|&pos| pos >= self.cells) {
             return Err(EngError::ContextLimit(
                 "the Bolt decode window exceeds the context".to_owned(),
             ));
@@ -1051,7 +1124,10 @@ impl Bolt {
                 "a Bolt prefill batch needs 1 to 8 tokens".to_owned(),
             ));
         }
-        if pos.checked_add(tokens.len()).is_none_or(|end| end > CELLS) {
+        if pos
+            .checked_add(tokens.len())
+            .is_none_or(|end| end > self.cells)
+        {
             return Err(EngError::ContextLimit(
                 "the Bolt prefill batch exceeds the context".to_owned(),
             ));
@@ -1179,7 +1255,7 @@ impl Bolt {
         logits: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
-        if pos.checked_add(m).is_none_or(|end| end > CELLS) {
+        if pos.checked_add(m).is_none_or(|end| end > self.cells) {
             return Err(EngError::ContextLimit(
                 "the Bolt decode step exceeds the context".to_owned(),
             ));
@@ -1594,7 +1670,7 @@ impl Bolt {
                         n_q_head: HEADS,
                         n_kv_head: KV_HEADS,
                         head_dim: head,
-                        cells: CELLS,
+                        cells: self.cells,
                         window: if layer.global { 0 } else { LOCAL_WINDOW },
                         scale: 1.0,
                         split: attn_split,
@@ -2050,7 +2126,7 @@ mod tests {
         // no room for the headroom reserve must be refused by the shared admit;
         // the same demand fits once the reserve is included.
         let weights_bytes = 3_000_000_000u64;
-        let demand = bolt_demand(weights_bytes, true).expect("the Bolt demand computes");
+        let demand = bolt_demand(weights_bytes, true, 32_768).expect("the Bolt demand computes");
         assert_eq!(demand.tensors, weights_bytes);
         assert!(demand.kv_cache > 0 && demand.work > 0 && demand.headroom > 0);
         let allocations = demand.tensors + demand.kv_cache + demand.work;
@@ -2111,6 +2187,36 @@ mod tests {
         );
         // Both probes failing: the save proceeds, as the other stores' saves do.
         assert!(admit_snapshot(one_gib, Err(refusal)).is_ok());
+    }
+
+    #[test]
+    fn the_planned_cells_are_the_largest_count_the_card_carries() {
+        let weights = 7_578_800_000u64;
+        let free_for = |cells: usize| {
+            let demand = bolt_demand(weights, true, cells).expect("demand");
+            demand.tensors + demand.kv_cache + demand.work + demand.headroom
+        };
+        // A 3090-sized card holds the model maximum.
+        assert_eq!(
+            plan_cells(22_000_000_000, weights, true).expect("plan"),
+            Some(MAX_CELLS)
+        );
+        // A card that carries 40,960 cells and not one step more gets exactly those.
+        let free = free_for(40_960);
+        assert_eq!(plan_cells(free, weights, true).expect("plan"), Some(40_960));
+        assert_eq!(
+            plan_cells(free - 1, weights, true).expect("plan"),
+            Some(39_936)
+        );
+        // The count the plan returns passes the shared admission, and a card short of the
+        // smallest count plans none.
+        let demand = bolt_demand(weights, true, 40_960).expect("demand");
+        assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
+        assert_eq!(
+            plan_cells(free_for(1024) - 1, weights, true).expect("plan"),
+            None
+        );
+        assert_eq!(MAX_CELLS, 65_536);
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
@@ -2460,7 +2566,7 @@ mod tests {
             Err(EngError::BadRequest(_))
         ));
         assert!(matches!(
-            model.prefill_batch(&seq, &[2], CELLS, false),
+            model.prefill_batch(&seq, &[2], model.cells(), false),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(
@@ -2469,11 +2575,11 @@ mod tests {
         ));
         // Decode bounds its position like prefill: the last valid cell is one below the cap.
         assert!(matches!(
-            model.decode(&seq, 2, CELLS),
+            model.decode(&seq, 2, model.cells()),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(
-            model.decode_hidden(&seq, 2, CELLS),
+            model.decode_hidden(&seq, 2, model.cells()),
             Err(EngError::ContextLimit(_))
         ));
         assert!(matches!(

@@ -4,7 +4,7 @@
 //! reads a hit back into a host copy that the store then holds as an ordinary entry. The family
 //! supplies the layout (one object per physical layer), its identity and its store; the policy
 //! (when to write, how long a stop may wait, how a damaged entry falls back) is the tier's.
-use super::resident::bolt::{BoltSnapshot, CELLS};
+use super::resident::bolt::BoltSnapshot;
 use crate::{
     EngError,
     family::{
@@ -232,11 +232,12 @@ impl BoltDisk {
         store: &mut Store,
         identity: &PrefixIdentity,
         prompt: &[u32],
+        context_cells: usize,
         layer_bytes: LayerBytes<'_>,
     ) {
         self.tier.hit = None;
         retry_while_removed(PROMOTE_ATTEMPTS, || {
-            self.promote_once(store, identity, prompt, layer_bytes)
+            self.promote_once(store, identity, prompt, context_cells, layer_bytes)
         });
     }
 
@@ -247,6 +248,7 @@ impl BoltDisk {
         store: &mut Store,
         identity: &PrefixIdentity,
         prompt: &[u32],
+        context_cells: usize,
         layer_bytes: LayerBytes<'_>,
     ) -> bool {
         let tier = &mut self.tier;
@@ -261,9 +263,9 @@ impl BoltDisk {
         }
         let began = Instant::now();
         let cells = candidate.key_len - 1;
-        if cells > CELLS {
+        if cells > context_cells {
             eprintln!(
-                "{TIER_LABEL}: kv disk entry of {cells} positions does not fit the {CELLS} position context"
+                "{TIER_LABEL}: kv disk entry of {cells} positions does not fit the {context_cells} position context"
             );
             return false;
         }
