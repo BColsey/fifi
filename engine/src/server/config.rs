@@ -340,7 +340,7 @@ impl Config {
                 )
             {
                 return Err(StartupError(format!(
-                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY}, {INKLING_FAMILY} and {RAON1_FAMILY} families take"
+                    "engines[{index}] sets context_limit, which only the {FAKE_FAMILY} family and the {INKLING_FAMILY} family take"
                 )));
             }
             if engine.family == INKLING_FAMILY {

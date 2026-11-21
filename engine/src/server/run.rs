@@ -411,8 +411,7 @@ pub(crate) fn start_one(
                 config.id,
                 describe(&error)
             ))
-        })?
-    {
+        })? {
         (
             LoadedDefaults {
                 values,

@@ -164,6 +164,53 @@ pub(crate) fn f16_roundtrip(v: f32) -> f32 {
     half::f16::from_f32(v).to_f32()
 }
 
+/// How the host reference rounds an activation before a quantized dot.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationRule {
+    /// The fork's CPU rule: Q8_K blocks of 256 for the K-quants, Q8_0 blocks of 32 for the plain
+    /// quants.
+    ForkCpu,
+    /// The device rule: blocks of 32 for every quantized weight, scale `amax / 127` stored as
+    /// f16, codes rounded from the unrounded scale.
+    Q8_1Blocks,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_RULE: std::cell::Cell<ActivationRule> =
+        const { std::cell::Cell::new(ActivationRule::ForkCpu) };
+}
+
+/// Runs `f` with the host reference rounding activations by `rule` on this thread.
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) fn with_activation_rule<R>(rule: ActivationRule, f: impl FnOnce() -> R) -> R {
+    let previous = ACTIVATION_RULE.with(|cell| cell.replace(rule));
+    let result = f();
+    ACTIVATION_RULE.with(|cell| cell.set(previous));
+    result
+}
+
+/// The device activation rounding: per block of 32, `d = amax / 127`, `q = round(x / d)`, the
+/// value read back as `q * f16(d)`.
+#[cfg(test)]
+fn quantize_q8_1_blocks(x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len() % 32, 0, "blocks of 32 need whole blocks");
+    let mut out = x.to_vec();
+    for blk in out.as_chunks_mut::<32>().0 {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if amax == 0.0 {
+            continue;
+        }
+        let d = amax / 127.0;
+        let stored = f16_roundtrip(d);
+        for v in blk.iter_mut() {
+            *v = stored * (*v / d).round();
+        }
+    }
+    out
+}
+
 /// Roundtrip-quantizes one contraction-length activation column the way the
 /// fork's CPU mul_mat does before a quantized dot: Q8_K blocks of 256 for the
 /// K-quants, Q8_0 blocks of 32 for the plain quants, an F16 roundtrip for F16
@@ -172,6 +219,12 @@ pub(crate) fn f16_roundtrip(v: f32) -> f32 {
 /// its detail that the codes use the reciprocal of the unrounded scale while
 /// the stored (f16-rounded) scale dequantizes them.
 fn quantize_activation_column(ty: GgufType, x: &[f32]) -> Vec<f32> {
+    #[cfg(test)]
+    if ACTIVATION_RULE.with(std::cell::Cell::get) == ActivationRule::Q8_1Blocks
+        && !matches!(ty, GgufType::F16 | GgufType::F32)
+    {
+        return quantize_q8_1_blocks(x);
+    }
     let mut out = match ty {
         GgufType::F16 => x.iter().map(|&v| f16_roundtrip(v)).collect(),
         _ => x.to_vec(),

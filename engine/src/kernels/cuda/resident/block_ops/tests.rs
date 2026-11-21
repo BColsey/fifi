@@ -236,6 +236,7 @@ fn f16_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 #[test]
+#[allow(clippy::needless_range_loop)]
 fn the_mixed_residual_read_apply_and_mean_match_the_host() {
     let Some(r) = rig("block_ops hc") else { return };
     let (h, hc, mix) = (64usize, 4usize, 17usize);

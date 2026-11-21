@@ -203,11 +203,6 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     } else {
         select_weight_format(has_gguf, has_safetensors)
     };
-    if family == RAON1_FAMILY && args.kv_dtype.is_some() {
-        return Err(StartupError(format!(
-            "serve --model: --kv is not an option of the {family} family"
-        )));
-    }
 
     let qwen36 = uses_qwen36_options(&family).then(|| Q36Options {
         // An MLX pack has no weight format member: the MLX arm reads the safetensors shards as
@@ -703,7 +698,10 @@ fn refuse_non_qwen36_flags(family: &str, args: &ModelServeArgs) -> Result<(), St
     }
     for (flag, given) in [
         ("--kv", args.kv_dtype.is_some()),
-        ("--context", args.context_limit.is_some()),
+        (
+            "--context",
+            args.context_limit.is_some() && family != RAON1_FAMILY,
+        ),
     ] {
         if given {
             let hint = if family == sensenova::FAMILY {
@@ -1200,13 +1198,16 @@ mod tests {
     }
 
     #[test]
-    fn flint_is_explicitly_not_simplified_yet() {
+    fn flint_is_named_by_family_and_starts_from_a_bare_entry() {
         let dir = model_dir(Some("qwen3_5_moe"), true, false);
         let mut args = args_for(dir.path());
         args.family = Some("flint".to_string());
-        let error = discover(&args).unwrap_err();
-        assert!(error.0.contains("no simplified startup"), "{}", error.0);
-        assert!(error.0.contains("--config"), "{}", error.0);
+        let discovered = discover(&args).expect("flint is a family of the shared table");
+        assert_eq!(discovered.family, "flint");
+        assert!(!super::uses_qwen36_options(&discovered.family));
+        let config = super::config_from(&discovered, &args);
+        assert_eq!(config.engines[0].family, "flint");
+        assert!(config.engines[0].qwen36.is_none(), "a bare entry");
     }
 
     #[test]
@@ -1408,7 +1409,9 @@ mod tests {
 
     #[test]
     fn an_architecture_outside_the_table_is_refused_naming_it_and_the_known_ones() {
-        for architecture in ["mamba9", "flint", "qwen4exp", "nemotron_h_moe", "raon1"] {
+        // flint and raon1 are in the shared table now; qwen4exp and nemotron_h_moe refuse
+        // with their note, which still names them and the known architectures.
+        for architecture in ["mamba9", "qwen4exp", "nemotron_h_moe"] {
             let dir = directory_of_architecture(architecture);
             let error = discover(&args_for(dir.path())).unwrap_err().0;
             assert!(error.contains(architecture), "{error}");
@@ -1454,8 +1457,13 @@ mod tests {
             assert_eq!(again.engines[0].family, *family);
             let mut with_flag = args_for(dir.path());
             with_flag.context_limit = Some(4096);
-            let error = discover(&with_flag).unwrap_err().0;
-            assert!(error.contains("--context is not an option"), "{error}");
+            // raon1 takes --context; every other bare family refuses it.
+            if *family == super::RAON1_FAMILY {
+                assert!(discover(&with_flag).is_ok(), "{architecture}: --context");
+            } else {
+                let error = discover(&with_flag).unwrap_err().0;
+                assert!(error.contains("--context is not an option"), "{error}");
+            }
         }
     }
 
@@ -1508,7 +1516,6 @@ mod tests {
     fn a_refused_architecture_is_named_with_its_reason_when_there_is_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         for (architecture, reason) in [
-            ("raon1", "CUDA serving is not on main"),
             ("clip", "vision projector"),
             ("dflash", "draft model"),
             ("qwen4exp", "quantization kernels"),
@@ -1791,5 +1798,6 @@ mod tests {
         let mut args = args_for(dir.path());
         args.kv_dtype = Some("q8".to_string());
         let error = discover(&args).unwrap_err();
-        assert!(error.0.contains("--kv is not an option"), "{}", error.0);    }
+        assert!(error.0.contains("--kv is not an option"), "{}", error.0);
+    }
 }

@@ -19,6 +19,7 @@ use std::path::Path;
 use super::reference::{Hyper, hyper};
 use super::{RAON_1_MINI_PREVIEW, Raon1Model, Raon1Spec, RaonKind, open_raon_1_mini_preview};
 use crate::EngError;
+use crate::family::mem::DEVICE;
 use crate::family::project::cuda::{
     BorrowedLoader, CudaWeight, CudaWeights, LoadOptions, Reserve, WeightLayout, served_admission,
 };
@@ -73,15 +74,18 @@ const TIME_RANK: usize = SPEC.time_step_rank as usize;
 const CONV_TAPS: usize = SPEC.conv_kernel as usize - 1;
 // The row operations fix these widths: a spec outside them does not build.
 const _: () = assert!(
-    HEAD_DIM == 128 && RANK == 512 && ROPE == 64 && Q_NOPE == 128 && STREAMS == 4 && HEADS % 8 == 0
+    HEAD_DIM == 128
+        && RANK == 512
+        && ROPE == 64
+        && Q_NOPE == 128
+        && STREAMS == 4
+        && HEADS.is_multiple_of(8)
 );
 
 /// Rows per thread of the multi-row convolution kernel; shorter chunks use the one-row kernel.
 const CONV_ROWS_PER_THREAD: usize = 16;
 /// Bytes of KV cache per position: seven attention layers of 576 f16 values.
 const KV_BYTES_PER_POSITION: u64 = SPEC.mla_layers.len() as u64 * MLA_ROW as u64 * 2;
-/// Device bytes kept free beside the weights, the scratch and the cache.
-const HEADROOM: u64 = 768 << 20;
 /// Smallest context a start accepts.
 const MIN_CONTEXT: usize = 2048;
 /// The model's trained context.
@@ -421,7 +425,7 @@ impl Raon1Device {
             + mla_factor_bytes
             + Scratch::bytes(vocab, fixup)
             + state_bytes(spec)
-            + HEADROOM;
+            + DEVICE.raon_headroom;
         let free = u64::try_from(ctx.memory_info()?.free).unwrap_or(u64::MAX);
         let room = free.checked_sub(fixed).ok_or_else(|| {
             plan_error(format!(
@@ -455,7 +459,7 @@ impl Raon1Device {
         let reserve = Reserve {
             kv_cache: cells as u64 * KV_BYTES_PER_POSITION,
             work: mla_factor_bytes + Scratch::bytes(vocab, fixup) + state_bytes(spec),
-            headroom: HEADROOM,
+            headroom: DEVICE.raon_headroom,
         };
         let loader = BorrowedLoader::new(&ctx)?;
         let weights = loader.load_sliced(
