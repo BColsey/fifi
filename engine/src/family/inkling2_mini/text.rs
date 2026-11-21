@@ -176,6 +176,7 @@ impl Decoder {
             experts.disable_retention();
             "file_cache_only"
         } else {
+            experts.enable_pressure_adaptation();
             "packed_host_lru"
         };
         eprintln!(
@@ -304,6 +305,9 @@ impl Decoder {
     }
 
     pub fn reset(&mut self) {
+        if let Experts::Mlx { cache, .. } = &mut self.experts {
+            cache.refresh_pressure();
+        }
         self.conv = Default::default();
         self.attention = Default::default();
         self.position = 0;

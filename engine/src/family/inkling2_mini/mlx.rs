@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::mlx_budget::PressureRetention,
     kernels::{
         BoundedIndices, HostPages, MlxKernels, PackedPages, PageRange, QuantizationMode,
         QuantizationSpec, ResidentPackedWeight,
@@ -487,6 +488,7 @@ pub struct MlxExpertCache {
     source: Arc<InklingExpertSource>,
     owner: OwnerKey,
     max_bytes: usize,
+    pressure: Option<PressureRetention>,
     entries: VecDeque<CachedExpert>,
     denominators: [Option<[Option<[u8; 4]>; 2]>; LAYERS],
     staging: Option<HostPages>,
@@ -510,6 +512,7 @@ impl MlxExpertCache {
             source,
             owner: kernels.owner_key(),
             max_bytes,
+            pressure: None,
             entries: VecDeque::new(),
             denominators: [None; LAYERS],
             staging: None,
@@ -582,10 +585,43 @@ impl MlxExpertCache {
 
     /// Disable packed retention after the shared prefill allocation has been admitted.
     pub(super) fn disable_retention(&mut self) {
-        self.max_bytes = 0;
-        self.stats.evictions += self.entries.len() as u64;
-        self.entries.clear();
-        self.stats.cached_bytes = 0;
+        self.restrict_retention(0);
+    }
+
+    pub(super) fn enable_pressure_adaptation(&mut self) {
+        self.pressure = PressureRetention::start_if_enabled(self.max_bytes);
+        self.refresh_pressure();
+    }
+
+    pub(super) fn refresh_pressure(&mut self) {
+        let Some((severity, cap)) = self.pressure.as_ref().map(PressureRetention::poll) else {
+            return;
+        };
+        if cap < self.max_bytes {
+            let previous_capacity = self.max_bytes;
+            let previous_bytes = self.stats.cached_bytes;
+            self.restrict_retention(cap);
+            eprintln!(
+                "Inkling 2 Mini: memory_pressure={severity} expert_cache_previous_capacity_bytes={previous_capacity} expert_cache_capacity_bytes={cap} expert_cache_released_bytes={}",
+                previous_bytes - self.stats.cached_bytes,
+            );
+        }
+    }
+
+    fn restrict_retention(&mut self, cap: usize) {
+        self.max_bytes = self.max_bytes.min(cap);
+        self.evict_to(self.max_bytes);
+    }
+
+    fn evict_to(&mut self, limit: usize) {
+        while self.stats.cached_bytes > limit {
+            let entry = self
+                .entries
+                .pop_front()
+                .expect("tracked packed expert bytes");
+            self.stats.cached_bytes -= entry.bytes.len();
+            self.stats.evictions += 1;
+        }
     }
 
     pub(super) fn capacity_bytes(&self) -> usize {
@@ -711,6 +747,7 @@ impl MlxExpertCache {
                 "Inkling cache and input must belong to the active Metal owner".into(),
             ));
         }
+        self.refresh_pressure();
         let staging_start = self.timing.is_some().then(std::time::Instant::now);
         let page_size = HostPages::page_size();
         RoutePages::validate(routes, page_size)?;
@@ -844,11 +881,7 @@ impl MlxExpertCache {
         if len > self.max_bytes {
             return Ok(());
         }
-        while self.stats.cached_bytes > self.max_bytes - len {
-            let entry = self.entries.pop_front().unwrap();
-            self.stats.cached_bytes -= entry.bytes.len();
-            self.stats.evictions += 1;
-        }
+        self.evict_to(self.max_bytes - len);
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(len).map_err(|_| {
             EngError::MemoryPlan("Inkling packed expert cache allocation failed".into())
@@ -1133,6 +1166,37 @@ mod tests {
         }
         assert_eq!(reuse.stats().staging_allocations, 1);
         assert_eq!(reuse.stats().staging_fallback_syncs, 0);
+
+        // Apply the same worker-side limits without publishing a system event.
+        let before = reuse.stats();
+        assert_eq!(before.cached_bytes, capacity);
+        let expected_newest = reuse.entries.back().unwrap().expert;
+        reuse.restrict_retention(capacity / 2);
+        assert_eq!(reuse.stats().cached_bytes, capacity / 2);
+        assert_eq!(reuse.entries.back().unwrap().expert, expected_newest);
+        assert_eq!(
+            reuse.stats().evictions - before.evictions,
+            (TOP_K / 2) as u64
+        );
+        reuse.restrict_retention(0);
+        reuse.restrict_retention(capacity);
+        assert_eq!(reuse.capacity_bytes(), 0);
+        assert!(reuse.entries.is_empty());
+        assert_eq!(reuse.stats().cached_bytes, 0);
+        assert_eq!(reuse.stats().evictions - before.evictions, TOP_K as u64);
+        let refreshed = reuse
+            .forward_quantized_readback(&mut kernels, 0, &next, &host_input)
+            .unwrap();
+        let layout = MlxRoutedExpertPlan::new(&reuse.source, 0, &next).unwrap();
+        let mut pages = HostPages::try_new(layout.staging_bytes()).unwrap();
+        let stage = MlxRoutedExpertStage::read(&mut kernels, &layout, &mut pages).unwrap();
+        let reference = stage.forward_quantized(&mut kernels, &input).unwrap();
+        assert_eq!(
+            refreshed.host_bytes().unwrap(),
+            bytes(&mut kernels, &reference)
+        );
+        assert_eq!(reuse.stats().cached_bytes, 0);
+        assert_eq!(reuse.stats().staging_allocations, 1);
 
         let setup_row = |offset: usize, logits: f32| {
             let mut row = [-20.0; EXPERTS];

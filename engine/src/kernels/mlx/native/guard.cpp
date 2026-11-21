@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <libproc.h>
+#include <dispatch/dispatch.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
@@ -372,6 +373,38 @@ extern "C" int inference_mlx_array_new_data_managed_payload(
 extern "C" size_t inference_page_size() noexcept {
   const long size = sysconf(_SC_PAGESIZE);
   return size > 0 ? static_cast<size_t>(size) : 0;
+}
+
+// Process-lifetime source and state. The callback has no model, stream or Rust
+// pointer to release during engine shutdown, and never calls the MLX adapter.
+static std::atomic<unsigned int> memory_pressure_high_water{0};
+
+extern "C" int inference_mlx_start_memory_pressure() noexcept {
+  static const dispatch_source_t source = []() noexcept -> dispatch_source_t {
+    dispatch_source_t result = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (result == nullptr) return nullptr;
+    dispatch_set_context(result, result);
+    dispatch_source_set_event_handler_f(result, [](void* context) noexcept {
+      const unsigned long flags =
+          dispatch_source_get_data(static_cast<dispatch_source_t>(context));
+      const unsigned int severity = (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2u
+          : (flags & DISPATCH_MEMORYPRESSURE_WARN) ? 1u : 0u;
+      // Event handlers for this single source do not run concurrently.
+      if (severity > memory_pressure_high_water.load(std::memory_order_relaxed)) {
+        memory_pressure_high_water.store(severity, std::memory_order_relaxed);
+      }
+    });
+    dispatch_resume(result);
+    return result;
+  }();
+  return source == nullptr ? 1 : 0;
+}
+
+extern "C" unsigned int inference_mlx_memory_pressure() noexcept {
+  return memory_pressure_high_water.load(std::memory_order_relaxed);
 }
 
 // Kernel-attributed disk reads and process-lifetime peak physical footprint.

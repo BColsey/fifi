@@ -13,6 +13,46 @@ const CEILING_MIB: &str = "FIFI_MLX_WORKING_SET_MIB";
 ))]
 pub(crate) const PRESSURE_MARGIN: u64 = 1 << 30;
 
+/// Downward-only limit for disposable host cache entries. Staging, KV and
+/// other startup reservations are already deducted from `admitted_bytes`.
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct PressureRetention {
+    admitted_bytes: usize,
+}
+
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+impl PressureRetention {
+    pub(crate) fn start_if_enabled(admitted_bytes: usize) -> Option<Self> {
+        if admitted_bytes == 0
+            || !std::env::var_os("FIFI_MLX_ADAPT_EXPERT_CACHE").is_some_and(|value| value == "1")
+        {
+            return None;
+        }
+        if !crate::kernels::mlx::native::start_memory_pressure() {
+            eprintln!("Metal memory pressure observer unavailable; retaining startup cache limit");
+            return None;
+        }
+        Some(Self { admitted_bytes })
+    }
+
+    pub(crate) fn poll(&self) -> (u32, usize) {
+        let severity = crate::kernels::mlx::native::memory_pressure();
+        (severity, pressure_limit(self.admitted_bytes, severity))
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+fn pressure_limit(admitted_bytes: usize, severity: u32) -> usize {
+    match severity {
+        0 => admitted_bytes,
+        1 => admitted_bytes / 2,
+        _ => 0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceBudget {
     recommended: u64,
@@ -126,6 +166,15 @@ pub(crate) fn enabled_with_default(auto_default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_only_reduces_the_admitted_disposable_cache() {
+        for bytes in [0, 1, 100, usize::MAX] {
+            assert_eq!(pressure_limit(bytes, 0), bytes);
+            assert_eq!(pressure_limit(bytes, 1), bytes / 2);
+            assert_eq!(pressure_limit(bytes, 2), 0);
+        }
+    }
 
     #[test]
     fn metal_working_set_caps_explicit_budget_and_checks_base_charges() {
