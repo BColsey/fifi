@@ -18,8 +18,8 @@ use crate::{
     EngError,
     family::{
         exl3_tensors::f32_le_bytes,
-        flash_next::load::gguf::{GgufModel, feeds::gguf_feeds},
-        project::cuda::CudaWeights,
+        flash_next::load::gguf::{GgufModel, feeds::gguf_feeds, trunk::gguf_trunk},
+        project::cuda::{CudaProjector, CudaWeights},
     },
     kernels::cuda::{
         CudaContext, DeviceStream,
@@ -36,18 +36,55 @@ const GGUF_GDN: GdnForm = GdnForm {
     gate: GdnGate::Sigmoid,
 };
 
+/// What the decode step borrows, owned by the device so that dropping the device (and with it
+/// the engine) frees the card. The fields drop in declaration order: the uploaded weights first,
+/// then the stream, the card handle and the model. The step and the MoE block borrow the boxed
+/// values below for as long as the device lives; a box's contents do not move when the box does.
+struct Held {
+    weights: Box<CudaWeights>,
+    stream: Box<DeviceStream>,
+    projector: Box<CudaProjector>,
+    model: Box<GgufModel>,
+}
+
 /// The token driver of a Flash-Next GGUF over resident experts, for `positions` cached positions:
-/// the decode step, the native MoE block and the host feeds of the file. `threads` is the host PLE
+/// the decode step, the native MoE block and the host feeds of the file. The driver owns the
+/// card handle, the stream, the uploaded weights and the model; dropping it frees them.
+/// `chunk_limit` is the host bytes one tensor upload reads at a time and `threads` the host PLE
 /// projection's thread count.
 pub(in crate::family::qwen::flash_next) fn gguf_driver(
-    model: &'static GgufModel,
-    ctx: &'static CudaContext,
-    stream: &'static DeviceStream,
-    weights: &'static CudaWeights,
+    model: GgufModel,
+    projector: CudaProjector,
+    chunk_limit: usize,
     positions: usize,
     threads: usize,
 ) -> Result<TokenDriver<GgufDevice, PackFeeds>, EngError> {
-    let config = model.config();
+    let model = Box::new(model);
+    let projector = Box::new(projector);
+    let stream = Box::new(projector.context().stream()?);
+    let weights = Box::new(gguf_trunk(&model, projector.context(), true, chunk_limit)?);
+    let held = Held {
+        weights,
+        stream,
+        projector,
+        model,
+    };
+    #[allow(unsafe_code)] // the one lifetime extension of the device; see the SAFETY note
+    // SAFETY: each referent sits in its own box inside `held`, which the device stores after
+    // the step and the MoE block, so it outlives them (fields drop in order); nothing moves out
+    // of a box or mutates it, and the references do not leave the device.
+    let (ctx, stream, weights): (
+        &'static CudaContext,
+        &'static DeviceStream,
+        &'static CudaWeights,
+    ) = unsafe {
+        (
+            &*std::ptr::from_ref(held.projector.context()),
+            &*std::ptr::from_ref::<DeviceStream>(&held.stream),
+            &*std::ptr::from_ref::<CudaWeights>(&held.weights),
+        )
+    };
+    let config = held.model.config();
     let layers = config.layers();
     let step = FlashStep::from_shape(
         ctx,
@@ -60,7 +97,7 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
     )?
     .with_gdn_form(GGUF_GDN);
     let moe = GgufMoe::new(ctx, weights, &step.moe_dims(1))?;
-    let feeds = gguf_feeds(model, threads)?;
+    let feeds = gguf_feeds(&held.model, threads)?;
     let ple = config.model_shape()?.ple;
     let shape = DriverShape {
         layers,
@@ -72,7 +109,7 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
             ple_embed: ple.embed(),
         },
     };
-    TokenDriver::new(GgufDevice::new(step, moe), feeds, shape)
+    TokenDriver::new(GgufDevice::new(step, moe, held), feeds, shape)
 }
 
 pub(in crate::family::qwen::flash_next) struct GgufDevice {
@@ -82,10 +119,12 @@ pub(in crate::family::qwen::flash_next) struct GgufDevice {
     stream_width: usize,
     /// The width of the head's output (the vocabulary).
     logits_width: usize,
+    /// Last field: the step and the block above borrow it.
+    _held: Held,
 }
 
 impl GgufDevice {
-    fn new(step: FlashStep<'static>, moe: GgufMoe<'static>) -> Self {
+    fn new(step: FlashStep<'static>, moe: GgufMoe<'static>, held: Held) -> Self {
         let stream_width = step.geometry.branches * step.geometry.hidden;
         let logits_width = step.model.vocab;
         Self {
@@ -93,6 +132,7 @@ impl GgufDevice {
             moe,
             stream_width,
             logits_width,
+            _held: held,
         }
     }
 }

@@ -12,7 +12,7 @@ use std::{path::Path, sync::Arc};
 
 use sha2::{Digest, Sha256};
 
-use super::{GgufModel, plan::Card, trunk::gguf_trunk};
+use super::{GgufModel, plan::Card};
 use crate::{
     EngError,
     family::{
@@ -22,7 +22,7 @@ use crate::{
             cuda::{
                 executor::{CudaRules, FlashCudaExecutor},
                 gguf_device::gguf_driver,
-                start::{BuildGuard, ple_threads},
+                start::ple_threads,
             },
             host_plan::{HOST_LABELS, HostMemory},
             settings::{
@@ -32,7 +32,6 @@ use crate::{
         },
         session::PrefixIdentity,
     },
-    kernels::cuda::DeviceStream,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::{TokenizerBundle, TokenizerPin},
 };
@@ -174,19 +173,17 @@ pub(in crate::family::qwen::flash_next) fn start(
         tokenizer: crate::weights::sha256_hex(&tokenizer_digest).into(),
     };
     let prefill_chunk = options.prefill_chunk.unwrap_or(DEFAULT_PREFILL_CHUNK) as usize;
-    let guard = BuildGuard::acquire()?;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
-        let mut guard = guard;
         stages.begin("initializing CUDA");
-        let projector: &'static CudaProjector = Box::leak(Box::new(CudaProjector::new()?));
-        guard.commit();
-        let ctx = projector.context();
-        let stream: &'static DeviceStream = Box::leak(Box::new(ctx.stream()?));
-        stages.begin("uploading the weights");
-        let model: &'static GgufModel = Box::leak(Box::new(owned));
-        let weights = Box::leak(Box::new(gguf_trunk(model, ctx, true, UPLOAD_CHUNK_BYTES)?));
-        stages.begin("building the decode step");
-        let driver = gguf_driver(model, ctx, stream, weights, context as usize, ple_threads())?;
+        let projector = CudaProjector::new()?;
+        stages.begin("uploading the weights and building the decode step");
+        let driver = gguf_driver(
+            owned,
+            projector,
+            UPLOAD_CHUNK_BYTES,
+            context as usize,
+            ple_threads(),
+        )?;
         FlashCudaExecutor::new(driver, rules, identity)
     })?;
     Ok((engine, bundle, context))

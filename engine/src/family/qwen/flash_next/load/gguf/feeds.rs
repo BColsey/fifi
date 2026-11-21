@@ -25,7 +25,7 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 
 /// The embedding table of the file: one row decoded per token, read in place.
 struct GgufEmbedding {
-    weights: &'static GgufWeights,
+    weights: std::sync::Arc<GgufWeights>,
     name: String,
     ty: crate::weights::GgufType,
     hidden: usize,
@@ -68,7 +68,7 @@ fn read_floats(weights: &GgufWeights, entry: &Mapped) -> Result<Vec<f32>, EngErr
 /// The token feeds of `model`: embedding rows from the file, the PLE block from the file's PLE
 /// layer, n-gram rows from the file's table. `threads` is the host PLE projection's thread count.
 pub(in crate::family::qwen::flash_next) fn gguf_feeds(
-    model: &'static GgufModel,
+    model: &GgufModel,
     threads: usize,
 ) -> Result<PackFeeds, EngError> {
     let config = model.config();
@@ -87,7 +87,7 @@ pub(in crate::family::qwen::flash_next) fn gguf_feeds(
         return Err(refuse("embedding rows are not whole blocks"));
     }
     let embedding = GgufEmbedding {
-        weights: &model.weights,
+        weights: std::sync::Arc::clone(&model.weights),
         name: embed.name.clone(),
         ty: embed.ty,
         hidden,

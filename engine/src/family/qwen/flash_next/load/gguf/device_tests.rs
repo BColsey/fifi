@@ -7,14 +7,28 @@
 //! Each test needs the card and holds a CUDA adapter lease for its process, and a process holds
 //! at most two: run them by name, one per process, with `--ignored`.
 
-use super::{GgufModel, host, smallmodel::write_small, trunk::gguf_trunk};
-use crate::{
-    family::{
-        flash_next::cuda::gguf_device::gguf_driver, project::cuda::CudaProjector,
-        session::TokenStepper,
-    },
-    kernels::cuda::DeviceStream,
+use super::{
+    GgufModel, host,
+    smallmodel::{Small, write_small},
 };
+use crate::family::{
+    flash_next::cuda::{
+        driver::TokenDriver,
+        gguf_device::{GgufDevice, gguf_driver},
+        pack_feeds::PackFeeds,
+    },
+    project::cuda::CudaProjector,
+    session::TokenStepper,
+};
+
+/// The driver over the small model, owning its model, card handle and weights.
+fn driver_of(small: &Small, positions: usize) -> TokenDriver<GgufDevice, PackFeeds> {
+    let model = GgufModel::open(&small.first)
+        .expect("open")
+        .expect("a qwen4exp model");
+    let projector = CudaProjector::new().expect("the card");
+    gguf_driver(model, projector, 8 << 20, positions, 2).expect("the driver")
+}
 
 fn argmax(values: &[f32]) -> usize {
     values
@@ -34,14 +48,7 @@ fn the_device_logits_follow_the_host_forward_on_the_small_model() {
             .expect("open")
             .expect("a qwen4exp model"),
     ));
-    let projector: &'static CudaProjector =
-        Box::leak(Box::new(CudaProjector::new().expect("the card")));
-    let ctx = projector.context();
-    let stream: &'static DeviceStream = Box::leak(Box::new(ctx.stream().expect("stream")));
-    let weights = Box::leak(Box::new(
-        gguf_trunk(model, ctx, true, 8 << 20).expect("the trunk uploads"),
-    ));
-    let mut driver = gguf_driver(model, ctx, stream, weights, 64, 2).expect("the driver");
+    let mut driver = driver_of(&small, 64);
 
     let tokens = [5u32, 9, 200, 17, 33, 481];
     let reference = host::HostModel::load(model, 4).expect("host layers");
@@ -87,19 +94,7 @@ fn time_run<S: TokenStepper>(driver: &mut S) -> f64 {
 #[ignore = "needs a GPU (about 2 GiB)"]
 fn the_decode_time_per_token_on_the_small_model() {
     let small = write_small(7);
-    let model: &'static GgufModel = Box::leak(Box::new(
-        GgufModel::open(&small.first)
-            .expect("open")
-            .expect("a qwen4exp model"),
-    ));
-    let projector: &'static CudaProjector =
-        Box::leak(Box::new(CudaProjector::new().expect("the card")));
-    let ctx = projector.context();
-    let stream: &'static DeviceStream = Box::leak(Box::new(ctx.stream().expect("stream")));
-    let weights = Box::leak(Box::new(
-        gguf_trunk(model, ctx, true, 8 << 20).expect("the trunk uploads"),
-    ));
-    let mut driver = gguf_driver(model, ctx, stream, weights, 128, 2).expect("the driver");
+    let mut driver = driver_of(&small, 128);
     time_run(&mut driver);
     let mut times: Vec<f64> = (0..5).map(|_| time_run(&mut driver)).collect();
     times.sort_by(f64::total_cmp);
@@ -185,4 +180,52 @@ fn an_engine_started_on_the_small_gguf_serves_the_greedy_tokens_of_the_host_forw
     eprintln!("engine tokens {got:?}, host greedy tokens {want:?}");
     assert!(started.engine.shutdown().failure.is_none());
     assert_eq!(got, want);
+}
+
+/// Stopping the engine returns the card memory it took. The reading before the start is taken
+/// with a card handle already open, so the context's own bytes are in both readings.
+#[test]
+#[ignore = "needs a GPU (about 2 GiB)"]
+fn stopping_the_engine_gives_back_its_card_memory() {
+    use crate::{family::flash_next::factory, sched::worker::EngineNote};
+    const SLACK: usize = 256 << 20;
+    let small = write_small(7);
+    let dir = small.dir.path();
+    for (name, text) in [
+        ("tokenizer.json", TOKENIZER_JSON),
+        (
+            "tokenizer_config.json",
+            r#"{"eos_token":"h","chat_template":"{{ messages[0].content }}"}"#,
+        ),
+    ] {
+        std::fs::write(dir.join(name), text).expect("tokenizer file");
+    }
+    let probe = CudaProjector::new().expect("the card");
+    let before = probe.memory_info().expect("memory").free;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = factory::start_engine(
+        dir,
+        dir,
+        None,
+        false,
+        Some(Box::new(move |note| tx.send(note).expect("note"))),
+    )
+    .expect("the engine starts");
+    if let EngineNote::Failed(why) = rx.recv().expect("a note") {
+        panic!("the start failed: {why}");
+    }
+    let during = probe.memory_info().expect("memory").free;
+    assert!(started.engine.shutdown().failure.is_none());
+    let after = probe.memory_info().expect("memory").free;
+    eprintln!(
+        "card free MiB: before {}, running {}, stopped {}",
+        before >> 20,
+        during >> 20,
+        after >> 20
+    );
+    assert!(
+        after + SLACK >= before,
+        "the stopped engine kept {} MiB",
+        (before - after) >> 20
+    );
 }

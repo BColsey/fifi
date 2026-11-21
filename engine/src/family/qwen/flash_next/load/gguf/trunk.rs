@@ -173,7 +173,7 @@ fn f32_to_f16(value: f32) -> u16 {
 /// Uploads the resident trunk of `model` on `ctx`, and with `resident_experts` the routed experts
 /// as native stacks under [`expert_key`]. `chunk_limit` is the host bytes one native read holds.
 pub(in crate::family::qwen::flash_next) fn gguf_trunk(
-    model: &'static GgufModel,
+    model: &GgufModel,
     ctx: &CudaContext,
     resident_experts: bool,
     chunk_limit: usize,
