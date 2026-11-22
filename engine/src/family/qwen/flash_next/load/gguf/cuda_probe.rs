@@ -99,6 +99,98 @@ fn project(
         .collect())
 }
 
+#[test]
+#[ignore = "requires an admitted CUDA device; synthetic packed expert stacks"]
+fn packed_expert_stacks_run_indexed_cuda_matvec() {
+    use super::expert_layout::{ExpertLayout, ExpertPart, ExpertStacks};
+    use crate::{family::recipe::Role, kernels::cuda::resident::matvec_expert::ExpertMatvecCall};
+    let per_part = 4 * 34;
+    let parts = [Role::ExpertGate, Role::ExpertUp, Role::ExpertDown].map(|role| ExpertPart {
+        role,
+        ty: GgufType::Q80,
+        bytes: 0..0,
+    });
+    let mut layout = ExpertLayout {
+        parts,
+        bytes: 3 * per_part,
+    };
+    for (i, part) in layout.parts.iter_mut().enumerate() {
+        part.bytes = i * per_part..(i + 1) * per_part;
+    }
+    let stacks = ExpertStacks::new(&layout, 2).unwrap();
+    let mut packed = vec![0; stacks.bytes];
+    for slot in 0..2 {
+        let mut record = vec![0; layout.bytes];
+        for (part_index, part) in layout.parts.iter().enumerate() {
+            for row in record[part.bytes.clone()].chunks_exact_mut(34) {
+                row[..2].copy_from_slice(&0x3800u16.to_le_bytes());
+                row[2..].fill((1 + slot + part_index * 2) as u8);
+            }
+        }
+        stacks
+            .copy_record(&layout, slot, &record, &mut packed)
+            .unwrap();
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let w = ctx.allocate(packed.len()).unwrap();
+    w.write_at(&stream, 0, &packed).unwrap();
+    let ids = ctx.allocate(8).unwrap();
+    ids.write_at(&stream, 0, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    let x = ctx.allocate(32 * 4).unwrap();
+    let input: Vec<u8> = vec![1.0f32; 32]
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect();
+    x.write_at(&stream, 0, &input).unwrap();
+    let qbytes = q8_1_bytes(32, 1).unwrap();
+    let q = ctx.allocate(qbytes).unwrap();
+    ctx.quantize_q8_1(
+        &stream,
+        QuantizeCall {
+            x: x.range(0, 128).unwrap(),
+            y: q.range(0, qbytes).unwrap(),
+            k: 32,
+            ncols: 1,
+        },
+    )
+    .unwrap();
+    let y = ctx.allocate(8 * 4).unwrap();
+    for (i, part) in stacks.parts.iter().enumerate() {
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty: QuantType::Q80,
+                w_stack: w.range(part.start, part.len()).unwrap(),
+                ids: ids.range(0, 8).unwrap(),
+                x_q8: q.range(0, qbytes).unwrap(),
+                x_per_slot: false,
+                y: y.range(0, 32).unwrap(),
+                y_slot_stride: 4,
+                k: 32,
+                rows: 4,
+                n_expert: 2,
+                n_used: 2,
+                glu_gate: None,
+            },
+        )
+        .unwrap();
+        let mut out = vec![0u8; 32];
+        y.read_at(&stream, 0, &mut out).unwrap();
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        for (index, value) in got.iter().enumerate() {
+            let expected = 16.0 * (1 + (if index < 4 { 1 } else { 0 }) + i * 2) as f32;
+            assert!(
+                (value - expected).abs() < 0.1,
+                "part {i}, output {index}: {value} != {expected}"
+            );
+        }
+    }
+}
+
 /// Read an output row range or one expert slice from the checkpoint's mapped tensor.
 fn mapped_blocks(
     model: &GgufModel,
