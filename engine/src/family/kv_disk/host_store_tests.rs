@@ -414,45 +414,60 @@ fn an_opened_tier_takes_the_bound_the_plan_resolved() {
 fn the_default_budget_leaves_out_what_the_engine_holds() {
     let none = default_host_budget(0).expect("the machine's memory is known");
     let held = default_host_budget(1 << 30).expect("the machine's memory is known");
-    assert_eq!(none - held, 1 << 30);
+    assert_eq!(
+        none - held,
+        none.min(1 << 30),
+        "a host with less room leaves none"
+    );
     assert_eq!(default_host_budget(u64::MAX), Some(0), "never below zero");
 }
 
-/// A vector-landed family with no planner budget, and one with one.
-struct Planned(Option<u64>);
+/// A vector-landed family that sets a planner budget, and one that keeps the trait default.
+struct Planned(u64);
+struct Plain;
 
-impl VecFamily for Planned {
-    type Snapshot = Snap;
-    type Path = u8;
-    const LABEL: &'static str = "planned";
+macro_rules! test_family {
+    ($name:ident) => {
+        impl VecFamily for $name {
+            type Snapshot = Snap;
+            type Path = u8;
+            const LABEL: &'static str = "planned";
 
-    fn longest_entry(&self) -> usize {
-        4_000
-    }
-    fn part_bytes(&self, positions: usize) -> Result<Vec<usize>, EngError> {
-        Ok(vec![Fake::bytes_of(positions)])
-    }
-    fn view_of(&self, _snapshot: &Snap) -> Option<SnapshotView> {
-        None
-    }
-    fn finish(&mut self, _landing: Vec<u8>, positions: usize) -> Result<Snap, EngError> {
-        Ok(snap(positions, 0))
-    }
-    fn budget_bytes(&self) -> Option<u64> {
-        self.0
-            .or_else(|| default_host_budget(HostFamily::resident_bytes(self)))
-    }
-    fn resident(&self) -> u64 {
-        4_096
-    }
+            fn longest_entry(&self) -> usize {
+                4_000
+            }
+            fn part_bytes(&self, positions: usize) -> Result<Vec<usize>, EngError> {
+                Ok(vec![Fake::bytes_of(positions)])
+            }
+            fn view_of(&self, _snapshot: &Snap) -> Option<SnapshotView> {
+                None
+            }
+            fn finish(&mut self, _landing: Vec<u8>, positions: usize) -> Result<Snap, EngError> {
+                Ok(snap(positions, 0))
+            }
+            fn resident(&self) -> u64 {
+                4_096
+            }
+            test_family!(@budget $name);
+        }
+    };
+    (@budget Planned) => {
+        fn budget_bytes(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    };
+    (@budget Plain) => {};
 }
+
+test_family!(Planned);
+test_family!(Plain);
 
 #[test]
 fn a_family_budget_reaches_the_tier_through_the_shared_trait() {
-    assert_eq!(HostFamily::host_budget(&Planned(Some(77))), Some(77));
+    assert_eq!(HostFamily::host_budget(&Planned(77)), Some(77));
     assert_eq!(
-        HostFamily::host_budget(&Planned(None)),
+        HostFamily::host_budget(&Plain),
         default_host_budget(4_096),
-        "without a planner budget the machine's default, less what the family holds"
+        "without a planner budget the trait default: the machine's, less what the family holds"
     );
 }

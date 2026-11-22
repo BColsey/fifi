@@ -217,7 +217,7 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
     use std::sync::Mutex;
     use std::time::Instant;
     // A save, a spill check and a landing each ask, often within one request: one read serves them.
-    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    static LAST: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     cached_read(&mut last, Instant::now(), || {
         std::process::Command::new("/usr/bin/vm_stat")
@@ -229,21 +229,28 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
 }
 
 /// A read kept for one second: a value read less than a second before `now` is returned without
-/// reading again. A failed read is not kept, so the next call tries again.
+/// reading again. A failed read is remembered for ten seconds, so a host where the tool is missing
+/// or broken is not asked on every save, and then tried again.
 #[cfg(any(test, target_os = "macos"))]
 fn cached_read(
-    last: &mut Option<(std::time::Instant, u64)>,
+    last: &mut Option<(std::time::Instant, Option<u64>)>,
     now: std::time::Instant,
     read: impl FnOnce() -> Option<u64>,
 ) -> Option<u64> {
-    if let Some((at, value)) = *last
-        && now.saturating_duration_since(at) < std::time::Duration::from_secs(1)
-    {
-        return Some(value);
+    use std::time::Duration;
+    if let Some((at, value)) = *last {
+        let keep = if value.is_some() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(10)
+        };
+        if now.saturating_duration_since(at) < keep {
+            return value;
+        }
     }
-    let value = read()?;
+    let value = read();
     *last = Some((now, value));
-    Some(value)
+    value
 }
 
 /// The available bytes in the text of `vm_stat`: its page size times the free, inactive and
@@ -648,7 +655,7 @@ Pages purgeable:                                1244.\n\
     }
 
     #[test]
-    fn a_read_is_kept_for_a_second_and_a_failure_is_not_kept() {
+    fn a_read_is_kept_for_a_second_and_a_failure_for_ten() {
         use super::cached_read;
         use std::time::{Duration, Instant};
         let start = Instant::now();
@@ -664,12 +671,18 @@ Pages purgeable:                                1244.\n\
             Some(9),
             "after it the read runs again"
         );
-        let mut empty = None;
-        assert_eq!(cached_read(&mut empty, start, || None), None);
+        let mut failed = None;
+        assert_eq!(cached_read(&mut failed, start, || None), None);
         assert_eq!(
-            cached_read(&mut empty, start, || Some(5)),
+            cached_read(&mut failed, start + Duration::from_secs(5), || {
+                panic!("a failed read is not repeated within ten seconds")
+            }),
+            None
+        );
+        assert_eq!(
+            cached_read(&mut failed, start + Duration::from_secs(11), || Some(5)),
             Some(5),
-            "a failed read leaves nothing kept"
+            "after ten seconds it tries again"
         );
     }
 }

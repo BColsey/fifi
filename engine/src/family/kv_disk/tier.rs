@@ -676,12 +676,21 @@ pub(crate) fn stop_timeout_note(bound: Duration) -> String {
     }
 }
 
-/// The reason a finished job was started for (a stopped one reads as the watermark).
+/// The reason a finished job was started for. A job whose record was dropped while it ran (a
+/// stop cancelled it) reads as the watermark, and the first such write says so.
 fn take_reason(inflight: &mut Vec<(u64, Reason)>, id: u64) -> Reason {
-    inflight
-        .iter()
-        .position(|(job, _)| *job == id)
-        .map_or(Reason::Watermark, |at| inflight.remove(at).1)
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match inflight.iter().position(|(job, _)| *job == id) {
+        Some(at) => inflight.remove(at).1,
+        None => {
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "kv disk: a finished write has no recorded reason (it was cancelled while it ran); it counts as the watermark"
+                );
+            }
+            Reason::Watermark
+        }
+    }
 }
 
 impl Counters {
