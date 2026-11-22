@@ -25,6 +25,7 @@ use crate::{
 
 pub(in crate::family::inkling2) mod attention;
 mod cache;
+mod cold_controller;
 mod device_prefill;
 mod residency;
 mod resident_prefill;
@@ -49,6 +50,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     prefill_resident: bool,
     device_prefill: Option<RefCell<device_prefill::Workspace>>,
     device_prefill_wmma: bool,
+    cold_controller: Option<cold_controller::Staging>,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
     prefill_report: Option<RefCell<PrefillBankReport>>,
@@ -70,9 +72,16 @@ type ControllerOutput = Option<[Vec<f32>; 2]>;
 
 pub(in crate::family::inkling2) use super::dense::ControlledAttentionInput;
 
+type ControllerPayload<'a> = [&'a [u8]; 3];
+
+enum BatchWeights<'a> {
+    Resident(ControllerWeights<'a>),
+    Cold(&'a cold_controller::Staging, ControllerPayload<'a>),
+}
+
 pub(in crate::family::inkling2) struct BatchController<'a> {
     cuda: &'a GgufCuda,
-    weights: ControllerWeights<'a>,
+    weights: BatchWeights<'a>,
     shape: [usize; 2],
     capacity: usize,
 }
@@ -83,11 +92,27 @@ impl BatchController<'_> {
         inputs: &[&[f32]],
         role: &str,
     ) -> Result<Vec<[Vec<f32>; 2]>, EngError> {
+        let (weights, staged) = match self.weights {
+            BatchWeights::Resident(weights) => (weights, false),
+            BatchWeights::Cold(buffers, payload) => {
+                (buffers.upload(&self.cuda.context, payload)?, true)
+            }
+        };
         let values = self
             .cuda
             .step
-            .project_controller_batch(&self.cuda.context, inputs, self.weights, self.shape)?
+            .project_controller_batch(&self.cuda.context, inputs, weights, self.shape)?
             .ok_or_else(|| bad("CUDA controller batch was not admitted"))?;
+        if staged {
+            static USED: std::sync::Once = std::sync::Once::new();
+            USED.call_once(|| eprintln!("Inkling CUDA used staged prefill controller"));
+            if self.cuda.prefill_report.is_some() {
+                eprintln!(
+                    "Inkling CUDA staged prefill controller {}",
+                    serde_json::json!({"role": role, "rows": inputs.len()})
+                );
+            }
+        }
         let receipt = || {
             serde_json::json!({
                 "role": role, "rows": inputs.len(), "tiles": inputs.len().div_ceil(self.capacity),
@@ -134,24 +159,15 @@ impl AttentionControllers<'_> {
         if multirow && inputs.len() > 1 {
             let capacity = self.cuda.step.controller_batch_capacity(self.shape)?;
             if capacity >= 2 {
-                let mut result = vec![[None, None, None]; inputs.len()];
-                for (index, weights) in self.weights.into_iter().enumerate() {
-                    let Some(weights) = weights else { continue };
-                    let controller = BatchController {
+                let controllers = self.weights.map(|weights| {
+                    weights.map(|weights| BatchController {
                         cuda: self.cuda,
-                        weights,
+                        weights: BatchWeights::Resident(weights),
                         shape: self.shape,
                         capacity,
-                    };
-                    let role = ["q", "k", "v"][index];
-                    let gates: Vec<_> = inputs.iter().map(|row| row[index]).collect();
-                    for (row, projection) in
-                        result.iter_mut().zip(controller.project(&gates, role)?)
-                    {
-                        row[index] = Some(projection);
-                    }
-                }
-                return Ok(result);
+                    })
+                });
+                return project_controller_roles(controllers, inputs);
             }
         }
         let rows: Vec<_> = inputs
@@ -183,6 +199,24 @@ impl AttentionControllers<'_> {
             })
             .collect())
     }
+}
+
+pub(in crate::family::inkling2) fn project_controller_roles(
+    controllers: [Option<BatchController<'_>>; 3],
+    inputs: &[[&[f32]; 3]],
+) -> Result<Vec<[ControllerOutput; 3]>, EngError> {
+    let mut result = vec![[None, None, None]; inputs.len()];
+    for (index, controller) in controllers.into_iter().enumerate() {
+        let Some(controller) = controller else {
+            continue;
+        };
+        let role = ["q", "k", "v"][index];
+        let gates: Vec<_> = inputs.iter().map(|row| row[index]).collect();
+        for (row, projection) in result.iter_mut().zip(controller.project(&gates, role)?) {
+            row[index] = Some(projection);
+        }
+    }
+    Ok(result)
 }
 
 fn projection_bytes(matrices: &[GgufDenseUpload<'_>]) -> u64 {
@@ -515,6 +549,17 @@ impl GgufCuda {
                 serde_json::json!(admitted)
             );
         }
+        let cold_controller = if full_expert_fit
+            && group_projections
+            && spec.core.gate_rank != 0
+            && std::env::var("FIFI_INKLING_CUDA_STAGE_PREFILL_CONTROLLERS").as_deref() == Ok("1")
+            && optional.iter().any(|item| {
+                item.matrix.name.contains(".controllers.") && !dense.contains_key(item.matrix.name)
+            }) {
+            cold_controller::Staging::admit(&context, [spec.core.gate_rank as usize, hidden])?
+        } else {
+            None
+        };
         Ok(Self {
             step,
             draft_head: None,
@@ -532,6 +577,7 @@ impl GgufCuda {
             device_prefill_wmma: device_prefill
                 && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_WMMA").as_deref()
                     == Ok("1"),
+            cold_controller,
             resident,
             cache: RefCell::default(),
             prefill_report: profile.then(RefCell::default),
@@ -732,21 +778,35 @@ impl GgufCuda {
         Some(Ok(weights.map(|(w, dtype)| (w, *dtype))))
     }
 
-    pub(in crate::family::inkling2) fn batch_controller(
-        &self,
+    pub(in crate::family::inkling2) fn stages_prefill_controllers(&self) -> bool {
+        self.cold_controller.is_some()
+    }
+
+    pub(in crate::family::inkling2) fn batch_controller<'a>(
+        &'a self,
         names: [&str; 3],
         shape: [usize; 2],
         rows: usize,
-    ) -> Result<Option<BatchController<'_>>, EngError> {
+        cold_payload: impl FnOnce() -> Result<Option<ControllerPayload<'a>>, EngError>,
+    ) -> Result<Option<BatchController<'a>>, EngError> {
         let capacity = self.step.controller_batch_capacity(shape)?;
         if rows < 2 || capacity < 2 {
             return Ok(None);
         }
-        let Some(weights) = self
+        let weights = match self
             .controller_weights(names, 2 * shape[1], shape)
             .transpose()?
-        else {
-            return Ok(None);
+        {
+            Some(weights) => BatchWeights::Resident(weights),
+            None => {
+                let Some(staging) = &self.cold_controller else {
+                    return Ok(None);
+                };
+                let Some(payload) = cold_payload()? else {
+                    return Ok(None);
+                };
+                BatchWeights::Cold(staging, payload)
+            }
         };
         Ok(Some(BatchController {
             cuda: self,

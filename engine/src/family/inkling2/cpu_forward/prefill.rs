@@ -295,6 +295,7 @@ impl CpuForward {
                 names.each_ref().map(String::as_str),
                 [self.spec.core.gate_rank as usize, self.hidden()],
                 rows.len(),
+                !self.draft_window_enabled(),
             )?
         } else {
             None

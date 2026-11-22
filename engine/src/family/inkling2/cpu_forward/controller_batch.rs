@@ -8,7 +8,8 @@ use super::{
 };
 use crate::EngError;
 use crate::family::inkling2::{
-    cpu_attention::AttentionProjection, cuda_projection::gguf::ControlledAttentionInput,
+    cpu_attention::AttentionProjection,
+    cuda_projection::gguf::{ControlledAttentionInput, project_controller_roles},
 };
 
 type AttentionInputs = [Vec<f32>; 3];
@@ -90,7 +91,23 @@ impl CpuForward {
         let shape = [self.spec.core.gate_rank as usize, self.hidden()];
         let names = ATTENTION_ROLES.map(|(role, _)| control_names(layer, role));
         let names = name_refs(&names);
-        let Some(controllers) = weights.attention_controllers(names, shape, rows.len())? else {
+        let multirow = multirow_controllers_enabled();
+        let batched = if multirow
+            && rows.len() > 1
+            && !self.draft_window_enabled()
+            && weights.stages_prefill_controllers()
+        {
+            let batch =
+                |index: usize| weights.batch_controller(names[index], shape, rows.len(), true);
+            [batch(0)?, batch(1)?, batch(2)?]
+        } else {
+            [None, None, None]
+        };
+        let resident = if batched.iter().any(Option::is_some) {
+            None
+        } else if let Some(controllers) = weights.attention_controllers(names, shape, rows.len())? {
+            Some(controllers)
+        } else {
             return Ok(None);
         };
 
@@ -106,7 +123,10 @@ impl CpuForward {
             .iter()
             .map(|row| row.each_ref().map(|item| item.control.gate.as_slice()))
             .collect();
-        let projections = controllers.project(&inputs, multirow_controllers_enabled())?;
+        let projections = match resident {
+            Some(controllers) => controllers.project(&inputs, multirow)?,
+            None => project_controller_roles(batched, &inputs)?,
+        };
         let local = visit.attention == Attention::Local;
         let mut result = Vec::with_capacity(prepared.len());
         for (row, projections) in prepared.into_iter().zip(projections) {

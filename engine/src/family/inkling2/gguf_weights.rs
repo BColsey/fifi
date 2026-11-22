@@ -867,10 +867,38 @@ impl GgufTextWeights {
         names: [&str; 3],
         shape: [usize; 2],
         rows: usize,
+        allow_cold: bool,
     ) -> Result<Option<super::cuda_projection::gguf::BatchController<'_>>, EngError> {
+        self.cuda.as_ref().map_or(Ok(None), |cuda| {
+            cuda.batch_controller(names, shape, rows, || {
+                if !allow_cold {
+                    return Ok(None);
+                }
+                let [rank, hidden] = shape;
+                let mut payload = [&[][..]; 3];
+                let shapes = [[rank, 2 * hidden], [hidden, rank], [hidden, rank]];
+                for ((name, [expected_rows, expected_cols]), dst) in
+                    names.into_iter().zip(shapes).zip(&mut payload)
+                {
+                    let (tensor, bytes) = self.tensor(name)?;
+                    if tensor.kind != GgufType::F32
+                        || tensor.planes != 1
+                        || [tensor.rows, tensor.columns] != [expected_rows, expected_cols]
+                    {
+                        return Ok(None);
+                    }
+                    *dst = bytes;
+                }
+                Ok(Some(payload))
+            })
+        })
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn stages_prefill_controllers(&self) -> bool {
         self.cuda
             .as_ref()
-            .map_or(Ok(None), |cuda| cuda.batch_controller(names, shape, rows))
+            .is_some_and(|cuda| cuda.stages_prefill_controllers())
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
