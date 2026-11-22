@@ -87,15 +87,38 @@ pub(in super::super::super) fn start(
         facts.host.provenance_note()
     );
 
+    Err(execution_refusal(model))
+}
+
+/// Kernel availability does not imply that the CUDA executor can load GGUF weights.
+fn execution_refusal(model: &GgufModel) -> EngError {
     let gaps = model.kernel_gaps();
     if !gaps.is_empty() {
-        return Err(model.kernel_refusal(&gaps));
+        return model.kernel_refusal(&gaps);
     }
-    Err(EngError::Checkpoint(format!(
+    EngError::Checkpoint(format!(
         "Flash-Next GGUF {} is planned and every matrix type has a decode kernel, but the \
          executor does not read GGUF weights yet",
         model.first_path().display()
-    )))
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testkit::{Spec, write_flash};
+    use super::*;
+
+    #[test]
+    fn supported_matrix_types_still_refuse_until_executor_reads_gguf() {
+        let fixture = write_flash(&Spec::default());
+        let model = GgufModel::open(&fixture.first).unwrap().unwrap();
+        assert!(model.kernel_gaps().is_empty());
+        let error = execution_refusal(&model).describe();
+        assert!(
+            error.contains("executor does not read GGUF weights yet"),
+            "{error}"
+        );
+    }
 }
 
 fn tier_line(load: &crate::family::qwen::flash_next::moe::load_plan::LoadPlan) -> String {
