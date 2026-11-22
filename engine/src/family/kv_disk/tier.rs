@@ -38,6 +38,8 @@ const WRITE_PAUSE: Duration = Duration::from_secs(600);
 pub(crate) enum Reason {
     /// The store passed its watermark: this is one of the entries the next saves push out.
     Watermark,
+    /// The store holds more bytes than its budget: this is one of the oldest entries over it.
+    Budget,
     /// The engine is stopping and this entry exists only in memory.
     Stop,
 }
@@ -46,6 +48,7 @@ impl Reason {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Reason::Watermark => "watermark",
+            Reason::Budget => "byte budget",
             Reason::Stop => "stop",
         }
     }
@@ -115,6 +118,7 @@ pub(crate) struct Spilled {
 #[derive(Default)]
 pub(crate) struct Counters {
     pub(crate) watermark: Spilled,
+    pub(crate) budget: Spilled,
     pub(crate) stop: Spilled,
     /// Spills dropped before they were written: their slot was needed by a save.
     pub(crate) dropped: u64,
@@ -243,6 +247,7 @@ impl DiskTier {
                     let why = take_reason(&mut self.inflight, id);
                     let spilled = match why {
                         Reason::Watermark => &mut self.counters.watermark,
+                        Reason::Budget => &mut self.counters.budget,
                         Reason::Stop => &mut self.counters.stop,
                     };
                     spilled.entries += 1;
@@ -636,9 +641,12 @@ pub(crate) fn restore_report(
     let mut hit = None;
     if let Some(disk) = disk {
         let counters = &disk.counters;
-        tier.disk_written_entries =
-            u32::try_from(counters.watermark.entries + counters.stop.entries).unwrap_or(u32::MAX);
-        tier.disk_written_bytes = counters.watermark.bytes + counters.stop.bytes;
+        tier.disk_written_entries = u32::try_from(
+            counters.watermark.entries + counters.budget.entries + counters.stop.entries,
+        )
+        .unwrap_or(u32::MAX);
+        tier.disk_written_bytes =
+            counters.watermark.bytes + counters.budget.bytes + counters.stop.bytes;
         tier.disk_dropped = u32::try_from(counters.dropped).unwrap_or(u32::MAX);
         hit = disk.hit.take();
     }
@@ -678,11 +686,13 @@ fn take_reason(inflight: &mut Vec<(u64, Reason)>, id: u64) -> Reason {
 
 impl Counters {
     /// The totals by reason, for a log line.
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         format!(
-            "{} entries {} B at the watermark, {} entries {} B at a stop, {} dropped",
+            "{} entries {} B at the watermark, {} entries {} B over the byte budget, {} entries {} B at a stop, {} dropped",
             self.watermark.entries,
             self.watermark.bytes,
+            self.budget.entries,
+            self.budget.bytes,
             self.stop.entries,
             self.stop.bytes,
             self.dropped

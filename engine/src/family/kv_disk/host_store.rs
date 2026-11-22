@@ -313,12 +313,16 @@ impl HostStoreDisk {
 
     /// After a save: queues the oldest entries the host store holds beyond the bytes it may hold
     /// (the operator's bound, or the family's budget) - every entry when the newest alone is
-    /// over it. Nothing happens without a bound.
+    /// over it. Nothing happens without a bound. The least recently used entries go first and the
+    /// pinned roots last, since the store can release only the former; every entry's bytes count.
+    /// Spilling writes a copy to disk: the entry stays in the store, and its memory is released
+    /// only when the store evicts it.
     pub(crate) fn spill_over_budget<F: HostFamily>(&mut self, family: &F, store: &Store<F>) {
         let Some(budget) = self.host_bytes.or_else(|| family.host_budget()) else {
             return;
         };
-        let entries: Vec<_> = store.entries_lru().collect();
+        let mut entries: Vec<_> = store.entries_lru().collect();
+        entries.sort_by_key(|&(_, kind, _)| kind == SaveKind::Root);
         let sizes: Vec<u64> = entries
             .iter()
             .map(|&(_, _, snapshot)| family.view(snapshot).map_or(0, |view| view.bytes))
@@ -330,7 +334,7 @@ impl HostStoreDisk {
             if self.tier.has(key) {
                 continue;
             }
-            if let Some(held) = held_of(family, key, kind, snapshot, Reason::Watermark) {
+            if let Some(held) = held_of(family, key, kind, snapshot, Reason::Budget) {
                 self.tier.enqueue(held);
             }
         }

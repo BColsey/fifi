@@ -215,22 +215,35 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
 #[cfg(target_os = "macos")]
 pub(crate) fn available_memory_bytes() -> Option<u64> {
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     // A save, a spill check and a landing each ask, often within one request: one read serves them.
-    static LAST: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cached_read(&mut last, Instant::now(), || {
+        std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| parse_vm_stat(&String::from_utf8_lossy(&out.stdout)))
+    })
+}
+
+/// A read kept for one second: a value read less than a second before `now` is returned without
+/// reading again. A failed read is not kept, so the next call tries again.
+#[cfg(any(test, target_os = "macos"))]
+fn cached_read(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+    read: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
     if let Some((at, value)) = *last
-        && at.elapsed() < Duration::from_secs(1)
+        && now.saturating_duration_since(at) < std::time::Duration::from_secs(1)
     {
-        return value;
+        return Some(value);
     }
-    let value = std::process::Command::new("/usr/bin/vm_stat")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| parse_vm_stat(&String::from_utf8_lossy(&out.stdout)));
-    *last = Some((Instant::now(), value));
-    value
+    let value = read()?;
+    *last = Some((now, value));
+    Some(value)
 }
 
 /// The available bytes in the text of `vm_stat`: its page size times the free, inactive and
@@ -631,6 +644,32 @@ Pages purgeable:                                1244.\n\
         assert_eq!(
             parse_vm_stat("Mach (page size of 4096 bytes)\nPages free: 1.\n"),
             None
+        );
+    }
+
+    #[test]
+    fn a_read_is_kept_for_a_second_and_a_failure_is_not_kept() {
+        use super::cached_read;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(cached_read(&mut last, start, || Some(7)), Some(7));
+        assert_eq!(
+            cached_read(&mut last, start + Duration::from_millis(500), || Some(9)),
+            Some(7),
+            "within the second the first value serves"
+        );
+        assert_eq!(
+            cached_read(&mut last, start + Duration::from_millis(1_500), || Some(9)),
+            Some(9),
+            "after it the read runs again"
+        );
+        let mut empty = None;
+        assert_eq!(cached_read(&mut empty, start, || None), None);
+        assert_eq!(
+            cached_read(&mut empty, start, || Some(5)),
+            Some(5),
+            "a failed read leaves nothing kept"
         );
     }
 }

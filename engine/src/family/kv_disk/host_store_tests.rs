@@ -363,3 +363,96 @@ fn an_entry_already_on_disk_is_not_prepared_again_by_the_next_save() {
     disk.spill_over_budget(&Fake, &held);
     assert_eq!(PREPARES.with(|count| count.get()), 1, "on disk");
 }
+
+#[test]
+fn byte_bound_spills_leave_the_pinned_roots_for_last_and_say_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut disk = open(dir.path(), 8);
+    let mut held: PrefixStore<Snap, u8> = PrefixStore::with_limits(StoreLimits {
+        roots: 2,
+        entries: 8,
+    });
+    let root = put(&mut held, 1_600, 1, SaveKind::Root);
+    let oldest = put(&mut held, 1_500, 2, SaveKind::Periodic);
+    put(&mut held, 1_700, 3, SaveKind::Periodic);
+    // One byte under what the store holds: one entry must go, and it is the oldest unpinned one.
+    let total: usize = [1_600, 1_500, 1_700].map(Fake::bytes_of).iter().sum();
+    disk.host_bytes = Some(total as u64 - 1);
+    disk.spill_over_budget(&Fake, &held);
+    pump_until_idle(&mut disk);
+    assert!(
+        disk.tier.cache.has_exact(&oldest),
+        "the oldest unpinned entry"
+    );
+    assert!(!disk.tier.cache.has_exact(&root), "the root stays for last");
+    assert_eq!(disk.tier.counters.budget.entries, 1);
+    assert_eq!(disk.tier.counters.watermark.entries, 0);
+    assert!(
+        disk.tier
+            .counters
+            .summary()
+            .contains("over the byte budget"),
+        "the log line names the reason"
+    );
+}
+
+#[test]
+fn an_opened_tier_takes_the_bound_the_plan_resolved() {
+    for bound in [Some(1_234u64), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = Resolved {
+            dir: dir.path().join("cache"),
+            quota_bytes: 1 << 30,
+            host_bytes: bound,
+        };
+        let disk = HostStoreDisk::open("fake", &resolved, "test", &load(), 2).unwrap();
+        assert_eq!(disk.host_bytes, bound);
+    }
+}
+
+#[test]
+fn the_default_budget_leaves_out_what_the_engine_holds() {
+    let none = default_host_budget(0).expect("the machine's memory is known");
+    let held = default_host_budget(1 << 30).expect("the machine's memory is known");
+    assert_eq!(none - held, 1 << 30);
+    assert_eq!(default_host_budget(u64::MAX), Some(0), "never below zero");
+}
+
+/// A vector-landed family with no planner budget, and one with one.
+struct Planned(Option<u64>);
+
+impl VecFamily for Planned {
+    type Snapshot = Snap;
+    type Path = u8;
+    const LABEL: &'static str = "planned";
+
+    fn longest_entry(&self) -> usize {
+        4_000
+    }
+    fn part_bytes(&self, positions: usize) -> Result<Vec<usize>, EngError> {
+        Ok(vec![Fake::bytes_of(positions)])
+    }
+    fn view_of(&self, _snapshot: &Snap) -> Option<SnapshotView> {
+        None
+    }
+    fn finish(&mut self, _landing: Vec<u8>, positions: usize) -> Result<Snap, EngError> {
+        Ok(snap(positions, 0))
+    }
+    fn budget_bytes(&self) -> Option<u64> {
+        self.0
+            .or_else(|| default_host_budget(HostFamily::resident_bytes(self)))
+    }
+    fn resident(&self) -> u64 {
+        4_096
+    }
+}
+
+#[test]
+fn a_family_budget_reaches_the_tier_through_the_shared_trait() {
+    assert_eq!(HostFamily::host_budget(&Planned(Some(77))), Some(77));
+    assert_eq!(
+        HostFamily::host_budget(&Planned(None)),
+        default_host_budget(4_096),
+        "without a planner budget the machine's default, less what the family holds"
+    );
+}
