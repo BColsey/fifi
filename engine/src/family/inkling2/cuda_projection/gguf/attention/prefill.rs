@@ -322,10 +322,10 @@ impl ResidentAttention {
             )
         })();
         // A later enqueue can fail after queries or commit were accepted. Drain
-        // before the borrowed sidecar or pinned workspace can be reused; a fence
-        // failure takes precedence. Do not retry serially on a possibly dirty ring.
-        work.transfer.synchronize(&self.stream)?;
-        queued?;
+        // before the borrowed sidecar or pinned workspace can be reused. Do not
+        // retry serially on a possibly dirty ring.
+        work.transfer
+            .synchronize_after_enqueue(&self.stream, queued)?;
         let mut status = vec![0; 4 * count];
         work.transfer.read(0, &mut status)?;
         if status.into_iter().any(|byte| byte != 0) {

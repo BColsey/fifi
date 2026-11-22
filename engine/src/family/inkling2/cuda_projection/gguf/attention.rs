@@ -714,7 +714,11 @@ mod tests {
             ..row
         });
         let cursor = || attention.state.borrow().next_position[0];
-        let batch = |position, rows: &[Row<'_>], side, values: &VecDeque<_>, tiled| {
+        let batch = |position,
+                     rows: &[Row<'_>],
+                     side: Option<DeviceRange<'_>>,
+                     values: &VecDeque<_>,
+                     tiled| {
             attention.step_prefill_dispatch(
                 &ctx,
                 0,
