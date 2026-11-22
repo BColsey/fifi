@@ -475,11 +475,51 @@ extern "C" int inference_mlx_async_eval(const mlx_vector_array outputs) noexcept
   return mlx_async_eval(outputs);
 }
 
+// One row meets a weight through the same tiled kernel a window of rows does: the row is stacked
+// with a copy of itself and the first result row is kept. The one-row (vector) kernel adds in
+// another order than the tiled one, so without this a row's result depends on whether it shares
+// its step with another row. A decoder that decodes windows turns it on for its engine thread
+// before it traces anything.
+static thread_local bool one_row_products_tiled = false;
+
+extern "C" void inference_mlx_set_row_invariant_products(bool on) noexcept {
+  one_row_products_tiled = on;
+}
+
+static bool one_row_products_are_tiled() noexcept { return one_row_products_tiled; }
+
 extern "C" int inference_mlx_quantized_matmul(
     mlx_array* result, mlx_array activation, mlx_array weight, mlx_array scales,
     mlx_array biases, bool transpose, mlx_optional_int group_size,
     mlx_optional_int bits, const char* mode, mlx_stream stream) noexcept {
   return run_selected_operation(result, stream, [&] {
+    if (one_row_products_are_tiled() && mlx_array_ndim(activation) == 2 &&
+        mlx_array_shape(activation)[0] == 1) {
+      mlx_vector_array parts = mlx_vector_array_new();
+      mlx_vector_array_append_value(parts, activation);
+      mlx_vector_array_append_value(parts, activation);
+      mlx_array pair = mlx_array_new();
+      int status = mlx_concatenate_axis(&pair, parts, 0, stream);
+      mlx_vector_array_free(parts);
+      if (status != 0) {
+        mlx_array_free(pair);
+        return status;
+      }
+      mlx_array both = mlx_array_new();
+      status = mlx_quantized_matmul(&both, pair, weight, scales, biases, transpose,
+                                    group_size, bits, mode, stream);
+      mlx_array_free(pair);
+      if (status != 0) {
+        mlx_array_free(both);
+        return status;
+      }
+      const int start[2] = {0, 0};
+      const int stop[2] = {1, mlx_array_shape(both)[1]};
+      const int stride[2] = {1, 1};
+      status = mlx_slice(result, both, start, 2, stop, 2, stride, 2, stream);
+      mlx_array_free(both);
+      return status;
+    }
     return mlx_quantized_matmul(result, activation, weight, scales, biases,
                                 transpose, group_size, bits, mode, stream);
   });
@@ -492,8 +532,36 @@ extern "C" int inference_mlx_contiguous(
 
 extern "C" int inference_mlx_matmul(mlx_array* result, mlx_array a, mlx_array b,
                                     mlx_stream stream) noexcept {
-  return run_selected_operation(result, stream,
-                                [&] { return mlx_matmul(result, a, b, stream); });
+  return run_selected_operation(result, stream, [&] {
+    // One row takes the kernel a stack of rows takes (see the quantized product above).
+    if (one_row_products_are_tiled() && mlx_array_ndim(a) == 2 &&
+        mlx_array_ndim(b) == 2 && mlx_array_shape(a)[0] == 1) {
+      mlx_vector_array parts = mlx_vector_array_new();
+      mlx_vector_array_append_value(parts, a);
+      mlx_vector_array_append_value(parts, a);
+      mlx_array pair = mlx_array_new();
+      int status = mlx_concatenate_axis(&pair, parts, 0, stream);
+      mlx_vector_array_free(parts);
+      if (status != 0) {
+        mlx_array_free(pair);
+        return status;
+      }
+      mlx_array both = mlx_array_new();
+      status = mlx_matmul(&both, pair, b, stream);
+      mlx_array_free(pair);
+      if (status != 0) {
+        mlx_array_free(both);
+        return status;
+      }
+      const int start[2] = {0, 0};
+      const int stop[2] = {1, mlx_array_shape(both)[1]};
+      const int stride[2] = {1, 1};
+      status = mlx_slice(result, both, start, 2, stop, 2, stride, 2, stream);
+      mlx_array_free(both);
+      return status;
+    }
+    return mlx_matmul(result, a, b, stream);
+  });
 }
 
 extern "C" int inference_mlx_astype(mlx_array* result, mlx_array input,
@@ -2995,18 +3063,20 @@ static int compile_moe_rows(
   // The health reduce keeps its own MLX accumulation order in both router paths.
   if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
   // The fused router top-k kernel replaces the eight selection and renorm ops below at the
-  // decode contract (B = 1 with a multiple-of-32 expert count up to 1024 and top-k up to 32);
-  // the ids and the gates come out in the exact shapes and the same rank order, tie rule, and
-  // gate rounding as the op chain, which the batched shapes keep using.
+  // decode contract (a multiple-of-32 expert count up to 1024 and top-k up to 32); the ids and
+  // the gates come out in the exact shapes and the same rank order, tie rule, and gate rounding
+  // as the op chain, for one row and for a window alike, so a row's gates do not depend on its
+  // window.
   const bool router_kernel =
-      batch == 1 && p->experts % 32 == 0 && p->experts <= 1024 && p->top_k <= 32;
+      p->experts % 32 == 0 && p->experts <= 1024 && p->top_k <= 32;
   if (status == 0 && router_kernel) {
     const int rk_dims[5] = {batch, p->experts, p->top_k,
                             p->top_k > 8 ? p->top_k : 8, p->renorm};
-    const int rk_ids[1] = {p->top_k};
+    // The ids are `[B, k]` for one row as for a window: the same kernel selects row by row.
+    const int rk_ids[2] = {batch, p->top_k};
     status = router_topk_kernel_call(
-        &clamped.value, &gates.value, probs.value, rk_dims, rk_ids, 1,
-        gates_shape, 4, p->router_source, s);
+        &clamped.value, &gates.value, probs.value, rk_dims, rk_ids, 2, gates_shape, 4,
+        p->router_source, s);
   } else if (status == 0) {
   if (status == 0) status = inference_mlx_negative(&negated.value, probs.value, s);
   if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 1, s);
@@ -3025,13 +3095,26 @@ static int compile_moe_rows(
         &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
   }
   const int moe_lhs = compile_moe_lhs_index(batch);
+  // The persistent row-index operands of one row are `[k]`; the window shape is `[B, k]`, so one
+  // row reads them as `[1, k]` and runs the very graph a window of rows runs.
+  mlx_array rows_lhs = p->rows_lhs[moe_lhs];
+  mlx_array flat_lhs = p->flat_lhs[moe_lhs];
+  CompileScopeArray rows_lhs_pair, flat_lhs_pair;
+  if (status == 0 && batch == 1) {
+    const int pair_shape[2] = {1, p->top_k};
+    status = inference_mlx_reshape(&rows_lhs_pair.value, rows_lhs, pair_shape, 2, s);
+    if (status == 0)
+      status = inference_mlx_reshape(&flat_lhs_pair.value, flat_lhs, pair_shape, 2, s);
+    rows_lhs = rows_lhs_pair.value;
+    flat_lhs = flat_lhs_pair.value;
+  }
   if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
   // ONE gathered product of the stacked gate/up operand over the batched rows, then the
   // 4-axis split into the gate half [0, I) and the up half [I, 2I) of every gathered row.
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
         &stacked.value, x3.value, in.values[12], in.values[13], in.values[14],
-        p->rows_lhs[moe_lhs], clamped.value, true, compile_quant_optional(p->group[3]),
+        rows_lhs, clamped.value, true, compile_quant_optional(p->group[3]),
         compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
   if (status == 0 && stacked.value.ctx == nullptr) {
     // Fail closed: a null stacked product must not reach the split.
@@ -3061,7 +3144,7 @@ static int compile_moe_rows(
   if (status == 0) status = inference_mlx_multiply(&h.value, act.value, hu.value, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &eo.value, h.value, in.values[15], in.values[16], in.values[17], p->flat_lhs[moe_lhs],
+        &eo.value, h.value, in.values[15], in.values[16], in.values[17], flat_lhs,
         clamped.value, true, compile_quant_optional(p->group[4]),
         compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
   // F32 gates promote the expert products before reducing only the expert axis.
@@ -3098,10 +3181,24 @@ static int compile_moe_rows(
   // the same mlx_add the eager loop ran after the block.
   if (status == 0)
     status = inference_mlx_add(&resid_out.value, in.values[0], total_used, s);
+  // The route of one row is reported as `[k]` ids and `[k, 1, 1]` gates, the shapes its readers
+  // take; a window's are `[B, k]` and `[B, k, 1, 1]`.
+  CompileScopeArray route_ids, route_gates;
+  mlx_array ids_used = clamped.value;
+  mlx_array gates_used = gates.value;
+  if (status == 0 && batch == 1) {
+    const int id_shape[1] = {p->top_k};
+    const int gate_shape[3] = {p->top_k, 1, 1};
+    status = inference_mlx_reshape(&route_ids.value, clamped.value, id_shape, 1, s);
+    if (status == 0)
+      status = inference_mlx_reshape(&route_gates.value, gates.value, gate_shape, 3, s);
+    ids_used = route_ids.value;
+    gates_used = route_gates.value;
+  }
   compile_touching("moe rows body output vector");
   if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
-  if (status == 0) status = mlx_vector_array_append_value(results, clamped.value);
-  if (status == 0) status = mlx_vector_array_append_value(results, gates.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, ids_used);
+  if (status == 0) status = mlx_vector_array_append_value(results, gates_used);
   if (status == 0) status = mlx_vector_array_append_value(results, health.value);
   compile_touching("moe rows closure result vector");
   if (status == 0) status = mlx_vector_array_set(res, results);
@@ -3151,159 +3248,9 @@ static int compile_moe_body(
     return 1;
   }
   const int batch = x_shape[0];
-  if (batch != 1) {
-    if (batch != 2 && batch != 4 && batch != 8) return 1;
-    return compile_moe_rows(res, in, p, batch);
-  }
-  // Collected in a body-owned vector and moved into the caller's null slot at the end; the probe
-  // body above explains why appending to `*res` directly is wrong.
-  mlx_vector_array results = mlx_vector_array_new();
-  if (results.ctx == nullptr) {
-    return 1;
-  }
-  const mlx_stream s = p->stream;
-  const int one_hidden[2] = {1, p->hidden};
-  const int flat_shape[1] = {p->experts};
-  const int gates_shape[3] = {p->top_k, 1, 1};
-  const int x3_shape[3] = {1, 1, p->hidden};
-  const int start[1] = {0};
-  const int stop[1] = {p->top_k};
-  const int strides1[1] = {1};
-  const uint32_t expert_upper = static_cast<uint32_t>(p->experts - 1);
-  CompileScopeArray logits, probs, flat, negated, order, ids;
-  CompileScopeArray clamped, top, health, renorm_sum, gates0, gates;
-  CompileScopeArray x3, stacked, hg, hu, act, h, eo, weighted, experts;
-  CompileScopeArray sg_flat, sg, su, act2, sh, so_flat, so;
-  CompileScopeArray scalar_logit, factor, shared_out, total, total_act, resid_out;
-  // The folded post-attention norm: in.values[0] is the raw residual stream; the same
-  // rms_norm shim the eager loop called normalizes it once, and every consumer below reads
-  // the normalized row exactly as the uncompiled block did.
-  CompileScopeArray x_normed;
-  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[18], p->eps, s);
-  // Router probabilities softmax(x . router_t) [1, E]: the F32 router promotes the
-  // activation-dtype logits, so the routing arithmetic runs in F32 exactly as uncompiled.
-  if (status == 0)
-    status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[1], s);
-  if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
-  if (status == 0) status = inference_mlx_reshape(&flat.value, probs.value, flat_shape, 1, s);
-  // Device routing: stable argsort of the negated row, slice, ONE clamp below the expert count
-  // for the whole layer, take, renormalize, health.
-  if (status == 0) status = inference_mlx_negative(&negated.value, flat.value, s);
-  if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 0, s);
-  if (status == 0) status = inference_mlx_slice(&ids.value, order.value, start, stop, strides1, 1, s);
-  if (status == 0)
-    status = inference_mlx_clamp_indices(&clamped.value, ids.value, expert_upper, s);
-  if (status == 0)
-    status = inference_mlx_resident_take_axis(&top.value, flat.value, clamped.value, 0, s);
-  if (status == 0) status = inference_mlx_sum_axis(&health.value, flat.value, 0, true, s);
-  if (status == 0 && p->renorm != 0) {
-    status = inference_mlx_sum_axis(&renorm_sum.value, top.value, 0, true, s);
-    if (status == 0) status = inference_mlx_divide(&gates0.value, top.value, renorm_sum.value, s);
-  }
-  // Without renormalization the gates are the chosen probabilities themselves.
-  if (status == 0)
-    status = inference_mlx_reshape(
-        &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 3, s);
-  // The selected experts on x: ONE gathered product of the stacked gate/up operand, split
-  // into the gate half [0, I) and the up half [I, 2I), SwiGLU, down, the gate-weighted sum.
-  // The gather reads the SAME once-clamped ids as `combine`, so the layer builds one clamp
-  // node. The row-index operands come from the payload: at B=1 they are [k] with the row id 0
-  // (the stacked gather) and the arange over the k gathered rows (down), exactly the defaults
-  // mlx_gather_qmm would build per call - as persistent arrays they bind once at trace time
-  // instead of replaying arange and broadcast kernels on every decode step.
-  if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
-  if (status == 0)
-    status = inference_mlx_resident_gather_qmm(
-        &stacked.value, x3.value, in.values[12], in.values[13], in.values[14], p->rows_lhs[0],
-        clamped.value, true, compile_quant_optional(p->group[3]),
-        compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
-  // The stacked product is [k, 1, 2I]: the slice shapes come from its own static shape, so
-  // the body bakes no intermediate width beyond the payload's quantization triple.
-  if (status == 0 && stacked.value.ctx == nullptr) {
-    // Fail closed: a null stacked product must not reach the split.
-    status = 1;
-  }
-  if (status == 0) {
-    const int* stacked_shape = mlx_array_shape(stacked.value);
-    if (stacked_shape == nullptr || stacked_shape[2] % 2 != 0) {
-      status = 1;
-    } else {
-      const int taken = stacked_shape[0];
-      const int half = stacked_shape[2] / 2;
-      const int split_start[3] = {0, 0, 0};
-      const int split_strides[3] = {1, 1, 1};
-      const int gate_stop[3] = {taken, 1, half};
-      const int up_start[3] = {0, 0, half};
-      const int up_stop[3] = {taken, 1, half * 2};
-      status = inference_mlx_slice(
-          &hg.value, stacked.value, split_start, gate_stop, split_strides, 3, s);
-      if (status == 0)
-        status = inference_mlx_slice(
-            &hu.value, stacked.value, up_start, up_stop, split_strides, 3, s);
-    }
-  }
-  if (status == 0) status = inference_mlx_silu(&act.value, hg.value, s);
-  if (status == 0) status = inference_mlx_multiply(&h.value, act.value, hu.value, s);
-  if (status == 0)
-    status = inference_mlx_resident_gather_qmm(
-        &eo.value, h.value, in.values[15], in.values[16], in.values[17], p->flat_lhs[0],
-        clamped.value, true, compile_quant_optional(p->group[4]),
-        compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
-  // The F32 gates promote the weighted products, so the expert sum is F32.
-  if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
-  if (status == 0) status = inference_mlx_sum_axis(&experts.value, weighted.value, 0, false, s);
-  // The shared expert: sigmoid(x . s) * down(silu(gate(x)) * up(x)).
-  if (status == 0)
-    status = inference_mlx_reshape(&sg_flat.value, x_normed.value, one_hidden, 2, s);
-  if (status == 0)
-    status = inference_mlx_quantized_matmul(
-        &sg.value, sg_flat.value, in.values[2], in.values[3], in.values[4], true,
-        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
-        compile_quant_mode(p->mode[0]), s);
-  if (status == 0)
-    status = inference_mlx_quantized_matmul(
-        &su.value, sg_flat.value, in.values[5], in.values[6], in.values[7], true,
-        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
-        compile_quant_mode(p->mode[1]), s);
-  if (status == 0) status = inference_mlx_silu(&act2.value, sg.value, s);
-  if (status == 0) status = inference_mlx_multiply(&sh.value, act2.value, su.value, s);
-  if (status == 0 && sh.value.ctx != nullptr) {
-    const int* sh_shape = mlx_array_shape(sh.value);
-    if (sh_shape == nullptr || sh_shape[1] < 1) {
-      status = 1;
-    } else {
-      const int so_shape[2] = {1, sh_shape[1]};
-      status = inference_mlx_reshape(&so_flat.value, sh.value, so_shape, 2, s);
-    }
-  }
-  if (status == 0)
-    status = inference_mlx_quantized_matmul(
-        &so.value, so_flat.value, in.values[8], in.values[9], in.values[10], true,
-        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
-        compile_quant_mode(p->mode[2]), s);
-  // The F32 shared scalar promotes the sigmoid factor, so the shared product is F32 and so is
-  // the block total; the total then converts to the activation dtype (the block's `to_act`).
-  if (status == 0) status = inference_mlx_matmul(&scalar_logit.value, x_normed.value, in.values[11], s);
-  if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
-  if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
-  if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
-  if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
-  const mlx_array total_used = total_act.value.ctx != nullptr ? total_act.value : total.value;
-  // The folded output residual: the raw residual stream of in.values[0] joins the block total,
-  // the same mlx_add the eager loop ran after the block.
-  if (status == 0)
-    status = inference_mlx_add(&resid_out.value, in.values[0], total_used, s);
-  compile_touching("moe body output vector");
-  if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
-  // The route is the once-clamped ids, exactly the `BoundedIndices::ids` the uncompiled route
-  // exposes; the clamp of an in-range id is the identity, so the values are bit for bit equal.
-  if (status == 0) status = mlx_vector_array_append_value(results, clamped.value);
-  if (status == 0) status = mlx_vector_array_append_value(results, gates.value);
-  if (status == 0) status = mlx_vector_array_append_value(results, health.value);
-  compile_touching("moe closure result vector");
-  if (status == 0) status = mlx_vector_array_set(res, results);
-  const int release = mlx_vector_array_free(results);
-  return status != 0 ? status : release;
+  if (batch != 1 && batch != 2 && batch != 4 && batch != 8) return 1;
+  // One graph for one row and for a window: a row's result does not depend on its window.
+  return compile_moe_rows(res, in, p, batch);
 }
 
 // ===== Compiled attention pre-RoPE block =====

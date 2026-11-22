@@ -226,6 +226,14 @@ impl Context {
         Ok(())
     }
 
+    /// Makes this thread's one-row products take the tiled kernel a window of rows takes.
+    pub(super) fn set_row_invariant_products(&mut self, on: bool) -> Result<(), EngError> {
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        unsafe { ffi::mlx_set_row_invariant_products(on) };
+        Ok(())
+    }
+
     pub(super) fn set_cache_limit(&mut self, limit: usize) -> Result<usize, EngError> {
         let _dispatch = DispatchGuard::enter();
         self.check_ready()?;

@@ -781,6 +781,13 @@ impl MlxKernels {
         self.context.reset_peak_memory()
     }
 
+    /// Makes the one-row quantized and dense products of this thread take the tiled kernel a window
+    /// of rows takes, so a row's result does not depend on how many rows share its step. Set it
+    /// before the first trace: compiled blocks keep the products they were traced with.
+    pub fn set_row_invariant_products(&mut self, on: bool) -> Result<(), EngError> {
+        self.context.set_row_invariant_products(on)
+    }
+
     /// Sets the process-wide allocator cache limit and returns the previous limit.
     pub fn set_cache_limit(&mut self, bytes: u64) -> Result<u64, EngError> {
         let limit = usize::try_from(bytes)
