@@ -274,14 +274,15 @@ pub(super) fn build_tiered(
         decay: f64::from(plan.decay_milli) / 1000.0,
     };
     let timeout = Duration::from_millis(u64::from(plan.timeout_ms));
-    // The guess reads the same mapping the host will own, so build it first.
-    let guess = if guess_enabled(std::env::var_os(GUESS_VAR).as_deref()) {
-        Some(
-            build_router_guess(header, &region, dims)
-                .map_err(|error| checkpoint(format!("router guess: {error:?}")))?,
-        )
-    } else {
-        None
+    // The guess reads the same mapping the host will own, so build it first. Its advice only
+    // decides which experts the banks prefetch, so a checkpoint whose routers it cannot read
+    // (anything but plain F32) serves without it.
+    let guess = match build_router_guess(header, &region, dims) {
+        Ok(guess) => Some(guess),
+        Err(error) => {
+            eprintln!("q36 cuda: router-guess prefetch off: {error:?}");
+            None
+        }
     };
     let mut host = TieredHost::new(config, locator, region, pool, timeout)
         .map_err(|error| checkpoint(error.to_string()))?;
@@ -369,14 +370,6 @@ pub(super) fn attach_tiered_parts(
 
 /// The device bytes kept free beside the banks: the loader's headroom (1 GiB).
 const ADMISSION_RESERVE: u64 = crate::family::mem::DEVICE.load_headroom;
-
-/// Whether the router-guess expert prefetch runs: `Q36_TIERED_GUESS=1`. The flag exists
-/// so the prefetch (new behaviour in the tiered token path) ships dark until it is
-/// qualified on a device; anything but `1` keeps today's behaviour.
-const GUESS_VAR: &str = "Q36_TIERED_GUESS";
-fn guess_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
 
 /// Builds the [`RouterGuess`] of the whole model straight from the checkpoint mapping:
 /// every layer's `ffn_gate_inp` router matrix and `post_attention_layernorm` weight are
@@ -613,16 +606,5 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn the_guess_flag_is_exactly_one() {
-        use super::{GUESS_VAR, guess_enabled};
-        use std::ffi::OsStr;
-        assert_eq!(GUESS_VAR, "Q36_TIERED_GUESS");
-        assert!(guess_enabled(Some(OsStr::new("1"))));
-        assert!(!guess_enabled(Some(OsStr::new("0"))));
-        assert!(!guess_enabled(Some(OsStr::new("true"))));
-        assert!(!guess_enabled(None));
     }
 }
