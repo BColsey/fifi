@@ -205,6 +205,10 @@ pub(crate) struct WideCall<'a> {
     pub(crate) rows: usize,
     /// The cell of the first row; its keys are cells `0 ..= p0 + row`.
     pub(crate) p0: usize,
+    /// The cells of each head's plane when this sequence's planes are not the geometry's size: a
+    /// session sized to its request. The key split stays the geometry's, so a row's output does
+    /// not depend on how many cells its session holds.
+    cells: Option<usize>,
 }
 
 impl<'a> WideCall<'a> {
@@ -221,7 +225,14 @@ impl<'a> WideCall<'a> {
             out,
             rows,
             p0,
+            cells: None,
         }
+    }
+
+    /// The call over planes of `cells` cells per head.
+    pub(crate) fn with_cells(mut self, cells: usize) -> Self {
+        self.cells = Some(cells);
+        self
     }
 }
 
@@ -347,12 +358,13 @@ impl WideAttention {
         &self,
         codes: &'b DeviceBuffer,
         scales: &'b DeviceBuffer,
+        cells: usize,
     ) -> Result<AttnKvView<'b>, EngError> {
         let g = self.geometry;
         let mut view = kv8_plane_view(
             codes.range(0, codes.bytes())?,
             scales.range(0, scales.bytes())?,
-            g.cells,
+            cells,
             CPF_ATTN_WIDE_HEAD_DIM,
         );
         if g.n_kv_head != g.virtual_kv()? {
@@ -363,7 +375,7 @@ impl WideAttention {
             }
             let extents = view
                 .layout
-                .extents(g.cells, g.virtual_kv()?, CPF_ATTN_WIDE_HEAD_DIM)?;
+                .extents(cells, g.virtual_kv()?, CPF_ATTN_WIDE_HEAD_DIM)?;
             view.payload = codes.range(0, extents.payload_bytes)?;
             view.scales = Some(scales.range(0, extents.scale_bytes.unwrap_or(0))?);
         }
@@ -421,7 +433,11 @@ impl WideAttention {
     ) -> Result<(), EngError> {
         let g = self.geometry;
         let [k_codes, k_scales, v_codes, v_scales] = call.planes;
-        let views = [self.view(k_codes, k_scales)?, self.view(v_codes, v_scales)?];
+        let cells = call.cells.unwrap_or(g.cells);
+        let views = [
+            self.view(k_codes, k_scales, cells)?,
+            self.view(v_codes, v_scales, cells)?,
+        ];
         let split = cpf_attn_wide_split(g.cells)?;
         let part_bytes = cpf_attn_part_bytes(
             g.kernel_geometry(call.rows)?,
@@ -441,7 +457,7 @@ impl WideAttention {
                     n_head: g.n_head,
                     n_kv_head: g.virtual_kv()?,
                     head_dim: CPF_ATTN_WIDE_HEAD_DIM,
-                    cache_rows: g.cells,
+                    cache_rows: cells,
                     ld: 0,
                     p0: i64::try_from(call.p0)
                         .map_err(|_| rule("wide rows", "the first position overflows"))?,

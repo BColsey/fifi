@@ -505,7 +505,7 @@ fn a_window_of_sessions_equals_the_solo_runs() {
         .expect("window buffers");
     let lengths = [5usize, 17, 1, 130, 40, 2, 9, 77];
     let seqs: Vec<_> = (0..Bolt::WINDOW_ROWS)
-        .map(|_| model.new_seq().expect("sequence"))
+        .map(|_| model.new_seq_cells(2048).expect("sequence"))
         .collect();
     for width in [2usize, 3, 4, 5, 8] {
         let prompts: Vec<Vec<u32>> = (0..width)

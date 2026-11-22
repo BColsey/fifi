@@ -66,6 +66,7 @@ mod device {
     use crate::{
         EngError,
         family::{
+            cell_pool::{CellRequest, CellRoom, INITIAL_CELLS, even_share, session_cells_or_queue},
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             host_store::{HostStorePlan, largest_entry_bytes},
@@ -117,6 +118,9 @@ mod device {
         identity: PrefixIdentity,
         /// The sessions the engine serves at once; the worker reads it after start.
         max_seqs: usize,
+        /// The cells a request that names no generation limit may use for its whole context: the
+        /// even share of the pool among the sessions.
+        share: usize,
         /// The prompt rows the worker feeds per tick while sessions share the model.
         prompt_rows: usize,
         /// The kind of the entry the last restore used, the prompt tokens it shared beyond the
@@ -228,12 +232,15 @@ mod device {
         /// Whether the device has room for one more session's planes and the headroom. A probe
         /// that cannot read the device says yes, and the allocation decides.
         fn can_admit_session(&self) -> bool {
+            if self.model.pool().free() < INITIAL_CELLS {
+                return false;
+            }
             let Some(cost) = budget::bolt_seq_cost() else {
                 return true;
             };
             let per_session = cost
                 .per_position
-                .saturating_mul(self.model.cells() as u64)
+                .saturating_mul(INITIAL_CELLS as u64)
                 .saturating_add(cost.fixed)
                 .saturating_add(budget::BOLT_HEADROOM_BYTES);
             self.model
@@ -256,8 +263,36 @@ mod device {
             Ok(BoltSession {
                 core: DecodeSession::default(),
                 pos: 0,
-                seq: self.model.new_seq()?,
+                seq: self.model.new_seq_cells(INITIAL_CELLS)?,
             })
+        }
+
+        /// Sizes the session's cells to the request, leased from the pool: a request that names
+        /// its generation limit holds the prompt and the limit, one that names none holds the
+        /// even share, and a prompt above the share holds what it needs while the pool can
+        /// fund it. A pool that cannot fund the prompt yet refuses with a memory-plan error and
+        /// the worker queues the request until a session lets go. The planes are released
+        /// before the new ones are allocated and their contents are not kept: this runs before
+        /// any prefix restore.
+        fn reset_for_request(
+            &mut self,
+            st: &mut Self::Session,
+            prompt_tokens: usize,
+            completion_limit: Option<u32>,
+            _has_prefix_boundary: bool,
+        ) -> Result<(), EngError> {
+            let room = CellRoom {
+                reachable: st.seq.reachable(),
+                ceiling: self.model.cells(),
+                share: self.share,
+            };
+            let request = CellRequest {
+                prompt: prompt_tokens,
+                completion: completion_limit,
+            };
+            let cells = session_cells_or_queue(request, room)?;
+            self.model.resize_seq(&mut st.seq, cells)?;
+            self.reset(st)
         }
 
         fn decode_window(
@@ -286,6 +321,7 @@ mod device {
         }
 
         fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
+            // The most one session holds: a prompt below it queues until the pool funds it.
             crate::family::session::check_prompt(prompt_tokens, self.model.cells())
         }
 
@@ -296,7 +332,7 @@ mod device {
         }
 
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
-            let cells = self.model.cells();
+            let cells = st.seq.cells();
             st.core.prefill(
                 &mut Step {
                     model: &mut self.model,
@@ -316,7 +352,7 @@ mod device {
             let limits = Limits {
                 eos: &self.eos,
                 sampler_vocab: VOCAB,
-                context_limit: self.model.cells(),
+                context_limit: st.seq.cells(),
             };
             st.core.decode(
                 &mut Step {
@@ -463,7 +499,7 @@ mod device {
             session: &'a mut BoltSession,
         ) -> (&'a mut DecodeSession, Step<'a>, Limits<'a>) {
             let BoltSession { core, pos, seq } = session;
-            let cells = self.model.cells();
+            let cells = seq.cells();
             (
                 core,
                 Step {
@@ -480,7 +516,7 @@ mod device {
         }
 
         fn check_row(&self, session: &BoltSession, token: u32) -> Result<(), EngError> {
-            let cells = self.model.cells();
+            let cells = session.seq.cells();
             if session.pos >= cells {
                 return Err(EngError::ContextLimit(format!(
                     "position {} reaches the {cells} cell context",
@@ -555,9 +591,9 @@ mod device {
             headroom: budget::BOLT_HEADROOM_BYTES,
             cost: budget::bolt_seq_cost()
                 .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
-            context: model.cells() as u64,
+            context: INITIAL_CELLS as u64,
             row_cap: budget::BOLT_WINDOW_SEQS,
-            ceiling: budget::BOLT_WINDOW_SEQS,
+            ceiling: budget::BOLT_WINDOW_SEQS.min((model.pool().total() / INITIAL_CELLS).max(1)),
         };
         plan_seqs(
             inputs,
@@ -622,7 +658,7 @@ mod device {
             });
             announce_failure(&loaded, Some(&announce));
             let mut model = loaded?;
-            let first = model.new_seq()?;
+            let first = model.new_seq_cells(INITIAL_CELLS)?;
             let ask = budget::session_ask(seqs, model.graph_mode.active());
             if let Some(note) = &ask.note {
                 eprintln!("gemma4 bolt: {note}");
@@ -665,6 +701,7 @@ mod device {
             let disk = tier_plan.as_ref().and_then(|(resolved, origin)| {
                 HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, store.entries.max(1))
             });
+            let model_pool = model.pool().total();
             let mut serve = BoltServe {
                 prompt_rows: prompt_rows.unwrap_or(model.rows),
                 model,
@@ -672,6 +709,7 @@ mod device {
                 prefix,
                 identity,
                 max_seqs: plan.seqs,
+                share: even_share(model_pool, plan.seqs),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
@@ -995,19 +1033,106 @@ mod device {
         /// A serve with room for three sessions and no tokenizer: the tests drive the executor
         /// seam and the model directly.
         fn serve_of(model: Bolt) -> BoltServe {
+            serve_with(model, 3)
+        }
+
+        fn serve_with(model: Bolt, sessions: usize) -> BoltServe {
+            let pool = model.pool().total();
             BoltServe {
                 prompt_rows: model.rows,
                 model,
                 eos: vec![0],
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
-                max_seqs: 3,
+                max_seqs: sessions,
+                share: even_share(pool, sessions),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
                 disk: None,
                 prefix_tier: PrefixTier::default(),
             }
+        }
+
+        /// A new session sized to a request of `prompt_tokens` that names no generation limit.
+        fn sized_session(serve: &mut BoltServe, prompt_tokens: usize) -> BoltSession {
+            let mut session = serve.new_session().expect("session");
+            serve
+                .reset_for_request(&mut session, prompt_tokens, None, false)
+                .expect("sized for the request");
+            session
+        }
+
+        /// One prompt near the model's context takes the whole pool of a default start; eight
+        /// short sessions take an even share each and a long prompt queues while they are live.
+        /// The cells of every session are printed.
+        #[test]
+        #[ignore = "requires the pinned Bolt file and a device; use --release --test-threads=1"]
+        fn one_long_prompt_or_eight_short_sessions_share_the_pool() {
+            let path = pinned_bolt();
+            let bytes = std::fs::metadata(&path).expect("model file").len();
+            let model = bolt::load_choosing(
+                &[crate::family::gguf_select::GgufFile { path, bytes }],
+                None,
+                MaxSeqs::Auto,
+                &|_| {},
+            )
+            .expect("load");
+            let (pool, ceiling) = (model.pool().total(), model.cells());
+            let mut serve = serve_with(model, Bolt::WINDOW_ROWS);
+            let share = serve.share;
+            eprintln!("pool {pool} cells, one session up to {ceiling}, even share {share}");
+
+            // Eight short sessions run together, each at its even share.
+            let short = prompt(40, 1);
+            let mut sessions: Vec<BoltSession> = (0..Bolt::WINDOW_ROWS)
+                .map(|_| sized_session(&mut serve, short.len()))
+                .collect();
+            for session in &sessions {
+                assert_eq!(session.seq.cells(), share);
+            }
+            eprintln!(
+                "8 short sessions: {:?} cells each, {} pool cells free",
+                sessions.iter().map(|s| s.seq.cells()).collect::<Vec<_>>(),
+                serve.model.pool().free()
+            );
+            for session in &mut sessions {
+                serve.prefill(session, &short).expect("prefill");
+            }
+            let seqs: Vec<&BoltSeq> = sessions.iter().map(|session| &session.seq).collect();
+            serve.model.reserve_window(seqs.len()).expect("window rows");
+            let positions: Vec<usize> = sessions.iter().map(|session| session.pos).collect();
+            let rows = serve
+                .model
+                .decode_rows(&seqs, &vec![2u32; seqs.len()], &positions)
+                .expect("eight sessions decode together");
+            assert_eq!(rows.len(), Bolt::WINDOW_ROWS);
+
+            // A prompt above an even share queues while they are live: the pool cannot fund it.
+            let long_len = ceiling - 4_096;
+            let mut waiting = serve.new_session().expect("a ninth session");
+            assert!(matches!(
+                serve.reset_for_request(&mut waiting, long_len, None, false),
+                Err(EngError::MemoryPlan(_))
+            ));
+            drop(waiting);
+
+            // The sessions let go and the same prompt takes the pool.
+            drop(sessions);
+            let mut lone = sized_session(&mut serve, long_len);
+            eprintln!(
+                "1 long prompt of {long_len} tokens: {} cells, {} pool cells free",
+                lone.seq.cells(),
+                serve.model.pool().free()
+            );
+            assert_eq!(lone.seq.cells(), ceiling);
+            let started = std::time::Instant::now();
+            serve
+                .prefill(&mut lone, &prompt(long_len, 3))
+                .expect("the long prompt prefills");
+            eprintln!("prefill of {long_len} tokens took {:?}", started.elapsed());
+            // The last prompt token stays pending for the first decode step.
+            assert_eq!(lone.pos, long_len - 1);
         }
 
         fn prompt(len: usize, salt: u32) -> Vec<u32> {
@@ -1052,11 +1177,11 @@ mod device {
 
         fn restore_matches_a_cold_run(base_len: usize) {
             let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
-            let mut source = serve.new_session().expect("source");
-            let mut target = serve.new_session().expect("target");
-            let mut cold = serve.new_session().expect("cold");
             let base = prompt(base_len, 0);
             let extended: Vec<u32> = base.iter().copied().chain(prompt(40, 5_000)).collect();
+            let mut source = sized_session(&mut serve, base.len());
+            let mut target = sized_session(&mut serve, extended.len());
+            let mut cold = sized_session(&mut serve, extended.len());
 
             serve.reset(&mut source).expect("reset");
             serve.prefill(&mut source, &base).expect("prefill");

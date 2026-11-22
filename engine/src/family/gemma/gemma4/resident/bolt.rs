@@ -41,6 +41,7 @@ use super::{
 };
 use crate::EngError;
 use crate::family::card_fit::CellFigures;
+use crate::family::cell_pool::{CellLease, CellPool};
 use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceRange;
@@ -66,6 +67,7 @@ use crate::kernels::cuda::resident::shortlist;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceStream, GraphExec, is_capture_refusal};
 use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Geometry is read from the family descriptor, the single source of truth;
@@ -268,6 +270,10 @@ impl BoltLayer {
 /// number of sequences can step through the same weights.
 pub(crate) struct BoltSeq {
     id: u64,
+    /// The cells of each head's plane: what this session's request was sized to.
+    cells: usize,
+    /// The pool cells this session holds; they return when the session drops.
+    lease: CellLease,
     /// One entry per layer; `Some` for the physical layers.
     kv: Vec<Option<Kv>>,
     /// The position of the first row of the step (`StepParams.pos`).
@@ -390,12 +396,15 @@ pub(crate) struct Scratch {
 }
 
 pub(crate) struct Bolt {
-    /// KV cells per physical layer: the planned context of this load.
+    /// The most KV cells one session holds per physical layer: the model's context, or less when
+    /// the card carries less.
     cells: usize,
     /// The splits of one decode attention launch on this device.
     attn_splits: usize,
     /// The rows of one prefill chunk: the planned rows of this load.
     pub(crate) rows: usize,
+    /// The cells every session of this load draws from: what the card carries beside the weights.
+    pool: Arc<CellPool>,
     /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
     /// FIRST so it drops first: fields drop in declaration order, and the
     /// graph must be destroyed before any buffer whose address it baked (a
@@ -467,7 +476,7 @@ pub(crate) fn bolt_demand(
 }
 
 /// The cells, prefill rows and demand of one load.
-type Planned = (usize, usize, crate::kernels::cuda::plan::Demand);
+type Planned = (usize, usize, usize, crate::kernels::cuda::plan::Demand);
 
 /// The byte figures of Bolt's per-session cell sizing, planned by the shared card-fit rule.
 fn cell_figures(splits: Option<usize>, wide: bool, rows: usize) -> Result<CellFigures, EngError> {
@@ -478,7 +487,6 @@ fn cell_figures(splits: Option<usize>, wide: bool, rows: usize) -> Result<CellFi
             super::super::budget::BOLT_HEADROOM_BYTES,
             super::super::budget::BOLT_SEQ_FIXED_BYTES,
         ),
-        (MAX_CELLS, FALLBACK_CELLS),
     )
     .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
 }
@@ -549,25 +557,31 @@ pub(crate) fn load_choosing(
     // override or the default says; the admission charges its buffer when it is built.
     let wide_load = WideLoad::read(&ctx, "gemma4 bolt", wide_geometry(MAX_CELLS))?;
     let wide = wide_load.passed();
-    // The cells a card serves for a file, and the demand of that load.
-    // A file serves no more cells than its header gives as its context.
+    // The cells a card carries for a file, the rows of one prefill chunk it takes, and the demand
+    // of that load: one session holds at most the cells the file's header gives as its context,
+    // and every session leases its cells from the pool of what the card carries.
     let plan = |file: &crate::family::gguf_select::GgufFile| -> Result<Planned, EngError> {
         let rows = cell_figures(split, wide, Bolt::WINDOW_ROWS)?.prefill_rows(
             free,
             file.bytes,
-            super::super::budget::BOLT_PREFILL_LADDER,
+            (super::super::budget::BOLT_PREFILL_LADDER, FALLBACK_CELLS),
             &|rows| scratch_bytes(split, wide, rows),
             "FIFI_BOLT_PREFILL_ROWS",
         );
-        let cells = cell_figures(split, wide, rows)?
-            .serve(free, file.bytes, sessions)
-            .min(header_context(&file.path).unwrap_or(MAX_CELLS));
-        let demand = bolt_demand(file.bytes, split, cells, wide, rows)?;
-        Ok((cells, rows, demand))
+        let figures = cell_figures(split, wide, rows)?;
+        let (cells, pool) =
+            figures.planned(free, file.bytes, sessions, (MAX_CELLS, FALLBACK_CELLS));
+        let cells = cells.min(header_context(&file.path).unwrap_or(MAX_CELLS));
+        Ok((
+            cells,
+            pool,
+            rows,
+            bolt_demand(file.bytes, split, cells, wide, rows)?,
+        ))
     };
     let choice = crate::family::gguf_select::choose(files, &|file| {
         plan(file)
-            .and_then(|(_, _, demand)| crate::kernels::cuda::plan::admit(&demand, free))
+            .and_then(|(_, _, _, demand)| crate::kernels::cuda::plan::admit(&demand, free))
             .map(|_| ())
             .map_err(|error| error.describe())
     })?;
@@ -587,12 +601,13 @@ pub(crate) fn load_choosing(
             choice.chosen.path.display()
         );
     }
-    let (cells, rows, demand) = plan(&choice.chosen)?;
+    let (cells, pool, rows, demand) = plan(&choice.chosen)?;
     crate::kernels::cuda::plan::admit(&demand, free)?;
     planned(cells);
     eprintln!(
-        "bolt cuda: {cells} KV cells per layer and {rows} prefill rows per chunk chosen from the \
-         card ({free} bytes free, {} bytes of weights; the model maximum is {MAX_CELLS})",
+        "bolt cuda: {pool} KV cells per layer and {rows} prefill rows per chunk chosen from the \
+         card, shared by every session up to {cells} each ({free} bytes free, {} bytes of \
+         weights; the model maximum is {MAX_CELLS})",
         choice.chosen.bytes
     );
     let mut layers = Vec::with_capacity(LAYERS);
@@ -815,6 +830,10 @@ pub(crate) fn load_choosing(
     let mmq = DenseChunkGemm::new(&ctx, MMQ_K_MAX, rows)
         .inspect_err(|error| eprintln!("bolt cuda: no tensor-core prefill: {}", error.describe()))
         .ok();
+    // The pool was planned from the free memory before the weights went up; what the load
+    // allocated beyond its demand is already gone, so the pool is cut to what the card holds now.
+    let held = u64::try_from(ctx.memory_info()?.free).unwrap_or(0);
+    let pool = cell_figures(split, wide, rows)?.held_pool(pool, held, sessions);
     let draw = crate::family::decode_step::draw::DrawBuffers::new(
         &ctx,
         Bolt::WINDOW_ROWS,
@@ -822,9 +841,10 @@ pub(crate) fn load_choosing(
         Bolt::DRAW_WIDTH,
     )?;
     Ok(Bolt {
-        cells,
+        cells: cells.min(pool),
         attn_splits,
         rows,
+        pool: CellPool::new(pool),
         ctx,
         stream,
         layers,
@@ -848,6 +868,18 @@ pub(crate) fn load_choosing(
     })
 }
 
+impl BoltSeq {
+    /// The cells of each head's plane this sequence holds.
+    pub(crate) fn cells(&self) -> usize {
+        self.cells
+    }
+
+    /// The most cells this sequence can be resized to: its own and every free cell of the pool.
+    pub(crate) fn reachable(&self) -> usize {
+        self.lease.reachable()
+    }
+}
+
 impl Bolt {
     /// The most sessions one decode window steps together: the decode attention and the head
     /// launch are planned for this many rows.
@@ -863,25 +895,67 @@ impl Bolt {
         self.attn_splits
     }
 
+    /// The cells the card carries for every session together.
+    pub(crate) fn pool(&self) -> &Arc<CellPool> {
+        &self.pool
+    }
+
     /// Allocates the device state of one more sequence: zeroed KV8 planes for the physical
     /// layers at `cells` positions and its two position words. The planes are read only below
     /// the position word, so a sequence that is reset needs no clearing.
     pub(crate) fn new_seq(&self) -> Result<BoltSeq, EngError> {
-        // One zero chunk on the device, copied down every plane: the planes are cleared at
-        // device speed and no host memory the size of a plane is touched.
-        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
-        let built = self.build_seq(&zeros);
-        // The queued copies read `zeros`: the stream drains before it drops, whether or not the
-        // build succeeded.
-        let drained = self.stream.synchronize();
-        let seq = built?;
-        drained?;
+        self.new_seq_cells(self.cells)
+    }
+
+    /// A sequence over `cells` cells per head, leased from the pool.
+    pub(crate) fn new_seq_cells(&self, cells: usize) -> Result<BoltSeq, EngError> {
+        let mut seq = BoltSeq {
+            id: 0,
+            cells: 0,
+            lease: self.pool.lease_for(cells, self.cells)?,
+            kv: Vec::new(),
+            pos: zero(&self.ctx, 4)?,
+            kv_len: zero(&self.ctx, 4)?,
+        };
+        self.fill_seq(&mut seq)?;
         Ok(seq)
     }
 
-    fn build_seq(&self, zeros: &DeviceBuffer) -> Result<BoltSeq, EngError> {
+    /// Resizes `seq` to `cells` per head: its planes are released first and the new ones
+    /// allocated and zeroed, so the peak is one session's planes, not two. The contents are not
+    /// kept: a session is resized only at the start of a request, before any prefix restore. A
+    /// pool that cannot fund the growth refuses with a memory-plan error and leaves `seq` as it
+    /// was.
+    pub(crate) fn resize_seq(&self, seq: &mut BoltSeq, cells: usize) -> Result<(), EngError> {
+        if cells == seq.cells {
+            return Ok(());
+        }
+        seq.lease.resize_for(cells, self.cells)?;
+        self.fill_seq(seq)
+    }
+
+    /// Builds the planes of `seq` at the cells its lease holds. The sequence takes a new id, so a
+    /// captured decode graph never replays old planes.
+    fn fill_seq(&self, seq: &mut BoltSeq) -> Result<(), EngError> {
+        seq.kv = Vec::new();
+        seq.cells = 0;
+        let cells = seq.lease.cells();
+        // One zero chunk on the device, copied down every plane: the planes are cleared at
+        // device speed and no host memory the size of a plane is touched.
+        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
+        let built = self.build_kv(&zeros, cells);
+        // The queued copies read `zeros`: the stream drains before it drops, whether or not the
+        // build succeeded.
+        let drained = self.stream.synchronize();
+        seq.kv = built?;
+        drained?;
+        seq.cells = cells;
+        seq.id = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn build_kv(&self, zeros: &DeviceBuffer, cells: usize) -> Result<Vec<Option<Kv>>, EngError> {
         let ctx = &self.ctx;
-        let cells = self.cells;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
             let mut at = 0;
@@ -907,12 +981,7 @@ impl Bolt {
                 None
             });
         }
-        Ok(BoltSeq {
-            id: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
-            kv,
-            pos: zero(ctx, 4)?,
-            kv_len: zero(ctx, 4)?,
-        })
+        Ok(kv)
     }
 
     /// The `(offset, bytes)` ranges of the cells `0..fed` of every plane of one layer's cache, in
@@ -952,7 +1021,7 @@ impl Bolt {
     /// memory (less the OS floor) cannot hold it refuses with a memory-plan error and nothing
     /// is stored.
     pub(crate) fn snapshot_seq(&self, seq: &BoltSeq, fed: usize) -> Result<BoltSnapshot, EngError> {
-        if fed > self.cells {
+        if fed > seq.cells {
             return Err(EngError::ContextLimit(
                 "the Bolt snapshot exceeds the context".to_owned(),
             ));
@@ -960,7 +1029,7 @@ impl Bolt {
         let mut total = 0usize;
         for (layer, planes) in self.layers.iter().zip(&seq.kv) {
             if planes.is_some() {
-                for plane in Self::snapshot_ranges(layer.head, fed, self.cells) {
+                for plane in Self::snapshot_ranges(layer.head, fed, seq.cells) {
                     total += plane.iter().map(|range| range.1).sum::<usize>();
                 }
             }
@@ -986,7 +1055,7 @@ impl Bolt {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
             for (buffer, ranges) in buffers
                 .into_iter()
-                .zip(Self::snapshot_ranges(layer.head, fed, self.cells))
+                .zip(Self::snapshot_ranges(layer.head, fed, seq.cells))
             {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
@@ -1006,6 +1075,11 @@ impl Bolt {
         seq: &BoltSeq,
         snapshot: &BoltSnapshot,
     ) -> Result<(), EngError> {
+        if snapshot.fed > seq.cells {
+            return Err(EngError::ContextLimit(
+                "the Bolt snapshot exceeds the session's cells".to_owned(),
+            ));
+        }
         let mut at = 0;
         for (layer, planes) in self.layers.iter().zip(&seq.kv) {
             let Some(kv) = planes else { continue };
@@ -1013,7 +1087,7 @@ impl Bolt {
             for (buffer, ranges) in
                 buffers
                     .into_iter()
-                    .zip(Self::snapshot_ranges(layer.head, snapshot.fed, self.cells))
+                    .zip(Self::snapshot_ranges(layer.head, snapshot.fed, seq.cells))
             {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
@@ -1102,7 +1176,11 @@ impl Bolt {
                 "the Bolt window buffers are not reserved for this many rows".to_owned(),
             ));
         }
-        if positions.iter().any(|&pos| pos >= self.cells) {
+        if seqs
+            .iter()
+            .zip(positions)
+            .any(|(seq, &pos)| pos >= seq.cells)
+        {
             return Err(EngError::ContextLimit(
                 "the Bolt decode window exceeds the context".to_owned(),
             ));
@@ -1263,7 +1341,7 @@ impl Bolt {
         }
         if pos
             .checked_add(tokens.len())
-            .is_none_or(|end| end > self.cells)
+            .is_none_or(|end| end > seq.cells)
         {
             return Err(EngError::ContextLimit(
                 "the Bolt prefill batch exceeds the context".to_owned(),
@@ -1431,7 +1509,7 @@ impl Bolt {
         logits: bool,
     ) -> Result<(), EngError> {
         let m = tokens.len();
-        if pos.checked_add(m).is_none_or(|end| end > self.cells) {
+        if pos.checked_add(m).is_none_or(|end| end > seq.cells) {
             return Err(EngError::ContextLimit(
                 "the Bolt decode step exceeds the context".to_owned(),
             ));
@@ -1803,7 +1881,8 @@ impl Bolt {
                     sc.ctx_out.buf.range(at, bytes)?,
                     count,
                     first,
-                );
+                )
+                .with_cells(own.shape.cells);
                 let take = layer.global && count > 1;
                 if WideAttention::try_attend(self.wide_prefill.as_ref(), take, ctx, stream, call)? {
                     return Ok(());
@@ -1823,7 +1902,7 @@ impl Bolt {
                         n_q_head: HEADS,
                         n_kv_head: KV_HEADS,
                         head_dim: head,
-                        cells: self.cells,
+                        cells: own.shape.cells,
                         window: if layer.global { 0 } else { LOCAL_WINDOW },
                         scale: 1.0,
                         split: attn_split,
@@ -2223,24 +2302,31 @@ mod tests {
 
     use super::*;
 
-    fn plan_cells(
+    fn planned_cells(
         free: u64,
         weights: u64,
-        split: bool,
+        splits: Option<usize>,
         wide: bool,
         sessions: usize,
-    ) -> Result<Option<usize>, EngError> {
-        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide, 8)?.plan(free, weights, sessions))
+    ) -> Result<(usize, usize), EngError> {
+        Ok(cell_figures(splits, wide, 8)?.planned(
+            free,
+            weights,
+            sessions,
+            (MAX_CELLS, FALLBACK_CELLS),
+        ))
     }
 
-    fn cells_for(
-        free: u64,
-        weights: u64,
-        split: bool,
-        wide: bool,
-        sessions: usize,
-    ) -> Result<usize, EngError> {
-        Ok(cell_figures(split.then_some(ATTN_SPLIT_MAX), wide, 8)?.serve(free, weights, sessions))
+    fn pool_cells(free: u64, weights: u64, split: bool, wide: bool, sessions: usize) -> usize {
+        planned_cells(
+            free,
+            weights,
+            split.then_some(ATTN_SPLIT_MAX),
+            wide,
+            sessions,
+        )
+        .expect("plan")
+        .1
     }
 
     #[test]
@@ -2323,201 +2409,126 @@ mod tests {
     }
 
     #[test]
-    fn the_planned_cells_are_the_largest_count_the_card_carries() {
+    fn a_snapshot_the_host_cannot_back_is_refused_before_it_is_allocated() {
+        use crate::family::mem::HostFacts;
+        let one_gib = 1usize << 30;
+        let meminfo = |available_gib: u64| {
+            format!(
+                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
+                32 * (1 << 20),
+                available_gib * (1 << 20)
+            )
+        };
+        // The budget is the available figure, clamped by the cgroup's remaining bytes.
+        let tight = HostFacts::from_meminfo("test", &meminfo(20), Some(1 << 29)).expect("host");
+        let error = admit_snapshot(one_gib, Ok(tight.host_memory()))
+            .expect_err("a cgroup with half a GiB left cannot back 1 GiB");
+        assert!(
+            matches!(&error, EngError::MemoryPlan(text) if text.contains("a Bolt prefix snapshot")),
+            "{error:?}"
+        );
+        let roomy = HostFacts::from_meminfo("test", &meminfo(20), None).expect("host");
+        assert!(admit_snapshot(one_gib, Ok(roomy.host_memory())).is_ok());
+    }
+
+    /// A cgroup layout the probe cannot parse falls back to the bare figure, and a probe that
+    /// cannot verify anything proceeds: the save is not refused for a host the probe cannot read.
+    #[test]
+    fn a_probe_that_cannot_read_the_host_falls_back_and_proceeds() {
+        use crate::family::mem::HostFacts;
+        let one_gib = 1usize << 30;
+        let meminfo = "MemTotal:       33554432 kB\nMemAvailable:    2097152 kB\n";
+        let refusal = EngError::MemoryPlan("cgroup v1 layout".into());
+        // The bare fallback keeps the machine-wide figures: 2 GiB available backs 1 GiB.
+        let bare = HostFacts::bare("test", "test", &refusal, meminfo)
+            .expect("bare")
+            .host_memory();
+        assert_eq!(bare.1, 2 << 30);
+        assert!(admit_snapshot(one_gib, Ok(bare)).is_ok());
+        assert!(
+            admit_snapshot(3 << 30, Ok(bare)).is_err(),
+            "the bare figure still refuses"
+        );
+        // Both probes failing: the save proceeds, as the other stores' saves do.
+        assert!(admit_snapshot(one_gib, Err(refusal)).is_ok());
+    }
+
+    #[test]
+    fn the_pool_is_the_largest_count_the_card_carries() {
         let weights = 7_578_800_000u64;
         let free_for = |cells: usize| {
             let demand =
                 bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false, 8).expect("demand");
             demand.tensors + demand.kv_cache + demand.work + demand.headroom
         };
-        // A 3090-sized card holds the model maximum.
-        assert_eq!(
-            plan_cells(22_000_000_000, weights, true, false, 1).expect("plan"),
-            Some(MAX_CELLS)
-        );
-        // A card that carries 40,960 cells and not one step more gets exactly those.
+        // A card that carries 40,960 cells and not one step more has exactly those, and one
+        // session may hold all of them.
         let free = free_for(40_960);
         assert_eq!(
-            plan_cells(free, weights, true, false, 1).expect("plan"),
-            Some(40_960)
+            planned_cells(free, weights, Some(ATTN_SPLIT_MAX), false, 1).expect("plan"),
+            (40_960, 40_960)
         );
-        assert_eq!(
-            plan_cells(free - 1, weights, true, false, 1).expect("plan"),
-            Some(39_936)
-        );
-        // The count the plan returns passes the shared admission, and a card short of the
-        // smallest count plans none.
-        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false, 8).expect("demand");
+        assert_eq!(pool_cells(free - 1, weights, true, false, 1), 39_936);
+        // The pool passes the shared admission, and a card short of one cell plans the fallback
+        // that the admission refuses with its own figures.
+        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), 40_960, false).expect("demand");
         assert!(crate::kernels::cuda::plan::admit(&demand, free).is_ok());
-        assert_eq!(
-            plan_cells(free_for(1024) - 1, weights, true, false, 1).expect("plan"),
-            None
-        );
+        let short = free_for(0) - 1;
+        assert_eq!(pool_cells(short, weights, true, false, 1), FALLBACK_CELLS);
+        let refused =
+            bolt_demand(weights, Some(ATTN_SPLIT_MAX), FALLBACK_CELLS, false).expect("demand");
+        assert!(crate::kernels::cuda::plan::admit(&refused, short).is_err());
         assert_eq!(MAX_CELLS, 65_536);
     }
 
-    /// The cell planner as it was written inside Bolt before the shared planner took it over.
-    fn reference_cells(
-        free: u64,
-        weights: u64,
-        split: bool,
-        wide: bool,
-        sessions: usize,
-    ) -> Option<usize> {
-        use crate::family::card_fit::{
-            CacheForm, CardBytes, ContextLimits, SESSION_PLAN_SLACK_BYTES, plan_card_fit,
-        };
-        let per_position =
-            crate::family::gemma::gemma4::budget::bolt_kv_bytes_per_position().unwrap();
-        let scratch = scratch_bytes(split.then_some(ATTN_SPLIT_MAX), wide, 8).unwrap();
-        let extra = u64::try_from(sessions.max(1) - 1).unwrap_or(u64::MAX);
-        let unlisted = if extra > 0 {
-            SESSION_PLAN_SLACK_BYTES
-        } else {
-            0
-        };
-        let charge = |cells: u32| {
-            let cache = u64::from(cells).checked_mul(per_position)?;
-            let further = cache
-                .checked_add(crate::family::gemma::gemma4::budget::BOLT_SEQ_FIXED_BYTES)?
-                .checked_mul(extra)?;
-            cache
-                .checked_add(scratch)?
-                .checked_add(crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES)?
-                .checked_add(unlisted)?
-                .checked_add(further)
-        };
-        let ceiling = u32::try_from(MAX_CELLS).unwrap();
-        plan_card_fit(
-            CardBytes {
-                free,
-                weights,
-                band: 0,
-            },
-            &[CacheForm {
-                form: (),
-                charge: &charge,
-            }],
-            ContextLimits {
-                ceiling,
-                sufficient: ceiling,
-            },
-        )
-        .map(|fit| fit.context as usize)
-    }
-
+    /// One session holds up to the model's context whatever the planned session count; the pool
+    /// is what the card carries for all of them together. On a 3090 the pool funds the full
+    /// context for a lone prompt and an even share of it for each of eight sessions.
     #[test]
-    fn the_shared_planner_gives_the_cells_the_bolt_planner_gave() {
-        let weights = 7_578_800_000u64;
-        let mut seen = 0;
-        for free in (6..=24u64).map(|gib| gib * 1_000_000_000 + 123_456_789) {
-            for sessions in 1..=Bolt::WINDOW_ROWS {
-                for (split, wide) in [(true, false), (true, true), (false, false)] {
-                    let old = reference_cells(free, weights, split, wide, sessions);
-                    let new = cell_figures(split.then_some(ATTN_SPLIT_MAX), wide, 8)
-                        .expect("figures")
-                        .plan(free, weights, sessions);
-                    assert_eq!(
-                        new, old,
-                        "free {free} sessions {sessions} split {split} wide {wide}"
-                    );
-                    seen += 1;
-                }
-            }
-        }
-        // The default start on a 3090: eight planned sessions, the split armed, the gate passing
-        // or not.
-        for wide in [false, true] {
-            let free = 22_000_000_000u64;
-            let one = reference_cells(free, weights, true, wide, 1);
-            let all = reference_cells(free, weights, true, wide, 8).unwrap_or(0);
-            let old = one.map_or(FALLBACK_CELLS, |one| all.max(one.min(FALLBACK_CELLS)));
-            let now = cell_figures(Some(ATTN_SPLIT_MAX), wide, 8)
-                .expect("figures")
-                .serve(free, weights, 8);
-            eprintln!("default start, wide {wide}: served {old} cells before, {now} cells now");
-            assert_eq!(now, old);
-        }
-        assert_eq!(seen, 19 * 8 * 3);
+    fn a_session_holds_the_model_context_and_the_pool_is_what_the_card_carries() {
+        let weights = 7_946_927_552u64;
+        let free = 23_448_322_048u64;
+        let (cells, pool) = planned_cells(
+            free,
+            weights,
+            Some(ATTN_SPLIT_MAX),
+            false,
+            Bolt::WINDOW_ROWS,
+        )
+        .expect("plan");
+        assert_eq!(cells, MAX_CELLS);
+        assert!(
+            (MAX_CELLS..Bolt::WINDOW_ROWS * MAX_CELLS).contains(&pool),
+            "{pool}"
+        );
+        eprintln!(
+            "3090 default start: pool {pool} cells, one session up to {cells}, an even share of \
+             {} for each of {} sessions",
+            pool / Bolt::WINDOW_ROWS,
+            Bolt::WINDOW_ROWS
+        );
+        // A smaller card still holds the pool of what it carries; one session never holds more
+        // than the pool.
+        let small =
+            planned_cells(12_000_000_000, weights, Some(ATTN_SPLIT_MAX), false, 2).expect("plan");
+        assert!(small.0 <= small.1 && small.1 < pool);
     }
 
     #[test]
     fn the_planned_cells_fund_the_wide_prefill_buffer_when_the_gate_passes() {
         let weights = 7_600_000_000u64;
         for free in [11_000_000_000u64, 14_000_000_000, 21_000_000_000] {
-            let plain = cells_for(free, weights, true, false, 1).expect("cells");
-            let wide = cells_for(free, weights, true, true, 1).expect("cells");
+            let plain = planned_cells(free, weights, Some(ATTN_SPLIT_MAX), false, 1)
+                .expect("cells")
+                .0;
+            let wide = planned_cells(free, weights, Some(ATTN_SPLIT_MAX), true, 1)
+                .expect("cells")
+                .0;
             assert!(wide <= plain, "{free}: {wide} against {plain}");
             let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), wide, true, 8).expect("demand");
             crate::kernels::cuda::plan::admit(&demand, free)
                 .unwrap_or_else(|error| panic!("{free}: {wide} cells: {error:?}"));
         }
-    }
-
-    /// The sessions the planner funds once `cells` are resident beside the weights.
-    fn funded_sessions(free: u64, weights: u64, cells: usize) -> usize {
-        use crate::family::seq_plan::{SeqInputs, plan_seqs};
-        // What the first session holds beyond its admission demand, as measured on the 3090.
-        const UNLISTED_BYTES: u64 = 196 << 20;
-        let demand = bolt_demand(weights, Some(ATTN_SPLIT_MAX), cells, false, 8).expect("demand");
-        let after_first =
-            free.saturating_sub(demand.tensors + demand.kv_cache + demand.work + UNLISTED_BYTES);
-        let plan = plan_seqs(
-            SeqInputs {
-                free: after_first,
-                headroom: crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES,
-                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost().expect("cost"),
-                context: cells as u64,
-                row_cap: Bolt::WINDOW_ROWS,
-                ceiling: Bolt::WINDOW_ROWS,
-            },
-            None,
-        )
-        .expect("plan");
-        plan.seqs
-    }
-
-    #[test]
-    fn widening_the_cache_never_costs_a_session_the_fixed_size_funded() {
-        let weights = 7_946_927_552u64;
-        let target = Bolt::WINDOW_ROWS;
-        for free in (9u64..=24)
-            .map(|gib| gib << 30)
-            .chain([23_448_322_048, 23_566_221_312])
-        {
-            let cells = cells_for(free, weights, true, false, target).expect("cells");
-            let old = funded_sessions(free, weights, FALLBACK_CELLS);
-            let now = funded_sessions(free, weights, cells);
-            assert!(
-                cells
-                    >= FALLBACK_CELLS.min(
-                        plan_cells(free, weights, true, false, 1)
-                            .unwrap()
-                            .unwrap_or(0)
-                    ),
-                "{free}: {cells} cells"
-            );
-            assert!(
-                now >= old,
-                "{free}: {now} sessions at {cells} cells, {old} at the fixed size"
-            );
-        }
-    }
-
-    #[test]
-    fn the_cache_is_widened_only_as_far_as_every_planned_session_fits() {
-        let weights = 7_946_927_552u64;
-        let free = 23_448_322_048u64;
-        let cells = cells_for(free, weights, true, false, Bolt::WINDOW_ROWS).expect("cells");
-        assert!(cells > FALLBACK_CELLS && cells < MAX_CELLS, "{cells}");
-        assert_eq!(funded_sessions(free, weights, cells), Bolt::WINDOW_ROWS);
-        // The model maximum alone would have cost a session on this card.
-        assert!(funded_sessions(free, weights, MAX_CELLS) < Bolt::WINDOW_ROWS);
-        // One planned session (the decode graph) takes the whole model maximum.
-        assert_eq!(
-            cells_for(free, weights, true, false, 1).expect("cells"),
-            MAX_CELLS
-        );
     }
 
     fn logits(model: &Bolt) -> Vec<f32> {
@@ -2828,11 +2839,12 @@ mod tests {
         }
     }
 
-    /// The cells the default start picks serve every session the planner then funds, each up to
-    /// the last cell.
+    /// The default start's pool serves every session the planner then funds, each at its even
+    /// share and up to its last cell, and one session alone takes the model's context.
     #[test]
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
-    fn the_default_cells_serve_every_planned_session_to_the_last_cell() {
+    fn the_default_pool_serves_every_planned_session_to_the_last_cell() {
+        use crate::family::cell_pool::CELL_GRANULE;
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
         let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
         let bytes = std::fs::metadata(&path).expect("model file").len();
@@ -2842,40 +2854,66 @@ mod tests {
             &|_| {},
         )
         .expect("load");
-        let cells = model.cells();
-        let first = model.new_seq().expect("first session");
+        let pool = model.pool().total();
+        let initial = CELL_GRANULE;
+        let first = model.new_seq_cells(initial).expect("first session");
         let free = u64::try_from(model.ctx.memory_info().expect("memory").free).unwrap_or(u64::MAX);
         let plan = plan_seqs(
             SeqInputs {
                 free,
                 headroom: crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES,
                 cost: crate::family::gemma::gemma4::budget::bolt_seq_cost().expect("cost"),
-                context: cells as u64,
+                context: initial as u64,
                 row_cap: Bolt::WINDOW_ROWS,
                 ceiling: Bolt::WINDOW_ROWS,
             },
             None,
         )
         .expect("session plan");
+        let share = pool / plan.seqs / CELL_GRANULE * CELL_GRANULE;
         eprintln!(
-            "default cells {cells}, planned sessions {} ({})",
+            "pool {pool} cells, one session up to {}, planned sessions {} ({}), even share {share}",
+            model.cells(),
             plan.seqs,
             plan.describe()
         );
-        assert!(cells >= FALLBACK_CELLS, "{cells}");
+        assert_eq!(plan.seqs, Bolt::WINDOW_ROWS);
         let mut seqs = vec![first];
         for _ in 1..plan.seqs {
-            seqs.push(model.new_seq().expect("a planned session"));
+            seqs.push(model.new_seq_cells(initial).expect("a planned session"));
         }
+        for seq in &mut seqs {
+            model.resize_seq(seq, share).expect("an even share");
+        }
+        assert!(
+            model.pool().free() < share,
+            "the shares leave less than one share free"
+        );
         model.reserve_window(plan.seqs).expect("the window rows");
         let refs: Vec<&BoltSeq> = seqs.iter().collect();
         let tokens = vec![2u32; plan.seqs];
-        let positions = vec![cells - 1; plan.seqs];
+        let positions = vec![share - 1; plan.seqs];
         let rows = model
             .decode_rows(&refs, &tokens, &positions)
             .expect("every session decodes at the last cell");
         assert_eq!(rows.len(), plan.seqs);
         assert!(rows.iter().all(|row| row.len() == VOCAB));
+        // The pool is spent: another session queues.
+        assert!(matches!(
+            model.new_seq_cells(share),
+            Err(EngError::MemoryPlan(_))
+        ));
+        // One session alone takes the model's context: the others return their cells.
+        drop(refs);
+        seqs.truncate(1);
+        let mut lone = seqs.pop().expect("one session");
+        model
+            .resize_seq(&mut lone, model.cells())
+            .expect("the whole context");
+        assert_eq!(lone.cells(), model.cells());
+        model
+            .prefill_batch(&lone, &[2], model.cells() - 1, false)
+            .expect("the last cell of the whole context");
     }
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
