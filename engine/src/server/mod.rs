@@ -22,6 +22,7 @@ mod hf;
 #[cfg(test)]
 mod hf_tests;
 mod local_models;
+mod loopback_key;
 mod messages;
 mod model_serve;
 mod pieces;

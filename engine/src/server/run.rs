@@ -73,6 +73,22 @@ fn purge_kv_caches(_config: &Config) -> Result<(), StartupError> {
     Ok(())
 }
 
+/// The kept loopback key, with the line that tells the user where it is and how to send it.
+fn generated_key(variable: &str) -> Result<String, StartupError> {
+    let path = super::loopback_key::key_path().ok_or_else(|| {
+        StartupError(format!(
+            "no home directory to keep a generated API key in; set {variable} to name one"
+        ))
+    })?;
+    let (key, created) = super::loopback_key::load_or_create(&path)?;
+    eprintln!(
+        "api key: {variable} is not set; using the key {} {} (send it as `Authorization: Bearer <key>`): {key}",
+        if created { "generated into" } else { "kept in" },
+        path.display()
+    );
+    Ok(key)
+}
+
 /// `args` are the command-line arguments after the program name.
 /// The call returns after a shutdown signal, the end of the running requests
 /// and the end of the supervised workers.
@@ -97,14 +113,18 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         .filter(|arg| arg.as_str() != "--purge-kv-cache")
         .cloned()
         .collect();
-    let args: &[String] = match without_purge.first().map(String::as_str) {
-        Some("serve") => &without_purge[1..],
-        _ => &without_purge,
+    let served = without_purge.first().map(String::as_str) == Some("serve");
+    let args: &[String] = if served {
+        &without_purge[1..]
+    } else {
+        &without_purge
     };
     // The simplified startup is a front end to the same path: it builds
     // a normal in-memory `Config` and everything downstream (key check,
     // listen validation, engine start, serving) is the `--config` path.
-    let config = if args.first().map(String::as_str) == Some("--model") {
+    let simplified = !args.iter().any(|arg| arg == "--config")
+        && (served || args.first().map(String::as_str) == Some("--model"));
+    let config = if simplified {
         let parsed = crate::server::model_serve::parse_args(args)?;
         let config = crate::server::model_serve::build_config(&parsed)?;
         if parsed.print_config {
@@ -115,8 +135,13 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     } else {
         Config::from_file(&config_path(args)?)?
     };
-    let key = config.api_key(|name| std::env::var(name).ok())?;
     let address = config.listen_address()?;
+    let key = match config.api_key(|name| std::env::var(name).ok()) {
+        Ok(key) => key,
+        // A simplified start on loopback with no key set uses the key it keeps for the user.
+        Err(_) if simplified && address.ip().is_loopback() => generated_key(&config.api_key_env)?,
+        Err(error) => return Err(error),
+    };
     if purge_kv_cache {
         purge_kv_caches(&config)?;
     }

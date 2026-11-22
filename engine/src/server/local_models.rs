@@ -197,6 +197,104 @@ fn in_hub(root: &Path, query: &str) -> Vec<PathBuf> {
     best(query, candidates)
 }
 
+/// A model of a local store, for choosing one when none was named.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Local {
+    /// The path a start takes: a model directory, or one weights file.
+    pub(crate) path: PathBuf,
+    pub(crate) store: &'static str,
+    /// The name `--model` takes for it.
+    pub(crate) name: String,
+    pub(crate) modified: std::time::SystemTime,
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Every model of the three stores, the most recently written first (ties by path, so the order
+/// is stable). A model directory counts by its newest weights file.
+pub(crate) fn all(stores: &Stores) -> Vec<Local> {
+    let newest = |path: &Path| -> std::time::SystemTime {
+        if path.is_dir() {
+            std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| modified(&entry.path()))
+                .max()
+                .unwrap_or_else(|| modified(path))
+        } else {
+            modified(path)
+        }
+    };
+    let mut found = Vec::new();
+    for path in in_models(&stores.models, "") {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        found.push(Local {
+            modified: newest(&path),
+            path,
+            store: "the models directory",
+            name,
+        });
+    }
+    let library = stores
+        .ollama
+        .join("manifests")
+        .join("registry.ollama.ai")
+        .join("library");
+    for model in std::fs::read_dir(&library).into_iter().flatten().flatten() {
+        let name = model.file_name().to_string_lossy().into_owned();
+        for tag in std::fs::read_dir(model.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let query = format!("{name}:{}", tag.file_name().to_string_lossy());
+            if let Ok(blobs) = in_ollama(&stores.ollama, &query) {
+                for path in blobs {
+                    found.push(Local {
+                        modified: modified(&path),
+                        path,
+                        store: "the Ollama store",
+                        name: query.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for path in in_hub(&stores.hub, "") {
+        // `.../models--org--repo/snapshots/<commit>`
+        let repo = path
+            .ancestors()
+            .nth(2)
+            .and_then(Path::file_name)
+            .map(|folder| {
+                folder
+                    .to_string_lossy()
+                    .replacen("models--", "", 1)
+                    .replace("--", "/")
+            })
+            .unwrap_or_default();
+        found.push(Local {
+            modified: newest(&path),
+            path,
+            store: "the hub cache",
+            name: repo,
+        });
+    }
+    found.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    found
+}
+
 /// Looks `name` up in the stores. `Ok(None)` when nothing local matches.
 pub(crate) fn resolve(name: &str, stores: &Stores) -> Result<Option<Found>, StartupError> {
     let lookups: [(&'static str, Result<Vec<PathBuf>, StartupError>); 3] = [
@@ -368,5 +466,28 @@ mod tests {
         touch(&root.path().join("models/pair/Model-7B-Q8_0.gguf"));
         let error = resolve("Model-7B", &stores(root.path())).expect_err("two files, no directory");
         assert!(error.0.contains("matches several models"), "{}", error.0);
+    }
+
+    #[test]
+    fn every_store_is_listed_newest_first_with_the_name_to_pass() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = root.path();
+        touch(&root.join("models/a/a-Q4.gguf"));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        ollama_model(root, "qwen3", "8b", "abc");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        touch(&root.join("hub/models--org--repo/snapshots/c0ffee/m.gguf"));
+        let listed: Vec<(String, &str)> = super::all(&stores(root))
+            .into_iter()
+            .map(|model| (model.name, model.store))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("org/repo".to_string(), "the hub cache"),
+                ("qwen3:8b".to_string(), "the Ollama store"),
+                ("a".to_string(), "the models directory"),
+            ]
+        );
     }
 }

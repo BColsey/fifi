@@ -67,7 +67,7 @@ pub(crate) struct ModelServeArgs {
     pub(crate) print_config: bool,
 }
 
-/// Parse the arguments after `serve` when the first one is `--model`.
+/// Parse the arguments of the simplified startup (`serve`, with or without `--model`).
 /// The flag set is the preflight candidate surface plus the serving
 /// address and `--print-config`; anything else is a usage error, not a
 /// guess.
@@ -120,15 +120,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
         }
         index += 1;
     }
-    if parsed.model_dir.as_os_str().is_empty() {
-        return Err(StartupError(format!(
-            "serve --model: --model <path> is required\n{USAGE}"
-        )));
-    }
+    // No `--model` is the default start: `resolve_model_dir` chooses a local model.
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <path> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve [--model <dir|file.gguf|name|org/repo[:QUANT]>] [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8|bf16] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -222,6 +218,15 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 /// snapshot of its `main` ref, and anything else is left for
 /// discovery to reject in its own words.
 fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupError> {
+    if args.model_dir.as_os_str().is_empty() {
+        return resolve_default_model(
+            args,
+            &super::local_models::Stores::from_env(),
+            &mut |line| {
+                eprintln!("{line}");
+            },
+        );
+    }
     let text = args.model_dir.to_string_lossy();
     // A path that exists, or a link that points nowhere: the model check names what is wrong with
     // it (a dangling link) instead of reading its name as a store entry.
@@ -262,6 +267,53 @@ fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupErr
         )));
     }
     Ok(args.clone())
+}
+
+/// `serve` with no `--model`: the most recently written model of the local stores that a family
+/// serves. Models a family refuses are skipped, each with its reason; with none left the error
+/// says where to get one. The choice and how to name another are printed.
+fn resolve_default_model(
+    args: &ModelServeArgs,
+    stores: &super::local_models::Stores,
+    say: &mut dyn FnMut(&str),
+) -> Result<ModelServeArgs, StartupError> {
+    let local = super::local_models::all(stores);
+    let mut skipped: Vec<String> = Vec::new();
+    for model in &local {
+        let mut resolved = args.clone();
+        resolved.model_dir = model.path.clone();
+        match discover(&resolved) {
+            Ok(_) => {
+                for line in &skipped {
+                    say(line);
+                }
+                say(&format!(
+                    "model: no --model given; serving {} from {} (the newest of {} local); name another with --model <name>",
+                    model.name,
+                    model.store,
+                    local.len()
+                ));
+                return Ok(resolved);
+            }
+            Err(error) => skipped.push(format!(
+                "model: skipping {} ({}): {}",
+                model.name,
+                model.path.display(),
+                error.0.lines().next().unwrap_or_default()
+            )),
+        }
+    }
+    let tried = if skipped.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", skipped.join("\n"))
+    };
+    Err(StartupError(format!(
+        "serve: no --model given and no model is stored locally that this engine serves (looked in {}, {} and {}){tried}\nname one: --model <org/repo> fetches a GGUF repo from the hub, --model <file.gguf> serves a file, or put a model in the models directory",
+        stores.models.display(),
+        stores.ollama.display(),
+        stores.hub.display()
+    )))
 }
 
 /// A hub repo name that is not a path: one quantization of its cached snapshot, or of the hub
@@ -1424,5 +1476,70 @@ mod tests {
             .0;
         assert!(error.contains("dangling symlink"), "{error}");
         assert!(!error.contains("nothing local is named"), "{error}");
+    }
+
+    fn stores_in(root: &Path) -> crate::server::local_models::Stores {
+        crate::server::local_models::Stores {
+            models: root.join("models"),
+            ollama: root.join("ollama"),
+            hub: root.join("hub"),
+        }
+    }
+
+    #[test]
+    fn serve_with_no_model_names_none_and_parses() {
+        let args =
+            parse_args(&["--listen".to_string(), "127.0.0.1:9".to_string()]).expect("parses");
+        assert!(args.model_dir.as_os_str().is_empty());
+        assert_eq!(parse_args(&[]).expect("parses"), ModelServeArgs::default());
+    }
+
+    #[test]
+    fn the_default_model_is_the_newest_one_a_family_serves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let models = root.path().join("models");
+        for name in ["old", "new", "newest"] {
+            std::fs::create_dir_all(models.join(name)).expect("dir");
+        }
+        write_architecture(&models.join("old").join("old.gguf"), "qwen35moe");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        write_architecture(&models.join("new").join("new.gguf"), "gemma4");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // The newest file is not a model any family serves: it is skipped, with its reason.
+        write_architecture(
+            &models.join("newest").join("newest.gguf"),
+            "no-such-architecture",
+        );
+        let mut said = Vec::new();
+        let chosen = super::resolve_default_model(
+            &ModelServeArgs::default(),
+            &stores_in(root.path()),
+            &mut |line| said.push(line.to_string()),
+        )
+        .expect("chosen");
+        assert_eq!(chosen.model_dir, models.join("new"));
+        assert!(
+            said.iter().any(|line| line.contains("skipping newest")),
+            "{said:?}"
+        );
+        let last = said.last().expect("a line");
+        assert!(
+            last.contains("serving new ") && last.contains("--model <name>"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_local_the_default_start_says_where_to_get_a_model() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let error = super::resolve_default_model(
+            &ModelServeArgs::default(),
+            &stores_in(root.path()),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .0;
+        assert!(error.contains("no --model given"), "{error}");
+        assert!(error.contains("--model <org/repo>"), "{error}");
     }
 }
