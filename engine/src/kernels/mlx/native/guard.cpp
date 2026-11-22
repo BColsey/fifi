@@ -486,6 +486,10 @@ extern "C" void inference_mlx_set_row_invariant_products(bool on) noexcept {
   one_row_products_tiled = on;
 }
 
+extern "C" bool inference_mlx_row_invariant_products() noexcept {
+  return one_row_products_tiled;
+}
+
 static bool one_row_products_are_tiled() noexcept { return one_row_products_tiled; }
 
 extern "C" int inference_mlx_quantized_matmul(

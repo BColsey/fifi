@@ -781,6 +781,11 @@ impl MlxKernels {
         self.context.reset_peak_memory()
     }
 
+    /// Whether the one-row products of this thread take the tiled kernel a window of rows takes.
+    pub fn row_invariant_products(&self) -> bool {
+        self.context.row_invariant_products()
+    }
+
     /// Makes the one-row quantized and dense products of this thread take the tiled kernel a window
     /// of rows takes, so a row's result does not depend on how many rows share its step. Set it
     /// before the first trace: compiled blocks keep the products they were traced with.

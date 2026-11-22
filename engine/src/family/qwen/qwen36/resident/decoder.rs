@@ -321,9 +321,6 @@ impl<'c> ResidentDecoder<'c> {
         kv: KvDtype,
         device_plan: Option<ExpertDevicePlan>,
     ) -> Result<Self, EngError> {
-        // A row's product takes the kernel a window of rows takes, whether it decodes alone or in a
-        // window: set before anything traces, since compiled blocks keep the products they traced.
-        kernels.set_row_invariant_products(true)?;
         let act = activation.dtype();
         if kv == KvDtype::Q8
             && !host
