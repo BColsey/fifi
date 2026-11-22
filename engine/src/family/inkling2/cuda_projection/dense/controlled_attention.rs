@@ -165,12 +165,37 @@ impl DenseStep {
             )?;
             context.dense_gemv_group(&self.stream, &projections)
         })?;
+        self.capture_first_controller_tile(m, hidden)?;
         let mut values = values.into_iter().skip(3 * m);
         Ok(Some(
             (0..m)
                 .map(|_| split_projections(&mut values, weights))
                 .collect(),
         ))
+    }
+
+    fn capture_first_controller_tile(&self, rows: usize, hidden: usize) -> Result<(), EngError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let Some(dir) = std::env::var_os("FIFI_INKLING_DEBUG_CONTROLLER_CAPTURE") else {
+            return Ok(());
+        };
+        if DONE.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let slot = self.arena.tensor(Slot::Output as usize)?;
+        let mut bytes = vec![0u8; 24 * rows * hidden * size_of::<f32>()];
+        slot.buffer()
+            .read_at(&self.stream, slot.offset(), &mut bytes)?;
+        std::fs::write(dir.join("gpu.f32"), bytes)
+            .map_err(|e| bad(format!("capture GPU tile: {e}")))?;
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::json!({"rows":rows,"hidden":hidden}).to_string(),
+        )
+        .map_err(|e| bad(format!("capture GPU tile metadata: {e}")))?;
+        Ok(())
     }
 
     fn batch_call<'a>(

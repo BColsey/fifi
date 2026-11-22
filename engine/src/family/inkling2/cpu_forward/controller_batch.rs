@@ -267,7 +267,8 @@ impl CpuForward {
         } else {
             [None, None, None]
         };
-        let resident = if batched.iter().any(Option::is_some) {
+        let staged_controller = batched.iter().any(Option::is_some);
+        let resident = if staged_controller {
             None
         } else if let Some(controllers) = weights.attention_controllers(names, shape, rows.len())? {
             Some(controllers)
@@ -298,6 +299,13 @@ impl CpuForward {
         };
         let _subspan = self.phase_span(Work::AttentionControlApply);
         let local = visit.attention == Attention::Local;
+        let capture = self.capture_host_controller_inputs(
+            layer,
+            local,
+            &prepared,
+            &projections,
+            staged_controller,
+        )?;
         let mut result = Vec::with_capacity(prepared.len());
         for (row, projections) in prepared.into_iter().zip(projections) {
             let mut inputs = AttentionInputs::default();
@@ -314,7 +322,78 @@ impl CpuForward {
             }
             result.push(inputs);
         }
+        if let Some((dir, count, mut words)) = capture {
+            for role in 0..3 {
+                for row in result.iter().take(count) {
+                    words.extend_from_slice(&row[role]);
+                }
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_ne_bytes()).collect();
+            std::fs::write(dir.join("cpu.f32"), bytes)
+                .map_err(|e| bad(format!("capture CPU controller: {e}")))?;
+        }
         Ok(Some(result))
+    }
+
+    fn capture_host_controller_inputs(
+        &self,
+        layer: &str,
+        local: bool,
+        prepared: &[[PreparedInput; 3]],
+        projections: &[[Option<[Vec<f32>; 2]>; 3]],
+        staged: bool,
+    ) -> Result<Option<(std::path::PathBuf, usize, Vec<f32>)>, EngError> {
+        let Some(dir) = std::env::var_os("FIFI_INKLING_DEBUG_CONTROLLER_CAPTURE") else {
+            return Ok(None);
+        };
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.join("meta.json").exists() || dir.join("cpu.f32").exists() {
+            return Ok(None);
+        }
+        let metadata = std::fs::read(dir.join("meta.json"))
+            .map_err(|e| bad(format!("read capture metadata: {e}")))?;
+        let meta: serde_json::Value = serde_json::from_slice(&metadata)
+            .map_err(|e| bad(format!("parse capture metadata: {e}")))?;
+        let count = meta["rows"]
+            .as_u64()
+            .ok_or_else(|| bad("missing capture rows"))? as usize;
+        if count == 0
+            || count > prepared.len()
+            || count > projections.len()
+            || meta["hidden"].as_u64() != Some(self.hidden() as u64)
+        {
+            return Err(bad("invalid capture dimensions"));
+        }
+        let mut words = Vec::with_capacity(24 * count * self.hidden());
+        for role in 0..3 {
+            for row in prepared.iter().take(count) {
+                words.extend_from_slice(&row[role].control.gate);
+            }
+        }
+        for role in 0..3 {
+            let gamma = self
+                .weights
+                .vec(&attention_norm_name(layer, local, role), self.hidden())?;
+            for row in prepared.iter().take(count) {
+                words.extend_from_slice(&row[role].input);
+                words.extend_from_slice(&row[role].control.message);
+                words.extend_from_slice(&gamma);
+            }
+        }
+        for role in 0..3 {
+            for row in projections.iter().take(count) {
+                let [gain, forget] = row[role]
+                    .as_ref()
+                    .ok_or_else(|| bad("capture requires completed controller projections"))?;
+                words.extend_from_slice(gain);
+                words.extend_from_slice(forget);
+            }
+        }
+        eprintln!(
+            "Inkling controller input capture {}",
+            serde_json::json!({"layer":layer,"rows":count,"staged":staged})
+        );
+        Ok(Some((dir, count, words)))
     }
 
     fn prepare_attention_controllers(
