@@ -192,8 +192,48 @@ impl ExpertDeviceStacks {
         Ok(device)
     }
 
-    /// Read the incoming expert before overwriting its slot. The caller commits its
-    /// slot map only after success and must discard this bank on a device-copy error.
+    /// Execute a disk-mode pass; the shared policy advances during planning, so
+    /// any subsequent failure poisons it before this method returns.
+    pub(in super::super::super) fn step_disk<P: crate::family::expert_bank::SlotPolicy>(
+        &mut self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        model: &GgufModel,
+        state: &mut crate::family::expert_bank::ExpertBankState<P>,
+        layer: usize,
+        picks: &[i32],
+    ) -> Result<crate::family::expert_bank::PassCopies, EngError> {
+        use crate::family::expert_bank::{HostMode, NO_PLACE};
+        if state.mode() != HostMode::Disk {
+            return Err(EngError::BadRequest(
+                "GGUF disk step requires disk mode".into(),
+            ));
+        }
+        let copies = state.begin_pass(layer, picks)?;
+        for op in &copies.ops {
+            let result = if op.src_place == NO_PLACE && op.demote.is_none() {
+                self.replace_from_model(
+                    stream,
+                    model,
+                    layer,
+                    usize::from(op.slot),
+                    u32::from(op.incoming),
+                )
+            } else {
+                Err(EngError::BadRequest(
+                    "unexpected GGUF disk copy plan".into(),
+                ))
+            };
+            if let Err(error) = result {
+                state.poison();
+                return Err(error);
+            }
+        }
+        Ok(copies)
+    }
+
+    /// Read the incoming expert before overwriting its slot. `begin_pass` advances
+    /// shared bank state before copies, so its caller must poison that state on any
+    /// replacement failure and must not expose the new slot row before success.
     pub(in super::super::super) fn replace_from_model(
         &mut self,
         stream: &crate::kernels::cuda::DeviceStream,

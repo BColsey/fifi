@@ -659,17 +659,45 @@ fn full_expert_device_stacks_match_host() {
         .unwrap();
     let ctx = CudaContext::new().unwrap();
     let stream = ctx.stream().unwrap();
-    // Slot zero initially reads sparse fixture zeros; replacement must install expert 256.
-    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0]).unwrap();
-    assert!(bank.replace_from_model(&stream, &model, 0, 1, 256).is_err());
+    use super::expert_layout::ExpertLayout;
+    use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
+    let experts = model.config().dims.experts as usize;
+    let geometry = BankGeometry::new(
+        1,
+        experts,
+        1,
+        2,
+        ExpertLayout::for_layer(&model, 0).unwrap().bytes,
+    )
+    .unwrap();
+    let mut row = vec![-1; experts];
+    row[0] = 0;
+    row[1] = 1;
+    let state = || {
+        let policy =
+            ReplaceOnMissLru::from_fill(geometry, &[&row], &[vec![0; experts]], None).unwrap();
+        ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap()
+    };
+    let mut bad_state = state();
+    let mut short_bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0]).unwrap();
     assert!(
-        bank.replace_from_model(&stream, &model, 0, 0, model.config().dims.experts)
+        short_bank
+            .step_disk(&stream, &model, &mut bad_state, 0, &[256])
             .is_err()
     );
-    assert!(bank.part(0).is_ok());
-    bank.replace_from_model(&stream, &model, 0, 0, 256).unwrap();
+    assert!(bad_state.is_poisoned());
+    assert!(bad_state.begin_pass(0, &[256]).is_err());
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
+    let mut state = state();
+    let copies = bank
+        .step_disk(&stream, &model, &mut state, 0, &[256])
+        .unwrap();
+    assert_eq!(copies.ops.len(), 1);
+    let slot = copies.ops[0].slot;
+    assert_eq!(state.slot_row(0)[256], i32::from(slot));
     let ids = ctx.allocate(4).unwrap();
-    ids.write_at(&stream, 0, &0i32.to_ne_bytes()).unwrap();
+    ids.write_at(&stream, 0, &i32::from(slot).to_ne_bytes())
+        .unwrap();
     let mut checked = 0;
     for (tensor, expert) in projection_samples(&model).filter(|(_, expert)| expert.is_some()) {
         let k = tensor.dims[0] as usize;
@@ -704,7 +732,7 @@ fn full_expert_device_stacks_match_host() {
                 y_slot_stride: rows,
                 k,
                 rows,
-                n_expert: 1,
+                n_expert: 2,
                 n_used: 1,
                 glu_gate: None,
             },
