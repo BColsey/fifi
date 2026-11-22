@@ -810,6 +810,25 @@ mod tests {
         assert!(aligned >= packed && planned >= packed && distinct.len() > 1);
         // Specific to this pinned layout and slot count, not a general planner guarantee.
         assert_eq!(aligned, planned);
+        let reserve = super::super::plan::stack_alignment_reserve(model.config().layers()).unwrap();
+        let mut min_headroom = u64::MAX;
+        for slot_count in 1..=model.config().dims.experts as usize {
+            let actual = ExpertAllocation::for_model(&model, slot_count)
+                .unwrap()
+                .device_bytes as u64;
+            let bound =
+                sizes.shape.expert_bytes * model.config().layers() as u64 * slot_count as u64
+                    + reserve;
+            assert!(
+                actual <= bound,
+                "slot count {slot_count}: {actual} > {bound}"
+            );
+            min_headroom = min_headroom.min(bound - actual);
+        }
+        eprintln!(
+            "checked all {} slot counts; minimum reserve headroom {min_headroom} bytes",
+            model.config().dims.experts
+        );
         eprintln!(
             "layers {} slots {slots}: packed {packed} aligned {aligned} mean-plan {planned} padding {} plan-margin {} distinct-record-sizes {}",
             model.config().layers(),
