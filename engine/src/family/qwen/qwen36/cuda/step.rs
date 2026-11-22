@@ -443,6 +443,9 @@ pub(crate) struct QwenResidentStep<'a> {
     tiered_report: TokenReport,
     /// The sessions the card-short planner funded beside the banks; `None` on every other start.
     sessions_funded: Option<usize>,
+    /// The most cells a session may grow to when the step's own state is built smaller than the
+    /// context (the state grows on demand); `None` when the state is the context.
+    ceiling_cells: Option<usize>,
     /// The least free VRAM seen while serving: the first prefill, the first decode and every
     /// later new low, so the headroom constants can be judged against what the engine measured.
     free_marks: crate::family::mem::fill::FreeMarks,
@@ -894,6 +897,7 @@ impl<'a> QwenResidentStep<'a> {
             tiered: None,
             tiered_report: TokenReport::default(),
             sessions_funded: None,
+            ceiling_cells: None,
             free_marks: crate::family::mem::fill::FreeMarks::default(),
             globals: GlobalWeights::new(
                 &res.names,
@@ -1422,6 +1426,10 @@ impl<'a> QwenResidentStep<'a> {
     /// The counters of the last token's tiered boundary (all zero on a plain step).
     /// Records the sessions the planner funded beside the banks: the sessions executor caps itself
     /// at them.
+    pub(crate) fn set_ceiling_cells(&mut self, cells: usize) {
+        self.ceiling_cells = Some(cells);
+    }
+
     pub(crate) fn set_sessions_funded(&mut self, sessions: usize) {
         self.sessions_funded = Some(sessions);
     }

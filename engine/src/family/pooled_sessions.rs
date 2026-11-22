@@ -64,8 +64,14 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     fn funded_sessions(&self) -> Option<usize> {
         None
     }
-    /// The cells of the context the step was built for, which become the pool.
+    /// The cells of the part the step runs now.
     fn context_cells(&self) -> usize;
+    /// The most cells a session may grow to, which become the pool: the context the step was
+    /// built for. A step whose own state is smaller than its context (it grows on demand) says
+    /// the context here; the default is the running part's cells.
+    fn ceiling_cells(&self) -> usize {
+        self.context_cells()
+    }
     /// A zeroed part holding `cells` positions.
     fn new_part(&mut self, cells: usize) -> Result<Self::Part>;
     /// Exchanges the part the step runs with `part`.
@@ -176,7 +182,7 @@ impl<E: PartHost> PooledSessions<E> {
         if !single {
             step.check_sessions()?;
         }
-        let ceiling = step.context_cells();
+        let ceiling = step.ceiling_cells();
         let pool = CellPool::new(ceiling);
         if single {
             // The step's own planes are the session's; the lease still follows the tokens it

@@ -196,6 +196,10 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
         self.seq_cells()
     }
 
+    fn ceiling_cells(&self) -> usize {
+        self.ceiling_cells.unwrap_or_else(|| self.seq_cells())
+    }
+
     fn new_part(&mut self, cells: usize) -> Result<Self::Part, EngError> {
         self.new_seq(cells)
     }

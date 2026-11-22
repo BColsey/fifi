@@ -114,6 +114,9 @@ struct StartupPlan {
     verify: bool,
     allow_unpinned: bool,
     modes: RuntimeModes,
+    /// The cells the step's state is built with, when the sessions executor grows it on demand
+    /// (the tiered rung): the cache the context names is a ceiling, not a reservation.
+    initial_cells: Option<usize>,
 }
 
 impl StartupPlan {
@@ -164,6 +167,7 @@ impl StartupPlan {
             verify,
             allow_unpinned,
             modes,
+            initial_cells: None,
         })
     }
 
@@ -254,6 +258,7 @@ impl StartupPlan {
             verify,
             allow_unpinned,
             modes,
+            initial_cells: None,
         })
     }
 }
@@ -1351,6 +1356,7 @@ fn lower_rung(
         tensors,
         expert_bytes: tensors.saturating_sub(resident),
         kv_cache: plan.reserve,
+        kv_credit: kv_credit(settings, plan, plan.device_first_native.is_some())?,
         work: load_options(plan.reserve, plan.modes.fixed_admission)
             .reserve
             .work,
@@ -1376,7 +1382,12 @@ fn lower_rung(
         CardVerdict::Short(short) => {
             let variant = card_short::tiered_variant(settings);
             let modes = runtime_modes(&variant)?;
-            let variant_plan = StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+            let mut variant_plan =
+                StartupPlan::new(&variant, plan.verify, plan.allow_unpinned, modes)?;
+            if let Some(initial) = initial_cache(settings, plan.device_first_native.is_some())? {
+                variant_plan.reserve = initial.bytes;
+                variant_plan.initial_cells = Some(initial.cells);
+            }
             Ok(Some((variant, variant_plan, short)))
         }
     }
@@ -1532,6 +1543,44 @@ fn memory_receipt(
         })
         .collect();
     Ok(TierReceipt::from_layers(card, dense, experts, &layers, pinned).with_cache(cache))
+}
+
+/// The cache of a pooled start at the cells a session begins with: the cells and the bytes. The
+/// sessions executor builds its parts at these and grows them on demand.
+struct InitialCache {
+    cells: usize,
+    bytes: u64,
+}
+
+/// The initial cache of a start that runs the sessions executor, `None` for one that serves with
+/// the step's own state (it keeps the whole cache it names).
+fn initial_cache(
+    settings: &Q36Settings,
+    device_first: bool,
+) -> Result<Option<InitialCache>, EngError> {
+    if session_plan(settings, device_first).is_none() {
+        return Ok(None);
+    }
+    let kv_mode = serve_kv_mode(settings)?;
+    let cells = context_tokens(
+        u32::try_from(crate::family::cell_pool::INITIAL_CELLS).unwrap_or(u32::MAX),
+        kv_mode,
+    )?;
+    Ok(Some(InitialCache {
+        cells,
+        bytes: kv_cache_bytes(cells, kv_mode)?,
+    }))
+}
+
+/// The bytes of the cache the lower rung does not keep: the whole cache the fit named less the
+/// initial one the sessions executor builds. Zero when the start serves with the step's own state.
+fn kv_credit(
+    settings: &Q36Settings,
+    plan: &StartupPlan,
+    device_first: bool,
+) -> Result<u64, EngError> {
+    Ok(initial_cache(settings, device_first)?
+        .map_or(0, |initial| plan.reserve.saturating_sub(initial.bytes)))
 }
 
 /// The sessions a start asks the lower rung to fund beside its banks: the named count, else the
@@ -1971,6 +2020,7 @@ fn make(
         verify: _,
         allow_unpinned: _,
         modes,
+        initial_cells,
     } = plan;
     let device_first = device_first_native.is_some();
     if device_first && paged.is_none() {
@@ -1988,6 +2038,12 @@ fn make(
     stages.begin("building the step");
     let mut options = step_options(settings.context_limit, layout, kv_mode)?;
     options.tiered = tiered;
+    // The cache the context names is a ceiling: a start whose sessions grow on demand builds its
+    // state at the initial cells and lets the banks take the rest of the card.
+    let ceiling_cells = options.context_tokens;
+    if let Some(initial) = initial_cells {
+        options.context_tokens = initial.min(ceiling_cells);
+    }
     let res = match paged {
         Some(plan) => StepResources::allocate_paged(projector.context(), plan)?,
         None => {
@@ -2050,6 +2106,10 @@ fn make(
         )?,
         None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
     };
+    if initial_cells.is_some() {
+        // The state is built small; the context the config named is what a session may grow to.
+        step.set_ceiling_cells(ceiling_cells);
+    }
     if let Some((model, path)) = gguf.as_ref() {
         step.set_prefix_identity(gguf_prefix_identity(
             &model.weights,
@@ -2282,6 +2342,61 @@ fn enable_kv_disk(step: &mut QwenResidentStep<'_>, settings: &Q36Settings) -> Re
         step.enable_disk_tier(&resolved, origin);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod initial_cache_tests {
+    use super::*;
+    use crate::family::qwen::qwen36::settings::{Backend, Q36Env, Q36Options};
+
+    fn settings(body: &str) -> Q36Settings {
+        let options: Q36Options = serde_json::from_str(body).expect("a valid qwen36 object");
+        Q36Settings::new(
+            Path::new("/m"),
+            Path::new("/t"),
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("valid settings")
+    }
+
+    /// A start that runs the sessions executor builds its state at the initial cells and gives
+    /// the rest of the context back to the banks; one that serves with the step's own state keeps
+    /// the cache it names.
+    #[test]
+    fn a_pooled_start_builds_its_cache_at_the_initial_cells_and_credits_the_rest() {
+        let pooled = settings("{}");
+        let initial = initial_cache(&pooled, false)
+            .expect("plans")
+            .expect("the default start runs the sessions executor");
+        assert_eq!(initial.cells, crate::family::cell_pool::INITIAL_CELLS);
+        let kv_mode = serve_kv_mode(&pooled).expect("a mode");
+        assert_eq!(
+            initial.bytes,
+            kv_cache_bytes(initial.cells, kv_mode).unwrap()
+        );
+        // A 32,768-cell cache is the ceiling: the credit is what the initial cells do not take.
+        let full = kv_cache_bytes(32_768, kv_mode).unwrap();
+        let plan = StartupPlan {
+            reserve: full,
+            paged: None,
+            device_first_native: None,
+            verify: false,
+            allow_unpinned: false,
+            modes: runtime_modes(&pooled).expect("modes"),
+            initial_cells: None,
+        };
+        assert_eq!(
+            kv_credit(&pooled, &plan, false).unwrap(),
+            full - initial.bytes
+        );
+        assert!(full - initial.bytes > 0);
+        // One session named: the plain engine keeps the state it builds, so nothing is credited.
+        let single = settings(r#"{"max_seqs": 1}"#);
+        assert!(initial_cache(&single, false).unwrap().is_none());
+        assert_eq!(kv_credit(&single, &plan, false).unwrap(), 0);
+    }
 }
 
 #[cfg(test)]

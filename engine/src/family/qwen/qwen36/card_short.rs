@@ -40,6 +40,9 @@ pub(crate) struct CardFigures {
     /// the planned tensors plus the free-after-load floor the start refuses below. The cache,
     /// the work and the headroom come after that check, so it bounds the weights alone.
     pub(crate) after_load_floor: u64,
+    /// Bytes of the cache the start builds at its ceiling and gives back before it serves: the
+    /// banks take them (zero when the executor keeps the whole cache).
+    pub(crate) kv_credit: u64,
     /// Device bytes of one session's part (KV planes, DeltaNet and convolution state) at its
     /// initial cells: what each session after the first keeps on the card beside the banks.
     pub(crate) session_part_bytes: u64,
@@ -177,6 +180,7 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
                     .tiered_headroom
                     .saturating_sub(figures.headroom)
                     .saturating_add(reserve),
+                kv_credit: figures.kv_credit,
             }),
         })
     };
@@ -296,6 +300,7 @@ mod tests {
             tiered_headroom: GIB,
             slot_bytes: 1_769_472,
             after_load_floor: 0,
+            kv_credit: 0,
             session_part_bytes: 0,
             sessions: 1,
             sessions_named: false,
@@ -578,6 +583,45 @@ mod tests {
             CardVerdict::Short(short) => assert_eq!(short.sessions, 3),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The cache the start builds at its ceiling and gives back before it serves belongs to the
+    /// banks: the slots rise by the credit spread over the layers' slot bytes.
+    #[test]
+    fn the_cache_the_executor_gives_back_is_taken_by_the_banks() {
+        let credit = 584_000_000u64;
+        let without = |free: u64| match decide(&figures(free), 64 * GIB) {
+            CardVerdict::Short(short) => short.slots,
+            other => panic!("{other:?}"),
+        };
+        let with = |free: u64| match decide(
+            &CardFigures {
+                kv_credit: credit,
+                ..figures(free)
+            },
+            64 * GIB,
+        ) {
+            CardVerdict::Short(short) => short.slots,
+            other => panic!("{other:?}"),
+        };
+        let per_slot = 1_769_472u64 * 40;
+        let gained = (with(19_000_000_000) - without(19_000_000_000)) as u64;
+        assert!(
+            gained * per_slot <= credit + per_slot && (gained + 1) * per_slot > credit,
+            "{gained} slots for {credit} bytes"
+        );
+        assert!(gained >= 8, "{gained}");
+        // The card is still short by the whole cache: the credit moves slots, not the verdict.
+        assert!(matches!(
+            decide(
+                &CardFigures {
+                    kv_credit: credit,
+                    ..figures(5_805_441_024)
+                },
+                64 * GIB
+            ),
+            CardVerdict::Short(_)
+        ));
     }
 
     /// The idle part is a planner charge: a card that holds the minimum banks but not the idle

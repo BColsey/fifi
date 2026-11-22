@@ -112,6 +112,11 @@ pub(crate) struct CardBudget {
     /// what the card-tiered load's admission keeps free in excess of the resident load's
     /// headroom the `demand` was summed with. Zero when both keep the same.
     pub(crate) carry_reserve: u64,
+    /// Bytes of the `demand` the family does not keep once the start ends: the cache it builds
+    /// at its ceiling and gives back before it serves (a session holds only the cells of its
+    /// tokens and grows on demand). The banks may take them. Zero for a family that keeps its
+    /// whole demand.
+    pub(crate) kv_credit: u64,
 }
 
 impl CardBudget {
@@ -196,6 +201,7 @@ impl TierBudget {
                     card.expert_bytes, card.demand
                 ))
             })?
+            .saturating_sub(card.kv_credit)
             .checked_add(card.carry_reserve)
             .ok_or_else(overflow)?;
         let per_slot_of_layers = card
@@ -414,6 +420,7 @@ mod tests {
                 slot_bytes: 5,
                 min_slots: 2,
                 carry_reserve: 0,
+                kv_credit: 0,
             }),
         }
     }
