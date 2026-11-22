@@ -10,11 +10,40 @@ use super::{
 };
 use crate::{
     EngError,
-    weights::dspark_gguf::{DsparkBlock, DsparkConfig, DsparkGguf, DsparkMarkovWeights},
+    weights::dspark_gguf::{
+        DsparkBlock, DsparkConfig, DsparkGguf, DsparkMarkovWeights, MarkovMatrix,
+    },
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-use crate::{kernels::cuda::CudaContext, weights::dspark_gguf::DeviceDraft};
+use crate::{
+    kernels::cuda::CudaContext,
+    weights::dspark_gguf::{DeviceDraft, DeviceDraftOptions},
+};
+
+pub(crate) const CUDA_MARKOV_ENV: &str = "FIFI_INKLING_DSPARK_CUDA_MARKOV";
+
+pub(crate) fn cuda_markov_requested() -> bool {
+    std::env::var(CUDA_MARKOV_ENV).as_deref() == Ok("1")
+}
+
+struct MarkovHead<'a> {
+    weights: &'a DsparkMarkovWeights,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    device: Option<(&'a DeviceDraft, &'a CudaContext)>,
+}
+
+impl MarkovHead<'_> {
+    fn project(&self, kind: MarkovMatrix, input: &[f32]) -> Result<Vec<f32>, EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some((device, cuda)) = self.device
+            && let Some(values) = device.project_markov(cuda, kind, input)?
+        {
+            return Ok(values);
+        }
+        Ok(self.weights.matrix(kind).project(input))
+    }
+}
 
 pub(crate) struct DsparkDrafter {
     model: DsparkGguf,
@@ -41,8 +70,11 @@ impl DsparkDrafter {
         self.device = Some(DeviceDraft::load(
             cuda,
             &self.model,
-            context,
-            reserve_floor,
+            DeviceDraftOptions {
+                context,
+                markov: cuda_markov_requested(),
+                reserve_floor,
+            },
         )?);
         Ok(())
     }
@@ -102,7 +134,11 @@ impl Drafter for DsparkDrafter {
         let block = self.forward(&embedding, &target)?;
         let config = self.model.config();
         let tokens = select_block(
-            self.model.markov(),
+            MarkovHead {
+                weights: self.model.markov(),
+                #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+                device: self.device.as_ref().zip(target.output.cuda_context()),
+            },
             config,
             target.output,
             block,
@@ -122,7 +158,7 @@ impl Drafter for DsparkDrafter {
 }
 
 fn select_block(
-    head: &DsparkMarkovWeights,
+    head: MarkovHead<'_>,
     config: &DsparkConfig,
     output: &dyn DraftOutput,
     block: DsparkBlock,
@@ -138,17 +174,17 @@ fn select_block(
         hidden.iter_mut().for_each(|value| *value = round(*value));
         joint_input.clear();
         joint_input.extend_from_slice(&state);
-        joint_input.extend(head.previous.row(previous as usize));
+        joint_input.extend(head.weights.previous.row(previous as usize));
         joint_input.extend_from_slice(&hidden);
         joint_input.extend_from_slice(&recurrent_context);
 
-        let mut gates = head.joint.project(&joint_input);
-        for (gate, &bias) in gates.iter_mut().zip(&head.joint_bias) {
+        let mut gates = head.project(MarkovMatrix::Joint, &joint_input)?;
+        for (gate, &bias) in gates.iter_mut().zip(&head.weights.joint_bias) {
             *gate += bias;
         }
         update_markov(&mut state, &mut latent, &gates)?;
-        let mut correction = head.output.project(&latent);
-        for (value, &bias) in correction.iter_mut().zip(&head.output_bias) {
+        let mut correction = head.project(MarkovMatrix::Output, &latent)?;
+        for (value, &bias) in correction.iter_mut().zip(&head.weights.output_bias) {
             *value += bias;
         }
 
@@ -256,5 +292,101 @@ mod tests {
         assert_eq!(choose_token(&[4., 3.], &[0., 1.], 2, 30.).unwrap(), 0);
         assert!(choose_token(&[f32::NAN], &[0.], 1, 30.).is_err());
         assert!(update_markov(&mut [0.], &mut [0.], &[0.; 2]).is_err());
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires the published Inkling DSpark GGUF and CUDA"]
+    fn published_markov_cuda_matches_cpu_recurrence() {
+        use std::{path::Path, sync::Arc, time::Instant};
+
+        let sidecar = std::env::var_os("FIFI_TEST_INKLING_DSPARK_GGUF")
+            .expect("set FIFI_TEST_INKLING_DSPARK_GGUF");
+        let model = DsparkGguf::open(Path::new(&sidecar)).unwrap();
+        let cfg = model.config();
+        let probe = |i| ((i % 19) as f32 - 9.0) / 19.0;
+        let anchor: Vec<_> = (0..cfg.width).map(probe).collect();
+        let taps: Arc<[f32]> = (0..cfg.width * cfg.target_layers.len())
+            .map(probe)
+            .collect();
+        let block = model.forward(&anchor, &[taps], 1).unwrap();
+        let cuda = CudaContext::new().unwrap();
+        let device = DeviceDraft::load(
+            &cuda,
+            &model,
+            DeviceDraftOptions {
+                context: 32,
+                markov: true,
+                reserve_floor: |_| crate::expert_tier::VRAM_HEADROOM_BYTES,
+            },
+        )
+        .unwrap();
+        let weights = model.markov();
+        let heads = [
+            MarkovHead {
+                weights,
+                device: None,
+            },
+            MarkovHead {
+                weights,
+                device: Some((&device, &cuda)),
+            },
+        ];
+        let mut states = [vec![0.0; cfg.markov_rank], vec![0.0; cfg.markov_rank]];
+        let mut latent = states.clone();
+        let context: Vec<_> = block.recurrent_context.into_iter().map(round).collect();
+        let mut times = [std::time::Duration::ZERO; 2];
+        let mut max_error = [0.0f64; 2];
+        for (step, hidden) in block.hidden.iter().enumerate() {
+            // Teacher forcing gives both projection backends the same token history.
+            let previous = (8 + 2309 * step) % cfg.vocab;
+            let mut inputs = states.clone();
+            for input in &mut inputs {
+                input.extend(weights.previous.row(previous));
+                input.extend(hidden.iter().copied().map(round));
+                input.extend_from_slice(&context);
+            }
+            let mut gates = [Vec::new(), Vec::new()];
+            let mut correction = [Vec::new(), Vec::new()];
+            for (arm, head) in heads.iter().enumerate() {
+                let start = Instant::now();
+                gates[arm] = head.project(MarkovMatrix::Joint, &inputs[arm]).unwrap();
+                times[arm] += start.elapsed();
+                for (value, &bias) in gates[arm].iter_mut().zip(&weights.joint_bias) {
+                    *value += bias;
+                }
+                update_markov(&mut states[arm], &mut latent[arm], &gates[arm]).unwrap();
+                let start = Instant::now();
+                correction[arm] = head.project(MarkovMatrix::Output, &latent[arm]).unwrap();
+                times[arm] += start.elapsed();
+                for (value, &bias) in correction[arm].iter_mut().zip(&weights.output_bias) {
+                    *value += bias;
+                }
+            }
+            for (index, [reference, candidate]) in [gates, correction].into_iter().enumerate() {
+                assert_eq!(reference.len(), candidate.len());
+                let norm: f64 = reference.iter().map(|&x| f64::from(x).powi(2)).sum();
+                let error: f64 = reference
+                    .iter()
+                    .zip(&candidate)
+                    .map(|(&want, &got)| f64::from(want - got).powi(2))
+                    .sum();
+                max_error[index] = max_error[index].max((error / norm).sqrt());
+            }
+            assert_eq!(
+                states[0], states[1],
+                "BF16 recurrent state at proposal {step}"
+            );
+            assert_eq!(latent[0], latent[1], "BF16 latent at proposal {step}");
+        }
+        eprintln!(
+            "published Markov projections, {} proposals: CPU {:.3} ms, CUDA {:.3} ms, joint/correction max relative RMS {:.3e}/{:.3e}",
+            block.hidden.len(),
+            times[0].as_secs_f64() * 1000.0,
+            times[1].as_secs_f64() * 1000.0,
+            max_error[0],
+            max_error[1],
+        );
+        assert!(max_error.into_iter().all(|value| value < 2e-5));
     }
 }

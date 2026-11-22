@@ -3,7 +3,11 @@
 use std::path::Path;
 
 use super::serve::InklingDraft;
-use crate::{EngError, weights::dspark_gguf::DsparkGguf};
+use crate::{
+    EngError,
+    family::speculate::dspark::{CUDA_MARKOV_ENV, cuda_markov_requested},
+    weights::dspark_gguf::DsparkGguf,
+};
 
 pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, EngError> {
     const PATH: &str = "FIFI_INKLING_DSPARK_GGUF";
@@ -14,6 +18,11 @@ pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, E
         return Err(super::bad(
             "FIFI_INKLING_DSPARK_CUDA_HEAD requires FIFI_INKLING_DSPARK_CUDA=1 and a DSpark GGUF sidecar",
         ));
+    }
+    if cuda_markov_requested() && (!cuda || path.is_none()) {
+        return Err(super::bad(format!(
+            "{CUDA_MARKOV_ENV} requires FIFI_INKLING_DSPARK_CUDA=1 and a DSpark GGUF sidecar"
+        )));
     }
     let Some(path) = path else {
         return Ok(None);

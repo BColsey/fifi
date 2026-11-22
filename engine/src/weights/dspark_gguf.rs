@@ -12,7 +12,7 @@ mod device;
 mod forward;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) use device::DeviceDraft;
+pub(crate) use device::{DeviceDraft, DeviceDraftOptions};
 
 const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 32 * 1024 * 1024,
@@ -270,6 +270,12 @@ impl DsparkGguf {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MarkovMatrix {
+    Joint,
+    Output,
+}
+
 #[derive(Debug)]
 pub(crate) struct DsparkMarkovWeights {
     pub(crate) previous: DsparkMatrix,
@@ -277,6 +283,15 @@ pub(crate) struct DsparkMarkovWeights {
     pub(crate) joint_bias: Vec<f32>,
     pub(crate) output: DsparkMatrix,
     pub(crate) output_bias: Vec<f32>,
+}
+
+impl DsparkMarkovWeights {
+    pub(crate) fn matrix(&self, kind: MarkovMatrix) -> &DsparkMatrix {
+        match kind {
+            MarkovMatrix::Joint => &self.joint,
+            MarkovMatrix::Output => &self.output,
+        }
+    }
 }
 
 #[derive(Debug)]
