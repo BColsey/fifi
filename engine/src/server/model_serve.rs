@@ -599,8 +599,15 @@ fn select_family(
                 .filter_map(|fact| fact.architecture.as_deref())
                 .collect();
             if inspection.config_model_types.is_empty() && !seen.is_empty() {
+                let why: String = seen
+                    .iter()
+                    .filter_map(|architecture| {
+                        crate::server::config::gguf_architecture_note(architecture)
+                    })
+                    .map(|note| format!(" ({note})"))
+                    .collect();
                 return Err(StartupError(format!(
-                    "serve --model: no family serves the GGUF architecture {}; known architectures: {}; pass --family or write a --config file",
+                    "serve --model: no family serves the GGUF architecture {}{why}; known architectures: {}; pass --family or write a --config file",
                     seen.join(", "),
                     crate::server::config::known_gguf_architectures()
                 )));

@@ -165,6 +165,7 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         "server started with {} engines",
         state.engines().len()
     ));
+=======
     let state = Arc::new(state);
     // One boot line for the warm-turn flip: the effective state and how to
     // roll it back. The polarity comes from the SAME function the request
