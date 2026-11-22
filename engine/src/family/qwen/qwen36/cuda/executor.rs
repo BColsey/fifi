@@ -74,19 +74,11 @@ pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
     }
 }
 
-/// Keep the admitted arena, but cap every worker piece by its current depth.
+/// The rows of a worker piece at `p0`: the admitted arena, cut by the piece-time model at the
+/// depth the piece ends at (the same rule the chunk loop plans its pieces by).
 pub(super) fn piece_of(verdict: &ChunkVerdict, p0: usize, sm_count: usize) -> Option<usize> {
     match verdict {
-        ChunkVerdict::Ready { m_sess } => {
-            // The experimental arena is larger, but only its initial 8K may use
-            // larger worker pieces. Preserve later cancellation/depth boundaries.
-            let rows = if *m_sess == 4096 {
-                if p0 < 8192 { 4096.min(8192 - p0) } else { 2048 }
-            } else {
-                *m_sess
-            };
-            Some(piece_rows(DEPTH_ANCHORS, sm_count, p0, rows))
-        }
+        ChunkVerdict::Ready { m_sess } => Some(piece_rows(DEPTH_ANCHORS, sm_count, p0, *m_sess)),
         _ => None,
     }
 }

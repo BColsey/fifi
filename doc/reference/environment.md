@@ -119,7 +119,6 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `Q36_TIERED_PROBE` | `0` | only `1` is on | Times the per-layer route wait and the token's device span during decode so their split can decide the TCAP gate. |
 | `Q36_TIERED_SPLIT_JOBS` | `0` | only `1` is on | Split each missed expert's job: the two half-projections run on workers while the down pass runs on the joining thread. The whole-expert path is the reviewed default. |
 | `Q36_TIERED_SPLIT_MAX_JOBS` | unset | unsigned count | Experimental cap on split-job dispatch; unset keeps the existing split policy. Changes only dispatch. |
-| `Q36_TIERED_WIDE_PREFILL` | `0` | only `1` is on | With the chunked prefill on, lets a session wider than 4,096 rows take the chunked prefill path; a 4,096-row session needs no flag. |
 | `Q36_P2P_WATERFILL` | `0` | only `1` is on | Experimental multi-device GGUF path: a bandwidth-waterfill placement planner redistributes the sliceable roles instead of the even deal. |
 | `Q36_P2P_HOST_EXPERT_BYTES` | `0` | nonnegative byte count | With waterfill: per-card sliced mass moved to pinned host RAM at load (`_0` sets card 0's budget separately). An unparseable value refuses the start. |
 | `Q36_P2P_PREFIX` | `0` | only `1` is on | Experimental: prefix save/restore on the card path; wired but not yet qualified. |

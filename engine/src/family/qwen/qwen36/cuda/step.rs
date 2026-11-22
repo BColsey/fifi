@@ -1513,19 +1513,13 @@ impl<'a> QwenResidentStep<'a> {
         tokens: &[u32],
         m_sess: usize,
     ) -> Result<(), EngError> {
-        use super::prefill_driver::{drive_chunks, drive_tiered_wide_chunks};
+        use super::prefill_driver::drive_chunks;
         use crate::family::prefill::arena::PrefillStep;
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();
         let fixed_depth = self.fixed_prefill_depth();
         self.prefill_report.note_chunked_epoch_start(start);
-        let wide_tiered = self.tiered_mode
-            && self.kv8_chunked_prefill
-            && self.state.layout().kv.mode == KvMode::Int8G32
-            && self.tiered_chunk
-            && (m_sess == 4096
-                || std::env::var_os("Q36_TIERED_WIDE_PREFILL").is_some_and(|v| v == "1"));
         let run = |step, rows: &[u32]| match step {
             PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
             PrefillStep::Feed { p0 } => {
@@ -1541,12 +1535,10 @@ impl<'a> QwenResidentStep<'a> {
                 Ok(())
             }
         };
-        let result = if wide_tiered {
-            drive_tiered_wide_chunks(start, tokens, m_sess, fixed_depth, run)
-        } else {
-            drive_chunks(start, tokens, m_sess, fixed_depth, run)
-        };
-        result.map(|_| ())
+        // A tiered session streams its experts, so each piece crosses every layer once and the
+        // widest pieces the arena holds win; a resident session keeps its depth table.
+        let streamed = self.tiered_mode;
+        drive_chunks(start, tokens, (m_sess, fixed_depth, streamed), run).map(|_| ())
     }
 
     /// The multiprocessors of the device, when the prefill pieces are depth-bound.
@@ -1579,7 +1571,7 @@ impl<'a> QwenResidentStep<'a> {
         };
         use super::prefill_driver::{Q36ChunkCtx, Q36ChunkFamily, check_chunk_start, chunk_ids};
         use super::prefill_plan::ChunkSlot;
-        use crate::family::prefill::chunk_family::ChunkFamily;
+        use crate::family::prefill::chunk_loop::{ChunkOrder, StatusClear, drive_chunk};
 
         // A chunk advances the live state: refused through a gated state or an awaiting window.
         self.state_usable()?;
@@ -1670,54 +1662,48 @@ impl<'a> QwenResidentStep<'a> {
             chunk_rows,
             sparse,
         };
-        // Qwen3.6 opens and commits per chunk, clearing status before staging ids. This caller
-        // owns that order and window lifetime. Each call takes its own dyn borrow of `fam`, so
-        // the step's report reads `fam.segmented_parts` between them.
-        fn open_and_run<'a, 'w>(
-            family: &mut dyn ChunkFamily<Ctx = Q36ChunkCtx<'a, 'w>>,
-            ctx: &mut Q36ChunkCtx<'a, 'w>,
-            p0: usize,
-            m: usize,
-        ) -> Result<(), EngError> {
-            family.begin_window(ctx)?;
-            family.clear_chunk_status(ctx)?;
-            family.write_chunk_inputs(ctx, p0, m)?;
-            family.run_layers(ctx, p0, m)
-        }
-        open_and_run(&mut fam, &mut ctx, p0, m).inspect_err(|_| {
+        // Qwen3.6 opens and commits per chunk, clearing status before staging ids; the shared
+        // chunk loop runs the calls and this step reports from its hooks.
+        let order = ChunkOrder {
+            open_window: true,
+            clear_status: StatusClear::BeforeInputs,
+        };
+        let mut parts = 0usize;
+        let outcome = drive_chunk(
+            &mut fam,
+            &mut ctx,
+            (p0, m),
+            order,
+            |_, _| Ok(()),
+            |fam, _| {
+                parts = fam.segmented_parts;
+                Ok(())
+            },
+            |status| {
+                // The status read completed the stream, so the serve-phase marks (if armed) are
+                // readable now; nothing prints when the knob is off. The elapsed read comes
+                // first so the recorded step time excludes the share line's queries and print.
+                let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                super::prefill::phase_timing::serve::end()?;
+                prefill_report.push_step(StepRecord {
+                    p0,
+                    rows: m,
+                    kind: StepKind::Chunk,
+                    ns,
+                    status,
+                });
+                Ok(())
+            },
+        );
+        prefill_report.note_segmented_parts(parts);
+        outcome.inspect_err(|_| {
             ctx.state.poison();
             super::prefill::phase_timing::serve::discard();
         })?;
-        prefill_report.note_segmented_parts(fam.segmented_parts);
-        let t_status = std::time::Instant::now();
-        let status = (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
-            .read_health(&mut ctx)
-            .inspect_err(|_| {
-                ctx.state.poison();
-                super::prefill::phase_timing::serve::discard();
-            })?;
-        // The status read completed the stream, so the serve-phase marks (if armed) are
-        // readable now; nothing prints when the knob is off. The elapsed read comes
-        // first so the recorded step time excludes the share line's queries and print.
-        let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        super::prefill::phase_timing::serve::end()?;
-        prefill_report.push_step(StepRecord {
-            p0,
-            rows: m,
-            kind: StepKind::Chunk,
-            ns,
-            status,
-        });
-        let t_reval = std::time::Instant::now();
-        (&mut fam as &mut dyn ChunkFamily<Ctx = Q36ChunkCtx>)
-            .commit_chunk(&mut ctx, p0, m, status)
-            .inspect_err(|_| ctx.state.poison())?;
         if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
             eprintln!(
-                "chunk-close p0={p0} m={m}: body {:.0} ms, status-read {:.0} ms, revalidate {:.0} ms",
-                t_status.duration_since(opened).as_secs_f64() * 1e3,
-                t_reval.duration_since(t_status).as_secs_f64() * 1e3,
-                t_reval.elapsed().as_secs_f64() * 1e3,
+                "chunk-close p0={p0} m={m}: {:.0} ms",
+                opened.elapsed().as_secs_f64() * 1e3
             );
         }
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the

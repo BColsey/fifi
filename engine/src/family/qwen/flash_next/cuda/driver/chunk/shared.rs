@@ -6,7 +6,8 @@ use crate::{
     family::{
         prefill::{
             chunk_family::ChunkFamily,
-            steps::{PrefillStep, check_chunk_start, drive_steps},
+            chunk_loop::{ChunkOrder, PiecePlan, StatusClear, drive_chunk, drive_prompt},
+            steps::check_chunk_start,
         },
         project::exl3_jobs_plan::exl3_rows_ceiling,
     },
@@ -153,16 +154,13 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             ));
         }
         let start = self.pos;
-        let steps = tokens
-            .chunks(cap)
-            .enumerate()
-            .map(|(i, chunk)| PrefillStep::Chunk {
-                p0: start + i * cap,
-                rows: chunk.len(),
-            })
-            .collect();
+        let plan = PiecePlan {
+            max_rows: cap,
+            table: None,
+            model: None,
+        };
         let mut first = true;
-        drive_steps(start, tokens, steps, |_, rows| {
+        drive_prompt(start, tokens, &plan, |_, rows| {
             self.run_shared_chunk(rows, false, first)?;
             first = false;
             Ok(())
@@ -211,21 +209,29 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             clock: ChunkClock::new(),
         };
         let mut family = FlashChunkFamily { driver: self };
-        let result = (|| {
-            if open_window {
-                family.begin_window(&mut ctx)?;
-            }
-            if want_logits {
-                family.driver.device.begin_prefill_logits()?;
-            }
-            family.write_chunk_inputs(&mut ctx, p0, m)?;
-            family.clear_chunk_status(&mut ctx)?;
-            family.run_layers(&mut ctx, p0, m)?;
-            let logits = family.driver.queue_head(want_logits, &mut ctx.clock)?;
-            let status = family.read_health(&mut ctx)?;
-            family.commit_chunk(&mut ctx, p0, m, status)?;
-            Ok(logits)
-        })();
+        let mut logits = None;
+        let order = ChunkOrder {
+            open_window,
+            clear_status: StatusClear::AfterInputs,
+        };
+        let result = drive_chunk(
+            &mut family,
+            &mut ctx,
+            (p0, m),
+            order,
+            |family, _| {
+                if want_logits {
+                    family.driver.device.begin_prefill_logits()?;
+                }
+                Ok(())
+            },
+            |family, ctx| {
+                logits = family.driver.queue_head(want_logits, &mut ctx.clock)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .map(|_| logits);
         if result.is_err() {
             family.driver.poisoned = true;
         }

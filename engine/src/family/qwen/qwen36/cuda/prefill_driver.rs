@@ -15,16 +15,19 @@
 use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot, Extra, M_LADDER, PART_CHARGE, SPARE_MIN,
-        chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
+        Admission, ChunkCost, ChunkSlot, DEPTH_ANCHORS, Extra, LARGE_M_LADDER, M_LADDER,
+        PART_CHARGE, SPARE_MIN, chunk_tensors, exl3_chunk_tensors, m_pos,
     },
 };
 use crate::family::exl3::launch::Launch;
-use crate::family::prefill::arena::PrefillStep;
+use crate::family::prefill::{
+    arena::PrefillStep,
+    chunk_loop::{PiecePlan, drive_prompt},
+};
 use crate::{
     EngError,
     family::{
-        prefill::arena::{ArenaHooks, allocate_zeroed, drive_steps},
+        prefill::arena::{ArenaHooks, allocate_zeroed},
         project::cuda::WeightLayout,
     },
     kernels::cuda::{
@@ -720,69 +723,38 @@ impl PrefillArena {
 // `check_chunk_start` moved to the shared prefill core (`family::prefill::arena`); the old
 // path lives as the re-export at the top of this file.
 
-/// Drives the prompt rows of one feed_rows call through the prefill plan: each step gets its own
-/// rows, a feed step exactly one. The start position is the committed row count at the call, so a
-/// second prefill call or a prefix import continues at its own position. The list that ran is
-/// returned.
+/// The Qwen3.6 pieces of a prompt: the session arena `m_sess` bounds a piece, its depth table
+/// ([`m_pos`]) cuts a resident session's pieces, a streamed session (its experts cross the link
+/// once per piece) takes the arena's rows, and a depth-bound arena (`fixed_depth`, the card's
+/// multiprocessors) is cut by the piece-time model.
+pub(super) fn piece_plan(
+    m_sess: usize,
+    fixed_depth: Option<usize>,
+    streamed: bool,
+) -> PiecePlan<'static> {
+    PiecePlan {
+        max_rows: m_sess,
+        table: if streamed { None } else { Some(&m_pos) },
+        model: fixed_depth.map(|sm_count| (DEPTH_ANCHORS, sm_count)),
+    }
+}
+
+/// Drives the prompt rows of one feed_rows call through the shared chunk loop: each step gets its
+/// own rows, a feed step exactly one. The start position is the committed row count at the call,
+/// so a second prefill call or a prefix import continues at its own position. The list that ran
+/// is returned.
 pub(super) fn drive_chunks(
     start: usize,
     tokens: &[u32],
-    m_sess: usize,
-    fixed_depth: Option<usize>,
+    (m_sess, fixed_depth, streamed): (usize, Option<usize>, bool),
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
-    drive_steps(start, tokens, steps, run)
-}
-
-/// Reuses the admitted arena for adjacent tiered chunks through 8K.
-/// The 4,096-row experiment also coalesces the initial pieces; normal arenas keep their cutoff.
-/// This bounded experiment leaves the normal planner and every later position unchanged.
-pub(super) fn coalesce_tiered_deep(steps: Vec<PrefillStep>, m_sess: usize) -> Vec<PrefillStep> {
-    let first_deep = if m_sess == 4096 { 0 } else { 3_072 };
-    const LAST_END: usize = 8_192;
-    const KV8_MAX_ROWS: usize = 4_096;
-    let limit = m_sess.min(KV8_MAX_ROWS);
-    let mut out = Vec::with_capacity(steps.len());
-    for step in steps {
-        let mut merged = false;
-        if let Some(PrefillStep::Chunk { p0, rows }) = out.last_mut()
-            && let PrefillStep::Chunk {
-                p0: next,
-                rows: more,
-            } = step
-            && *p0 >= first_deep
-            && p0.checked_add(*rows) == Some(next)
-            && let Some(total) = rows.checked_add(more)
-            && total <= limit
-            && p0.checked_add(total).is_some_and(|end| end <= LAST_END)
-        {
-            *rows = total;
-            merged = true;
-        }
-        if !merged {
-            out.push(step);
-        }
+    if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
+        return Err(EngError::BadRequest(format!(
+            "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
+        )));
     }
-    out
-}
-
-/// Experimental tiered driver: coalesce only the bounded deep pieces of the normal plan.
-pub(super) fn drive_tiered_wide_chunks(
-    start: usize,
-    tokens: &[u32],
-    m_sess: usize,
-    fixed_depth: Option<usize>,
-    run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
-) -> Result<Vec<PrefillStep>, EngError> {
-    let steps = chunk_list_with_depth_tier(start, tokens.len(), m_sess, fixed_depth)?;
-    let original = steps.len();
-    let widened = coalesce_tiered_deep(steps, m_sess);
-    eprintln!(
-        "tiered-wide-prefill: planned {original} steps as {}",
-        widened.len()
-    );
-    drive_steps(start, tokens, widened, run)
+    drive_prompt(start, tokens, &piece_plan(m_sess, fixed_depth, streamed), run)
 }
 
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.

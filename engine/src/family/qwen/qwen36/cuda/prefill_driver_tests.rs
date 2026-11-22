@@ -13,6 +13,7 @@ use super::prefill_driver::{
     needs_arena, require_fixed_room, stage_label, wide_stage_candidate, zero_spans,
 };
 use super::prefill_plan::{
+    chunk_list_with_depth_tier,
     ChunkCost, Extra, M_LADDER, PART_CHARGE, SPARE_MIN, chunk_costs, chunk_list, kv_bytes,
     state_bytes,
 };
@@ -623,7 +624,7 @@ fn drive_chunks_slices_rows_at_their_positions() {
         for &count in &[0usize, 1, 2, 129, 300] {
             let tokens: Vec<u32> = (0..count as u32).map(|at| at + 7).collect();
             let mut log: Vec<(PrefillStep, Vec<u32>)> = Vec::new();
-            let ran = drive_chunks(start, &tokens, 128, None, |step, rows| {
+            let ran = drive_chunks(start, &tokens, (128, None, false), |step, rows| {
                 log.push((step, rows.to_vec()));
                 Ok(())
             })
@@ -659,79 +660,38 @@ fn drive_chunks_slices_rows_at_their_positions() {
     }
 }
 
+/// The shared chunk loop plans a resident session's pieces exactly as the plan oracle
+/// (`chunk_list_with_depth_tier`) does, for every arena size, depth and prompt length checked.
 #[test]
-fn tiered_wide_deep_coalesces_only_contiguous_rows_through_8k() {
-    use super::prefill_driver::coalesce_tiered_deep;
-
-    let original = chunk_list(0, 8_288, 2_048).unwrap();
-    let widened = coalesce_tiered_deep(original, 2_048);
-    assert_eq!(
-        widened,
-        vec![
-            PrefillStep::Chunk { p0: 0, rows: 2_048 },
-            PrefillStep::Chunk {
-                p0: 2_048,
-                rows: 2_048
-            },
-            PrefillStep::Chunk {
-                p0: 4_096,
-                rows: 2_048
-            },
-            PrefillStep::Chunk {
-                p0: 6_144,
-                rows: 2_048
-            },
-            PrefillStep::Chunk {
-                p0: 8_192,
-                rows: 96
-            },
-        ]
-    );
+fn the_shared_loop_plans_a_resident_session_like_the_plan_oracle() {
+    for m_sess in [16usize, 128, 256, 512, 1024, 2048, 4096] {
+        for fixed in [None, Some(82usize), Some(30)] {
+            for p0 in [0usize, 1, 2047, 3071, 3072, 70_000, 73_700, 155_000, 200_000] {
+                for rows in [0usize, 1, 2, 127, 129, 2049, 5000] {
+                    let tokens = vec![0u32; rows];
+                    let got = drive_chunks(p0, &tokens, (m_sess, fixed, false), |_, _| Ok(()))
+                        .expect("a ladder size plans");
+                    let want = chunk_list_with_depth_tier(p0, rows, m_sess, fixed).expect("plan");
+                    assert_eq!(got, want, "arena {m_sess}, depth tier {fixed:?}, {p0}+{rows}");
+                }
+            }
+        }
+    }
+    assert!(drive_chunks(0, &[0u32; 4], (300, None, false), |_, _| Ok(())).is_err());
 }
 
+/// A streamed session takes the arena's rows at every depth the piece model allows, so a prompt
+/// crosses each streamed layer in fewer pieces than the depth table would give.
 #[test]
-fn tiered_wide_deep_respects_arena_gaps_feeds_and_depth_limit() {
-    use super::prefill_driver::coalesce_tiered_deep;
-
-    let source = vec![
-        PrefillStep::Chunk {
-            p0: 4_096,
-            rows: 1_024,
-        },
-        PrefillStep::Chunk {
-            p0: 5_120,
-            rows: 1_024,
-        },
-        PrefillStep::Feed { p0: 6_144 },
-        PrefillStep::Chunk {
-            p0: 7_168,
-            rows: 1_024,
-        },
-        PrefillStep::Chunk {
-            p0: 8_192,
-            rows: 1_024,
-        },
-    ];
-    assert_eq!(coalesce_tiered_deep(source.clone(), 1_024), source);
-    let got = coalesce_tiered_deep(source, 2_048);
-    assert_eq!(
-        got,
-        vec![
-            PrefillStep::Chunk {
-                p0: 4_096,
-                rows: 2_048
-            },
-            PrefillStep::Feed { p0: 6_144 },
-            PrefillStep::Chunk {
-                p0: 7_168,
-                rows: 1_024
-            },
-            PrefillStep::Chunk {
-                p0: 8_192,
-                rows: 1_024
-            },
-        ]
-    );
+fn a_streamed_session_plans_wider_pieces_than_a_resident_one() {
+    let tokens = vec![0u32; 16_384];
+    let count = |streamed| {
+        drive_chunks(8_192, &tokens, (4096, None, streamed), |_, _| Ok(()))
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count(true), 4);
+    assert!(count(false) > count(true));
 }
 
 #[test]
@@ -739,7 +699,7 @@ fn fixed_drive_limits_depth_without_shrinking_the_session_arena() {
     let tokens: Vec<u32> = (0..1024).collect();
     let mut seen = Vec::new();
     let mut copied = Vec::new();
-    drive_chunks(155_136, &tokens, 512, Some(82), |step, rows| {
+    drive_chunks(155_136, &tokens, (512, Some(82), false), |step, rows| {
         seen.push(step);
         copied.extend_from_slice(rows);
         Ok(())
@@ -2023,9 +1983,8 @@ fn tiered_4096_requires_opt_in_and_retains_admission_reserves() {
 }
 
 #[test]
-fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
+fn tiered_4096_pieces_preserve_tokens_and_follow_the_piece_model() {
     use super::executor::piece_of;
-    use super::prefill_driver::drive_tiered_wide_chunks;
     for (start, total) in [
         (0, 7903),
         (4095, 3808),
@@ -2041,20 +2000,14 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
                 .unwrap()
                 .min(start + total - at);
             assert!(size > 0 && size <= 4096);
-            if at >= 8192 {
-                assert!(size <= 2048);
-            }
             let chunk = &tokens[at - start..at - start + size];
-            drive_tiered_wide_chunks(at, chunk, 4096, None, |step, rows| {
+            drive_chunks(at, chunk, (4096, None, true), |step, rows| {
                 let (p0, count) = match step {
                     PrefillStep::Feed { p0 } => (p0, 1),
                     PrefillStep::Chunk { p0, rows } => (p0, rows),
                 };
                 assert_eq!(p0, start + seen.len());
                 assert_eq!(count, rows.len());
-                if count > 2048 {
-                    assert!(p0 + count <= 8192);
-                }
                 seen.extend_from_slice(rows);
                 Ok(())
             })
@@ -2063,16 +2016,4 @@ fn tiered_4096_chunks_preserve_tokens_and_the_8k_boundary() {
         }
         assert_eq!(seen, tokens);
     }
-    let steps =
-        super::prefill_driver::coalesce_tiered_deep(chunk_list(0, 7903, 4096).unwrap(), 4096);
-    assert_eq!(
-        steps,
-        vec![
-            PrefillStep::Chunk { p0: 0, rows: 4096 },
-            PrefillStep::Chunk {
-                p0: 4096,
-                rows: 3807
-            }
-        ]
-    );
 }

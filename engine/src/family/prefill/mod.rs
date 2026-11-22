@@ -21,6 +21,13 @@ pub(crate) mod admission;
 )]
 pub(crate) mod piece_rows;
 
+/// The one chunk loop: the pieces of a prompt and what one piece runs, for every chunked family.
+#[allow(
+    dead_code,
+    reason = "the CUDA family drivers consume the chunk loop; host builds use it only in tests"
+)]
+pub(crate) mod chunk_loop;
+
 // Both CUDA drivers consume these helpers. Host builds use them only in tests.
 #[allow(
     dead_code,
