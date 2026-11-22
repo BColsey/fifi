@@ -61,11 +61,11 @@ __device__ __forceinline__ float block_sum(float v) {
  * count, every block strides h (and delta), norm_out and q8 by one row, and the rows share the
  * weight — a whole per-head or per-batch norm loop collapses into one launch. */
 __global__ void add_rmsnorm_q8_k(float *base_h, const float *base_delta, const float *w, int n,
-                                 float eps, float *base_norm_out, block_q8_1 *base_y) {
+                                 float eps, float *base_norm_out, block_q8_1 *base_y, int64_t h_stride) {
   const int64_t padded =
       ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
   const int64_t r = blockIdx.x;
-  float *h = base_h + r * n;
+  float *h = base_h + r * h_stride;
   const float *delta = base_delta != NULL ? base_delta + r * n : NULL;
   float *norm_out = base_norm_out + r * n;
   block_q8_1 *y = base_y + r * (padded / kQk8_1);
@@ -125,7 +125,8 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
             n < 256 || n > kMaxWidth || n % 256 != 0 || !std::isfinite(args->eps) ||
             args->eps <= 0.0f || rows < 1 || rows > kMaxRows || !aligned(args->h, 4) ||
             (args->delta != NULL && !aligned(args->delta, 4)) || !aligned(args->w, 4) ||
-            !aligned(args->norm_out, 16) || !aligned(args->q8, 4)) {
+            !aligned(args->norm_out, 16) || !aligned(args->q8, 4) || args->h_stride < 0 ||
+            (args->h_stride != 0 && args->h_stride < n)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         // The kernel writes h, norm_out and q8 (row-strided over `rows` blocks) while it reads
@@ -134,7 +135,8 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
         const int64_t padded = ((int64_t)n + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
         const int64_t row = (int64_t)n * (int64_t)sizeof(float);
         const int64_t q8_bytes = padded / kQk8_1 * (int64_t)sizeof(block_q8_1);
-        const Extent written[3] = {{args->h, (size_t)(row * rows)},
+        const int64_t h_stride = args->h_stride == 0 ? n : args->h_stride;
+        const Extent written[3] = {{args->h, (size_t)((rows - 1) * h_stride * (int64_t)sizeof(float) + row)},
                                    {args->norm_out, (size_t)(row * rows)},
                                    {args->q8, (size_t)(q8_bytes * rows)}};
         const Extent read[2] = {{args->delta, (size_t)(row * rows)}, {args->w, (size_t)row}};
@@ -153,7 +155,7 @@ extern "C" int inference_cuda_add_rmsnorm_q8_launch(
         }
         add_rmsnorm_q8_k<<<dim3((unsigned)rows), kThreads, 0, (cudaStream_t)stream>>>(
             (float *)args->h, (const float *)args->delta, (const float *)args->w, n, args->eps,
-            (float *)args->norm_out, (block_q8_1 *)args->q8);
+            (float *)args->norm_out, (block_q8_1 *)args->q8, h_stride);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

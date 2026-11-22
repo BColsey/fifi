@@ -58,19 +58,13 @@ pub(crate) const BOLT_HEADROOM_BYTES: u64 = crate::family::mem::DEVICE.bolt_head
 )]
 pub(crate) const BOLT_SEQ_FIXED_BYTES: u64 = 2 * NEMOTRON_BOLT_E4B.vocab as u64 * 4 + 8;
 
-/// The rows of one prefill piece of the Bolt step: the model takes this many prompt rows in one
-/// launch of its projections.
-pub(crate) const BOLT_PIECE_ROWS: usize = 8;
+/// The prefill chunk sizes a Bolt start may plan, largest first: the shared prefill admission
+/// takes the largest the card leaves room for. The smallest is one decode window.
+pub(crate) const BOLT_PREFILL_LADDER: &[usize] = &[64, 32, 16, 8];
 
-const _: () = assert!(BOLT_AUTO_PROMPT_ROWS >= BOLT_PIECE_ROWS);
-
-/// The prompt rows per tick that the engine feeds while several sessions are live, when the entry
-/// does not set `prompt_rows`.
-#[cfg_attr(
-    not(feature = "native-cuda"),
-    allow(dead_code, reason = "only the CUDA starter reads the share")
-)]
-pub(crate) const BOLT_AUTO_PROMPT_ROWS: usize = 8;
+/// The most sessions one decode window steps together (the decode attention and the head launch
+/// are planned for this many rows); the session planner's row cap and ceiling.
+pub(crate) const BOLT_WINDOW_SEQS: usize = 8;
 
 /// Bolt's batching choices: idle prompts take whole pieces, and a pooled session that idles for the
 /// default interval is released. Other executors keep the worker's defaults until their batching
@@ -203,8 +197,8 @@ mod tests {
                     headroom: BOLT_HEADROOM_BYTES,
                     cost,
                     context: 32_768,
-                    row_cap: BOLT_PIECE_ROWS,
-                    ceiling: BOLT_PIECE_ROWS,
+                    row_cap: BOLT_WINDOW_SEQS,
+                    ceiling: BOLT_WINDOW_SEQS,
                 },
                 None,
             )
@@ -289,8 +283,11 @@ mod tests {
         }
         assert_eq!(Some(allocated), bolt_kv_bytes_per_position());
         assert_eq!(
-            BOLT_PIECE_ROWS,
-            crate::family::gemma::gemma4::resident::bolt::Bolt::PREFILL_BATCH
+            BOLT_WINDOW_SEQS,
+            crate::family::gemma::gemma4::resident::bolt::Bolt::WINDOW_ROWS
         );
+        // The smallest rung is one decode window; the ladder runs largest first.
+        assert_eq!(BOLT_PREFILL_LADDER.last(), Some(&BOLT_WINDOW_SEQS));
+        assert!(BOLT_PREFILL_LADDER.windows(2).all(|pair| pair[0] > pair[1]));
     }
 }

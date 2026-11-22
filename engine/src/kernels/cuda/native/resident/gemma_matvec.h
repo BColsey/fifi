@@ -22,7 +22,7 @@ typedef struct inference_cuda_gemma_matvec_args {
     void *y;               /* f32 [ncols][rows], written */
     int rows;              /* 1..(1<<20) */
     int k;                 /* multiple of 32, <= 65536 */
-    int ncols;             /* 1..8; each activation row padded to 512 values */
+    int ncols;             /* 1..64; each activation row padded to 512 values */
 } inference_cuda_gemma_matvec_args;
 
 #ifdef __cplusplus

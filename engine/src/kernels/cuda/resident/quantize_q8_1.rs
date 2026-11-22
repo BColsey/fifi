@@ -14,7 +14,7 @@
 //! test asserts invariants, not bytes, and reports the bit-equal share.
 //!
 //! Every refusal is a `BadRequest` and happens before any native call. In order: the backend is
-//! usable; `k` is a multiple of 32; `ncols` is in `1..=8`; `x` holds `ncols * k` floats and `y`
+//! usable; `k` is a multiple of 32; `ncols` is in `1..=64`; `x` holds `ncols * k` floats and `y`
 //! holds [`q8_1_bytes`] bytes, both 4-byte aligned; `y` overlaps no byte of `x`. A refused call
 //! changes nothing.
 
@@ -65,9 +65,9 @@ impl CudaContext {
                 call.k
             )));
         }
-        if !(1..=8).contains(&call.ncols) {
+        if !(1..=64).contains(&call.ncols) {
             return Err(EngError::BadRequest(format!(
-                "the CUDA quantize takes 1 to 8 rows, got {}",
+                "the CUDA quantize takes 1 to 64 rows, got {}",
                 call.ncols
             )));
         }

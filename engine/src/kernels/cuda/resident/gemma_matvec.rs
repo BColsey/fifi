@@ -4,7 +4,11 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::gemma_matvec::{GemmaMatvecRaw, gemma_matvec_launch};
 
-/// A repacked weight plane and 1 to 8 activation rows, padded to 512 values.
+/// The most activation columns one call takes. The kernel runs them as tiles of up to 32 and
+/// every column is independent, so a column's result does not depend on the call it is in.
+pub(crate) const GEMMA_MATVEC_MAX_COLS: usize = 64;
+
+/// A repacked weight plane and 1 to [`GEMMA_MATVEC_MAX_COLS`] activation rows, padded to 512 values.
 /// The output is contiguous f32 [ncols][rows].
 pub(crate) struct GemmaMatvecCall<'b> {
     pub(crate) w_qs: DeviceRange<'b>,
@@ -48,9 +52,9 @@ impl CudaContext {
                 call.k
             )));
         }
-        if !(1..=8).contains(&call.ncols) {
+        if !(1..=GEMMA_MATVEC_MAX_COLS).contains(&call.ncols) {
             return Err(EngError::BadRequest(format!(
-                "the gemma matvec takes 1 to 8 columns, got {}",
+                "the gemma matvec takes 1 to {GEMMA_MATVEC_MAX_COLS} columns, got {}",
                 call.ncols
             )));
         }

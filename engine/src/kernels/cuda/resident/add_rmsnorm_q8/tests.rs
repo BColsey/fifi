@@ -435,6 +435,85 @@ fn add_rmsnorm_q8_batches_rows_like_single_launches() {
     }
 }
 
+/// Rows of `h` that sit a stride apart (a layer's slice of a wider per-row plane) give, per row,
+/// the bytes of the dense launch on that row, and the bytes between the slices stay untouched.
+#[test]
+fn add_rmsnorm_q8_reads_rows_of_a_strided_plane_like_dense_rows() {
+    if !testkit::device_present("add_rmsnorm_q8_reads_rows_of_a_strided_plane_like_dense_rows") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let eps = 1e-6f32;
+    let mut rng = testkit::Rng::new(0x5741_1de5);
+    for (n, stride, rows, slice) in [(256usize, 1792usize, 9usize, 3usize), (256, 256, 4, 0)] {
+        let need = add_rmsnorm_q8_needs(n, 1).expect("sizes");
+        let all = add_rmsnorm_q8_needs(n, rows).expect("sizes");
+        let plane: Vec<f32> = (0..rows * stride)
+            .map(|_| (rng.normal() as f32) * 0.05)
+            .collect();
+        let w: Vec<f32> = (0..n).map(|_| 1.0 + (rng.normal() as f32) * 0.1).collect();
+        let plane_dev = testkit::upload_f32(&ctx, &plane);
+        let w_dev = testkit::upload_f32(&ctx, &w);
+        let norm = testkit::upload_filled(&ctx, 0xAB, all.row);
+        let q8 = testkit::upload_filled(&ctx, 0xA5, all.q8);
+        let first = slice * n * 4;
+        let span = ((rows - 1) * stride + n) * 4;
+        ctx.add_rmsnorm_q8_strided(
+            &stream,
+            AddNormQ8Call {
+                n,
+                eps,
+                h: plane_dev.range(first, span).expect("h range"),
+                delta: None,
+                weight: w_dev.range(0, need.weight).expect("weight range"),
+                norm_out: norm.range(0, all.row).expect("norm_out range"),
+                q8: q8.range(0, all.q8).expect("q8 range"),
+                rows,
+            },
+            stride,
+        )
+        .expect("queue strided add_rmsnorm_q8");
+        stream.synchronize().expect("drain");
+        let got_norm = testkit::read_bytes(&ctx, &norm, all.row);
+        let got_q8 = testkit::read_bytes(&ctx, &q8, all.q8);
+        let after = testkit::read_bytes(&ctx, &plane_dev, rows * stride * 4);
+        let want_plane: Vec<u8> = plane.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(after, want_plane, "stride {stride}: the plane changed");
+        for row in 0..rows {
+            let at = row * stride + slice * n;
+            let dense = testkit::upload_f32(&ctx, &plane[at..at + n]);
+            let want_norm = testkit::upload_filled(&ctx, 0, need.row);
+            let want_q8 = testkit::upload_filled(&ctx, 0, need.q8);
+            ctx.add_rmsnorm_q8(
+                &stream,
+                AddNormQ8Call {
+                    n,
+                    eps,
+                    h: dense.range(0, need.row).expect("dense h"),
+                    delta: None,
+                    weight: w_dev.range(0, need.weight).expect("weight range"),
+                    norm_out: want_norm.range(0, need.row).expect("norm range"),
+                    q8: want_q8.range(0, need.q8).expect("q8 range"),
+                    rows: 1,
+                },
+            )
+            .expect("queue dense row");
+            stream.synchronize().expect("drain");
+            assert_eq!(
+                &got_norm[row * need.row..(row + 1) * need.row],
+                &testkit::read_bytes(&ctx, &want_norm, need.row)[..],
+                "stride {stride} row {row}: norm bytes differ from the dense launch"
+            );
+            assert_eq!(
+                &got_q8[row * need.q8..(row + 1) * need.q8],
+                &testkit::read_bytes(&ctx, &want_q8, need.q8)[..],
+                "stride {stride} row {row}: q8 bytes differ from the dense launch"
+            );
+        }
+    }
+}
+
 #[test]
 fn add_rmsnorm_q8_needs_are_pure_and_exact() {
     let need = add_rmsnorm_q8_needs(2048, 1).expect("sizes");

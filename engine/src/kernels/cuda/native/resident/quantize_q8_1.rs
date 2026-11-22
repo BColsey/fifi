@@ -72,7 +72,7 @@ fn check_quantize(call: &QuantizeRaw<'_>) -> Result<(), DeviceFailure> {
     let sized = call.x.bytes >= x_bytes && call.y.bytes >= y_bytes;
     let aligned = call.x.offset.is_multiple_of(4) && call.y.offset.is_multiple_of(4);
     let apart = Span::of(&call.y, y_bytes).apart(&Span::of(&call.x, x_bytes));
-    if !(sized && aligned && apart) || k < 32 || !k.is_multiple_of(32) || !(1..=8).contains(&ncols)
+    if !(sized && aligned && apart) || k < 32 || !k.is_multiple_of(32) || !(1..=64).contains(&ncols)
     {
         return Err(invalid_argument());
     }
@@ -194,10 +194,10 @@ mod tests {
                 l.x.1 = 2090 * 2 * 4;
             }),
             ("no columns", |l| l.ncols = 0),
-            ("nine columns", |l| {
-                l.ncols = 9;
-                l.x.1 = 9 * 2080 * 4;
-                l.y = (131_072, 9 * 80 * 36);
+            ("sixty-five columns", |l| {
+                l.ncols = 65;
+                l.x.1 = 65 * 2080 * 4;
+                l.y = (131_072, 65 * 80 * 36);
             }),
             ("k * ncols overflows", |l| l.k = usize::MAX - 31),
             ("k * ncols * 4 overflows", |l| {
@@ -226,7 +226,7 @@ mod tests {
             ("k below one block", |a| a.k = 16),
             ("k not a multiple of 32", |a| a.k = 2048 + 4),
             ("no rows", |a| a.ncols = 0),
-            ("nine rows", |a| a.ncols = 9),
+            ("sixty-five rows", |a| a.ncols = 65),
             ("x offset not a multiple of 4", |a| a.x += 2),
             ("y offset not a multiple of 4", |a| a.y += 1),
             ("y over x", |a| a.y = a.x + 512),

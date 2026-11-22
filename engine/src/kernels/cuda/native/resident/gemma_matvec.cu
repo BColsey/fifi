@@ -91,7 +91,7 @@ extern "C" int inference_cuda_gemma_matvec_launch(const inference_cuda_gemma_mat
         if (args->w_qs == NULL || args->w_scales == NULL || args->x_q8 == NULL || args->y == NULL)
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         const int rows = args->rows, k = args->k, ncols = args->ncols;
-        if (ncols < 1 || ncols > 8) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (ncols < 1 || ncols > 64) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (rows < 1 || rows > (1 << 20)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (k < 32 || k > 65536 || k % 32 != 0) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if (!aligned(args->w_qs, 16) || !aligned(args->x_q8, 4) || !aligned(args->w_scales, 2) ||
@@ -109,22 +109,35 @@ extern "C" int inference_cuda_gemma_matvec_launch(const inference_cuda_gemma_mat
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         const int grid = (rows + kWarps - 1) / kWarps;
         Failure failure;
+        /* Columns are independent, so a call of more columns than one launch holds runs as tiles
+         * of 32, 16, 8 or fewer columns, each reading the weights once; a column's result does not
+         * depend on the tile it sits in. */
+        const size_t col_bytes = stride * kActBlockBytes;
+        for (int col0 = 0; col0 < ncols;) {
+            const int left = ncols - col0;
+            const int n = left >= 32 ? 32 : left >= 16 ? 16 : left >= 8 ? 8 : left;
+            const signed char *x = (const signed char *)args->x_q8 + (size_t)col0 * col_bytes;
+            float *y = (float *)args->y + (size_t)col0 * (size_t)rows;
 #define LAUNCH_COLS(N) \
     case N: gemma_matvec_kernel<N><<<grid, kThreads, 0, (cudaStream_t)stream>>>( \
-        (const signed char *)args->w_qs, (const __half *)args->w_scales, \
-        (const signed char *)args->x_q8, (float *)args->y, rows, k); break
-        switch (ncols) {
-            LAUNCH_COLS(1);
-            LAUNCH_COLS(2);
-            LAUNCH_COLS(3);
-            LAUNCH_COLS(4);
-            LAUNCH_COLS(5);
-            LAUNCH_COLS(6);
-            LAUNCH_COLS(7);
-            LAUNCH_COLS(8);
-        }
+        (const signed char *)args->w_qs, (const __half *)args->w_scales, x, y, rows, k); break
+            switch (n) {
+                LAUNCH_COLS(1);
+                LAUNCH_COLS(2);
+                LAUNCH_COLS(3);
+                LAUNCH_COLS(4);
+                LAUNCH_COLS(5);
+                LAUNCH_COLS(6);
+                LAUNCH_COLS(7);
+                LAUNCH_COLS(8);
+                LAUNCH_COLS(16);
+                LAUNCH_COLS(32);
+            }
 #undef LAUNCH_COLS
-        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) break;
+            col0 += n;
+        }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

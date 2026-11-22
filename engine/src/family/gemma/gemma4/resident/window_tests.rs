@@ -97,7 +97,7 @@ const PROJECTIONS: [(usize, usize); 11] = [
     (10752, 2560),
 ];
 
-/// Column j of a launch of 2 to 8 columns is, byte for byte, the launch of that column alone,
+/// Column j of a launch of 2 to 64 columns is, byte for byte, the launch of that column alone,
 /// at every projection shape of the Bolt step.
 #[test]
 #[ignore = "requires a device; use --test-threads=1"]
@@ -113,17 +113,17 @@ fn gemma_matvec_columns_equal_a_lone_column_at_every_bolt_shape() {
         let w_qs = ctx.upload(&qs).expect("weights");
         let w_scales = ctx.upload(&scales).expect("scales");
         let x = ctx
-            .upload(&floats(&activation_columns(&mut rng, 8, k)))
+            .upload(&floats(&activation_columns(&mut rng, 64, k)))
             .expect("activations");
         let row_bytes = q8_1_bytes(k, 1).expect("row bytes");
-        let q8 = ctx.upload(&vec![0u8; row_bytes * 8]).expect("q8");
+        let q8 = ctx.upload(&vec![0u8; row_bytes * 64]).expect("q8");
         ctx.quantize_q8_1(
             &stream,
             QuantizeCall {
-                x: x.range(0, 8 * k * 4).expect("x"),
-                y: q8.range(0, row_bytes * 8).expect("y"),
+                x: x.range(0, 64 * k * 4).expect("x"),
+                y: q8.range(0, row_bytes * 64).expect("y"),
                 k,
-                ncols: 8,
+                ncols: 64,
             },
         )
         .expect("quantize");
@@ -146,16 +146,16 @@ fn gemma_matvec_columns_equal_a_lone_column_at_every_bolt_shape() {
             stream.synchronize().expect("sync");
         };
         let single = ctx.upload(&vec![0u8; rows * 4]).expect("single");
-        let wide = ctx.upload(&vec![0u8; rows * 8 * 4]).expect("wide");
-        let alone: Vec<Vec<u8>> = (0..8)
+        let wide = ctx.upload(&vec![0u8; rows * 64 * 4]).expect("wide");
+        let alone: Vec<Vec<u8>> = (0..64)
             .map(|column| {
                 launch(column, 1, &single);
                 download(&ctx, &single, rows * 4)
             })
             .collect();
-        for columns in 2..=8 {
+        for columns in 2..=64 {
             launch(0, columns, &wide);
-            let got = download(&ctx, &wide, rows * 8 * 4);
+            let got = download(&ctx, &wide, rows * 64 * 4);
             for column in 0..columns {
                 assert_eq!(
                     &got[column * rows * 4..(column + 1) * rows * 4],
@@ -164,7 +164,7 @@ fn gemma_matvec_columns_equal_a_lone_column_at_every_bolt_shape() {
                 );
             }
         }
-        eprintln!("gemma_matvec rows {rows} k {k}: columns 2 to 8 equal the lone column");
+        eprintln!("gemma_matvec rows {rows} k {k}: columns 2 to 64 equal the lone column");
     }
 }
 
@@ -300,7 +300,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
     let positions = [0usize, 1, 37, 511, 512, 513, 4000, 30_000];
     let rows = positions.len();
     let part = ctx
-        .upload(&vec![0u8; attn_part_bytes(ATTN_SPLIT_MAX)])
+        .upload(&vec![0u8; attn_part_bytes(ATTN_SPLIT_MAX, 8)])
         .expect("part");
     for head in [256usize, 512] {
         let global = head == 512;
@@ -341,7 +341,7 @@ fn per_slot_rope_append_and_attention_equal_the_solo_launches() {
             let split = |armed: bool| {
                 armed.then(|| AttnDecodeGemmaSplit {
                     part: part
-                        .range(0, attn_part_bytes(ATTN_SPLIT_MAX))
+                        .range(0, attn_part_bytes(ATTN_SPLIT_MAX, 8))
                         .expect("part"),
                     max_splits: ATTN_SPLIT_MAX,
                     min_keys: ATTN_SPLIT_MIN_KEYS,
@@ -532,7 +532,7 @@ fn bits(row: &[f32]) -> Vec<u32> {
 fn prefill(model: &mut Bolt, seq: &super::bolt::BoltSeq, prompt: &[u32]) {
     let (head, _) = prompt.split_at(prompt.len() - 1);
     let mut pos = 0;
-    for chunk in head.chunks(Bolt::PREFILL_BATCH) {
+    for chunk in head.chunks(Bolt::WINDOW_ROWS) {
         model
             .prefill_batch(seq, chunk, pos, false)
             .expect("prefill");
@@ -576,12 +576,22 @@ fn solo_run(model: &mut Bolt, seq: &super::bolt::BoltSeq, prompt: &[u32]) -> Vec
 #[ignore = "requires the Q8_0 Bolt file in BOLT_Q8_FILE and a device; use --test-threads=1"]
 fn a_window_of_sessions_equals_the_solo_runs() {
     let path = std::env::var("BOLT_Q8_FILE").expect("BOLT_Q8_FILE names the Q8_0 Bolt file");
-    let mut model = super::bolt::load(std::path::Path::new(&path)).expect("load");
+    // The cache is planned for a full window of sessions: a lone-session plan fills the card.
+    let file = crate::family::gguf_select::GgufFile {
+        path: std::path::PathBuf::from(&path),
+        bytes: std::fs::metadata(&path).expect("the Bolt file").len(),
+    };
+    let mut model = super::bolt::load_choosing(
+        &[file],
+        crate::family::gemma4::config::MaxSeqs::Count(Bolt::WINDOW_ROWS),
+        &|_| {},
+    )
+    .expect("load");
     model
-        .reserve_window(Bolt::PREFILL_BATCH)
+        .reserve_window(Bolt::WINDOW_ROWS)
         .expect("window buffers");
     let lengths = [5usize, 17, 1, 130, 40, 2, 9, 77];
-    let seqs: Vec<_> = (0..Bolt::PREFILL_BATCH)
+    let seqs: Vec<_> = (0..Bolt::WINDOW_ROWS)
         .map(|_| model.new_seq().expect("sequence"))
         .collect();
     for width in [2usize, 3, 4, 5, 8] {

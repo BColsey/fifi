@@ -335,7 +335,7 @@ static int gemma_check(const inference_cuda_attn_decode_gemma_args *args, bool e
         args->k_scales == NULL || args->v_codes == NULL || args->v_scales == NULL ||
         args->kv_len == NULL)
         return INFERENCE_CUDA_INVALID_ARGUMENT;
-    if (args->m < 1 || args->m > 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    if (args->m < 1 || args->m > 64) return INFERENCE_CUDA_INVALID_ARGUMENT;
     if (!(args->n_q_head == 16 && (args->n_kv_head == 1 || args->n_kv_head == 8))
         && !(args->n_q_head == 8 && args->n_kv_head == 2))
         return INFERENCE_CUDA_INVALID_ARGUMENT;

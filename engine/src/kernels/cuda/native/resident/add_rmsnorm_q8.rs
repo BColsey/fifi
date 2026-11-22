@@ -42,6 +42,7 @@ struct AddNormQ8ArgsRepr {
     n: c_int,
     eps: f32,
     rows: c_int,
+    h_stride: c_int,
 }
 
 const _: () = assert!(
@@ -54,6 +55,7 @@ const _: () = assert!(
         && offset_of!(AddNormQ8ArgsRepr, n) == 40
         && offset_of!(AddNormQ8ArgsRepr, eps) == 44
         && offset_of!(AddNormQ8ArgsRepr, rows) == 48
+        && offset_of!(AddNormQ8ArgsRepr, h_stride) == 52
 );
 
 /// What one launch reads and writes: the residual row `h` (updated in place when `delta` is
@@ -68,6 +70,8 @@ pub(in crate::kernels::cuda) struct AddNormQ8Raw<'a> {
     pub(in crate::kernels::cuda) n: usize,
     pub(in crate::kernels::cuda) eps: f32,
     pub(in crate::kernels::cuda) rows: usize,
+    /// f32 elements between rows of `h`; 0 is `n` (dense).
+    pub(in crate::kernels::cuda) h_stride: usize,
 }
 
 /// Bytes of the `block_q8_1` output of one row of `n` values: padded to 512 values, one 36-byte
@@ -90,7 +94,14 @@ fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
     let fits = |range: &RawRange<'_>, need: usize, align: usize| {
         range.bytes >= need && range.offset.is_multiple_of(align)
     };
-    if !fits(&call.h, all_rows, 4)
+    let h_stride = if call.h_stride == 0 { n } else { call.h_stride };
+    let h_rows = h_stride
+        .checked_mul(4)
+        .and_then(|stride| stride.checked_mul(rows.saturating_sub(1)))
+        .and_then(|lead| lead.checked_add(row))
+        .ok_or_else(invalid_argument)?;
+    if !fits(&call.h, h_rows, 4)
+        || h_stride < n
         || !fits(&call.weight, row, 4)
         || !fits(&call.norm_out, all_rows, 16)
         || !fits(&call.q8, q8_all, 4)
@@ -107,7 +118,7 @@ fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
         return Err(invalid_argument());
     }
     let written = [
-        Span::of(&call.h, all_rows),
+        Span::of(&call.h, h_rows),
         Span::of(&call.norm_out, all_rows),
         Span::of(&call.q8, q8_all),
     ];
@@ -142,6 +153,7 @@ pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
         n: c_int::try_from(call.n).map_err(|_| invalid_argument())?,
         eps: call.eps,
         rows: c_int::try_from(call.rows).map_err(|_| invalid_argument())?,
+        h_stride: c_int::try_from(call.h_stride).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_add_norm_q8` proved every range inside its live allocation, large enough,
@@ -206,6 +218,7 @@ mod tests {
             n: args.n,
             eps: args.eps,
             rows: args.rows,
+            h_stride: 0,
         };
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or
@@ -310,6 +323,7 @@ mod tests {
             n: layout.n,
             eps,
             rows: 1,
+            h_stride: 0,
         })
     }
 

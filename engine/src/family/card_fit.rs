@@ -195,6 +195,44 @@ impl CellFigures {
         plan_card_fit(card, &[form], limits).map(|fit| fit.context as usize)
     }
 
+    /// The rows of one prefill chunk a card takes: the largest rung of `ladder` (largest first)
+    /// whose scratch, `scratch_for(rows)`, the shared prefill admission leaves room for beside the
+    /// weights, the fallback cache and the headroom. A rung that does not fit is skipped; the
+    /// smallest rung is the floor. The variable `cap_var` may name one rung to cap the ladder.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn prefill_rows(
+        &self,
+        free: u64,
+        weights: u64,
+        ladder: &'static [usize],
+        scratch_for: &dyn Fn(usize) -> Option<u64>,
+        cap_var: &str,
+    ) -> usize {
+        use crate::family::prefill::admission::{Admission, ChunkCost};
+        let cap = std::env::var(cap_var)
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .filter(|rows| ladder.contains(rows));
+        let cache = self.per_position.saturating_mul(self.fallback as u64);
+        let room = free
+            .saturating_sub(weights)
+            .saturating_sub(cache)
+            .saturating_sub(self.headroom);
+        let costs: Vec<ChunkCost> = ladder
+            .iter()
+            .filter_map(|&m| {
+                let arena = usize::try_from(scratch_for(m)?).ok()?;
+                Some(ChunkCost { m, arena, part: 0 })
+            })
+            .collect();
+        let budget = usize::try_from(room).unwrap_or(usize::MAX);
+        Admission::new(budget, 0, 0, ladder)
+            .admit(0, &costs, cap, cap_var)
+            .ok()
+            .flatten()
+            .unwrap_or(ladder[ladder.len() - 1])
+    }
+
     /// The cells a load serves: concurrency first, then context. The cache is widened beyond the
     /// fallback only as far as the planned `sessions` all still fit; a card that cannot fund them
     /// even at the fallback serves that many cells (or what one session carries, when less), so

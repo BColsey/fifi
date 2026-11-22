@@ -49,7 +49,7 @@ fn check_gemma_matvec(call: &GemmaMatvecRaw<'_>) -> Result<(), DeviceFailure> {
     if !(1..=(1usize << 20)).contains(&call.rows)
         || !(32..=65_536).contains(&call.k)
         || !call.k.is_multiple_of(32)
-        || !(1..=8).contains(&call.ncols)
+        || !(1..=64).contains(&call.ncols)
     {
         return Err(invalid_argument());
     }
@@ -120,27 +120,27 @@ mod tests {
         let mut call = GemmaMatvecRaw {
             w_qs: range(0, 4 * 64),
             w_scales: range(4096, 4 * 2 * 2),
-            x_q8: range(8192, (7 * 16 + 2) * 36),
-            y: range(16384, 8 * 4 * 4),
+            x_q8: range(8192, (63 * 16 + 2) * 36),
+            y: range(65536, 64 * 4 * 4),
             rows: 4,
             k: 64,
-            ncols: 8,
+            ncols: 64,
         };
         assert_eq!(check_gemma_matvec(&call), Ok(()));
-        for ncols in [0, 9, usize::MAX] {
+        for ncols in [0, 65, usize::MAX] {
             call.ncols = ncols;
             assert!(check_gemma_matvec(&call).is_err(), "ncols {ncols}");
         }
-        call.ncols = 8;
-        call.x_q8 = range(8192, 8 * 2 * 36);
+        call.ncols = 64;
+        call.x_q8 = range(8192, 64 * 2 * 36);
         assert!(
             check_gemma_matvec(&call).is_err(),
             "unpadded activation rows"
         );
-        call.x_q8 = range(8192, (7 * 16 + 2) * 36);
-        call.y = range(16384, 8 * 4 * 4 - 4);
+        call.x_q8 = range(8192, (63 * 16 + 2) * 36);
+        call.y = range(65536, 64 * 4 * 4 - 4);
         assert!(check_gemma_matvec(&call).is_err(), "last output missing");
-        call.y = range(8192 + 7 * 16 * 36, 8 * 4 * 4);
+        call.y = range(8192 + 63 * 16 * 36, 64 * 4 * 4);
         assert!(
             check_gemma_matvec(&call).is_err(),
             "last activation overlaps output"

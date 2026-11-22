@@ -163,7 +163,7 @@ pub(crate) struct Gemma {
 /// What the wide prefill attention sees of the global layers: one kv head of 512-wide planes
 /// read by every query head, at most one prefill batch of rows.
 fn wide_geometry() -> WideGeometry {
-    WideGeometry::unscaled(HEADS, 1, CELLS, Gemma::PREFILL_BATCH)
+    WideGeometry::unscaled(HEADS, 1, CELLS)
 }
 
 pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {

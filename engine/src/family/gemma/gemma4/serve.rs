@@ -155,7 +155,7 @@ mod device {
         }
 
         fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
-            for chunk in tokens.chunks(Bolt::PREFILL_BATCH) {
+            for chunk in tokens.chunks(self.model.rows) {
                 self.model
                     .prefill_batch(self.seq, chunk, *self.pos, false)?;
                 *self.pos += chunk.len();
@@ -554,8 +554,8 @@ mod device {
             cost: budget::bolt_seq_cost()
                 .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
             context: model.cells() as u64,
-            row_cap: Bolt::PREFILL_BATCH,
-            ceiling: Bolt::PREFILL_BATCH,
+            row_cap: budget::BOLT_WINDOW_SEQS,
+            ceiling: budget::BOLT_WINDOW_SEQS,
         };
         plan_seqs(
             inputs,
@@ -597,7 +597,7 @@ mod device {
         // weights are uploaded; the server's request bound needs the figure before the engine is
         // ready.
         let (announce, resolved) = std::sync::mpsc::sync_channel::<Announcement<usize>>(1);
-        let engine = spawn_engine_noted(Bolt::PREFILL_BATCH, ready_note, move |_| {
+        let engine = spawn_engine_noted(budget::BOLT_PREFILL_LADDER[0], ready_note, move |_| {
             let loaded = bolt::load_choosing(&files, seqs, &|cells| {
                 let _ = announce.try_send(Ok(cells));
             });
@@ -640,12 +640,12 @@ mod device {
                 HostStoreDisk::open(TIER_LABEL, resolved, origin, &load, 1)
             });
             let mut serve = BoltServe {
+                prompt_rows: prompt_rows.unwrap_or(model.rows),
                 model,
                 eos: eos.clone(),
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity,
                 max_seqs: plan.seqs,
-                prompt_rows: prompt_rows.unwrap_or(budget::BOLT_AUTO_PROMPT_ROWS),
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,
@@ -747,7 +747,7 @@ mod device {
             }
             // The restored branch: rewind to the save point, feed the held
             // token plus an extension whose tokens differ from turn 1's drawn
-            // tokens (one PREFILL_BATCH of rows), then draw greedily.
+            // tokens (one window of rows), then draw greedily.
             let extension: Vec<u32> = (0..7).map(|index| 90_000 + index).collect();
             let mut tail: Vec<u32> = vec![prompt[saved]];
             tail.extend_from_slice(&extension);
@@ -938,12 +938,12 @@ mod device {
         /// seam and the model directly.
         fn serve_of(model: Bolt) -> BoltServe {
             BoltServe {
+                prompt_rows: model.rows,
                 model,
                 eos: vec![0],
                 prefix: PrefixStore::with_limits(ONE_TIP),
                 identity: PrefixIdentity::default(),
                 max_seqs: 3,
-                prompt_rows: budget::BOLT_AUTO_PROMPT_ROWS,
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached: 0,
                 prefix_shadow: None,

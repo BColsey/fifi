@@ -313,13 +313,13 @@ fn quantize_rejects_unsound_calls_before_launching() {
         ),
         (
             "no columns",
-            "takes 1 to 8 rows",
+            "takes 1 to 64 rows",
             Spec { ncols: 0, ..VALID },
         ),
         (
-            "nine columns",
-            "takes 1 to 8 rows",
-            Spec { ncols: 9, ..VALID },
+            "sixty-five columns",
+            "takes 1 to 64 rows",
+            Spec { ncols: 65, ..VALID },
         ),
         (
             "k that overflows the byte count",

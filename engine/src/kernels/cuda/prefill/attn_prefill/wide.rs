@@ -35,8 +35,6 @@ pub(crate) struct WideGeometry {
     pub(crate) n_kv_head: usize,
     /// Cells of each kv head's plane.
     pub(crate) cells: usize,
-    /// The most rows of one call (the family's prefill batch).
-    pub(crate) max_rows: usize,
     /// The score scale of the family's attention.
     pub(crate) scale: f32,
 }
@@ -61,8 +59,8 @@ impl WideGeometry {
                 ),
             ));
         }
-        if self.cells == 0 || self.max_rows == 0 {
-            return Err(rule("wide geometry", "no cells or no rows"));
+        if self.cells == 0 {
+            return Err(rule("wide geometry", "no cells"));
         }
         Ok(virtual_kv)
     }
@@ -85,11 +83,13 @@ impl WideGeometry {
         }
     }
 
-    /// Bytes of the partial buffer of a call of up to `max_rows` rows over `cells` cells.
+    /// Bytes of the partial buffer of one launch: a query tile of rows over `cells` cells. A call of
+    /// more rows runs as consecutive launches of one tile each, so the buffer does not grow with
+    /// the rows.
     pub(crate) fn part_bytes(self) -> Result<usize, EngError> {
         let split = cpf_attn_wide_split(self.cells)?;
         cpf_attn_part_bytes(
-            self.kernel_geometry(self.max_rows)?,
+            self.kernel_geometry(CPF_ATTN_Q_TILE)?,
             CpfAttnPlan {
                 q_tile: CPF_ATTN_Q_TILE,
                 max_splits: split.max_splits,
@@ -270,12 +270,11 @@ impl WideLoad {
 
 impl WideGeometry {
     /// The geometry of a family whose attention scores are unscaled (the norm carries the scale).
-    pub(crate) fn unscaled(n_head: usize, n_kv_head: usize, cells: usize, max_rows: usize) -> Self {
+    pub(crate) fn unscaled(n_head: usize, n_kv_head: usize, cells: usize) -> Self {
         Self {
             n_head,
             n_kv_head,
             cells,
-            max_rows,
             scale: 1.0,
         }
     }
@@ -382,12 +381,45 @@ impl WideAttention {
         call: WideCall<'_>,
     ) -> Result<(), EngError> {
         let g = self.geometry;
-        if call.rows == 0 || call.rows > g.max_rows {
-            return Err(rule(
-                "wide rows",
-                &format!("{} rows, the buffer holds {}", call.rows, g.max_rows),
-            ));
+        if call.rows == 0 {
+            return Err(rule("wide rows", "no rows"));
         }
+        // One launch takes one query tile of rows; the rows of a chunk are independent, so the
+        // chunk runs as consecutive launches with the bytes of one launch.
+        let row_bytes = g.n_head * CPF_ATTN_WIDE_HEAD_DIM * 4;
+        fn part<'a>(
+            range: DeviceRange<'a>,
+            at: usize,
+            bytes: usize,
+        ) -> Result<DeviceRange<'a>, EngError> {
+            range.buffer().range(range.offset() + at, bytes)
+        }
+        let mut done = 0;
+        while done < call.rows {
+            let rows = (call.rows - done).min(CPF_ATTN_Q_TILE);
+            self.attend_tile(
+                ctx,
+                stream,
+                WideCall {
+                    planes: call.planes,
+                    q: part(call.q, done * row_bytes, rows * row_bytes)?,
+                    out: part(call.out, done * row_bytes, rows * row_bytes)?,
+                    rows,
+                    p0: call.p0 + done,
+                },
+            )?;
+            done += rows;
+        }
+        Ok(())
+    }
+
+    fn attend_tile(
+        &self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        call: WideCall<'_>,
+    ) -> Result<(), EngError> {
+        let g = self.geometry;
         let [k_codes, k_scales, v_codes, v_scales] = call.planes;
         let views = [self.view(k_codes, k_scales)?, self.view(v_codes, v_scales)?];
         let split = cpf_attn_wide_split(g.cells)?;
@@ -467,7 +499,6 @@ mod tests {
             n_head,
             n_kv_head,
             cells: 32_767,
-            max_rows: 8,
             scale: 1.0,
         }
     }
