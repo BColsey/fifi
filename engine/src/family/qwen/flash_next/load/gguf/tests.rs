@@ -23,6 +23,28 @@ fn open(spec: &Spec) -> (super::testkit::Written, GgufModel) {
     (written, model)
 }
 
+#[test]
+fn expert_allocation_accounts_for_each_layer_and_staging() {
+    use super::expert_layout::{ExpertAllocation, ExpertLayout, ExpertStacks};
+    let (_file, model) = open(&Spec::default());
+    assert!(ExpertAllocation::for_model(&model, 0).is_err());
+    assert!(ExpertAllocation::for_model(&model, model.config().dims.experts as usize + 1).is_err());
+    let allocation = ExpertAllocation::for_model(&model, 11).unwrap();
+    let layouts: Vec<_> = (0..model.config().layers())
+        .map(|layer| ExpertLayout::for_layer(&model, layer).unwrap())
+        .collect();
+    let expected: Vec<_> = layouts
+        .iter()
+        .map(|layout| ExpertStacks::new(layout, 11).unwrap().bytes)
+        .collect();
+    assert_eq!(allocation.layer_bytes, expected);
+    assert_eq!(allocation.device_bytes, expected.iter().sum::<usize>());
+    assert_eq!(
+        allocation.staging_bytes,
+        layouts.iter().map(|layout| layout.bytes).max().unwrap()
+    );
+}
+
 /// The EXL3 configuration of the same model, as the pack path reads it.
 fn exl3_dims() -> Dims {
     let mut dims = Dims::read(CONFIG).expect("the fixture config");

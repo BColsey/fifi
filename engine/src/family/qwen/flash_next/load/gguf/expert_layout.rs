@@ -29,6 +29,45 @@ pub(in super::super::super) struct ExpertStacks {
     slots: usize,
 }
 
+/// Exact allocations for one device stack per layer and one reusable host record.
+/// Excludes allocator overhead, other device buffers and any pinned-host store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in super::super::super) struct ExpertAllocation {
+    pub(in super::super::super) layer_bytes: Vec<usize>,
+    pub(in super::super::super) device_bytes: usize,
+    pub(in super::super::super) staging_bytes: usize,
+}
+
+impl ExpertAllocation {
+    pub(in super::super::super) fn for_model(
+        model: &GgufModel,
+        slots: usize,
+    ) -> Result<Self, EngError> {
+        if slots == 0 || slots > model.config().dims.experts as usize {
+            return Err(EngError::MemoryPlan(
+                "invalid GGUF expert allocation slot count".into(),
+            ));
+        }
+        let mut layer_bytes = Vec::with_capacity(model.config().layers());
+        let mut device_bytes = 0usize;
+        let mut staging_bytes = 0usize;
+        for layer in 0..model.config().layers() {
+            let layout = ExpertLayout::for_layer(model, layer)?;
+            let bytes = ExpertStacks::new(&layout, slots)?.bytes;
+            device_bytes = device_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| EngError::MemoryPlan("GGUF expert allocation overflow".into()))?;
+            staging_bytes = staging_bytes.max(layout.bytes);
+            layer_bytes.push(bytes);
+        }
+        Ok(Self {
+            layer_bytes,
+            device_bytes,
+            staging_bytes,
+        })
+    }
+}
+
 impl ExpertStacks {
     pub(in super::super::super) fn new(
         record: &ExpertLayout,

@@ -781,7 +781,7 @@ mod tests {
     #[test]
     #[ignore = "reports expert layout accounting from the pinned split GGUF headers"]
     fn pinned_header_expert_stack_accounting() {
-        use super::super::expert_layout::{ExpertLayout, ExpertStacks};
+        use super::super::expert_layout::{ExpertAllocation, ExpertLayout, ExpertStacks};
         let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
         let model = GgufModel::open(std::path::Path::new(&path))
             .unwrap()
@@ -803,6 +803,9 @@ mod tests {
             distinct.insert(record.bytes);
         }
         let planned = sizes.shape.expert_bytes * model.config().layers() as u64 * slots as u64;
+        let allocation = ExpertAllocation::for_model(&model, slots).unwrap();
+        assert_eq!(allocation.device_bytes as u64, aligned);
+        assert_eq!(allocation.staging_bytes as u64, largest);
         assert_eq!(largest, sizes.record_bytes_max);
         assert!(aligned >= packed && planned >= packed && distinct.len() > 1);
         // Specific to this pinned layout and slot count, not a general planner guarantee.
