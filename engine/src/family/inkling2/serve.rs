@@ -147,7 +147,13 @@ fn start_draft(
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         return Err(super::bad("CUDA draft head requires native-cuda on Linux"));
     }
-    Ok(Speculator::new(drafter, draft.max_drafts))
+    let speculator = Speculator::new(drafter, draft.max_drafts);
+    Ok(if draft.adaptive_drafts {
+        eprintln!("Inkling DSpark adaptive draft budget enabled");
+        speculator.with_adaptive_drafts()
+    } else {
+        speculator
+    })
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -281,6 +287,7 @@ pub(crate) struct InklingDraft {
     pub(super) model: DsparkGguf,
     pub(super) cuda: bool,
     pub(super) cuda_head: bool,
+    pub(super) adaptive_drafts: bool,
     pub(super) taps: Vec<usize>,
     pub(super) max_drafts: usize,
     pub(super) width: usize,

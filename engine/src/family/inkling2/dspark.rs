@@ -27,6 +27,7 @@ pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, E
     let Some(path) = path else {
         return Ok(None);
     };
+    let adaptive_drafts = std::env::var("FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT").as_deref() == Ok("1");
     let model = DsparkGguf::open(Path::new(&path))?;
     let config = model.config();
     let workspace_bytes = config.workspace_bytes(context)?;
@@ -40,6 +41,7 @@ pub(crate) fn configured_draft(context: usize) -> Result<Option<InklingDraft>, E
         model,
         cuda,
         cuda_head,
+        adaptive_drafts,
         taps,
         max_drafts,
         width,

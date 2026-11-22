@@ -72,6 +72,8 @@ Set `FIFI_INKLING_DSPARK_GROUPED_PREFILL=1` to capture target features during gr
 
 Set `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1` with `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1` to group resident Q, K, and V cross-pass controller projections in one transfer. Grouped prefill also batches those controllers across prompt rows when `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS=1` is set. Controllers with missing resident matrices use their existing fallback.
 
+Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width after a rejection and restore it after fully accepted windows. Two consecutive windows accepting fewer than half their proposals switch that generation to one-token target decode. Each new request starts at the configured width, including a request that restores a saved prefix. The request log reports adaptive stand-down steps when they occur. The fixed DSpark width is the default.
+
 ## Tokenizer files
 
 Engines that use external tokenizer files read `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` from its `tokenizer_dir`.

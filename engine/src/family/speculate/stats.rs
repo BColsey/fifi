@@ -7,6 +7,8 @@ pub(crate) enum StandDown {
     NoDraft,
     /// The output limit or the cache left no room for a draft.
     NoRoom,
+    /// Consecutive weak windows exhausted the generation's draft budget.
+    Adaptive,
 }
 
 /// What the windows of an engine did.
@@ -17,7 +19,7 @@ pub(crate) struct SpecStats {
     drafted: u64,
     accepted: u64,
     emitted: u64,
-    stand_down: [u64; 2],
+    stand_down: [u64; 3],
 }
 
 impl SpecStats {
@@ -55,7 +57,7 @@ impl SpecStats {
 
     /// The teardown line.
     pub(crate) fn line(&self) -> String {
-        format!(
+        let mut line = format!(
             "spec: windows={} rows_fed={} drafted={} accepted={} emitted={} \
              stand_down_no_draft={} stand_down_no_room={} \
              acceptance={} tokens_per_step={}",
@@ -70,7 +72,13 @@ impl SpecStats {
                 .map_or("-".to_owned(), |a| format!("{a:.3}")),
             self.tokens_per_step()
                 .map_or("-".to_owned(), |t| format!("{t:.3}")),
-        )
+        );
+        let adaptive = self.stand_down[StandDown::Adaptive as usize];
+        if adaptive > 0 {
+            use std::fmt::Write;
+            let _ = write!(line, " stand_down_adaptive={adaptive}");
+        }
+        line
     }
 }
 
@@ -103,7 +111,7 @@ mod tests {
         stats.stand_down(StandDown::NoDraft);
         stats.stand_down(StandDown::NoDraft);
         stats.stand_down(StandDown::NoRoom);
-        assert_eq!(stats.stand_down, [2, 1]);
+        assert_eq!(stats.stand_down, [2, 1, 0]);
         assert_eq!(stats.tokens_per_step(), Some(1.0));
         assert_eq!(stats.acceptance(), None);
     }

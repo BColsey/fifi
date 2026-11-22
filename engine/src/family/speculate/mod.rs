@@ -8,6 +8,7 @@
 //! alike (see `accept`). The settings default to `draft_mode = disabled`.
 
 pub(crate) mod accept;
+pub(crate) mod budget;
 pub(crate) mod calibrator;
 pub(crate) mod config;
 #[cfg(test)]
