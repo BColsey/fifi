@@ -6,8 +6,8 @@ use super::{GgufCuda, GgufTextWeights, MappedFile, TextSpec, bad, expert_layer_o
 use crate::{
     EngError,
     family::{
-        mem::HostFacts,
         inkling2::cpu_forward::{route, sigmoid},
+        mem::HostFacts,
         qwen36::tiered::guess::{LayerRouter, RecallMeter, RouterGuess},
     },
 };

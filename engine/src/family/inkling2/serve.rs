@@ -314,15 +314,14 @@ impl TextSettings {
             let state_needs_admission =
                 self.context > DEFAULT_TEXT_CONTEXT || self.prefix_reuse || window_bytes != 0;
             if state_needs_admission || requested_rows > 1 {
-                let admission =
-                    match crate::family::mem::HostFacts::read(LABEL, "Inkling") {
-                        Ok(admission) => admission,
-                        Err(error) if !state_needs_admission => {
-                            eprintln!("Inkling grouped prefill unavailable: {error:?}");
-                            return Ok(plan);
-                        }
-                        Err(error) => return Err(error),
-                    };
+                let admission = match crate::family::mem::HostFacts::read(LABEL, "Inkling") {
+                    Ok(admission) => admission,
+                    Err(error) if !state_needs_admission => {
+                        eprintln!("Inkling grouped prefill unavailable: {error:?}");
+                        return Ok(plan);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if state_needs_admission {
                     admission.admit_payload(host_reserve, LABEL)?;
                 }
