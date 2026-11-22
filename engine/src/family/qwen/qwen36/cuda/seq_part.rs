@@ -126,6 +126,27 @@ impl<'a> QwenResidentStep<'a> {
         self.context.memory_info().ok().map(|info| info.free as u64)
     }
 
+    /// Re-lays the planes of `part` (which is out of the step) in `cells` cells with the sequence
+    /// intact: the part's graph baked the old planes, so it goes first and the next token warms
+    /// and captures again. On an error the part keeps its planes.
+    pub(crate) fn grow_seq(
+        &mut self,
+        part: &mut SeqPart<'a>,
+        cells: usize,
+    ) -> Result<(), EngError> {
+        self.check_sessions()?;
+        let options = self.seq_options(cells);
+        // Queued work may still read the old planes or run the old graph.
+        self.stream.synchronize()?;
+        let grown = part
+            .state
+            .grown(self.context, &self.stream, &self.res.dims, &options)?;
+        part.graph = None;
+        part.warmed = false;
+        part.state = grown;
+        Ok(())
+    }
+
     /// The KV cells the running part holds.
     pub(crate) fn seq_cells(&self) -> usize {
         self.state.layout().kv.capacity
@@ -150,6 +171,14 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
 
     fn swap_part(&mut self, part: &mut Self::Part) {
         self.swap_seq(part);
+    }
+
+    fn grow_part(&mut self, part: &mut Self::Part, cells: usize) -> Result<(), EngError> {
+        self.grow_seq(part, cells)
+    }
+
+    fn before_decode(&mut self) {
+        self.log_prefill_job();
     }
 
     fn part_cells(part: &Self::Part) -> usize {

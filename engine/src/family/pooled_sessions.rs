@@ -23,8 +23,8 @@ use crate::{
     EngError,
     family::{
         cell_pool::{
-            CellLease, CellPool, CellRequest, CellRoom, INITIAL_CELLS, even_share,
-            session_cells_or_queue,
+            CellLease, CellPool, CellRequest, CellRoom, INITIAL_CELLS, admission_room, even_share,
+            fit_planes, fund_growth, session_cells_or_queue,
         },
         executor::{BatchPolicy, ExecutorOps, GenerationState},
         sampler::Sampler,
@@ -65,6 +65,10 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     fn new_part(&mut self, cells: usize) -> Result<Self::Part>;
     /// Exchanges the part the step runs with `part`.
     fn swap_part(&mut self, part: &mut Self::Part);
+    /// Gives `part` room for `cells` positions, keeping everything it holds: the sequence goes
+    /// on where it was, in larger planes. `part` is out of the step. On an error the part is as
+    /// it was.
+    fn grow_part(&mut self, part: &mut Self::Part, cells: usize) -> Result<()>;
     /// The cells `part` holds.
     fn part_cells(part: &Self::Part) -> usize;
     /// The positions `part` has consumed.
@@ -75,6 +79,8 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     fn free_device_bytes(&self) -> Option<u64>;
     /// Finishes a save staged for the part that is about to leave.
     fn finish_save(&mut self) -> Result<()>;
+    /// Runs before a session's decode: the host's per-job bookkeeping that its own `decode` does.
+    fn before_decode(&mut self) {}
     /// Every id that ends generation: the host's shared handle.
     fn eos_ids(&self) -> Arc<[u32]>;
     /// The logits the sampler may choose from.
@@ -103,21 +109,19 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     }
 }
 
-/// How a session's cells are sized until a session can grow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Sizing {
-    /// A session takes every cell it can reach: the first one the whole context it would get
-    /// alone, later ones what is left. A request the pool cannot fund waits for a session to
-    /// let go; no live session is shrunk.
-    WholePool,
-    /// The pool is split among `max_seqs` sessions by what each request needs.
-    EvenShare,
-}
-
 /// One session of a [`PooledSessions`] engine.
 pub(crate) struct PooledSession<P> {
     core: DecodeSession,
     slot: Rc<SeqSlot<P>>,
+    /// The number the session is named by in refusals.
+    serial: u64,
+}
+
+/// The next session number: refusals name the session they refuse.
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_serial() -> u64 {
+    NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The executor of several sessions over one resident step.
@@ -131,10 +135,7 @@ pub(crate) struct PooledSessions<E: PartHost> {
     pool: Arc<CellPool>,
     /// The most cells one session holds: the context the card plan chose.
     ceiling: usize,
-    /// The even share of the pool among the sessions.
-    share: usize,
     max_seqs: usize,
-    sizing: Sizing,
     /// Whether the step cannot host more than one session (tiered experts and the like keep
     /// state outside a session's part) and a start that named no count serves its one session
     /// over the step's own planes instead of refusing. No part is ever built or swapped.
@@ -149,25 +150,26 @@ pub(crate) struct PooledSessions<E: PartHost> {
 
 impl<E: PartHost> PooledSessions<E> {
     /// Takes over a built step and the session the engine opened with. The step's planes were
-    /// sized for the whole context and become the pool's cells. With [`Sizing::WholePool`] the
-    /// first session keeps those planes, so a lone client runs the state it always ran; with
-    /// [`Sizing::EvenShare`] they go back to the card and every session leases by its request.
+    /// sized for the whole context: they go back to the card and their cells become the pool.
+    /// Every session starts with the cells its request needs and grows as it decodes.
     pub(crate) fn new(
         mut step: E,
         core: DecodeSession,
         max_seqs: usize,
-        sizing: Sizing,
+        allow_single: bool,
     ) -> Result<(Self, PooledSession<E::Part>)> {
         // A start that named no session count and whose step cannot host sessions serves one
         // session; a named count above one is refused by the step, as it asked for more.
-        let single = sizing == Sizing::WholePool && step.check_sessions().is_err();
+        let single = allow_single && step.check_sessions().is_err();
         if !single {
             step.check_sessions()?;
         }
         let ceiling = step.context_cells();
         let pool = CellPool::new(ceiling);
         if single {
-            let lease = pool.lease_for(ceiling, ceiling)?;
+            // The step's own planes are the session's; the lease still follows the tokens it
+            // has, and grows with them.
+            let lease = pool.lease_for(INITIAL_CELLS.min(ceiling), ceiling)?;
             let slot = Rc::new(SeqSlot {
                 inner: RefCell::new(SlotInner { part: None, lease }),
             });
@@ -182,74 +184,63 @@ impl<E: PartHost> PooledSessions<E> {
                 resident: Some(Rc::clone(&slot)),
                 pool,
                 ceiling,
-                share: ceiling,
                 max_seqs: 1,
-                sizing,
                 single: true,
                 waiting: std::cell::Cell::new(false),
                 eos: step.eos_ids(),
                 sampler_vocab: step.sampler_vocab(),
                 step,
             };
-            return Ok((this, PooledSession { core, slot }));
+            return Ok((
+                this,
+                PooledSession {
+                    core,
+                    slot,
+                    serial: next_serial(),
+                },
+            ));
         }
         let initial = INITIAL_CELLS.min(ceiling);
-        let share = even_share(ceiling, max_seqs);
         let small = step.part_bytes_at(initial);
-        let (idle, resident, slot) = match sizing {
-            Sizing::WholePool => {
-                let lease = pool.lease_for(ceiling, ceiling)?;
-                let idle = step.new_part(initial)?;
-                let slot = Rc::new(SeqSlot {
-                    inner: RefCell::new(SlotInner { part: None, lease }),
-                });
-                (Some(idle), Some(Rc::clone(&slot)), slot)
-            }
-            Sizing::EvenShare => {
-                let lease = pool.lease_for(initial, ceiling)?;
-                let mut small = step.new_part(initial)?;
-                step.swap_part(&mut small);
-                drop(small);
-                let part = step.new_part(initial)?;
-                let slot = Rc::new(SeqSlot {
-                    inner: RefCell::new(SlotInner {
-                        part: Some(part),
-                        lease,
-                    }),
-                });
-                (None, None, slot)
-            }
-        };
-        match sizing {
-            Sizing::WholePool => eprintln!(
-                "{}: sessions: one pool of {} cells; the first request takes the whole \
-                 context, later ones take what is left or wait for a session to finish \
-                 (at most {max_seqs}; set max_seqs to split the pool evenly)",
-                E::LABEL,
-                pool.total()
-            ),
-            Sizing::EvenShare => eprintln!(
-                "{}: sessions {max_seqs}: one pool of {} cells, up to {ceiling} for one \
-                 session, even share {share}, {small} B of state per session at start",
-                E::LABEL,
-                pool.total()
-            ),
-        }
+        let lease = pool.lease_for(initial, ceiling)?;
+        let mut first = step.new_part(initial)?;
+        step.swap_part(&mut first);
+        drop(first);
+        let part = step.new_part(initial)?;
+        let slot = Rc::new(SeqSlot {
+            inner: RefCell::new(SlotInner {
+                part: Some(part),
+                lease,
+            }),
+        });
+        eprintln!(
+            "{}: sessions: one pool of {} cells, up to {ceiling} for one session ({} each when \
+             {max_seqs} are live); a session holds the cells of its tokens ({small} B of state \
+             at start) and grows as it decodes; a request the pool cannot fund waits",
+            E::LABEL,
+            pool.total(),
+            even_share(ceiling, max_seqs)
+        );
         let this = Self {
-            idle,
-            resident,
+            idle: None,
+            resident: None,
             pool,
             ceiling,
-            share,
             max_seqs,
-            sizing,
             single: false,
             waiting: std::cell::Cell::new(false),
             eos: step.eos_ids(),
             sampler_vocab: step.sampler_vocab(),
             step,
         };
-        Ok((this, PooledSession { core, slot }))
+        Ok((
+            this,
+            PooledSession {
+                core,
+                slot,
+                serial: next_serial(),
+            },
+        ))
     }
 
     /// Makes `slot`'s part the one the step runs.
@@ -290,12 +281,28 @@ impl<E: PartHost> PooledSessions<E> {
     /// trims idle sessions) leaves it here, so one call at each entry covers them all.
     fn reclaim(&mut self) {
         if self.orphaned() {
-            self.deactivate();
+            // A save the dropped session staged that cannot finish is lost with it; its planes
+            // and cells go back all the same.
+            if self.deactivate().is_err() {
+                self.force_deactivate();
+            }
         }
     }
 
-    /// Puts the idle part under the step, so that the resident session's part is in its slot.
-    fn deactivate(&mut self) {
+    /// Puts the idle part under the step, so that the resident session's part is in its slot. A
+    /// save staged for the part that leaves finishes first, as when a session takes the step:
+    /// the staged copy names the part's lineage, which must still be in the step to finish.
+    fn deactivate(&mut self) -> Result<()> {
+        if self.resident.is_none() {
+            return Ok(());
+        }
+        self.step.finish_save()?;
+        self.force_deactivate();
+        Ok(())
+    }
+
+    /// The exchange of [`Self::deactivate`], whatever became of a staged save.
+    fn force_deactivate(&mut self) {
         let Some(left) = self.resident.take() else {
             return;
         };
@@ -312,8 +319,14 @@ impl<E: PartHost> PooledSessions<E> {
     /// are allocated, and the new planes start zeroed with no captured graph.
     fn resize(&mut self, session: &mut PooledSession<E::Part>, cells: usize) -> Result<()> {
         if self.single {
-            // The one session holds the whole pool, whatever the request.
-            return Ok(());
+            // The planes are the step's own: only the cells the session is leased follow the
+            // request.
+            return session
+                .slot
+                .inner
+                .borrow_mut()
+                .lease
+                .resize_for(cells, self.ceiling);
         }
         let resident = self
             .resident
@@ -327,7 +340,7 @@ impl<E: PartHost> PooledSessions<E> {
         if session.slot.inner.borrow().lease.cells() == cells && held == Some(cells) {
             return Ok(());
         }
-        self.deactivate();
+        self.deactivate()?;
         let small = INITIAL_CELLS.min(self.ceiling);
         session
             .slot
@@ -350,6 +363,112 @@ impl<E: PartHost> PooledSessions<E> {
                 Err(error)
             }
         }
+    }
+
+    /// Gives the session room for `positions` positions: the cells it holds are leased from the
+    /// pool by half again what it needs (so a long decode grows a few times, not at every
+    /// token) and its planes are re-laid in larger ones with the sequence intact. A session the
+    /// pool cannot fund is refused alone: it keeps its planes and its cells, and no other
+    /// session's cells are touched.
+    fn make_room(&mut self, session: &PooledSession<E::Part>, positions: usize) -> Result<()> {
+        let held = self.held_cells(session);
+        if positions <= held {
+            return Ok(());
+        }
+        let who = session.serial;
+        let cells = fund_growth(
+            &mut session.slot.inner.borrow_mut().lease,
+            who,
+            held,
+            positions,
+            self.ceiling,
+        )?;
+        if self.single {
+            // The planes are the step's own and already hold the context: only the lease grew.
+            return Ok(());
+        }
+        // The old planes stay until the copy ends: the card must hold both.
+        let cells = fit_planes(
+            &mut session.slot.inner.borrow_mut().lease,
+            who,
+            held,
+            cells,
+            positions,
+            self.step.free_device_bytes(),
+            |cells| self.step.part_bytes_at(cells),
+        )?;
+        if let Err(error) = self.deactivate_if_resident(session) {
+            session.slot.inner.borrow_mut().lease.resize(held);
+            return Err(error);
+        }
+        let began = std::time::Instant::now();
+        let grown = {
+            let mut inner = session.slot.inner.borrow_mut();
+            match inner.part.as_mut() {
+                Some(part) => self.step.grow_part(part, cells),
+                None => Err(EngError::Backend {
+                    operation: "pooled sessions",
+                    message: "the session's sequence part is missing".to_owned(),
+                }),
+            }
+        };
+        match grown {
+            Ok(()) => {
+                eprintln!(
+                    "{}: session {who} grew from {held} to {cells} cells in {:.1} ms ({} of {} cells free)",
+                    E::LABEL,
+                    began.elapsed().as_secs_f64() * 1000.0,
+                    self.pool.free(),
+                    self.pool.total()
+                );
+                Ok(())
+            }
+            // The planes are as they were: the lease follows them.
+            Err(error) => {
+                session.slot.inner.borrow_mut().lease.resize(held);
+                Err(match error {
+                    EngError::MemoryPlan(detail) => EngError::MemoryPlan(format!(
+                        "session {who} cannot grow from {held} to {cells} cells on the card: \
+                         {detail}; the request ends here and the others go on"
+                    )),
+                    other => other,
+                })
+            }
+        }
+    }
+
+    /// The cells the session's planes hold now.
+    fn held_cells(&self, session: &PooledSession<E::Part>) -> usize {
+        if self.single {
+            return session.slot.inner.borrow().lease.cells();
+        }
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| Rc::ptr_eq(resident, &session.slot))
+        {
+            self.step.context_cells()
+        } else {
+            session
+                .slot
+                .inner
+                .borrow()
+                .part
+                .as_ref()
+                .map_or(0, E::part_cells)
+        }
+    }
+
+    /// Puts the session's part in its slot when the step runs it.
+    fn deactivate_if_resident(&mut self, session: &PooledSession<E::Part>) -> Result<()> {
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| Rc::ptr_eq(resident, &session.slot))
+        {
+            self.deactivate()?;
+        }
+        Ok(())
     }
 
     /// Device bytes the planes of one more session need at the start.
@@ -401,7 +520,9 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
                     E::LABEL
                 )));
             }
-            let lease = self.pool.lease_for(self.ceiling, self.ceiling)?;
+            let lease = self
+                .pool
+                .lease_for(INITIAL_CELLS.min(self.ceiling), self.ceiling)?;
             let slot = Rc::new(SeqSlot {
                 inner: RefCell::new(SlotInner { part: None, lease }),
             });
@@ -409,6 +530,7 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
             return Ok(PooledSession {
                 core: DecodeSession::default(),
                 slot,
+                serial: next_serial(),
             });
         }
         let cells = INITIAL_CELLS.min(self.ceiling);
@@ -431,6 +553,7 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         let part = self.step.new_part(cells)?;
         Ok(PooledSession {
             core: DecodeSession::default(),
+            serial: next_serial(),
             slot: Rc::new(SeqSlot {
                 inner: RefCell::new(SlotInner {
                     part: Some(part),
@@ -457,11 +580,11 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         ExecutorOps::reset(&mut self.step, &mut st.core)
     }
 
-    /// Sizes the session's cells to the request, leased from the pool: a request that names its
-    /// generation limit holds the prompt and the limit, one that names none holds the even share,
-    /// and a prompt above the share holds what it needs while the pool can fund it. A pool that
-    /// cannot fund the prompt yet refuses with a memory-plan error and the worker queues the
-    /// request until a session lets go. This runs before any prefix restore.
+    /// Sizes the session's cells to the request, leased from the pool: the tokens of the prompt
+    /// and a little room, whatever generation limit the request names. The
+    /// session grows from there as it decodes. A pool that cannot fund the prompt yet refuses
+    /// with a memory-plan error and the worker queues the request until a session lets go. This
+    /// runs before any prefix restore.
     fn reset_for_request(
         &mut self,
         st: &mut PooledSession<E::Part>,
@@ -470,24 +593,14 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         _has_prefix_boundary: bool,
     ) -> Result<()> {
         self.reclaim();
-        let reachable = st.slot.inner.borrow().lease.reachable();
         let room = CellRoom {
-            reachable,
+            reachable: st.slot.inner.borrow().lease.reachable(),
             ceiling: self.ceiling,
-            share: match self.sizing {
-                Sizing::WholePool => reachable,
-                Sizing::EvenShare => self.share,
-            },
-        };
-        // Until a session can grow, a whole-pool session holds every cell it can reach whatever
-        // limit the request names, as a lone client always had.
-        let completion = match self.sizing {
-            Sizing::WholePool => None,
-            Sizing::EvenShare => completion_limit,
+            share: INITIAL_CELLS,
         };
         let request = CellRequest {
             prompt: prompt_tokens,
-            completion,
+            completion: Some(admission_room(completion_limit)),
         };
         let cells = session_cells_or_queue(request, room)?;
         self.resize(st, cells)?;
@@ -495,6 +608,12 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
     }
 
     fn prefill(&mut self, st: &mut PooledSession<E::Part>, toks: &[u32]) -> Result<()> {
+        // A prompt that leaves no room to generate is refused with the structured error the
+        // server answers with; only then does the session ask the pool for room: one more cell
+        // than its tokens.
+        let total = st.core.history().len() + toks.len();
+        crate::family::session::check_prompt(total, self.ceiling)?;
+        self.make_room(st, total + 1)?;
         self.activate(&st.slot)?;
         ExecutorOps::prefill(&mut self.step, &mut st.core, toks)
     }
@@ -508,8 +627,19 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         st: &mut PooledSession<E::Part>,
         generation: &mut GenerationState,
     ) -> Result<DecodeBatch> {
+        // The pending token takes the position after the ones fed: one more cell than it has.
+        self.make_room(st, st.core.history().len())?;
         self.activate(&st.slot)?;
-        ExecutorOps::decode(&mut self.step, &mut st.core, generation)
+        self.step.before_decode();
+        // The session ends at the cells one session can reach, not at the cells it holds now:
+        // it grows before the step that needs more.
+        let limits = Limits {
+            eos: &self.eos,
+            sampler_vocab: self.sampler_vocab,
+            context_limit: self.ceiling,
+        };
+        st.core
+            .decode(&mut RowStep(&mut self.step), generation, &limits)
     }
 
     /// A host with a batched body steps the window's rows in one step through the shared window
@@ -566,14 +696,14 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         key: &[u32],
         kind: SaveKind,
     ) -> Result<bool> {
-        // The entry is exported from the part the step runs, so the session's part must be it,
-        // and the prefix store is laid out for the whole context: a session cut to fewer cells
-        // saves nothing.
+        // The entry is exported from the part the step runs, so the session's part must be it.
+        // The store takes a cache of any size of the same form, so a session below the whole
+        // context saves too.
         let resident = self
             .resident
             .as_ref()
             .is_some_and(|resident| Rc::ptr_eq(resident, &st.slot));
-        if !resident || self.step.context_cells() != self.ceiling {
+        if !resident {
             return Ok(false);
         }
         ExecutorOps::save_prefix(&mut self.step, &st.core, key, kind)
@@ -585,9 +715,6 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
 
     fn restore_prefix(&mut self, st: &mut PooledSession<E::Part>, prompt: &[u32]) -> Result<usize> {
         self.activate(&st.slot)?;
-        if self.step.context_cells() != self.ceiling {
-            return Ok(0);
-        }
         ExecutorOps::restore_prefix(&mut self.step, &mut st.core, prompt)
     }
 }
@@ -595,7 +722,8 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
 impl<E: PartHost> Drop for PooledSessions<E> {
     fn drop(&mut self) {
         // Every part leaves the step through its slot before the step's own drop synchronizes.
-        self.deactivate();
+        let _ = self.deactivate();
+        self.force_deactivate();
     }
 }
 
@@ -648,6 +776,7 @@ impl<E: PartHost> WindowRows for PooledSessions<E> {
     /// The row's part runs in the step: the driver calls `activate_row` before it reads the
     /// model side.
     fn activate_row(&mut self, session: &mut PooledSession<E::Part>) -> Result<()> {
+        self.make_room(session, session.core.history().len())?;
         self.activate(&session.slot)
     }
 
@@ -655,13 +784,14 @@ impl<E: PartHost> WindowRows for PooledSessions<E> {
         &'a mut self,
         session: &'a mut PooledSession<E::Part>,
     ) -> (&'a mut DecodeSession, RowStep<'a, E>, Limits<'a>) {
-        let context_limit = self.step.context_cells();
         let Self {
             step,
             eos,
             sampler_vocab,
+            ceiling,
             ..
         } = self;
+        let context_limit = *ceiling;
         (
             &mut session.core,
             RowStep(step),
@@ -704,7 +834,8 @@ impl<E: PartHost> WindowRows for PooledSessions<E> {
         Ok(())
     }
 
-    /// The planes are allocated at admission; a position costs no memory.
+    /// A row's planes grow in `activate_row`, before its step: the position itself needs nothing
+    /// beyond them.
     fn row_growth(&self, _session: &PooledSession<E::Part>) -> Result<u64> {
         Ok(0)
     }
@@ -746,8 +877,7 @@ impl<E: PartHost> WindowRows for PooledSessions<E> {
             ));
         }
         // Every part leaves the step, so that the batched body reads them all from their slots.
-        self.step.finish_save()?;
-        self.deactivate();
+        self.deactivate()?;
         let mut held: Vec<_> = sessions
             .iter()
             .map(|session| session.slot.inner.borrow_mut())
@@ -809,6 +939,35 @@ mod tests {
         /// Fails the finish of a save on this call of it, counting from one.
         fail_save_on: Option<usize>,
         saves: usize,
+        /// Makes the growth of a part fail, as a card with no room does.
+        fail_grow: bool,
+        /// A save is staged and not finished.
+        staged: bool,
+        /// The cells of the part each save and each restore ran over.
+        saved: Vec<usize>,
+        restored: Vec<usize>,
+        /// The free bytes of the fake card, when it can be read.
+        free_bytes: Option<u64>,
+    }
+
+    impl Fake {
+        fn new(refuses: bool) -> Self {
+            Self {
+                refuses,
+                running: FakePart {
+                    cells: POOL,
+                    fed: 0,
+                },
+                batches: Vec::new(),
+                fail_save_on: None,
+                saves: 0,
+                fail_grow: false,
+                staged: false,
+                saved: Vec::new(),
+                restored: Vec::new(),
+                free_bytes: None,
+            }
+        }
     }
 
     impl TokenStepper for Fake {
@@ -866,6 +1025,22 @@ mod tests {
         }
 
         fn boundary(&mut self, _st: &mut DecodeSession) {}
+
+        fn save_prefix(
+            &mut self,
+            _st: &DecodeSession,
+            _key: &[u32],
+            _kind: crate::family::session::SaveKind,
+        ) -> Result<bool> {
+            self.staged = true;
+            self.saved.push(self.running.cells);
+            Ok(true)
+        }
+
+        fn restore_prefix(&mut self, _st: &mut DecodeSession, prompt: &[u32]) -> Result<usize> {
+            self.restored.push(self.running.cells);
+            Ok(prompt.len() - 1)
+        }
     }
 
     impl PartHost for Fake {
@@ -893,6 +1068,14 @@ mod tests {
             std::mem::swap(&mut self.running, part);
         }
 
+        fn grow_part(&mut self, part: &mut FakePart, cells: usize) -> Result<()> {
+            if self.fail_grow {
+                return Err(EngError::MemoryPlan("the card has no room".to_owned()));
+            }
+            part.cells = cells;
+            Ok(())
+        }
+
         fn part_cells(part: &FakePart) -> usize {
             part.cells
         }
@@ -906,11 +1089,12 @@ mod tests {
         }
 
         fn free_device_bytes(&self) -> Option<u64> {
-            None
+            self.free_bytes
         }
 
         fn finish_save(&mut self) -> Result<()> {
             self.saves += 1;
+            self.staged = false;
             if self.fail_save_on == Some(self.saves) {
                 return Err(EngError::Backend {
                     operation: "fake",
@@ -957,40 +1141,17 @@ mod tests {
     type Engine = PooledSessions<Fake>;
     type Session = PooledSession<FakePart>;
 
-    fn engine(max_seqs: usize, sizing: Sizing) -> (Engine, Session) {
-        PooledSessions::new(
-            Fake {
-                refuses: false,
-                running: FakePart {
-                    cells: POOL,
-                    fed: 0,
-                },
-                batches: Vec::new(),
-                fail_save_on: None,
-                saves: 0,
-            },
-            DecodeSession::default(),
-            max_seqs,
-            sizing,
-        )
-        .expect("sessions")
+    fn engine(max_seqs: usize) -> (Engine, Session) {
+        PooledSessions::new(Fake::new(false), DecodeSession::default(), max_seqs, false)
+            .expect("sessions")
     }
 
-    fn refusing(max_seqs: usize, sizing: Sizing) -> Result<(Engine, Session)> {
+    fn refusing(max_seqs: usize, allow_single: bool) -> Result<(Engine, Session)> {
         PooledSessions::new(
-            Fake {
-                refuses: true,
-                running: FakePart {
-                    cells: POOL,
-                    fed: 0,
-                },
-                batches: Vec::new(),
-                fail_save_on: None,
-                saves: 0,
-            },
+            Fake::new(true),
             DecodeSession::default(),
             max_seqs,
-            sizing,
+            allow_single,
         )
     }
 
@@ -1019,7 +1180,7 @@ mod tests {
 
     /// The tokens one prompt generates alone on a one-session engine.
     fn solo(prompt: &[u32], limit: u32) -> Vec<u32> {
-        let (mut engine, first) = engine(1, Sizing::WholePool);
+        let (mut engine, first) = engine(1);
         let mut session = prefilled(&mut engine, first, prompt);
         let mut generation = generation(limit);
         let mut tokens = Vec::new();
@@ -1035,12 +1196,12 @@ mod tests {
     }
 
     #[test]
-    fn a_session_dropped_after_a_failed_setup_gives_the_whole_pool_back() {
-        let (mut sessions, mut first) = engine(8, Sizing::WholePool);
+    fn a_session_dropped_after_a_failed_setup_gives_its_cells_back() {
+        let (mut sessions, mut first) = engine(8);
         sessions
-            .reset_for_request(&mut first, 100, None, false)
-            .expect("the first request takes the pool");
-        assert_eq!(sessions.pool.free(), 0);
+            .reset_for_request(&mut first, 100_000, None, false)
+            .expect("the first request holds its prompt");
+        assert!(sessions.pool.free() < POOL / 8);
         // The worker drops a session whose setup failed; its part still runs in the step.
         drop(first);
         assert!(
@@ -1050,44 +1211,66 @@ mod tests {
         let mut second = sessions
             .new_session()
             .expect("the next request is admitted");
+        assert_eq!(sessions.pool.free(), POOL - INITIAL_CELLS);
         sessions
-            .reset_for_request(&mut second, 100, None, false)
-            .expect("and takes the whole pool");
-        assert_eq!(sessions.step.context_cells(), POOL);
+            .reset_for_request(&mut second, 100_000, None, false)
+            .expect("and holds the same prompt");
     }
 
     #[test]
-    fn a_dropped_share_does_not_refuse_a_long_prompt_on_an_empty_pool() {
-        let (mut sessions, mut first) = engine(2, Sizing::EvenShare);
+    fn a_dropped_session_does_not_refuse_a_long_prompt_on_an_empty_pool() {
+        let (mut sessions, mut first) = engine(2);
         sessions
             .reset_for_request(&mut first, 100, None, false)
-            .expect("the first request takes its share");
-        assert_eq!(sessions.step.context_cells(), POOL / 2);
+            .expect("the first request holds its prompt and a little room");
+        assert_eq!(sessions.step.context_cells(), 2 * INITIAL_CELLS);
         drop(first);
         let mut lone = sessions.new_session().expect("admitted");
         sessions
             .reset_for_request(&mut lone, 70_000, None, false)
-            .expect("a prompt above one share is served while the pool is empty");
+            .expect("a long prompt is served while the pool is empty");
         assert!(sessions.step.context_cells() >= 70_000);
     }
 
     #[test]
     fn a_live_session_keeps_its_cells() {
-        let (mut sessions, mut first) = engine(8, Sizing::WholePool);
+        let (mut sessions, mut first) = engine(8);
         sessions
-            .reset_for_request(&mut first, 100, None, false)
-            .expect("the first request takes the pool");
+            .reset_for_request(&mut first, 112_000, None, false)
+            .expect("the first request holds the pool");
         assert!(!sessions.orphaned());
+        assert_eq!(sessions.pool.free(), 0);
         assert!(matches!(
             sessions.new_session(),
             Err(EngError::MemoryPlan(_))
         ));
-        assert_eq!(sessions.pool.free(), 0);
+    }
+
+    #[test]
+    fn a_session_grows_with_its_prompt_and_keeps_where_it_was() {
+        let (mut sessions, _first) = engine(4);
+        let mut grower = sessions.new_session().expect("a session");
+        assert_eq!(sessions.held_cells(&grower), INITIAL_CELLS);
+        let prompt = vec![1u32; 3000];
+        sessions
+            .prefill(&mut grower, &prompt[..1000])
+            .expect("fits");
+        assert_eq!(sessions.held_cells(&grower), INITIAL_CELLS);
+        sessions
+            .prefill(&mut grower, &prompt[1000..])
+            .expect("grows");
+        let held = sessions.held_cells(&grower);
+        assert!(held > 3000 && held % INITIAL_CELLS == 0, "{held}");
+        assert_eq!(sessions.pool.free(), POOL - INITIAL_CELLS - held);
+        // The sequence went on where it was: it consumed all but the pending token.
+        sessions.deactivate().expect("the part goes to its slot");
+        let part = grower.slot.inner.borrow().part.expect("part");
+        assert_eq!(part.fed, 2999);
     }
 
     #[test]
     fn a_window_of_rows_equals_each_row_alone_through_one_batched_step() {
-        let (mut engine, first) = engine(4, Sizing::EvenShare);
+        let (mut engine, first) = engine(4);
         let mut a = prefilled(&mut engine, first, &[1, 2]);
         let mut b = next_session(&mut engine, &[5]);
         let mut c = next_session(&mut engine, &[0, 3, 4]);
@@ -1130,7 +1313,7 @@ mod tests {
 
     #[test]
     fn a_row_that_reaches_its_limit_ends_alone() {
-        let (mut engine, first) = engine(2, Sizing::EvenShare);
+        let (mut engine, first) = engine(2);
         let mut a = prefilled(&mut engine, first, &[1]);
         let mut b = next_session(&mut engine, &[2]);
         let (mut ga, mut gb) = (generation(2), generation(8));
@@ -1153,7 +1336,7 @@ mod tests {
 
     #[test]
     fn a_row_with_a_recording_request_takes_the_logits_rows_and_the_others_still_serve() {
-        let (mut engine, first) = engine(2, Sizing::EvenShare);
+        let (mut engine, first) = engine(2);
         let mut a = prefilled(&mut engine, first, &[1, 2]);
         let mut b = next_session(&mut engine, &[5]);
         let (mut ga, mut gb) = (generation(4), generation(4));
@@ -1178,7 +1361,7 @@ mod tests {
 
     #[test]
     fn a_row_that_cannot_be_brought_to_the_step_is_refused_alone() {
-        let (mut engine, first) = engine(3, Sizing::EvenShare);
+        let (mut engine, first) = engine(3);
         let mut a = prefilled(&mut engine, first, &[1, 2]);
         let mut b = next_session(&mut engine, &[5]);
         let mut c = next_session(&mut engine, &[0, 3]);
@@ -1203,29 +1386,78 @@ mod tests {
     }
 
     #[test]
-    fn a_row_that_has_consumed_all_but_the_last_cell_takes_one_more_token() {
-        let (mut engine, first) = engine(2, Sizing::EvenShare);
-        // A new session holds the initial 1024 cells; a prompt of 1023 tokens consumes 1022 and
-        // leaves one pending.
+    fn a_row_that_fills_its_cells_grows_and_goes_on() {
+        let (mut engine, first) = engine(2);
         let prompt = vec![1u32; INITIAL_CELLS - 1];
         let mut a = engine.new_session().expect("a");
         engine.prefill(&mut a, &prompt).expect("prefill a");
         let mut b = first;
         engine.prefill(&mut b, &prompt).expect("prefill b");
         let (mut ga, mut gb) = (generation(8), generation(8));
-        let first_step = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
-        assert!(first_step.iter().all(Result::is_ok), "{first_step:?}");
-        // Each row has now consumed 1023 of its 1024 cells with a token pending: one more, and
-        // the row ends at the limit, as the solo decode does.
-        let boundary = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
-        for row in &boundary {
-            let batch = row.as_ref().expect("the row takes its last cell");
-            assert_eq!(batch.tokens.len(), 1);
-            assert!(
-                matches!(batch.finish, Some(DecodeFinish::Length)),
-                "{batch:?}"
-            );
+        for _ in 0..3 {
+            let step = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+            assert!(step.iter().all(Result::is_ok), "{step:?}");
         }
+        // Past 1024 positions each row holds more cells, and its tokens are those of a lone run.
+        assert!(engine.held_cells(&a) > INITIAL_CELLS);
+        assert!(engine.held_cells(&b) > INITIAL_CELLS);
+    }
+
+    #[test]
+    fn a_row_the_pool_cannot_grow_is_refused_alone_and_no_neighbour_is_touched() {
+        let (mut engine, first) = engine(3);
+        let prompt = vec![1u32; INITIAL_CELLS - 1];
+        let mut small = first;
+        engine.prefill(&mut small, &prompt).expect("prefill");
+        let mut big = engine.new_session().expect("big");
+        engine
+            .reset_for_request(&mut big, 111_000, None, false)
+            .expect("the second request takes the rest of the pool");
+        assert_eq!(engine.pool.free(), 0);
+        let big_prompt = vec![2u32; 111_000];
+        engine.prefill(&mut big, &big_prompt).expect("prefill big");
+        let (mut gs, mut gb) = (generation(8), generation(8));
+        let before = engine.held_cells(&big);
+        let mut refused = false;
+        for _ in 0..4 {
+            let step = window(
+                &mut engine,
+                &mut [&mut small, &mut big],
+                &mut [&mut gs, &mut gb],
+            );
+            assert!(step[1].is_ok(), "the neighbour goes on: {step:?}");
+            if let Err(error) = &step[0] {
+                assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the row that cannot grow is refused");
+        assert_eq!(
+            engine.held_cells(&small),
+            INITIAL_CELLS,
+            "it keeps its planes"
+        );
+        assert_eq!(
+            engine.held_cells(&big),
+            before,
+            "the neighbour's cells are untouched"
+        );
+    }
+
+    #[test]
+    fn a_growth_that_fails_on_the_card_leaves_the_session_as_it_was() {
+        let (mut engine, first) = engine(2);
+        let mut a = first;
+        engine
+            .prefill(&mut a, &vec![1u32; INITIAL_CELLS - 1])
+            .expect("fits");
+        engine.step.fail_grow = true;
+        let free = engine.pool.free();
+        let result = engine.prefill(&mut a, &[1, 2, 3]);
+        assert!(matches!(result, Err(EngError::MemoryPlan(_))), "{result:?}");
+        assert_eq!(engine.held_cells(&a), INITIAL_CELLS);
+        assert_eq!(engine.pool.free(), free, "the lease follows the planes");
     }
 
     /// A start that named no session count and whose step cannot host sessions (tiered experts)
@@ -1233,7 +1465,7 @@ mod tests {
     /// with the whole pool, and says busy to a second one.
     #[test]
     fn a_step_that_cannot_host_sessions_serves_one_for_a_start_that_named_no_count() {
-        let (mut sessions, mut first) = refusing(8, Sizing::WholePool).expect("one session");
+        let (mut sessions, mut first) = refusing(8, true).expect("one session");
         assert_eq!(sessions.max_seqs(), 1);
         sessions
             .reset_for_request(&mut first, 100, None, false)
@@ -1249,7 +1481,7 @@ mod tests {
     /// The worker drops a session whose setup failed and asks for another: the planes pass on.
     #[test]
     fn a_dropped_one_session_hands_its_planes_to_the_next() {
-        let (mut sessions, first) = refusing(8, Sizing::WholePool).expect("one session");
+        let (mut sessions, first) = refusing(8, true).expect("one session");
         drop(first);
         assert!(sessions.can_admit_session());
         let mut next = sessions.new_session().expect("the planes pass on");
@@ -1257,14 +1489,48 @@ mod tests {
             .reset_for_request(&mut next, 100, None, false)
             .expect("and serve a request");
         assert_eq!(sessions.step.context_cells(), POOL);
-        assert_eq!(sessions.pool.free(), 0);
+        assert_eq!(sessions.pool.free(), POOL - 2 * INITIAL_CELLS);
+    }
+
+    /// The one session of a step that cannot host more holds the cells of its tokens too: its
+    /// lease grows through the shared rule as it decodes, the step's own planes stay as they are,
+    /// and a growth the pool cannot fund refuses that session alone with its cells unchanged.
+    #[test]
+    fn the_one_session_of_a_single_step_grows_its_cells_as_it_decodes() {
+        let (mut sessions, mut one) = refusing(8, true).expect("one session");
+        sessions
+            .reset_for_request(&mut one, 100, None, false)
+            .expect("sized to the prompt and a little room");
+        assert_eq!(sessions.held_cells(&one), 2 * INITIAL_CELLS);
+        assert_eq!(sessions.pool.free(), POOL - 2 * INITIAL_CELLS);
+        sessions
+            .prefill(&mut one, &vec![1u32; 3000])
+            .expect("the prompt grows the lease");
+        let held = sessions.held_cells(&one);
+        assert!(held > 3000 && held % INITIAL_CELLS == 0, "{held}");
+        assert_eq!(sessions.pool.free(), POOL - held);
+        assert_eq!(
+            sessions.step.context_cells(),
+            POOL,
+            "the planes are the step's own"
+        );
+        // A pool that cannot fund the next growth refuses it and leaves the lease as it was.
+        let rest = sessions.pool.free();
+        let hold = sessions
+            .pool
+            .lease_for(rest, sessions.ceiling)
+            .expect("the rest of the pool");
+        let result = sessions.prefill(&mut one, &vec![2u32; held]);
+        assert!(matches!(result, Err(EngError::MemoryPlan(_))), "{result:?}");
+        assert_eq!(sessions.held_cells(&one), held);
+        drop(hold);
     }
 
     /// A failed `new_session` after the dropped session was reclaimed leaves the step with no
     /// resident session: the next request must still be admitted.
     #[test]
     fn a_failed_new_session_does_not_lock_the_one_session_step() {
-        let (mut sessions, first) = refusing(8, Sizing::WholePool).expect("one session");
+        let (mut sessions, first) = refusing(8, true).expect("one session");
         drop(first);
         // The reclaim in `new_session` frees the planes; a pool that cannot lease fails the call.
         sessions.reclaim();
@@ -1293,9 +1559,146 @@ mod tests {
     /// A start that named more than one session asked for what the step cannot do: it is refused.
     #[test]
     fn a_named_session_count_on_a_step_that_cannot_host_sessions_is_refused() {
-        assert!(matches!(
-            refusing(4, Sizing::EvenShare),
-            Err(EngError::BadRequest(_))
-        ));
+        assert!(matches!(refusing(4, false), Err(EngError::BadRequest(_))));
+    }
+
+    /// A session grown from a small start sits below the ceiling: the prefix store still takes its
+    /// entry, and a second session restores it.
+    #[test]
+    fn a_session_below_the_ceiling_saves_and_a_second_restores_the_entry() {
+        let (mut engine, mut a) = engine(4);
+        engine
+            .reset_for_request(&mut a, 100, None, false)
+            .expect("a is sized to its prompt");
+        engine.prefill(&mut a, &[1, 2, 3, 4]).expect("prefill");
+        assert!(engine.held_cells(&a) < POOL);
+        let saved = engine
+            .save_prefix(&a, &[1, 2, 3, 4], crate::family::session::SaveKind::Tip)
+            .expect("save");
+        assert!(saved, "a session below the ceiling saves");
+        assert_eq!(engine.step.saved, vec![2 * INITIAL_CELLS]);
+        let mut b = engine.new_session().expect("b");
+        engine
+            .reset_for_request(&mut b, 100, None, false)
+            .expect("b is sized to its prompt");
+        let covered = engine
+            .restore_prefix(&mut b, &[1, 2, 3, 4, 5])
+            .expect("restore");
+        assert_eq!(covered, 4);
+        assert_eq!(engine.step.restored, vec![2 * INITIAL_CELLS]);
+    }
+
+    /// A growth between a staged save and its finish completes the save first: the staged copy
+    /// names the lineage of the part that is leaving the step.
+    #[test]
+    fn a_session_grown_after_a_staged_save_completes_the_save_first() {
+        let (mut engine, mut a) = engine(2);
+        engine
+            .reset_for_request(&mut a, 100, None, false)
+            .expect("sized");
+        engine.prefill(&mut a, &[1, 2, 3]).expect("prefill");
+        assert!(
+            engine
+                .save_prefix(&a, &[1, 2, 3], crate::family::session::SaveKind::Tip)
+                .expect("staged")
+        );
+        assert!(engine.step.staged);
+        let before = engine.step.saves;
+        engine
+            .prefill(&mut a, &vec![1u32; 3000])
+            .expect("grows past its cells");
+        assert!(
+            !engine.step.staged,
+            "the save finished before the planes moved"
+        );
+        assert!(engine.step.saves > before);
+    }
+
+    /// A staged save that cannot finish refuses the growth, and the session keeps its cells.
+    #[test]
+    fn a_growth_whose_staged_save_cannot_finish_leaves_the_session_as_it_was() {
+        let (mut engine, mut a) = engine(2);
+        engine
+            .reset_for_request(&mut a, 100, None, false)
+            .expect("sized");
+        engine.prefill(&mut a, &[1, 2, 3]).expect("prefill");
+        assert!(
+            engine
+                .save_prefix(&a, &[1, 2, 3], crate::family::session::SaveKind::Tip)
+                .expect("staged")
+        );
+        engine.step.fail_save_on = Some(engine.step.saves + 1);
+        let held = engine.held_cells(&a);
+        let free = engine.pool.free();
+        assert!(engine.prefill(&mut a, &vec![1u32; 3000]).is_err());
+        assert_eq!(engine.held_cells(&a), held);
+        assert_eq!(engine.pool.free(), free, "the lease follows the planes");
+    }
+
+    /// The old planes stay until the copy ends, so a card with room for the new planes alone is
+    /// too short: the session retries at exactly the cells it needs, and a card short of that
+    /// refuses it, naming the session and the bytes.
+    #[test]
+    fn a_growth_the_card_cannot_hold_beside_the_old_planes_retries_at_the_need_and_then_refuses() {
+        let (mut engine, mut a) = engine(2);
+        let mut b = engine.new_session().expect("b");
+        // Room for 1500 cells of planes but not for the 2048 the rule asks for.
+        engine.step.free_bytes = Some(1600);
+        engine
+            .prefill(&mut b, &vec![1u32; 1500])
+            .expect("grows to exactly its need");
+        assert_eq!(engine.held_cells(&b), 1501);
+        // Room for less than the need: refused, the session as it was.
+        engine.step.free_bytes = Some(1200);
+        let held = engine.held_cells(&a);
+        let free = engine.pool.free();
+        let result = engine.prefill(&mut a, &vec![1u32; 3000]);
+        let Err(EngError::MemoryPlan(message)) = result else {
+            panic!("a memory-plan refusal, got {result:?}");
+        };
+        assert!(message.contains("session"), "{message}");
+        assert!(message.contains("1200 B"), "{message}");
+        assert_eq!(engine.held_cells(&a), held);
+        assert_eq!(engine.pool.free(), free);
+    }
+
+    /// An oversize prompt gets the structured error the server compacts to, not the pool's text.
+    #[test]
+    fn a_prompt_above_the_ceiling_is_refused_with_the_structured_error() {
+        let (mut engine, mut a) = engine(2);
+        let result = engine.prefill(&mut a, &vec![1u32; POOL]);
+        assert!(
+            matches!(
+                result,
+                Err(EngError::PromptTooLong {
+                    limit_tokens,
+                    ..
+                }) if limit_tokens == (POOL - 1) as u64
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A refusal to grow names the session and the shortfall.
+    #[test]
+    fn a_refusal_to_grow_names_the_session_and_the_cells_it_lacks() {
+        let (mut engine, first) = engine(3);
+        let mut small = first;
+        engine
+            .prefill(&mut small, &vec![1u32; INITIAL_CELLS - 1])
+            .expect("fits");
+        let mut big = engine.new_session().expect("big");
+        engine
+            .reset_for_request(&mut big, 111_000, None, false)
+            .expect("takes the rest");
+        let result = engine.prefill(&mut small, &vec![1u32; INITIAL_CELLS + 5]);
+        let Err(EngError::MemoryPlan(message)) = result else {
+            panic!("a memory-plan refusal, got {result:?}");
+        };
+        assert!(
+            message.contains(&format!("session {}", small.serial)),
+            "{message}"
+        );
+        assert!(message.contains("more cells"), "{message}");
     }
 }

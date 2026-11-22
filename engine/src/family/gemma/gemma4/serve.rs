@@ -114,7 +114,10 @@ mod device {
     use crate::{
         EngError,
         family::{
-            cell_pool::{CellRequest, CellRoom, INITIAL_CELLS, even_share, session_cells_or_queue},
+            cell_pool::{
+                CellRequest, CellRoom, INITIAL_CELLS, admission_room, even_share,
+                session_cells_or_queue,
+            },
             engine_announce::{Announcement, announce_failure, await_announced},
             executor::{ExecutorOps, GenerationState},
             host_store::{HostStorePlan, largest_entry_bytes},
@@ -166,8 +169,8 @@ mod device {
         identity: PrefixIdentity,
         /// The sessions the engine serves at once; the worker reads it after start.
         max_seqs: usize,
-        /// The cells a request that names no generation limit may use for its whole context: the
-        /// even share of the pool among the sessions.
+        /// The even share of the pool among the sessions, for the start line: a session holds the
+        /// cells of its tokens and grows from there.
         share: usize,
         /// The prompt rows the worker feeds per tick while sessions share the model.
         prompt_rows: usize,
@@ -332,11 +335,12 @@ mod device {
             let room = CellRoom {
                 reachable: st.seq.reachable(),
                 ceiling: self.model.cells(),
-                share: self.share,
+                // A session holds the cells of its tokens and grows as it decodes.
+                share: INITIAL_CELLS,
             };
             let request = CellRequest {
                 prompt: prompt_tokens,
-                completion: completion_limit,
+                completion: Some(admission_room(completion_limit)),
             };
             let cells = session_cells_or_queue(request, room)?;
             self.model.resize_seq(&mut st.seq, cells)?;
@@ -380,6 +384,12 @@ mod device {
         }
 
         fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<(), EngError> {
+            // The prompt must stay below the cells the session holds: one more than its tokens.
+            self.model.make_room(
+                &mut st.seq,
+                st.pos,
+                st.core.history().len() + toks.len() + 1,
+            )?;
             let cells = st.seq.cells();
             st.core.prefill(
                 &mut Step {
@@ -397,10 +407,13 @@ mod device {
             st: &mut Self::Session,
             generation: &mut GenerationState,
         ) -> Result<DecodeBatch, EngError> {
+            // The pending token takes the position after the ones fed: one more cell than it has.
+            self.model
+                .make_room(&mut st.seq, st.pos, st.core.history().len())?;
             let limits = Limits {
                 eos: &self.eos,
                 sampler_vocab: VOCAB,
-                context_limit: st.seq.cells(),
+                context_limit: self.model.cells(),
             };
             st.core.decode(
                 &mut Step {
@@ -547,7 +560,7 @@ mod device {
             session: &'a mut BoltSession,
         ) -> (&'a mut DecodeSession, Step<'a>, Limits<'a>) {
             let BoltSession { core, pos, seq } = session;
-            let cells = seq.cells();
+            let cells = self.model.cells();
             (
                 core,
                 Step {
@@ -563,8 +576,15 @@ mod device {
             )
         }
 
+        /// A row grows before the step that needs more cells, and a row the pool cannot fund is
+        /// refused alone.
+        fn activate_row(&mut self, session: &mut BoltSession) -> Result<(), EngError> {
+            self.model
+                .make_room(&mut session.seq, session.pos, session.core.history().len())
+        }
+
         fn check_row(&self, session: &BoltSession, token: u32) -> Result<(), EngError> {
-            let cells = session.seq.cells();
+            let cells = self.model.cells();
             if session.pos >= cells {
                 return Err(EngError::ContextLimit(format!(
                     "position {} reaches the {cells} cell context",
@@ -766,6 +786,10 @@ mod device {
             };
             serve.log_host_budget();
             if plan.seqs > 1 {
+                eprintln!(
+                    "gemma4 bolt: one pool of {model_pool} cells, {} each when {} sessions are live; a session holds the cells of its tokens and grows as it decodes",
+                    serve.share, plan.seqs
+                );
                 eprintln!(
                     "gemma4 bolt: {} prompt rows per tick while sessions share the model ({})",
                     serve.prompt_rows,
@@ -1130,13 +1154,13 @@ mod device {
             let share = serve.share;
             eprintln!("pool {pool} cells, one session up to {ceiling}, even share {share}");
 
-            // Eight short sessions run together, each at its even share.
+            // Eight short sessions run together, each holding the cells of its prompt and some room.
             let short = prompt(40, 1);
             let mut sessions: Vec<BoltSession> = (0..Bolt::WINDOW_ROWS)
                 .map(|_| sized_session(&mut serve, short.len()))
                 .collect();
             for session in &sessions {
-                assert_eq!(session.seq.cells(), share);
+                assert_eq!(session.seq.cells(), 2 * INITIAL_CELLS);
             }
             eprintln!(
                 "8 short sessions: {:?} cells each, {} pool cells free",

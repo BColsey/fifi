@@ -41,7 +41,7 @@ use super::{
 };
 use crate::EngError;
 use crate::family::card_fit::CellFigures;
-use crate::family::cell_pool::{CellLease, CellPool};
+use crate::family::cell_pool::{CellLease, CellPool, fit_planes, fund_growth};
 use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceRange;
@@ -932,6 +932,102 @@ impl Bolt {
         }
         seq.lease.resize_for(cells, self.cells)?;
         self.fill_seq(seq)
+    }
+
+    /// Gives `seq` room for `positions` positions with the `fed` cells it has kept: leases the
+    /// cells from the pool (the one growth rule of `family::cell_pool`) and re-lays the planes in
+    /// larger ones. A pool or a card that cannot fund it refuses with a memory-plan error and
+    /// leaves `seq` as it was: its planes, its lease and its id. No other sequence is touched.
+    pub(crate) fn make_room(
+        &self,
+        seq: &mut BoltSeq,
+        fed: usize,
+        positions: usize,
+    ) -> Result<(), EngError> {
+        let held = seq.cells;
+        if positions <= held {
+            return Ok(());
+        }
+        let who = seq.id;
+        let cells = fund_growth(&mut seq.lease, who, held, positions, self.cells)?;
+        // The old planes stay until the copy ends: the card must hold both.
+        let per_position = crate::family::gemma::gemma4::budget::bolt_seq_cost()
+            .map_or(0, |cost| cost.per_position);
+        let cells = fit_planes(
+            &mut seq.lease,
+            who,
+            held,
+            cells,
+            positions,
+            self.ctx.memory_info().ok().map(|info| info.free as u64),
+            |cells| per_position.saturating_mul(cells as u64),
+        )?;
+        let began = std::time::Instant::now();
+        match self.grow_planes(seq, cells, fed) {
+            Ok(()) => {
+                eprintln!(
+                    "gemma4 bolt: session {who} grew from {held} to {cells} cells in {:.1} ms ({} of {} cells free)",
+                    began.elapsed().as_secs_f64() * 1000.0,
+                    self.pool.free(),
+                    self.pool.total()
+                );
+                Ok(())
+            }
+            Err(error) => {
+                seq.lease.resize(held);
+                Err(match error {
+                    EngError::MemoryPlan(detail) => EngError::MemoryPlan(format!(
+                        "session {who} cannot grow from {held} to {cells} cells on the card: \
+                         {detail}; the request ends here and the others go on"
+                    )),
+                    other => other,
+                })
+            }
+        }
+    }
+
+    /// Re-lays the planes of `seq` in `cells` cells per head, keeping the first `fed` cells of
+    /// every head of every plane (a sliding layer's ring lives in the first cells of its plane, so
+    /// it is kept whole once `fed` passes the ring). The old planes are released after the copies
+    /// on the stream, so the peak is both sets together. The sequence takes a new id, so a
+    /// captured decode graph never replays the old planes.
+    fn grow_planes(&self, seq: &mut BoltSeq, cells: usize, fed: usize) -> Result<(), EngError> {
+        let zeros = zero(&self.ctx, ZERO_CHUNK)?;
+        let built = self.build_kv(&zeros, cells);
+        let drained = self.stream.synchronize();
+        let mut grown = built?;
+        drained?;
+        let keep = fed.min(seq.cells);
+        for (old, new) in seq.kv.iter().zip(grown.iter_mut()) {
+            let (Some(old), Some(new)) = (old, new) else {
+                continue;
+            };
+            let layer_head = old.shape.head_dim;
+            for (from, to, unit) in [
+                (&old.k_codes, &new.k_codes, layer_head),
+                (&old.k_scales, &new.k_scales, (layer_head / 32) * 2),
+                (&old.v_codes, &new.v_codes, layer_head),
+                (&old.v_scales, &new.v_scales, (layer_head / 32) * 2),
+            ] {
+                for kv_head in 0..KV_HEADS {
+                    let bytes = keep * unit;
+                    if bytes == 0 {
+                        continue;
+                    }
+                    self.ctx.copy_device(
+                        &self.stream,
+                        from.range(kv_head * seq.cells * unit, bytes)?,
+                        to.range(kv_head * cells * unit, bytes)?,
+                    )?;
+                }
+            }
+        }
+        // The copies read the old planes: the stream drains before they drop.
+        self.stream.synchronize()?;
+        seq.kv = grown;
+        seq.cells = cells;
+        seq.id = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Builds the planes of `seq` at the cells its lease holds. The sequence takes a new id, so a
@@ -2869,6 +2965,45 @@ mod tests {
         model
             .prefill_batch(&lone, &[2], model.cells() - 1, false)
             .expect("the last cell of the whole context");
+    }
+
+    /// A sequence grown in the middle of a decode gives, at every step, the logits of a sequence
+    /// sized for the whole run from the start, bit for bit: the growth crosses the sliding window
+    /// of the local layers and re-lays every plane. A wrong copy would serve wrong text.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_sequence_grown_mid_decode_gives_the_logits_of_one_sized_for_the_run() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
+        let bytes = std::fs::metadata(&path).expect("model file").len();
+        let mut model = load_choosing(
+            &[crate::family::gguf_select::GgufFile { path, bytes }],
+            crate::family::gemma::gemma4::config::MaxSeqs::Auto,
+            &|_| {},
+        )
+        .expect("load");
+        let steps = 1600usize;
+        let mut grown = model.new_seq_cells(CELL_GRANULE).expect("small sequence");
+        let full = model.new_seq_cells(2 * CELL_GRANULE).expect("whole run");
+        let mut growths = 0;
+        for pos in 0..steps {
+            let token = 2 + (pos as u32 * 17) % 5000;
+            let before = grown.cells();
+            model.make_room(&mut grown, pos, pos + 1).expect("room");
+            growths += usize::from(grown.cells() != before);
+            model.decode(&grown, token, pos).expect("grown step");
+            let a = model.capped_logits().expect("grown logits");
+            model.decode(&full, token, pos).expect("full step");
+            let b = model.capped_logits().expect("full logits");
+            let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(
+                same,
+                "the logits differ at position {pos} (grown holds {} cells)",
+                grown.cells()
+            );
+        }
+        assert!(growths >= 1, "the sequence grew during the run");
+        assert!(grown.cells() >= steps);
     }
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.

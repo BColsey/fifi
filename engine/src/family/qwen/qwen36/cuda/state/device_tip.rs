@@ -57,7 +57,7 @@ impl DeviceTip {
 
     fn check(&self, stream: &DeviceStream, state: &ResidentState) -> Result<(), EngError> {
         if self.owner != stream.id()
-            || self.layout != state.layout
+            || !self.layout.same_form(&state.layout)
             || self.identity != state.identity
         {
             return Err(EngError::BadRequest(

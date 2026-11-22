@@ -554,9 +554,10 @@ fn the_effects_of_the_recovery_gate_on_the_step_are_what_the_window_logic_assume
 
 /// The call sites of `begin_import(` and `begin_reset(` outside tests under `qwen36/cuda`, as
 /// (file, call). A new restoring site must be added to the table of the specification (17.2) and
-/// to this list together with its gate and its window close.
+/// to this list together with its gate and its window close. `state/grow.rs` builds a new state
+/// with the old one's contents between two tokens, never over a live window.
 #[test]
-fn the_restoring_entry_points_are_exactly_the_six_of_the_table() {
+fn the_restoring_entry_points_are_exactly_the_seven_of_the_table() {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .expect("read_dir")
@@ -611,6 +612,7 @@ fn the_restoring_entry_points_are_exactly_the_six_of_the_table() {
             "state.rs begin_reset",
             "state/device_tip.rs begin_import",
             "state/export.rs begin_import",
+            "state/grow.rs begin_import",
             "state/pinned.rs begin_import",
             "state/prefix.rs begin_import",
             "state/rollback.rs begin_import",

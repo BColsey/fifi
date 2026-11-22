@@ -333,7 +333,7 @@ impl QwenResidentStep<'_> {
     /// only this body — exactly like the Mac glue.
     /// Writes the one prefill line of a job, once: the first decode after the prefill, or
     /// the next reset when no decode ran.
-    fn log_prefill_job(&mut self) {
+    pub(super) fn log_prefill_job(&mut self) {
         // A session that has not fed a row yet has nothing to report: an empty line at the
         // first reset would name no path and no pieces.
         if self.last_prefill_report().feed_rows_calls().is_empty() {
