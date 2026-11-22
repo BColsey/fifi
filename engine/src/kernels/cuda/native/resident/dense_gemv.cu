@@ -14,6 +14,10 @@
 #include "resident/dense_gemv.h"
 #include "resident/gguf_gemv.cuh"
 
+#ifdef FIFI_BUILD_INKLING_Q8_REUSE_PROBE
+#include "resident/inkling_q8_reuse_probe.h"
+#endif
+
 namespace {
 
 constexpr int kMaxM = 32768;
@@ -664,6 +668,62 @@ extern "C" int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
+
+#ifdef FIFI_BUILD_INKLING_Q8_REUSE_PROBE
+namespace {
+
+// Two adjacent input rows share a decoded Q8_0 weight. Keep lane c on
+// column block*32+c and preserve the baseline FMA order within each row.
+__global__ void inkling_q8_reuse_pair(inference_cuda_dense_gemv_args a) {
+    extern __shared__ float2 paired[];
+    const int first = blockIdx.y * 2;
+    const bool has_second = first + 1 < a.m;
+    const auto *x = static_cast<const float *>(a.x) + size_t(first) * a.ld_x;
+    const auto *second = has_second ? x + a.ld_x : x;
+    for (int c = threadIdx.x; c < a.cols; c += blockDim.x) {
+        paired[c] = make_float2(x[c], second[c]);
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row >= a.rows) return;
+    const int blocks = a.cols / 32;
+    const auto *weights = static_cast<const uint8_t *>(a.w) + size_t(row) * blocks * 34;
+    float lo = 0.0f, hi = 0.0f;
+    for (int k = 0; k < blocks; ++k) {
+        const float w = fifi_gguf::decode<8>(weights + k * 34, lane);
+        const float2 v = paired[k * 32 + lane];
+        lo = fmaf(w, v.x, lo);
+        hi = fmaf(w, v.y, hi);
+    }
+    lo = warp_sum(lo);
+    hi = warp_sum(hi);
+    if (lane == 0) {
+        auto *y = static_cast<float *>(a.y) + size_t(first) * a.ld_y + row;
+        y[0] = lo;
+        if (has_second) y[a.ld_y] = hi;
+    }
+}
+
+}  // namespace
+
+int inkling_q8_reuse_probe_launch(const inference_cuda_dense_gemv_args *args, void *stream,
+                                 InklingQ8ReusePolicy policy, InklingQ8ReuseLaunch &out) {
+    out = {};
+    if (!args || !valid(*args, stream)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    const auto &a = *args;
+    if (!policy.use_pair(a)) return inference_cuda_dense_gemv_launch(args, stream, &out.stage);
+    const dim3 grid((a.rows + kWarps - 1) / kWarps, (a.m + 1) / 2);
+    inkling_q8_reuse_pair<<<grid, kWarps * 32, size_t(a.cols) * sizeof(float2),
+                            static_cast<cudaStream_t>(stream)>>>(a);
+    Failure failure;
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    out.stage = failure.stage;
+    out.used_pair = failure.ok();
+    return int(failure.err);
+}
+#endif
 
 extern "C" int inference_cuda_gguf_exact_expert_tile_launch(
     const inference_cuda_dense_gemv_args *args, void *stream, int *out_stage, int *out_tile) {
