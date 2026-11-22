@@ -106,6 +106,11 @@ pub(crate) fn check_dense_rules(
     check_dense_mmq_rules(mmq_type_of(ty)?, k, n, m, ld, col_off)
 }
 
+/// Whether the dense GEMM has a case for `ty`: the types whose weights it reads.
+pub(crate) fn has_dense_case(ty: QuantType) -> bool {
+    mmq_type_of(ty).is_ok()
+}
+
 pub(super) fn check_dense_mmq_rules(
     ty: MmqType,
     k: usize,

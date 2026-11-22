@@ -48,6 +48,7 @@ use crate::kernels::cuda::prefill::attn_prefill::{
     WideAttention, WideCall, WideGeometry, WideLoad,
 };
 use crate::kernels::cuda::prefill::dense_chunk_gemm::DenseChunkGemm;
+use crate::kernels::cuda::prefill::mmq_dense::has_dense_case;
 use crate::kernels::cuda::resident::add_rmsnorm_q8::AddNormQ8Call;
 use crate::kernels::cuda::resident::attn_decode_gemma::{
     AttnDecodeGemmaCall, AttnDecodeGemmaSplit,
@@ -55,6 +56,7 @@ use crate::kernels::cuda::resident::attn_decode_gemma::{
 use crate::kernels::cuda::resident::embed::EmbedNativeCall;
 use crate::kernels::cuda::resident::gelu_ffn::GeluFfnCall;
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
+use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::resident::quantize_q8_1::QuantizeCall;
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::resident::rope_gemma::RopeGemmaCall;
@@ -88,6 +90,16 @@ pub(crate) const FFN: usize = 10_240;
 const MMQ_MIN_ROWS: usize = 16;
 /// The widest activation a chunk projects.
 const MMQ_K_MAX: usize = FFN;
+
+/// Whether a group of projections over one activation runs on the tensor cores: the chunk is wide
+/// enough and every weight of the group rests in one type that has a dense case, since one
+/// quantized activation serves one layout.
+fn on_tensor_cores(mut types: impl Iterator<Item = QuantType>, m: usize) -> bool {
+    let Some(first) = types.next() else {
+        return false;
+    };
+    m >= MMQ_MIN_ROWS && has_dense_case(first) && types.all(|ty| ty == first)
+}
 /// The model's maximum positions: the ceiling of the planned KV cells per physical layer.
 pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
     Some(dense) => dense.context_limit as usize,
@@ -1327,34 +1339,31 @@ impl Bolt {
         Ok(replaced)
     }
 
-    /// Keeps the existing norm reduction and quantization order for every activation row.
-    /// Quantizes the `m` f32 rows `x` of `weight`'s width for the [`Self::project`] calls that
-    /// follow, when the chunk runs on the tensor cores.
-    fn project_input(&self, weight: &NativeWeight, x: &Vector, m: usize) -> Result<(), EngError> {
-        match self.mmq.as_ref().filter(|_| m >= MMQ_MIN_ROWS) {
-            Some(gemm) => {
-                let x = x.buf.range(0, m * weight.k() * 4)?;
-                gemm.input(&self.ctx, &self.stream, weight, x, m)
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// One projection of `m` rows into `y`: the tensor-core GEMM of a wide chunk on the rows of the
-    /// last [`Self::project_input`], else the matvec on their q8_1 rows `x_q8`.
-    fn project(
+    /// The projections of one group over one activation, `x` as f32 rows and `x_q8` as q8_1 rows:
+    /// one `(weight, y)` per projection. A chunk of 16 rows or more runs the group on the tensor
+    /// cores when every weight of it rests in one type that has a dense case, since one quantized
+    /// activation serves one layout; any other group runs each weight through the matvec.
+    fn project_group(
         &self,
-        weight: &NativeWeight,
+        group: &[(&NativeWeight, &Vector)],
+        x: &Vector,
         x_q8: &DeviceBuffer,
-        y: &Vector,
         m: usize,
     ) -> Result<(), EngError> {
-        match self.mmq.as_ref().filter(|_| m >= MMQ_MIN_ROWS) {
+        let first = group[0].0;
+        let wide = on_tensor_cores(group.iter().map(|(weight, _)| weight.quant()), m);
+        match self.mmq.as_ref().filter(|_| wide) {
             Some(gemm) => {
-                let y = y.buf.range(0, m * weight.n_rows() * 4)?;
-                gemm.project(&self.ctx, &self.stream, weight, m, y)
+                let rows = x.buf.range(0, m * first.k() * 4)?;
+                gemm.input(&self.ctx, &self.stream, first, rows, m)?;
+                group.iter().try_for_each(|(weight, y)| {
+                    let y = y.buf.range(0, m * weight.n_rows() * 4)?;
+                    gemm.project(&self.ctx, &self.stream, weight, m, y)
+                })
             }
-            None => self.matvec(weight, weight.n_rows(), x_q8, y, m),
+            None => group
+                .iter()
+                .try_for_each(|(weight, y)| self.matvec(weight, weight.n_rows(), x_q8, y, m)),
         }
     }
 
@@ -1369,6 +1378,7 @@ impl Bolt {
         matvec(&self.ctx, &self.stream, weight, rows, x_q8, y, m)
     }
 
+    /// Keeps the existing norm reduction and quantization order for every activation row.
     fn norm_rows<'b>(
         &self,
         stream: &DeviceStream,
@@ -1880,11 +1890,14 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        self.project_input(&layer.q, &sc.nrm, m)?;
-        self.project(&layer.q, &sc.q8_hidden, &sc.q, m)?;
-        if let (Some(k), Some(v)) = (&layer.k, &layer.v) {
-            self.project(k, &sc.q8_hidden, &sc.k, m)?;
-            self.project(v, &sc.q8_hidden, &sc.v, m)?;
+        match (&layer.k, &layer.v) {
+            (Some(k), Some(v)) => self.project_group(
+                &[(&layer.q, &sc.q), (k, &sc.k), (v, &sc.v)],
+                &sc.nrm,
+                &sc.q8_hidden,
+                m,
+            )?,
+            _ => self.project_group(&[(&layer.q, &sc.q)], &sc.nrm, &sc.q8_hidden, m)?,
         }
         // The QK-norm of the reference graph: each head of q and of k is
         // RMS-normalized and scaled by its own weight before RoPE. Values get the
@@ -1949,8 +1962,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        self.project_input(&layer.out, &sc.ctx_out, m)?;
-        self.project(&layer.out, &sc.q8_ctx, &sc.proj, m)?;
+        self.project_group(&[(&layer.out, &sc.proj)], &sc.ctx_out, &sc.q8_ctx, m)?;
         self.trace(pos, &format!("L{index}_proj"), &sc.proj, m * HIDDEN * 4);
         self.norm_rows(
             stream,
@@ -1984,9 +1996,12 @@ impl Bolt {
             sc.q8_hidden.range(0, sc.q8_hidden.bytes())?,
             m,
         )?;
-        self.project_input(&layer.ffn_gate, &sc.nrm, m)?;
-        self.project(&layer.ffn_gate, &sc.q8_hidden, &sc.gate, m)?;
-        self.project(&layer.ffn_up, &sc.q8_hidden, &sc.up, m)?;
+        self.project_group(
+            &[(&layer.ffn_gate, &sc.gate), (&layer.ffn_up, &sc.up)],
+            &sc.nrm,
+            &sc.q8_hidden,
+            m,
+        )?;
         ctx.gelu_ffn(
             stream,
             GeluFfnCall {
@@ -2006,8 +2021,7 @@ impl Bolt {
                 ncols: m,
             },
         )?;
-        self.project_input(&layer.ffn_down, &sc.mixed, m)?;
-        self.project(&layer.ffn_down, &sc.q8_mixed, &sc.down, m)?;
+        self.project_group(&[(&layer.ffn_down, &sc.down)], &sc.mixed, &sc.q8_mixed, m)?;
         self.norm_rows(
             stream,
             sc.down.buf.range(0, m * HIDDEN * 4)?,
@@ -2238,6 +2252,22 @@ mod tests {
         assert!(!split_armed_from(Some("0")).expect("zero disarms"));
         assert!(!split_armed_from(Some("off")).expect("off disarms"));
         assert!(split_armed_from(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn a_group_runs_on_the_tensor_cores_only_in_one_type_with_a_dense_case() {
+        use QuantType::{Iq4Nl, Q4K, Q6K, Q80};
+        let wide = MMQ_MIN_ROWS;
+        assert!(on_tensor_cores([Q80, Q80, Q80].into_iter(), wide));
+        assert!(on_tensor_cores([Q4K, Q4K].into_iter(), wide));
+        assert!(on_tensor_cores([Q6K].into_iter(), 64));
+        // A mixed group keeps each weight on the matvec: one activation layout serves one type.
+        assert!(!on_tensor_cores([Q4K, Q6K, Q6K].into_iter(), wide));
+        assert!(!on_tensor_cores([Q80, Q4K].into_iter(), wide));
+        // A short chunk, a type without a dense case and an empty group never do.
+        assert!(!on_tensor_cores([Q80, Q80].into_iter(), wide - 1));
+        assert!(!on_tensor_cores([Iq4Nl].into_iter(), wide));
+        assert!(!on_tensor_cores(std::iter::empty(), wide));
     }
 
     #[test]
