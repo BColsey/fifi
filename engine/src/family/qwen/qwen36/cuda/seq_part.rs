@@ -156,6 +156,10 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
         part.cells()
     }
 
+    fn part_fed(part: &Self::Part) -> usize {
+        part.state.tokens()
+    }
+
     fn part_bytes_at(&self, cells: usize) -> u64 {
         self.seq_bytes_at(cells)
     }
@@ -166,5 +170,17 @@ impl crate::family::pooled_sessions::PartHost for QwenResidentStep<'static> {
 
     fn finish_save(&mut self) -> Result<(), EngError> {
         self.complete_prefix_save()
+    }
+
+    fn eos_ids(&self) -> std::sync::Arc<[u32]> {
+        std::sync::Arc::clone(&self.rules.eos)
+    }
+
+    fn sampler_vocab(&self) -> usize {
+        self.rules.sampler_vocab
+    }
+
+    fn embedding_rows(&self) -> usize {
+        self.res.dims.shape.vocab
     }
 }

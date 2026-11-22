@@ -27,7 +27,9 @@ use crate::{
             session_cells_or_queue,
         },
         executor::{BatchPolicy, ExecutorOps, GenerationState},
-        session::{DecodeSession, SaveKind, StoreLimits},
+        sampler::Sampler,
+        session::{DecodeSession, Limits, SaveKind, StoreLimits, TokenStepper},
+        window::WindowRows,
     },
     sched::job::PrefixReport,
     tokenizer::DecodeBatch,
@@ -50,7 +52,7 @@ struct SlotInner<P> {
 /// What a resident step gives the sessions executor: the part of it that one sequence owns, and
 /// the exchange of that part. The weights, context, stream, arenas and prefix store stay the
 /// step's own and shared.
-pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> {
+pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> + TokenStepper {
     /// One sequence's state on the device.
     type Part;
     /// The prefix of the host's log lines.
@@ -65,12 +67,40 @@ pub(crate) trait PartHost: ExecutorOps<Session = DecodeSession> {
     fn swap_part(&mut self, part: &mut Self::Part);
     /// The cells `part` holds.
     fn part_cells(part: &Self::Part) -> usize;
+    /// The positions `part` has consumed.
+    fn part_fed(part: &Self::Part) -> usize;
     /// Device bytes of a part holding `cells` positions.
     fn part_bytes_at(&self, cells: usize) -> u64;
     /// Free device memory now, when the card can be read.
     fn free_device_bytes(&self) -> Option<u64>;
     /// Finishes a save staged for the part that is about to leave.
     fn finish_save(&mut self) -> Result<()>;
+    /// Every id that ends generation: the host's shared handle.
+    fn eos_ids(&self) -> Arc<[u32]>;
+    /// The logits the sampler may choose from.
+    fn sampler_vocab(&self) -> usize;
+    /// The rows of the embedding table: a token at or above it is refused.
+    fn embedding_rows(&self) -> usize;
+    /// Whether the host steps several parts in one batched body ([`Self::step_parts_drawn`]).
+    /// A host that does not keeps the windows time sliced, a row after a row.
+    fn batched(&self) -> bool {
+        false
+    }
+    /// Steps every part once with its token in one batched body, and draws the next token of
+    /// each part from its own sampler on the device, in order. Called with two or more parts,
+    /// each of which is out of the step (the step runs no part of its own). An error leaves
+    /// every part in an unknown state.
+    fn step_parts_drawn(
+        &mut self,
+        _parts: &mut [&mut Self::Part],
+        _tokens: &[u32],
+        _samplers: &[&Sampler],
+    ) -> Result<Vec<u32>> {
+        Err(EngError::Backend {
+            operation: "pooled sessions",
+            message: "this host has no batched step".to_owned(),
+        })
+    }
 }
 
 /// How a session's cells are sized until a session can grow.
@@ -107,6 +137,9 @@ pub(crate) struct PooledSessions<E: PartHost> {
     sizing: Sizing,
     /// Whether the last session request found the pool empty and said so.
     waiting: std::cell::Cell<bool>,
+    /// The ids that end generation, and the sampler's vocabulary: the window's limits.
+    eos: Arc<[u32]>,
+    sampler_vocab: usize,
     step: E,
 }
 
@@ -175,6 +208,8 @@ impl<E: PartHost> PooledSessions<E> {
             max_seqs,
             sizing,
             waiting: std::cell::Cell::new(false),
+            eos: step.eos_ids(),
+            sampler_vocab: step.sampler_vocab(),
             step,
         };
         Ok((this, PooledSession { core, slot }))
@@ -409,9 +444,11 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
         ExecutorOps::decode(&mut self.step, &mut st.core, generation)
     }
 
-    /// The rows run one after another on the shared step, each through the single-row decode: a
-    /// row's tokens are the ones the same request gets alone. A failed row is its own error; the
-    /// step's state of that row is poisoned and the worker resets it.
+    /// A host with a batched body steps the window's rows in one step through the shared window
+    /// driver; any other host runs the rows one after another on the shared step, each through
+    /// the single-row decode. Either way a row's tokens are the ones the same request gets
+    /// alone. A failed row is its own error; the step's state of that row is poisoned and the
+    /// worker resets it.
     fn decode_window(
         &mut self,
         sessions: &mut [&mut PooledSession<E::Part>],
@@ -424,6 +461,9 @@ impl<E: PartHost> ExecutorOps for PooledSessions<E> {
             return Err(EngError::BadRequest(
                 "a decode window needs equal nonempty slices within max_seqs".into(),
             ));
+        }
+        if self.step.batched() {
+            return crate::family::window::decode_window(self, sessions, generations);
         }
         Ok(sessions
             .iter_mut()
@@ -491,13 +531,239 @@ impl<E: PartHost> Drop for PooledSessions<E> {
     }
 }
 
+/// The model side of one row of a window: the shared step, with the row's part running in it.
+pub(crate) struct RowStep<'a, E: PartHost>(&'a mut E);
+
+impl<E: PartHost> TokenStepper for RowStep<'_, E> {
+    const OPERATION: &'static str = <E as TokenStepper>::OPERATION;
+
+    fn feed(&mut self, token: u32) -> Result<()> {
+        TokenStepper::feed(self.0, token)
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        TokenStepper::feed_rows(self.0, tokens)
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+        TokenStepper::logits(self.0, token)
+    }
+
+    fn next_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32> {
+        TokenStepper::next_token(self.0, token, sampler, sampler_vocab)
+    }
+
+    fn fed(&self) -> usize {
+        TokenStepper::fed(self.0)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        TokenStepper::reset(self.0)
+    }
+}
+
+/// The window seam: the sessions of a pooled engine are the rows of a window, and a host that
+/// supplies [`PartHost::step_parts_drawn`] steps them in one body.
+impl<E: PartHost> WindowRows for PooledSessions<E> {
+    type Stepper<'a>
+        = RowStep<'a, E>
+    where
+        Self: 'a;
+    type Permit = ();
+    const OPERATION: &'static str = <E as TokenStepper>::OPERATION;
+
+    /// The row's part runs in the step: the driver calls `activate_row` before it reads the
+    /// model side.
+    fn activate_row(&mut self, session: &mut PooledSession<E::Part>) -> Result<()> {
+        self.activate(&session.slot)
+    }
+
+    fn split<'a>(
+        &'a mut self,
+        session: &'a mut PooledSession<E::Part>,
+    ) -> (&'a mut DecodeSession, RowStep<'a, E>, Limits<'a>) {
+        let context_limit = self.step.context_cells();
+        let Self {
+            step,
+            eos,
+            sampler_vocab,
+            ..
+        } = self;
+        (
+            &mut session.core,
+            RowStep(step),
+            Limits {
+                eos,
+                sampler_vocab: *sampler_vocab,
+                context_limit,
+            },
+        )
+    }
+
+    /// The row's consumed positions against its cells, as the solo decode compares them: a row
+    /// that has consumed all but the last cell still takes one more token.
+    fn check_row(&self, session: &PooledSession<E::Part>, token: u32) -> Result<()> {
+        let resident = self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| Rc::ptr_eq(resident, &session.slot));
+        let (cells, fed) = if resident {
+            (self.step.context_cells(), TokenStepper::fed(&self.step))
+        } else {
+            session
+                .slot
+                .inner
+                .borrow()
+                .part
+                .as_ref()
+                .map_or((0, 0), |part| (E::part_cells(part), E::part_fed(part)))
+        };
+        if fed >= cells {
+            return Err(EngError::ContextLimit(format!(
+                "position {fed} reaches the {cells} cell context of the session"
+            )));
+        }
+        if token as usize >= self.step.embedding_rows() {
+            return Err(EngError::BadRequest(
+                "token is outside the embedding table".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The planes are allocated at admission; a position costs no memory.
+    fn row_growth(&self, _session: &PooledSession<E::Part>) -> Result<u64> {
+        Ok(0)
+    }
+
+    fn reserve_growth(&self, _bytes: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// The logits rows of a window with a request that records its draw: only the host walk has
+    /// the candidates. The rows run one after another, each through the host's single-row logits.
+    fn step_rows(
+        &mut self,
+        sessions: &mut [&mut PooledSession<E::Part>],
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        let mut rows = Vec::with_capacity(sessions.len());
+        for (session, &token) in sessions.iter_mut().zip(tokens) {
+            self.activate(&session.slot)?;
+            rows.push(TokenStepper::logits(&mut self.step, token)?);
+        }
+        Ok(rows)
+    }
+
+    /// Whether the host's batched body draws the window's tokens; a window with a recording
+    /// request takes `step_rows` instead.
+    fn draws_on_device(&self) -> bool {
+        self.step.batched()
+    }
+
+    fn step_rows_drawn(
+        &mut self,
+        sessions: &mut [&mut PooledSession<E::Part>],
+        tokens: &[u32],
+        samplers: &[&Sampler],
+    ) -> Result<Vec<u32>> {
+        if tokens.len() != sessions.len() || samplers.len() != sessions.len() {
+            return Err(EngError::BadRequest(
+                "a window needs one token and one sampler per session".to_owned(),
+            ));
+        }
+        // Every part leaves the step, so that the batched body reads them all from their slots.
+        self.step.finish_save()?;
+        self.deactivate();
+        let mut held: Vec<_> = sessions
+            .iter()
+            .map(|session| session.slot.inner.borrow_mut())
+            .collect();
+        let mut parts = Vec::with_capacity(held.len());
+        for inner in &mut held {
+            parts.push(inner.part.as_mut().ok_or_else(|| EngError::Backend {
+                operation: "pooled sessions",
+                message: "the session's sequence part is missing".to_owned(),
+            })?);
+        }
+        self.step.step_parts_drawn(&mut parts, tokens, samplers)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::window::decode_window;
+    use crate::tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer};
 
-    /// A host with no device: a part is its cell count, and the step runs one part.
+    const VOCAB: usize = 16;
+    const EOS: u32 = 9;
+
+    fn tokenizer() -> Tokenizer {
+        let vocab: Vec<String> = (0..VOCAB)
+            .map(|id| format!("\"{}\":{id}", char::from(b'a' + id as u8)))
+            .collect();
+        let json = format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},"post_processor":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},"decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},"model":{{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{{{}}},"merges":[]}}}}"#,
+            vocab.join(",")
+        );
+        Tokenizer::from_bytes(json.as_bytes()).expect("tokenizer")
+    }
+
+    fn generation(limit: u32) -> GenerationState {
+        GenerationState::new(IncrementalDecoder::new(&tokenizer())).with_max_tokens(limit)
+    }
+
+    /// The next token of a row: a function of its pending token alone.
+    fn next_of(token: u32) -> u32 {
+        (token + 1) % VOCAB as u32
+    }
+
+    /// A sequence part with no device: its cells and the positions it has consumed.
+    #[derive(Clone, Copy, Debug)]
+    struct FakePart {
+        cells: usize,
+        fed: usize,
+    }
+
+    /// A host with no device: the step runs one part, and a batched step draws `next_of`.
     struct Fake {
-        running: usize,
+        running: FakePart,
+        /// The cells of the parts of each batched step.
+        batches: Vec<Vec<usize>>,
+        /// Fails the finish of a save on this call of it, counting from one.
+        fail_save_on: Option<usize>,
+        saves: usize,
+    }
+
+    impl TokenStepper for Fake {
+        const OPERATION: &'static str = "fake";
+
+        fn feed(&mut self, _token: u32) -> Result<()> {
+            self.running.fed += 1;
+            Ok(())
+        }
+
+        fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+            self.running.fed += 1;
+            let mut row = vec![0.0; VOCAB];
+            row[next_of(token) as usize] = 4.0;
+            Ok(row)
+        }
+
+        fn fed(&self) -> usize {
+            self.running.fed
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.running.fed = 0;
+            Ok(())
+        }
     }
 
     impl ExecutorOps for Fake {
@@ -507,27 +773,33 @@ mod tests {
             st.history()
         }
 
-        fn reset(&mut self, _st: &mut DecodeSession) -> Result<()> {
-            Ok(())
+        fn reset(&mut self, st: &mut DecodeSession) -> Result<()> {
+            st.reset(self)
         }
 
-        fn prefill(&mut self, _st: &mut DecodeSession, _toks: &[u32]) -> Result<()> {
-            Ok(())
+        fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<()> {
+            let cells = self.running.cells;
+            st.prefill(self, toks, cells)
         }
 
         fn decode(
             &mut self,
-            _st: &mut DecodeSession,
-            _generation: &mut GenerationState,
+            st: &mut DecodeSession,
+            generation: &mut GenerationState,
         ) -> Result<DecodeBatch> {
-            Err(EngError::BadRequest("the fake host does not decode".into()))
+            let limits = Limits {
+                eos: &[EOS],
+                sampler_vocab: VOCAB,
+                context_limit: self.running.cells,
+            };
+            st.decode(self, generation, &limits)
         }
 
         fn boundary(&mut self, _st: &mut DecodeSession) {}
     }
 
     impl PartHost for Fake {
-        type Part = usize;
+        type Part = FakePart;
         const LABEL: &'static str = "fake";
 
         fn check_sessions(&self) -> Result<()> {
@@ -535,19 +807,23 @@ mod tests {
         }
 
         fn context_cells(&self) -> usize {
-            self.running
+            self.running.cells
         }
 
-        fn new_part(&mut self, cells: usize) -> Result<usize> {
-            Ok(cells)
+        fn new_part(&mut self, cells: usize) -> Result<FakePart> {
+            Ok(FakePart { cells, fed: 0 })
         }
 
-        fn swap_part(&mut self, part: &mut usize) {
+        fn swap_part(&mut self, part: &mut FakePart) {
             std::mem::swap(&mut self.running, part);
         }
 
-        fn part_cells(part: &usize) -> usize {
-            *part
+        fn part_cells(part: &FakePart) -> usize {
+            part.cells
+        }
+
+        fn part_fed(part: &FakePart) -> usize {
+            part.fed
         }
 
         fn part_bytes_at(&self, cells: usize) -> u64 {
@@ -559,20 +835,109 @@ mod tests {
         }
 
         fn finish_save(&mut self) -> Result<()> {
+            self.saves += 1;
+            if self.fail_save_on == Some(self.saves) {
+                return Err(EngError::Backend {
+                    operation: "fake",
+                    message: "the staged save failed".to_owned(),
+                });
+            }
             Ok(())
+        }
+
+        fn eos_ids(&self) -> Arc<[u32]> {
+            Arc::from(vec![EOS])
+        }
+
+        fn sampler_vocab(&self) -> usize {
+            VOCAB
+        }
+
+        fn embedding_rows(&self) -> usize {
+            VOCAB
+        }
+
+        fn batched(&self) -> bool {
+            true
+        }
+
+        fn step_parts_drawn(
+            &mut self,
+            parts: &mut [&mut FakePart],
+            tokens: &[u32],
+            samplers: &[&Sampler],
+        ) -> Result<Vec<u32>> {
+            assert_eq!(samplers.len(), parts.len());
+            self.batches
+                .push(parts.iter().map(|part| part.cells).collect());
+            for part in parts.iter_mut() {
+                part.fed += 1;
+            }
+            Ok(tokens.iter().map(|&token| next_of(token)).collect())
         }
     }
 
     const POOL: usize = 110 * 1024;
 
-    fn engine(max_seqs: usize, sizing: Sizing) -> (PooledSessions<Fake>, PooledSession<usize>) {
+    type Engine = PooledSessions<Fake>;
+    type Session = PooledSession<FakePart>;
+
+    fn engine(max_seqs: usize, sizing: Sizing) -> (Engine, Session) {
         PooledSessions::new(
-            Fake { running: POOL },
+            Fake {
+                running: FakePart {
+                    cells: POOL,
+                    fed: 0,
+                },
+                batches: Vec::new(),
+                fail_save_on: None,
+                saves: 0,
+            },
             DecodeSession::default(),
             max_seqs,
             sizing,
         )
         .expect("sessions")
+    }
+
+    /// A session of the engine that has consumed `prompt`, leaving its last token pending.
+    fn prefilled(engine: &mut Engine, mut session: Session, prompt: &[u32]) -> Session {
+        engine
+            .reset_for_request(&mut session, prompt.len(), None, false)
+            .expect("admitted");
+        engine.prefill(&mut session, prompt).expect("prefill");
+        session
+    }
+
+    fn next_session(engine: &mut Engine, prompt: &[u32]) -> Session {
+        let session = engine.new_session().expect("a session");
+        prefilled(engine, session, prompt)
+    }
+
+    /// Runs one window of the live sessions and returns each row's result.
+    fn window(
+        engine: &mut Engine,
+        sessions: &mut [&mut Session],
+        generations: &mut [&mut GenerationState],
+    ) -> Vec<Result<DecodeBatch>> {
+        decode_window(engine, sessions, generations).expect("window")
+    }
+
+    /// The tokens one prompt generates alone on a one-session engine.
+    fn solo(prompt: &[u32], limit: u32) -> Vec<u32> {
+        let (mut engine, first) = engine(1, Sizing::WholePool);
+        let mut session = prefilled(&mut engine, first, prompt);
+        let mut generation = generation(limit);
+        let mut tokens = Vec::new();
+        loop {
+            let batch = engine
+                .decode(&mut session, &mut generation)
+                .expect("decode");
+            tokens.extend(&batch.tokens);
+            if batch.finish.is_some() {
+                return tokens;
+            }
+        }
     }
 
     #[test]
@@ -624,5 +989,148 @@ mod tests {
             Err(EngError::MemoryPlan(_))
         ));
         assert_eq!(sessions.pool.free(), 0);
+    }
+
+    #[test]
+    fn a_window_of_rows_equals_each_row_alone_through_one_batched_step() {
+        let (mut engine, first) = engine(4, Sizing::EvenShare);
+        let mut a = prefilled(&mut engine, first, &[1, 2]);
+        let mut b = next_session(&mut engine, &[5]);
+        let mut c = next_session(&mut engine, &[0, 3, 4]);
+        let (mut ga, mut gb, mut gc) = (generation(12), generation(12), generation(12));
+        let mut got = [Vec::new(), Vec::new(), Vec::new()];
+        let mut live = vec![0usize, 1, 2];
+        while !live.is_empty() {
+            let batches = {
+                let mut rows: Vec<&mut Session> = Vec::new();
+                let mut gens: Vec<&mut GenerationState> = Vec::new();
+                for (index, (session, generation)) in
+                    [(&mut a, &mut ga), (&mut b, &mut gb), (&mut c, &mut gc)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    if live.contains(&index) {
+                        rows.push(session);
+                        gens.push(generation);
+                    }
+                }
+                window(&mut engine, &mut rows, &mut gens)
+            };
+            let mut finished = Vec::new();
+            for (&index, batch) in live.iter().zip(batches) {
+                let batch = batch.expect("row");
+                got[index].extend(&batch.tokens);
+                if batch.finish.is_some() {
+                    finished.push(index);
+                }
+            }
+            live.retain(|index| !finished.contains(index));
+        }
+        assert_eq!(got[0], solo(&[1, 2], 12));
+        assert_eq!(got[1], solo(&[5], 12));
+        assert_eq!(got[2], solo(&[0, 3, 4], 12));
+        // The prompt [5] runs into EOS (9) mid-window: 6, 7, 8, 9.
+        assert_eq!(got[1].last(), Some(&EOS));
+        assert!(!engine.step.batches.is_empty(), "the rows were batched");
+    }
+
+    #[test]
+    fn a_row_that_reaches_its_limit_ends_alone() {
+        let (mut engine, first) = engine(2, Sizing::EvenShare);
+        let mut a = prefilled(&mut engine, first, &[1]);
+        let mut b = next_session(&mut engine, &[2]);
+        let (mut ga, mut gb) = (generation(2), generation(8));
+        let first_window = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+        assert!(
+            first_window
+                .iter()
+                .all(|row| row.as_ref().is_ok_and(|b| b.finish.is_none()))
+        );
+        let second = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+        let ended = second[0].as_ref().expect("row a");
+        assert!(
+            matches!(ended.finish, Some(DecodeFinish::Length)),
+            "{ended:?}"
+        );
+        let alive = second[1].as_ref().expect("row b");
+        assert!(alive.finish.is_none());
+        assert!(!alive.tokens.is_empty());
+    }
+
+    #[test]
+    fn a_row_with_a_recording_request_takes_the_logits_rows_and_the_others_still_serve() {
+        let (mut engine, first) = engine(2, Sizing::EvenShare);
+        let mut a = prefilled(&mut engine, first, &[1, 2]);
+        let mut b = next_session(&mut engine, &[5]);
+        let (mut ga, mut gb) = (generation(4), generation(4));
+        let _capture = gb.sampler.arm_capture(8);
+        let results = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+        let (ra, rb) = (
+            results[0].as_ref().expect("a"),
+            results[1].as_ref().expect("b"),
+        );
+        assert_eq!(ra.tokens, vec![next_of(2)]);
+        assert_eq!(rb.tokens, vec![next_of(5)]);
+        assert!(
+            engine.step.batches.is_empty(),
+            "the window took the host walk"
+        );
+        // Once the recording request is gone, the same sessions batch again.
+        let (mut gc, mut gd) = (generation(4), generation(4));
+        let again = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut gc, &mut gd]);
+        assert_eq!(again.len(), 2);
+        assert_eq!(engine.step.batches.len(), 1);
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_brought_to_the_step_is_refused_alone() {
+        let (mut engine, first) = engine(3, Sizing::EvenShare);
+        let mut a = prefilled(&mut engine, first, &[1, 2]);
+        let mut b = next_session(&mut engine, &[5]);
+        let mut c = next_session(&mut engine, &[0, 3]);
+        let (mut ga, mut gb, mut gc) = (generation(4), generation(4), generation(4));
+        // The finish of the staged save fails when the window first brings the second row.
+        engine.step.fail_save_on = Some(engine.step.saves + 2);
+        let results = window(
+            &mut engine,
+            &mut [&mut a, &mut b, &mut c],
+            &mut [&mut ga, &mut gb, &mut gc],
+        );
+        assert!(results[0].is_ok(), "row a serves");
+        assert!(results[1].is_err(), "row b is refused alone");
+        assert!(results[2].is_ok(), "row c serves");
+        // The refusal belongs to that window: the next one serves every row.
+        let next = window(
+            &mut engine,
+            &mut [&mut a, &mut b, &mut c],
+            &mut [&mut ga, &mut gb, &mut gc],
+        );
+        assert!(next.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn a_row_that_has_consumed_all_but_the_last_cell_takes_one_more_token() {
+        let (mut engine, first) = engine(2, Sizing::EvenShare);
+        // A new session holds the initial 1024 cells; a prompt of 1023 tokens consumes 1022 and
+        // leaves one pending.
+        let prompt = vec![1u32; INITIAL_CELLS - 1];
+        let mut a = engine.new_session().expect("a");
+        engine.prefill(&mut a, &prompt).expect("prefill a");
+        let mut b = first;
+        engine.prefill(&mut b, &prompt).expect("prefill b");
+        let (mut ga, mut gb) = (generation(8), generation(8));
+        let first_step = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+        assert!(first_step.iter().all(Result::is_ok), "{first_step:?}");
+        // Each row has now consumed 1023 of its 1024 cells with a token pending: one more, and
+        // the row ends at the limit, as the solo decode does.
+        let boundary = window(&mut engine, &mut [&mut a, &mut b], &mut [&mut ga, &mut gb]);
+        for row in &boundary {
+            let batch = row.as_ref().expect("the row takes its last cell");
+            assert_eq!(batch.tokens.len(), 1);
+            assert!(
+                matches!(batch.finish, Some(DecodeFinish::Length)),
+                "{batch:?}"
+            );
+        }
     }
 }
