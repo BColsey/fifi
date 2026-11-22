@@ -73,7 +73,8 @@ fn purge_kv_caches(_config: &Config) -> Result<(), StartupError> {
 }
 
 /// `args` are the command-line arguments after the program name.
-/// The call returns after a shutdown signal and the end of the running requests.
+/// The call returns after a shutdown signal, the end of the running requests
+/// and the end of the supervised workers.
 ///
 /// Diagnostic commands (`doctor`, `check`, `config validate`, `--help`,
 /// `--version`) are dispatched first and never start the server; see
@@ -919,10 +920,16 @@ pub(crate) async fn serve(
             eprintln!("enginesrv: cannot set TCP_NODELAY on an accepted connection: {error}");
         }
     });
-    axum::serve(listener, router(state))
+    let served = axum::serve(listener, router(Arc::clone(&state)))
         .with_graceful_shutdown(shutdown)
         .await
-        .map_err(|error| StartupError(format!("server failure: {error}")))
+        .map_err(|error| StartupError(format!("server failure: {error}")));
+    served?;
+    // The supervised workers are this server's own processes: a server
+    // that stops takes their memory off the card with it.
+    tokio::task::spawn_blocking(move || state.workers().stop_all())
+        .await
+        .map_err(|error| StartupError(format!("stopping the supervised workers: {error}")))
 }
 
 /// The call needs a running Tokio runtime. A signal that arrives before the first poll is not

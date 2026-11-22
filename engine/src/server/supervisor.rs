@@ -94,6 +94,13 @@ struct Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // A child still attached here was never stopped, as when the
+        // front goes down without `stop_all`: it must not outlive the
+        // front with its memory on the card.
+        if let Some(child) = self.child.lock().unwrap_or_else(poison).as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(path) = &self.config_path {
             let _ = std::fs::remove_file(path);
         }
@@ -102,6 +109,35 @@ impl Drop for Worker {
 
 fn poison<T>(error: std::sync::PoisonError<T>) -> T {
     error.into_inner()
+}
+
+/// Ends a worker's process: SIGTERM first, so a graceful shutdown
+/// flushes what its family writes at exit, then a kill once the grace
+/// period passes. The process is reaped here, so a later drop of the
+/// record finds nothing left to end.
+fn terminate(worker: &Worker) {
+    let mut child = worker.child.lock().unwrap_or_else(poison).take();
+    let Some(child) = child.as_mut() else {
+        return;
+    };
+    let pid = child.id();
+    let _ = Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = std::time::Instant::now() + TERM_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(crate) struct WorkerSupervisor {
@@ -324,33 +360,32 @@ impl WorkerSupervisor {
             status.load_stage = None;
         }
         let worker = Arc::clone(&worker);
-        // The wait runs on the runtime's blocking pool; a worker that
-        // ignores SIGTERM is killed after the grace period.
-        tokio::task::spawn_blocking(move || {
-            let mut child = worker.child.lock().unwrap_or_else(poison).take();
-            let Some(child) = child.as_mut() else {
-                return;
-            };
-            let pid = child.id();
-            let _ = Command::new("kill")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let deadline = std::time::Instant::now() + TERM_GRACE;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    _ => break,
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+        // The wait runs on the runtime's blocking pool.
+        tokio::task::spawn_blocking(move || terminate(&worker));
         Some(id.to_string())
+    }
+
+    /// Ends every worker the way `stop` ends one, and returns once
+    /// their processes are gone. The server calls it as it stops:
+    /// otherwise its workers outlive it with their memory on the card,
+    /// and the next server has no record of them.
+    // shortcut: a front that is killed outright (SIGKILL, out of memory) never
+    // reaches this, until a worker exits on its own when its front goes away.
+    pub(crate) fn stop_all(&self) {
+        let workers: Vec<Arc<Worker>> = self
+            .workers
+            .lock()
+            .unwrap_or_else(poison)
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect();
+        let threads: Vec<_> = workers
+            .into_iter()
+            .map(|worker| std::thread::spawn(move || terminate(&worker)))
+            .collect();
+        for thread in threads {
+            let _ = thread.join();
+        }
     }
 
     /// A worker entry the tests insert directly, standing in for a
@@ -973,6 +1008,114 @@ mod tests {
         for path in [script, copied] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// A worker record with a live `sleep` child and a configuration
+    /// file on disk: the state a spawn leaves once its address is known.
+    fn sleeping_worker(id: &str) -> (Arc<Worker>, PathBuf, u32) {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("start the stand-in worker");
+        let pid = child.id();
+        let config_path =
+            std::env::temp_dir().join(format!("fifi-worker-{}-{id}.json", std::process::id()));
+        std::fs::write(&config_path, "{}").expect("write the configuration file");
+        let worker = Arc::new(Worker {
+            id: id.to_string(),
+            model: Mutex::new(None),
+            model_dir: PathBuf::new(),
+            key: String::new(),
+            addr: Mutex::new(None),
+            child: Arc::new(Mutex::new(Some(child))),
+            status: Mutex::new(WorkerStatus {
+                state: "ready".to_string(),
+                load_stage: None,
+                error: None,
+                context_limit: None,
+            }),
+            config_path: Some(config_path.clone()),
+        });
+        (worker, config_path, pid)
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn stopping_everything_ends_each_worker_and_removes_its_file() {
+        let supervisor = WorkerSupervisor::new();
+        let mut pids = Vec::new();
+        let mut files = Vec::new();
+        for id in ["one", "two"] {
+            let (worker, config_path, pid) = sleeping_worker(id);
+            supervisor
+                .workers
+                .lock()
+                .unwrap_or_else(poison)
+                .insert(id.to_string(), worker);
+            pids.push(pid);
+            files.push(config_path);
+        }
+        assert!(pids.iter().all(|pid| process_exists(*pid)), "{pids:?}");
+
+        supervisor.stop_all();
+
+        assert_eq!(supervisor.count(), 0);
+        assert!(pids.iter().all(|pid| !process_exists(*pid)), "{pids:?}");
+        assert!(files.iter().all(|path| !path.exists()), "{files:?}");
+    }
+
+    #[test]
+    fn a_worker_nobody_stopped_does_not_outlive_its_record() {
+        let (worker, config_path, pid) = sleeping_worker("alone");
+        assert!(process_exists(pid));
+
+        drop(worker);
+
+        assert!(!process_exists(pid));
+        assert!(!config_path.exists());
+    }
+
+    /// A restart of the server is what the contract asks for to free
+    /// card memory, so the server's own shutdown ends its workers.
+    #[tokio::test]
+    async fn the_servers_shutdown_ends_its_workers() {
+        let engine = testkit::engine(testkit::script("unused"));
+        let entry = testkit::entry("boot", "fake-model", &engine, 128);
+        let state = Arc::new(AppState::new(testkit::API_KEY, vec![entry]));
+        let (worker, config_path, pid) = sleeping_worker("one");
+        state
+            .workers()
+            .workers
+            .lock()
+            .unwrap_or_else(poison)
+            .insert("one".to_string(), worker);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the front");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(crate::server::run::serve(listener, state, async move {
+            let _ = stopped.await;
+        }));
+
+        stop.send(()).expect("signal");
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server did not stop")
+            .expect("the server task")
+            .expect("served");
+        assert!(!process_exists(pid));
+        assert!(!config_path.exists());
     }
 
     #[tokio::test]
