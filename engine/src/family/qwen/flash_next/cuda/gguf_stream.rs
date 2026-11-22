@@ -1,35 +1,36 @@
-//! The routed experts of a Flash-Next GGUF that do not fit the card: which layers' experts are
-//! resident, which stream, and the staging of the picked experts of a streamed layer before its
-//! expert launches.
+//! The routed experts of a Flash-Next GGUF that do not all fit the card: a cache of the experts
+//! each layer picks most, in the file's own quantization, per stack.
 //!
-//! The placement is the shared stream plan (`expert_bank::layer_stream::StreamPlan`): layers on
-//! the card, layers in pinned host memory, layers read from the model file in place. The copy is
-//! the shared card transport (`expert_bank::layer_stream_card::CardTransport`), which stages a
-//! layer's three expert stacks in the file's own quantization and leaves expert `e` of a stack at
-//! its natural offset, so the router's ids index the staged stack unchanged. This module only
-//! turns the file's expert index into that plan and those spans, and stages a decode token's
-//! picks.
+//! Every layer holds `slots` experts of its three stacks (gate, up, down) in device buffers that
+//! are native weights of `slots` experts each. The shared per-layer least-recently-used policy
+//! (`expert_bank::policy::LayerLru`) decides which expert holds which slot: a pick that holds a
+//! slot is a hit, a miss takes the least recent slot no pick of the token protects. The records
+//! of the missed experts are copied from pinned host memory, or read from the model file in place
+//! for the layers the host budget did not take, into their slots. The block then runs on the
+//! slot stacks with the router's expert ids replaced by slot ids.
 //!
-//! Counters: every staging adds the bytes it moved and the bytes the picks needed, so a receipt
-//! can say how much of what crossed the bus the token used.
+//! Counters: hits and misses per pick, the bytes the misses moved, and the bytes of every picked
+//! expert (what the launches read), so a receipt shows how much of a token's expert bytes the
+//! card already held.
 
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{fs::File, os::unix::fs::FileExt, rc::Rc, sync::Arc, time::Instant};
 
-use super::super::load::gguf::{GgufModel, placement::LayerStacks};
+use super::super::load::gguf::{
+    GgufModel,
+    placement::{CachePlan, LayerStacks},
+};
 use crate::{
     EngError,
-    family::expert_bank::{
-        layer_stream::{ExpertTransport, Home, StreamPlan, UploadSet},
-        layer_stream_card::{CardTransport, StackHome, StackShape, StackSpan},
-    },
+    family::expert_bank::{layer_stream::Home, policy::LayerLru},
     kernels::cuda::{
-        CudaContext, DeviceStream, NativeWeight, PinnedBuf, resident::matvec_q::QuantType,
+        CudaContext, DeviceEvent, DeviceStream, NativeWeight, PinnedBuf,
+        resident::matvec_q::QuantType,
     },
 };
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::MemoryPlan(format!(
-        "Flash-Next GGUF expert streaming: {}",
+        "Flash-Next GGUF expert cache: {}",
         detail.as_ref()
     ))
 }
@@ -37,75 +38,92 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 /// Host bytes one pinned fill reads at a time.
 const FILL_CHUNK: usize = 64 << 20;
 
-/// What the staging moved and used, over the transport's life.
+/// Where the records of one stack of one layer are held between tokens.
+enum Source {
+    /// In the pinned buffer `buf` of the cache's store, from byte 0.
+    Pinned { buf: usize },
+    /// In a model file, from `offset`, read in place on a miss.
+    File { file: Arc<File>, offset: u64 },
+}
+
+struct CacheLayer {
+    lru: LayerLru,
+    /// The slots of gate, up and down: native weights of `slots` experts each.
+    stacks: [NativeWeight; 3],
+    sources: [Source; 3],
+    /// Bytes of one expert in each stack.
+    record: [usize; 3],
+}
+
+/// What the cache has done over its life.
 #[derive(Debug, Default, Clone, Copy)]
 pub(in crate::family::qwen::flash_next) struct StreamTotals {
-    /// Layer stagings (one per streamed layer per token).
-    pub(in crate::family::qwen::flash_next) stagings: u64,
+    /// Layer visits (one per layer per token).
+    pub(in crate::family::qwen::flash_next) visits: u64,
+    /// Picked experts (distinct per visit) that held a slot.
+    pub(in crate::family::qwen::flash_next) hits: u64,
+    /// Picked experts copied into a slot.
+    pub(in crate::family::qwen::flash_next) misses: u64,
     /// Bytes copied to the card.
     pub(in crate::family::qwen::flash_next) moved: u64,
     /// Bytes of the picked experts: what the launches read.
     pub(in crate::family::qwen::flash_next) needed: u64,
-    /// Seconds the copy stream spent copying.
-    pub(in crate::family::qwen::flash_next) copy_seconds: f64,
-    /// Seconds the host spent in the staging call (the read, the wait).
+    /// Seconds the host spent staging (the reads, the copies and their wait).
     pub(in crate::family::qwen::flash_next) host_seconds: f64,
 }
 
-/// The streamed layers' experts: the transport and the plan that placed them.
-pub(in crate::family::qwen::flash_next) struct ExpertStreams {
-    transport: CardTransport<'static>,
-    plan: StreamPlan,
-    /// The transport's layer number of each model layer, `None` for a resident layer.
-    streamed: Vec<Option<usize>>,
-    record_bytes: Vec<u64>,
-    next_slot: usize,
+/// The expert caches of every layer and the copy path that fills them.
+pub(in crate::family::qwen::flash_next) struct ExpertCache {
+    ctx: Rc<CudaContext>,
+    copy: DeviceStream,
+    copied: DeviceEvent,
+    layers: Vec<CacheLayer>,
+    store: Vec<PinnedBuf>,
+    /// Host staging of the records a file-backed layer misses.
+    bounce: PinnedBuf,
+    experts: usize,
+    slots: usize,
     totals: StreamTotals,
 }
 
-impl ExpertStreams {
-    /// The transport for the layers `plan` streams. Pinned layers are read from the file into
-    /// pinned host memory now; disk layers keep the file open and are read on a miss.
+impl ExpertCache {
+    /// The cache of `plan.slots` experts per layer. The layers `plan` homes in pinned memory are
+    /// read into pinned buffers now; the others keep their file open. Every slot starts holding
+    /// the expert of its own number, which is uploaded here.
     pub(in crate::family::qwen::flash_next) fn new(
         model: &GgufModel,
         stacks: &[LayerStacks],
-        plan: StreamPlan,
+        plan: &CachePlan,
         ctx: &Rc<CudaContext>,
-        compute: &Rc<DeviceStream>,
     ) -> Result<Self, EngError> {
         let experts = model.config().experts();
+        let slots = plan.slots;
         let weights = &*model.weights;
-        let mut files: Vec<Option<(Arc<std::fs::File>, Option<Arc<std::fs::File>>)>> =
-            vec![None; weights.paths().len()];
-        let mut spans: Vec<Vec<StackSpan>> = Vec::new();
+        let mut files: Vec<Option<Arc<File>>> = vec![None; weights.paths().len()];
         let mut store: Vec<PinnedBuf> = Vec::new();
-        let mut streamed = vec![None; stacks.len()];
         let index = model.expert_index()?;
+        let copy = ctx.stream()?;
+        let mut layers = Vec::with_capacity(stacks.len());
+        let mut bounce_bytes = 0usize;
         for (layer, facts) in stacks.iter().enumerate() {
-            let home = plan.home(layer);
-            if home == Home::Card {
-                continue;
-            }
-            streamed[layer] = Some(spans.len());
             let slices = index
                 .slices(layer, 0)
                 .map_err(|error| refuse(format!("layer {layer}: {error:?}")))?;
             let [gate, up, down] = slices
                 .three()
                 .map_err(|error| refuse(format!("layer {layer}: {error:?}")))?;
-            let mut layer_spans = Vec::with_capacity(3);
-            for (stack, slice) in facts.stacks.iter().zip([gate, up, down]) {
+            let mut record = [0usize; 3];
+            let mut sources: Vec<Source> = Vec::with_capacity(3);
+            let mut bufs: Vec<NativeWeight> = Vec::with_capacity(3);
+            for (part, (stack, slice)) in facts.stacks.iter().zip([gate, up, down]).enumerate() {
                 let quant = QuantType::from_gguf(stack.ty).ok_or_else(|| {
                     refuse(format!("{} is {}, with no kernel", stack.name, stack.ty.name()))
                 })?;
-                let shape = StackShape {
-                    quant,
-                    k: stack.k,
-                    n_rows: stack.rows,
-                };
                 let bytes = usize::try_from(stack.bytes)
                     .map_err(|_| refuse(format!("{} overflows usize", stack.name)))?;
-                let span_home = match home {
+                let each = bytes / experts;
+                record[part] = each;
+                let source = match plan.homes[layer] {
                     Home::Pinned => {
                         let mut buffer = ctx.pinned_buf(bytes)?;
                         let mut chunk = vec![0u8; FILL_CHUNK.min(bytes)];
@@ -117,143 +135,200 @@ impl ExpertStreams {
                             done += take;
                         }
                         store.push(buffer);
-                        StackHome::Pinned {
+                        Source::Pinned {
                             buf: store.len() - 1,
-                            offset: 0,
                         }
                     }
-                    Home::Disk => {
-                        let (file, direct) = open_shard(weights.paths(), stack.shard, &mut files)?;
-                        StackHome::File {
-                            file,
-                            direct,
-                            offset: slice.file_range.start,
-                        }
-                    }
-                    Home::Card => unreachable!("a resident layer is skipped above"),
+                    _ => Source::File {
+                        file: open_shard(weights.paths(), stack.shard, &mut files)?,
+                        offset: slice.file_range.start,
+                    },
                 };
-                layer_spans.push(StackSpan {
-                    bytes,
-                    home: span_home,
-                    shape: Some(shape),
-                });
+                // The slots start as experts 0..slots: the first `slots` records of the stack.
+                let mut first = vec![0u8; each * slots];
+                weights.read_range(&stack.name, 0, &mut first)?;
+                let buffer = ctx.upload(&first)?;
+                bufs.push(NativeWeight::from_buffer(
+                    buffer,
+                    quant,
+                    stack.k,
+                    stack.rows / experts * slots,
+                    Some(slots),
+                )?);
+                sources.push(source);
             }
-            spans.push(layer_spans);
+            bounce_bytes = bounce_bytes.max(plan.top_k * record.iter().sum::<usize>());
+            let stacks3: [NativeWeight; 3] = bufs
+                .try_into()
+                .map_err(|_| refuse(format!("layer {layer} lost a stack")))?;
+            let sources3: [Source; 3] = sources
+                .try_into()
+                .map_err(|_| refuse(format!("layer {layer} lost a source")))?;
+            layers.push(CacheLayer {
+                lru: LayerLru::from_identity(experts, slots),
+                stacks: stacks3,
+                sources: sources3,
+                record,
+            });
         }
-        let record_bytes = stacks
-            .iter()
-            .map(|layer| layer.stacks.iter().map(|stack| stack.bytes).sum::<u64>() / experts as u64)
-            .collect();
-        let transport = CardTransport::new(
-            Rc::clone(ctx),
-            Rc::clone(compute),
-            experts,
-            spans,
-            store,
-            plan.staging_slots(),
-        )?;
+        let bounce = ctx.pinned_buf(bounce_bytes.max(4096))?;
         Ok(Self {
-            transport,
-            plan,
-            streamed,
-            record_bytes,
-            next_slot: 0,
+            ctx: Rc::clone(ctx),
+            copy,
+            copied: ctx.event()?,
+            layers,
+            store,
+            bounce,
+            experts,
+            slots,
             totals: StreamTotals::default(),
         })
     }
 
-    /// The plan the transport follows.
-    pub(in crate::family::qwen::flash_next) fn plan(&self) -> &StreamPlan {
-        &self.plan
+    /// Experts held per layer.
+    pub(in crate::family::qwen::flash_next) fn slots(&self) -> usize {
+        self.slots
     }
 
-    /// The transport's layer number of `layer`, `None` when its experts are on the card.
-    pub(in crate::family::qwen::flash_next) fn is_streamed(&self, layer: usize) -> bool {
-        self.streamed.get(layer).copied().flatten().is_some()
+    /// Stack `stack` (0 gate, 1 up, 2 down) of `layer`: `slots` experts.
+    pub(in crate::family::qwen::flash_next) fn stack(
+        &self,
+        layer: usize,
+        stack: usize,
+    ) -> Result<&NativeWeight, EngError> {
+        self.layers
+            .get(layer)
+            .map(|layer| &layer.stacks[stack])
+            .ok_or_else(|| refuse(format!("layer {layer} does not exist")))
     }
 
-    /// The next staging slot for a streamed layer, alternating between the plan's slots.
-    pub(in crate::family::qwen::flash_next) fn take_slot(&mut self) -> usize {
-        let slot = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % self.plan.staging_slots().max(1);
-        slot
-    }
-
-    /// Copies the `picks` of `layer` into `slot`, and makes the compute stream wait for the copy.
+    /// Makes every picked expert of `layer` hold a slot, copying the missed ones in, and returns
+    /// the slot of each pick in pick order. The copies are complete when this returns.
     pub(in crate::family::qwen::flash_next) fn stage(
         &mut self,
         layer: usize,
-        slot: usize,
         picks: &[u32],
-    ) -> Result<(), EngError> {
-        let index = self
-            .streamed
-            .get(layer)
-            .copied()
-            .flatten()
-            .ok_or_else(|| refuse(format!("layer {layer} is not a streamed layer")))?;
+    ) -> Result<Vec<i32>, EngError> {
         let started = Instant::now();
-        let ticket = self
-            .transport
-            .begin(index, &UploadSet::Subset(picks.to_vec()), slot)?;
-        let report = self.transport.wait(ticket)?;
-        self.totals.stagings += 1;
-        self.totals.moved += report.bytes;
-        self.totals.needed += picks.len() as u64 * self.record_bytes[layer];
-        self.totals.copy_seconds += report.seconds;
+        let experts = self.experts;
+        let cache = self
+            .layers
+            .get_mut(layer)
+            .ok_or_else(|| refuse(format!("layer {layer} does not exist")))?;
+        let mut demanded = vec![false; experts];
+        let mut order: Vec<u16> = Vec::with_capacity(picks.len());
+        for &pick in picks {
+            let expert = u16::try_from(pick)
+                .ok()
+                .filter(|&expert| usize::from(expert) < experts)
+                .ok_or_else(|| refuse(format!("expert {pick} of {experts}")))?;
+            if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
+                order.push(expert);
+            }
+        }
+        let plan = cache
+            .lru
+            .apply(&order, &demanded)
+            .map_err(refuse)?;
+        let record_bytes: usize = cache.record.iter().sum();
+        // Every record of a file-backed layer is read into the bounce buffer before the first
+        // copy queues: the buffer cannot be written while a copy of it is outstanding.
+        let mut bounce_at = 0usize;
+        let mut from_file = false;
+        let mut jobs: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
+        for slot_move in &plan.moves {
+            let (slot, incoming) = (usize::from(slot_move.slot), usize::from(slot_move.incoming));
+            for part in 0..3 {
+                let each = cache.record[part];
+                let staged = match &cache.sources[part] {
+                    Source::Pinned { .. } => None,
+                    Source::File { file, offset } => {
+                        let mut host = vec![0u8; each];
+                        file.read_exact_at(&mut host, *offset + (incoming * each) as u64)
+                            .map_err(|error| refuse(format!("read of expert {incoming}: {error}")))?;
+                        self.bounce.write(bounce_at, &host)?;
+                        from_file = true;
+                        bounce_at += each;
+                        Some(bounce_at - each)
+                    }
+                };
+                jobs.push((part, slot, incoming, staged));
+            }
+        }
+        for (part, slot, incoming, staged) in jobs {
+            let each = cache.record[part];
+            let dst = cache.stacks[part].buffer().range(slot * each, each)?;
+            match (&cache.sources[part], staged) {
+                (Source::Pinned { buf }, _) => {
+                    self.ctx.copy_from_pinned(
+                        &self.copy,
+                        &mut self.store[*buf],
+                        incoming * each,
+                        dst,
+                    )?;
+                }
+                (Source::File { .. }, Some(at)) => {
+                    self.ctx
+                        .copy_from_pinned(&self.copy, &mut self.bounce, at, dst)?;
+                }
+                (Source::File { .. }, None) => {
+                    return Err(refuse("a file record was not staged"));
+                }
+            }
+        }
+        if !plan.moves.is_empty() {
+            self.copy.record(&self.copied)?;
+            self.copied.synchronize()?;
+            if from_file {
+                self.bounce.wait(&self.copied)?;
+            }
+            for buffer in &mut self.store {
+                if buffer.pending_stream().is_some() {
+                    buffer.wait(&self.copied)?;
+                }
+            }
+        }
+        self.totals.visits += 1;
+        self.totals.hits += plan.hits as u64;
+        self.totals.misses += plan.moves.len() as u64;
+        self.totals.moved += (plan.moves.len() * record_bytes) as u64;
+        self.totals.needed += (order.len() * record_bytes) as u64;
         self.totals.host_seconds += started.elapsed().as_secs_f64();
-        Ok(())
+        picks
+            .iter()
+            .map(|&pick| {
+                cache
+                    .lru
+                    .slot_of(pick as u16)
+                    .map(i32::from)
+                    .ok_or_else(|| refuse(format!("expert {pick} holds no slot after its pass")))
+            })
+            .collect()
     }
 
-    /// The launches that read `slot` are queued: the next copy into it may follow them.
-    pub(in crate::family::qwen::flash_next) fn release(&mut self, slot: usize) -> Result<(), EngError> {
-        self.transport.release(slot)
-    }
-
-    /// Stack `stack` (0 gate, 1 up, 2 down) of `layer` as staged in `slot`.
-    pub(in crate::family::qwen::flash_next) fn staged(
-        &self,
-        layer: usize,
-        slot: usize,
-        stack: usize,
-    ) -> Result<&NativeWeight, EngError> {
-        let index = self
-            .streamed
-            .get(layer)
-            .copied()
-            .flatten()
-            .ok_or_else(|| refuse(format!("layer {layer} is not a streamed layer")))?;
-        self.transport.staged(index, slot, stack)
-    }
-
-    /// What the staging has moved and used so far.
+    /// What the cache has done so far.
     pub(in crate::family::qwen::flash_next) fn totals(&self) -> StreamTotals {
         self.totals
     }
 }
 
-/// The shard's buffered file and, when the filesystem takes it, its direct handle (the whole-layer
-/// reads use the direct one), opened once.
-#[allow(clippy::type_complexity)]
+/// The shard's file, opened once through the local-storage guard.
 fn open_shard(
     paths: &[std::path::PathBuf],
     shard: usize,
-    files: &mut [Option<(Arc<std::fs::File>, Option<Arc<std::fs::File>>)>],
-) -> Result<(Arc<std::fs::File>, Option<Arc<std::fs::File>>), EngError> {
+    files: &mut [Option<Arc<File>>],
+) -> Result<Arc<File>, EngError> {
     if let Some(Some(open)) = files.get(shard) {
-        return Ok(open.clone());
+        return Ok(Arc::clone(open));
     }
     let path = paths
         .get(shard)
         .ok_or_else(|| refuse(format!("shard {shard} is not open")))?;
     crate::storage_guard::require_local(path, "expert stacks")?;
     let file = Arc::new(
-        std::fs::File::open(path)
+        File::open(path)
             .map_err(|error| refuse(format!("cannot open {}: {error}", path.display())))?,
     );
-    let direct = crate::family::expert_bank::host_tier::open_direct(path)
-        .ok()
-        .map(Arc::new);
-    files[shard] = Some((Arc::clone(&file), direct.clone()));
-    Ok((file, direct))
+    files[shard] = Some(Arc::clone(&file));
+    Ok(file)
 }

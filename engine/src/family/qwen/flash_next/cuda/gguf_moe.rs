@@ -9,7 +9,7 @@
 //! expert. The routed experts are native stacks held on the card (`trunk::expert_key`).
 
 use super::{
-    gguf_stream::{ExpertStreams, StreamTotals},
+    gguf_stream::{ExpertCache, StreamTotals},
     step::{MoeBlock, refuse},
 };
 use crate::family::engine_owner::Handle;
@@ -42,8 +42,8 @@ pub(in crate::family::qwen::flash_next) struct GgufMoe<'w> {
     moe: DeviceBuffer,
     down: DeviceBuffer,
     shared: DeviceBuffer,
-    /// The experts of the layers that do not fit the card, staged per token.
-    streams: Option<ExpertStreams>,
+    /// The cache of the experts when they do not all fit the card; `None` when they do.
+    cache: Option<ExpertCache>,
 }
 
 fn pack(ctx: &CudaContext, k: usize, rows: usize) -> Result<DeviceBuffer, EngError> {
@@ -57,20 +57,20 @@ impl<'w> GgufMoe<'w> {
         ctx: &CudaContext,
         weights: impl Into<Handle<'w, CudaWeights>>,
         dims: &MoeDims,
-        streams: Option<ExpertStreams>,
+        cache: Option<ExpertCache>,
     ) -> Result<Self, EngError> {
         Ok(Self {
             weights: weights.into(),
             moe: pack(ctx, dims.hidden, 1)?,
             down: pack(ctx, dims.inter, dims.top_k)?,
             shared: pack(ctx, dims.shared_inter, 1)?,
-            streams,
+            cache,
         })
     }
 
     /// What the staging has moved and used so far, when any layer streams.
     pub(in crate::family::qwen::flash_next) fn stream_totals(&self) -> Option<StreamTotals> {
-        self.streams.as_ref().map(ExpertStreams::totals)
+        self.cache.as_ref().map(ExpertCache::totals)
     }
 
     fn native(&self, key: &str) -> Result<&crate::kernels::cuda::NativeWeight, EngError> {
@@ -92,22 +92,29 @@ fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
 
-/// The picked experts the router wrote, sorted and without repeats.
-fn read_picks(launch: &Launch<'_>, ids: &DeviceRange<'_>, experts: usize) -> Result<Vec<u32>, EngError> {
+/// The experts the router picked: in rank order, and each distinct one once.
+struct Picks {
+    in_order: Vec<u32>,
+    distinct: Vec<u32>,
+}
+
+/// The picks the router wrote, read back from the device.
+fn read_picks(launch: &Launch<'_>, ids: &DeviceRange<'_>, experts: usize) -> Result<Picks, EngError> {
     let mut raw = vec![0u8; ids.bytes()];
     ids.buffer().read_at(launch.stream, ids.offset(), &mut raw)?;
-    let mut picks = Vec::with_capacity(raw.len() / 4);
+    let mut in_order = Vec::with_capacity(raw.len() / 4);
     for chunk in raw.chunks_exact(4) {
         let id = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let id = u32::try_from(id)
             .ok()
             .filter(|&id| (id as usize) < experts)
             .ok_or_else(|| refuse(format!("the router picked expert {id} of {experts}")))?;
-        picks.push(id);
+        in_order.push(id);
     }
-    picks.sort_unstable();
-    picks.dedup();
-    Ok(picks)
+    let mut distinct = in_order.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    Ok(Picks { in_order, distinct })
 }
 
 impl GgufMoe<'_> {
@@ -190,50 +197,52 @@ impl MoeBlock for GgufMoe<'_> {
                 ncols: 1,
             },
         )?;
-        let streamed = self
-            .streams
-            .as_ref()
-            .is_some_and(|streams| streams.is_streamed(layer));
-        if !streamed {
+        if self.cache.is_none() {
             let weights = self.layer_weights(layer, self.resident_stacks(layer)?)?;
             let buffers = self.buffers(bufs, moe)?;
             return run_moe_block(launch, &weights, &buffers, dims);
         }
-        // A streamed layer: the router runs first, the host learns the picks, the picked experts
-        // are copied into the staging slot, and the launches that read them follow the copy.
-        let slot = self
-            .streams
-            .as_mut()
-            .map(ExpertStreams::take_slot)
-            .ok_or_else(|| refuse("no expert streams".into()))?;
-        let streams = self.streams.as_ref().ok_or_else(|| refuse("no expert streams".into()))?;
-        let staged = [
-            streams.staged(layer, slot, 0)?,
-            streams.staged(layer, slot, 1)?,
-            streams.staged(layer, slot, 2)?,
-        ];
-        {
-            let weights = self.layer_weights(layer, staged)?;
+        // The experts are cached per layer: the router runs first and the host learns the picks,
+        // the missed experts are copied into their slots, the router's expert ids are replaced by
+        // the slot ids, and the launches that read the experts run on the slot stacks.
+        let router_only = {
+            let cache = self.cache.as_ref().ok_or_else(|| refuse("no expert cache".into()))?;
+            let stacks = [
+                cache.stack(layer, 0)?,
+                cache.stack(layer, 1)?,
+                cache.stack(layer, 2)?,
+            ];
+            let weights = self.layer_weights(layer, stacks)?;
             let buffers = self.buffers(bufs, moe)?;
-            run_moe_ops(launch, &weights, &buffers, dims, 0..1)?;
-        }
+            run_moe_ops(launch, &weights, &buffers, dims, 0..1)
+        };
+        router_only?;
         let picks = read_picks(launch, &bufs.route.ids, dims.n_expert)?;
-        let streams = self.streams.as_mut().ok_or_else(|| refuse("no expert streams".into()))?;
-        streams.stage(layer, slot, &picks)?;
-        let streams = self.streams.as_ref().ok_or_else(|| refuse("no expert streams".into()))?;
-        let staged = [
-            streams.staged(layer, slot, 0)?,
-            streams.staged(layer, slot, 1)?,
-            streams.staged(layer, slot, 2)?,
-        ];
-        {
-            let weights = self.layer_weights(layer, staged)?;
-            let buffers = self.buffers(bufs, moe)?;
-            run_moe_ops(launch, &weights, &buffers, dims, 1..usize::MAX)?;
-        }
-        self.streams
+        let slots = self
+            .cache
             .as_mut()
-            .ok_or_else(|| refuse("no expert streams".into()))?
-            .release(slot)
+            .ok_or_else(|| refuse("no expert cache".into()))?
+            .stage(layer, &picks.distinct)?;
+        let mut raw = Vec::with_capacity(picks.in_order.len() * 4);
+        for &expert in &picks.in_order {
+            let slot = *picks
+                .distinct
+                .iter()
+                .position(|&other| other == expert)
+                .and_then(|at| slots.get(at))
+                .ok_or_else(|| refuse(format!("expert {expert} has no slot")))?;
+            raw.extend_from_slice(&slot.to_le_bytes());
+        }
+        let ids = &bufs.route.ids;
+        ids.buffer().write_at(launch.stream, ids.offset(), &raw)?;
+        let cache = self.cache.as_ref().ok_or_else(|| refuse("no expert cache".into()))?;
+        let stacks = [
+            cache.stack(layer, 0)?,
+            cache.stack(layer, 1)?,
+            cache.stack(layer, 2)?,
+        ];
+        let weights = self.layer_weights(layer, stacks)?;
+        let buffers = self.buffers(bufs, moe)?;
+        run_moe_ops(launch, &weights, &buffers, dims, 1..usize::MAX)
     }
 }

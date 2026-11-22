@@ -9,7 +9,7 @@ use super::{
     driver::{DriverShape, StateIo, TokenDevice, TokenDriver},
     feeds::{StartShape, StartSink},
     gguf_moe::GgufMoe,
-    gguf_stream::{ExpertStreams, StreamTotals},
+    gguf_stream::{ExpertCache, StreamTotals},
     pack_feeds::PackFeeds,
     state::StateSlot,
     step::FlashStep,
@@ -19,10 +19,10 @@ use crate::{
     EngError,
     family::{
         engine_owner::{EngineOwner, Handle},
-        expert_bank::layer_stream::{Home, StreamPlan},
         exl3_tensors::f32_le_bytes,
         qwen::flash_next::load::gguf::{
-            GgufModel, feeds::gguf_feeds, placement::layer_stacks, trunk::gguf_trunk,
+            GgufModel, feeds::gguf_feeds, placement::{ExpertSetup, layer_stacks},
+            trunk::gguf_trunk,
         },
         project::cuda::{CudaProjector, CudaWeights},
     },
@@ -56,24 +56,33 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
     chunk_limit: usize,
     positions: usize,
     threads: usize,
-    placement: StreamPlan,
+    setup: ExpertSetup,
 ) -> Result<TokenDriver<GgufDevice, PackFeeds>, EngError> {
     let model = Box::new(model);
     let ctx = projector.shared_context();
     drop(projector);
     let stream = Rc::new(ctx.stream()?);
     let stacks = layer_stacks(&model)?;
-    let resident = |layer: usize| placement.home(layer) == Home::Card;
+    let resident = |_layer: usize| matches!(setup, ExpertSetup::Resident);
     let weights = Rc::new(gguf_trunk(&model, &ctx, &resident, chunk_limit)?);
     let expert_total: u64 = stacks
         .iter()
         .flat_map(|layer| layer.stacks.iter().map(|stack| stack.bytes))
         .sum();
-    let resident_bytes = placement.resident_bytes();
-    let streams = if placement.streamed().is_empty() {
-        None
-    } else {
-        Some(ExpertStreams::new(&model, &stacks, placement, &ctx, &stream)?)
+    let (cache, resident_bytes) = match &setup {
+        ExpertSetup::Resident => (None, expert_total),
+        ExpertSetup::Cached(plan) => {
+            let cache = ExpertCache::new(&model, &stacks, plan, &ctx)?;
+            let held: u64 = stacks
+                .iter()
+                .map(|layer| {
+                    layer.stacks.iter().map(|stack| stack.bytes).sum::<u64>()
+                        / model.config().experts() as u64
+                        * plan.slots as u64
+                })
+                .sum();
+            (Some(cache), held)
+        }
     };
     let config = model.config();
     let layers = config.layers();
@@ -91,7 +100,7 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
         &ctx,
         Handle::Shared(Rc::clone(&weights)),
         &step.moe_dims(1),
-        streams,
+        cache,
     )?;
     let feeds = gguf_feeds(&model, threads)?;
     let ple = config.model_shape()?.ple;
@@ -215,19 +224,19 @@ impl TokenDevice for GgufDevice {
 
     fn reset(&mut self) -> Result<(), EngError> {
         if let Some(now) = self.owner.step().moe.stream_totals()
-            && now.stagings != self.reported.stagings
+            && now.visits != self.reported.visits
         {
-            let (moved, needed) = (
-                now.moved - self.reported.moved,
-                now.needed - self.reported.needed,
+            let (visits, hits, misses) = (
+                now.visits - self.reported.visits,
+                now.hits - self.reported.hits,
+                now.misses - self.reported.misses,
             );
+            let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
             eprintln!(
-                "flash-next gguf: expert stream since the last request: {} layer stagings, moved {:.1} MiB, needed {:.1} MiB ({:.0}% used), copy {:.2} s, host in staging {:.2} s",
-                now.stagings - self.reported.stagings,
-                moved as f64 / (1u64 << 20) as f64,
-                needed as f64 / (1u64 << 20) as f64,
-                100.0 * needed as f64 / moved.max(1) as f64,
-                now.copy_seconds - self.reported.copy_seconds,
+                "flash-next gguf: expert cache since the last request: {visits} layer visits, {:.1}% of the picked experts held a slot ({hits} hits, {misses} misses); moved {:.1} MiB of the {:.1} MiB the picks read, host in staging {:.2} s",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64,
+                mib(now.moved - self.reported.moved),
+                mib(now.needed - self.reported.needed),
                 now.host_seconds - self.reported.host_seconds,
             );
             self.reported = now;

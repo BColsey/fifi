@@ -1,8 +1,8 @@
-//! Where the routed experts of a Flash-Next GGUF sit in the file and where the memory plan puts
-//! them: the three stacks of every layer, each with its own stored type and size, and the shared
-//! layer placement (`expert_bank::layer_stream::StreamPlan`) over those sizes. A model's layers
-//! differ in type per stack (the gate and up of a layer share a type, the down has its own), so
-//! the sizes are per stack and per layer, never one uniform record.
+//! Where the routed experts of a Flash-Next GGUF sit in the file and how the memory plan holds
+//! them: the three stacks of every layer, each with its own stored type and size, and the slot
+//! count and host homes that follow from those sizes. A model's layers differ in type per stack
+//! (the gate and up of a layer share a type, the down has its own), so the sizes are per stack
+//! and per layer, never one uniform record.
 
 use super::{
     GgufModel,
@@ -11,7 +11,7 @@ use super::{
 use crate::{
     EngError,
     family::{
-        expert_bank::layer_stream::{Home, LayerExperts, StreamBudget, StreamPlan},
+        expert_bank::layer_stream::Home,
         recipe::Role as Wanted,
     },
     weights::GgufType,
@@ -92,68 +92,79 @@ fn expert_part(entry: &Mapped) -> Option<usize> {
     }
 }
 
-/// Card bytes the transport allocates per staging slot for the layers `plan` streams: one buffer
-/// per distinct (stack, size, type, shape), because a staged stack is a native weight over a
-/// buffer of exactly its size. A mixed-quant file has several, so this can exceed the plan's
-/// charge of one largest layer per slot.
-pub(in crate::family::qwen::flash_next) fn staging_bytes_per_slot(
-    stacks: &[LayerStacks],
-    plan: &StreamPlan,
-) -> u64 {
-    let mut keys: Vec<(usize, u64, GgufType, usize, usize)> = Vec::new();
-    for (layer, facts) in stacks.iter().enumerate() {
-        if plan.home(layer) == Home::Card {
-            continue;
-        }
-        for (stack, fact) in facts.stacks.iter().enumerate() {
-            let key = (stack, fact.bytes, fact.ty, fact.k, fact.rows);
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-    }
-    keys.iter().map(|key| key.1).sum()
+/// How the routed experts are held: all on the card, or `slots` per layer cached on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::family::qwen::flash_next) enum ExpertSetup {
+    /// Every expert of every layer sits on the card as the file stores it.
+    Resident,
+    /// A cache of `slots` experts per layer, filled from the host or the file.
+    Cached(CachePlan),
 }
 
-/// The plan: where every layer's experts live, from the card and host bytes the memory plan
-/// left for the routed experts. The staging the transport really allocates is charged: when the
-/// layers that stream need more than the plan's one-largest-layer figure, the card budget loses
-/// the difference and the placement is made again.
-pub(in crate::family::qwen::flash_next) fn stream_plan(
-    stacks: &[LayerStacks],
-    experts: usize,
-    mut budget: StreamBudget,
-) -> Result<StreamPlan, EngError> {
-    let layers = stacks
-        .iter()
-        .map(|layer| {
-            LayerExperts::new(
-                experts,
-                layer.stacks.iter().map(|stack| stack.bytes).collect(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let limit = budget.card_bytes;
-    for _ in 0..16 {
-        let plan = StreamPlan::choose(&layers, budget)?;
-        let staging = staging_bytes_per_slot(stacks, &plan) * plan.staging_slots() as u64;
-        let used = plan.resident_bytes() + staging;
-        if used <= limit {
-            return Ok(plan);
-        }
-        budget.card_bytes = budget.card_bytes.saturating_sub(used - limit);
+/// How the routed experts are held when they do not all fit the card: `slots` experts of every
+/// layer sit on the card, and each layer's whole set of experts lives in pinned host memory
+/// ([`Home::Pinned`]) or is read from the model file in place on a miss ([`Home::Disk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::family::qwen::flash_next) struct CachePlan {
+    /// Experts of each layer held on the card.
+    pub(in crate::family::qwen::flash_next) slots: usize,
+    /// Where each layer's experts are read from on a miss.
+    pub(in crate::family::qwen::flash_next) homes: Vec<Home>,
+    /// Experts picked per token and layer: the most one pass can miss.
+    pub(in crate::family::qwen::flash_next) top_k: usize,
+}
+
+impl CachePlan {
+    /// Layers pinned in host memory and layers read from disk.
+    pub(in crate::family::qwen::flash_next) fn counts(&self) -> (usize, usize) {
+        let pinned = self.homes.iter().filter(|&&home| home == Home::Pinned).count();
+        (pinned, self.homes.len() - pinned)
     }
-    Err(refuse(
-        "the staging of the streamed layers does not settle against the card budget",
-    ))
+}
+
+impl std::fmt::Display for CachePlan {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (pinned, disk) = self.counts();
+        write!(
+            out,
+            "{} expert slots in every layer on the card, {pinned} layers pinned in host memory, {disk} read from the file",
+            self.slots
+        )
+    }
+}
+
+/// The host home of every layer: the largest layers first take pinned memory while `host_bytes`
+/// lasts, the rest are read from the file. `slots` is the planner's slot count per layer.
+pub(in crate::family::qwen::flash_next) fn cache_plan(
+    stacks: &[LayerStacks],
+    top_k: usize,
+    slots: usize,
+    host_bytes: u64,
+) -> CachePlan {
+    let bytes = |layer: usize| stacks[layer].stacks.iter().map(|stack| stack.bytes).sum::<u64>();
+    let mut order: Vec<usize> = (0..stacks.len()).collect();
+    order.sort_by_key(|&layer| (std::cmp::Reverse(bytes(layer)), layer));
+    let mut homes = vec![Home::Disk; stacks.len()];
+    let mut left = host_bytes;
+    for layer in order {
+        if bytes(layer) <= left {
+            left -= bytes(layer);
+            homes[layer] = Home::Pinned;
+        }
+    }
+    CachePlan {
+        slots,
+        homes,
+        top_k,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{layer_stacks, stream_plan};
+    use super::{cache_plan, layer_stacks};
     use crate::{
         family::{
-            expert_bank::layer_stream::{Home, StreamBudget},
+            expert_bank::layer_stream::Home,
             qwen::flash_next::load::gguf::testkit::{Spec, write_flash},
         },
         weights::GgufType,
@@ -200,37 +211,17 @@ mod tests {
         assert_ne!(record(0), record(8));
         assert_ne!(record(0), record(47));
         let total: u64 = (0..48).map(record).sum();
-        // With a card that holds a third of the experts the plan keeps whole layers on the card,
-        // the next ones in pinned memory, and the rest on disk, and charges the staging.
-        let plan = stream_plan(
-            &stacks,
-            512,
-            StreamBudget {
-                card_bytes: total / 3,
-                host_bytes: total / 3,
-                staging_slots: 2,
-            },
-        )
-        .expect("plan");
-        let homes = |home: Home| (0..48).filter(|&layer| plan.home(layer) == home).count();
-        assert!(homes(Home::Card) > 0 && homes(Home::Pinned) > 0 && homes(Home::Disk) > 0);
-        // The layers on the card and the staging the transport allocates fit the card budget.
-        assert!(
-            plan.resident_bytes()
-                + super::staging_bytes_per_slot(&stacks, &plan) * plan.staging_slots() as u64
-                <= total / 3
-        );
-        // A card that holds everything streams nothing.
-        let all = stream_plan(
-            &stacks,
-            512,
-            StreamBudget {
-                card_bytes: total * 2,
-                host_bytes: 0,
-                staging_slots: 2,
-            },
-        )
-        .expect("plan");
-        assert!(all.streamed().is_empty());
+        // A host budget of a third of the experts pins the largest layers that fit it and reads
+        // the rest from the file; one that holds everything pins every layer.
+        let plan = cache_plan(&stacks, 10, 167, total / 3);
+        let (pinned, disk) = plan.counts();
+        assert!(pinned > 0 && disk > 0 && pinned + disk == 48);
+        let pinned_bytes: u64 = (0..48)
+            .filter(|&layer| plan.homes[layer] == Home::Pinned)
+            .map(record)
+            .sum();
+        assert!(pinned_bytes <= total / 3);
+        assert_eq!(cache_plan(&stacks, 10, 167, total).counts(), (48, 0));
+        assert_eq!(cache_plan(&stacks, 10, 167, 0).counts(), (0, 48));
     }
 }

@@ -9,6 +9,7 @@
 
 use super::{
     GgufModel, host,
+    placement::ExpertSetup,
     smallmodel::{Small, write_small, write_small_with},
 };
 use crate::family::{
@@ -21,30 +22,13 @@ use crate::family::{
     session::TokenStepper,
 };
 
-/// Every layer's experts on the card: the placement of a model that fits.
-fn all_on_card(model: &GgufModel) -> crate::family::expert_bank::layer_stream::StreamPlan {
-    let stacks = super::placement::layer_stacks(model)
-        .expect("stacks");
-    super::placement::stream_plan(
-        &stacks,
-        model.config().experts(),
-        crate::family::expert_bank::layer_stream::StreamBudget {
-            card_bytes: u64::MAX / 4,
-            host_bytes: 0,
-            staging_slots: 2,
-        },
-    )
-    .expect("plan")
-}
-
 /// The driver over the small model, owning its model, card handle and weights.
 fn driver_of(small: &Small, positions: usize) -> TokenDriver<GgufDevice, PackFeeds> {
     let model = GgufModel::open(&small.first)
         .expect("open")
         .expect("a qwen4exp model");
     let projector = CudaProjector::new().expect("the card");
-    let placement = all_on_card(&model);
-    gguf_driver(model, projector, 8 << 20, positions, 2, placement).expect("the driver")
+    gguf_driver(model, projector, 8 << 20, positions, 2, ExpertSetup::Resident).expect("the driver")
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -411,8 +395,8 @@ fn which_layer_first_differs_when_the_indexer_drops_positions() {
 
 /// The real file's first two layers on the card against the host forward from the file's own
 /// dequantized weights, token by token: the residual stream after each layer stays within the
-/// activation-rounding bound. The experts are placed by a budget of `FIFI_FLASH_CARD_GIB`
-/// (default 10), so the first layers stream; the host decodes each picked expert from the file.
+/// activation-rounding bound. The experts are cached, `FIFI_FLASH_SLOTS` (default 64) per layer
+/// and read from the file on a miss; the host decodes each picked expert from the file.
 /// Needs FIFI_FLASH_GGUF and the card.
 #[test]
 #[ignore = "needs a GPU and the real file"]
@@ -427,26 +411,23 @@ fn real_file_first_layers_follow_the_host_with_streamed_experts() {
             .expect("a qwen4exp model at FIFI_FLASH_GGUF")
     };
     let model: &'static GgufModel = Box::leak(Box::new(open()));
-    let gib: u64 = std::env::var("FIFI_FLASH_CARD_GIB")
+    let slots: usize = std::env::var("FIFI_FLASH_SLOTS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(10);
-    let stacks =
-        super::placement::layer_stacks(model).expect("stacks");
-    let placement = super::placement::stream_plan(
-        &stacks,
-        model.config().experts(),
-        crate::family::expert_bank::layer_stream::StreamBudget {
-            card_bytes: gib << 30,
-            host_bytes: 0,
-            staging_slots: 2,
-        },
-    )
-    .expect("plan");
+        .unwrap_or(64);
+    let stacks = super::placement::layer_stacks(model).expect("stacks");
+    let placement = super::placement::cache_plan(&stacks, model.config().top_k(), slots, 0);
     eprintln!("placement: {placement}");
     let projector = CudaProjector::new().expect("the card");
     let tokens = [760u32, 6511, 314];
-    let mut driver = gguf_driver(open(), projector, 64 << 20, tokens.len() + 8, 2, placement)
+    let mut driver = gguf_driver(
+        open(),
+        projector,
+        64 << 20,
+        tokens.len() + 8,
+        2,
+        ExpertSetup::Cached(placement),
+    )
         .expect("the driver");
     let layers = 2;
     let reference = host::HostModel::load(model, layers).expect("host layers");

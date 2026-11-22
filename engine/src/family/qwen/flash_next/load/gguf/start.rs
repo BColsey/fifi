@@ -14,13 +14,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgufModel,
-    placement::{layer_stacks, stream_plan},
+    placement::{ExpertSetup, cache_plan, layer_stacks},
     plan::Card,
 };
 use crate::{
     EngError,
     family::{
-        expert_bank::{bank_tier::TierChoice, layer_stream::StreamBudget},
+        expert_bank::bank_tier::TierChoice,
         mem::Facts,
         project::cuda::CudaProjector,
         qwen::flash_next::{
@@ -40,9 +40,6 @@ use crate::{
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::{TokenizerBundle, TokenizerPin},
 };
-
-/// Staging slots of the streamed experts: one computes while the next layer loads.
-const STAGING_SLOTS: usize = 2;
 
 /// Host bytes one native tensor read holds while a tensor is uploaded.
 const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
@@ -136,21 +133,29 @@ pub(in crate::family::qwen::flash_next) fn start(
     if !gaps.is_empty() {
         return Err(model.kernel_refusal(&gaps));
     }
-    // The routed experts that do not fit beside the trunk and the K/V stream through the shared
-    // layer placement: layers on the card, in pinned memory, or read from the file in place.
-    let experts = model.config().dims.experts as usize;
+    // The routed experts that do not all fit beside the trunk and the K/V are cached: the memory
+    // plan's slot count per layer sits on the card, and each layer's experts are read from pinned
+    // host memory or from the file on a miss.
+    let experts = model.config().experts();
     let tier = load.context.plan;
-    let stacks = layer_stacks(model)?;
-    let budget = StreamBudget {
-        card_bytes: tier.bank_bytes() + tier.vram_left(),
-        host_bytes: match tier.store_tier() {
+    let setup = if tier.slots_per_layer() >= experts {
+        ExpertSetup::Resident
+    } else {
+        let host_bytes = match tier.store_tier() {
             TierChoice::Disk | TierChoice::CardDisk { .. } => tier.host_spare_bytes(),
             _ => tier.cold_bytes() + tier.host_spare_bytes(),
-        },
-        staging_slots: STAGING_SLOTS,
+        };
+        ExpertSetup::Cached(cache_plan(
+            &layer_stacks(model)?,
+            model.config().top_k(),
+            tier.slots_per_layer(),
+            host_bytes,
+        ))
     };
-    let stream = stream_plan(&stacks, experts, budget)?;
-    eprintln!("flash-next gguf: routed experts: {stream}");
+    match &setup {
+        ExpertSetup::Resident => eprintln!("flash-next gguf: routed experts: all on the card"),
+        ExpertSetup::Cached(plan) => eprintln!("flash-next gguf: routed experts: {plan}"),
+    }
 
     let vocab = model.config().model_shape()?.vocab;
     let bundle = TokenizerBundle::load(
@@ -196,7 +201,7 @@ pub(in crate::family::qwen::flash_next) fn start(
             UPLOAD_CHUNK_BYTES,
             context as usize,
             ple_threads(),
-            stream,
+            setup,
         )?;
         FlashCudaExecutor::new(driver, rules, identity)
     })?;
