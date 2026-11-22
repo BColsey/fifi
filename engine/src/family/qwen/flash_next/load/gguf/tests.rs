@@ -448,6 +448,29 @@ fn stored_expert_layout_matches_per_layer_and_global_file_sizes() {
 }
 
 #[test]
+fn expert_stacks_are_part_major_aligned_and_checked() {
+    use super::expert_layout::{ExpertLayout, ExpertStacks};
+    let (_written, model) = open(&Spec::default());
+    for layer in 0..model.config().layers() {
+        let record = ExpertLayout::for_layer(&model, layer).unwrap();
+        let stack = ExpertStacks::new(&record, 7).unwrap();
+        for (index, part) in record.parts.iter().enumerate() {
+            assert_eq!(stack.parts[index].start % 4, 0);
+            assert_eq!(stack.parts[index].len(), part.bytes.len() * 7);
+            let first = stack.slot(index, 0).unwrap();
+            let last = stack.slot(index, 6).unwrap();
+            assert_eq!(first.start, stack.parts[index].start);
+            assert_eq!(last.end, stack.parts[index].end);
+            assert_eq!(first.len(), part.bytes.len());
+            assert!(stack.slot(index, 7).is_err());
+        }
+        assert!(stack.slot(3, 0).is_err());
+        assert!(ExpertStacks::new(&record, 0).is_err());
+        assert!(ExpertStacks::new(&record, usize::MAX).is_err());
+    }
+}
+
+#[test]
 fn packed_expert_read_preserves_role_boundaries_and_rejects_bad_requests() {
     use super::expert_layout::ExpertLayout;
     let (written, model) = open(&Spec {

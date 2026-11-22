@@ -1,5 +1,5 @@
-//! Stored-byte layouts for GGUF expert records. These are not CUDA bank layouts:
-//! a device consumer must separately account for its alignment and dispatch requirements.
+//! Stored-byte layouts for GGUF expert records and part-major stack planning.
+//! The stack plan describes kernel byte ranges; it does not allocate or dispatch.
 
 use std::ops::Range;
 
@@ -18,6 +18,66 @@ pub(in super::super::super) struct ExpertPart {
 pub(in super::super::super) struct ExpertLayout {
     pub(in super::super::super) parts: [ExpertPart; 3],
     pub(in super::super::super) bytes: usize,
+}
+
+/// Part-major stacks match `matvec_expert`: each part contains all slots contiguously.
+/// The buffer base and each part start must be four-byte aligned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in super::super::super) struct ExpertStacks {
+    pub(in super::super::super) parts: [Range<usize>; 3],
+    pub(in super::super::super) bytes: usize,
+    slots: usize,
+}
+
+impl ExpertStacks {
+    pub(in super::super::super) fn new(
+        record: &ExpertLayout,
+        slots: usize,
+    ) -> Result<Self, EngError> {
+        let bad = || EngError::MemoryPlan("invalid GGUF expert stack size".into());
+        if slots == 0 {
+            return Err(bad());
+        }
+        let mut offset = 0usize;
+        let mut ranges = Vec::with_capacity(3);
+        for part in &record.parts {
+            let len = part
+                .bytes
+                .end
+                .checked_sub(part.bytes.start)
+                .filter(|n| *n > 0)
+                .ok_or_else(bad)?;
+            let start = offset.checked_add(3).ok_or_else(bad)? & !3;
+            let end = start
+                .checked_add(len.checked_mul(slots).ok_or_else(bad)?)
+                .ok_or_else(bad)?;
+            ranges.push(start..end);
+            offset = end;
+        }
+        Ok(Self {
+            parts: ranges.try_into().map_err(|_| bad())?,
+            bytes: offset,
+            slots,
+        })
+    }
+
+    pub(in super::super::super) fn slot(
+        &self,
+        part: usize,
+        slot: usize,
+    ) -> Result<Range<usize>, EngError> {
+        let bad = || EngError::BadRequest("invalid GGUF expert stack slot".into());
+        let range = self.parts.get(part).ok_or_else(bad)?;
+        if slot >= self.slots {
+            return Err(bad());
+        }
+        let stride = range.len() / self.slots;
+        let start = range
+            .start
+            .checked_add(stride.checked_mul(slot).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        Ok(start..start.checked_add(stride).ok_or_else(bad)?)
+    }
 }
 
 impl ExpertLayout {
