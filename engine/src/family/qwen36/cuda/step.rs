@@ -77,7 +77,6 @@ use super::{
         Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
     },
 };
-use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::decode_step::state_layout::StateLayout;
 use crate::family::state_words::Word;
 use crate::{
