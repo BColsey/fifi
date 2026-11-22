@@ -83,6 +83,7 @@ pub(crate) mod attn_decode;
 pub(crate) mod attn_decode_gemma;
 pub(crate) mod attn_decode_q8;
 pub(crate) mod attn_prep;
+pub(crate) mod correct_draft_logits_bf16;
 pub(crate) mod dense_gemv;
 pub(crate) mod draft_attention_bf16;
 pub(crate) mod embed;
