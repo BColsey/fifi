@@ -85,7 +85,8 @@ fn checkpoint(message: String) -> EngError {
 /// blob that only starts with the GGUF magic, or any shard of a split set). A file names its own
 /// weights only: its siblings are not counted, and `config.json` and tokenizer files are looked
 /// for beside it. Tokenizer presence is read from `tokenizer_dir` (pass the same path twice for
-/// the usual one-directory layout).
+/// the usual one-directory layout). A symlink is judged by its own name: a link to one shard of a
+/// split set is that one file unless its name follows the split pattern.
 pub fn inspect(model_path: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
     crate::storage_guard::require_local(model_path, "model weights")?;
     let from_file = crate::family::gguf_select::is_gguf_file(model_path);
@@ -456,15 +457,7 @@ mod tests {
         assert!(error.contains("not a directory or a GGUF file"), "{error}");
     }
 
-    /// `path` as a path relative to the working directory, with `..` steps up to the root.
-    fn relative_to_cwd(path: &std::path::Path) -> PathBuf {
-        let cwd = std::env::current_dir().expect("working directory");
-        let mut relative = PathBuf::new();
-        for _ in 1..cwd.components().count() {
-            relative.push("..");
-        }
-        relative.join(path.strip_prefix("/").expect("an absolute path"))
-    }
+    use crate::test_paths::relative_to_cwd;
 
     #[test]
     fn a_relative_path_to_a_file_is_inspected_like_the_absolute_one() {
@@ -511,5 +504,34 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("missing"), &gone).unwrap();
         let error = crate::capability::describe_error(&inspect(&gone, &dir).unwrap_err());
         assert!(error.contains("dangling symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_judged_by_its_own_name_even_when_it_points_at_one_shard_of_a_set() {
+        let dir = scratch("shardlink");
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let first = crate::weights::write_two_shard_set(&dir.join("blobs"), "big");
+        let link = dir.join("model.gguf");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        // The link's name has no `-0000N-of-0000M` part, so it is one file: the shard it points
+        // at. Naming the shard itself, or the directory of the set, serves the whole set.
+        let report = inspect(&link, &link).unwrap();
+        assert_eq!(report.gguf_files.len(), 1);
+        assert_eq!(report.weights_path, link);
+        let whole = inspect(&first, &first).unwrap();
+        assert_eq!(whole.gguf_files.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_loops_is_refused_and_not_followed_forever() {
+        let dir = scratch("looplink");
+        let (a, b) = (dir.join("a.gguf"), dir.join("b.gguf"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let error = crate::capability::describe_error(&inspect(&a, &dir).unwrap_err());
+        assert!(error.contains("a.gguf"), "{error}");
+        assert!(error.contains("does not resolve"), "{error}");
     }
 }

@@ -21,6 +21,16 @@ pub(crate) fn lookup(name: &str) -> Option<PathBuf> {
     config_value(&text, name).map(PathBuf::from)
 }
 
+/// `path` (absolute) as a path relative to the working directory, with `..` steps up to the root.
+pub(crate) fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("working directory");
+    let mut relative = PathBuf::new();
+    for _ in 1..cwd.components().count() {
+        relative.push("..");
+    }
+    relative.join(path.strip_prefix("/").expect("an absolute path"))
+}
+
 /// The string at key `name` of the config object. A file that is not a JSON object panics, so
 /// a typo cannot hide a path.
 fn config_value(text: &str, name: &str) -> Option<String> {

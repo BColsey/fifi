@@ -203,7 +203,9 @@ fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
 /// discovery to reject in its own words.
 fn resolve_model_dir(args: &ModelServeArgs) -> Result<ModelServeArgs, StartupError> {
     let text = args.model_dir.to_string_lossy();
-    if args.model_dir.exists() {
+    // A path that exists, or a link that points nowhere: the model check names what is wrong with
+    // it (a dangling link) instead of reading its name as a store entry.
+    if args.model_dir.exists() || std::fs::symlink_metadata(&args.model_dir).is_ok() {
         return Ok(args.clone());
     }
     // `org/repo` or `org/repo:QUANT`: the hub cache, then the hub itself.
@@ -1193,12 +1195,7 @@ mod tests {
         write_architecture(&real, "gemma4");
         let link = dir.path().join("bolt.gguf");
         std::os::unix::fs::symlink(&real, &link).expect("link");
-        let cwd = std::env::current_dir().expect("cwd");
-        let mut relative = PathBuf::new();
-        for _ in 1..cwd.components().count() {
-            relative.push("..");
-        }
-        let relative = relative.join(link.strip_prefix("/").expect("absolute"));
+        let relative = crate::test_paths::relative_to_cwd(&link);
         for path in [&real, &link, &relative] {
             let discovered = discover(&args_for(path)).expect("discovers");
             assert_eq!(
@@ -1208,5 +1205,45 @@ mod tests {
             );
             assert_eq!(discovered.tokenizer_dir, *path, "{path:?}");
         }
+    }
+
+    #[test]
+    fn a_link_into_a_crowded_directory_takes_its_own_header_and_none_of_the_neighbours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).expect("store");
+        let real = store.join("sha256-0f1e");
+        write_architecture(&real, "gemma4");
+        write_architecture(&store.join("other.gguf"), "qwen35moe");
+        write_architecture(&store.join("another.gguf"), "qwen35moe");
+        std::fs::write(store.join("tokenizer.json"), b"{}").expect("tokenizer");
+        let shelf = dir.path().join("shelf");
+        std::fs::create_dir_all(&shelf).expect("shelf");
+        let link = shelf.join("bolt.gguf");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let discovered = discover(&args_for(&link)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+        // The side files come from the link's own directory, not the target's.
+        assert_eq!(discovered.tokenizer_dir, link);
+    }
+
+    #[test]
+    fn a_dangling_plain_name_is_named_a_dangling_link_not_a_store_miss() {
+        // A relative name resolves against the working directory, so the link goes there under a
+        // name no other test uses and is removed on every exit path.
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let name = format!("dangling-{}.gguf", std::process::id());
+        let _guard = Remove(PathBuf::from(&name));
+        std::os::unix::fs::symlink("no-such-target", &name).expect("link");
+        let error = super::build_config(&args_for(Path::new(&name)))
+            .unwrap_err()
+            .0;
+        assert!(error.contains("dangling symlink"), "{error}");
+        assert!(!error.contains("nothing local is named"), "{error}");
     }
 }
