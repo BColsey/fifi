@@ -33,6 +33,7 @@ pub(crate) mod run;
 mod sampler_trace;
 mod sse;
 mod state;
+pub(crate) mod supervisor;
 #[cfg(test)]
 mod testkit;
 mod tokenize;

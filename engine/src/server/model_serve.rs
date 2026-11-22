@@ -366,6 +366,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
         api_key_env: DEFAULT_API_KEY_ENV.to_string(),
         prefix_reuse: Some(false),
         sample_trace: false,
+        supervised_engines: false,
         web_dir: None,
         engines: vec![EngineConfig {
             id: if uses_qwen36_options(&discovered.family) {

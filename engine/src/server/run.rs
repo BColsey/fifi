@@ -142,6 +142,7 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         state.hf().sweep_partials();
     }
     state = state.with_sample_trace(config.sample_trace);
+    state.set_supervised_engines(config.supervised_engines);
     if let Some(web_dir) = &config.web_dir {
         // Refuse at startup, with the path named, rather than serving a
         // shell that 404s: a configured-but-missing frontend is a
@@ -989,6 +990,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             prefix_reuse,
             sample_trace: false,
+            supervised_engines: false,
             web_dir: None,
             engines,
         }

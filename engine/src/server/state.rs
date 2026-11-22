@@ -122,6 +122,14 @@ pub(crate) struct AppState {
     /// Whether the process permits sampler-trace capture: the config's
     /// `sample_trace` setting, checked before a request arms a sampler.
     sample_trace: bool,
+    /// The supervised worker engines (see `supervisor.rs`): a
+    /// runtime-added engine of a process-lifetime family serves from
+    /// its own process, so stopping it frees the memory.
+    workers: Arc<super::supervisor::WorkerSupervisor>,
+    /// Whether runtime-added pinned-family engines start supervised
+    /// workers instead of loading in-process: the config's
+    /// `supervised_engines` setting, set once at boot.
+    supervised_engines: std::sync::atomic::AtomicBool,
     /// The sampler-trace ring, fed by submit when a request arms capture
     /// and read by `GET /v1/sampler-trace`.
     traces: SamplerTraceRing,
@@ -227,6 +235,8 @@ impl AppState {
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
             web_dir: None,
             sessions: Mutex::new(HashMap::new()),
+            workers: Arc::new(super::supervisor::WorkerSupervisor::new()),
+            supervised_engines: std::sync::atomic::AtomicBool::new(false),
             telemetry: Mutex::new(None),
         }
     }
@@ -564,7 +574,60 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len();
-        owned + stopping
+        owned + stopping + self.workers.count()
+    }
+
+    /// The supervised worker engines.
+    pub(crate) fn workers(&self) -> &super::supervisor::WorkerSupervisor {
+        &self.workers
+    }
+
+    /// Whether runtime-added pinned-family engines start supervised
+    /// workers: the config's `supervised_engines` setting.
+    pub(crate) fn supervised_engines(&self) -> bool {
+        self.supervised_engines
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_supervised_engines(&self, on: bool) {
+        self.supervised_engines
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The engine id a session is bound to, when it has one: the
+    /// proxy path's read side of `resolve_session`.
+    pub(crate) fn session_binding(&self, id: &str) -> Option<String> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.get_mut(id).map(|(engine_id, used)| {
+            *used = now_ms();
+            engine_id.clone()
+        })
+    }
+
+    /// Binds a session to an engine id the local resolve path does
+    /// not know: a supervised worker. Mirrors `resolve_session`'s
+    /// capacity eviction.
+    pub(crate) fn bind_session(&self, id: &str, engine_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if sessions.len() >= SESSION_CAP
+            && !sessions.contains_key(id)
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            sessions.remove(&oldest);
+        }
+        sessions.insert(id.to_string(), (engine_id.to_string(), now_ms()));
+    }
+
+    /// Drops every session binding an engine id holds: the worker
+    /// stop path, mirroring `remove_engine`'s retain.
+    pub(crate) fn drop_sessions_for(&self, engine_id: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (bound, _)| bound != engine_id);
     }
 
     /// Test hook: marks an id as shutting down, the window a second
@@ -582,9 +645,9 @@ impl AppState {
         &self.hf
     }
 
-    /// True when `id` names a served engine.
+    /// True when `id` names a served engine or a supervised worker.
     pub(crate) fn engine_exists(&self, id: &str) -> bool {
-        self.engines().iter().any(|entry| entry.id == id)
+        self.engines().iter().any(|entry| entry.id == id) || self.workers.contains(id)
     }
 
     /// True when the runtime API — not the boot configuration —
@@ -730,6 +793,35 @@ impl AppState {
             match models.iter_mut().find(|model| model.id == entry.model) {
                 Some(model) => model.engines.push(info),
                 None => models.push(Model::new(entry.model.clone(), self.started, vec![info])),
+            }
+        }
+        // The supervised workers ride the same list once their engine
+        // can name its model: before readiness the engine list shows
+        // them, and a name that arrives late groups exactly when
+        // requests can use it. The failure detail stays on the engine
+        // list, which the worker's own loader state feeds.
+        for worker in self.workers.snapshot() {
+            let Some(model) = worker.model else {
+                continue;
+            };
+            let info = EngineInfo {
+                id: worker.id.clone(),
+                model: model.clone(),
+                // The four states the supervisor records, as the wire
+                // type's static names; the stage detail a loading
+                // worker carries stays on the engine list.
+                state: match worker.status.state.as_str() {
+                    "ready" => "ready",
+                    "failed" => "failed",
+                    "stopped" => "stopped",
+                    _ => "starting",
+                },
+                load_stage: None,
+                error: None,
+            };
+            match models.iter_mut().find(|candidate| candidate.id == model) {
+                Some(candidate) => candidate.engines.push(info),
+                None => models.push(Model::new(model, self.started, vec![info])),
             }
         }
         ModelList::new(models)

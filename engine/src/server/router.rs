@@ -59,10 +59,24 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
             get(super::hf::downloads).post(super::hf::start_download),
         )
         .route("/v1/hf/downloads/{id}", delete(super::hf::cancel_download))
+        // The proxy runs inside the authentication layer: a request
+        // the caller may not make must not reach the worker, and a
+        // request whose routing names a supervised worker skips the
+        // local handler instead of running beside it. Routes whose
+        // bodies carry none of the routing fields pass straight
+        // through.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::supervisor::proxy_to_worker,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let messages_routes = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::supervisor::proxy_to_worker,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_messages_auth,

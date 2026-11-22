@@ -26,7 +26,7 @@ use crate::EngError;
 /// page needs: the directory the weights came from, so a cache
 /// snapshot can be matched to the engine serving it.
 pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engines: Vec<serde_json::Value> = state
+    let mut engines: Vec<serde_json::Value> = state
         .entries()
         .iter()
         .map(|entry| {
@@ -53,6 +53,30 @@ pub(crate) async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json:
             row
         })
         .collect();
+    // The supervised workers ride the same list, with the state
+    // their own health poll reported.
+    for worker in state.workers().snapshot() {
+        let mut row = serde_json::json!({
+            "id": worker.id,
+            "model": worker.model,
+            "model_dir": worker.model_dir.display().to_string(),
+            "state": worker.status.state,
+            "runtime_added": true,
+            "memory_held_until_restart": false,
+            "supervised": true,
+        });
+        let cells = row.as_object_mut().expect("row is an object");
+        if let Some(stage) = worker.status.load_stage {
+            cells.insert("load_stage".into(), stage.into());
+        }
+        if let Some(error) = worker.status.error {
+            cells.insert("error".into(), serde_json::json!({ "message": error }));
+        }
+        if let Some(context) = worker.status.context_limit {
+            cells.insert("context_limit".into(), context.into());
+        }
+        engines.push(row);
+    }
     Json(serde_json::json!({ "engines": engines }))
 }
 
@@ -173,7 +197,7 @@ pub(crate) async fn add(
         // `build_config` always assembles exactly one engine; the
         // guard above keeps that assumption honest if it ever changes.
         let engine_config = engines.swap_remove(0);
-        Ok::<_, crate::server::StartupError>((config.prefix_reuse, engine_config))
+        Ok::<_, crate::server::StartupError>((args, config.prefix_reuse, engine_config))
     })
     .await
     .map_err(|_| EngError::BadRequest("engine derivation failed".into()))?
@@ -184,8 +208,35 @@ pub(crate) async fn add(
             scrub_tokenizer.as_deref(),
         ))
     })?;
-    let (file_prefix_reuse, mut engine_config) = derivation;
+    let (worker_args, file_prefix_reuse, mut engine_config) = derivation;
     engine_config.id = id.clone();
+    if state.supervised_engines() && super::run::holds_memory_until_restart(&engine_config.family) {
+        // A process-lifetime family starts a supervised worker, so
+        // stopping the engine ends the process and frees its memory:
+        // the refusal below belongs to the in-process path only.
+        return state
+            .workers()
+            .spawn(&id, &worker_args)
+            .map_err(|error| {
+                ServerError::from(EngError::BadRequest(scrub_paths(
+                    &error,
+                    &scrub_model,
+                    scrub_tokenizer.as_deref(),
+                )))
+            })
+            .map(|()| {
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "id": id,
+                        "model": engine_config.model,
+                        "model_dir": engine_config.model_dir.display().to_string(),
+                        "state": "starting",
+                        "supervised": true,
+                    })),
+                )
+            });
+    }
     refuse_pinned_family(&state, &engine_config.family)?;
     let started = tokio::task::spawn_blocking(move || {
         crate::server::run::start_one(&engine_config, file_prefix_reuse)
@@ -314,6 +365,19 @@ pub(crate) async fn remove(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     if !valid_engine_id(&id) {
         return Err(ServerError::NotFound("no such engine".into()));
+    }
+    if state.workers().contains(&id) {
+        // A supervised worker: its process ends, so the memory it
+        // held is genuinely freed — the honest answer the in-process
+        // stop cannot give.
+        state.workers().stop(&id);
+        state.drop_sessions_for(&id);
+        return Ok(Json(serde_json::json!({
+            "id": id,
+            "state": "stopped",
+            "memory_released": true,
+            "supervised": true,
+        })));
     }
     let id_for_stop = id.clone();
     let stopped = tokio::task::spawn_blocking(move || state.remove_engine(&id_for_stop))

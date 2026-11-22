@@ -101,6 +101,14 @@ pub(crate) struct Config {
     /// `sampler_trace.rs`'s contract.
     #[serde(default)]
     pub(crate) sample_trace: bool,
+    /// True when a runtime-added engine of a family that keeps its card memory for the
+    /// process lifetime (Qwen3.6 dense/moe, Flash-Next) is served by a supervised
+    /// `enginesrv serve --model` worker process instead: stopping that engine ends the
+    /// worker and frees its memory, where the in-process start holds it until restart.
+    /// The default is false: such an add is refused exactly as before, and every other
+    /// family still loads in-process whatever this key says.
+    #[serde(default)]
+    pub(crate) supervised_engines: bool,
     /// The built web frontend to serve at `/` (`web/dist` after
     /// `npm run build`). Absent: no frontend routes, as before. The
     /// shell and its hashed assets are public like `/health`; every API
@@ -417,6 +425,18 @@ mod tests {
             {"id": "e1", "model_dir": "m", "tokenizer_dir": "t", "family": "fake"}
         ]
     }"#;
+
+    #[test]
+    fn supervised_engines_is_opt_in() {
+        let config = load(VALID).expect("valid config");
+        assert!(!config.supervised_engines, "absent means false");
+        let mut value: serde_json::Value = serde_json::from_str(VALID).unwrap();
+        value["supervised_engines"] = serde_json::json!(true);
+        let config = load(&value.to_string()).expect("valid config");
+        assert!(config.supervised_engines);
+        value["supervised_engines"] = serde_json::json!("yes");
+        assert!(message(load(&value.to_string())).contains("expected a boolean"));
+    }
 
     #[test]
     fn flint_cuda_profile_is_explicit_and_family_scoped() {
