@@ -640,17 +640,20 @@ fn check_weights(dims: &MoeDims, weights: &WeightFacts) -> Result<(), EngError> 
             weights.router_shared.bytes, dims.hidden
         )));
     }
-    let gu_rows = product(&[dims.n_expert, dims.inter])?;
-    let down_rows = product(&[dims.n_expert, dims.hidden])?;
+    // The stacks hold every expert of the layer, or the slots of a cache of them: one depth in
+    // all three, at most the router's expert count.
+    let depth = weights.gate.experts;
+    let gu_rows = product(&[depth, dims.inter])?;
+    let down_rows = product(&[depth, dims.hidden])?;
     let stacks = [
         ("gate", weights.gate, gu_rows, dims.hidden),
         ("up", weights.up, gu_rows, dims.hidden),
         ("down", weights.down, down_rows, dims.inter),
     ];
     for (name, stack, rows, k) in stacks {
-        if stack.experts != dims.n_expert {
+        if stack.experts != depth || depth == 0 || depth > dims.n_expert {
             return Err(refuse(format!(
-                "the {name} stack depth {} does not equal the {} experts",
+                "the {name} stack depth {} is not the gate's {depth}, or is not within the {} experts",
                 stack.experts, dims.n_expert
             )));
         }
@@ -1048,10 +1051,12 @@ fn op_router(
     bufs: &MoeBuffers<'_>,
     dims: MoeDims,
 ) -> Result<(), EngError> {
+    // The router scores every expert of the layer: its own matrix says how many, whatever depth
+    // the expert stacks have.
     let shape = RouterShape {
         m: dims.rows,
         hidden: dims.hidden,
-        n_expert: dims.n_expert,
+        n_expert: weights.router.bytes() / (dims.hidden * F32),
         top_k: dims.top_k,
     };
     launch.ctx.router(
