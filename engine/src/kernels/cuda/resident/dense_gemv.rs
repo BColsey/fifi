@@ -14,9 +14,11 @@ use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::{DenseDtype, DenseGemvBytes};
 use crate::kernels::cuda::native::resident::dense_gemv::{
     DenseGemvRaw, GEMV_MAX_COLS, GEMV_MAX_LD, GEMV_MAX_M, GEMV_MAX_ROWS, GemvDims,
-    dense_gemv_launch, gguf_wmma_launch, typed_gemv_need, typed_wmma_need,
+    dense_gemv_launch, gguf_exact_expert_tile_launch, gguf_wmma_launch, typed_gemv_need,
+    typed_wmma_need,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
+use crate::weights::GgufType;
 
 /// `m` activation rows of `cols` values at stride `ld_x`, against a weight of `rows` rows of
 /// `cols` values; `rows` results per activation row at stride `ld_y`.
@@ -72,6 +74,50 @@ pub(crate) fn dense_gemv_bytes(
     typed_gemv_need(shape.dims(), dtype).ok_or_else(|| invalid_shape(shape))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DenseGemvGroupCounts {
+    pub(crate) wmma: usize,
+    pub(crate) exact_tiles: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupKernel {
+    Gemv,
+    Wmma,
+    ExactTile,
+}
+
+fn group_kernel(
+    shape: DenseGemvShape,
+    dtype: DenseDtype,
+    min_wmma_rows: Option<usize>,
+    exact_tile: bool,
+) -> Result<(GroupKernel, DenseGemvBytes), EngError> {
+    if let Some(need) = min_wmma_rows
+        .filter(|&rows| shape.m >= rows)
+        .and_then(|_| typed_wmma_need(shape.dims(), dtype))
+    {
+        return Ok((GroupKernel::Wmma, need));
+    }
+    let need = dense_gemv_bytes(shape, dtype)?;
+    // Mirror the native tile bounds to keep known fallbacks on the original entry.
+    // The native ABI still validates and rechecks eligibility before enqueueing.
+    let kernel = if exact_tile
+        && matches!(
+            dtype,
+            DenseDtype::PackedGguf(GgufType::Iq2Xxs | GgufType::Q20)
+        )
+        && (2..=512).contains(&shape.m)
+        && shape.rows <= 2304
+        && shape.cols <= 2304
+    {
+        GroupKernel::ExactTile
+    } else {
+        GroupKernel::Gemv
+    };
+    Ok((kernel, need))
+}
+
 fn invalid_shape(shape: DenseGemvShape) -> EngError {
     EngError::BadRequest(format!(
         "the CUDA dense matvec takes 1 to {GEMV_MAX_M} rows of activations, 1 to \
@@ -103,20 +149,22 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
     ) -> Result<(), EngError> {
-        self.dense_gemv_group_with_wmma(stream, calls, None)
+        self.dense_gemv_group_with_tiles(stream, calls, None, false)
             .map(|_| ())
     }
 
-    /// Queues mixed exact and Tensor Core projections in the supplied order and returns the
-    /// number of Tensor Core launches. An explicit row threshold allows qualified callers to
-    /// round their packed weights and activation tiles to F16 before F32 accumulation.
-    /// Unsupported formats, shapes and devices use the exact GEMV.
-    pub(crate) fn dense_gemv_group_with_wmma(
+    /// Queues the group in order. Where supported, an explicit row threshold permits WMMA
+    /// (F16 operands, F32 accumulation); only the remaining ordinary GEMVs may opt into exact
+    /// FP32 expert tiling. Validates all calls before the first launch, including capacity,
+    /// alignment, overlap and adapter ownership. Counts actual enqueues, and never retries a
+    /// native launch failure.
+    pub(crate) fn dense_gemv_group_with_tiles(
         &self,
         stream: &DeviceStream,
         calls: &[DenseGemvCall<'_>],
         min_wmma_rows: Option<usize>,
-    ) -> Result<usize, EngError> {
+        exact_tile: bool,
+    ) -> Result<DenseGemvGroupCounts, EngError> {
         self.check_launch_stream(stream)?;
         let min_wmma_rows = match min_wmma_rows {
             Some(rows) if self.mmq_device_facts()?.cc >= 700 => Some(rows),
@@ -125,28 +173,28 @@ impl CudaContext {
         let planned = calls
             .iter()
             .map(|call| {
-                let need = min_wmma_rows
-                    .filter(|&rows| call.shape.m >= rows)
-                    .and_then(|_| typed_wmma_need(call.shape.dims(), call.dtype));
-                match need {
-                    Some(need) => self
-                        .plan_dense_projection(call, need)
-                        .map(|raw| (raw, true)),
-                    None => self.plan_dense_gemv(call).map(|raw| (raw, false)),
-                }
+                let (kernel, need) =
+                    group_kernel(call.shape, call.dtype, min_wmma_rows, exact_tile)?;
+                self.plan_dense_projection(call, need)
+                    .map(|raw| (kernel, raw))
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.launch_on(stream, |raw_stream| {
-            let mut wmma_launches = 0;
-            for (call, wmma) in planned {
-                if wmma {
-                    gguf_wmma_launch(raw_stream, call)?;
-                    wmma_launches += 1;
-                } else {
-                    dense_gemv_launch(raw_stream, call)?;
+            let mut counts = DenseGemvGroupCounts::default();
+            for (kernel, call) in planned {
+                match kernel {
+                    GroupKernel::Gemv => dense_gemv_launch(raw_stream, call)?,
+                    GroupKernel::Wmma => {
+                        gguf_wmma_launch(raw_stream, call)?;
+                        counts.wmma += 1;
+                    }
+                    GroupKernel::ExactTile => {
+                        counts.exact_tiles +=
+                            usize::from(gguf_exact_expert_tile_launch(raw_stream, call)?);
+                    }
                 }
             }
-            Ok(wmma_launches)
+            Ok(counts)
         })
     }
 
@@ -182,3 +230,40 @@ pub(crate) use moe::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufM
 
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    #[test]
+    fn exact_expert_tile_only_replaces_ordinary_eligible_gemv() {
+        let iq2 = DenseDtype::PackedGguf(GgufType::Iq2Xxs);
+        let q2 = DenseDtype::PackedGguf(GgufType::Q20);
+        let q8 = DenseDtype::PackedGguf(GgufType::Q80);
+        let gate = |m| DenseGemvShape::packed(m, 2304, 2304);
+        let down = |m| DenseGemvShape::packed(m, 2304, 1152);
+        let kernel = |shape, dtype, wmma, tile| group_kernel(shape, dtype, wmma, tile).unwrap().0;
+        assert_eq!(kernel(gate(15), iq2, Some(16), false), GroupKernel::Gemv);
+        assert_eq!(
+            kernel(gate(15), iq2, Some(16), true),
+            GroupKernel::ExactTile
+        );
+        for tile in [false, true] {
+            assert_eq!(kernel(gate(16), iq2, Some(16), tile), GroupKernel::Wmma);
+            assert_eq!(kernel(down(32), q2, Some(32), tile), GroupKernel::Wmma);
+        }
+        assert_eq!(kernel(down(31), q2, Some(32), true), GroupKernel::ExactTile);
+        assert_eq!(kernel(down(512), q2, None, true), GroupKernel::ExactTile);
+        assert_eq!(kernel(gate(1), iq2, None, true), GroupKernel::Gemv);
+        assert_eq!(kernel(gate(513), iq2, None, true), GroupKernel::Gemv);
+        assert_eq!(kernel(gate(4), q8, Some(2), true), GroupKernel::Gemv);
+        for shape in [
+            DenseGemvShape::packed(4, 2305, 2304),
+            DenseGemvShape::packed(4, 2304, 2560),
+        ] {
+            assert_eq!(kernel(shape, iq2, None, true), GroupKernel::Gemv);
+        }
+        assert!(group_kernel(gate(0), iq2, None, true).is_err());
+        assert!(group_kernel(DenseGemvShape::packed(4, 2304, 2303), iq2, None, true).is_err());
+    }
+}

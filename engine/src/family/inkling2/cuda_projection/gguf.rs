@@ -52,6 +52,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     prefill_resident: bool,
     device_prefill: Option<RefCell<device_prefill::Workspace>>,
     device_prefill_wmma: bool,
+    device_prefill_exact_tile: bool,
     cold_controller: Option<cold_controller::Staging>,
     resident: ResidentExperts,
     cache: RefCell<BTreeMap<u32, cache::LayerCache>>,
@@ -673,6 +674,13 @@ impl GgufCuda {
             device_prefill_wmma: device_prefill
                 && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_WMMA").as_deref()
                     == Ok("1"),
+            device_prefill_exact_tile: device_prefill
+                && std::env::var("FIFI_INKLING_CUDA_DEVICE_EXPERT_PREFILL_EXACT_TILE").as_deref()
+                    == Ok("1")
+                // Only SM75 has component evidence. A refused diagnostic keeps the baseline.
+                && context
+                    .device_attributes()
+                    .is_ok_and(|attrs| attrs.compute_capability == (7, 5)),
             cold_controller,
             resident,
             cache: RefCell::default(),

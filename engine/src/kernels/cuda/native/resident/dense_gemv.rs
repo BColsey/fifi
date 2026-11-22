@@ -121,6 +121,13 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_gguf_exact_expert_tile_launch"]
+    fn gguf_exact_expert_tile_raw(
+        args: *const DenseGemvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        out_tile: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gguf_wmma_launch"]
     fn gguf_wmma_raw(
         args: *const DenseGemvArgsRaw,
@@ -248,7 +255,17 @@ pub(in crate::kernels::cuda) fn dense_gemv_launch(
     call: DenseGemvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, dense_gemv_raw)
+    projection_launch(stream, call, need, ProjectionEntry::Gemv).map(|_| ())
+}
+
+/// Same operands as dense GEMV. The native entry selects the exact tile or ordinary GEMV
+/// before enqueueing, and reports whether it tiled. Do not retry a launch failure.
+pub(in crate::kernels::cuda) fn gguf_exact_expert_tile_launch(
+    stream: &RawStream,
+    call: DenseGemvRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    let need = typed_gemv_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
+    projection_launch(stream, call, need, ProjectionEntry::ExactExpertTile).map(|tile| tile != 0)
 }
 
 pub(in crate::kernels::cuda) fn gguf_wmma_launch(
@@ -256,18 +273,21 @@ pub(in crate::kernels::cuda) fn gguf_wmma_launch(
     call: DenseGemvRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let need = typed_wmma_need(call.dims, call.dtype).ok_or_else(invalid_argument)?;
-    projection_launch(stream, call, need, gguf_wmma_raw)
+    projection_launch(stream, call, need, ProjectionEntry::Wmma).map(|_| ())
 }
 
-type ProjectionEntry =
-    unsafe extern "C" fn(*const DenseGemvArgsRaw, *mut c_void, *mut c_int) -> c_int;
+enum ProjectionEntry {
+    Gemv,
+    Wmma,
+    ExactExpertTile,
+}
 
 fn projection_launch(
     stream: &RawStream,
     call: DenseGemvRaw<'_>,
     need: DenseGemvBytes,
     entry: ProjectionEntry,
-) -> Result<(), DeviceFailure> {
+) -> Result<c_int, DeviceFailure> {
     check(&call, need)?;
     let dims = call.dims;
     let as_int = |v: usize| c_int::try_from(v).map_err(|_| invalid_argument());
@@ -283,13 +303,24 @@ fn projection_launch(
         weight_dtype: call.dtype.code(),
     };
     let mut stage = STAGE_NONE;
+    let mut tile = 0;
+    let stream = stream.0.as_ptr();
     // SAFETY: `check` proved every range inside its live allocation (`RawRange::new`), large
     // enough for the call, aligned (the weight to 2, x and y to 4), and the written `y` apart from
     // `w` and `x`; the entry checks the addresses again. The allocations outlive the queued work
     // (`inference_cuda_free` synchronizes first). `args` is a live local that the entry reads only
-    // during the call, `stream` is live, and `stage` is a writable c_int.
-    let status = unsafe { entry(&raw const args, stream.0.as_ptr(), &mut stage) };
-    checked(status, stage)
+    // during the call, `stream` is live, and `stage` and `tile` are writable c_ints.
+    let status = unsafe {
+        match entry {
+            ProjectionEntry::Gemv => dense_gemv_raw(&raw const args, stream, &mut stage),
+            ProjectionEntry::Wmma => gguf_wmma_raw(&raw const args, stream, &mut stage),
+            ProjectionEntry::ExactExpertTile => {
+                gguf_exact_expert_tile_raw(&raw const args, stream, &mut stage, &mut tile)
+            }
+        }
+    };
+    checked(status, stage)?;
+    Ok(tile)
 }
 
 #[cfg(test)]
@@ -329,6 +360,31 @@ mod tests {
         assert!(typed_wmma_need(dims(32, 7, 128, 127, 11), q2).is_none());
         assert!(typed_wmma_need(dims(32, 7, 128, 135, 11), DenseDtype::F32).is_none());
         assert!(typed_wmma_need(dims(i32::MAX as usize + 1, 7, 128, 135, 11), q2).is_none());
+    }
+
+    #[test]
+    fn exact_expert_tile_uses_baseline_gemv_extents_including_fallbacks() {
+        let iq2 = DenseDtype::PackedGguf(GgufType::Iq2Xxs);
+        let q2 = DenseDtype::PackedGguf(GgufType::Q20);
+        let gate = typed_gemv_need(dims(5, 2304, 2304, 2312, 2316), iq2).unwrap();
+        assert_eq!(gate.w, 2304 * 9 * 66);
+        assert_eq!(gate.x, (4 * 2312 + 2304) * 4);
+        assert_eq!(gate.y, (4 * 2316 + 2304) * 4);
+        let down = typed_gemv_need(dims(4, 2304, 1152, 1152, 2304), q2).unwrap();
+        assert_eq!(down.w, 2304 * 18 * 18);
+        assert_eq!(down.x, 4 * 1152 * 4);
+        assert_eq!(down.y, 4 * 2304 * 4);
+        // Singleton, oversize tile and other codec are valid ordinary GEMVs.
+        assert!(typed_gemv_need(dims(1, 2304, 2304, 2304, 2304), iq2).is_some());
+        assert!(typed_gemv_need(dims(513, 2305, 2560, 2560, 2305), iq2).is_some());
+        assert!(
+            typed_gemv_need(
+                dims(2, 9, 256, 256, 9),
+                DenseDtype::PackedGguf(GgufType::Q80)
+            )
+            .is_some()
+        );
+        assert!(typed_gemv_need(dims(2, 2304, 2303, 2304, 2304), iq2).is_none());
     }
 
     #[test]

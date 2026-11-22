@@ -44,12 +44,11 @@ typedef struct inference_cuda_dense_gemv_args {
 int inference_cuda_dense_gemv_launch(const inference_cuda_dense_gemv_args *args, void *stream,
                                      int *out_stage);
 
-/* Component-only opt-in: args describe one already-grouped expert matrix and
+/* Opt-in: args describe one already-grouped expert matrix and
  * its F32 activation rows. Same layout, checks and per-row arithmetic as
  * packed GEMV. Tiles IQ2_XXS (16) and Q2_0 (42) only, for 2 <= m <= 512 and
  * rows, cols <= 2304. Other valid calls use dense GEMV, never WMMA or MMQ.
- * Optional host out_tile reports 2 or 4 after a tiled enqueue, 0 otherwise.
- * No production dispatch calls this entry. */
+ * Optional host out_tile reports 2 or 4 after a tiled enqueue, 0 otherwise. */
 int inference_cuda_gguf_exact_expert_tile_launch(const inference_cuda_dense_gemv_args *args,
                                                  void *stream, int *out_stage, int *out_tile);
 

@@ -14,7 +14,9 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf,
         prefill::row_ops::{ClippedExpertCall, IndexedRankSumCall, RowGatherCall, RowShape},
-        resident::dense_gemv::{DenseDtype, DenseGemvCall, DenseGemvShape, dense_gemv_bytes},
+        resident::dense_gemv::{
+            DenseDtype, DenseGemvCall, DenseGemvGroupCounts, DenseGemvShape, dense_gemv_bytes,
+        },
     },
 };
 
@@ -166,6 +168,7 @@ struct Projections<'a> {
     caps: [f32; 2],
     dtypes: [DenseDtype; 2],
     min_wmma_rows: [Option<usize>; 2],
+    exact_tile: bool,
     matrices: BTreeMap<ExpertId, [Matrix<'a>; 2]>,
 }
 
@@ -229,7 +232,7 @@ impl GgufCuda {
             return Ok(None);
         };
         let mut output = Vec::with_capacity(routes.len());
-        let mut wmma = [0; 2];
+        let mut counts = [DenseGemvGroupCounts::default(); 2];
         for (window, routes) in routes.chunks(scratch.rows).enumerate() {
             let first = window * scratch.rows;
             let plan = RoutedWindow::prepare(&projections, layer, routes, |row, id| {
@@ -237,8 +240,9 @@ impl GgufCuda {
             })?;
             let (rows, launches) = scratch.execute(cuda, &projections, &plan)?;
             output.extend(rows);
-            for (total, count) in wmma.iter_mut().zip(launches) {
-                *total += count;
+            for (total, count) in counts.iter_mut().zip(launches) {
+                total.wmma += count.wmma;
+                total.exact_tiles += count.exact_tiles;
             }
         }
         if self.prefill_report.is_some() {
@@ -246,7 +250,9 @@ impl GgufCuda {
                 "Inkling CUDA device expert prefill {}",
                 serde_json::json!({"layer": layer, "rows": routes.len(),
                     "windows": routes.len().div_ceil(scratch.rows),
-                    "wmma_gate_calls": wmma[0], "wmma_down_calls": wmma[1]})
+                    "wmma_gate_calls": counts[0].wmma, "wmma_down_calls": counts[1].wmma,
+                    "exact_tile_gate_calls": counts[0].exact_tiles,
+                    "exact_tile_down_calls": counts[1].exact_tiles})
             );
         }
         Ok(Some(output))
@@ -296,6 +302,7 @@ impl GgufCuda {
             },
             dtypes,
             min_wmma_rows: WMMA_MIN_ROWS.map(|rows| self.device_prefill_wmma.then_some(rows)),
+            exact_tile: self.device_prefill_exact_tile,
             caps,
             matrices,
         }))
@@ -410,22 +417,22 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-    ) -> Result<(Vec<Vec<f32>>, [usize; 2]), EngError> {
+    ) -> Result<(Vec<Vec<f32>>, [DenseGemvGroupCounts; 2]), EngError> {
         let l = &plan.layout;
         let upload = self.buffer.range(0, l.flag.end)?;
         self.host.write(0, plan.upload.as_flattened())?;
         cuda.copy_from_pinned(&self.stream, &mut self.host, 0, upload)?;
-        let result = self.enqueue(cuda, projections, plan).and_then(|wmma| {
+        let result = self.enqueue(cuda, projections, plan).and_then(|counts| {
             // The status word and reduced rows are contiguous; stage them in one copy.
             let readback = self
                 .buffer
                 .range(l.flag.start, l.output.end - l.flag.start)?;
             cuda.copy_to_pinned(&self.stream, readback, &mut self.host, l.flag.start)?;
-            Ok(wmma)
+            Ok(counts)
         });
         // A launch can be refused after the upload has been queued.
         let waited = self.host.synchronize(&self.stream);
-        let wmma = result?;
+        let counts = result?;
         waited?;
         let mut flag = [0; 4];
         self.host.read(l.flag.start, &mut flag)?;
@@ -440,7 +447,7 @@ impl Scratch {
             .chunks_exact(projections.geometry.hidden)
             .map(|row| row.iter().copied().map(f32::from_ne_bytes).collect())
             .collect();
-        Ok((rows, wmma))
+        Ok((rows, counts))
     }
 
     fn enqueue(
@@ -448,7 +455,7 @@ impl Scratch {
         cuda: &CudaContext,
         projections: &Projections<'_>,
         plan: &RoutedWindow,
-    ) -> Result<[usize; 2], EngError> {
+    ) -> Result<[DenseGemvGroupCounts; 2], EngError> {
         let l = &plan.layout;
         let shape = projections.geometry;
         let count = plan.rows * shape.rank;
@@ -468,7 +475,7 @@ impl Scratch {
                 source_rows: plan.rows,
             },
         )?;
-        let gate_wmma = self.project(cuda, projections, plan, 0)?;
+        let gate = self.project(cuda, projections, plan, 0)?;
         cuda.row_clipped_expert(
             &self.stream,
             ClippedExpertCall {
@@ -483,7 +490,7 @@ impl Scratch {
                 caps: projections.caps,
             },
         )?;
-        let down_wmma = self.project(cuda, projections, plan, 1)?;
+        let down = self.project(cuda, projections, plan, 1)?;
         cuda.row_indexed_rank_sum(
             &self.stream,
             IndexedRankSumCall {
@@ -500,7 +507,7 @@ impl Scratch {
                 rank: shape.rank,
             },
         )?;
-        Ok([gate_wmma, down_wmma])
+        Ok([gate, down])
     }
 
     fn project(
@@ -509,7 +516,7 @@ impl Scratch {
         projections: &Projections<'_>,
         plan: &RoutedWindow,
         stage: usize,
-    ) -> Result<usize, EngError> {
+    ) -> Result<DenseGemvGroupCounts, EngError> {
         let l = &plan.layout;
         let pair = [(&l.gathered, &l.gate), (&l.middle, &l.down)][stage];
         let calls = plan
@@ -533,7 +540,12 @@ impl Scratch {
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
-        cuda.dense_gemv_group_with_wmma(&self.stream, &calls, projections.min_wmma_rows[stage])
+        cuda.dense_gemv_group_with_tiles(
+            &self.stream,
+            &calls,
+            projections.min_wmma_rows[stage],
+            projections.exact_tile,
+        )
     }
 }
 
