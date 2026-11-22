@@ -412,7 +412,7 @@ fn which_layer_first_differs_when_the_indexer_drops_positions() {
 /// The real file's first two layers on the card against the host forward from the file's own
 /// dequantized weights, token by token: the residual stream after each layer stays within the
 /// activation-rounding bound. The experts are placed by a budget of `FIFI_FLASH_CARD_GIB`
-/// (default 3), so the first layers stream; the host decodes each picked expert from the file.
+/// (default 10), so the first layers stream; the host decodes each picked expert from the file.
 /// Needs FIFI_FLASH_GGUF and the card.
 #[test]
 #[ignore = "needs a GPU and the real file"]
@@ -430,7 +430,7 @@ fn real_file_first_layers_follow_the_host_with_streamed_experts() {
     let gib: u64 = std::env::var("FIFI_FLASH_CARD_GIB")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(3);
+        .unwrap_or(10);
     let stacks =
         super::placement::layer_stacks(model).expect("stacks");
     let placement = super::placement::stream_plan(
