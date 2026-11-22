@@ -19,9 +19,7 @@
 #include <mutex>
 #include <unistd.h>
 #include <mach/mach.h>
-#ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <libproc.h>
-#endif
 #include <dispatch/dispatch.h>
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
