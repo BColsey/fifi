@@ -117,6 +117,35 @@ pub(crate) fn prefix_store_limits_of(
     }
 }
 
+/// The concurrent sessions a start derives for itself on the MLX arm when `max_seqs` is not set:
+/// four decode in one window. Measured on the 36 GiB Mac with the 35B-A3B 4-bit model, four
+/// clients decode at about twice the rate of one in aggregate and a lone client keeps its rate.
+pub(crate) const AUTO_MAX_SEQS: usize = 4;
+
+/// Opens an engine under `settings`, and when its `max_seqs` was derived and the memory plan
+/// refuses it (`MemoryPlan`), opens one session instead (and says so): concurrent sessions the
+/// start chose for itself are an optimization, never a reason to refuse. Any other error (a bad
+/// shard, a failed import) is not about the session count and stands, as does a value the
+/// operator set.
+pub(crate) fn open_with_fewer_sessions<T>(
+    settings: &Q36Settings,
+    mut open: impl FnMut(&Q36Settings) -> Result<T, EngError>,
+) -> Result<T, EngError> {
+    let derived_and_concurrent = settings.max_seqs_derived();
+    match open(settings) {
+        Err(error @ EngError::MemoryPlan(_)) if derived_and_concurrent => {
+            eprintln!(
+                "q36: {} concurrent sessions (derived) do not start: {error:?}; starting one session",
+                settings.max_seqs
+            );
+            let mut one = settings.clone();
+            one.max_seqs = 1;
+            open(&one)
+        }
+        other => other,
+    }
+}
+
 /// The `qwen36` object of an engine entry. Every member is optional.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1001,7 +1030,8 @@ pub(crate) struct Q36Settings {
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
     /// Whether the config named `max_seqs`. The CUDA arm sizes its sessions from the cache pool
-    /// when it did not; a named count is a cap on that.
+    /// when it did not; a named count is a cap on that. The MLX arm derives its count from the host
+    /// plan when it did not (`max_seqs_derived`).
     pub(crate) max_seqs_set: bool,
     /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
     /// six. Validated by the parse; `prefix_store_limits_of` applies it.
@@ -1383,6 +1413,12 @@ fn kv_offload_of(options: &Q36Options, backend: Backend) -> Result<Option<u64>, 
 }
 
 impl Q36Settings {
+    /// Whether the session count is the host plan's rather than the config's: the MLX arm with
+    /// more than one session and no `max_seqs` named. A memory refusal of such a count starts one
+    /// session instead (`open_with_fewer_sessions`).
+    pub(crate) fn max_seqs_derived(&self) -> bool {
+        !self.max_seqs_set && self.backend == Backend::Mlx && self.max_seqs > 1
+    }
     /// Checks the entry and its `qwen36` object (absent means all members absent); the config
     /// value wins over the environment. The backend fixes which keys are read: `Cuda` refuses
     /// the chunked-prefill budget keys by name and makes the allocator and session keys
@@ -1636,7 +1672,7 @@ impl Q36Settings {
             Some(value) => crate::kernels::ProgramLimit::new(value)?,
             None => crate::kernels::ProgramLimit::default(),
         };
-        let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
+        let max_seqs_given = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The shipped Mac profile turns the compiled decode blocks on. A host-derived start does
         // the same for the MoE family, except under speculation, whose windows the compiled
         // blocks were not measured with.
@@ -1655,6 +1691,23 @@ impl Q36Settings {
         let prefix_store_entries = match options.prefix_store_entries {
             None => None,
             Some(value) => Some(ranged("prefix_store_entries", Some(value), value, 1, 4096)?),
+        };
+        // A host-derived MoE start whose compiled decode and prefill budget already fund sessions
+        // runs `AUTO_MAX_SEQS` of them when `max_seqs` is not named: the batch worker decodes
+        // several clients' rows in one window, and a lone client takes the single-row step as
+        // before. A named count wins. (The CUDA arm sizes its sessions from its cache pool.)
+        let max_seqs_derived = options.max_seqs.is_none()
+            && backend == Backend::Mlx
+            && env.host.is_some()
+            && spec.feed_forward.is_none()
+            && !speculation.enabled()
+            && compile
+            && prefill_chunk >= MIN_PREFILL_CHUNK_ROWS
+            && prefill_budget.is_some_and(|budget| prefill_reserve.max(session_cap) < budget);
+        let max_seqs = if max_seqs_derived {
+            AUTO_MAX_SEQS
+        } else {
+            max_seqs_given
         };
         if max_seqs > 1 && backend == Backend::Cuda {
             if spec.feed_forward.is_some() {
@@ -1700,6 +1753,9 @@ impl Q36Settings {
         }
         if compile_from_host {
             derived.push("compile");
+        }
+        if max_seqs_derived {
+            derived.push("max_seqs");
         }
         if context_from_host {
             derived.push("context_limit");
@@ -1762,6 +1818,16 @@ impl Q36Settings {
                         "session_cap_bytes",
                         options.session_cap_bytes.is_some(),
                         String::new(),
+                    ),
+                },
+                NoteValue {
+                    key: "max_seqs",
+                    value: max_seqs.to_string(),
+                    source: source(
+                        "max_seqs",
+                        options.max_seqs.is_some(),
+                        "derived: concurrent sessions of a compiled MoE start the prefill budget funds"
+                            .into(),
                     ),
                 },
                 NoteValue {

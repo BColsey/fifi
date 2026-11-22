@@ -41,9 +41,16 @@ fn a_36_gib_host_with_no_members_reproduces_the_shipped_profile() {
     assert_eq!(got.context_limit, 262_144);
     assert_eq!(got.session_cap, 4 << 30);
     assert!(got.compile);
+    assert_eq!(got.max_seqs, super::settings::AUTO_MAX_SEQS);
+    assert!(got.max_seqs_derived());
     assert_eq!(
         got.derived,
-        ["cache_limit_bytes", "prefill_budget_bytes", "compile"]
+        [
+            "cache_limit_bytes",
+            "prefill_budget_bytes",
+            "compile",
+            "max_seqs"
+        ]
     );
     let line = got.host_note.expect("one startup line");
     assert!(
@@ -134,7 +141,7 @@ fn a_member_keeps_its_value_while_the_rest_derive() {
     assert_eq!(got.cache_limit, 2 * GIB);
     assert_eq!(got.prefill_budget, Some(32_212_254_720));
     assert_eq!(got.prefill_reserve, 10_880 * 262_144 + 65_863_680 + 3 * GIB);
-    assert_eq!(got.derived, ["prefill_budget_bytes", "compile"]);
+    assert_eq!(got.derived, ["prefill_budget_bytes", "compile", "max_seqs"]);
     let line = got.host_note.expect("line");
     assert!(
         line.contains("cache_limit_bytes=2147483648 (set)"),
@@ -473,4 +480,113 @@ fn a_ceiling_below_the_resident_model_sizes_the_context_from_the_staged_weights(
     let got = resolve(Some(&named), &env).unwrap();
     assert_eq!(got.context_limit, 32_768);
     assert!(got.mlx_staged_cap.is_some());
+}
+
+#[test]
+fn concurrent_sessions_derive_only_where_the_compiled_start_funds_them() {
+    let derived = resolve(None, &env(36)).expect("serves");
+    assert_eq!(derived.max_seqs, super::settings::AUTO_MAX_SEQS);
+    // A member wins, in either direction.
+    for set in [1usize, 2] {
+        let options = Q36Options {
+            max_seqs: Some(set),
+            ..Q36Options::default()
+        };
+        let got = resolve(Some(&options), &env(36)).expect("serves");
+        assert_eq!(got.max_seqs, set);
+        assert!(!got.max_seqs_derived());
+    }
+    // Without compiled decode the window cannot batch, so the start stays at one session.
+    let options = Q36Options {
+        compile: Some(false),
+        ..Q36Options::default()
+    };
+    let got = resolve(Some(&options), &env(36)).expect("serves");
+    assert_eq!((got.max_seqs, got.max_seqs_derived()), (1, false));
+    // Nothing is derived without a host: a start with no facts keeps one session.
+    let options = Q36Options {
+        cache_limit_bytes: Some(GIB),
+        ..Q36Options::default()
+    };
+    let got = Q36Settings::new(
+        Path::new("/a"),
+        Path::new("/a"),
+        Some(&options),
+        &Q36Env::default(),
+        Backend::Mlx,
+    )
+    .expect("serves");
+    assert_eq!((got.max_seqs, got.max_seqs_derived()), (1, false));
+}
+
+#[test]
+fn a_derived_concurrent_start_the_memory_refuses_opens_one_session() {
+    use super::settings::open_with_fewer_sessions;
+    use std::cell::RefCell;
+    let derived = resolve(None, &env(36)).expect("serves");
+    assert!(derived.max_seqs_derived() && derived.max_seqs > 1);
+    let tried = RefCell::new(Vec::new());
+    // The plan refuses every concurrent count and admits one session.
+    let refuse_concurrency = |settings: &Q36Settings| {
+        tried.borrow_mut().push(settings.max_seqs);
+        if settings.max_seqs > 1 {
+            Err(EngError::MemoryPlan(
+                "the session reserve does not fit".into(),
+            ))
+        } else {
+            Ok(settings.max_seqs)
+        }
+    };
+    assert_eq!(
+        open_with_fewer_sessions(&derived, refuse_concurrency).unwrap(),
+        1
+    );
+    assert_eq!(*tried.borrow(), [super::settings::AUTO_MAX_SEQS, 1]);
+
+    // A start the memory admits opens once, at the derived count.
+    tried.borrow_mut().clear();
+    let admit = |settings: &Q36Settings| {
+        tried.borrow_mut().push(settings.max_seqs);
+        Ok(settings.max_seqs)
+    };
+    assert_eq!(
+        open_with_fewer_sessions(&derived, admit).unwrap(),
+        super::settings::AUTO_MAX_SEQS
+    );
+    assert_eq!(tried.borrow().len(), 1);
+
+    // An error that is not about memory is not retried: a bad shard would load twice.
+    tried.borrow_mut().clear();
+    let broken = |settings: &Q36Settings| -> Result<usize, EngError> {
+        tried.borrow_mut().push(settings.max_seqs);
+        Err(EngError::Checkpoint("a shard is unreadable".into()))
+    };
+    assert!(open_with_fewer_sessions(&derived, broken).is_err());
+    assert_eq!(tried.borrow().len(), 1, "no retry");
+
+    // A count the operator set is never lowered: the refusal stands.
+    let options = Q36Options {
+        max_seqs: Some(2),
+        ..Q36Options::default()
+    };
+    let set = resolve(Some(&options), &env(36)).expect("serves");
+    tried.borrow_mut().clear();
+    let refuse = |settings: &Q36Settings| -> Result<usize, EngError> {
+        tried.borrow_mut().push(settings.max_seqs);
+        Err(EngError::MemoryPlan(
+            "the session reserve does not fit".into(),
+        ))
+    };
+    assert!(open_with_fewer_sessions(&set, refuse).is_err());
+    assert_eq!(*tried.borrow(), [2], "tried once, at the set count");
+
+    // One session that fails fails: there is nothing to lower.
+    let one = Q36Options {
+        max_seqs: Some(1),
+        ..Q36Options::default()
+    };
+    let single = resolve(Some(&one), &env(36)).expect("serves");
+    tried.borrow_mut().clear();
+    assert!(open_with_fewer_sessions(&single, refuse).is_err());
+    assert_eq!(tried.borrow().len(), 1);
 }

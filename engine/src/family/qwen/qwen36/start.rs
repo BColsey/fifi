@@ -19,12 +19,14 @@
 //! is dtype aware, so a BF16 engine plans its chunk exactly like an F32 engine when the budget
 //! allows one.
 
-use super::resident::executor::{Q36Executor, Q36Rules};
-use super::settings::{DiskExperts, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin_for_spec};
+use super::resident::executor::{Q36Executor, Q36Rules, Q36Session};
+use super::settings::{
+    DiskExperts, NO_BUDGET_PIECE, Q36Settings, open_with_fewer_sessions, tokenizer_pin_for_spec,
+};
 use crate::family::mlx_budget::DeviceBudget;
 use crate::{
     EngError,
-    sched::worker::{Engine, ReadyNote, spawn_engine_noted},
+    sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
     tokenizer::TokenizerBundle,
 };
 
@@ -74,7 +76,7 @@ pub(crate) fn start(
         EngError::BadRequest("engine config: the worker piece exceeds usize".into())
     })?;
     let owned = settings.clone();
-    let rules = rules_of(settings, eos, sampler_vocab);
+    let rules = rules_of(settings, eos.clone(), sampler_vocab);
     // The eviction-cliff boot report, once per engine: the limits the rules carry are the
     // ones the executor builds the store with, so this is the effective shape at ready
     // time. The budget an entry charges is the SESSION CAP (`SessionBudget::new(rules.
@@ -96,70 +98,82 @@ pub(crate) fn start(
         eprintln!("{line}");
     }
     let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
-        let device = DeviceBudget::detect()?;
-        stages.begin("opening the model");
-        let (disk_setting, ignored) =
-            DiskExperts::of(std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").as_deref());
-        if let Some(reason) = ignored {
-            eprintln!(
-                "q36: FIFI_Q36_MLX_DISK_EXPERTS ignored: {reason}; the placement is automatic"
-            );
-        }
-        // Without a device budget of its own, a start is sized from the memory budget (the one
-        // rule every MLX family reads) when its host plan streams the routed experts, when
-        // `FIFI_Q36_MLX_DISK_EXPERTS=1` forces streaming, or when its resident model does not fit.
-        let force_stream = disk_setting == DiskExperts::On;
-        let device = match device {
-            Some(device) => Some(device),
-            None => match crate::family::mem::sizing_for(
-                &owned.artifact,
-                owned.mlx_staged_cap,
-                force_stream,
-            ) {
-                Some((because, memory)) => {
-                    eprintln!("{}", because.note(memory.budget()));
-                    Some(DeviceBudget::from_memory(memory)?)
-                }
-                None => None,
-            },
-        };
-        // Automatic and `1` let the placement choose by fit; `0` keeps the experts resident, so a
-        // start that does not fit is refused before any import.
-        let disk_experts = disk_setting != DiskExperts::Off;
-        let (mut executor, session) = if let Some(device) = device {
-            Q36Executor::open_for_device(&owned, rules, device, disk_experts, force_stream)?
-        } else {
-            Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
-        };
-        if owned.speculation.enabled() {
-            executor.set_speculation(&owned.speculation)?;
-            eprintln!(
-                "q36: speculation on: up to {} draft(s), ngram, verify window on the chunk path",
-                owned.speculation.num_draft_tokens
-            );
-        }
-        stages.begin("planning the prefill chunk");
-        let (delta_warmup, moe_warmup, attn_warmup) = executor.compile_warmup_seconds();
-        if !delta_warmup.is_empty() || !moe_warmup.is_empty() || !attn_warmup.is_empty() {
-            let total = |seconds: &[f64]| seconds.iter().sum::<f64>();
-            eprintln!(
-                "q36 compile: warm-up traced {} delta program(s) in {:.3} s, {} moe program(s) \
-                 in {:.3} s, and {} attn program(s) in {:.3} s",
-                delta_warmup.len(),
-                total(delta_warmup),
-                moe_warmup.len(),
-                total(moe_warmup),
-                attn_warmup.len(),
-                total(attn_warmup)
-            );
-        }
-        if let Some(line) = plan_prefill(&mut executor, &owned, device)? {
-            eprintln!("{line}");
-        }
-        executor.enable_disk_tier(&owned)?;
-        Ok((executor, session))
+        open_with_fewer_sessions(&owned, |attempt| {
+            let rules = rules_of(attempt, eos.clone(), sampler_vocab);
+            open_engine(attempt, rules, stages)
+        })
     })?;
     Ok((engine, bundle))
+}
+
+/// Opens the executor and its first session for `owned`: the device budget, the model, the
+/// compile warm-up, the prefill plan and the disk tier. Everything native is built here, on the
+/// engine thread.
+fn open_engine(
+    owned: &Q36Settings,
+    rules: Q36Rules,
+    stages: &Stages<'_>,
+) -> Result<(Q36Executor, Q36Session), EngError> {
+    let device = DeviceBudget::detect()?;
+    stages.begin("opening the model");
+    let (disk_setting, ignored) =
+        DiskExperts::of(std::env::var_os("FIFI_Q36_MLX_DISK_EXPERTS").as_deref());
+    if let Some(reason) = ignored {
+        eprintln!("q36: FIFI_Q36_MLX_DISK_EXPERTS ignored: {reason}; the placement is automatic");
+    }
+    // Without a device budget of its own, a start is sized from the memory budget (the one
+    // rule every MLX family reads) when its host plan streams the routed experts, when
+    // `FIFI_Q36_MLX_DISK_EXPERTS=1` forces streaming, or when its resident model does not fit.
+    let force_stream = disk_setting == DiskExperts::On;
+    let device = match device {
+        Some(device) => Some(device),
+        None => match crate::family::mem::sizing_for(
+            &owned.artifact,
+            owned.mlx_staged_cap,
+            force_stream,
+        ) {
+            Some((because, memory)) => {
+                eprintln!("{}", because.note(memory.budget()));
+                Some(DeviceBudget::from_memory(memory)?)
+            }
+            None => None,
+        },
+    };
+    // Automatic and `1` let the placement choose by fit; `0` keeps the experts resident, so a
+    // start that does not fit is refused before any import.
+    let disk_experts = disk_setting != DiskExperts::Off;
+    let (mut executor, session) = if let Some(device) = device {
+        Q36Executor::open_for_device(owned, rules, device, disk_experts, force_stream)?
+    } else {
+        Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?
+    };
+    if owned.speculation.enabled() {
+        executor.set_speculation(&owned.speculation)?;
+        eprintln!(
+            "q36: speculation on: up to {} draft(s), ngram, verify window on the chunk path",
+            owned.speculation.num_draft_tokens
+        );
+    }
+    stages.begin("planning the prefill chunk");
+    let (delta_warmup, moe_warmup, attn_warmup) = executor.compile_warmup_seconds();
+    if !delta_warmup.is_empty() || !moe_warmup.is_empty() || !attn_warmup.is_empty() {
+        let total = |seconds: &[f64]| seconds.iter().sum::<f64>();
+        eprintln!(
+            "q36 compile: warm-up traced {} delta program(s) in {:.3} s, {} moe program(s) \
+             in {:.3} s, and {} attn program(s) in {:.3} s",
+            delta_warmup.len(),
+            total(delta_warmup),
+            moe_warmup.len(),
+            total(moe_warmup),
+            attn_warmup.len(),
+            total(attn_warmup)
+        );
+    }
+    if let Some(line) = plan_prefill(&mut executor, owned, device)? {
+        eprintln!("{line}");
+    }
+    executor.enable_disk_tier(owned)?;
+    Ok((executor, session))
 }
 
 /// Plans the chunked prefill of `executor` and returns the line to log. The budget comes from
