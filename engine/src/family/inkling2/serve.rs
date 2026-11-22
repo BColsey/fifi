@@ -7,13 +7,16 @@ use super::DEFAULT_TEXT_CONTEXT;
 use super::{
     TextBackend,
     cpu_forward::{CpuForward, PrefixState},
+    phase_profile::{Step, Work},
 };
 use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        sampler::Sampler,
         session::{
             DecodeSession, Limits, PrefixStore, SaveKind, StoreLimits, TokenStepper, check_prompt,
+            sample_logits,
         },
         speculate::{driver::Speculator, dspark::DsparkDrafter},
     },
@@ -215,6 +218,18 @@ fn enable_grouped_verify(forward: &mut CpuForward) -> bool {
     }
 }
 
+impl CpuForward {
+    pub(super) fn sample_target(
+        &self,
+        logits: &[f32],
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32, EngError> {
+        let _span = self.phase_span(Work::Sampling);
+        sample_logits(Self::OPERATION, logits, sampler, sampler_vocab)
+    }
+}
+
 impl TokenStepper for CpuForward {
     const OPERATION: &'static str = "inkling2_text";
 
@@ -235,6 +250,16 @@ impl TokenStepper for CpuForward {
             operation: Self::OPERATION,
             message: "the output projection returned no logits".into(),
         })
+    }
+
+    fn next_token(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32, EngError> {
+        let logits = self.logits(token)?;
+        self.sample_target(&logits, sampler, sampler_vocab)
     }
 
     fn fed(&self) -> usize {
@@ -414,6 +439,20 @@ struct TextExecutor {
 }
 
 impl TextExecutor {
+    fn finish_profile_step(&self, step: Step, tokens: usize) {
+        if let Some(profile) = &self.forward.phase_profile {
+            profile.finish(step, self.forward.position(), tokens);
+        }
+    }
+
+    fn report_profile(&mut self, completed: bool) {
+        if let Some(profile) = &mut self.forward.phase_profile
+            && let Some(receipt) = profile.take_receipt(completed)
+        {
+            eprintln!("Inkling GGUF phases {receipt}");
+        }
+    }
+
     fn report_speculation(&mut self) {
         if let Some(speculator) = &mut self.speculator
             && speculator.stats.used()
@@ -435,12 +474,25 @@ impl ExecutorOps for TextExecutor {
     }
 
     fn reset(&mut self, session: &mut Self::Session) -> Result<(), EngError> {
+        self.report_profile(false);
         session.reset(&mut self.forward)
     }
 
     fn prefill(&mut self, session: &mut Self::Session, tokens: &[u32]) -> Result<(), EngError> {
+        let step = self
+            .forward
+            .phase_profile
+            .as_ref()
+            .map(|profile| profile.begin_prefill(self.forward.position()));
         let context = self.forward.context;
-        session.prefill(&mut self.forward, tokens, context)
+        let result = session.prefill(&mut self.forward, tokens, context);
+        if let Some(step) = step {
+            self.finish_profile_step(step, 0);
+            if result.is_err() {
+                self.report_profile(false);
+            }
+        }
+        result
     }
 
     fn decode(
@@ -453,12 +505,23 @@ impl ExecutorOps for TextExecutor {
             sampler_vocab: self.forward.vocab_size() as usize,
             context_limit: self.forward.context,
         };
-        let Some(speculator) = &mut self.speculator else {
-            return session.decode(&mut self.forward, generation, &limits);
+        let step = self
+            .forward
+            .phase_profile
+            .as_ref()
+            .map(|profile| profile.begin_decode(self.forward.position()));
+        let batch = match &mut self.speculator {
+            Some(speculator) => speculator.decode(session, &mut self.forward, generation, &limits),
+            None => session.decode(&mut self.forward, generation, &limits),
         };
-        let batch = speculator.decode(session, &mut self.forward, generation, &limits);
-        if batch.as_ref().is_ok_and(|batch| batch.finish.is_some()) || batch.is_err() {
+        if let Some(step) = step {
+            self.finish_profile_step(step, batch.as_ref().map_or(0, |batch| batch.tokens.len()));
+        }
+        if (self.speculator.is_some() || self.forward.phase_profile.is_some())
+            && (batch.as_ref().is_ok_and(|batch| batch.finish.is_some()) || batch.is_err())
+        {
             self.report_speculation();
+            self.report_profile(batch.is_ok());
         }
         batch
     }

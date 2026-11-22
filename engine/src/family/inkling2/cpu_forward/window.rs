@@ -2,13 +2,15 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::family::session::TokenStepper;
+
 use super::{CpuForward, ForwardRow, VisitState, bad};
 use crate::{
     EngError,
     family::{
         inkling2::cpu_attention::VisitUndo,
         sampler::Sampler,
-        session::{TokenStepper, sample_logits},
         speculate::{
             config::MAX_DRAFT_ROWS,
             driver::{DraftOutput, TargetConditioning, WindowModel},
@@ -141,6 +143,7 @@ impl DraftOutput for CpuForward {
         if hidden.len() != self.hidden() {
             return Err(bad("draft hidden row does not match the Inkling head"));
         }
+        let _span = self.phase_span(super::Work::DraftVocab);
         self.project_logits(hidden)
     }
 
@@ -152,7 +155,10 @@ impl DraftOutput for CpuForward {
         cap: f32,
     ) -> Result<Option<u32>, EngError> {
         match &self.weights {
-            super::Weights::Gguf(weights) => weights.draft_greedy(rows, vocab, cap),
+            super::Weights::Gguf(weights) => {
+                let _span = self.phase_span(super::Work::DraftVocab);
+                weights.draft_greedy(rows, vocab, cap)
+            }
             super::Weights::Native(_) => Ok(None),
         }
     }
@@ -202,7 +208,7 @@ impl WindowModel for CpuForward {
             .ok_or_else(|| bad("verify window does not contain the requested row"))?;
         // The acceptance loop draws only the prefix it reaches.
         let logits = self.logits_for_head(&row.head_input)?;
-        sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab)
+        self.sample_target(&logits, sampler, sampler_vocab)
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<(), EngError> {

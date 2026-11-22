@@ -317,6 +317,7 @@ impl CpuForward {
         prefix: &str,
         inputs: Vec<Vec<f32>>,
     ) -> Result<Vec<MlpRow>, EngError> {
+        let _span = self.phase_span(super::Work::Router);
         let input_rows: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
         let logits =
             weights.prefill_router_logits(&format!("{prefix}.gate.weight"), &input_rows)?;
@@ -356,6 +357,7 @@ impl CpuForward {
         prefix: &str,
         mlp: &[MlpRow],
     ) -> Result<Vec<Vec<f32>>, EngError> {
+        let span = self.phase_span(super::Work::Experts);
         let routes: Vec<_> = mlp
             .iter()
             .map(|row| PrefillRoute {
@@ -387,6 +389,7 @@ impl CpuForward {
             })?
         };
         let Some(batch) = batch else {
+            drop(span);
             return mlp
                 .iter()
                 .map(|row| self.moe_with_route(layer, prefix, &row.input, &row.route))

@@ -9,6 +9,7 @@ use super::{
     cpu_attention::VisitState,
     cpu_weights::{NativeWeights, Weights},
     gguf_weights::{GgufPlan, Metadata, gguf_path},
+    phase_profile::{PhaseProfile, Span, Work},
 };
 use crate::{EngError, expert_tier::ExpertId};
 
@@ -55,6 +56,7 @@ pub(super) struct CpuForward {
     pub(super) math: TextMath,
     pub(super) weights: Weights,
     pub(super) context: usize,
+    pub(super) phase_profile: Option<Box<PhaseProfile>>,
     visits: Vec<LayerVisit>,
     state: Vec<VisitState>,
     position: usize,
@@ -160,6 +162,8 @@ impl CpuForward {
             let weights = NativeWeights::open(directory, &spec)?;
             (spec, config, Weights::Native(Box::new(weights)))
         };
+        let profile = matches!(&weights, Weights::Gguf(_))
+            && std::env::var("FIFI_INKLING_GGUF_PHASE_PROFILE").as_deref() == Ok("1");
         let visits = spec.visits();
         let state = (0..visits.len()).map(|_| VisitState::default()).collect();
         Ok(Self {
@@ -167,6 +171,7 @@ impl CpuForward {
             math: config.text_config,
             weights,
             context,
+            phase_profile: profile.then(Box::default),
             visits,
             state,
             position: 0,
@@ -183,6 +188,10 @@ impl CpuForward {
             #[cfg(all(feature = "native-cuda", target_os = "linux"))]
             grouped_draft_prefill: false,
         })
+    }
+
+    pub(super) fn phase_span(&self, work: Work) -> Option<Span<'_>> {
+        self.phase_profile.as_ref()?.span(work)
     }
 
     pub(super) fn hidden(&self) -> usize {
@@ -427,6 +436,7 @@ impl CpuForward {
     }
 
     fn logits_for_head(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {
+        let _span = self.phase_span(Work::TargetVocab);
         let mut logits = self.project_logits(hidden)?;
         for value in &mut logits {
             *value = softcap(*value, self.math.final_logit_softcapping);
@@ -578,6 +588,7 @@ impl CpuForward {
         let Some(bank) = bank else {
             return Ok(());
         };
+        let _span = self.phase_span(Work::Controller);
         let (kind, offset) = match role {
             Role::Query => ("cross_pass_queries", 0),
             Role::Key => ("cross_pass_kv_queries", 0),
@@ -616,6 +627,7 @@ impl CpuForward {
     }
 
     fn moe_route(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<MoeRoute, EngError> {
+        let _span = self.phase_span(Work::Router);
         let experts = self.spec.n_routed_experts as usize;
         let logits = self
             .weights
@@ -664,6 +676,7 @@ impl CpuForward {
         input: &[f32],
         route: &MoeRoute,
     ) -> Result<Vec<f32>, EngError> {
+        let _span = self.phase_span(Work::Experts);
         let gate_up = format!("{prefix}.experts.w13_weight");
         let down = format!("{prefix}.experts.w2_weight");
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -4,7 +4,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use super::cpu_forward::{CpuForward, dot, rms_norm, sigmoid};
 use super::cpu_weights::Projection;
-use super::{Attention, LayerVisit};
+use super::{Attention, LayerVisit, phase_profile::Work};
 use crate::EngError;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -142,6 +142,7 @@ impl CpuForward {
         let device_output = if let Weights::Gguf(weights) = &self.weights
             && let Some((context, attention)) = weights.resident_attention()
         {
+            let _span = self.phase_span(Work::DeviceAttention);
             Some(attention.step(
                 context,
                 visit.state_slot,
@@ -169,6 +170,7 @@ impl CpuForward {
         let out = if let Some(out) = device_output {
             out
         } else {
+            let _span = self.phase_span(Work::CpuAttention);
             let table = self.weights.vec(
                 &format!("{attn}.rel_logits_proj.proj"),
                 self.math.d_rel * self.math.rel_extent,
@@ -179,9 +181,11 @@ impl CpuForward {
             }
             out
         };
-        let raw = self
-            .weights
-            .project(&format!("{attn}.wo_ud.weight"), &out, self.hidden())?;
+        let raw = {
+            let _span = self.phase_span(Work::Projection);
+            self.weights
+                .project(&format!("{attn}.wo_ud.weight"), &out, self.hidden())?
+        };
         self.output_conv(
             raw,
             &format!("{layer}.attn_sconv.weight"),
@@ -270,6 +274,7 @@ impl CpuForward {
                 rows,
             })
         });
+        let _span = self.phase_span(Work::Projection);
         run(calls)
     }
 
@@ -311,6 +316,7 @@ impl CpuForward {
         conv: &mut CausalConv,
     ) -> Result<Vec<f32>, EngError> {
         let taps = self.math.sconv_kernel_size;
+        let _span = self.phase_span(Work::Convolution);
         let channels = heads.kv_channels();
         let (name, dynamic) = if coefficients.is_empty() {
             ("weight", None)
@@ -382,6 +388,7 @@ impl CpuForward {
         state: &mut CausalConv,
     ) -> Result<Vec<f32>, EngError> {
         let taps = self.math.sconv_kernel_size;
+        let _span = self.phase_span(Work::Convolution);
         let kernel = self.weights.vec(name, input.len() * taps)?;
         Ok(state.apply(input, &kernel, taps, None))
     }

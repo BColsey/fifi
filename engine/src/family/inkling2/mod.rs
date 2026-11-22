@@ -18,6 +18,8 @@ mod dspark;
 #[cfg(target_pointer_width = "64")]
 mod gguf_weights;
 #[cfg(target_pointer_width = "64")]
+mod phase_profile;
+#[cfg(target_pointer_width = "64")]
 mod serve;
 
 #[cfg(target_pointer_width = "64")]
