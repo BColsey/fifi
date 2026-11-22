@@ -15,9 +15,12 @@ use crate::{EngError, expert_tier::ExpertId};
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod controller_batch;
+mod depth_mix;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod prefill;
 mod window;
+
+use depth_mix::Stream;
 
 const MIX_EPS: f32 = 1e-6;
 pub(super) const ROUTE_NORMALIZATION_FLOOR: f32 = 1.0 / 16384.0;
@@ -60,6 +63,7 @@ pub(super) struct CpuForward {
     pub(super) weights: Weights,
     pub(super) context: usize,
     pub(super) phase_profile: Option<Box<PhaseProfile>>,
+    cache_depth_mix: bool,
     visits: Vec<LayerVisit>,
     state: Vec<VisitState>,
     position: usize,
@@ -120,12 +124,6 @@ impl<'a> TapRow<'a> {
     }
 }
 
-#[derive(Clone)]
-struct Stream {
-    blocks: Vec<Vec<f32>>,
-    current: Vec<f32>,
-}
-
 struct MessageBank {
     first_block: usize,
     stream: Stream,
@@ -176,8 +174,14 @@ impl CpuForward {
             let weights = NativeWeights::open(directory, &spec)?;
             (spec, config, Weights::Native(Box::new(weights)))
         };
-        let profile = matches!(&weights, Weights::Gguf(_))
-            && std::env::var("FIFI_INKLING_GGUF_PHASE_PROFILE").as_deref() == Ok("1");
+        let gguf = matches!(&weights, Weights::Gguf(_));
+        let profile =
+            gguf && std::env::var("FIFI_INKLING_GGUF_PHASE_PROFILE").as_deref() == Ok("1");
+        let cache_depth_mix =
+            gguf && std::env::var("FIFI_INKLING_GGUF_CACHE_DEPTH_MIX").as_deref() == Ok("1");
+        if cache_depth_mix {
+            eprintln!("Inkling GGUF depth mix cache enabled");
+        }
         let visits = spec.visits();
         let state = (0..visits.len()).map(|_| VisitState::default()).collect();
         Ok(Self {
@@ -186,6 +190,7 @@ impl CpuForward {
             weights,
             context,
             phase_profile: profile.then(Box::default),
+            cache_depth_mix,
             visits,
             state,
             position: 0,
@@ -397,10 +402,7 @@ impl CpuForward {
             .weights
             .row("model.llm.embed.weight", id as usize, self.hidden())?;
         self.norm(&mut input, "model.llm.embed_norm.weight")?;
-        Ok(Stream {
-            blocks: Vec::new(),
-            current: input,
-        })
+        Ok(Stream::new(input, self.cache_depth_mix))
     }
 
     fn forward(
@@ -426,7 +428,7 @@ impl CpuForward {
             let start = core.core_start + pass * width;
             if pass > 0 {
                 bank = Some(MessageBank {
-                    first_block: prelude.blocks.len() + 1,
+                    first_block: prelude.block_count() + 1,
                     stream: std::mem::replace(&mut stream, prelude.clone()),
                 });
             }
@@ -481,7 +483,7 @@ impl CpuForward {
         taps: &mut TapRow<'_>,
     ) -> Result<(), EngError> {
         for &visit in visits {
-            taps.capture(visit.state_slot, &stream.current);
+            taps.capture(visit.state_slot, stream.current());
             self.layer(visit, &mut state[visit.state_slot], stream, bank)?;
         }
         Ok(())
@@ -545,11 +547,9 @@ impl CpuForward {
         };
         let attn = self.attention(layer, visit, state, projected)?;
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
-            stream
-                .blocks
-                .push(std::mem::replace(&mut stream.current, attn));
+            stream.seal(attn);
         } else {
-            add(&mut stream.current, &attn, 1.0);
+            stream.add_current(&attn);
         }
 
         Ok(stream.mix(0, &query))
@@ -574,7 +574,7 @@ impl CpuForward {
         stream: &mut Stream,
         mlp: Vec<f32>,
     ) -> Result<(), EngError> {
-        add(&mut stream.current, &self.mlp_conv(mlp, layer, state)?, 1.0);
+        stream.add_current(&self.mlp_conv(mlp, layer, state)?);
         Ok(())
     }
 
@@ -641,7 +641,7 @@ impl CpuForward {
         role_index: usize,
     ) -> Result<Vec<f32>, EngError> {
         let Some(query_index) = visit.weight_layer.checked_sub(1) else {
-            return Ok(stream.current.clone());
+            return Ok(stream.current().to_vec());
         };
         let row = if visit.attention == Attention::Local {
             0
@@ -1026,38 +1026,6 @@ impl TextMath {
     }
 }
 
-impl Stream {
-    fn mix(&self, first_block: usize, query: &[f32]) -> Vec<f32> {
-        let states = self.blocks[first_block..]
-            .iter()
-            .rev()
-            .chain(std::iter::once(&self.current));
-        let scale = (query.len() as f32).sqrt().recip();
-        let rows = states
-            .map(|state| {
-                let mut norm = state.clone();
-                rms_norm(&mut norm, MIX_EPS);
-                (dot(&norm, query) * scale, norm)
-            })
-            .collect::<Vec<_>>();
-        let peak = rows
-            .iter()
-            .map(|(score, _)| *score)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut mass = 0.0;
-        let mut result = vec![0.0; query.len()];
-        for (score, state) in rows {
-            let weight = (score - peak).exp();
-            mass += weight;
-            add(&mut result, &state, weight);
-        }
-        for value in &mut result {
-            *value /= mass;
-        }
-        result
-    }
-}
-
 pub(super) fn route(scores: &[f32], bias: &[f32], count: usize) -> Result<Vec<usize>, EngError> {
     let mut order: Vec<(usize, f32)> = scores
         .iter()
@@ -1105,19 +1073,6 @@ fn routing_uses_bias_to_rank_and_orders_ties_by_expert() {
         route(&[0.9, 0.2, 0.5, 0.5], &[0.0, 1.0, 0.0, 0.0], 3).unwrap(),
         [1, 0, 2]
     );
-}
-
-#[test]
-fn depth_mix_can_exclude_the_first_core_boundary() {
-    let stream = Stream {
-        blocks: vec![vec![0.0, 2.0]],
-        current: vec![2.0, 0.0],
-    };
-    let both = stream.mix(0, &[0.0; 2]);
-    let current = stream.mix(1, &[0.0; 2]);
-    assert!((both[0] - both[1]).abs() < 1e-6);
-    assert!((current[0] - std::f32::consts::SQRT_2).abs() < 1e-6);
-    assert_eq!(current[1], 0.0);
 }
 
 #[test]

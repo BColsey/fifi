@@ -130,7 +130,7 @@ impl DraftOutput for CpuForward {
         if token >= self.vocab_size() {
             return Err(bad("draft anchor is outside the Inkling vocabulary"));
         }
-        Ok(self.embed(token)?.current)
+        Ok(self.embed(token)?.into_current())
     }
 
     fn project(&self, hidden: &[f32]) -> Result<Vec<f32>, EngError> {

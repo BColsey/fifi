@@ -39,7 +39,7 @@ impl PromptRow<'_> {
                 .as_ref()
                 .ok_or_else(|| bad("Inkling prefill lost its core prelude"))?;
             self.bank = Some(MessageBank {
-                first_block: prelude.blocks.len() + 1,
+                first_block: prelude.block_count() + 1,
                 stream: std::mem::replace(&mut self.stream, prelude.clone()),
             });
         }
@@ -104,7 +104,10 @@ impl CpuForward {
             .count() as u128;
 
         // Current stream, prelude, prior pass bank, and a transient stream clone.
-        let stream_values = 4 * (blocks + 1) * hidden;
+        // Bound the optional current-row cache for each stream, even though
+        // prelude clones and message banks share immutable normalized rows.
+        let cached_rows = if self.cache_depth_mix { 4 } else { 0 };
+        let stream_values = (4 * (blocks + 1) + cached_rows) * hidden;
         // Routed contributions, MLP input, accumulated output, and staging
         // copies of the input, output, and gate/up and down intermediates.
         let mut projection_values = (top_k + 6) * hidden + 6 * middle;
@@ -297,7 +300,7 @@ impl CpuForward {
             None
         };
         let inputs = rows.iter_mut().map(|row| {
-            row.taps.capture(visit.state_slot, &row.stream.current);
+            row.taps.capture(visit.state_slot, row.stream.current());
             if let Some(journal) = &mut row.journal {
                 journal.attention =
                     Some(state.checkpoint_attention(self.kv_capacity(visit.attention)));
