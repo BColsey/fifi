@@ -341,6 +341,84 @@ fn mapped_checkpoint_projections_match_host_dots() {
     );
 }
 
+#[test]
+#[ignore = "needs pinned expert row samples and an admitted CUDA device"]
+fn mapped_expert_rows_match_indexed_cuda_matvec() {
+    use crate::{kernels::cuda::resident::matvec_expert::ExpertMatvecCall, weights::dequantize};
+    let model = projection_model();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut checked = 0;
+    for (tensor, expert) in projection_samples(&model).filter(|(_, e)| e.is_some()) {
+        let x: Vec<f32> = (0..tensor.dims[0])
+            .map(|n| if n % 5 < 2 { -1.0 } else { 1.0 })
+            .collect();
+        let bytes = mapped_blocks(&model, tensor, expert, 1..4).unwrap();
+        assert!(bytes.iter().any(|&v| v != 0));
+        let weights = dequantize(tensor.ty, &bytes).unwrap();
+        let stride = bytes.len() / 3;
+        let mut padded = bytes.clone();
+        padded.resize(4 * stride, 0);
+        let w = ctx.allocate(padded.len()).unwrap();
+        w.write_at(&stream, 0, &padded).unwrap();
+        let input: Vec<u8> = x.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let xd = ctx.allocate(input.len()).unwrap();
+        xd.write_at(&stream, 0, &input).unwrap();
+        let qbytes = q8_1_bytes(x.len(), 1).unwrap();
+        let q = ctx.allocate(qbytes).unwrap();
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: xd.range(0, input.len()).unwrap(),
+                y: q.range(0, qbytes).unwrap(),
+                k: x.len(),
+                ncols: 1,
+            },
+        )
+        .unwrap();
+        let ids = ctx.allocate(4).unwrap();
+        ids.write_at(&stream, 0, &0i32.to_ne_bytes()).unwrap();
+        let y = ctx.allocate(16).unwrap();
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty: QuantType::from_gguf(tensor.ty).unwrap(),
+                w_stack: w.range(0, padded.len()).unwrap(),
+                ids: ids.range(0, 4).unwrap(),
+                x_q8: q.range(0, qbytes).unwrap(),
+                x_per_slot: false,
+                y: y.range(0, 16).unwrap(),
+                y_slot_stride: 4,
+                k: x.len(),
+                rows: 4,
+                n_expert: 1,
+                n_used: 1,
+                glu_gate: None,
+            },
+        )
+        .unwrap();
+        let mut out = [0u8; 16];
+        y.read_at(&stream, 0, &mut out).unwrap();
+        for (chunk, row) in out
+            .chunks_exact(4)
+            .take(3)
+            .zip(weights.chunks_exact(x.len()))
+        {
+            let got = f32::from_ne_bytes(chunk.try_into().unwrap());
+            let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+            let scale: f32 = row.iter().map(|v| v.abs()).sum();
+            assert!(
+                (got - want).abs() <= 0.003 * scale + 1e-5,
+                "{} got {got}, expected {want}",
+                tensor.name
+            );
+        }
+        eprintln!("checked {} {:?}", tensor.name, tensor.ty);
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "expected gate, up and down expert stacks");
+}
+
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
 #[test]
 #[ignore = "requires the complete pinned GGUF and an admitted CUDA device"]
