@@ -202,6 +202,123 @@ fn packed_expert_stacks_run_indexed_cuda_matvec() {
     }
 }
 
+fn split_expert_fixture() -> (
+    super::testkit::Written,
+    GgufModel,
+    super::expert_layout::ExpertLayout,
+    super::expert_layout::ExpertStacks,
+    Vec<u8>,
+) {
+    use super::{
+        expert_layout::{ExpertLayout, ExpertStacks},
+        testkit::{Spec, write_flash},
+    };
+    let mut spec = Spec {
+        shards: 4,
+        ..Spec::default()
+    };
+    spec.expert_types[0] = (GgufType::Q80, GgufType::Q80);
+    let file = write_flash(&spec);
+    let model = GgufModel::open(&file.first).unwrap().unwrap();
+    let layout = ExpertLayout::for_layer(&model, 0).unwrap();
+    let stacks = ExpertStacks::new(&layout, 2).unwrap();
+    for (part_index, part) in layout.parts.iter().enumerate() {
+        let tensor = model.map().get(part.role, Some(0)).unwrap();
+        let mut payload = vec![0u8; part.bytes.len()];
+        for block in payload.chunks_exact_mut(34) {
+            block[..2].copy_from_slice(&0x3800u16.to_le_bytes());
+            block[2..].fill((part_index + 1) as u8);
+        }
+        file.patch(&tensor.name, part.bytes.len() as u64, &payload);
+    }
+    let mut record = vec![0; layout.bytes];
+    layout.read(&model, 0, 1, &mut record).unwrap();
+    (file, model, layout, stacks, record)
+}
+
+#[test]
+fn split_gguf_expert_fixture_builds_valid_q8_records() {
+    let (_file, _model, layout, stacks, record) = split_expert_fixture();
+    let mut bank = vec![0; stacks.bytes];
+    stacks.copy_record(&layout, 1, &record, &mut bank).unwrap();
+    for (i, part) in layout.parts.iter().enumerate() {
+        let data = &bank[stacks.slot(i, 1).unwrap()];
+        assert_eq!(data.len(), part.bytes.len());
+        for block in data.chunks_exact(34) {
+            assert_eq!(&block[..2], &0x3800u16.to_le_bytes());
+            assert!(block[2..].iter().all(|v| *v == (i + 1) as u8));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires admitted CUDA device; synthetic split GGUF full expert"]
+fn split_gguf_expert_upload_and_indexed_matvec() {
+    use crate::kernels::cuda::resident::matvec_expert::ExpertMatvecCall;
+    let (_file, model, layout, stacks, record) = split_expert_fixture();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let bank = ctx.allocate(stacks.bytes).unwrap();
+    stacks
+        .upload_record(&layout, 1, &record, &bank, &stream)
+        .unwrap();
+    let ids = ctx.allocate(4).unwrap();
+    ids.write_at(&stream, 0, &1i32.to_ne_bytes()).unwrap();
+    for (i, part) in layout.parts.iter().enumerate() {
+        let tensor = model.map().get(part.role, Some(0)).unwrap();
+        let k = tensor.dims[0] as usize;
+        let rows = tensor.dims[1] as usize;
+        let input: Vec<u8> = vec![1.0f32; k]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let x = ctx.allocate(input.len()).unwrap();
+        x.write_at(&stream, 0, &input).unwrap();
+        let qbytes = q8_1_bytes(k, 1).unwrap();
+        let q = ctx.allocate(qbytes).unwrap();
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x.range(0, input.len()).unwrap(),
+                y: q.range(0, qbytes).unwrap(),
+                k,
+                ncols: 1,
+            },
+        )
+        .unwrap();
+        let y = ctx.allocate(rows * 4).unwrap();
+        let range = &stacks.parts[i];
+        ctx.matvec_expert(
+            &stream,
+            ExpertMatvecCall {
+                ty: QuantType::Q80,
+                w_stack: bank.range(range.start, range.len()).unwrap(),
+                ids: ids.range(0, 4).unwrap(),
+                x_q8: q.range(0, qbytes).unwrap(),
+                x_per_slot: false,
+                y: y.range(0, rows * 4).unwrap(),
+                y_slot_stride: rows,
+                k,
+                rows,
+                n_expert: 2,
+                n_used: 1,
+                glu_gate: None,
+            },
+        )
+        .unwrap();
+        let mut out = vec![0; rows * 4];
+        y.read_at(&stream, 0, &mut out).unwrap();
+        let expected = k as f32 * 0.5 * (i + 1) as f32;
+        for chunk in out.chunks_exact(4) {
+            let got = f32::from_ne_bytes(chunk.try_into().unwrap());
+            assert!(
+                (got - expected).abs() <= expected * 0.005,
+                "part {i}: {got} != {expected}"
+            );
+        }
+    }
+}
+
 /// Read an output row range or one expert slice from the checkpoint's mapped tensor.
 fn mapped_blocks(
     model: &GgufModel,
