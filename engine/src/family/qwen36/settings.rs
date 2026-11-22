@@ -1000,6 +1000,9 @@ pub(crate) struct Q36Settings {
     pub(crate) compile_program_limit: crate::kernels::ProgramLimit,
     /// Maximum concurrent sessions. One preserves the original single-job worker.
     pub(crate) max_seqs: usize,
+    /// Whether the config named `max_seqs`. The CUDA arm sizes its sessions from the cache pool
+    /// when it did not; a named count is a cap on that.
+    pub(crate) max_seqs_set: bool,
     /// The exact LRU entry count override of the prefix store, or `None` for the default cap of
     /// six. Validated by the parse; `prefix_store_limits_of` applies it.
     pub(crate) prefix_store_entries: Option<usize>,
@@ -1653,10 +1656,20 @@ impl Q36Settings {
             None => None,
             Some(value) => Some(ranged("prefix_store_entries", Some(value), value, 1, 4096)?),
         };
-        if max_seqs > 1 {
-            if backend != Backend::Mlx {
-                return Err(bad("max_seqs above 1 requires the MLX backend".into()));
+        if max_seqs > 1 && backend == Backend::Cuda {
+            if spec.feed_forward.is_some() {
+                return Err(bad(
+                    "max_seqs above 1 requires MoE device routing; the dense family runs one sequence at a time"
+                        .into(),
+                ));
             }
+            if speculation.enabled() {
+                return Err(bad(
+                    "max_seqs above 1 does not run with speculative decoding".into(),
+                ));
+            }
+        }
+        if max_seqs > 1 && backend == Backend::Mlx {
             if spec.feed_forward.is_some() {
                 return Err(bad(
                     "max_seqs above 1 requires MoE device routing; the dense family runs one sequence at a time"
@@ -1790,6 +1803,7 @@ impl Q36Settings {
             compile,
             compile_program_limit,
             max_seqs,
+            max_seqs_set: options.max_seqs.is_some(),
             prefix_store_entries,
             backend,
             prefix_reuse: false,
@@ -3193,6 +3207,7 @@ mod tests {
                 compile: false,
                 compile_program_limit: Default::default(),
                 max_seqs: 1,
+                max_seqs_set: false,
                 prefix_store_entries: None,
                 backend: Backend::Mlx,
                 prefix_reuse: false,
@@ -3371,7 +3386,10 @@ mod tests {
         options.max_seqs = Some(4);
         assert!(message(settings(Some(&options), &env)).contains("compile=true"));
         options.compile = Some(true);
-        assert!(message(settings_for(Some(&options), &env, Backend::Cuda)).contains("MLX"));
+        let cuda = settings_for(Some(&options), &env, Backend::Cuda).unwrap();
+        assert_eq!((cuda.max_seqs, cuda.max_seqs_set), (4, true));
+        let unset = settings_for(Some(&with_limit()), &env, Backend::Cuda).unwrap();
+        assert_eq!((unset.max_seqs, unset.max_seqs_set), (1, false));
         assert!(message(settings(Some(&options), &env)).contains("prefill_budget_bytes"));
         options.prefill_budget_bytes = Some(8 << 30);
         options.prefill_session_reserve_bytes = Some(0);

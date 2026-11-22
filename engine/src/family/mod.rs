@@ -1,6 +1,8 @@
 pub(crate) mod admission_sketch;
 pub(crate) mod card_fit;
+pub(crate) mod cell_pool;
 mod config;
+pub(crate) mod pooled_sessions;
 // Gated with the CUDA families: the step's result pair and kernels are device types.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[allow(

@@ -925,7 +925,13 @@ pub(crate) fn start(
     } else {
         (None, None)
     };
-    let engine = if owned.cuda_devices == [0] {
+    let sessions = session_plan(&owned, device_first);
+    let engine = if let Some((seqs, sizing)) = sessions {
+        spawn_engine_noted(piece, ready_note, move |stages| {
+            let (step, core) = make_announced(stages, owned, rules, plan, guard, announce)?;
+            crate::family::pooled_sessions::PooledSessions::new(step, core, seqs, sizing)
+        })?
+    } else if owned.cuda_devices == [0] {
         spawn_engine_noted(piece, ready_note, move |stages| {
             make_announced(stages, owned, rules, plan, guard, announce)
         })?
@@ -940,6 +946,38 @@ pub(crate) fn start(
     };
     Ok((engine, bundle, served))
 }
+
+/// How many sessions a start serves and how it sizes them, or `None` for the one-session step.
+///
+/// A start that names no `max_seqs` runs the sessions executor whenever its form can hold more
+/// than one session: the plain resident GGUF step on one card. The count then comes from the
+/// cache pool, and `max_seqs` is only a cap. A named count above one splits the pool evenly; a
+/// named 1 keeps the one-session step.
+fn session_plan(
+    settings: &Q36Settings,
+    device_first: bool,
+) -> Option<(usize, crate::family::pooled_sessions::Sizing)> {
+    use crate::family::pooled_sessions::Sizing;
+    if settings.cuda_devices != [0] {
+        return None;
+    }
+    if settings.max_seqs_set {
+        return (settings.max_seqs > 1).then_some((settings.max_seqs, Sizing::EvenShare));
+    }
+    let plain = settings.weights == WeightFormat::Gguf
+        && !settings.speculation.enabled()
+        && settings.tiered.is_none()
+        && settings.expert_bank.is_none()
+        && settings.kv_offload_host_bytes.is_none()
+        && settings.draft_rollback == RollbackMode::Host
+        && settings.draft_verify == VerifyMode::Eager
+        && !device_first
+        && !super::sparse_exec::armed();
+    plain.then_some((DEFAULT_SESSION_CAP, Sizing::WholePool))
+}
+
+/// The most sessions a default start serves; the pool decides how many are live.
+const DEFAULT_SESSION_CAP: usize = 8;
 
 fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<u64, EngError> {
     match value {

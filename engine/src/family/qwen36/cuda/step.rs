@@ -2937,6 +2937,9 @@ mod rollback_runtime;
 #[path = "window_gate.rs"]
 mod window_gate;
 
+#[path = "seq_part.rs"]
+pub(super) mod seq_part;
+
 #[cfg(test)]
 #[path = "window_gate_device_tests.rs"]
 mod window_gate_device_tests;
