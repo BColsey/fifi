@@ -143,6 +143,7 @@ impl ExpertStacks {
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in super::super::super) struct ExpertDeviceStacks<'a> {
     source: Option<(&'a GgufModel, usize)>,
+    slot_experts: Option<Vec<u32>>,
     layout: ExpertLayout,
     stacks: ExpertStacks,
     buffer: crate::kernels::cuda::DeviceBuffer,
@@ -161,6 +162,7 @@ impl<'a> ExpertDeviceStacks<'a> {
         let buffer = ctx.allocate(stacks.bytes)?;
         Ok(Self {
             source: None,
+            slot_experts: None,
             layout,
             stacks,
             buffer,
@@ -194,6 +196,7 @@ impl<'a> ExpertDeviceStacks<'a> {
                 .read(model, layer, u64::from(expert), &mut record)?;
             device.upload(stream, slot, &record)?;
         }
+        device.slot_experts = Some(experts.to_vec());
         Ok(device)
     }
 
@@ -218,6 +221,21 @@ impl<'a> ExpertDeviceStacks<'a> {
             ));
         }
         self.check_source(model, layer)?;
+        let mut slots = self
+            .slot_experts
+            .clone()
+            .ok_or_else(|| EngError::BadRequest("unknown GGUF device slot identities".into()))?;
+        if state.geometry().slots != slots.len()
+            || state.geometry().experts != model.config().dims.experts as usize
+            || layer >= state.geometry().layers
+            || slots.iter().enumerate().any(|(slot, &expert)| {
+                state.expert_in_slot(layer, slot).map(u32::from) != Some(expert)
+            })
+        {
+            return Err(EngError::BadRequest(
+                "GGUF device slots disagree with bank state".into(),
+            ));
+        }
         let copies = match state.begin_pass(layer, picks) {
             Ok(copies) => copies,
             Err(error) => {
@@ -244,7 +262,9 @@ impl<'a> ExpertDeviceStacks<'a> {
                 state.poison();
                 return Err(error);
             }
+            slots[usize::from(op.slot)] = u32::from(op.incoming);
         }
+        self.slot_experts = Some(slots);
         Ok(copies)
     }
 
@@ -297,6 +317,7 @@ impl<'a> ExpertDeviceStacks<'a> {
         if self.poisoned {
             return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
         }
+        self.slot_experts = None;
         let ready = self
             .ready
             .get_mut(slot)

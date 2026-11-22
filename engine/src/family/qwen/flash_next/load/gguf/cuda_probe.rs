@@ -685,8 +685,14 @@ fn full_expert_device_stacks_match_host() {
             .step_disk(&stream, &model, &mut bad_state, 0, &[256])
             .is_err()
     );
-    assert!(bad_state.is_poisoned());
-    assert!(bad_state.begin_pass(0, &[256]).is_err());
+    assert!(!bad_state.is_poisoned());
+    assert_eq!(bad_state.slot_row(0)[256], -1);
+    bad_state.poison();
+    assert!(
+        short_bank
+            .step_disk(&stream, &model, &mut bad_state, 0, &[0])
+            .is_err()
+    );
     assert!(short_bank.part(0).is_err());
     assert!(short_bank.upload(&stream, 0, &[]).is_err());
     assert!(
@@ -694,6 +700,14 @@ fn full_expert_device_stacks_match_host() {
             .step_disk(&stream, &model, &mut state(), 0, &[0])
             .is_err()
     );
+    let mut swapped = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[1, 0]).unwrap();
+    let mut mismatch = state();
+    assert!(
+        swapped
+            .step_disk(&stream, &model, &mut mismatch, 0, &[0])
+            .is_err()
+    );
+    assert!(!mismatch.is_poisoned());
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
     let mut state = state();
     let other = GgufModel::open(std::path::Path::new(&path))
@@ -715,6 +729,12 @@ fn full_expert_device_stacks_match_host() {
     assert_eq!(copies.ops.len(), 1);
     let slot = copies.ops[0].slot;
     assert_eq!(state.slot_row(0)[256], i32::from(slot));
+    assert!(
+        bank.step_disk(&stream, &model, &mut state, 0, &[256])
+            .unwrap()
+            .ops
+            .is_empty()
+    );
     let ids = ctx.allocate(4).unwrap();
     ids.write_at(&stream, 0, &i32::from(slot).to_ne_bytes())
         .unwrap();
