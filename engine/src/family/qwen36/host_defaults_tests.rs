@@ -460,7 +460,7 @@ fn a_ceiling_below_the_resident_model_sizes_the_context_from_the_staged_weights(
     let unset = resolve(None, &env).unwrap();
     assert!(unset.mlx_staged_cap.is_some());
     assert!(
-        unset.context_limit < 262_144 && unset.context_limit % 1024 == 0,
+        unset.context_limit < 262_144 && unset.context_limit.is_multiple_of(1024),
         "the context follows the staged room: {}",
         unset.context_limit
     );
