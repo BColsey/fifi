@@ -800,6 +800,30 @@ fn gguf_ple_weights_load_without_transformer_trunk() {
 }
 
 #[test]
+fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
+    let (_written, model) = open(&Spec::default());
+    let shape = model.config().model_shape().unwrap();
+    let ple = shape.ple.dims();
+    let rows = u64::from(ple.ngram - 1) * u64::from(ple.heads_per_ngram);
+    let embedding = rows * u64::from(ple.head_dim);
+    let stream = u64::from(ple.hidden) * u64::from(ple.branches);
+    let tokens = 4096u64;
+    let pending = tokens * embedding * 4;
+    let starts = tokens * (stream + embedding) * 4;
+    let staging = super::super::super::host_plan::HostTerms::DEFAULT
+        .ngram_staging_bytes()
+        .unwrap();
+    assert_eq!((rows, embedding), (16, 2560));
+    assert_eq!(
+        (pending, starts, staging),
+        (41_943_040, 209_715_200, 85_983_232)
+    );
+    eprintln!(
+        "4096-token fixture payloads: pending={pending} starts={starts} existing staging={staging}; excludes metadata and other allocations"
+    );
+}
+
+#[test]
 fn gguf_token_feed_chunk_matches_serial_and_resume() {
     use super::super::super::cuda::driver::TokenFeeds;
     use super::token_feed::GgufTokenFeeds;
