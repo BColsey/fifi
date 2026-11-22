@@ -809,6 +809,15 @@ fn gguf_feed_drives_token_driver_with_fake_device() {
 }
 
 #[test]
+fn gguf_feed_drives_chunk_driver_with_fake_device() {
+    let (_written, model) = open(&Spec::default());
+    let rows = model.ngram().unwrap();
+    let feed = super::token_feed::GgufTokenFeeds::new(&model, &rows, 2).unwrap();
+    let shape = model.config().model_shape().unwrap();
+    super::super::super::cuda::driver::fakes::exercise_chunk_feed(feed, &shape);
+}
+
+#[test]
 fn gguf_token_feed_rejects_a_different_ngram_shard() {
     let (_a, model_a) = open(&Spec::default());
     let (_b, model_b) = open(&Spec::default());

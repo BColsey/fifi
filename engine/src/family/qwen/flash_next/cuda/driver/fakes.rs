@@ -407,6 +407,42 @@ pub(in super::super::super) fn exercise_host_feed<F: TokenFeeds>(
     assert_eq!(driver.feeds.ple_state().unwrap().0, &[2]);
 }
 
+/// Exercise the host feed through chunk prefill while keeping the device fake.
+pub(in super::super::super) fn exercise_chunk_feed<F: TokenFeeds>(
+    feeds: F,
+    model: &crate::family::qwen::flash_next::step::ModelShape,
+) {
+    use crate::family::session::TokenStepper;
+    let shape = DriverShape {
+        layers: model.ple_layer + 1,
+        ple_layer: model.ple_layer,
+        positions: 8,
+        start: StartShape {
+            sampler_vocab: model.vocab,
+            stream: model.hyper.width(),
+            ple_embed: model.ple.embed(),
+        },
+    };
+    let mut driver =
+        super::chunk::ChunkDriver::new(FakeChunkDevice::default(), feeds, shape).unwrap();
+    let tokens = [1, model.ple.dims().eos, 2];
+    driver.run_chunk(&tokens, false).unwrap();
+    assert_eq!(driver.fed(), tokens.len());
+    assert_eq!(driver.feeds().ple_state().unwrap().0, &[2]);
+    driver.device_mut().fail = Some("write_back");
+    assert!(driver.run_chunk(&[3, 4], false).is_err());
+    assert_eq!(driver.fed(), tokens.len());
+    assert!(
+        driver.run_chunk(&[3], false).is_err(),
+        "failed chunk poisons the driver"
+    );
+    driver.reset().unwrap();
+    assert_eq!(driver.fed(), 0);
+    assert!(driver.feeds().ple_state().unwrap().0.is_empty());
+    driver.run_chunk(&[2], false).unwrap();
+    assert_eq!(driver.feeds().ple_state().unwrap().0, &[2]);
+}
+
 impl TokenFeeds for FakeFeeds {
     fn begin(&mut self, token: u32) -> Result<StartVectors, EngError> {
         if self.fail_begin == Some(token) {
