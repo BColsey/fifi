@@ -511,14 +511,22 @@ impl CpuForward {
             weights.prefill_router_logits(&format!("{prefix}.gate.weight"), &input_rows)?;
         let experts = self.spec.n_routed_experts as usize;
         let bias = self.weights.vec(&format!("{prefix}.gate.bias"), experts)?;
-        inputs
+        let rows = inputs
             .into_iter()
             .zip(logits.chunks_exact(experts))
             .map(|(input, scores)| {
                 let route = self.moe_route_from_logits(layer, scores.to_vec(), &bias)?;
                 Ok(MlpRow { route, input })
             })
-            .collect()
+            .collect::<Result<Vec<_>, EngError>>()?;
+        if std::env::var("FIFI_INKLING_DEBUG_PREFILL_ROUTES").as_deref() == Ok("1") {
+            let routes: Vec<_> = rows.iter().map(|row| &row.route.selected).collect();
+            eprintln!(
+                "Inkling grouped route diagnostic {}",
+                serde_json::json!({"layer":layer,"routes":routes})
+            );
+        }
+        Ok(rows)
     }
 
     fn diagnose_chained_projections(
