@@ -966,6 +966,119 @@ fn full_expert_device_stacks_match_host() {
     );
 }
 
+#[test]
+#[ignore = "needs two verified expert ranges and an admitted CUDA device"]
+fn two_real_expert_slots_match_host() {
+    use super::expert_layout::{ExpertDeviceStacks, ExpertLayout, ExpertProjectionInputs};
+    use crate::{
+        family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
+        weights::dequantize,
+    };
+    use sha2::{Digest, Sha256};
+    let path = std::env::var_os("FIFI_FLASH_TWO_EXPERT_FIXTURE").unwrap();
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let layout = ExpertLayout::for_layer(&model, 0).unwrap();
+    let hashes = [
+        [
+            "3da6977d2c06568b213e1e79fd49f3de3816c594c7b6f0928cbc4f74eed6d13b",
+            "923942e4b406fc5602397c2444bc2fbb961e1e79d64ddb2469a3e0da99249e32",
+            "f3564536713b47dd71045f35e7129099fc843b239628f2a053f6b2e9f1af8a61",
+        ],
+        [
+            "ac0f9bfdd7ec13f0d982a235686c747b7e31737d170ed1d7a54faa71f424cd6a",
+            "3730d2e7670e0c512ccbbd9c5d21e15badb7c21096f2c336222a8915e1dede6f",
+            "113aa44f068b315a90dd7ece5b35e836bf595af188b345af3110f073fac1fb19",
+        ],
+    ];
+    for (id, expected) in [256u64, 257].into_iter().zip(hashes) {
+        let mut record = vec![0; layout.bytes];
+        layout.read(&model, 0, id, &mut record).unwrap();
+        for (part, hash) in layout.parts.iter().zip(expected) {
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&record[part.bytes.clone()])),
+                hash
+            );
+        }
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[256, 257]).unwrap();
+    let experts = model.config().dims.experts as usize;
+    let geometry = BankGeometry::new(1, experts, 1, 2, layout.bytes).unwrap();
+    let mut mapping = vec![-1; experts];
+    mapping[256] = 0;
+    mapping[257] = 1;
+    let policy =
+        ReplaceOnMissLru::from_fill(geometry, &[&mapping], &[vec![0; experts]], None).unwrap();
+    let state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let ids = ctx.allocate(8).unwrap();
+    ids.write_at(
+        &stream,
+        0,
+        &[1i32.to_ne_bytes(), 0i32.to_ne_bytes()].concat(),
+    )
+    .unwrap();
+    for part in &layout.parts {
+        let tensor = model.map().get(part.role, Some(0)).unwrap();
+        let projection = bank.projection(&state, part.role).unwrap();
+        let (k, rows) = (projection.k, projection.rows);
+        let input: Vec<f32> = (0..k).map(|i| if i % 5 < 2 { -1.0 } else { 1.0 }).collect();
+        let bytes: Vec<u8> = input.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let x = ctx.allocate(bytes.len()).unwrap();
+        x.write_at(&stream, 0, &bytes).unwrap();
+        let qbytes = q8_1_bytes(k, 1).unwrap();
+        let q = ctx.allocate(qbytes).unwrap();
+        ctx.quantize_q8_1(
+            &stream,
+            QuantizeCall {
+                x: x.range(0, bytes.len()).unwrap(),
+                y: q.range(0, qbytes).unwrap(),
+                k,
+                ncols: 1,
+            },
+        )
+        .unwrap();
+        let y = ctx.allocate(rows * 8).unwrap();
+        projection
+            .launch(
+                &ctx,
+                &stream,
+                ExpertProjectionInputs {
+                    ids: ids.range(0, 8).unwrap(),
+                    x_q8: q.range(0, qbytes).unwrap(),
+                    x_per_slot: false,
+                    output: y.range(0, rows * 8).unwrap(),
+                    output_stride: rows,
+                    used: 2,
+                },
+            )
+            .unwrap();
+        let mut output = vec![0; rows * 8];
+        y.read_at(&stream, 0, &mut output).unwrap();
+        for (rank, expert) in [257u64, 256].into_iter().enumerate() {
+            let blocks = mapped_blocks(&model, tensor, Some(expert), 0..rows as u64).unwrap();
+            let weights = dequantize(tensor.ty, &blocks).unwrap();
+            for (index, row) in weights.chunks_exact(k).enumerate() {
+                let off = (rank * rows + index) * 4;
+                let got = f32::from_ne_bytes(output[off..off + 4].try_into().unwrap());
+                let want: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+                let tolerance = 0.003 * row.iter().map(|v| v.abs()).sum::<f32>() + 1e-5;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{:?} expert {expert} row {index}",
+                    part.role
+                );
+            }
+        }
+        eprintln!(
+            "checked {:?} {rows} rows for two distinct experts",
+            part.role
+        );
+    }
+}
+
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
 #[test]
 #[ignore = "requires the complete pinned GGUF and an admitted CUDA device"]
