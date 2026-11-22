@@ -1332,6 +1332,10 @@ fn build_driver_resolving(
         let device = CardChunkDevice::with_ple(step, moe, ple_route);
         let mut chunked = ChunkDriver::new(device, feeds, shape)?;
         chunked.chunk_cap = rows;
+        chunked.sm_count = projector
+            .context()
+            .device_attributes()
+            .map_or(0, |attributes| attributes.sm_count as usize);
         chunked.ple_device = ple_on_card;
         let route_note = if ple_on_card {
             ", PLE projections on the card"

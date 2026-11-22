@@ -381,6 +381,9 @@ pub(in crate::family::qwen::flash_next::cuda) struct ChunkDriver<D: ChunkDevice,
     shared_window: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::qwen::flash_next::cuda) chunk_cap: usize,
+    /// The multiprocessors of the card the chunks run on (0 when unknown): the piece model
+    /// scales its rows by it.
+    pub(in crate::family::qwen::flash_next::cuda) sm_count: usize,
     /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
     pub(in crate::family::qwen::flash_next::cuda) ple_device: bool,
     /// The batch host route: the projections of the whole chunk in one blocked product
@@ -412,6 +415,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             generation: 0,
             shared_window: false,
             chunk_cap: 1,
+            sm_count: 0,
             ple_device: false,
             ple_host_batch: None,
         })

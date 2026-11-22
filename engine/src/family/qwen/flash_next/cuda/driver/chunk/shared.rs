@@ -157,7 +157,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let start = self.pos;
         let plan = PiecePlan {
             max_rows: cap,
-            model: (MEASURED_ANCHORS, 0),
+            model: (MEASURED_ANCHORS, self.sm_count),
         };
         let mut first = true;
         drive_prompt(start, tokens, &plan, |_, rows| {
