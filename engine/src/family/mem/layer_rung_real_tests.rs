@@ -181,6 +181,8 @@ fn before_refuses(m: &Loaded, card_free: u64, host_budget: u64) -> bool {
         tiered_headroom: RESERVE,
         slot_bytes: m.expert_bytes / m.experts as u64 / m.expert_layers as u64,
         after_load_floor: 0,
+        session_part_bytes: 0,
+        sessions: 1,
         layers: m.expert_layers,
         experts: m.experts,
         top_k: m.top_k.max(1),

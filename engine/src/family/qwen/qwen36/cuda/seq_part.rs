@@ -40,16 +40,15 @@ impl SeqPart<'_> {
 }
 
 impl<'a> QwenResidentStep<'a> {
-    /// Whether this step can serve more than one session: the plain resident step only. The
-    /// paged, sparse, tiered, banked, K-row, rollback and speculative forms keep state outside the
-    /// part a session owns.
+    /// Whether this step can serve more than one session: the plain and the tiered resident
+    /// step. The tiered runtime (banks, host pool, staging, scratch) is the step's own and is used
+    /// inside one call, so sessions share it as they share the weights. The paged, sparse,
+    /// banked, K-row, rollback and speculative forms keep state outside the part a session owns.
     pub(crate) fn check_sessions(&self) -> Result<(), EngError> {
         let refused = if self.res.paged.is_some() {
             Some("paged KV")
         } else if self.res.sparse.is_some() {
             Some("sparse decode")
-        } else if self.tiered_mode {
-            Some("tiered experts")
         } else if self.exl3_bank.is_some() {
             Some("banked EXL3 experts")
         } else if self.res.krow.is_some() || self.krow_wanted {

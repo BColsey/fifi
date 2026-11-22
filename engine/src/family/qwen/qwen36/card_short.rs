@@ -40,6 +40,11 @@ pub(crate) struct CardFigures {
     /// the planned tensors plus the free-after-load floor the start refuses below. The cache,
     /// the work and the headroom come after that check, so it bounds the weights alone.
     pub(crate) after_load_floor: u64,
+    /// Device bytes of one session's part (KV planes, DeltaNet and convolution state) at its
+    /// initial cells: what each session after the first keeps on the card beside the banks.
+    pub(crate) session_part_bytes: u64,
+    /// The sessions the start would like to serve beside the banks: the most the planner funds.
+    pub(crate) sessions: usize,
     /// Layers of the model.
     pub(crate) layers: usize,
     /// Experts per layer.
@@ -77,6 +82,10 @@ pub(crate) struct CardShort {
     pub(crate) host_bytes: u64,
     /// Whether the host cannot hold those experts, so they are read from the file on a miss.
     pub(crate) from_disk: bool,
+    /// The sessions the card funds beside the banks, at most the figures' target.
+    pub(crate) sessions: usize,
+    /// The slots per layer the banks gave up to fund those sessions.
+    pub(crate) slots_given_up: usize,
     /// The most slots per layer the card carries beside the rest of the load, with the tiered
     /// load's headroom kept free (an upper bound the bank sizing may lower).
     #[cfg_attr(
@@ -87,6 +96,17 @@ pub(crate) struct CardShort {
 }
 
 impl CardShort {
+    /// The tail of the start line that says what the sessions cost the banks.
+    fn sessions_note(&self) -> String {
+        if self.sessions <= 1 {
+            return String::new();
+        }
+        format!(
+            ", {} sessions funded beside the banks ({} slots/layer given up for them)",
+            self.sessions, self.slots_given_up
+        )
+    }
+
     /// The one start line, printed once the banks exist: `slots` is the count the banks hold
     /// and `context` the context limit the start serves.
     pub(crate) fn line(&self, slots: usize, context: usize) -> String {
@@ -101,8 +121,11 @@ impl CardShort {
         };
         format!(
             "q36 cuda: card short by {} bytes (needs {} tensors+KV+headroom, has {} free): \
-             serving tiered, {slots} slots/layer on card, {experts}, context {context}",
-            self.short_by, self.needed, self.free
+             serving tiered, {slots} slots/layer on card, {experts}, context {context}{}",
+            self.short_by,
+            self.needed,
+            self.free,
+            self.sessions_note()
         )
     }
 }
@@ -125,43 +148,72 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
     let Some(needed) = figures.needed() else {
         return CardVerdict::Fits;
     };
-    let budget = TierBudget {
-        record_bytes: 0,
-        layers: figures.layers,
-        experts: figures.experts,
-        slots: 0,
-        max_spare_places: 0,
-        min_spare_places: 0,
-        overhead_bytes: HOST_OVERHEAD_BYTES,
-        cache_floor: 0,
-        ring_bytes: 0,
-        available: host_available,
-        card: Some(CardBudget {
-            free: figures.free,
-            demand: needed,
-            expert_bytes: figures.expert_bytes,
-            slot_bytes: figures.slot_bytes,
-            min_slots: figures.top_k,
-            carry_reserve: figures.tiered_headroom.saturating_sub(figures.headroom),
-        }),
+    let ladder = |sessions: usize| {
+        let reserve =
+            crate::family::card_fit::session_reserve_bytes(figures.session_part_bytes, sessions)
+                .unwrap_or(u64::MAX);
+        choose_tier(&TierBudget {
+            record_bytes: 0,
+            layers: figures.layers,
+            experts: figures.experts,
+            slots: 0,
+            max_spare_places: 0,
+            min_spare_places: 0,
+            overhead_bytes: HOST_OVERHEAD_BYTES,
+            cache_floor: 0,
+            ring_bytes: 0,
+            available: host_available,
+            card: Some(CardBudget {
+                free: figures.free,
+                demand: needed,
+                expert_bytes: figures.expert_bytes,
+                slot_bytes: figures.slot_bytes,
+                min_slots: figures.top_k,
+                carry_reserve: figures
+                    .tiered_headroom
+                    .saturating_sub(figures.headroom)
+                    .saturating_add(reserve),
+            }),
+        })
     };
-    match choose_tier(&budget) {
-        Ok(TierChoice::CardTiered { host_bytes, slots }) => CardVerdict::Short(CardShort {
+    // One session first: what the card carries without any reserve is the baseline the sessions
+    // are funded against, and the refusal when even that is short.
+    let one = ladder(1);
+    let base_slots = match &one {
+        Ok(TierChoice::CardTiered { slots, .. } | TierChoice::CardDisk { slots }) => *slots,
+        _ => 0,
+    };
+    // The most sessions the card funds beside the banks: the largest count whose reserve leaves
+    // the banks at least their share of the one-session slots. The count is what the card funds,
+    // never a constant; the figures' target only caps it.
+    let keep = base_slots - base_slots * SESSION_SLOT_GIVE_UP_PERCENT / 100;
+    let funded = (2..=figures.sessions)
+        .rev()
+        .find_map(|sessions| match ladder(sessions) {
+            Ok(
+                choice @ (TierChoice::CardTiered { slots, .. } | TierChoice::CardDisk { slots }),
+            ) if slots >= keep => Some((sessions, choice)),
+            _ => None,
+        });
+    let (sessions, chosen) = match funded {
+        Some((sessions, choice)) => (sessions, Ok(choice)),
+        None => (1, one),
+    };
+    let short = |host_bytes: u64, from_disk: bool, slots: usize| {
+        CardVerdict::Short(CardShort {
             short_by: needed.saturating_sub(figures.free),
             needed,
             free: figures.free,
             host_bytes,
-            from_disk: false,
+            from_disk,
+            sessions,
+            slots_given_up: base_slots.saturating_sub(slots),
             slots,
-        }),
-        Ok(TierChoice::CardDisk { slots }) => CardVerdict::Short(CardShort {
-            short_by: needed.saturating_sub(figures.free),
-            needed,
-            free: figures.free,
-            host_bytes: figures.expert_bytes,
-            from_disk: true,
-            slots,
-        }),
+        })
+    };
+    match chosen {
+        Ok(TierChoice::CardTiered { host_bytes, slots }) => short(host_bytes, false, slots),
+        Ok(TierChoice::CardDisk { slots }) => short(figures.expert_bytes, true, slots),
         Ok(_) => CardVerdict::Fits,
         Err(refusal) => CardVerdict::Refused {
             line: format!(
@@ -174,6 +226,15 @@ pub(crate) fn decide(figures: &CardFigures, host_available: u64) -> CardVerdict 
         },
     }
 }
+
+/// The share of the one-session slots the sessions may take from the banks, in percent: a
+/// session is worth its reserve only while the banks keep three quarters of what one session
+/// would have had.
+const SESSION_SLOT_GIVE_UP_PERCENT: usize = 25;
+
+/// The sessions a start with no named count asks the planner to fund beside the tiered banks.
+/// A target, not a ceiling: the planner takes what the card funds up to it.
+pub(crate) const TIERED_SESSION_TARGET: usize = 4;
 
 /// Whether the config leaves the card-short choice to the engine. A config that names tiered
 /// experts, host-paged KV or more than one device is taken as given and never re-tiered, as is
@@ -220,6 +281,8 @@ mod tests {
             tiered_headroom: GIB,
             slot_bytes: 1_769_472,
             after_load_floor: 0,
+            session_part_bytes: 0,
+            sessions: 1,
             layers: 40,
             experts: 256,
             top_k: 8,
@@ -365,6 +428,68 @@ mod tests {
             ),
             CardVerdict::Fits
         );
+    }
+
+    /// The sessions the card funds beside the banks: each takes its part's bytes out of the slots,
+    /// the planner stops where the banks would lose more than a quarter, and the count never
+    /// passes the target. Q4_K_M on a card with 21.3 GB free, 95 MiB of state per session.
+    #[test]
+    fn the_sessions_are_funded_from_the_slots_up_to_a_quarter_of_them() {
+        let part = 95u64 << 20;
+        let at = |sessions: usize| CardFigures {
+            session_part_bytes: part,
+            sessions,
+            ..figures(21_300_000_000)
+        };
+        let mut seen = Vec::new();
+        for target in 1..=8 {
+            match decide(&at(target), 64 * GIB) {
+                CardVerdict::Short(short) => {
+                    seen.push((target, short.sessions, short.slots, short.slots_given_up));
+                }
+                other => panic!("target {target}: {other:?}"),
+            }
+        }
+        eprintln!("target, sessions funded, slots/layer, slots given up: {seen:?}");
+        let one = seen[0].2;
+        for &(target, sessions, slots, given_up) in &seen {
+            assert!(sessions >= 1 && sessions <= target, "{seen:?}");
+            assert_eq!(given_up, one - slots, "{seen:?}");
+            assert!(slots * 4 >= one * 3, "a quarter at most: {seen:?}");
+        }
+        // The slots only shrink as sessions are funded, and one session gives up nothing.
+        assert_eq!(seen[0].3, 0);
+        assert!(seen.windows(2).all(|pair| pair[1].2 <= pair[0].2));
+        // A target of four funds four here: each session costs far less than a quarter.
+        assert_eq!(seen[3].1, 4, "{seen:?}");
+        let line = match decide(&at(4), 64 * GIB) {
+            CardVerdict::Short(short) => short.line(seen[3].2, 32_768),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            line.contains("4 sessions funded beside the banks"),
+            "{line}"
+        );
+    }
+
+    /// A card that carries only the minimum banks funds one session: the planner never takes the
+    /// banks below a quarter, and never refuses for the sessions it could not fund.
+    #[test]
+    fn a_card_with_room_for_the_minimum_banks_funds_one_session() {
+        let enough = 3_253_406_976 + 566_231_040;
+        let tight = CardFigures {
+            session_part_bytes: 95 << 20,
+            sessions: 4,
+            ..figures(enough)
+        };
+        match decide(&tight, 64 * GIB) {
+            CardVerdict::Short(short) => {
+                assert_eq!(short.sessions, 1);
+                assert_eq!(short.slots_given_up, 0);
+                assert!(!short.line(8, 32_768).contains("sessions funded"));
+            }
+            other => panic!("expected the lower rung, got {other:?}"),
+        }
     }
 
     #[test]

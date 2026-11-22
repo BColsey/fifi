@@ -521,7 +521,13 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     let mut step = build_step(&projector, &res, &device, rules, s, layout)?;
     if let Some(plan) = s.tiered {
         let source = (model.weights.header(), s.gguf.as_path());
-        attach_tiered_parts(&mut step, projector.context(), (source, &res.dims), &plan)?;
+        attach_tiered_parts(
+            &mut step,
+            projector.context(),
+            (source, &res.dims),
+            &plan,
+            1,
+        )?;
     }
     run_all(&mut step, s, mode, identities)
 }
