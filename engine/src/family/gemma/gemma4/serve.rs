@@ -1069,11 +1069,10 @@ mod device {
         #[test]
         #[ignore = "requires the pinned Bolt file and a device; use --release --test-threads=1"]
         fn one_long_prompt_or_eight_short_sessions_share_the_pool() {
-            let path = pinned_bolt();
+            let path = bolt_file();
             let bytes = std::fs::metadata(&path).expect("model file").len();
             let model = bolt::load_choosing(
                 &[crate::family::gguf_select::GgufFile { path, bytes }],
-                None,
                 MaxSeqs::Auto,
                 &|_| {},
             )
