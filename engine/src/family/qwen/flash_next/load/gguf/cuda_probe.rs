@@ -759,6 +759,20 @@ fn full_expert_device_stacks_match_host() {
             .is_err()
     );
     assert!(!mismatch.is_poisoned());
+    assert!(
+        swapped
+            .projection(crate::family::recipe::Role::ExpertGate)
+            .is_ok()
+    );
+    swapped
+        .replace_from_model(&stream, &model, 0, 0, 256)
+        .unwrap();
+    assert!(swapped.part(0).is_ok());
+    assert!(
+        swapped
+            .projection(crate::family::recipe::Role::ExpertGate)
+            .is_err()
+    );
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
     let mut state = state();
     let other = GgufModel::open(std::path::Path::new(&path))

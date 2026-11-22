@@ -385,6 +385,11 @@ impl<'a> ExpertDeviceStacks<'a> {
     ) -> Result<ExpertProjection<'_>, EngError> {
         use crate::kernels::cuda::resident::matvec_q::QuantType;
         let invalid = || EngError::BadRequest("invalid GGUF expert projection".into());
+        if self.slot_experts.is_none() {
+            return Err(EngError::BadRequest(
+                "unknown GGUF device slot identities".into(),
+            ));
+        }
         let (model, layer) = self.source.ok_or_else(invalid)?;
         let index = self
             .layout
