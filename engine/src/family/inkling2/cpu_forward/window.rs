@@ -51,12 +51,6 @@ impl CpuForward {
         if self.position != 0 || self.failed {
             return Err(bad("speculation requires a reset Inkling target"));
         }
-        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-        if let super::Weights::Gguf(weights) = &self.weights
-            && weights.resident_attention().is_some()
-        {
-            return Err(bad("Inkling speculation requires host attention"));
-        }
         if max_drafts == 0 || max_drafts >= MAX_DRAFT_ROWS as usize {
             return Err(bad("speculation row limit is out of range"));
         }
@@ -285,6 +279,24 @@ mod tests {
         });
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires a leased CUDA device and packed GGUF resident attention"]
+    fn cuda_resident_attention_resumes_after_window_rejection() {
+        check_target_window(|target| {
+            target.enable_cuda(0).unwrap();
+            assert!(
+                matches!(&target.weights, super::super::Weights::Gguf(weights)
+                    if weights.resident_attention().is_some()),
+                "set FIFI_INKLING_CUDA_RESIDENT_ATTENTION=1 and admit the resident ring",
+            );
+            assert!(
+                target.enable_grouped_verify(),
+                "grouped CUDA verifier unavailable"
+            );
+        });
+    }
+
     fn check_target_window(enable_backend: impl FnOnce(&mut CpuForward)) {
         use std::{env, path::Path};
 
@@ -401,6 +413,18 @@ mod tests {
                         .eq(expected.iter().map(|x| x.to_bits())),
                     "conditioning differed at row {index}, kept {kept}"
                 );
+            }
+            if kept < solo_states.len() {
+                // No reset or prefix restore here. The next step must see
+                // committed attention rows even if rejected rows wrapped.
+                let logits = TokenStepper::logits(&mut target, solo_draws[kept - 1]).unwrap();
+                assert_eq!(sampler.sample(&logits).unwrap(), solo_draws[kept]);
+                let next = &solo_states[kept];
+                assert_eq!(
+                    target.state, next.visits,
+                    "resume after retaining {kept} rows"
+                );
+                assert_eq!(target.features, next.features);
             }
         }
         target.run_window(&[3, 4]).unwrap();

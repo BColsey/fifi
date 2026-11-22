@@ -65,7 +65,7 @@ impl DsparkDrafter {
         &mut self,
         cuda: &CudaContext,
         context: usize,
-        reserve_floor: fn(u64) -> u64,
+        reserve_floor: impl Fn(u64) -> u64,
     ) -> Result<(), EngError> {
         self.device = Some(DeviceDraft::load(
             cuda,

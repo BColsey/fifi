@@ -1,14 +1,18 @@
 //! GGUF attention with resident, per-visit K/V and reusable staging.
 //!
-//! Host K/V rows still back prefix snapshots. The device ring is valid only for the
-//! current continuation, so restore invalidates its cursor even at the same position.
+//! Host K/V rows back prefix snapshots and speculative verifier undo.
+//! A known device cursor is valid for the current continuation. Prefix restore
+//! invalidates every cursor. Rejection repairs only overwritten visible rows.
 
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 
 use crate::{
     EngError,
     expert_tier::VRAM_HEADROOM_BYTES,
-    family::inkling2::{Attention, LayerVisit, TextSpec, gguf_weights::GgufTextWeights},
+    family::inkling2::{
+        Attention, LayerVisit, TextSpec, gguf_weights::GgufTextWeights,
+        resident_history::upload_rows,
+    },
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceStream, PinnedBuf,
         resident::relative_attention::{HEAD_DIM, RelativeAttentionCall, RelativeAttentionShape},
@@ -61,6 +65,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
     arena: DeviceBuffer,
     scratch_at: usize,
     projection_headroom: u64,
+    reserve_credit: u64,
     stream: DeviceStream,
     state: RefCell<Runtime>,
 }
@@ -68,7 +73,7 @@ pub(in crate::family::inkling2) struct ResidentAttention {
 struct Runtime {
     transfer: PinnedBuf,
     encoded: Vec<u8>,
-    next_position: Vec<usize>,
+    next_position: Vec<Option<usize>>,
 }
 
 impl Plan {
@@ -186,7 +191,7 @@ impl Plan {
                 "Inkling CUDA relative attention reserve: before {before}, allocated {device_bytes}, credited {credit}, free {free}, projection floor {projection_headroom} bytes"
             );
         }
-        let next_position = vec![0; self.visits.len()];
+        let next_position = vec![None; self.visits.len()];
         eprintln!(
             "Inkling CUDA relative attention admitted {} visits, {} device bytes",
             self.visits.len(),
@@ -197,6 +202,7 @@ impl Plan {
             arena,
             scratch_at,
             projection_headroom,
+            reserve_credit: credit,
             stream,
             state: RefCell::new(Runtime {
                 transfer,
@@ -236,8 +242,12 @@ impl ResidentAttention {
         self.projection_headroom
     }
 
+    pub(in crate::family::inkling2) fn reserve_credit(&self) -> u64 {
+        self.reserve_credit
+    }
+
     pub(in crate::family::inkling2) fn invalidate(&self) {
-        self.state.borrow_mut().next_position.fill(0);
+        self.state.borrow_mut().next_position.fill(None);
     }
 
     pub(in crate::family::inkling2) fn step(
@@ -249,9 +259,10 @@ impl ResidentAttention {
     ) -> Result<Vec<f32>, EngError> {
         let visit = self.visits[state_slot];
         let mut state = self.state.borrow_mut();
-        if state.next_position[state_slot] != history.position {
-            self.reseed(visit, &history, &mut state.encoded)?;
-        }
+        // The kernel can publish a cache row even when its output or a
+        // later transfer fails. Leave this cursor unknown until completion.
+        let device_cursor = state.next_position[state_slot].take();
+        self.restore_rows(visit, &history, device_cursor, &mut state.encoded)?;
 
         let ordered = row.encode(visit.shape, history.position, &mut state.encoded)?;
         let input_bytes = state.encoded.len();
@@ -309,30 +320,32 @@ impl ResidentAttention {
         if !result.iter().all(|v| v.is_finite()) {
             return Err(bad("non-finite CUDA relative attention output"));
         }
-        state.next_position[state_slot] = history.position + 1;
+        state.next_position[state_slot] = Some(history.position + 1);
         Ok(result)
     }
 
-    fn reseed(
+    fn restore_rows(
         &self,
         visit: Visit,
         history: &History<'_>,
+        device_cursor: Option<usize>,
         bytes: &mut Vec<u8>,
     ) -> Result<(), EngError> {
         let capacity = visit.shape.capacity;
-        let rows = capacity.min(history.position);
-        if rows == 0 {
+        let upload = upload_rows(history.position, device_cursor, capacity);
+        if upload.is_empty() {
             return Ok(());
         }
         let row_bytes = visit.cache_bytes / capacity;
-        let slot = (history.position - rows) % capacity;
-        let splits = ring_splits(slot, rows, capacity);
+        let splits = ring_splits(upload.start % capacity, upload.len(), capacity);
+        let skip = history.position - upload.end;
+        let rewind = device_cursor.is_some_and(|cursor| cursor > history.position);
         for (plane, values) in [history.keys, history.values].into_iter().enumerate() {
-            if values.len() < rows {
+            if values.len() < skip + upload.len() {
                 return Err(bad("missing host rows for CUDA relative attention restore"));
             }
             bytes.clear();
-            for row in values.iter().take(rows).rev() {
+            for row in values.iter().skip(skip).take(upload.len()).rev() {
                 if f32_bytes(row.len())? != row_bytes {
                     return Err(bad("invalid host row for CUDA relative attention restore"));
                 }
@@ -345,11 +358,14 @@ impl ResidentAttention {
                     continue;
                 }
                 let len = count * row_bytes;
-                self.arena.write_at(
-                    &self.stream,
-                    base + at * row_bytes,
-                    &bytes[read..read + len],
-                )?;
+                let offset = base + at * row_bytes;
+                let slice = &bytes[read..read + len];
+                if rewind {
+                    // The following attention launch uses the same stream.
+                    self.arena.write_at_enqueue(&self.stream, offset, slice)?;
+                } else {
+                    self.arena.write_at(&self.stream, offset, slice)?;
+                }
                 read += len;
             }
         }
@@ -509,5 +525,10 @@ mod tests {
         attention.invalidate();
         assert_eq!(run(2, 2.0, &[40.0, 20.0]), [7.75; HEAD_DIM]);
         assert_eq!(run(3, 6.0, &[2.0, 40.0, 20.0]), [6.0; HEAD_DIM]);
+
+        // Abandon two speculative rows after they overwrite a visible value.
+        run(4, 100.0, &[6.0, 2.0, 40.0]);
+        run(5, 200.0, &[100.0, 6.0, 2.0]);
+        assert_eq!(run(4, 8.0, &[6.0, 2.0, 40.0]), [2.0; HEAD_DIM]);
     }
 }

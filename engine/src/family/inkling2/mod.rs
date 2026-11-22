@@ -19,6 +19,11 @@ mod dspark;
 mod gguf_weights;
 #[cfg(target_pointer_width = "64")]
 mod phase_profile;
+#[cfg(all(
+    target_pointer_width = "64",
+    any(test, all(feature = "native-cuda", target_os = "linux"))
+))]
+mod resident_history;
 #[cfg(target_pointer_width = "64")]
 mod serve;
 

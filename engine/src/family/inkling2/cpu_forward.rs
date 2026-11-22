@@ -213,14 +213,11 @@ impl CpuForward {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     pub(super) fn enable_cuda(&mut self, host_reserve: u64) -> Result<(), EngError> {
-        // Draft windows stage only the authoritative host state.
-        let attention = (!self.draft_window_enabled()).then_some(
-            super::cuda_projection::gguf::attention::Config {
-                context: self.context,
-                relative_dims: self.math.d_rel,
-                relative_extent: self.math.rel_extent,
-            },
-        );
+        let attention = super::cuda_projection::gguf::attention::Config {
+            context: self.context,
+            relative_dims: self.math.d_rel,
+            relative_extent: self.math.rel_extent,
+        };
         self.weights
             .enable_cuda(&self.spec, self.math.rms_norm_eps, host_reserve, attention)
     }
@@ -230,6 +227,16 @@ impl CpuForward {
         match &self.weights {
             Weights::Gguf(weights) => weights.cuda_context(),
             Weights::Native(_) => None,
+        }
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn draft_target_reserve_credit(&self) -> u64 {
+        match &self.weights {
+            Weights::Gguf(weights) => weights
+                .resident_attention()
+                .map_or(0, |(_, attention)| attention.reserve_credit()),
+            Weights::Native(_) => 0,
         }
     }
 

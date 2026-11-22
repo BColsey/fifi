@@ -161,10 +161,10 @@ impl DevicePlan {
     }
 }
 
-pub(crate) struct DeviceDraftOptions {
+pub(crate) struct DeviceDraftOptions<F> {
     pub(crate) context: usize,
     pub(crate) markov: bool,
-    pub(crate) reserve_floor: fn(u64) -> u64,
+    pub(crate) reserve_floor: F,
 }
 
 pub(crate) struct DeviceDraft {
@@ -183,7 +183,7 @@ impl DeviceDraft {
             context,
             markov,
             reserve_floor,
-        }: DeviceDraftOptions,
+        }: DeviceDraftOptions<impl Fn(u64) -> u64>,
     ) -> Result<Self, EngError> {
         let plan = DevicePlan::new(model, context, markov)?;
         let before = cuda.memory_info()?.free as u64;

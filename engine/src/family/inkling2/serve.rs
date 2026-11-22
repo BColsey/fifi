@@ -155,11 +155,10 @@ fn cuda_draft(mut drafter: DsparkDrafter, forward: &CpuForward) -> Result<Dspark
     let cuda = forward
         .draft_cuda_context()
         .ok_or_else(|| super::bad("CUDA DSpark requires a GGUF CUDA Inkling target"))?;
-    drafter.enable_cuda(
-        cuda,
-        forward.context,
-        super::cuda_projection::state_headroom,
-    )?;
+    let target_credit = forward.draft_target_reserve_credit();
+    drafter.enable_cuda(cuda, forward.context, |draft_credit| {
+        super::cuda_projection::state_headroom(target_credit.saturating_add(draft_credit))
+    })?;
     Ok(drafter)
 }
 

@@ -569,20 +569,14 @@ impl GgufTextWeights {
         spec: &TextSpec,
         eps: f32,
         host_reserve: u64,
-        attention: Option<attention::Config>,
+        attention: attention::Config,
     ) -> Result<(), EngError> {
-        let resident_attention = if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref()
-            == Ok("1")
-        {
-            Some(attention.ok_or_else(|| {
-                    EngError::BadRequest(
-                        "Inkling speculation requires host attention. Unset FIFI_INKLING_CUDA_RESIDENT_ATTENTION"
-                            .into(),
-                    )
-                })?)
-        } else {
-            None
-        };
+        let resident_attention =
+            if std::env::var("FIFI_INKLING_CUDA_RESIDENT_ATTENTION").as_deref() == Ok("1") {
+                Some(attention)
+            } else {
+                None
+            };
         let packed = std::env::var("FIFI_INKLING_CUDA_PACKED_GGUF").as_deref() == Ok("1");
         let group_projections =
             std::env::var("FIFI_INKLING_CUDA_GROUP_PROJECTIONS").as_deref() == Ok("1");
