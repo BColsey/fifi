@@ -344,6 +344,22 @@ struct HDelta {
     norm: Vec<f32>,
 }
 
+impl HDelta {
+    fn view(&self) -> DeltaWeights<'_, HostWeight> {
+        DeltaWeights {
+            qkv: &self.qkv,
+            z: &self.z,
+            b: &self.b,
+            a: &self.a,
+            out: &self.out,
+            conv: &self.conv,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            norm: &self.norm,
+        }
+    }
+}
+
 struct HQsa {
     q: HostWeight,
     k: HostWeight,
@@ -408,6 +424,73 @@ fn read_floats(weights: &GgufWeights, entry: &Mapped) -> Result<Vec<f32>, EngErr
     Ok(values)
 }
 
+const DELTA_ROLES: [Wanted; 9] = [
+    Wanted::DeltaQkv,
+    Wanted::DeltaGate,
+    Wanted::DeltaBeta,
+    Wanted::DeltaAlpha,
+    Wanted::DeltaOut,
+    Wanted::DeltaConv,
+    Wanted::DeltaDecay,
+    Wanted::DeltaDtBias,
+    Wanted::DeltaNorm,
+];
+
+fn delta_entries(model: &GgufModel, index: usize) -> Result<[&Mapped; 9], EngError> {
+    let mut entries = Vec::with_capacity(DELTA_ROLES.len());
+    for role in DELTA_ROLES {
+        entries.push(
+            model.map().get(role, Some(index)).ok_or_else(|| {
+                refuse(format!("{role:?} of DeltaNet layer {index} is not mapped"))
+            })?,
+        );
+    }
+    Ok(entries.try_into().expect("one entry per DeltaNet role"))
+}
+
+fn load_delta(model: &GgufModel, index: usize) -> Result<HDelta, EngError> {
+    let [qkv, z, b, a, out, conv, decay, dt_bias, norm] = delta_entries(model, index)?;
+    let dims = &model.config().dims;
+    let (kh, vh) = (dims.key_heads as usize, dims.value_heads as usize);
+    let vd = dims.value_dim as usize;
+    let twice_key = 2 * (dims.key_heads * dims.key_dim) as usize;
+    let ck = dims.conv_kernel as usize;
+    let floats = |entry| read_floats(&model.weights, entry);
+    let tiled = |entry, skip, hd| {
+        HostWeight::new(
+            &[entry],
+            Remap::ValueOut {
+                skip,
+                hd,
+                key_heads: kh,
+                value_heads: vh,
+            },
+        )
+    };
+    let a_log: Vec<f32> = floats(decay)?
+        .into_iter()
+        .map(|value| (-value).ln())
+        .collect();
+    Ok(HDelta {
+        qkv: tiled(qkv, twice_key, vd),
+        z: tiled(z, 0, vd),
+        b: tiled(b, 0, 1),
+        a: tiled(a, 0, 1),
+        out: HostWeight::new(
+            &[out],
+            Remap::ValueIn {
+                hd: vd,
+                key_heads: kh,
+                value_heads: vh,
+            },
+        ),
+        conv: untile(&floats(conv)?, twice_key * ck, vd * ck, kh, vh),
+        a_log: untile(&a_log, 0, 1, kh, vh),
+        dt_bias: untile(&floats(dt_bias)?, 0, 1, kh, vh),
+        norm: floats(norm)?,
+    })
+}
+
 impl HostModel {
     /// Reads the first `layers` layers (the PLE layer must be among them), the embedding, the
     /// final mixer and the output head. The result runs the step on a truncated model.
@@ -421,8 +504,6 @@ impl HostModel {
                 dims.kinds.len()
             )));
         }
-        let (kh, vh) = (dims.key_heads as usize, dims.value_heads as usize);
-        let vd = dims.value_dim as usize;
         let map = model.map();
         let weights = &model.weights;
         let get = |role: Slot, layer: Option<usize>| -> Result<&Mapped, EngError> {
@@ -468,54 +549,7 @@ impl HostModel {
                     idx_k_norm: floats(Wanted::IndexKNorm.into(), at)?,
                 })
             } else {
-                let key_width = (dims.key_heads * dims.key_dim) as usize;
-                let ck = dims.conv_kernel as usize;
-                let tiled_rows = |role, skip| {
-                    Ok::<_, EngError>(HostWeight::new(
-                        &[get(role, at)?],
-                        Remap::ValueOut {
-                            skip,
-                            hd: if role == Wanted::DeltaBeta.into()
-                                || role == Wanted::DeltaAlpha.into()
-                            {
-                                1
-                            } else {
-                                vd
-                            },
-                            key_heads: kh,
-                            value_heads: vh,
-                        },
-                    ))
-                };
-                let conv = untile(
-                    &floats(Wanted::DeltaConv.into(), at)?,
-                    2 * key_width * ck,
-                    vd * ck,
-                    kh,
-                    vh,
-                );
-                let a_log: Vec<f32> = floats(Wanted::DeltaDecay.into(), at)?
-                    .iter()
-                    .map(|decay| (-decay).ln())
-                    .collect();
-                HAttn::Delta(HDelta {
-                    qkv: tiled_rows(Wanted::DeltaQkv.into(), 2 * key_width)?,
-                    z: tiled_rows(Wanted::DeltaGate.into(), 0)?,
-                    b: tiled_rows(Wanted::DeltaBeta.into(), 0)?,
-                    a: tiled_rows(Wanted::DeltaAlpha.into(), 0)?,
-                    out: HostWeight::new(
-                        &[get(Wanted::DeltaOut.into(), at)?],
-                        Remap::ValueIn {
-                            hd: vd,
-                            key_heads: kh,
-                            value_heads: vh,
-                        },
-                    ),
-                    conv,
-                    a_log: untile(&a_log, 0, 1, kh, vh),
-                    dt_bias: untile(&floats(Wanted::DeltaDtBias.into(), at)?, 0, 1, kh, vh),
-                    norm: floats(Wanted::DeltaNorm.into(), at)?,
-                })
+                HAttn::Delta(load_delta(model, index)?)
             };
             out_layers.push(HLayer {
                 attn_hyper: hyper(Site::Mixer, at)?,
@@ -575,17 +609,7 @@ impl HostModel {
                 .map(|layer| FlashLayerWeights {
                     attn_hyper: hyper(&layer.attn_hyper),
                     attn: match &layer.attn {
-                        HAttn::Delta(d) => AttnWeights::Delta(DeltaWeights {
-                            qkv: &d.qkv,
-                            z: &d.z,
-                            b: &d.b,
-                            a: &d.a,
-                            out: &d.out,
-                            conv: &d.conv,
-                            a_log: &d.a_log,
-                            dt_bias: &d.dt_bias,
-                            norm: &d.norm,
-                        }),
+                        HAttn::Delta(d) => AttnWeights::Delta(d.view()),
                         HAttn::Qsa(q) => AttnWeights::Qsa(QsaWeights {
                             q: &q.q,
                             k: &q.k,
@@ -753,6 +777,82 @@ pub(super) fn rms_by_layer(run: &HostRun) -> BTreeMap<usize, Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "emits tensor byte ranges from a header-only fixture"]
+    fn delta_tensor_sample_plan() {
+        let path = std::env::var_os("FIFI_FLASH_GGUF_PROJECTION_FIXTURE").unwrap();
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let entries = delta_entries(&model, 0).unwrap();
+        let items: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let tensor = model.weights.header().tensor(&entry.name).unwrap();
+                serde_json::json!({"name": entry.name, "shard": tensor.shard(),
+                "start": tensor.abs_offset(), "bytes": entry.bytes})
+            })
+            .collect();
+        let output = std::env::var_os("FIFI_FLASH_DELTA_PLAN").unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&items).unwrap()).unwrap();
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "needs staged real DeltaNet tensors and an admitted CUDA device"]
+    fn real_delta_block_cpu_cuda_parity() {
+        use super::super::cuda_probe::Projection;
+        use crate::{
+            family::qwen::flash_next::deltanet::{self, DeltaState},
+            kernels::cuda::CudaContext,
+        };
+        let path = std::env::var_os("FIFI_FLASH_DELTA_FIXTURE").expect("set DeltaNet-only fixture");
+        let model = GgufModel::open(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let weights = load_delta(&model, 0).unwrap();
+        let shape = model.config().model_shape().unwrap();
+        let ngram = model.ngram().unwrap();
+        let ctx = CudaContext::new().unwrap();
+        let stream = ctx.stream().unwrap();
+        let launches = std::cell::Cell::new(0);
+        let mut cpu = HostProjector::new(&model.weights, &ngram, 8);
+        let mut gpu = HostProjector::new(&model.weights, &ngram, 8).with_cuda(Projection {
+            ctx: &ctx,
+            stream: &stream,
+            launches: &launches,
+        });
+        let mut cpu_state = DeltaState::new(&shape.delta);
+        let mut gpu_state = DeltaState::new(&shape.delta);
+        let hidden = weights.qkv.parts[0].input;
+        for token in 0..3 {
+            let x: Vec<f32> = (0..hidden)
+                .map(|i| (((i * 37 + token * 23) % 251) as f32 - 125.0) / 125.0)
+                .collect();
+            let want = deltanet::step(&mut cpu, &shape.delta, &weights.view(), &mut cpu_state, &x)
+                .unwrap();
+            let got = deltanet::step(&mut gpu, &shape.delta, &weights.view(), &mut gpu_state, &x)
+                .unwrap();
+            assert_eq!(want.len(), got.len());
+            let norm = want
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let error = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(norm.is_finite() && norm > 0.0 && error.is_finite());
+            eprintln!("step {token}: relative L2 {}", error / norm);
+            assert!(error / norm < 0.03);
+        }
+        assert!(launches.get() > 0);
+        eprintln!("CUDA projection launches: {}", launches.get());
+    }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
