@@ -225,7 +225,9 @@ impl CudaContext {
 }
 
 mod moe;
-pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::moe::GgufGate;
+pub(crate) use crate::kernels::cuda::native::resident::dense_gemv::moe::{
+    GgufGate, GgufMoeSchedule,
+};
 pub(crate) use moe::{GgufMoeCall, GgufMoePick, GgufMoePicks, GgufMoeShape, GgufMoeWeights};
 
 #[cfg(all(test, feature = "native-cuda"))]

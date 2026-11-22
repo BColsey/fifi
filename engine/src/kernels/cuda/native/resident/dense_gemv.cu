@@ -291,6 +291,7 @@ bool launch_inkling_iq2_gate(const inference_cuda_gguf_moe_args &a, DeviceSelect
 }
 
 #include "resident/inkling_gate_dot.cuh"
+#include "resident/inkling_q2_down.cuh"
 
 size_t weight_row_bytes(int dtype, int cols) {
     switch (dtype) {
@@ -585,22 +586,32 @@ __global__ void sum_moe(inference_cuda_gguf_moe_args a, const float *down) {
     a.y[col] = out;
 }
 
+bool launch_inkling_q2_down(const inference_cuda_gguf_moe_args &a, DeviceSelectedWeights index,
+                            const float *middle, float *down, cudaStream_t stream, Failure &failure) {
+    if (!inkling_q2_down_shape(a.hidden, a.middle, a.count, a.down_dtype)) return false;
+    const dim3 grid(kInklingDownRows / kQ2RowsPerCta, kInklingDownPicks);
+    inkling_q2_down<<<grid, kWarps * 32, 0, stream>>>(
+        static_cast<const uint8_t *>(a.down), middle, down, index);
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    return true;
+}
+
 template <bool DevicePicks = false, typename Index>
 void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selected_down,
-                cudaStream_t stream, Failure &failure, int *grouped_iq2_gate) {
+                cudaStream_t stream, Failure &failure, int *schedule) {
     float *middle = a.scratch + size_t(a.count) * 2 * a.middle;
     float *down = middle + size_t(a.count) * a.middle;
+    const int request = schedule ? *schedule : 0;
+    const int gate_request = request & INFERENCE_CUDA_GGUF_MOE_GATE_MASK;
     int selected_gate = 0;
     if constexpr (DevicePicks) {
-        if (grouped_iq2_gate && *grouped_iq2_gate == 2 &&
-            launch_inkling_gate_dot(a, gate, middle, stream, failure)) {
+        if (gate_request == 2 && launch_inkling_gate_dot(a, gate, middle, stream, failure)) {
             selected_gate = 2;
-        } else if (grouped_iq2_gate && *grouped_iq2_gate != 0 &&
-                   launch_inkling_iq2_gate(a, gate, stream, failure)) {
+        } else if (gate_request != 0 && launch_inkling_iq2_gate(a, gate, stream, failure)) {
             selected_gate = 1;
         }
     }
-    if (grouped_iq2_gate) *grouped_iq2_gate = selected_gate;
+    if (schedule) *schedule = selected_gate;
     if (!selected_gate) {
         launch_packed({a.gate, a.x, a.scratch, a.count, 2 * a.middle, a.hidden,
                        0, 2 * a.middle, a.gate_dtype}, stream, failure, gate);
@@ -613,8 +624,16 @@ void launch_moe(const inference_cuda_gguf_moe_args &a, Index gate, Index selecte
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (!failure.ok()) return;
 
-    launch_packed({a.down, middle, down, a.count, a.hidden, a.middle,
-                   a.middle, a.hidden, a.down_dtype}, stream, failure, selected_down);
+    bool exact_down = false;
+    if constexpr (DevicePicks) {
+        exact_down = (request & INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN) &&
+            launch_inkling_q2_down(a, selected_down, middle, down, stream, failure);
+        if (schedule && exact_down && failure.ok()) *schedule |= INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN;
+    }
+    if (!exact_down) {
+        launch_packed({a.down, middle, down, a.count, a.hidden, a.middle,
+                       a.middle, a.hidden, a.down_dtype}, stream, failure, selected_down);
+    }
     if (!failure.ok()) return;
 
     sum_moe<DevicePicks><<<(a.hidden + threads - 1) / threads, threads, 0, stream>>>(a, down);
@@ -692,7 +711,7 @@ extern "C" int inference_cuda_gguf_wmma_launch(const inference_cuda_dense_gemv_a
 extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                                const inference_cuda_gguf_moe_matrices *matrices,
                                                void *stream, int *out_stage,
-                                               int *grouped_iq2_gate) {
+                                               int *schedule) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         MoeSizes sizes;
@@ -706,18 +725,18 @@ extern "C" int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args
                 gate.matrices[slot] = matrices->gate[slot];
                 down.matrices[slot] = matrices->down[slot];
             }
-            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
+            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, schedule);
         } else if (args->device_ids) {
             const auto experts = unsigned(args->experts);
             const DeviceSelectedWeights gate{sizes.gate_stride, args->device_ids, experts};
             const DeviceSelectedWeights down{sizes.down_stride, args->device_ids, experts};
-            launch_moe<true>(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
+            launch_moe<true>(*args, gate, down, (cudaStream_t)stream, failure, schedule);
         } else {
             SelectedWeights gate = {sizes.gate_stride, {}};
             for (int slot = 0; slot < args->count; ++slot) gate.ids[slot] = args->picks[slot].expert;
             SelectedWeights down = gate;
             down.stride = sizes.down_stride;
-            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, grouped_iq2_gate);
+            launch_moe(*args, gate, down, (cudaStream_t)stream, failure, schedule);
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

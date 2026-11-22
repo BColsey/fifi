@@ -542,7 +542,7 @@ impl CpuForward {
             return self.finish_layer(&layer, state, stream, mlp);
         }
         let input = self.finish_mlp_input(residual, bank, physical, &layer)?;
-        let mlp = self.moe(physical, &prefix, &input)?;
+        let mlp = self.moe(physical, &prefix, &input, decode)?;
         self.finish_layer(&layer, state, stream, mlp)
     }
 
@@ -587,6 +587,7 @@ impl CpuForward {
             prefix,
             RouteInput {
                 layer: physical as u32,
+                decode: true,
                 input,
                 caps: [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
                 scale: self.math.route_scale,
@@ -873,7 +874,15 @@ impl CpuForward {
         })
     }
 
-    fn moe(&self, layer: usize, prefix: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
+    fn moe(
+        &self,
+        layer: usize,
+        prefix: &str,
+        input: &[f32],
+        decode: bool,
+    ) -> Result<Vec<f32>, EngError> {
+        #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+        let _ = decode;
         #[cfg(all(feature = "native-cuda", target_os = "linux"))]
         if !self.draft_window_enabled()
             && let Weights::Gguf(weights) = &self.weights
@@ -881,6 +890,7 @@ impl CpuForward {
                 prefix,
                 super::cuda_projection::gguf::router::RouteInput {
                     layer: layer as u32,
+                    decode,
                     input,
                     caps: [self.math.mlp_gate_softcap, self.math.mlp_up_softcap],
                     scale: self.math.route_scale,

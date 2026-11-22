@@ -7,7 +7,7 @@ use crate::{
         CudaContext, DeviceRange, DeviceStream,
         context::{Claim, require_apart, require_fit},
         native::resident::dense_gemv::moe::{
-            GgufGate, GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, launch_gguf_moe,
+            GgufMoeRaw, GgufMoeRawPicks, GgufMoeRawWeights, GgufMoeSchedule, launch_gguf_moe,
         },
     },
 };
@@ -59,17 +59,17 @@ impl CudaContext {
         stream: &DeviceStream,
         call: GgufMoeCall<'_>,
     ) -> Result<(), EngError> {
-        self.gguf_moe_with_gate(stream, call, GgufGate::Packed)
+        self.gguf_moe_scheduled(stream, call, GgufMoeSchedule::default())
             .map(|_| ())
     }
 
-    /// Requests a resident gate schedule and reports what was queued.
-    pub(crate) fn gguf_moe_with_gate(
+    /// Requests optional resident expert schedules and reports what was queued.
+    pub(crate) fn gguf_moe_scheduled(
         &self,
         stream: &DeviceStream,
         call: GgufMoeCall<'_>,
-        schedule: GgufGate,
-    ) -> Result<GgufGate, EngError> {
+        schedule: GgufMoeSchedule,
+    ) -> Result<GgufMoeSchedule, EngError> {
         self.ensure_usable()?;
         let raw = self.plan_gguf_moe(&call)?;
         self.launch_on(stream, |stream_raw| {

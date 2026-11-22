@@ -60,3 +60,48 @@ mkdir "$out/results"
 Leased RTX 2080 Ti evidence for the component at `a6c96b666962429a7af752081ee720d9c4c60cb9` is in `../evidence/upload-fix/{verify.jsonl,memcheck.log,timing.jsonl}` relative to the qualification worktree. Each 512-token seed/skew schedule matched 9,437,184 outputs per codec bitwise; the 32-token skewed memcheck had zero errors. Event-only batch times were roughly 1.7× (IQ2_XXS) and 1.5× (Q2_0) faster than packed GEMV over those schedules, not compared with WMMA. This does not establish production speed or model quality.
 
 Expect two `verify.jsonl` records (one per codec, each `bitwise: 9437184`) and no sanitizer errors. Before grouped verification, the padded IQ2_XXS edge with `m=512`, `rows=9`, `cols=256` covers a fixture regression: the probe must finish pageable uploads on the default stream before either GEMV reads them on its nonblocking stream. The probe checks exact bits and finite written outputs, validates tiled vs fallback status, and checks stride padding, a leading output guard, and unchanged inputs on padded tail cases. It includes singletons; activation counts 2, 3, 4, 5 and 7; partial output warps/CTAs; and valid fallbacks for oversize count/width and unsupported codec. The sanitizer run also exercises skew with many small/empty expert groups. `timing.jsonl` should contain 12 records, four samples per arm each (ABBA then BAAB, milliseconds per full expert group schedule). Both arms use the same FP32 inputs, order, and number of launches. The event interval excludes transfers, routing/gather, activation/GLU, scales, and output verification. Timing is component-only; it is not prefill throughput or a full-model parity result. Require the bitwise fixtures before interpreting timings; the model integration still needs strict logits, prefix/continuation and speculative fallback checks on its exact tip.
+
+## SM75 decode Q2_0 down
+
+A historical 63-token Q2_0 down trace attributed **122 ms** to this work; that is a baseline observation, not a result for the new schedule. `FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN=1` is default-off and read at model load. It only requests the new schedule for non-draft decode on SM75 with the packed, grouped, batched device-routing path and a fully resident expert layer. The native launch additionally requires device-selected stacks, Q2_0 down, hidden width 2304, middle width 1152 and eight picks. Prefill, host picks, separate matrices and other valid shapes/codecs keep the ordinary path. Look for `Inkling CUDA used exact Q2_0 expert down GEMV` in the opt-in arm. Launch failures propagate; this is not a retry path. Gate schedule, routing, scales, rank reduction and activation/health handling are unchanged.
+
+The baseline assigns each logical lane one F32 accumulator. The new schedule maps four adjacent logical lanes of a row to one physical lane, sharing two packed bytes and a decoded half scale while retaining all four independent lane FMA chains. Logical XOR distances 16/8/4 become 4/2/1 within an eight-lane group; distances 2/1 are register adds. A CTA stages one routed activation row using adjacent-thread loads as described in [NVIDIA CUDA Best Practices: Coalesced Access to Global Memory](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory). The packed weights are not repacked; the four row segments within a warp do not imply warp-wide contiguous weight loads or a measured bandwidth gain.
+
+Use the same model and offset parser as above. Build the separate decode fixture and run its malformed ABI cases without initializing a GPU:
+
+```bash
+set -euo pipefail
+fixture="$PWD/engine/tools/inkling-exact-expert-tile"
+out=$(realpath -m ../tmp/exact-decode-down)
+mkdir -p "$out"
+NVCC=/usr/bin/nvcc CXX=/usr/bin/g++-13 bash "$fixture/build.sh" "$out" 75 decode-down \
+  2>&1 | tee "$out/build.log"
+"$out/decode-down" --host-only
+model="$HOME/fifi-scratch/ee8307597ab8/inkling-2-mini-20261120/quants/UD-IQ1_M/Inkling-2-Mini-UD-IQ1_M.gguf"
+read -r gate down < <(python3 -B "$fixture/tensor-offsets.py" "$model")
+```
+
+The GPU lease owner can then run the following in the same shell after confirming the service is masked and inactive. Do not interpret timing until `verify.jsonl` passes and memcheck reports zero errors. The fixture tests bitwise finite output and all written scratch for each fixed gate schedule, two baseline fallbacks, and invalid-route/nonfinite health handling. It uses a two-byte-aligned tensor base. Event timings compare the complete native expert call with the same integer-dot gate in both arms, excluding routing and transfers. These are component timings, not 63-token model results.
+
+```bash
+export FIFI_SCRATCH_ROOT="$HOME/fifi-qwen36"
+export CUDA_VISIBLE_DEVICES=GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c
+export TMPDIR="$out/tmp" TMP="$out/tmp" TEMP="$out/tmp"
+mkdir "$out/results"
+"$FIFI_SCRATCH_ROOT/gpu-run-local" bash -euo pipefail -c '
+  out=$1; model=$2; gate=$3; down=$4
+  test "/proc/$$/fd/9" -ef "$FIFI_SCRATCH_ROOT/gpu.lock"
+  test "$(systemctl --user show fifi-qwen36-2080ti.service -p UnitFileState --value)" = masked
+  test "$(systemctl --user show fifi-qwen36-2080ti.service -p ActiveState --value)" = inactive
+  test "$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=memory.free --format=csv,noheader,nounits)" -ge 1024
+  for seed in 123 321 573; do
+    timeout 120 "$out/decode-down" "$model" "$gate" "$down" "$seed" 0
+  done > "$out/results/verify.jsonl"
+  timeout 180 compute-sanitizer --tool memcheck --error-exitcode 1 \
+    "$out/decode-down" "$model" "$gate" "$down" 321 0 > "$out/results/memcheck.log" 2>&1
+  for seed in 123 321 573; do
+    timeout 120 "$out/decode-down" "$model" "$gate" "$down" "$seed" 200
+  done > "$out/results/timing.jsonl"
+  test -z "$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader,nounits)"
+' _ "$out" "$model" "$gate" "$down"
+```

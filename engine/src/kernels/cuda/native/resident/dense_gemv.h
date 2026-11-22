@@ -100,11 +100,13 @@ typedef struct inference_cuda_gguf_moe_matrices {
     const void *down[INFERENCE_CUDA_GGUF_MOE_MAX_PICKS];
 } inference_cuda_gguf_moe_matrices;
 
-/* Optional in/out opt-in for the Inkling IQ2 gate: 1 requests it; on success
- * this reports whether it was enqueued. NULL always uses the baseline. */
+/* Optional in/out schedule: gate bits 0–1 encode packed (0), grouped IQ2 (1),
+ * or integer dot (2); bit 2 requests the exact Q2_0 down schedule independently.
+ * Reports only the kernels enqueued. NULL always uses the baseline. */
+enum { INFERENCE_CUDA_GGUF_MOE_GATE_MASK = 3, INFERENCE_CUDA_GGUF_MOE_EXACT_Q2_DOWN = 4 };
 int inference_cuda_gguf_moe_launch(const inference_cuda_gguf_moe_args *args,
                                   const inference_cuda_gguf_moe_matrices *matrices,
-                                  void *stream, int *out_stage, int *grouped_iq2_gate);
+                                  void *stream, int *out_stage, int *schedule);
 
 #ifdef __cplusplus
 }

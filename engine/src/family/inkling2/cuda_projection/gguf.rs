@@ -48,6 +48,7 @@ pub(in crate::family::inkling2) struct GgufCuda {
     resident_attention: Option<attention::ResidentAttention>,
     moe_scratch: Option<ResidentMoe>,
     route_scratch: Option<router::RouteScratch>,
+    decode_exact_q2_down: bool,
     batch_streamed: bool,
     prefill_resident: bool,
     device_prefill: Option<RefCell<device_prefill::Workspace>>,
@@ -667,6 +668,11 @@ impl GgufCuda {
             batch_router: std::env::var("FIFI_INKLING_CUDA_BATCH_ROUTER").as_deref() == Ok("1"),
             resident_attention,
             moe_scratch,
+            decode_exact_q2_down: route_scratch.is_some()
+                && std::env::var("FIFI_INKLING_CUDA_DECODE_EXACT_Q2_DOWN").as_deref() == Ok("1")
+                && context
+                    .device_attributes()
+                    .is_ok_and(|attrs| attrs.compute_capability == (7, 5)),
             route_scratch,
             batch_streamed,
             prefill_resident,

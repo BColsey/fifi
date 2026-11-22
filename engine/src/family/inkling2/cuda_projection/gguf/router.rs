@@ -13,7 +13,9 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
         resident::{
-            dense_gemv::{DenseDtype, GgufGate, GgufMoeCall, GgufMoePicks, GgufMoeWeights},
+            dense_gemv::{
+                DenseDtype, GgufGate, GgufMoeCall, GgufMoePicks, GgufMoeSchedule, GgufMoeWeights,
+            },
             router::{
                 RouterLogitsCall, RouterShape, RouterSigmoidBias, RouterSigmoidCall,
                 router_packed_logits_bytes,
@@ -24,6 +26,7 @@ use crate::{
 
 pub(in crate::family::inkling2) struct RouteInput<'a> {
     pub(in crate::family::inkling2) layer: u32,
+    pub(in crate::family::inkling2) decode: bool,
     pub(in crate::family::inkling2) input: &'a [f32],
     pub(in crate::family::inkling2) caps: [f32; 2],
     pub(in crate::family::inkling2) scale: f32,
@@ -245,7 +248,7 @@ impl GgufCuda {
                     scale: route.scale,
                 },
             )?;
-            let gate = self.context.gguf_moe_with_gate(
+            let schedule = self.context.gguf_moe_scheduled(
                 stream,
                 GgufMoeCall {
                     shape: moe.shape,
@@ -262,9 +265,16 @@ impl GgufCuda {
                     scratch,
                     y,
                 },
-                gate_schedule(),
+                GgufMoeSchedule {
+                    gate: gate_schedule(),
+                    exact_q2_down: route.decode && self.decode_exact_q2_down,
+                },
             )?;
-            match gate {
+            if schedule.exact_q2_down {
+                static USED: Once = Once::new();
+                USED.call_once(|| eprintln!("Inkling CUDA used exact Q2_0 expert down GEMV"));
+            }
+            match schedule.gate {
                 GgufGate::Packed => (),
                 GgufGate::GroupedIq2 => {
                     static NOTICE: Once = Once::new();
