@@ -26,6 +26,8 @@ struct Trace {
     calls: Vec<String>,
     windows: Vec<Vec<Vec<u32>>>,
     draws: Vec<(u32, u32)>,
+    /// Every prefill piece: its first token and its rows.
+    fed: Vec<(u32, usize)>,
     /// Every save point that fired: (key length, kind). The calls trace keeps its
     /// kind-less `save:N` shape; the kind assertion reads this instead.
     saves: Vec<(usize, SaveKind)>,
@@ -356,6 +358,9 @@ impl ExecutorOps for WindowFake {
 
     fn prefill(&mut self, row: &mut Row, tokens: &[u32]) -> Result<(), EngError> {
         self.note(&format!("prefill:{}", tokens.len()));
+        if let Some(first) = tokens.first() {
+            lock(&self.log).fed.push((*first, tokens.len()));
+        }
         if let Some((entered, release)) = self.hold_prefill.take() {
             entered.send(()).expect("signal prefill");
             release.recv_timeout(WAIT).expect("release prefill");
@@ -1006,7 +1011,7 @@ fn prefill_uses_existing_pieces_and_never_adds_prompt_rows_to_a_window() {
 }
 
 #[test]
-fn a_cold_prompt_and_a_stream_share_the_iteration_budget_in_either_arrival_order() {
+fn a_cold_prompt_beside_a_stream_is_fed_one_whole_piece_a_tick_in_either_arrival_order() {
     for cold_first in [false, true] {
         let log = Log::default();
         let (hold, entered, unblock) = gate();
@@ -1045,7 +1050,7 @@ fn a_cold_prompt_and_a_stream_share_the_iteration_budget_in_either_arrival_order
             } else if call == "window" {
                 let window = windows.next().unwrap();
                 if streaming && !cold_decoded {
-                    assert!(rows + window.len() <= 4, "over budget in {window:?}");
+                    assert!(rows <= 4, "more than one whole piece beside {window:?}");
                     if window.iter().any(|history| history[0] == 1) {
                         cold_decoded = true;
                         assert_eq!(window.len(), 2, "cold client finished during streaming");
@@ -1177,8 +1182,8 @@ fn an_idle_batch_feeds_each_cold_prompt_a_whole_piece() {
 
 #[test]
 fn an_executor_that_does_not_opt_in_keeps_the_shared_idle_budget() {
-    // The default policy gives two cold prompts one piece between them per tick: each takes two
-    // rows at a time, where the opted-in executor above feeds each a whole piece at once.
+    // The default policy gives two cold prompts one piece between them per tick: they take turns,
+    // each fed its whole piece, where the opted-in executor above feeds both in one tick.
     let log = Log::default();
     let mut fake = WindowFake::new(&log);
     fake.idle_pieces = 1;
@@ -1191,18 +1196,18 @@ fn an_executor_that_does_not_opt_in_keeps_the_shared_idle_budget() {
     for events in [first_events, second_events] {
         let result = usage(&collect(events));
         assert_eq!(
-            result.prefill_pieces.count, 2,
+            result.prefill_pieces.count, 1,
             "{:?}",
             result.prefill_pieces
         );
-        assert_eq!(result.prefill_pieces.max_rows, 2);
+        assert_eq!(result.prefill_pieces.max_rows, 3);
         assert_eq!(result.completion_tokens, 2);
     }
     engine.shutdown();
 }
 
 #[test]
-fn a_cold_prompt_takes_the_piece_minus_the_decode_rows_while_a_stream_decodes() {
+fn a_cold_prompt_beside_a_stream_is_fed_the_pieces_it_would_be_fed_alone() {
     let log = Log::default();
     let (hold, entered, unblock) = gate();
     let mut fake = WindowFake::new(&log);
@@ -1217,9 +1222,10 @@ fn a_cold_prompt_takes_the_piece_minus_the_decode_rows_while_a_stream_decodes() 
     unblock.send(()).unwrap();
     assert_eq!(usage(&collect(stream_events)).completion_tokens, 16);
     let result = usage(&collect(cold_events));
-    // The piece is 4 and one row of it decodes the stream, so the prompt feeds 3 rows per tick.
+    // The piece is 4: six rows are a piece of 4 and a piece of 2, the decode rows of the stream
+    // do not cut the first.
     assert_eq!(result.prefill_pieces.count, 2);
-    assert_eq!(result.prefill_pieces.max_rows, 3);
+    assert_eq!(result.prefill_pieces.max_rows, 4);
     assert_eq!(result.completion_tokens, 1);
     engine.shutdown();
 }
@@ -2550,6 +2556,75 @@ fn longest_prefill_run(share: Option<usize>) -> usize {
     longest
 }
 
+/// The pieces fed for the prompt whose rows are all `marker`, in order.
+fn pieces_of(log: &Log, marker: u32) -> Vec<usize> {
+    lock(log)
+        .fed
+        .iter()
+        .filter(|(first, _)| *first == marker)
+        .map(|(_, rows)| *rows)
+        .collect()
+}
+
+#[test]
+fn a_prompts_pieces_do_not_depend_on_the_prompts_that_share_its_ticks() {
+    // The fake plans pieces of four rows. Each prompt is fed the same pieces whether it runs
+    // alone, beside other cold prompts or beside a decoding stream, whatever the prompt share:
+    // the tick's budget only counts whole pieces and never cuts one.
+    let prompts: [(u32, usize); 3] = [(5, 23), (6, 37), (7, 10)];
+    let run = |together: bool, stream: bool, share: Option<usize>, which: usize| -> Log {
+        let log = Log::default();
+        let mut fake = WindowFake::new(&log);
+        fake.prompt_share = share;
+        fake.max = 4;
+        let (engine, release) = start(fake);
+        let mut events = Vec::new();
+        if stream {
+            let (job, stream_events) = job(&[0], 60);
+            engine.handle().try_submit(job).expect("stream");
+            events.push(stream_events);
+        }
+        let chosen: Vec<(u32, usize)> = if together {
+            prompts.to_vec()
+        } else {
+            vec![prompts[which]]
+        };
+        for (marker, len) in chosen {
+            let (cold, cold_events) = job(&vec![marker; len], 1);
+            engine.handle().try_submit(cold).expect("cold");
+            events.push(cold_events);
+        }
+        release.send(()).expect("load");
+        for stream_events in events {
+            collect(stream_events);
+        }
+        engine.shutdown();
+        log
+    };
+    for (marker, len) in prompts {
+        let mut want = vec![4; len / 4];
+        if len % 4 > 0 {
+            want.push(len % 4);
+        }
+        for (together, stream, share) in [
+            (true, false, None),
+            (true, true, None),
+            (true, true, Some(1)),
+            (true, true, Some(24)),
+            (true, true, Some(64)),
+        ] {
+            let log = run(together, stream, share, 0);
+            assert_eq!(
+                pieces_of(&log, marker),
+                want,
+                "prompt {marker}: together {together}, stream {stream}, share {share:?}"
+            );
+        }
+    }
+    let alone = run(false, false, None, 1);
+    assert_eq!(pieces_of(&alone, 6), vec![4, 4, 4, 4, 4, 4, 4, 4, 4, 1]);
+}
+
 #[test]
 fn a_prompt_share_feeds_several_pieces_in_one_tick_while_a_stream_decodes() {
     // The fake plans pieces of four rows. A cold prompt beside a decoding stream feeds one piece
@@ -3354,15 +3429,11 @@ fn a_restored_prompt_with_its_tail_in_shared_pieces_reaches_the_cold_rows_tokens
         .filter_map(|call| call.strip_prefix("prefill:"))
         .map(|rows| rows.parse::<usize>().expect("rows"))
         .collect();
-    assert_eq!(
-        pieces.iter().sum::<usize>(),
-        turn_two.len() - 40,
-        "the rows fed after the restore are the tail: {pieces:?}"
-    );
-    assert!(
-        pieces.len() > 1,
-        "the tail ran in several shared pieces: {pieces:?}"
-    );
+    // The pieces are the prompt's own partition, whatever else the tick holds: whole pieces of
+    // four rows from the restored position, cut only at the save point before the last token and
+    // at the end of the prompt.
+    let want: Vec<usize> = [4, 4, 4, 4, 4, 4, 4, 1, 1].to_vec();
+    assert_eq!(pieces, want, "the tail runs in the prompt's own pieces");
     assert!(
         lock(&cold_log)
             .calls

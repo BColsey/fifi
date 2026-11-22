@@ -3610,24 +3610,12 @@ mod tests {
 
     /// The wide prefill attention against the row attention, final-token logits of the same
     /// prompts on one load: lengths cross the sliding window (512) and a partial last chunk.
-    /// `BOLT_WIDE_LENS` is a comma list of prompt lengths.
     #[test]
     #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
     fn wide_prefill_matches_the_row_attention_logits() {
         let path = std::env::var("BOLT_Q8_FILE").expect("converted model path");
-        let lens: Vec<usize> = std::env::var("BOLT_WIDE_LENS")
-            .unwrap_or_else(|_| "40,600,1100".to_owned())
-            .split(',')
-            .map(|n| n.parse().expect("a prompt length"))
-            .collect();
-        // `BOLT_WIDE_WIDTHS` lists the other batch widths to compare, comma separated (default
-        // 5,3; empty for none).
-        let widths: Vec<usize> = std::env::var("BOLT_WIDE_WIDTHS")
-            .unwrap_or_else(|_| "5,3".to_owned())
-            .split(',')
-            .filter(|n| !n.is_empty())
-            .map(|n| n.parse().expect("a batch width"))
-            .collect();
+        let lens: [usize; 3] = [40, 600, 1100];
+        let widths: [usize; 2] = [5, 3];
         let mut model = super::load(std::path::Path::new(&path)).expect("load");
         assert!(
             model.use_wide_prefill(true),

@@ -542,12 +542,15 @@ fn refresh_report<E: ExecutorOps>(executor: &E, slot: &mut Slot<E::Session>) {
     }
 }
 
-/// Feed at most the slot's grant, respecting the executor's piece limit and save points.
-fn prefill<E: ExecutorOps>(
-    executor: &mut E,
-    slot: &mut Slot<E::Session>,
+/// The rows of one prefill piece of a slot: the executor's planned piece, cut to the request's
+/// own width and the engine's chunk, then to the next save point or the end of the prompt. It
+/// depends on that prompt and its session only, never on the other slots of the tick, so a prompt
+/// is fed the same pieces whatever shares its ticks.
+fn piece_rows<E: ExecutorOps>(
+    executor: &E,
+    slot: &Slot<E::Session>,
     prefill_chunk: usize,
-) -> Result<(), EngError> {
+) -> Result<usize, EngError> {
     let prefill_chunk = super::request_prefill_chunk(executor, &slot.session, prefill_chunk);
     let rows = executor
         .prefill_piece()
@@ -562,8 +565,17 @@ fn prefill<E: ExecutorOps>(
         .points
         .front()
         .map_or(slot.job.prompt.len(), |point| point.0);
-    let remaining = span(&slot.job.prompt, slot.cursor, target)?;
-    let end = slot.cursor + rows.min(remaining.len());
+    Ok(rows.min(target.saturating_sub(slot.cursor)))
+}
+
+/// Feeds one whole piece of the slot, respecting the executor's piece limit and save points.
+fn prefill<E: ExecutorOps>(
+    executor: &mut E,
+    slot: &mut Slot<E::Session>,
+    prefill_chunk: usize,
+) -> Result<(), EngError> {
+    let rows = piece_rows(executor, slot, prefill_chunk)?;
+    let end = slot.cursor + rows;
     let piece = span(&slot.job.prompt, slot.cursor, end)?;
     let before = executor.prefill_bank_report();
     let result = executor.prefill(&mut slot.session, piece);
@@ -596,27 +608,42 @@ fn prefill<E: ExecutorOps>(
     Ok(())
 }
 
-/// Feeds up to `grant` rows of one slot's prompt in as many pieces as they need. It stops when the
-/// grant is spent, the prompt is whole, the slot is cancelled, or a piece feeds nothing.
-fn prefill_share<E: ExecutorOps>(
+/// Feeds up to `pieces` whole pieces of one slot's prompt. It stops when they are fed, the prompt
+/// is whole, the slot is cancelled, or a piece feeds nothing.
+fn prefill_pieces<E: ExecutorOps>(
     executor: &mut E,
     slot: &mut Slot<E::Session>,
-    grant: usize,
+    prefill_chunk: usize,
+    pieces: usize,
 ) -> Result<(), EngError> {
-    let mut left = grant;
-    loop {
+    for _ in 0..pieces {
         let before = slot.cursor;
-        prefill(executor, slot, left)?;
-        let fed = slot.cursor - before;
-        left = left.saturating_sub(fed);
-        if left == 0
-            || fed == 0
+        prefill(executor, slot, prefill_chunk)?;
+        if slot.cursor == before
             || slot.cursor == slot.job.prompt.len()
             || slot.job.generation.cancel.load(Ordering::SeqCst)
         {
-            return Ok(());
+            break;
         }
     }
+    Ok(())
+}
+
+/// The whole pieces each cold slot feeds this tick, in slot order. `rows` is the tick's prompt row
+/// budget and `piece` the engine's piece width: the budget buys `rows / piece` pieces, at least
+/// one, dealt one at a time across the cold slots starting at `turn`, so slots take turns when
+/// the pieces are fewer than the slots and share them evenly otherwise. Without a prompt share
+/// (`several` false) a slot takes at most one piece a tick. A piece is never cut to the budget:
+/// what a prompt is fed does not depend on the other prompts of the tick.
+fn piece_grants(cold: usize, rows: usize, piece: usize, turn: usize, several: bool) -> Vec<usize> {
+    let mut total = (rows / piece.max(1)).max(1);
+    if !several {
+        total = total.min(cold);
+    }
+    let (each, extra) = (total / cold, total % cold);
+    (0..cold)
+        .map(|ordinal| each + usize::from((ordinal + cold - turn % cold) % cold < extra))
+        .collect()
 }
 
 /// Removes only failed window rows. Their mutated generations and sessions cannot be replayed.
@@ -671,6 +698,9 @@ fn work_loop<E: ExecutorOps>(
     let mut pool = Pool::new(session, &shared.ticks, policy.idle_trim);
     let mut slots: Vec<Slot<E::Session>> = Vec::new();
     let mut waiting: Option<Waiting> = None;
+    // The cold slot that is dealt the first piece of the tick; it moves on every tick that has a
+    // cold slot, so slots take turns when the budget buys fewer pieces than there are slots.
+    let mut turn = 0usize;
     // `iteration_rows` is the engine's per-tick row budget (the rows the engine was spawned
     // with). A tick feeds at most one planned piece of prompt rows beside the decode rows, so
     // the budget is never below the piece: a smaller one only slows every cold prompt, while a
@@ -851,6 +881,27 @@ fn work_loop<E: ExecutorOps>(
             Some(rows) => rows.max(prompt_slots),
             None => tick_rows.max(slots.len()) - decode_rows,
         };
+        // Pieces are whole: the tick's budget only counts how many each cold slot is dealt, and
+        // the slots that get none this tick take the next turn.
+        let piece = executor
+            .prefill_piece()
+            .unwrap_or(prefill_chunk)
+            .min(prefill_chunk);
+        let grants = if prompt_slots == 0 {
+            Vec::new()
+        } else {
+            piece_grants(
+                prompt_slots,
+                prompt_rows,
+                piece,
+                turn,
+                decoding_share.is_some(),
+            )
+        };
+        let mut cold = 0;
+        if prompt_slots > 0 {
+            turn = turn.wrapping_add(1);
+        }
         let mut index = 0;
         while index < slots.len() {
             if !slots[index].ready {
@@ -858,21 +909,14 @@ fn work_loop<E: ExecutorOps>(
                 if shared.stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let grant = match decoding_share {
-                    Some(_) => prompt_rows.div_ceil(prompt_slots),
-                    None => prompt_rows.div_ceil(prompt_slots).min(prefill_chunk),
-                };
-                prompt_slots -= 1;
+                let pieces = grants[cold];
+                cold += 1;
                 if remove_cancelled(&mut slots, index, shared, &mut pool) {
                     continue;
                 }
                 let cursor = slots[index].cursor;
                 let called = Instant::now();
-                let result = if decoding_share.is_some() {
-                    prefill_share(executor, &mut slots[index], grant)
-                } else {
-                    prefill(executor, &mut slots[index], grant)
-                };
+                let result = prefill_pieces(executor, &mut slots[index], prefill_chunk, pieces);
                 tick.executor_call(called);
                 if result.is_ok() {
                     TickCounters::add(
@@ -882,11 +926,11 @@ fn work_loop<E: ExecutorOps>(
                 }
                 // A denied call can already have fed rows. Charge its grant and retry
                 // on a later tick. Successful short pieces return unused rows immediately.
-                prompt_rows -= if result.is_ok() {
+                prompt_rows = prompt_rows.saturating_sub(if result.is_ok() {
                     slots[index].cursor - cursor
                 } else {
-                    grant
-                };
+                    pieces * piece
+                });
                 if let Err(error) = result {
                     if matches!(error, EngError::Backend { .. }) {
                         native_failed(shared, jobs, &error);
