@@ -421,12 +421,14 @@ mod tests {
     fn largest_fitting_cuda_golden_grid() {
         const MIB: u64 = 1 << 20;
         let demand = |context: u32| {
-            Ok(crate::family::qwen::qwen36::admission_sketch::admission_demand(
-                (u64::from(context) / 1024) * MIB,
-                0,
-                0,
-                0,
-            ))
+            Ok(
+                crate::family::qwen::qwen36::admission_sketch::admission_demand(
+                    (u64::from(context) / 1024) * MIB,
+                    0,
+                    0,
+                    0,
+                ),
+            )
         };
         let band = crate::family::qwen::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
         let fixed = 768 * MIB + band; // part+spare+margin+floor+band

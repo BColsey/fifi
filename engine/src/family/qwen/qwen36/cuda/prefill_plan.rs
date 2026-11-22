@@ -1,7 +1,7 @@
 //! The pure plan of chunked prefill: the two-term chunk policy and the chunk list, the admission
 //! rule, and the arena tensor list of one chunk.
 //!
-//! Host arithmetic only: no CUDA call. It sits in `family::qwen36::cuda`, so it compiles with
+//! Host arithmetic only: no CUDA call. It sits in `family::qwen::qwen36::cuda`, so it compiles with
 //! that module (`native-cuda` on Linux) and not in the default feature set; it calls the
 //! `kernels::cuda` sizing functions, and `kernels::cuda` never calls back. Every tensor size is
 //! the output of the function that owns the formula (the sister wrappers, `mmq_size`, the
@@ -960,8 +960,8 @@ mod card_tests {
         )
         .expect("shape");
         let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
-        let tip = crate::family::qwen::qwen36::settings::delta_state_bytes(&QWEN3_6_35B_A3B).expect("tip")
-            as usize;
+        let tip = crate::family::qwen::qwen36::settings::delta_state_bytes(&QWEN3_6_35B_A3B)
+            .expect("tip") as usize;
         let home = PathBuf::from(std::env::var("HOME").unwrap());
         let mut files: Vec<PathBuf> = Vec::new();
         for dir in [
