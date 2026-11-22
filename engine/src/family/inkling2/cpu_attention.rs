@@ -171,7 +171,7 @@ impl CpuForward {
     pub(super) fn local_decode_prep<'a>(
         &self,
         state: &'a VisitState,
-        read_weights: &'a dyn Fn([usize; 4]) -> Result<[Vec<f32>; 4], EngError>,
+        read_weights: &'a attention::LocalReadWeights<'a>,
     ) -> attention::LocalPrep<'a> {
         use crate::kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape};
         debug_assert_eq!(self.math.sconv_kernel_size, PrepShape::TAPS);
@@ -465,7 +465,7 @@ impl CpuForward {
 
     fn scale_channels(&self, x: &mut [f32], tensor: &str) -> Result<(), EngError> {
         let weights = self.weights.vec(tensor, x.len())?;
-        for (x, weight) in x.iter_mut().zip(weights) {
+        for (x, weight) in x.iter_mut().zip(weights.iter()) {
             *x *= weight;
         }
         Ok(())

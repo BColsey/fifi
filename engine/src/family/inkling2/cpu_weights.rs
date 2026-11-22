@@ -3,7 +3,7 @@
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use super::cuda_projection::{CudaProjection, DenseUpload};
 
-use std::{ops::Range, path::Path};
+use std::{borrow::Cow, ops::Range, path::Path};
 
 use super::{TextSpec, bad, checkpoint};
 use crate::{
@@ -38,16 +38,21 @@ pub(super) enum Weights {
 }
 
 impl Weights {
-    pub(super) fn vec(&self, name: &str, len: usize) -> Result<Vec<f32>, EngError> {
+    pub(super) fn vec(&self, name: &str, len: usize) -> Result<Cow<'_, [f32]>, EngError> {
         match self {
-            Self::Native(w) => w.vec(name, len),
+            Self::Native(w) => w.vec(name, len).map(Cow::Owned),
             Self::Gguf(w) => w.vec(name, len),
         }
     }
 
-    pub(super) fn row(&self, name: &str, row: usize, cols: usize) -> Result<Vec<f32>, EngError> {
+    pub(super) fn row(
+        &self,
+        name: &str,
+        row: usize,
+        cols: usize,
+    ) -> Result<Cow<'_, [f32]>, EngError> {
         match self {
-            Self::Native(w) => w.row(name, row, cols),
+            Self::Native(w) => w.row(name, row, cols).map(Cow::Owned),
             Self::Gguf(w) => w.row(name, row, cols),
         }
     }

@@ -29,7 +29,7 @@ use super::{super::state_headroom, bad};
 
 mod local;
 pub(in crate::family::inkling2) mod prefill;
-pub(in crate::family::inkling2) use local::{LocalPrep, LocalResult};
+pub(in crate::family::inkling2) use local::{LocalPrep, LocalReadWeights, LocalResult};
 
 #[derive(Clone, Copy)]
 pub(in crate::family::inkling2) struct Config {

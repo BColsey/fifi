@@ -1,6 +1,7 @@
 //! Bind the Unsloth fixed-loop GGUF layout to the Inkling text graph.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs::{self, File},
     io::BufReader,
@@ -29,6 +30,8 @@ use super::{
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use crate::kernels::cuda::resident::dense_gemv::DenseDtype;
+
+mod host_cache;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod device_route;
@@ -182,6 +185,7 @@ struct Tensor {
     rows: usize,
     planes: usize,
     vector_order: VectorOrder,
+    decoded: Option<Box<[f32]>>,
 }
 
 type Tensors = BTreeMap<String, Tensor>;
@@ -215,6 +219,7 @@ impl Bindings<'_> {
                 rows: dims.get(1).copied().unwrap_or(1) as usize,
                 planes: dims.get(2).copied().unwrap_or(1) as usize,
                 vector_order: VectorOrder::Stored,
+                decoded: None,
             },
         );
         Ok(())
@@ -522,17 +527,21 @@ impl GgufPlan {
     pub(super) fn map(self, path: &Path) -> Result<(TextSpec, GgufTextWeights), EngError> {
         let mapping = MappedFile::open(path, self.header.file_len())
             .map_err(|error| bad(format!("map GGUF: {error}")))?;
-        Ok((
-            self.spec,
-            GgufTextWeights {
-                mapping,
-                tensors: self.tensors,
-                #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-                cuda: None,
-                #[cfg(all(feature = "native-cuda", target_os = "linux"))]
-                ram: None,
-            },
-        ))
+        let mut weights = GgufTextWeights {
+            mapping,
+            tensors: self.tensors,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            cuda: None,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            ram: None,
+        };
+        if std::env::var("FIFI_INKLING_GGUF_CACHE_HOST_WEIGHTS").as_deref() == Ok("1") {
+            let (tensors, bytes) = host_cache::populate(&mut weights)?;
+            if tensors != 0 {
+                eprintln!("Inkling GGUF cached host weight rows: {tensors} tensors, {bytes} bytes");
+            }
+        }
+        Ok((self.spec, weights))
     }
 }
 
@@ -788,39 +797,36 @@ impl GgufTextWeights {
         Ok((tensor, bytes))
     }
 
-    pub(super) fn vec(&self, name: &str, len: usize) -> Result<Vec<f32>, EngError> {
+    pub(super) fn vec(&self, name: &str, len: usize) -> Result<Cow<'_, [f32]>, EngError> {
         let (tensor, bytes) = self.tensor(name)?;
         if tensor.columns * tensor.rows != len || tensor.planes != 1 {
             return Err(bad(format!("GGUF vector {name} has the wrong length")));
         }
-        let mut values = vec![0.0; len];
-        dequantize_into(tensor.kind, bytes, &mut values)?;
-        let (cols, rows) = (tensor.columns, tensor.rows);
-        let transpose = |flip| {
-            let values = &values;
-            (0..cols)
-                .flat_map(move |col| {
-                    let col = if flip { cols - 1 - col } else { col };
-                    (0..rows).map(move |row| values[row * cols + col])
-                })
-                .collect()
-        };
-        match tensor.vector_order {
-            VectorOrder::Stored => Ok(values),
-            VectorOrder::Transpose => Ok(transpose(false)),
-            VectorOrder::ConvTaps => Ok(transpose(true)),
+        if let Some(values) = tensor.decoded.as_deref() {
+            return Ok(Cow::Borrowed(values));
         }
+        host_cache::decode_vec(tensor, bytes).map(Cow::Owned)
     }
 
-    pub(super) fn row(&self, name: &str, row: usize, cols: usize) -> Result<Vec<f32>, EngError> {
+    pub(super) fn row(
+        &self,
+        name: &str,
+        row: usize,
+        cols: usize,
+    ) -> Result<Cow<'_, [f32]>, EngError> {
         let (tensor, bytes) = self.tensor(name)?;
         if tensor.columns != cols || row >= tensor.rows || tensor.planes != 1 {
             return Err(bad(format!("GGUF row {row} escapes {name}")));
         }
+        if matches!(tensor.vector_order, VectorOrder::Stored)
+            && let Some(values) = tensor.decoded.as_deref()
+        {
+            return Ok(Cow::Borrowed(&values[row * cols..][..cols]));
+        }
         let stride = bytes.len() / tensor.rows;
         let mut values = vec![0.0; cols];
         dequantize_into(tensor.kind, &bytes[row * stride..][..stride], &mut values)?;
-        Ok(values)
+        Ok(Cow::Owned(values))
     }
 
     pub(super) fn project(&self, name: &str, x: &[f32], rows: usize) -> Result<Vec<f32>, EngError> {

@@ -79,9 +79,11 @@ impl Prediction {
             vec![LayerRouter {
                 router: weights
                     .vec(&format!("{prefix}.mlp.gate.weight"), hidden * experts)?
+                    .into_owned()
                     .into(),
                 norm_weight: weights
                     .vec(&format!("{prefix}.mlp_norm.weight"), hidden)?
+                    .into_owned()
                     .into(),
             }],
             hidden,
@@ -89,7 +91,9 @@ impl Prediction {
             eps,
         )
         .map_err(|e| bad(format!("GGUF RAM router: {e:?}")))?;
-        let bias = weights.vec(&format!("{prefix}.mlp.gate.bias"), experts)?;
+        let bias = weights
+            .vec(&format!("{prefix}.mlp.gate.bias"), experts)?
+            .into_owned();
         Ok(Self {
             stack,
             router,

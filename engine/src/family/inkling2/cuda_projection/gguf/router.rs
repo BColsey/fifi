@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     sync::{Once, OnceLock},
 };
@@ -200,13 +201,13 @@ impl GgufCuda {
             && !self.resident.placement().has_cold(layer)
     }
 
-    pub(in crate::family::inkling2) fn routed_expert_group(
+    pub(in crate::family::inkling2) fn routed_expert_group<'a>(
         &self,
         prefix: &str,
         route: RouteInput<'_>,
         dtypes: [DenseDtype; 2],
         control: Option<MlpController<'_>>,
-        bias: impl FnOnce(usize) -> Result<Vec<f32>, EngError>,
+        bias: impl FnOnce(usize) -> Result<Cow<'a, [f32]>, EngError>,
     ) -> Result<Option<Vec<f32>>, EngError> {
         let Some((router, DenseDtype::F32)) = self.dense.get(&format!("{prefix}.gate.weight"))
         else {

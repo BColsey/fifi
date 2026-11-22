@@ -151,9 +151,9 @@ impl CpuForward {
             };
             let gamma = if local {
                 let norm = gamma(0)?;
-                [norm.clone(), norm.clone(), norm]
+                [Some(norm), None, None]
             } else {
-                [gamma(0)?, gamma(1)?, gamma(2)?]
+                [Some(gamma(0)?), Some(gamma(1)?), Some(gamma(2)?)]
             };
             (prepared, gamma)
         };
@@ -161,7 +161,9 @@ impl CpuForward {
             gate: &prepared[i].control.gate,
             input: &prepared[i].input,
             message: &prepared[i].control.message,
-            gamma: &gamma[i],
+            gamma: gamma[i]
+                .as_deref()
+                .unwrap_or_else(|| gamma[0].as_deref().expect("query gamma")),
         });
         run(&controllers, inputs)
     }

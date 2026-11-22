@@ -75,7 +75,7 @@ fn local_decode_updates_raw_and_processed_rows_and_refuses_stale_cursor() {
                     rel_limit: 1.0,
                     eps: 1e-5,
                 },
-                read_weights: &|_| Ok(weights.clone()),
+                read_weights: &|_| Ok(weights.each_ref().map(|row| Cow::Borrowed(row.as_slice()))),
                 raw,
             },
             LocalProjection {

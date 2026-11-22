@@ -400,7 +400,8 @@ impl CpuForward {
     fn embed(&self, id: u32) -> Result<Stream, EngError> {
         let mut input = self
             .weights
-            .row("model.llm.embed.weight", id as usize, self.hidden())?;
+            .row("model.llm.embed.weight", id as usize, self.hidden())?
+            .into_owned();
         self.norm(&mut input, "model.llm.embed_norm.weight")?;
         Ok(Stream::new(input, self.cache_depth_mix))
     }
@@ -766,7 +767,7 @@ impl CpuForward {
     fn norm(&self, values: &mut [f32], weight: &str) -> Result<(), EngError> {
         let weights = self.weights.vec(weight, values.len())?;
         rms_norm(values, self.math.rms_norm_eps);
-        for (value, weight) in values.iter_mut().zip(weights) {
+        for (value, weight) in values.iter_mut().zip(weights.iter()) {
             *value *= weight;
         }
         Ok(())

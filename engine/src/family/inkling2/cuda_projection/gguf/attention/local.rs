@@ -9,7 +9,10 @@ use crate::{
     kernels::cuda::resident::inkling_local_prep::{PrepMath, PrepShape},
 };
 
-type ReadWeights<'a> = dyn Fn([usize; 4]) -> Result<[Vec<f32>; 4], EngError> + 'a;
+use std::borrow::Cow;
+
+pub(in crate::family::inkling2) type LocalReadWeights<'a> =
+    dyn Fn([usize; 4]) -> Result<[Cow<'a, [f32]>; 4], EngError> + 'a;
 
 pub(super) struct AuxStore {
     buffer: DeviceBuffer,
@@ -74,7 +77,7 @@ mod tests;
 pub(in crate::family::inkling2) struct LocalPrep<'a> {
     pub math: PrepMath,
     // Query scale, relative scale, channel-major K and V kernels.
-    pub read_weights: &'a ReadWeights<'a>,
+    pub read_weights: &'a LocalReadWeights<'a>,
     pub raw: [&'a VecDeque<Vec<f32>>; 2],
 }
 
@@ -204,7 +207,7 @@ impl LocalPrep<'_> {
         let [q, rel, kv, ..] = layout.prep.words();
         let widths = [q, rel, kv * PrepShape::TAPS, kv * PrepShape::TAPS];
         let weights = (self.read_weights)(widths)?;
-        if weights.each_ref().map(Vec::len) != widths
+        if weights.each_ref().map(|row| row.len()) != widths
             || self
                 .raw
                 .iter()
