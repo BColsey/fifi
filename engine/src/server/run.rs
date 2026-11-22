@@ -365,15 +365,21 @@ pub(crate) fn start_one(
             describe(&error)
         ))
     })?;
-    // A model path may name one `.gguf` file; its side files sit beside it.
+    // A model path may name one `.gguf` file.
     let model_directory = crate::family::gguf_select::directory_of(&config.model_dir);
-    let loaded = SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
-        StartupError(format!(
-            "engine {} failed to start: {}",
-            config.id,
-            describe(&error)
-        ))
-    })?;
+    // A path to one weights file names no side files: another model's `generation_config.json`
+    // in the same directory is not this model's.
+    let loaded = if crate::family::gguf_select::is_gguf_file(&config.model_dir) {
+        SamplingDefaults::of_lone_file()
+    } else {
+        SamplingDefaults::from_model_dir(&model_directory).map_err(|error| {
+            StartupError(format!(
+                "engine {} failed to start: {}",
+                config.id,
+                describe(&error)
+            ))
+        })?
+    };
     // Resolve the flag once, before anything consumes it: Flint's env
     // opt-in is checked first (it only reads the engine's own options),
     // then the family-aware decision covers the ready note, the starter

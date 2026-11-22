@@ -37,7 +37,8 @@ impl Stores {
     }
 }
 
-/// A model found in a store: the directory a start takes and where it came from.
+/// A model found in a store: the path a start takes (a model directory, or one weights file when
+/// the name was a file's) and where it came from.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Found {
     pub(crate) dir: PathBuf,
@@ -80,7 +81,8 @@ fn best(query: &str, mut candidates: Vec<(String, PathBuf)>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The directories of the models directory whose name, or whose weights file's name, matches.
+/// The directories of the models directory whose name matches, and the weights files whose name
+/// matches.
 fn in_models(root: &Path, query: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
@@ -92,14 +94,29 @@ fn in_models(root: &Path, query: &str) -> Vec<PathBuf> {
         candidates.push((name, dir.clone()));
         for file in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let file_name = file.file_name().to_string_lossy().into_owned();
-            if file_name.to_lowercase().ends_with(".gguf") {
-                candidates.push((file_name, dir.clone()));
+            // A weights file's name names that file, not the directory it sits in: the directory
+            // may hold other quantizations. Later shards of a split set are not names of their own.
+            let later_shard =
+                crate::weights::shard_name_of(&file.path()).is_some_and(|shard| shard.number != 1);
+            if file_name.to_lowercase().ends_with(".gguf") && !later_shard {
+                candidates.push((file_name, file.path()));
             }
         }
     }
-    let mut dirs = best(query, candidates);
-    dirs.dedup();
-    dirs
+    let found = best(query, candidates);
+    let dirs: Vec<PathBuf> = found.iter().filter(|path| path.is_dir()).cloned().collect();
+    // A directory and a weights file in it that both match are one model: the directory.
+    let mut paths: Vec<PathBuf> = found
+        .into_iter()
+        .filter(|path| {
+            path.is_dir()
+                || !path
+                    .parent()
+                    .is_some_and(|parent| dirs.iter().any(|dir| dir == parent))
+        })
+        .collect();
+    paths.dedup();
+    paths
 }
 
 /// The model layer of the Ollama manifest `name[:tag]`, as a link directory under `links`.
@@ -273,7 +290,7 @@ mod tests {
         let by_file = resolve("Other-7B", &stores(root.path()))
             .expect("resolves")
             .expect("found");
-        assert_eq!(by_file.dir, root.path().join("models/other"));
+        assert_eq!(by_file.dir, root.path().join("models/other/Other-7B.gguf"));
     }
 
     #[test]
@@ -352,5 +369,24 @@ mod tests {
                 .expect("resolves")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_partial_name_that_matches_a_directory_and_its_one_file_is_one_model() {
+        let root = tempfile::tempdir().expect("tempdir");
+        touch(
+            &root
+                .path()
+                .join("models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"),
+        );
+        let found = resolve("qwen3.6", &stores(root.path()))
+            .expect("resolves")
+            .expect("found");
+        assert_eq!(found.dir, root.path().join("models/Qwen3.6-35B-A3B-GGUF"));
+        // Two files of one directory that both match, and not the directory: still two models.
+        touch(&root.path().join("models/pair/Model-7B-Q4_K_M.gguf"));
+        touch(&root.path().join("models/pair/Model-7B-Q8_0.gguf"));
+        let error = resolve("Model-7B", &stores(root.path())).expect_err("two files, no directory");
+        assert!(error.0.contains("matches several models"), "{}", error.0);
     }
 }

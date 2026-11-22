@@ -288,8 +288,19 @@ pub(crate) struct GgufTokenizer {
 }
 
 impl GgufTokenizer {
-    /// Reads the tokenizer keys of the GGUF at `path`. Only the header is read.
+    /// Reads the tokenizer keys of the GGUF at `path`, and the `generation_config.json` beside it
+    /// when there is one. Only the header of the weights file is read.
     pub(crate) fn read(path: &Path) -> Result<Self, EngError> {
+        Self::read_with(path, true)
+    }
+
+    /// Reads the tokenizer keys of the GGUF at `path` and nothing beside it: a lone file's header
+    /// is all it says, whatever else sits in its directory.
+    pub(crate) fn read_alone(path: &Path) -> Result<Self, EngError> {
+        Self::read_with(path, false)
+    }
+
+    fn read_with(path: &Path, sidecar: bool) -> Result<Self, EngError> {
         let file = File::open(path)
             .map_err(|error| reject(format!("cannot open {}: {error}", path.display())))?;
         let header = crate::weights::shared_header(path, HEADER_CAP_BYTES)?;
@@ -401,6 +412,7 @@ impl GgufTokenizer {
             template_note,
             generation_config: path
                 .parent()
+                .filter(|_| sidecar)
                 .and_then(|dir| std::fs::read(dir.join("generation_config.json")).ok()),
             add_bos: matches!(
                 header.meta("tokenizer.ggml.add_bos_token"),
@@ -589,7 +601,15 @@ fn serialize(value: &serde_json::Value) -> Result<Vec<u8>, EngError> {
 
 /// The tokenizer bundle of the GGUF at `path`, built from its own header.
 pub(crate) fn bundle_from_gguf(path: &Path) -> Result<TokenizerBundle, EngError> {
-    let tokenizer = GgufTokenizer::read(path)?;
+    bundle_of(GgufTokenizer::read(path)?, path)
+}
+
+/// The tokenizer bundle of one GGUF file named alone: its header and nothing beside it.
+pub(crate) fn bundle_from_lone_gguf(path: &Path) -> Result<TokenizerBundle, EngError> {
+    bundle_of(GgufTokenizer::read_alone(path)?, path)
+}
+
+fn bundle_of(tokenizer: GgufTokenizer, path: &Path) -> Result<TokenizerBundle, EngError> {
     let note = format!(
         "tokenizer: built from the metadata of {} (pre-tokenizer {}, {} tokens, {} merges)",
         path.display(),
@@ -608,6 +628,10 @@ pub(crate) fn bundle_from_gguf(path: &Path) -> Result<TokenizerBundle, EngError>
 /// A draft model's file without a template is skipped; later shards of a split model hold no
 /// tokenizer keys and are never first. `None` when no file qualifies.
 pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, EngError> {
+    // A path to one weights file is its own candidate.
+    if crate::family::gguf_select::is_gguf_file(dir) {
+        return Ok(has_vocabulary(dir).then(|| dir.to_path_buf()));
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(None),
@@ -625,27 +649,32 @@ pub(crate) fn vocabulary_gguf(dir: &Path) -> Result<Option<std::path::PathBuf>, 
     files.sort();
     for file in files {
         // A file that is not a readable GGUF is not a candidate; the start reports its own.
-        let Ok(header) = crate::weights::shared_header(&file, HEADER_CAP_BYTES) else {
-            continue;
-        };
-        // A file with no template qualifies when a spec names one for its architecture.
-        let has_template = matches!(
-            header.meta("tokenizer.chat_template"),
-            Some(MetaValue::String(_))
-        ) || matches!(
-            header.meta("general.architecture"),
-            Some(MetaValue::String(name))
-                if crate::family::spec::chat_template_fallback(name).is_some()
-        );
-        if matches!(
-            header.meta("tokenizer.ggml.tokens"),
-            Some(MetaValue::Array(_))
-        ) && has_template
-        {
+        if has_vocabulary(&file) {
             return Ok(Some(file));
         }
     }
     Ok(None)
+}
+
+/// Whether the GGUF at `path` carries a vocabulary and a chat template (or an architecture whose
+/// spec names one); an unreadable file does not.
+fn has_vocabulary(path: &Path) -> bool {
+    let Ok(header) = crate::weights::shared_header(path, HEADER_CAP_BYTES) else {
+        return false;
+    };
+    let has_template = matches!(
+        header.meta("tokenizer.chat_template"),
+        Some(MetaValue::String(_))
+    ) || matches!(
+        header.meta("general.architecture"),
+        Some(MetaValue::String(name))
+            if crate::family::spec::chat_template_fallback(name).is_some()
+    );
+    has_template
+        && matches!(
+            header.meta("tokenizer.ggml.tokens"),
+            Some(MetaValue::Array(_))
+        )
 }
 
 /// Reads the whole data range of one metadata array.
@@ -722,7 +751,7 @@ fn int_array(file: &File, array: &ArrayMeta, expect: usize) -> Result<Vec<i32>, 
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{GgufTokenizer, bundle_from_gguf};
+    use super::{GgufTokenizer, bundle_from_gguf, vocabulary_gguf};
     use crate::tokenizer::{PromptMessage, Role, Thinking};
     use std::path::PathBuf;
 
@@ -984,6 +1013,60 @@ pub(crate) mod tests {
             [1, id("<turn|>"), id("<|tool_response>")]
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lone_file_ignores_the_generation_config_beside_it_and_a_directory_reads_it() {
+        let path = delimiter_file();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("m.gguf");
+        std::fs::copy(&path, &file).expect("copy");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            br#"{"eos_token_id": [1, 5]}"#,
+        )
+        .expect("write");
+        let ids = |bundle: &crate::tokenizer::TokenizerBundle| bundle.eos_token_ids().to_vec();
+        let alone = super::bundle_from_lone_gguf(&file).expect("alone");
+        let beside = bundle_from_gguf(&file).expect("beside");
+        assert!(!ids(&alone).contains(&5), "{:?}", ids(&alone));
+        assert!(ids(&beside).contains(&5), "{:?}", ids(&beside));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn two_vocabularies_in_one_directory_each_file_gets_its_own() {
+        // No tokenizer.json and two files that both carry a vocabulary: a name-sorted scan of the
+        // directory would give the first file's vocabulary to both.
+        let first = delimiter_file();
+        let second = space_marker_file_without_template("gemma4");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a-first.gguf");
+        let b = dir.path().join("b-second.gguf");
+        std::fs::copy(&first, &a).expect("copy");
+        std::fs::copy(&second, &b).expect("copy");
+        let sizes = |path: &std::path::Path| {
+            crate::tokenizer::gemma::load(path)
+                .expect("a file is its own tokenizer")
+                .vocab_size()
+        };
+        let (size_a, size_b) = (sizes(&a), sizes(&b));
+        assert_ne!(size_a, size_b);
+        assert_eq!(
+            size_a,
+            bundle_from_gguf(&first).expect("first").vocab_size()
+        );
+        assert_eq!(
+            size_b,
+            bundle_from_gguf(&second).expect("second").vocab_size()
+        );
+        // The preflight's resolver names the asked-for file too.
+        assert_eq!(vocabulary_gguf(&b).expect("scan"), Some(b.clone()));
+        assert_eq!(vocabulary_gguf(&a).expect("scan"), Some(a.clone()));
+        // Naming the directory is the user's word for "whichever comes first".
+        assert_eq!(vocabulary_gguf(dir.path()).expect("scan"), Some(a));
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]

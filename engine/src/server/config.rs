@@ -52,6 +52,23 @@ pub(crate) const GGUF_ARCHITECTURE_FAMILIES: &[(&str, &str)] = &[
     ("gemma4", crate::family::gemma::gemma4::FAMILY),
 ];
 
+/// Why a GGUF architecture that is not in [`GGUF_ARCHITECTURE_FAMILIES`] is not served, for the
+/// refusal text; an architecture with no line is simply not a family of this engine.
+pub(crate) fn gguf_architecture_note(architecture: &str) -> Option<&'static str> {
+    Some(match architecture {
+        "qwen4exp" => {
+            "Flash-Next's loader stops on quantization kernels that do not exist yet (IQ2_S and others)"
+        }
+        "nemotron_h_moe" => "the Nemotron entry needs an options block: write a --config file",
+        "raon1" => "Raon's CUDA serving is not on main yet",
+        "dflash" => "a draft model for speculative decoding, not a model to serve on its own",
+        "clip" => {
+            "a vision projector (mmproj), not a language model: name the model file beside it"
+        }
+        _ => return None,
+    })
+}
+
 /// The architectures of [`GGUF_ARCHITECTURE_FAMILIES`], for refusal text.
 pub(crate) fn known_gguf_architectures() -> String {
     GGUF_ARCHITECTURE_FAMILIES

@@ -397,6 +397,10 @@ impl TokenizerBundle {
     }
 
     fn load_checked(dir: &Path, pin: Option<&TokenizerPin>) -> Result<Self, EngError> {
+        // A GGUF file named as the tokenizer source is its own vocabulary: its header builds it.
+        if crate::family::gguf_select::is_gguf_file(dir) {
+            return super::gguf::bundle_from_lone_gguf(dir);
+        }
         // A directory of GGUF weights with no tokenizer.json starts from the vocabulary in the
         // GGUF header. The pin names files that are not there, so it does not apply.
         if !dir.join("tokenizer.json").is_file()

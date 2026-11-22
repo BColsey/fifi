@@ -595,7 +595,7 @@ fn gguf_tokenizer_check(inspection: &ModelInspection, checks: &mut Vec<Check>) {
     if inspection.tokenizer_missing.is_empty() {
         return;
     }
-    let Ok(Some(path)) = crate::tokenizer::gguf::vocabulary_gguf(&inspection.model_dir) else {
+    let Ok(Some(path)) = crate::tokenizer::gguf::vocabulary_gguf(&inspection.weights_path) else {
         return;
     };
     checks.retain(|check| check.name != "tokenizer files");

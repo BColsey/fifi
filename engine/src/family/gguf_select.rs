@@ -45,9 +45,41 @@ fn is_gguf(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
 }
 
-/// The directory of a model path: the path itself, or the parent of a path to a `.gguf` file.
+/// Whether `path` is a GGUF file: named `.gguf`, or holding the GGUF magic whatever its name
+/// (an Ollama blob is `sha256-<hex>` with no extension).
+pub(crate) fn is_gguf_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if is_gguf(path) {
+        return true;
+    }
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok()
+        && &magic == b"GGUF"
+}
+
+/// The first shard of the split set that `path` belongs to, when it is a shard and the first
+/// exists; any other path unchanged.
+pub(crate) fn first_shard(path: &Path) -> PathBuf {
+    match shard_name_of(path) {
+        Some(name) if name.number != 1 => {
+            let first = name.sibling(path, 1);
+            if first.is_file() {
+                first
+            } else {
+                path.to_path_buf()
+            }
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The directory of a model path: the path itself, or the parent of a path to a GGUF file.
 pub(crate) fn directory_of(model: &Path) -> PathBuf {
-    if model.is_file() && is_gguf(model) {
+    if is_gguf_file(model) {
         match model.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => return parent.to_path_buf(),
             _ => return PathBuf::from("."),
@@ -64,13 +96,15 @@ pub(crate) fn candidates(model: &Path) -> Result<(PathBuf, Vec<GgufFile>), EngEr
         EngError::Checkpoint(format!("model path {}: {error}", what.display()))
     };
     if model.is_file() {
-        if !is_gguf(model) {
+        if !is_gguf_file(model) {
             return Err(EngError::Checkpoint(format!(
-                "model path {} is a file without the .gguf extension; name a .gguf file or the \
-                 directory that holds it",
+                "model path {} is a file that does not start with the GGUF magic; name a GGUF \
+                 file or the directory that holds it",
                 model.display()
             )));
         }
+        let first = first_shard(model);
+        let model = first.as_path();
         let mut bytes = std::fs::metadata(model)
             .map_err(|error| read(error, model))?
             .len();
@@ -297,7 +331,7 @@ mod tests {
         let message = candidates(&dir.path().join("config.json"))
             .unwrap_err()
             .describe();
-        assert!(message.contains(".gguf extension"), "{message}");
+        assert!(message.contains("GGUF magic"), "{message}");
     }
 
     #[test]
@@ -346,6 +380,60 @@ mod tests {
             error.describe().contains("does not take a split GGUF set"),
             "{}",
             error.describe()
+        );
+    }
+
+    /// A GGUF header with no keys and no tensors, padded to `len` bytes.
+    fn gguf_bytes(len: usize) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_file_with_the_gguf_magic_is_a_model_whatever_it_is_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blob = dir.path().join("sha256-0123abcd");
+        std::fs::write(&blob, gguf_bytes(64)).expect("write");
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, b"hello world").expect("write");
+        assert!(super::is_gguf_file(&blob));
+        assert!(!super::is_gguf_file(&other));
+        assert!(!super::is_gguf_file(dir.path()));
+        assert_eq!(super::directory_of(&blob), dir.path());
+        let (found, files) = super::candidates(&blob).expect("a blob is a candidate");
+        assert_eq!(found, dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, blob);
+        let error = super::candidates(&other)
+            .expect_err("not a GGUF")
+            .describe();
+        assert!(error.contains("GGUF magic"), "{error}");
+    }
+
+    #[test]
+    fn any_shard_of_a_split_set_names_the_whole_set_from_its_first_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for number in 1..=3 {
+            std::fs::write(
+                dir.path().join(format!("m-{number:05}-of-00003.gguf")),
+                gguf_bytes(100 * number),
+            )
+            .expect("write");
+        }
+        let third = dir.path().join("m-00003-of-00003.gguf");
+        let first = dir.path().join("m-00001-of-00003.gguf");
+        assert_eq!(super::first_shard(&third), first);
+        let (_, files) = super::candidates(&third).expect("candidates");
+        assert_eq!(
+            files,
+            vec![super::GgufFile {
+                path: first,
+                bytes: 600
+            }]
         );
     }
 }

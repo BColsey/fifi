@@ -120,13 +120,13 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ModelServeArgs, StartupError
     }
     if parsed.model_dir.as_os_str().is_empty() {
         return Err(StartupError(format!(
-            "serve --model: --model <dir> is required\n{USAGE}"
+            "serve --model: --model <dir|file.gguf|name> is required\n{USAGE}"
         )));
     }
     Ok(parsed)
 }
 
-const USAGE: &str = "usage: enginesrv serve --model <dir> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8] [--listen <addr>] [--print-config]";
+const USAGE: &str = "usage: enginesrv serve --model <dir|file.gguf|name> [--tokenizer-dir <dir>] [--family <name>] [--context <n>] [--kv f32|q8] [--listen <addr>] [--print-config]";
 
 /// What discovery chose: the family, the weight format, and the
 /// options that carry them. Every other option stays the resolver's
@@ -139,13 +139,25 @@ pub(crate) struct Discovered {
     pub(crate) tokenizer_dir: PathBuf,
 }
 
+/// Where the tokenizer is read from when `--tokenizer-dir` is not given: the model directory; for
+/// a model path that is one GGUF file, the file itself, whose header carries the vocabulary and the
+/// chat template. A sibling `tokenizer.json` is never taken for a lone file, because it may belong
+/// to another model in the same directory: pass the directory to use its files.
+fn default_tokenizer_dir(model: &Path) -> PathBuf {
+    if crate::family::gguf_select::is_gguf_file(model) {
+        crate::family::gguf_select::first_shard(model)
+    } else {
+        model.to_path_buf()
+    }
+}
+
 /// Inspect the directory and choose family, format, and options.
 /// Pure filesystem evidence; no preflight, no probing.
 fn discover(args: &ModelServeArgs) -> Result<Discovered, StartupError> {
     let tokenizer_dir = args
         .tokenizer_dir
         .clone()
-        .unwrap_or_else(|| args.model_dir.clone());
+        .unwrap_or_else(|| default_tokenizer_dir(&args.model_dir));
     let inspection = inspect::inspect(&args.model_dir, &tokenizer_dir)
         .map_err(|error| StartupError(describe_error(&error)))?;
 
@@ -478,9 +490,27 @@ fn select_family(
                 .iter()
                 .filter_map(|fact| fact.architecture.as_deref())
                 .collect();
-            if inspection.config_model_types.is_empty() && !seen.is_empty() {
+            if inspection.config_model_types.is_empty()
+                && seen.is_empty()
+                && !inspection.gguf_files.is_empty()
+            {
                 return Err(StartupError(format!(
-                    "serve --model: no family serves the GGUF architecture {}; known architectures: {}; pass --family or write a --config file",
+                    "serve --model: {} names no general.architecture, so no family can be chosen from it; known architectures: {}; pass --family (detectable families: {}) or write a --config file",
+                    inspection.weights_path.display(),
+                    crate::server::config::known_gguf_architectures(),
+                    detectable_names()
+                )));
+            }
+            if inspection.config_model_types.is_empty() && !seen.is_empty() {
+                let why: String = seen
+                    .iter()
+                    .filter_map(|architecture| {
+                        crate::server::config::gguf_architecture_note(architecture)
+                    })
+                    .map(|note| format!(" ({note})"))
+                    .collect();
+                return Err(StartupError(format!(
+                    "serve --model: no family serves the GGUF architecture {}{why}; known architectures: {}; pass --family or write a --config file",
                     seen.join(", "),
                     crate::server::config::known_gguf_architectures()
                 )));
@@ -989,5 +1019,92 @@ mod tests {
             let error = discover(&with_flag).unwrap_err().0;
             assert!(error.contains("--context is not an option"), "{error}");
         }
+    }
+
+    /// One tiny GGUF of `architecture` at `path`.
+    fn write_architecture(path: &Path, architecture: &str) {
+        std::fs::write(
+            path,
+            crate::tokenizer::gguf::tests::tiny_gguf(architecture, "gpt2", "raon"),
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn a_bare_gguf_file_is_identified_by_its_own_architecture_not_its_neighbours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_architecture(&dir.path().join("a.gguf"), "qwen35moe");
+        write_architecture(&dir.path().join("b.gguf"), "gemma4");
+        for (name, family) in [
+            ("a.gguf", "qwen3_6_35b_a3b"),
+            ("b.gguf", crate::family::gemma::gemma4::FAMILY),
+        ] {
+            let discovered = discover(&args_for(&dir.path().join(name))).expect("discovers");
+            assert_eq!(discovered.family, family, "{name}");
+            assert_eq!(discovered.weight_format, "gguf");
+        }
+    }
+
+    #[test]
+    fn an_ollama_blob_with_no_extension_is_served_like_any_gguf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blob = dir.path().join("sha256-0f1e2d3c");
+        write_architecture(&blob, "gemma4");
+        let discovered = discover(&args_for(&blob)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+    }
+
+    #[test]
+    fn the_tokenizer_of_a_bare_file_is_the_file_even_with_a_tokenizer_json_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("m.gguf");
+        write_architecture(&file, "gemma4");
+        assert_eq!(super::default_tokenizer_dir(&file), file);
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").expect("write");
+        assert_eq!(super::default_tokenizer_dir(&file), file);
+        // A directory is its own tokenizer directory.
+        assert_eq!(super::default_tokenizer_dir(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn a_refused_architecture_is_named_with_its_reason_when_there_is_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (architecture, reason) in [
+            ("raon1", "CUDA serving is not on main"),
+            ("clip", "vision projector"),
+            ("dflash", "draft model"),
+            ("qwen4exp", "quantization kernels"),
+        ] {
+            let file = dir.path().join(format!("{architecture}.gguf"));
+            write_architecture(&file, architecture);
+            let error = discover(&args_for(&file)).unwrap_err().0;
+            assert!(error.contains(reason), "{architecture}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_gguf_that_names_no_architecture_is_refused_saying_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("mystery.gguf");
+        std::fs::write(&file, minimal_gguf()).expect("write");
+        let error = discover(&args_for(&file)).unwrap_err().0;
+        assert!(error.contains("names no general.architecture"), "{error}");
+    }
+
+    #[test]
+    fn two_models_in_one_directory_each_read_only_their_own_header() {
+        // Side files beside a lone file may belong to the other model: neither the config.json
+        // model_type nor the tokenizer.json of the directory decides for a named file.
+        let dir = model_dir(Some("qwen3_5_moe"), false, false);
+        write_architecture(&dir.path().join("a.gguf"), "qwen35moe");
+        write_architecture(&dir.path().join("b.gguf"), "gemma4");
+        let b = dir.path().join("b.gguf");
+        let discovered = discover(&args_for(&b)).expect("discovers");
+        assert_eq!(discovered.family, crate::family::gemma::gemma4::FAMILY);
+        assert_eq!(discovered.tokenizer_dir, b);
+        // Naming the directory still uses its files.
+        let whole = discover(&args_for(dir.path())).expect("discovers");
+        assert_eq!(whole.family, "qwen3_6_35b_a3b");
+        assert_eq!(whole.tokenizer_dir, dir.path());
     }
 }
