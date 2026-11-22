@@ -1466,6 +1466,7 @@ fn two_real_expert_slots_match_host() {
     let host_input: Vec<f32> = (0..k).map(|i| if i % 5 < 2 { -1.0 } else { 1.0 }).collect();
     let mut error_sq = 0.0f64;
     let mut norm_sq = 0.0f64;
+    let mut host_rows = vec![vec![0.0f32; hidden]; 2];
     for (rank, expert) in [257u64, 256].into_iter().enumerate() {
         let input: Vec<f32> = act_bytes[rank * n_ff * 4..(rank + 1) * n_ff * 4]
             .chunks_exact(4)
@@ -1505,6 +1506,7 @@ fn two_real_expert_slots_match_host() {
                 "down after SwiGLU rank {rank} row {index}"
             );
             let host_want: f32 = row.iter().zip(&host_activation).map(|(w, x)| w * x).sum();
+            host_rows[rank][index] = host_want;
             let bound = tolerance + max_activation_delta * row.iter().map(|w| w.abs()).sum::<f32>();
             assert!(
                 (got - host_want).abs() <= bound,
@@ -1519,6 +1521,46 @@ fn two_real_expert_slots_match_host() {
         "checked {hidden} down rows for two independent host expert MLPs; relative L2 {relative_l2}"
     );
     assert!(norm_sq > 0.0 && relative_l2 <= 0.05);
+    let residual = ctx.allocate(hidden * 4).unwrap();
+    residual.write_at(&stream, 0, &vec![0; hidden * 4]).unwrap();
+    let route_weights = ctx.allocate(8).unwrap();
+    route_weights
+        .write_at(
+            &stream,
+            0,
+            &[0.25f32.to_ne_bytes(), 0.75f32.to_ne_bytes()].concat(),
+        )
+        .unwrap();
+    let combined = ctx.allocate(hidden * 4).unwrap();
+    ctx.moe_combine(
+        &stream,
+        CombineCall {
+            shape: CombineShape {
+                m: 1,
+                n: hidden,
+                top_k: 2,
+                ld_down: hidden,
+            },
+            res: residual.range(0, hidden * 4).unwrap(),
+            down: y_down.range(0, hidden * 8).unwrap(),
+            weights: route_weights.range(0, 8).unwrap(),
+            shared: None,
+            out: CombineOut::To(combined.range(0, hidden * 4).unwrap()),
+        },
+    )
+    .unwrap();
+    let mut result = vec![0; hidden * 4];
+    combined.read_at(&stream, 0, &mut result).unwrap();
+    let (mut err, mut norm) = (0.0f64, 0.0f64);
+    for (index, chunk) in result.chunks_exact(4).enumerate() {
+        let got = f32::from_ne_bytes(chunk.try_into().unwrap());
+        let want = 0.25 * host_rows[0][index] + 0.75 * host_rows[1][index];
+        err += f64::from(got - want).powi(2);
+        norm += f64::from(want).powi(2);
+    }
+    let combined_l2 = (err / norm).sqrt();
+    eprintln!("two-expert weighted output relative L2 {combined_l2}");
+    assert!(norm > 0.0 && combined_l2 <= 0.05);
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
