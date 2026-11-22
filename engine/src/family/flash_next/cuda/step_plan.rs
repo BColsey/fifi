@@ -37,6 +37,7 @@
 //! context budget charges.
 
 use super::state::{FlashGeometry, StateBytes, StatePlan, overflow, product, sum};
+use crate::capability::tuning::attention_splits;
 use crate::{
     EngError,
     family::{
@@ -90,15 +91,7 @@ impl StepOptions {
     /// the attention fills the multiprocessors as it did on the card it was tuned on.
     pub(super) fn for_sm_count(sm_count: u32) -> Self {
         Self {
-            qsa_splits: crate::capability::tuning::attention_splits(DEFAULT_QSA_SPLITS, sm_count),
-        }
-    }
-}
-
-impl Default for StepOptions {
-    fn default() -> Self {
-        Self {
-            qsa_splits: DEFAULT_QSA_SPLITS,
+            qsa_splits: attention_splits(DEFAULT_QSA_SPLITS, sm_count),
         }
     }
 }

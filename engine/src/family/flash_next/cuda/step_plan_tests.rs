@@ -17,7 +17,7 @@ const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
 
 fn plan_at(g: &FlashGeometry, rows: usize, positions: usize) -> StepPlan {
-    StepPlan::new(g, rows, positions, &StepOptions::default()).expect("the step plan")
+    StepPlan::new(g, rows, positions, &StepOptions::for_sm_count(82)).expect("the step plan")
 }
 
 fn slot(plan: &StepPlan, slot: Slot) -> &PlannedSlot {
@@ -34,7 +34,7 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     let (_, g) = real();
     assert_eq!(
-        StepPlan::prefill_bytes(false, &g, 0, 0, &StepOptions::default()).unwrap(),
+        StepPlan::prefill_bytes(false, &g, 0, 0, &StepOptions::for_sm_count(82)).unwrap(),
         0
     );
     // The charge-equality ladder reaches the supported width: the arena a 2,048-row
@@ -42,18 +42,26 @@ fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
     // under-charge here is the memory defect of a wider window).
     let ceiling = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap();
     for rows in [1, 64, 65, MAX_STEP_ROWS, ceiling] {
-        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::for_sm_count(82)).unwrap();
         let actual = crate::kernels::cuda::plan_arena(&plan.arena_tensors())
             .unwrap()
             .total;
         assert_eq!(
-            StepPlan::prefill_bytes(true, &g, rows, 32_768, &StepOptions::default()).unwrap(),
+            StepPlan::prefill_bytes(true, &g, rows, 32_768, &StepOptions::for_sm_count(82))
+                .unwrap(),
             u64::try_from(actual).unwrap()
         );
     }
     // The rows bound of the charge is the runtime ceiling, one above refuses.
     assert!(
-        StepPlan::prefill_bytes(true, &g, ceiling + 1, 32_768, &StepOptions::default()).is_err()
+        StepPlan::prefill_bytes(
+            true,
+            &g,
+            ceiling + 1,
+            32_768,
+            &StepOptions::for_sm_count(82)
+        )
+        .is_err()
     );
 }
 
@@ -62,7 +70,7 @@ fn shared_prefill_extension_replans_the_full_tensor_list() {
     let (_, g) = real();
     for rows in [1, 64, 65, MAX_STEP_ROWS] {
         let old = plan_at(&g, rows, 32_768);
-        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::for_sm_count(82)).unwrap();
         assert_eq!(plan.slots().len(), old.slots().len() + 2);
         for entry in old.slots() {
             assert_eq!(plan.index(entry.slot), old.index(entry.slot));
@@ -93,7 +101,7 @@ fn shared_prefill_extension_replans_the_full_tensor_list() {
 fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
     let (_, g) = real();
     for (rows, perm_bytes) in [(1, 8288), (64, 13_472), (65, 13_568), (256, 29_312)] {
-        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::for_sm_count(82)).unwrap();
         let perm = slot(&plan, Slot::PrefillPerm);
         assert_eq!(perm.bytes, perm_bytes);
         assert_eq!(
@@ -116,7 +124,7 @@ fn shared_prefill_extension_sizes_its_slots_and_reuses_projection_scratch() {
 #[test]
 fn shared_prefill_extension_keeps_the_existing_bounds() {
     let (_, g) = real();
-    let options = StepOptions::default();
+    let options = StepOptions::for_sm_count(82);
     // The rows bound is the runtime ceiling (the supported width, raisable by the
     // measurement variable), so the refusal probe sits one above it, not above 256.
     let above = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap() + 1;
@@ -343,21 +351,22 @@ fn rows_and_splits_outside_the_kernels_are_refused() {
     // Above the runtime rows ceiling (the supported width), as the prefill bound test.
     let above = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap() + 1;
     for rows in [0, above] {
-        let error = StepPlan::new(&g, rows, 4096, &StepOptions::default()).expect_err("rows");
+        let error =
+            StepPlan::new(&g, rows, 4096, &StepOptions::for_sm_count(82)).expect_err("rows");
         assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
     }
     for qsa_splits in [0, 129] {
         let error = StepPlan::new(&g, 1, 4096, &StepOptions { qsa_splits }).expect_err("splits");
         assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
     }
-    let error = StepPlan::new(&g, 1, 0, &StepOptions::default()).expect_err("context");
+    let error = StepPlan::new(&g, 1, 0, &StepOptions::for_sm_count(82)).expect_err("context");
     assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
 }
 
 #[test]
 fn the_footprint_at_32k_128k_and_256k() {
     let (_, g) = real();
-    let options = StepOptions::default();
+    let options = StepOptions::for_sm_count(82);
     let mut totals = Vec::new();
     for positions in [32_768usize, 131_072, 262_144] {
         let f = footprint(&g, positions, 1, &options, KvFormat::F16).unwrap();
@@ -411,7 +420,7 @@ fn a_prefill_arena_that_starves_the_card_refuses_at_plan_time_with_the_bytes() {
     let (_, g) = real();
     let ceiling = crate::family::project::exl3_jobs_plan::exl3_rows_ceiling().unwrap();
     let charge =
-        StepPlan::prefill_bytes(true, &g, ceiling, 32_768, &StepOptions::default()).unwrap();
+        StepPlan::prefill_bytes(true, &g, ceiling, 32_768, &StepOptions::for_sm_count(82)).unwrap();
     assert_eq!(
         ceiling, 2_048,
         "the supported window the refusal is computed from"
@@ -445,9 +454,9 @@ fn a_prefill_arena_that_starves_the_card_refuses_at_plan_time_with_the_bytes() {
 
 #[test]
 fn the_qsa_splits_follow_the_device_multiprocessor_count() {
-    // The tuned card keeps the default, so its plan bytes are unchanged.
-    assert_eq!(StepOptions::for_sm_count(82), StepOptions::default());
-    assert_eq!(StepOptions::for_sm_count(0), StepOptions::default());
+    // The tuned card keeps the default count, and a device that reports none keeps it too.
+    assert_eq!(StepOptions::for_sm_count(82).qsa_splits, DEFAULT_QSA_SPLITS);
+    assert_eq!(StepOptions::for_sm_count(0).qsa_splits, DEFAULT_QSA_SPLITS);
     let (_, g) = real();
     let part = |sm_count: u32| {
         let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::for_sm_count(sm_count))

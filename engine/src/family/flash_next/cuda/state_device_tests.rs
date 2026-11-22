@@ -25,7 +25,7 @@ fn the_state_and_step_arenas_allocate_at_32k_and_free_cleanly() {
     let ctx = CudaContext::new().expect("context");
     let state_plan = StatePlan::new(&geometry, POSITIONS, KvFormat::F16).expect("state plan");
     let step_plan =
-        StepPlan::new(&geometry, 1, POSITIONS, &StepOptions::default()).expect("step plan");
+        StepPlan::new(&geometry, 1, POSITIONS, &StepOptions::for_sm_count(82)).expect("step plan");
     {
         let state = ctx.arena(&state_plan.arena_tensors()).expect("state arena");
         let step = ctx.arena(&step_plan.arena_tensors()).expect("step arena");

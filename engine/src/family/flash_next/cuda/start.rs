@@ -65,7 +65,7 @@ use crate::{
         exl3_pack::layer_name,
         flash_next::{
             artifact::{pack_identity, tokenizer_pin},
-            host_plan::HostFrame,
+            host_plan::{HOST_LABELS, HostFrame},
             load::{
                 model_shape,
                 pack_files::{FlashPackFiles, NGRAM_FILE},
@@ -484,18 +484,7 @@ fn log_tuning_line(call: &TuningCall<'_>) {
         Decision, DeviceFacts, HardwareFacts, MemoryTopology, TuningInput, TuningMode,
         TuningOverrides, decide, log_line,
     };
-    let (sm_count, compute_capability, pcie_link) =
-        match call.projector.context().device_attributes() {
-            Ok(attributes) => (
-                attributes.sm_count,
-                attributes.compute_capability,
-                HardwareFacts::pcie_link_of(
-                    &attributes.bus_id,
-                    std::path::Path::new("/sys/bus/pci/devices"),
-                ),
-            ),
-            Err(_) => (0, (0, 0), (0, 0)),
-        };
+    let (sm_count, compute_capability, pcie_link) = call.projector.device_facts();
     let (cpu_threads, cpu_isa) = HardwareFacts::host_side();
     let facts = HardwareFacts {
         topology: MemoryTopology::Discrete {
@@ -621,12 +610,9 @@ fn build_driver_resolving(
     // read this snapshot, so the plan that sizes the store cannot build from a figure the guard
     // disagrees with (a cgroup-capped host used to plan an inclusive store the guard then
     // refused at load time).
-    let facts = Facts::read_with_card("Flash-Next expert bank", "Flash-Next", || {
-        let card = projector.memory_info()?;
-        Ok((card.free as u64, card.total as u64))
-    })?;
+    let facts = Facts::read_card(HOST_LABELS, projector.card_bytes())?;
     let free_vram = facts.card_free();
-    let vram_total = facts.card.map_or(0, |card| card.total);
+    let vram_total = facts.card_total();
 
     stage("opening the pack");
     let files = FlashPackFiles::open(artifact)?;
@@ -734,12 +720,7 @@ fn build_driver_resolving(
     let host_frame = HostFrame::new(memory, terms);
     let geometry_for_arena = FlashGeometry::new(&model, &kinds)?;
     // The attention splits the step will launch with: the charge below sizes the same plan.
-    let step_options = StepOptions::for_sm_count(
-        projector
-            .context()
-            .device_attributes()
-            .map_or(0, |attributes| attributes.sm_count),
-    );
+    let step_options = StepOptions::for_sm_count(projector.context().sm_count());
     let plan_for = |context: u32| -> Result<FlashLoadPlan, EngError> {
         let prefill_arena_bytes = if rows > 1 {
             StepPlan::prefill_bytes(

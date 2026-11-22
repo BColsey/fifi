@@ -181,19 +181,23 @@ impl Facts {
     /// that sizes the card and the host reads one snapshot of both. `card` returns the card's
     /// `(free, total)` bytes (the one CUDA query stays in the caller; this module holds no CUDA
     /// type).
-    pub(crate) fn read_with_card(
-        label: &'static str,
-        root_label: &'static str,
-        card: impl FnOnce() -> Result<(u64, u64), EngError>,
+    pub(crate) fn read_card(
+        (label, root_label): (&'static str, &'static str),
+        card: Result<(u64, u64), EngError>,
     ) -> Result<Self, EngError> {
         let host = HostFacts::read(label, root_label)?;
-        let (free, total) = card()?;
+        let (free, total) = card?;
         Ok(Self::with_host(host).with_card(free, total))
     }
 
     /// The card's free bytes, 0 when no card was read.
     pub(crate) fn card_free(&self) -> u64 {
         self.card.map_or(0, |card| card.free)
+    }
+
+    /// The card's total bytes, 0 when no card was read.
+    pub(crate) fn card_total(&self) -> u64 {
+        self.card.map_or(0, |card| card.total)
     }
 
     /// The facts around a host that is already read (or built by a test).

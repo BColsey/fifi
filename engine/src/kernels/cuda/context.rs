@@ -449,6 +449,12 @@ impl CudaContext {
             .map_err(|status| diagnostic_backend_error("device attributes", status))
     }
 
+    /// The device's multiprocessor count, 0 when the driver refuses the query.
+    pub(crate) fn sm_count(&self) -> u32 {
+        self.device_attributes()
+            .map_or(0, |attributes| attributes.sm_count)
+    }
+
     /// The driver's module loading mode: 1 is `CU_MODULE_EAGER_LOADING` and 2 is
     /// `CU_MODULE_LAZY_LOADING` (cuda.h of the build image), through the adapter's own query
     /// entry. The device-side observation point of the adapter's eager-loading constructor.

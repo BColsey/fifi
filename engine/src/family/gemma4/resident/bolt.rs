@@ -184,22 +184,11 @@ pub(crate) const fn attn_part_bytes(splits: usize) -> usize {
 /// [`ATTN_SPLITS_VAR`] overrides the count (1 to 128), for a comparison on one binary; a bad value
 /// fails the load.
 fn device_attn_splits(ctx: &CudaContext) -> Result<usize, EngError> {
-    if let Ok(text) = std::env::var(ATTN_SPLITS_VAR) {
-        return match text.trim().parse::<usize>() {
-            Ok(count) if (1..=crate::capability::tuning::SPLIT_CEILING).contains(&count) => {
-                Ok(count)
-            }
-            _ => Err(EngError::BadRequest(format!(
-                "bolt attention splits: {ATTN_SPLITS_VAR} takes 1 to {}, got {text:?}",
-                crate::capability::tuning::SPLIT_CEILING
-            ))),
-        };
-    }
-    Ok(crate::capability::tuning::attention_splits(
+    crate::capability::tuning::attention_splits_or_env(
+        ATTN_SPLITS_VAR,
         ATTN_SPLIT_MAX,
-        ctx.device_attributes()
-            .map_or(0, |attributes| attributes.sm_count),
-    ))
+        ctx.sm_count(),
+    )
 }
 
 /// The environment variable that sets the split count of the decode attention instead of the

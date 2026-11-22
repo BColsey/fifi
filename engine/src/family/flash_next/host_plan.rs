@@ -21,6 +21,8 @@ use crate::{
     },
 };
 
+/// The labels the Flash-Next starts read the host and the card under.
+pub(crate) const HOST_LABELS: (&str, &str) = ("Flash-Next expert bank", "Flash-Next");
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 

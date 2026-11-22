@@ -68,10 +68,7 @@ pub(crate) struct CardShort {
     /// load's headroom kept free (an upper bound the bank sizing may lower).
     #[cfg_attr(
         not(test),
-        allow(
-            dead_code,
-            reason = "the ladder's promise; the tests check it against the bank admission"
-        )
+        allow(dead_code, reason = "the tests read the ladder's promise")
     )]
     pub(crate) slots: usize,
 }

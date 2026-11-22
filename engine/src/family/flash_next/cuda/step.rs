@@ -186,10 +186,7 @@ impl<'a> FlashStep<'a> {
             )));
         }
         let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
-        let options = StepOptions::for_sm_count(
-            ctx.device_attributes()
-                .map_or(0, |attributes| attributes.sm_count),
-        );
+        let options = StepOptions::for_sm_count(ctx.sm_count());
         let step_plan = if shared_prefill {
             StepPlan::new_prefill(&geometry, rows, positions, &options)?
         } else {

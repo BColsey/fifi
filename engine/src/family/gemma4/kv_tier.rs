@@ -67,20 +67,8 @@ impl VecFamily for BoltFamily<'_> {
     }
 }
 
-/// What names a Bolt load to an entry kept outside the process.
-/// The numeric path of a load: whether the attention split is armed and, off the card the count
-/// was tuned on, how many splits. A different count sums the softmax in a different order, so an
-/// entry written under one count is not another's; the tuned card keeps the original name.
-fn numeric_path(attention_splits: Option<usize>) -> String {
-    match attention_splits {
-        None => "bolt-kv8 attention-split false".to_owned(),
-        Some(splits) if splits == super::resident::bolt::ATTN_SPLIT_MAX => {
-            "bolt-kv8 attention-split true".to_owned()
-        }
-        Some(splits) => format!("bolt-kv8 attention-split true splits {splits}"),
-    }
-}
-
+/// What names a Bolt load to an entry kept outside the process; its numeric path names the
+/// attention split count (see `split_path_name`).
 pub(super) fn load_identity(
     weights: &str,
     layer_bytes: &[usize],
@@ -91,7 +79,11 @@ pub(super) fn load_identity(
         weights: weights.to_owned(),
         tokenizer: crate::weights::sha256_hex(&tokenizer),
         template: crate::weights::sha256_hex(&template),
-        numeric_path: numeric_path(attention_splits),
+        numeric_path: crate::capability::tuning::split_path_name(
+            "bolt-kv8",
+            attention_splits,
+            super::resident::bolt::ATTN_SPLIT_MAX,
+        ),
         family: CONTRACT,
         layout: format!(
             "{LAYOUT_TAG}; {} physical layers; bytes per cell by layer {layer_bytes:?}",

@@ -533,6 +533,33 @@ impl CudaProjector {
         self.context.memory_info()
     }
 
+    /// The device facts the tuner line prints: multiprocessors, compute capability and PCIe link.
+    /// A refused query degrades to zeros without latching the backend.
+    pub(crate) fn device_facts(&self) -> (u32, (u32, u32), (u32, u32)) {
+        use crate::capability::tuning::HardwareFacts;
+        self.context
+            .device_attributes()
+            .map_or((0, (0, 0), (0, 0)), |attributes| {
+                (
+                    attributes.sm_count,
+                    attributes.compute_capability,
+                    HardwareFacts::pcie_link_of(
+                        &attributes.bus_id,
+                        std::path::Path::new("/sys/bus/pci/devices"),
+                    ),
+                )
+            })
+    }
+
+    /// The card's `(free, total)` bytes.
+    pub(crate) fn card_bytes(&self) -> Result<(u64, u64), EngError> {
+        let card = self.context.memory_info()?;
+        Ok((
+            u64::try_from(card.free).unwrap_or(u64::MAX),
+            u64::try_from(card.total).unwrap_or(u64::MAX),
+        ))
+    }
+
     /// The CUDA context that this projector's weights live on. The resident step is built from
     /// it and a `&CudaWeights`, so both share one adapter lease.
     pub(crate) fn context(&self) -> &CudaContext {

@@ -354,7 +354,7 @@ fn the_planned_offsets_have_no_hazard_over_a_full_token() {
     let (_, g) = real();
     assert_eq!(g.ple_layer, 1, "the real model runs PLE after layer 0");
     for (rows, positions) in [(1, 32_768), (1, 262_144), (4, 4096)] {
-        let plan = StepPlan::new(&g, rows, positions, &StepOptions::default()).unwrap();
+        let plan = StepPlan::new(&g, rows, positions, &StepOptions::for_sm_count(82)).unwrap();
         let placed = placed_with(&plan, |_| {});
         let ops = token_ops(&g);
         // 2 feeds/embed, 48 layers of 11 to 17 ops, 2 PLE ops, 3 epilogue ops.
@@ -372,7 +372,7 @@ fn a_feed_that_dies_before_its_consumer_is_found() {
     // The lifetime this slice first planned for PleEmbed, StepBegin..Ple, puts the n-gram row's
     // bytes up for reuse from phase 3 on, while the PLE op runs after layer 0.
     let (_, g) = real();
-    let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::default()).unwrap();
+    let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::for_sm_count(82)).unwrap();
     let placed = placed_with(&plan, |p| {
         if p.slot == Slot::PleEmbed {
             p.last = Phase::Ple as usize;
@@ -389,7 +389,7 @@ fn a_feed_that_dies_before_its_consumer_is_found() {
 fn a_tensor_cut_short_is_found_in_every_mixer() {
     // Cutting the gate of the attention site at its read breaks the apply of both layer kinds.
     let (_, g) = real();
-    let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::default()).unwrap();
+    let plan = StepPlan::new(&g, 1, 32_768, &StepOptions::for_sm_count(82)).unwrap();
     let placed = placed_with(&plan, |p| {
         if p.slot == Slot::Gate(Site::Attn) {
             p.last = Phase::HyperReadA as usize;
@@ -409,7 +409,7 @@ fn a_tensor_cut_short_is_found_in_every_mixer() {
 #[test]
 fn prefill_256_row_slot_ranges() {
     let (_, g) = real();
-    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::default()).unwrap();
+    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::for_sm_count(82)).unwrap();
     let (bo, bb) = plan.placement(Slot::BlockOut(Site::Mlp)).unwrap();
     let moe = plan
         .slots()
@@ -544,7 +544,7 @@ fn prefill_moe_ops(subs: usize) -> Vec<Op> {
 #[test]
 fn the_prefill_op_order_has_no_hazard() {
     let (_, g) = real();
-    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::default()).unwrap();
+    let plan = StepPlan::new_prefill(&g, 256, 12_288, &StepOptions::for_sm_count(82)).unwrap();
     let placed = placed_with(&plan, |_| {});
     // Stream must be live before the MoE reads it: the embed writes it.
     let mut ops = vec![

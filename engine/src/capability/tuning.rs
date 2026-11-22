@@ -233,6 +233,43 @@ pub(crate) fn attention_splits(tuned: usize, sm_count: u32) -> usize {
         .clamp(1, SPLIT_CEILING)
 }
 
+/// The split count of a family's decode attention: `env`'s value (1 to [`SPLIT_CEILING`]) when the
+/// operator sets it, else `tuned` scaled to the device. A bad value is refused.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starts size their attention splits")
+)]
+pub(crate) fn attention_splits_or_env(
+    env: &str,
+    tuned: usize,
+    sm_count: u32,
+) -> Result<usize, crate::EngError> {
+    match std::env::var(env) {
+        Err(_) => Ok(attention_splits(tuned, sm_count)),
+        Ok(text) => match text.trim().parse::<usize>() {
+            Ok(count) if (1..=SPLIT_CEILING).contains(&count) => Ok(count),
+            _ => Err(crate::EngError::BadRequest(format!(
+                "{env} takes 1 to {SPLIT_CEILING}, got {text:?}"
+            ))),
+        },
+    }
+}
+
+/// The numeric-path name of an attention split in a prefix entry's identity: off, the tuned count
+/// (the name entries were written under), or another count, which sums the softmax in another
+/// order and so names another path.
+#[cfg_attr(
+    not(feature = "native-cuda"),
+    allow(dead_code, reason = "only the CUDA starts name their attention split")
+)]
+pub(crate) fn split_path_name(prefix: &str, splits: Option<usize>, tuned: usize) -> String {
+    match splits {
+        None => format!("{prefix} attention-split false"),
+        Some(count) if count == tuned => format!("{prefix} attention-split true"),
+        Some(count) => format!("{prefix} attention-split true splits {count}"),
+    }
+}
+
 /// One decision the family puts to the tuner: named candidates ordered
 /// best-first (the family derives each with its own qualified machinery
 /// and says why in the source string), plus the value the start uses

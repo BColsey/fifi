@@ -1305,13 +1305,7 @@ fn lower_rung(
     let resident = native_load_bytes(&model.weights, &resident_names)?;
     let geometry = planning_geometry(&dims, &expert_quant(model.weights.header(), &dims)?)?;
     // The card and the host of this decision, read together.
-    let facts = Facts::read_with_card("q36 cuda tiered", "Qwen36", || {
-        let card = projector.memory_info()?;
-        Ok((
-            u64::try_from(card.free).unwrap_or(u64::MAX),
-            u64::try_from(card.total).unwrap_or(u64::MAX),
-        ))
-    })?;
+    let facts = Facts::read_card(("q36 cuda tiered", "Qwen36"), projector.card_bytes())?;
     let free = facts.card_free();
     let figures = CardFigures {
         free,

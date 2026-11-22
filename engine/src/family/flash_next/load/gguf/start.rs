@@ -12,7 +12,7 @@ use super::{GgufModel, plan::Card};
 use crate::{
     EngError,
     family::{
-        flash_next::host_plan::HostMemory,
+        flash_next::host_plan::{HOST_LABELS, HostMemory},
         flash_next::settings::{
             DEFAULT_CUDA_CONTEXT, FlashOptions, MAX_CUDA_CONTEXT, cuda_settings, default_context,
             ring_budget_bytes,
@@ -42,10 +42,7 @@ pub(in crate::family::flash_next) fn start(
     eprintln!("{}", model.summary());
 
     let projector = CudaProjector::new()?;
-    let facts = Facts::read_with_card("Flash-Next expert bank", "Flash-Next", || {
-        let card = projector.memory_info()?;
-        Ok((card.free as u64, card.total as u64))
-    })?;
+    let facts = Facts::read_card(HOST_LABELS, projector.card_bytes())?;
     let ring_budget = ring_budget_bytes(
         std::env::var("INFERENCE_FLASH_NEXT_RING_BUDGET")
             .ok()
