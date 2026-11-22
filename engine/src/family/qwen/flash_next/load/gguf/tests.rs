@@ -853,6 +853,45 @@ fn gguf_token_feed_rejects_a_different_ngram_shard() {
 }
 
 #[test]
+fn gguf_ple_load_fixture_payloads_are_visible_to_admission_work() {
+    let (_written, model) = open(&Spec::default());
+    let layer = Some(model.config().dims.ple_layer);
+    let roles = [
+        Wanted::PleNormKey,
+        Wanted::PleNormQuery,
+        Wanted::PleNormConv,
+        Wanted::PleConv,
+    ];
+    let mut retained = 0u64;
+    let mut peak = 0u64;
+    for role in roles {
+        let entry = model.map().get(role, layer).unwrap();
+        let decoded = entry
+            .dims
+            .iter()
+            .try_fold(4u64, |n, d| n.checked_mul(*d))
+            .unwrap();
+        peak = peak.max(
+            retained
+                .checked_add(entry.bytes)
+                .unwrap()
+                .checked_add(decoded)
+                .unwrap(),
+        );
+        retained = retained.checked_add(decoded).unwrap();
+    }
+    let loaded = super::ple_weights::GgufPleWeights::load(&model).unwrap();
+    let view = loaded.view();
+    let actual = 4
+        * (view.norm_key.len() + view.norm_query.len() + view.norm_conv.len() + view.conv.len())
+            as u64;
+    assert_eq!(retained, actual);
+    assert_eq!(retained, 286_720);
+    assert_eq!(peak, 450_560);
+    eprintln!("PLE load fixture decoded={retained} peak_encoded_plus_decoded={peak}");
+}
+
+#[test]
 fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     let (_written, model) = open(&Spec::default());
     let shape = model.config().model_shape().unwrap();
