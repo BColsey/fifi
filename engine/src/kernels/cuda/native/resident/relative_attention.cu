@@ -37,8 +37,24 @@ __device__ float warp_sum(float value) {
     return value;
 }
 
+struct KvPair {
+    const float *key, *value;
+};
+
+struct SerialKv {
+    __device__ KvPair operator()(const Args &a, const Rows &r, int distance) const {
+        const int row = r.slot - distance;
+        const size_t slot = row < 0 ? row + a.capacity : row;
+        const size_t src = (slot * a.kv_heads + r.kv_head) * kHeadDim;
+        return {distance == 0 ? a.k + r.kv_head * kHeadDim : a.keys + src,
+                distance == 0 ? a.v + r.kv_head * kHeadDim : a.values + src};
+    }
+};
+
 // One warp computes the weighted sum over its interleaved subset of newest-first rows.
-__device__ void partial(const Args &a, const Rows &r, Partials &p) {
+// Only the source addresses vary by reader; the FP32 recurrence and order do not.
+template <class ReadKv>
+__device__ void partial(const Args &a, const Rows &r, Partials &p, ReadKv read_kv) {
     const int lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
     float query[kColumns];
     float acc[kColumns] = {};
@@ -49,11 +65,7 @@ __device__ void partial(const Args &a, const Rows &r, Partials &p) {
     const float rel = lane < a.relative_dims ? a.relative[r.head * a.relative_dims + lane] : 0.f;
     float peak = -INFINITY, sum = 0.f;
     for (int distance = warp; distance < r.count; distance += kWarps) {
-        const int row = r.slot - distance;
-        const size_t slot = row < 0 ? row + a.capacity : row;
-        const size_t src = (slot * a.kv_heads + r.kv_head) * kHeadDim;
-        const float *key = distance == 0 ? a.k + r.kv_head * kHeadDim : a.keys + src;
-        const float *value = distance == 0 ? a.v + r.kv_head * kHeadDim : a.values + src;
+        const auto [key, value] = read_kv(a, r, distance);
         float dot = 0.f;
 #pragma unroll
         for (int i = 0; i < kColumns; ++i) {
@@ -130,7 +142,7 @@ __global__ void relative_attention(Args a) {
         a.keys[dst] = a.k[src];
         a.values[dst] = a.v[src];
     }
-    partial(a, r, p);
+    partial(a, r, p, SerialKv{});
     __syncthreads();
     finish(a, r, p);
 }
