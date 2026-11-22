@@ -73,6 +73,9 @@ pub(crate) struct Kv {
     v_codes: DeviceBuffer,
     v_scales: DeviceBuffer,
     shape: Kv8Shape,
+    /// The ring geometry the planes were built from, and the context their cells were counted for.
+    geometry: KvRing,
+    context: usize,
 }
 
 pub(crate) struct Layer {
@@ -168,6 +171,8 @@ pub(crate) fn load(path: &std::path::Path) -> Result<Gemma, EngError> {
             v_codes: zero(&ctx, n_kv * cells * head)?,
             v_scales: zero(&ctx, n_kv * cells * (head / 32) * 2)?,
             shape: Kv8Shape::of_layer(geometry, CELLS, 1, n_kv, head, Kv8CodeScale::UnroundedF32),
+            geometry,
+            context: CELLS,
         };
         layers.push(Layer {
             attn_norm: vector(&weights, &ctx, &format!("{base}attn_norm.weight"), HIDDEN)?,

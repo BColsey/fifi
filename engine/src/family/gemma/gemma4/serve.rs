@@ -289,7 +289,7 @@ mod device {
             if self.model.pool().free() < INITIAL_CELLS {
                 return false;
             }
-            let Some(cost) = budget::bolt_seq_cost() else {
+            let Some(cost) = budget::bolt_seq_cost(self.model.rows) else {
                 return true;
             };
             let per_session = cost
@@ -686,7 +686,7 @@ mod device {
         let inputs = SeqInputs {
             free,
             headroom: budget::BOLT_HEADROOM_BYTES,
-            cost: budget::bolt_seq_cost()
+            cost: budget::bolt_seq_cost(model.rows)
                 .ok_or_else(|| EngError::MemoryPlan("the Bolt sequence cost overflows".into()))?,
             context: INITIAL_CELLS as u64,
             row_cap: budget::BOLT_WINDOW_SEQS,
@@ -712,7 +712,9 @@ mod device {
         sessions: usize,
         cells: usize,
     ) -> (PrefixStore<BoltSnapshot, PrefixIdentity>, HostStorePlan) {
-        let entry_bytes = largest_entry_bytes(budget::bolt_kv_bytes_per_position(), cells as u64);
+        // The full-attention layers keep every position; the sliding layers keep their last window.
+        let entry_bytes = largest_entry_bytes(budget::bolt_kv_bytes_per_position(), cells as u64)
+            .saturating_add(budget::bolt_window_snapshot_bytes().unwrap_or(u64::MAX));
         let plan = HostStorePlan::for_start(prefix_reuse, entry_bytes, budget, sessions);
         (PrefixStore::with_limits(plan.limits(0)), plan)
     }
@@ -780,7 +782,11 @@ mod device {
             let load = kv_tier::load_identity(
                 &model.weights_identity,
                 &text_identity,
-                &model.snapshot_layer_bytes(1),
+                // Taken twice the window in: a layout that keeps the whole prefix and one that keeps
+                // the window differ here, so an entry of the old layout is not read as the new one.
+                &model.snapshot_layer_bytes(
+                    2 * crate::family::spec::NEMOTRON_BOLT_E4B.sliding_window as usize,
+                ),
                 bolt::attn_split_wanted()?.then(|| model.attn_splits()),
             );
             let identity = PrefixIdentity {
@@ -919,15 +925,14 @@ mod device {
             }
         }
 
-        /// A true cold replay of a restore past a decode. Turn 1 decodes 48
-        /// greedy tokens past the save point (cells P..P+48 now hold turn-1
-        /// tokens); the restore rewinds to P, the tail prefill overwrites only
-        /// the first cells of that span with DIFFERENT tokens, and the drawn
-        /// chain must equal the chain a cold run of prompt + tail draws after a
-        /// reset. A cache read above the position word (or a ring-buffer
-        /// window) would leak the surviving turn-1 cells into the restored run
-        /// and break the equality. The prompt is 3,000 tokens so turn 1 crosses
-        /// the 512-cell sliding window.
+        /// A true cold replay of a restore past a decode. A snapshot is taken at the save point;
+        /// turn 1 decodes 48 greedy tokens past it (cells P..P+48 now hold turn-1 tokens, and a
+        /// sliding layer's ring has wrapped over the oldest cells of the window); the restore
+        /// writes the snapshot back, the tail prefill overwrites the first cells of that span with
+        /// DIFFERENT tokens, and the drawn chain must equal the chain a cold run of prompt + tail
+        /// draws after a reset. A cache read above the position word would leak the surviving
+        /// turn-1 cells into the restored run and break the equality. The prompt is 3,000 tokens
+        /// so turn 1 crosses the 512-position sliding window.
         #[test]
         #[ignore = "requires a Bolt Q8_0 file and a device"]
         fn a_restore_past_a_decode_matches_the_cold_replay() {
@@ -938,6 +943,7 @@ mod device {
             // The save point mirrors the session's: `prompt.len() - 1` tokens
             // fed, the last token held pending.
             let saved = prompt.len() - 1;
+            let snapshot = model.snapshot_seq(&seq, saved).expect("snapshot");
             // Turn 1: 48 greedy tokens past the save point.
             let mut token = prompt[saved];
             for pos in (saved..).take(48) {
@@ -961,6 +967,7 @@ mod device {
                 }
                 drawn
             };
+            model.restore_seq(&seq, &snapshot).expect("restore");
             let restored = draw(&mut model);
             // The cold control: reset (position 0), re-feed the prompt, then
             // the same tail and greedy continuation.
@@ -990,9 +997,9 @@ mod device {
                 "the graph stays off without FIFI_BOLT_DECODE_GRAPH"
             );
             // 1,000 prompt rows and 96 more drawn: every decode reads past
-            // the 512-cell sliding window of the local layers (Bolt's
-            // LOCAL_WINDOW is the spec's sliding_window), so the windowed
-            // attention of a replay is exercised over its full span.
+            // the 512-position sliding window of the local layers (the spec's
+            // sliding_window), so the windowed attention of a replay is
+            // exercised over its full span.
             let prompt: Vec<u32> = (0..1_000u32).map(|index| 100 + (index % 977)).collect();
             let extension: Vec<u32> = (0..8u32).map(|index| 90_000 + index).collect();
             let run = |model: &mut Bolt, prompt: &[u32]| -> Vec<u32> {
@@ -1335,6 +1342,64 @@ mod device {
                 restored, fresh,
                 "a restored session continues like a cold one"
             );
+        }
+
+        /// The greedy chain of `steps` tokens after the pending last token of a prefilled session.
+        fn draw_chain(serve: &mut BoltServe, session: &BoltSession, steps: usize) -> Vec<u32> {
+            let mut token = session.core.pending().expect("a pending token");
+            let mut chain = Vec::new();
+            for step in 0..steps {
+                serve
+                    .model
+                    .decode(&session.seq, token, session.pos + step)
+                    .expect("decode");
+                let logits = serve.model.capped_logits().expect("logits");
+                token = logits
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, logits[0]), |(best, value), (index, &other)| {
+                        if other > value { (index as u32, other) } else { (best, value) }
+                    })
+                    .0;
+                chain.push(token);
+            }
+            chain
+        }
+
+        /// Prefix reuse on and off give the same text: a conversation of six turns grows from 350
+        /// to well past the 512-position window of the sliding layers, and at every turn the
+        /// session that restores the previous turn's saved prefix draws the chain a cold prefill
+        /// of the whole prompt draws.
+        #[test]
+        #[ignore = "requires a Bolt Q8_0 file and a device"]
+        fn reuse_on_and_off_draw_the_same_text_over_a_conversation_past_the_window() {
+            let mut serve = serve_of(bolt::load(&bolt_file()).expect("load"));
+            let mut hot = sized_session(&mut serve, 2_048);
+            let mut cold = sized_session(&mut serve, 2_048);
+            let mut convo = prompt(200, 0);
+            let mut equal = 0;
+            for turn in 0..6u32 {
+                convo.extend(prompt(150 + 40 * turn as usize, 1_000 * (turn + 1)));
+                serve.reset(&mut cold).expect("reset");
+                serve.prefill(&mut cold, &convo).expect("cold prefill");
+                let cold_chain = draw_chain(&mut serve, &cold, 24);
+
+                serve.reset(&mut hot).expect("reset");
+                let covered = serve.restore_prefix(&mut hot, &convo).expect("restore");
+                assert!(turn == 0 || covered > 0, "turn {turn} restores the saved prefix");
+                serve.prefill(&mut hot, &convo[covered..]).expect("tail prefill");
+                assert_eq!(hot.pos, cold.pos, "turn {turn}");
+                assert!(
+                    serve.save_prefix(&hot, &convo, SaveKind::Tip).expect("save"),
+                    "turn {turn} saves its prompt"
+                );
+                let hot_chain = draw_chain(&mut serve, &hot, 24);
+                assert_eq!(hot_chain, cold_chain, "turn {turn} at {} tokens", convo.len());
+                equal += 1;
+                convo.extend(&cold_chain);
+            }
+            assert_eq!(equal, 6);
+            assert!(convo.len() > 1_200, "the conversation passed the window twice");
         }
 
         /// A different prompt saves over the tip, and the old key no longer restores: the store

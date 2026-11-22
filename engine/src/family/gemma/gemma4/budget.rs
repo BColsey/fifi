@@ -28,18 +28,67 @@ fn kv8_layer_bytes(heads: u32, head: u32) -> Option<u64> {
     codes.checked_add(scales)
 }
 
-/// The Bolt cache cost of one context position, summed over the twenty-four
-/// physical layers (twenty sliding at head 256, four full at head 512).
-/// `None` if the arithmetic overflows.
+/// The kinds of the physical layers, in layer order.
+fn physical_kinds() -> &'static [AttentionKind] {
+    let spec = NEMOTRON_BOLT_E4B;
+    &spec.layers_attention[..spec.first_shared_layer() as usize]
+}
+
+fn layer_head(kind: AttentionKind) -> u32 {
+    match kind {
+        AttentionKind::Full => NEMOTRON_BOLT_E4B.full_head_dim(),
+        _ => NEMOTRON_BOLT_E4B.head_dim,
+    }
+}
+
+/// The Bolt cache cost of one context position: only the full-attention layers (four, at head
+/// 512) keep every position. A sliding layer keeps a ring of fixed size, charged per session by
+/// [`bolt_ring_bytes`]. `None` if the arithmetic overflows.
 pub(crate) fn bolt_kv_bytes_per_position() -> Option<u64> {
     let spec = NEMOTRON_BOLT_E4B;
     let mut total = 0u64;
-    for &kind in &spec.layers_attention[..spec.first_shared_layer() as usize] {
-        let head = match kind {
-            AttentionKind::Full => spec.full_head_dim(),
-            _ => spec.head_dim,
-        };
-        total = total.checked_add(kv8_layer_bytes(spec.heads_kv, head)?)?;
+    for &kind in physical_kinds() {
+        if kind == AttentionKind::Full {
+            total = total.checked_add(kv8_layer_bytes(spec.heads_kv, layer_head(kind))?)?;
+        }
+    }
+    Some(total)
+}
+
+/// The cells of one sliding layer's ring when a step appends at most `rows` tokens: the same
+/// formula the kernels admit by.
+pub(crate) fn bolt_ring_cells(rows: usize) -> Option<usize> {
+    crate::family::kv_ring::ring_cells(NEMOTRON_BOLT_E4B.sliding_window as usize, rows)
+}
+
+/// The bytes of every sliding layer's ring, which each session holds from its first token
+/// whatever its context: `None` if the arithmetic overflows.
+pub(crate) fn bolt_ring_bytes(rows: usize) -> Option<u64> {
+    let spec = NEMOTRON_BOLT_E4B;
+    let cells = u64::try_from(bolt_ring_cells(rows)?).ok()?;
+    let mut total = 0u64;
+    for &kind in physical_kinds() {
+        if kind != AttentionKind::Full {
+            total = total.checked_add(
+                cells.checked_mul(kv8_layer_bytes(spec.heads_kv, layer_head(kind))?)?,
+            )?;
+        }
+    }
+    Some(total)
+}
+
+/// The bytes of the sliding layers' kept window in a prefix snapshot: the last `sliding_window`
+/// positions of every sliding layer.
+pub(crate) fn bolt_window_snapshot_bytes() -> Option<u64> {
+    let spec = NEMOTRON_BOLT_E4B;
+    let mut total = 0u64;
+    for &kind in physical_kinds() {
+        if kind != AttentionKind::Full {
+            total = total.checked_add(
+                u64::from(spec.sliding_window)
+                    .checked_mul(kv8_layer_bytes(spec.heads_kv, layer_head(kind))?)?,
+            )?;
+        }
     }
     Some(total)
 }
@@ -80,14 +129,15 @@ pub(crate) fn bolt_batch_policy() -> crate::family::executor::BatchPolicy {
     }
 }
 
-/// What one more session costs the sequence planner.
+/// What one more session costs the sequence planner: its logits rows and position words, its
+/// sliding layers' rings for a prefill chunk of `rows`, and the cells of its full-attention layers.
 #[cfg_attr(
     not(feature = "native-cuda"),
     allow(dead_code, reason = "only the CUDA starter plans sessions")
 )]
-pub(crate) fn bolt_seq_cost() -> Option<SeqCost> {
+pub(crate) fn bolt_seq_cost(rows: usize) -> Option<SeqCost> {
     Some(SeqCost {
-        fixed: BOLT_SEQ_FIXED_BYTES,
+        fixed: BOLT_SEQ_FIXED_BYTES.checked_add(bolt_ring_bytes(rows)?)?,
         per_position: bolt_kv_bytes_per_position()?,
     })
 }
@@ -147,18 +197,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bolt_costs_30464_bytes_per_position() {
-        // Twenty sliding layers at 1088 bytes plus four full layers at 2176.
-        assert_eq!(20 * 1088 + 4 * 2176, 30_464);
-        assert_eq!(bolt_kv_bytes_per_position(), Some(30_464));
+    fn a_context_position_costs_the_four_full_layers_only() {
+        // Four full layers at 2176 bytes; the twenty sliding layers keep a ring instead.
+        assert_eq!(bolt_kv_bytes_per_position(), Some(4 * 2176));
+        assert_eq!(bolt_kv_bytes_per_position(), Some(8_704));
+    }
+
+    #[test]
+    fn a_session_holds_the_rings_of_its_sliding_layers_from_its_first_token() {
+        // Window 512 and a chunk of 64 rows: 575 cells at 1088 bytes in each of twenty layers.
+        assert_eq!(bolt_ring_cells(64), Some(575));
+        assert_eq!(bolt_ring_bytes(64), Some(20 * 575 * 1088));
+        assert_eq!(bolt_ring_bytes(8), Some(20 * 519 * 1088));
+        // The kept window of a snapshot is 512 positions of the same layers.
+        assert_eq!(bolt_window_snapshot_bytes(), Some(20 * 512 * 1088));
+        // The one formula: the ring a layer is built with is the one the budget charges.
+        let ring = NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, 64);
+        assert_eq!(ring.cells(usize::MAX), 575);
     }
 
     #[test]
     fn an_extra_session_costs_its_planes_and_its_window_rows() {
-        let cost = bolt_seq_cost().expect("cost");
-        assert_eq!(cost.per_position, 30_464);
-        // Raw and capped logits rows of 262,144 floats, and two position words.
-        assert_eq!(cost.fixed, 2 * 262_144 * 4 + 8);
+        let cost = bolt_seq_cost(64).expect("cost");
+        assert_eq!(cost.per_position, 8_704);
+        // Raw and capped logits rows of 262,144 floats, two position words, and the rings.
+        assert_eq!(cost.fixed, 2 * 262_144 * 4 + 8 + 20 * 575 * 1088);
+    }
+
+    #[test]
+    fn the_ring_cuts_what_a_long_session_costs_by_the_sliding_layers_share() {
+        // A session of 32,768 cells: it cost 30,464 bytes a cell before.
+        let before = 30_464u64 * 32_768;
+        let cost = bolt_seq_cost(64).expect("cost");
+        let after = cost.per_position * 32_768 + (cost.fixed - BOLT_SEQ_FIXED_BYTES);
+        assert!(after * 3 < before, "{after} against {before}");
     }
 
     #[test]
@@ -184,11 +256,11 @@ mod tests {
     /// file the memory plan picks (the 4,033.5 MiB Q4_K file when Q8_0 does not fit), the first
     /// session and the scratch, about 300 MiB the desktop holds, and the headroom.
     #[test]
-    fn the_default_plans_one_session_on_a_6_gb_card_and_three_on_an_8_gb_card() {
+    fn the_default_plans_four_sessions_on_a_6_gb_card_and_eight_on_an_8_gb_card() {
         use crate::family::seq_plan::{SeqInputs, plan_seqs};
         let mib = |value: f64| (value * f64::from(1u32 << 20)) as u64;
-        let cost = bolt_seq_cost().expect("cost");
-        let first_session = 30_464 * 32_768;
+        let cost = bolt_seq_cost(8).expect("cost");
+        let first_session = cost.per_position * 32_768 + (cost.fixed - BOLT_SEQ_FIXED_BYTES);
         let plan = |card_mib: f64| {
             let free = mib(card_mib - 300.0 - 4_033.5 - 9.0) - first_session;
             plan_seqs(
@@ -204,11 +276,12 @@ mod tests {
             )
             .expect("plan")
         };
-        // 6,144 MiB: 849 MiB remain after the first session, 337 MiB above the headroom, which
-        // is less than the 954 MiB of one more session.
-        assert_eq!(plan(6_144.0).seqs, 1);
-        // 8,192 MiB: 2,897 MiB remain, 2,385 above the headroom: two more sessions.
-        assert_eq!(plan(8_192.0).seqs, 3);
+        // 6,144 MiB: 1,519 MiB remain after the first session, 1,007 above the headroom, which
+        // funds three more sessions of 285 MiB (one used to fit: 954 MiB each).
+        assert_eq!(plan(6_144.0).seqs, 4);
+        // 8,192 MiB: 3,055 MiB above the headroom fund ten more; the window of eight rows caps it
+        // (three before the rings).
+        assert_eq!(plan(8_192.0).seqs, 8);
     }
 
     #[test]
@@ -246,12 +319,12 @@ mod tests {
 
     #[test]
     fn the_plan_reports_the_cell_count_charge() {
-        // The executor's full cache: 32,768 cells at 30,464 bytes each is just
-        // under one GiB, the number a serving preflight must admit.
+        // The full-attention layers' cache: 32,768 cells at 8,704 bytes each; the sliding layers'
+        // rings are charged per session beside it.
         let plan = bolt_kv_plan(32_768).expect("bounded plan");
         assert_eq!(plan.positions, 32_768);
-        assert_eq!(plan.bytes_per_position, 30_464);
-        assert_eq!(plan.positions * plan.bytes_per_position, 998_244_352);
+        assert_eq!(plan.bytes_per_position, 8_704);
+        assert_eq!(plan.positions * plan.bytes_per_position, 285_212_672);
     }
 
     #[test]
@@ -266,22 +339,23 @@ mod tests {
         assert_eq!(LOCAL_HEAD as u32, spec.head_dim);
         assert_eq!(GLOBAL_HEAD as u32, spec.full_head_dim());
         assert_eq!(PHYSICAL_LAYERS as u32, spec.first_shared_layer());
-        // Sum the per-position allocation exactly as the executor lays out the
-        // planes: k and v codes plus fp16 scales, full attention every sixth
-        // layer. Sliding layers reserve the full cell count too — the window
-        // bounds attention, not the allocation — so they cost full cells here.
-        let mut allocated = 0u64;
+        // Sum the per-position allocation exactly as the executor lays out the planes: k and v
+        // codes plus fp16 scales. Only the full-attention layers (every sixth) grow with the
+        // context; each sliding layer holds `bolt_ring_cells` cells whatever the context.
+        let (mut grows, mut rings) = (0u64, 0u64);
         for layer in 0..PHYSICAL_LAYERS {
-            let head = if layer % 6 == 5 {
-                GLOBAL_HEAD
-            } else {
-                LOCAL_HEAD
-            } as u64;
+            let global = layer % 6 == 5;
+            let head = if global { GLOBAL_HEAD } else { LOCAL_HEAD } as u64;
             let codes = 2 * KV_HEADS as u64 * head;
             let scales = 2 * KV_HEADS as u64 * (head / 32) * 2;
-            allocated += codes + scales;
+            if global {
+                grows += codes + scales;
+            } else {
+                rings += (codes + scales) * bolt_ring_cells(8).expect("cells") as u64;
+            }
         }
-        assert_eq!(Some(allocated), bolt_kv_bytes_per_position());
+        assert_eq!(Some(grows), bolt_kv_bytes_per_position());
+        assert_eq!(Some(rings), bolt_ring_bytes(8));
         assert_eq!(
             BOLT_WINDOW_SEQS,
             crate::family::gemma::gemma4::resident::bolt::Bolt::WINDOW_ROWS

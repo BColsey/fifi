@@ -4,6 +4,16 @@
 //! `ring` number (`kv8_append`, `attn_decode_gemma`), and the host side (plane sizes, the cells a
 //! snapshot copies) reads it from here, so a family states its window once.
 
+// The snapshot and append rules below are read by the CUDA Bolt executor; portable builds keep
+// them for the unit tests.
+#![cfg_attr(
+    not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+    allow(
+        dead_code,
+        reason = "only the CUDA Bolt executor reads the ring geometry"
+    )
+)]
+
 use std::ops::Range;
 
 use super::spec::{AttentionKind, FamilySpec};
@@ -36,13 +46,6 @@ pub(crate) struct KvRing {
 }
 
 /// A contiguous piece of one plane head's cells.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CellRun {
     /// First cell of the run.
@@ -69,26 +72,12 @@ impl KvRing {
 
     /// Whether one append of `rows` tokens keeps the whole window of every query readable. A
     /// linear plane takes any count; a ring takes at most [`Self::widest_append`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt append checks its chunk against the ring when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn admits(self, rows: usize) -> bool {
         self.ring == 0 || ring_admits(self.ring, self.window, rows, self.ring)
     }
 
     /// The most tokens one append may write: the ring's cells beyond the window, plus one.
     /// `usize::MAX` for a linear plane.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt append splits its chunk at the ring margin when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn widest_append(self) -> usize {
         if self.ring == 0 {
             usize::MAX
@@ -97,15 +86,16 @@ impl KvRing {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
+    /// The positions a query reaches; 0 for a linear layer.
+    #[cfg(test)]
     pub(crate) fn window(self) -> usize {
         self.window
+    }
+
+    /// The bytes a plane of `kv_heads` heads holds for the kept positions of a snapshot.
+    #[cfg(test)]
+    pub(crate) fn kept_bytes(self, fed: usize, kv_heads: usize, unit: usize) -> usize {
+        self.kept(fed).len() * kv_heads * unit
     }
 
     /// Whether a cache for `context` positions is smaller as a ring than as a linear plane.
@@ -131,13 +121,6 @@ impl KvRing {
     /// The positions a snapshot of a sequence fed `fed` tokens must keep: the last `window` (all
     /// of them for a linear layer). A ring layer can only be restored at exactly `fed`, because
     /// older positions are overwritten.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn kept(self, fed: usize) -> Range<usize> {
         if self.window == 0 {
             0..fed
@@ -148,13 +131,6 @@ impl KvRing {
 
     /// The cell runs that hold the kept positions of one head, in position order: one run for a
     /// linear plane or a ring that has not wrapped over them, two when they wrap.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn runs(self, context: usize, fed: usize) -> Vec<CellRun> {
         let kept = self.kept(fed);
         if kept.is_empty() {
@@ -183,13 +159,6 @@ impl KvRing {
 
     /// The `(byte offset, bytes)` ranges of every kv head's kept cells in a plane laid out
     /// `[kv head][cell][unit]`, head by head, each head's runs in position order.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn plane_ranges(
         self,
         context: usize,
@@ -206,31 +175,12 @@ impl KvRing {
             })
             .collect()
     }
-
-    /// The bytes a plane of `kv_heads` heads holds for the kept positions of a snapshot.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
-    pub(crate) fn kept_bytes(self, fed: usize, kv_heads: usize, unit: usize) -> usize {
-        self.kept(fed).len() * kv_heads * unit
-    }
 }
 
 impl FamilySpec {
     /// The cache geometry of a layer of `kind` that is fed at most `rows` tokens at a time. A
     /// sliding layer reaches `sliding_window` positions; every other kind reaches the whole
     /// context.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Bolt snapshot reads the ring cells when bolt.rs takes the ring"
-        )
-    )]
     pub(crate) fn kv_ring(&self, kind: AttentionKind, rows: usize) -> KvRing {
         match kind {
             AttentionKind::Sliding => KvRing::sliding(self.sliding_window as usize, rows),

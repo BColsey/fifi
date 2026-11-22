@@ -43,6 +43,7 @@ use crate::EngError;
 use crate::family::card_fit::CellFigures;
 use crate::family::cell_pool::{CellLease, CellPool, fit_planes, fund_growth};
 use crate::family::gemma::gemma4::gguf::ple_rows_from_merged;
+use crate::family::kv_ring::KvRing;
 use crate::family::spec::{AttentionKind, NEMOTRON_BOLT_E4B};
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::prefill::attn_prefill::{
@@ -112,7 +113,6 @@ pub(crate) const MAX_CELLS: usize = match NEMOTRON_BOLT_E4B.feed_forward {
 };
 /// The cell count a refusal is worded for when the card carries no planned count.
 const FALLBACK_CELLS: usize = 32_768;
-pub(crate) const LOCAL_WINDOW: usize = NEMOTRON_BOLT_E4B.sliding_window as usize;
 pub(crate) const SOFT_CAP: f32 = 30.0;
 /// The identity and mixing scales applied to the per-layer inputs.
 const PLE_IDENTITY_SCALE: f32 = 16.0;
@@ -416,8 +416,15 @@ pub(crate) struct Bolt {
     cells: usize,
     /// The splits of one decode attention launch on this device.
     attn_splits: usize,
-    /// The rows of one prefill chunk: the planned rows of this load.
+    /// The rows of one prefill chunk: the planned rows of this load. It is also the widest append
+    /// any caller makes (`prefill_batch` refuses more), so it sizes the sliding layers' rings.
     pub(crate) rows: usize,
+    /// The positions a sliding layer reaches, from the spec the file's header was checked against.
+    local_window: usize,
+    /// The geometry of a sliding layer's cache: a ring of `local_window + rows - 1` cells. A test
+    /// can set it linear, which keeps every position in the sliding layers' planes as the
+    /// control the ring must equal bit for bit.
+    local_ring: KvRing,
     /// The cells every session of this load draws from: what the card carries beside the weights.
     pool: Arc<CellPool>,
     /// The captured one-token decode body, armed by [`bolt_graph`]. Declared
@@ -476,9 +483,11 @@ pub(crate) fn bolt_demand(
 ) -> Result<crate::kernels::cuda::plan::Demand, EngError> {
     let kv = super::super::budget::bolt_kv_plan(cells as u64)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV budget overflows".into()))?;
+    // The first session: the full-attention layers' cells and every sliding layer's ring.
     let kv_bytes = kv
         .positions
         .checked_mul(kv.bytes_per_position)
+        .and_then(|bytes| bytes.checked_add(super::super::budget::bolt_ring_bytes(prefill_rows)?))
         .ok_or_else(|| EngError::MemoryPlan("the Bolt KV cache charge overflows".into()))?;
     let scratch = scratch_bytes(attn_splits, wide_prefill, prefill_rows)
         .ok_or_else(|| EngError::MemoryPlan("the Bolt scratch charge overflows".into()))?;
@@ -493,14 +502,22 @@ pub(crate) fn bolt_demand(
 /// The cells, prefill rows and demand of one load.
 type Planned = (usize, usize, usize, crate::kernels::cuda::plan::Demand);
 
+/// The working set shared by every session and the first session's sliding rings, which are
+/// charged with it: the rings do not grow with the context, so they are not part of the pool.
+fn shared_bytes(splits: Option<usize>, wide: bool, rows: usize) -> Option<u64> {
+    scratch_bytes(splits, wide, rows)?.checked_add(super::super::budget::bolt_ring_bytes(rows)?)
+}
+
 /// The byte figures of Bolt's per-session cell sizing, planned by the shared card-fit rule.
 fn cell_figures(splits: Option<usize>, wide: bool, rows: usize) -> Result<CellFigures, EngError> {
     CellFigures::checked(
         super::super::budget::bolt_kv_bytes_per_position(),
-        scratch_bytes(splits, wide, rows),
+        shared_bytes(splits, wide, rows),
         (
             super::super::budget::BOLT_HEADROOM_BYTES,
-            super::super::budget::BOLT_SEQ_FIXED_BYTES,
+            super::super::budget::BOLT_SEQ_FIXED_BYTES
+                .checked_add(super::super::budget::bolt_ring_bytes(rows).unwrap_or(u64::MAX))
+                .unwrap_or(u64::MAX),
         ),
     )
     .ok_or_else(|| EngError::MemoryPlan("the Bolt cell figures overflow".into()))
@@ -580,7 +597,7 @@ pub(crate) fn load_choosing(
             free,
             file.bytes,
             (super::super::budget::BOLT_PREFILL_LADDER, FALLBACK_CELLS),
-            &|rows| scratch_bytes(split, wide, rows),
+            &|rows| shared_bytes(split, wide, rows),
             "FIFI_BOLT_PREFILL_ROWS",
         );
         let figures = cell_figures(split, wide, rows)?;
@@ -879,6 +896,8 @@ pub(crate) fn load_choosing(
         cells: cells.min(pool),
         attn_splits,
         rows,
+        local_window: NEMOTRON_BOLT_E4B.sliding_window as usize,
+        local_ring: NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, rows),
         pool: CellPool::new(pool),
         ctx,
         stream,
@@ -928,6 +947,18 @@ impl Bolt {
     /// The splits of one decode attention launch on this device.
     pub(crate) fn attn_splits(&self) -> usize {
         self.attn_splits
+    }
+
+    /// Makes the sliding layers of sequences created from now on keep every position in a linear
+    /// plane, or a ring again: the control a ring must equal bit for bit. A test hook; the ring is
+    /// what every start uses.
+    #[cfg(test)]
+    pub(crate) fn set_linear_local_layers(&mut self, linear: bool) {
+        self.local_ring = if linear {
+            KvRing::LINEAR
+        } else {
+            NEMOTRON_BOLT_E4B.kv_ring(AttentionKind::Sliding, self.rows)
+        };
     }
 
     /// The cells the card carries for every session together.
@@ -1000,7 +1031,7 @@ impl Bolt {
         let who = seq.id;
         let cells = fund_growth(&mut seq.lease, who, held, positions, self.cells)?;
         // The old planes stay until the copy ends: the card must hold both.
-        let per_position = crate::family::gemma::gemma4::budget::bolt_seq_cost()
+        let per_position = crate::family::gemma::gemma4::budget::bolt_seq_cost(self.rows)
             .map_or(0, |cost| cost.per_position);
         let cells = fit_planes(
             &mut seq.lease,
@@ -1036,13 +1067,14 @@ impl Bolt {
     }
 
     /// Re-lays the planes of `seq` in `cells` cells per head, keeping the first `fed` cells of
-    /// every head of every plane (a sliding layer's ring lives in the first cells of its plane, so
-    /// it is kept whole once `fed` passes the ring). The old planes are released after the copies
-    /// on the stream, so the peak is both sets together. The sequence takes a new id, so a
-    /// captured decode graph never replays the old planes.
+    /// every head of every plane of a full-attention layer. A sliding layer's ring has the same
+    /// cells whatever the context, so its planes are moved, not copied. The old planes are
+    /// released after the copies on the stream, so the peak is both sets of the full-attention
+    /// planes together. The sequence takes a new id, so a captured decode graph never replays the
+    /// old planes.
     fn grow_planes(&self, seq: &mut BoltSeq, cells: usize, fed: usize) -> Result<(), EngError> {
         let zeros = zero(&self.ctx, ZERO_CHUNK)?;
-        let built = self.build_kv(&zeros, cells);
+        let built = self.build_kv(&zeros, cells, Some(&seq.kv));
         let drained = self.stream.synchronize();
         let mut grown = built?;
         drained?;
@@ -1052,6 +1084,7 @@ impl Bolt {
                 continue;
             };
             let layer_head = old.shape.head_dim;
+            let (from_cells, to_cells) = (old.shape.cells, new.shape.cells);
             for (from, to, unit) in [
                 (&old.k_codes, &new.k_codes, layer_head),
                 (&old.k_scales, &new.k_scales, (layer_head / 32) * 2),
@@ -1059,20 +1092,26 @@ impl Bolt {
                 (&old.v_scales, &new.v_scales, (layer_head / 32) * 2),
             ] {
                 for kv_head in 0..KV_HEADS {
-                    let bytes = keep * unit;
+                    let bytes = keep.min(from_cells).min(to_cells) * unit;
                     if bytes == 0 {
                         continue;
                     }
                     self.ctx.copy_device(
                         &self.stream,
-                        from.range(kv_head * seq.cells * unit, bytes)?,
-                        to.range(kv_head * cells * unit, bytes)?,
+                        from.range(kv_head * from_cells * unit, bytes)?,
+                        to.range(kv_head * to_cells * unit, bytes)?,
                     )?;
                 }
             }
         }
         // The copies read the old planes: the stream drains before they drop.
         self.stream.synchronize()?;
+        // The rings keep their planes: only the layers `build_kv` left empty move across.
+        for (old, new) in seq.kv.iter_mut().zip(grown.iter_mut()) {
+            if new.is_none() {
+                *new = old.take();
+            }
+        }
         seq.kv = grown;
         seq.cells = cells;
         seq.id = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1088,7 +1127,7 @@ impl Bolt {
         // One zero chunk on the device, copied down every plane: the planes are cleared at
         // device speed and no host memory the size of a plane is touched.
         let zeros = zero(&self.ctx, ZERO_CHUNK)?;
-        let built = self.build_kv(&zeros, cells);
+        let built = self.build_kv(&zeros, cells, None);
         // The queued copies read `zeros`: the stream drains before it drops, whether or not the
         // build succeeded.
         let drained = self.stream.synchronize();
@@ -1099,7 +1138,26 @@ impl Bolt {
         Ok(())
     }
 
-    fn build_kv(&self, zeros: &DeviceBuffer, cells: usize) -> Result<Vec<Option<Kv>>, EngError> {
+    /// The cache geometry of one physical layer and the context its cells are counted for: a
+    /// full-attention layer keeps a plane of the session's cells, a sliding layer a ring whose
+    /// cells do not depend on the session (the linear control keeps the session's cells too).
+    fn layer_geometry(&self, layer: &BoltLayer, seq_cells: usize) -> (KvRing, usize) {
+        if layer.global || self.local_ring == KvRing::LINEAR {
+            (KvRing::LINEAR, seq_cells)
+        } else {
+            (self.local_ring, MAX_CELLS)
+        }
+    }
+
+    /// The planes of every physical layer at `cells` cells for the full-attention layers. With the
+    /// planes a sequence already `holds`, the layers whose planes are rings are left out (`None`):
+    /// a ring has the same cells at any context, so the caller moves those across.
+    fn build_kv(
+        &self,
+        zeros: &DeviceBuffer,
+        cells: usize,
+        holds: Option<&[Option<Kv>]>,
+    ) -> Result<Vec<Option<Kv>>, EngError> {
         let ctx = &self.ctx;
         let plane = |bytes: usize| -> Result<DeviceBuffer, EngError> {
             let buffer = ctx.allocate(bytes)?;
@@ -1112,36 +1170,52 @@ impl Bolt {
             Ok(buffer)
         };
         let mut kv = Vec::with_capacity(LAYERS);
-        for layer in &self.layers {
+        for (index, layer) in self.layers.iter().enumerate() {
             let head = layer.head;
-            kv.push(if layer.physical() {
-                Some(Kv {
-                    k_codes: plane(KV_HEADS * cells * head)?,
-                    k_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
-                    v_codes: plane(KV_HEADS * cells * head)?,
-                    v_scales: plane(KV_HEADS * cells * (head / 32) * 2)?,
-                    shape: Kv8Shape::linear(1, KV_HEADS, head, cells, Kv8CodeScale::UnroundedF32),
-                })
-            } else {
+            let held_ring = holds
+                .and_then(|planes| planes.get(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|plane| plane.geometry != KvRing::LINEAR);
+            kv.push(if !layer.physical() || held_ring {
                 None
+            } else {
+                let (geometry, context) = self.layer_geometry(layer, cells);
+                let shape = Kv8Shape::of_layer(
+                    geometry,
+                    context,
+                    1,
+                    KV_HEADS,
+                    head,
+                    Kv8CodeScale::UnroundedF32,
+                );
+                let plane_cells = shape.cells;
+                Some(Kv {
+                    k_codes: plane(KV_HEADS * plane_cells * head)?,
+                    k_scales: plane(KV_HEADS * plane_cells * (head / 32) * 2)?,
+                    v_codes: plane(KV_HEADS * plane_cells * head)?,
+                    v_scales: plane(KV_HEADS * plane_cells * (head / 32) * 2)?,
+                    shape,
+                    geometry,
+                    context,
+                })
             });
         }
         Ok(kv)
     }
 
-    /// The `(offset, bytes)` ranges of the cells `0..fed` of every plane of one layer's cache, in
-    /// the order a snapshot stores them. Cells are laid out `[kv head][cell][unit]`, so the cells
-    /// of one head are contiguous from the head's base.
-    fn snapshot_ranges(head: usize, fed: usize, cells: usize) -> [[(usize, usize); KV_HEADS]; 4] {
-        let codes = head;
-        let scales = (head / 32) * 2;
-        let plane = |unit: usize| {
-            let mut ranges = [(0, 0); KV_HEADS];
-            for (kv_head, range) in ranges.iter_mut().enumerate() {
-                *range = (kv_head * cells * unit, fed * unit);
-            }
-            ranges
-        };
+    /// The `(offset, bytes)` ranges of the positions a snapshot of `fed` tokens keeps, of every
+    /// plane of one layer's cache, in the order a snapshot stores them: plane by plane (k codes,
+    /// k scales, v codes, v scales), kv head by kv head, a head's cells in position order. A
+    /// full-attention layer keeps cells `0..fed`; a sliding layer keeps its last window, which
+    /// sits in ring cells (two runs when it wraps).
+    fn snapshot_ranges(
+        geometry: KvRing,
+        context: usize,
+        head: usize,
+        fed: usize,
+    ) -> [Vec<(usize, usize)>; 4] {
+        let (codes, scales) = (head, (head / 32) * 2);
+        let plane = |unit: usize| geometry.plane_ranges(context, fed, KV_HEADS, unit);
         [plane(codes), plane(scales), plane(codes), plane(scales)]
     }
 
@@ -1152,7 +1226,8 @@ impl Bolt {
             .iter()
             .filter(|layer| layer.physical())
             .map(|layer| {
-                Self::snapshot_ranges(layer.head, fed, self.cells)
+                let (geometry, context) = self.layer_geometry(layer, self.cells);
+                Self::snapshot_ranges(geometry, context, layer.head, fed)
                     .iter()
                     .map(|plane| plane.iter().map(|range| range.1).sum::<usize>())
                     .sum()
@@ -1172,11 +1247,11 @@ impl Bolt {
             ));
         }
         let mut total = 0usize;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            if planes.is_some() {
-                for plane in Self::snapshot_ranges(layer.head, fed, seq.cells) {
-                    total += plane.iter().map(|range| range.1).sum::<usize>();
-                }
+        for planes in seq.kv.iter().flatten() {
+            for plane in
+                Self::snapshot_ranges(planes.geometry, planes.context, planes.shape.head_dim, fed)
+            {
+                total += plane.iter().map(|range| range.1).sum::<usize>();
             }
         }
         // Linux grants an allocation it cannot back and kills the process later, so the
@@ -1195,13 +1270,14 @@ impl Bolt {
         })?;
         data.resize(total, 0);
         let mut at = 0;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            let Some(kv) = planes else { continue };
+        for kv in seq.kv.iter().flatten() {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
-            for (buffer, ranges) in buffers
-                .into_iter()
-                .zip(Self::snapshot_ranges(layer.head, fed, seq.cells))
-            {
+            for (buffer, ranges) in buffers.into_iter().zip(Self::snapshot_ranges(
+                kv.geometry,
+                kv.context,
+                kv.shape.head_dim,
+                fed,
+            )) {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
                         buffer.read_at(&self.stream, offset, &mut data[at..at + bytes])?;
@@ -1226,14 +1302,14 @@ impl Bolt {
             ));
         }
         let mut at = 0;
-        for (layer, planes) in self.layers.iter().zip(&seq.kv) {
-            let Some(kv) = planes else { continue };
+        for kv in seq.kv.iter().flatten() {
             let buffers = [&kv.k_codes, &kv.k_scales, &kv.v_codes, &kv.v_scales];
-            for (buffer, ranges) in
-                buffers
-                    .into_iter()
-                    .zip(Self::snapshot_ranges(layer.head, snapshot.fed, seq.cells))
-            {
+            for (buffer, ranges) in buffers.into_iter().zip(Self::snapshot_ranges(
+                kv.geometry,
+                kv.context,
+                kv.shape.head_dim,
+                snapshot.fed,
+            )) {
                 for (offset, bytes) in ranges {
                     if bytes > 0 {
                         buffer.write_at(&self.stream, offset, &snapshot.data[at..at + bytes])?;
@@ -2034,6 +2110,16 @@ impl Bolt {
                 let own = seq.kv[source]
                     .as_ref()
                     .expect("the shared-KV source layer is physical");
+                // One chunk is appended whole before it is attended, so a sliding layer's ring
+                // must hold the window plus the chunk: a wider chunk would overwrite cells its own
+                // first rows still read. The ring is sized from `rows`, the widest chunk
+                // `prefill_batch` takes, so this refuses a caller that bypassed that limit.
+                if !own.geometry.admits(count) {
+                    return Err(EngError::BadRequest(format!(
+                        "a Bolt append of {count} rows is wider than the sliding ring's margin of {}",
+                        own.geometry.widest_append()
+                    )));
+                }
                 let (at, bytes) = (row * q_rows * 4, count * q_rows * 4);
                 let (kat, kbytes) = (row * kv_rows * 4, count * kv_rows * 4);
                 rotate(row, count, seq.pos.range(0, 4)?)?;
@@ -2114,10 +2200,10 @@ impl Bolt {
                         n_kv_head: KV_HEADS,
                         head_dim: head,
                         cells: own.shape.cells,
-                        window: if layer.global { 0 } else { LOCAL_WINDOW },
+                        window: if layer.global { 0 } else { self.local_window },
                         scale: 1.0,
                         split: attn_split,
-                        ring: 0,
+                        ring: own.shape.ring,
                     },
                 )
             };
@@ -2154,8 +2240,8 @@ impl Bolt {
                         n_q_head: HEADS,
                         n_kv_head: KV_HEADS,
                         head_dim: head,
-                        window: if layer.global { 0 } else { LOCAL_WINDOW },
-                        ring: 0,
+                        window: if layer.global { 0 } else { self.local_window },
+                        ring: own.shape.ring,
                         scale: 1.0,
                         q: sc.q_normed.buf.range(0, rows * q_rows * 4)?,
                         rows: table,
@@ -3065,7 +3151,8 @@ mod tests {
             SeqInputs {
                 free,
                 headroom: crate::family::gemma::gemma4::budget::BOLT_HEADROOM_BYTES,
-                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost().expect("cost"),
+                cost: crate::family::gemma::gemma4::budget::bolt_seq_cost(model.rows)
+                    .expect("cost"),
                 context: initial as u64,
                 row_cap: Bolt::WINDOW_ROWS,
                 ceiling: Bolt::WINDOW_ROWS,
@@ -3162,6 +3249,138 @@ mod tests {
         }
         assert!(growths >= 1, "the sequence grew during the run");
         assert!(grown.cells() >= steps);
+    }
+
+    fn load_q8() -> Bolt {
+        let path = std::path::PathBuf::from(std::env::var("BOLT_Q8_FILE").expect("model path"));
+        let bytes = std::fs::metadata(&path).expect("model file").len();
+        load_choosing(
+            &[crate::family::gguf_select::GgufFile { path, bytes }],
+            crate::family::gemma::gemma4::config::MaxSeqs::Auto,
+            &|_| {},
+        )
+        .expect("load")
+    }
+
+    /// The bits of the capped logits of the last step.
+    fn logit_bits(model: &Bolt) -> Vec<u32> {
+        model
+            .capped_logits()
+            .expect("logits")
+            .iter()
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
+    /// A session whose sliding layers keep a ring gives, at every chunk and every decode step, the
+    /// logits of a session that keeps every position in linear planes, bit for bit: the prompt
+    /// crosses the 512-position window, the chunk widths run from one to the planned rows, and the
+    /// positions straddle the ring's end at every offset.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_ring_session_gives_the_logits_of_the_linear_control_bit_for_bit() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let mut model = load_q8();
+        assert_ne!(model.local_ring, KvRing::LINEAR, "the ring is what a start builds");
+        let cells = 2 * CELL_GRANULE;
+        let ring = model.new_seq_cells(cells).expect("ring session");
+        model.set_linear_local_layers(true);
+        let linear = model.new_seq_cells(cells).expect("linear session");
+        model.set_linear_local_layers(false);
+        // The ring planes are the fixed small size; the linear control keeps every cell.
+        let ring_cells = |seq: &BoltSeq| {
+            seq.kv
+                .iter()
+                .flatten()
+                .map(|kv| kv.shape.cells)
+                .collect::<Vec<_>>()
+        };
+        assert!(ring_cells(&ring).iter().any(|&c| c < cells), "{:?}", ring_cells(&ring));
+        assert!(ring_cells(&linear).iter().all(|&c| c == cells));
+        let widths = [1usize, 8.min(model.rows), 3, 5.min(model.rows), 2, 7.min(model.rows), 1, model.rows];
+        let mut pos = 0usize;
+        let mut turn = 0usize;
+        while pos < 1_700 {
+            let width = widths[turn % widths.len()].min(1_700 - pos);
+            let tokens: Vec<u32> = (0..width).map(|i| 2 + ((pos + i) as u32 * 37) % 9_000).collect();
+            model.prefill_batch(&ring, &tokens, pos, true).expect("ring chunk");
+            let a = logit_bits(&model);
+            model.prefill_batch(&linear, &tokens, pos, true).expect("linear chunk");
+            let b = logit_bits(&model);
+            assert_eq!(a, b, "the logits differ after the chunk ending at {}", pos + width);
+            pos += width;
+            turn += 1;
+        }
+        for step in 0..40usize {
+            let token = 3 + (step as u32 * 11) % 5_000;
+            model.decode(&ring, token, pos + step).expect("ring step");
+            let a = logit_bits(&model);
+            model.decode(&linear, token, pos + step).expect("linear step");
+            assert_eq!(a, logit_bits(&model), "the logits differ at decode step {step}");
+        }
+    }
+
+    /// A snapshot keeps the sliding layers' last window and a restore writes it back where the
+    /// ring wants it: for every fed count around the window and the ring's end, a fresh session
+    /// restored from the snapshot continues with the logits of the session it was taken from.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_snapshot_of_a_ring_session_restores_into_another_session_bit_for_bit() {
+        use crate::family::cell_pool::CELL_GRANULE;
+        let mut model = load_q8();
+        let cells = 2 * CELL_GRANULE;
+        let source = model.new_seq_cells(cells).expect("source");
+        let target = model.new_seq_cells(cells).expect("target");
+        let total = 1_600usize;
+        let token_at = |pos: usize| 2 + (pos as u32 * 29) % 9_000;
+        let tokens: Vec<u32> = (0..total).map(token_at).collect();
+        // Feed the source one token at a time, saving at the counts that straddle the window.
+        let mut snapshots = Vec::new();
+        for pos in 0..total {
+            model.prefill_batch(&source, &tokens[pos..=pos], pos, false).expect("feed");
+            let fed = pos + 1;
+            if [100, 511, 512, 513, 519, 520, 1_030, 1_600].contains(&fed) {
+                snapshots.push((fed, model.snapshot_seq(&source, fed).expect("snapshot")));
+            }
+        }
+        for (fed, snapshot) in &snapshots {
+            let layers = model.snapshot_layer_bytes(*fed);
+            assert_eq!(layers.iter().sum::<usize>(), snapshot.bytes(), "size at {fed}");
+            // Past the window the entry stops growing with the prefix on the sliding layers.
+            model.restore_seq(&target, snapshot).expect("restore");
+            // The source continues from its own cells only for the count it is at; rebuild it.
+            let probe = model.new_seq_cells(cells).expect("probe");
+            for pos in 0..*fed {
+                model.prefill_batch(&probe, &tokens[pos..=pos], pos, false).expect("refeed");
+            }
+            for step in 0..6usize {
+                let token = 5 + step as u32;
+                model.decode(&probe, token, fed + step).expect("probe step");
+                let a = logit_bits(&model);
+                model.decode(&target, token, fed + step).expect("restored step");
+                assert_eq!(a, logit_bits(&model), "fed {fed} step {step}");
+            }
+        }
+        // The window caps the sliding layers: a long entry is not larger than a window-long one by
+        // more than the full-attention layers' cells.
+        let (short, long) = (model.snapshot_layer_bytes(600), model.snapshot_layer_bytes(1_600));
+        let sliding = |layers: &[usize]| layers[0];
+        assert_eq!(sliding(&short), sliding(&long), "a sliding layer stores its window only");
+        assert!(long[5] > short[5], "a full-attention layer stores every position");
+    }
+
+    /// A chunk wider than the ring's margin is refused at the append, never written over the
+    /// cells its own first rows still read.
+    #[test]
+    #[ignore = "requires the converted Bolt file and a device; use --release --test-threads=1"]
+    fn a_chunk_wider_than_the_rings_margin_is_refused_not_wrapped() {
+        let model = load_q8();
+        let seq = model.new_seq().expect("session");
+        let margin = model.local_ring.widest_append();
+        assert_eq!(margin, model.rows, "the ring is sized for the widest chunk a step takes");
+        assert!(!model.local_ring.admits(margin + 1));
+        assert!(model.local_ring.admits(margin));
+        drop(seq);
     }
 
     /// One model owns the device. Replaying from position zero overwrites every live cache cell.
