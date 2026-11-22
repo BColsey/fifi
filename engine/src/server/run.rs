@@ -661,17 +661,16 @@ fn start_flash(
         prefix_reuse,
         ready_note,
     )?;
-    let effective = if settings.cuda.is_none() {
-        crate::capability::effective::flash_mlx_effective(
+    let effective = match settings.as_ref().filter(|settings| settings.cuda.is_none()) {
+        Some(settings) => crate::capability::effective::flash_mlx_effective(
             config
                 .flash_next
                 .as_ref()
                 .unwrap_or(&FlashOptions::default()),
             &env,
-            &settings,
-        )
-    } else {
-        Vec::new()
+            settings,
+        ),
+        None => Vec::new(),
     };
     Ok(StartedEngine {
         engine: started.engine,
