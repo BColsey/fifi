@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "77a07f8a4a27d34b8ba82a58d670453bffc2bf4b54a9fed9b7e05dac0c10beef",
+ "x-source-sha256": "d960df65d2549697ed5fa10da353c30fd95fd338868334b42560338b51953f83",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -2675,6 +2675,10 @@
      "memory_held_until_restart": {
       "type": "boolean",
       "description": "True when the engine's family keeps its weights allocated for the life of the process, so stopping the engine does not return its card or host memory until the server restarts."
+     },
+     "supervised": {
+      "type": "boolean",
+      "description": "True when a supervised worker process serves this engine: stopping it ends the worker, so its memory is freed at once. Such an engine is always runtime_added and never memory_held_until_restart."
      }
     }
    },
@@ -3511,7 +3515,7 @@
    "post": {
     "operationId": "addEngine",
     "summary": "Start one engine at runtime (server extension)",
-    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths.",
+    "description": "Server extension. Boots one engine in the running process through the exact CLI boot path, so a model the GUI downloaded to the hub cache is served without a restart. model_dir accepts a local model directory or org/repo, resolved to the hub cache the way serve --model does. The load is asynchronous; the state surfaces report progress. Only engines this route added can be removed by DELETE /v1/engines/{id}. An id is 1 to 64 characters of letters, digits, dot, underscore or dash; at most eight runtime engines run at once. Error text names directories as model_dir and tokenizer_dir, not by their host paths. When the configuration sets supervised_engines, an add of a family that keeps its memory for the process lifetime starts a supervised worker process instead, and its loader stages and failures surface through these same state routes.",
     "requestBody": {
      "required": true,
      "content": {
@@ -3570,6 +3574,10 @@
           },
           "state": {
            "type": "string"
+          },
+          "supervised": {
+           "type": "boolean",
+           "description": "Present and true when a supervised worker process serves this engine; its loader stages surface through the engine and model lists."
           }
          }
         }
@@ -3589,7 +3597,7 @@
    "delete": {
     "operationId": "removeEngine",
     "summary": "Stop one runtime-added engine (server extension)",
-    "description": "Stops one engine the runtime API added. In-flight and queued jobs on it are cancelled; sessions bound to it rebind on their next request. Boot-configured engines are refused. The answer says whether the stop returned the engine's memory: the Qwen3.6 and Flash-Next families allocate their weights for the life of the process, so for them memory_released is false, the card memory returns only when the server process restarts, and POST /v1/engines refuses another engine of the family until then (\"restart the server to free card memory\"). A second stop of an engine that is still shutting down answers so.",
+    "description": "Stops one engine the runtime API added. In-flight and queued jobs on it are cancelled; sessions bound to it rebind on their next request. Boot-configured engines are refused. The answer says whether the stop returned the engine's memory: the Qwen3.6 and Flash-Next families allocate their weights for the life of the process, so for them memory_released is false, the card memory returns only when the server process restarts, and POST /v1/engines refuses another engine of the family until then (\"restart the server to free card memory\") \u2014 unless the engine runs as a supervised worker, whose process ends here and frees its memory at once. A second stop of an engine that is still shutting down answers so.",
     "parameters": [
      {
       "name": "id",
@@ -3628,7 +3636,11 @@
           },
           "memory_released": {
            "type": "boolean",
-           "description": "False when the family keeps its weights allocated for the life of the process (Qwen3.6 and Flash-Next): the engine stopped, but its card memory returns only when the server process restarts, and a new engine of that family is refused until then."
+           "description": "False when the family keeps its weights allocated for the life of the process (Qwen3.6 and Flash-Next): the engine stopped, but its card memory returns only when the server process restarts, and a new engine of that family is refused until then. Always true for a supervised worker, whose process ends here."
+          },
+          "supervised": {
+           "type": "boolean",
+           "description": "Present and true when the engine ran as a supervised worker process that this stop ended."
           },
           "memory_held_until_restart": {
            "type": "boolean",

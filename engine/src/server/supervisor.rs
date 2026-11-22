@@ -163,7 +163,12 @@ impl WorkerSupervisor {
     /// worker's internal id stays whatever `serve --model` derives,
     /// because the front routes by its id and never exposes the
     /// worker's.
-    pub(crate) fn spawn(&self, id: &str, args: &ModelServeArgs) -> Result<(), String> {
+    pub(crate) fn spawn(
+        &self,
+        id: &str,
+        args: &ModelServeArgs,
+        model: Option<String>,
+    ) -> Result<(), String> {
         let binary = std::env::current_exe()
             .map_err(|error| format!("the supervised worker needs this binary's path: {error}"))?;
         let key = worker_key(id);
@@ -231,7 +236,10 @@ impl WorkerSupervisor {
             .map_err(|error| format!("the worker reader failed to start: {error}"))?;
         let worker = Arc::new(Worker {
             id: id.to_string(),
-            model: Mutex::new(None),
+            // The derivation's own model name, so the lists carry it
+            // before the worker's engine can report one; the health
+            // poll refreshes it once it can.
+            model: Mutex::new(model),
             model_dir: args.model_dir.clone(),
             key,
             addr: Mutex::new(None),

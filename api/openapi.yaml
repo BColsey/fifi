@@ -2005,6 +2005,13 @@ components:
             True when the engine's family keeps its weights allocated for
             the life of the process, so stopping the engine does not
             return its card or host memory until the server restarts.
+        supervised:
+          type: boolean
+          description: >-
+            True when a supervised worker process serves this engine:
+            stopping it ends the worker, so its memory is freed at
+            once. Such an engine is always runtime_added and never
+            memory_held_until_restart.
     HfDownloadJob:
       type: object
       required: [id, repo, revision, state]
@@ -2733,7 +2740,11 @@ paths:
         DELETE /v1/engines/{id}. An id is 1 to 64 characters of
         letters, digits, dot, underscore or dash; at most eight
         runtime engines run at once. Error text names directories as
-        model_dir and tokenizer_dir, not by their host paths.
+        model_dir and tokenizer_dir, not by their host paths. When the
+        configuration sets supervised_engines, an add of a family that
+        keeps its memory for the process lifetime starts a supervised
+        worker process instead, and its loader stages and failures
+        surface through these same state routes.
       requestBody:
         required: true
         content:
@@ -2771,6 +2782,12 @@ paths:
                     type: string
                   state:
                     type: string
+                  supervised:
+                    type: boolean
+                    description: >-
+                      Present and true when a supervised worker process
+                      serves this engine; its loader stages surface
+                      through the engine and model lists.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2788,7 +2805,9 @@ paths:
         life of the process, so for them memory_released is false, the
         card memory returns only when the server process restarts, and
         POST /v1/engines refuses another engine of the family until
-        then ("restart the server to free card memory"). A second
+        then ("restart the server to free card memory") — unless the
+        engine runs as a supervised worker, whose process ends here
+        and frees its memory at once. A second
         stop of an engine that is still shutting down answers so.
       parameters:
         - name: id
@@ -2819,7 +2838,13 @@ paths:
                       the life of the process (Qwen3.6 and Flash-Next): the
                       engine stopped, but its card memory returns only when
                       the server process restarts, and a new engine of that
-                      family is refused until then.
+                      family is refused until then. Always true for a
+                      supervised worker, whose process ends here.
+                  supervised:
+                    type: boolean
+                    description: >-
+                      Present and true when the engine ran as a supervised
+                      worker process that this stop ended.
                   memory_held_until_restart:
                     type: boolean
                     description: Present and true when memory_released is false.

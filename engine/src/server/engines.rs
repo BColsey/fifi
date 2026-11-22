@@ -214,9 +214,10 @@ pub(crate) async fn add(
         // A process-lifetime family starts a supervised worker, so
         // stopping the engine ends the process and frees its memory:
         // the refusal below belongs to the in-process path only.
+        let model_name = engine_config.model.clone().unwrap_or_default();
         return state
             .workers()
-            .spawn(&id, &worker_args)
+            .spawn(&id, &worker_args, Some(model_name.clone()))
             .map_err(|error| {
                 ServerError::from(EngError::BadRequest(scrub_paths(
                     &error,
@@ -229,7 +230,7 @@ pub(crate) async fn add(
                     StatusCode::CREATED,
                     Json(serde_json::json!({
                         "id": id,
-                        "model": engine_config.model,
+                        "model": model_name,
                         "model_dir": engine_config.model_dir.display().to_string(),
                         "state": "starting",
                         "supervised": true,
@@ -370,10 +371,15 @@ pub(crate) async fn remove(
         // A supervised worker: its process ends, so the memory it
         // held is genuinely freed — the honest answer the in-process
         // stop cannot give.
+        let model = state
+            .workers()
+            .get(&id)
+            .and_then(|worker| worker.model.clone());
         state.workers().stop(&id);
         state.drop_sessions_for(&id);
         return Ok(Json(serde_json::json!({
             "id": id,
+            "model": model.unwrap_or_default(),
             "state": "stopped",
             "memory_released": true,
             "supervised": true,
