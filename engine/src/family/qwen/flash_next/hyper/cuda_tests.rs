@@ -29,15 +29,15 @@ fn noise(key: u64, scale: f32) -> f32 {
     (2.0 * unit - 1.0) * scale
 }
 
-fn values(count: usize, salt: u64, scale: f32) -> Vec<f32> {
+fn values(count: usize, stream: u64, scale: f32) -> Vec<f32> {
     (0..count as u64)
-        .map(|i| noise(salt << 32 | i, scale))
+        .map(|i| noise(stream << 32 | i, scale))
         .collect()
 }
 
 /// Binary16 codes of the values, and the f32 values the codes hold.
-fn f16_weights(count: usize, salt: u64, scale: f32) -> (Vec<u8>, Vec<f32>) {
-    let codes: Vec<half::f16> = values(count, salt, scale)
+fn f16_weights(count: usize, stream: u64, scale: f32) -> (Vec<u8>, Vec<f32>) {
+    let codes: Vec<half::f16> = values(count, stream, scale)
         .into_iter()
         .map(half::f16::from_f32)
         .collect();
