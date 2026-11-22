@@ -29,14 +29,14 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Element `j` of the row (`salt` 0) or the partial (`salt` 1) of request `k`: a finite float in [1, 2) derived from a
+/// Element `j` of the row (`kind` 0) or the partial (`kind` 1) of request `k`: a finite float in [1, 2) derived from a
 /// hash of `(k, j)`, so a stale or torn word equals the expected one only by a 2^-23 collision per element.
-fn pattern(salt: u64, k: u64, j: usize) -> f32 {
-    f32::from_bits(0x3F80_0000 | (mix((k << 24) ^ ((j as u64) << 1) ^ salt) as u32 & 0x007F_FFFF))
+fn pattern(kind: u64, k: u64, j: usize) -> f32 {
+    f32::from_bits(0x3F80_0000 | (mix((k << 24) ^ ((j as u64) << 1) ^ kind) as u32 & 0x007F_FFFF))
 }
 
-fn pattern_vec(salt: u64, k: u64, hidden: usize) -> Vec<f32> {
-    (0..hidden).map(|j| pattern(salt, k, j)).collect()
+fn pattern_vec(kind: u64, k: u64, hidden: usize) -> Vec<f32> {
+    (0..hidden).map(|j| pattern(kind, k, j)).collect()
 }
 
 fn host_port(backing: &mut [u64], hidden: usize) -> MailboxPort {
