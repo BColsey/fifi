@@ -270,10 +270,7 @@ mod tests {
     use super::*;
     use crate::{
         family::{
-            inkling2::{
-                OUTPUT_HEAD,
-                cuda_projection::{DensePlan, upload_tensor},
-            },
+            inkling2::cuda_projection::{DensePlan, upload_tensor},
             speculate::dspark::choose_token,
         },
         weights::{GgufLimits, GgufWeights, dspark_gguf::DsparkGguf},
@@ -297,11 +294,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let tensor = target.header().tensor(OUTPUT_HEAD).unwrap();
+        let name = "output.weight";
+        let tensor = target.header().tensor(name).unwrap();
         assert_eq!(tensor.dims().len(), 2);
         assert_eq!(tensor.dims()[0], width as u64);
         assert!(tensor.dims()[1] >= vocab as u64);
-        let (kind, weights) = target.read_tensor(OUTPUT_HEAD).unwrap();
+        let (kind, weights) = target.read_tensor(name).unwrap();
         let dtype = DenseDtype::from_gguf(kind).unwrap();
         let need = dense_gemv_bytes(DenseGemvShape::packed(1, vocab, width), dtype).unwrap();
 
