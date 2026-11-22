@@ -313,7 +313,7 @@ fn disk_bank_read_failure_poisons_policy_and_device() {
     assert!(state.is_poisoned());
     assert!(state.begin_pass(0, &[256]).is_err());
     assert!(bank.part(0).is_err());
-    assert!(bank.projection(Role::ExpertGate).is_err());
+    assert!(bank.projection(&state, Role::ExpertGate).is_err());
     assert!(
         bank.step_disk(&stream, &model, &mut state, 0, &[0])
             .is_err()
@@ -761,8 +761,8 @@ fn full_expert_device_stacks_match_host() {
     assert!(!mismatch.is_poisoned());
     assert!(
         swapped
-            .projection(crate::family::recipe::Role::ExpertGate)
-            .is_ok()
+            .projection(&mismatch, crate::family::recipe::Role::ExpertGate)
+            .is_err()
     );
     swapped
         .replace_from_model(&stream, &model, 0, 0, 256)
@@ -770,7 +770,7 @@ fn full_expert_device_stacks_match_host() {
     assert!(swapped.part(0).is_ok());
     assert!(
         swapped
-            .projection(crate::family::recipe::Role::ExpertGate)
+            .projection(&mismatch, crate::family::recipe::Role::ExpertGate)
             .is_err()
     );
     let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
@@ -804,7 +804,7 @@ fn full_expert_device_stacks_match_host() {
     ids.write_at(&stream, 0, &i32::from(slot).to_ne_bytes())
         .unwrap();
     assert!(
-        bank.projection(crate::family::recipe::Role::Router)
+        bank.projection(&state, crate::family::recipe::Role::Router)
             .is_err()
     );
     let mut checked = 0;
@@ -812,7 +812,7 @@ fn full_expert_device_stacks_match_host() {
         let Slot::Layer(role) = tensor.role else {
             panic!("expert role")
         };
-        let projection = bank.projection(role).unwrap();
+        let projection = bank.projection(&state, role).unwrap();
         let k = projection.k;
         let rows = projection.rows;
         assert_eq!(
@@ -873,6 +873,11 @@ fn full_expert_device_stacks_match_host() {
         checked += 1;
     }
     assert_eq!(checked, 3);
+    state.poison();
+    assert!(
+        bank.projection(&state, crate::family::recipe::Role::ExpertGate)
+            .is_err()
+    );
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.

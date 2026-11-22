@@ -270,21 +270,7 @@ impl<'a> ExpertDeviceStacks<'a> {
             ));
         }
         self.check_source(model, layer)?;
-        let mut slots = self
-            .slot_experts
-            .clone()
-            .ok_or_else(|| EngError::BadRequest("unknown GGUF device slot identities".into()))?;
-        if state.geometry().slots != slots.len()
-            || state.geometry().experts != model.config().dims.experts as usize
-            || layer >= state.geometry().layers
-            || slots.iter().enumerate().any(|(slot, &expert)| {
-                state.expert_in_slot(layer, slot).map(u32::from) != Some(expert)
-            })
-        {
-            return Err(EngError::BadRequest(
-                "GGUF device slots disagree with bank state".into(),
-            ));
-        }
+        let mut slots = self.check_state(state)?.to_vec();
         let copies = match state.begin_pass(layer, picks) {
             Ok(copies) => copies,
             Err(error) => {
@@ -378,18 +364,43 @@ impl<'a> ExpertDeviceStacks<'a> {
         Ok(())
     }
 
-    /// Derive the weight type and dimensions from the source tensor, not caller inputs.
-    pub(in super::super::super) fn projection(
+    fn check_state<P: crate::family::expert_bank::SlotPolicy>(
         &self,
-        role: Role,
-    ) -> Result<ExpertProjection<'_>, EngError> {
-        use crate::kernels::cuda::resident::matvec_q::QuantType;
-        let invalid = || EngError::BadRequest("invalid GGUF expert projection".into());
-        if self.slot_experts.is_none() {
+        state: &crate::family::expert_bank::ExpertBankState<P>,
+    ) -> Result<&[u32], EngError> {
+        if self.poisoned || state.is_poisoned() {
+            return Err(EngError::BadRequest("poisoned GGUF expert bank".into()));
+        }
+        let (model, layer) = self
+            .source
+            .ok_or_else(|| EngError::BadRequest("missing GGUF expert source".into()))?;
+        let slots = self
+            .slot_experts
+            .as_deref()
+            .ok_or_else(|| EngError::BadRequest("unknown GGUF device slot identities".into()))?;
+        if state.geometry().slots != slots.len()
+            || state.geometry().experts != model.config().dims.experts as usize
+            || layer >= state.geometry().layers
+            || slots.iter().enumerate().any(|(slot, &expert)| {
+                state.expert_in_slot(layer, slot).map(u32::from) != Some(expert)
+            })
+        {
             return Err(EngError::BadRequest(
-                "unknown GGUF device slot identities".into(),
+                "GGUF device slots disagree with bank state".into(),
             ));
         }
+        Ok(slots)
+    }
+
+    /// Derive projection metadata only when the published policy agrees with the device slots.
+    pub(in super::super::super) fn projection<'b, P: crate::family::expert_bank::SlotPolicy>(
+        &'b self,
+        state: &'b crate::family::expert_bank::ExpertBankState<P>,
+        role: Role,
+    ) -> Result<ExpertProjection<'b>, EngError> {
+        use crate::kernels::cuda::resident::matvec_q::QuantType;
+        let invalid = || EngError::BadRequest("invalid GGUF expert projection".into());
+        self.check_state(state)?;
         let (model, layer) = self.source.ok_or_else(invalid)?;
         let index = self
             .layout
