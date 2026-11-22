@@ -195,7 +195,7 @@ pub(super) fn cold_cap_for(
     reserve: u64,
 ) -> usize {
     /// The measured maximum of DISTINCT cold experts serving one layer's picks.
-    const COLD_TARGET: usize = 78;
+    const COLD_TARGET: usize = super::prefill::COLD_CHANNELS_MAX;
     let per_expert = ExpertBank::bytes_for(geometry, geometry.top_k).unwrap_or(u64::MAX)
         / u64::try_from(geometry.top_k).unwrap_or(1);
     let banks = ExpertBank::bytes_for(geometry, slots_per_layer)

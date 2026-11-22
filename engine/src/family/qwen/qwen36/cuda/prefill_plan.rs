@@ -15,6 +15,7 @@
 //! which this plan keeps until a decision on the difference.
 
 use super::dims::{KvMode, StepDims, StepOptions};
+use super::prefill::{COLD_CHANNELS_MAX, tiered_bounds_ints};
 use crate::family::decode_step::mixer_geometry::MixerGeometry;
 use crate::family::decode_step::state_layout::{KvPool, StateLayout};
 use crate::{
@@ -327,7 +328,11 @@ fn moe_rows_with(
         ),
         (
             S::ExpertBounds,
-            word_bytes(&[expert_bounds_ints(e.experts)?])?,
+            // A tiered chunk layer groups its picks over the bank slots and then the cold
+            // channels; the slot holds the most any plan asks, every expert on the card plus
+            // the deepest staging.
+            word_bytes(&[expert_bounds_ints(e.experts)?
+                .max(tiered_bounds_ints(e.experts, COLD_CHANNELS_MAX))])?,
             Ids,
             Down,
         ),

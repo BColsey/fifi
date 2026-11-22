@@ -666,7 +666,8 @@ fn prefill_call_shapes_are_the_plan_values() {
 #[test]
 fn prefill_stage_needs_fit_the_session_slots() {
     use super::prefill::{
-        attn_proj_cols, chunk_attn_geometry, chunk_conv_shape, delta_proj_cols, routed_up_view,
+        COLD_CHANNELS_MAX, attn_proj_cols, chunk_attn_geometry, chunk_conv_shape, delta_proj_cols,
+        routed_up_view, tiered_bounds_ints,
     };
     use crate::family::decode_step::mixer_geometry::MixerGeometry;
     use crate::kernels::cuda::prefill::attn_prefill::{
@@ -813,6 +814,17 @@ fn prefill_stage_needs_fit_the_session_slots() {
                 S::ExpertBounds,
                 "bounds",
             );
+            // Every tiered layer a plan can produce, from the picks of one token up to every
+            // expert resident, with every depth of cold staging.
+            for slots in 8..=moe.n_expert {
+                for cold in [0, 1, COLD_CHANNELS_MAX] {
+                    fits(
+                        tiered_bounds_ints(slots, cold) * 4,
+                        S::ExpertBounds,
+                        "tiered bounds over every bank slot and cold channel",
+                    );
+                }
+            }
             // 12 Scatter.
             fits(q8(h, routed), S::Q8S, "scatter y");
             fits(row(h), S::X2, "scatter x");

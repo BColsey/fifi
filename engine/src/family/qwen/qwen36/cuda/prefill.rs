@@ -2992,6 +2992,17 @@ pub(super) struct TieredChunkGroups {
     pub(super) cold_count: usize,
 }
 
+/// The most cold channels a layer stages: the depth the staging planner funds (the hottest
+/// distinct cold experts per layer top out at this many on this model).
+pub(super) const COLD_CHANNELS_MAX: usize = 78;
+
+/// Ints of the bounds table of one tiered chunk layer: one bound per bank slot and per cold
+/// channel, and one more for the first. The launch builds exactly this many and the arena slot is
+/// planned for the most any plan can ask.
+pub(super) const fn tiered_bounds_ints(slots: usize, cold_channels: usize) -> usize {
+    slots + cold_channels + 1
+}
+
 pub(super) fn group_tiered_picks(
     slot_ids: &[i32],
     weights: &[f32],
@@ -3020,6 +3031,11 @@ pub(super) fn group_tiered_picks(
             .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
         if cold >= 0 {
             let channel = usize::try_from(cold).unwrap_or(usize::MAX);
+            if channel >= COLD_CHANNELS_MAX {
+                return Err(EngError::BadRequest(format!(
+                    "tiered chunk: cold channel {channel} is past the {COLD_CHANNELS_MAX} a layer stages"
+                )));
+            }
             // Grow-only: `resize(channel + 1)` alone would TRUNCATE the table when a
             // lower channel follows a higher one (Vec::resize shrinks too), and
             // `len().max(channel) + 1` ratchets past every real channel.
@@ -3079,7 +3095,7 @@ pub(super) fn group_tiered_picks(
     }
     // Compact: the bank groups, then the cold groups; the bounds span the whole domain.
     let mut ids_dst = Vec::with_capacity(m * top_k);
-    let mut expert_bounds = Vec::with_capacity(slots + cold_groups.len() + 1);
+    let mut expert_bounds = Vec::with_capacity(tiered_bounds_ints(slots, cold_groups.len()));
     expert_bounds.push(0i32);
     for group in groups.iter().chain(&cold_groups) {
         ids_dst.extend_from_slice(group);
