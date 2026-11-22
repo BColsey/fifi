@@ -80,6 +80,7 @@ pub(in super::super::super) fn start(
         }
     };
     let load = plan.at_context(u64::from(context), kv, floor)?;
+    verify_expert_stack_budget(model, load.context.plan.slots_per_layer())?;
     eprintln!(
         "{load}; serving {} slots per layer; expert tier: {}; {}",
         load.context.plan.slots_per_layer(),
@@ -88,6 +89,30 @@ pub(in super::super::super) fn start(
     );
 
     Err(execution_refusal(model))
+}
+
+/// Check the actual part-major stack bytes against the planner's conservative charge.
+/// This covers expert buffers only, not CUDA allocation overhead or other buffers.
+fn verify_expert_stack_budget(model: &GgufModel, slots: usize) -> Result<(), EngError> {
+    use super::{expert_layout::ExpertAllocation, plan::stack_alignment_reserve};
+    let sizes = model.sizes()?;
+    let actual = ExpertAllocation::for_model(model, slots)?.device_bytes;
+    let charge = sizes
+        .shape
+        .expert_bytes
+        .checked_mul(sizes.shape.layers as u64)
+        .and_then(|bytes| bytes.checked_mul(slots as u64))
+        .and_then(|bytes| bytes.checked_add(stack_alignment_reserve(sizes.shape.layers).ok()?))
+        .ok_or_else(|| EngError::MemoryPlan("GGUF expert stack budget overflows".into()))?;
+    if u64::try_from(actual)
+        .map_err(|_| EngError::MemoryPlan("GGUF expert allocation overflows".into()))?
+        > charge
+    {
+        return Err(EngError::MemoryPlan(
+            "GGUF expert stacks exceed planned budget".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Kernel availability does not imply that the CUDA executor can load GGUF weights.
@@ -107,6 +132,19 @@ fn execution_refusal(model: &GgufModel) -> EngError {
 mod tests {
     use super::super::testkit::{Spec, write_flash};
     use super::*;
+
+    #[test]
+    fn expert_stack_budget_checks_slot_limits_and_valid_plans() {
+        let fixture = write_flash(&Spec::default());
+        let model = GgufModel::open(&fixture.first).unwrap().unwrap();
+        assert!(verify_expert_stack_budget(&model, 0).is_err());
+        assert!(
+            verify_expert_stack_budget(&model, model.config().dims.experts as usize + 1).is_err()
+        );
+        for slots in [1, 11, model.config().dims.experts as usize] {
+            verify_expert_stack_budget(&model, slots).unwrap();
+        }
+    }
 
     #[test]
     fn supported_matrix_types_still_refuse_until_executor_reads_gguf() {
