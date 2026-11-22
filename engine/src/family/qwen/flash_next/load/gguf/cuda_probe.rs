@@ -1355,6 +1355,82 @@ fn two_real_expert_slots_match_host() {
             part.role
         );
     }
+    use crate::family::recipe::Role;
+    use crate::kernels::cuda::prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape};
+    let gate = bank.projection(&state, Role::ExpertGate).unwrap();
+    let up = bank.projection(&state, Role::ExpertUp).unwrap();
+    assert_eq!((gate.k, gate.rows), (up.k, up.rows));
+    let (k, n_ff) = (gate.k, gate.rows);
+    let input: Vec<u8> = (0..k)
+        .flat_map(|i| (if i % 5 < 2 { -1.0f32 } else { 1.0 }).to_ne_bytes())
+        .collect();
+    let x = ctx.allocate(input.len()).unwrap();
+    x.write_at(&stream, 0, &input).unwrap();
+    let qb = q8_1_bytes(k, 1).unwrap();
+    let q = ctx.allocate(qb).unwrap();
+    ctx.quantize_q8_1(
+        &stream,
+        QuantizeCall {
+            x: x.range(0, input.len()).unwrap(),
+            y: q.range(0, qb).unwrap(),
+            k,
+            ncols: 1,
+        },
+    )
+    .unwrap();
+    let gu = ctx.allocate(4 * n_ff * 4).unwrap();
+    for (projection, offset) in [(gate, 0), (up, n_ff * 4)] {
+        projection
+            .launch(
+                &ctx,
+                &stream,
+                ExpertProjectionInputs {
+                    ids: ids.range(0, 8).unwrap(),
+                    x_q8: q.range(0, qb).unwrap(),
+                    x_per_slot: false,
+                    output: gu.range(offset, 3 * n_ff * 4).unwrap(),
+                    output_stride: 2 * n_ff,
+                    used: 2,
+                },
+            )
+            .unwrap();
+    }
+    let act = ctx.allocate(2 * n_ff * 4).unwrap();
+    ctx.swiglu_rows(
+        &stream,
+        SwigluRowsCall {
+            shape: SwigluRowsShape {
+                rows: 2,
+                n_ff,
+                up_off: n_ff,
+                ld_in: 2 * n_ff,
+                ld_out: n_ff,
+            },
+            gu: gu.range(0, 4 * n_ff * 4).unwrap(),
+            act: act.range(0, 2 * n_ff * 4).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut gu_bytes = vec![0; 4 * n_ff * 4];
+    gu.read_at(&stream, 0, &mut gu_bytes).unwrap();
+    let mut act_bytes = vec![0; 2 * n_ff * 4];
+    act.read_at(&stream, 0, &mut act_bytes).unwrap();
+    for rank in 0..2 {
+        for index in 0..n_ff {
+            let f =
+                |off: usize| f32::from_ne_bytes(gu_bytes[off * 4..off * 4 + 4].try_into().unwrap());
+            let g = f(rank * 2 * n_ff + index);
+            let u = f(rank * 2 * n_ff + n_ff + index);
+            let off = (rank * n_ff + index) * 4;
+            let got = f32::from_ne_bytes(act_bytes[off..off + 4].try_into().unwrap());
+            let want = g / (1.0 + (-g).exp()) * u;
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "SwiGLU rank {rank} row {index}"
+            );
+        }
+    }
+    eprintln!("checked {n_ff} SwiGLU values for two real experts");
 }
 
 /// The token loop and unquantized operators stay on the host; this is not a serving test.
