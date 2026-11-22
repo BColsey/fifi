@@ -1056,6 +1056,51 @@ fn classify_expert_pair(
 }
 
 #[test]
+#[ignore = "needs the locally hashed two-expert sparse fixture; CPU-only preflight"]
+fn two_real_expert_gate_preflight() {
+    use crate::{family::recipe::Role, weights::dequantize};
+    use sha2::{Digest, Sha256};
+    let path = std::env::var_os("FIFI_FLASH_TWO_EXPERT_FIXTURE").unwrap();
+    let model = GgufModel::open(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let tensor = model.map().get(Role::ExpertGate, Some(0)).unwrap();
+    let k = tensor.dims[0] as usize;
+    let input: Vec<f32> = (0..k).map(|i| if i % 5 < 2 { -1.0 } else { 1.0 }).collect();
+    let mut weights = Vec::new();
+    for (expert, hash) in [
+        (
+            256,
+            "3da6977d2c06568b213e1e79fd49f3de3816c594c7b6f0928cbc4f74eed6d13b",
+        ),
+        (
+            257,
+            "ac0f9bfdd7ec13f0d982a235686c747b7e31737d170ed1d7a54faa71f424cd6a",
+        ),
+    ] {
+        let blocks = mapped_blocks(&model, tensor, Some(expert), 0..tensor.dims[1]).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&blocks)), hash);
+        weights.push(dequantize(tensor.ty, &blocks).unwrap());
+    }
+    let mut distinguishing = 0;
+    for (a, b) in weights[0].chunks_exact(k).zip(weights[1].chunks_exact(k)) {
+        let dot = |row: &[f32]| -> f32 { row.iter().zip(&input).map(|(w, x)| w * x).sum() };
+        let tol = 0.003
+            * (0.75 * a.iter().map(|v| v.abs()).sum::<f32>()
+                + 0.25 * b.iter().map(|v| v.abs()).sum::<f32>())
+            + 1e-5;
+        if (0.5 * (dot(a) - dot(b))).abs() > tol {
+            distinguishing += 1;
+        }
+    }
+    assert!(
+        distinguishing > 0,
+        "swapping expert weights must be detectable"
+    );
+    eprintln!("{distinguishing} gate rows detect a swapped 0.25/0.75 expert weighting");
+}
+
+#[test]
 #[ignore = "needs two verified expert ranges and an admitted CUDA device"]
 fn two_real_expert_slots_match_host() {
     use super::expert_layout::{ExpertDeviceStacks, ExpertLayout, ExpertProjectionInputs};
@@ -1166,6 +1211,56 @@ fn two_real_expert_slots_match_host() {
     );
     let slots = [state.slot_row(0)[257], state.slot_row(0)[256]];
     assert!(slots.iter().all(|&slot| slot >= 0) && slots[0] != slots[1]);
+    assert_eq!(i32::from(copies.ops[0].slot), slots[0]);
+    let miss_id = ctx.allocate(4).unwrap();
+    miss_id
+        .write_at(&stream, 0, &slots[0].to_ne_bytes())
+        .unwrap();
+    bank.projection(&state, crate::family::recipe::Role::ExpertGate)
+        .unwrap()
+        .launch(
+            &ctx,
+            &stream,
+            ExpertProjectionInputs {
+                ids: miss_id.range(0, 4).unwrap(),
+                x_q8: q.range(0, qbytes).unwrap(),
+                x_per_slot: false,
+                output: y.range(0, rows * 4).unwrap(),
+                output_stride: rows,
+                used: 1,
+            },
+        )
+        .unwrap();
+    let mut after = vec![0; rows * 8];
+    y.read_at(&stream, 0, &mut after).unwrap();
+    assert_eq!(
+        &after[rows * 4..],
+        &output[rows * 4..],
+        "resident rank remains untouched"
+    );
+    let missing_blocks = mapped_blocks(&model, tensor, Some(257), 0..rows as u64).unwrap();
+    let missing = dequantize(tensor.ty, &missing_blocks).unwrap();
+    for (index, (hit_row, miss_row)) in resident
+        .chunks_exact(k)
+        .zip(missing.chunks_exact(k))
+        .enumerate()
+    {
+        let off = index * 4;
+        let got_miss = f32::from_ne_bytes(after[off..off + 4].try_into().unwrap());
+        let hit_off = (rows + index) * 4;
+        let got_hit = f32::from_ne_bytes(after[hit_off..hit_off + 4].try_into().unwrap());
+        let dot = |row: &[f32]| -> f32 { row.iter().zip(&input).map(|(a, b)| a * b).sum() };
+        let expected = 0.25 * dot(miss_row) + 0.75 * dot(hit_row);
+        let tolerance = 0.003
+            * (0.25 * miss_row.iter().map(|v| v.abs()).sum::<f32>()
+                + 0.75 * hit_row.iter().map(|v| v.abs()).sum::<f32>())
+            + 1e-5;
+        assert!(
+            (0.25 * got_miss + 0.75 * got_hit - expected).abs() <= tolerance,
+            "combined gate row {index}"
+        );
+    }
+    eprintln!("checked {rows} miss-only gate rows and host-side weighted combination");
     let ids = classify_expert_pair(&ctx, &stream, state.slot_row(0), slots);
     for part in &layout.parts {
         let tensor = model.map().get(part.role, Some(0)).unwrap();
