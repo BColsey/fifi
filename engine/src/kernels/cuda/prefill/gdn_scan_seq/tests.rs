@@ -1234,8 +1234,8 @@ fn run_decode(rig: &Rig, inp: &ScanInputs) -> Result<(Vec<f32>, Vec<f32>), EngEr
     Ok((f32s(&out_bytes), f32s(&state_bytes)))
 }
 
-fn seed_of(nk: usize, nv: usize, m: usize, salt: u64) -> u64 {
-    0x5ca1_0000 ^ salt ^ ((nk as u64) << 36) ^ ((nv as u64) << 20) ^ m as u64
+fn seed_of(nk: usize, nv: usize, m: usize, tag: u64) -> u64 {
+    0x5ca1_0000 ^ tag ^ ((nk as u64) << 36) ^ ((nv as u64) << 20) ^ m as u64
 }
 
 /// Test 3: the entry against the host f64 reference of the recurrence in the ggml L2 form,
