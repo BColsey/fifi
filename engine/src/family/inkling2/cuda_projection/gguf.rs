@@ -67,6 +67,8 @@ type Projections = BTreeMap<String, (Resident, DenseDtype)>;
 
 type ControllerOutput = Option<[Vec<f32>; 2]>;
 
+pub(in crate::family::inkling2) use super::dense::ControlledAttentionInput;
+
 pub(in crate::family::inkling2) struct AttentionControllers<'a> {
     cuda: &'a GgufCuda,
     weights: [Option<ControllerWeights<'a>>; 3],
@@ -74,6 +76,23 @@ pub(in crate::family::inkling2) struct AttentionControllers<'a> {
 }
 
 impl AttentionControllers<'_> {
+    pub(in crate::family::inkling2) fn chained_projections<const N: usize>(
+        &self,
+        inputs: [ControlledAttentionInput<'_>; 3],
+        requests: [Option<Projection<'_>>; N],
+        eps: f32,
+    ) -> Result<Option<[Vec<f32>; N]>, EngError> {
+        let [Some(q), Some(k), Some(v)] = self.weights else {
+            return Ok(None);
+        };
+        let Some(weights) = self.cuda.attention_group([self.shape[1]; 3], requests) else {
+            return Ok(None);
+        };
+        self.cuda
+            .step
+            .controlled_attention(&self.cuda.context, inputs, [q, k, v], weights?, eps)
+    }
+
     pub(in crate::family::inkling2) fn project(
         &self,
         inputs: &[[&[f32]; 3]],

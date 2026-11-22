@@ -2,8 +2,8 @@
 //! order, then computes the routed expert outputs using the shared CUDA banks.
 
 use super::{
-    CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, TapRow, VisitState, Weights, add, bad,
-    controller_batch::controller_batch_enabled, window::PendingRow,
+    AttentionInput, CpuForward, LayerVisit, MessageBank, MoeRoute, Stream, TapRow, VisitState,
+    Weights, add, bad, controller_batch::controller_batch_enabled, window::PendingRow,
 };
 use crate::{
     EngError,
@@ -284,7 +284,7 @@ impl CpuForward {
                 state,
                 &mut row.stream,
                 row.bank.as_ref(),
-                projected.next(),
+                AttentionInput::Grouped(projected.next()),
             )
         });
         let router = format!("{prefix}.gate.weight");

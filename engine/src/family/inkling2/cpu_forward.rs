@@ -496,7 +496,7 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         let physical = visit.weight_layer;
         let layer = format!("model.llm.layers.{physical}");
-        let input = self.mlp_input(visit, &layer, state, stream, bank, None)?;
+        let input = self.mlp_input(visit, &layer, state, stream, bank, AttentionInput::Token)?;
         let mlp = self.moe(physical, &format!("{layer}.mlp"), &input)?;
         self.finish_layer(&layer, state, stream, mlp)
     }
@@ -508,7 +508,7 @@ impl CpuForward {
         state: &mut VisitState,
         stream: &mut Stream,
         bank: Option<&MessageBank>,
-        projected: Option<super::cpu_attention::AttentionProjection>,
+        attention: AttentionInput,
     ) -> Result<Vec<f32>, EngError> {
         let physical = visit.weight_layer;
         let query = self.weights.vec(
@@ -519,12 +519,16 @@ impl CpuForward {
         if let Weights::Gguf(weights) = &self.weights {
             weights.predict_experts(physical, || stream.mix(0, &query));
         }
-        let projected = match projected {
-            Some(projected) => projected,
-            None => {
-                let inputs = self.attention_inputs(visit, layer, stream, bank)?;
-                self.project_attention(layer, visit.attention, &inputs)?
-            }
+        let projected = match attention {
+            AttentionInput::Token => self.project_layer_attention(visit, layer, stream, bank)?,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            AttentionInput::Grouped(projected) => match projected {
+                Some(projected) => projected,
+                None => {
+                    let inputs = self.attention_inputs(visit, layer, stream, bank)?;
+                    self.project_attention(layer, visit.attention, &inputs)?
+                }
+            },
         };
         let attn = self.attention(layer, visit, state, projected)?;
         if physical.is_multiple_of(self.spec.n_layers_per_attn_res_block) {
@@ -550,6 +554,24 @@ impl CpuForward {
     ) -> Result<(), EngError> {
         add(&mut stream.current, &self.mlp_conv(mlp, layer, state)?, 1.0);
         Ok(())
+    }
+
+    fn project_layer_attention(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        stream: &Stream,
+        bank: Option<&MessageBank>,
+    ) -> Result<super::cpu_attention::AttentionProjection, EngError> {
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        if let Some(bank) = bank
+            && !self.draft_window_enabled()
+            && let Some(projected) = self.chained_attention_inputs(visit, layer, stream, bank)?
+        {
+            return Ok(projected);
+        }
+        let inputs = self.attention_inputs(visit, layer, stream, bank)?;
+        self.project_attention(layer, visit.attention, &inputs)
     }
 
     fn attention_inputs(
@@ -619,12 +641,7 @@ impl CpuForward {
         local: bool,
         role_index: usize,
     ) -> Result<(), EngError> {
-        let norm = if local {
-            "attn_norm"
-        } else {
-            ATTENTION_ROLES[role_index].1
-        };
-        self.norm(input, &format!("{layer}.{norm}.weight"))
+        self.norm(input, &attention_norm_name(layer, local, role_index))
     }
 
     fn norm(&self, values: &mut [f32], weight: &str) -> Result<(), EngError> {
@@ -819,10 +836,25 @@ fn control_names(layer: &str, role: Role) -> [String; 3] {
     ["down", "gain", "forget"].map(|part| format!("{ctrl}.{part}_weight"))
 }
 
+fn attention_norm_name(layer: &str, local: bool, role_index: usize) -> String {
+    let norm = if local {
+        "attn_norm"
+    } else {
+        ATTENTION_ROLES[role_index].1
+    };
+    format!("{layer}.{norm}.weight")
+}
+
 fn apply_control(input: &mut [f32], message: Vec<f32>, [gain, forget]: [Vec<f32>; 2]) {
     for (((value, message), gain), forget) in input.iter_mut().zip(message).zip(gain).zip(forget) {
         *value = (*value - forget.tanh() * *value) + gain.tanh() * message;
     }
+}
+
+enum AttentionInput {
+    Token,
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    Grouped(Option<super::cpu_attention::AttentionProjection>),
 }
 
 struct MoeRoute {

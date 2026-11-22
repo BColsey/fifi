@@ -74,6 +74,8 @@ Set `FIFI_INKLING_CUDA_CHAIN_ATTENTION_OUTPUT=1` with `FIFI_INKLING_CUDA_RESIDEN
 
 Set `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1` with `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1` to group resident Q, K, and V cross-pass controller projections in one transfer. Grouped prefill also batches those controllers across prompt rows when `FIFI_INKLING_CUDA_BATCH_ATTENTION_PROJECTIONS=1` is set. Controllers with missing resident matrices use their existing fallback.
 
+Set `FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT=1` with `FIFI_INKLING_CUDA_BATCH_CONTROLLERS=1`, `FIFI_INKLING_CUDA_GROUP_PROJECTIONS=1`, and `FIFI_INKLING_CUDA_GROUP_ATTENTION=1` to keep cross-pass controller outputs on CUDA through residual gating, weighted RMSNorm, and the attention input projections. This applies to ordinary single-row GGUF execution when all required matrices are resident. Grouped prefill and speculative verification retain their existing paths. The chain is off by default.
+
 Set `FIFI_INKLING_DSPARK_ADAPTIVE_DRAFT=1` to reduce the DSpark draft width after a rejection and restore it after fully accepted windows. Two consecutive windows accepting fewer than half their proposals switch that generation to one-token target decode. Each new request starts at the configured width, including a request that restores a saved prefix. The request log reports adaptive stand-down steps when they occur. The fixed DSpark width is the default.
 
 ## Tokenizer files

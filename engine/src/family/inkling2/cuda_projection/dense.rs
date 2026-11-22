@@ -21,7 +21,10 @@ use crate::{
 use super::{Resident, bad};
 
 mod attention_prefill;
+mod controlled_attention;
 mod draft_head;
+
+pub(in crate::family::inkling2) use controlled_attention::ControlledAttentionInput;
 
 pub(super) use draft_head::DraftHead;
 
@@ -349,30 +352,35 @@ impl DenseStep {
         // The large logits slot is idle during attention. Its non-overlapping
         // input and result ranges keep the group's staging within the same arena.
         let input = self.range(Slot::Output, 0, input_rows)?;
+        let (calls, rows) = self.group_calls(input_offsets, input_rows, weights)?;
+        let output = self.range(Slot::Output, input_rows, rows)?;
+        let values = self.run_rows(context, &self.stream, &inputs, [input, output], || {
+            context.dense_gemv_group(&self.stream, &calls)
+        })?;
+        Ok(split_projections(values.into_iter(), weights))
+    }
+
+    fn group_calls<'a, const N: usize>(
+        &'a self,
+        input_offsets: [usize; 3],
+        output_offset: usize,
+        weights: [Option<ResidentProjection<'a>>; N],
+    ) -> Result<(Vec<DenseGemvCall<'a>>, usize), EngError> {
         let mut rows = 0;
         let mut calls = Vec::with_capacity(N);
-        for projection in weights.iter().flatten() {
-            let ResidentProjection {
-                weight,
-                dtype,
-                input,
-            } = *projection;
+        for ResidentProjection {
+            weight,
+            dtype,
+            input,
+        } in weights.into_iter().flatten()
+        {
             let [out_rows, cols] = weight.shape;
             let x = self.range(Slot::Output, input_offsets[input], cols)?;
-            let y = self.range(Slot::Output, input_rows + rows, out_rows)?;
+            let y = self.range(Slot::Output, output_offset + rows, out_rows)?;
             calls.push(self.call((&weight.codes, weight.shape, dtype), x, y)?);
             rows += out_rows;
         }
-        let output = self.range(Slot::Output, input_rows, rows)?;
-        let mut values = self
-            .run_rows(context, &self.stream, &inputs, [input, output], || {
-                context.dense_gemv_group(&self.stream, &calls)
-            })?
-            .into_iter();
-        Ok(weights.map(|weight| {
-            let rows = weight.map_or(0, |projection| projection.weight.shape[0]);
-            values.by_ref().take(rows).collect()
-        }))
+        Ok((calls, rows))
     }
 
     pub(super) fn project_router(
@@ -515,13 +523,7 @@ impl DenseStep {
                 let gain = self.range(Slot::Output, words + offset, hidden)?;
                 let forget = self.range(Slot::Output, words + offset + hidden, hidden)?;
                 // Each triple finishes reading the shared reduction before the next down GEMV.
-                for ((weight, dtype), (x, y)) in row.weights.into_iter().zip([
-                    (gate, reduced),
-                    (reduced, gain),
-                    (reduced, forget),
-                ]) {
-                    calls.push(self.call((&weight.codes, weight.shape, dtype), x, y)?);
-                }
+                calls.extend(self.controller_calls(row.weights, [gate, reduced, gain, forget])?);
                 inputs.push(row.input);
             }
             let values = self.run_rows(context, &self.stream, &inputs, [input, output], || {
@@ -533,6 +535,21 @@ impl DenseStep {
             }));
         }
         Ok(results)
+    }
+
+    fn controller_calls<'a>(
+        &'a self,
+        [down, gain, forget]: ControllerWeights<'a>,
+        [gate, reduced, gain_out, forget_out]: [DeviceRange<'a>; 4],
+    ) -> Result<[DenseGemvCall<'a>; 3], EngError> {
+        let call = |(weight, dtype): (&'a Resident, _), x, y| {
+            self.call((&weight.codes, weight.shape, dtype), x, y)
+        };
+        Ok([
+            call(down, gate, reduced)?,
+            call(gain, reduced, gain_out)?,
+            call(forget, reduced, forget_out)?,
+        ])
     }
 
     fn launch(
@@ -652,6 +669,16 @@ impl DenseStep {
         }
         slot.buffer().range(slot.offset() + skip, bytes)
     }
+}
+
+fn split_projections<const N: usize>(
+    mut values: impl Iterator<Item = f32>,
+    weights: [Option<ResidentProjection<'_>>; N],
+) -> [Vec<f32>; N] {
+    weights.map(|weight| {
+        let rows = weight.map_or(0, |projection| projection.weight.shape[0]);
+        values.by_ref().take(rows).collect()
+    })
 }
 
 fn scale_projection(mut values: Vec<f32>, scale: f32) -> Result<Vec<f32>, EngError> {

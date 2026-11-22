@@ -1,10 +1,15 @@
 //! Batch independent Q/K/V cross-pass controllers before host attention.
 
+use std::sync::{Once, OnceLock};
+
 use super::{
     ATTENTION_ROLES, Attention, ControlInput, CpuForward, LayerVisit, MessageBank, Stream, Weights,
-    Work, apply_control, bad, control_names,
+    Work, apply_control, attention_norm_name, bad, control_names,
 };
 use crate::EngError;
+use crate::family::inkling2::{
+    cpu_attention::AttentionProjection, cuda_projection::gguf::ControlledAttentionInput,
+};
 
 type AttentionInputs = [Vec<f32>; 3];
 
@@ -14,6 +19,61 @@ struct PreparedInput {
 }
 
 impl CpuForward {
+    pub(super) fn chained_attention_inputs(
+        &self,
+        visit: LayerVisit,
+        layer: &str,
+        stream: &Stream,
+        bank: &MessageBank,
+    ) -> Result<Option<AttentionProjection>, EngError> {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !controller_batch_enabled()
+            || !*ENABLED.get_or_init(|| {
+                std::env::var("FIFI_INKLING_CUDA_CHAIN_ATTENTION_INPUT").as_deref() == Ok("1")
+            })
+        {
+            return Ok(None);
+        }
+        let Weights::Gguf(weights) = &self.weights else {
+            return Ok(None);
+        };
+        let names = ATTENTION_ROLES.map(|(role, _)| control_names(layer, role));
+        let shape = [self.spec.core.gate_rank as usize, self.hidden()];
+        let Some(controllers) = weights.attention_controllers(name_refs(&names), shape, 1)? else {
+            return Ok(None);
+        };
+        let local = visit.attention == Attention::Local;
+        let (prepared, gamma) = {
+            let _span = self.phase_span(Work::Controller);
+            let prepared = self.prepare_attention_controllers(visit, stream, bank)?;
+            let gamma = |index| {
+                self.weights
+                    .vec(&attention_norm_name(layer, local, index), shape[1])
+            };
+            let gamma = if local {
+                let norm = gamma(0)?;
+                [norm.clone(), norm.clone(), norm]
+            } else {
+                [gamma(0)?, gamma(1)?, gamma(2)?]
+            };
+            (prepared, gamma)
+        };
+        let inputs = std::array::from_fn(|i| ControlledAttentionInput {
+            gate: &prepared[i].control.gate,
+            input: &prepared[i].input,
+            message: &prepared[i].control.message,
+            gamma: &gamma[i],
+        });
+        let projected = self.attention_requests(layer, visit.attention, |calls| {
+            controllers.chained_projections(inputs, calls, self.math.rms_norm_eps)
+        })?;
+        if projected.is_some() {
+            static USED: Once = Once::new();
+            USED.call_once(|| eprintln!("Inkling CUDA used chained controller attention input"));
+        }
+        Ok(projected)
+    }
+
     pub(super) fn grouped_attention_inputs<'a>(
         &self,
         visit: LayerVisit,
@@ -29,9 +89,7 @@ impl CpuForward {
         }
         let shape = [self.spec.core.gate_rank as usize, self.hidden()];
         let names = ATTENTION_ROLES.map(|(role, _)| control_names(layer, role));
-        let names = names
-            .each_ref()
-            .map(|names| names.each_ref().map(String::as_str));
+        let names = name_refs(&names);
         let Some(controllers) = weights.attention_controllers(names, shape, rows.len())? else {
             return Ok(None);
         };
@@ -92,8 +150,14 @@ impl CpuForward {
     }
 }
 
+fn name_refs(names: &[[String; 3]; 3]) -> [[&str; 3]; 3] {
+    names
+        .each_ref()
+        .map(|names| names.each_ref().map(String::as_str))
+}
+
 pub(super) fn controller_batch_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| std::env::var("FIFI_INKLING_CUDA_BATCH_CONTROLLERS").as_deref() == Ok("1"))
 }

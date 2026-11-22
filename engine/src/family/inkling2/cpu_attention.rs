@@ -222,15 +222,10 @@ impl CpuForward {
         attention: Attention,
         inputs: &[Vec<f32>; 3],
     ) -> Result<AttentionProjection, EngError> {
-        self.attention_requests(
-            &format!("{layer}.attn"),
-            self.heads(attention),
-            attention,
-            |calls| {
-                self.weights
-                    .attention_projections(inputs.each_ref().map(Vec::as_slice), calls)
-            },
-        )
+        self.attention_requests(layer, attention, |calls| {
+            self.weights
+                .attention_projections(inputs.each_ref().map(Vec::as_slice), calls)
+        })
     }
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -245,21 +240,18 @@ impl CpuForward {
             .iter()
             .map(|input| input.each_ref().map(Vec::as_slice))
             .collect();
-        self.attention_requests(
-            &format!("{layer}.attn"),
-            self.heads(attention),
-            attention,
-            |calls| weights.attention_projections_rows(&refs, calls),
-        )
+        self.attention_requests(layer, attention, |calls| {
+            weights.attention_projections_rows(&refs, calls)
+        })
     }
 
-    fn attention_requests<R>(
+    pub(super) fn attention_requests<R>(
         &self,
-        attn: &str,
-        heads: Heads,
+        layer: &str,
         attention: Attention,
         run: impl FnOnce([Option<Projection<'_>>; 8]) -> R,
     ) -> R {
+        let heads = self.heads(attention);
         let dynamic = attention == Attention::Global;
         let taps = self.math.sconv_kernel_size * heads.kv;
         let requests = [
@@ -272,7 +264,7 @@ impl CpuForward {
             ("k_sconv.weight_proj", 1, taps),
             ("v_sconv.weight_proj", 2, taps),
         ];
-        let names = requests.map(|(suffix, _, _)| format!("{attn}.{suffix}"));
+        let names = requests.map(|(suffix, _, _)| format!("{layer}.attn.{suffix}"));
         let calls = std::array::from_fn(|i| {
             let (_, input, rows) = requests[i];
             (i < 6 || dynamic).then_some(Projection {
