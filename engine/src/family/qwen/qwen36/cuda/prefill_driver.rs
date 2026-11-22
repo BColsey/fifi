@@ -739,22 +739,51 @@ pub(super) fn piece_plan(
     }
 }
 
+/// The plan of a prompt's pieces, refused for an arena off the ladder.
+fn checked_plan(
+    m_sess: usize,
+    fixed_depth: Option<usize>,
+    streamed: bool,
+) -> Result<PiecePlan<'static>, EngError> {
+    if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
+        return Err(EngError::BadRequest(format!(
+            "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
+        )));
+    }
+    Ok(piece_plan(m_sess, fixed_depth, streamed))
+}
+
 /// Drives the prompt rows of one feed_rows call through the shared chunk loop: each step gets its
-/// own rows, a feed step exactly one. The start position is the committed row count at the call,
-/// so a second prefill call or a prefix import continues at its own position. The list that ran
-/// is returned.
+/// own rows, a feed step exactly one. The start position is the committed row count at the call
+/// (`feed_rows` gets tokens `0..n-1`; the last prompt token goes through decode), so a second
+/// prefill call or a prefix import continues at its own position. The list that ran is returned.
 pub(super) fn drive_chunks(
     start: usize,
     tokens: &[u32],
     (m_sess, fixed_depth, streamed): (usize, Option<usize>, bool),
     run: impl FnMut(PrefillStep, &[u32]) -> Result<(), EngError>,
 ) -> Result<Vec<PrefillStep>, EngError> {
-    if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
-        return Err(EngError::BadRequest(format!(
-            "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
-        )));
-    }
-    drive_prompt(start, tokens, &piece_plan(m_sess, fixed_depth, streamed), run)
+    drive_prompt(
+        start,
+        tokens,
+        &checked_plan(m_sess, fixed_depth, streamed)?,
+        run,
+    )
+}
+
+/// The pieces of `n_rows` rows from `p0` for an arena of `m_sess` rows, for the plan tests.
+#[cfg(test)]
+pub(super) fn pieces_of(
+    p0: usize,
+    n_rows: usize,
+    m_sess: usize,
+    fixed_depth: Option<usize>,
+) -> Result<Vec<PrefillStep>, EngError> {
+    crate::family::prefill::chunk_loop::plan_pieces(
+        p0,
+        n_rows,
+        &checked_plan(m_sess, fixed_depth, false)?,
+    )
 }
 
 /// Preserves the per-token vocabulary refusal before checking the signed kernel index.

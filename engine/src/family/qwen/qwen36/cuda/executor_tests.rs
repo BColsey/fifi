@@ -461,7 +461,7 @@ fn default_worker_piece_caps_measured_depth_without_shrinking_the_arena() {
 
 #[test]
 fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
-    use super::prefill_plan::chunk_list;
+    use super::prefill_driver::pieces_of;
 
     let arena = ChunkVerdict::Ready { m_sess: 1024 };
     for p0 in [65_536, 72_704, 72_705, 73_727, 73_728, 81_920, 119_321] {
@@ -470,10 +470,14 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
         let mut grouped = Vec::new();
         while at < end {
             let rows = piece_of(&arena, at, 82).unwrap().min(end - at);
-            grouped.extend(chunk_list(at, rows, 1024).unwrap());
+            grouped.extend(pieces_of(at, rows, 1024, None).unwrap());
             at += rows;
         }
-        assert_eq!(grouped, chunk_list(p0, 4097, 1024).unwrap(), "depth {p0}");
+        assert_eq!(
+            grouped,
+            pieces_of(p0, 4097, 1024, None).unwrap(),
+            "depth {p0}"
+        );
     }
 }
 

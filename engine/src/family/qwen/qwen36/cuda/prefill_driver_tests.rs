@@ -10,12 +10,10 @@ use super::prefill_driver::{
     AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
     StageChoice, ZERO_CHUNK, admit_fixed, admit_fixed_staged, admit_guard, admit_m_sess,
     admit_with_staging, drive_chunks, fixed_chunk_rows, fixed_staging_rows, ledger_line,
-    needs_arena, require_fixed_room, stage_label, wide_stage_candidate, zero_spans,
+    needs_arena, pieces_of, require_fixed_room, stage_label, wide_stage_candidate, zero_spans,
 };
 use super::prefill_plan::{
-    chunk_list_with_depth_tier,
-    ChunkCost, Extra, M_LADDER, PART_CHARGE, SPARE_MIN, chunk_costs, chunk_list, kv_bytes,
-    state_bytes,
+    ChunkCost, Extra, M_LADDER, PART_CHARGE, SPARE_MIN, chunk_costs, kv_bytes, state_bytes,
 };
 use super::start::prefill_start_line;
 use super::step::{ChunkFacts, ChunkVerdict, chunk_verdict};
@@ -629,7 +627,7 @@ fn drive_chunks_slices_rows_at_their_positions() {
                 Ok(())
             })
             .expect("a ladder chunk size plans every count");
-            let expected = chunk_list(start, count, 128).expect("the same plan");
+            let expected = pieces_of(start, count, 128, None).expect("the same plan");
             assert_eq!(
                 ran, expected,
                 "the plan that ran is returned: start {start}, {count} rows"
@@ -660,22 +658,122 @@ fn drive_chunks_slices_rows_at_their_positions() {
     }
 }
 
-/// The shared chunk loop plans a resident session's pieces exactly as the plan oracle
-/// (`chunk_list_with_depth_tier`) does, for every arena size, depth and prompt length checked.
+/// The shared chunk loop's plans of a resident session, against lists fixed from the plan the
+/// driver used before the shared loop (arena, depth tier, start, rows).
 #[test]
-fn the_shared_loop_plans_a_resident_session_like_the_plan_oracle() {
-    for m_sess in [16usize, 128, 256, 512, 1024, 2048, 4096] {
-        for fixed in [None, Some(82usize), Some(30)] {
-            for p0 in [0usize, 1, 2047, 3071, 3072, 70_000, 73_700, 155_000, 200_000] {
-                for rows in [0usize, 1, 2, 127, 129, 2049, 5000] {
-                    let tokens = vec![0u32; rows];
-                    let got = drive_chunks(p0, &tokens, (m_sess, fixed, false), |_, _| Ok(()))
-                        .expect("a ladder size plans");
-                    let want = chunk_list_with_depth_tier(p0, rows, m_sess, fixed).expect("plan");
-                    assert_eq!(got, want, "arena {m_sess}, depth tier {fixed:?}, {p0}+{rows}");
-                }
-            }
-        }
+fn the_shared_loop_plans_a_resident_session_like_the_plan_it_replaced() {
+    fn chunk(p0: usize, rows: usize) -> PrefillStep {
+        PrefillStep::Chunk { p0, rows }
+    }
+    let cases: Vec<(usize, Option<usize>, usize, usize, Vec<PrefillStep>)> = vec![
+        (
+            4096,
+            None,
+            0,
+            9000,
+            vec![
+                chunk(0, 2048),
+                chunk(2048, 2048),
+                chunk(4096, 1024),
+                chunk(5120, 1024),
+                chunk(6144, 1024),
+                chunk(7168, 1024),
+                chunk(8192, 808),
+            ],
+        ),
+        (
+            2048,
+            None,
+            2900,
+            5000,
+            vec![
+                chunk(2900, 2048),
+                chunk(4948, 1024),
+                chunk(5972, 1024),
+                chunk(6996, 904),
+            ],
+        ),
+        (
+            1024,
+            None,
+            70_000,
+            3000,
+            vec![
+                chunk(70_000, 512),
+                chunk(70_512, 512),
+                chunk(71_024, 512),
+                chunk(71_536, 512),
+                chunk(72_048, 512),
+                chunk(72_560, 440),
+            ],
+        ),
+        (
+            512,
+            Some(82),
+            155_136,
+            1024,
+            vec![chunk(155_136, 512), chunk(155_648, 256), chunk(155_904, 256)],
+        ),
+        (
+            512,
+            Some(30),
+            155_648,
+            700,
+            vec![
+                chunk(155_648, 128),
+                chunk(155_776, 128),
+                chunk(155_904, 128),
+                chunk(156_032, 128),
+                chunk(156_160, 128),
+                chunk(156_288, 60),
+            ],
+        ),
+        (
+            2048,
+            Some(82),
+            0,
+            5000,
+            vec![chunk(0, 2048), chunk(2048, 2048), chunk(4096, 904)],
+        ),
+        (
+            4096,
+            Some(82),
+            73_000,
+            2000,
+            vec![
+                chunk(73_000, 512),
+                chunk(73_512, 512),
+                chunk(74_024, 512),
+                chunk(74_536, 464),
+            ],
+        ),
+        (
+            128,
+            None,
+            5,
+            400,
+            vec![chunk(5, 128), chunk(133, 128), chunk(261, 128), chunk(389, 16)],
+        ),
+        (
+            16,
+            None,
+            7,
+            35,
+            vec![chunk(7, 16), chunk(23, 16), chunk(39, 3)],
+        ),
+        (
+            256,
+            Some(82),
+            200_000,
+            600,
+            vec![chunk(200_000, 256), chunk(200_256, 256), chunk(200_512, 88)],
+        ),
+    ];
+    for (m_sess, fixed, p0, rows, want) in cases {
+        let tokens = vec![0u32; rows];
+        let got = drive_chunks(p0, &tokens, (m_sess, fixed, false), |_, _| Ok(()))
+            .expect("a ladder size plans");
+        assert_eq!(got, want, "arena {m_sess}, depth tier {fixed:?}, {p0}+{rows}");
     }
     assert!(drive_chunks(0, &[0u32; 4], (300, None, false), |_, _| Ok(())).is_err());
 }

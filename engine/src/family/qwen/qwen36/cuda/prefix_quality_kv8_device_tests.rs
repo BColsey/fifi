@@ -2,7 +2,8 @@
 use super::*;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::qwen::qwen36::cuda::{
-    prefill_plan::{Extra, chunk_list},
+    prefill_driver::pieces_of,
+    prefill_plan::Extra,
     state::pinned::PinnedSnapshot,
 };
 
@@ -14,7 +15,7 @@ fn chunked(
     range: std::ops::Range<usize>,
 ) -> Result<Vec<Row>, EngError> {
     let mut rows = Vec::new();
-    for piece in chunk_list(range.start, range.len(), ROWS)? {
+    for piece in pieces_of(range.start, range.len(), ROWS, None)? {
         let PrefillStep::Chunk { p0, rows: count } = piece else {
             return Err(bad("KV8 cohort unexpectedly planned a one-row feed"));
         };
@@ -206,7 +207,7 @@ fn kv8_restore_partitions_preserve_all_scored_positions() {
     for cut in [1024, 1280, 1536] {
         let mut selected = Vec::new();
         for range in [0..cut, cut..CONTEXT] {
-            for piece in chunk_list(range.start, range.len(), ROWS).unwrap() {
+            for piece in pieces_of(range.start, range.len(), ROWS, None).unwrap() {
                 let PrefillStep::Chunk { p0, rows } = piece else {
                     panic!("one-row piece")
                 };

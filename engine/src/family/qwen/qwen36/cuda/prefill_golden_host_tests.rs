@@ -27,9 +27,10 @@ use super::prefill_golden_device_tests::{
     FED_ROWS, IDS_SHA256, PROMPT_IDS, planned_table, prompt_ids, store_goldens, table_text,
 };
 use super::prefill_plan::{
-    M_LADDER, PART_CHARGE, SPARE_MIN, chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_costs,
-    exl3_chunk_tensors, state_bytes,
+    M_LADDER, PART_CHARGE, SPARE_MIN, chunk_tensors, exl3_chunk_costs, exl3_chunk_tensors,
+    state_bytes,
 };
+use super::prefill_driver::pieces_of;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::plan_arena;
@@ -247,7 +248,7 @@ fn the_plan_tables_hold_their_golden_digests() {
     // is fed; the token after them goes through decode.
     let mut partition_text = String::new();
     for &cap in &SIZES {
-        let steps = chunk_list_with_depth_tier(0, FED_ROWS, cap, None).expect("chunk list");
+        let steps = pieces_of(0, FED_ROWS, cap, None).expect("chunk list");
         for step in &steps {
             match step {
                 PrefillStep::Chunk { p0, rows } => {
@@ -277,7 +278,7 @@ fn the_plan_tables_hold_their_golden_digests() {
         }
     }
     // At cap 2048 the depth tier, not the cap, cuts the chunks from position 4,096 on.
-    let deep = chunk_list_with_depth_tier(0, FED_ROWS, 2048, None).expect("chunk list");
+    let deep = pieces_of(0, FED_ROWS, 2048, None).expect("chunk list");
     assert!(
         deep.iter().any(|step| matches!(
             step,

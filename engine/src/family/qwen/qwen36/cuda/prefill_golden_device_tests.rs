@@ -52,8 +52,9 @@ use super::exl3_load::load_exl3_dir;
 use super::prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillArena, PrefillBudget, ZERO_CHUNK};
 use super::prefill_exl3_step_device_tests::{SAMPLER_VOCAB, rules as step_rules};
 use super::prefill_plan::{
-    ChunkSlot, chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
+    ChunkSlot, chunk_tensors, exl3_chunk_tensors,
 };
+use super::prefill_driver::pieces_of;
 use super::resources::StepResources;
 use super::state::export::ExportedState;
 use super::step::ChunkVerdict;
@@ -556,7 +557,7 @@ fn capture(
         })
         .collect();
     let expected: Vec<(usize, usize, &'static str)> =
-        chunk_list_with_depth_tier(0, FED_ROWS, wanted, None)
+        pieces_of(0, FED_ROWS, wanted, None)
             .expect("chunk list")
             .iter()
             .map(|step| match step {

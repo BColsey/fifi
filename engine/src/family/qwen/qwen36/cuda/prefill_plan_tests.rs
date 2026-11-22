@@ -7,11 +7,12 @@ use super::{
     dims::KvMode,
     prefill_plan::{
         Admission, ChunkCost, ChunkSlot as S, EXL3_SLOTS, EXL3_TILE_ROWS, Extra, M_LADDER,
-        PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_list,
-        chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_cost, exl3_chunk_costs,
-        exl3_chunk_tensors, fixed_depth_rows, kv_bytes, m_pos, state_bytes,
+        DEPTH_ANCHORS, PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_tensors,
+        exl3_chunk_cost, exl3_chunk_costs, exl3_chunk_tensors, kv_bytes, m_pos, state_bytes,
     },
+    prefill_driver::pieces_of,
 };
+use crate::family::prefill::piece_rows::piece_rows;
 use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
@@ -38,6 +39,10 @@ fn chunk(p0: usize, rows: usize) -> PrefillStep {
 
 fn feed(p0: usize) -> PrefillStep {
     PrefillStep::Feed { p0 }
+}
+
+fn chunk_list(p0: usize, n_rows: usize, m_sess: usize) -> Result<Vec<PrefillStep>, EngError> {
+    pieces_of(p0, n_rows, m_sess, None)
 }
 
 fn steps(p0: usize, n_rows: usize, m_sess: usize) -> Vec<PrefillStep> {
@@ -70,10 +75,10 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         (196_608, 16, 16),
         (usize::MAX, 512, 128),
     ] {
-        assert_eq!(fixed_depth_rows(p0, rows, 82), want);
+        assert_eq!(piece_rows(DEPTH_ANCHORS, NSM, p0, rows), want);
     }
     assert_eq!(
-        chunk_list_with_depth_tier(155_136, 1024, 512, Some(82)).unwrap(),
+        pieces_of(155_136, 1024, 512, Some(82)).unwrap(),
         vec![
             chunk(155_136, 512),
             chunk(155_648, 256),
@@ -81,17 +86,11 @@ fn fixed_depth_tier_preserves_early_chunks_and_the_legacy_plan() {
         ]
     );
     assert_eq!(
-        chunk_list_with_depth_tier(155_648, 257, 512, Some(82)).unwrap(),
+        pieces_of(155_648, 257, 512, Some(82)).unwrap(),
         vec![chunk(155_648, 256), feed(155_904)]
     );
-    for (p0, count, arena) in [(0, 3000, 1024), (196_096, 1024, 512), (245_760, 1024, 512)] {
-        assert_eq!(
-            chunk_list_with_depth_tier(p0, count, arena, None).unwrap(),
-            chunk_list(p0, count, arena).unwrap()
-        );
-    }
-    assert!(chunk_list_with_depth_tier(usize::MAX, 1, 512, Some(82)).is_err());
-    assert!(chunk_list_with_depth_tier(0, 1, 0, Some(82)).is_err());
+    assert!(pieces_of(usize::MAX, 1, 512, Some(82)).is_err());
+    assert!(pieces_of(0, 1, 0, Some(82)).is_err());
 }
 
 #[test]
@@ -256,7 +255,7 @@ fn a_chunk_size_off_the_ladder_or_an_overflowing_run_is_refused() {
         assert!(error_text(error).contains("[4096, 2048, 1024, 512, 256, 128]"));
     }
     let error = chunk_list(usize::MAX, 2, 2048).expect_err("p0 + n overflows");
-    assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
+    assert!(matches!(error, EngError::BadRequest(_)), "{error:?}");
 }
 
 // ---- admission against the design table ----------------------------------------------------

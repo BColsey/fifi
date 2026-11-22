@@ -91,8 +91,7 @@ pub(crate) fn m_pos(p0: usize) -> usize {
 // The admission types moved to the shared prefill core (`family::prefill`); these re-exports
 // keep the old paths alive for the driver, the step and the plan tests.
 pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
-use crate::family::prefill::arena::PrefillStep;
-use crate::family::prefill::piece_rows::{Anchor, piece_rows};
+use crate::family::prefill::piece_rows::Anchor;
 use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 impl Admission {
@@ -104,59 +103,12 @@ impl Admission {
     }
 }
 
-/// The steps that feed `n_rows` rows from position `p0` (`feed_rows` gets tokens `0..n-1`; the
-/// last prompt token goes through decode). Each chunk has `min(M_pos(p0), m_sess, rows left)`
-/// rows, `m_sess` being the session's arena size (already capped by `qwen36.prefill_chunk`).
-pub(crate) fn chunk_list(
-    p0: usize,
-    n_rows: usize,
-    m_sess: usize,
-) -> Result<Vec<PrefillStep>, EngError> {
-    chunk_list_with_depth_tier(p0, n_rows, m_sess, None)
-}
-
 /// The measured anchors of the piece-time model: on the 82-SM RTX 3090 a piece of 1,024 rows
 /// reaches 0.45 s at 73,728 positions of depth, and a piece of 512 rows at 155,648 (two runs keep
 /// 512-row pieces below 0.454 s through 152K). The rows at every depth and on every device
-/// follow from them ([`piece_rows`]).
+/// follow from them (`piece_rows`).
 pub(super) const DEPTH_ANCHORS: (Anchor, Anchor) =
     (Anchor::at(73_728, 1024), Anchor::at(155_648, 512));
-
-/// Bound a piece without changing the session arena or sampling free VRAM: the rows a piece may
-/// have at its end depth on a device of `sm_count` multiprocessors.
-#[cfg(test)]
-pub(crate) fn fixed_depth_rows(p0: usize, rows: usize, sm_count: usize) -> usize {
-    piece_rows(DEPTH_ANCHORS, sm_count, p0, rows)
-}
-
-pub(crate) fn chunk_list_with_depth_tier(
-    p0: usize,
-    n_rows: usize,
-    m_sess: usize,
-    fixed_depth: Option<usize>,
-) -> Result<Vec<PrefillStep>, EngError> {
-    if m_sess != 16 && !LARGE_M_LADDER.contains(&m_sess) {
-        return Err(EngError::BadRequest(format!(
-            "prefill plan: chunk size {m_sess} is not one of {LARGE_M_LADDER:?} or 16"
-        )));
-    }
-    let end = p0.checked_add(n_rows).ok_or_else(overflow)?;
-    let mut steps = Vec::new();
-    let mut at = p0;
-    while at < end {
-        let rows = m_pos(at).min(m_sess).min(end - at);
-        let rows = match fixed_depth {
-            Some(sm_count) => piece_rows(DEPTH_ANCHORS, sm_count, at, rows),
-            None => rows,
-        };
-        steps.push(match rows {
-            1 => PrefillStep::Feed { p0: at },
-            _ => PrefillStep::Chunk { p0: at, rows },
-        });
-        at += rows;
-    }
-    Ok(steps)
-}
 
 /// KV bytes of a session of `window` positions: the pool's exact bytes per position, without
 /// `KvPool`'s per-plane `STATE_ALIGN` rounding (at most 255 B a plane, 40 planes at `Int8G32` —
