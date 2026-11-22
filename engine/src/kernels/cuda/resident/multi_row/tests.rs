@@ -742,9 +742,7 @@ fn gemma_rows_in_one_launch_are_the_bytes_of_single_row_launches() {
         return;
     }
     let rig = Rig::new();
-    const N_Q: usize = 8;
     let kv_lens = [1, 30, 99, 100, 101, 149, 150, 190];
-    let n = kv_lens.len();
     let mut rng = Rng::new(0x6d52_0500);
     // (head_dim, window, ring, split): local layers (256, window, ring), a global layer (512).
     let cases: [GemmaCase; 7] = [
@@ -757,28 +755,89 @@ fn gemma_rows_in_one_launch_are_the_bytes_of_single_row_launches() {
         (512, 0, 0, Some((16, 8))),
     ];
     for (head_dim, window, ring, split) in cases {
-        let rows: Vec<RowBuffers> = kv_lens
-            .iter()
-            .map(|&len| gemma_row(&rig, &mut rng, head_dim, len))
-            .collect();
-        let q_row = N_Q * head_dim * 4;
-        let q = rig.up(&normal(&mut rng, n * N_Q * head_dim, 1.0));
-        let table = rig
-            .ctx
-            .kv_rows(
-                &rows
-                    .iter()
-                    .map(|r| gemma_kv_row(r, head_dim))
-                    .collect::<Vec<_>>(),
-            )
-            .expect("table");
-        let part_floats = |m: usize, max_splits: usize| m * N_Q * max_splits * (2 + head_dim);
-        let part = rig.filled(SENTINEL, n * N_Q * 16 * (2 + head_dim) * 4);
-        let out = rig.filled(SENTINEL, n * q_row);
+        gemma_compare(&rig, &mut rng, &kv_lens, head_dim, window, ring, split);
+    }
+}
+
+/// One launch of `kv_lens.len()` Bolt rows against the same rows one at a time. The part buffer
+/// holds exactly what the call needs and each path has its own sentinels, so a slot one path never
+/// wrote reads differently from the other path's.
+fn gemma_compare(
+    rig: &Rig,
+    rng: &mut Rng,
+    kv_lens: &[i32],
+    head_dim: usize,
+    window: usize,
+    ring: usize,
+    split: Option<(usize, usize)>,
+) {
+    const N_Q: usize = 8;
+    let n = kv_lens.len();
+    let rows: Vec<RowBuffers> = kv_lens
+        .iter()
+        .map(|&len| gemma_row(rig, rng, head_dim, len))
+        .collect();
+    let q_row = N_Q * head_dim * 4;
+    let q = rig.up(&normal(rng, n * N_Q * head_dim, 1.0));
+    let table = rig
+        .ctx
+        .kv_rows(
+            &rows
+                .iter()
+                .map(|r| gemma_kv_row(r, head_dim))
+                .collect::<Vec<_>>(),
+        )
+        .expect("table");
+    let part_floats = |m: usize, max_splits: usize| m * N_Q * max_splits * (2 + head_dim);
+    let max_splits_of = split.map_or(1, |(max_splits, _)| max_splits);
+    let part = rig.filled(0xc3, part_floats(n, max_splits_of) * 4);
+    let out = rig.filled(0xa7, n * q_row);
+    rig.ctx
+        .attn_decode_gemma_multi(
+            &rig.stream,
+            DecodeGemmaMultiCall {
+                n_q_head: N_Q,
+                n_kv_head: N_KV,
+                head_dim,
+                cells: CELLS,
+                window,
+                ring,
+                scale: 1.0,
+                q: q.range(0, n * q_row).unwrap(),
+                rows: &table,
+                split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
+                    part: part.range(0, part_floats(n, max_splits) * 4).unwrap(),
+                    max_splits,
+                    min_keys,
+                }),
+                out: out.range(0, n * q_row).unwrap(),
+            },
+        )
+        .expect("many rows");
+    let many = rig.read(&out, n * q_row);
+    for (r, row) in rows.iter().enumerate() {
+        let out1 = rig.filled(0x3d, q_row);
+        let part1 = rig.filled(0x5a, part_floats(1, max_splits_of) * 4);
+        let status = rig.filled(0, 4);
         rig.ctx
-            .attn_decode_gemma_multi(
+            .attn_decode_gemma(
                 &rig.stream,
-                DecodeGemmaMultiCall {
+                AttnDecodeGemmaCall {
+                    out: out1.range(0, q_row).unwrap(),
+                    status: Some(status.range(0, 4).unwrap()),
+                    q: q.range(r * q_row, q_row).unwrap(),
+                    k_codes: row.k_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                    k_scales: row
+                        .k_scales
+                        .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+                        .unwrap(),
+                    v_codes: row.v_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                    v_scales: row
+                        .v_scales
+                        .range(0, N_KV * CELLS * (head_dim / 32) * 2)
+                        .unwrap(),
+                    kv_len: row.step.range(8, 4).unwrap(),
+                    m: 1,
                     n_q_head: N_Q,
                     n_kv_head: N_KV,
                     head_dim,
@@ -786,62 +845,19 @@ fn gemma_rows_in_one_launch_are_the_bytes_of_single_row_launches() {
                     window,
                     ring,
                     scale: 1.0,
-                    q: q.range(0, n * q_row).unwrap(),
-                    rows: &table,
                     split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
-                        part: part.range(0, part_floats(n, max_splits) * 4).unwrap(),
+                        part: part1.range(0, part_floats(1, max_splits) * 4).unwrap(),
                         max_splits,
                         min_keys,
                     }),
-                    out: out.range(0, n * q_row).unwrap(),
                 },
             )
-            .expect("many rows");
-        let many = rig.read(&out, n * q_row);
-        for (r, row) in rows.iter().enumerate() {
-            let out1 = rig.filled(SENTINEL, q_row);
-            let part1 = rig.filled(SENTINEL, part_floats(1, 16) * 4);
-            let status = rig.filled(0, 4);
-            rig.ctx
-                .attn_decode_gemma(
-                    &rig.stream,
-                    AttnDecodeGemmaCall {
-                        out: out1.range(0, q_row).unwrap(),
-                        status: Some(status.range(0, 4).unwrap()),
-                        q: q.range(r * q_row, q_row).unwrap(),
-                        k_codes: row.k_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
-                        k_scales: row
-                            .k_scales
-                            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
-                            .unwrap(),
-                        v_codes: row.v_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
-                        v_scales: row
-                            .v_scales
-                            .range(0, N_KV * CELLS * (head_dim / 32) * 2)
-                            .unwrap(),
-                        kv_len: row.step.range(8, 4).unwrap(),
-                        m: 1,
-                        n_q_head: N_Q,
-                        n_kv_head: N_KV,
-                        head_dim,
-                        cells: CELLS,
-                        window,
-                        ring,
-                        scale: 1.0,
-                        split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
-                            part: part1.range(0, part_floats(1, max_splits) * 4).unwrap(),
-                            max_splits,
-                            min_keys,
-                        }),
-                    },
-                )
-                .expect("single row");
-            assert_eq!(
-                rig.read(&out1, q_row),
-                many[r * q_row..(r + 1) * q_row],
-                "gemma out, head_dim {head_dim} window {window} ring {ring} split {split:?}, row {r}"
-            );
-        }
+            .expect("single row");
+        assert_eq!(
+            rig.read(&out1, q_row),
+            many[r * q_row..(r + 1) * q_row],
+            "gemma out, head_dim {head_dim} window {window} ring {ring} split {split:?}, row {r}"
+        );
     }
 }
 
@@ -938,13 +954,19 @@ fn a_ring_wraps_in_the_rows_path_driven_by_append() {
         return;
     }
     let rig = Rig::new();
+    // A ring shorter than the cells, a ring of exactly the cells, and a window as long as the ring.
+    for (window, ring) in [(100, 150), (100, CELLS), (CELLS, CELLS)] {
+        ring_wrap_case(&rig, window, ring);
+    }
+}
+
+fn ring_wrap_case(rig: &Rig, window: usize, ring: usize) {
     const N_Q: usize = 8;
-    let (window, ring) = (100, 150);
     let starts = [0i32, 30, 90];
     let n = starts.len();
     let mut rng = Rng::new(0x6d52_0600);
-    let many: Vec<RowBuffers> = (0..n).map(|_| zero_row(&rig)).collect();
-    let single: Vec<RowBuffers> = (0..n).map(|_| zero_row(&rig)).collect();
+    let many: Vec<RowBuffers> = (0..n).map(|_| zero_row(rig)).collect();
+    let single: Vec<RowBuffers> = (0..n).map(|_| zero_row(rig)).collect();
     let table = rig
         .ctx
         .kv_rows(&many.iter().map(kv_row).collect::<Vec<_>>())
@@ -967,8 +989,8 @@ fn a_ring_wraps_in_the_rows_path_driven_by_append() {
         k.write_at(&rig.stream, 0, &f32_bytes(&kk)).unwrap();
         v.write_at(&rig.stream, 0, &f32_bytes(&vv)).unwrap();
         for r in 0..n {
-            set_step(&rig, &many[r], starts[r] + step);
-            set_step(&rig, &single[r], starts[r] + step);
+            set_step(rig, &many[r], starts[r] + step);
+            set_step(rig, &single[r], starts[r] + step);
             wrapped |= starts[r] + step >= ring as i32 + 5;
         }
         rig.ctx
@@ -1054,7 +1076,141 @@ fn a_ring_wraps_in_the_rows_path_driven_by_append() {
         }
     }
     assert!(wrapped, "the positions passed the ring");
-    assert_rows_equal(&rig, &many, &single, "ring planes after the wrap");
+    assert_rows_equal(rig, &many, &single, "ring planes after the wrap");
+}
+
+/// A row whose length is out of range is refused alone: its output is NaN and mask 4 reaches its
+/// own step block; the rows around it carry the bytes of their own single-row launches.
+#[test]
+fn an_out_of_range_gemma_row_is_refused_alone() {
+    if !testkit::device_present("an out of range gemma row among valid rows") {
+        return;
+    }
+    let rig = Rig::new();
+    const N_Q: usize = 8;
+    // 193 is past the cells of a linear plane, 0 is below the first key.
+    let kv_lens = [10, 193, 50, 0, 190];
+    let n = kv_lens.len();
+    let head_dim = 256;
+    let q_row = N_Q * head_dim * 4;
+    let mut rng = Rng::new(0x6d52_0a00);
+    for split in [None, Some((8usize, 16usize))] {
+        let rows: Vec<RowBuffers> = kv_lens
+            .iter()
+            .map(|&len| gemma_row(&rig, &mut rng, head_dim, len))
+            .collect();
+        let q = rig.up(&normal(&mut rng, n * N_Q * head_dim, 1.0));
+        let table = rig
+            .ctx
+            .kv_rows(
+                &rows
+                    .iter()
+                    .map(|r| gemma_kv_row(r, head_dim))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("table");
+        let part_bytes = n * N_Q * 8 * (2 + head_dim) * 4;
+        let part = rig.filled(0xc3, part_bytes);
+        let out = rig.filled(0xa7, n * q_row);
+        rig.ctx
+            .attn_decode_gemma_multi(
+                &rig.stream,
+                DecodeGemmaMultiCall {
+                    n_q_head: N_Q,
+                    n_kv_head: N_KV,
+                    head_dim,
+                    cells: CELLS,
+                    window: 0,
+                    ring: 0,
+                    scale: 1.0,
+                    q: q.range(0, n * q_row).unwrap(),
+                    rows: &table,
+                    split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
+                        part: part.range(0, part_bytes).unwrap(),
+                        max_splits,
+                        min_keys,
+                    }),
+                    out: out.range(0, n * q_row).unwrap(),
+                },
+            )
+            .expect("many rows");
+        let many = rig.read(&out, n * q_row);
+        for (r, row) in rows.iter().enumerate() {
+            let step = rig.read(&row.step, STEP_BYTES);
+            let status = i32::from_le_bytes(step[16..20].try_into().unwrap());
+            let mine = &many[r * q_row..(r + 1) * q_row];
+            if (1..=CELLS as i32).contains(&kv_lens[r]) {
+                assert_eq!(
+                    status, 0,
+                    "split {split:?}: a valid row keeps a clean status, row {r}"
+                );
+                let out1 = rig.filled(0x3d, q_row);
+                let part1 = rig.filled(0x5a, N_Q * 8 * (2 + head_dim) * 4);
+                rig.ctx
+                    .attn_decode_gemma(
+                        &rig.stream,
+                        AttnDecodeGemmaCall {
+                            out: out1.range(0, q_row).unwrap(),
+                            status: None,
+                            q: q.range(r * q_row, q_row).unwrap(),
+                            k_codes: row.k_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                            k_scales: row.k_scales.range(0, N_KV * CELLS * 8 * 2).unwrap(),
+                            v_codes: row.v_codes.range(0, N_KV * CELLS * head_dim).unwrap(),
+                            v_scales: row.v_scales.range(0, N_KV * CELLS * 8 * 2).unwrap(),
+                            kv_len: row.step.range(8, 4).unwrap(),
+                            m: 1,
+                            n_q_head: N_Q,
+                            n_kv_head: N_KV,
+                            head_dim,
+                            cells: CELLS,
+                            window: 0,
+                            ring: 0,
+                            scale: 1.0,
+                            split: split.map(|(max_splits, min_keys)| AttnDecodeGemmaSplit {
+                                part: part1.range(0, part1_bytes(max_splits, head_dim)).unwrap(),
+                                max_splits,
+                                min_keys,
+                            }),
+                        },
+                    )
+                    .expect("single row");
+                assert_eq!(rig.read(&out1, q_row), mine, "split {split:?}: row {r}");
+            } else {
+                assert_eq!(status, 4, "split {split:?}: mask 4 on the refused row {r}");
+                assert!(
+                    mine.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|word| *word == [0x00, 0x00, 0xc0, 0x7f]),
+                    "split {split:?}: the refused row {r} is all NaN"
+                );
+            }
+        }
+    }
+}
+
+/// Bytes of the part scratch of one Bolt row at `max_splits`.
+fn part1_bytes(max_splits: usize, head_dim: usize) -> usize {
+    8 * max_splits * (2 + head_dim) * 4
+}
+
+/// The Bolt entry at the row limit, in the single-pass and the split-K paths (the split-K scratch
+/// is the largest buffer of any entry: 64 splits for 256 rows).
+#[test]
+fn the_gemma_entry_runs_at_256_rows() {
+    if !testkit::device_present("gemma many rows at the row limit") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x6d52_0b00);
+    let kv_lens: Vec<i32> = (0..256).map(|r| (r * 7 + 1) % 191 + 1).collect();
+    for (head_dim, window, ring, split) in [
+        (256, 0, 0, None),
+        (256, 100, 150, Some((16, 16))),
+        (256, 0, 0, Some((64, 8))),
+    ] {
+        gemma_compare(&rig, &mut rng, &kv_lens, head_dim, window, ring, split);
+    }
 }
 
 /// The attention entries at the row limit (256), and the table refusal one row past it.

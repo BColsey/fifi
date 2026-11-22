@@ -632,9 +632,11 @@ pub(in crate::kernels::cuda) fn attn_decode_gemma_multi_launch(
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the ranges are proved live, sized and aligned above (`part` to 16, the table to 8,
-    // the rest to 4) with `out` apart from every other range; the entry repeats the shape rules of
-    // the single-row entry; the plane and step addresses in the table were proved by the safe
-    // layer; `args` and `stage` are live for the call.
+    // the rest to 4) with `out` apart from every other range. The entry checks the shape, the
+    // alignment and the split rules (a `part` pointer, `max_splits` 1 to 128, `min_keys` at
+    // least 8) of the single-row entry on the arguments, but not extents: the extents of every
+    // row's planes and step block were proved, and proved apart from the outputs, by the safe layer,
+    // which is the only writer of the table. `args` and `stage` are live for the call.
     let status = unsafe { gemma_raw(&args, stream.as_ptr(), &mut stage) };
     checked(status, stage)
 }

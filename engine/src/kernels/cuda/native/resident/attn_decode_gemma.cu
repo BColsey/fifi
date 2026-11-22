@@ -354,6 +354,11 @@ static int gemma_check(const inference_cuda_attn_decode_gemma_args *args, bool e
         !aligned(args->k_scales, 2) || !aligned(args->v_scales, 2) ||
         (args->status != NULL && !aligned(args->status, 4)))
         return INFERENCE_CUDA_INVALID_ARGUMENT;
+    // The split rules hold for every caller: s_w and s_l of the combine hold kMaxSplits entries.
+    if (args->split != 0 &&
+        (args->part == NULL || args->max_splits < 1 || args->max_splits > kMaxSplits ||
+         args->min_keys < 8 || !aligned(args->part, 16)))
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
     if (!extents) return INFERENCE_CUDA_OK;  // the many-rows entry proves extents per row on the Rust side
     const size_t plane = (size_t)args->n_kv_head * args->cells;
     const size_t codes_bytes = plane * args->head_dim;
@@ -372,9 +377,6 @@ static int gemma_check(const inference_cuda_attn_decode_gemma_args *args, bool e
     if (args->status != NULL && !apart(args->out, out_bytes, args->status, 4))
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     if (args->split != 0) {
-        if (args->part == NULL || args->max_splits < 1 || args->max_splits > kMaxSplits ||
-            args->min_keys < 8 || !aligned(args->part, 16))
-            return INFERENCE_CUDA_INVALID_ARGUMENT;
         const size_t part_bytes = (size_t)args->m * args->n_q_head *
                                   args->max_splits * (2 + args->head_dim) * 4;
         for (int i = 0; i < 6; ++i) {
