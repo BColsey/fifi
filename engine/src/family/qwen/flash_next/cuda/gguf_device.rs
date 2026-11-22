@@ -112,14 +112,21 @@ pub(in crate::family::qwen::flash_next) fn gguf_driver(
         moe,
     };
     let owner = EngineOwner::new(run, model, weights, stream, ctx);
+    print_vram_receipt(resident_bytes, expert_total);
+    TokenDriver::new(GgufDevice { owner, reported: StreamTotals::default() }, feeds, shape)
+}
+
+/// The one place the start prints what the card holds: the live device bytes after the build and
+/// the share of the routed experts that sit on the card.
+fn print_vram_receipt(resident_bytes: u64, expert_total: u64) {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     eprintln!(
         "flash-next gguf: card bytes live after the build {:.2} GiB; resident experts {:.2} of {:.2} GiB ({:.1}% of the routed experts)",
-        crate::family::engine_owner::live_device_bytes() as f64 / (1u64 << 30) as f64,
-        resident_bytes as f64 / (1u64 << 30) as f64,
-        expert_total as f64 / (1u64 << 30) as f64,
+        gib(crate::family::engine_owner::live_device_bytes() as u64),
+        gib(resident_bytes),
+        gib(expert_total),
         100.0 * resident_bytes as f64 / expert_total.max(1) as f64,
     );
-    TokenDriver::new(GgufDevice { owner, reported: StreamTotals::default() }, feeds, shape)
 }
 
 pub(in crate::family::qwen::flash_next) struct GgufDevice {
