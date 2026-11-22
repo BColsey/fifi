@@ -3245,8 +3245,10 @@ fn the_fused_router_matches_the_op_chain_for_every_row_of_a_window() {
     let mut k = MlxKernels::try_new().unwrap();
     let floats = |bytes: &[u8]| -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect()
     };
     for (top_k, renorm) in [(8u32, true), (8, false), (4, true)] {
