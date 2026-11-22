@@ -37,6 +37,8 @@ pub(in super::super) mod start;
 pub(super) mod tensors;
 #[cfg(test)]
 mod testkit;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in super::super) mod token_feed;
 mod weight_map;
 
 use std::path::Path;

@@ -800,6 +800,58 @@ fn gguf_ple_weights_load_without_transformer_trunk() {
 }
 
 #[test]
+fn gguf_token_feed_chunk_matches_serial_and_resume() {
+    use super::super::super::cuda::driver::TokenFeeds;
+    use super::token_feed::GgufTokenFeeds;
+    let (_written, model) = open(&Spec::default());
+    let rows = model.ngram().unwrap();
+    let mut chunk = GgufTokenFeeds::new(&model, &rows, 2).unwrap();
+    let mut serial = GgufTokenFeeds::new(&model, &rows, 2).unwrap();
+    let shape = model.config().model_shape().unwrap();
+    let weights = super::ple_weights::GgufPleWeights::load(&model).unwrap();
+    let mut projector = super::projector::HostProjector::new(&model.weights, &rows, 2);
+    let mut state = super::super::super::ple::PleState::new(&shape.ple);
+    let tokens = [1, 2];
+    let starts = chunk.begin_chunk(&tokens, false).unwrap();
+    assert_eq!(starts.len(), 2);
+    assert!(chunk.begin_chunk(&[u32::MAX], false).is_err());
+    assert!(chunk.ple_update(2, &starts[0].stream).is_err());
+    for (token, start) in tokens.into_iter().zip(&starts) {
+        let reference = serial.begin(token).unwrap();
+        assert_eq!(*start, reference);
+        let a = chunk.ple_update(token, &start.stream).unwrap();
+        let b = serial.ple_update(token, &reference.stream).unwrap();
+        let oracle = super::super::super::ple::step(
+            &mut projector,
+            &shape.ple,
+            &weights.view(),
+            &mut state,
+            token,
+            &start.stream,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, oracle);
+    }
+    assert_eq!(chunk.ple_state(), serial.ple_state());
+    let (history, ring) = chunk.ple_state().unwrap();
+    let (history, ring) = (history.to_vec(), ring.to_vec());
+    chunk.reset();
+    assert_ne!(chunk.ple_state().unwrap().0, history);
+    chunk.ple_resume(&history, &ring).unwrap();
+    assert_eq!(chunk.ple_state(), serial.ple_state());
+    assert!(chunk.ple_resume(&history, &[]).is_err());
+    assert_eq!(chunk.ple_state(), serial.ple_state());
+    let start = chunk.begin(1).unwrap();
+    assert!(chunk.ple_update(1, &[]).is_err());
+    assert_eq!(chunk.ple_state(), serial.ple_state());
+    assert!(
+        chunk.ple_update(1, &start.stream).is_err(),
+        "failed update consumes matching rows"
+    );
+}
+
+#[test]
 fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
     let (_written, model) = open(&Spec::default());
     let sizes = model.sizes().expect("sizes");
