@@ -270,6 +270,56 @@ fn split_gguf_expert_fixture_builds_valid_q8_records() {
 }
 
 #[test]
+#[ignore = "requires admitted CUDA device; truncates only an owned synthetic shard"]
+fn disk_bank_read_failure_poisons_policy_and_device() {
+    use super::expert_layout::ExpertDeviceStacks;
+    use crate::family::{
+        expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
+        recipe::Role,
+    };
+    let (file, model, layout, _, _) = split_expert_fixture();
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut bank = ExpertDeviceStacks::from_model(&ctx, &stream, &model, 0, &[0, 1]).unwrap();
+    let experts = model.config().dims.experts as usize;
+    let geometry = BankGeometry::new(1, experts, 1, 2, layout.bytes).unwrap();
+    let mut row = vec![-1; experts];
+    row[0] = 0;
+    row[1] = 1;
+    let policy = ReplaceOnMissLru::from_fill(geometry, &[&row], &[vec![0; experts]], None).unwrap();
+    let mut state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let tensor = model.map().get(Role::ExpertGate, Some(0)).unwrap();
+    let weights = file.open();
+    let path = weights.paths()[tensor.shard].canonicalize().unwrap();
+    let dir = file.dir.path().canonicalize().unwrap();
+    assert_eq!(path.parent(), Some(dir.as_path()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let error = bank
+        .step_disk(&stream, &model, &mut state, 0, &[256])
+        .unwrap_err();
+    eprintln!(
+        "expected truncated-shard read failure: {}",
+        error.describe()
+    );
+    assert!(
+        state.slot_row(0)[256] >= 0,
+        "policy advanced before the read"
+    );
+    assert!(state.is_poisoned());
+    assert!(state.begin_pass(0, &[256]).is_err());
+    assert!(bank.part(0).is_err());
+    assert!(
+        bank.step_disk(&stream, &model, &mut state, 0, &[0])
+            .is_err()
+    );
+}
+
+#[test]
 #[ignore = "requires admitted CUDA device; synthetic split GGUF full expert"]
 fn split_gguf_expert_upload_and_indexed_matvec() {
     use super::expert_layout::ExpertDeviceStacks;
