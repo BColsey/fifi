@@ -1519,6 +1519,7 @@ impl<'a> QwenResidentStep<'a> {
 
         let start = self.tokens();
         self.prefill_report.note_chunked_epoch_start(start);
+        let sm_count = self.prefill_sm_count();
         let run = |step, rows: &[u32]| match step {
             PrefillStep::Chunk { p0, .. } => self.run_chunk(p0, rows),
             PrefillStep::Feed { p0 } => {
@@ -1534,7 +1535,7 @@ impl<'a> QwenResidentStep<'a> {
                 Ok(())
             }
         };
-        drive_chunks(start, tokens, (m_sess, self.prefill_sm_count()), run).map(|_| ())
+        drive_chunks(start, tokens, (m_sess, sm_count), run).map(|_| ())
     }
 
     /// The multiprocessors the prefill arena was admitted on, 0 before there is one.

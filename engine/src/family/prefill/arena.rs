@@ -4,9 +4,8 @@
 //! [`zero_spans`] and [`ZERO_CHUNK`] are the one reused zero buffer of the arena fill;
 //! [`allocate_zeroed`] is the fill itself — one arena, a whole-arena scribble when the golden
 //! capture arm asks for it, then one zero fill. The family's test-only I/O counters ride along as
-//! [`ArenaHooks`] fn pointers, so no family name travels through here. [`PrefillStep`] and
-//! [`drive_steps`] are the family-neutral chunk walk: the family builds its own step list, this
-//! drives it.
+//! [`ArenaHooks`] fn pointers, so no family name travels through here. [`PrefillStep`] is the
+//! family-neutral step the shared chunk loop plans and walks.
 
 use crate::{
     EngError,
@@ -84,4 +83,4 @@ pub(crate) fn allocate_zeroed(
 }
 
 // The pure walk is also used by host-backed drivers; retain the first family's import paths.
-pub(crate) use super::steps::{PrefillStep, check_chunk_start, drive_steps};
+pub(crate) use super::steps::{PrefillStep, check_chunk_start};
