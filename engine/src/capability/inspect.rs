@@ -273,6 +273,21 @@ pub fn inspect(model_path: &Path, tokenizer_dir: &Path) -> Result<ModelInspectio
     })
 }
 
+/// Whether the GGUF at `path` declares an Inkling architecture: an Inkling text
+/// checkpoint reads its sidecar files from its parent directory, unlike other
+/// bare GGUFs, which are their own tokenizer.
+pub(crate) fn gguf_is_inkling(path: &Path) -> bool {
+    crate::weights::shared_header(path, GGUF_HEADER_CAP_BYTES)
+        .ok()
+        .and_then(|header| match header.meta("general.architecture") {
+            Some(MetaValue::String(value)) => {
+                Some(matches!(value.as_str(), "inkling2_loop" | "inkling2"))
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn gguf_fact(path: &Path, file_bytes: u64) -> Result<GgufFact, EngError> {
     let header = crate::weights::shared_header(path, GGUF_HEADER_CAP_BYTES)?;
     let architecture = match header.meta("general.architecture") {

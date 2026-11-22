@@ -147,7 +147,13 @@ pub(crate) struct Discovered {
 /// to another model in the same directory: pass the directory to use its files.
 fn default_tokenizer_dir(model: &Path) -> PathBuf {
     if crate::family::gguf_select::is_gguf_file(model) {
-        crate::family::gguf_select::first_shard(model)
+        let first = crate::family::gguf_select::first_shard(model);
+        // An Inkling text checkpoint reads its sidecars from the parent; every other
+        // bare GGUF is its own tokenizer.
+        if crate::capability::inspect::gguf_is_inkling(&first) {
+            return crate::family::gguf_select::directory_of(&first);
+        }
+        first
     } else {
         model.to_path_buf()
     }
@@ -598,6 +604,17 @@ fn select_family(
                 .iter()
                 .filter_map(|fact| fact.architecture.as_deref())
                 .collect();
+            if inspection.config_model_types.is_empty()
+                && seen.is_empty()
+                && !inspection.gguf_files.is_empty()
+            {
+                return Err(StartupError(format!(
+                    "serve --model: {} names no general.architecture, so no family can be chosen from it; known architectures: {}; pass --family (detectable families: {}) or write a --config file",
+                    inspection.weights_path.display(),
+                    crate::server::config::known_gguf_architectures(),
+                    detectable_names()
+                )));
+            }
             if inspection.config_model_types.is_empty() && !seen.is_empty() {
                 let why: String = seen
                     .iter()
