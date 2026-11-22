@@ -2676,8 +2676,8 @@ mod tests {
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
     fn a_restored_prefix_gives_the_same_32_greedy_tokens_on_the_real_artifact() {
-        use super::super::super::artifact::tokenizer_pin;
-        use super::super::super::mlx::tests::env_path;
+        use crate::family::qwen::flash_next::artifact::tokenizer_pin;
+        use crate::family::qwen::flash_next::mlx::tests::env_path;
         use crate::tokenizer::TokenizerBundle;
         let _serial = crate::native_test_lock();
         let artifact = env_path("FLASH_NEXT_ARTIFACT");
@@ -3033,8 +3033,8 @@ mod tests {
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
     fn the_executor_serves_the_real_artifact_with_the_device_token_chain() {
-        use super::super::super::artifact::tokenizer_pin;
-        use super::super::super::mlx::tests::{PROMPT as C5_PROMPT, env_path};
+        use crate::family::qwen::flash_next::artifact::tokenizer_pin;
+        use crate::family::qwen::flash_next::mlx::tests::{PROMPT as C5_PROMPT, env_path};
         use crate::tokenizer::TokenizerBundle;
         let _serial = crate::native_test_lock();
         let artifact = env_path("FLASH_NEXT_ARTIFACT");
@@ -3248,7 +3248,7 @@ mod tests {
     #[test]
     #[ignore = "needs the Flash-Next artifact on the Mac"]
     fn the_executor_reports_the_prefill_rate_of_a_long_prompt() {
-        use super::super::super::mlx::tests::env_path;
+        use crate::family::qwen::flash_next::mlx::tests::env_path;
         let _serial = crate::native_test_lock();
         let env = |name: &str, default: Option<u64>| -> u64 {
             std::env::var(name).map_or_else(

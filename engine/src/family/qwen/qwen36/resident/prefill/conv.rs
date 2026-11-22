@@ -73,8 +73,8 @@ pub(super) fn causal_conv(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::ops::{assert_close, f32_tensor, values};
     use super::*;
+    use crate::family::qwen::qwen36::resident::ops::{assert_close, f32_tensor, values};
     use crate::tensor::Dtype;
 
     fn upload(kernels: &mut MlxKernels, shape: Vec<u32>, data: &[f32]) -> ExecutionTensor {

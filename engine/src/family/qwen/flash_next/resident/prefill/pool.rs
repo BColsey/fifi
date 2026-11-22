@@ -15,12 +15,12 @@
 //! Every byte that a chunk imports is written by that chunk. The pool never reads the S3 expert
 //! cache and never writes to it.
 
-use super::super::super::prefill_plan::{Wave, require_sorted_ranks};
 use super::super::{
     ops::short_import,
     slots::{ExpertSlots, SetLayout},
     weights::RMoe,
 };
+use crate::family::qwen::flash_next::prefill_plan::{Wave, require_sorted_ranks};
 #[cfg(feature = "native-fault-qualification")]
 use crate::family::stored::record_page_import;
 use crate::family::stored::{read_stack_into, read_stack_runs_into};
@@ -317,15 +317,15 @@ fn put_words(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::super::prefill_plan::{ChunkRoute, split_waves};
-    use super::super::super::{
+    use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::prefill_plan::{ChunkRoute, split_waves};
+    use crate::family::qwen::flash_next::resident::{
         fixtures::config,
         moe::tests::{checkpoint_from, routed_entries},
         ops::values,
         weights::ResidentWeights,
     };
-    use super::*;
-    use crate::family::qwen::flash_next::load::FlashWeights;
 
     /// Loads the routed fixture: 4 experts of width 64 and 32, top-k 2, two layers.
     fn load(kernels: &mut MlxKernels) -> (StreamedCheckpoint, ResidentWeights) {

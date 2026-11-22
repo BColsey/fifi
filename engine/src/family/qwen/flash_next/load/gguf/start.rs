@@ -24,7 +24,7 @@ use crate::{
 
 /// Plans the model on this machine and prints the plan. Returns the refusal that stands
 /// between the file and a served start; there is no serving path yet, so `Ok` never occurs.
-pub(in super::super::super) fn start(
+pub(in crate::family::qwen::flash_next) fn start(
     model: &GgufModel,
     options: Option<&FlashOptions>,
 ) -> Result<Infallible, EngError> {

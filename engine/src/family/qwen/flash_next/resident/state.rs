@@ -503,12 +503,12 @@ impl ResidentState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::load::FlashWeights;
     use super::super::fixtures;
     use super::super::ops::{assert_close, values, zeros};
     use super::super::qsa::MAX_POSITIONS;
     use super::super::{ResidentDecoder, StepMode};
     use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
     use crate::sched::SessionBudget;
 
     #[test]
@@ -808,10 +808,10 @@ mod tests {
 
 #[cfg(test)]
 mod snapshot_tests {
-    use super::super::super::load::FlashWeights;
     use super::super::ops::values;
     use super::super::{ResidentDecoder, StepMode, fixtures};
     use super::{LayerState, ResidentState};
+    use crate::family::qwen::flash_next::load::FlashWeights;
     use crate::{
         EngError, kernels::MlxKernels, sched::SessionBudget, tensor::ExecutionTensor,
         weights::StreamedCheckpoint,

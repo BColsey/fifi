@@ -35,33 +35,33 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 
 /// What the plan reads from the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in super::super::super) struct GgufSizes {
-    pub(in super::super::super) shape: TierShape,
+pub(in crate::family::qwen::flash_next) struct GgufSizes {
+    pub(in crate::family::qwen::flash_next) shape: TierShape,
     /// Device bytes of the resident trunk in the forms the executor holds it in.
-    pub(in super::super::super) trunk_bytes: u64,
+    pub(in crate::family::qwen::flash_next) trunk_bytes: u64,
     /// The embedding table, whose rows the host gathers.
-    pub(in super::super::super) embedding_bytes: u64,
+    pub(in crate::family::qwen::flash_next) embedding_bytes: u64,
     /// The n-gram table, read row by row from its file.
-    pub(in super::super::super) ngram_bytes: u64,
+    pub(in crate::family::qwen::flash_next) ngram_bytes: u64,
     /// The largest per-layer expert record: what one staging slot holds.
-    pub(in super::super::super) record_bytes_max: u64,
+    pub(in crate::family::qwen::flash_next) record_bytes_max: u64,
     /// The routed experts of all layers, as stored.
-    pub(in super::super::super) expert_bytes: u64,
+    pub(in crate::family::qwen::flash_next) expert_bytes: u64,
 }
 
 /// What the machine offers: the card's free memory after the CUDA context exists, and the
 /// host's total and available memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in super::super::super) struct Card {
-    pub(in super::super::super) free_vram: u64,
-    pub(in super::super::super) host: HostMemory,
+pub(in crate::family::qwen::flash_next) struct Card {
+    pub(in crate::family::qwen::flash_next) free_vram: u64,
+    pub(in crate::family::qwen::flash_next) host: HostMemory,
     /// Video memory set aside for the prefill ring before the bank sizes itself.
-    pub(in super::super::super) ring_budget: u64,
+    pub(in crate::family::qwen::flash_next) ring_budget: u64,
 }
 
 impl GgufModel {
     /// The sizes the memory plan needs.
-    pub(in super::super::super) fn sizes(&self) -> Result<GgufSizes, EngError> {
+    pub(in crate::family::qwen::flash_next) fn sizes(&self) -> Result<GgufSizes, EngError> {
         let layers = self.config.layers();
         let experts = u64::from(self.config.dims.experts);
         let top_k = self.config.dims.top_k as usize;

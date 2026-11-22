@@ -33,7 +33,7 @@ use crate::{
 /// What a tensor of the file serves: a role of one layer, or a role outside the layers, named as
 /// the recipe names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in super::super::super) enum Slot {
+pub(in crate::family::qwen::flash_next) enum Slot {
     Layer(Wanted),
     Global(Global),
 }
@@ -41,7 +41,7 @@ pub(in super::super::super) enum Slot {
 impl Slot {
     /// One tensor of a hyper-connection site: a site of a layer, or the final site that feeds
     /// the head.
-    pub(in super::super::super) fn hyper(site: Site, part: SiteTensor) -> Self {
+    pub(in crate::family::qwen::flash_next) fn hyper(site: Site, part: SiteTensor) -> Self {
         match site {
             Site::Head => Self::Global(Global::HeadSite(part)),
             Site::Mixer | Site::Ffn => Self::Layer(Wanted::Hyper(site, part)),
@@ -63,7 +63,7 @@ impl From<Global> for Slot {
 
 /// Which memory a role's bytes serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in super::super::super) enum Place {
+pub(in crate::family::qwen::flash_next) enum Place {
     /// Uploaded once and resident on the card for the run.
     Device,
     /// Read on the host: the embedding rows of each token and the PLE vectors.
@@ -76,7 +76,7 @@ pub(in super::super::super) enum Place {
 
 /// How the device holds a tensor (the counterpart of the EXL3 trunk's `Form`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in super::super::super) enum Form {
+pub(in crate::family::qwen::flash_next) enum Form {
     /// The GGUF blocks as stored; the matvec kernel of the tensor's type reads them.
     Blocks,
     /// Widened to F16 at upload, for the kernels that read half-precision weights.
@@ -93,7 +93,7 @@ pub(in super::super::super) enum Form {
 
 /// How the stored values relate to the EXL3 pack's stored values for the same role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in super::super::super) enum Convention {
+pub(in crate::family::qwen::flash_next) enum Convention {
     AsStored,
     /// Stored as `1 + w`; the EXL3 pack stores `w`. A consumer that adds the 1 itself
     /// subtracts it at load.
@@ -102,22 +102,22 @@ pub(in super::super::super) enum Convention {
 
 /// One tensor of the file claimed by a role.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in super::super::super) struct Mapped {
-    pub(in super::super::super) role: Slot,
-    pub(in super::super::super) layer: Option<usize>,
-    pub(in super::super::super) name: String,
-    pub(in super::super::super) ty: GgufType,
-    pub(in super::super::super) dims: Vec<u64>,
-    pub(in super::super::super) bytes: u64,
-    pub(in super::super::super) shard: usize,
-    pub(in super::super::super) place: Place,
-    pub(in super::super::super) form: Form,
-    pub(in super::super::super) convention: Convention,
+pub(in crate::family::qwen::flash_next) struct Mapped {
+    pub(in crate::family::qwen::flash_next) role: Slot,
+    pub(in crate::family::qwen::flash_next) layer: Option<usize>,
+    pub(in crate::family::qwen::flash_next) name: String,
+    pub(in crate::family::qwen::flash_next) ty: GgufType,
+    pub(in crate::family::qwen::flash_next) dims: Vec<u64>,
+    pub(in crate::family::qwen::flash_next) bytes: u64,
+    pub(in crate::family::qwen::flash_next) shard: usize,
+    pub(in crate::family::qwen::flash_next) place: Place,
+    pub(in crate::family::qwen::flash_next) form: Form,
+    pub(in crate::family::qwen::flash_next) convention: Convention,
 }
 
 impl Mapped {
     /// Bytes this tensor takes on the card in its device form (zero off the card).
-    pub(in super::super::super) fn device_bytes(&self) -> u64 {
+    pub(in crate::family::qwen::flash_next) fn device_bytes(&self) -> u64 {
         let elements: u64 = self.dims.iter().product();
         match self.form {
             Form::Blocks => self.bytes,
@@ -135,11 +135,11 @@ impl Mapped {
 
 /// A tensor type some matrix of the model has and no CUDA decode kernel reads yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in super::super::super) struct KernelGap {
-    pub(in super::super::super) ty: GgufType,
-    pub(in super::super::super) tensors: usize,
-    pub(in super::super::super) bytes: u64,
-    pub(in super::super::super) first: String,
+pub(in crate::family::qwen::flash_next) struct KernelGap {
+    pub(in crate::family::qwen::flash_next) ty: GgufType,
+    pub(in crate::family::qwen::flash_next) tensors: usize,
+    pub(in crate::family::qwen::flash_next) bytes: u64,
+    pub(in crate::family::qwen::flash_next) first: String,
 }
 
 /// What a role requires of its tensor's type.
@@ -583,7 +583,7 @@ fn mismatch(detail: String) -> EngError {
 
 /// The tensors of a file mapped to roles.
 #[derive(Debug)]
-pub(in super::super::super) struct TensorMap {
+pub(in crate::family::qwen::flash_next) struct TensorMap {
     entries: Vec<Mapped>,
     unmapped: Vec<String>,
     total: usize,
@@ -594,7 +594,7 @@ impl TensorMap {
     /// Maps every tensor of `header` that a role of the model claims. A role whose tensor is
     /// missing, has other dimensions, or has a non-float type where floats are required
     /// refuses the whole map; the error lists up to five such tensors and the total.
-    pub(in super::super::super) fn build(
+    pub(in crate::family::qwen::flash_next) fn build(
         header: &GgufHeader,
         config: &GgufConfig,
     ) -> Result<Self, EngError> {
@@ -680,27 +680,27 @@ impl TensorMap {
     }
 
     /// Every claimed tensor, in the order of the executor's structures.
-    pub(in super::super::super) fn entries(&self) -> &[Mapped] {
+    pub(in crate::family::qwen::flash_next) fn entries(&self) -> &[Mapped] {
         &self.entries
     }
 
     /// Tensors in the file.
-    pub(in super::super::super) fn total(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn total(&self) -> usize {
         self.total
     }
 
     /// Tensors of the file claimed by a role (a tied head and embedding count once).
-    pub(in super::super::super) fn mapped(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn mapped(&self) -> usize {
         self.mapped_names
     }
 
     /// Names of file tensors no role claims.
-    pub(in super::super::super) fn unmapped(&self) -> &[String] {
+    pub(in crate::family::qwen::flash_next) fn unmapped(&self) -> &[String] {
         &self.unmapped
     }
 
     /// The entry of `role` in `layer` (`None` for roles outside the layers).
-    pub(in super::super::super) fn get(
+    pub(in crate::family::qwen::flash_next) fn get(
         &self,
         role: impl Into<Slot>,
         layer: Option<usize>,
@@ -712,7 +712,7 @@ impl TensorMap {
     }
 
     /// File bytes of the tensors served from `place`.
-    pub(in super::super::super) fn file_bytes(&self, place: Place) -> u64 {
+    pub(in crate::family::qwen::flash_next) fn file_bytes(&self, place: Place) -> u64 {
         self.entries
             .iter()
             .filter(|entry| entry.place == place)
@@ -721,13 +721,13 @@ impl TensorMap {
     }
 
     /// Device bytes of the resident trunk in the forms the executor holds it in.
-    pub(in super::super::super) fn device_bytes(&self) -> u64 {
+    pub(in crate::family::qwen::flash_next) fn device_bytes(&self) -> u64 {
         self.entries.iter().map(Mapped::device_bytes).sum()
     }
 
     /// The tensor types that matrices of the model have and `supported` does not accept,
     /// each with its tensor count, bytes and first tensor, in order of first appearance.
-    pub(in super::super::super) fn kernel_gaps(
+    pub(in crate::family::qwen::flash_next) fn kernel_gaps(
         &self,
         supported: impl Fn(Place, GgufType) -> bool,
     ) -> Vec<KernelGap> {
@@ -756,7 +756,7 @@ impl TensorMap {
 /// Whether the in-tree CUDA kernels read a matrix of `ty` served from `place` as stored blocks:
 /// the dense matvec kernels for the trunk, the expert kernels for the routed experts. Every type
 /// of the shared native list has both (`GgufType::has_native_kernel`).
-pub(in super::super::super) fn has_decode_kernel(_place: Place, ty: GgufType) -> bool {
+pub(in crate::family::qwen::flash_next) fn has_decode_kernel(_place: Place, ty: GgufType) -> bool {
     ty.has_native_kernel()
 }
 

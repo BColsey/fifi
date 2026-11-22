@@ -2,7 +2,6 @@
 //! the real step plan, aliasing over the launch positions, and the pure refusals of
 //! `check_block`. No device, no kernel.
 
-use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
 use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
@@ -13,6 +12,7 @@ use super::{
 use crate::EngError;
 use crate::family::decode_step::shard::ShardTable;
 use crate::family::project::cuda::WeightLayout;
+use crate::family::qwen::qwen36::host::HostShape;
 use crate::family::{QWEN3_6_35B_A3B, gguf_model::Inventory};
 use crate::kernels::cuda::resident::router::{RouterShape, router_logits_bytes};
 use crate::kernels::cuda::xf_bytes;

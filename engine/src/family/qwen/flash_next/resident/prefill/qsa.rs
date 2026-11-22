@@ -230,13 +230,13 @@ pub(super) fn chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::fixtures;
-    use super::super::super::ops::{f32_tensor, values};
-    use super::super::super::qsa::{QsaStep, step as decode_step};
-    use super::super::super::weights::{RAttn, ResidentWeights};
     use super::super::assert_parity;
     use super::*;
     use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::resident::fixtures;
+    use crate::family::qwen::flash_next::resident::ops::{f32_tensor, values};
+    use crate::family::qwen::flash_next::resident::qsa::{QsaStep, step as decode_step};
+    use crate::family::qwen::flash_next::resident::weights::{RAttn, ResidentWeights};
     use crate::kernels::MlxKernels;
 
     /// Input of position `pos`: `x[i] = ((i + 5 pos) % 11 - 5) / 16`, exact in f32 (the decode test).

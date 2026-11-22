@@ -372,15 +372,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::attn::{ConcatCache, concat_step, growth_bytes, step};
-    use super::super::super::ops::{assert_parity, f32_tensor, values};
-    use super::super::super::weights::{RMixer, ResidentWeights};
     use super::*;
     use crate::family::math::rope_half;
     use crate::family::project::Projector;
     use crate::family::qwen::qwen36::host::{self, KvCache as HostCache, MixerW, rms_plain};
     use crate::family::qwen::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen::qwen36::host_load::HostWeights;
+    use crate::family::qwen::qwen36::resident::attn::{
+        ConcatCache, concat_step, growth_bytes, step,
+    };
+    use crate::family::qwen::qwen36::resident::ops::{assert_parity, f32_tensor, values};
+    use crate::family::qwen::qwen36::resident::weights::{RMixer, ResidentWeights};
     use crate::family::qwen::qwen36::settings::Activation;
     use crate::family::qwen::qwen36::tiny::{self, TINY_GQA};
     use crate::kernels::MlxKernels;

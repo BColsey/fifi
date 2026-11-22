@@ -565,10 +565,10 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::deltanet::step as decode_delta_step;
-    use super::super::super::ops::f32_tensor;
     use super::super::{assert_parity, import_f32};
     use super::*;
+    use crate::family::qwen::flash_next::resident::deltanet::step as decode_delta_step;
+    use crate::family::qwen::flash_next::resident::ops::f32_tensor;
     use crate::family::qwen::flash_next::{load::FlashWeights, resident::fixtures};
     use crate::kernels::{BinaryOp, MlxKernels};
     use crate::sched::SessionBudget;

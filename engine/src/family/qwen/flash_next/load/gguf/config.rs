@@ -46,7 +46,7 @@ use crate::{
 };
 
 /// The architecture string of the model's GGUF files.
-pub(in super::super::super) const ARCHITECTURE: &str = "qwen4exp";
+pub(in crate::family::qwen::flash_next) const ARCHITECTURE: &str = "qwen4exp";
 
 fn refuse(detail: impl AsRef<str>) -> EngError {
     EngError::Checkpoint(format!("Flash-Next GGUF: {}", detail.as_ref()))
@@ -55,21 +55,21 @@ fn refuse(detail: impl AsRef<str>) -> EngError {
 /// The hash constants of the n-gram table: the layer multipliers and the row range of every
 /// head. The EXL3 pack keeps them as three small tensors beside the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in super::super::super) struct NgramHash {
-    pub(in super::super::super) multipliers: Vec<i64>,
-    pub(in super::super::super) offsets: Vec<i64>,
-    pub(in super::super::super) vocab: Vec<i64>,
+pub(in crate::family::qwen::flash_next) struct NgramHash {
+    pub(in crate::family::qwen::flash_next) multipliers: Vec<i64>,
+    pub(in crate::family::qwen::flash_next) offsets: Vec<i64>,
+    pub(in crate::family::qwen::flash_next) vocab: Vec<i64>,
 }
 
 /// The configuration read from the metadata.
 #[derive(Debug)]
-pub(in super::super::super) struct GgufConfig {
+pub(in crate::family::qwen::flash_next) struct GgufConfig {
     pub(super) dims: Dims,
-    pub(in super::super::super) hash: NgramHash,
+    pub(in crate::family::qwen::flash_next) hash: NgramHash,
     /// Rows of the n-gram table: the largest row any head addresses.
-    pub(in super::super::super) ngram_rows_needed: u64,
-    pub(in super::super::super) max_positions: u32,
-    pub(in super::super::super) rope_sections: [u32; 4],
+    pub(in crate::family::qwen::flash_next) ngram_rows_needed: u64,
+    pub(in crate::family::qwen::flash_next) max_positions: u32,
+    pub(in crate::family::qwen::flash_next) rope_sections: [u32; 4],
 }
 
 struct Meta<'a> {
@@ -402,31 +402,31 @@ impl GgufConfig {
     }
 
     /// The shape of every block and the model-level layout.
-    pub(in super::super::super) fn model_shape(&self) -> Result<ModelShape, EngError> {
+    pub(in crate::family::qwen::flash_next) fn model_shape(&self) -> Result<ModelShape, EngError> {
         self.dims.model_shape()
     }
 
     /// Per layer, whether it is a QSA attention layer (the others are DeltaNet).
-    pub(in super::super::super) fn kinds(&self) -> &[bool] {
+    pub(in crate::family::qwen::flash_next) fn kinds(&self) -> &[bool] {
         &self.dims.kinds
     }
 
     /// Routed experts picked per token and layer.
-    pub(in super::super::super) fn top_k(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn top_k(&self) -> usize {
         self.dims.top_k as usize
     }
 
-    pub(in super::super::super) fn layers(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn layers(&self) -> usize {
         self.dims.kinds.len()
     }
 
     /// The layer whose attention read follows the PLE update.
-    pub(in super::super::super) fn ple_layer(&self) -> usize {
+    pub(in crate::family::qwen::flash_next) fn ple_layer(&self) -> usize {
         self.dims.ple_layer
     }
 }
 
 /// Whether a tensor type stores floating-point values as plain elements.
-pub(in super::super::super) fn is_float(ty: GgufType) -> bool {
+pub(in crate::family::qwen::flash_next) fn is_float(ty: GgufType) -> bool {
     matches!(ty, GgufType::F32 | GgufType::F16 | GgufType::Bf16)
 }

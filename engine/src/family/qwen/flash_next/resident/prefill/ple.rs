@@ -90,12 +90,12 @@ pub(super) fn block_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::fixtures;
-    use super::super::super::ops::{values, zeros};
-    use super::super::super::weights::ResidentWeights;
     use super::super::{assert_parity, import_f32};
     use super::*;
     use crate::family::project::Projector;
+    use crate::family::qwen::flash_next::resident::fixtures;
+    use crate::family::qwen::flash_next::resident::ops::{values, zeros};
+    use crate::family::qwen::flash_next::resident::weights::ResidentWeights;
     use crate::family::qwen::flash_next::{load::FlashWeights, mlx::MlxProjector, ple};
     use crate::kernels::MlxKernels;
     use crate::weights::StreamedCheckpoint;

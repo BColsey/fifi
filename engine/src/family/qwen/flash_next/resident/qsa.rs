@@ -513,13 +513,6 @@ pub(super) fn step(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::load::FlashWeights;
-    use super::super::super::mlx::MlxProjector;
-    use super::super::super::mlx::tests::{
-        COS_BLOCK, COS_END, Gate, REL_BLOCK, REL_END, env_path, open_checkpoint, top5, write_report,
-    };
-    use super::super::super::qsa::{self as host, QsaCache};
-    use super::super::super::step::{AttnWeights, ModelState, step as host_step};
     use super::super::fixtures;
     use super::super::ops::{f32_tensor, values, zeros};
     use super::super::weights::{RAttn, ResidentWeights, synthetic};
@@ -527,6 +520,13 @@ mod tests {
     use super::*;
     use crate::family::math::{rms0, rope_half};
     use crate::family::project::Projector;
+    use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::mlx::MlxProjector;
+    use crate::family::qwen::flash_next::mlx::tests::{
+        COS_BLOCK, COS_END, Gate, REL_BLOCK, REL_END, env_path, open_checkpoint, top5, write_report,
+    };
+    use crate::family::qwen::flash_next::qsa::{self as host, QsaCache};
+    use crate::family::qwen::flash_next::step::{AttnWeights, ModelState, step as host_step};
     use crate::kernels::MlxKernels;
     use crate::tensor::Dtype;
 

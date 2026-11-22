@@ -11,16 +11,16 @@
 //! 512-row chunk from about 457 ms to 207 ms; the decode path keeps `gather_qmm` with `false`). The
 //! gate-weighted rows of a token are summed in choice order, as the decode step sums them.
 
-use super::super::super::{
-    moe::{MoeShape, select},
-    prefill_plan::{ChunkRoute, WavePlan, split_waves, union_and_remap},
-};
 use super::super::{
     ops::{Ctx, dim, values},
     weights::RMoe,
 };
 use super::pool::{PrefillPool, WavePages};
 use crate::family::prefill::mlx::submit_shared_expert;
+use crate::family::qwen::flash_next::{
+    moe::{MoeShape, select},
+    prefill_plan::{ChunkRoute, WavePlan, split_waves, union_and_remap},
+};
 use crate::{
     EngError,
     kernels::{BinaryOp, ReduceOp, UnaryOp},
@@ -195,7 +195,9 @@ pub(super) fn step_chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{
+    use super::super::{assert_parity, import_f32};
+    use super::*;
+    use crate::family::qwen::flash_next::resident::{
         fixtures::{Entry, config},
         moe::{
             step_paged,
@@ -204,8 +206,6 @@ mod tests {
         slots::{ExpertSlots, POOL_SETS, SetLayout},
         weights::ResidentWeights,
     };
-    use super::super::{assert_parity, import_f32};
-    use super::*;
     use crate::{
         family::qwen::flash_next::load::FlashWeights,
         kernels::{HostPages, MlxKernels},

@@ -178,11 +178,11 @@ pub(super) fn block(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{load::FlashWeights, mlx::MlxProjector};
     use super::super::fixtures;
     use super::super::ops::{assert_close, f32_tensor, values, zeros};
     use super::*;
     use crate::family::project::Projector;
+    use crate::family::qwen::flash_next::{load::FlashWeights, mlx::MlxProjector};
     use crate::kernels::MlxKernels;
 
     fn assert_parity(got: &[f32], want: &[f32], what: &str) {

@@ -341,15 +341,16 @@ mod tests {
         let _serial = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
         let consts = Consts::import(&mut kernels, &real_shape()).unwrap();
-        let tiny = super::super::super::tiny::checkpoint(&super::super::super::tiny::TINY);
-        let weight = super::super::super::host_load::HostWeights::load(
+        let tiny =
+            crate::family::qwen::qwen36::tiny::checkpoint(&crate::family::qwen::qwen36::tiny::TINY);
+        let weight = crate::family::qwen::qwen36::host_load::HostWeights::load(
             &tiny,
-            &super::super::super::tiny::TINY,
-            &super::super::super::tiny::config(&super::super::super::tiny::TINY),
+            &crate::family::qwen::qwen36::tiny::TINY,
+            &crate::family::qwen::qwen36::tiny::config(&crate::family::qwen::qwen36::tiny::TINY),
         )
         .unwrap();
         let view = weight.view();
-        let super::super::super::host::MixerW::Delta(d) = &view.layers[0].mixer else {
+        let crate::family::qwen::qwen36::host::MixerW::Delta(d) = &view.layers[0].mixer else {
             panic!("layer 0 is DeltaNet");
         };
         let crate::family::stored::StoredWeight::Packed(packed) = d.out else {

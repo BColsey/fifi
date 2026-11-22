@@ -90,12 +90,12 @@ pub(super) fn import_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::fixtures;
-    use super::super::super::ops::{assert_close, values};
-    use super::super::super::ple::import_token;
     use super::super::assert_parity;
     use super::*;
     use crate::family::project::Projector;
+    use crate::family::qwen::flash_next::resident::fixtures;
+    use crate::family::qwen::flash_next::resident::ops::{assert_close, values};
+    use crate::family::qwen::flash_next::resident::ple::import_token;
     use crate::family::qwen::flash_next::{load::FlashWeights, mlx::MlxProjector};
     use crate::kernels::MlxKernels;
 

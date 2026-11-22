@@ -254,12 +254,12 @@ fn record_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::load::FlashWeights;
     use super::super::{
         fixtures::config,
         moe::tests::{checkpoint_from, routed_entries},
     };
     use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
     use crate::{family::stored::read_stack_into, kernels::MlxKernels};
 
     #[test]

@@ -2,8 +2,6 @@
 //! Unlike the CPU mapper, this owner can unmap before targeted cache release.
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-use super::super::super::loader::{ExpertLayerMapping, ProjectionRanges};
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 use super::WeightSource;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 use super::{ExpertIndex, ExpertProjection};
@@ -15,6 +13,8 @@ use crate::expert_tier::{
 };
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 use crate::family::mapped_file::MappedFile;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+use crate::family::nemotron::nemotron35::loader::{ExpertLayerMapping, ProjectionRanges};
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use crate::kernels::cuda::resident::expert_activation::ReluSquaredCall;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -34,7 +34,7 @@ pub(super) fn stream_plan<S: WeightSource>(
     layer: u32,
     experts: u32,
     max_pairs: usize,
-) -> Result<super::super::super::admission::ChunkStreamPlan, EngError> {
+) -> Result<crate::family::nemotron::nemotron35::admission::ChunkStreamPlan, EngError> {
     let shape = if source.has_mapped_experts() {
         let mapping = source.expert_layer_mapping(layer)?;
         if mapping.experts.len() != experts as usize || experts == 0 {
@@ -78,7 +78,7 @@ fn stream_memory_plan(
     experts: u32,
     up_shape: [usize; 2],
     max_pairs: usize,
-) -> Result<super::super::super::admission::ChunkStreamPlan, EngError> {
+) -> Result<crate::family::nemotron::nemotron35::admission::ChunkStreamPlan, EngError> {
     use crate::expert_tier::{StreamBankPlan, gpu_stream::MAX_STREAM_PAIRS};
     let [rows, columns] = up_shape;
     if experts == 0
@@ -134,7 +134,7 @@ pub(super) fn reserve_streaming<S: WeightSource>(
     spec: &super::NemotronExecSpec,
     source: &mut S,
     capacity: u32,
-    admission: &mut super::super::super::admission::cuda::CudaAdmission,
+    admission: &mut crate::family::nemotron::nemotron35::admission::cuda::CudaAdmission,
 ) -> Result<(), EngError> {
     if admission.stream_plan().is_some()
         || std::env::var_os("NEM35_CHUNK_EXPERTS").as_deref() != Some(std::ffi::OsStr::new("gpu"))
@@ -154,7 +154,7 @@ pub(super) fn reserve_streaming<S: WeightSource>(
     ];
     let mut plan = None;
     for (layer, kind) in spec.blocks.iter().enumerate() {
-        if *kind != super::super::super::NemotronBlockKind::Moe {
+        if *kind != crate::family::nemotron::nemotron35::NemotronBlockKind::Moe {
             continue;
         }
         let next = stream_plan(source, layer as u32, spec.moe.routed_experts, pairs)?;
@@ -177,7 +177,7 @@ pub(super) fn reserve_streaming<S: WeightSource>(
 /// for every later layer and chunk.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) fn gpu_stream_routed<S: WeightSource>(
-    cuda: &mut super::super::super::cuda_projection::CudaProjector,
+    cuda: &mut crate::family::nemotron::nemotron35::cuda_projection::CudaProjector,
     hybrid: &mut super::HybridRuntime,
     source: &mut S,
     layer: u32,
@@ -416,7 +416,7 @@ pub(super) fn gpu_stream_routed<S: WeightSource>(
 /// Resolves checkpoint keys in pair order without downloading or cloning weight bytes.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) fn resident_ranges<'a>(
-    projector: &'a super::super::super::cuda_projection::CudaProjector,
+    projector: &'a crate::family::nemotron::nemotron35::cuda_projection::CudaProjector,
     keys: &[u64],
     shape: [u32; 2],
 ) -> Result<Vec<crate::kernels::cuda::Nvfp4WeightRange<'a>>, EngError> {
@@ -454,12 +454,12 @@ pub(super) fn resident_ranges<'a>(
 /// Keeps model admission and timing around the shared format kernel.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(super) fn project_grouped(
-    projector: &super::super::super::cuda_projection::CudaProjector,
+    projector: &crate::family::nemotron::nemotron35::cuda_projection::CudaProjector,
     stream: &crate::kernels::cuda::DeviceStream,
     weights: &[crate::kernels::cuda::Nvfp4WeightRange<'_>],
     inputs: &[f32],
 ) -> Result<Vec<f32>, EngError> {
-    use super::super::super::transport_accounting::{self, Category};
+    use crate::family::nemotron::nemotron35::transport_accounting::{self, Category};
     let shape = weights
         .first()
         .ok_or_else(|| EngError::BadRequest("NVFP4 routed batch needs a pair".into()))?

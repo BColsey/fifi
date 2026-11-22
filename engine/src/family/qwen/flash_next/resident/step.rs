@@ -286,11 +286,13 @@ pub(super) fn split_rows(flat: Vec<f32>, layers: usize) -> Result<Vec<Vec<f32>>,
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::load::FlashWeights;
-    use super::super::super::mlx::MlxProjector;
-    use super::super::super::step::{LayerState as HostLayer, ModelState, step as host_step};
     use super::super::fixtures;
     use super::*;
+    use crate::family::qwen::flash_next::load::FlashWeights;
+    use crate::family::qwen::flash_next::mlx::MlxProjector;
+    use crate::family::qwen::flash_next::step::{
+        LayerState as HostLayer, ModelState, step as host_step,
+    };
     use crate::sched::SessionBudget;
     use crate::weights::StreamedCheckpoint;
 

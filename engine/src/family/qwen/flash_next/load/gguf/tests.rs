@@ -413,7 +413,7 @@ fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
         let load = plan
             .at_context(
                 4096,
-                super::super::super::moe::context_budget::KvFormat::F16,
+                crate::family::qwen::flash_next::moe::context_budget::KvFormat::F16,
                 11,
             )
             .unwrap_or_else(|error| panic!("{label}: {}", error.describe()));
@@ -426,7 +426,7 @@ fn the_plan_on_a_24_gib_card_and_a_62_gib_host_does_not_refuse() {
 fn a_host_that_cannot_pin_the_cold_experts_plans_the_disk_tier() {
     use crate::family::expert_bank::bank_tier::TierChoice;
     let (_written, model) = open(&Spec::default());
-    let kv = super::super::super::moe::context_budget::KvFormat::F16;
+    let kv = crate::family::qwen::flash_next::moe::context_budget::KvFormat::F16;
     let tier = |available| {
         model
             .load_plan(card(22 * GIB + GIB / 2, 62 * GIB, available))
@@ -502,7 +502,7 @@ fn real_file_maps_every_tensor_and_agrees_with_the_exl3_configuration() {
         eprintln!("dims equal the EXL3 config.json: {:?}", want);
     }
     // The three default-context lines for a 24 GiB card and a 62 GiB host.
-    let kv = super::super::super::moe::context_budget::KvFormat::F16;
+    let kv = crate::family::qwen::flash_next::moe::context_budget::KvFormat::F16;
     let plan = model
         .load_plan(card(22 * GIB + GIB / 2, 62 * GIB, 40 * GIB))
         .expect("plan");

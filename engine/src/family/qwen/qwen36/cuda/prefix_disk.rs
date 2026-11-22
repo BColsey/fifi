@@ -294,12 +294,12 @@ impl QwenResidentStep<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{
+    use super::*;
+    use crate::family::decode_step::state_layout::StateLayout;
+    use crate::family::qwen::qwen36::cuda::{
         dims::{KvMode, StepDims},
         start::step_options,
     };
-    use super::*;
-    use crate::family::decode_step::state_layout::StateLayout;
     use crate::family::{
         QWEN3_6_35B_A3B, gguf_model::Inventory, qwen::qwen36::host::HostShape,
         session::PrefixIdentity,
