@@ -636,6 +636,67 @@ pub(super) fn run(
     Ok(run)
 }
 
+/// Full logit rows for successive greedy decisions on one uninterrupted host state.
+/// The first row predicts the token after the prompt; each later row feeds the prior argmax.
+pub(super) fn greedy_rows(
+    model: &GgufModel,
+    host: &HostModel,
+    prompt: &[u32],
+    decisions: usize,
+    threads: usize,
+) -> Result<Vec<Vec<f32>>, EngError> {
+    use crate::family::qwen::flash_next::step::{ModelState, step};
+
+    let Some((&last, prefix)) = prompt.split_last() else {
+        return Err(refuse("the greedy oracle needs a nonempty prompt"));
+    };
+    let ngram = model.ngram()?;
+    let mut projector = HostProjector::new(&model.weights, &ngram, threads);
+    let weights = host.view();
+    let mut state = ModelState::new(&host.shape, &weights);
+    for &token in prefix {
+        step(
+            &mut projector,
+            &host.shape,
+            &weights,
+            &mut state,
+            token,
+            false,
+        )?;
+    }
+    let mut token = last;
+    let mut rows = Vec::with_capacity(decisions);
+    for _ in 0..decisions {
+        let row = step(
+            &mut projector,
+            &host.shape,
+            &weights,
+            &mut state,
+            token,
+            false,
+        )?
+        .logits;
+        token = greedy_token(&row)?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+pub(super) fn greedy_token(row: &[f32]) -> Result<u32, EngError> {
+    if row.is_empty() || row.iter().any(|value| !value.is_finite()) {
+        return Err(refuse(
+            "the greedy oracle needs a nonempty finite logit row",
+        ));
+    }
+    let best = row.iter().enumerate().fold(
+        0,
+        |best, (id, value)| {
+            if *value > row[best] { id } else { best }
+        },
+    );
+    u32::try_from(best).map_err(|_| refuse("greedy token ID does not fit u32"))
+}
+
 /// A summary line per layer: the RMS of the residual after the layer.
 pub(super) fn rms_by_layer(run: &HostRun) -> BTreeMap<usize, Vec<f32>> {
     let mut out: BTreeMap<usize, Vec<f32>> = BTreeMap::new();
@@ -651,6 +712,14 @@ pub(super) fn rms_by_layer(run: &HostRun) -> BTreeMap<usize, Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greedy_token_rejects_invalid_rows_and_breaks_ties_by_lowest_id() {
+        assert_eq!(greedy_token(&[-3.0, 5.0, 5.0, 0.0]).unwrap(), 1);
+        for row in [&[][..], &[f32::NAN], &[1.0, f32::INFINITY]] {
+            assert!(greedy_token(row).is_err());
+        }
+    }
 
     #[test]
     fn tiled_and_grouped_orders_are_inverse_permutations() {

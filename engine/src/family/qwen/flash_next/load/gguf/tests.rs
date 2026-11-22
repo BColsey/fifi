@@ -601,6 +601,27 @@ fn real_file_host_forward_continues_a_sentence() {
     assert_eq!(top[0].0.trim(), "Paris", "top five: {top:?}");
 }
 
+/// Fixed token IDs, so the CPU and CUDA probes can compare greedy decisions without a
+/// separate tokenizer or a text comparison. Unlike exploratory probes, this never skips.
+#[test]
+#[ignore = "requires the complete pinned GGUF and runs full-model host decoding"]
+fn real_file_host_greedy_parity_baseline() {
+    let model = real_model().expect("set FIFI_FLASH_GGUF to the pinned Flash-Next checkpoint");
+    let host = super::host::HostModel::load(&model, model.config().layers()).expect("load");
+    let prompt = [9707, 11, 1879];
+    let rows = super::host::greedy_rows(&model, &host, &prompt, 3, 8).expect("host greedy trace");
+    assert_eq!(rows.len(), 3);
+    let width = rows[0].len();
+    let tokens: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row.len(), width);
+            super::host::greedy_token(row).expect("finite logits")
+        })
+        .collect();
+    eprintln!("Flash-Next GGUF host baseline: prompt={prompt:?}, vocab={width}, greedy={tokens:?}");
+}
+
 #[test]
 fn an_unrelated_gguf_that_does_not_open_leaves_the_exl3_start_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
