@@ -384,6 +384,9 @@ pub(super) struct RouteScratch {
     partial_cap: usize,
     partial_bytes: Vec<u8>,
     partial_dst: Option<DeviceBuffer>,
+    /// `m` ones of f32, the weights of the overflow partial's combine: uploaded once and grown
+    /// with `m`, not per layer.
+    ones: Option<DeviceBuffer>,
     /// The hidden block's f32 staging, grown with m and refilled per layer.
     hidden_f32: Vec<f32>,
 }
@@ -680,8 +683,17 @@ impl<'w> TieredRuntime<'w> {
             };
             stream.record(event)?;
         }
-        let ones: Vec<u8> = [0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
-        let ones_buf = ctx.upload(&ones)?;
+        let ones_bytes = m * 4;
+        if self
+            .route
+            .ones
+            .as_ref()
+            .is_none_or(|ones| ones.bytes() < ones_bytes)
+        {
+            let ones: Vec<u8> = [0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
+            self.route.ones = Some(ctx.upload(&ones)?);
+        }
+        let ones_buf = self.route.ones.as_ref().expect("grown above");
         let down = self
             .route
             .partial_dst
@@ -699,7 +711,7 @@ impl<'w> TieredRuntime<'w> {
                 },
                 res,
                 down,
-                weights: ones_buf.range(0, ones.len())?,
+                weights: ones_buf.range(0, ones_bytes)?,
                 shared: None,
                 out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
             },
