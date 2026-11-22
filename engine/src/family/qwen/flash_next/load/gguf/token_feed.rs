@@ -78,6 +78,11 @@ impl<'a> GgufTokenFeeds<'a> {
         ngram: &'a GgufNgramRows,
         threads: usize,
     ) -> Result<Self, EngError> {
+        if !ngram.same_source(&model.ngram()?)? {
+            return Err(EngError::BadRequest(
+                "GGUF token feed n-gram source mismatch".into(),
+            ));
+        }
         let shape = model.config().model_shape()?;
         Ok(Self {
             weights: GgufPleWeights::load(model)?,

@@ -809,6 +809,41 @@ fn gguf_feed_drives_token_driver_with_fake_device() {
 }
 
 #[test]
+fn gguf_token_feed_rejects_a_different_ngram_shard() {
+    let (_a, model_a) = open(&Spec::default());
+    let (_b, model_b) = open(&Spec::default());
+    let rows_a = model_a.ngram().unwrap();
+    assert!(super::token_feed::GgufTokenFeeds::new(&model_a, &rows_a, 1).is_ok());
+    let error = super::token_feed::GgufTokenFeeds::new(&model_b, &rows_a, 1)
+        .err()
+        .expect("different source must be refused");
+    assert!(error.describe().contains("n-gram source mismatch"));
+
+    // Replace only a path owned by this fixture: the model must keep using its opened shard.
+    let table = model_a
+        .map()
+        .get(crate::family::recipe::Global::NgramTable, None)
+        .unwrap();
+    let shard = model_a
+        .weights
+        .header()
+        .tensor(&table.name)
+        .unwrap()
+        .shard();
+    let path_a = &model_a.weights.paths()[shard];
+    assert_eq!(path_a.parent(), Some(_a.dir.path()));
+    let old = path_a.with_extension("saved-gguf");
+    assert!(!old.exists());
+    std::fs::rename(path_a, &old).unwrap();
+    std::fs::hard_link(&model_b.weights.paths()[shard], path_a).unwrap();
+    let reopened = model_a.ngram().unwrap();
+    assert!(rows_a.same_source(&reopened).unwrap());
+    let rows_b = model_b.ngram().unwrap();
+    assert!(super::token_feed::GgufTokenFeeds::new(&model_a, &rows_b, 1).is_err());
+    assert!(super::token_feed::GgufTokenFeeds::new(&model_a, &rows_a, 1).is_ok());
+}
+
+#[test]
 fn gguf_feed_fixture_chunk_payloads_are_visible_to_admission_work() {
     let (_written, model) = open(&Spec::default());
     let shape = model.config().model_shape().unwrap();
