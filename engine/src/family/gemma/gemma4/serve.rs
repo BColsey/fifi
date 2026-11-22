@@ -1206,9 +1206,9 @@ mod device {
             assert_eq!(lone.pos, long_len - 1);
         }
 
-        fn prompt(len: usize, salt: u32) -> Vec<u32> {
+        fn prompt(len: usize, offset: u32) -> Vec<u32> {
             (0..len as u32)
-                .map(|index| 100 + salt + (index % 977))
+                .map(|index| 100 + offset + (index % 977))
                 .collect()
         }
 
