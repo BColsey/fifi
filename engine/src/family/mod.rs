@@ -49,6 +49,7 @@ pub(in crate::family) mod exl3_tensors;
     reason = "ungated so plain host gates compile the seam; the Flash-Next bank reaches it everywhere, the flint resident cache under test or native-cuda; the allow covers the members only tests still reach"
 )]
 pub(crate) mod expert_bank;
+pub(crate) mod expert_placement;
 pub mod flint;
 pub mod gemma;
 pub mod gguf_model;

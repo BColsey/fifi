@@ -41,6 +41,14 @@ export interface EffectiveSetting {
   origin: string;
 }
 
+export interface ExpertPlacement {
+  mode: "resident" | "host_streamed" | "disk_streamed";
+  vram_bytes?: number;
+  ram_bytes?: number;
+  disk_bytes?: number;
+  slots_per_layer?: number;
+}
+
 export interface SystemEngine {
   id: string;
   model: string;
@@ -52,6 +60,8 @@ export interface SystemEngine {
    * them — not a re-resolution. Empty where a family composes no
    * per-key origins. */
   settings: EffectiveSetting[];
+  /** Startup capacities from the loaded backend, not live occupancy. */
+  expert_placement?: ExpertPlacement;
 }
 
 export interface SystemInfo {
@@ -61,6 +71,11 @@ export interface SystemInfo {
     cpu_threads: number;
     mem_total_bytes: number | { unavailable: string };
     mem_available_bytes: number | { unavailable: string };
+    /** Cumulative /proc/stat jiffies; null off Linux. Diff two polls
+     * for the CPU percentage. */
+    cpu_times?: number[] | null;
+    /** This process's block-level I/O; null off Linux. */
+    proc_io?: { read_bytes: number; write_bytes: number } | null;
   };
   engines: SystemEngine[];
 }
@@ -285,6 +300,17 @@ export function getSystem(signal?: AbortSignal): Promise<SystemInfo> {
   return getJson<SystemInfo>("/v1/system", true, signal);
 }
 
+/** One server event line (see /v1/logs): engine lifecycle, failures,
+ * and download lifecycle. Excludes raw errors and request text. */
+export interface LogEvent {
+  ts_ms: number;
+  line: string;
+}
+
+export function listLogs(signal?: AbortSignal): Promise<{ events: LogEvent[] }> {
+  return getJson<{ events: LogEvent[] }>("/v1/logs", true, signal);
+}
+
 /** One row of the monitor's recent-request ring: the log line reduced
  * to the server's allowlist (see reqlog RING_KEYS), then to the fields
  * this panel reads. The request/metadata keys (request_id, method,
@@ -312,6 +338,11 @@ export interface RecentRequest {
   prefill_ms?: number | null;
   time_to_first_token_ms: number | null;
   decode_tokens_per_second: number | null;
+  /** Expert-bank admit activity of the prefill (see reqlog), when the
+   * executor has a bank: admit passes, experts moved in, bytes queued. */
+  prefill_bank_passes?: number | null;
+  prefill_bank_misses?: number | null;
+  prefill_bank_upload_bytes?: number | null;
 }
 
 /** One in-flight request of the active board (see reqlog ACTIVE_KEYS):

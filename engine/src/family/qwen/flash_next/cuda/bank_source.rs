@@ -407,6 +407,7 @@ pub(in super::super) struct RungSource {
     store: RingRecords,
     /// The site's UNMERGED spans, for the parse walk (one tensor a span).
     spans: Vec<Vec<Span>>,
+    expert_source_bytes: Option<u64>,
     checkpoint: &'static Checkpoint,
     layout: SlotBankLayout,
     layers: usize,
@@ -732,6 +733,12 @@ impl RungSource {
         &self.mode
     }
 
+    /// Stored tensor extent bytes for all routed experts, excluding shard headers,
+    /// unrelated tensors, and read alignment or staging overhead.
+    pub(super) fn expert_source_bytes(&self) -> Option<u64> {
+        self.expert_source_bytes
+    }
+
     /// Derives the layout and counts exactly as the buffered source
     /// does, walks every site's extents once (merging what the pack wrote
     /// contiguously), and builds the pooled store over them, opening
@@ -756,10 +763,12 @@ impl RungSource {
         let mut spans_by_site = Vec::with_capacity(layers * experts);
         let mut sites = Vec::with_capacity(layers * experts);
         let mut record_bytes = 0u64;
+        let mut expert_source_bytes = Some(0u64);
         for layer in 0..layers {
             for expert in 0..experts {
                 let (spans, raw) = expert_spans(checkpoint, dir, layer, expert)?;
                 record_bytes = record_bytes.max(raw);
+                expert_source_bytes = expert_source_bytes.and_then(|sum| sum.checked_add(raw));
                 sites.push(merge_abutting(&spans));
                 spans_by_site.push(spans);
             }
@@ -785,6 +794,7 @@ impl RungSource {
         Ok(Self {
             store,
             spans: spans_by_site,
+            expert_source_bytes,
             checkpoint,
             layout,
             layers,

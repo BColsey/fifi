@@ -156,6 +156,13 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         eprintln!("web UI: serving {} at /", web_dir.display());
         state = state.with_web_dir(web_dir.clone());
     }
+    // After every builder: the hub's download events land in the
+    // monitor's ring from the first job on.
+    state.wire_hub_events();
+    state.record_event(&format!(
+        "server started with {} engines",
+        state.engines().len()
+    ));
     let state = Arc::new(state);
     // One boot line for the warm-turn flip: the effective state and how to
     // roll it back. The polarity comes from the SAME function the request

@@ -22,6 +22,7 @@ use crate::{
     EngError,
     family::{
         executor::{ExecutorOps, GenerationState},
+        expert_placement::ExpertPlacement,
         session::{
             DecodeSession, Limits, PrefixIdentity, PrefixStore, SaveKind, SnapshotBudget,
             StoreLimits, check_prompt,
@@ -49,6 +50,7 @@ pub(in super::super) struct CudaRules {
 pub(in super::super) struct FlashCudaExecutor<S: ResumesState> {
     driver: S,
     rules: CudaRules,
+    expert_placement: Option<ExpertPlacement>,
     /// The prefix store of the resume switch (`INFERENCE_FLASH_NEXT_PREFIX_RESUME`): the tip
     /// plus one rolling block cut at `RESUME_BLOCK_SPACING` below it (`RESUME_LIMITS`, no
     /// roots), both stamped with the arena generation that wrote their rows (the store's
@@ -140,6 +142,7 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
             Self {
                 driver,
                 rules,
+                expert_placement: None,
                 // The recent-longer protection keeps a restored Tip ancestor from being the
                 // room victim of the very Block save that follows it, so a conversation's
                 // block entry survives the turn that restored the tip (S2).
@@ -153,6 +156,12 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
             },
             DecodeSession::default(),
         ))
+    }
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(super) fn with_expert_placement(mut self, placement: ExpertPlacement) -> Self {
+        self.expert_placement = Some(placement);
+        self
     }
 
     /// The number of positions the caches accept.
@@ -227,6 +236,10 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
 
 impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
     type Session = DecodeSession;
+
+    fn expert_placement(&self) -> Option<&ExpertPlacement> {
+        self.expert_placement.as_ref()
+    }
 
     /// The expert bank's lifetime counters for the request log's `prefill_bank_*` keys
     /// (log-only). `None` when this driver keeps no bank (the fake test drivers).

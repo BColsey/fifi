@@ -4,8 +4,10 @@ import {
   getReady,
   getSystem,
   getTelemetry,
+  listLogs,
   listModels,
   type ActiveRequest,
+  type LogEvent,
   type Model,
   type RecentRequest,
   type SystemInfo,
@@ -27,7 +29,7 @@ import {
   type ActiveSnapshot,
   type PanelData,
 } from "./panel";
-import { groupSpeed, speedSummary } from "./speed";
+import { byteRate, cpuUtilization, groupSpeed, speedSummary } from "./speed";
 import { appendPoint, HISTORY_KEY, parseHistory, serialize, values, type SparkPoint } from "./sparkstore";
 import { copyText, downloadText, flashCopied } from "./copy";
 
@@ -72,6 +74,19 @@ export class MonitorView {
   /** GPU telemetry from /v1/telemetry; null when unprobed or down. */
   private telemetry: TelemetryInfo | null = null;
   private telemetryError: string | null = null;
+  /** The server's event ring from /v1/logs; null when unreachable. */
+  private logs: LogEvent[] | null = null;
+  private logsError: string | null = null;
+  /** The previous poll's host counters and clock: the CPU percentage
+   * and disk throughput are diffs between consecutive samples, like
+   * the active board's live tok/s. */
+  private hostPrev: { host: SystemInfo["host"]; at: number } | null = null;
+  private hostRates: { cpu: number | null; read: number | null; write: number | null } = {
+    cpu: null,
+    read: null,
+    write: null,
+  };
+  private logOffset: number | null = null;
 
   constructor(section: HTMLElement) {
     this.scroll.className = "panel-scroll";
@@ -157,6 +172,12 @@ export class MonitorView {
         systemError = err instanceof ApiError ? err.code : "network";
       }
     }
+    this.updateHostRates(system?.host, performance.now());
+    const logs = healthOk ? this.refreshLogs() : Promise.resolve();
+    if (!healthOk) {
+      this.logs = null;
+      this.logsError = null;
+    }
     // The recent-rows fetch-and-reduce is the panel module's one
     // implementation; the sweep calls it only from a reachable server —
     // a dead one gets null rows, and applyProbe's full replacement keeps
@@ -176,6 +197,7 @@ export class MonitorView {
       this.telemetry = null;
       this.telemetryError = null;
     }
+    await logs;
     this.data = applyProbe({
       healthOk,
       readyOk,
@@ -223,6 +245,29 @@ export class MonitorView {
 
   closeRequestDetail(): void {
     if (this.requestDrawer.open) this.requestDrawer.close();
+  }
+
+  private async refreshLogs(): Promise<void> {
+    try {
+      this.logs = (await listLogs(AbortSignal.timeout(4000))).events.slice(-200);
+      this.logsError = null;
+    } catch (err) {
+      this.logs = null;
+      this.logsError = err instanceof ApiError ? err.code : "network";
+    }
+  }
+
+  private updateHostRates(host: SystemInfo["host"] | undefined, at: number): void {
+    const prev = this.hostPrev;
+    const before = prev?.host.proc_io;
+    const after = host?.proc_io;
+    const dt = at - (prev?.at ?? at);
+    this.hostRates = {
+      cpu: cpuUtilization(prev?.host.cpu_times, host?.cpu_times),
+      read: before && after ? byteRate(before.read_bytes, after.read_bytes, dt) : null,
+      write: before && after ? byteRate(before.write_bytes, after.write_bytes, dt) : null,
+    };
+    this.hostPrev = host ? { host, at } : null;
   }
 
   private card(title: string, sub?: string): { card: HTMLElement; body: HTMLElement } {
@@ -352,6 +397,17 @@ export class MonitorView {
     if (ramUsed !== null && typeof host?.mem_total_bytes === "number") {
       figs.push([formatBytes(ramUsed), "RAM · of " + formatBytes(host.mem_total_bytes)]);
     }
+    const rate = (v: number | null) => v === null ? "—" : formatBytes(Math.round(v)) + "/s";
+    figs.push([
+      this.hostRates.cpu === null ? "—" : Math.round(this.hostRates.cpu) + "%",
+      "Host CPU" + (host ? " · " + host.cpu_threads + " threads" : ""),
+    ]);
+    figs.push([
+      this.hostRates.read === null && this.hostRates.write === null
+        ? "—"
+        : "↓ " + rate(this.hostRates.read) + " · ↑ " + rate(this.hostRates.write),
+      "Process disk · read / write",
+    ]);
     for (const [value, label] of figs) {
       const fig = document.createElement("div");
       fig.className = "hero-fig";
@@ -418,12 +474,22 @@ export class MonitorView {
     const system = document.createElement("div");
     system.className = "monitor-grid";
     system.append(this.renderSystemCard(), this.renderEnginesCard());
-    column.append(system);
+    column.append(system, this.renderLogCard());
 
     const focused = document.activeElement;
     const requestKey = focused instanceof HTMLButtonElement ? focused.dataset.request : undefined;
     const keepRefresh = this.scroll.contains(focused) && focused?.classList.contains("monitor-refresh");
+    const oldTail = this.scroll.querySelector<HTMLElement>(".log-tail");
+    if (oldTail && oldTail.clientHeight > 0) {
+      const atEnd = oldTail.scrollTop + oldTail.clientHeight >= oldTail.scrollHeight - 4;
+      this.logOffset = atEnd ? null : oldTail.scrollTop;
+    }
     this.scroll.replaceChildren(column);
+    const tail = column.querySelector<HTMLElement>(".log-tail");
+    if (tail) {
+      tail.scrollTop = this.logOffset ?? tail.scrollHeight;
+      if (focused === oldTail) tail.focus({ preventScroll: true });
+    }
     if (requestKey !== undefined) {
       const request = Array.from(column.querySelectorAll<HTMLButtonElement>(".req-inspect"))
         .find((button) => button.dataset.request === requestKey);
@@ -548,9 +614,44 @@ export class MonitorView {
     return card;
   }
 
-  /** One block per GPU from /v1/telemetry: utilisation and VRAM bars,
-   * temperature and power as facts. The probe is a subprocess on the
-   * server; its failure renders as a stated reason, not empty bars. */
+  private renderLogCard(): HTMLElement {
+    const { card, body } = this.card("Server events", "Engine and download lifecycle · newest last.");
+    if (this.logs === null) {
+      this.hint(
+        body,
+        this.logsError === "unauthorized"
+          ? "Set the API key in About to see server events."
+          : this.logsError === null
+            ? "Waiting for the server."
+            : "Server events unavailable (" + this.logsError + ")."
+      );
+      return card;
+    }
+    if (this.logs.length === 0) {
+      this.hint(body, "No server events yet.");
+      return card;
+    }
+    const tail = document.createElement("div");
+    tail.className = "log-tail";
+    tail.tabIndex = 0;
+    tail.setAttribute("role", "region");
+    tail.setAttribute("aria-label", "Server events");
+    for (const event of this.logs) {
+      const row = document.createElement("div");
+      row.className = "log-line" + (/failed|error/i.test(event.line) ? " log-bad" : "");
+      const time = document.createElement("span");
+      time.className = "log-time";
+      time.textContent = formatClock(event.ts_ms);
+      const text = document.createElement("span");
+      text.textContent = event.line;
+      row.append(time, text);
+      tail.append(row);
+    }
+    body.append(tail);
+    return card;
+  }
+
+  /** The probe runs out of process; its failure is a stated reason, not empty bars. */
   private renderGpuCard(): HTMLElement {
     const { card, body } = this.card("GPUs", "Per-card utilisation, VRAM, temperature, and power.");
     if (this.telemetryError !== null) {
@@ -870,6 +971,15 @@ export class MonitorView {
       ["First token", row.time_to_first_token_ms === null ? "—" : Math.round(row.time_to_first_token_ms) + " ms"],
       ["Decode", row.decode_tokens_per_second === null ? "—" : row.decode_tokens_per_second.toFixed(1) + " tok/s"],
     ];
+    if (row.prefill_bank_passes != null) {
+      const up = row.prefill_bank_upload_bytes;
+      facts.push([
+        "Prefill expert bank",
+        `${row.prefill_bank_passes} admit passes` +
+          (row.prefill_bank_misses != null ? ` · ${row.prefill_bank_misses} experts moved` : "") +
+          (up != null ? ` · ${formatBytes(up)} queued for copy` : ""),
+      ]);
+    }
     for (const [name, value] of facts) {
       const dt = document.createElement("dt");
       dt.textContent = name;
@@ -993,6 +1103,24 @@ export class MonitorView {
         ctx.textContent = "context limit " + formatTokens(systemEngine.context_limit) + " tokens" +
           (systemEngine.queued !== undefined ? " · " + systemEngine.queued + " queued" : "");
         block.append(ctx);
+        const placement = systemEngine.expert_placement;
+        if (placement) {
+          const label = { resident: "GPU resident", host_streamed: "RAM streaming", disk_streamed: "Disk streaming" }[placement.mode];
+          const tiers = [
+            ["VRAM bank", placement.vram_bytes],
+            ["Pinned RAM store", placement.ram_bytes],
+            ["Disk backing", placement.disk_bytes],
+          ] as const;
+          const facts = document.createElement("div");
+          facts.className = "cache-facts expert-placement";
+          facts.textContent = [
+            "Experts at load: " + label,
+            ...tiers.flatMap(([tier, bytes]) => bytes === undefined ? [] : [tier + " " + formatBytes(bytes)]),
+            ...(placement.slots_per_layer === undefined ? [] : [placement.slots_per_layer + " slots/layer"]),
+          ].join(" · ");
+          facts.title = "Startup capacity. The pinned RAM store excludes staging and the disk victim cache. Backing can overlap the VRAM bank.";
+          block.append(facts);
+        }
       }
       if (engine.cache !== undefined) {
         const facts = document.createElement("div");

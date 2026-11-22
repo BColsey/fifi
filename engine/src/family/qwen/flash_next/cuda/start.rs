@@ -63,6 +63,7 @@ use crate::{
         device_budget::KvPlan,
         exl3::source::PackReader,
         exl3_pack::layer_name,
+        expert_placement::ExpertPlacement,
         mem::Facts,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
         qwen::flash_next::{
@@ -456,7 +457,9 @@ fn make(
         Some(guard),
     );
     announce_failure(&driver, announce.as_ref());
-    FlashCudaExecutor::new(driver?, rules, identity)
+    let (driver, placement) = driver?;
+    let (executor, session) = FlashCudaExecutor::new(driver, rules, identity)?;
+    Ok((executor.with_expert_placement(placement), session))
 }
 
 /// The figures one `tuning plan` line reports.
@@ -576,6 +579,7 @@ pub(super) fn build_driver(
         prefill_chunk,
         guard,
     )
+    .map(|(driver, _)| driver)
 }
 
 /// [`build_driver`], and when `announce` is given the context of `wanted` is a placeholder: the
@@ -589,7 +593,7 @@ fn build_driver_resolving(
     sampler_vocab: usize,
     prefill_chunk: u32,
     mut guard: Option<BuildGuard>,
-) -> Result<StepDriver, EngError> {
+) -> Result<(StepDriver, ExpertPlacement), EngError> {
     super::driver::chunk::prof::check_switch_spelling()?;
     let refill_timing =
         super::driver::chunk::prof::check_switch_env("INFERENCE_FLASH_NEXT_DISK_PROFILE")?;
@@ -1143,9 +1147,14 @@ fn build_driver_resolving(
         rows,
         0..layers,
     )?;
+    let bank_geometry = *bank.geometry();
+    let placement = host_plan.expert_placement(
+        &bank_geometry,
+        tier,
+        retained_source.and_then(bank_source::RungSource::expert_source_bytes),
+    );
     // The streamed experts per layer — the loader's ring horizon is twice
     // this, and the tuner's line below reports the same capped rule.
-    let bank_geometry = *bank.geometry();
     let streamed = bank_geometry
         .experts
         .checked_sub(bank_geometry.slots)
@@ -1344,7 +1353,7 @@ fn build_driver_resolving(
         );
         StepDriver::Token(TokenDriver::new(CardDevice::new(step, moe), feeds, shape)?)
     };
-    Ok(driver)
+    Ok((driver, placement))
 }
 
 /// The one driver type at the engine boundary: the plain token driver of decode, or the chunk

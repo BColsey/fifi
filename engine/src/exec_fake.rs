@@ -184,6 +184,7 @@ pub(crate) struct FakeExecutor {
     window_calls: Arc<std::sync::atomic::AtomicUsize>,
     deny_restore_once: bool,
     mlx_plan: Option<crate::family::mlx_report::MlxExecutionPlan>,
+    pub(crate) expert_placement: Option<crate::family::expert_placement::ExpertPlacement>,
 }
 
 impl FakeExecutor {
@@ -213,6 +214,7 @@ impl FakeExecutor {
             window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             deny_restore_once: false,
             mlx_plan: None,
+            expert_placement: None,
         }
     }
 
@@ -319,6 +321,11 @@ impl ExecutorOps for FakeExecutor {
     fn mlx_execution_plan(&self) -> Option<&crate::family::mlx_report::MlxExecutionPlan> {
         self.mlx_plan.as_ref()
     }
+
+    fn expert_placement(&self) -> Option<&crate::family::expert_placement::ExpertPlacement> {
+        self.expert_placement.as_ref()
+    }
+
     type Session = FakeSession;
 
     fn max_seqs(&self) -> usize {

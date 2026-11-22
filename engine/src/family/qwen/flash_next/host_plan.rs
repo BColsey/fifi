@@ -14,10 +14,13 @@
 
 use crate::{
     EngError,
-    family::expert_bank::{
-        BankGeometry, HostMode,
-        bank_tier::{TierBudget, TierChoice, choose_tier},
-        plan_error,
+    family::{
+        expert_bank::{
+            BankGeometry, HostMode,
+            bank_tier::{TierBudget, TierChoice, choose_tier},
+            plan_error,
+        },
+        expert_placement::{ExpertPlacement, ExpertPlacementMode},
     },
 };
 
@@ -119,6 +122,36 @@ pub(super) struct HostPinPlan {
 }
 
 impl HostPinPlan {
+    /// Reports the built bank, including slot overrides. A full bank needs no refills,
+    /// even if startup allocated a host store or opened a disk reader.
+    pub(in crate::family::qwen::flash_next) fn expert_placement(
+        &self,
+        geometry: &BankGeometry,
+        tier: TierChoice,
+        disk_source_bytes: Option<u64>,
+    ) -> ExpertPlacement {
+        let mode = if geometry.slots == geometry.experts {
+            ExpertPlacementMode::Resident
+        } else if tier == TierChoice::Disk {
+            ExpertPlacementMode::DiskStreamed
+        } else {
+            ExpertPlacementMode::HostStreamed
+        };
+        ExpertPlacement {
+            mode,
+            vram_bytes: (geometry.layers as u64)
+                .checked_mul(geometry.slots as u64)
+                .and_then(|slots| slots.checked_mul(geometry.record_bytes as u64)),
+            ram_bytes: Some(self.store_bytes),
+            disk_bytes: if mode == ExpertPlacementMode::DiskStreamed {
+                disk_source_bytes
+            } else {
+                None
+            },
+            slots_per_layer: Some(geometry.slots),
+        }
+    }
+
     /// Sizes the pinned store from the machine and refuses (it never shrinks the store, and never
     /// changes the context) when
     /// - the process and the OS floor exceed `available`, or
@@ -313,5 +346,62 @@ impl HostPinPlan {
                  valid"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expert_placement_uses_final_slots_and_the_serving_backing_store() {
+        let memory = HostMemory::with_floor(GIB, GIB, 0);
+        let terms = HostTerms {
+            engine_heap: 0,
+            margin: 0,
+            ..HostTerms::DEFAULT
+        };
+        let partial = BankGeometry::new(2, 8, 2, 3, 16).unwrap();
+        let full = BankGeometry {
+            slots: 8,
+            ..partial
+        };
+        let measured_disk_bytes = Some(192);
+
+        let inclusive = HostPinPlan::new(&partial, HostMode::Inclusive, &memory, &terms).unwrap();
+        let report =
+            inclusive.expert_placement(&partial, TierChoice::Inclusive, measured_disk_bytes);
+        assert_eq!(report.mode, ExpertPlacementMode::HostStreamed);
+        assert_eq!(report.vram_bytes, Some(96));
+        assert_eq!(report.ram_bytes, Some(256)); // includes experts already on the card
+        assert_eq!(report.disk_bytes, None);
+        assert_eq!(report.slots_per_layer, Some(3));
+
+        let exclusive = HostPinPlan::new(&partial, HostMode::Exclusive, &memory, &terms).unwrap();
+        let report =
+            exclusive.expert_placement(&partial, TierChoice::Exclusive { spare_places: 1 }, None);
+        assert_eq!(report.mode, ExpertPlacementMode::HostStreamed);
+        assert_eq!(report.ram_bytes, Some(192)); // includes one spare per layer
+
+        let disk = HostPinPlan::new_disk(&partial, &memory, &terms, 4096).unwrap();
+        let report = disk.expert_placement(&partial, TierChoice::Disk, measured_disk_bytes);
+        assert_eq!(report.mode, ExpertPlacementMode::DiskStreamed);
+        assert_eq!(report.ram_bytes, Some(0)); // staging is not a backing store
+        assert_eq!(report.disk_bytes, measured_disk_bytes);
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({"mode": "disk_streamed", "vram_bytes": 96, "ram_bytes": 0,
+                               "disk_bytes": 192, "slots_per_layer": 3})
+        );
+        let resident = disk.expert_placement(&full, TierChoice::Disk, measured_disk_bytes);
+        assert_eq!(resident.mode, ExpertPlacementMode::Resident);
+        assert_eq!(resident.vram_bytes, Some(256));
+        assert_eq!(resident.disk_bytes, None);
+        assert!(
+            serde_json::to_value(resident)
+                .unwrap()
+                .get("disk_bytes")
+                .is_none()
+        );
     }
 }

@@ -368,7 +368,14 @@ pub(crate) struct HfHub {
     chunk_bytes: u64,
     chunk_timeout: Duration,
     free_space: FreeSpaceFn,
+    /// The server's event-ring tap, wired by `AppState::wire_hub_events`:
+    /// download lifecycle lines for `GET /v1/logs`. `None` in tests that
+    /// never wire it.
+    event_logger: Mutex<Option<EventTap>>,
 }
+
+/// The signature of the server's event-ring tap.
+type EventTap = Box<dyn Fn(&str) + Send + Sync>;
 
 type FreeSpaceFn = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
@@ -526,6 +533,23 @@ impl HfHub {
             chunk_bytes: chunk_bytes.max(1),
             chunk_timeout,
             free_space,
+            event_logger: Mutex::new(None),
+        }
+    }
+
+    /// Install the tap the server's event ring reads. The hub never
+    /// holds the ring itself, only this closure.
+    pub(crate) fn set_event_logger(&self, tap: impl Fn(&str) + Send + Sync + 'static) {
+        *self.event_logger.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(tap));
+    }
+    pub(super) fn emit(&self, line: &str) {
+        if let Some(tap) = self
+            .event_logger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            tap(line);
         }
     }
 
@@ -879,6 +903,7 @@ impl HfHub {
         match self.run_job_inner(job) {
             Ok(()) => {}
             Err(cause) if cause == CANCELLED => {
+                self.emit(&format!("download {} cancelled", job.repo));
                 *job.state.lock().unwrap_or_else(|e| e.into_inner()) = JobState::Cancelled;
             }
             Err(cause) => {
@@ -886,6 +911,7 @@ impl HfHub {
                 // A cancellation that loses the race to the error path
                 // stays a cancellation, not a failure.
                 if state.is_active() {
+                    self.emit(&format!("download {} failed", job.repo));
                     *state = JobState::Failed(cause);
                 }
             }
@@ -893,6 +919,11 @@ impl HfHub {
     }
 
     fn run_job_inner(&self, job: &Job) -> Result<(), String> {
+        self.emit(&format!(
+            "download {} started: {} files",
+            job.repo,
+            job.files.len()
+        ));
         let repo_dir = repo_cache_dir(&self.hub_dir, &job.repo);
         let snapshot_dir = repo_dir.join("snapshots").join(&job.commit);
         let blobs_dir = repo_dir.join("blobs");
@@ -924,6 +955,11 @@ impl HfHub {
                 .map_err(|error| format!("cannot record the ref: {error}"))?;
         }
         let _ = std::fs::remove_file(&marker);
+        self.emit(&format!(
+            "download {} finished: {:.1} MiB",
+            job.repo,
+            bytes_done as f64 / (1024.0 * 1024.0)
+        ));
         let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
         *state = JobState::Done {
             commit: job.commit.clone(),

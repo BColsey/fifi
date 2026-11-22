@@ -14,10 +14,20 @@ use crate::EngError;
 use crate::family::sampler::{CaptureHandle, SamplingDefaults};
 use crate::sched::worker::{EngineHandle, EngineState, RetryClass};
 use crate::tokenizer::TokenizerBundle;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The most server events the monitor's ring holds.
+const EVENT_CAP: usize = 512;
+
+/// One server event line for `GET /v1/logs`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct EventLine {
+    pub(crate) ts_ms: u64,
+    pub(crate) line: String,
+}
 
 /// The quiet time after which a stream sends a keep-alive comment (the server design).
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -97,9 +107,11 @@ pub(crate) struct AppState {
     started: u64,
     requests: AtomicU64,
     keep_alive: Duration,
-    /// The ids of the engines whose failure text the log already holds.
-    reported: Mutex<HashSet<String>>,
     log: Box<dyn Fn(&str) + Send + Sync>,
+    /// The monitor's event ring, fed by lifecycle calls and the hub's
+    /// download events, read by `GET /v1/logs`. Bounded by EVENT_CAP;
+    /// lines are server-authored lifecycle text, never request text.
+    events: Arc<Mutex<VecDeque<EventLine>>>,
     request_log: Sink,
     /// The monitor's recent-request ring, fed by the served routes' log
     /// lines and read by `GET /v1/recent-requests`.
@@ -146,6 +158,21 @@ pub(crate) fn unix_seconds() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// Append one event to a ring, evicting the oldest line at the cap.
+fn push_event(ring: &mut VecDeque<EventLine>, line: &str) {
+    if ring.len() >= EVENT_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(EventLine {
+        ts_ms: now_ms(),
+        line: line
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(256)
+            .collect(),
+    });
+}
+
 /// Why `remove_engine` refused: the id names an engine the boot
 /// configuration owns (removable only by restart), or no engine at
 /// all.
@@ -190,8 +217,8 @@ impl AppState {
             started: unix_seconds(),
             requests: AtomicU64::new(0),
             keep_alive: KEEP_ALIVE,
-            reported: Mutex::new(HashSet::new()),
             log: Box::new(|line| eprintln!("error: {line}")),
+            events: Arc::new(Mutex::new(VecDeque::new())),
             request_log: default_sink(),
             recent: RecentRing::new(),
             active: ActiveBoard::new(),
@@ -276,6 +303,31 @@ impl AppState {
     pub(crate) fn with_keep_alive(mut self, interval: Duration) -> Self {
         self.keep_alive = interval;
         self
+    }
+
+    pub(crate) fn record_event(&self, line: &str) {
+        let mut ring = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        push_event(&mut ring, line);
+    }
+
+    /// The ring, oldest first, for `GET /v1/logs`.
+    pub(crate) fn events_snapshot(&self) -> Vec<EventLine> {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Route the hub's download lifecycle into the event ring. Runs
+    /// after every builder, so the closure shares the final ring.
+    pub(crate) fn wire_hub_events(&self) {
+        let ring = Arc::clone(&self.events);
+        self.hf.set_event_logger(move |line| {
+            let mut ring = ring.lock().unwrap_or_else(PoisonError::into_inner);
+            push_event(&mut ring, line);
+        });
     }
 
     pub(crate) fn keep_alive(&self) -> Duration {
@@ -426,7 +478,7 @@ impl AppState {
     }
 
     /// The message of the `not_ready` answer: the state of every engine. It never shows the text
-    /// of a failure, because the route is public. `new_failures` supplies that text for the log.
+    /// of a failure, because the route is public. `log_new_failures` supplies that text for the log.
     pub(crate) fn not_ready_message(&self) -> String {
         let engines = self.engines();
         if engines.is_empty() {
@@ -439,22 +491,21 @@ impl AppState {
         format!("no engine is ready: {}", parts.join("; "))
     }
 
-    fn new_failures(&self) -> Vec<String> {
-        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
-        self.engines()
-            .iter()
-            .filter_map(|entry| {
-                let cause = entry.handle.failure()?;
-                reported
-                    .insert(entry.id.clone())
-                    .then(|| format!("engine {} failed: {cause}", entry.id))
-            })
-            .collect()
+    fn log_failure(&self, entry: &EngineEntry) {
+        // Keep the claim and append together so a concurrent stop cannot overtake them.
+        let mut ring = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(failure) = entry.handle.unreported_failure() {
+            let id = &entry.id;
+            push_event(&mut ring, &format!("engine {id} failed ({})", failure.code));
+            drop(ring);
+            // Raw diagnostics can contain local paths or remote error text.
+            (self.log)(&format!("engine {id} failed: {}", failure.message));
+        }
     }
 
     pub(crate) fn log_new_failures(&self) {
-        for line in self.new_failures() {
-            (self.log)(&line);
+        for entry in self.engines().iter() {
+            self.log_failure(entry);
         }
     }
 
@@ -587,6 +638,8 @@ impl AppState {
         }
         let mut list: Vec<Arc<EngineEntry>> = engines.iter().cloned().collect();
         list.push(Arc::clone(&shared));
+        // Record registration before another request can observe this engine failing.
+        self.record_event(&format!("engine {} registered", shared.id));
         *engines = list.into();
         drop(engines);
         self.owned
@@ -648,6 +701,10 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|_, (engine_id, _)| engine_id != id);
         let report = engine.shutdown();
+        if let Some(entry) = &removed {
+            self.log_failure(entry);
+        }
+        self.record_event(&format!("engine {id} stopped"));
         self.stopping
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -731,6 +788,28 @@ mod tests {
             AppState::new(testkit::API_KEY, entries),
             vec![first, second],
         )
+    }
+
+    #[test]
+    fn event_ring_evicts_the_oldest_and_bounds_each_line() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        for i in 0..=super::EVENT_CAP {
+            state.record_event(&format!("event {i}\n{}", "é".repeat(300)));
+        }
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), super::EVENT_CAP);
+        assert!(events[0].line.starts_with("event 1é"));
+        assert_eq!(events[0].line.chars().count(), 256);
+    }
+
+    #[test]
+    fn wire_hub_events_routes_download_lines_into_the_ring() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        state.wire_hub_events();
+        state.hf().emit("download org/repo finished: 1.0 MiB");
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].line, "download org/repo finished: 1.0 MiB");
     }
 
     #[test]
@@ -920,17 +999,43 @@ mod tests {
             testkit::entry("e1", "model-a", &broken, 4_096),
             testkit::entry("e2", "model-b", &waiting, 4_096),
         ];
-        let state = AppState::new(testkit::API_KEY, entries);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let state = AppState::new(testkit::API_KEY, entries).with_log(move |line| {
+            sink.lock().expect("sink").push(line.to_string());
+        });
         testkit::wait_for_state(&state.engines()[0].handle, EngineState::Error);
-        let first = state.new_failures();
-        assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].starts_with("engine e1 failed: "), "{first:?}");
-        assert!(first[0].contains("fixture load failure"), "{first:?}");
-        assert!(
-            state.new_failures().is_empty(),
-            "the text was reported twice"
-        );
+        state.log_new_failures();
+        state.log_new_failures();
+        let lines = seen.lock().expect("sink");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("engine e1 failed: "));
+        assert!(lines[0].contains("fixture load failure"));
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].line.starts_with("engine e1 failed ("));
+        assert!(!events[0].line.contains("fixture load failure"));
         drop(gate);
+    }
+
+    #[test]
+    fn reused_engine_ids_report_each_failure_even_if_removed_before_a_poll() {
+        let state = AppState::new(testkit::API_KEY, Vec::new());
+        for _ in 0..2 {
+            let engine = testkit::failing_engine();
+            let entry = testkit::entry("repeat", "model-a", &engine, 4_096);
+            let handle = entry.handle.clone();
+            assert!(state.add_engine(entry, engine).is_some());
+            testkit::wait_for_state(&handle, EngineState::Error);
+            state.remove_engine("repeat").expect("remove failed engine");
+        }
+        let events = state.events_snapshot();
+        assert_eq!(events.len(), 6);
+        for instance in events.chunks_exact(3) {
+            assert_eq!(instance[0].line, "engine repeat registered");
+            assert!(instance[1].line.starts_with("engine repeat failed ("));
+            assert_eq!(instance[2].line, "engine repeat stopped");
+        }
     }
 
     #[test]

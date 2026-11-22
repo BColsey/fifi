@@ -29,6 +29,7 @@ use super::job::{
 };
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState, PrefillPairOutcome};
+use crate::family::expert_placement::ExpertPlacement;
 use crate::family::mlx_report::LoadedMlxExecution;
 use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
@@ -140,12 +141,14 @@ struct Shared {
     state: AtomicU8,
     /// The first recorded cause of `Error` or `NativeFailed`, for `/ready` and the logs.
     failure: Mutex<Option<EngineFailure>>,
+    failure_reported: AtomicBool,
     /// The loading stage the engine thread last announced, or `None`
     /// once it has settled (ready or failed). Stages are names of the
     /// phases the family's own start code actually performs — no
     /// percentages, no invented sequence.
     load_stage: Mutex<Option<&'static str>>,
     mlx_execution: OnceLock<LoadedMlxExecution>,
+    expert_placement: OnceLock<ExpertPlacement>,
     /// Set by `shutdown`. The worker cancels every job that it has not finished.
     stop: AtomicBool,
     /// The cancel flag of the running job, so `shutdown` can cancel it.
@@ -172,8 +175,10 @@ impl Shared {
         Shared {
             state: AtomicU8::new(EngineState::Loading as u8),
             failure: Mutex::new(None),
+            failure_reported: AtomicBool::new(false),
             load_stage: Mutex::new(None),
             mlx_execution: OnceLock::new(),
+            expert_placement: OnceLock::new(),
             stop: AtomicBool::new(false),
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
@@ -290,6 +295,7 @@ impl EngineHandle {
         *lock(&self.shared.load_stage)
     }
 
+    #[cfg(any(test, feature = "native-cuda"))]
     pub(crate) fn failure(&self) -> Option<String> {
         self.shared.failure()
     }
@@ -298,9 +304,22 @@ impl EngineHandle {
         self.shared.mlx_execution.get()
     }
 
+    pub(crate) fn expert_placement(&self) -> Option<&ExpertPlacement> {
+        self.shared.expert_placement.get()
+    }
+
     /// The structured failure, for authenticated operator surfaces.
     pub(crate) fn failure_info(&self) -> Option<EngineFailure> {
         self.shared.failure_info()
+    }
+
+    /// A handle and its clones report this engine instance's failure only once.
+    pub(crate) fn unreported_failure(&self) -> Option<EngineFailure> {
+        if self.shared.failure_reported.load(Ordering::Relaxed) {
+            return None;
+        }
+        let failure = self.failure_info()?;
+        (!self.shared.failure_reported.swap(true, Ordering::Relaxed)).then_some(failure)
     }
 
     /// Queues a job without waiting. A refused job is dropped, and its channel closes.
@@ -629,6 +648,9 @@ fn work<E, F>(
             plan: plan.clone(),
             worker_piece_rows: prefill_chunk,
         });
+    }
+    if let Some(placement) = executor.expert_placement() {
+        let _ = shared.expert_placement.set(*placement);
     }
     shared.set_state(EngineState::Ready);
     shared.clear_load_stage();
@@ -1901,6 +1923,41 @@ mod tests {
             handle.state() == super::EngineState::Ready
         });
         assert_eq!(handle.load_stage(), None, "a ready engine reports no stage");
+        assert_eq!(handle.expert_placement(), None);
+    }
+
+    #[test]
+    fn expert_placement_is_published_at_startup() {
+        use crate::family::expert_placement::{ExpertPlacement, ExpertPlacementMode};
+
+        let placement = ExpertPlacement {
+            mode: ExpertPlacementMode::HostStreamed,
+            vram_bytes: Some(48),
+            ram_bytes: Some(96),
+            disk_bytes: None,
+            slots_per_layer: Some(3),
+        };
+        let (release, hold) = mpsc::channel::<()>();
+        let engine = spawn_engine(8, move |_| {
+            hold.recv().unwrap();
+            let mut executor = FakeExecutor::new(vec![], &[EOS], 100_000);
+            executor.expert_placement = Some(placement);
+            Ok((executor, <FakeExecutor as ExecutorOps>::Session::default()))
+        })
+        .expect("spawn engine");
+        let handle = engine.handle();
+        let clone = handle.clone();
+        let loading_placement = handle.expert_placement().copied();
+        release.send(()).unwrap();
+        assert_eq!(loading_placement, None);
+        wait_until("the engine to become ready", || {
+            handle.state() == super::EngineState::Ready
+        });
+        assert_eq!(handle.expert_placement(), Some(&placement));
+        assert!(std::ptr::eq(
+            handle.expert_placement().unwrap(),
+            clone.expert_placement().unwrap()
+        ));
     }
 
     /// An executor that reports a prefix store of no roots and no entries leaves the handle

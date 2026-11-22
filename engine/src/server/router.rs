@@ -38,6 +38,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/v1/system", get(system))
         .route("/v1/telemetry", get(telemetry))
         .route("/v1/recent-requests", get(recent_requests))
+        .route("/v1/logs", get(logs))
         .route("/v1/sampler-trace", get(get_sampler_trace))
         .route("/v1/route-trace", get(get_route_trace))
         .route("/v1/chat/completions", post(chat))
@@ -247,6 +248,11 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             {
                 engine["execution"] = json!(plan);
             }
+            if status != crate::sched::worker::EngineState::Loading
+                && let Some(placement) = entry.handle.expert_placement()
+            {
+                engine["expert_placement"] = json!(placement);
+            }
             engine
         })
         .collect();
@@ -257,9 +263,63 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "cpu_threads": host.cpu_threads,
             "mem_total_bytes": probe_json(&host.mem_total_bytes),
             "mem_available_bytes": probe_json(&host.mem_available_bytes),
+            // Rate inputs, not rates: the monitor diffs two polls into
+            // a CPU percentage and disk throughput. Null off Linux.
+            "cpu_times": read_cpu_times(),
+            "proc_io": read_proc_io().map(|(read_bytes, write_bytes)| {
+                json!({"read_bytes": read_bytes, "write_bytes": write_bytes})
+            }),
         },
         "engines": engines,
     }))
+}
+
+/// `/proc/stat`'s aggregate CPU line as cumulative jiffy counts
+/// (`user nice system idle iowait irq softirq steal ...`). The
+/// monitor diffs two polls into a utilisation percentage; `None`
+/// off Linux, where the figure stays absent rather than wrong.
+fn read_cpu_times() -> Option<Vec<u64>> {
+    parse_cpu_times(std::fs::read_to_string("/proc/stat").ok()?.lines().next()?)
+}
+
+fn parse_cpu_times(line: &str) -> Option<Vec<u64>> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    // Guest and guest_nice are already included in user and nice.
+    let times: Vec<u64> = fields
+        .take(8)
+        .map(|f| f.parse().ok())
+        .collect::<Option<_>>()?;
+    (times.len() >= 4).then_some(times)
+}
+
+/// `/proc/self/io`'s `read_bytes` and `write_bytes`: this process's
+/// block-level I/O, which is the model-streaming and download
+/// traffic the monitor's disk figure wants. `None` off Linux.
+fn read_proc_io() -> Option<(u64, u64)> {
+    parse_proc_io(&std::fs::read_to_string("/proc/self/io").ok()?)
+}
+
+fn parse_proc_io(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| -> Option<u64> {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
+/// The monitor's server-event ring: engine lifecycle, failures and
+/// download lines, oldest first, bounded by the state's ring cap.
+async fn logs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.log_new_failures();
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({"events": state.events_snapshot()})),
+    )
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
@@ -503,9 +563,16 @@ mod tests {
             assert_eq!(body["backends_compiled"], serde_json::json!([]));
         }
         assert!(body["host"]["cpu_threads"].as_u64().is_some_and(|n| n >= 1));
+        // The rate inputs: present everywhere, populated on Linux.
+        assert!(matches!(
+            body["host"]["cpu_times"],
+            serde_json::Value::Null | serde_json::Value::Array(_)
+        ));
+        assert!(body["host"]["proc_io"].is_object() || body["host"]["proc_io"].is_null());
         assert_eq!(body["engines"][0]["id"], "e1");
         assert_eq!(body["engines"][0]["context_limit"], 4_096);
-        // No device claims of any kind from a serving process.
+        assert!(body["engines"][0].get("expert_placement").is_none());
+        // The fake engine publishes no device facts.
         let text = body.to_string();
         assert!(!text.contains("vram") && !text.contains("device"), "{text}");
     }
@@ -690,6 +757,46 @@ mod tests {
         assert_schema("RecentRequests", &body);
         assert!(body["requests"].as_array().expect("array").is_empty());
         assert!(body["active"].as_array().expect("active array").is_empty());
+    }
+
+    #[tokio::test]
+    async fn logs_route_lists_the_event_ring_oldest_first() {
+        let state = Arc::new(AppState::new(testkit::API_KEY, Vec::new()));
+        state.record_event("engine e1 registered");
+        state.record_event("engine e1 stopped");
+        let app = router(state);
+        let (status, _, _) = testkit::send(&app, testkit::get("/v1/logs", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let request = testkit::get("/v1/logs", Some(testkit::API_KEY));
+        let (status, headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-store");
+        let body = testkit::json_of(&body);
+        assert_schema("Logs", &body);
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["line"], "engine e1 registered");
+        assert_eq!(events[1]["line"], "engine e1 stopped");
+        assert!(events[0]["ts_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn cpu_times_parse_from_the_aggregate_proc_stat_line() {
+        let times = super::parse_cpu_times("cpu  100 20 30 4000 50 0 0 10 55 7").expect("parse");
+        assert_eq!(times, vec![100, 20, 30, 4000, 50, 0, 0, 10]);
+        assert!(super::parse_cpu_times("cpu 100 1 3").is_none());
+        assert!(super::parse_cpu_times("procs_running 3").is_none());
+        // A non-numeric jiffy poisons the whole line, not one field.
+        assert!(super::parse_cpu_times("cpu 100 x 3").is_none());
+    }
+
+    #[test]
+    fn proc_io_reads_only_the_two_counter_lines() {
+        let pair =
+            super::parse_proc_io("rchar: 1\nread_bytes: 4096\nwchar: 2\nwrite_bytes: 8192\n")
+                .expect("parse");
+        assert_eq!(pair, (4096, 8192));
+        assert!(super::parse_proc_io("read_bytes: 4096\n").is_none());
     }
 
     fn web_state() -> (

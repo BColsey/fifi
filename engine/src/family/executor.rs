@@ -209,6 +209,10 @@ pub(crate) trait ExecutorOps {
     fn mlx_execution_plan(&self) -> Option<&super::mlx_report::MlxExecutionPlan> {
         None
     }
+    /// The routed experts' placement after startup has built the bank.
+    fn expert_placement(&self) -> Option<&super::expert_placement::ExpertPlacement> {
+        None
+    }
     /// The limits of this executor's prefix store: how many pinned roots and how many LRU entries
     /// it holds. The worker asks once per job and plans its save points with the answer: it emits a
     /// root point only when `roots > 0`, so a job with a root boundary behaves like a job without
