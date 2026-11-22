@@ -261,6 +261,15 @@ impl HostFacts {
         })
     }
 
+    /// What the enclosing cgroup leaves a payload: its remainder less the process's own overhead
+    /// (the term [`HostFacts::payload_spare`] charges inside a binding cgroup), or `None` when no
+    /// cgroup limit binds. A store funded up to this figure is never refused by
+    /// [`HostFacts::admit_payload`] for the cgroup's sake.
+    pub(crate) fn cgroup_payload_room(&self) -> Option<u64> {
+        self.cgroup_remaining
+            .map(|remaining| remaining.saturating_sub(self.process_overhead()))
+    }
+
     /// The bytes of the budget a payload-only admission keeps back.
     pub(crate) fn payload_kept_back(&self) -> u64 {
         self.budget() - self.payload_spare()

@@ -515,16 +515,12 @@ pub(crate) fn bounded_by_cap(system: Option<u64>, cap: u64, active: u64) -> Opti
     system.map(|bytes| bytes.min(cap.saturating_sub(active)))
 }
 
-/// The bytes of snapshots a host store may hold when no planner funds a figure: the machine's
-/// memory less the OS floor the plans keep, less the `resident` bytes the engine already holds.
+/// The bytes of snapshots a host store may hold when no planner funds a figure: the shared
+/// planner's host figure ([`crate::family::mem::host_store_budget`]), which leaves out the OS
+/// floor, the `resident` bytes the engine holds and what a cgroup limit takes away.
 /// `None` when the machine's memory is unknown.
 pub(crate) fn default_host_budget(resident: u64) -> Option<u64> {
-    let total = crate::family::mem::physical_memory_bytes()?;
-    bounded_by_cap(
-        Some(total),
-        total.saturating_sub(crate::family::mem::os_floor_of(total)),
-        resident,
-    )
+    crate::family::mem::host_store_budget(resident)
 }
 
 /// Which of the entries (oldest first, `sizes` bytes each) to write so the rest fit in `budget`

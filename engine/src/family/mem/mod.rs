@@ -47,6 +47,28 @@ pub(crate) fn tier_available_bytes(label: &'static str) -> Option<u64> {
     }
 }
 
+/// The bytes of snapshots a host store may hold when no planner funds a figure: the machine's
+/// memory less the OS floor the plans keep, less the `resident` bytes the engine already holds,
+/// and no more than the enclosing cgroup leaves a payload (the room the save admission
+/// [`HostFacts::admit_payload`] admits against), so a store never funds an entry that admission
+/// then refuses. `None` when the machine's memory is unknown.
+pub(crate) fn host_store_budget(resident: u64) -> Option<u64> {
+    let total = physical_memory_bytes()?;
+    let cgroup = HostFacts::read("kv disk", "kv disk")
+        .ok()
+        .and_then(|host| host.cgroup_payload_room());
+    Some(host_store_budget_of(total, resident, cgroup))
+}
+
+/// [`host_store_budget`] of a machine with `total` bytes, `resident` bytes held and `cgroup`
+/// bytes of room left by its cgroup (`None` when no limit binds).
+pub(crate) fn host_store_budget_of(total: u64, resident: u64, cgroup: Option<u64>) -> u64 {
+    let host = total
+        .saturating_sub(os_floor_of(total))
+        .saturating_sub(resident);
+    cgroup.map_or(host, |room| host.min(room))
+}
+
 /// The bytes this process holds resident now (its resident set, which counts pinned buffers),
 /// or zero when they cannot be read.
 pub(crate) fn process_resident_bytes() -> u64 {
@@ -263,6 +285,49 @@ mod tests {
         }
         assert_eq!(os_floor_of(0), 0);
         assert_eq!(os_floor_of(u64::MAX), u64::MAX.div_ceil(10));
+    }
+
+    #[test]
+    fn a_cgroup_limit_bounds_the_host_store_budget_to_what_the_save_admission_admits() {
+        let text = "MemTotal: 67108864 kB\nMemAvailable: 62914560 kB\n";
+        let total = 64 * GIB;
+        let floor = os_floor_of(total);
+
+        // No cgroup limit: the machine's figure, as before.
+        let free = HostFacts::from_meminfo("test", text, None).unwrap();
+        assert_eq!(free.cgroup_payload_room(), None);
+        let unlimited = host_store_budget_of(total, GIB, free.cgroup_payload_room());
+        assert_eq!(unlimited, total - floor - GIB);
+
+        // A fake 12 GiB cgroup remainder: the budget is the cgroup's room, not the host's.
+        let fenced = HostFacts::from_meminfo("test", text, Some(12 * GIB)).unwrap();
+        let room = fenced.cgroup_payload_room().expect("a limit binds");
+        assert_eq!(room, 12 * GIB - fenced.process_overhead());
+        let budget = host_store_budget_of(total, GIB, Some(room));
+        assert_eq!(budget, room);
+        assert!(
+            budget < unlimited,
+            "the host figure over-counts under a cgroup"
+        );
+
+        // The save admission takes exactly what the budget funds and refuses one byte more.
+        assert!(fenced.admit_payload(budget, "a stored entry").is_ok());
+        assert!(fenced.admit_payload(budget + 1, "a stored entry").is_err());
+        assert!(fenced.admit_payload(unlimited, "a stored entry").is_err());
+
+        // A cgroup roomier than the host leaves the host figure binding.
+        let roomy = HostFacts::from_meminfo("test", text, Some(200 * GIB)).unwrap();
+        assert_eq!(
+            host_store_budget_of(total, GIB, roomy.cgroup_payload_room()),
+            unlimited
+        );
+
+        // A cgroup nearly full leaves nothing, never an underflow.
+        let full = HostFacts::from_meminfo("test", text, Some(GIB)).unwrap();
+        assert_eq!(
+            host_store_budget_of(total, 0, full.cgroup_payload_room()),
+            0
+        );
     }
 
     #[test]
