@@ -447,3 +447,30 @@ fn the_working_set_setting_bounds_the_plan_as_it_bounds_the_load() {
     let higher = resolve(None, &env_on(36, Some(27), Some(65536))).unwrap();
     assert_eq!(higher.prefill_budget, Some(27 * GIB));
 }
+
+/// A start that names no context and runs under a working-set ceiling too small for the resident
+/// model takes the largest context the staged model leaves room for, and one that names a context
+/// that fits the staged model keeps it: the two cases of the contributor's "size omitted Qwen
+/// context from staged weights" and "honor disk staging with host-derived budgets" changes, which
+/// the one memory budget serves without a second planner.
+#[test]
+fn a_ceiling_below_the_resident_model_sizes_the_context_from_the_staged_weights() {
+    let env = env_on(36, Some(27), Some(8192));
+    let host = env.host.unwrap();
+    let unset = resolve(None, &env).unwrap();
+    assert!(unset.mlx_staged_cap.is_some());
+    assert!(
+        unset.context_limit < 262_144 && unset.context_limit % 1024 == 0,
+        "the context follows the staged room: {}",
+        unset.context_limit
+    );
+    let staged = host.staged(EXPERTS).model_bytes;
+    assert!(staged + unset.prefill_reserve <= 8 * GIB);
+    let named = Q36Options {
+        context_limit: Some(32_768),
+        ..Q36Options::default()
+    };
+    let got = resolve(Some(&named), &env).unwrap();
+    assert_eq!(got.context_limit, 32_768);
+    assert!(got.mlx_staged_cap.is_some());
+}
