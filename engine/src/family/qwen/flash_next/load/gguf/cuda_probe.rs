@@ -966,6 +966,95 @@ fn full_expert_device_stacks_match_host() {
     );
 }
 
+fn classify_expert_pair(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    row: &[i32],
+    expected: [i32; 2],
+) -> crate::kernels::cuda::DeviceBuffer {
+    use crate::kernels::cuda::resident::tiered_classify::{
+        CTRL_BYTES, ClassifyCall, ClassifyShape, REQUEST_BYTES,
+    };
+    let allocate = |bytes: usize| {
+        let buffer = ctx.allocate(bytes).unwrap();
+        buffer.write_at(stream, 0, &vec![0; bytes]).unwrap();
+        buffer
+    };
+    let ids = allocate(8);
+    ids.write_at(
+        stream,
+        0,
+        &[257i32.to_ne_bytes(), 256i32.to_ne_bytes()].concat(),
+    )
+    .unwrap();
+    let weights = allocate(8);
+    weights
+        .write_at(
+            stream,
+            0,
+            &[0.25f32.to_ne_bytes(), 0.75f32.to_ne_bytes()].concat(),
+        )
+        .unwrap();
+    let table = allocate(row.len() * 4);
+    table
+        .write_at(
+            stream,
+            0,
+            &row.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let norm = allocate(16);
+    let out = allocate(8);
+    let out_weights = allocate(8);
+    let log = allocate(16);
+    let ctrl = allocate(CTRL_BYTES);
+    let word = allocate(4);
+    let request = allocate(REQUEST_BYTES);
+    let mailbox = allocate(16);
+    ctx.tiered_classify(
+        stream,
+        ClassifyCall {
+            shape: ClassifyShape {
+                n_expert: row.len(),
+                slots: 3,
+                top_k: 2,
+                hidden: 4,
+                layer: 0,
+            },
+            ids: ids.range(0, 8).unwrap(),
+            weights: weights.range(0, 8).unwrap(),
+            slot_row: table.range(0, row.len() * 4).unwrap(),
+            norm_row: norm.range(0, 16).unwrap(),
+            slot_ids_out: out.range(0, 8).unwrap(),
+            weights_out: out_weights.range(0, 8).unwrap(),
+            log_out: log.range(0, 16).unwrap(),
+            ctrl: ctrl.range(0, CTRL_BYTES).unwrap(),
+            word: word.range(0, 4).unwrap(),
+            mbox_req: request.range(0, REQUEST_BYTES).unwrap(),
+            mbox_row: mailbox.range(0, 16).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut observed = [0u8; 8];
+    out.read_at(stream, 0, &mut observed).unwrap();
+    let actual: Vec<i32> = observed
+        .chunks_exact(4)
+        .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(actual, expected);
+    let mut weight_bytes = [0u8; 8];
+    out_weights.read_at(stream, 0, &mut weight_bytes).unwrap();
+    let actual_weights: Vec<f32> = weight_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        actual_weights,
+        [if row[257] < 0 { 0.0 } else { 0.25 }, 0.75]
+    );
+    out
+}
+
 #[test]
 #[ignore = "needs two verified expert ranges and an admitted CUDA device"]
 fn two_real_expert_slots_match_host() {
@@ -1015,6 +1104,7 @@ fn two_real_expert_slots_match_host() {
     let policy =
         ReplaceOnMissLru::from_fill(geometry, &[&mapping], &[vec![0; experts]], None).unwrap();
     let mut state = ExpertBankState::with_policy(geometry, HostMode::Disk, policy).unwrap();
+    let _before = classify_expert_pair(&ctx, &stream, state.slot_row(0), [0, 2]);
     let copies = bank
         .step_disk(&stream, &model, &mut state, 0, &[257, 256])
         .unwrap();
@@ -1024,13 +1114,7 @@ fn two_real_expert_slots_match_host() {
     );
     let slots = [state.slot_row(0)[257], state.slot_row(0)[256]];
     assert!(slots.iter().all(|&slot| slot >= 0) && slots[0] != slots[1]);
-    let ids = ctx.allocate(8).unwrap();
-    ids.write_at(
-        &stream,
-        0,
-        &[slots[0].to_ne_bytes(), slots[1].to_ne_bytes()].concat(),
-    )
-    .unwrap();
+    let ids = classify_expert_pair(&ctx, &stream, state.slot_row(0), slots);
     for part in &layout.parts {
         let tensor = model.map().get(part.role, Some(0)).unwrap();
         let projection = bank.projection(&state, part.role).unwrap();
